@@ -569,20 +569,28 @@ ReachableCallGraphPass::ReachableCallGraphPass(GlobalContext *Ctx_,
 }
 
 std::string ReachableCallGraphPass::getSourceLocation(const BasicBlock *BB) {
-  for (auto &I : *BB) {
-    auto &loc = I.getDebugLoc();
-    if (loc && loc.getLine() != 0) {
-      auto f = loc->getFilename().str();
-      if (f.empty()) {
-        f = BB->getParent()->getParent()->getSourceFileName();
-      }
-      if (f.find("./") == 0) {
-        f = f.substr(2);
-      }
-      return f + ":" + std::to_string(loc->getLine());
+    for (const auto &I : *BB) {
+        auto loc = I.getDebugLoc();
+        if (loc && loc.getLine() != 0) {
+            // Get the filename from the debug location
+            std::string f = loc->getFilename().str();
+            // If filename is empty, get it from the parent function
+            if (f.empty()) {
+                f = BB->getParent()->getParent()->getSourceFileName();
+            }
+            // Remove leading "./" if present
+            if (f.find("./") == 0) {
+                f = f.substr(2);
+            }
+            // Extract the base filename by finding the last '/' or '\\'
+            size_t pos = f.find_last_of("/\\");
+            if (pos != std::string::npos) {
+                f = f.substr(pos + 1);
+            }
+            return f + ":" + std::to_string(loc.getLine());
+        }
     }
-  }
-  return "NoLoc:0";
+    return "NoLoc:0";
 }
 
 void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, bool dumpUnreachable) {

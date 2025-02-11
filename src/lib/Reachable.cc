@@ -7,25 +7,42 @@
  */
 
 
-#include <llvm/IR/DebugInfo.h>
 #include <llvm/Pass.h>
-#include <llvm/IR/Instructions.h>
-#include <llvm/Support/Debug.h>
-#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Constants.h>
-#include <llvm/ADT/StringExtras.h>
+#include <llvm/IR/DebugInfoMetadata.h>
+#include <llvm/IR/GlobalValue.h>
 #include <llvm/Analysis/CallGraph.h>
+#include <llvm/Support/Debug.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/ADT/StringRef.h>
 
 #include <algorithm>
 #include <cassert>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
+#include <limits>
 #include <vector>
+#include <cstdint>
 
 #include "Reachable.h"
 #include "Annotation.h"
 #include "PointTo.h"
+
+
+#if defined(LLVM34)
+#include "llvm/DebugInfo.h"
+#else
+#include "llvm/IR/DebugInfo.h"
+#endif
 
 #define RA_LOG(stmt) KA_LOG(2, "Reachable: " << stmt)
 #define RA_DEBUG(stmt) KA_LOG(3, "Reachable: " << stmt)
@@ -596,6 +613,84 @@ std::string ReachableCallGraphPass::getSourceLocation(const BasicBlock *BB) {
     return "NoLoc:0";
 }
 
+/// \brief Retrieve the first available debug location in \p BB that is not
+/// inside /usr/ and store the **absolute, normalized path** in \p Filename.
+/// Sets \p Line and \p Col accordingly.
+///
+/// This version does:
+///  1) Loops over instructions in \p BB
+///  2) Checks the debug location (and possibly inlined-at location)
+///  3) Builds an absolute, normalized path (resolving "." and "..")
+///  4) Skips if the path is empty, line=0, or the path starts with "/usr/"
+///  5) Returns the first valid debug info found
+void getDebugLocationFullPath(const BasicBlock &BB,
+                              std::string &Filename,
+                              unsigned &Line,
+                              unsigned &Col) {
+  Filename.clear();
+  Line = 0;
+  Col = 0;
+
+  // We don't want paths that point to system libraries in /usr/
+  static const std::string Xlibs("/usr/");
+
+  // Iterate over instructions in the basic block
+  for (auto &Inst : BB) {
+    if (DILocation *Loc = Inst.getDebugLoc()) {
+      // Extract directory & filename
+      std::string Dir  = Loc->getDirectory().str();
+      std::string File = Loc->getFilename().str();
+      unsigned    L    = Loc->getLine();
+      unsigned    C    = Loc->getColumn();
+
+      // If there's no filename, check the inlined location
+      if (File.empty()) {
+        if (DILocation *inlinedAt = Loc->getInlinedAt()) {
+          Dir  = inlinedAt->getDirectory().str();
+          File = inlinedAt->getFilename().str();
+          L    = inlinedAt->getLine();
+          C    = inlinedAt->getColumn();
+        }
+      }
+
+      // Skip if still no filename or line==0
+      if (File.empty() || L == 0)
+        continue;
+
+      // Build an absolute path in a SmallString
+      llvm::SmallString<256> FullPath;
+
+      // 1) If Dir is already absolute, just start with that.
+      //    Otherwise, use the current working directory as a base.
+      if (!Dir.empty() && llvm::sys::path::is_absolute(Dir)) {
+        FullPath = Dir;
+      } else {
+        llvm::sys::fs::current_path(FullPath); // get the current working dir
+        if (!Dir.empty()) {
+          llvm::sys::path::append(FullPath, Dir);
+        }
+      }
+
+      // 2) Append the filename
+      llvm::sys::path::append(FullPath, File);
+
+      // 3) Remove dot segments (both "." and "..")
+      llvm::sys::path::remove_dots(FullPath, /*remove_dot_dot=*/true);
+
+      // Now FullPath is absolute & normalized
+      // Check if it's in /usr/
+      if (StringRef(FullPath).startswith(Xlibs))
+        continue; // skip system-libs
+
+      // Found a valid location => set output vars
+      Filename = FullPath.str().str(); // convert to std::string
+      Line     = L;
+      Col      = C;
+      break; // stop after the first valid location
+    }
+  }
+}
+
 void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, bool dumpUnreachable) {
   std::deque<const BasicBlock*> worklist;
   std::unordered_set<const BasicBlock*> visited;
@@ -727,6 +822,37 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
       }
     }
     OS << "\n";
+  }
+}
+
+void ReachableCallGraphPass::dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo) {
+  ModuleList::iterator i, e;
+  for (i = modules.begin(), e = modules.end(); i != e; ++i) {
+    Module *M = i->first;
+    for (auto &F : *M) {
+      unsigned minLine = std::numeric_limits<unsigned>::max();
+      unsigned maxLine = 0;
+      std::string filepath;
+
+      for (auto &BB : F) {
+        unsigned line = 0;
+        unsigned col = 0;
+        getDebugLocationFullPath(BB, filepath, line, col);
+        uint32_t bb_id = getBasicBlockId(&BB);
+
+        if (line < minLine && line > 0) {
+          minLine = line;
+        }
+        if (line > maxLine && line > 0) {
+          maxLine = line;
+        }
+        if (!filepath.empty() && line != 0)
+          bbLocs << bb_id << "," << F.getGUID() << "," << filepath << ":" << line << "\n";
+
+      }
+      if (!filepath.empty() && minLine != std::numeric_limits<unsigned>::max() && maxLine != 0)
+        funcInfo << F.getGUID() << "," << F.getName().str() << "," << filepath << "," << minLine << "," << maxLine << "\n";
+    }
   }
 }
 

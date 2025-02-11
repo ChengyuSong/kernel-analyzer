@@ -140,7 +140,12 @@ void doBasicInitialization(Module *M) {
       // external linkage always ends up with the function name
       auto FID = F.getGUID();
       if (!F.isDeclaration() && !F.empty()) {
-        assert(GlobalCtx.Funcs.count(FID) == 0);
+	if (GlobalCtx.Funcs.count(FID) != 0) {
+	  WARNING("Function " << F.getName()
+              << " has been defined multiple times, previously in "
+              << GlobalCtx.Funcs[FID]->getParent()->getModuleIdentifier()
+              << ", and now in " << M->getModuleIdentifier() << "\n");
+	}
         GlobalCtx.Funcs[FID] = &F;
       } else {
         GlobalCtx.ExtFuncs[FID] = &F;

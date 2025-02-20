@@ -54,6 +54,11 @@ cl::opt<std::string> DumpPolicy(
 cl::opt<std::string> DumpDistance(
   "dump-distance", cl::desc("Dump distance"), cl::init(""));
 
+cl::opt<std::string> DumpBidMapping(
+  "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum"), cl::init(""));
+
+cl::opt<std::string> DumpFuncInfo(
+  "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
 
 GlobalContext GlobalCtx;
 
@@ -140,7 +145,12 @@ void doBasicInitialization(Module *M) {
       // external linkage always ends up with the function name
       auto FID = F.getGUID();
       if (!F.isDeclaration() && !F.empty()) {
-        assert(GlobalCtx.Funcs.count(FID) == 0);
+	if (GlobalCtx.Funcs.count(FID) != 0) {
+	  WARNING("Function " << F.getName()
+              << " has been defined multiple times, previously in "
+              << GlobalCtx.Funcs[FID]->getParent()->getModuleIdentifier()
+              << ", and now in " << M->getModuleIdentifier() << "\n");
+	}
         GlobalCtx.Funcs[FID] = &F;
       } else {
         GlobalCtx.ExtFuncs[FID] = &F;
@@ -206,13 +216,19 @@ int main(int argc, char **argv) {
 
   ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, false);
   RCGPass.run(GlobalCtx.Modules);
+
+  if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
+    std::ofstream bbLocs(DumpBidMapping);
+    std::ofstream funcInfo(DumpFuncInfo);
+    RCGPass.dumpIDMapping(GlobalCtx.Modules, bbLocs, funcInfo);
+  }
   if (!DumpPolicy.empty()) {
     std::ofstream policy(DumpPolicy);
     RCGPass.dumpPolicy(policy);
   }
   if (!DumpDistance.empty()) {
     std::ofstream distance(DumpDistance);
-    RCGPass.dumpDistance(distance, true, true);
+    RCGPass.dumpDistance(distance, true, false);
   }
 
   return 0;

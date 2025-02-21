@@ -7,6 +7,7 @@
 #include <limits>
 #include <unordered_set>
 #include <unordered_map>
+#include <vector>
 
 #include "Global.h"
 
@@ -31,6 +32,9 @@ private:
   std::unordered_map<const llvm::BasicBlock*, double> distances;
   std::unordered_set<const llvm::BasicBlock*> exitBBs;
   std::unordered_set<const llvm::BasicBlock*> entryBBs;
+  using CallSequence = std::vector<const llvm::CallBase*>;
+  std::unordered_map<const llvm::BasicBlock*, CallSequence> BBswithCalls;
+  std::unordered_map<const llvm::CallBase*, double> callDistances;
   std::unordered_set<const llvm::CallBase*> reachableIndirectCalls;
 
 public:

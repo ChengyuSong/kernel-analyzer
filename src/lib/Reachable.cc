@@ -207,57 +207,90 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
   bool Changed = false;
 
   RA_LOG("### Run on function: " << F->getName() << "\n");
-  for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
-    Instruction *I = &*i;
+  for (auto &BB : *F) {
+    for (auto &i : BB) {
+      Instruction *I = &i;
 
-    if (UseTypeBasedCallGraph) {
-      if (CallInst *CI = dyn_cast<CallInst>(I)) {
-        if (Function *CF = CI->getCalledFunction()) {
-          // direct call
-          auto RCF = getFuncDef(CF);
-          Changed |= Ctx->Callees[CI].insert(RCF).second;
-          Changed |= Ctx->Callers[RCF].insert(CI).second;
-          // check for call to exit functions
-          if (isExitFn(RCF->getName())) {
-            RA_LOG("Exit Call: " << *CI << "\n");
-            exitBBs.insert(CI->getParent());
+      if (UseTypeBasedCallGraph) {
+        if (CallInst *CI = dyn_cast<CallInst>(I)) {
+          if (Function *CF = CI->getCalledFunction()) {
+            // direct call
+            auto RCF = getFuncDef(CF);
+            Changed |= Ctx->Callees[CI].insert(RCF).second;
+            Changed |= Ctx->Callers[RCF].insert(CI).second;
+            // check for call to exit functions
+            if (isExitFn(RCF->getName())) {
+              RA_LOG("Exit Call: " << *CI << "\n");
+              exitBBs.insert(CI->getParent());
+            }
+          } else if (!CI->isInlineAsm()) {
+            // indirect call
+            auto &FS = calleeByType[CI];
+            Changed |= findCalleesByType(CI, FS);
+            for (auto F : FS) {
+              RA_DEBUG("Adding indirect caller for " << F->getName() << "@" << F << "\n");
+              Changed |= callerByType[F].insert(CI).second;
+            }
           }
-        } else if (!CI->isInlineAsm()) {
-          // indirect call
-          auto &FS = calleeByType[CI];
-          Changed |= findCalleesByType(CI, FS);
-          for (auto F : FS) {
-            RA_DEBUG("Adding indirect caller for " << F->getName() << "@" << F << "\n");
-            Changed |= callerByType[F].insert(CI).second;
+        } else if (InvokeInst *II = dyn_cast<InvokeInst>(I)) {
+          if (Function *CF = II->getCalledFunction()) {
+            // direct call
+            auto RCF = getFuncDef(CF);
+            Changed |= Ctx->Callees[II].insert(RCF).second;
+            Changed |= Ctx->Callers[RCF].insert(II).second;
+            // check for call to exit functions
+            if (isExitFn(RCF->getName())) {
+              RA_LOG("Exit Call: " << *II << "\n");
+              exitBBs.insert(II->getParent());
+            }
+          } else if (!II->isInlineAsm()) {
+            // indirect call
+            KA_ERR("Indirect invoke not supported\n");
           }
-        }
-      } else if (InvokeInst *II = dyn_cast<InvokeInst>(I)) {
-        if (Function *CF = II->getCalledFunction()) {
-          // direct call
-          auto RCF = getFuncDef(CF);
-          Changed |= Ctx->Callees[II].insert(RCF).second;
-          Changed |= Ctx->Callers[RCF].insert(II).second;
-          // check for call to exit functions
-          if (isExitFn(RCF->getName())) {
-            RA_LOG("Exit Call: " << *II << "\n");
-            exitBBs.insert(II->getParent());
-          }
-        } else if (!II->isInlineAsm()) {
-          // indirect call
-          KA_ERR("Indirect invoke not supported\n");
         }
       }
-    }
 
-    // check against target list
-    auto f = F->getParent()->getSourceFileName();
-    auto loc = I->getDebugLoc();
-    if (loc) {
-      for (auto &target : targetList) {
-        if (f.find(target.first) != std::string::npos && loc.getLine() == target.second) {
-          RA_LOG("Target I: " << *I << "\n");
-          distances[I->getParent()] = 0.0;
-          reachableBBs.insert(I->getParent());
+      // check against target list
+      auto f = F->getParent()->getSourceFileName();
+      auto loc = I->getDebugLoc();
+      if (loc) {
+        for (auto &target : targetList) {
+          if (f.find(target.first) != std::string::npos && loc.getLine() == target.second) {
+            RA_LOG("Target I: " << *I << "\n");
+            distances[I->getParent()] = 0.0;
+            reachableBBs.insert(I->getParent());
+          }
+        }
+      }
+
+      // collect interesting callsites
+      if (auto CI = dyn_cast<CallBase>(I)) {
+        if (CI->isInlineAsm()) { // skip inline asm
+          continue;
+        }
+        bool hasCallee = true; // likely
+        auto itr = Ctx->Callees.find(CI);
+        if (itr == Ctx->Callees.end()) {
+          hasCallee = false;
+          if (UseTypeBasedCallGraph) {
+            itr = calleeByType.find(CI);
+            hasCallee = (itr != calleeByType.end());
+          }
+        }
+        if (!hasCallee) {
+          // RA_DEBUG("No callee for " << *CI << "\n");
+          continue;
+        }
+        bool defined = false;
+        for (auto F : itr->second) {
+          if (F->isIntrinsic() || F->empty()) {
+            continue; // skip intrinsic and declaration
+          }
+          defined = true;
+        }
+        if (defined) {
+          // record the call site
+          BBswithCalls[&BB].push_back(CI);
         }
       }
     }
@@ -314,59 +347,6 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
   while (!worklist.empty()) {
     auto *BB = worklist.front();
     worklist.pop_front();
-    // go through instructions, looking for calls
-    bool willReturn = true;
-    for (auto &I : *BB) {
-      if (auto CI = dyn_cast<CallBase>(&I)) {
-        if (CI->isInlineAsm()) {
-          RA_DEBUG("Skip inline asm call\n");
-          continue;
-        }
-        // propagate through return edge
-        bool found = true; // likely
-        auto itr = Ctx->Callees.find(CI);
-        if (itr == Ctx->Callees.end()) {
-          found = false;
-          if (UseTypeBasedCallGraph) {
-            itr = calleeByType.find(CI);
-            found = (itr != calleeByType.end());
-          }
-        }
-        if (!found) {
-          RA_DEBUG("No callee for " << *CI << "\n");
-          continue;
-        }
-        bool added = false;
-        for (auto F : itr->second) {
-          if (F->isIntrinsic() || F->empty()) {
-            continue;
-          }
-          if (F->doesNotReturn()) {
-            RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
-            willReturn = false;
-            break; // not need to continue
-          }
-          // add exit block(s) as reachable
-          for (auto &BB : *F) {
-            if (isa<ReturnInst>(BB.getTerminator())) {
-              RA_LOG("Adding callee: " << F->getName() << "\n");
-              if (reachable.insert(&BB).second) {
-                worklist.push_back(&BB);
-              }
-            }
-          }
-          added = true;
-        }
-        if (added) {
-          // record the call site
-          BBswithCalls[BB].push_back(CI);
-        }
-      }
-    }
-    // if there is a call to non-returning function, the BB is not reachable
-    if (!willReturn) {
-      continue;
-    }
     // add predecessors
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
       auto *Pred = *PI;
@@ -397,12 +377,52 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
       RA_DEBUG(F->getName() << " is reachable\n");
       for (auto CI : itr->second) {
         auto CBB = CI->getParent();
-        RA_DEBUG("\tadding caller: " << CI->getFunction()->getName() << "\n");
-        if (reachable.insert(CBB).second) {
-          worklist.push_back(CBB);
+        // go through instructions, handle additional callees
+        bool willReturn = true;
+        bool added = false;
+        auto hasCalls = BBswithCalls.find(CBB);
+        assert(hasCalls != BBswithCalls.end());
+        auto calls = hasCalls->second;
+        for (auto i = calls.size() - 1; i > 0; --i) {
+          if (calls[i] == CI) {
+            // find the current callsite and there are additional callees before it
+            CI = calls[i - 1];
+            auto fitr = Ctx->Callees.find(CI);
+            if (fitr == Ctx->Callees.end()) {
+              if (UseTypeBasedCallGraph) {
+                fitr = calleeByType.find(CI);
+              }
+            }
+            // any callsite here is guaranteed to have a callee
+            for (auto F : fitr->second) {
+              if (F->doesNotReturn()) {
+                RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
+                willReturn = false;
+                break; // not need to continue
+              }
+              // add exit block(s) as reachable
+              for (auto &TBB : *F) {
+                if (isa<ReturnInst>(TBB.getTerminator())) {
+                  RA_LOG("Adding callee: " << F->getName() << "\n");
+                  if (reachable.insert(&TBB).second) {
+                    worklist.push_back(&TBB);
+                    added = true;
+                  }
+                }
+              }
+            }
+            if (added) break; // one callsite at a time
+          }
         }
-      }
-    }
+        if (willReturn && !added) {
+          // if all callees have been processed, add the CBB
+          RA_DEBUG("\tadding caller: " << CI->getFunction()->getName() << "\n");
+          if (reachable.insert(CBB).second) {
+            worklist.push_back(CBB);
+          }
+        }
+      } // end of callers
+    } // end of entry block
   }
 }
 
@@ -476,7 +496,8 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     if (hasCalls != BBswithCalls.end()) {
       auto &calls = hasCalls->second;
       bool added = false;
-      for (auto i = calls.size() - 1;; --i) {
+      for (auto i = calls.size() - 1; i > 0; --i) {
+        // we don't care the first callsite (i == 0)
         auto *CI = calls[i];
         // in most cases, if a BB with calls in enqueued, the reachability comes
         // from the callee, we want to further propagate the reachability to the
@@ -488,36 +509,34 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           assert(itr != callDistances.end());
           auto dist = itr->second;
           queuedCalls.erase(CI);
-          if (i > 0) {
-            // there is additional callees before the callsite
-            CI = calls[i - 1];
-            // propagate to return sites in the callee
-            auto fitr = Ctx->Callees.find(CI);
-            if (fitr == Ctx->Callees.end()) {
-              if (UseTypeBasedCallGraph) {
-                fitr = calleeByType.find(CI);
-              }
+          // for loop condition ensures (i > 0)
+          // so there is additional callees before the callsite
+          CI = calls[i - 1];
+          // propagate to return sites in the callee
+          auto fitr = Ctx->Callees.find(CI);
+          if (fitr == Ctx->Callees.end()) {
+            if (UseTypeBasedCallGraph) {
+              fitr = calleeByType.find(CI);
             }
-            // any callsite here is guaranteed to have a callee
-            for (auto F : fitr->second) {
-              // add exit block(s) as reachable
-              for (auto &TBB : *F) {
-                if (isa<ReturnInst>(TBB.getTerminator())) {
-                  auto itr = distances.find(&TBB);
-                  if (itr == distances.end() || itr->second > dist) {
-                    RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
-                    distances[&TBB] = dist;
-                    if (queued.insert(&TBB).second) {
-                      worklist.push_back(&TBB);
-                    }
-                    added = true;
+          }
+          // any callsite here is guaranteed to have a callee
+          for (auto F : fitr->second) {
+            // add exit block(s) as reachable
+            for (auto &TBB : *F) {
+              if (isa<ReturnInst>(TBB.getTerminator())) {
+                auto itr = distances.find(&TBB);
+                if (itr == distances.end() || itr->second > dist) {
+                  RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
+                  distances[&TBB] = dist;
+                  if (queued.insert(&TBB).second) {
+                    worklist.push_back(&TBB);
                   }
+                  added = true;
                 }
               }
             }
           }
         }
-        if (i == 0) break;
       }
       if (added) {
         // if we have propagated reachability to a callee, it will come back,

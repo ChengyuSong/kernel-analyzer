@@ -351,6 +351,7 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
       auto *Pred = *PI;
       if (reachable.insert(Pred).second) {
+        RA_DEBUG("Adding Pred: " << *Pred << "\n");
         worklist.push_back(Pred);
       }
     }

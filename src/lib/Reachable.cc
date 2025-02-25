@@ -495,53 +495,88 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     auto hasCalls = BBswithCalls.find(BB);
     if (hasCalls != BBswithCalls.end()) {
       auto &calls = hasCalls->second;
-      bool added = false;
-      for (auto i = calls.size() - 1; i > 0; --i) {
-        // we don't care the first callsite (i == 0)
+      bool finished = false;
+      const CallBase *propagate = nullptr;
+      double dist = NAN;
+      for (auto i = calls.size() - 1;; --i) {
+        // iterate through all callsites, in reverse order
         auto *CI = calls[i];
-        // in most cases, if a BB with calls in enqueued, the reachability comes
-        // from the callee, we want to further propagate the reachability to the
-        // additional callees before the callsite, if any
         if (queuedCalls.find(CI) != queuedCalls.end()) {
+          // if the reachability comes from the callee
           RA_DEBUG("Find current callsite: " << *CI << "\n");
-          // get the distance of current callsite
-          auto itr = callDistances.find(CI);
-          assert(itr != callDistances.end());
-          auto dist = itr->second;
           queuedCalls.erase(CI);
-          // for loop condition ensures (i > 0)
-          // so there is additional callees before the callsite
-          CI = calls[i - 1];
-          // propagate to return sites in the callee
-          auto fitr = Ctx->Callees.find(CI);
-          if (fitr == Ctx->Callees.end()) {
-            if (UseTypeBasedCallGraph) {
-              fitr = calleeByType.find(CI);
-            }
+          if (i > 0) {
+            // there are additional callees before the current callsite
+            // we need to propagate the reachability to them
+            RA_DEBUG("Propagate to additional callees\n");
+            // get the distance of current callsite
+            auto itr = callDistances.find(CI);
+            assert(itr != callDistances.end());
+            dist = itr->second;
+            // record the callsite to be propagated to
+            propagate = calls[i - 1];
+          } else {
+            // all callees have been processed
+            finished = true;
           }
-          // any callsite here is guaranteed to have a callee
-          for (auto F : fitr->second) {
-            // add exit block(s) as reachable
-            for (auto &TBB : *F) {
-              if (isa<ReturnInst>(TBB.getTerminator())) {
-                auto itr = distances.find(&TBB);
-                if (itr == distances.end() || itr->second > dist) {
-                  RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
-                  distances[&TBB] = dist;
-                  if (queued.insert(&TBB).second) {
-                    worklist.push_back(&TBB);
-                  }
-                  added = true;
+          break; // always break if coming from callee
+        }
+        if (i == 0) break;
+      }
+      if (!finished) {
+        // if not finished, we either have more callsite(s) to process,
+        // or the reachability is coming from the successor,
+        if (propagate == nullptr) {
+          // in the later case, we want to propagate BB distance to the last callsite
+          RA_DEBUG("Propagate BB distance to last callsite\n");
+          propagate = calls.back();
+          dist = distances[BB];
+        }
+        // propagate to return sites in the callee
+        auto fitr = Ctx->Callees.find(propagate);
+        if (fitr == Ctx->Callees.end()) {
+          if (UseTypeBasedCallGraph) {
+            fitr = calleeByType.find(propagate);
+          }
+        }
+        bool added = false;
+        // any callsite here is guaranteed to have a callee
+        for (auto F : fitr->second) {
+          // add exit block(s) as reachable
+          for (auto &TBB : *F) {
+            if (isa<ReturnInst>(TBB.getTerminator())) {
+              auto itr = distances.find(&TBB);
+              if (itr == distances.end() || itr->second > dist) {
+                RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
+                distances[&TBB] = dist;
+                if (queued.insert(&TBB).second) {
+                  worklist.push_back(&TBB);
                 }
+                added = true;
               }
             }
           }
         }
-      }
-      if (added) {
-        // if we have propagated reachability to a callee, it will come back,
-        // so we don't need to propagate to predecessors for now
-        continue;
+        if (added) {
+          // if we have propagated reachability to a callee, it will come back,
+          // so we don't need to propagate to predecessors for now
+          continue;
+        } else {
+          // there is another callsite but no propagation is needed
+          // simulate the propagation by adding the callsite to the queue
+          queuedCalls.insert(propagate);
+          if (queued.insert(BB).second)
+              worklist.push_back(BB);
+          continue;
+        }
+      } else {
+        // if all callsites have been processed, use the distance of the first
+        // callsite as the distance of the BB
+        RA_DEBUG("All callees processed\n");
+        auto itr = callDistances.find(calls.front());
+        assert(itr != callDistances.end());
+        dist = itr->second;
+        distances[BB] = dist;
       }
     }
     // check predecessors
@@ -614,14 +649,14 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
         }
         if (!CI->isIndirectCall()) {
           // for direct calls, prob can be propagated directly
-          auto itr2 = distances.find(CBB);
-          if (itr2 == distances.end() || itr2->second > dist) {
+          auto itr2 = callDistances.find(CI);
+          if (itr2 == callDistances.end() || itr2->second > dist) {
             RA_DEBUG("Adding direct caller: " << CI->getFunction()->getName() << "\n");
-            distances[CBB] = dist;
-            if (queued.insert(CBB).second)
-              worklist.push_back(CBB);
+            // distances[CBB] = dist;
             callDistances[CI] = dist;
             queuedCalls.insert(CI);
+            if (queued.insert(CBB).second)
+              worklist.push_back(CBB);
           }
         } else {
           // indirect call is tricky, treat like predecessors
@@ -658,14 +693,14 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
             WARNING("dist overflow for indirect call\n");
             continue;
           }
-          auto itr2 = distances.find(CBB);
-          if (itr2 == distances.end() || itr2->second > dist) {
+          auto itr2 = callDistances.find(CI);
+          if (itr2 == callDistances.end() || itr2->second > dist) {
             RA_DEBUG("Adding indirect caller: " << CI->getFunction()->getName() << "\n");
-            distances[CBB] = dist;
-            if (queued.insert(CBB).second)
-              worklist.push_back(CBB);
+            // distances[CBB] = dist;
             callDistances[CI] = dist;
             queuedCalls.insert(CI);
+            if (queued.insert(CBB).second)
+              worklist.push_back(CBB);
           }
         }
       }

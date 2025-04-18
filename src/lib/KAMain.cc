@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
   TyPMCGPass TyCG(&GlobalCtx);
   TyCG.run(GlobalCtx.Modules);
 
-  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, false);
+  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, true);
   RCGPass.run(GlobalCtx.Modules);
 
   if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){

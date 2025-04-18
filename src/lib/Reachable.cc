@@ -162,7 +162,8 @@ bool ReachableCallGraphPass::findCalleesByType(CallInst *CI, FuncSet &FS) {
       // just compare known args
       if (F->getFunctionType()->isVarArg()) {
         //errs() << "VarArg: " << F->getName() << "\n";
-        KA_ERR("VarArg address taken function\n");
+        WARNING("VarArg address taken function\n");
+        continue;
       } else if (F->arg_size() != CS.arg_size()) {
         RA_DEBUG("ArgNum mismatch: " << F->getName() << "\n");
         continue;
@@ -501,7 +502,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           FuncSet &Callees = UseTypeBasedCallGraph ? calleeByType[CI] : Ctx->Callees[CI];
           RA_LOG("\tfrom indirect call @" << CF->getName() << ", callee size = " << Callees.size() << "\n");
           // XXX: skip potentially imprecise callsites?
-          if (Callees.size() > 50) {
+          if (itr->second.size() > 5 && Callees.size() > 50) {
             RA_DEBUG("Skip indirect call with too many callees\n");
             continue;
           }
@@ -724,14 +725,15 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
     for (auto &I : *BB) {
       // check for callees
       if (const CallBase *CI = dyn_cast<CallBase>(&I)) {
-        auto itr = Ctx->Callees.find(CI);
-        if (itr == Ctx->Callees.end() && UseTypeBasedCallGraph) {
-          itr = calleeByType.find(CI);
-        }
-        for (auto F: itr->second) {
+        FuncSet &Callees = CI->isIndirectCall() ?
+	    (UseTypeBasedCallGraph ? calleeByType[CI] : Ctx->Callees[CI])
+	  : Ctx->Callees[CI];
+        for (auto F: Callees) {
           auto *FBB = &F->getEntryBlock();
-          if (distances.find(FBB) != distances.end() && visited.insert(FBB).second) {
-            worklist.push_back(FBB);
+          if (distances.find(FBB) != distances.end()) {
+	    RA_DEBUG("callee: " << F->getName() << " reachable \n");
+	    if (visited.insert(FBB).second)
+              worklist.push_back(FBB);
           }
         }
       }

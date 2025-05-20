@@ -162,7 +162,8 @@ bool ReachableCallGraphPass::findCalleesByType(CallInst *CI, FuncSet &FS) {
       // just compare known args
       if (F->getFunctionType()->isVarArg()) {
         //errs() << "VarArg: " << F->getName() << "\n";
-        KA_ERR("VarArg address taken function\n");
+        WARNING("VarArg address taken function\n");
+        continue;
       } else if (F->arg_size() != CS.arg_size()) {
         RA_DEBUG("ArgNum mismatch: " << F->getName() << "\n");
         continue;

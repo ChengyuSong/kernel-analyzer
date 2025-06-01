@@ -25,6 +25,7 @@ private:
   CallerMap callerByType;
 
   const bool UseTypeBasedCallGraph;
+  const bool PropagateThroughReturnEdgees;
 
   std::vector<std::pair<std::string, int> > targetList;
   std::vector<std::string> entryList;
@@ -39,7 +40,7 @@ private:
 
 public:
     ReachableCallGraphPass(GlobalContext *Ctx_, std::string &TargetList,
-        std::string &EntryList, bool typeBased = true);
+        std::string &EntryList, bool typeBased = true, bool propagateRet = false);
     virtual bool doInitialization(llvm::Module *);
     virtual bool doFinalization(llvm::Module *);
     virtual void run(ModuleList &modules);

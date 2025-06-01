@@ -283,7 +283,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
           }
         }
         if (!hasCallee) {
-          // RA_DEBUG("No callee for " << *CI << "\n");
+          RA_DEBUG("No callee for " << *CI << "\n");
           continue;
         }
         bool defined = false;
@@ -293,7 +293,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
           }
           defined = true;
         }
-        if (defined) {
+        if (defined && PropagateThroughReturnEdgees) {
           // record the call site
           BBswithCalls[&BB].push_back(CI);
         }
@@ -385,42 +385,44 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
         // go through instructions, handle additional callees
         bool willReturn = true;
         bool added = false;
-        auto hasCalls = BBswithCalls.find(CBB);
-        assert(hasCalls != BBswithCalls.end());
-        auto calls = hasCalls->second;
-        for (auto i = calls.size() - 1; i > 0; --i) {
-          if (calls[i] == CI) {
-            // find the current callsite and there are additional callees before it
-            CI = calls[i - 1];
-            auto fitr = Ctx->Callees.find(CI);
-            if (fitr == Ctx->Callees.end()) {
-              if (UseTypeBasedCallGraph) {
-                fitr = calleeByType.find(CI);
+        if (PropagateThroughReturnEdgees) {
+          auto hasCalls = BBswithCalls.find(CBB);
+          assert(hasCalls != BBswithCalls.end());
+          auto calls = hasCalls->second;
+          for (auto i = calls.size() - 1; i > 0; --i) {
+            if (calls[i] == CI) {
+              // find the current callsite and there are additional callees before it
+              auto PCI = calls[i - 1];
+              auto fitr = Ctx->Callees.find(PCI);
+              if (fitr == Ctx->Callees.end()) {
+                if (UseTypeBasedCallGraph) {
+                  fitr = calleeByType.find(PCI);
+                }
               }
-            }
-            // any callsite here is guaranteed to have a callee
-            for (auto F : fitr->second) {
-              if (F->doesNotReturn()) {
-                RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
-                willReturn = false;
-                break; // not need to continue
-              }
-              // add exit block(s) as reachable
-              for (auto &TBB : *F) {
-                if (isa<ReturnInst>(TBB.getTerminator())) {
-                  RA_LOG("Adding callee: " << F->getName() << "\n");
-                  if (reachable.insert(&TBB).second) {
-                    worklist.push_back(&TBB);
-                    added = true;
+              // any callsite here is guaranteed to have a callee
+              for (auto F : fitr->second) {
+                if (F->doesNotReturn()) {
+                  RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
+                  willReturn = false;
+                  break; // not need to continue
+                }
+                // add exit block(s) as reachable
+                for (auto &TBB : *F) {
+                  if (isa<ReturnInst>(TBB.getTerminator())) {
+                    RA_LOG("Adding callee: " << F->getName() << "\n");
+                    if (reachable.insert(&TBB).second) {
+                      worklist.push_back(&TBB);
+                      added = true;
+                    }
                   }
                 }
               }
+              if (added) break; // one callsite at a time
             }
-            if (added) break; // one callsite at a time
           }
         }
         if (willReturn && !added) {
-          // if all callees have been processed, add the CBB
+          // if all callsites have been processed, add the CBB
           RA_DEBUG("\tadding caller: " << CI->getFunction()->getName() << "\n");
           if (reachable.insert(CBB).second) {
             worklist.push_back(CBB);
@@ -496,92 +498,94 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     auto *BB = worklist.front();
     worklist.pop_front();
     queued.erase(BB);
-    // go through instructions, looking for calls
-    auto hasCalls = BBswithCalls.find(BB);
-    if (hasCalls != BBswithCalls.end()) {
-      auto &calls = hasCalls->second;
-      bool finished = false;
-      const CallBase *propagate = nullptr;
-      double dist = NAN;
-      for (auto i = calls.size() - 1;; --i) {
-        // iterate through all callsites, in reverse order
-        auto *CI = calls[i];
-        if (queuedCalls.find(CI) != queuedCalls.end()) {
-          // if the reachability comes from the callee
-          RA_DEBUG("Find current callsite: " << *CI << "\n");
-          queuedCalls.erase(CI);
-          if (i > 0) {
-            // there are additional callees before the current callsite
-            // we need to propagate the reachability to them
-            RA_DEBUG("Propagate to additional callees\n");
-            // get the distance of current callsite
-            auto itr = callDistances.find(CI);
-            assert(itr != callDistances.end());
-            dist = itr->second;
-            // record the callsite to be propagated to
-            propagate = calls[i - 1];
-          } else {
-            // all callees have been processed
-            finished = true;
+    if (PropagateThroughReturnEdgees) {
+      // go through instructions, looking for calls
+      auto hasCalls = BBswithCalls.find(BB);
+      if (hasCalls != BBswithCalls.end()) {
+        auto &calls = hasCalls->second;
+        bool finished = false;
+        const CallBase *propagate = nullptr;
+        double dist = NAN;
+        for (auto i = calls.size() - 1;; --i) {
+          // iterate through all callsites, in reverse order
+          auto *CI = calls[i];
+          if (queuedCalls.find(CI) != queuedCalls.end()) {
+            // if the reachability comes from the callee
+            RA_DEBUG("Find current callsite: " << *CI << "\n");
+            queuedCalls.erase(CI);
+            if (i > 0) {
+              // there are additional callees before the current callsite
+              // we need to propagate the reachability to them
+              RA_DEBUG("Propagate to additional callees\n");
+              // get the distance of current callsite
+              auto itr = callDistances.find(CI);
+              assert(itr != callDistances.end());
+              dist = itr->second;
+              // record the callsite to be propagated to
+              propagate = calls[i - 1];
+            } else {
+              // all callees have been processed
+              finished = true;
+            }
+            break; // always break if coming from callee
           }
-          break; // always break if coming from callee
+          if (i == 0) break;
         }
-        if (i == 0) break;
-      }
-      if (!finished) {
-        // if not finished, we either have more callsite(s) to process,
-        // or the reachability is coming from the successor,
-        if (propagate == nullptr) {
-          // in the later case, we want to propagate BB distance to the last callsite
-          RA_DEBUG("Propagate BB distance to last callsite\n");
-          propagate = calls.back();
-          dist = distances[BB];
-        }
-        // propagate to return sites in the callee
-        auto fitr = Ctx->Callees.find(propagate);
-        if (fitr == Ctx->Callees.end()) {
-          if (UseTypeBasedCallGraph) {
-            fitr = calleeByType.find(propagate);
+        if (!finished) {
+          // if not finished, we either have more callsite(s) to process,
+          // or the reachability is coming from the successor,
+          if (propagate == nullptr) {
+            // in the later case, we want to propagate BB distance to the last callsite
+            RA_DEBUG("Propagate BB distance to last callsite\n");
+            propagate = calls.back();
+            dist = distances[BB];
           }
-        }
-        bool added = false;
-        // any callsite here is guaranteed to have a callee
-        for (auto F : fitr->second) {
-          // add exit block(s) as reachable
-          for (auto &TBB : *F) {
-            if (isa<ReturnInst>(TBB.getTerminator())) {
-              auto itr = distances.find(&TBB);
-              if (itr == distances.end() || itr->second > dist) {
-                RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
-                distances[&TBB] = dist;
-                if (queued.insert(&TBB).second) {
-                  worklist.push_back(&TBB);
+          // propagate to return sites in the callee
+          auto fitr = Ctx->Callees.find(propagate);
+          if (fitr == Ctx->Callees.end()) {
+            if (UseTypeBasedCallGraph) {
+              fitr = calleeByType.find(propagate);
+            }
+          }
+          bool added = false;
+          // any callsite here is guaranteed to have a callee
+          for (auto F : fitr->second) {
+            // add exit block(s) as reachable
+            for (auto &TBB : *F) {
+              if (isa<ReturnInst>(TBB.getTerminator())) {
+                auto itr = distances.find(&TBB);
+                if (itr == distances.end() || itr->second > dist) {
+                  RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
+                  distances[&TBB] = dist;
+                  if (queued.insert(&TBB).second) {
+                    worklist.push_back(&TBB);
+                  }
+                  added = true;
                 }
-                added = true;
               }
             }
           }
-        }
-        if (added) {
-          // if we have propagated reachability to a callee, it will come back,
-          // so we don't need to propagate to predecessors for now
-          continue;
+          if (added) {
+            // if we have propagated reachability to a callee, it will come back,
+            // so we don't need to propagate to predecessors for now
+            continue;
+          } else {
+            // there is another callsite but no propagation is needed
+            // simulate the propagation by adding the callsite to the queue
+            queuedCalls.insert(propagate);
+            if (queued.insert(BB).second)
+                worklist.push_back(BB);
+            continue;
+          }
         } else {
-          // there is another callsite but no propagation is needed
-          // simulate the propagation by adding the callsite to the queue
-          queuedCalls.insert(propagate);
-          if (queued.insert(BB).second)
-              worklist.push_back(BB);
-          continue;
+          // if all callsites have been processed, use the distance of the first
+          // callsite as the distance of the BB
+          RA_DEBUG("All callees processed\n");
+          auto itr = callDistances.find(calls.front());
+          assert(itr != callDistances.end());
+          dist = itr->second;
+          distances[BB] = dist;
         }
-      } else {
-        // if all callsites have been processed, use the distance of the first
-        // callsite as the distance of the BB
-        RA_DEBUG("All callees processed\n");
-        auto itr = callDistances.find(calls.front());
-        assert(itr != callDistances.end());
-        dist = itr->second;
-        distances[BB] = dist;
       }
     }
     // check predecessors
@@ -593,8 +597,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
         auto *Succ = *SI;
         numSucc += 1.0;
         // unreachable one has prob 0
-        if (reachableBBs.find(Succ) == reachableBBs.end())
+        if (reachableBBs.find(Succ) == reachableBBs.end()) {
+          RA_DEBUG("Skip unreachable successor: " << *Succ << "\n");
           continue;
+        }
         auto itr = distances.find(Succ);
         if (itr != distances.end()) {
           prob += 1.0 / std::pow(2, itr->second);
@@ -602,7 +608,8 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
       }
       prob /= numSucc;
       if (prob == 0.0) {
-        WARNING("prob dropped to 0 for basic block\n");
+        WARNING("prob dropped to 0 for basic block in " << BB->getParent()->getName() << "\n");
+        RA_DEBUG("\t " << *BB << "\n");
         continue;
       }
       auto dist = (-std::log2(prob));
@@ -657,9 +664,12 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           auto itr2 = callDistances.find(CI);
           if (itr2 == callDistances.end() || itr2->second > dist) {
             RA_DEBUG("Adding direct caller: " << CI->getFunction()->getName() << "\n");
-            // distances[CBB] = dist;
-            callDistances[CI] = dist;
-            queuedCalls.insert(CI);
+            if (PropagateThroughReturnEdgees) {
+              callDistances[CI] = dist;
+              queuedCalls.insert(CI);
+            } else {
+              distances[CBB] = dist;
+            }
             if (queued.insert(CBB).second)
               worklist.push_back(CBB);
           }
@@ -701,9 +711,12 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           auto itr2 = callDistances.find(CI);
           if (itr2 == callDistances.end() || itr2->second > dist) {
             RA_DEBUG("Adding indirect caller: " << CI->getFunction()->getName() << "\n");
-            // distances[CBB] = dist;
-            callDistances[CI] = dist;
-            queuedCalls.insert(CI);
+            if (PropagateThroughReturnEdgees) {
+              callDistances[CI] = dist;
+              queuedCalls.insert(CI);
+            } else {
+              distances[CBB] = dist;
+            }
             if (queued.insert(CBB).second)
               worklist.push_back(CBB);
           }
@@ -718,8 +731,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
 }
 
 ReachableCallGraphPass::ReachableCallGraphPass(GlobalContext *Ctx_,
-  std::string &TargetList, std::string &EntryList, bool typeBased)
-  : Ctx(Ctx_), UseTypeBasedCallGraph(typeBased) {
+  std::string &TargetList, std::string &EntryList, bool typeBased,
+  bool propagateRet)
+  : Ctx(Ctx_), UseTypeBasedCallGraph(typeBased),
+    PropagateThroughReturnEdgees(propagateRet) {
   // parse target list
   // format: filename:line_number
   if (!TargetList.empty()) {
@@ -931,6 +946,10 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
 
   for (const auto &kv : distances) {
     auto *BB = kv.first;
+    if (kv.second == 0.0) {
+      // skip target BB
+      continue;
+    }
     auto term = BB->getTerminator();
     auto branch = dyn_cast<BranchInst>(term);
     if (!branch || !branch->isConditional())
@@ -938,20 +957,21 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
     auto TT = branch->getSuccessor(0);
     auto FT = branch->getSuccessor(1);
     bool reached = false;
-    OS << getBasicBlockId(BB) << ",";
+    std::string tdist;
     auto itr = distances.find(FT);
     if (itr != distances.end()) {
-      OS << itr->second * 1000 << ",";
+      tdist = std::to_string(itr->second * 1000);
       reached = true;
     } else {
-      OS << "inf,";
+      tdist = "inf,";
     }
+    std::string fdist;
     itr = distances.find(TT);
     if (itr != distances.end()) {
-      OS << itr->second * 1000 << "\n";
+      fdist = std::to_string(itr->second * 1000);
       reached = true;
     } else {
-      OS << "inf\n";
+      fdist = "inf";
     }
     if (!reached) {
       bool hasCall = false;
@@ -962,9 +982,13 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
         }
       }
       if (!hasCall) {
-        WARNING("Branch reachable but both targets are not!! " << *BB
+        WARNING("Branch reachable but both targets are not!! @"
+            << getSourceLocation(BB) << " in " << BB->getParent()->getName()
+            << "\n" << *BB
             << "\nAnd no call in the BB\n");
       }
+    } else {
+      OS << getBasicBlockId(BB) << "," << tdist << "," << fdist << "\n";
     }
   }
 

@@ -252,9 +252,13 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
       }
 
       // check against target list
-      auto f = F->getParent()->getSourceFileName();
+      StringRef f = F->getParent()->getSourceFileName();
       auto loc = I->getDebugLoc();
       if (loc) {
+        auto scope = loc.getScope();
+        if (DIScope *DS = dyn_cast<DIScope>(scope)) {
+          f = DS->getFilename();
+        }
         for (auto &target : targetList) {
           if (f.find(target.first) != std::string::npos && loc.getLine() == target.second) {
             RA_LOG("Target I: " << *I << "\n");

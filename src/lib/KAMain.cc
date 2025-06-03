@@ -42,6 +42,9 @@ cl::list<std::string> InputFilenames(
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
 
+cl::opt<bool> UseTypeBasedCallGraph(
+  "type-based-callgraph", cl::desc("Use type-based call graph"), cl::init(false));
+
 cl::opt<std::string> TargetList(
   "target-list", cl::desc("Target list"), cl::init(""));
 
@@ -211,10 +214,12 @@ int main(int argc, char **argv) {
   for (auto &[id, f] : GlobalCtx.Funcs) { GlobalCtx.ExtFuncs.erase(id); }
 
   // Main workflow
-  TyPMCGPass TyCG(&GlobalCtx);
-  TyCG.run(GlobalCtx.Modules);
+  if (!UseTypeBasedCallGraph) {
+    TyPMCGPass TyCG(&GlobalCtx);
+    TyCG.run(GlobalCtx.Modules);
+  }
 
-  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, false);
+  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
   RCGPass.run(GlobalCtx.Modules);
 
   if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){

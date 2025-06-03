@@ -16,7 +16,7 @@ private:
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
-  bool findCalleesByType(llvm::CallInst*, FuncSet&);
+  bool findCalleesByType(llvm::CallBase*, FuncSet&);
   std::string getSourceLocation(const llvm::BasicBlock *BB);
 
   GlobalContext *Ctx;

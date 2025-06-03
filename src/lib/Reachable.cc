@@ -1,7 +1,7 @@
 /*
  * Reachability-based Call Graph Analysis
  *
- * Copyrigth (C) 2024 Chengyu Song
+ * Copyrigth (C) 2024 - 2025 Chengyu Song
  *
  * For licensing details see LICENSE
  */
@@ -154,20 +154,19 @@ bool ReachableCallGraphPass::isCompatibleType(Type *T1, Type *T2) {
   }
 }
 
-bool ReachableCallGraphPass::findCalleesByType(CallInst *CI, FuncSet &FS) {
-    CallBase &CS = *CI;
+bool ReachableCallGraphPass::findCalleesByType(CallBase *CB, FuncSet &FS) {
     bool Changed = false;
-    RA_LOG("Handle indirect call: " << *CI << "\n");
+    RA_LOG("Handle indirect call: " << *CB << "\n");
     for (const Function *F : Ctx->AddressTakenFuncs) {
       // just compare known args
       if (F->getFunctionType()->isVarArg()) {
         //errs() << "VarArg: " << F->getName() << "\n";
         WARNING("VarArg address taken function\n");
         continue;
-      } else if (F->arg_size() != CS.arg_size()) {
+      } else if (F->arg_size() != CB->arg_size()) {
         RA_DEBUG("ArgNum mismatch: " << F->getName() << "\n");
         continue;
-      } else if (!isCompatibleType(F->getReturnType(), CI->getType())) {
+      } else if (!isCompatibleType(F->getReturnType(), CB->getType())) {
         RA_DEBUG("Return type mismatch: " << F->getName() << "\n");
         continue;
       }
@@ -179,7 +178,7 @@ bool ReachableCallGraphPass::findCalleesByType(CallInst *CI, FuncSet &FS) {
 
       // type matching on args
       bool Matched = true;
-      auto AI = CS.arg_begin();
+      auto AI = CB->arg_begin();
       for (auto FI = F->arg_begin(), FE = F->arg_end();
            FI != FE; ++FI, ++AI) {
         // check type mis-match
@@ -213,7 +212,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
       Instruction *I = &i;
 
       if (UseTypeBasedCallGraph) {
-        if (CallInst *CI = dyn_cast<CallInst>(I)) {
+        if (CallBase *CI = dyn_cast<CallBase>(I)) {
           if (Function *CF = CI->getCalledFunction()) {
             // direct call
             auto RCF = getFuncDef(CF);
@@ -232,21 +231,9 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
               RA_DEBUG("Adding indirect caller for " << F->getName() << "@" << F << "\n");
               Changed |= callerByType[F].insert(CI).second;
             }
-          }
-        } else if (InvokeInst *II = dyn_cast<InvokeInst>(I)) {
-          if (Function *CF = II->getCalledFunction()) {
-            // direct call
-            auto RCF = getFuncDef(CF);
-            Changed |= Ctx->Callees[II].insert(RCF).second;
-            Changed |= Ctx->Callers[RCF].insert(II).second;
-            // check for call to exit functions
-            if (isExitFn(RCF->getName())) {
-              RA_LOG("Exit Call: " << *II << "\n");
-              exitBBs.insert(II->getParent());
+            if (isa<InvokeInst>(CI)) {
+              RA_DEBUG("Indirect invoke instruction: " << *CI << "\n");
             }
-          } else if (!II->isInlineAsm()) {
-            // indirect call
-            KA_ERR("Indirect invoke not supported\n");
           }
         }
       }

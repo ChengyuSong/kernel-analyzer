@@ -897,9 +897,16 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
     for (auto &I : *BB) {
       // check for callees
       if (const CallBase *CI = dyn_cast<CallBase>(&I)) {
+        if (CI->isInlineAsm() || CI->isIndirectCall()) {
+          continue; // skip inline asm
+        }
         auto itr = Ctx->Callees.find(CI);
         if (itr == Ctx->Callees.end() && UseTypeBasedCallGraph) {
           itr = calleeByType.find(CI);
+          if (itr == calleeByType.end()) {
+            WARNING("No callees for " << *CI << "\n");
+            continue; // no callees
+          }
         }
         for (auto F: itr->second) {
           auto *FBB = &F->getEntryBlock();

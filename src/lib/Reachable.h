@@ -27,6 +27,9 @@ private:
   const bool UseTypeBasedCallGraph;
   const bool PropagateThroughReturnEdgees;
 
+  std::unordered_map<const llvm::BasicBlock*, uint64_t> BBIDs;
+  uint64_t nextBBID;
+
   std::vector<std::pair<std::string, int> > targetList;
   std::vector<std::string> entryList;
   std::unordered_set<const llvm::BasicBlock*> reachableBBs;

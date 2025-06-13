@@ -223,6 +223,15 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
     for (auto &i : BB) {
       Instruction *I = &i;
 
+      // assign a BB ID
+      if (BBIDs.find(&BB) == BBIDs.end()) {
+        BBIDs[&BB] = nextBBID++;
+        if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator())) {
+          // assign a unique ID to the switch case
+          nextBBID += SI->getNumCases();
+        }
+      }
+
       if (UseTypeBasedCallGraph) {
         if (CallBase *CI = dyn_cast<CallBase>(I)) {
           if (Function *CF = CI->getCalledFunction()) {
@@ -734,7 +743,8 @@ ReachableCallGraphPass::ReachableCallGraphPass(GlobalContext *Ctx_,
   std::string &TargetList, std::string &EntryList, bool typeBased,
   bool propagateRet)
   : Ctx(Ctx_), UseTypeBasedCallGraph(typeBased),
-    PropagateThroughReturnEdgees(propagateRet) {
+    PropagateThroughReturnEdgees(propagateRet),
+    nextBBID(1000) {
   // parse target list
   // format: filename:line_number
   if (!TargetList.empty()) {
@@ -1060,7 +1070,6 @@ void ReachableCallGraphPass::dumpIDMapping(ModuleList &modules, std::ostream &bb
 
 bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string suffix) {
   ModuleList::iterator i, e;
-  uint64_t bbid = 100; // start from 100, to avoid conflict with existing IDs
   double max_dist = std::max_element(distances.begin(), distances.end(),
       [](const std::pair<const BasicBlock*, double> &a,
          const std::pair<const BasicBlock*, double> &b) {
@@ -1092,9 +1101,15 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
           dist *= 1000.0;
           // instrument a call to trace distance
           IRBuilder<> IRB(&*BB.getFirstInsertionPt());
-          auto *BBID = ConstantInt::get(Int64Ty, bbid++);
+          auto *BBID = ConstantInt::get(Int64Ty, BBIDs[&BB]);
           auto *Dist = ConstantInt::get(Int64Ty, (uint64_t)dist);
           IRB.CreateCall(TraceDistanceFunc, {BBID, Dist});
+
+          // add an annotation for other instrumentation
+          auto term = BB.getTerminator();
+          MDNode *MD = MDNode::get(M->getContext(),
+                                   {ConstantAsMetadata::get(BBID)});
+          term->setMetadata("bbid", MD);
         }
       }
     }

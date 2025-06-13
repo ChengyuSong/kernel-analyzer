@@ -57,6 +57,7 @@ Function* ReachableCallGraphPass::getFuncDef(Function *F) {
     return F;
 }
 
+// check if T2 and be accepted as T1
 bool ReachableCallGraphPass::isCompatibleType(Type *T1, Type *T2) {
   if (T1 == T2) {
       return true;
@@ -68,7 +69,7 @@ bool ReachableCallGraphPass::isCompatibleType(Type *T1, Type *T2) {
       return true;
 
     // assume all integer type are compatible
-    if (T2->isIntegerTy())
+    if (T2->isIntegerTy() && T2->getIntegerBitWidth() == T1->getIntegerBitWidth())
       return true;
     else
       return false;
@@ -100,9 +101,15 @@ bool ReachableCallGraphPass::isCompatibleType(Type *T1, Type *T2) {
     if (!ST2)
       return false;
 
-    // literal has to be equal
-    if (ST1->isLiteral() != ST2->isLiteral())
+    // check if both are packed
+    if (ST1->isPacked() != ST2->isPacked()) {
       return false;
+    }
+
+    // check for literal struct
+    if (ST1->isLiteral() != ST2->isLiteral()) {
+      return false;
+    }
 
     // literal, compare content
     if (ST1->isLiteral()) {
@@ -166,7 +173,7 @@ bool ReachableCallGraphPass::findCalleesByType(CallBase *CB, FuncSet &FS) {
       } else if (F->arg_size() != CB->arg_size()) {
         RA_DEBUG("ArgNum mismatch: " << F->getName() << "\n");
         continue;
-      } else if (!isCompatibleType(F->getReturnType(), CB->getType())) {
+      } else if (!isCompatibleType(CB->getType(), F->getReturnType())) {
         RA_DEBUG("Return type mismatch: " << F->getName() << "\n");
         continue;
       }
@@ -179,8 +186,7 @@ bool ReachableCallGraphPass::findCalleesByType(CallBase *CB, FuncSet &FS) {
       // type matching on args
       bool Matched = true;
       auto AI = CB->arg_begin();
-      for (auto FI = F->arg_begin(), FE = F->arg_end();
-           FI != FE; ++FI, ++AI) {
+      for (auto FI = F->arg_begin(), FE = F->arg_end(); FI != FE; ++FI, ++AI) {
         // check type mis-match
         Type *FormalTy = FI->getType();
         Type *ActualTy = (*AI)->getType();
@@ -280,7 +286,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
           }
           defined = true;
         }
-        if (defined && PropagateThroughReturnEdgees) {
+        if (defined /*&& PropagateThroughReturnEdgees*/) {
           // record the call site
           BBswithCalls[&BB].push_back(CI);
         }
@@ -372,7 +378,8 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
         // go through instructions, handle additional callees
         bool willReturn = true;
         bool added = false;
-        if (PropagateThroughReturnEdgees) {
+        if (true /*PropagateThroughReturnEdgees*/) {
+          // always propagate reachability through return edges
           auto hasCalls = BBswithCalls.find(CBB);
           assert(hasCalls != BBswithCalls.end());
           auto calls = hasCalls->second;

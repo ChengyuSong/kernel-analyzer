@@ -915,7 +915,7 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
       currentDist = dist;
       RA_LOG("Best option: " << BB->getParent()->getName() << " at " << currentDist << "\n");
     }
-    OS << getBasicBlockId(BB) << "," << getSourceLocation(BB) << "," << distances[BB] * 1000 << "\n";
+    OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << "," << distances[BB] * 1000 << "\n";
 
     for (auto &I : *BB) {
       // check for callees
@@ -950,7 +950,7 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
   if (dumpUnreachable) {
     for (auto BB : exitBBs) {
       if (distances.find(BB) == distances.end()) {
-        OS << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ",-1\n";
+        OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ",-1\n";
       }
     }
   }
@@ -980,7 +980,7 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
       tdist = std::to_string(itr->second * 1000);
       reached = true;
     } else {
-      tdist = "inf,";
+      tdist = "inf";
     }
     std::string fdist;
     itr = distances.find(TT);
@@ -1005,7 +1005,7 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
             << "\nAnd no call in the BB\n");
       }
     } else {
-      OS << getBasicBlockId(BB) << "," << tdist << "," << fdist << "\n";
+      OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << tdist << "," << fdist << "\n";
     }
   }
 
@@ -1014,7 +1014,7 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
   for (auto const &CI : reachableIndirectCalls) {
     // dump callsite ID = (BBID, order)
     auto CBB = CI->getParent();
-    auto CBBID = getBasicBlockId(CBB);
+    auto CBBID = BBIDs[CBB];
     OS << CBBID << ",";
     unsigned order = 0;
     for (auto &I: *CBB) {
@@ -1059,7 +1059,7 @@ void ReachableCallGraphPass::dumpIDMapping(ModuleList &modules, std::ostream &bb
           maxLine = line;
         }
         if (!filepath.empty() && line != 0)
-          bbLocs << bb_id << "," << F.getGUID() << "," << filepath << ":" << line << "\n";
+          bbLocs << BBIDs[&BB] << "," << bb_id << "," << F.getGUID() << "," << filepath << ":" << line << "\n";
 
       }
       if (!filepath.empty() && minLine != std::numeric_limits<unsigned>::max() && maxLine != 0)

@@ -53,6 +53,7 @@ public:
     void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
     void dumpPolicy(std::ostream &OS);
     void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
+    bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
     void dumpCallees();
     void dumpCallers();
 };

@@ -63,6 +63,9 @@ cl::opt<std::string> DumpBidMapping(
 cl::opt<std::string> DumpFuncInfo(
   "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
 
+cl::opt<std::string> DumpAnnotatedIR(
+  "dump-annotated-ir", cl::desc("Dump annotated IR"), cl::init(""));
+
 GlobalContext GlobalCtx;
 
 #define Diag llvm::errs()
@@ -234,6 +237,9 @@ int main(int argc, char **argv) {
   if (!DumpDistance.empty()) {
     std::ofstream distance(DumpDistance);
     RCGPass.dumpDistance(distance, true, false);
+  }
+  if (!DumpAnnotatedIR.empty()) {
+    RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
   }
 
   return 0;

@@ -916,7 +916,7 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
       RA_LOG("Best option: " << BB->getParent()->getName() << " at " << currentDist << "\n");
     }
     OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ","
-       << BB->getParent()->getName().str() << "," << distances[BB] * 1000 << "\n";
+       << distances[BB] * 1000 << "\n";
 
     for (auto &I : *BB) {
       // check for callees
@@ -954,6 +954,15 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
         OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ",-1\n";
       }
     }
+  }
+  // dump the covered functions
+  std::unordered_set<const Function*> reachedFunctions;
+  for (auto BB : reachableBBs) {
+    reachedFunctions.insert(BB->getParent());
+  }
+  OS << "##########\n";
+  for (auto *F : reachedFunctions) {
+    OS << "fun:" << F->getName().str() << "\n";
   }
 }
 

@@ -915,7 +915,8 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
       currentDist = dist;
       RA_LOG("Best option: " << BB->getParent()->getName() << " at " << currentDist << "\n");
     }
-    OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << "," << distances[BB] * 1000 << "\n";
+    OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ","
+       << BB->getParent()->getName().str() << "," << distances[BB] * 1000 << "\n";
 
     for (auto &I : *BB) {
       // check for callees
@@ -1103,7 +1104,7 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
           IRBuilder<> IRB(&*BB.getFirstInsertionPt());
           auto *BBID = ConstantInt::get(Int64Ty, BBIDs[&BB]);
           auto *Dist = ConstantInt::get(Int64Ty, (uint64_t)dist);
-          IRB.CreateCall(TraceDistanceFunc, {BBID, Dist});
+          IRB.CreateCall(TraceDistanceFunc, {BBID, Dist})->setCannotMerge();
 
           // add an annotation for other instrumentation
           auto term = BB.getTerminator();

@@ -935,6 +935,9 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
       continue;
     auto TT = branch->getSuccessor(0);
     auto FT = branch->getSuccessor(1);
+    uint32_t TT_bid = getBasicBlockId(TT);
+    uint32_t FT_bid = getBasicBlockId(FT);
+
     bool reached = false;
     OS << getBasicBlockId(BB) << ",";
     auto itr = distances.find(FT);
@@ -946,11 +949,12 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
     }
     itr = distances.find(TT);
     if (itr != distances.end()) {
-      OS << itr->second * 1000 << "\n";
+      OS << itr->second * 1000 << ",";
       reached = true;
     } else {
-      OS << "inf\n";
+      OS << "inf,";
     }
+    OS << FT_bid << "," << TT_bid << "\n";
     if (!reached) {
       bool hasCall = false;
       for (auto &I : *BB) {

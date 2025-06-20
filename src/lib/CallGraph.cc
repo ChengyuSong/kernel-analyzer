@@ -426,7 +426,6 @@ bool CallGraphPass::runOnFunction(Function *F) {
 #pragma clang diagnostic pop
 #endif
       // normal handling
-      bool isNull = false;
       Value *ptr = I->getOperand(0);
       NodeIndex ptrNode = NF.getValueNodeFor(ptr);
       auto itr = funcPtsGraph.find(ptrNode);
@@ -438,7 +437,6 @@ bool CallGraphPass::runOnFunction(Function *F) {
           CG_LOG("Load: source obj: " << idx << "\n");
           if (idx == NF.getNullObjectNode() && itr->second.find_next(idx) == end) {
             CG_LOG("Loading from null obj, ptr = " << ptrNode << "\n");
-            isNull = true;
             // XXX
             funcPtsGraph[valNode].insert(idx);
             break;

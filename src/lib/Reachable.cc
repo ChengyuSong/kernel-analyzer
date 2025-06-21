@@ -1021,7 +1021,7 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
             << "\nAnd no call in the BB\n");
       }
     } else {
-      OS << getBasicBlockId(BB) << "," << tdist << "," << fdist << FT_bid << "," << TT_bid << BBIDs[BB] << "\n";
+      OS << getBasicBlockId(BB) << "," << tdist << "," << fdist << "," << FT_bid << "," << TT_bid << "," << BBIDs[BB] << "\n";
     }
   }
 

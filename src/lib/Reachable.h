@@ -16,7 +16,7 @@ private:
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
-  bool findCalleesByType(llvm::CallInst*, FuncSet&);
+  bool findCalleesByType(llvm::CallBase*, FuncSet&);
   std::string getSourceLocation(const llvm::BasicBlock *BB);
 
   GlobalContext *Ctx;
@@ -25,6 +25,10 @@ private:
   CallerMap callerByType;
 
   const bool UseTypeBasedCallGraph;
+  const bool PropagateThroughReturnEdgees;
+
+  std::unordered_map<const llvm::BasicBlock*, uint64_t> BBIDs;
+  uint64_t nextBBID;
 
   std::vector<std::pair<std::string, int> > targetList;
   std::vector<std::string> entryList;
@@ -39,7 +43,7 @@ private:
 
 public:
     ReachableCallGraphPass(GlobalContext *Ctx_, std::string &TargetList,
-        std::string &EntryList, bool typeBased = true);
+        std::string &EntryList, bool typeBased = true, bool propagateRet = false);
     virtual bool doInitialization(llvm::Module *);
     virtual bool doFinalization(llvm::Module *);
     virtual void run(ModuleList &modules);
@@ -52,6 +56,7 @@ public:
     void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
     void dumpPolicy(std::ostream &OS);
     void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
+    bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
     void dumpCallees();
     void dumpCallers();
 };

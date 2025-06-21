@@ -42,6 +42,9 @@ cl::list<std::string> InputFilenames(
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
 
+cl::opt<bool> UseTypeBasedCallGraph(
+  "type-based-callgraph", cl::desc("Use type-based call graph"), cl::init(false));
+
 cl::opt<std::string> TargetList(
   "target-list", cl::desc("Target list"), cl::init(""));
 
@@ -59,6 +62,9 @@ cl::opt<std::string> DumpBidMapping(
 
 cl::opt<std::string> DumpFuncInfo(
   "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
+
+cl::opt<std::string> DumpAnnotatedIR(
+  "dump-annotated-ir", cl::desc("Dump annotated IR"), cl::init(""));
 
 GlobalContext GlobalCtx;
 
@@ -211,10 +217,12 @@ int main(int argc, char **argv) {
   for (auto &[id, f] : GlobalCtx.Funcs) { GlobalCtx.ExtFuncs.erase(id); }
 
   // Main workflow
-  TyPMCGPass TyCG(&GlobalCtx);
-  TyCG.run(GlobalCtx.Modules);
+  if (!UseTypeBasedCallGraph) {
+    TyPMCGPass TyCG(&GlobalCtx);
+    TyCG.run(GlobalCtx.Modules);
+  }
 
-  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, true);
+  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
   RCGPass.run(GlobalCtx.Modules);
 
   if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
@@ -229,6 +237,9 @@ int main(int argc, char **argv) {
   if (!DumpDistance.empty()) {
     std::ofstream distance(DumpDistance);
     RCGPass.dumpDistance(distance, true, false);
+  }
+  if (!DumpAnnotatedIR.empty()) {
+    RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
   }
 
   return 0;

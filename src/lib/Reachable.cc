@@ -922,23 +922,27 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
     for (auto &I : *BB) {
       // check for callees
       if (const CallBase *CI = dyn_cast<CallBase>(&I)) {
-        if (CI->isInlineAsm() || CI->isIndirectCall()) {
-          continue; // skip inline asm
+        if (CI->isInlineAsm()) {
+          // skip inline asm calls
+          continue;
         }
         auto itr = Ctx->Callees.find(CI);
+        // lookup indirect callees
         if (itr == Ctx->Callees.end() && UseTypeBasedCallGraph) {
           itr = calleeByType.find(CI);
-          if (itr == calleeByType.end()) {
-            WARNING("No callees for " << *CI << "\n");
-            continue; // no callees
-          }
         }
-        for (auto F: itr->second) {
+        if (itr == Ctx->Callees.end()) {
+          WARNING("No callees for " << *CI << "\n");
+          continue;
+        }
+        for (auto *F : itr->second) {
+          if (F->isDeclaration() || F->empty()) {
+            continue;
+          }
           auto *FBB = &F->getEntryBlock();
-          if (distances.find(FBB) != distances.end()) {
-	    RA_DEBUG("callee: " << F->getName() << " reachable \n");
-	    if (visited.insert(FBB).second)
-              worklist.push_back(FBB);
+          if (distances.find(FBB) != distances.end() && visited.insert(FBB).second) {
+            RA_DEBUG("callee: " << F->getName() << " reachable \n");
+            worklist.push_back(FBB);
           }
         }
       }

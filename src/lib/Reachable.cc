@@ -640,8 +640,8 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     if (BB == &F->getEntryBlock()) {
       if (entryBBs.find(BB) != entryBBs.end()) {
         RA_LOG("Entry func " << F->getName() << " is reachable\n");
-        break;
-        // continue;
+        // break;
+        continue;
       }
       auto itr = Ctx->Callers.find(F);
       if (itr == Ctx->Callers.end()) {

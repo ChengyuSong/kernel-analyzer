@@ -26,9 +26,12 @@ private:
 
   const bool UseTypeBasedCallGraph;
   const bool PropagateThroughReturnEdgees;
-
+  
   std::unordered_map<const llvm::BasicBlock*, uint64_t> BBIDs;
   uint64_t nextBBID;
+  // Maximum call stack depth to propagate across callers
+  const unsigned maxCallStackDepth;
+  std::unordered_map<const BasicBlock*, unsigned> callDepth;
 
   std::vector<std::pair<std::string, int> > targetList;
   std::vector<std::string> entryList;

@@ -389,8 +389,16 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
       }
 
       RA_DEBUG(F->getName() << " is reachable\n");
-      for (auto CI : itr->second) {
-        auto CBB = CI->getParent();
+      unsigned currDepth = callDepth[BB];
+      for (auto *CI : itr->second) {
+        auto *CBB = CI->getParent();
+        unsigned newDepth = currDepth + 1;
+        if (newDepth > maxCallStackDepth) {
+          RA_LOG("Max depth reached (" << maxCallStackDepth 
+                 << ") for function " << F->getName() << ", skipping caller\n");
+          continue;  // do not propagate beyond threshold
+        }
+        callDepth[CBB] = newDepth;  // record depth before enqueue
         // go through instructions, handle additional callees
         bool willReturn = true;
         bool added = false;
@@ -473,11 +481,17 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   std::deque<const BasicBlock*> worklist;
   RA_DEBUG("\n\n=== Collecting exit BBs ===\n\n");
   worklist.insert(worklist.end(), exitBBs.begin(), exitBBs.end());
+  callDepth.clear();
+  for (auto *BB : exitBBs) {
+    callDepth[BB] = 0;
+  }
   collectReachable(worklist, exitBBs);
 
   // now do a BFS search on the target list, find all reachable BBs first
   RA_LOG("\n\n=== Collecting reachable BBs ===\n\n");
+  callDepth.clear();
   for (const auto &kv : distances) {
+    callDepth[kv.first] = 0;
     worklist.push_back(kv.first);
   }
   collectReachable(worklist, reachableBBs);
@@ -690,7 +704,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           FuncSet &Callees = UseTypeBasedCallGraph ? calleeByType[CI] : Ctx->Callees[CI];
           RA_LOG("\tfrom indirect call @" << CF->getName() << ", callee size = " << Callees.size() << "\n");
           // XXX: skip potentially imprecise callsites?
-          if (itr->second.size() > 5 && Callees.size() > 50) {
+          if (Callees.size() > 50) {
             RA_DEBUG("Skip indirect call with too many callees\n");
             continue;
           }
@@ -745,7 +759,8 @@ ReachableCallGraphPass::ReachableCallGraphPass(GlobalContext *Ctx_,
   bool propagateRet)
   : Ctx(Ctx_), UseTypeBasedCallGraph(typeBased),
     PropagateThroughReturnEdgees(propagateRet),
-    nextBBID(1000) {
+    nextBBID(1000),
+    maxCallStackDepth(15) {
   // parse target list
   // format: filename:line_number
   if (!TargetList.empty()) {
@@ -916,8 +931,8 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, b
       currentDist = dist;
       RA_LOG("Best option: " << BB->getParent()->getName() << " at " << currentDist << "\n");
     }
-    OS << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ","
-       << distances[BB] * 1000 << "," << BBIDs[BB] << "\n";
+    OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ","
+       << distances[BB] * 1000 << "\n";
 
     for (auto &I : *BB) {
       // check for callees
@@ -990,8 +1005,6 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
       continue;
     auto TT = branch->getSuccessor(0);
     auto FT = branch->getSuccessor(1);
-    uint32_t TT_bid = getBasicBlockId(TT);
-    uint32_t FT_bid = getBasicBlockId(FT);
 
     bool reached = false;
     std::string tdist;
@@ -1025,7 +1038,7 @@ void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
             << "\nAnd no call in the BB\n");
       }
     } else {
-      OS << getBasicBlockId(BB) << "," << tdist << "," << fdist << "," << FT_bid << "," << TT_bid << "," << BBIDs[BB] << "\n";
+      OS << BBIDs[BB] << "," << tdist << "," << fdist << "," << BBIDs[FT] << "," << BBIDs[TT] << "\n";
     }
   }
 

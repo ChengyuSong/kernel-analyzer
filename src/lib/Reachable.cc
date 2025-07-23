@@ -1126,7 +1126,12 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
           continue; // skip unreachable BBs
         if (BB.getFirstInsertionPt() == BB.end())
           continue; // skip empty BBs
+
+        // add an annotation for other instrumentation
         auto *BBID = ConstantInt::get(Int64Ty, BBIDs[&BB]);
+        auto term = BB.getTerminator();
+        MDNode *MD = MDNode::get(M->getContext(),
+                                  {ConstantAsMetadata::get(BBID)});
         term->setMetadata("bbid", MD);
         // annotate reachable basic block with ID and distance
         if (reachableBBs.count(&BB)) {
@@ -1138,11 +1143,6 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
           IRBuilder<> IRB(&*BB.getFirstInsertionPt());
           auto *Dist = ConstantInt::get(Int64Ty, (uint64_t)dist);
           IRB.CreateCall(TraceDistanceFunc, {BBID, Dist})->setCannotMerge();
-
-          // add an annotation for other instrumentation
-          auto term = BB.getTerminator();
-          MDNode *MD = MDNode::get(M->getContext(),
-                                   {ConstantAsMetadata::get(BBID)});
         }
       }
     }

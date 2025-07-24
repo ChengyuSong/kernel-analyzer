@@ -513,13 +513,19 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   // now calculate distances in a bottom-up manner
   std::unordered_set<const BasicBlock*> queued;
   std::unordered_set<const CallBase*> queuedCalls;
+  callDepth.clear();
   for (const auto &kv : distances) {
     worklist.push_back(kv.first);
     queued.insert(kv.first);
+    callDepth[kv.first] = 0;
   }
   // fixed point iteration?
   while (!worklist.empty()) {
     auto *BB = worklist.front();
+    unsigned currDepth = callDepth[BB];
+    if (currDepth >= maxCallStackDepth) {
+      continue;  // do not propagate beyond threshold
+    }
     worklist.pop_front();
     queued.erase(BB);
     if (PropagateThroughReturnEdgees) {
@@ -582,6 +588,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
                   RA_DEBUG("Propagate distance " << dist << " to callee: " << F->getName() << "\n");
                   distances[&TBB] = dist;
                   if (queued.insert(&TBB).second) {
+                    callDepth[&TBB] = currDepth + 1;
                     worklist.push_back(&TBB);
                   }
                   added = true;
@@ -597,8 +604,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
             // there is another callsite but no propagation is needed
             // simulate the propagation by adding the callsite to the queue
             queuedCalls.insert(propagate);
-            if (queued.insert(BB).second)
-                worklist.push_back(BB);
+            if (queued.insert(BB).second){
+              callDepth[BB] = currDepth + 1;
+              worklist.push_back(BB);
+            }
             continue;
           }
         } else {
@@ -673,7 +682,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           continue;
         }
       }
-
+      // check callers
       RA_LOG(F->getName() << " is reachable from " << itr->second.size() << " callers\n");
       auto dist = distances[BB];
       for (auto CI : itr->second) {
@@ -694,8 +703,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
             } else {
               distances[CBB] = dist;
             }
-            if (queued.insert(CBB).second)
+            if (queued.insert(CBB).second){
+              callDepth[CBB] = currDepth + 1;
               worklist.push_back(CBB);
+            }
           }
         } else {
           // indirect call is tricky, treat like predecessors
@@ -741,8 +752,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
             } else {
               distances[CBB] = dist;
             }
-            if (queued.insert(CBB).second)
+            if (queued.insert(CBB).second){
+              callDepth[CBB] = currDepth + 1;
               worklist.push_back(CBB);
+            }
           }
         }
       }

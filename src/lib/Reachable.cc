@@ -1118,11 +1118,14 @@ void ReachableCallGraphPass::dumpIDMapping(ModuleList &modules, std::ostream &bb
 
 bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string suffix) {
   ModuleList::iterator i, e;
-  double max_dist = std::max_element(distances.begin(), distances.end(),
-      [](const std::pair<const BasicBlock*, double> &a,
-         const std::pair<const BasicBlock*, double> &b) {
-        return a.second < b.second;
-      })->second;
+  double max_dist = INFINITY;
+  if (!distances.empty()) {
+    max_dist = std::max_element(distances.begin(), distances.end(),
+        [](const std::pair<const BasicBlock*, double> &a,
+           const std::pair<const BasicBlock*, double> &b) {
+          return a.second < b.second;
+        })->second;
+  }
 
   for (i = modules.begin(), e = modules.end(); i != e; ++i) {
     Module *M = i->first;

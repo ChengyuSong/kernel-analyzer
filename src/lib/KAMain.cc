@@ -42,6 +42,9 @@ cl::list<std::string> InputFilenames(
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
 
+cl::opt<unsigned> CallStackLen(
+  "call-stack-len", cl::desc("The maximum call stack length from entry to the targets"), cl::init(10));
+
 cl::opt<bool> UseTypeBasedCallGraph(
   "type-based-callgraph", cl::desc("Use type-based call graph"), cl::init(false));
 
@@ -222,7 +225,8 @@ int main(int argc, char **argv) {
     TyCG.run(GlobalCtx.Modules);
   }
 
-  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
+  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, 
+    UseTypeBasedCallGraph, false, CallStackLen);
   RCGPass.run(GlobalCtx.Modules);
 
   if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){

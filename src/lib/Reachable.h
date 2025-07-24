@@ -46,7 +46,8 @@ private:
 
 public:
     ReachableCallGraphPass(GlobalContext *Ctx_, std::string &TargetList,
-        std::string &EntryList, bool typeBased = true, bool propagateRet = false);
+        std::string &EntryList, bool typeBased = true, 
+        bool propagateRet = false, unsigned CallStackLen = 10);
     virtual bool doInitialization(llvm::Module *);
     virtual bool doFinalization(llvm::Module *);
     virtual void run(ModuleList &modules);

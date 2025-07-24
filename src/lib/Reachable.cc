@@ -771,11 +771,11 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
 
 ReachableCallGraphPass::ReachableCallGraphPass(GlobalContext *Ctx_,
   std::string &TargetList, std::string &EntryList, bool typeBased,
-  bool propagateRet)
+  bool propagateRet, unsigned CallStackLen)
   : Ctx(Ctx_), UseTypeBasedCallGraph(typeBased),
     PropagateThroughReturnEdgees(propagateRet),
     nextBBID(1000),
-    maxCallStackDepth(15) {
+    maxCallStackDepth(CallStackLen) {
   // parse target list
   // format: filename:line_number
   if (!TargetList.empty()) {

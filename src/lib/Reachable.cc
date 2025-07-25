@@ -919,86 +919,44 @@ void getDebugLocationFullPath(const BasicBlock &BB,
 }
 
 void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpSolution, bool dumpUnreachable) {
-  std::deque<const BasicBlock*> worklist;
-  std::unordered_set<const BasicBlock*> visited;
-  double currentDist = std::numeric_limits<double>::max();;
-  for (auto BB : entryBBs) {
-    if (distances.find(BB) != distances.end()) {
-      RA_LOG("Entry BB of " << BB->getParent()->getName() << " is reachable\n");
-      worklist.push_back(BB);
-      visited.insert(BB);
-    }
-  }
-  if (worklist.empty()) {
-    WARNING("Target not reachable from entry BBs\n");
-    return;
-  }
+    // Set precision for output
+    OS << std::fixed << std::setprecision(6);
 
-  // set precision
-  OS << std::fixed << std::setprecision(6);
+    // Copy and sort distances by ascending value
+    std::vector<std::pair<const BasicBlock*, double>> sorted;
+    sorted.reserve(distances.size());
+    for (const auto &entry : distances) {
+        sorted.emplace_back(entry.first, entry.second);
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto &a, const auto &b) { return a.second < b.second; });
 
-  // dump reachable bb
-  while (!worklist.empty()) {
-    auto *BB = worklist.front();
-    worklist.pop_front();
-    auto dist = distances[BB];
-    if (dumpSolution && (dist < currentDist)) {
-      currentDist = dist;
-      RA_LOG("Best option: " << BB->getParent()->getName() << " at " << currentDist << "\n");
+    // Output sorted distance entries
+    for (const auto &pair : sorted) {
+        const BasicBlock *BB = pair.first;
+        double dist = pair.second;
+        OS << BBIDs[BB] << ","
+           << getBasicBlockId(BB) << ","
+           << getSourceLocation(BB) << ","
+           << (dist * 1000) << "\n";
     }
-    OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ","
-       << distances[BB] * 1000 << "\n";
 
-    for (auto &I : *BB) {
-      // check for callees
-      if (const CallBase *CI = dyn_cast<CallBase>(&I)) {
-        if (CI->isInlineAsm()) {
-          // skip inline asm calls
-          continue;
-        }
-        auto itr = Ctx->Callees.find(CI);
-        // lookup indirect callees
-        if (itr == Ctx->Callees.end() && UseTypeBasedCallGraph) {
-          itr = calleeByType.find(CI);
-        }
-        if (itr == Ctx->Callees.end()) {
-          WARNING("No callees for " << *CI << "\n");
-          continue;
-        }
-        for (auto *F : itr->second) {
-          if (F->isDeclaration() || F->empty()) {
-            continue;
-          }
-          auto *FBB = &F->getEntryBlock();
-          if (distances.find(FBB) != distances.end() && visited.insert(FBB).second) {
-            RA_DEBUG("callee: " << F->getName() << " reachable \n");
-            worklist.push_back(FBB);
-          }
-        }
-      }
-    }
-    for (auto SI = succ_begin(BB), SE = succ_end(BB); SI != SE; ++SI) {
-      auto *Succ = *SI;
-      if (distances.find(Succ) != distances.end() && visited.insert(Succ).second) {
-        worklist.push_back(Succ);
-      }
-    }
-  }
-  // dump unreachable bb
+  // If dumpUnreachable is enabled, output unreachable basic blocks
   if (dumpUnreachable) {
-    for (auto BB : exitBBs) {
+    for (const auto *BB : exitBBs) {
       if (distances.find(BB) == distances.end()) {
         OS << BBIDs[BB] << "," << getBasicBlockId(BB) << "," << getSourceLocation(BB) << ",-1\n";
       }
     }
   }
-  // dump the covered functions
-  std::unordered_set<const Function*> reachedFunctions;
-  for (auto BB : reachableBBs) {
-    reachedFunctions.insert(BB->getParent());
+
+  // Dump the covered functions
+  std::unordered_set<const Function *> reachedFunctions;
+  for (const auto &entry : distances) {
+    reachedFunctions.insert(entry.first->getParent());
   }
   OS << "##########\n";
-  for (auto *F : reachedFunctions) {
+  for (const auto *F : reachedFunctions) {
     OS << "fun:" << F->getName().str() << "\n";
   }
 }

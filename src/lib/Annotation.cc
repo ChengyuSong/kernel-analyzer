@@ -249,7 +249,10 @@ bool isExitFn(StringRef name) {
   if (name.equals("exit") ||
     name.equals("_exit") ||
     name.equals("_Exit") ||
+    name.equals("quick_exit") ||
     name.equals("exit_group") ||
+    name.equals("terminate") ||
+    name.equals("abort") ||
     name.equals("panic") ||
     name.equals("BUG") ||
     name.equals("BUG_ON"))

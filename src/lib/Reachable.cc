@@ -230,7 +230,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
     }
     // treat any BB ending in llvm::UnreachableInst as an "exit"
     if (isa<UnreachableInst>(BB.getTerminator())) {
-      RA_LOG("Non ret BB: " << BB.getName() << "\n");
+      RA_LOG("Unreachable Inst BB: " << BBIDs[&BB] << "\n");
       exitBBs.insert(&BB);
     }
     for (auto &i : BB) {
@@ -383,7 +383,6 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
     auto *F = BB->getParent();
     if (BB == &F->getEntryBlock()) {
       if (entryBBs.find(BB) != entryBBs.end()) {
-        RA_LOG("Entry func " << F->getName() << " is reachable\n");
         continue;
       }
       auto itr = Ctx->Callers.find(F);
@@ -1108,23 +1107,23 @@ void ReachableCallGraphPass::dumpCriticalBBs(std::ostream &OS) {
 
 bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string suffix) {
   ModuleList::iterator i, e;
-  double max_dist = INFINITY;
-  if (!distances.empty()) {
-    max_dist = std::max_element(distances.begin(), distances.end(),
-        [](const std::pair<const BasicBlock*, double> &a,
-           const std::pair<const BasicBlock*, double> &b) {
-          return a.second < b.second;
-        })->second;
-  }
+  // double max_dist = INFINITY;
+  // if (!distances.empty()) {
+  //   max_dist = std::max_element(distances.begin(), distances.end(),
+  //       [](const std::pair<const BasicBlock*, double> &a,
+  //          const std::pair<const BasicBlock*, double> &b) {
+  //         return a.second < b.second;
+  //       })->second;
+  // }
 
   for (i = modules.begin(), e = modules.end(); i != e; ++i) {
     Module *M = i->first;
     auto ModName = M->getName().str();
     auto NewName = ModName + suffix;
-    auto VoidTy = Type::getVoidTy(M->getContext());
+    // auto VoidTy = Type::getVoidTy(M->getContext());
     auto Int64Ty = Type::getInt64Ty(M->getContext());
-    FunctionCallee TraceDistanceFunc = M->getOrInsertFunction(
-        "__taint_trace_distance", VoidTy, Int64Ty, Int64Ty);
+    // FunctionCallee TraceDistanceFunc = M->getOrInsertFunction(
+    //     "__taint_trace_distance", VoidTy, Int64Ty, Int64Ty);
     for (auto &F : *M) {
       if (F.isDeclaration() || F.empty() || F.isIntrinsic()) {
         continue; // skip declaration and intrinsic
@@ -1142,16 +1141,16 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
                                   {ConstantAsMetadata::get(BBID)});
         term->setMetadata("bbid", MD);
         // annotate reachable basic block with ID and distance
-        if (reachableBBs.count(&BB)) {
-          // check if we have a distance
-          auto itr = distances.find(&BB);
-          double dist = (itr != distances.end()) ? itr->second : max_dist;
-          dist *= 1000.0;
-          // instrument a call to trace distance
-          IRBuilder<> IRB(&*BB.getFirstInsertionPt());
-          auto *Dist = ConstantInt::get(Int64Ty, (uint64_t)dist);
-          IRB.CreateCall(TraceDistanceFunc, {BBID, Dist})->setCannotMerge();
-        }
+        // if (reachableBBs.count(&BB)) {
+        //   // check if we have a distance
+        //   auto itr = distances.find(&BB);
+        //   double dist = (itr != distances.end()) ? itr->second : max_dist;
+        //   dist *= 1000.0;
+        //   // instrument a call to trace distance
+        //   IRBuilder<> IRB(&*BB.getFirstInsertionPt());
+        //   auto *Dist = ConstantInt::get(Int64Ty, (uint64_t)dist);
+        //   IRB.CreateCall(TraceDistanceFunc, {BBID, Dist})->setCannotMerge();
+        // }
       }
     }
     // verify

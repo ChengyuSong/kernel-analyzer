@@ -42,6 +42,7 @@ private:
   using CallSequence = std::vector<const llvm::CallBase*>;
   std::unordered_map<const llvm::BasicBlock*, CallSequence> BBswithCalls;
   std::unordered_map<const llvm::CallBase*, double> callDistances;
+  std::unordered_map<const llvm::BasicBlock*, std::vector<const llvm::BasicBlock*>> criticalBBs;
   std::unordered_set<const llvm::CallBase*> reachableIndirectCalls;
 
 public:
@@ -54,11 +55,13 @@ public:
 
     // simple bfs pass
     void collectReachable(std::deque<const BasicBlock*> &worklist,
-        std::unordered_set<const BasicBlock*> &reachable);
+        std::unordered_set<const BasicBlock*> &reachable,
+        const std::unordered_set<const BasicBlock*> &others = {});
 
     // debug
-    void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
     void dumpPolicy(std::ostream &OS);
+    void dumpCriticalBBs(std::ostream &OS);
+    void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
     void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
     bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
     void dumpCallees();

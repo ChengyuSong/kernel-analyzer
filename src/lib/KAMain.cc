@@ -55,13 +55,16 @@ cl::opt<std::string> EntryList(
   "entry-list", cl::desc("Entry list"), cl::init(""));
 
 cl::opt<std::string> DumpPolicy(
-  "dump-policy", cl::desc("Dump static policy"), cl::init(""));
+  "dump-policy", cl::desc("Dump policy, format: bid,true_distance,false_distance,false_bid,true_bid"), cl::init(""));
 
 cl::opt<std::string> DumpDistance(
-  "dump-distance", cl::desc("Dump distance"), cl::init(""));
+  "dump-distance", cl::desc("Dump distances, format: bid,bb_hash,loc,distance"), cl::init(""));
+
+cl::opt<std::string> DumpCriticalBBs(
+  "dump-critical-branch", cl::desc("Dump critical basic blocks, format: critical_bid, exit_bid_1, exit_bid_2, ..."), cl::init(""));
 
 cl::opt<std::string> DumpBidMapping(
-  "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum"), cl::init(""));
+  "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,bb_hash,fun_GUID,filepath:linenum"), cl::init(""));
 
 cl::opt<std::string> DumpFuncInfo(
   "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
@@ -244,6 +247,10 @@ int main(int argc, char **argv) {
   }
   if (!DumpAnnotatedIR.empty()) {
     RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
+  }
+  if (!DumpCriticalBBs.empty()) {
+    std::ofstream criticalBBs(DumpCriticalBBs);
+    RCGPass.dumpCriticalBBs(criticalBBs);
   }
 
   return 0;

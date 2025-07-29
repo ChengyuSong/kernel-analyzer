@@ -220,17 +220,21 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
 
   RA_LOG("### Run on function: " << F->getName() << "\n");
   for (auto &BB : *F) {
+    // assign a BB ID
+    if (BBIDs.find(&BB) == BBIDs.end()) {
+      BBIDs[&BB] = nextBBID++;
+      if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator())) {
+        // assign a unique ID to the switch case
+        nextBBID += SI->getNumCases();
+      }
+    }
+    // treat any BB ending in llvm::UnreachableInst as an "exit"
+    if (isa<UnreachableInst>(BB.getTerminator())) {
+      RA_LOG("Non ret BB: " << BB.getName() << "\n");
+      exitBBs.insert(&BB);
+    }
     for (auto &i : BB) {
       Instruction *I = &i;
-
-      // assign a BB ID
-      if (BBIDs.find(&BB) == BBIDs.end()) {
-        BBIDs[&BB] = nextBBID++;
-        if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator())) {
-          // assign a unique ID to the switch case
-          nextBBID += SI->getNumCases();
-        }
-      }
 
       if (UseTypeBasedCallGraph) {
         if (CallBase *CI = dyn_cast<CallBase>(I)) {
@@ -240,7 +244,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
             Changed |= Ctx->Callees[CI].insert(RCF).second;
             Changed |= Ctx->Callers[RCF].insert(CI).second;
             // check for call to exit functions
-            if (isExitFn(RCF->getName())) {
+            if (isExitFn(RCF->getName()) || CF->doesNotReturn()) {
               RA_LOG("Exit Call: " << *CI << "\n");
               exitBBs.insert(CI->getParent());
             }
@@ -356,7 +360,8 @@ bool ReachableCallGraphPass::doFinalization(Module *M) {
 }
 
 void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &worklist,
-    std::unordered_set<const BasicBlock*> &reachable) {
+    std::unordered_set<const BasicBlock*> &reachable,
+    const std::unordered_set<const BasicBlock*> &others) {
   while (!worklist.empty()) {
     auto *BB = worklist.front();
     worklist.pop_front();
@@ -365,6 +370,12 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
       auto *Pred = *PI;
       if (reachable.insert(Pred).second) {
         RA_DEBUG("Adding Pred: " << *Pred << "\n");
+        // if the predecessor is reachable to the target
+        // stop propagating unreachable BB through it
+        if (others.find(Pred) != others.end()) {
+          criticalBBs[Pred].push_back(BB);
+          break;
+        }
         worklist.push_back(Pred);
       }
     }
@@ -402,7 +413,8 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
         // go through instructions, handle additional callees
         bool willReturn = true;
         bool added = false;
-        if (true /*PropagateThroughReturnEdgees*/) {
+        // do not PropagateThroughReturnEdgees when computing unreachable BBs
+        if (true /*PropagateThroughReturnEdgees*/ && others.empty()) {
           // always propagate reachability through return edges
           auto hasCalls = BBswithCalls.find(CBB);
           assert(hasCalls != BBswithCalls.end());
@@ -438,11 +450,18 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
               if (added) break; // one callsite at a time
             }
           }
-        }
+        } // end of PropagateThroughReturnEdgees
+
         if (willReturn && !added) {
           // if all callsites have been processed, add the CBB
           RA_DEBUG("\tadding caller: " << CI->getFunction()->getName() << "\n");
           if (reachable.insert(CBB).second) {
+            // if the caller BB CBB is reachable to the target
+            // do not propagate unreachable BB through this call sites
+            if (others.find(CBB) != others.end()) {
+              criticalBBs[CBB].push_back(BB);
+              continue;
+            }
             worklist.push_back(CBB);
           }
         }
@@ -477,17 +496,8 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     return;
   }
 
-  // do a BFS search on the call graph to find BB that can reach exits
+  // do a BFS search on the target list, find all reachable BBs first
   std::deque<const BasicBlock*> worklist;
-  RA_DEBUG("\n\n=== Collecting exit BBs ===\n\n");
-  worklist.insert(worklist.end(), exitBBs.begin(), exitBBs.end());
-  callDepth.clear();
-  for (auto *BB : exitBBs) {
-    callDepth[BB] = 0;
-  }
-  collectReachable(worklist, exitBBs);
-
-  // now do a BFS search on the target list, find all reachable BBs first
   RA_LOG("\n\n=== Collecting reachable BBs ===\n\n");
   callDepth.clear();
   for (const auto &kv : distances) {
@@ -495,6 +505,16 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     worklist.push_back(kv.first);
   }
   collectReachable(worklist, reachableBBs);
+
+  // do a BFS search on the call graph to find BB that can reach exits
+  worklist.clear();
+  RA_DEBUG("\n\n=== Collecting exit BBs ===\n\n");
+  callDepth.clear();
+  for (auto *BB : exitBBs) {
+    callDepth[BB] = 0;
+    worklist.push_back(BB);
+  }
+  collectReachable(worklist, exitBBs, reachableBBs);
 
   // check if target is reachable
   bool reached = false;
@@ -1051,6 +1071,9 @@ void ReachableCallGraphPass::dumpIDMapping(ModuleList &modules, std::ostream &bb
       unsigned minLine = std::numeric_limits<unsigned>::max();
       unsigned maxLine = 0;
       std::string filepath;
+      if (F.isDeclaration() || F.empty() || F.isIntrinsic()) {
+        continue; // skip declaration and intrinsic
+      }
 
       for (auto &BB : F) {
         unsigned line = 0;
@@ -1071,6 +1094,15 @@ void ReachableCallGraphPass::dumpIDMapping(ModuleList &modules, std::ostream &bb
       if (!filepath.empty() && minLine != std::numeric_limits<unsigned>::max() && maxLine != 0)
         funcInfo << F.getGUID() << "," << F.getName().str() << "," << filepath << "," << minLine << "," << maxLine << "\n";
     }
+  }
+}
+
+void ReachableCallGraphPass::dumpCriticalBBs(std::ostream &OS) {
+  for (auto const &[BB, exits] : criticalBBs) {
+    OS << BBIDs[BB];
+    for (auto *exitBB : exits)
+      OS << "," << BBIDs[exitBB];
+    OS << "\n";
   }
 }
 

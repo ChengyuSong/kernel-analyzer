@@ -2,6 +2,7 @@
  * Reachability-based Call Graph Analysis
  *
  * Copyrigth (C) 2024 - 2025 Chengyu Song
+ * Copyrigth (C) 2024 - 2025 Haochen Zeng
  *
  * For licensing details see LICENSE
  */

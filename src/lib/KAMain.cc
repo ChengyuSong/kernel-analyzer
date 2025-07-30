@@ -5,6 +5,7 @@
  * Copyright (C) 2015 Byoungyoung Lee
  * Copyright (C) 2016 Kangjie Lu
  * Copyright (C) 2015 - 2024 Chengyu Song
+ * Copyrigth (C) 2024 - 2025 Haochen Zeng
  *
  * For licensing details see LICENSE
  */

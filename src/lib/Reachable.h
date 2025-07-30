@@ -25,7 +25,6 @@ private:
   CallerMap callerByType;
 
   const bool UseTypeBasedCallGraph;
-  const bool PropagateThroughReturnEdgees;
   
   std::unordered_map<const llvm::BasicBlock*, uint64_t> BBIDs;
   uint64_t nextBBID;
@@ -48,15 +47,17 @@ private:
 public:
     ReachableCallGraphPass(GlobalContext *Ctx_, std::string &TargetList,
         std::string &EntryList, bool typeBased = true, 
-        bool propagateRet = false, unsigned CallStackLen = 10);
+        unsigned CallStackLen = 10);
     virtual bool doInitialization(llvm::Module *);
     virtual bool doFinalization(llvm::Module *);
     virtual void run(ModuleList &modules);
 
-    // simple bfs pass
-    void collectReachable(std::deque<const BasicBlock*> &worklist,
-        std::unordered_set<const BasicBlock*> &reachable,
-        const std::unordered_set<const BasicBlock*> &others = {});
+    // BFS pass
+    void collectReachable(std::deque<const BasicBlock *> &worklist,
+                        std::unordered_set<const BasicBlock *> &reachable,
+                        const std::unordered_set<const BasicBlock *> &others = {});
+    void propagateThroughReturnEdgees(std::unordered_set<const BasicBlock *> &reachable,
+                                    const BasicBlock *CBB);
 
     // debug
     void dumpPolicy(std::ostream &OS);

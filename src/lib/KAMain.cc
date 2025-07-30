@@ -229,7 +229,7 @@ int main(int argc, char **argv) {
   }
 
   ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, 
-    UseTypeBasedCallGraph, false, CallStackLen);
+    UseTypeBasedCallGraph, CallStackLen);
   RCGPass.run(GlobalCtx.Modules);
 
   if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){

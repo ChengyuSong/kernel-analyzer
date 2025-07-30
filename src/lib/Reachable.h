@@ -18,6 +18,10 @@ private:
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
   bool findCalleesByType(llvm::CallBase*, FuncSet&);
   std::string getSourceLocation(const llvm::BasicBlock *BB);
+  void getDebugLocationFullPath(const BasicBlock &BB,
+                                std::string &Filename,
+                                unsigned &Line,
+                                unsigned &Col);
 
   GlobalContext *Ctx;
 

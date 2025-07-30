@@ -817,7 +817,7 @@ std::string ReachableCallGraphPass::getSourceLocation(const BasicBlock *BB) {
 ///  3) Builds an absolute, normalized path (resolving "." and "..")
 ///  4) Skips if the path is empty, line=0, or the path starts with "/usr/"
 ///  5) Returns the first valid debug info found
-void getDebugLocationFullPath(const BasicBlock &BB,
+void ReachableCallGraphPass::getDebugLocationFullPath(const BasicBlock &BB,
                               std::string &Filename,
                               unsigned &Line,
                               unsigned &Col) {
@@ -886,27 +886,25 @@ void getDebugLocationFullPath(const BasicBlock &BB,
 }
 
 void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpUnreachable) {
-    // Set precision for output
-    OS << std::fixed << std::setprecision(6);
-
-    // Copy and sort distances by ascending value
-    std::vector<std::pair<const BasicBlock*, double>> sorted;
-    sorted.reserve(distances.size());
-    for (const auto &entry : distances) {
-        sorted.emplace_back(entry.first, entry.second);
-    }
-    std::sort(sorted.begin(), sorted.end(),
-              [](const auto &a, const auto &b) { return a.second < b.second; });
-
-    // Output sorted distance entries
-    for (const auto &pair : sorted) {
-        const BasicBlock *BB = pair.first;
-        double dist = pair.second;
-        OS << BBIDs[BB] << ","
-           << getBasicBlockId(BB) << ","
-           << getSourceLocation(BB) << ","
-           << (dist * 1000) << "\n";
-    }
+  // Set precision for output
+  OS << std::fixed << std::setprecision(6);
+  // Copy and sort distances by ascending value
+  std::vector<std::pair<const BasicBlock*, double>> sorted;
+  sorted.reserve(distances.size());
+  for (const auto &entry : distances) {
+      sorted.emplace_back(entry.first, entry.second);
+  }
+  std::sort(sorted.begin(), sorted.end(),
+            [](const auto &a, const auto &b) { return a.second < b.second; });
+  // Output sorted distance entries
+  for (const auto &pair : sorted) {
+      const BasicBlock *BB = pair.first;
+      double dist = pair.second;
+      OS << BBIDs[BB] << ","
+          << getBasicBlockId(BB) << ","
+          << getSourceLocation(BB) << ","
+          << (dist * 1000) << "\n";
+  }
 
   // If dumpUnreachable is enabled, output unreachable basic blocks
   if (dumpUnreachable) {
@@ -930,7 +928,6 @@ void ReachableCallGraphPass::dumpDistance(std::ostream &OS, bool dumpUnreachable
 }
 
 void ReachableCallGraphPass::dumpPolicy(std::ostream &OS) {
-
   // set precision
   OS << std::fixed << std::setprecision(6);
 
@@ -1055,6 +1052,12 @@ void ReachableCallGraphPass::dumpCriticalBBs(std::ostream &OS) {
 }
 
 bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string suffix) {
+  std::unordered_set<const llvm::BasicBlock*> inverseCriticalBBs;
+  for (const auto &[k,v] : criticalBBs) {
+    for (const auto *exitBB : v) {
+      inverseCriticalBBs.insert(exitBB);
+    }
+  }
   ModuleList::iterator i, e;
   // double max_dist = INFINITY;
   // if (!distances.empty()) {
@@ -1069,10 +1072,12 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
     Module *M = i->first;
     auto ModName = M->getName().str();
     auto NewName = ModName + suffix;
-    // auto VoidTy = Type::getVoidTy(M->getContext());
+    auto VoidTy = Type::getVoidTy(M->getContext());
     auto Int64Ty = Type::getInt64Ty(M->getContext());
     // FunctionCallee TraceDistanceFunc = M->getOrInsertFunction(
     //     "__taint_trace_distance", VoidTy, Int64Ty, Int64Ty);
+    FunctionCallee TraceFunc = M->getOrInsertFunction(
+    "__taint_trace_divergence", VoidTy, Int64Ty);
     for (auto &F : *M) {
       if (F.isDeclaration() || F.empty() || F.isIntrinsic()) {
         continue; // skip declaration and intrinsic
@@ -1089,6 +1094,13 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
         MDNode *MD = MDNode::get(M->getContext(),
                                   {ConstantAsMetadata::get(BBID)});
         term->setMetadata("bbid", MD);
+
+        // instrument __taint_trace_divergence callback
+        if (inverseCriticalBBs.count(&BB)) {
+          IRBuilder<> IRB(&*BB.getFirstInsertionPt());
+          auto *CI = IRB.CreateCall(TraceFunc, {BBID});
+          CI->setCannotMerge();
+        }
         // annotate reachable basic block with ID and distance
         // if (reachableBBs.count(&BB)) {
         //   // check if we have a distance

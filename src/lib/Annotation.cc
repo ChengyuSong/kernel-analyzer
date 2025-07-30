@@ -254,6 +254,7 @@ bool isExitFn(StringRef name) {
     name.equals("terminate") ||
     name.equals("abort") ||
     name.equals("panic") ||
+    name.equals("png_error") ||
     name.equals("BUG") ||
     name.equals("BUG_ON"))
     return true;

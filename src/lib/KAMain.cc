@@ -244,7 +244,7 @@ int main(int argc, char **argv) {
   }
   if (!DumpDistance.empty()) {
     std::ofstream distance(DumpDistance);
-    RCGPass.dumpDistance(distance, true, false);
+    RCGPass.dumpDistance(distance, true);
   }
   if (!DumpAnnotatedIR.empty()) {
     RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);

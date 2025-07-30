@@ -31,6 +31,7 @@ private:
   // Maximum call stack depth to propagate across callers
   const unsigned maxCallStackDepth;
   std::unordered_map<const BasicBlock*, unsigned> callDepth;
+  std::unordered_map<const BasicBlock*, unsigned> retDepth;
 
   std::vector<std::pair<std::string, int> > targetList;
   std::vector<std::string> entryList;
@@ -62,7 +63,7 @@ public:
     // debug
     void dumpPolicy(std::ostream &OS);
     void dumpCriticalBBs(std::ostream &OS);
-    void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
+    void dumpDistance(std::ostream &OS, bool dumpUnreachable = false);
     void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
     bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
     void dumpCallees();

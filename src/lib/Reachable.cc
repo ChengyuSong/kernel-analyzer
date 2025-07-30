@@ -431,9 +431,10 @@ void ReachableCallGraphPass::propagateThroughReturnEdgees(
       if (reachable.insert(Pred).second) {
         RA_DEBUG("Adding Pred: " << BBIDs[Pred] << "\n");
         propagateThroughReturnEdgees(reachable, Pred);
+        worklist.push_back(Pred);
       }
-    }
-  }
+    } // end of processing predecessors of this BB
+  } // end of propagation through predecessors
 }
 
 void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &worklist,
@@ -450,7 +451,10 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
     }
     // add predecessors
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
-      auto *Pred = *PI;
+      const BasicBlock *Pred = *PI;
+      if (reachable.find(Pred) != reachable.end()) {
+        continue; // already added
+      }
       if (reachable.insert(Pred).second) {
         RA_DEBUG("Adding Pred: " << BBIDs[Pred] << "\n");
         // if the predecessor is reachable to the target
@@ -491,7 +495,9 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
                  << ") for function " << F->getName() << ", skipping caller\n");
           continue;  // do not propagate beyond threshold
         }
-        callDepth[CBB] = newDepth;  // record depth before enqueue
+        if (reachable.find(CBB) != reachable.end()) {
+          continue; // already added
+        }
         // if all callsites have been processed, add the CBB
         RA_DEBUG("\tadding caller: " << CI->getFunction()->getName() << "\n");
         if (reachable.insert(CBB).second) {
@@ -501,6 +507,7 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
             criticalBBs[CBB].push_back(BB);
             continue;
           }
+          callDepth[CBB] = newDepth;  // record depth before enqueue
           worklist.push_back(CBB);
         }
       } // end of callers

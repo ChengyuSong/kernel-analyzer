@@ -276,6 +276,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
           if (f.find(target.first) != std::string::npos && loc.getLine() == target.second) {
             RA_LOG("Target I: " << *I << "\n");
             distances[I->getParent()] = 0.0;
+            targetBBs.insert(I->getParent());
             reachableBBs.insert(I->getParent());
           }
         }
@@ -1074,6 +1075,16 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
     auto NewName = ModName + suffix;
     auto VoidTy = Type::getVoidTy(M->getContext());
     auto Int64Ty = Type::getInt64Ty(M->getContext());
+    auto *BoolTy = Type::getInt1Ty(M->getContext());
+    auto *TrueVal = ConstantInt::getTrue(BoolTy);
+    auto *FalseVal = ConstantInt::getFalse(BoolTy);
+    GlobalVariable *HasReachedTarget = cast<GlobalVariable>(
+          M->getOrInsertGlobal("has_reached_target", BoolTy));
+    HasReachedTarget->setLinkage(GlobalValue::LinkOnceODRLinkage);
+    HasReachedTarget->setComdat(M->getOrInsertComdat(HasReachedTarget->getName()));
+    if (!HasReachedTarget->hasInitializer())
+        HasReachedTarget->setInitializer(FalseVal);
+
     // FunctionCallee TraceDistanceFunc = M->getOrInsertFunction(
     //     "__taint_trace_distance", VoidTy, Int64Ty, Int64Ty);
     FunctionCallee TraceFunc = M->getOrInsertFunction(
@@ -1100,6 +1111,15 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
           IRBuilder<> IRB(&*BB.getFirstInsertionPt());
           auto *CI = IRB.CreateCall(TraceFunc, {BBID});
           CI->setCannotMerge();
+        }
+        // Instrument code to set has_reached_target to true
+        for (const llvm::BasicBlock* tb : targetBBs) {
+          if (tb == &BB) {
+            IRBuilder<> IRB(BB.getTerminator());
+            IRB.CreateStore(TrueVal, HasReachedTarget)->setMetadata(
+                M->getMDKindID("nosanitize"), MDNode::get(M->getContext(), None));
+            break;
+          }
         }
         // annotate reachable basic block with ID and distance
         // if (reachableBBs.count(&BB)) {

@@ -425,7 +425,10 @@ void ReachableCallGraphPass::propagateThroughReturnEdgees(
         RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
         break; // no further propagation for no-return functions
       }
-      RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
+      static std::unordered_set<const Function*> Seen;
+      if (Seen.insert(F).second) {
+        RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
+      }
       // add exit block(s) as reachable
       for (auto &TBB : *F) {
         if (isa<UnreachableInst>(TBB.getTerminator())) {
@@ -648,7 +651,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
       }
       prob /= numSucc;
       if (prob == 0.0) {
-        WARNING("prob dropped to 0 for basic block in " << BB->getParent()->getName() << "\n");
+        WARNING("prob dropped to 0 for BB "<< getSourceLocation(BB) << " in " << BB->getParent()->getName() << "\n");
         RA_DEBUG("\t " << *BB << "\n");
         continue;
       }
@@ -691,7 +694,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
         }
       }
       // check callers
-      RA_LOG(F->getName() << " is reachable from " << itr->second.size() << " callers\n");
+      static std::unordered_set<const Function*> Seen;
+      if (Seen.insert(F).second) {
+        RA_LOG(F->getName() << " is reachable from " << itr->second.size() << " callers\n");
+      }
       auto dist = distances[BB];
       for (auto CI : itr->second) {
         auto CBB = CI->getParent();

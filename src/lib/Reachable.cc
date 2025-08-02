@@ -629,6 +629,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
       auto *Pred = *PI;
       double numSucc = 0.0;
       double prob = 0.0;
+      if (reachableBBs.find(Pred) == reachableBBs.end()) {
+        RA_DEBUG("Skip unreachable Pred: " << *Pred << "\n");
+        continue;
+      }
       for (auto SI = succ_begin(Pred), SE = succ_end(Pred); SI != SE; ++SI) {
         auto *Succ = *SI;
         numSucc += 1.0;

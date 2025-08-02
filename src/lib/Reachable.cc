@@ -229,8 +229,9 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
         nextBBID += SI->getNumCases();
       }
     }
-    // treat any BB ending in llvm::UnreachableInst as an "exit"
-    if (isa<UnreachableInst>(BB.getTerminator())) {
+    auto* TI = BB.getTerminator();
+    // treat any BB ending in llvm::UnreachableInst and exception as an "exit"
+    if (isa<UnreachableInst>(TI) || isa<ResumeInst>(TI)) {
       RA_DEBUG("Unreachable Inst BB: " << BBIDs[&BB] << "\n");
       exitBBs.insert(&BB);
     }
@@ -345,14 +346,38 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
       isEntry = (itr != entryList.end());
     }
     if (isEntry) {
+      // Record entry block
       entryBBs.insert(&F.getEntryBlock());
+      // Compute the maximum source line number for this function
+      unsigned maxLine = 0;
       for (auto &BB : F) {
-        if (isa<ReturnInst>(BB.getTerminator())) {
-          exitBBs.insert(&BB);
+        for (auto &I : BB) {
+          if (auto DL = I.getDebugLoc()) {
+            maxLine = std::max(maxLine, DL.getLine());
+          }
         }
       }
-    }
-  }
+      // Seed exitBBs with normal exit terminators
+      for (auto &BB : F) {
+        auto *TI = BB.getTerminator();
+        if (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI) ||
+            isa<ResumeInst>(TI) || TI->getNumSuccessors() == 0) {
+          exitBBs.insert(&BB);
+        }
+        if (maxLine > 0) {
+          // Also include any BB whose debug line equals the function's last line
+          for (auto &I : BB) {
+            if (auto DL = I.getDebugLoc()) {
+              if (DL.getLine() == maxLine) {
+                exitBBs.insert(&BB);
+                break;
+              }
+            }
+          }
+        }
+      } // end of finding exitBBs
+    } // end of entry function processing
+  } // end of processing all functions in this Module
 
   return false;
 }
@@ -554,6 +579,8 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     worklist.push_back(kv.first);
   }
   collectReachable(worklist, reachableBBs);
+  for (const auto *BB : exitBBs)
+    reachableBBs.erase(BB);
 
   // do a BFS search on the call graph to find BB that can reach exits
   RA_LOG("\n\n=== Collecting exit BBs ===\n\n");

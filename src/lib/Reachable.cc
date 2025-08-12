@@ -387,83 +387,102 @@ bool ReachableCallGraphPass::doFinalization(Module *M) {
 }
 
 void ReachableCallGraphPass::propagateThroughReturnEdgees(
-  std::unordered_set<const BasicBlock*> &reachable, 
-  const BasicBlock* CBB) {
-  auto hasCalls = BBswithCalls.find(CBB);
-  if (hasCalls == BBswithCalls.end()) return;
-  
+  std::unordered_set<const BasicBlock*> &reachable,
+  const BasicBlock* startBB) {
+  // Pure iterative BFS to avoid recursion and ensure no cases are skipped.
   std::deque<const BasicBlock*> worklist;
-  unsigned currDepth = retDepth[CBB];
-  if (currDepth >= maxCallStackDepth) {
-    RA_LOG("Max depth reached (" << maxCallStackDepth 
-           << ") for BB " << BBIDs[CBB] << ", skipping propagation\n");
-    return; // do not propagate beyond threshold
+  std::unordered_set<const BasicBlock*> queued;
+
+  if (startBB == nullptr) {
+    return;
   }
 
-  CallSequence calls = hasCalls->second;
-  for (size_t i = calls.size(); i-- > 0; ) {
-    // find the current callsite and there are additional callees before it
-    const llvm::CallBase* CI = calls[i];
-    // Look up callees for this call site with proper map/iterator logic
-    // Unified lookup of direct or type-based callees
-    const FuncSet *callees = nullptr;
-    if (auto it = Ctx->Callees.find(CI); it != Ctx->Callees.end()) {
-        callees = &it->second;
-    } else if (UseTypeBasedCallGraph) {
-        if (auto it2 = calleeByType.find(CI); it2 != calleeByType.end()) {
-            callees = &it2->second;
-        }
-    }
-    if (!callees) {
-        RA_DEBUG("No callee for " << *CI << "\n");
-        continue;
-    }
-    
-    // Iterate over each callee function
-    for (auto *F : *callees) {
-      if (isExitFn(F->getName()) || F->doesNotReturn()) {
-        RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
-        break; // no further propagation for no-return functions
-      }
-      static std::unordered_set<const Function*> Seen;
-      if (Seen.insert(F).second) {
-        RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
-      }
-      // add exit block(s) as reachable
-      for (auto &TBB : *F) {
-        if (isa<UnreachableInst>(TBB.getTerminator())) {
-          continue; // skip unreachable BBs
-        }
-        if (isa<ReturnInst>(TBB.getTerminator())) {
-          RA_DEBUG("Adding callee: " << F->getName() << "\n");
-          if (reachable.find(&TBB) != reachable.end()) {
-            continue; // already added
-          }
-          retDepth[&TBB] = currDepth + 1;
-          worklist.push_back(&TBB);
-        }
-      } // end of BBs for this callee F
-    } // end of candidate callees for this callsite CI
-  } // end of all callsites for this CBB
+  // Seed
+  queued.insert(startBB);
+  worklist.push_back(startBB);
 
-  // BFS back propagate through predecessors
   // Do not add callers to prevent fake call edges.
   while (!worklist.empty()) {
     const BasicBlock *BB = worklist.front();
     worklist.pop_front();
-    reachable.insert(BB);
-    // process the current BBs
-    propagateThroughReturnEdgees(reachable, BB);
+
+    // Mark reachable once dequeued to keep BFS semantics
+    if (!reachable.insert(BB).second) {
+      // Already processed
+    }
+
+    // Check depth budget for return-edge expansion
+    unsigned currDepth = 0;
+    if (auto it = retDepth.find(BB); it != retDepth.end()) {
+      currDepth = it->second;
+    }
+    if (currDepth < maxCallStackDepth) {
+      // If this BB has interesting callsites, push callee return blocks
+      if (auto hasCalls = BBswithCalls.find(BB); hasCalls != BBswithCalls.end()) {
+        const CallSequence &calls = hasCalls->second;
+        for (size_t i = calls.size(); i-- > 0; ) {
+          const llvm::CallBase* CI = calls[i];
+
+          // Unified lookup of direct or type-based callees
+          const FuncSet *callees = nullptr;
+          if (auto it = Ctx->Callees.find(CI); it != Ctx->Callees.end()) {
+            callees = &it->second;
+          } else if (UseTypeBasedCallGraph) {
+            if (auto it2 = calleeByType.find(CI); it2 != calleeByType.end()) {
+              callees = &it2->second;
+            }
+          }
+          if (!callees) {
+            RA_DEBUG("No callee for " << *CI << "\n");
+            continue;
+          }
+
+          for (auto *F : *callees) {
+            if (isExitFn(F->getName()) || F->doesNotReturn()) {
+              RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
+              break; // stop on no-return functions
+            }
+            static std::unordered_set<const Function*> Seen;
+            if (Seen.insert(F).second) {
+              RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
+            }
+            for (auto &TBB : *F) {
+              if (isa<UnreachableInst>(TBB.getTerminator())) {
+                continue;
+              }
+              if (isa<ReturnInst>(TBB.getTerminator())) {
+                if (!reachable.count(&TBB) && queued.insert(&TBB).second) {
+                  RA_DEBUG("Adding callee: " << F->getName() << "\n");
+                  retDepth[&TBB] = currDepth + 1;
+                  worklist.push_back(&TBB);
+                }
+              }
+            }
+          }
+        }
+      }
+    } else {
+      RA_LOG("Max depth reached (" << maxCallStackDepth
+             << ") for BB " << BBIDs[BB] << ", skipping propagation\n");
+    }
+
     RA_DEBUG("Propagating Ret BB through: " << BBIDs[BB] << "\n");
-    // add its predecessors
+
+    // Add CFG predecessors to continue backward propagation
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
       const BasicBlock *Pred = *PI;
-      if (reachable.find(Pred) != reachable.end()) {
-        continue; // already added
+      if (reachable.count(Pred)) {
+        continue; // already processed
       }
-      worklist.push_back(Pred);
-    } // end of processing predecessors of this BB
-  } // end of propagation through predecessors
+      if (queued.insert(Pred).second) {
+        // keep same ret-depth across normal CFG edges
+        if (currDepth != 0) {
+          retDepth[Pred] = currDepth;
+        }
+        worklist.push_back(Pred);
+      }
+    }
+  }
 }
 
 void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &worklist,

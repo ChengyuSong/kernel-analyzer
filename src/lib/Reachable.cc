@@ -348,6 +348,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
     if (isEntry) {
       // Record entry block
       entryBBs.insert(&F.getEntryBlock());
+      RA_LOG("[init] Entry function detected: " << F.getName() << "\n");
       // Compute the maximum source line number for this function
       unsigned maxLine = 0;
       for (auto &BB : F) {
@@ -368,6 +369,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             || isa<UnreachableInst>(TI)
             || isa<ResumeInst>(TI)) {
           exitBBs.insert(&BB);
+          RA_LOG("[init] ExitByTerm added: " << F.getName() << " @ " << getSourceLocation(&BB) << "\n");
         }
         if (maxLine > 0) {
           // Also include any BB whose debug line equals the function's last line
@@ -375,6 +377,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             if (auto DL = I.getDebugLoc()) {
               if (DL.getLine() == maxLine) {
                 exitBBs.insert(&BB);
+                RA_LOG("[init] ExitByMaxLine added: " << F.getName() << " @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
                 break;
               }
             }
@@ -501,6 +504,7 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
     if (isComputingReachable) {
       // do not PropagateThroughReturnEdgees when computing unreachable BBs
       propagateThroughReturnEdgees(reachable, BB);
+      RA_LOG("[collectReachable] After ret-edge, reachable size=" << reachable.size() << ", current BB=" << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
     }
     // add predecessors
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
@@ -532,7 +536,11 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
           found = (itr != callerByType.end());
         }
         if (!found) {
-          WARNING("No caller for " << F->getName() << "\n");
+          static std::unordered_set<const Function*> WarnedNoCaller1;
+          if (WarnedNoCaller1.insert(F).second) {
+            std::string context_str = isComputingReachable ? "Reachable Analysis: " : "Unreachable Analysis: ";
+            WARNING(context_str << "No caller for " << F->getName() << "\n");
+          }
           continue;
         }
       }
@@ -596,6 +604,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     WARNING("No entry BBs found\n");
     return;
   }
+  RA_LOG("[run] Num entry BBs: " << entryBBs.size() << "\n");
+  for (auto *EBB : entryBBs) {
+    RA_LOG("[run] Entry BB: " << BBIDs[EBB] << " @ " << getSourceLocation(EBB) << " of function " << EBB->getParent()->getName() << "\n");
+  }
 
   // do a BFS search on the target list, find all reachable BBs first
   std::deque<const BasicBlock*> worklist;
@@ -606,12 +618,16 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     worklist.push_back(kv.first);
   }
   collectReachable(worklist, reachableBBs);
+  RA_LOG("[run] reachableBBs after target-backward: " << reachableBBs.size() << "\n");
   // Remove exit blocks from reachable set, but never remove entry blocks
   for (const auto *BB : exitBBs) {
     if (entryBBs.find(BB) != entryBBs.end()) {
+      RA_LOG("[run] Skip removing entry from reachable: BB " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
       continue;
     }
-    reachableBBs.erase(BB);
+    if (reachableBBs.erase(BB)) {
+      RA_LOG("[run] Removed exit BB from reachable: " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+    }
   }
 
   // do a BFS search on the call graph to find BB that can reach exits
@@ -620,9 +636,11 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   callDepth.clear();
   retDepth.clear();
   for (auto *BB : exitBBs) {
+    RA_LOG("[run] Seed exit BB: " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
     worklist.push_back(BB);
   }
   collectReachable(worklist, exitBBs, reachableBBs);
+  RA_LOG("[run] exitBBs reachable to target size: " << exitBBs.size() << "\n");
 
   // check if target is reachable
   bool reached = false;
@@ -630,6 +648,9 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     if (reachableBBs.find(entry) != reachableBBs.end()) {
       RA_LOG("\n\n=== Target is reachable from entry ===\n\n");
       reached = true;
+    }
+    else {
+      RA_LOG("[run] Entry not in reachableBBs: " << BBIDs[entry] << " @ " << getSourceLocation(entry) << " func " << entry->getParent()->getName() << "\n");
     }
   }
 
@@ -652,6 +673,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     auto *BB = worklist.front();
     worklist.pop_front();
     queued.erase(BB);
+    RA_DEBUG("[distance] Pop BB: " << BBIDs[BB] << " @ " << getSourceLocation(BB) << ", depth=" << callDepth[BB] << "\n");
     unsigned currDepth = callDepth[BB];
     if (currDepth >= maxCallStackDepth) {
       continue;  // do not propagate beyond threshold
@@ -696,6 +718,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
         if (queued.insert(Pred).second){
           callDepth[Pred] = currDepth;
           worklist.push_back(Pred);
+          RA_DEBUG("[distance] Enqueue Pred: " << BBIDs[Pred] << " @ " << getSourceLocation(Pred) << ", dist=" << dist*1000 << "\n");
         }
       }
     }
@@ -714,10 +737,9 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           found = (itr != callerByType.end());
         }
         if (!found) {
-          if (!F->getName().equals("main")) {
+          static std::unordered_set<const Function*> WarnedNoCaller2;
+          if (WarnedNoCaller2.insert(F).second) {
             WARNING("No caller for " << F->getName() << "\n");
-          } else {
-            RA_LOG("main is reached\n");
           }
           continue;
         }
@@ -725,7 +747,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
       // check callers
       static std::unordered_set<const Function*> Seen;
       if (Seen.insert(F).second) {
-        RA_LOG(F->getName() << " is reachable from " << itr->second.size() << " callers\n");
+        RA_DEBUG(F->getName() << " is reachable from " << itr->second.size() << " callers\n");
       }
       auto dist = distances[BB];
       for (auto CI : itr->second) {
@@ -744,6 +766,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
             if (queued.insert(CBB).second){
               callDepth[CBB] = currDepth + 1;
               worklist.push_back(CBB);
+              RA_DEBUG("[distance] Enqueue Caller CBB: " << BBIDs[CBB] << " @ " << getSourceLocation(CBB) << ", from F=" << F->getName() << "\n");
             }
           }
         } else {
@@ -751,7 +774,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
           // for each call site, check if all its callees have been processed
           double prob = 0.0;
           FuncSet &Callees = UseTypeBasedCallGraph ? calleeByType[CI] : Ctx->Callees[CI];
-          RA_LOG("\tfrom indirect call @" << CF->getName() << ", callee size = " << Callees.size() << "\n");
+          RA_DEBUG("\tfrom indirect call @" << CF->getName() << ", callee size = " << Callees.size() << "\n");
           // XXX: skip potentially imprecise callsites?
           if (Callees.size() > 50) {
             RA_DEBUG("Skip indirect call with too many callees\n");

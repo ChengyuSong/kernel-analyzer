@@ -62,8 +62,8 @@ public:
     void collectReachable(std::deque<const BasicBlock *> &worklist,
                         std::unordered_set<const BasicBlock *> &reachable,
                         const std::unordered_set<const BasicBlock *> &others = {});
-    void propagateThroughReturnEdgees(std::unordered_set<const BasicBlock *> &reachable,
-                                    const BasicBlock *CBB);
+    void propagateThroughReturnEdgees(std::unordered_set<const BasicBlock *> &retReachable,
+                                    const BasicBlock *startBB);
 
     // debug
     void dumpPolicy(std::ostream &OS);

@@ -395,99 +395,79 @@ bool ReachableCallGraphPass::doFinalization(Module *M) {
 }
 
 void ReachableCallGraphPass::propagateThroughReturnEdgees(
-  std::unordered_set<const BasicBlock*> &reachable,
+  std::unordered_set<const BasicBlock*> &retReachable,
   const BasicBlock* startBB) {
-  // Pure iterative BFS to avoid recursion and ensure no cases are skipped.
-  std::deque<const BasicBlock*> worklist;
-  std::unordered_set<const BasicBlock*> queued;
-
+  // Only collect BBs via return-edges. Do not touch the main worklist or callers.
   if (startBB == nullptr) {
     return;
   }
 
-  // Seed
-  queued.insert(startBB);
-  worklist.push_back(startBB);
+  std::deque<const BasicBlock*> local;
+  std::unordered_set<const BasicBlock*> visited;
+  visited.insert(startBB);
+  local.push_back(startBB);
 
-  // Do not add callers to prevent fake call edges.
-  while (!worklist.empty()) {
-    const BasicBlock *BB = worklist.front();
-    worklist.pop_front();
+  while (!local.empty()) {
+    const BasicBlock *BB = local.front();
+    local.pop_front();
 
-    // Mark reachable once dequeued to keep BFS semantics
-    if (!reachable.insert(BB).second) {
-      // Already processed
-    }
-
-    // Check depth budget for return-edge expansion
     unsigned currDepth = 0;
     if (auto it = retDepth.find(BB); it != retDepth.end()) {
       currDepth = it->second;
     }
-    if (currDepth < maxCallStackDepth) {
-      // If this BB has interesting callsites, push callee return blocks
-      if (auto hasCalls = BBswithCalls.find(BB); hasCalls != BBswithCalls.end()) {
-        const CallSequence &calls = hasCalls->second;
-        for (size_t i = calls.size(); i-- > 0; ) {
-          const llvm::CallBase* CI = calls[i];
-
-          // Unified lookup of direct or type-based callees
-          const FuncSet *callees = nullptr;
-          if (auto it = Ctx->Callees.find(CI); it != Ctx->Callees.end()) {
-            callees = &it->second;
-          } else if (UseTypeBasedCallGraph) {
-            if (auto it2 = calleeByType.find(CI); it2 != calleeByType.end()) {
-              callees = &it2->second;
-            }
-          }
-          if (!callees) {
-            RA_DEBUG("No callee for " << *CI << "\n");
-            continue;
-          }
-
-          for (auto *F : *callees) {
-            if (isExitFn(F->getName()) || F->doesNotReturn()) {
-              RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
-              break; // stop on no-return functions
-            }
-            static std::unordered_set<const Function*> Seen;
-            if (Seen.insert(F).second) {
-              RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
-            }
-            for (auto &TBB : *F) {
-              if (isa<UnreachableInst>(TBB.getTerminator())) {
-                continue;
-              }
-              if (isa<ReturnInst>(TBB.getTerminator())) {
-                if (!reachable.count(&TBB) && queued.insert(&TBB).second) {
-                  RA_DEBUG("Adding callee: " << F->getName() << "\n");
-                  retDepth[&TBB] = currDepth + 1;
-                  worklist.push_back(&TBB);
-                }
-              }
-            }
-          }
-        }
-      }
-    } else {
+    if (currDepth >= maxCallStackDepth) {
       RA_LOG("Max depth reached (" << maxCallStackDepth
-             << ") for BB " << BBIDs[BB] << ", skipping propagation\n");
+             << ") for BB " << BBIDs[BB] << ", skipping ret-edge propagation\n");
+      continue;
     }
 
-    RA_DEBUG("Propagating Ret BB through: " << BBIDs[BB] << "\n");
-
-    // Add CFG predecessors to continue backward propagation
-    for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
-      const BasicBlock *Pred = *PI;
-      if (reachable.count(Pred)) {
-        continue; // already processed
-      }
-      if (queued.insert(Pred).second) {
-        // keep same ret-depth across normal CFG edges
-        if (currDepth != 0) {
-          retDepth[Pred] = currDepth;
+    // If this BB has interesting callsites, push callee return blocks
+    auto hasCalls = BBswithCalls.find(BB);
+    if (hasCalls == BBswithCalls.end()) {
+      continue;
+    }
+    const CallSequence &calls = hasCalls->second;
+    for (size_t i = calls.size(); i-- > 0; ) {
+      const llvm::CallBase* CI = calls[i];
+      // Unified lookup of direct or type-based callees
+      const FuncSet *callees = nullptr;
+      if (auto it = Ctx->Callees.find(CI); it != Ctx->Callees.end()) {
+        callees = &it->second;
+      } else if (UseTypeBasedCallGraph) {
+        if (auto it2 = calleeByType.find(CI); it2 != calleeByType.end()) {
+          callees = &it2->second;
         }
-        worklist.push_back(Pred);
+      }
+      if (!callees) {
+        RA_DEBUG("No callee for " << *CI << "\n");
+        continue;
+      }
+
+      for (auto *F : *callees) {
+        if (isExitFn(F->getName()) || F->doesNotReturn()) {
+          RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
+          break; // stop on no-return functions
+        }
+        static std::unordered_set<const Function*> Seen;
+        if (Seen.insert(F).second) {
+          RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
+        }
+        for (auto &TBB : *F) {
+          if (isa<UnreachableInst>(TBB.getTerminator())) {
+            continue;
+          }
+          if (isa<ReturnInst>(TBB.getTerminator())) {
+            if (retReachable.insert(&TBB).second) {
+              retDepth[&TBB] = currDepth + 1;
+              // Keep exploring ret-edges from new return blocks as well
+              if (visited.insert(&TBB).second) {
+                local.push_back(&TBB);
+              }
+              RA_DEBUG("[ret] add callee ret-BB: " << F->getName()
+                      << " -> " << BBIDs[&TBB] << "\n");
+            }
+          }
+        }
       }
     }
   }
@@ -497,14 +477,16 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
     std::unordered_set<const BasicBlock*> &reachable,
     const std::unordered_set<const BasicBlock*> &others) {
   bool isComputingReachable = others.empty();
+  // Accumulator for ret-edge-only BBs across the whole BFS
+  std::unordered_set<const BasicBlock*> retEdgeAccum;
   while (!worklist.empty()) {
     auto *BB = worklist.front();
     worklist.pop_front();
     // add callee when computing reachable BBs
     if (isComputingReachable) {
-      // do not PropagateThroughReturnEdgees when computing unreachable BBs
-      propagateThroughReturnEdgees(reachable, BB);
-      RA_LOG("[collectReachable] After ret-edge, reachable size=" << reachable.size() << ", current BB=" << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+      // collect ret-edge-only BBs into accumulator; do not mutate 'reachable' here
+      propagateThroughReturnEdgees(retEdgeAccum, BB);
+      RA_DEBUG("[collectReachable] ret-edge accum size=" << retEdgeAccum.size() << ", from BB=" << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
     }
     // add predecessors
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
@@ -576,6 +558,12 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
         }
       } // end of callers
     } // end of entry block
+  }
+  // Merge ret-edge-only BBs after BFS completes
+  if (isComputingReachable) {
+    for (const BasicBlock *RBB : retEdgeAccum) {
+      reachable.insert(RBB);
+    }
   }
 }
 

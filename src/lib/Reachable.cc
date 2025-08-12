@@ -359,9 +359,14 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
       }
       // Seed exitBBs with normal exit terminators
       for (auto &BB : F) {
+        // Never treat the entry block as an exit block
+        if (&BB == &F.getEntryBlock()) {
+          continue;
+        }
         auto *TI = BB.getTerminator();
-        if (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI) ||
-            isa<ResumeInst>(TI) || TI->getNumSuccessors() == 0) {
+        if (isa<ReturnInst>(TI)
+            || isa<UnreachableInst>(TI)
+            || isa<ResumeInst>(TI)) {
           exitBBs.insert(&BB);
         }
         if (maxLine > 0) {
@@ -601,8 +606,13 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
     worklist.push_back(kv.first);
   }
   collectReachable(worklist, reachableBBs);
-  for (const auto *BB : exitBBs)
+  // Remove exit blocks from reachable set, but never remove entry blocks
+  for (const auto *BB : exitBBs) {
+    if (entryBBs.find(BB) != entryBBs.end()) {
+      continue;
+    }
     reachableBBs.erase(BB);
+  }
 
   // do a BFS search on the call graph to find BB that can reach exits
   RA_LOG("\n\n=== Collecting exit BBs ===\n\n");

@@ -234,6 +234,10 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
     if (isa<UnreachableInst>(TI) || isa<ResumeInst>(TI)) {
       RA_DEBUG("Unreachable Inst BB: " << BBIDs[&BB] << "\n");
       exitBBs.insert(&BB);
+      RA_LOG("[add-exit] by terminator: BB " << BBIDs[&BB]
+             << " @ " << getSourceLocation(&BB)
+             << " func " << F->getName()
+             << " term=" << TI->getOpcodeName() << "\n");
     }
     for (auto &i : BB) {
       Instruction *I = &i;
@@ -246,9 +250,19 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
             Changed |= Ctx->Callees[CI].insert(RCF).second;
             Changed |= Ctx->Callers[RCF].insert(CI).second;
             // check for call to exit functions
-            if (isExitFn(RCF->getName()) || CF->doesNotReturn()) {
+            bool __isExitFn = isExitFn(RCF->getName());
+            bool __doesNotReturn = CF->doesNotReturn();
+            if (__isExitFn || __doesNotReturn) {
               RA_DEBUG("Exit Call: " << *CI << "\n");
               exitBBs.insert(CI->getParent());
+              RA_LOG("[add-exit] by call: BB " << BBIDs[CI->getParent()]
+                     << " @ " << getSourceLocation(CI->getParent())
+                     << " func " << F->getName()
+                     << " callee=" << RCF->getName()
+                     << " reason=" << (__isExitFn ? "isExitFn" : "")
+                     << ((__isExitFn && __doesNotReturn) ? "+" : "")
+                     << (__doesNotReturn ? "doesNotReturn" : "")
+                     << "\n");
             }
           } else if (!CI->isInlineAsm()) {
             // indirect call
@@ -369,7 +383,8 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             || isa<UnreachableInst>(TI)
             || isa<ResumeInst>(TI)) {
           exitBBs.insert(&BB);
-          RA_LOG("[init] ExitByTerm added: " << F.getName() << " @ " << getSourceLocation(&BB) << "\n");
+          RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB " << BBIDs[&BB]
+                 << " @ " << getSourceLocation(&BB) << "\n");
         }
         if (maxLine > 0) {
           // Also include any BB whose debug line equals the function's last line
@@ -377,7 +392,8 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             if (auto DL = I.getDebugLoc()) {
               if (DL.getLine() == maxLine) {
                 exitBBs.insert(&BB);
-                RA_LOG("[init] ExitByMaxLine added: " << F.getName() << " @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
+                RA_LOG("[init] ExitByMaxLine added: " << F.getName() << " BB " << BBIDs[&BB]
+                       << " @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
                 break;
               }
             }
@@ -501,6 +517,14 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
           continue; // already added
       } else if(reachable.insert(Pred).second) {
         RA_DEBUG("Adding " << BBIDs[BB] << "'s Pred: " << BBIDs[Pred] << "\n");
+        // When computing exit BBs (others is not empty), log propagation reason
+        if (!isComputingReachable) {
+          RA_LOG("[add-exit] by pred-edge: add BB " << BBIDs[Pred]
+                 << " @ " << getSourceLocation(Pred)
+                 << " func " << Pred->getParent()->getName()
+                 << " from Succ " << BBIDs[BB]
+                 << " @ " << getSourceLocation(BB) << "\n");
+        }
         worklist.push_back(Pred);
       }
     }
@@ -555,6 +579,13 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
           }
           callDepth[CBB] = newDepth;  // record depth before enqueue
           worklist.push_back(CBB);
+          // When computing exit BBs (others is not empty), log propagation via caller edge
+          if (!isComputingReachable) {
+            RA_LOG("[add-exit] by caller-edge: add BB " << BBIDs[CBB]
+                   << " @ " << getSourceLocation(CBB)
+                   << " func " << CBB->getParent()->getName()
+                   << " via call into callee " << F->getName() << "\n");
+          }
         }
       } // end of callers
     } // end of entry block

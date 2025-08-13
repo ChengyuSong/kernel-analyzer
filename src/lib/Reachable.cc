@@ -903,62 +903,96 @@ void ReachableCallGraphPass::getDebugLocationFullPath(const BasicBlock &BB,
   Line = 0;
   Col = 0;
 
-  // We don't want paths that point to system libraries in /usr/
+  // We don't want paths that point to system libraries
   static const std::string Xlibs("/usr/");
+  auto isSystemLikePath = [](StringRef P) -> bool {
+    if (P.empty()) return false;
+    // Consider any path that is exactly /usr/... or contains /usr/ segment
+    // as system-like (covers sysroot cases like /toolchain/sysroot/usr/...)
+    if (P.startswith("/usr/")) return true;
+    return P.contains("/usr/");
+  };
 
   // Iterate over instructions in the basic block
   for (auto &Inst : BB) {
     if (DILocation *Loc = Inst.getDebugLoc()) {
-      // Extract directory & filename
-      std::string Dir  = Loc->getDirectory().str();
-      std::string File = Loc->getFilename().str();
-      unsigned    L    = Loc->getLine();
-      unsigned    C    = Loc->getColumn();
+      // Fallback: remember the first valid system-lib location if no user code is found
+      std::string systemFallbackPath;
+      unsigned systemFallbackLine = 0;
+      unsigned systemFallbackCol  = 0;
 
-      // If there's no filename, check the inlined location
-      if (File.empty()) {
-        if (DILocation *inlinedAt = Loc->getInlinedAt()) {
-          Dir  = inlinedAt->getDirectory().str();
-          File = inlinedAt->getFilename().str();
-          L    = inlinedAt->getLine();
-          C    = inlinedAt->getColumn();
+      // Walk inlined-at chain from inner to outer to prefer user code call sites
+      for (DILocation *Cur = Loc; Cur != nullptr; Cur = Cur->getInlinedAt()) {
+        std::string Dir  = Cur->getDirectory().str();
+        std::string File = Cur->getFilename().str();
+        unsigned    L    = Cur->getLine();
+        unsigned    C    = Cur->getColumn();
+
+        // Skip if missing filename or invalid line
+        if (File.empty() || L == 0)
+          continue;
+
+        // Normalize suspicious relative system paths like "usr/..." to "/usr/..."
+        if (!Dir.empty() && !llvm::sys::path::is_absolute(Dir) && llvm::StringRef(Dir).startswith("usr/")) {
+          Dir = "/" + Dir;
         }
+        if (!File.empty() && !llvm::sys::path::is_absolute(File) && llvm::StringRef(File).startswith("usr/")) {
+          File = "/" + File;
+        }
+
+        // Build an absolute path in a SmallString
+        llvm::SmallString<256> FullPath;
+
+        // If File itself is absolute, prefer it directly
+        if (!File.empty() && llvm::sys::path::is_absolute(File)) {
+          FullPath = File;
+        } else {
+          // If Dir is already absolute, start with that. Otherwise base on CWD.
+          if (!Dir.empty() && llvm::sys::path::is_absolute(Dir)) {
+            FullPath = Dir;
+          } else {
+            llvm::sys::fs::current_path(FullPath);
+            if (!Dir.empty()) {
+              llvm::sys::path::append(FullPath, Dir);
+            }
+          }
+          // Append the filename (relative)
+          llvm::sys::path::append(FullPath, File);
+        }
+
+        // Normalize dots
+        llvm::sys::path::remove_dots(FullPath, /*remove_dot_dot=*/true);
+
+        // Skip if system-like, but record the first one as a fallback
+        StringRef FullRef(FullPath);
+        if (isSystemLikePath(FullRef)) {
+          if (systemFallbackPath.empty()) {
+            systemFallbackPath = FullPath.str().str();
+            systemFallbackLine = L;
+            systemFallbackCol  = C;
+          }
+          continue;
+        }
+
+        // Found a valid location => set output vars
+        Filename = FullPath.str().str();
+        Line     = L;
+        Col      = C;
+        break;
       }
 
-      // Skip if still no filename or line==0
-      if (File.empty() || L == 0)
-        continue;
+      // If we selected a valid non-system frame, stop scanning instructions
+      if (!Filename.empty())
+        break;
 
-      // Build an absolute path in a SmallString
-      llvm::SmallString<256> FullPath;
-
-      // 1) If Dir is already absolute, just start with that.
-      //    Otherwise, use the current working directory as a base.
-      if (!Dir.empty() && llvm::sys::path::is_absolute(Dir)) {
-        FullPath = Dir;
-      } else {
-        llvm::sys::fs::current_path(FullPath); // get the current working dir
-        if (!Dir.empty()) {
-          llvm::sys::path::append(FullPath, Dir);
-        }
+      // If not found in this instruction's inlined chain, but we have a
+      // system fallback recorded, use it and stop.
+      if (Filename.empty() && !systemFallbackPath.empty()) {
+        Filename = systemFallbackPath;
+        Line     = systemFallbackLine;
+        Col      = systemFallbackCol;
+        break;
       }
-
-      // 2) Append the filename
-      llvm::sys::path::append(FullPath, File);
-
-      // 3) Remove dot segments (both "." and "..")
-      llvm::sys::path::remove_dots(FullPath, /*remove_dot_dot=*/true);
-
-      // Now FullPath is absolute & normalized
-      // Check if it's in /usr/
-      if (StringRef(FullPath).startswith(Xlibs))
-        continue; // skip system-libs
-
-      // Found a valid location => set output vars
-      Filename = FullPath.str().str(); // convert to std::string
-      Line     = L;
-      Col      = C;
-      break; // stop after the first valid location
     }
   }
 }

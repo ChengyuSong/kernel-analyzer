@@ -222,7 +222,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
   RA_LOG("### Run on function: " << F->getName() << "\n");
   for (auto &BB : *F) {
     // assign a BB ID
-    if (BBIDs.find(&BB) == BBIDs.end()) {
+    if (BBIDs.find(&BB) == BBIDs.end() || BBIDs[&BB] == 0) {
       BBIDs[&BB] = nextBBID++;
       if (auto *SI = dyn_cast<SwitchInst>(BB.getTerminator())) {
         // assign a unique ID to the switch case
@@ -383,8 +383,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             || isa<UnreachableInst>(TI)
             || isa<ResumeInst>(TI)) {
           exitBBs.insert(&BB);
-          RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB " << BBIDs[&BB]
-                 << " @ " << getSourceLocation(&BB) << "\n");
+          RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB @ " << getSourceLocation(&BB) << "\n");
         }
         if (maxLine > 0) {
           // Also include any BB whose debug line equals the function's last line
@@ -392,8 +391,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             if (auto DL = I.getDebugLoc()) {
               if (DL.getLine() == maxLine) {
                 exitBBs.insert(&BB);
-                RA_LOG("[init] ExitByMaxLine added: " << F.getName() << " BB " << BBIDs[&BB]
-                       << " @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
+                RA_LOG("[init] ExitByMaxLine added: " << F.getName() << " BB @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
                 break;
               }
             }
@@ -503,6 +501,8 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
       // collect ret-edge-only BBs into accumulator; do not mutate 'reachable' here
       propagateThroughReturnEdgees(retEdgeAccum, BB);
       RA_DEBUG("[collectReachable] ret-edge accum size=" << retEdgeAccum.size() << ", from BB=" << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+    }else if (others.find(BB) != others.end()) {
+      continue;
     }
     // add predecessors
     for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
@@ -565,18 +565,18 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
                  << ") for function " << F->getName() << ", skipping caller\n");
           continue;  // do not propagate beyond threshold
         }
+        // If this caller basic block is already known reachable-to-target, 
+        // mark critical and skip adding to exit set.
+        if (others.find(CBB) != others.end()) {
+          criticalBBs[CBB].push_back(BB);
+          continue;
+        }
         if (reachable.find(CBB) != reachable.end()) {
           continue; // already added
         }
         // if all callsites have been processed, add the CBB
         RA_DEBUG("\tadding caller: " << CI->getFunction()->getName() << "\n");
         if (reachable.insert(CBB).second) {
-          // if the caller BB CBB is reachable to the target
-          // do not propagate unreachable BB through this call sites
-          if (others.find(CBB) != others.end()) {
-            criticalBBs[CBB].push_back(BB);
-            continue;
-          }
           callDepth[CBB] = newDepth;  // record depth before enqueue
           worklist.push_back(CBB);
           // When computing exit BBs (others is not empty), log propagation via caller edge
@@ -638,9 +638,16 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   }
   collectReachable(worklist, reachableBBs);
   RA_LOG("[run] reachableBBs after target-backward: " << reachableBBs.size() << "\n");
-  for (const auto *BB : exitBBs) {
-    if (reachableBBs.find(BB) != reachableBBs.end()) {
-      RA_LOG("[run] Removing reachable BB from exitBBs" << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+  {
+    std::vector<const BasicBlock*> toErase;
+    toErase.reserve(exitBBs.size());
+    for (const auto *BB : exitBBs) {
+      if (reachableBBs.find(BB) != reachableBBs.end()) {
+        toErase.push_back(BB);
+      }
+    }
+    for (const auto *BB : toErase) {
+      RA_LOG("[run] Removing reachable BB from exitBBs " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
       exitBBs.erase(BB);
     }
   }

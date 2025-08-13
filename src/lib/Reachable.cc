@@ -56,6 +56,191 @@
 
 using namespace llvm;
 
+static std::string getSourceLocation(const BasicBlock *BB) {
+  for (const auto &I : *BB) {
+      auto loc = I.getDebugLoc();
+      if (loc && loc.getLine() != 0) {
+          // Get the filename from the debug location
+          std::string f = loc->getFilename().str();
+          // If filename is empty, get it from the parent function
+          if (f.empty()) {
+              f = BB->getParent()->getParent()->getSourceFileName();
+          }
+          // Remove leading "./" if present
+          if (f.find("./") == 0) {
+              f = f.substr(2);
+          }
+          // Extract the base filename by finding the last '/' or '\\'
+          size_t pos = f.find_last_of("/\\");
+          if (pos != std::string::npos) {
+              f = f.substr(pos + 1);
+          }
+          return f + ":" + std::to_string(loc.getLine());
+      }
+  }
+  return "NoLoc:0";
+}
+
+/// \brief Retrieve the first available debug location in \p BB that is not
+/// inside /usr/ and store the **absolute, normalized path** in \p Filename.
+/// Sets \p Line and \p Col accordingly.
+///
+/// This version does:
+///  1) Loops over instructions in \p BB
+///  2) Checks the debug location (and possibly inlined-at location)
+///  3) Builds an absolute, normalized path (resolving "." and "..")
+///  4) Skips if the path is empty, line=0, or the path starts with "/usr/"
+///  5) Returns the first valid debug info found
+static void getDebugLocationFullPath(const BasicBlock &BB,
+                              std::string &Filename,
+                              unsigned &Line,
+                              unsigned &Col) {
+  Filename.clear();
+  Line = 0;
+  Col = 0;
+
+  // We don't want paths that point to system libraries
+  static const std::string Xlibs("/usr/");
+  auto isSystemLikePath = [](StringRef P) -> bool {
+    if (P.empty()) return false;
+    // Consider any path that is exactly /usr/... or contains /usr/ segment
+    // as system-like (covers sysroot cases like /toolchain/sysroot/usr/...)
+    if (P.startswith("/usr/")) return true;
+    return P.contains("/usr/");
+  };
+
+  // Iterate over instructions in the basic block
+  for (auto &Inst : BB) {
+    if (DILocation *Loc = Inst.getDebugLoc()) {
+      // Fallback: remember the first valid system-lib location if no user code is found
+      std::string systemFallbackPath;
+      unsigned systemFallbackLine = 0;
+      unsigned systemFallbackCol  = 0;
+
+      // Walk inlined-at chain from inner to outer to prefer user code call sites
+      for (DILocation *Cur = Loc; Cur != nullptr; Cur = Cur->getInlinedAt()) {
+        std::string Dir  = Cur->getDirectory().str();
+        std::string File = Cur->getFilename().str();
+        unsigned    L    = Cur->getLine();
+        unsigned    C    = Cur->getColumn();
+
+        // Skip if missing filename or invalid line
+        if (File.empty() || L == 0)
+          continue;
+
+        // Normalize suspicious relative system paths like "usr/..." to "/usr/..."
+        if (!Dir.empty() && !llvm::sys::path::is_absolute(Dir) && llvm::StringRef(Dir).startswith("usr/")) {
+          Dir = "/" + Dir;
+        }
+        if (!File.empty() && !llvm::sys::path::is_absolute(File) && llvm::StringRef(File).startswith("usr/")) {
+          File = "/" + File;
+        }
+
+        // Build an absolute path in a SmallString
+        llvm::SmallString<256> FullPath;
+
+        // If File itself is absolute, prefer it directly
+        if (!File.empty() && llvm::sys::path::is_absolute(File)) {
+          FullPath = File;
+        } else {
+          // If Dir is already absolute, start with that. Otherwise base on CWD.
+          if (!Dir.empty() && llvm::sys::path::is_absolute(Dir)) {
+            FullPath = Dir;
+          } else {
+            llvm::sys::fs::current_path(FullPath);
+            if (!Dir.empty()) {
+              llvm::sys::path::append(FullPath, Dir);
+            }
+          }
+          // Append the filename (relative)
+          llvm::sys::path::append(FullPath, File);
+        }
+
+        // Normalize dots
+        llvm::sys::path::remove_dots(FullPath, /*remove_dot_dot=*/true);
+
+        // Skip if system-like, but record the first one as a fallback
+        StringRef FullRef(FullPath);
+        if (isSystemLikePath(FullRef)) {
+          if (systemFallbackPath.empty()) {
+            systemFallbackPath = FullPath.str().str();
+            systemFallbackLine = L;
+            systemFallbackCol  = C;
+          }
+          continue;
+        }
+
+        // Found a valid location => set output vars
+        Filename = FullPath.str().str();
+        Line     = L;
+        Col      = C;
+        break;
+      }
+
+      // If we selected a valid non-system frame, stop scanning instructions
+      if (!Filename.empty())
+        break;
+
+      // If not found in this instruction's inlined chain, but we have a
+      // system fallback recorded, use it and stop.
+      if (Filename.empty() && !systemFallbackPath.empty()) {
+        Filename = systemFallbackPath;
+        Line     = systemFallbackLine;
+        Col      = systemFallbackCol;
+        break;
+      }
+    }
+  }
+}
+
+// === Helpers to distinguish developer-introduced EH from compiler cleanups ===
+static bool isPureCleanupLP(const llvm::BasicBlock *BB) {
+  // Look for a landingpad as the first non-PHI instruction; treat a pure
+  // `cleanup` landingpad with zero clauses as compiler-generated cleanup.
+  for (const llvm::Instruction &I : *BB) {
+    if (I.getOpcode() == llvm::Instruction::PHI) continue; // skip PHIs
+    if (auto *LPI = llvm::dyn_cast<llvm::LandingPadInst>(&I)) {
+      return LPI->isCleanup() && LPI->getNumClauses() == 0;
+    }
+    break; // first non-PHI wasn't a landingpad
+  }
+  return false;
+}
+
+static bool hasUserDebugLocation(const llvm::BasicBlock *BB, std::string &OutPath) {
+  OutPath.clear();
+  unsigned L = 0, C = 0;
+  getDebugLocationFullPath(*BB, OutPath, L, C);
+  if (OutPath.empty()) return false;
+  llvm::StringRef P(OutPath);
+  // Be conservative: treat anything under /usr/ as non-user code
+  if (P.contains("/usr/")) return false;
+  return true;
+}
+
+static bool isDeveloperExceptionBB(const llvm::BasicBlock *BB) {
+  // Only consider blocks that actually resume unwinding
+  if (!llvm::isa<llvm::ResumeInst>(BB->getTerminator()))
+    return false;
+
+  // If this is a pure cleanup landing pad, it's almost certainly compiler-gen
+  if (isPureCleanupLP(BB))
+    return false;
+
+  // Require a non-system debug location
+  std::string P;
+  if (!hasUserDebugLocation(BB, P))
+    return false;
+
+#if LLVM_VERSION_MAJOR >= 15
+  if (auto DL = BB->getTerminator()->getDebugLoc()) {
+    if (DL->isImplicitCode())
+      return false; // compiler-synthesized
+  }
+#endif
+  return true;
+}
+
 Function* ReachableCallGraphPass::getFuncDef(Function *F) {
   FuncMap::iterator it = Ctx->Funcs.find(F->getGUID());
   if (it != Ctx->Funcs.end())
@@ -230,14 +415,18 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
       }
     }
     auto* TI = BB.getTerminator();
-    // treat any BB ending in llvm::UnreachableInst and exception as an "exit"
-    if (isa<UnreachableInst>(TI) || isa<ResumeInst>(TI)) {
-      RA_DEBUG("Unreachable Inst BB: " << BBIDs[&BB] << "\n");
+    // Treat unreachable as exit; treat resume (EH) as exit only when it's
+    // likely developer-introduced (not compiler cleanup).
+    bool isDevEH = isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB);
+    if (isa<UnreachableInst>(TI) || isDevEH) {
+      RA_DEBUG((isDevEH ? "Developer EH BB: " : "Unreachable Inst BB: ") << BBIDs[&BB] << "\n");
       exitBBs.insert(&BB);
       RA_LOG("[add-exit] by terminator: BB " << BBIDs[&BB]
              << " @ " << getSourceLocation(&BB)
              << " func " << F->getName()
-             << " term=" << TI->getOpcodeName() << "\n");
+             << " term=" << TI->getOpcodeName()
+             << (isDevEH ? ", reason=developer-exception" : "")
+             << "\n");
     }
     for (auto &i : BB) {
       Instruction *I = &i;
@@ -381,9 +570,13 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
         auto *TI = BB.getTerminator();
         if (isa<ReturnInst>(TI)
             || isa<UnreachableInst>(TI)
-            || isa<ResumeInst>(TI)) {
-          exitBBs.insert(&BB);
-          RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB @ " << getSourceLocation(&BB) << "\n");
+            || (isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB))) {
+          {
+            bool isDevEH = isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB);
+            exitBBs.insert(&BB);
+            RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB @ " << getSourceLocation(&BB)
+                   << (isDevEH ? " (developer-exception)" : "") << "\n");
+          }
         }
         if (maxLine > 0) {
           // Also include any BB whose debug line equals the function's last line
@@ -890,143 +1083,6 @@ ReachableCallGraphPass::ReachableCallGraphPass(
         continue;
       RA_LOG("Entry: " << line << "\n");
       entryList.push_back(line);
-    }
-  }
-}
-
-std::string ReachableCallGraphPass::getSourceLocation(const BasicBlock *BB) {
-    for (const auto &I : *BB) {
-        auto loc = I.getDebugLoc();
-        if (loc && loc.getLine() != 0) {
-            // Get the filename from the debug location
-            std::string f = loc->getFilename().str();
-            // If filename is empty, get it from the parent function
-            if (f.empty()) {
-                f = BB->getParent()->getParent()->getSourceFileName();
-            }
-            // Remove leading "./" if present
-            if (f.find("./") == 0) {
-                f = f.substr(2);
-            }
-            // Extract the base filename by finding the last '/' or '\\'
-            size_t pos = f.find_last_of("/\\");
-            if (pos != std::string::npos) {
-                f = f.substr(pos + 1);
-            }
-            return f + ":" + std::to_string(loc.getLine());
-        }
-    }
-    return "NoLoc:0";
-}
-
-/// \brief Retrieve the first available debug location in \p BB that is not
-/// inside /usr/ and store the **absolute, normalized path** in \p Filename.
-/// Sets \p Line and \p Col accordingly.
-///
-/// This version does:
-///  1) Loops over instructions in \p BB
-///  2) Checks the debug location (and possibly inlined-at location)
-///  3) Builds an absolute, normalized path (resolving "." and "..")
-///  4) Skips if the path is empty, line=0, or the path starts with "/usr/"
-///  5) Returns the first valid debug info found
-void ReachableCallGraphPass::getDebugLocationFullPath(const BasicBlock &BB,
-                              std::string &Filename,
-                              unsigned &Line,
-                              unsigned &Col) {
-  Filename.clear();
-  Line = 0;
-  Col = 0;
-
-  // We don't want paths that point to system libraries
-  static const std::string Xlibs("/usr/");
-  auto isSystemLikePath = [](StringRef P) -> bool {
-    if (P.empty()) return false;
-    // Consider any path that is exactly /usr/... or contains /usr/ segment
-    // as system-like (covers sysroot cases like /toolchain/sysroot/usr/...)
-    if (P.startswith("/usr/")) return true;
-    return P.contains("/usr/");
-  };
-
-  // Iterate over instructions in the basic block
-  for (auto &Inst : BB) {
-    if (DILocation *Loc = Inst.getDebugLoc()) {
-      // Fallback: remember the first valid system-lib location if no user code is found
-      std::string systemFallbackPath;
-      unsigned systemFallbackLine = 0;
-      unsigned systemFallbackCol  = 0;
-
-      // Walk inlined-at chain from inner to outer to prefer user code call sites
-      for (DILocation *Cur = Loc; Cur != nullptr; Cur = Cur->getInlinedAt()) {
-        std::string Dir  = Cur->getDirectory().str();
-        std::string File = Cur->getFilename().str();
-        unsigned    L    = Cur->getLine();
-        unsigned    C    = Cur->getColumn();
-
-        // Skip if missing filename or invalid line
-        if (File.empty() || L == 0)
-          continue;
-
-        // Normalize suspicious relative system paths like "usr/..." to "/usr/..."
-        if (!Dir.empty() && !llvm::sys::path::is_absolute(Dir) && llvm::StringRef(Dir).startswith("usr/")) {
-          Dir = "/" + Dir;
-        }
-        if (!File.empty() && !llvm::sys::path::is_absolute(File) && llvm::StringRef(File).startswith("usr/")) {
-          File = "/" + File;
-        }
-
-        // Build an absolute path in a SmallString
-        llvm::SmallString<256> FullPath;
-
-        // If File itself is absolute, prefer it directly
-        if (!File.empty() && llvm::sys::path::is_absolute(File)) {
-          FullPath = File;
-        } else {
-          // If Dir is already absolute, start with that. Otherwise base on CWD.
-          if (!Dir.empty() && llvm::sys::path::is_absolute(Dir)) {
-            FullPath = Dir;
-          } else {
-            llvm::sys::fs::current_path(FullPath);
-            if (!Dir.empty()) {
-              llvm::sys::path::append(FullPath, Dir);
-            }
-          }
-          // Append the filename (relative)
-          llvm::sys::path::append(FullPath, File);
-        }
-
-        // Normalize dots
-        llvm::sys::path::remove_dots(FullPath, /*remove_dot_dot=*/true);
-
-        // Skip if system-like, but record the first one as a fallback
-        StringRef FullRef(FullPath);
-        if (isSystemLikePath(FullRef)) {
-          if (systemFallbackPath.empty()) {
-            systemFallbackPath = FullPath.str().str();
-            systemFallbackLine = L;
-            systemFallbackCol  = C;
-          }
-          continue;
-        }
-
-        // Found a valid location => set output vars
-        Filename = FullPath.str().str();
-        Line     = L;
-        Col      = C;
-        break;
-      }
-
-      // If we selected a valid non-system frame, stop scanning instructions
-      if (!Filename.empty())
-        break;
-
-      // If not found in this instruction's inlined chain, but we have a
-      // system fallback recorded, use it and stop.
-      if (Filename.empty() && !systemFallbackPath.empty()) {
-        Filename = systemFallbackPath;
-        Line     = systemFallbackLine;
-        Col      = systemFallbackCol;
-        break;
-      }
     }
   }
 }

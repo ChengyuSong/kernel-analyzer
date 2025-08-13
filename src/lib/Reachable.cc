@@ -638,14 +638,10 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   }
   collectReachable(worklist, reachableBBs);
   RA_LOG("[run] reachableBBs after target-backward: " << reachableBBs.size() << "\n");
-  // Remove exit blocks from reachable set, but never remove entry blocks
   for (const auto *BB : exitBBs) {
-    if (entryBBs.find(BB) != entryBBs.end()) {
-      RA_LOG("[run] Skip removing entry from reachable: BB " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
-      continue;
-    }
-    if (reachableBBs.erase(BB)) {
-      RA_LOG("[run] Removed exit BB from reachable: " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+    if (reachableBBs.find(BB) != reachableBBs.end()) {
+      RA_LOG("[run] Removing reachable BB from exitBBs" << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+      exitBBs.erase(BB);
     }
   }
 

@@ -229,18 +229,8 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
 
 bool isEntryFn(StringRef name) {
   if (name.equals("main") ||
-    name.startswith("do_syscall_") ||
-    name.endswith("do_softirq") ||
-    name.equals("start_kernel") ||
-    name.equals("init") ||
-    name.equals("module_init") ||
-    name.equals("module_exit") ||
-    name.equals("init_module") ||
-    name.equals("cleanup_module") ||
-    name.equals("do_init_module") ||
-    name.equals("do_cleanup_module") ||
-    name.equals("do_one_initcall") ||
-    name.equals("do_one_initcall_sync"))
+    name.startswith("LLVMFuzzerTestOneInput") ||
+    name.startswith("FuzzerTestOneInput"))
     return true;
   else return false;
 }

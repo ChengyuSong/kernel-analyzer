@@ -425,7 +425,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
              << " @ " << getSourceLocation(&BB)
              << " func " << F->getName()
              << " term=" << TI->getOpcodeName()
-             << (isDevEH ? ", reason=developer-exception" : "")
+             << (isDevEH ? ", reason=developer-exception" : "UnreachableInst")
              << "\n");
     }
     for (auto &i : BB) {
@@ -575,7 +575,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
             bool isDevEH = isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB);
             exitBBs.insert(&BB);
             RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB @ " << getSourceLocation(&BB)
-                   << (isDevEH ? " (developer-exception)" : "") << "\n");
+                   << (isDevEH ? " (developer-exception)" : "UnreachableInst or ReturnInst") << "\n");
           }
         }
         if (maxLine > 0) {
@@ -610,13 +610,12 @@ void ReachableCallGraphPass::propagateThroughReturnEdgees(
   }
 
   std::deque<const BasicBlock*> local;
-  std::unordered_set<const BasicBlock*> visited;
-  visited.insert(startBB);
   local.push_back(startBB);
 
   while (!local.empty()) {
     const BasicBlock *BB = local.front();
     local.pop_front();
+    retReachable.insert(BB);
 
     unsigned currDepth = 0;
     if (auto it = retDepth.find(BB); it != retDepth.end()) {
@@ -626,6 +625,19 @@ void ReachableCallGraphPass::propagateThroughReturnEdgees(
       RA_LOG("Max depth reached (" << maxCallStackDepth
              << ") for BB " << BBIDs[BB] << ", skipping ret-edge propagation\n");
       continue;
+    }
+
+    // Add CFG predecessors to continue backward propagation
+    for (auto PI = pred_begin(BB), PE = pred_end(BB); PI != PE; ++PI) {
+      const BasicBlock *Pred = *PI;
+      if (retReachable.count(Pred)) {
+        continue; // already processed
+      }
+      // keep same ret-depth across normal CFG edges
+      if (currDepth != 0) {
+        retDepth[Pred] = currDepth;
+      }
+      local.push_back(Pred);
     }
 
     // If this BB has interesting callsites, push callee return blocks
@@ -660,24 +672,20 @@ void ReachableCallGraphPass::propagateThroughReturnEdgees(
           RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
         }
         for (auto &TBB : *F) {
-          if (isa<UnreachableInst>(TBB.getTerminator())) {
-            continue;
-          }
           if (isa<ReturnInst>(TBB.getTerminator())) {
-            if (retReachable.insert(&TBB).second) {
-              retDepth[&TBB] = currDepth + 1;
-              // Keep exploring ret-edges from new return blocks as well
-              if (visited.insert(&TBB).second) {
-                local.push_back(&TBB);
-              }
-              RA_DEBUG("[ret] add callee ret-BB: " << F->getName()
-                      << " -> " << BBIDs[&TBB] << "\n");
+            if (retReachable.count(&TBB)) {
+              continue; // already processed
             }
+            retDepth[&TBB] = currDepth + 1;
+            // Keep exploring ret-edges from new return blocks as well
+            local.push_back(&TBB);
+            RA_DEBUG("[ret] add callee ret-BB: " << F->getName()
+                    << " -> " << BBIDs[&TBB] << "\n");
           }
-        }
-      }
-    }
-  }
+        } // end of propagate through return BBs
+      } // end of propagate through potential callees
+    } // end of propagate through all call sites
+  } // end of local worklist
 }
 
 void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &worklist,
@@ -840,7 +848,7 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
       }
     }
     for (const auto *BB : toErase) {
-      RA_LOG("[run] Removing reachable BB from exitBBs " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
+      RA_LOG("[run] Removing BB from exitBBs " << BBIDs[BB] << " @ " << getSourceLocation(BB) << "\n");
       exitBBs.erase(BB);
     }
   }

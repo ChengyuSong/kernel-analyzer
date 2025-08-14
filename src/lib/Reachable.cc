@@ -405,6 +405,55 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
   bool Changed = false;
 
   RA_LOG("### Run on function: " << F->getName() << "\n");
+
+  // if no entry specified, use the common one
+  // collect the exit block of the entry function too
+  bool isEntry = false;
+  if (entryList.empty()) {
+    isEntry = isEntryFn(F->getName());
+  } else {
+    auto itr = std::find(entryList.begin(), entryList.end(), F->getName().str());
+    isEntry = (itr != entryList.end());
+  }
+  if (isEntry) {
+    // Record entry block
+    entryBBs.insert(&F->getEntryBlock());
+    RA_LOG("[init] Entry function detected: " << F->getName() << "\n");
+    // Compute the maximum source line number for this function (first pass)
+    unsigned maxLine = 0;
+    for (const auto &BB : *F) {
+      for (const auto &I : BB) {
+        if (auto DL = I.getDebugLoc()) {
+          maxLine = std::max(maxLine, DL.getLine());
+        }
+      }
+    }
+    // Seed exitBBs (second pass)
+    for (const auto &BB : *F) {
+      // Never treat the entry block as an exit block
+      if (&BB == &F->getEntryBlock()) {
+        continue;
+      }
+      auto *TI = BB.getTerminator();
+      if (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI)) {
+        exitBBs.insert(&BB);
+        RA_LOG("[init] ExitByTerm added: " << F->getName() << " BB @ " << getSourceLocation(&BB) << "\n");
+      }
+      if (maxLine > 0) {
+        // Also include any BB whose debug line equals the function's last line
+        for (const auto &I : BB) {
+          if (auto DL = I.getDebugLoc()) {
+            if (DL.getLine() == maxLine) {
+              exitBBs.insert(&BB);
+              RA_LOG("[init] ExitByMaxLine added: " << F->getName() << " BB @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
   for (auto &BB : *F) {
     // assign a BB ID
     if (BBIDs.find(&BB) == BBIDs.end() || BBIDs[&BB] == 0) {
@@ -539,61 +588,7 @@ bool ReachableCallGraphPass::doInitialization(Module *M) {
         }
       }
     }
-
-    // if no entry specified, use the common one
-    // collect the exit block of the entry function too
-    bool isEntry = false;
-    if (entryList.empty()) {
-      isEntry = isEntryFn(F.getName());
-    } else {
-      auto itr = std::find(entryList.begin(), entryList.end(), F.getName().str());
-      isEntry = (itr != entryList.end());
-    }
-    if (isEntry) {
-      // Record entry block
-      entryBBs.insert(&F.getEntryBlock());
-      RA_LOG("[init] Entry function detected: " << F.getName() << "\n");
-      // Compute the maximum source line number for this function
-      unsigned maxLine = 0;
-      for (auto &BB : F) {
-        for (auto &I : BB) {
-          if (auto DL = I.getDebugLoc()) {
-            maxLine = std::max(maxLine, DL.getLine());
-          }
-        }
-      }
-      // Seed exitBBs with normal exit terminators
-      for (auto &BB : F) {
-        // Never treat the entry block as an exit block
-        if (&BB == &F.getEntryBlock()) {
-          continue;
-        }
-        auto *TI = BB.getTerminator();
-        if (isa<ReturnInst>(TI)
-            || isa<UnreachableInst>(TI)
-            || (isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB))) {
-          {
-            bool isDevEH = isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB);
-            exitBBs.insert(&BB);
-            RA_LOG("[init] ExitByTerm added: " << F.getName() << " BB @ " << getSourceLocation(&BB)
-                   << (isDevEH ? " (developer-exception)" : "UnreachableInst or ReturnInst") << "\n");
-          }
-        }
-        if (maxLine > 0) {
-          // Also include any BB whose debug line equals the function's last line
-          for (auto &I : BB) {
-            if (auto DL = I.getDebugLoc()) {
-              if (DL.getLine() == maxLine) {
-                exitBBs.insert(&BB);
-                RA_LOG("[init] ExitByMaxLine added: " << F.getName() << " BB @ " << getSourceLocation(&BB) << " (maxLine=" << maxLine << ")\n");
-                break;
-              }
-            }
-          }
-        }
-      } // end of finding exitBBs
-    } // end of entry function processing
-  } // end of processing all functions in this Module
+  }
 
   return false;
 }

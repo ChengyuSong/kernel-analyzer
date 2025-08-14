@@ -36,6 +36,7 @@ private:
   std::vector<std::string> entryList;
   std::unordered_set<const llvm::BasicBlock*> targetBBs;
   std::unordered_set<const llvm::BasicBlock*> reachableBBs;
+  std::unordered_set<const llvm::Function*> reachableFuns;
   std::unordered_map<const llvm::BasicBlock*, double> distances;
   std::unordered_set<const llvm::BasicBlock*> exitBBs;
   std::unordered_set<const llvm::BasicBlock*> entryBBs;

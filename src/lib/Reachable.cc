@@ -482,6 +482,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
             distances[I->getParent()] = 0.0;
             targetBBs.insert(I->getParent());
             reachableBBs.insert(I->getParent());
+            reachableFuns.insert(F);
           }
         }
       }
@@ -662,16 +663,17 @@ void ReachableCallGraphPass::propagateThroughReturnEdgees(
         continue;
       }
 
-      for (auto *F : *callees) {
+      for (const auto *F : *callees) {
         if (isExitFn(F->getName()) || F->doesNotReturn()) {
           RA_DEBUG("DoesNotReturn: " << F->getName() << "\n");
           break; // stop on no-return functions
         }
         static std::unordered_set<const Function*> Seen;
         if (Seen.insert(F).second) {
+          reachableFuns.insert(F);
           RA_LOG(F->getName() << " is reachable through ret edge to the targets\n");
         }
-        for (auto &TBB : *F) {
+        for (const auto &TBB : *F) {
           if (isa<ReturnInst>(TBB.getTerminator())) {
             if (retReachable.count(&TBB)) {
               continue; // already processed
@@ -753,6 +755,7 @@ void ReachableCallGraphPass::collectReachable(std::deque<const BasicBlock*> &wor
       }
 
       if (isComputingReachable) {
+        reachableFuns.insert(F);
         RA_LOG(F->getName() << " is reachable through call edge to the targets\n");
       }else {
         RA_LOG(F->getName() << " is reachable to the exit\n");
@@ -839,7 +842,17 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   }
   collectReachable(worklist, reachableBBs);
   RA_LOG("[run] reachableBBs after target-backward: " << reachableBBs.size() << "\n");
+
+  // add more BB to exitBBs
   {
+    for (const auto *F: reachableFuns){
+      for (const auto &TBB : *F) {
+        if (isa<ReturnInst>(TBB.getTerminator()) && reachableBBs.find(&TBB) == reachableBBs.end()) {
+            exitBBs.insert(&TBB);
+        }
+      }
+    }
+
     std::vector<const BasicBlock*> toErase;
     toErase.reserve(exitBBs.size());
     for (const auto *BB : exitBBs) {

@@ -435,10 +435,6 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
         continue;
       }
       auto *TI = BB.getTerminator();
-      if (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI)) {
-        exitBBs.insert(&BB);
-        RA_LOG("[init] ExitByTerm added: " << F->getName() << " BB @ " << getSourceLocation(&BB) << "\n");
-      }
       if (maxLine > 0) {
         // Also include any BB whose debug line equals the function's last line
         for (const auto &I : BB) {
@@ -467,7 +463,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
     // Treat unreachable as exit; treat resume (EH) as exit only when it's
     // likely developer-introduced (not compiler cleanup).
     bool isDevEH = isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB);
-    if (isa<UnreachableInst>(TI) || isDevEH) {
+    if (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI) || isDevEH) {
       RA_DEBUG((isDevEH ? "Developer EH BB: " : "Unreachable Inst BB: ") << BBIDs[&BB] << "\n");
       exitBBs.insert(&BB);
       RA_LOG("[add-exit] by terminator: BB " << BBIDs[&BB]
@@ -838,16 +834,8 @@ void ReachableCallGraphPass::run(ModuleList &modules) {
   collectReachable(worklist, reachableBBs);
   RA_LOG("[run] reachableBBs after target-backward: " << reachableBBs.size() << "\n");
 
-  // add more BB to exitBBs
+  // clean exitBBs
   {
-    for (const auto *F: reachableFuns){
-      for (const auto &TBB : *F) {
-        if (isa<ReturnInst>(TBB.getTerminator()) && reachableBBs.find(&TBB) == reachableBBs.end()) {
-            exitBBs.insert(&TBB);
-        }
-      }
-    }
-
     std::vector<const BasicBlock*> toErase;
     toErase.reserve(exitBBs.size());
     for (const auto *BB : exitBBs) {

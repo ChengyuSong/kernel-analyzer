@@ -434,7 +434,6 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
       if (&BB == &F->getEntryBlock()) {
         continue;
       }
-      auto *TI = BB.getTerminator();
       if (maxLine > 0) {
         // Also include any BB whose debug line equals the function's last line
         for (const auto &I : BB) {
@@ -1357,74 +1356,91 @@ bool ReachableCallGraphPass::annotateModules(ModuleList &modules, std::string su
   return true;
 }
 
-void ReachableCallGraphPass::dumpCallees() {
-    RES_REPORT("\n[dumpCallees]\n");
-    raw_ostream &OS = outs();
-    OS << "Num of Callees: " << calleeByType.size() << "\n";
-    for (CalleeMap::iterator i = calleeByType.begin(),
-         e = calleeByType.end(); i != e; ++i) {
-
-        auto CI = i->first;
-        FuncSet &v = i->second;
-        // only dump indirect call?
-        if (CI->isInlineAsm() || CI->getCalledFunction() /*|| v.empty()*/)
-             continue;
-
-        // OS << "CS:" << *CI << "\n";
-        // const DebugLoc &LOC = CI->getDebugLoc();
-        // OS << "LOC: ";
-        // LOC.print(OS);
-        // OS << "^@^";
-        std::string prefix = "<" + CI->getParent()->getParent()->getParent()->getName().str() + ">"
-            + CI->getParent()->getParent()->getName().str() + "::";
-#if 1
-        for (FuncSet::iterator j = v.begin(), ej = v.end();
-             j != ej; ++j) {
-            //OS << "\t" << ((*j)->hasInternalLinkage() ? "f" : "F")
-            //    << " " << (*j)->getName() << "\n";
-            OS << prefix << *CI << "\t";
-            OS << (*j)->getName() << "\n";
-        }
-#endif
-        // OS << "\n";
-
-        // v = Ctx->Callees[CI];
-        // OS << "Callees: ";
-        // for (FuncSet::iterator j = v.begin(), ej = v.end();
-        //      j != ej; ++j) {
-        //     OS << (*j)->getName() << "::";
-        // }
-        // OS << "\n";
-        if (v.empty()) {
-#if LLVM_VERSION_MAJOR > 10
-            OS << "!!EMPTY =>" << *CI->getCalledOperand()<<"\n";
-#else
-            OS << "!!EMPTY =>" << *CI->getCalledValue()<<"\n";
-#endif
-            OS<< "Uninitialized function pointer is dereferenced!\n";
-        }
+void ReachableCallGraphPass::dumpCallees(std::ostream &calleeInfo) {
+  RA_LOG("\n\n=== Dumping caller->callees ===\n\n");
+  // Build caller -> set{callees} using direct edges first.
+  // If a caller has no direct callees recorded, fall back to type-based.
+  std::unordered_map<const Function*, std::unordered_set<const Function*>> caller2callees;
+  for (const auto &kv : Ctx->Callees) {
+    const CallBase *CI = kv.first;
+    const FuncSet  &FS = kv.second;
+    const Function *CallerF = CI->getFunction();
+    auto &CalSet = caller2callees[CallerF];
+    for (const Function *CalleeF : FS) {
+      CalSet.insert(CalleeF);
     }
-    RES_REPORT("\n[End of dumpCallees]\n");
+  }
+  if (UseTypeBasedCallGraph) {
+    for (const auto &kv : calleeByType) { // calleeByType: CallBase* -> FuncSet
+      const CallBase *CI = kv.first;
+      const Function *CallerF = CI->getFunction();
+      auto findIt = caller2callees.find(CallerF);
+      bool hasDirect = (findIt != caller2callees.end() && !findIt->second.empty());
+      if (hasDirect) {
+        continue; // already have direct callees for this caller
+      }
+      const FuncSet &FS = kv.second;
+      auto &CalSet = caller2callees[CallerF];
+      for (const Function *CalleeF : FS) {
+        CalSet.insert(CalleeF);
+      }
+    }
+  }
+  // Emit lines: callerGUID,calleeGUID,calleeGUID,... for callers that have any callees
+  for (const auto &kv : caller2callees) {
+    const Function *CallerF = kv.first;
+    const auto     &Callees = kv.second;
+    if (Callees.empty()) {
+      continue;
+    }
+    calleeInfo << CallerF->getGUID();
+    for (const Function *CF : Callees) {
+      calleeInfo << ',' << CF->getGUID();
+    }
+    calleeInfo << '\n';
+  }
 }
 
-void ReachableCallGraphPass::dumpCallers() {
-    RES_REPORT("\n[dumpCallers]\n");
-    for (auto M : Ctx->Callers) {
-        const Function *F = M.first;
-        CallInstSet &CIS = M.second;
-        RES_REPORT("F : " << getScopeName(F) << "\n");
-
-        for (auto *CI : CIS) {
-            auto CallerF = CI->getParent()->getParent();
-            RES_REPORT("\t");
-            if (CallerF && CallerF->hasName()) {
-                RES_REPORT("(" << getScopeName(CallerF) << ") ");
-            } else {
-                RES_REPORT("(anonymous) ");
-            }
-
-            RES_REPORT(*CI << "\n");
-        }
+void ReachableCallGraphPass::dumpCallers(std::ostream &callerInfo) {
+  RA_LOG("\n\n=== Dumping callee->callers ===\n\n");
+  // Collect all callees that have recorded callers (direct or type-based)
+  std::unordered_set<const Function*> allCallees;
+  for (const auto &kv : Ctx->Callers) {
+    allCallees.insert(kv.first);
+  }
+  if (UseTypeBasedCallGraph) {
+    for (const auto &kv : callerByType) {
+      allCallees.insert(kv.first);
     }
-    RES_REPORT("\n[End of dumpCallers]\n");
+  }
+  // For each callee, emit one line: calleeGUID,callerGUID,callerGUID,...
+  for (const Function *Callee : allCallees) {
+    std::unordered_set<const Function*> callerFns;
+    // Direct callers
+    bool has_direct_callers = false;
+    if (auto it = Ctx->Callers.find(Callee); it != Ctx->Callers.end()) {
+      for (const CallBase *CI : it->second) {
+        callerFns.insert(CI->getFunction());
+        has_direct_callers = true;
+      }
+    }
+    // Fallback to Type-based (indirect) callers
+    if (!has_direct_callers && UseTypeBasedCallGraph) {
+      if (auto it2 = callerByType.find(Callee); it2 != callerByType.end()) {
+        for (const CallBase *CI : it2->second) {
+          callerFns.insert(CI->getFunction());
+        }
+      }
+    }
+    if (callerFns.empty()) {
+      // No callers recorded for this callee
+      continue;
+    }
+
+    callerInfo << Callee->getGUID();
+    for (const Function *CallerF : callerFns) {
+      callerInfo << ',' << CallerF->getGUID();
+    }
+    callerInfo << '\n';
+  }
 }

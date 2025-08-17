@@ -70,6 +70,16 @@ cl::opt<std::string> DumpBidMapping(
 cl::opt<std::string> DumpFuncInfo(
   "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
 
+cl::opt<std::string> DumpCallerCallee(
+  "dump-caller-callee", 
+  cl::desc("Dump caller → callee mapping, format: caller_GUID,callee_GUID,..."), 
+  cl::init(""));
+
+cl::opt<std::string> DumpCalleeCaller(
+  "dump-callee-caller", 
+  cl::desc("Dump callee → caller mapping, format: callee_GUID,caller_GUID,..."), 
+  cl::init(""));
+
 cl::opt<std::string> DumpAnnotatedIR(
   "dump-annotated-ir", cl::desc("Dump annotated IR"), cl::init(""));
 
@@ -237,6 +247,12 @@ int main(int argc, char **argv) {
     std::ofstream bbLocs(DumpBidMapping);
     std::ofstream funcInfo(DumpFuncInfo);
     RCGPass.dumpIDMapping(GlobalCtx.Modules, bbLocs, funcInfo);
+  }
+  if (!DumpCallerCallee.empty() && !DumpCalleeCaller.empty()){
+    std::ofstream callercallee(DumpCallerCallee);
+    std::ofstream calleecaller(DumpCalleeCaller);
+    RCGPass.dumpCallees(callercallee);
+    RCGPass.dumpCallers(calleecaller);
   }
   if (!DumpPolicy.empty()) {
     std::ofstream policy(DumpPolicy);

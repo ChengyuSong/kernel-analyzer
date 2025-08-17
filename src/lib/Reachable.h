@@ -67,8 +67,12 @@ public:
     void dumpDistance(std::ostream &OS, bool dumpUnreachable = false);
     void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
     bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
-    void dumpCallees();
-    void dumpCallers();
+    // dumpCallees CSV format:
+    // one line per *caller* function: callerGUID,calleeGUID[,calleeGUID...]
+    void dumpCallees(std::ostream &calleeInfo);
+    // dumpCallers CSV format:
+    // one line per *callee* function: calleeGUID,callerGUID[,callerGUID...]
+    void dumpCallers(std::ostream &callerInfo);
 };
 
 #endif

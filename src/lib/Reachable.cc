@@ -462,7 +462,7 @@ bool ReachableCallGraphPass::runOnFunction(Function *F) {
     // Treat unreachable as exit; treat resume (EH) as exit only when it's
     // likely developer-introduced (not compiler cleanup).
     bool isDevEH = isa<ResumeInst>(TI) && isDeveloperExceptionBB(&BB);
-    if (isa<ReturnInst>(TI) || isa<UnreachableInst>(TI) || isDevEH) {
+    if (isa<UnreachableInst>(TI) || isDevEH) {
       RA_DEBUG((isDevEH ? "Developer EH BB: " : "Unreachable Inst BB: ") << BBIDs[&BB] << "\n");
       exitBBs.insert(&BB);
       RA_LOG("[add-exit] by terminator: BB " << BBIDs[&BB]

@@ -4,12 +4,9 @@ set (KASource
   StructAnalyzer.cc
   NodeFactory.cc
   PointTo.cc
+  CFLEdgeBuilder.cc
   CallGraph.cc
   Reachable.cc
-  TyPMCommon.cc
-  MLTA.cc
-  TyPM.cc
-  TyPMPass.cc
 )
 
 # Build executable, KAMain.
@@ -23,4 +20,5 @@ target_link_libraries(KAMain
   LLVMAnalysis
   LLVMIRReader
   LLVMBitWriter
+  graCFLlib
   )

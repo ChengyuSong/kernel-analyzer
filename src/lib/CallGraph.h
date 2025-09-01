@@ -15,9 +15,11 @@ private:
   bool handleCall(llvm::CallBase*, const llvm::Function*);
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
   bool findCalleesByType(llvm::CallBase*, FuncSet&);
+  void buildEdgesFromPtsGraph(const PtsGraph &ptsGraph);
 
   AndersNodeFactory &NF;
   StructAnalyzer &SA;
+  CFLEdgeBuilder &EB;
   PtsGraph funcPtsGraph;
 
   using node_set_t = std::unordered_set<NodeIndex>;
@@ -31,15 +33,13 @@ private:
   std::unordered_map<const StructInfo*, node_set_t> retStructs; // structs returned by functions
   std::unordered_map<const StructInfo*, node_set_t> argStructs; // structs passed as arguments
   std::unordered_map<const StructInfo*, node_set_t> globalStructs; // structs stored in globals
-  std::unordered_map<const StructInfo*, NodeIndex> typeShortcuts;
-  node_set_t typeShortcutsObj;
 
   CalleeMap calleeByType;
 
 public:
   CallGraphPass(GlobalContext *Ctx_)
       : IterativeModulePass(Ctx_, "CallGraph"),
-        NF(Ctx->nodeFactory), SA(Ctx->structAnalyzer),
+        NF(Ctx->nodeFactory), SA(Ctx->structAnalyzer), EB(Ctx->edgeBuilder),
         funcPtsGraph(Ctx->GlobalInitPtsGraph) // copy the init graph
         { }
   virtual bool doInitialization(llvm::Module *);

@@ -34,7 +34,8 @@ class AndersNode {
 public:
     enum AndersNodeType {
         VALUE_NODE,
-        OBJ_NODE
+        OBJ_NODE,
+        DEREF_NODE
     };
 private:
     AndersNodeType type;
@@ -121,6 +122,9 @@ private:
     // take variable arguments.
     boost::unordered_flat_map<const llvm::Function*, NodeIndex> varargMap;
 
+    // derefMap - This map caches the deref-relations across value nodes.
+    boost::unordered_flat_map<const llvm::Value*, NodeIndex> derefMap;
+
     // gepMap - This map maintains the gep-relations across value nodes.
     // The mappings are of the form <base-ptr, offset> -> gep-ptr,
     // where base-ptr is the ValueNodeIndex for nodes that created out of llvm SSA variables
@@ -153,6 +157,7 @@ public:
         const bool heap = false);
     NodeIndex createReturnNode(const llvm::Function* f);
     NodeIndex createVarargNode(const llvm::Function* f);
+    NodeIndex createDereferenceNode(const llvm::Value* ptr);
 
     // Map lookup interfaces (return NULL if value not found)
     NodeIndex getValueNodeFor(const llvm::Value* val);
@@ -161,6 +166,7 @@ public:
     NodeIndex getObjectNodeForConstant(const llvm::Constant* c);
     NodeIndex getReturnNodeFor(const llvm::Function* f);
     NodeIndex getVarargNodeFor(const llvm::Function* f);
+    NodeIndex getDereferenceNodeFor(const llvm::Value* ptr);
 
     // Node merge interfaces
     void mergeNode(NodeIndex n0, NodeIndex n1);	// Merge n1 into n0
@@ -170,6 +176,12 @@ public:
     // Pointer arithmetic
     const bool isObjectNode(NodeIndex i) const {
         return (nodes.at(i).type == AndersNode::OBJ_NODE);
+    }
+    const bool isValueNode(NodeIndex i) const {
+        return (nodes.at(i).type == AndersNode::VALUE_NODE);
+    }
+    const bool isDereferenceNode(NodeIndex i) const {
+        return (nodes.at(i).type == AndersNode::DEREF_NODE);
     }
     const bool isUnionObject(NodeIndex i) const {
         return nodes.at(i).isUnion();

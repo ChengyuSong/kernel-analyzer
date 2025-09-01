@@ -25,6 +25,7 @@
 #include "Common.h"
 #include "StructAnalyzer.h"
 #include "NodeFactory.h"
+#include "CFLEdgeBuilder.h"
 
 typedef std::vector< std::pair<llvm::Module*, llvm::StringRef> > ModuleList;
 typedef std::unordered_map<llvm::Module*, llvm::StringRef> ModuleMap;
@@ -108,6 +109,9 @@ public:
 
   // Global init point-to graph
   PtsGraph GlobalInitPtsGraph;
+
+  // CFL edge builder
+  CFLEdgeBuilder edgeBuilder;
 
   ModuleList Modules;
 

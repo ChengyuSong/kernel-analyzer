@@ -4,7 +4,7 @@
  * Copyright (C) 2012 Xi Wang, Haogang Chen, Nickolai Zeldovich
  * Copyright (C) 2015 Byoungyoung Lee
  * Copyright (C) 2016 Kangjie Lu
- * Copyright (C) 2015 - 2024 Chengyu Song
+ * Copyright (C) 2015 - 2025 Chengyu Song
  *
  * For licensing details see LICENSE
  */
@@ -31,7 +31,7 @@
 #include "Global.h"
 #include "Pass.h"
 #include "PointTo.h"
-#include "TyPMPass.h"
+#include "CallGraph.h"
 #include "Reachable.h"
 
 using namespace llvm;
@@ -65,6 +65,12 @@ cl::opt<std::string> DumpFuncInfo(
 
 cl::opt<std::string> DumpAnnotatedIR(
   "dump-annotated-ir", cl::desc("Dump annotated IR"), cl::init(""));
+
+cl::opt<std::string> GrammarFile(
+  "grammar-file", cl::desc("Grammar file for CFL-reachability analysis"), cl::init(""));
+
+cl::opt<std::string> CFLEdgeOutput(
+  "cfl-edge-output", cl::desc("Output file for CFL-reachability edges"), cl::init(""));
 
 GlobalContext GlobalCtx;
 
@@ -151,12 +157,12 @@ void doBasicInitialization(Module *M) {
       // external linkage always ends up with the function name
       auto FID = F.getGUID();
       if (!F.isDeclaration() && !F.empty()) {
-	if (GlobalCtx.Funcs.count(FID) != 0) {
-	  WARNING("Function " << F.getName()
+        if (GlobalCtx.Funcs.count(FID) != 0) {
+          WARNING("Function " << F.getName()
               << " has been defined multiple times, previously in "
               << GlobalCtx.Funcs[FID]->getParent()->getModuleIdentifier()
               << ", and now in " << M->getModuleIdentifier() << "\n");
-	}
+        }
         GlobalCtx.Funcs[FID] = &F;
       } else {
         GlobalCtx.ExtFuncs[FID] = &F;
@@ -217,30 +223,42 @@ int main(int argc, char **argv) {
   for (auto &[id, f] : GlobalCtx.Funcs) { GlobalCtx.ExtFuncs.erase(id); }
 
   // Main workflow
-  if (!UseTypeBasedCallGraph) {
-    TyPMCGPass TyCG(&GlobalCtx);
-    TyCG.run(GlobalCtx.Modules);
+  populateNodeFactory(GlobalCtx);
+
+  // CFL-reachability edge construction
+  if (GrammarFile.empty()) {
+    // TODO: embed a default grammar file
+    errs() << "No grammar file provided for CFL-reachability analysis\n";
+  } else if (!GlobalCtx.edgeBuilder.initializeGrammar(GrammarFile)) {
+    errs() << "Failed to initialize CFL edge builder with grammar file: " << GrammarFile << "\n";
   }
 
-  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
-  RCGPass.run(GlobalCtx.Modules);
+  CallGraphPass CGPass(&GlobalCtx);
+  CGPass.run(GlobalCtx.Modules);
 
-  if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
-    std::ofstream bbLocs(DumpBidMapping);
-    std::ofstream funcInfo(DumpFuncInfo);
-    RCGPass.dumpIDMapping(GlobalCtx.Modules, bbLocs, funcInfo);
+  if (!CFLEdgeOutput.empty()) {
+    GlobalCtx.edgeBuilder.outputEdgesToFile(CFLEdgeOutput);
   }
-  if (!DumpPolicy.empty()) {
-    std::ofstream policy(DumpPolicy);
-    RCGPass.dumpPolicy(policy);
-  }
-  if (!DumpDistance.empty()) {
-    std::ofstream distance(DumpDistance);
-    RCGPass.dumpDistance(distance, true, false);
-  }
-  if (!DumpAnnotatedIR.empty()) {
-    RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
-  }
+
+  // ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
+  // RCGPass.run(GlobalCtx.Modules);
+
+  // if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
+  //   std::ofstream bbLocs(DumpBidMapping);
+  //   std::ofstream funcInfo(DumpFuncInfo);
+  //   RCGPass.dumpIDMapping(GlobalCtx.Modules, bbLocs, funcInfo);
+  // }
+  // if (!DumpPolicy.empty()) {
+  //   std::ofstream policy(DumpPolicy);
+  //   RCGPass.dumpPolicy(policy);
+  // }
+  // if (!DumpDistance.empty()) {
+  //   std::ofstream distance(DumpDistance);
+  //   RCGPass.dumpDistance(distance, true, false);
+  // }
+  // if (!DumpAnnotatedIR.empty()) {
+  //   RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
+  // }
 
   return 0;
 }

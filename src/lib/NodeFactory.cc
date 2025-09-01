@@ -50,7 +50,7 @@ NodeIndex AndersNodeFactory::createValueNode(const Value* val) {
     unsigned nextIdx = nodes.size();
     nodes.emplace_back(AndersNode(AndersNode::VALUE_NODE, nextIdx, val));
     if (val != nullptr) {
-        assert(!valueNodeMap.count(val) && "Trying to insert two mappings to revValueNodeMap!");
+        assert(!valueNodeMap.count(val) && "Trying to insert two mappings to valueNodeMap!");
         valueNodeMap[val] = nextIdx;
     }
 
@@ -109,6 +109,17 @@ NodeIndex AndersNodeFactory::createVarargNode(const llvm::Function* f) {
     assert(!varargMap.count(f) && "Trying to insert two mappings to varargMap!");
     varargMap[f] = nextIdx;
 
+    return nextIdx;
+}
+
+NodeIndex AndersNodeFactory::createDereferenceNode(const llvm::Value* ptr) {
+    unsigned nextIdx = nodes.size();
+    nodes.emplace_back(AndersNode(AndersNode::DEREF_NODE, nextIdx, ptr));
+    if (ptr != nullptr) {
+        if (derefMap.count(ptr))
+            return derefMap[ptr];
+        derefMap[ptr] = nextIdx;
+    }
     return nextIdx;
 }
 
@@ -306,6 +317,14 @@ NodeIndex AndersNodeFactory::getReturnNodeFor(const llvm::Function* f) {
 NodeIndex AndersNodeFactory::getVarargNodeFor(const llvm::Function* f) {
     auto itr = varargMap.find(f);
     if (itr == varargMap.end())
+        return InvalidIndex;
+    else
+        return itr->second;
+}
+
+NodeIndex AndersNodeFactory::getDereferenceNodeFor(const llvm::Value* ptr) {
+    auto itr = derefMap.find(ptr);
+    if (itr == derefMap.end())
         return InvalidIndex;
     else
         return itr->second;

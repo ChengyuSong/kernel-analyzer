@@ -4,13 +4,13 @@
 
 namespace gracfl 
 {
-    SolverFWTopoParallel::SolverFWTopoParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads)
+    SolverFWTopoParallel::SolverFWTopoParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads)
     : SolverFWTopo(graphfilepath, grammar)
     {
         numOfThreads_ = numOfThreads;
     }
 
-    SolverFWTopoParallel::SolverFWTopoParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads)
+    SolverFWTopoParallel::SolverFWTopoParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads)
     : SolverFWTopo(edges, grammar)
     {
         numOfThreads_ = numOfThreads;
@@ -47,8 +47,8 @@ namespace gracfl
     void SolverFWTopoParallel::runSingleIterationParallel(
         std::vector<TemporalVectorWithLbldVtx>& outEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<uint>>& grammar3index,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<uint>>& grammar3index,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

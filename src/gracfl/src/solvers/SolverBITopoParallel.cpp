@@ -27,14 +27,14 @@ namespace gracfl
         return result;
     }
 
-    SolverBITopoParallel::SolverBITopoParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads)
+    SolverBITopoParallel::SolverBITopoParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads)
     : grammar_(grammar)
     , graph_(new Graph2DBiConcurrent(graphfilepath, grammar))
     {
         numOfThreads_ = numOfThreads;
     }
 
-    SolverBITopoParallel::SolverBITopoParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads)
+    SolverBITopoParallel::SolverBITopoParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads)
     : grammar_(grammar)
     , graph_(new Graph2DBiConcurrent(edges, grammar))
     {
@@ -80,8 +80,8 @@ namespace gracfl
         std::vector<TemporalVectorConcurrentWithLbldVtx>& outEdges,
         std::vector<TemporalVectorConcurrentWithLbldVtx>& inEdges,
         std::vector<std::vector<tbb::concurrent_unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<uint>>& grammar3index,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<uint>>& grammar3index,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

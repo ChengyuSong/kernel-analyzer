@@ -10,7 +10,7 @@ namespace gracfl {
         loadGraphFile(graphfilepath, grammar);
     }
 
-    Graph::Graph(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph::Graph(const std::vector<Edge>& edges, const Grammar& grammar)
     {
         numLabels_ = grammar.getLabelSize();
         loadEdges(edges, grammar);
@@ -41,7 +41,7 @@ namespace gracfl {
         infile.close();
     }
 
-    void Graph::loadEdges(std::vector<Edge>& edges, const Grammar& grammar)
+    void Graph::loadEdges(const std::vector<Edge>& edges, const Grammar& grammar)
     {
         for (const Edge& edge : edges)
         {

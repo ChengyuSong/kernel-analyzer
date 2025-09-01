@@ -34,7 +34,7 @@ namespace gracfl {
          * @param edges Reference to the vector of edges to be loaded.
          * @param grammar Reference to the grammar object for labeled edge interpretation.
          */
-        Graph2DBi(std::vector<Edge>& edges, const Grammar& grammar);
+        Graph2DBi(const std::vector<Edge>& edges, const Grammar& grammar);
 
         /**
          * @brief Initializes internal containers for graph data.

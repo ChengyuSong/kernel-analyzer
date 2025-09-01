@@ -28,8 +28,8 @@ namespace gracfl
          * @param grammar Reference to the Grammar object.
          * @param numOfThreads Number of threads to use in parallel execution.
          */
-        SolverBWGramParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads);
-        SolverBWGramParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads);
+        SolverBWGramParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads);
+        SolverBWGramParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads);
 
         /**
          * @brief Executes the CFL solver until convergence is achieved.
@@ -45,7 +45,7 @@ namespace gracfl
          * @param inEdges Incoming edges organized by label and destination node.
          * @param inHashset Reachability set (node × label → {source nodes}).
          * @param grammar2index Binary grammar productions (A → B).
-         * @param grammar3indexLeft Ternary grammar productions (A → B C, left-associated, B -> list of (A, C)s).
+         * @param grammar3indexRight Ternary grammar productions (A → B C, right-associated, C -> list of (A, B)s).
          * @param labelSize Number of grammar nonterminals.
          * @param nodeSize Number of nodes in the graph.
          * @param terminate Flag indicating whether convergence has been reached.
@@ -53,8 +53,8 @@ namespace gracfl
         void runSingleIterationParallel(
             std::vector<std::vector<TemporalVector>>& inEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& inHashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

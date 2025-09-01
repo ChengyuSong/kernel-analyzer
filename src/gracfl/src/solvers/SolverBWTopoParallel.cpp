@@ -4,13 +4,13 @@
 
 namespace gracfl 
 {
-    SolverBWTopoParallel::SolverBWTopoParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads)
+    SolverBWTopoParallel::SolverBWTopoParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads)
     : SolverBWTopo(graphfilepath, grammar)
     {
         numOfThreads_ = numOfThreads;
     }
 
-    SolverBWTopoParallel::SolverBWTopoParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads)
+    SolverBWTopoParallel::SolverBWTopoParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads)
     : SolverBWTopo(edges, grammar)
     {
         numOfThreads_ = numOfThreads;
@@ -47,8 +47,8 @@ namespace gracfl
     void SolverBWTopoParallel::runSingleIterationParallel(
         std::vector<TemporalVectorWithLbldVtx>& inEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& inHashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<uint>>& grammar3index,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<uint>>& grammar3index,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

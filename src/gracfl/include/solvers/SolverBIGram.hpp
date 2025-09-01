@@ -19,7 +19,7 @@ namespace gracfl
      */
     class SolverBIGram : public SolverBase
     {
-        Grammar& grammar_; ///< Reference to the grammar rules used for CFL parsing.
+        const Grammar& grammar_; ///< Reference to the grammar rules used for CFL parsing.
         Graph3DBi* graph_; ///< Pointer to the bidirectional graph structure.
     public:
         /**
@@ -27,14 +27,14 @@ namespace gracfl
          * @param graphfilepath Path to the input graph file.
          * @param grammar Reference to the Grammar object.
          */
-        SolverBIGram(std::string graphfilepath, Grammar& grammar);
+        SolverBIGram(std::string graphfilepath, const Grammar& grammar);
 
         /**
          * @brief Constructor for SolverBIGram.
          * @param edges Vector of edges to initialize the graph.
          * @param grammar Reference to the Grammar object.
          */
-        SolverBIGram(std::vector<Edge>& edges, Grammar& grammar);
+        SolverBIGram(const std::vector<Edge>& edges, const Grammar& grammar);
 
         /**
          * @brief Destructor.
@@ -66,9 +66,9 @@ namespace gracfl
             std::vector<std::vector<TemporalVector>>& outEdges,
             std::vector<std::vector<TemporalVector>>& inEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
-            std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
+            const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

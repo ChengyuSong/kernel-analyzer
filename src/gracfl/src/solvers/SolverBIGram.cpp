@@ -3,13 +3,13 @@
 
 namespace gracfl 
 {
-    SolverBIGram::SolverBIGram(std::string graphfilepath, Grammar& grammar)
+    SolverBIGram::SolverBIGram(std::string graphfilepath, const Grammar& grammar)
     : grammar_(grammar)
     , graph_(new Graph3DBi(graphfilepath, grammar))
     {
     }
 
-    SolverBIGram::SolverBIGram(std::vector<Edge>& edges, Grammar& grammar)
+    SolverBIGram::SolverBIGram(const std::vector<Edge>& edges, const Grammar& grammar)
     : grammar_(grammar)
     , graph_(new Graph3DBi(edges, grammar))
     {
@@ -57,9 +57,9 @@ namespace gracfl
         std::vector<std::vector<TemporalVector>>& outEdges,
         std::vector<std::vector<TemporalVector>>& inEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
-        std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
+        const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

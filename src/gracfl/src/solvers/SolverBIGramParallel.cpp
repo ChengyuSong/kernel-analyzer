@@ -28,14 +28,14 @@ namespace gracfl
         return result;
     }
 
-    SolverBIGramParallel::SolverBIGramParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads)
+    SolverBIGramParallel::SolverBIGramParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads)
     : grammar_(grammar)
     , graph_(new Graph3DBiConcurrent(graphfilepath, grammar))
     {
         numOfThreads_ = numOfThreads;
     }
 
-    SolverBIGramParallel::SolverBIGramParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads)
+    SolverBIGramParallel::SolverBIGramParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads)
     : grammar_(grammar)
     , graph_(new Graph3DBiConcurrent(edges, grammar))
     {
@@ -86,9 +86,9 @@ namespace gracfl
         std::vector<std::vector<TemporalVectorConcurrent>>& outEdges,
         std::vector<std::vector<TemporalVectorConcurrent>>& inEdges,
         std::vector<std::vector<tbb::concurrent_unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
-        std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
+        const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

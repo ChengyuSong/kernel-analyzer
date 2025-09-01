@@ -8,7 +8,7 @@ namespace gracfl {
         addInitialEdges();
     }
 
-    Graph3DBiConcurrent::Graph3DBiConcurrent(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph3DBiConcurrent::Graph3DBiConcurrent(const std::vector<Edge>& edges, const Grammar& grammar)
         : Graph(edges, grammar) 
     {
         initContainers();

@@ -19,7 +19,7 @@ namespace gracfl
      */
     class SolverBITopoParallel : public SolverBase
     {
-        Grammar& grammar_;  ///< Reference to the grammar used for parsing and derivation.
+        const Grammar& grammar_;  ///< Reference to the grammar used for parsing and derivation.
         Graph2DBiConcurrent* graph_;  ///< Pointer to the bidirectional 2D graph structure.
         uint numOfThreads_;
     public:
@@ -28,8 +28,8 @@ namespace gracfl
          * @param graphfilepath Path to the input graph file.
          * @param grammar Reference to the Grammar object used for CFL derivations.
          */
-        SolverBITopoParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads);
-        SolverBITopoParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads);
+        SolverBITopoParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads);
+        SolverBITopoParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads);
 
         /**
          * @brief Destructor.
@@ -61,8 +61,8 @@ namespace gracfl
             std::vector<TemporalVectorConcurrentWithLbldVtx>& outEdges,
             std::vector<TemporalVectorConcurrentWithLbldVtx>& inEdges,
             std::vector<std::vector<tbb::concurrent_unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<uint>>& grammar3index,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<uint>>& grammar3index,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

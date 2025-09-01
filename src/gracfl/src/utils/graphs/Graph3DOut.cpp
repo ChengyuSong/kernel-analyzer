@@ -8,7 +8,7 @@ namespace gracfl {
         addInitialEdges();
     }
 
-    Graph3DOut::Graph3DOut(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph3DOut::Graph3DOut(const std::vector<Edge>& edges, const Grammar& grammar)
         : Graph(edges, grammar) 
     {
         initContainers();

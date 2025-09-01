@@ -8,7 +8,7 @@ namespace gracfl {
         addInitialEdges();
     }
 
-    Graph2DOut::Graph2DOut(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph2DOut::Graph2DOut(const std::vector<Edge>& edges, const Grammar& grammar)
         : Graph(edges, grammar) 
     {
         initContainers();

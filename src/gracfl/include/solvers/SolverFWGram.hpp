@@ -20,7 +20,7 @@ namespace gracfl
     class SolverFWGram : public SolverBase 
     {
     protected:
-        Grammar& grammar_;  ///< Reference to the grammar defining CFL rules.
+        const Grammar& grammar_;  ///< Reference to the grammar defining CFL rules.
         Graph3DOut* graph_; ///< Pointer to the graph structure supporting forward traversal.
     public:
         /**
@@ -31,7 +31,7 @@ namespace gracfl
          * @param graphfilepath Path to the graph file.
          * @param grammar Reference to the Grammar object for rule-based traversal.
          */
-        SolverFWGram(std::string graphfilepath, Grammar& grammar);
+        SolverFWGram(std::string graphfilepath, const Grammar& grammar);
 
         /**
          * @brief Constructs a SolverFWGram instance from edges.
@@ -39,7 +39,7 @@ namespace gracfl
          * @param edges Vector of edges to initialize the graph.
          * @param grammar Reference to the Grammar object for rule-based traversal.
          */
-        SolverFWGram(std::vector<Edge>& edges, Grammar& grammar);
+        SolverFWGram(const std::vector<Edge>& edges, const Grammar& grammar);
 
         /**
          * @brief Destructor for SolverFWGram.
@@ -69,8 +69,8 @@ namespace gracfl
         void runSingleIteration(
             std::vector<std::vector<TemporalVector>>& outEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

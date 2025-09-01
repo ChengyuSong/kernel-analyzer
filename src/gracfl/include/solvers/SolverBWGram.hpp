@@ -21,12 +21,12 @@ namespace gracfl
     class SolverBWGram : public SolverBase 
     {
     protected:
-        Grammar& grammar_;
+        const Grammar& grammar_;
         Graph3DIn* graph_;
     public:
        
-        SolverBWGram(std::string graphfilepath, Grammar& grammar);
-        SolverBWGram(std::vector<Edge>& edges, Grammar& grammar);
+        SolverBWGram(std::string graphfilepath, const Grammar& grammar);
+        SolverBWGram(const std::vector<Edge>& edges, const Grammar& grammar);
         ~SolverBWGram();
 
         void runCFL() override;
@@ -48,8 +48,8 @@ namespace gracfl
         void runSingleIteration(
             std::vector<std::vector<TemporalVector>>& inEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
             uint labelSize,
             uint nodeSize,
             bool& terminate

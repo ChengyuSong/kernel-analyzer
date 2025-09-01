@@ -3,13 +3,13 @@
 
 namespace gracfl 
 {
-    SolverBWGramParallel::SolverBWGramParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads)
+    SolverBWGramParallel::SolverBWGramParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads)
     : SolverBWGram(graphfilepath, grammar)
     {
         numOfThreads_ = numOfThreads;
     }
 
-    SolverBWGramParallel::SolverBWGramParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads)
+    SolverBWGramParallel::SolverBWGramParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads)
     : SolverBWGram(edges, grammar)
     {
         numOfThreads_ = numOfThreads;
@@ -46,8 +46,8 @@ namespace gracfl
     void SolverBWGramParallel::runSingleIterationParallel(
         std::vector<std::vector<TemporalVector>>& inEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& inHashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexRight,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

@@ -27,7 +27,7 @@ namespace gracfl {
         std::vector<std::vector<tbb::concurrent_unordered_set<ull>>> hashset_;
 
         Graph3DBiConcurrent(std::string& graphfilepath, const Grammar& grammar);
-        Graph3DBiConcurrent(std::vector<Edge>& edges, const Grammar& grammar);
+        Graph3DBiConcurrent(const std::vector<Edge>& edges, const Grammar& grammar);
         void initContainers();
         void addInitialEdges();
         void clearContainers();

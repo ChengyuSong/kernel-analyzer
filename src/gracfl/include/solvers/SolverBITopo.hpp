@@ -19,7 +19,7 @@ namespace gracfl
      */
     class SolverBITopo : public SolverBase
     {
-        Grammar& grammar_;  ///< Reference to the grammar used for parsing and derivation.
+        const Grammar& grammar_;  ///< Reference to the grammar used for parsing and derivation.
         Graph2DBi* graph_;  ///< Pointer to the bidirectional 2D graph structure.
     public:
         /**
@@ -27,14 +27,14 @@ namespace gracfl
          * @param graphfilepath Path to the input graph file.
          * @param grammar Reference to the Grammar object used for CFL derivations.
          */
-        SolverBITopo(std::string graphfilepath, Grammar& grammar);
+        SolverBITopo(std::string graphfilepath, const Grammar& grammar);
 
         /**
          * @brief Constructor for SolverBITopo from edges.
          * @param edges Vector of edges to initialize the graph.
          * @param grammar Reference to the Grammar object used for CFL derivations.
          */
-        SolverBITopo(std::vector<Edge>& edges, Grammar& grammar);
+        SolverBITopo(const std::vector<Edge>& edges, const Grammar& grammar);
 
         /**
          * @brief Destructor.
@@ -66,8 +66,8 @@ namespace gracfl
             std::vector<TemporalVectorWithLbldVtx>& outEdges,
             std::vector<TemporalVectorWithLbldVtx>& inEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<uint>>& grammar3index,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<uint>>& grammar3index,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

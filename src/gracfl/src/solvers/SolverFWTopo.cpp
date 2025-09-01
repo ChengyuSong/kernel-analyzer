@@ -4,13 +4,13 @@
 
 namespace gracfl 
 {
-    SolverFWTopo::SolverFWTopo(std::string graphfilepath, Grammar& grammar)
+    SolverFWTopo::SolverFWTopo(std::string graphfilepath, const Grammar& grammar)
         : grammar_(grammar)
         , graph_(new Graph2DOut(graphfilepath, grammar))
     {
     }
 
-    SolverFWTopo::SolverFWTopo(std::vector<Edge>& edges, Grammar& grammar)
+    SolverFWTopo::SolverFWTopo(const std::vector<Edge>& edges, const Grammar& grammar)
         : grammar_(grammar)
         , graph_(new Graph2DOut(edges, grammar))
     {
@@ -52,8 +52,8 @@ namespace gracfl
     void SolverFWTopo::runSingleIteration(
         std::vector<TemporalVectorWithLbldVtx>& outEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<uint>>& grammar3index,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<uint>>& grammar3index,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

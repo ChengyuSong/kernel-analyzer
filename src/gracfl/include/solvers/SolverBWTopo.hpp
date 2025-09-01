@@ -20,7 +20,7 @@ namespace gracfl
     class SolverBWTopo : public SolverBase
     {
     protected:
-        Grammar& grammar_;  ///< Reference to the grammar containing CFL production rules.
+        const Grammar& grammar_;  ///< Reference to the grammar containing CFL production rules.
         Graph2DIn* graph_;  ///< Pointer to the 2D incoming edge graph representation.
     public:
         /**
@@ -28,8 +28,8 @@ namespace gracfl
          * @param graphfilepath Path to the input graph file.
          * @param grammar Reference to the Grammar object for rule processing.
          */
-        SolverBWTopo(std::string graphfilepath, Grammar& grammar);
-        SolverBWTopo(std::vector<Edge>& edges, Grammar& grammar);
+        SolverBWTopo(std::string graphfilepath, const Grammar& grammar);
+        SolverBWTopo(const std::vector<Edge>& edges, const Grammar& grammar);
 
         /**
          * @brief Destructor.
@@ -55,8 +55,8 @@ namespace gracfl
         void runSingleIteration(
             std::vector<TemporalVectorWithLbldVtx>& inEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& inHashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<uint>>& grammar3index,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<uint>>& grammar3index,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

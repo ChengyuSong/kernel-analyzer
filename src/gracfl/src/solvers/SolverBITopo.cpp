@@ -3,13 +3,13 @@
 
 namespace gracfl 
 {
-    SolverBITopo::SolverBITopo(std::string graphfilepath, Grammar& grammar)
+    SolverBITopo::SolverBITopo(std::string graphfilepath, const Grammar& grammar)
     : grammar_(grammar)
     , graph_(new Graph2DBi(graphfilepath, grammar))
     {
     }
 
-    SolverBITopo::SolverBITopo(std::vector<Edge>& edges, Grammar& grammar)
+    SolverBITopo::SolverBITopo(const std::vector<Edge>& edges, const Grammar& grammar)
     : grammar_(grammar)
     , graph_(new Graph2DBi(edges, grammar))
     {
@@ -54,8 +54,8 @@ namespace gracfl
         std::vector<TemporalVectorWithLbldVtx>& outEdges,
         std::vector<TemporalVectorWithLbldVtx>& inEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<uint>>& grammar3index,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<uint>>& grammar3index,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

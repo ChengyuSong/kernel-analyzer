@@ -8,7 +8,7 @@ namespace gracfl {
         addInitialEdges();
     }
 
-    Graph2DBiConcurrent::Graph2DBiConcurrent(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph2DBiConcurrent::Graph2DBiConcurrent(const std::vector<Edge>& edges, const Grammar& grammar)
         : Graph(edges, grammar) 
     {
         initContainers();

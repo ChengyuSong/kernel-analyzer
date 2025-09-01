@@ -22,7 +22,7 @@ namespace gracfl {
         std::vector<std::vector<std::unordered_set<ull>>> hashset_;
         
         Graph2DOut(std::string& graphfilepath, const Grammar& grammar);
-        Graph2DOut(std::vector<Edge>& edges, const Grammar& grammar);
+        Graph2DOut(const std::vector<Edge>& edges, const Grammar& grammar);
         void initContainers();
         void addInitialEdges();
         void clearContainers();

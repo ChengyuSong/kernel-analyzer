@@ -8,7 +8,7 @@ namespace gracfl {
         addInitialEdges();
     }
 
-    Graph2DBi::Graph2DBi(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph2DBi::Graph2DBi(const std::vector<Edge>& edges, const Grammar& grammar)
         : Graph(edges, grammar) 
     {
         initContainers();

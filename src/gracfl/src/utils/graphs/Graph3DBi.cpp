@@ -8,7 +8,7 @@ namespace gracfl {
         addInitialEdges();
     }
 
-    Graph3DBi::Graph3DBi(std::vector<Edge>& edges, const Grammar& grammar)
+    Graph3DBi::Graph3DBi(const std::vector<Edge>& edges, const Grammar& grammar)
         : Graph(edges, grammar) 
     {
         initContainers();

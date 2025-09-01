@@ -23,7 +23,7 @@ namespace gracfl {
         std::vector<std::vector<std::unordered_set<ull>>> hashset_;
         
         Graph3DBi(std::string& graphfilepath, const Grammar& grammar);
-        Graph3DBi(std::vector<Edge>& edges, const Grammar& grammar);
+        Graph3DBi(const std::vector<Edge>& edges, const Grammar& grammar);
         void initContainers();
         void addInitialEdges();
         void clearContainers();

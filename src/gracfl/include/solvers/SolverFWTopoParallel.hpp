@@ -31,8 +31,8 @@ namespace gracfl
          * @param grammar Reference to the Grammar object used in the analysis.
          * @param numOfThreads Number of OpenMP threads to use during parallel execution.
          */
-        SolverFWTopoParallel(std::string graphfilepath, Grammar& grammar, uint numOfThreads);
-        SolverFWTopoParallel(std::vector<Edge>& edges, Grammar& grammar, uint numOfThreads);
+        SolverFWTopoParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads);
+        SolverFWTopoParallel(const std::vector<Edge>& edges, const Grammar& grammar, uint numOfThreads);
 
         /**
          * @brief Executes the full parallel forward-directional CFL-reachability analysis.
@@ -56,8 +56,8 @@ namespace gracfl
         void runSingleIterationParallel(
             std::vector<TemporalVectorWithLbldVtx>& outEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<uint>>& grammar3index,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<uint>>& grammar3index,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

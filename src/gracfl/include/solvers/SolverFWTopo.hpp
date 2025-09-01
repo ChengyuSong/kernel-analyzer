@@ -20,7 +20,7 @@ namespace gracfl
     class SolverFWTopo : public SolverBase
     {
     protected:
-        Grammar& grammar_;  ///< Reference to the grammar used for parsing and derivation.
+        const Grammar& grammar_;  ///< Reference to the grammar used for parsing and derivation.
         Graph2DOut* graph_; ///< Pointer to the forward 2D graph structure.
     public:
         /**
@@ -28,8 +28,8 @@ namespace gracfl
          * @param graphfilepath Path to the input graph file.
          * @param grammar Reference to the Grammar object used for CFL derivations.
          */
-        SolverFWTopo(std::string graphfilepath, Grammar& grammar);
-        SolverFWTopo(std::vector<Edge>& edges, Grammar& grammar);
+        SolverFWTopo(std::string graphfilepath, const Grammar& grammar);
+        SolverFWTopo(const std::vector<Edge>& edges, const Grammar& grammar);
         /**
          * @brief Destructor.
          */
@@ -57,8 +57,8 @@ namespace gracfl
         void runSingleIteration(
             std::vector<TemporalVectorWithLbldVtx>& outEdges,
             std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-            std::vector<std::vector<uint>>& grammar2index,
-            std::vector<std::vector<uint>>& grammar3index,
+            const std::vector<std::vector<uint>>& grammar2index,
+            const std::vector<std::vector<uint>>& grammar3index,
             uint labelSize,
             uint nodeSize,
             bool& terminate);

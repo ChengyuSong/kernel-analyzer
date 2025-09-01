@@ -3,13 +3,13 @@
 
 namespace gracfl 
 {   
-    SolverFWGram::SolverFWGram(std::string graphfilepath, Grammar& grammar)
+    SolverFWGram::SolverFWGram(std::string graphfilepath, const Grammar& grammar)
     : grammar_(grammar)
     , graph_(new Graph3DOut(graphfilepath, grammar))
     {
     }
 
-    SolverFWGram::SolverFWGram(std::vector<Edge>& edges, Grammar& grammar)
+    SolverFWGram::SolverFWGram(const std::vector<Edge>& edges, const Grammar& grammar)
     : grammar_(grammar)
     , graph_(new Graph3DOut(edges, grammar))
     {
@@ -50,8 +50,8 @@ namespace gracfl
     void SolverFWGram::runSingleIteration(
         std::vector<std::vector<TemporalVector>>& outEdges,
         std::vector<std::vector<std::unordered_set<ull>>>& hashset,
-        std::vector<std::vector<uint>>& grammar2index,
-        std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
+        const std::vector<std::vector<uint>>& grammar2index,
+        const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
         uint labelSize,
         uint nodeSize,
         bool& terminate)

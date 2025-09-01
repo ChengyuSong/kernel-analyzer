@@ -26,7 +26,7 @@ namespace gracfl {
         std::vector<std::vector<tbb::concurrent_unordered_set<ull>>> hashset_;
 
         Graph2DBiConcurrent(std::string& graphfilepath, const Grammar& grammar);
-        Graph2DBiConcurrent(std::vector<Edge>& edges, const Grammar& grammar);
+        Graph2DBiConcurrent(const std::vector<Edge>& edges, const Grammar& grammar);
         void initContainers();
         void addInitialEdges();
         void clearContainers();

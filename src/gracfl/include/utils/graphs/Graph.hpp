@@ -19,10 +19,10 @@ namespace gracfl {
     public:
         Graph() = default;
         Graph(std::string& graphfilepath, const Grammar& grammar);
-        Graph(std::vector<Edge>& edges, const Grammar& grammar);
+        Graph(const std::vector<Edge>& edges, const Grammar& grammar);
         virtual ~Graph() = default;
         void loadGraphFile(std::string& graphfilepath, const Grammar& grammar);
-        void loadEdges(std::vector<Edge>& edges, const Grammar& grammar);
+        void loadEdges(const std::vector<Edge>& edges, const Grammar& grammar);
         ull countEdgeHelper(std::vector<std::vector<std::unordered_set<ull>>>& hashset);
         ull countEdgeHelperConcurrent(std::vector<std::vector<tbb::concurrent_unordered_set<ull>>>& hashset);
 

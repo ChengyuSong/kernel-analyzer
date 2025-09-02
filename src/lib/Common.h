@@ -2,11 +2,22 @@
 #define _COMMON_H
 
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Config/llvm-config.h>
 #include "Flags.h"
 
 #include <unistd.h>
 #include <bitset>
 #include <chrono>
+
+// LLVM 18+ deprecated startswith in favor of starts_with
+// This macro provides compatibility across LLVM versions
+#if LLVM_VERSION_MAJOR >= 18
+  #define LLVM_STRING_STARTS_WITH(str, prefix) (str).starts_with(prefix)
+  #define LLVM_STRING_ENDS_WITH(str, suffix) (str).ends_with(suffix)
+#else
+  #define LLVM_STRING_STARTS_WITH(str, prefix) (str).startswith(prefix)
+  #define LLVM_STRING_ENDS_WITH(str, suffix) (str).endswith(suffix)
+#endif
 
 #define KA_LOG(lv, stmt)							\
 	do {											\

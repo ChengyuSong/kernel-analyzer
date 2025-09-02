@@ -875,7 +875,7 @@ void getDebugLocationFullPath(const BasicBlock &BB,
 
       // Now FullPath is absolute & normalized
       // Check if it's in /usr/
-      if (StringRef(FullPath).startswith(Xlibs))
+      if (LLVM_STRING_STARTS_WITH(StringRef(FullPath), Xlibs))
         continue; // skip system-libs
 
       // Found a valid location => set output vars

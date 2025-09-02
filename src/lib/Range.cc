@@ -157,7 +157,7 @@ void RangePass::collectInitializers(GlobalVariable *GV, Constant *I)
 		StructType *ST = CS->getType();
 		// Skip anonymous structs
 		if (!ST->hasName() || ST->getName() == "struct.anon" 
-			|| ST->getName().startswith("struct.anon."))
+			|| LLVM_STRING_STARTS_WITH(ST->getName(), "struct.anon."))
 			return;
 		
 		for (unsigned i = 0; i != ST->getNumElements(); ++i) {
@@ -196,7 +196,7 @@ bool RangePass::doInitialization(Module *M)
 		 e = M->global_end(); i != e; ++i) {
 
 		// skip strings literals
-		if (i->hasInitializer() && !i->getName().startswith("."))
+		if (i->hasInitializer() && !LLVM_STRING_STARTS_WITH(i->getName(), "."))
 			collectInitializers(&*i, i->getInitializer());
 	}
 	return false;

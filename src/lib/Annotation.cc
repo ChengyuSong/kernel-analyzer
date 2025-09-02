@@ -78,16 +78,16 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
     name.equals("kcalloc"))
     return false;
 
-  if (name.startswith("kmalloc") ||
-    name.startswith("__kmalloc") ||
-    name.startswith("kzalloc")) {
+  if (LLVM_STRING_STARTS_WITH(name, "kmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "__kmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "kzalloc")) {
     *size = 0;
     *flag = 1;
     return true;
   }
 
   // kmem_cache_alloc
-  if (name.startswith("kmem_cache_alloc") ||
+  if (LLVM_STRING_STARTS_WITH(name, "kmem_cache_alloc") ||
     name.equals("kmem_cache_zalloc")) {
     *size = -1;
     *flag = 1;
@@ -149,8 +149,8 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
     return 3;
 
   // vmalloc
-  if (name.startswith("vmalloc") ||
-    name.startswith("vzalloc"))
+  if (LLVM_STRING_STARTS_WITH(name, "vmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "vzalloc"))
     return -1; // don't really have flags
 
   if (name.equals("__vmalloc"))
@@ -229,8 +229,8 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
 
 bool isEntryFn(StringRef name) {
   if (name.equals("main") ||
-    name.startswith("do_syscall_") ||
-    name.endswith("do_softirq") ||
+    LLVM_STRING_STARTS_WITH(name, "do_syscall_") ||
+    LLVM_STRING_ENDS_WITH(name, "do_softirq") ||
     name.equals("start_kernel") ||
     name.equals("init") ||
     name.equals("module_init") ||
@@ -414,7 +414,7 @@ std::string getAnonStructId(Value *V, Module *M, StringRef Prefix) {
     while (Ty->isPointerTy())
       Ty = Ty->getContainedType(0);
     if (StructType *STy = dyn_cast<StructType>(Ty)) {
-      if (!STy->getStructName().startswith("struct.anon")) {
+      if (!LLVM_STRING_STARTS_WITH(STy->getStructName(), "struct.anon")) {
         return STy->getStructName();
       }
     }
@@ -581,7 +581,7 @@ static inline void getBBDebugLoc(const BasicBlock *BB, std::string &Filename, un
   unsigned col = 0;
   for (auto &I : *BB) {
     getInsDebugLoc(&I, filename, line, col);
-    if (filename.empty() || line == 0 || filename.startswith("/usr/"))
+    if (filename.empty() || line == 0 || LLVM_STRING_STARTS_WITH(filename, "/usr/"))
       continue;
     std::size_t found = filename.find_last_of("/\\");
     if (found != std::string::npos)

@@ -190,7 +190,7 @@ bool SafeStackPass::isSafeCall(CallInst *CI, unsigned ArgNo, uint64_t Size) {
 			// for unknown reason, llvm tends to use SyS for syscall
 			// making sys_* pure declaration, try to solve this here
 			//
-			if (FuncName.startswith("sys_")) {
+			if (LLVM_STRING_STARTS_WITH(FuncName, "sys_")) {
 				std::string SyS = "SyS_" + FuncName.substr(4).str();
 				FuncName = SyS;
 			}

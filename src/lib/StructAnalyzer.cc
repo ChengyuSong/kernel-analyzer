@@ -78,7 +78,7 @@ StructInfo& StructAnalyzer::addStructInfo(const StructType* st, const Module* M,
   const StructLayout* stLayout = layout->getStructLayout(const_cast<StructType*>(st));
   stInfo.addElementType(0, const_cast<StructType*>(st));
 
-  if (!st->isLiteral() && st->getName().startswith("union")) {
+  if (!st->isLiteral() && LLVM_STRING_STARTS_WITH(st->getName(), "union")) {
     // handle union
     stInfo.addFieldOffset(currentOffset);
     stInfo.addField(1, false, false, true);

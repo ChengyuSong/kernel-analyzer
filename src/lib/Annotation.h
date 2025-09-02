@@ -80,8 +80,8 @@ static inline std::string getScopeName(const llvm::StructType *Ty, const llvm::M
     return "";
   llvm::StringRef structName = Ty->getStructName();
   size_t dotPos = structName.rfind('.');
-  if (M && (structName.startswith("struct.anon") ||
-    structName.startswith("union.anon"))) {
+  if (M && (LLVM_STRING_STARTS_WITH(structName, "struct.anon") ||
+    LLVM_STRING_STARTS_WITH(structName, "union.anon"))) {
     llvm::StringRef rest = structName.substr(6);
     llvm::StringRef moduleName = llvm::sys::path::stem(
       M->getModuleIdentifier());
@@ -153,7 +153,7 @@ static inline std::string getValueId(llvm::Value *V) {
     return getArgId(A);
   else if (llvm::CallInst *CI = llvm::dyn_cast<llvm::CallInst>(V)) {
     if (llvm::Function *F = CI->getCalledFunction())
-      if (F->getName().startswith("kint_arg.i"))
+      if (LLVM_STRING_STARTS_WITH(F->getName(), "kint_arg.i"))
         return getLoadStoreId(CI).str();
     return getRetId(CI);
   } else if (llvm::isa<llvm::LoadInst>(V) || llvm::isa<llvm::StoreInst>(V)) {

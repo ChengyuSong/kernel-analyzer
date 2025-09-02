@@ -79,7 +79,7 @@ NodeIndex createNodeForTypedVal(const Value *v, const Type *type, bool isHeap,
   NodeIndex obj = AndersNodeFactory::InvalidIndex;
   if (const StructType *structType = dyn_cast<StructType>(type)) {
     // check if the struct is a union
-    if (!structType->isLiteral() && structType->getStructName().startswith("union"))
+    if (!structType->isLiteral() && LLVM_STRING_STARTS_WITH(structType->getStructName(), "union"))
       obj = nodeFactory.createObjectNode(v, type, true, isHeap);
     else
       obj = processStruct(v, structType, isHeap, nodeFactory, structAnalyzer);
@@ -252,7 +252,7 @@ static NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int 
   if (const StructType* structType = dyn_cast<StructType>(elemType)) {
     stInfo = structAnalyzer.getStructInfo(structType, nodeFactory.getModule());
     assert(stInfo != nullptr && "structInfoMap should have info for all structs!");
-    if (!structType->isLiteral() && structType->getStructName().startswith("union"))
+    if (!structType->isLiteral() && LLVM_STRING_STARTS_WITH(structType->getStructName(), "union"))
       isUnion = true;
     maxSize = stInfo->getExpandedSize();
     allocSize *= stInfo->getAllocSize();
@@ -554,9 +554,9 @@ unsigned offsetToFieldNum(const Type* type, int64_t off, const DataLayout* dataL
   Type* elemType = const_cast<Type*>(type);
   if (elemType->isStructTy()) {
     StructType* stType = cast<StructType>(elemType);
-    if (!stType->isLiteral() && stType->getName().startswith("union"))
+    if (!stType->isLiteral() && LLVM_STRING_STARTS_WITH(stType->getName(), "union"))
       return ret;
-    if (!stType->isLiteral() && stType->getName().startswith("union"))
+    if (!stType->isLiteral() && LLVM_STRING_STARTS_WITH(stType->getName(), "union"))
       return ret;
     if (stType->isOpaque())
       return ret;
@@ -585,14 +585,14 @@ unsigned offsetToFieldNum(const Type* type, int64_t off, const DataLayout* dataL
       // since we have collapsed arrays, we want the offset into individual element
       offset %= allocSize;
       unsigned idx = stLayout->getElementContainingOffset(offset);
-      if (!stType->isLiteral() && stType->getName().startswith("union")) {
+      if (!stType->isLiteral() && LLVM_STRING_STARTS_WITH(stType->getName(), "union")) {
         offset -= stInfo->getDataLayout()->getTypeAllocSize(stType);
         if (offset <= 0)
           break;
       }
       ret += stInfo->getOffset(idx);
 
-      if (!stType->isLiteral() && stType->getName().startswith("union")) {
+      if (!stType->isLiteral() && LLVM_STRING_STARTS_WITH(stType->getName(), "union")) {
         offset -= stInfo->getDataLayout()->getTypeAllocSize(stType);
       } else {
         offset -= stLayout->getElementOffset(idx);

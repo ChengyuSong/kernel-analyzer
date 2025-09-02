@@ -186,9 +186,54 @@ bool CallGraphPass::findCalleesByType(const CallBase *CS, FuncSet &FS) {
   return false;
 }
 
+bool CallGraphPass::handleMemcpy(const CallBase *CS) {
+  Value *dst = CS->getArgOperand(0);
+  Value *src = CS->getArgOperand(1);
+  CG_LOG("Memcpy: " << *dst << " = " << *src << "\n");
+  // field insensitive
+  NodeIndex dstNode = NF.getValueNodeFor(dst);
+  NodeIndex srcNode = NF.getValueNodeFor(src);
+  assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
+  assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
+  NodeIndex derefDst = NF.getDereferenceNodeFor(dst);
+  if (derefDst == AndersNodeFactory::InvalidIndex) {
+    CG_DEBUG("Create deref node " << derefDst << " for " << *dst << "\n");
+    derefDst = NF.createDereferenceNode(dst);
+    EB.addDereferenceEdges(dstNode, derefDst);
+  }
+  NodeIndex derefSrc = NF.getDereferenceNodeFor(src);
+  if (derefSrc == AndersNodeFactory::InvalidIndex) {
+    CG_DEBUG("Create deref node " << derefSrc << " for " << *src << "\n");
+    derefSrc = NF.createDereferenceNode(src);
+    EB.addDereferenceEdges(srcNode, derefSrc);
+  }
+  EB.addAssignmentEdges(derefSrc, derefDst);
+
+  return false;
+}
+
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   if (CF->isIntrinsic()) {
-    // TODO: handle memcpy
+    switch (CF->getIntrinsicID()) {
+      case Intrinsic::memcpy:
+      case Intrinsic::memcpy_inline:
+      case Intrinsic::memmove: {
+        // treat as copy
+        handleMemcpy(CS);
+        break;
+      }
+      case Intrinsic::memset:
+      case Intrinsic::memset_inline:
+      // case Intrinsic::experimental_memset_pattern:
+        break;
+      case Intrinsic::vastart:
+      case Intrinsic::vaend:
+      case Intrinsic::vacopy:
+        // TODO: handle vararg
+        break;
+      default:
+        break;
+      }
     return false;
   }
 
@@ -196,6 +241,8 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   if (CF->empty()) {
     // external function, nothing to do
     WARNING("Call: " << CF->getName() << " is empty!\n");
+    if (CF->getName() == "memcpy" || CF->getName() == "memmove")
+      handleMemcpy(CS);
     return false;
   }
 
@@ -632,6 +679,29 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Callee by type: total " << total << ", match by CFL " << match << "\n");
+    // check if all address-taken functions are used in indirect calls
+    size_t used = 0;
+    for (const Function *F : Ctx->AddressTakenFuncs) {
+      bool found = false;
+      for (auto &it : Ctx->Callees) {
+        FuncSet &FS = it.second;
+        if (FS.find(F) != FS.end()) {
+          found = true;
+          break;
+        }
+      }
+      if (found) {
+        used++;
+      } else {
+        WARNING("Address-taken function not used in indirect calls: " << F->getName() << "\n");
+        // print all users
+        for (auto *U : F->users()) {
+          if (!isa<Function>(U)) // skip personality
+            errs() << "  User: " << *U << "\n";
+        }
+      }
+    }
+    CG_LOG("Address-taken functions: total " << Ctx->AddressTakenFuncs.size() << ", used " << used << "\n");
   }
 
   return false;

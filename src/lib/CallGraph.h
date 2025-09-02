@@ -12,6 +12,7 @@ class CallGraphPass : public IterativeModulePass {
 private:
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
+  bool handleMemcpy(const llvm::CallBase*);
   bool handleCall(const llvm::CallBase*, const llvm::Function*);
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);

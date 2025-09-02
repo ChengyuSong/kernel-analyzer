@@ -263,7 +263,8 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
     if (isa<BranchInst>(I) || isa<SwitchInst>(I) || isa<UnreachableInst>(I) ||
         isa<BinaryOperator>(I) || isa<SExtInst>(I) || isa<ZExtInst>(I) ||
-        isa<TruncInst>(I) || isa<ICmpInst>(I) || isa<FCmpInst>(I))
+        isa<TruncInst>(I) || isa<ICmpInst>(I) || isa<FCmpInst>(I) ||
+        isa<LandingPadInst>(I) || isa<ResumeInst>(I) || isa<FenceInst>(I))
       continue;
 
     CG_DEBUG("Processing instruction: " << *I << "\n");
@@ -454,6 +455,30 @@ bool CallGraphPass::runOnFunction(Function *F) {
         assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
         EB.addAssignmentEdges(srcNode, dstNode);
       }
+      break;
+    }
+    case Instruction::ExtractValue: {
+      ExtractValueInst *EVI = cast<ExtractValueInst>(I);
+      // field insensitive, just connect the aggregate
+      Value *agg = EVI->getAggregateOperand();
+      NodeIndex aggNode = NF.getValueNodeFor(agg);
+      NodeIndex valNode = NF.getValueNodeFor(EVI);
+      assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue agg node");
+      EB.addAssignmentEdges(aggNode, valNode);
+      break;
+    }
+    case Instruction::InsertValue: {
+      InsertValueInst *IVI = cast<InsertValueInst>(I);
+      // field insensitive, just connect the aggregate
+      Value *agg = IVI->getAggregateOperand();
+      Value *val = IVI->getInsertedValueOperand();
+      NodeIndex aggNode = NF.getValueNodeFor(agg);
+      NodeIndex valNode = NF.getValueNodeFor(val);
+      NodeIndex resNode = NF.getValueNodeFor(IVI);
+      assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue agg node");
+      assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
+      EB.addAssignmentEdges(aggNode, resNode);
+      EB.addAssignmentEdges(valNode, resNode);
       break;
     }
     default: {

@@ -389,6 +389,12 @@ unsigned AndersNodeFactory::constGEPtoFieldNum(const llvm::ConstantExpr* expr) c
             const StructInfo* stInfo = structAnalyzer->getStructInfo(structType, module);
             assert(stInfo != NULL && "structInfoMap should have info for all structs!");
 
+            if (index >= stInfo->getSize()) {
+                // index is out of bounds, likely due to union
+                assert(stInfo->isFieldUnion(0) && "Field index is out of bounds");
+                // FIXME: we don't record anything about unions, so just return
+                break;
+            }
             ret += stInfo->getOffset(index);
 
             elemTy = structType->getElementType(index);

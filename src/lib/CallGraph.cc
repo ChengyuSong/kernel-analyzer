@@ -214,6 +214,11 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
 }
 
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
+  if (CF->isIntrinsic()) {
+    // handle intrinsic functions
+    return false;
+  }
+
   // assumes CF is the function definition
   if (CF->empty()) {
     // external function, nothing to do
@@ -351,9 +356,11 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   Value *ptr = I.getOperand(0);
   NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptr);
   if (derefNode == AndersNodeFactory::InvalidIndex) {
-    CG_DEBUG("Create deref node " << derefNode << " for " << *ptr << "\n");
+    CG_DEBUG("Create deref node for " << *ptr << "\n");
     derefNode = CGP.NF.createDereferenceNode(ptr);
-    CGP.EB.addDereferenceEdges(CGP.NF.getValueNodeFor(ptr), derefNode);
+    NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+    assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find load ptr node");
+    CGP.EB.addDereferenceEdges(ptrNode, derefNode);
   }
   CGP.EB.addAssignmentEdges(derefNode, valNode);
 }
@@ -368,9 +375,11 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
   NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptr);
   if (derefNode == AndersNodeFactory::InvalidIndex) {
-    CG_DEBUG("Create deref node " << derefNode << " for " << *ptr << "\n");
+    CG_DEBUG("Create deref node for " << *ptr << "\n");
     derefNode = CGP.NF.createDereferenceNode(ptr);
-    CGP.EB.addDereferenceEdges(CGP.NF.getValueNodeFor(ptr), derefNode);
+    NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+    assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find store ptr node");
+    CGP.EB.addDereferenceEdges(ptrNode, derefNode);
   }
   CGP.EB.addAssignmentEdges(valNode, derefNode);
 }

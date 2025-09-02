@@ -2,6 +2,7 @@
 #define _CALL_GRAPH_H
 
 #include <llvm/IR/Value.h>
+#include <llvm/IR/InstVisitor.h>
 
 #include <unordered_set>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -10,6 +11,35 @@
 
 class CallGraphPass : public IterativeModulePass {
 private:
+  class InstHandler : public llvm::InstVisitor<InstHandler> {
+  private:
+    CallGraphPass &CGP;
+    llvm::Function *F;
+
+  public:
+    InstHandler(CallGraphPass &cgp, llvm::Function *func) : CGP(cgp), F(func) {}
+
+    void visitReturnInst(llvm::ReturnInst &I);
+    void visitCallBase(llvm::CallBase &CB);
+    void visitAllocaInst(llvm::AllocaInst &I);
+    void visitLoadInst(llvm::LoadInst &I);
+    void visitStoreInst(llvm::StoreInst &I);
+    void visitGetElementPtrInst(llvm::GetElementPtrInst &I);
+    void visitBitCastInst(llvm::BitCastInst &I);
+    void visitPHINode(llvm::PHINode &I);
+    void visitSelectInst(llvm::SelectInst &I);
+    void visitExtractValueInst(llvm::ExtractValueInst &I);
+    void visitInsertValueInst(llvm::InsertValueInst &I);
+    void visitIntToPtrInst(llvm::IntToPtrInst &I);
+    void visitPtrToIntInst(llvm::PtrToIntInst &I);
+    void visitVAArgInst(llvm::VAArgInst &I);
+    void visitMemTransferInst(llvm::MemTransferInst &I);
+    void visitMemSetInst(llvm::MemSetInst &I);
+    void visitInstruction(llvm::Instruction &I) {} // Default handler for unhandled instructions
+  };
+
+  friend class InstHandler;
+
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
   bool handleMemcpy(const llvm::CallBase*);

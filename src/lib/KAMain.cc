@@ -137,10 +137,18 @@ void doBasicInitialization(Module *M) {
       if (!GV.isDeclaration()) {
         assert(GV.hasInitializer());
         if (GlobalCtx.Gobjs.count(GVID) != 0) {
-          WARNING("Global variable " << GV.getName()
-              << " has been defined multiple times, previously in "
-              << GlobalCtx.Gobjs[GVID]->getParent()->getModuleIdentifier()
-              << ", and now in " << M->getModuleIdentifier() << "\n");
+          // check for weak linkage
+          if (GV.hasWeakLinkage()) {
+            // keep the previous definition, even if it's weak too
+            continue;
+          } else if (!GlobalCtx.Gobjs[GVID]->hasWeakLinkage()) {
+            // both are not weak
+            WARNING("Global variable " << GV.getName()
+                << " has been defined multiple times, previously in "
+                << GlobalCtx.Gobjs[GVID]->getParent()->getModuleIdentifier()
+                << ", and now in " << M->getModuleIdentifier() << "\n");
+            continue;
+          } // else fall through to replace weak definition
         }
         GlobalCtx.Gobjs[GVID] = &GV;
       } else {
@@ -158,10 +166,18 @@ void doBasicInitialization(Module *M) {
       auto FID = F.getGUID();
       if (!F.isDeclaration() && !F.empty()) {
         if (GlobalCtx.Funcs.count(FID) != 0) {
-          WARNING("Function " << F.getName()
-              << " has been defined multiple times, previously in "
-              << GlobalCtx.Funcs[FID]->getParent()->getModuleIdentifier()
-              << ", and now in " << M->getModuleIdentifier() << "\n");
+          // check for weak linkage
+          if (F.hasWeakLinkage()) {
+            // keep the previous definition, even if it's weak too
+            continue;
+          } else if (!GlobalCtx.Funcs[FID]->hasWeakLinkage()) {
+            // both are not weak
+            WARNING("Function " << F.getName()
+                << " has been defined multiple times, previously in "
+                << GlobalCtx.Funcs[FID]->getParent()->getModuleIdentifier()
+                << ", and now in " << M->getModuleIdentifier() << "\n");
+            continue;
+          } // else fall through to replace weak definition
         }
         GlobalCtx.Funcs[FID] = &F;
       } else {

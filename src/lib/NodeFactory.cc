@@ -176,6 +176,9 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
                     return UniversalPtrIndex;
                 }
 
+#ifndef FIELD_SENSITIVE
+                return baseNode;
+#else
                 unsigned fieldNum = constGEPtoFieldNum(ce);
                 if (fieldNum == 0)
                     return baseNode;
@@ -190,6 +193,7 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
                 } else {
                     return itr->second;
                 }
+#endif
             }
             case Instruction::BitCast:
             {

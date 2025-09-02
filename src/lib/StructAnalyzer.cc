@@ -40,11 +40,14 @@ void StructAnalyzer::addContainer(const StructType* container, StructInfo& conta
           structType = real->second;
       }
       auto itr = structInfoMap.find(structType);
-      assert(itr != structInfoMap.end());
-      StructInfo& subInfo = itr->second;
-      for (auto item : subInfo.containers) {
-        if (item.first == ct)
-          addContainer(container, subInfo, item.second + offset, M);
+      if (itr != structInfoMap.end()) {
+        StructInfo& subInfo = itr->second;
+        for (auto item : subInfo.containers) {
+          if (item.first == ct)
+            addContainer(container, subInfo, item.second + offset, M);
+        }
+      } else {
+        WARNING("Containee " << ct->getName() << " subtype " << structType->getName() << " not found\n");
       }
     }
   }

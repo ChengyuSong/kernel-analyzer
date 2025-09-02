@@ -24,6 +24,7 @@
 #include "StructAnalyzer.h"
 
 #define PT_LOG(stmt) KA_LOG(2, "Point2: " << stmt)
+#define PT_DEBUG(stmt) KA_LOG(3, "Point2: " << stmt)
 
 using namespace llvm;
 
@@ -194,7 +195,9 @@ static void createNodeForGlobals(Module *M, AndersNodeFactory &nodeFactory,
     if (!retType->isVoidTy()) {
       // FIXME: handle potential aggregate return type
       // createNodeForTypedVal(&F, retType, false, nodeFactory, structAnalyzer);
-      assert(!retType->isAggregateType() && "Aggregate return type not supported");
+      if (retType->isAggregateType()) {
+        WARNING("Aggregate return type not supported, will collapse\n");
+      }
       nodeFactory.createReturnNode(&F);
     }
 
@@ -307,17 +310,19 @@ static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
     const StructType *CSTy = CS->getType();
     if (CSTy != objTy) {
       // type mismatch
-      PT_LOG("Initializer type mismatch for " << *CS << " vs " << *objTy << "\n");
+      PT_LOG("Initializer type mismatch for " << *CSTy << " vs " << *objTy << "\n");
       assert(CSTy->isLiteral() && "Non-literal struct type mismatch");
       const StructType *STy = dyn_cast<StructType>(objTy);
       auto dataLayout = nodeFactory.getDataLayout();
-      auto objSize = dataLayout->getTypeAllocSize(const_cast<Type*>(objTy));
+      auto objSize = dataLayout->getTypeStoreSize(const_cast<Type*>(objTy));
       for (unsigned i = 0, j = 0; i != CSTy->getNumElements(); ++i) {
-        // XXX try a heuristic
+        // try a heuristic, as struct could be used to initialize arrays
         Type *elemTy = CSTy->getElementType(i);
-        auto elemSize = dataLayout->getTypeAllocSize(elemTy);
-        if (elemSize % objSize == 0) {
-          // element size is a multiple of object size, use base type
+        auto elemSize = dataLayout->getTypeStoreSize(elemTy);
+        if ((elemSize % objSize == 0) && elemTy->isAggregateType()) {
+          // element size is a multiple of object size, and is of array or struct type,
+          // use base type
+          PT_DEBUG("Treating element as array initializer\n");
           processInitializer(obj, objTy, CS->getOperand(i), nodeFactory, ptsGraph);
         } else {
           // we could be looking at a sub-field
@@ -372,7 +377,11 @@ static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
     }
   } else {
     // non-aggregate initializer
-    assert(objTy->isSingleValueType() && "Single value initializer for non single value type");
+    if (!objTy->isSingleValueType()) {
+      // objTy is not single value type, but array of 1 element is fine too
+      const ArrayType *ATy = dyn_cast<ArrayType>(objTy);
+      assert(ATy && ATy->getNumElements() == 1 && "Single value initializer for non single value type");
+    }
     if (isa<ConstantPointerNull>(init)) {
       ptsGraph[obj].insert(nodeFactory.getNullObjectNode());
     } else if (isa<GlobalVariable>(init)) {
@@ -506,7 +515,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
       if (GV.hasInitializer()) {
         NodeIndex obj = nodeFactory.getObjectNodeFor(&GV);
         const Type *Ty = nodeFactory.getObjectType(obj);
-        //PT_LOG("Processing initializer for global " << GV.getName() << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
+        PT_DEBUG("Processing initializer for global " << GV.getName() << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
         processInitializer(obj, Ty, GV.getInitializer(), nodeFactory, ptsGraph);
       }
     }

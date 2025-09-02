@@ -11,7 +11,7 @@
 
 
 #include <llvm/IR/DebugInfo.h>
-#include <llvm/Pass.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/Support/Debug.h>
 #include <llvm/IR/InstIterator.h>
@@ -139,51 +139,54 @@ bool CallGraphPass::isCompatibleType(Type *T1, Type *T2) {
   }
 }
 
-bool CallGraphPass::findCalleesByType(CallBase *CS, FuncSet &FS) {
+bool CallGraphPass::isCompatible(const CallBase *CS, const Function *F) {
+  // just compare known args
+  if (F->getFunctionType()->isVarArg()) {
+    //errs() << "VarArg: " << F->getName() << "\n";
+    //report_fatal_error("VarArg address taken function\n");
+  } else if (F->arg_size() != CS->arg_size()) {
+    //errs() << "ArgNum mismatch: " << F.getName() << "\n";
+    return false;
+  } else if (!isCompatibleType(F->getReturnType(), CS->getType())) {
+    return false;
+  }
+
+  if (F->isIntrinsic()) {
+    //errs() << "Intrinsic: " << F.getName() << "\n";
+    return false;
+  }
+
+  // type matching on args
+  bool Matched = true;
+  auto AI = CS->arg_begin();
+  for (auto FI = F->arg_begin(), FE = F->arg_end();
+       FI != FE; ++FI, ++AI) {
+    // check type mis-match
+    Type *FormalTy = FI->getType();
+    Type *ActualTy = (*AI)->getType();
+
+    if (isCompatibleType(FormalTy, ActualTy))
+      continue;
+    else {
+      Matched = false;
+      break;
+    }
+  }
+
+  return Matched;
+}
+
+bool CallGraphPass::findCalleesByType(const CallBase *CS, FuncSet &FS) {
   //errs() << *CS << "\n";
   for (const Function *F : Ctx->AddressTakenFuncs) {
-
-    // just compare known args
-    if (F->getFunctionType()->isVarArg()) {
-      //errs() << "VarArg: " << F->getName() << "\n";
-      //report_fatal_error("VarArg address taken function\n");
-    } else if (F->arg_size() != CS->arg_size()) {
-      //errs() << "ArgNum mismatch: " << F.getName() << "\n";
-      continue;
-    } else if (!isCompatibleType(F->getReturnType(), CS->getType())) {
-      continue;
-    }
-
-    if (F->isIntrinsic()) {
-      //errs() << "Intrinsic: " << F.getName() << "\n";
-      continue;
-    }
-
-    // type matching on args
-    bool Matched = true;
-    auto AI = CS->arg_begin();
-    for (auto FI = F->arg_begin(), FE = F->arg_end();
-         FI != FE; ++FI, ++AI) {
-      // check type mis-match
-      Type *FormalTy = FI->getType();
-      Type *ActualTy = (*AI)->getType();
-
-      if (isCompatibleType(FormalTy, ActualTy))
-        continue;
-      else {
-        Matched = false;
-        break;
-      }
-    }
-
-    if (Matched)
+    if (isCompatible(CS, const_cast<Function*>(F)))
       FS.insert(F);
   }
 
   return false;
 }
 
-bool CallGraphPass::handleCall(llvm::CallBase *CS, const llvm::Function *CF) {
+bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   if (CF->isIntrinsic()) {
     // TODO: handle memcpy
     return false;
@@ -195,8 +198,6 @@ bool CallGraphPass::handleCall(llvm::CallBase *CS, const llvm::Function *CF) {
     WARNING("Call: " << CF->getName() << " is empty!\n");
     return false;
   }
-
-  bool Changed = false;
 
   // handle args
   unsigned numArgs = CS->arg_size();
@@ -237,7 +238,7 @@ bool CallGraphPass::handleCall(llvm::CallBase *CS, const llvm::Function *CF) {
     EB.addAssignmentEdges(retNode, callNode);
   }
 
-  return Changed;
+  return false;
 }
 
 static inline Type *getElementTy(Type *T) {
@@ -254,7 +255,6 @@ static inline Type *getElementTy(Type *T) {
 }
 
 bool CallGraphPass::runOnFunction(Function *F) {
-  bool Changed = false;
 
   CG_LOG("######\nProcessing Func: " << F->getName() << "\n");
 
@@ -287,42 +287,35 @@ bool CallGraphPass::runOnFunction(Function *F) {
         // direct call
         auto RCF = getFuncDef(CF);
         Ctx->Callees[CS].insert(RCF);
-        Changed |= handleCall(CS, RCF);
-        break;
-      }
-      // indirect call
-      Value *CO = CS->getCalledOperand();
-      NodeIndex callee = NF.getValueNodeFor(CO);
-      assert(callee != AndersNodeFactory::InvalidIndex && "Callee node not found!");
-      funcPts.insert(CO);
-      auto itr = funcPtsGraph.find(callee);
-      // iterate through all possible callees
-      if (itr != funcPtsGraph.end()) {
-        // if the point2 set of the callee is not empty
-        for (auto idx = itr->second.find_first(), end = itr->second.getSize();
-             idx < end; idx = itr->second.find_next(idx)) {
-          CG_LOG("Indirect Call: callee obj: " << idx << "\n");
-          if (NF.isSpecialNode(idx)) {
-            WARNING("Indirect Call: " << *CO << " callee is a special node: " << idx << "\n");
-            continue;
-          }
-          assert(NF.isObjectNode(idx) && "Function pointer points to non-object!");
-          const Value *CV = NF.getValueForNode(idx);
-          if (CV == NULL) {
-            WARNING("No value for function node!\n");
-            continue;
-          }
-          Function *CF = dyn_cast<Function>(const_cast<Value*>(CV));
-          if (CF == NULL) {
-            WARNING("Function pointer " << *CO << " points to non-function: " << *CV << "\n");
-            continue;
-          }
-          Ctx->Callees[CS].insert(CF);
-          CG_LOG("Indirect Call: callee: " << CF->getName() << "\n");
-          Changed |= handleCall(CS, CF);
-        }
+        handleCall(CS, RCF);
       } else {
-        CG_LOG("Indirect Call: callee not found in the graph: " << callee << "\n");
+        // indirect call
+        Value *CO = CS->getCalledOperand()->stripPointerCasts();
+        // resolve constant expr
+        if (auto *CE = dyn_cast<ConstantExpr>(CO)) {
+          switch (CE->getOpcode()) {
+            case Instruction::GetElementPtr: {
+              GEPOperator* GEP = dyn_cast<GEPOperator>(CE);
+              CO = GEP->getPointerOperand()->stripPointerCasts();
+              break;
+            }
+            case Instruction::BitCast: {
+              CO = CE->getOperand(0);
+              break;
+            }
+            default:
+              WARNING("Unhandled constant expression call target: " << *CE << "\n");
+          }
+        }
+        if (Function *CF = dyn_cast<Function>(CO)) {
+          // direct call through bitcast
+          auto RCF = getFuncDef(CF);
+          Ctx->Callees[CS].insert(RCF);
+          handleCall(CS, RCF);
+        } else {
+          funcPts.insert(CO);
+          Ctx->IndirectCallInsts.insert(CS);
+        }
       }
       break;
     }
@@ -469,7 +462,7 @@ bool CallGraphPass::runOnFunction(Function *F) {
     } // end switch
   }
 
-  return Changed;
+  return false;
 }
 
 void CallGraphPass::buildEdgesFromPtsGraph(const PtsGraph &ptsGraph) {
@@ -562,15 +555,12 @@ bool CallGraphPass::doInitialization(Module *M) {
       funcPtsGraph[valNode].insert(objNode);
       CG_LOG("AddressTaken: " << F.getName() << " : " << valNode << " -> " << objNode << "\n");
     }
-
-    // reachable?
-    if (F.getName().equals("main") || F.getName().startswith("SyS_")) {
-      reachable.insert(&F);
-      unvisited.insert(&F);
-    }
   }
 
-  buildEdgesFromPtsGraph(funcPtsGraph);
+  if (M == Ctx->Modules.back().first) {
+    // add edges when finishing the last module
+    buildEdgesFromPtsGraph(funcPtsGraph);
+  }
 
   return false;
 }
@@ -584,80 +574,114 @@ bool CallGraphPass::doFinalization(Module *M) {
       if (CallInst *CI = dyn_cast<CallInst>(&*i)) {
         if (CI->isInlineAsm())
           continue;
-        // FuncSet &FS = Ctx->Callees[CI];
-        // // calculate the caller info here
-        // for (const Function *CF : FS) {
-        //   CallInstSet &CIS = Ctx->Callers[CF];
-        //   CIS.insert(CI);
-        // }
-        // // collect indirect call targets by type
-        // FuncSet &TS = calleeByType[CI];
-        // findCalleesByType(CI, TS);
+        FuncSet &FS = Ctx->Callees[CI];
+        // calculate the caller info here
+        for (const Function *CF : FS) {
+          CallInstSet &CIS = Ctx->Callers[CF];
+          CIS.insert(CI);
+        }
+        // collect indirect call targets by type
+        if (Ctx->IndirectCallInsts.find(CI) != Ctx->IndirectCallInsts.end()) {
+          FuncSet &TS = calleeByType[CI];
+          findCalleesByType(CI, TS);
+        }
       }
     }
+  }
+
+  if (M == Ctx->Modules.back().first) {
+    // compare callees found by CFL and type matching
+    size_t total = 0, match = 0;
+    for (auto &it : calleeByType) {
+      const CallBase *CS = it.first;
+      FuncSet &TS = it.second;
+      FuncSet &FS = Ctx->Callees[CS];
+      total += TS.size();
+      for (const Function *F : TS) {
+        if (FS.find(F) != FS.end()) {
+          match++;
+        } else {
+          // not found by CFL
+          WARNING("Callee by type not found by CFL: " << F->getName() << " for " << *CS << "\n");
+        }
+      }
+    }
+    CG_LOG("Callee by type: total " << total << ", match by CFL " << match << "\n");
   }
 
   return false;
 }
 
 bool CallGraphPass::doModulePass(Module *M) {
-  bool Changed = true, ret = false;
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
 
-  // process functions
-  for (Function &F : *M) {
-    if (F.isDeclaration() || F.isIntrinsic() || F.empty())
-      continue;
-    Changed |= runOnFunction(&F);
-  }
-
-  // solve the CFL constraints
-  // std::unique_ptr<SolverBase> solver = std::make_unique<SolverFWTopoParallel>(EB.getEdges(), *EB.getGrammar(), 16);
-  std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGram>(EB.getEdges(), *EB.getGrammar());
-  // auto initEdges = solver->getEdgeCount();
-  solver->runCFL();
-
-  // parse results and update funcPtsGraph
-  std::vector<std::vector<std::unordered_set<unsigned long long>>> outputCFLGraph = solver->getGraph();
-  for (auto *fptr : funcPts) {
-    NodeIndex fptrNode = NF.getValueNodeFor(fptr);
-    if (fptrNode == AndersNodeFactory::InvalidIndex) {
-      WARNING("FuncPtr: " << *fptr << " node not found!\n");
-      continue;
-    }
-    auto &ptsSet = funcPtsGraph[fptrNode];
-    auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelMAs()];
-    for (auto idx : cflSet) {
-      ptsSet.insert(idx);
-      CG_LOG("FuncPtr: " << *fptr << " node: " << fptrNode << " -> obj: " << idx << "\n");
+  // process functions, only the first iteration
+  if (iteration == 0) {
+    for (Function &F : *M) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+        continue;
+      runOnFunction(&F);
     }
   }
 
-  for (NodeIndex i = 0; i < outputCFLGraph.size(); i++) {
-    if (NF.isSpecialNode(i) || NF.isDereferenceNode(i))
-      continue;
-    auto *val = NF.getValueForNode(i);
-    if (val && val->getType()->isPointerTy() && isa<Instruction>(val) && !isa<AllocaInst>(val)) {
-      errs() << "checking alias set of " << *val << "\n";
-      auto &cflSet = outputCFLGraph[i][EB.getLabelMAs()];
+  bool Changed = false;
+  if (M == Ctx->Modules.back().first) {
+    // solve CFL constraints after processing the last module
+    std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
+    // std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGram>(EB.getEdges(), *EB.getGrammar());
+    auto initEdges = solver->getEdgeCount();
+    CG_LOG("CFL Init Edges: " << initEdges << "\n");
+    solver->runCFL();
+    auto finalEdges = solver->getEdgeCount();
+    CG_LOG("CFL Final Edges: " << finalEdges << "\n");
+
+    // parse results and update the CFL edges
+    std::vector<std::vector<std::unordered_set<unsigned long long>>> outputCFLGraph = solver->getGraph();
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      CG_LOG("Handle indirect CallSite: " << *CS << "\n");
+      Value *fptr = CS->getCalledOperand()->stripPointerCasts();
+      NodeIndex fptrNode = NF.getValueNodeFor(fptr);
+      if (fptrNode == AndersNodeFactory::InvalidIndex) {
+        WARNING("FuncPtr for " << *CS << " node not found!\n");
+        continue;
+      }
+      auto &ptsSet = funcPtsGraph[fptrNode];
+      auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelMAs()];
       for (auto idx : cflSet) {
-        if (!NF.isDereferenceNode(idx) && idx != i) {
-          errs() << "\t\t" << idx << " ";
-          if (NF.isSpecialNode(idx)) {
-            errs() << "(spec)\n";
-          } else {
-            errs() << "(val) ";
-            auto *v = NF.getValueForNode(idx);
-            if (v) errs() << *v << "\n";
-            else errs() << "(null)\n";
-          }
+        // CG_LOG("FuncPtr: " << *fptr << " node: " << fptrNode << " -> obj: " << idx << "\n");
+        ptsSet.insert(idx);
+        if (NF.isSpecialNode(idx)) {
+          WARNING("Indirect Call: " << *fptr << " callee is a special node: " << idx << "\n");
+          continue;
+        }
+        const Value *CV = NF.getValueForNode(idx);
+        if (CV == NULL) {
+          WARNING("No value for function node!\n");
+          continue;
+        }
+        const Function *CF = dyn_cast<Function>(CV);
+        if (CF == NULL) {
+          // WARNING("Function pointer " << *fptr << " points to non-function: " << *CV << "\n");
+          continue;
+        }
+        // due to field insensitivity, we may have FPs, do a type match
+        if (!isCompatible(CS, CF)) {
+          // WARNING("Function pointer " << *fptr << " type mismatch: " << *CF << "\n");
+          continue;
+        }
+        if (Ctx->Callees[CS].insert(CF).second) {
+          // if new callee added, we need to rerun
+          Changed = true;
+          CG_LOG("Handle indirect Call: callee: " << CF->getName() << "\n");
+          handleCall(CS, CF);
         }
       }
     }
+    iteration++;
   }
 
-  return ret;
+  return Changed;
 }
 
 // debug

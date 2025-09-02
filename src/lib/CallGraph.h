@@ -12,15 +12,18 @@ class CallGraphPass : public IterativeModulePass {
 private:
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
-  bool handleCall(llvm::CallBase*, const llvm::Function*);
+  bool handleCall(const llvm::CallBase*, const llvm::Function*);
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
-  bool findCalleesByType(llvm::CallBase*, FuncSet&);
+  bool isCompatible(const llvm::CallBase*, const llvm::Function*);
+  bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void buildEdgesFromPtsGraph(const PtsGraph &ptsGraph);
 
   AndersNodeFactory &NF;
   StructAnalyzer &SA;
   CFLEdgeBuilder &EB;
   PtsGraph funcPtsGraph;
+
+  unsigned iteration;
 
   using node_set_t = std::unordered_set<NodeIndex>;
 
@@ -40,7 +43,8 @@ public:
   CallGraphPass(GlobalContext *Ctx_)
       : IterativeModulePass(Ctx_, "CallGraph"),
         NF(Ctx->nodeFactory), SA(Ctx->structAnalyzer), EB(Ctx->edgeBuilder),
-        funcPtsGraph(Ctx->GlobalInitPtsGraph) // copy the init graph
+        funcPtsGraph(Ctx->GlobalInitPtsGraph), // copy the init graph
+        iteration(0)
         { }
   virtual bool doInitialization(llvm::Module *);
   virtual bool doFinalization(llvm::Module *);

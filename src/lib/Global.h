@@ -96,7 +96,7 @@ public:
   CallerMap Callers;
 
   // Indirect call instructions
-  std::vector<CallBase*> IndirectCallInsts;
+  CallInstSet IndirectCallInsts;
 
   // Allocation sites
   CallInstSet AllocSites;

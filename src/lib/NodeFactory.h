@@ -205,10 +205,17 @@ public:
             llvm::errs() << "offset :" << offset << "\n";
             for (int i = n; i <= n + offset; i++)
                 dumpNode(i);
+            assert(false && "Base is a non-object node!");
         }
         if (isUnionObject(n))
             return n;
-        assert(isObjectNode(n + offset));
+        if (!isObjectNode(n + offset)) {
+            llvm::errs() << "n :" << n << "\n";
+            llvm::errs() << "offset :" << offset << "\n";
+            for (int i = n; i <= n + offset; i++)
+                dumpNode(i);
+            assert(false && "Offsetting an object node goes out of bound!");
+        }
         assert((nodes.at(n).getOffset() + offset) == nodes.at(n + offset).getOffset());
         return n + offset;
     }

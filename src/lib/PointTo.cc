@@ -289,22 +289,32 @@ static NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int 
 #endif
 }
 
-static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
-                               AndersNodeFactory &nodeFactory,
-                               PtsGraph &ptsGraph) {
+// return next obj to be processed
+static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
+                                    AndersNodeFactory &nodeFactory,
+                                    PtsGraph &ptsGraph) {
 
   assert(obj != AndersNodeFactory::InvalidIndex && "Invalid node index for global object");
+  if (isa<GlobalValue>(init))
+    PT_DEBUG("Processing global value " << init->getName() << " for obj " << obj << "\n");
+  else
+    PT_DEBUG("Processing initializer " << *init << " for obj " << obj << "\n");
 
   // collapse array type
   while (const ArrayType *arrayType = dyn_cast<ArrayType>(objTy))
     objTy = arrayType->getElementType();
 
+  NodeIndex ret = obj;
   // look for global values in the initializer
   if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
+    PT_DEBUG("\tArray initializer for obj " << obj << "\n");
     // array, always collapse, process element by element
-    for (unsigned i = 0; i != CA->getNumOperands(); ++i)
-      processInitializer(obj, objTy, CA->getOperand(i), nodeFactory, ptsGraph);
+    for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
+      // always (re-)start from the base obj
+      ret = processInitializer(obj, objTy, CA->getOperand(i), nodeFactory, ptsGraph);
+    }
   } else if (ConstantStruct *CS = dyn_cast<ConstantStruct>(init)) {
+    PT_DEBUG("\tStruct initializer for obj " << obj << "\n");
     // handle struct type specially, could be tricky because of type mismatch
     // GV could be allocated using the used type (see createNodeForGlobals)
     const StructType *CSTy = CS->getType();
@@ -315,35 +325,38 @@ static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
       const StructType *STy = dyn_cast<StructType>(objTy);
       auto dataLayout = nodeFactory.getDataLayout();
       auto objSize = dataLayout->getTypeStoreSize(const_cast<Type*>(objTy));
-      for (unsigned i = 0, j = 0; i != CSTy->getNumElements(); ++i) {
+      int offset = 0;
+      for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
         // try a heuristic, as struct could be used to initialize arrays
         Type *elemTy = CSTy->getElementType(i);
         auto elemSize = dataLayout->getTypeStoreSize(elemTy);
         if ((elemSize % objSize == 0) && elemTy->isAggregateType()) {
           // element size is a multiple of object size, and is of array or struct type,
-          // use base type
+          // use base type and base obj
           PT_DEBUG("Treating element as array initializer\n");
-          processInitializer(obj, objTy, CS->getOperand(i), nodeFactory, ptsGraph);
+          ret = processInitializer(obj, objTy, CS->getOperand(i), nodeFactory, ptsGraph);
         } else {
           // we could be looking at a sub-field
           assert(STy != NULL && "Struct initializer for non-struct type");
-          NodeIndex field = nodeFactory.getOffsetObjectNode(obj, j);
+          NodeIndex field = nodeFactory.getOffsetObjectNode(obj, offset);
           assert(field != AndersNodeFactory::InvalidIndex && "Invalid node index for field");
-          processInitializer(field, STy->getElementType(j), CS->getOperand(i), nodeFactory, ptsGraph);
-          // advance to next field if not array type
-          if (!elemTy->isArrayTy()) ++j;
+          assert(STy->getElementType(i) == elemTy && "Field type mismatch");
+          ret = processInitializer(field, elemTy, CS->getOperand(i), nodeFactory, ptsGraph);
+          offset += (ret - field);
         }
       }
     } else {
       // type match, process field by field
+      int offset = 0;
       for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
         const Type* elemTy = CSTy->getElementType(i);
         // collapse array type before processing
         while (const ArrayType *arrayType = dyn_cast<ArrayType>(elemTy))
           elemTy = arrayType->getElementType();
-        NodeIndex field = nodeFactory.getOffsetObjectNode(obj, i);
+        NodeIndex field = nodeFactory.getOffsetObjectNode(obj, offset);
         assert(field != AndersNodeFactory::InvalidIndex && "Invalid node index for field");
-        processInitializer(field, elemTy, CS->getOperand(i), nodeFactory, ptsGraph);
+        ret = processInitializer(field, elemTy, CS->getOperand(i), nodeFactory, ptsGraph);
+        offset += (ret - field);
       }
     }
   } else if (ConstantVector *CV = dyn_cast<ConstantVector>(init)) {
@@ -351,18 +364,21 @@ static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
     // for (unsigned i = 0; i != CV->getNumOperands(); ++i)
     //   processInitializer(obj, objTy, CV->getOperand(i), nodeFactory, ptsGraph);
     WARNING("Unhandled vector initializer: " << *init << "\n");
+    ret += 1;
   } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
+    PT_DEBUG("\tZero initializer for obj " << obj << "\n");
     // zero initializer
     Type *Ty = CAZ->getType();
     if (isa<ArrayType>(Ty) || isa<VectorType>(Ty)) {
       // array or vector, process element only once
-      processInitializer(obj, objTy, CAZ->getSequentialElement(), nodeFactory, ptsGraph);
+      ret = processInitializer(obj, objTy, CAZ->getSequentialElement(), nodeFactory, ptsGraph);
     } else {
       StructType *CSTy = dyn_cast<StructType>(Ty);
       assert(CSTy != NULL && "Invalid zero initializer type");
       // assert(!CSTy->isLiteral() && "Zero initializer cannot be literal?");
       assert(CSTy == objTy && "Zero initializer type mismatch");
       // struct, process field by field
+      int offset = 0;
       for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
         Type *elemTy = CSTy->getElementType(i);
         Constant *elem = CAZ->getStructElement(i);
@@ -371,12 +387,21 @@ static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
           elemTy = arrayType->getElementType();
           elem = cast<ConstantAggregateZero>(elem)->getSequentialElement();
         }
-        NodeIndex field = nodeFactory.getOffsetObjectNode(obj, i);
-        processInitializer(field, elemTy, elem, nodeFactory, ptsGraph);
+        auto dataLayout = nodeFactory.getDataLayout();
+        auto elemSize = dataLayout->getTypeStoreSize(elemTy);
+        if (elemSize == 0) {
+          // if a element type has zero size, we won't create a field for it
+          PT_LOG("Zero-sized element in zero initializer: " << *elemTy << "\n");
+          continue; // without increasing offset
+        }
+        NodeIndex field = nodeFactory.getOffsetObjectNode(obj, offset);
+        ret = processInitializer(field, elemTy, elem, nodeFactory, ptsGraph);
+        offset += (ret - field);
       }
     }
   } else {
     // non-aggregate initializer
+    ret += 1;
     if (!objTy->isSingleValueType()) {
       // objTy is not single value type, but array of 1 element is fine too
       const ArrayType *ATy = dyn_cast<ArrayType>(objTy);
@@ -408,15 +433,18 @@ static void processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
           processInitializer(obj, objTy, CE->getOperand(0), nodeFactory, ptsGraph);
           break;
         }
-        // case Instruction::IntToPtr: {
-        //   // IntToPtr, do nothing
-        //   break;
-        // }
+        case Instruction::IntToPtr: {
+          // IntToPtr, do nothing
+          ptsGraph[obj].insert(nodeFactory.getConstantIntNode());
+          break;
+        }
         default:
           WARNING("Unhandled constant expression initializer: " << *init << "\n");
       }
     }
   }
+
+  return ret;
 }
 
 void populateNodeFactory(GlobalContext &GlobalCtx) {
@@ -515,7 +543,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
       if (GV.hasInitializer()) {
         NodeIndex obj = nodeFactory.getObjectNodeFor(&GV);
         const Type *Ty = nodeFactory.getObjectType(obj);
-        PT_DEBUG("Processing initializer for global " << GV.getName() << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
+        PT_DEBUG("Processing initializer for global " << GV.getName() << ", id " << obj << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
         processInitializer(obj, Ty, GV.getInitializer(), nodeFactory, ptsGraph);
       }
     }

@@ -289,22 +289,49 @@ static NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int 
 #endif
 }
 
+static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
+                                    AndersNodeFactory &nodeFactory,
+                                    PtsGraph &ptsGraph, bool nestedUnion);
+
 static bool isUnionStruct(const Type* ty) {
   if (const StructType* st = dyn_cast<StructType>(ty)) {
     if (!st->isLiteral() && LLVM_STRING_STARTS_WITH(st->getStructName(), "union"))
       return true;
-    else if (st->getNumElements() == 1) {
-      // if it's a single field struct, also check if the only field is an union
-      return isUnionStruct(st->getElementType(0));
-    }
   }
   return false;
+}
+
+static inline void processStructElement(NodeIndex &obj, NodeIndex &nextField,
+                                        unsigned &offset, unsigned index,
+                                        Type *elemTy, Constant *init,
+                                        AndersNodeFactory &nodeFactory,
+                                        PtsGraph &ptsGraph, bool inUnion)
+{
+  PT_DEBUG("\t\tobj " << obj << " field " << index << ", offset " << offset << " init = " << *init << "\n");
+  // collapse array type before processing
+  while (ArrayType *arrayType = dyn_cast<ArrayType>(elemTy))
+    elemTy = arrayType->getElementType();
+  auto dataLayout = nodeFactory.getDataLayout();
+  auto elemSize = dataLayout->getTypeStoreSize(elemTy);
+  if (elemSize == 0) {
+    // if a element type has zero size, we won't create a field for it
+    PT_LOG("Zero-sized element in initializer: " << *elemTy << "\n");
+    return; // without increasing offset and next field
+  }
+  NodeIndex field = obj;
+  if (!inUnion) {
+    field = obj + offset;
+    assert(nodeFactory.getObjectOffset(field) == nodeFactory.getObjectOffset(obj) + offset && "Object offset mismatch");
+  }
+  bool isUnion = isUnionStruct(elemTy);
+  nextField = processInitializer(field, elemTy, init, nodeFactory, ptsGraph, isUnion | inUnion);
+  offset += (nextField - field);
 }
 
 // return next obj to be processed
 static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
                                     AndersNodeFactory &nodeFactory,
-                                    PtsGraph &ptsGraph, bool nestedUnion) {
+                                    PtsGraph &ptsGraph, bool inUnion) {
 
   assert(obj != AndersNodeFactory::InvalidIndex && "Invalid node index for global object");
   if (isa<GlobalValue>(init))
@@ -316,14 +343,14 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
   while (const ArrayType *arrayType = dyn_cast<ArrayType>(objTy))
     objTy = arrayType->getElementType();
 
-  NodeIndex ret = obj;
+  NodeIndex next = obj;
   // look for global values in the initializer
   if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
     PT_DEBUG("\tArray initializer for obj " << obj << "\n");
     // array, always collapse, process element by element
     for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
       // always (re-)start from the base obj
-      ret = processInitializer(obj, objTy, CA->getOperand(i), nodeFactory, ptsGraph, nestedUnion);
+      next = processInitializer(obj, objTy, CA->getOperand(i), nodeFactory, ptsGraph, inUnion);
     }
   } else if (ConstantStruct *CS = dyn_cast<ConstantStruct>(init)) {
     PT_DEBUG("\tStruct initializer for obj " << obj << "\n");
@@ -337,8 +364,7 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
       const StructType *STy = dyn_cast<StructType>(objTy);
       auto dataLayout = nodeFactory.getDataLayout();
       auto objSize = dataLayout->getTypeStoreSize(const_cast<Type*>(objTy));
-      int offset = 0;
-      for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
+      for (unsigned i = 0, offset = 0; i != CSTy->getNumElements(); ++i) {
         // try a heuristic, as struct could be used to initialize arrays
         Type *elemTy = CSTy->getElementType(i);
         auto elemSize = dataLayout->getTypeStoreSize(elemTy);
@@ -346,98 +372,52 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
           // element size is a multiple of object size, and is of array or struct type,
           // use base type and base obj
           PT_DEBUG("Treating element as array initializer\n");
-          ret = processInitializer(obj, objTy, CS->getOperand(i), nodeFactory, ptsGraph, nestedUnion);
+          next = processInitializer(obj, objTy, CS->getOperand(i), nodeFactory, ptsGraph, inUnion);
         } else {
           // we could be looking at a sub-field
           assert(STy != NULL && "Struct initializer for non-struct type");
-          NodeIndex field = nodeFactory.getOffsetObjectNode(obj, offset);
-          assert(field != AndersNodeFactory::InvalidIndex && "Invalid node index for field");
-          assert(STy->getElementType(i) == elemTy && "Field type mismatch");
-          ret = processInitializer(field, elemTy, CS->getOperand(i), nodeFactory, ptsGraph, nestedUnion);
-          offset += (ret - field);
+          // assert(STy->getElementType(i) == elemTy && "Field type mismatch");
+          processStructElement(obj, next, offset, i, elemTy,
+                               CS->getOperand(i), nodeFactory, ptsGraph, inUnion);
         }
       }
     } else {
       // type match, process field by field
-      int offset = 0;
       PT_DEBUG("\tStruct initializer with " << CSTy->getNumElements() << " elements\n");
-      for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
-        // PT_DEBUG("\t\tfield " << i << ", offset " << offset << " init = " << *CS->getOperand(i) << "\n");
-        const Type* elemTy = CSTy->getElementType(i);
-        // collapse array type before processing
-        while (const ArrayType *arrayType = dyn_cast<ArrayType>(elemTy))
-          elemTy = arrayType->getElementType();
-        NodeIndex field = nodeFactory.getOffsetObjectNode(obj, offset);
-        assert(field != AndersNodeFactory::InvalidIndex && "Invalid node index for field");
-        bool isUnion = isUnionStruct(elemTy);
-        ret = processInitializer(field, elemTy, CS->getOperand(i), nodeFactory, ptsGraph, isUnion | nestedUnion);
-        // XXX: special handling for advancing union
-        if (i == 0 && nodeFactory.isUnionObject(obj) && isUnion && !nestedUnion) {
-          // based on field, we cannot distinguish whether the first field is an union or
-          // the whole struct is an union, so we need to check, but only if we're not under nested union
-          PT_DEBUG("\t\tFirst field is an union, advancing the base obj instead of offset\n");
-          obj += 1; // union is treated as 1 field
-          assert(offset == 0 && "If the first field is an union, offset must be 0");
-          continue;
-        }
-        offset += (ret - field);
+      for (unsigned i = 0, offset = 0; i != CSTy->getNumElements(); ++i) {
+        processStructElement(obj, next, offset, i, CSTy->getElementType(i),
+                             CS->getOperand(i), nodeFactory, ptsGraph, inUnion);
       }
     }
   } else if (ConstantVector *CV = dyn_cast<ConstantVector>(init)) {
     // FIXME: handle vector type
     // for (unsigned i = 0; i != CV->getNumOperands(); ++i)
-    //   processInitializer(obj, objTy, CV->getOperand(i), nodeFactory, ptsGraph, nestedUnion);
+    //   processInitializer(obj, objTy, CV->getOperand(i), nodeFactory, ptsGraph, inUnion);
     WARNING("Unhandled vector initializer: " << *init << "\n");
-    ret += 1;
+    next += 1;
   } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
     PT_DEBUG("\tZero initializer for obj " << obj << "\n");
     // zero initializer
     Type *Ty = CAZ->getType();
     if (isa<ArrayType>(Ty) || isa<VectorType>(Ty)) {
       // array or vector, process element only once
-      ret = processInitializer(obj, objTy, CAZ->getSequentialElement(), nodeFactory, ptsGraph, nestedUnion);
+      next = processInitializer(obj, objTy, CAZ->getSequentialElement(), nodeFactory, ptsGraph, inUnion);
     } else {
       StructType *CSTy = dyn_cast<StructType>(Ty);
       assert(CSTy != NULL && "Invalid zero initializer type");
       // assert(!CSTy->isLiteral() && "Zero initializer cannot be literal?");
       assert(CSTy == objTy && "Zero initializer type mismatch");
       // struct, process field by field
-      int offset = 0;
       PT_DEBUG("\tZero struct initializer with " << CSTy->getNumElements() << " elements\n");
-      for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
+      for (unsigned i = 0, offset = 0; i != CSTy->getNumElements(); ++i) {
         Type *elemTy = CSTy->getElementType(i);
         Constant *elem = CAZ->getStructElement(i);
-        // PT_DEBUG("\t\tfield " << i << ", offset " << offset << " init = " << *elem << "\n");
-        // collapse array type before processing
-        while (const ArrayType *arrayType = dyn_cast<ArrayType>(elemTy)) {
-          elemTy = arrayType->getElementType();
-          elem = cast<ConstantAggregateZero>(elem)->getSequentialElement();
-        }
-        auto dataLayout = nodeFactory.getDataLayout();
-        auto elemSize = dataLayout->getTypeStoreSize(elemTy);
-        if (elemSize == 0) {
-          // if a element type has zero size, we won't create a field for it
-          PT_LOG("Zero-sized element in zero initializer: " << *elemTy << "\n");
-          continue; // without increasing offset
-        }
-        NodeIndex field = nodeFactory.getOffsetObjectNode(obj, offset);
-        bool isUnion = isUnionStruct(elemTy);
-        ret = processInitializer(field, elemTy, elem, nodeFactory, ptsGraph, isUnion | nestedUnion);
-        // XXX: special handling for advancing union
-        if (i == 0 && nodeFactory.isUnionObject(obj) && isUnion && !nestedUnion) {
-          // based on field, we cannot distinguish whether the first field is an union or
-          // the whole struct is an union, so we need to check, but only if we're not under nested union
-          PT_DEBUG("\t\tFirst field is an union, advancing the base obj instead of offset\n");
-          obj += 1; // union is treated as 1 field
-          assert(offset == 0 && "If the first field is an union, offset must be 0");
-          continue;
-        }
-        offset += (ret - field);
+        processStructElement(obj, next, offset, i, elemTy, elem, nodeFactory, ptsGraph, inUnion);
       }
     }
   } else {
     // non-aggregate initializer
-    ret += 1;
+    next += 1;
     if (!objTy->isSingleValueType()) {
       // objTy is not single value type, but array of 1 element is fine too
       const ArrayType *ATy = dyn_cast<ArrayType>(objTy);
@@ -466,7 +446,7 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
         }
         case Instruction::BitCast: {
           // BitCast, process the operand
-          processInitializer(obj, objTy, CE->getOperand(0), nodeFactory, ptsGraph, nestedUnion);
+          processInitializer(obj, objTy, CE->getOperand(0), nodeFactory, ptsGraph, inUnion);
           break;
         }
         case Instruction::IntToPtr: {
@@ -480,7 +460,7 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
     }
   }
 
-  return ret;
+  return next;
 }
 
 void populateNodeFactory(GlobalContext &GlobalCtx) {
@@ -571,6 +551,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
   // iterate again to process global initializers
   // collecting point2 information for global values
   for (auto i = GlobalCtx.Modules.begin(), e = GlobalCtx.Modules.end(); i != e; ++i) {
+    PT_LOG("#### Processing initializers for module " << i->first->getModuleIdentifier() << "\n");
     Module *M = i->first;
     nodeFactory.setDataLayout(&(M->getDataLayout()));
     nodeFactory.setModule(M);
@@ -580,7 +561,12 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
         NodeIndex obj = nodeFactory.getObjectNodeFor(&GV);
         const Type *Ty = nodeFactory.getObjectType(obj);
         PT_DEBUG("Processing initializer for global " << GV.getName() << ", id " << obj << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
-        processInitializer(obj, Ty, GV.getInitializer(), nodeFactory, ptsGraph, false);
+        // if (auto *STy = dyn_cast<StructType>(Ty)) {
+        //   const StructInfo *stInfo = structAnalyzer.getStructInfo(STy, M);
+        //   PT_DEBUG("stInfo size = " << stInfo->getExpandedSize() << ", alloc size = " << stInfo->getAllocSize() << "\n");
+        //   structAnalyzer.printStructInfo(*stInfo);
+        // }
+        processInitializer(obj, Ty, GV.getInitializer(), nodeFactory, ptsGraph, isUnionStruct(Ty));
       }
     }
   }

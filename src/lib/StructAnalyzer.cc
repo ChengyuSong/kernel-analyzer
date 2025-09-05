@@ -4,7 +4,7 @@
  * Copyright (C) 2015 Jia Chen
  * Copyright (C) 2015 - 2019 Chengyu Song
  * Copyright (C) 2018 - 2021 Yizhuo Zhai
- * Copyright (C) 2024 Chengyu Song
+ * Copyright (C) 2024 - 2025 Chengyu Song
  *
  * For licensing details see LICENSE
  */
@@ -250,21 +250,35 @@ void StructAnalyzer::printStructInfo() const
   for (auto const& mapping: structInfoMap) {
     errs() << "Struct " << mapping.first << ": sz < ";
     const StructInfo& info = mapping.second;
-    for (auto sz: info.fieldSize)
-      errs() << sz << " ";
-    errs() << ">, offset < ";
-    for (auto off: info.offsetMap)
-      errs() << off << " ";
-    errs() << ">, fieldOffset <";
-    for (auto off: info.fieldOffset)
-      errs() << off << " ";
-    errs() << ">, arrayFlag <";
-    for (auto af: info.arrayFlags)
-      errs() << af << " ";
-    errs() <<">, unionFlag <";
-    for (auto uf: info.unionFlags)
-      errs() << uf << " ";
-    errs() << ">\n";
+    printStructInfo(info);
   }
   errs() << "----------End of print------------\n";
+}
+
+void StructAnalyzer::printStructInfo(const StructInfo &info) const
+{
+  if (info.stType) {
+    if (info.stType->isLiteral())
+      errs() << "<literal>";
+    else
+      errs() << "Struct " << info.stType->getName();
+  }
+  errs() << ": sz < " << info.getExpandedSize()
+         << ", allocSize " << info.getAllocSize()
+         << ">, fieldSize < ";
+  for (auto sz: info.fieldSize)
+    errs() << sz << " ";
+  errs() << ">, offsetMap < ";
+  for (auto off: info.offsetMap)
+    errs() << off << " ";
+  errs() << ">, fieldOffset <";
+  for (auto off: info.fieldOffset)
+    errs() << off << " ";
+  errs() << ">, arrayFlag <";
+  for (auto af: info.arrayFlags)
+    errs() << af << " ";
+  errs() <<">, unionFlag <";
+  for (auto uf: info.unionFlags)
+    errs() << uf << " ";
+  errs() << ">\n";
 }

@@ -16,7 +16,7 @@
 class StructInfo
 {
 private:
-	std::vector<bool> arrayFlags;  // true if field is an array
+	std::vector<bool> arrayFlags; // true if field is an array
 	std::vector<bool> pointerFlags; // true if field is a pointer
 	std::vector<bool> unionFlags; // true if field is a union
 	std::vector<unsigned> fieldSize;
@@ -98,7 +98,7 @@ private:
 		if (numField == 0)
 			fieldSize.resize(1);
 		fieldSize[0] = numField;
-		if (stType->isSized()) 
+		if (stType->isSized())
 			allocSize = dataLayout->getTypeAllocSize(const_cast<llvm::StructType*>(stType));
 		else
 			allocSize = 0;
@@ -189,6 +189,7 @@ public:
 	void run(llvm::Module* M, const llvm::DataLayout* layout);
 
 	void printStructInfo() const;
+	void printStructInfo(const StructInfo &info) const;
 };
 
 #endif

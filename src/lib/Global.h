@@ -89,6 +89,9 @@ public:
   // functions whose addresses are taken
   FuncSet AddressTakenFuncs;
 
+  // allocation functions
+  FuncSet AllocFuncs;
+
   // Map a callsite to all potential callee functions.
   CalleeMap Callees;
 

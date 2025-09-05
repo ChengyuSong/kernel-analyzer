@@ -553,8 +553,12 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
         continue;
     
       int size, flag;
-      if (isAllocFn(F.getName(), &size, &flag))
+      if (isAllocFn(F.getName(), &size, &flag)) {
+        // skip allocator functions
+        PT_LOG("Skipping allocator function " << F.getName() << "\n");
+        GlobalCtx.AllocFuncs.insert(&F);
         continue;
+      }
     
       // Scan the function body
       for (auto itr = inst_begin(&F), ite = inst_end(&F); itr != ite; ++itr) {

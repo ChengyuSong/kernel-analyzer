@@ -289,7 +289,7 @@ static NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int 
 #endif
 }
 
-static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
+static NodeIndex processInitializer(NodeIndex obj, Type *objTy, Constant *init,
                                     AndersNodeFactory &nodeFactory,
                                     PtsGraph &ptsGraph, bool nestedUnion);
 
@@ -329,7 +329,7 @@ static inline void processStructElement(NodeIndex &obj, NodeIndex &nextField,
 }
 
 // return next obj to be processed
-static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *init,
+static NodeIndex processInitializer(NodeIndex obj, Type *objTy, Constant *init,
                                     AndersNodeFactory &nodeFactory,
                                     PtsGraph &ptsGraph, bool inUnion) {
 
@@ -356,15 +356,16 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
     PT_DEBUG("\tStruct initializer for obj " << obj << "\n");
     // handle struct type specially, could be tricky because of type mismatch
     // GV could be allocated using the used type (see createNodeForGlobals)
-    const StructType *CSTy = CS->getType();
+    StructType *CSTy = CS->getType();
     if (CSTy != objTy) {
       // type mismatch
       PT_LOG("Initializer type mismatch for " << *CSTy << " vs " << *objTy << "\n");
-      assert(CSTy->isLiteral() && "Non-literal struct type mismatch");
-      const StructType *STy = dyn_cast<StructType>(objTy);
-      auto dataLayout = nodeFactory.getDataLayout();
-      auto objSize = dataLayout->getTypeStoreSize(const_cast<Type*>(objTy));
-      for (unsigned i = 0, offset = 0; i != CSTy->getNumElements(); ++i) {
+      // assert(CSTy->isLiteral() && "Non-literal struct type mismatch");
+      StructType *STy = dyn_cast<StructType>(objTy);
+      auto *dataLayout = nodeFactory.getDataLayout();
+      auto objSize = dataLayout->getTypeStoreSize(objTy);
+      auto initSize = dataLayout->getTypeStoreSize(CSTy);
+      for (unsigned i = 0, j = 0, offset = 0; i != CSTy->getNumElements();) {
         // try a heuristic, as struct could be used to initialize arrays
         Type *elemTy = CSTy->getElementType(i);
         auto elemSize = dataLayout->getTypeStoreSize(elemTy);
@@ -376,10 +377,60 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
         } else {
           // we could be looking at a sub-field
           assert(STy != NULL && "Struct initializer for non-struct type");
-          // assert(STy->getElementType(i) == elemTy && "Field type mismatch");
-          processStructElement(obj, next, offset, i, elemTy,
+          Type *fieldTy = STy->getElementType(j);
+          if (dataLayout->getTypeStoreSize(fieldTy) != elemSize) {
+            PT_LOG("Struct field size mismatch: field " << j
+                   << " of struct " << *fieldTy
+                   << " size = " << dataLayout->getTypeStoreSize(fieldTy)
+                   << " vs field " << i << " of struct " << *elemTy
+                   << " size = " << elemSize << "\n");
+            // check for padding
+            auto *stLayout = dataLayout->getStructLayout(STy);
+            auto *csLayout = dataLayout->getStructLayout(CSTy);
+            if (stLayout->getElementOffset(j) > csLayout->getElementOffset(i)) {
+              bool padding = false;
+              for (unsigned k = i + 1; k != CSTy->getNumElements(); ++k) {
+                if (stLayout->getElementOffset(j) == csLayout->getElementOffset(k)) {
+                  PT_LOG("Skip padding field " << i << "\n");
+                  padding = true;
+                  i = k; // advancing to field k
+                  continue;
+                }
+              }
+              if (padding) continue; // next field
+            }
+            // if not padding, check if size as a whole matches
+            if (objSize == initSize && fieldTy->isIntegerTy() && elemTy->isIntegerTy()) {
+              // both are integer types, and of the same size, treat as compatible
+              PT_LOG("Try converting constant integers\n");
+              assert(i == 0 && j == 0 && offset == 0 && "Not at the beginning of struct?");
+              uint64_t val = 0;
+              bool allInt = true;
+              for (unsigned k = 0; k != CSTy->getNumElements(); ++k) {
+                ConstantInt *CI = dyn_cast<ConstantInt>(CS->getOperand(k));
+                if (!CI) {
+                  allInt = false;
+                  PT_LOG("\tfield " << k << " is not constant integer: " << *CS->getOperand(k) << "\n");
+                  break;
+                }
+                if (dataLayout->isBigEndian())
+                  val = (val << dataLayout->getTypeStoreSize(CSTy->getElementType(k)) * 8) | CI->getZExtValue();
+                else
+                  val |= (CI->getZExtValue() << (dataLayout->getTypeStoreSize(CSTy->getElementType(k)) * 8 * k));
+              }
+              if (allInt) {
+                Constant *newInit = ConstantInt::get(fieldTy, val);
+                PT_DEBUG("\tConverting to constant integer: " << *newInit << "\n");
+                return processInitializer(obj, fieldTy, newInit, nodeFactory, ptsGraph, inUnion);
+              }
+            }
+            WARNING("Not padding, skip remaining fields\n");
+            return next;
+          }
+          processStructElement(obj, next, offset, j, fieldTy,
                                CS->getOperand(i), nodeFactory, ptsGraph, inUnion);
         }
+        ++i; ++j;
       }
     } else {
       // type match, process field by field
@@ -406,7 +457,9 @@ static NodeIndex processInitializer(NodeIndex obj, const Type *objTy, Constant *
       StructType *CSTy = dyn_cast<StructType>(Ty);
       assert(CSTy != NULL && "Invalid zero initializer type");
       // assert(!CSTy->isLiteral() && "Zero initializer cannot be literal?");
-      assert(CSTy == objTy && "Zero initializer type mismatch");
+      if (CSTy != objTy) {
+        PT_LOG("Zero initializer type mismatch: " << *CSTy << " vs " << *objTy << "\n");
+      }
       // struct, process field by field
       PT_DEBUG("\tZero struct initializer with " << CSTy->getNumElements() << " elements\n");
       for (unsigned i = 0, offset = 0; i != CSTy->getNumElements(); ++i) {
@@ -559,7 +612,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
     for (auto &GV: M->globals()) {
       if (GV.hasInitializer()) {
         NodeIndex obj = nodeFactory.getObjectNodeFor(&GV);
-        const Type *Ty = nodeFactory.getObjectType(obj);
+        Type *Ty = const_cast<Type*>(nodeFactory.getObjectType(obj));
         PT_DEBUG("Processing initializer for global " << GV.getName() << ", id " << obj << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
         // if (auto *STy = dyn_cast<StructType>(Ty)) {
         //   const StructInfo *stInfo = structAnalyzer.getStructInfo(STy, M);

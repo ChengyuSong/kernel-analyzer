@@ -133,7 +133,7 @@ void doBasicInitialization(Module *M) {
   // collect global object definitions
   for (GlobalVariable &GV : M->globals()) {
     auto GVID = GV.getGUID();
-    if (GV.hasExternalLinkage()) {
+    if (GV.hasExternalLinkage() || GV.hasExternalWeakLinkage()) {
       if (!GV.isDeclaration()) {
         assert(GV.hasInitializer());
         if (GlobalCtx.Gobjs.count(GVID) != 0) {

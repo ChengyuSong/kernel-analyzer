@@ -55,6 +55,10 @@ void CFLEdgeBuilder::addAssignmentEdges(NodeIndex src, NodeIndex dst) {
     throw std::runtime_error("Labels not initialized - call initializeGrammar first");
   }
 
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for assignment edge");
+  }
+
   // Add assignment edge: src -> dst with label 'a'
   edges.emplace_back(src, dst, labelAssign);
 
@@ -65,6 +69,10 @@ void CFLEdgeBuilder::addAssignmentEdges(NodeIndex src, NodeIndex dst) {
 void CFLEdgeBuilder::addDereferenceEdges(NodeIndex src, NodeIndex dst) {
   if (!labelsInitialized) {
     throw std::runtime_error("Labels not initialized - call initializeGrammar first");
+  }
+
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for dereference edge");
   }
 
   // Add dereference edge: src -> dst with label 'd'

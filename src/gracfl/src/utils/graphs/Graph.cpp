@@ -53,8 +53,8 @@ namespace gracfl {
 
             edges_.push_back(edge);
             numNodes_ = std::max(numNodes_, std::max(edge.from + 1, edge.to + 1));
-            numEdges_++;
         }
+        numEdges_ = edges_.size();
     }
 
     ull Graph::countEdgeHelper(std::vector<std::vector<std::unordered_set<ull>>>& hashset)

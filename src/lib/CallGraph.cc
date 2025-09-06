@@ -143,8 +143,10 @@ bool CallGraphPass::isCompatibleType(Type *T1, Type *T2) {
 bool CallGraphPass::isCompatible(const CallBase *CS, const Function *F) {
   // just compare known args
   if (F->getFunctionType()->isVarArg()) {
-    //errs() << "VarArg: " << F->getName() << "\n";
+    errs() << "VarArg: " << F->getName() << "\n";
     //report_fatal_error("VarArg address taken function\n");
+    // FIXME: handle vararg function
+    return false;
   } else if (F->arg_size() != CS->arg_size()) {
     //errs() << "ArgNum mismatch: " << F.getName() << "\n";
     return false;
@@ -164,6 +166,7 @@ bool CallGraphPass::isCompatible(const CallBase *CS, const Function *F) {
        FI != FE; ++FI, ++AI) {
     // check type mis-match
     Type *FormalTy = FI->getType();
+    assert(AI != CS->arg_end() && "Argument number mismatch!");
     Type *ActualTy = (*AI)->getType();
 
     if (isCompatibleType(FormalTy, ActualTy))
@@ -348,7 +351,9 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
 void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
   // flow insensitive, create derference node for all following loads/stores
   NodeIndex derefNode = CGP.NF.createDereferenceNode(&I);
-  CGP.EB.addDereferenceEdges(CGP.NF.getValueNodeFor(&I), derefNode);
+  NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
+  CGP.EB.addDereferenceEdges(ptrNode, derefNode);
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
@@ -387,7 +392,9 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   Value *ptr = GEP.getPointerOperand();
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP ptr node");
   NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
 
 #ifndef FILED_SENSITIVE
   CGP.EB.addAssignmentEdges(ptrNode, valNode);
@@ -583,9 +590,9 @@ bool CallGraphPass::doInitialization(Module *M) {
   for (auto &GV : M->globals()) {
     if (Ctx->ExtGobjs.find(GV.getGUID()) != Ctx->ExtGobjs.end())
       continue;
-    auto init = GV.getInitializer();
-    if (!init)
+    if (!GV.hasInitializer())
       continue;
+    auto init = GV.getInitializer();
     Type *Ty = init->getType();
     // collapse array type
     while (ArrayType *AT = dyn_cast<ArrayType>(Ty))
@@ -637,6 +644,9 @@ bool CallGraphPass::doFinalization(Module *M) {
 
   // update callee mapping
   for (Function &F : *M) {
+    if (F.isDeclaration() || F.isIntrinsic() || F.empty() || Ctx->AllocFuncs.count(&F))
+      continue;
+
     for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
       // map callsite to possible callees
       if (CallInst *CI = dyn_cast<CallInst>(&*i)) {
@@ -710,7 +720,7 @@ bool CallGraphPass::doModulePass(Module *M) {
   // process functions, only the first iteration
   if (iteration == 0) {
     for (Function &F : *M) {
-      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty() || Ctx->AllocFuncs.count(&F))
         continue;
       runOnFunction(&F);
     }

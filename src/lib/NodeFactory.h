@@ -123,7 +123,7 @@ private:
     boost::unordered_flat_map<const llvm::Function*, NodeIndex> varargMap;
 
     // derefMap - This map caches the deref-relations across value nodes.
-    boost::unordered_flat_map<const llvm::Value*, NodeIndex> derefMap;
+    boost::unordered_flat_map<const NodeIndex, NodeIndex> derefMap;
 
     // gepMap - This map maintains the gep-relations across value nodes.
     // The mappings are of the form <base-ptr, offset> -> gep-ptr,
@@ -157,7 +157,7 @@ public:
         const bool heap = false);
     NodeIndex createReturnNode(const llvm::Function* f);
     NodeIndex createVarargNode(const llvm::Function* f);
-    NodeIndex createDereferenceNode(const llvm::Value* ptr);
+    NodeIndex createDereferenceNode(const NodeIndex ptr);
 
     // Map lookup interfaces (return NULL if value not found)
     NodeIndex getValueNodeFor(const llvm::Value* val);
@@ -166,7 +166,7 @@ public:
     NodeIndex getObjectNodeForConstant(const llvm::Constant* c);
     NodeIndex getReturnNodeFor(const llvm::Function* f);
     NodeIndex getVarargNodeFor(const llvm::Function* f);
-    NodeIndex getDereferenceNodeFor(const llvm::Value* ptr);
+    NodeIndex getDereferenceNodeFor(const NodeIndex ptr);
 
     // Node merge interfaces
     void mergeNode(NodeIndex n0, NodeIndex n1);	// Merge n1 into n0
@@ -253,8 +253,16 @@ public:
         const AndersNode& n = nodes.at(i);
         if (n.getValue() != nullptr)
             return n.getValue();
-        else
+        else if (n.type == AndersNode::OBJ_NODE)
             return nodes.at(i - n.getOffset()).getValue();
+        else if (n.type == AndersNode::DEREF_NODE) {
+            auto itr = derefMap.find(i);
+            if (itr != derefMap.end()) {
+                NodeIndex ptrNode = itr->second;
+                return getValueForNode(ptrNode);
+            }
+        }
+        return nullptr;
     }
 
     // Value remover

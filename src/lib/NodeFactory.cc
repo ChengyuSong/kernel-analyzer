@@ -112,10 +112,10 @@ NodeIndex AndersNodeFactory::createVarargNode(const llvm::Function* f) {
     return nextIdx;
 }
 
-NodeIndex AndersNodeFactory::createDereferenceNode(const llvm::Value* ptr) {
+NodeIndex AndersNodeFactory::createDereferenceNode(const NodeIndex ptr) {
     unsigned nextIdx = nodes.size();
-    nodes.emplace_back(AndersNode(AndersNode::DEREF_NODE, nextIdx, ptr));
-    if (ptr != nullptr) {
+    nodes.emplace_back(AndersNode(AndersNode::DEREF_NODE, nextIdx));
+    if (ptr != InvalidIndex) {
         if (derefMap.count(ptr))
             return derefMap[ptr];
         derefMap[ptr] = nextIdx;
@@ -322,7 +322,7 @@ NodeIndex AndersNodeFactory::getVarargNodeFor(const llvm::Function* f) {
         return itr->second;
 }
 
-NodeIndex AndersNodeFactory::getDereferenceNodeFor(const llvm::Value* ptr) {
+NodeIndex AndersNodeFactory::getDereferenceNodeFor(const NodeIndex ptr) {
     auto itr = derefMap.find(ptr);
     if (itr == derefMap.end())
         return InvalidIndex;

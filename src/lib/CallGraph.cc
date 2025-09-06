@@ -30,6 +30,8 @@
 
 #include "gracfl/include/solvers/Solver.hpp"
 
+#define FILED_SENSITIVE 1
+
 #define CG_LOG(stmt) KA_LOG(2, "CallGraph: " << stmt)
 #define CG_DEBUG(stmt) KA_LOG(3, "CallGraph: " << stmt)
 
@@ -194,24 +196,29 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   Value *dst = CS->getArgOperand(0);
   Value *src = CS->getArgOperand(1);
   CG_LOG("Memcpy: " << *dst << " = " << *src << "\n");
-  // field insensitive
   NodeIndex dstNode = NF.getValueNodeFor(dst);
   NodeIndex srcNode = NF.getValueNodeFor(src);
   assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
   assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
-  NodeIndex derefDst = NF.getDereferenceNodeFor(dst);
+#ifndef FIELD_SENSITIVE
+  // field insensitive: *dst = *src
+  NodeIndex derefDst = NF.getDereferenceNodeFor(dstNode);
   if (derefDst == AndersNodeFactory::InvalidIndex) {
+    derefDst = NF.createDereferenceNode(dstNode);
     CG_DEBUG("Create deref node " << derefDst << " for " << *dst << "\n");
-    derefDst = NF.createDereferenceNode(dst);
     EB.addDereferenceEdges(dstNode, derefDst);
   }
-  NodeIndex derefSrc = NF.getDereferenceNodeFor(src);
+  NodeIndex derefSrc = NF.getDereferenceNodeFor(srcNode);
   if (derefSrc == AndersNodeFactory::InvalidIndex) {
+    derefSrc = NF.createDereferenceNode(srcNode);
     CG_DEBUG("Create deref node " << derefSrc << " for " << *src << "\n");
-    derefSrc = NF.createDereferenceNode(src);
     EB.addDereferenceEdges(srcNode, derefSrc);
   }
   EB.addAssignmentEdges(derefSrc, derefDst);
+#else
+  //TODO: copy field by field
+  WARNING("Field sensitive memcpy not implemented yet\n");
+#endif
 
   return false;
 }
@@ -273,17 +280,85 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   return false;
 }
 
-static inline Type *getElementTy(Type *T) {
+static inline const Type *getElementTy(const Type *T) {
   while (T) {
-    if (ArrayType *AT = dyn_cast<ArrayType>(T))
+    if (const ArrayType *AT = dyn_cast<ArrayType>(T))
       T = AT->getElementType();
-    else if (VectorType *VT = dyn_cast<VectorType>(T))
+    else if (const VectorType *VT = dyn_cast<VectorType>(T))
       T = VT->getElementType();
     else
       break;
   }
 
   return T;
+}
+
+bool CallGraphPass::handleGEP(const GetElementPtrInst *GEP, AndersPtsSet &ptr2set, Module *M) {
+  const Type *ptrTy = getElementTy(GEP->getSourceElementType());
+  NodeIndex valNode = NF.getValueNodeFor(GEP);
+  assert(valNode != AndersNodeFactory::InvalidIndex && "GEP value node not found!");
+  // iterate through the point2 set of the source ptr
+  for (auto idx = ptr2set.find_first(), end = ptr2set.getSize();
+       idx < end; idx = ptr2set.find_next(idx)) {
+
+    CG_LOG("GEP source obj " << idx << ", end = " << end << "\n");
+    if (NF.isSpecialNode(idx)) {
+      // special object, e.g., null or univeral
+      EB.addAssignmentEdges(valNode, idx);
+      continue;
+    }
+
+    // check if we need to resize the obj of the ptr
+    // get allocated size
+    unsigned allocSize = NF.getObjectSize(idx);
+    if (const StructType *STy = dyn_cast<StructType>(ptrTy)) {
+      const StructInfo* stInfo = SA.getStructInfo(STy, M);
+      assert(stInfo != NULL && "Struct info not found!");
+      unsigned ptrSize = stInfo->getExpandedSize();
+      if (ptrSize > allocSize) {
+        if (NF.isOpaqueObject(idx)) {
+          // we don't know the allocation size for opaque objects
+          CG_LOG("GEP resize obj: " << idx << " to type " << STy->getName() << "\n");
+          assert(NF.isHeapObject(idx) && "GEP: non-heap obj needs to be resized!");
+          // resize the obj
+          idx = extendObjectSize(idx, STy, NF, SA, funcPtsGraph);
+        } else {
+          // XXX: this is likely due to passing data as void*
+          // lacking context sensitivity, we cannot distinguish them
+          // so remove them from the resulting point2 set
+          WARNING("GEP non-opaque obj size mismatch: " << idx << " vs type " << STy->getName() << "\n");
+          continue;
+        }
+      }
+    }
+
+    // get the field number
+    const DataLayout* DL = &(M->getDataLayout());
+    unsigned fieldNum = 0;
+    int64_t offset = getGEPOffset(GEP, DL);
+    if (offset < 0) {
+      // FIXME: handle negative offset, like container_of
+      WARNING("GEP: " << GEP << " negative offset: " << offset << "\n");
+      break;
+    } else {
+      fieldNum = offsetToFieldNum(GEP->getSourceElementType(), offset, DL, SA, M);
+    }
+    CG_LOG("GEP fieldNum: " << fieldNum << "\n");
+
+    NodeIndex nidx = idx + fieldNum;
+    // XXX: corner cases, e.g., struct with varaiable size array
+    if ((NF.getObjectOffset(idx) + fieldNum) > allocSize) {
+      WARNING("GEP: field number " << nidx << " out of bound (" << allocSize << ")!");
+      nidx = allocSize - 1;
+    }
+
+    // propagate the ptr info
+    NodeIndex deref = NF.createDereferenceNode(nidx);
+    EB.addDereferenceEdges(nidx, deref);
+    EB.addAssignmentEdges(deref, valNode);
+  }
+
+  return false;
 }
 
 bool CallGraphPass::runOnFunction(Function *F) {
@@ -349,24 +424,27 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
 }
 
 void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
-  // flow insensitive, create derference node for all following loads/stores
-  NodeIndex derefNode = CGP.NF.createDereferenceNode(&I);
+  // create a deref node for base ptr of alloca
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex derefNode = CGP.NF.createDereferenceNode(ptrNode);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
   CGP.EB.addDereferenceEdges(ptrNode, derefNode);
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
+
   Value *ptr = I.getOperand(0);
-  NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptr);
+  NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find load ptr node");
+
+  NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptrNode);
   if (derefNode == AndersNodeFactory::InvalidIndex) {
-    CG_DEBUG("Create deref node for " << *ptr << "\n");
-    derefNode = CGP.NF.createDereferenceNode(ptr);
-    NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
-    assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find load ptr node");
+    derefNode = CGP.NF.createDereferenceNode(ptrNode);
+    CG_DEBUG("Create deref node " << derefNode << " for " << *ptr << "\n");
     CGP.EB.addDereferenceEdges(ptrNode, derefNode);
   }
+
   CGP.EB.addAssignmentEdges(derefNode, valNode);
 }
 
@@ -376,16 +454,20 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     // XXX only consider pointer type
     return;
   }
-  Value *ptr = I.getOperand(1);
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptr);
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
+
+  Value *ptr = I.getOperand(1);
+  NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find store ptr node");
+
+  NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptrNode);
   if (derefNode == AndersNodeFactory::InvalidIndex) {
-    CG_DEBUG("Create deref node for " << *ptr << "\n");
-    derefNode = CGP.NF.createDereferenceNode(ptr);
-    NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
-    assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find store ptr node");
+    derefNode = CGP.NF.createDereferenceNode(ptrNode);
+    CG_DEBUG("Create deref node " << derefNode << " for " << *ptr << "\n");
     CGP.EB.addDereferenceEdges(ptrNode, derefNode);
   }
+
   CGP.EB.addAssignmentEdges(valNode, derefNode);
 }
 
@@ -399,68 +481,8 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
 #ifndef FILED_SENSITIVE
   CGP.EB.addAssignmentEdges(ptrNode, valNode);
 #else
-  Type *ptrTy = getElementTy(GEP.getSourceElementType());
-  auto itr = CGP.funcPtsGraph.find(ptrNode);
-  if (itr != CGP.funcPtsGraph.end()) {
-    // if the point2 set of the source ptr is not empty
-    for (auto idx = itr->second.find_first(), end = itr->second.getSize();
-         idx < end; idx = itr->second.find_next(idx)) {
-
-      CG_LOG("GEP source obj " << idx << ", end = " << end << "\n");
-      if (CGP.NF.isSpecialNode(idx)) {
-        // special object, e.g., null or univeral
-        CGP.funcPtsGraph[valNode].insert(idx);
-        continue;
-      }
-
-      // check if we need to resize the obj of the ptr
-      // get allocated size
-      unsigned allocSize = CGP.NF.getObjectSize(idx);
-      if (StructType *STy = dyn_cast<StructType>(ptrTy)) {
-        const StructInfo* stInfo = CGP.SA.getStructInfo(STy, F->getParent());
-        assert(stInfo != NULL && "Struct info not found!");
-        unsigned ptrSize = stInfo->getExpandedSize();
-        if (ptrSize > allocSize) {
-          if (CGP.NF.isOpaqueObject(idx)) {
-            // we don't know the allocation size for opaque objects
-            CG_LOG("GEP resize obj: " << idx << " to type " << STy->getName() << "\n");
-            assert(CGP.NF.isHeapObject(idx) && "GEP: non-heap obj needs to be resized!");
-            // resize the obj
-            idx = extendObjectSize(idx, STy, CGP.NF, CGP.SA, CGP.funcPtsGraph);
-          } else {
-            // XXX: this is likely due to passing data as void*
-            // lacking context sensitivity, we cannot distinguish them
-            // so remove them from the resulting point2 set
-            WARNING("GEP non-opaque obj size mismatch: " << idx << " vs type " << STy->getName() << "\n");
-            continue;
-          }
-        }
-      }
-
-      // get the field number
-      const DataLayout* DL = &(F->getParent()->getDataLayout());
-      unsigned fieldNum = 0;
-      int64_t offset = getGEPOffset(&GEP, DL);
-      if (offset < 0) {
-        // FIXME: handle negative offset, like container_of
-        WARNING("GEP: " << GEP << " negative offset: " << offset << "\n");
-        break;
-      } else {
-        fieldNum = offsetToFieldNum(GEP.getSourceElementType(), offset, DL, CGP.SA, F->getParent());
-      }
-      CG_LOG("GEP fieldNum: " << fieldNum << "\n");
-
-      NodeIndex nidx = idx + fieldNum;
-      // XXX: corner cases, e.g., struct with varaiable size array
-      if ((CGP.NF.getObjectOffset(idx) + fieldNum) > allocSize) {
-        WARNING("GEP: field number " << nidx << " out of bound (" << allocSize << ")!");
-        nidx = allocSize - 1;
-      }
-
-      // propagate the ptr info
-      CGP.funcPtsGraph[valNode].insert(nidx);
-    }
-  }
+  // collect GEPs for later processing
+  this->CGP.GEPs.insert(&GEP);
 #endif
 }
 
@@ -468,6 +490,7 @@ void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
   NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
   NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
   assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast src node");
+  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
   CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 
@@ -556,30 +579,47 @@ void CallGraphPass::buildEdgesFromPtsGraph(const PtsGraph &ptsGraph) {
       if (NF.isSpecialNode(srcNode)) {
         continue;
       }
+#ifndef FILED_SENSITIVE
+      // get the base ptr, and assume ptr = &src (src - d -> ptr) has already been setup
       auto *src = NF.getValueForNode(srcNode);
       assert(src != NULL && "Failed to find value of srcNode");
       NodeIndex ptr = NF.getValueNodeFor(src);
       assert(ptr != AndersNodeFactory::InvalidIndex && "Failed to find node for src");
-      NodeIndex deref = NF.createDereferenceNode(src);
+#else
+      // field sensitive, we don't have a ptr = &base.src edge yet
+      NodeIndex ptr = NF.createDereferenceNode(srcNode);
+      EB.addDereferenceEdges(srcNode, ptr);
+#endif
+      NodeIndex deref = NF.createDereferenceNode(ptr);
       EB.addDereferenceEdges(ptr, deref);
       for (auto obj = ptsSet.find_first(), end = ptsSet.getSize(); obj < end; obj = ptsSet.find_next(obj)) {
-        // field insensitive, make sure obj is base
         NodeIndex addr = obj;
         if (!NF.isSpecialNode(obj)) {
+#ifndef FILED_SENSITIVE
+          // field insensitive, get the base obj, then addr = &base
           auto *val = NF.getValueForNode(obj);
           assert(val != NULL && "Failed to find value of obj");
           addr = NF.getValueNodeFor(val);
           assert(addr != AndersNodeFactory::InvalidIndex && "Failed to find node for val");
+#else
+          // field sensitive, we don't have a ptr = &base.obj edge yet
+          addr = NF.createDereferenceNode(obj);
+          EB.addDereferenceEdges(obj, addr);
+#endif
         }
         EB.addAssignmentEdges(addr, deref);
       }
     } else {
       // Value node - process as address-of operation
       for (auto obj = ptsSet.find_first(), end = ptsSet.getSize(); obj < end; obj = ptsSet.find_next(obj)) {
+#ifndef FILED_SENSITIVE
         // field insensitive, make sure obj is base
         unsigned offset = NF.getObjectOffset(obj);
         NodeIndex objBase = NF.getOffsetObjectNode(obj, -(int)offset);
         EB.addDereferenceEdges(objBase, srcNode);
+#else
+        EB.addDereferenceEdges(obj, srcNode);
+#endif
       }
     }
   }
@@ -737,8 +777,8 @@ bool CallGraphPass::doModulePass(Module *M) {
     auto finalEdges = solver->getEdgeCount();
     CG_LOG("CFL Final Edges: " << finalEdges << "\n");
 
-    // parse results and update the CFL edges
     std::vector<std::vector<std::unordered_set<unsigned long long>>> outputCFLGraph = solver->getGraph();
+    // parse results and update call edges
     for (auto *CS : Ctx->IndirectCallInsts) {
       CG_LOG("Handle indirect CallSite: " << *CS << "\n");
       Value *fptr = CS->getCalledOperand()->stripPointerCasts();
@@ -779,6 +819,35 @@ bool CallGraphPass::doModulePass(Module *M) {
         }
       }
     }
+
+#ifdef FILED_SENSITIVE
+    // parse results and update GEP edges
+    for (auto *GEP : GEPs) {
+      CG_LOG("Handle GEP: " << *GEP << "\n");
+      auto *ptr = GEP->getPointerOperand()->stripPointerCasts();
+      NodeIndex ptrNode = NF.getValueNodeFor(ptr);
+      if (ptrNode == AndersNodeFactory::InvalidIndex) {
+        WARNING("GEP ptr for " << *GEP << " node not found!\n");
+        continue;
+      }
+      AndersPtsSet &ptsSet = funcPtsGraph[ptrNode];
+      auto &cflSet = outputCFLGraph[ptrNode][EB.getLabelMAs()];
+      bool hasNew = false;
+      for (auto idx : cflSet) {
+        // MAs gives aliasing ptrs, now we do the old fashioned points-to propagation
+        if (idx == ptrNode) continue;
+        auto itr = funcPtsGraph.find(idx);
+        if (itr != funcPtsGraph.end()) {
+          hasNew |= ptsSet.insert(itr->second);
+        }
+      }
+      if (hasNew) {
+        handleGEP(GEP, ptsSet, M);
+        Changed = true;
+      }
+    }
+#endif
+
     iteration++;
   }
 

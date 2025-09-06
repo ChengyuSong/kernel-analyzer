@@ -48,6 +48,7 @@ private:
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void buildEdgesFromPtsGraph(const PtsGraph &ptsGraph);
+  bool handleGEP(const llvm::GetElementPtrInst *GEP, AndersPtsSet &ptr2set, llvm::Module *M);
 
   AndersNodeFactory &NF;
   StructAnalyzer &SA;
@@ -67,6 +68,8 @@ private:
   std::unordered_map<const StructInfo*, node_set_t> retStructs; // structs returned by functions
   std::unordered_map<const StructInfo*, node_set_t> argStructs; // structs passed as arguments
   std::unordered_map<const StructInfo*, node_set_t> globalStructs; // structs stored in globals
+
+  std::unordered_set<const llvm::GetElementPtrInst*> GEPs;
 
   CalleeMap calleeByType;
 

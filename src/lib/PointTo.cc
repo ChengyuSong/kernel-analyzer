@@ -617,7 +617,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
       if (GV.hasInitializer()) {
         NodeIndex obj = nodeFactory.getObjectNodeFor(&GV);
         Type *Ty = const_cast<Type*>(nodeFactory.getObjectType(obj));
-        PT_DEBUG("Processing initializer for global " << GV.getName() << ", id " << obj << " type " << *Ty << " with " << *GV.getInitializer() << "\n");
+        PT_DEBUG("Processing initializer for global " << GV.getName() << ", id " << obj << " type " << *Ty << "\n");
         // if (auto *STy = dyn_cast<StructType>(Ty)) {
         //   const StructInfo *stInfo = structAnalyzer.getStructInfo(STy, M);
         //   PT_DEBUG("stInfo size = " << stInfo->getExpandedSize() << ", alloc size = " << stInfo->getAllocSize() << "\n");

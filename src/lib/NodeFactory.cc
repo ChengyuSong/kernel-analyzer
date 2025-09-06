@@ -369,7 +369,12 @@ unsigned AndersNodeFactory::constGEPtoFieldNum(const llvm::ConstantExpr* expr) c
             } else {
                 // slow path, convert to byte offset then back to field number
                 int64_t offset = getGEPOffset(GEP, dataLayout);
-                assert(offset >= 0 && "constexpr gep offset should be non-negative!");
+                // assert(offset >= 0 && "constexpr gep offset should be non-negative!");
+                if (offset < 0) {
+                    AA_LOG("Negative offset " << offset << " for GEP: " << *expr << "\n");
+                    // FIXME: return 0 for now
+                    return 0;
+                }
                 return offsetToFieldNum(elemTy, offset, dataLayout, *structAnalyzer, module);
             }
         } // else

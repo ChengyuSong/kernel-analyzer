@@ -17,6 +17,17 @@ bool CFLEdgeBuilder::initializeGrammar(const std::string& grammarFilePath) {
   }
 }
 
+bool CFLEdgeBuilder::initializeGrammar(const std::vector<std::string>& grammarLines) {
+  try {
+    grammar = std::make_unique<gracfl::Grammar>(grammarLines);
+    initializeLabels();
+    return true;
+  } catch (const std::exception& e) {
+    WARNING("Error initializing grammar: " << e.what() << "\n");
+    return false;
+  }
+}
+
 void CFLEdgeBuilder::initializeLabels() {
   if (!grammar) {
     throw std::runtime_error("Grammar not initialized");

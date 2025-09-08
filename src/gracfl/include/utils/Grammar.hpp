@@ -66,12 +66,30 @@ namespace gracfl
          */
 		void loadGrammarFile();
 
+		/**
+         * @brief Parses grammar rules from a vector of strings and populates rule and index structures.
+         * @param grammarLines Vector of strings where each string represents a grammar rule.
+         * @note Expects each string to contain 1–3 whitespace-separated symbols.
+         */
+		void loadGrammarFromLines(const std::vector<std::string>& grammarLines);
+
+		/**
+         * @brief Common initialization logic for setting up indices after parsing.
+         */
+		void initializeIndices();
+
 	
 		/**
          * @brief Constructs a Grammar object and loads the grammar from file.
          * @param grammarFilePath Path to a text file where each line is a grammar rule.
          */
-		explicit Grammar(const std::string& grammarFilePath); 
+		explicit Grammar(const std::string& grammarFilePath);
+
+		/**
+         * @brief Constructs a Grammar object and loads the grammar from a vector of strings.
+         * @param grammarLines Vector of strings where each string represents a grammar rule.
+         */
+		explicit Grammar(const std::vector<std::string>& grammarLines);
 
 		/**
          * @brief Get all epsilon (unary) production rules.

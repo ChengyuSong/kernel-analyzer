@@ -243,10 +243,13 @@ int main(int argc, char **argv) {
 
   // CFL-reachability edge construction
   if (GrammarFile.empty()) {
-    // TODO: embed a default grammar file
-    errs() << "No grammar file provided for CFL-reachability analysis\n";
-  } else if (!GlobalCtx.edgeBuilder.initializeGrammar(GrammarFile)) {
-    errs() << "Failed to initialize CFL edge builder with grammar file: " << GrammarFile << "\n";
+    if (!GlobalCtx.edgeBuilder.initializeGrammar(DefaultP2Grammar)) {
+      errs() << "Failed to initialize CFL edge builder with default grammar\n";
+    }
+  } else {
+    if (!GlobalCtx.edgeBuilder.initializeGrammar(GrammarFile)) {
+      errs() << "Failed to initialize CFL edge builder with grammar file: " << GrammarFile << "\n";
+    }
   }
 
   CallGraphPass CGPass(&GlobalCtx);

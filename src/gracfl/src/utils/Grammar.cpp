@@ -11,7 +11,18 @@ namespace gracfl
     {
         grammarFilePath_ = grammarFilePath;
         loadGrammarFile();
+        initializeIndices();
+    }
 
+    Grammar::Grammar(const std::vector<std::string>& grammarLines)
+    {
+        grammarFilePath_ = ""; // No file path for vector constructor
+        loadGrammarFromLines(grammarLines);
+        initializeIndices();
+    }
+
+    void Grammar::initializeIndices()
+    {
         grammar1index_.assign(labelSize_, false);
 		grammar2index_.assign(labelSize_, {});
 		grammar3index_.assign(labelSize_ * labelSize_, {});
@@ -43,14 +54,26 @@ namespace gracfl
             throw std::runtime_error("Unable to open grammar file: " + grammarFilePath_);
         }
 
-		std::string line;
+        std::vector<std::string> lines;
+        std::string line;
+        while (getline(grammarFile, line)) {
+            lines.push_back(line);
+        }
+        grammarFile.close();
+
+        loadGrammarFromLines(lines);
+    }
+
+    void Grammar::loadGrammarFromLines(const std::vector<std::string>& grammarLines)
+    {
 		std::string symbol;
 		int numSym;
 		std::vector<uint> symbols;
-
 		std::stringstream ss;
+
 		labelSize_ = 0;
-		while (getline(grammarFile, line))
+
+		for (const std::string& line : grammarLines)
 		{
 			ss.clear();
             symbols.clear();
@@ -89,7 +112,5 @@ namespace gracfl
 				exit(0);
 			}
 		}
-
-        grammarFile.close();
     }
 }

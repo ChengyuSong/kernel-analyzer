@@ -45,6 +45,11 @@ public:
   bool initializeGrammar(const std::string& grammarFilePath);
 
   /**
+   * @brief Initialize with grammar rules from vector of strings
+   */
+  bool initializeGrammar(const std::vector<std::string>& grammarLines);
+
+  /**
    * @brief Helper to add assignment edge pair
    * For assignment src -> dst, add edges (src, dst, 'a') and (dst, src, '-a')
    */

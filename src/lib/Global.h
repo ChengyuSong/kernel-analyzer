@@ -146,4 +146,20 @@ public:
   virtual void run(ModuleList &modules);
 };
 
+// Default P2 grammar for CFL-reachability analysis
+static const std::vector<std::string> DefaultP2Grammar = {
+  "M DV d",
+  "DV -d V",
+  "V MAM AMs",
+  "MAM MAs Mq",
+  "Mq",
+  "Mq M",
+  "MAs",
+  "MAs MAs MA",
+  "MA Mq -a",
+  "AMs",
+  "AMs AMs AM",
+  "AM a Mq"
+};
+
 #endif

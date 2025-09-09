@@ -30,8 +30,6 @@
 
 #include "gracfl/include/solvers/Solver.hpp"
 
-#define FILED_SENSITIVE 1
-
 #define CG_LOG(stmt) KA_LOG(2, "CallGraph: " << stmt)
 #define CG_DEBUG(stmt) KA_LOG(3, "CallGraph: " << stmt)
 
@@ -237,6 +235,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       handleMemcpy(CS);
     return false;
   }
+  // CG_DEBUG("Call: " << *CS << " -> " << CF->getName() << "\n");
 
   // handle args
   unsigned numArgs = CS->arg_size();
@@ -259,8 +258,14 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     }
     for (unsigned i = 0; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
+      if (!arg->getType()->isPointerTy())
+        continue; // skip non-pointer args
       NodeIndex argNode = NF.getValueNodeFor(arg);
-      assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
+      // assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
+      if (argNode == AndersNodeFactory::InvalidIndex) {
+        argNode = NF.createValueNode(arg);
+        CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
+      }
       Value *farg = CF->getArg(i);
       NodeIndex formalNode = NF.getValueNodeFor(farg);
       assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
@@ -376,6 +381,10 @@ bool CallGraphPass::runOnFunction(Function *F) {
 void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
   if (I.getNumOperands() > 0) {
     Value *rv = I.getOperand(0);
+    if (!rv->getType()->isPointerTy()) {
+      // XXX only consider pointer type
+      return;
+    }
     NodeIndex rvNode = CGP.NF.getValueNodeFor(rv);
     assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
     NodeIndex RT = CGP.NF.getReturnNodeFor(F);
@@ -386,6 +395,9 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
 
 void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
   if (CS.isInlineAsm()) return;
+  if (!CS.getType()->isVoidTy()) {
+    CGP.NF.createValueNode(&CS);
+  }
 
   if (Function *CF = CS.getCalledFunction()) {
     // direct call
@@ -425,14 +437,20 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
 
 void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
   // create a deref node for base ptr of alloca
-  NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
+  // NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
+  // assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
+  NodeIndex ptrNode = CGP.NF.createValueNode(&I);
   NodeIndex derefNode = CGP.NF.createDereferenceNode(ptrNode);
-  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
   CGP.EB.addDereferenceEdges(ptrNode, derefNode);
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
-  NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
+  // NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
+  if (!I.getType()->isPointerTy()) {
+    // XXX only consider pointer type
+    return;
+  }
+  NodeIndex valNode = CGP.NF.createValueNode(&I);
 
   Value *ptr = I.getOperand(0);
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
@@ -455,7 +473,11 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     return;
   }
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
+  // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
+  if (valNode == AndersNodeFactory::InvalidIndex) {
+    valNode = CGP.NF.createValueNode(val);
+    CG_DEBUG("Create value node " << valNode << " for store " << *val << "\n");
+  }
 
   Value *ptr = I.getOperand(1);
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
@@ -475,27 +497,33 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   Value *ptr = GEP.getPointerOperand();
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP ptr node");
-  NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
+  // NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
+  // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
+  NodeIndex valNode = CGP.NF.createValueNode(&GEP);
 
 #ifndef FILED_SENSITIVE
   CGP.EB.addAssignmentEdges(ptrNode, valNode);
-#else
+#endif
   // collect GEPs for later processing
   this->CGP.GEPs.insert(&GEP);
-#endif
 }
 
 void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
   NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
   assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast src node");
-  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
+  // NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  // assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
+  NodeIndex dstNode = CGP.NF.createValueNode(&I);
   CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&PHI);
+  // NodeIndex dstNode = CGP.NF.getValueNodeFor(&PHI);
+  if (!PHI.getType()->isPointerTy()) {
+    // XXX only consider pointer type
+    return;
+  }
+  NodeIndex dstNode = CGP.NF.createValueNode(&PHI);
   for (unsigned i = 0, e = PHI.getNumIncomingValues(); i != e; ++i) {
     Value *src = PHI.getIncomingValue(i);
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
@@ -505,7 +533,12 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
 }
 
 void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  // NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  if (!I.getType()->isPointerTy()) {
+    // XXX only consider pointer type
+    return;
+  }
+  NodeIndex dstNode = CGP.NF.createValueNode(&I);
   for (unsigned i = 1; i < I.getNumOperands(); i++) {
     Value *src = I.getOperand(i);
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
@@ -515,23 +548,38 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitExtractValueInst(ExtractValueInst &EVI) {
+  if (!EVI.getType()->isPointerTy()) {
+    // XXX only consider pointer type
+    return;
+  }
   // field insensitive, just connect the aggregate
   Value *agg = EVI.getAggregateOperand();
   NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
-  NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
-  assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue agg node");
+  // assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue agg node");
+  if (aggNode == AndersNodeFactory::InvalidIndex) {
+    aggNode = CGP.NF.createValueNode(agg);
+    CG_DEBUG("Create value node " << aggNode << " for ExtractValue " << *agg << "\n");
+  }
+  // NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
+  // assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue agg node");
+  NodeIndex valNode = CGP.NF.createValueNode(&EVI);
   CGP.EB.addAssignmentEdges(aggNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
   // field insensitive, just connect the aggregate
-  Value *agg = IVI.getAggregateOperand();
   Value *val = IVI.getInsertedValueOperand();
-  NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
+  if (!val->getType()->isPointerTy()) {
+    // XXX only consider pointer type
+    return;
+  }
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
-  assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue agg node");
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
+  Value *agg = IVI.getAggregateOperand();
+  NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
+  assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue agg node");
+  // NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
+  NodeIndex resNode = CGP.NF.createValueNode(&IVI);
   CGP.EB.addAssignmentEdges(aggNode, resNode);
   CGP.EB.addAssignmentEdges(valNode, resNode);
 }
@@ -625,27 +673,86 @@ void CallGraphPass::buildEdgesFromPtsGraph(const PtsGraph &ptsGraph) {
   }
 }
 
+void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init) {
+  if (!init)
+    return;
+
+  if (isa<ConstantPointerNull>(init)) {
+    // ptr = null: add assignment edges null -> ptr
+    EB.addAssignmentEdges(NF.getNullPtrNode(), ptrNode);
+  } else if (isa<GlobalVariable>(init)) {
+    NodeIndex valNode = NF.getValueNodeFor(init);
+    if (valNode == AndersNodeFactory::InvalidIndex) {
+      valNode = NF.createValueNode(init);
+    }
+    // ptr = &globalvar: add assignment edges globalvar_val -> ptr
+    EB.addAssignmentEdges(valNode, ptrNode);
+    CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
+  } else if (isa<Function>(init)) {
+    NodeIndex valNode = NF.getValueNodeFor(init);
+    if (valNode == AndersNodeFactory::InvalidIndex) {
+      valNode = NF.createValueNode(init);
+    }
+    // ptr = &function: add assignment edges function_val -> ptr
+    EB.addAssignmentEdges(valNode, ptrNode);
+    CG_DEBUG("add CFL assignment edges for function " << cast<Function>(init)->getName() << " -> " << ptrNode << "\n");
+  } else if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
+    // Field-insensitive: all array elements assign to the same ptr
+    for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
+      processInitializer(ptrNode, CA->getOperand(i));
+    }
+  } else if (ConstantStruct *CS = dyn_cast<ConstantStruct>(init)) {
+    // Field-insensitive: all struct fields assign to the same ptr
+    for (unsigned i = 0; i != CS->getNumOperands(); ++i) {
+      processInitializer(ptrNode, CS->getOperand(i));
+    }
+  } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
+    Type *Ty = CAZ->getType();
+    if (isa<ArrayType>(Ty) || isa<VectorType>(Ty)) {
+      processInitializer(ptrNode, CAZ->getSequentialElement());
+    } else if (StructType *CSTy = dyn_cast<StructType>(Ty)) {
+      for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
+        Constant *elem = CAZ->getStructElement(i);
+        processInitializer(ptrNode, elem);
+      }
+    }
+  } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(init)) {
+    switch (CE->getOpcode()) {
+      case Instruction::GetElementPtr: {
+        // Field-insensitive: get the base pointer with casts stripped
+        const Value* basePtr = cast<GEPOperator>(CE)->getPointerOperand()->stripPointerCasts();
+        NodeIndex baseNode = NF.getValueNodeFor(basePtr);
+        if (baseNode == AndersNodeFactory::InvalidIndex) {
+          baseNode = NF.createValueNode(basePtr);
+        }
+        // ptr = base_ptr: add assignment edges base_ptr -> ptr
+        EB.addAssignmentEdges(baseNode, ptrNode);
+        break;
+      }
+      case Instruction::BitCast: {
+        // BitCast: process the operand directly
+        processInitializer(ptrNode, CE->getOperand(0));
+        break;
+      }
+      case Instruction::IntToPtr: {
+        // ptr = (ptr)int: add assignment edges constantInt -> ptr
+        EB.addAssignmentEdges(NF.getConstantIntNode(), ptrNode);
+        break;
+      }
+      default:
+        CG_DEBUG("Unhandled constant expression: " << *init << "\n");
+    }
+  }
+}
+
 bool CallGraphPass::doInitialization(Module *M) {
 
   for (auto &GV : M->globals()) {
     if (Ctx->ExtGobjs.find(GV.getGUID()) != Ctx->ExtGobjs.end())
       continue;
-    if (!GV.hasInitializer())
+    if (GV.isDeclaration())
       continue;
-    auto init = GV.getInitializer();
-    Type *Ty = init->getType();
-    // collapse array type
-    while (ArrayType *AT = dyn_cast<ArrayType>(Ty))
-      Ty = AT->getElementType();
-    if (StructType *st = dyn_cast<StructType>(Ty)) {
-      const StructInfo *stInfo = SA.getStructInfo(st, M);
-      if (stInfo) {
-        CG_LOG("Record Global: " << GV.getName() << " : " << getScopeName(st, M) << " = " << stInfo << "\n");
-        if (st->isLiteral()) WARNING("Global: " << GV.getName() << " type is literal!\n");
-        NodeIndex valNode = NF.getValueNodeFor(&GV);
-        globalStructs[stInfo].insert(valNode);
-      }
-    }
+    NF.createValueNode(&GV);
   }
 
   for (Function &F : *M) {
@@ -665,16 +772,35 @@ bool CallGraphPass::doInitialization(Module *M) {
 
       // only add fval -> fobj edge in call graph analysis?
       NodeIndex valNode = NF.createValueNode(&F);
-      NodeIndex objNode = NF.getObjectNodeFor(&F);
-      assert(objNode != AndersNodeFactory::InvalidIndex && "Object node not found!");
-      funcPtsGraph[valNode].insert(objNode);
-      CG_LOG("AddressTaken: " << F.getName() << " : " << valNode << " -> " << objNode << "\n");
+      // NodeIndex objNode = NF.getObjectNodeFor(&F);
+      // assert(objNode != AndersNodeFactory::InvalidIndex && "Object node not found!");
+      // funcPtsGraph[valNode].insert(objNode);
+      // CG_LOG("AddressTaken: " << F.getName() << " : " << valNode << " -> " << objNode << "\n");
+    }
+
+    if (!F.isDeclaration() && !F.isIntrinsic() && !F.empty() && !Ctx->AllocFuncs.count(&F)) {
+      // create nodes for function arguments and return value
+      if (F.getFunctionType()->isVarArg())
+        NF.createVarargNode(&F);
+      for (auto &arg : F.args()) {
+        NF.createValueNode(&arg);
+      }
+      if (!F.getReturnType()->isVoidTy()) {
+        NF.createReturnNode(&F);
+      }
     }
   }
 
   if (M == Ctx->Modules.back().first) {
-    // add edges when finishing the last module
-    buildEdgesFromPtsGraph(funcPtsGraph);
+  //   // add edges when finishing the last module
+  //   buildEdgesFromPtsGraph(funcPtsGraph);
+    for (auto const &itr: Ctx->ExtGobjs) {
+      NF.createValueNode(itr.second);
+    }
+    for (auto const &itr: Ctx->ExtFuncs) {
+      if (!itr.second->getReturnType()->isVoidTy())
+        NF.createReturnNode(itr.second);
+    }
   }
 
   return false;
@@ -759,6 +885,17 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   // process functions, only the first iteration
   if (iteration == 0) {
+    for (auto &GV : M->globals()) {
+      if (GV.hasInitializer()) {
+        NodeIndex valNode = NF.getValueNodeFor(&GV);
+        assert(valNode != AndersNodeFactory::InvalidIndex && "Global value node not found!");
+        NodeIndex deref = NF.createDereferenceNode(valNode);
+        EB.addDereferenceEdges(valNode, deref);
+        CG_DEBUG("Processing initializer for GV " << GV.getName() << "\n");
+        auto init = GV.getInitializer();
+        processInitializer(deref, init);
+      }
+    }
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() || Ctx->AllocFuncs.count(&F))
         continue;
@@ -787,18 +924,18 @@ bool CallGraphPass::doModulePass(Module *M) {
         WARNING("FuncPtr for " << *CS << " node not found!\n");
         continue;
       }
-      auto &ptsSet = funcPtsGraph[fptrNode];
-      auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelMAs()];
+      // auto &ptsSet = funcPtsGraph[fptrNode];
+      auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelV()];
       for (auto idx : cflSet) {
-        // CG_LOG("FuncPtr: " << *fptr << " node: " << fptrNode << " -> obj: " << idx << "\n");
-        ptsSet.insert(idx);
+        // CG_DEBUG("FuncPtr: node: " << fptrNode << " -> ptr: " << idx << "\n");
+        // ptsSet.insert(idx);
         if (NF.isSpecialNode(idx)) {
-          WARNING("Indirect Call: " << *fptr << " callee is a special node: " << idx << "\n");
+          WARNING("Indirect Call: " << *CS << " callee is a special node: " << idx << "\n");
           continue;
         }
         const Value *CV = NF.getValueForNode(idx);
         if (CV == NULL) {
-          WARNING("No value for function node!\n");
+          // WARNING("No value for function node!\n");
           continue;
         }
         const Function *CF = dyn_cast<Function>(CV);
@@ -808,7 +945,7 @@ bool CallGraphPass::doModulePass(Module *M) {
         }
         // due to field insensitivity, we may have FPs, do a type match
         if (!isCompatible(CS, CF)) {
-          // WARNING("Function pointer " << *fptr << " type mismatch: " << *CF << "\n");
+          WARNING("Function pointer " << *CS << " type mismatch: " << CF->getName() << "\n");
           continue;
         }
         if (Ctx->Callees[CS].insert(CF).second) {
@@ -844,6 +981,54 @@ bool CallGraphPass::doModulePass(Module *M) {
       if (hasNew) {
         handleGEP(GEP, ptsSet, M);
         Changed = true;
+      }
+    }
+#endif
+
+#if 0 // debug
+    for (auto &it : Ctx->Gobjs) {
+      Value *GV = it.second;
+      NodeIndex valNode = NF.getValueNodeFor(GV);
+      if (valNode != AndersNodeFactory::InvalidIndex) {
+        // auto &alledges = outputCFLGraph[valNode];
+        // for (size_t i = 0; i < alledges.size(); i++) {
+        //   auto &cflSect = alledges[i];
+        //   auto label = EB.getGrammar()->getIDToSymbolMap().find(i)->second;
+        //   if (cflSect.empty()) continue;
+        //   CG_DEBUG("GlobalVar: " << GV->getName() << " : " << valNode << ", label " << label << "\n");
+        //   for (auto idx : cflSect) {
+        //     if (idx == valNode)
+        //       continue;
+        //     if (NF.isSpecialNode(idx)) {
+        //       CG_DEBUG("\tSpecialNode: " << idx << "\n");
+        //       continue;
+        //     }
+        //     const Value *CV = NF.getValueForNode(idx);
+        //     if (CV == NULL) {
+        //       CG_DEBUG("\tNoValue: " << idx << "\n");
+        //       continue;
+        //     }
+        //     CG_DEBUG("\t" << *CV << " : " << idx << "\n");
+        //   }
+        // }
+        auto &cflSect = outputCFLGraph[valNode][EB.getLabelV()];
+        if (cflSect.empty())
+          continue;
+        CG_DEBUG("GlobalVar: " << GV->getName() << " : " << valNode << " ->\n");
+        for (auto idx : cflSect) {
+          if (idx == valNode)
+            continue;
+          if (NF.isSpecialNode(idx)) {
+            CG_DEBUG("\tSpecialNode: " << idx << "\n");
+            continue;
+          }
+          const Value *CV = NF.getValueForNode(idx);
+          if (CV == NULL) {
+            CG_DEBUG("\tNoValue: " << idx << "\n");
+            continue;
+          }
+          CG_DEBUG("\t" << *CV << " : " << idx << "\n");
+        }
       }
     }
 #endif

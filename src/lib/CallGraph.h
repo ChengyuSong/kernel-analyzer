@@ -49,6 +49,7 @@ private:
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void buildEdgesFromPtsGraph(const PtsGraph &ptsGraph);
   bool handleGEP(const llvm::GetElementPtrInst *GEP, AndersPtsSet &ptr2set, llvm::Module *M);
+  void processInitializer(NodeIndex obj, llvm::Constant *init);
 
   AndersNodeFactory &NF;
   StructAnalyzer &SA;

@@ -26,7 +26,8 @@ private:
   uint labelAssignInv;  // '-a'  
   uint labelDeref;      // 'd'
   uint labelDerefInv;   // '-d'
-  uint labelMAs;
+  uint labelM;          // 'M'
+  uint labelV;          // 'V'
 
   bool labelsInitialized;
 
@@ -89,9 +90,10 @@ public:
   const gracfl::Grammar* getGrammar() const { return grammar.get(); }
 
   /**
-   * @brief Get label ID for assignment 'a'
+   * @brief Get label ID for aliasing labels
    */
-  const uint getLabelMAs() const { return labelMAs; }
+  const uint getLabelM() const { return labelM; }
+  const uint getLabelV() const { return labelV; }
 };
 
 #endif // CFL_EDGE_BUILDER_H

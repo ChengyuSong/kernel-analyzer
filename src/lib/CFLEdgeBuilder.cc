@@ -49,7 +49,8 @@ void CFLEdgeBuilder::initializeLabels() {
     labelAssignInv = findLabel("-a");
     labelDeref = findLabel("d");
     labelDerefInv = findLabel("-d");
-    labelMAs = findLabel("MAs");
+    labelM = findLabel("M");
+    labelV = findLabel("V");
     labelsInitialized = true;
 
     EB_LOG("CFL Labels initialized: a=" << labelAssign 

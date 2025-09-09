@@ -8,19 +8,7 @@
 
 #include <vector>
 #include <set>
-#include <unordered_set>
 #include <unordered_map>
-#include <cstdint>
-
-// Hash function for std::pair<const llvm::StructType*, unsigned>
-namespace std {
-template <>
-struct hash<std::pair<const llvm::StructType*, unsigned>> {
-	size_t operator()(const std::pair<const llvm::StructType*, unsigned>& p) const {
-		return std::hash<void*>()((void*)((uintptr_t)p.first + p.second));
-	}
-};
-}
 
 // Every struct type T is mapped to the vectors fieldSize and offsetMap.
 // If field [i] in the expanded struct T begins an embedded struct, fieldSize[i] is the # of fields in the largest such struct, else S[i] = 1.
@@ -52,10 +40,10 @@ private:
 	void setModule(const llvm::Module* M) { module = M; }
 
 	// container type(s), i.e., the struct(s) that contain this struct at the specified offset
-	std::unordered_set<std::pair<const llvm::StructType*, unsigned> > containers;
+	std::unordered_map<const llvm::StructType*, std::set<unsigned>> containers;
 	void addContainer(const llvm::StructType* st, unsigned offset)
 	{
-		containers.insert(std::make_pair(st, offset));
+		containers[st].insert(offset);
 	}
 
 	static const llvm::StructType* maxStruct;
@@ -159,10 +147,10 @@ public:
 	const llvm::StructType* getContainer(const llvm::StructType* st, unsigned offset) const
 	{
 		assert(!st->isOpaque());
-		if (containers.count(std::make_pair(st, offset)) == 1)
+		auto it = containers.find(st);
+		if (it != containers.end() && it->second.count(offset))
 			return st;
-		else
-			return nullptr;
+		return nullptr;
 	}
 
 	static unsigned getMaxStructSize() { return maxStructSize; }

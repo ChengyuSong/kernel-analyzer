@@ -42,9 +42,11 @@ void StructAnalyzer::addContainer(const StructType* container, StructInfo& conta
       auto itr = structInfoMap.find(structType);
       if (itr != structInfoMap.end()) {
         StructInfo& subInfo = itr->second;
-        for (auto item : subInfo.containers) {
-          if (item.first == ct)
-            addContainer(container, subInfo, item.second + offset, M);
+        auto it = subInfo.containers.find(ct);
+        if (it != subInfo.containers.end()) {
+          for (unsigned containerOffset : it->second) {
+            addContainer(container, subInfo, containerOffset + offset, M);
+          }
         }
       } else {
         WARNING("Containee " << ct->getName() << " subtype " << structType->getName() << " not found\n");

@@ -195,9 +195,17 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   Value *src = CS->getArgOperand(1);
   CG_LOG("Memcpy: " << *dst << " = " << *src << "\n");
   NodeIndex dstNode = NF.getValueNodeFor(dst);
+  // assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
+  if (dstNode == AndersNodeFactory::InvalidIndex) {
+    dstNode = NF.createValueNode(dst);
+    CG_DEBUG("Create value node " << dstNode << " for memcpy dst " << *dst << "\n");
+  }
   NodeIndex srcNode = NF.getValueNodeFor(src);
-  assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
-  assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
+  // assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
+  if (srcNode == AndersNodeFactory::InvalidIndex) {
+    srcNode = NF.createValueNode(src);
+    CG_DEBUG("Create value node " << srcNode << " for memcpy src " << *src << "\n");
+  }
 #ifndef FIELD_SENSITIVE
   // field insensitive: *dst = *src
   NodeIndex derefDst = NF.getDereferenceNodeFor(dstNode);
@@ -386,7 +394,11 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
       return;
     }
     NodeIndex rvNode = CGP.NF.getValueNodeFor(rv);
-    assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
+    // assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
+    if (rvNode == AndersNodeFactory::InvalidIndex) {
+      rvNode = CGP.NF.createValueNode(rv);
+      CG_DEBUG("Create value node " << rvNode << " for return " << *rv << "\n");
+    }
     NodeIndex RT = CGP.NF.getReturnNodeFor(F);
     assert(RT != AndersNodeFactory::InvalidIndex && "Return node not found!");
     CGP.EB.addAssignmentEdges(rvNode, RT);
@@ -527,7 +539,11 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
   for (unsigned i = 0, e = PHI.getNumIncomingValues(); i != e; ++i) {
     Value *src = PHI.getIncomingValue(i);
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
-    assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
+    // assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
+    if (srcNode == AndersNodeFactory::InvalidIndex) {
+      srcNode = CGP.NF.createValueNode(src);
+      CG_DEBUG("Create value node " << srcNode << " for PHI src " << *src << "\n");
+    }
     CGP.EB.addAssignmentEdges(srcNode, dstNode);
   }
 }
@@ -542,7 +558,11 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
   for (unsigned i = 1; i < I.getNumOperands(); i++) {
     Value *src = I.getOperand(i);
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
-    assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
+    // assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
+    if (srcNode == AndersNodeFactory::InvalidIndex) {
+      srcNode = CGP.NF.createValueNode(src);
+      CG_DEBUG("Create value node " << srcNode << " for select src " << *src << "\n");
+    }
     CGP.EB.addAssignmentEdges(srcNode, dstNode);
   }
 }
@@ -574,10 +594,18 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
     return;
   }
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
+  // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
+  if (valNode == AndersNodeFactory::InvalidIndex) {
+    valNode = CGP.NF.createValueNode(val);
+    CG_DEBUG("Create value node " << valNode << " for InsertValue val " << *val << "\n");
+  }
   Value *agg = IVI.getAggregateOperand();
   NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
-  assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue agg node");
+  // assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue agg node");
+  if (aggNode == AndersNodeFactory::InvalidIndex) {
+    aggNode = CGP.NF.createValueNode(agg);
+    CG_DEBUG("Create value node " << aggNode << " for InsertValue agg " << *agg << "\n");
+  }
   // NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
   NodeIndex resNode = CGP.NF.createValueNode(&IVI);
   CGP.EB.addAssignmentEdges(aggNode, resNode);

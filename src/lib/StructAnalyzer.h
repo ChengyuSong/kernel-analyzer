@@ -8,7 +8,19 @@
 
 #include <vector>
 #include <set>
+#include <unordered_set>
 #include <unordered_map>
+#include <cstdint>
+
+// Hash function for std::pair<const llvm::StructType*, unsigned>
+namespace std {
+template <>
+struct hash<std::pair<const llvm::StructType*, unsigned>> {
+	size_t operator()(const std::pair<const llvm::StructType*, unsigned>& p) const {
+		return std::hash<void*>()((void*)((uintptr_t)p.first + p.second));
+	}
+};
+}
 
 // Every struct type T is mapped to the vectors fieldSize and offsetMap.
 // If field [i] in the expanded struct T begins an embedded struct, fieldSize[i] is the # of fields in the largest such struct, else S[i] = 1.
@@ -40,7 +52,7 @@ private:
 	void setModule(const llvm::Module* M) { module = M; }
 
 	// container type(s), i.e., the struct(s) that contain this struct at the specified offset
-	std::set<std::pair<const llvm::StructType*, unsigned> > containers;
+	std::unordered_set<std::pair<const llvm::StructType*, unsigned> > containers;
 	void addContainer(const llvm::StructType* st, unsigned offset)
 	{
 		containers.insert(std::make_pair(st, offset));

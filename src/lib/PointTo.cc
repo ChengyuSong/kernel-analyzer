@@ -521,12 +521,6 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
   AndersNodeFactory &nodeFactory = GlobalCtx.nodeFactory;
   StructAnalyzer &structAnalyzer = GlobalCtx.structAnalyzer;
 
-  nodeFactory.setStructAnalyzer(&structAnalyzer);
-  nodeFactory.setGobjMap(&GlobalCtx.Gobjs);
-  nodeFactory.setExtGobjMap(&GlobalCtx.ExtGobjs);
-  nodeFactory.setFuncMap(&GlobalCtx.Funcs);
-  nodeFactory.setExtFuncMap(&GlobalCtx.ExtFuncs);
-
   PtsGraph &ptsGraph = GlobalCtx.GlobalInitPtsGraph;
 
   // universal ptr points to universal obj

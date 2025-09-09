@@ -238,8 +238,15 @@ int main(int argc, char **argv) {
   for (auto &[id, gv] : GlobalCtx.Gobjs) { GlobalCtx.ExtGobjs.erase(id); }
   for (auto &[id, f] : GlobalCtx.Funcs) { GlobalCtx.ExtFuncs.erase(id); }
 
+  // Initialize node factory
+  GlobalCtx.nodeFactory.setStructAnalyzer(&GlobalCtx.structAnalyzer);
+  GlobalCtx.nodeFactory.setGobjMap(&GlobalCtx.Gobjs);
+  GlobalCtx.nodeFactory.setExtGobjMap(&GlobalCtx.ExtGobjs);
+  GlobalCtx.nodeFactory.setFuncMap(&GlobalCtx.Funcs);
+  GlobalCtx.nodeFactory.setExtFuncMap(&GlobalCtx.ExtFuncs);
+
   // Main workflow
-  populateNodeFactory(GlobalCtx);
+  // populateNodeFactory(GlobalCtx);
 
   // CFL-reachability edge construction
   if (GrammarFile.empty()) {

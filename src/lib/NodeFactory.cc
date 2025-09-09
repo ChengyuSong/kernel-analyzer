@@ -50,7 +50,8 @@ NodeIndex AndersNodeFactory::createValueNode(const Value* val) {
     unsigned nextIdx = nodes.size();
     nodes.emplace_back(AndersNode(AndersNode::VALUE_NODE, nextIdx, val));
     if (val != nullptr) {
-        assert(!valueNodeMap.count(val) && "Trying to insert two mappings to valueNodeMap!");
+        if (valueNodeMap.count(val))
+            return valueNodeMap[val];
         valueNodeMap[val] = nextIdx;
     }
 

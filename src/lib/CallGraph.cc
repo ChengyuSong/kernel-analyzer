@@ -195,17 +195,17 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   Value *src = CS->getArgOperand(1);
   CG_LOG("Memcpy: " << *dst << " = " << *src << "\n");
   NodeIndex dstNode = NF.getValueNodeFor(dst);
-  // assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
-  if (dstNode == AndersNodeFactory::InvalidIndex) {
-    dstNode = NF.createValueNode(dst);
-    CG_DEBUG("Create value node " << dstNode << " for memcpy dst " << *dst << "\n");
-  }
+  assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
+  // if (dstNode == AndersNodeFactory::InvalidIndex) {
+  //   dstNode = NF.createValueNode(dst);
+  //   CG_DEBUG("Create value node " << dstNode << " for memcpy dst " << *dst << "\n");
+  // }
   NodeIndex srcNode = NF.getValueNodeFor(src);
-  // assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
-  if (srcNode == AndersNodeFactory::InvalidIndex) {
-    srcNode = NF.createValueNode(src);
-    CG_DEBUG("Create value node " << srcNode << " for memcpy src " << *src << "\n");
-  }
+  assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
+  // if (srcNode == AndersNodeFactory::InvalidIndex) {
+  //   srcNode = NF.createValueNode(src);
+  //   CG_DEBUG("Create value node " << srcNode << " for memcpy src " << *src << "\n");
+  // }
 #ifndef FIELD_SENSITIVE
   // field insensitive: *dst = *src
   NodeIndex derefDst = NF.getDereferenceNodeFor(dstNode);
@@ -269,11 +269,11 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       if (!arg->getType()->isPointerTy())
         continue; // skip non-pointer args
       NodeIndex argNode = NF.getValueNodeFor(arg);
-      // assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
-      if (argNode == AndersNodeFactory::InvalidIndex) {
-        argNode = NF.createValueNode(arg);
-        CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
-      }
+      assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
+      // if (argNode == AndersNodeFactory::InvalidIndex) {
+      //   argNode = NF.createValueNode(arg);
+      //   CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
+      // }
       Value *farg = CF->getArg(i);
       NodeIndex formalNode = NF.getValueNodeFor(farg);
       assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
@@ -282,7 +282,8 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   }
 
   // handle return
-  if (!CF->getReturnType()->isVoidTy()) {
+  // if (!CF->getReturnType()->isVoidTy()) {
+  if (CF->getReturnType()->isPointerTy()) {
     NodeIndex retNode = NF.getReturnNodeFor(CF);
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
     NodeIndex callNode = NF.getValueNodeFor(CS);
@@ -378,6 +379,13 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
   CG_LOG("######\nProcessing Func: " << F->getName() << "\n");
 
+  for (auto itr = inst_begin(F), ite = inst_end(F); itr != ite; ++itr) {
+    const Instruction *I = &*itr;
+    if (I->getType()->isPointerTy()) {
+      NF.createValueNode(I);
+    }
+  }
+
   // Use InstVisitor to handle instructions
   InstHandler visitor(*this, F);
   visitor.visit(F);
@@ -394,11 +402,11 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
       return;
     }
     NodeIndex rvNode = CGP.NF.getValueNodeFor(rv);
-    // assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
-    if (rvNode == AndersNodeFactory::InvalidIndex) {
-      rvNode = CGP.NF.createValueNode(rv);
-      CG_DEBUG("Create value node " << rvNode << " for return " << *rv << "\n");
-    }
+    assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
+    // if (rvNode == AndersNodeFactory::InvalidIndex) {
+    //   rvNode = CGP.NF.createValueNode(rv);
+    //   CG_DEBUG("Create value node " << rvNode << " for return " << *rv << "\n");
+    // }
     NodeIndex RT = CGP.NF.getReturnNodeFor(F);
     assert(RT != AndersNodeFactory::InvalidIndex && "Return node not found!");
     CGP.EB.addAssignmentEdges(rvNode, RT);
@@ -407,9 +415,9 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
 
 void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
   if (CS.isInlineAsm()) return;
-  if (!CS.getType()->isVoidTy()) {
-    CGP.NF.createValueNode(&CS);
-  }
+  // if (!CS.getType()->isVoidTy()) {
+  //   CGP.NF.createValueNode(&CS);
+  // }
 
   if (Function *CF = CS.getCalledFunction()) {
     // direct call
@@ -449,20 +457,21 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
 
 void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
   // create a deref node for base ptr of alloca
-  // NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
-  // assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
-  NodeIndex ptrNode = CGP.NF.createValueNode(&I);
+  NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
+  // NodeIndex ptrNode = CGP.NF.createValueNode(&I);
   NodeIndex derefNode = CGP.NF.createDereferenceNode(ptrNode);
   CGP.EB.addDereferenceEdges(ptrNode, derefNode);
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
-  // NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
   if (!I.getType()->isPointerTy()) {
     // XXX only consider pointer type
     return;
   }
-  NodeIndex valNode = CGP.NF.createValueNode(&I);
+  NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find load value node");
+  // NodeIndex valNode = CGP.NF.createValueNode(&I);
 
   Value *ptr = I.getOperand(0);
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
@@ -485,11 +494,11 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     return;
   }
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
-  if (valNode == AndersNodeFactory::InvalidIndex) {
-    valNode = CGP.NF.createValueNode(val);
-    CG_DEBUG("Create value node " << valNode << " for store " << *val << "\n");
-  }
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
+  // if (valNode == AndersNodeFactory::InvalidIndex) {
+  //   valNode = CGP.NF.createValueNode(val);
+  //   CG_DEBUG("Create value node " << valNode << " for store " << *val << "\n");
+  // }
 
   Value *ptr = I.getOperand(1);
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
@@ -509,9 +518,9 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   Value *ptr = GEP.getPointerOperand();
   NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP ptr node");
-  // NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
-  // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
-  NodeIndex valNode = CGP.NF.createValueNode(&GEP);
+  NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
+  // NodeIndex valNode = CGP.NF.createValueNode(&GEP);
 
 #ifndef FILED_SENSITIVE
   CGP.EB.addAssignmentEdges(ptrNode, valNode);
@@ -523,46 +532,48 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
 void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
   NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
   assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast src node");
-  // NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
-  // assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
-  NodeIndex dstNode = CGP.NF.createValueNode(&I);
+  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
+  // NodeIndex dstNode = CGP.NF.createValueNode(&I);
   CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
-  // NodeIndex dstNode = CGP.NF.getValueNodeFor(&PHI);
   if (!PHI.getType()->isPointerTy()) {
     // XXX only consider pointer type
     return;
   }
-  NodeIndex dstNode = CGP.NF.createValueNode(&PHI);
+  NodeIndex dstNode = CGP.NF.getValueNodeFor(&PHI);
+  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find phi dst node");
+  // NodeIndex dstNode = CGP.NF.createValueNode(&PHI);
   for (unsigned i = 0, e = PHI.getNumIncomingValues(); i != e; ++i) {
     Value *src = PHI.getIncomingValue(i);
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
-    // assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
-    if (srcNode == AndersNodeFactory::InvalidIndex) {
-      srcNode = CGP.NF.createValueNode(src);
-      CG_DEBUG("Create value node " << srcNode << " for PHI src " << *src << "\n");
-    }
+    assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
+    // if (srcNode == AndersNodeFactory::InvalidIndex) {
+    //   srcNode = CGP.NF.createValueNode(src);
+    //   CG_DEBUG("Create value node " << srcNode << " for PHI src " << *src << "\n");
+    // }
     CGP.EB.addAssignmentEdges(srcNode, dstNode);
   }
 }
 
 void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
-  // NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
   if (!I.getType()->isPointerTy()) {
     // XXX only consider pointer type
     return;
   }
-  NodeIndex dstNode = CGP.NF.createValueNode(&I);
+  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find select dst node");
+  // NodeIndex dstNode = CGP.NF.createValueNode(&I);
   for (unsigned i = 1; i < I.getNumOperands(); i++) {
     Value *src = I.getOperand(i);
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
-    // assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
-    if (srcNode == AndersNodeFactory::InvalidIndex) {
-      srcNode = CGP.NF.createValueNode(src);
-      CG_DEBUG("Create value node " << srcNode << " for select src " << *src << "\n");
-    }
+    assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
+    // if (srcNode == AndersNodeFactory::InvalidIndex) {
+    //   srcNode = CGP.NF.createValueNode(src);
+    //   CG_DEBUG("Create value node " << srcNode << " for select src " << *src << "\n");
+    // }
     CGP.EB.addAssignmentEdges(srcNode, dstNode);
   }
 }
@@ -580,9 +591,9 @@ void CallGraphPass::InstHandler::visitExtractValueInst(ExtractValueInst &EVI) {
     aggNode = CGP.NF.createValueNode(agg);
     CG_DEBUG("Create value node " << aggNode << " for ExtractValue " << *agg << "\n");
   }
-  // NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
-  // assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue agg node");
-  NodeIndex valNode = CGP.NF.createValueNode(&EVI);
+  NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue val node");
+  // NodeIndex valNode = CGP.NF.createValueNode(&EVI);
   CGP.EB.addAssignmentEdges(aggNode, valNode);
 }
 
@@ -594,11 +605,11 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
     return;
   }
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
-  if (valNode == AndersNodeFactory::InvalidIndex) {
-    valNode = CGP.NF.createValueNode(val);
-    CG_DEBUG("Create value node " << valNode << " for InsertValue val " << *val << "\n");
-  }
+  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
+  // if (valNode == AndersNodeFactory::InvalidIndex) {
+  //   valNode = CGP.NF.createValueNode(val);
+  //   CG_DEBUG("Create value node " << valNode << " for InsertValue val " << *val << "\n");
+  // }
   Value *agg = IVI.getAggregateOperand();
   NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
   // assert(aggNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue agg node");
@@ -607,6 +618,7 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
     CG_DEBUG("Create value node " << aggNode << " for InsertValue agg " << *agg << "\n");
   }
   // NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
+  // assert(resNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue res node");
   NodeIndex resNode = CGP.NF.createValueNode(&IVI);
   CGP.EB.addAssignmentEdges(aggNode, resNode);
   CGP.EB.addAssignmentEdges(valNode, resNode);

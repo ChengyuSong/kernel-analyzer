@@ -531,10 +531,17 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
 
 void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
   NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
-  assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast src node");
+  // assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast src node");
+  if (srcNode == AndersNodeFactory::InvalidIndex) {
+    srcNode = CGP.NF.createValueNode(I.getOperand(0));
+    CG_DEBUG("Create value node " << srcNode << " for bitcast src " << *(I.getOperand(0)) << "\n");
+  }
   NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
-  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
-  // NodeIndex dstNode = CGP.NF.createValueNode(&I);
+  // assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
+  if (dstNode == AndersNodeFactory::InvalidIndex) {
+    dstNode = CGP.NF.createValueNode(&I);
+    WARNING("Create value node " << dstNode << " for bitcast dst " << I << "\n");
+  }
   CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 

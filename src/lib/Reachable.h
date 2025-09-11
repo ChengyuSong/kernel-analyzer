@@ -17,7 +17,6 @@ private:
   bool runOnFunction(llvm::Function*);
   bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
   bool findCalleesByType(llvm::CallBase*, FuncSet&);
-  std::string getSourceLocation(const llvm::BasicBlock *BB);
 
   GlobalContext *Ctx;
 
@@ -25,40 +24,55 @@ private:
   CallerMap callerByType;
 
   const bool UseTypeBasedCallGraph;
-  const bool PropagateThroughReturnEdgees;
-
+  
   std::unordered_map<const llvm::BasicBlock*, uint64_t> BBIDs;
   uint64_t nextBBID;
+  // Maximum call stack depth to propagate across callers
+  const unsigned maxCallStackDepth;
+  std::unordered_map<const BasicBlock*, unsigned> callDepth;
+  std::unordered_map<const BasicBlock*, unsigned> retDepth;
 
   std::vector<std::pair<std::string, int> > targetList;
   std::vector<std::string> entryList;
+  std::unordered_set<const llvm::BasicBlock*> targetBBs;
   std::unordered_set<const llvm::BasicBlock*> reachableBBs;
+  std::unordered_set<const llvm::Function*> reachableFuns;
   std::unordered_map<const llvm::BasicBlock*, double> distances;
   std::unordered_set<const llvm::BasicBlock*> exitBBs;
   std::unordered_set<const llvm::BasicBlock*> entryBBs;
   using CallSequence = std::vector<const llvm::CallBase*>;
   std::unordered_map<const llvm::BasicBlock*, CallSequence> BBswithCalls;
   std::unordered_map<const llvm::CallBase*, double> callDistances;
+  std::unordered_map<const llvm::BasicBlock*, std::vector<const llvm::BasicBlock*>> criticalBBs;
   std::unordered_set<const llvm::CallBase*> reachableIndirectCalls;
 
 public:
     ReachableCallGraphPass(GlobalContext *Ctx_, std::string &TargetList,
-        std::string &EntryList, bool typeBased = true, bool propagateRet = false);
+        std::string &EntryList, bool typeBased = true, 
+        unsigned CallStackLen = 10);
     virtual bool doInitialization(llvm::Module *);
     virtual bool doFinalization(llvm::Module *);
     virtual void run(ModuleList &modules);
 
-    // simple bfs pass
-    void collectReachable(std::deque<const BasicBlock*> &worklist,
-        std::unordered_set<const BasicBlock*> &reachable);
+    // BFS pass
+    void collectReachable(std::deque<const BasicBlock *> &worklist,
+                        std::unordered_set<const BasicBlock *> &reachable,
+                        const std::unordered_set<const BasicBlock *> &others = {});
+    void propagateThroughReturnEdgees(std::unordered_set<const BasicBlock *> &retReachable,
+                                    const BasicBlock *startBB);
 
     // debug
-    void dumpDistance(std::ostream &OS, bool dumpSolution = false, bool dumpUnreachable = false);
     void dumpPolicy(std::ostream &OS);
+    void dumpCriticalBBs(std::ostream &OS);
+    void dumpDistance(std::ostream &OS, bool dumpUnreachable = false);
     void dumpIDMapping(ModuleList &modules, std::ostream &bbLocs, std::ostream &funcInfo);
     bool annotateModules(ModuleList &modules, std::string suffix=".annotated.bc");
-    void dumpCallees();
-    void dumpCallers();
+    // dumpCallees CSV format:
+    // one line per *caller* function: callerGUID,calleeGUID[,calleeGUID...]
+    void dumpCallees(std::ostream &calleeInfo);
+    // dumpCallers CSV format:
+    // one line per *callee* function: calleeGUID,callerGUID[,callerGUID...]
+    void dumpCallers(std::ostream &callerInfo);
 };
 
 #endif

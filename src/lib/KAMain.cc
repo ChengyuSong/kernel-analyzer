@@ -5,6 +5,7 @@
  * Copyright (C) 2015 Byoungyoung Lee
  * Copyright (C) 2016 Kangjie Lu
  * Copyright (C) 2015 - 2024 Chengyu Song
+ * Copyrigth (C) 2024 - 2025 Haochen Zeng
  *
  * For licensing details see LICENSE
  */
@@ -42,6 +43,9 @@ cl::list<std::string> InputFilenames(
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
 
+cl::opt<unsigned> CallStackLen(
+  "call-stack-len", cl::desc("The maximum call stack length from entry to the targets"), cl::init(10));
+
 cl::opt<bool> UseTypeBasedCallGraph(
   "type-based-callgraph", cl::desc("Use type-based call graph"), cl::init(false));
 
@@ -52,16 +56,29 @@ cl::opt<std::string> EntryList(
   "entry-list", cl::desc("Entry list"), cl::init(""));
 
 cl::opt<std::string> DumpPolicy(
-  "dump-policy", cl::desc("Dump static policy"), cl::init(""));
+  "dump-policy", cl::desc("Dump policy, format: bid,true_distance,false_distance,false_bid,true_bid"), cl::init(""));
 
 cl::opt<std::string> DumpDistance(
-  "dump-distance", cl::desc("Dump distance"), cl::init(""));
+  "dump-distance", cl::desc("Dump distances, format: bid,bb_hash,loc,distance"), cl::init(""));
+
+cl::opt<std::string> DumpCriticalBBs(
+  "dump-critical-branch", cl::desc("Dump critical basic blocks, format: critical_bid, exit_bid_1, exit_bid_2, ..."), cl::init(""));
 
 cl::opt<std::string> DumpBidMapping(
-  "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum"), cl::init(""));
+  "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,bb_hash,fun_GUID,filepath:linenum"), cl::init(""));
 
 cl::opt<std::string> DumpFuncInfo(
   "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
+
+cl::opt<std::string> DumpCallerCallee(
+  "dump-caller-callee", 
+  cl::desc("Dump caller → callee mapping, format: caller_GUID,callee_GUID,..."), 
+  cl::init(""));
+
+cl::opt<std::string> DumpCalleeCaller(
+  "dump-callee-caller", 
+  cl::desc("Dump callee → caller mapping, format: callee_GUID,caller_GUID,..."), 
+  cl::init(""));
 
 cl::opt<std::string> DumpAnnotatedIR(
   "dump-annotated-ir", cl::desc("Dump annotated IR"), cl::init(""));
@@ -222,7 +239,8 @@ int main(int argc, char **argv) {
     TyCG.run(GlobalCtx.Modules);
   }
 
-  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
+  ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, 
+    UseTypeBasedCallGraph, CallStackLen);
   RCGPass.run(GlobalCtx.Modules);
 
   if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
@@ -230,16 +248,26 @@ int main(int argc, char **argv) {
     std::ofstream funcInfo(DumpFuncInfo);
     RCGPass.dumpIDMapping(GlobalCtx.Modules, bbLocs, funcInfo);
   }
+  if (!DumpCallerCallee.empty() && !DumpCalleeCaller.empty()){
+    std::ofstream callercallee(DumpCallerCallee);
+    std::ofstream calleecaller(DumpCalleeCaller);
+    RCGPass.dumpCallees(callercallee);
+    RCGPass.dumpCallers(calleecaller);
+  }
   if (!DumpPolicy.empty()) {
     std::ofstream policy(DumpPolicy);
     RCGPass.dumpPolicy(policy);
   }
   if (!DumpDistance.empty()) {
     std::ofstream distance(DumpDistance);
-    RCGPass.dumpDistance(distance, true, false);
+    RCGPass.dumpDistance(distance, true);
   }
   if (!DumpAnnotatedIR.empty()) {
     RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
+  }
+  if (!DumpCriticalBBs.empty()) {
+    std::ofstream criticalBBs(DumpCriticalBBs);
+    RCGPass.dumpCriticalBBs(criticalBBs);
   }
 
   return 0;

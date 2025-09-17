@@ -26,6 +26,8 @@ unsigned StructInfo::maxStructSize = 0;
 
 void StructAnalyzer::addContainer(const StructType* container, StructInfo& containee, unsigned offset, const Module* M)
 {
+  SA_DEBUG("Add container: " << container->getName() << " contains " << containee.stType->getName()
+           << " at offset " << offset << "\n");
   containee.addContainer(container, offset);
   // recursively add to all nested structs
   const StructType* ct = containee.stType;

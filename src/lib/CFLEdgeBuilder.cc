@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <algorithm>
 
 #define EB_LOG(stmt) KA_LOG(2, "CFLEdgeBuilder: " << stmt)
 
@@ -92,6 +93,119 @@ void CFLEdgeBuilder::addDereferenceEdges(NodeIndex src, NodeIndex dst) {
 
   // Add inverse dereference edge: dst -> src with label '-d'
   edges.emplace_back(dst, src, labelDerefInv);
+}
+
+bool CFLEdgeBuilder::removeAssignmentEdges(NodeIndex src, NodeIndex dst) {
+  if (!labelsInitialized) {
+    throw std::runtime_error("Labels not initialized - call initializeGrammar first");
+  }
+
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for assignment edge removal");
+  }
+
+  bool removed = false;
+
+  // Remove assignment edge: src -> dst with label 'a'
+  auto it = std::find_if(edges.begin(), edges.end(),
+    [src, dst, this](const gracfl::Edge& edge) {
+      return edge.from == src && edge.to == dst && edge.label == labelAssign;
+    });
+  if (it != edges.end()) {
+    edges.erase(it);
+    removed = true;
+  }
+
+  // Remove inverse assignment edge: dst -> src with label '-a'
+  it = std::find_if(edges.begin(), edges.end(),
+    [src, dst, this](const gracfl::Edge& edge) {
+      return edge.from == dst && edge.to == src && edge.label == labelAssignInv;
+    });
+  if (it != edges.end()) {
+    edges.erase(it);
+    removed = true;
+  }
+
+  return removed;
+}
+
+bool CFLEdgeBuilder::removeDereferenceEdges(NodeIndex src, NodeIndex dst) {
+  if (!labelsInitialized) {
+    throw std::runtime_error("Labels not initialized - call initializeGrammar first");
+  }
+
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for dereference edge removal");
+  }
+
+  bool removed = false;
+
+  // Remove dereference edge: src -> dst with label 'd'
+  auto it = std::find_if(edges.begin(), edges.end(),
+    [src, dst, this](const gracfl::Edge& edge) {
+      return edge.from == src && edge.to == dst && edge.label == labelDeref;
+    });
+  if (it != edges.end()) {
+    edges.erase(it);
+    removed = true;
+  }
+
+  // Remove inverse dereference edge: dst -> src with label '-d'
+  it = std::find_if(edges.begin(), edges.end(),
+    [src, dst, this](const gracfl::Edge& edge) {
+      return edge.from == dst && edge.to == src && edge.label == labelDerefInv;
+    });
+  if (it != edges.end()) {
+    edges.erase(it);
+    removed = true;
+  }
+
+  return removed;
+}
+
+bool CFLEdgeBuilder::removeEdge(NodeIndex src, NodeIndex dst, uint label) {
+  if (!labelsInitialized) {
+    throw std::runtime_error("Labels not initialized - call initializeGrammar first");
+  }
+
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for edge removal");
+  }
+
+  auto it = std::find_if(edges.begin(), edges.end(),
+    [src, dst, label](const gracfl::Edge& edge) {
+      return edge.from == src && edge.to == dst && edge.label == label;
+    });
+
+  if (it != edges.end()) {
+    edges.erase(it);
+    return true;
+  }
+
+  return false;
+}
+
+size_t CFLEdgeBuilder::removeEdgesInvolvingNode(NodeIndex node) {
+  if (!labelsInitialized) {
+    throw std::runtime_error("Labels not initialized - call initializeGrammar first");
+  }
+
+  if (node == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for edge removal");
+  }
+
+  size_t initialSize = edges.size();
+
+  // Remove all edges where node is either source or destination
+  edges.erase(
+    std::remove_if(edges.begin(), edges.end(),
+      [node](const gracfl::Edge& edge) {
+        return edge.from == node || edge.to == node;
+      }),
+    edges.end()
+  );
+
+  return initialSize - edges.size();
 }
 
 void CFLEdgeBuilder::outputEdgesToFile(const std::string& filename) const {

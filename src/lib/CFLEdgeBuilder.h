@@ -64,6 +64,32 @@ public:
   void addDereferenceEdges(NodeIndex src, NodeIndex dst);
 
   /**
+   * @brief Helper to remove assignment edge pair
+   * Removes edges (src, dst, 'a') and (dst, src, '-a') if they exist
+   * @return true if any edges were removed, false otherwise
+   */
+  bool removeAssignmentEdges(NodeIndex src, NodeIndex dst);
+
+  /**
+   * @brief Helper to remove dereference edge pair
+   * Removes edges (src, dst, 'd') and (dst, src, '-d') if they exist
+   * @return true if any edges were removed, false otherwise
+   */
+  bool removeDereferenceEdges(NodeIndex src, NodeIndex dst);
+
+  /**
+   * @brief Remove specific edge by source, destination and label
+   * @return true if edge was found and removed, false otherwise
+   */
+  bool removeEdge(NodeIndex src, NodeIndex dst, uint label);
+
+  /**
+   * @brief Remove all edges involving a specific node (as source or destination)
+   * @return number of edges removed
+   */
+  size_t removeEdgesInvolvingNode(NodeIndex node);
+
+  /**
    * @brief Get the constructed edge list
    */
   const std::vector<gracfl::Edge>& getEdges() const { return edges; }

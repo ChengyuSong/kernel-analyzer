@@ -1,7 +1,7 @@
 /*
  * Helper functions for point-to analysis
  *
- * Copyright (C) 2019 - 2024 Chengyu Song
+ * Copyright (C) 2019 - 2025 Chengyu Song
  *
  * For licensing details see LICENSE
  */
@@ -198,7 +198,8 @@ static void createNodeForGlobals(Module *M, AndersNodeFactory &nodeFactory,
       if (retType->isAggregateType()) {
         WARNING("Aggregate return type not supported, will collapse\n");
       }
-      nodeFactory.createReturnNode(&F);
+      NodeIndex node = nodeFactory.createReturnNode(&F);
+      PT_DEBUG("Created return node " << node << " for function " << F.getName() << "\n");
     }
 
     // Create vararg node
@@ -210,7 +211,8 @@ static void createNodeForGlobals(Module *M, AndersNodeFactory &nodeFactory,
       // FIXME: handle potential aggregate argument type
       // createNodeForTypedVal(&A, A.getType(), false, nodeFactory, structAnalyzer);
       assert(!A.getType()->isAggregateType() && "Aggregate argument type not supported");
-      nodeFactory.createValueNode(&A);
+      NodeIndex node = nodeFactory.createValueNode(&A);
+      PT_DEBUG("Created value node " << node << " for arg " << A.getName() << " of function " << F.getName() << "\n");
     }
 
     NodeIndex fobj = nodeFactory.createObjectNode(&F);
@@ -218,14 +220,16 @@ static void createNodeForGlobals(Module *M, AndersNodeFactory &nodeFactory,
   }
 }
 
-static NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int FlagArg,
-                                    AndersNodeFactory &nodeFactory, StructAnalyzer &structAnalyzer) {
+NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int FlagArg,
+                                  AndersNodeFactory &nodeFactory, StructAnalyzer &structAnalyzer) {
 
 #if 1 //LLVM_VERSION_MAJOR > 13
   // Assuming opaque pointer type
   // We don't know what it points to, so we create an opaque object node
   return nodeFactory.createOpaqueObjectNode(I, true);
 #else
+  const PointerType* pType = dyn_cast<PointerType>(I->getType());
+  assert(pType != NULL && "Heap allocation should return a pointer type");
   const Type* elemType = pType->getElementType();
 
   // TODO: using casting is not the best way, consider sizeof
@@ -280,7 +284,7 @@ static NodeIndex createNodeForHeapObject(const Instruction *I, int SizeArg, int 
   // Create the first heap node
   NodeIndex obj = nodeFactory.getObjectNodeFor(I);
   if (obj == AndersNodeFactory::InvalidIndex) {
-    obj = nodeFactory.createObjectNode(I, isUnion, true);
+    obj = nodeFactory.createObjectNode(I, elemType, isUnion, true);
     for (unsigned i = 1; i < maxSize; ++i) {
       isUnion = (stInfo && i < stInfo->getExpandedSize()) ? stInfo->isFieldUnion(i) : false;
       nodeFactory.createObjectNode(obj, i, isUnion, true);
@@ -545,15 +549,20 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
     for (auto const& F: *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty())
         continue;
-    
+
       int size, flag;
       if (isAllocFn(F.getName(), &size, &flag)) {
         // skip allocator functions
         PT_LOG("Skipping allocator function " << F.getName() << "\n");
         GlobalCtx.AllocFuncs.insert(&F);
         continue;
+      } else if (F.getName().find_insensitive("alloc") != StringRef::npos &&
+                 F.getReturnType()->isPointerTy()) {
+        // treat as candidate allocator function
+        PT_LOG("Candidate allocator function " << F.getName() << "\n");
+        GlobalCtx.CandidateAllocFuncs.insert(&F);
       }
-    
+
       // Scan the function body
       for (auto itr = inst_begin(&F), ite = inst_end(&F); itr != ite; ++itr) {
         const Instruction *I = &*itr;
@@ -570,6 +579,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
           case Instruction::Alloca: {
             Type *Ty = cast<AllocaInst>(I)->getAllocatedType();
             NodeIndex obj = createNodeForTypedVal(I, Ty, false, nodeFactory, structAnalyzer);
+            PT_LOG("Created node " << obj << " for alloca " << *I << " with type " << *Ty << " in " << F.getName() << "\n");
             ptsGraph[valNode].insert(obj);
             break;
           }
@@ -578,6 +588,7 @@ void populateNodeFactory(GlobalContext &GlobalCtx) {
             if (Function *CF = CI->getCalledFunction()) {
               if (isAllocFn(CF->getName(), &size, &flag)) {
                 NodeIndex obj = createNodeForHeapObject(CI, size, flag, nodeFactory, structAnalyzer);
+                PT_LOG("Created node " << obj << " for heap alloc " << *I << " in " << F.getName() << "\n");
                 ptsGraph[valNode].insert(obj);
                 GlobalCtx.AllocSites.insert(CI);
               }
@@ -737,8 +748,7 @@ static void updateObjectNode(NodeIndex oldObj, NodeIndex newObj,
   for (auto itr = ptsGraph.begin(), end = ptsGraph.end(); itr != end; ++itr) {
     AndersPtsSet temp = itr->second; // make a copy
     // in case modification will break iteration
-    for (auto obj = temp.find_first(), end = temp.getSize(); obj < end;
-         obj = temp.find_next(obj)) {
+    for (auto obj : temp) {
       if (obj >= baseObj && obj < (baseObj + size)) {
         itr->second.reset(obj);
         itr->second.insert(newObj + (obj - baseObj));

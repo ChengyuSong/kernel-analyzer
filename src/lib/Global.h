@@ -91,6 +91,7 @@ public:
 
   // allocation functions
   FuncSet AllocFuncs;
+  FuncSet CandidateAllocFuncs;
 
   // Map a callsite to all potential callee functions.
   CalleeMap Callees;

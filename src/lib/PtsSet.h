@@ -1,79 +1,56 @@
 #ifndef ANDERSEN_PTSSET_H
 #define ANDERSEN_PTSSET_H
 
-#include <vector>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <algorithm>
 
 class AndersPtsSet {
 private:
-  std::vector<bool> _bitvec;
+  boost::unordered_flat_set<std::size_t> _set;
 
 public:
 
   AndersPtsSet() = default;
-  AndersPtsSet(const AndersPtsSet &S) : _bitvec(S._bitvec) {}
+  AndersPtsSet(const AndersPtsSet &S) : _set(S._set) {}
   ~AndersPtsSet() = default;
 
   const bool has(std::size_t idx) const {
-    return idx < _bitvec.size() ? _bitvec[idx] : false;
+    return _set.contains(idx);
   }
 
   bool insert(std::size_t idx) {
-    bool ret;
-    if (idx < _bitvec.size()) {
-      ret = !_bitvec[idx];
-    } else {
-      _bitvec.resize(idx + 1);
-      ret = true;
-    }
-    _bitvec[idx] = true;
-    return ret;
+    return _set.insert(idx).second;
   }
 
-  std::size_t insert(AndersPtsSet &S) {
-    std::size_t ret = 0;
-    if (S.getSize() > _bitvec.size()) {
-      _bitvec.resize(S.getSize());
-    }
-    for (std::size_t i = 0; i < S.getSize(); ++i) {
-      if (S._bitvec[i] && !_bitvec[i]) {
-        ret += 1;
-        _bitvec[i] = true;
-      }
-    }
-    return ret;
+  bool insert(const AndersPtsSet &S) {
+    if (S.isEmpty()) return false;
+
+    std::size_t oldSize = _set.size();
+    _set.insert(S._set.begin(), S._set.end());
+    return _set.size() > oldSize;
   }
 
   void reset(std::size_t idx) {
-    _bitvec[idx] = false;
+    _set.erase(idx);
   }
 
   void clear() {
-    _bitvec.clear();
+    _set.clear();
   }
 
   std::size_t getSize() const {
-    return _bitvec.size();
+    return _set.size();
   }
 
   bool isEmpty() const {
-    return _bitvec.empty();  // Always prefer using this function to perform empty test
+    return _set.empty();
   }
 
-  // iterator begin() { return _bitvec.begin(); }
-  // iterator end() { return _bitvec.end(); }
-  // const_iterator begin() const { return _bitvec.begin(); }
-  // const_iterator end() const { return _bitvec.end(); }
-
-  std::size_t find_first() const {
-    if (_bitvec.empty()) return -1;
-    return std::find(_bitvec.begin(), _bitvec.end(), true) - _bitvec.begin();
-  }
-
-  std::size_t find_next(std::size_t last) const {
-    if (_bitvec.empty()) return -1;
-    auto ret = (std::find(_bitvec.begin() + last + 1, _bitvec.end(), true) - _bitvec.begin());
-    return ret == 0 ? _bitvec.size() : ret;
-  }
+  // Iterator support
+  auto begin() { return _set.begin(); }
+  auto end() { return _set.end(); }
+  auto begin() const { return _set.begin(); }
+  auto end() const { return _set.end(); }
 };
 
 #endif //ANDERSEN_PTSSET_H

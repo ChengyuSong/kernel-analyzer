@@ -88,7 +88,8 @@ NodeIndex AndersNodeFactory::createObjectNode(const NodeIndex base, const unsign
     unsigned nextIdx = nodes.size();
     assert(nextIdx == base + offset);
     const Value *val = getValueForNode(base);
-    nodes.emplace_back(AndersNode(AndersNode::OBJ_NODE, nextIdx, val, NULL, offset, uniono, heap));
+    const Type *ty = getObjectType(base);
+    nodes.emplace_back(AndersNode(AndersNode::OBJ_NODE, nextIdx, val, ty, offset, uniono, heap));
 
     return nextIdx;
 }
@@ -498,6 +499,8 @@ void AndersNodeFactory::dumpNode(NodeIndex idx) const {
         AA_LOG("V ");
     else if (n.type == AndersNode::OBJ_NODE)
         AA_LOG("O ");
+    else if (n.type == AndersNode::DEREF_NODE)
+        AA_LOG("D ");
     else
         assert(false && "Wrong type number!");
     AA_LOG("#" << n.idx << "\t");

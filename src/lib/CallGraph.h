@@ -40,16 +40,22 @@ private:
 
   friend class InstHandler;
 
+  using cfl_result_t = std::vector<std::vector<std::unordered_set<unsigned long long>>>;
+
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
   bool handleMemcpy(const llvm::CallBase*);
   bool handleCall(const llvm::CallBase*, const llvm::Function*);
-  bool isCompatibleType(llvm::Type *T1, llvm::Type *T2);
+  bool removeCallEdges(const llvm::CallBase*, const llvm::Function*);
+  bool isCompatibleType(const llvm::Type *T1, const llvm::Type *T2);
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void buildEdgesFromPtsGraph(const PtsGraph &ptsGraph);
   bool handleGEP(const llvm::GetElementPtrInst *GEP, AndersPtsSet &ptr2set, llvm::Module *M);
   void processInitializer(NodeIndex obj, llvm::Constant *init);
+  bool findCustomAllocators(cfl_result_t &outputCFLGraph);
+  bool handleIndirectCall(cfl_result_t &outputCFLGraph);
+  bool handleGEP(cfl_result_t &outputCFLGraph, llvm::Module *M);
 
   AndersNodeFactory &NF;
   StructAnalyzer &SA;
@@ -70,7 +76,11 @@ private:
   std::unordered_map<const StructInfo*, node_set_t> argStructs; // structs passed as arguments
   std::unordered_map<const StructInfo*, node_set_t> globalStructs; // structs stored in globals
 
-  std::unordered_set<const llvm::GetElementPtrInst*> GEPs;
+  std::vector<const llvm::GetElementPtrInst*> GEPs;
+  std::unordered_map<NodeIndex, NodeIndex> reallocated; // record reallocated obj nodes
+  PtsGraph updatedGEPs; // GEP ptr nodes that have been updated
+
+  std::unordered_set<NodeIndex> AllocSites;
 
   CalleeMap calleeByType;
 
@@ -89,6 +99,7 @@ public:
   void dumpFuncPtrs(llvm::raw_ostream &OS);
   void dumpCallees(llvm::raw_ostream &OS);
   void dumpCallers(llvm::raw_ostream &OS);
+  void dumpGlobals(llvm::raw_ostream &OS);
 };
 
 #endif

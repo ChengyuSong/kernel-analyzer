@@ -246,7 +246,7 @@ int main(int argc, char **argv) {
   GlobalCtx.nodeFactory.setExtFuncMap(&GlobalCtx.ExtFuncs);
 
   // Main workflow
-  // populateNodeFactory(GlobalCtx);
+  populateNodeFactory(GlobalCtx);
 
   // CFL-reachability edge construction
   if (GrammarFile.empty()) {

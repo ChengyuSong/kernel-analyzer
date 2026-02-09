@@ -20,13 +20,14 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/Analysis/CallGraph.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/FormatVariadic.h>
 
 #include <vector>
 #include <algorithm>
 
 #include "CallGraph.h"
 #include "Annotation.h"
-#include "PointTo.h"
 
 #include "gracfl/include/solvers/Solver.hpp"
 
@@ -829,9 +830,9 @@ bool CallGraphPass::doInitialization(Module *M) {
       int size = 0, flag = 0;
       if (isAllocFn(F.getName(), &size, &flag)) {
         Ctx->AllocFuncs.insert(&F);
-      } else if (F.getName().find_insensitive("alloc") != StringRef::npos &&
-                 F.getReturnType()->isPointerTy()) {
-        Ctx->CandidateAllocFuncs.insert(&F);
+      } else if (F.getReturnType()->isPointerTy()) {
+        // collect pointer returning functions
+        PtrReturnFuncs.push_back(&F);
       }
       
       // create nodes for function arguments and return value
@@ -947,8 +948,7 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
         Ctx->AllocFuncs.insert(F);
         newAllocFuncs.insert(F);
         foundNewAlloc = true;
-#if 0
-        // update edges
+        // update edge
         for (auto const& U : F->users()) {
           if (const CallBase *CI = dyn_cast<CallBase>(U)) {
             if (CI->getCalledFunction() == F) {
@@ -958,14 +958,10 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
               AllocSites.insert(callNode);
               // remove call edges
               removeCallEdges(CI, F);
-              // add new edge
-              NodeIndex obj = createNodeForHeapObject(CI, 0, 0, NF, SA);
-              EB.addDereferenceEdges(callNode, obj);
               CG_LOG("Update custom allocator call: " << *CI << "\n");
             }
           }
         }
-#endif
         break;
       }
     }
@@ -981,6 +977,71 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
   return foundNewAlloc;
 }
 
+void CallGraphPass::queryAllocatorCandidatesWithLLM() {
+  if (!LLM || PtrReturnFuncs.empty())
+    return;
+
+  const StringRef SystemPrompt = "You classify allocator-like functions conservatively.";
+  std::string UserPrompt;
+  raw_string_ostream PromptOS(UserPrompt);
+  PromptOS << "Given function declarations only (no bodies), identify likely custom allocator functions.\n";
+  PromptOS << "Return strict JSON only in this format: {\"candidates\":[\"func_name1\",\"func_name2\"]}\n";
+  PromptOS << "Only include names from the provided list.\n\n";
+  PromptOS << "Declarations:\n";
+  for (const Function *F : PtrReturnFuncs) {
+    std::string FuncTy;
+    raw_string_ostream FOS(FuncTy);
+    FOS << *F->getFunctionType();
+    FOS.flush();
+    PromptOS << "- " << F->getName() << " : " << FuncTy << "\n";
+  }
+  PromptOS.flush();
+  CG_DEBUG("LLM allocator query system prompt:\n" << SystemPrompt << "\n");
+  CG_DEBUG("LLM allocator query user prompt:\n" << UserPrompt << "\n");
+
+  auto Resp = LLM->requestJSON(
+      SystemPrompt,
+      UserPrompt);
+  if (!Resp) {
+    WARNING("LLM allocator candidate query failed: " << toString(Resp.takeError()) << "\n");
+    return;
+  }
+  std::string RespText;
+  raw_string_ostream RespOS(RespText);
+  RespOS << formatv("{0}", *Resp);
+  RespOS.flush();
+  CG_DEBUG("LLM allocator response:\n" << RespText << "\n");
+
+  const json::Array *Candidates = nullptr;
+  if (const json::Object *Obj = Resp->getAsObject()) {
+    Candidates = Obj->getArray("candidates");
+    if (!Candidates)
+      Candidates = Obj->getArray("functions");
+  } else {
+    Candidates = Resp->getAsArray();
+  }
+
+  if (!Candidates) {
+    WARNING("LLM allocator candidate response missing 'candidates' array\n");
+    return;
+  }
+
+  size_t Added = 0;
+  for (const json::Value &V : *Candidates) {
+    std::optional<StringRef> Name = V.getAsString();
+    if (!Name)
+      continue;
+    for (Function *F : PtrReturnFuncs) {
+      if (F->getName() == *Name &&
+          Ctx->AllocFuncs.count(F) == 0 &&
+          Ctx->CandidateAllocFuncs.insert(F).second) {
+        Added++;
+      }
+    }
+  }
+  CG_LOG("LLM added " << Added << " candidate allocator(s)\n");
+}
+
 bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
   // resolve indirect calls
   bool Changed = false;
@@ -994,7 +1055,7 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
     }
     auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelV()];
     for (auto idx : cflSet) {
-      CG_DEBUG("FuncPtr: node: " << fptrNode << " -> ptr: " << idx << "\n");
+      // CG_DEBUG("FuncPtr: node: " << fptrNode << " -> ptr: " << idx << "\n");
       // ptsSet.insert(idx);
       if (NF.isSpecialNode(idx)) {
         WARNING("Indirect Call: " << *CS << " callee is a special node: " << idx << "\n");
@@ -1002,12 +1063,12 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       }
       const Value *CV = NF.getValueForNode(idx);
       if (CV == NULL) {
-        WARNING("No value for function node " << idx << "!\n");
+        // WARNING("No value for function node!\n");
         continue;
       }
       const Function *CF = dyn_cast<Function>(CV);
       if (CF == NULL) {
-        WARNING("Function pointer " << *fptr << " points to non-function: " << *CV << "\n");
+        // WARNING("Function pointer " << *fptr << " points to non-function: " << *CV << "\n");
         continue;
       }
       // due to field insensitivity, we may have FPs, do a type match
@@ -1018,8 +1079,8 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       if (Ctx->Callees[CS].insert(CF).second) {
         // if new callee added, we need to rerun
         Changed = true;
-        // CG_LOG("Handle indirect Call: callee: " << CF->getName() << "\n");
-        // handleCall(CS, CF);
+        CG_LOG("Handle indirect Call: callee: " << CF->getName() << "\n");
+        handleCall(CS, CF);
       }
     }
   }
@@ -1031,7 +1092,7 @@ bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
 
-  // process functions, only the first iteration
+  // process global initializers and functions, only the first iteration
   if (iteration == 0) {
     for (auto &GV : M->globals()) {
       // Skip compiler-introduced globals
@@ -1049,6 +1110,12 @@ bool CallGraphPass::doModulePass(Module *M) {
         auto init = GV.getInitializer();
         processInitializer(deref, init);
       }
+    }
+
+    // query LLM for allocator candidates before processing functions
+    if (LLM && M == Ctx->Modules.front().first) {
+      CG_LOG("LLM-assisted filtering is enabled.\n");
+      queryAllocatorCandidatesWithLLM();
     }
 
     for (Function &F : *M) {
@@ -1087,14 +1154,20 @@ bool CallGraphPass::doModulePass(Module *M) {
     auto outputCFLGraph = solver->getGraph();
 
     // handle custom allocators
-    findCustomAllocators(outputCFLGraph);
+    if (findCustomAllocators(outputCFLGraph)) {
+      // if new allocators found, we need to rerun
+      // solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
+      // solver->runCFL();
+      // outputCFLGraph = solver->getGraph();
+    }
 
     // parse results and update call edges
-    handleIndirectCall(outputCFLGraph);
+    Changed |= handleIndirectCall(outputCFLGraph);
 
     iteration++;
   }
 
+  Changed = false; // only run once
   return Changed;
 }
 

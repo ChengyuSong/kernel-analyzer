@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include "Global.h"
+#include "LLMClient.h"
 
 class CallGraphPass : public IterativeModulePass {
 private:
@@ -50,22 +51,25 @@ private:
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void processInitializer(NodeIndex obj, llvm::Constant *init);
+  void queryAllocatorCandidatesWithLLM();
   bool findCustomAllocators(cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(cfl_result_t &outputCFLGraph);
 
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
+  LLMClient *LLM;
 
   unsigned iteration;
 
   std::unordered_set<NodeIndex> AllocSites;
+  std::vector<llvm::Function*> PtrReturnFuncs;
 
   CalleeMap calleeByType;
 
 public:
-  CallGraphPass(GlobalContext *Ctx_)
+  CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_ = nullptr)
       : IterativeModulePass(Ctx_, "CallGraph"),
-        NF(Ctx->nodeFactory), EB(Ctx->edgeBuilder), iteration(0)
+        NF(Ctx->nodeFactory), EB(Ctx->edgeBuilder), LLM(LLMClient_), iteration(0)
         { }
   virtual bool doInitialization(llvm::Module *);
   virtual bool doFinalization(llvm::Module *);

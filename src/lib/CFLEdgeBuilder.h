@@ -4,6 +4,10 @@
 #include <vector>
 #include <fstream>
 #include <memory>
+#include <stack>
+#include <unordered_set>
+#include <unordered_map>
+#include <algorithm>
 
 #include "NodeFactory.h"
 #include "gracfl/include/utils/Edges.hpp"
@@ -120,6 +124,39 @@ public:
    */
   const uint getLabelM() const { return labelM; }
   const uint getLabelV() const { return labelV; }
+
+  /**
+   * @brief Detect and break cycles in the constraint graph
+   * Uses Tarjan's algorithm to find SCCs and removes select edges to break cycles
+   * @param maxSCCSize Maximum SCC size to break (default: 100)
+   * @return Number of edges removed
+   */
+  size_t detectAndBreakCycles(size_t maxSCCSize = 100);
+
+  /**
+   * @brief Aggressive edge reduction when facing too many edges
+   * @param maxEdges Maximum number of edges to keep
+   * @return Number of edges removed
+   */
+  size_t aggressiveEdgeReduction(size_t maxEdges);
+
+  /**
+   * @brief Analyze and report nodes with extremely high out-degree
+   * @param threshold Report nodes with out-degree above this value (default: 1000)
+   * @param topN Show top N nodes by out-degree (default: 20)
+   * @param outTopNodes Optional output vector to receive top N nodes as (NodeIndex, out-degree) pairs
+   */
+  void analyzeHighDegreeNodes(size_t threshold = 1000, size_t topN = 20,
+                               std::vector<std::pair<NodeIndex, size_t>>* outTopNodes = nullptr);
+
+private:
+  /**
+   * @brief Tarjan's SCC detection implementation
+   */
+  void tarjanSCC(std::vector<std::vector<NodeIndex>>& sccs);
+  void tarjanDFS(NodeIndex node, std::vector<std::vector<NodeIndex>>& adjList,
+                 std::vector<int>& disc, std::vector<int>& low, std::vector<bool>& onStack,
+                 std::stack<NodeIndex>& st, std::vector<std::vector<NodeIndex>>& sccs, int& time);
 };
 
 #endif // CFL_EDGE_BUILDER_H

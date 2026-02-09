@@ -4,6 +4,7 @@ set (KASource
   StructAnalyzer.cc
   NodeFactory.cc
   PointTo.cc
+  LLMClient.cc
   CFLEdgeBuilder.cc
   CallGraph.cc
   Reachable.cc

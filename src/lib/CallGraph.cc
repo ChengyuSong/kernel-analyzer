@@ -4,7 +4,7 @@
  * Copyright (C) 2012 Xi Wang, Haogang Chen, Nickolai Zeldovich
  * Copyright (C) 2015 - 2016 Chengyu Song 
  * Copyright (C) 2016 Kangjie Lu
- * Copyright (C) 2024 - 2025 Chengyu Song
+ * Copyright (C) 2024 - 2026 Chengyu Song
  *
  * For licensing details see LICENSE
  */
@@ -30,12 +30,40 @@
 
 #include "gracfl/include/solvers/Solver.hpp"
 
-#define FIELD_SENSITIVE 1
-
 #define CG_LOG(stmt) KA_LOG(2, "CallGraph: " << stmt)
 #define CG_DEBUG(stmt) KA_LOG(3, "CallGraph: " << stmt)
 
 using namespace llvm;
+
+// Helper to check if we should skip creating edges for a value
+static bool shouldSkipValue(const Value *V) {
+  if (!V)
+    return true;
+
+  // Skip nullptr
+  if (isa<ConstantPointerNull>(V))
+    return true;
+
+  // Skip compiler-introduced values
+  if (isCompilerIntroducedValue(V))
+    return true;
+
+  return false;
+}
+
+// Helper to check if we should skip creating edges for a function call
+static bool shouldSkipFunction(const Function *F) {
+  if (!F || !F->hasName())
+    return false;
+
+  StringRef name = F->getName();
+
+  // Skip kernel utility functions
+  if (isFreeFn(name) || isKernelUtilityFn(name))
+    return true;
+
+  return false;
+}
 
 Function* CallGraphPass::getFuncDef(Function *F) {
   FuncMap::iterator it = Ctx->Funcs.find(F->getGUID());
@@ -208,8 +236,7 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   //   srcNode = NF.createValueNode(src);
   //   CG_DEBUG("Create value node " << srcNode << " for memcpy src " << *src << "\n");
   // }
-#ifndef FIELD_SENSITIVE
-  // field insensitive: *dst = *src
+  // field-insensitive: *dst = *src
   NodeIndex derefDst = NF.getDereferenceNodeFor(dstNode);
   if (derefDst == AndersNodeFactory::InvalidIndex) {
     derefDst = NF.createDereferenceNode(dstNode);
@@ -223,10 +250,6 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
     EB.addDereferenceEdges(srcNode, derefSrc);
   }
   EB.addAssignmentEdges(derefSrc, derefDst);
-#else
-  //TODO: copy field by field
-  WARNING("Field sensitive memcpy not implemented yet: " << *CS << "\n");
-#endif
 
   return false;
 }
@@ -234,6 +257,12 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   if (CF->isIntrinsic()) {
     // handle intrinsic functions
+    return false;
+  }
+
+  // Skip kernel utility functions to reduce edge explosion
+  if (shouldSkipFunction(CF)) {
+    CG_DEBUG("Skipping kernel utility function: " << CF->getName() << "\n");
     return false;
   }
 
@@ -254,6 +283,12 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
     for (unsigned i = 0; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
+      if (!arg->getType()->isPointerTy())
+        continue; // skip non-pointer args
+      if (shouldSkipValue(arg)) {
+        CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
+        continue;
+      }
       NodeIndex argNode = NF.getValueNodeFor(arg);
       if (argNode == AndersNodeFactory::InvalidIndex) {
         WARNING("VarArg: actual (" << i << ") " << *arg << " node not found!\n");
@@ -270,6 +305,10 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       Value *arg = CS->getArgOperand(i);
       if (!arg->getType()->isPointerTy())
         continue; // skip non-pointer args
+      if (shouldSkipValue(arg)) {
+        CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
+        continue;
+      }
       NodeIndex argNode = NF.getValueNodeFor(arg);
       // assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
       if (argNode == AndersNodeFactory::InvalidIndex) {
@@ -342,132 +381,26 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   return false;
 }
 
-static inline const Type *getElementTy(const Type *T) {
-  while (T) {
-    if (const ArrayType *AT = dyn_cast<ArrayType>(T))
-      T = AT->getElementType();
-    else if (const VectorType *VT = dyn_cast<VectorType>(T))
-      T = VT->getElementType();
-    else
-      break;
-  }
-
-  return T;
-}
-
-bool CallGraphPass::handleGEP(const GetElementPtrInst *GEP, AndersPtsSet &ptr2set, Module *M) {
-  const Type *ptrTy = getElementTy(GEP->getSourceElementType());
-  const StructType *STy = dyn_cast<StructType>(ptrTy);
-  assert(STy != NULL && "GEP source element type is not struct type!");
-  const StructInfo* stInfo = SA.getStructInfo(STy, M);
-  assert(stInfo != NULL && "Struct info not found!");
-
-  NodeIndex valNode = NF.getValueNodeFor(GEP);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "GEP value node not found!");
-  auto &ptsSet = funcPtsGraph[valNode];
-  auto &diff = updatedGEPs[valNode];
-
-  // get the field number
-  const DataLayout* DL = &(M->getDataLayout());
-  unsigned fieldNum = 0;
-  int64_t offset = getGEPOffset(GEP, DL);
-  if (offset < 0) {
-    // FIXME: handle negative offset, like container_of
-    WARNING("GEP: " << GEP << " negative offset: " << offset << "\n");
-    return false;
-  } else {
-    fieldNum = offsetToFieldNum(GEP->getSourceElementType(), offset, DL, SA, M);
-  }
-  CG_DEBUG("GEP offset = " << offset << " fieldNum = " << fieldNum << "\n");
-
-  // iterate through the point2 set of the source ptr
-  for (auto idx : ptr2set) {
-
-    CG_DEBUG("GEP source obj " << idx << "\n");
-    if (NF.isSpecialNode(idx)) {
-      // special object, e.g., null or univeral
-      EB.addAssignmentEdges(valNode, idx);
-      continue;
-    }
-
-    // check if we need to resize the obj of the ptr
-    // get allocated size
-    unsigned allocSize = NF.getObjectSize(idx);
-    unsigned ptrSize = stInfo->getExpandedSize();
-    auto *AllocTy = NF.getObjectType(idx);
-    assert(AllocTy != nullptr && "GEP: obj type is NULL!");
-    if (ptrSize > allocSize) {
-      if (NF.isOpaqueObject(idx)) {
-        // we don't know the allocation size for opaque objects
-        CG_LOG("GEP resize obj: " << idx << " to type " << STy->getName() << "\n");
-        assert(NF.isHeapObject(idx) && "GEP: non-heap obj needs to be resized!");
-        // resize the obj
-        NodeIndex obj = extendObjectSize(idx, STy, NF, SA, funcPtsGraph);
-        if (obj == AndersNodeFactory::InvalidIndex) {
-          WARNING("GEP: failed to resize obj for " << *GEP << "\n");
-          continue;
-        }
-        CG_LOG("GEP resized new obj: " << obj << "\n");
-        reallocated[idx] = obj;
-        idx = obj;
-        allocSize = ptrSize;
-      } else {
-        // XXX: this is likely due to passing data as void*
-        // lacking context sensitivity, we cannot distinguish them
-        // so remove them from the resulting point2 set
-        WARNING("GEP non-opaque obj size mismatch: " << idx << " vs type " << STy->getName() << "\n");
-        continue;
-      }
-    } else if (!isCompatibleType(STy, AllocTy)) {
-      // incompatible type, likely due to cast
-      const StructType *ASTy = dyn_cast<StructType>(AllocTy);
-      if (!ASTy) continue; // not struct, skip
-      const StructInfo* astInfo = SA.getStructInfo(ASTy, M);
-      unsigned off = astInfo->getFieldOffset(NF.getObjectOffset(idx));
-      WARNING("GEP incompatible type: " << ASTy->getName() << " vs " << STy->getName() << ", offset = " << off << "\n");
-      if (stInfo->getContainer(ASTy, off) != nullptr) {
-        CG_LOG("\tcontainer of, proceed\n");
-      } else if (allocSize == ptrSize && (ASTy->getName().find(STy->getName()) == 0 || STy->getName().find(ASTy->getName()) == 0)) {
-        // likely due to different struct name suffix, e.g., struct.foo vs struct.foo.1
-        CG_LOG("\tlikely due to different struct name suffix, proceed\n");
-      } else {
-        continue;
-      }
-    }
-
-    NodeIndex nidx = idx + fieldNum;
-    // XXX: corner cases, e.g., struct with varaiable size array
-    if ((NF.getObjectOffset(idx) + fieldNum) >= allocSize) {
-      WARNING("GEP: field number " << nidx << " out of bound (" << allocSize << ")!\n");
-      // nidx = allocSize - 1;
-      continue;
-    }
-
-    // propagate the ptr info
-    assert(NF.isObjectNode(nidx) && "GEP points to a non-object node!");
-    if (ptsSet.insert(nidx)) {
-      NodeIndex deref = NF.createDereferenceNode(nidx);
-      EB.addDereferenceEdges(nidx, deref);
-      EB.addAssignmentEdges(deref, valNode);
-      diff.insert(nidx);
-    }
-  }
-
-  return false;
-}
-
 bool CallGraphPass::runOnFunction(Function *F) {
 
   CG_LOG("######\nProcessing Func: " << F->getName() << "\n");
 
-#ifndef FIELD_SENSITIVE
   for (auto itr = inst_begin(F), ite = inst_end(F); itr != ite; ++itr) {
     const Instruction *I = &*itr;
     if (I->getType()->isPointerTy()) {
       NF.createValueNode(I);
     }
+    if (const ReturnInst *RI = dyn_cast<ReturnInst>(I))
+      Ctx->RetSites[F] = RI;
+
+    if (const CallBase *CB = dyn_cast<CallBase>(I)) {
+      if (const Function *CF = CB->getCalledFunction()) {
+        int size, flag;
+        if (isAllocFn(CF->getName(), &size, &flag))
+          Ctx->AllocSites.insert(CB);
+      }
+    }
   }
-#endif
 
   // Use InstVisitor to handle instructions
   InstHandler visitor(*this, F);
@@ -484,6 +417,13 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
       // XXX only consider pointer type
       return;
     }
+
+    // Skip nullptr and compiler-introduced values
+    if (shouldSkipValue(rv)) {
+      CG_DEBUG("Skipping return value: " << *rv << "\n");
+      return;
+    }
+
     NodeIndex rvNode = CGP.NF.getValueNodeFor(rv);
     assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
     NodeIndex RT = CGP.NF.getReturnNodeFor(F);
@@ -493,11 +433,19 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
-  if (CS.isInlineAsm()) return;
+  if (CS.isInlineAsm()) return; // FIXME handle inline assembly
   if (CGP.Ctx->AllocSites.count(&CS)) {
     // record allocation sites
     CGP.AllocSites.insert(CGP.NF.getValueNodeFor(&CS));
     return; // skip allocation sites
+  }
+
+  // Check for function pointer cycles
+  if (!CS.getCalledFunction()) {
+    Value *CO = CS.getCalledOperand()->stripPointerCasts();
+    if (auto *Load = dyn_cast<LoadInst>(CO)) {
+      CG_DEBUG("Indirect call through loaded function pointer: " << *Load->getPointerOperand() << "\n");
+    }
   }
 
   if (Function *CF = CS.getCalledFunction()) {
@@ -530,7 +478,6 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       CGP.Ctx->Callees[&CS].insert(RCF);
       CGP.handleCall(&CS, RCF);
     } else {
-      CGP.funcPts.insert(CO);
       CGP.Ctx->IndirectCallInsts.insert(&CS);
     }
   }
@@ -573,6 +520,23 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     // XXX only consider pointer type
     return;
   }
+
+  // Skip nullptr and compiler-introduced values
+  if (shouldSkipValue(val)) {
+    CG_DEBUG("Skipping value in Store: " << *val << "\n");
+    return;
+  }
+
+  // Check for potential linked data structure patterns
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(val)) {
+    auto *ptrOp = GEP->getPointerOperand();
+    if (auto *Load = dyn_cast<LoadInst>(ptrOp)) {
+      // Pattern: store GEP(load(ptr)), ptr - typical linked list cycle
+      CG_DEBUG("Potential linked structure cycle: store GEP(load(" << *Load->getPointerOperand()
+               << ")), " << *I.getPointerOperand() << "\n");
+    }
+  }
+
   NodeIndex valNode = CGP.NF.getValueNodeFor(val);
   // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
   if (valNode == AndersNodeFactory::InvalidIndex) {
@@ -601,18 +565,7 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
 
-#ifndef FIELD_SENSITIVE
   CGP.EB.addAssignmentEdges(ptrNode, valNode);
-#else
-  auto *PTy = getElementTy(GEP.getSourceElementType());
-  if (!PTy->isStructTy()) {
-    // for non-struct type, just do assignment
-    CGP.EB.addAssignmentEdges(ptrNode, valNode);
-  } else {
-    // collect GEPs for later processing
-    this->CGP.GEPs.push_back(&GEP);
-  }
-#endif
 }
 
 void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
@@ -639,6 +592,13 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
   assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find phi dst node");
   for (unsigned i = 0, e = PHI.getNumIncomingValues(); i != e; ++i) {
     Value *src = PHI.getIncomingValue(i);
+
+    // Skip nullptr and compiler-introduced values
+    if (shouldSkipValue(src)) {
+      CG_DEBUG("Skipping value in PHI: " << *src << "\n");
+      continue;
+    }
+
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
     assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
     // if (srcNode == AndersNodeFactory::InvalidIndex) {
@@ -659,6 +619,13 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
   // NodeIndex dstNode = CGP.NF.createValueNode(&I);
   for (unsigned i = 1; i < I.getNumOperands(); i++) {
     Value *src = I.getOperand(i);
+
+    // Skip nullptr and compiler-introduced values
+    if (shouldSkipValue(src)) {
+      CG_DEBUG("Skipping value in Select: " << *src << "\n");
+      continue;
+    }
+
     NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
     assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
     // if (srcNode == AndersNodeFactory::InvalidIndex) {
@@ -737,55 +704,24 @@ void CallGraphPass::InstHandler::visitMemSetInst(MemSetInst &I) {
   CG_DEBUG("MemSet instruction (ignored for pointer analysis): " << I << "\n");
 }
 
-// Build CFL edges from a field-sensitive points-to graph
-void CallGraphPass::buildEdgesFromPtsGraph(const PtsGraph &ptsGraph) {
-  CG_LOG("Building CFL edges from PtsGraph with " << ptsGraph.size() << " entries\n");
-
-  // Process each points-to relationship in the graph
-  for (const auto& [srcNode, ptsSet] : ptsGraph) {
-    // check the type of srcNode
-    // if the srcNode is an object node, it's inserted when processing global initializers
-    // which is similar to store val, obj;
-    // otherwise, it's a value node, which is address of val = &obj
-    if (NF.isObjectNode(srcNode)) {
-      // Object node - process as store operation:
-      // gv1 = &gobj1; gv2 = &gobj2; *gv1 = gv2;
-      // field insensitive, make sure srcNode is base
-      if (NF.isSpecialNode(srcNode)) {
-        continue;
-      }
-      // field sensitive, we don't have a ptr = &base.src edge yet
-      NodeIndex ptr = NF.createDereferenceNode(srcNode);
-      EB.addDereferenceEdges(srcNode, ptr);
-      NodeIndex deref = NF.createDereferenceNode(ptr);
-      EB.addDereferenceEdges(ptr, deref);
-      for (auto obj : ptsSet) {
-        NodeIndex addr = obj;
-        if (!NF.isSpecialNode(obj)) {
-          // field sensitive, we don't have a ptr = &base.obj edge yet
-          addr = NF.createDereferenceNode(obj);
-          EB.addDereferenceEdges(obj, addr);
-        }
-        EB.addAssignmentEdges(addr, deref);
-      }
-    } else {
-      // Value node - process as address-of operation
-      for (auto obj : ptsSet) {
-        EB.addDereferenceEdges(obj, srcNode);
-      }
-    }
-  }
-}
-
 // Process global variable initializer in field-insensitive way
 void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init) {
   if (!init)
     return;
 
+  // Skip nullptr - don't create edges for null assignments
   if (isa<ConstantPointerNull>(init)) {
-    // ptr = null: add assignment edges null -> ptr
-    EB.addAssignmentEdges(NF.getNullPtrNode(), ptrNode);
-  } else if (isa<GlobalVariable>(init)) {
+    CG_DEBUG("Skipping nullptr in initializer\n");
+    return;
+  }
+
+  // Skip compiler-introduced values in initializers
+  if (shouldSkipValue(init)) {
+    CG_DEBUG("Skipping compiler value in initializer: " << *init << "\n");
+    return;
+  }
+
+  if (isa<GlobalVariable>(init)) {
     NodeIndex valNode = NF.getValueNodeFor(init);
     if (valNode == AndersNodeFactory::InvalidIndex) {
       valNode = NF.createValueNode(init);
@@ -841,7 +777,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init) {
       }
       case Instruction::IntToPtr: {
         // ptr = (ptr)int: add assignment edges constantInt -> ptr
-        EB.addAssignmentEdges(NF.getConstantIntNode(), ptrNode);
+        // EB.addAssignmentEdges(NF.getConstantIntNode(), ptrNode);
         break;
       }
       default:
@@ -857,10 +793,14 @@ bool CallGraphPass::doInitialization(Module *M) {
       continue;
     if (GV.isDeclaration())
       continue;
-#ifndef FIELD_SENSITIVE
-    // create a deref node for base ptr of global var
+
+    // Skip compiler-introduced globals
+    if (shouldSkipValue(&GV)) {
+      CG_DEBUG("Skipping compiler-introduced global: " << GV.getName() << "\n");
+      continue;
+    }
+
     NF.createValueNode(&GV);
-#endif
   }
 
   for (Function &F : *M) {
@@ -881,16 +821,19 @@ bool CallGraphPass::doInitialization(Module *M) {
       // only add fval -> fobj edge in call graph analysis?
       // create a value node for function pointer
       NodeIndex valNode = NF.createValueNode(&F);
-#ifdef FIELD_SENSITIVE
-      NodeIndex objNode = NF.getObjectNodeFor(&F);
-      assert(objNode != AndersNodeFactory::InvalidIndex && "Object node not found!");
-      funcPtsGraph[valNode].insert(objNode);
-      CG_LOG("AddressTaken: " << F.getName() << " : " << valNode << " -> " << objNode << "\n");
-#endif
+      (void)valNode;
     }
 
-    if (!F.isDeclaration() && !F.isIntrinsic() && !F.empty() && !Ctx->AllocFuncs.count(&F)) {
-#ifndef FIELD_SENSITIVE
+    if (!F.isDeclaration() && !F.isIntrinsic() && !F.empty()) {
+      // AllocFuncs is empty when skipping populating nodes
+      int size = 0, flag = 0;
+      if (isAllocFn(F.getName(), &size, &flag)) {
+        Ctx->AllocFuncs.insert(&F);
+      } else if (F.getName().find_insensitive("alloc") != StringRef::npos &&
+                 F.getReturnType()->isPointerTy()) {
+        Ctx->CandidateAllocFuncs.insert(&F);
+      }
+      
       // create nodes for function arguments and return value
       if (F.getFunctionType()->isVarArg())
         NF.createVarargNode(&F);
@@ -900,32 +843,10 @@ bool CallGraphPass::doInitialization(Module *M) {
       if (!F.getReturnType()->isVoidTy()) {
         NF.createReturnNode(&F);
       }
-#else
-      // in field-sensitive mode, allocate func arguments for functions without any uses
-      if (F.use_empty() && F.getName() != "LLVMFuzzerTestOneInput") {
-        assert(!F.hasAddressTaken() && "Function has address taken but no uses!");
-        for (unsigned i = 0; i < F.arg_size(); i++) {
-          Argument *arg = F.getArg(i);
-          const Type *AT = arg->getType();
-          if (AT->isPointerTy()) {
-            NodeIndex objNode = NF.createObjectNode(arg, AT, false, true);
-            assert(objNode != AndersNodeFactory::InvalidIndex && "Failed to create arg obj node!");
-            CG_LOG("Create obj node " << objNode << " for pointer arg " << i << ", type = " << *AT
-                   << " of function " << F.getName() << "\n");
-            NodeIndex valNode = NF.getValueNodeFor(arg);
-            assert(valNode != AndersNodeFactory::InvalidIndex && "Arg value node not found!");
-            funcPtsGraph[valNode].insert(objNode);
-            EB.addDereferenceEdges(objNode, valNode);
-            reallocated.insert({objNode, 0});
-          }
-        }
-      }
-#endif
     }
   }
 
   if (M == Ctx->Modules.back().first) {
-#ifndef FIELD_SENSITIVE
     for (auto const &itr: Ctx->ExtGobjs) {
       NF.createValueNode(itr.second);
     }
@@ -933,10 +854,6 @@ bool CallGraphPass::doInitialization(Module *M) {
       if (!itr.second->getReturnType()->isVoidTy())
         NF.createReturnNode(itr.second);
     }
-#else
-    // build CFL edges from field-sensitive points-to graph
-    buildEdgesFromPtsGraph(funcPtsGraph);
-#endif
   }
 
   return false;
@@ -1030,6 +947,7 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
         Ctx->AllocFuncs.insert(F);
         newAllocFuncs.insert(F);
         foundNewAlloc = true;
+#if 0
         // update edges
         for (auto const& U : F->users()) {
           if (const CallBase *CI = dyn_cast<CallBase>(U)) {
@@ -1047,6 +965,7 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
             }
           }
         }
+#endif
         break;
       }
     }
@@ -1073,10 +992,9 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       WARNING("FuncPtr for " << *CS << " node not found!\n");
       continue;
     }
-    // auto &ptsSet = funcPtsGraph[fptrNode];
     auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelV()];
     for (auto idx : cflSet) {
-      // CG_DEBUG("FuncPtr: node: " << fptrNode << " -> ptr: " << idx << "\n");
+      CG_DEBUG("FuncPtr: node: " << fptrNode << " -> ptr: " << idx << "\n");
       // ptsSet.insert(idx);
       if (NF.isSpecialNode(idx)) {
         WARNING("Indirect Call: " << *CS << " callee is a special node: " << idx << "\n");
@@ -1084,12 +1002,12 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       }
       const Value *CV = NF.getValueForNode(idx);
       if (CV == NULL) {
-        // WARNING("No value for function node!\n");
+        WARNING("No value for function node " << idx << "!\n");
         continue;
       }
       const Function *CF = dyn_cast<Function>(CV);
       if (CF == NULL) {
-        // WARNING("Function pointer " << *fptr << " points to non-function: " << *CV << "\n");
+        WARNING("Function pointer " << *fptr << " points to non-function: " << *CV << "\n");
         continue;
       }
       // due to field insensitivity, we may have FPs, do a type match
@@ -1100,83 +1018,10 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       if (Ctx->Callees[CS].insert(CF).second) {
         // if new callee added, we need to rerun
         Changed = true;
-        CG_LOG("Handle indirect Call: callee: " << CF->getName() << "\n");
-        handleCall(CS, CF);
+        // CG_LOG("Handle indirect Call: callee: " << CF->getName() << "\n");
+        // handleCall(CS, CF);
       }
     }
-  }
-
-  return Changed;
-}
-
-bool CallGraphPass::handleGEP(cfl_result_t &outputCFLGraph, Module *M) {
-  // resolve GEPs
-  bool Changed = false;
-  for (auto *GEP : GEPs) {
-    CG_DEBUG("Handle GEP: " << *GEP << " in function " << GEP->getFunction()->getName() << "\n");
-    auto *ptr = GEP->getPointerOperand()->stripPointerCasts();
-    NodeIndex ptrNode = NF.getValueNodeFor(ptr);
-    if (ptrNode == AndersNodeFactory::InvalidIndex) {
-      WARNING("GEP ptr for " << *GEP << " node not found!\n");
-      continue;
-    }
-    AndersPtsSet &ptsSet = funcPtsGraph[ptrNode];
-    AndersPtsSet &diff = updatedGEPs[ptrNode];
-    auto &cflSet = outputCFLGraph[ptrNode][EB.getLabelV()];
-    // auto start = std::chrono::high_resolution_clock::now();
-    for (auto idx : cflSet) {
-      // V gives us the aliasing set, now we need to find the point-to set
-      if (idx == ptrNode) continue;
-      auto itr = funcPtsGraph.find(idx);
-      if (itr != funcPtsGraph.end()) {
-        for (auto obj : itr->second) {
-          if (ptsSet.insert(obj)) {
-            // perform expensive checks only for new targets
-            if (NF.isSpecialNode(obj)) {
-              WARNING("GEP: " << *GEP << " points to a special node: " << obj << "\n");
-              continue;
-            } else if (!NF.isObjectNode(obj)) {
-              WARNING("GEP: " << *GEP << " points to a non-object node: " << obj << "\n");
-              continue;
-            }
-            // fix obj if its a dummy arg
-            auto dit = reallocated.find(obj);
-            if (dit != reallocated.end()) {
-              if (dit->second != 0) {
-                obj = dit->second; // already fixed
-              } else {
-                // obj is introduced as external arg, no type, need to fix
-                auto *objVal = NF.getValueForNode(obj);
-                assert(objVal && "No value for dummy arg obj node");
-                NF.removeNodeForObject(objVal); // remove old obj node from nodeFactory
-                const Type *PTy = GEP->getSourceElementType();
-                NodeIndex objNode = createNodeForTypedVal(objVal, PTy, true, NF, SA); // assume heap
-                if (objNode != AndersNodeFactory::InvalidIndex) {
-                  EB.addDereferenceEdges(objNode, idx);
-                  CG_LOG("Create Object Node: " << objNode << " for GEP ptr " << *GEP
-                        << ", type = " << *PTy << " for arg node " << obj << "!\n");
-                  dit->second = objNode; // update fixed map
-                  obj = objNode; // use the new node
-                } else {
-                  WARNING("Failed to create object node for GEP ptr " << *GEP
-                          << ", type = " << *PTy << "\n");
-                }
-              }
-            }
-            diff.insert(obj);
-          }
-        }
-      }
-    }
-    // auto end = std::chrono::high_resolution_clock::now();
-    // auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    // CG_LOG("Time spent in GEP cflSet loop: " << duration << " us\n");
-    if (!diff.isEmpty()) {
-      handleGEP(GEP, diff, M);
-      Changed = true;
-      diff.clear();
-    }
-    assert(diff.isEmpty() && "GEP updated set not empty!");
   }
 
   return Changed;
@@ -1188,8 +1033,13 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   // process functions, only the first iteration
   if (iteration == 0) {
-#ifndef FIELD_SENSITIVE
     for (auto &GV : M->globals()) {
+      // Skip compiler-introduced globals
+      if (shouldSkipValue(&GV)) {
+        CG_DEBUG("Skipping initializer for compiler global: " << GV.getName() << "\n");
+        continue;
+      }
+
       if (GV.hasInitializer()) {
         NodeIndex valNode = NF.getValueNodeFor(&GV);
         assert(valNode != AndersNodeFactory::InvalidIndex && "Global value node not found!");
@@ -1200,10 +1050,11 @@ bool CallGraphPass::doModulePass(Module *M) {
         processInitializer(deref, init);
       }
     }
-#endif
 
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() || Ctx->AllocFuncs.count(&F))
+        continue;
+      if (shouldSkipFunction(&F))
         continue;
       runOnFunction(&F);
     }
@@ -1211,6 +1062,19 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   bool Changed = false;
   if (M == Ctx->Modules.back().first) {
+    // Analyze edge and cycle patterns before CFL solving
+    CG_LOG("Analyzing constraint graph structure...\n");
+    std::vector<std::pair<NodeIndex, size_t>> topNodes;
+    EB.analyzeHighDegreeNodes(1000, 20, &topNodes);
+
+    // Examine top nodes
+    if (!topNodes.empty()) {
+      CG_LOG("Examining top " << topNodes.size() << " high-degree nodes:\n");
+      for (const auto& [nodeId, degree] : topNodes) {
+        NF.dumpNode(nodeId);
+      }
+    }
+
     // solve CFL constraints after processing the last module
     std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
     // std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGram>(EB.getEdges(), *EB.getGrammar());
@@ -1223,20 +1087,10 @@ bool CallGraphPass::doModulePass(Module *M) {
     auto outputCFLGraph = solver->getGraph();
 
     // handle custom allocators
-    if (findCustomAllocators(outputCFLGraph)) {
-      // if new allocators found, we need to rerun
-      solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
-      solver->runCFL();
-      outputCFLGraph = solver->getGraph();
-    }
+    findCustomAllocators(outputCFLGraph);
 
     // parse results and update call edges
-    Changed |= handleIndirectCall(outputCFLGraph);
-
-#ifdef FIELD_SENSITIVE
-    // parse results and update GEP edges
-    Changed |= handleGEP(outputCFLGraph, M);
-#endif
+    handleIndirectCall(outputCFLGraph);
 
     iteration++;
   }
@@ -1305,8 +1159,6 @@ void CallGraphPass::dumpCallees(raw_ostream &OS) {
     if (CI->isInlineAsm() || CI->getCalledFunction())
       continue;
     auto caller = CI->getParent()->getParent();
-    if (reachable.find(caller) == reachable.end())
-      continue;
     if (v.empty()) {
       OS << "!!EMPTY =>" << *CI << " @@" << caller->getName() << "\n";
       // OS << "Uninitialized function pointer is dereferenced!\n";

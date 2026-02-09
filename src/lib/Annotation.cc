@@ -55,7 +55,7 @@ using namespace llvm;
 // size stores the arg number of the size operand
 //
 bool isAllocFn(StringRef name, int *size, int *flag) {
-  
+
   // user space
   // malloc/new
   if (name.equals("malloc") ||
@@ -72,10 +72,13 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
     return true;
   }
 
-  // kmalloc
+  // Core slab allocators - basic kmalloc family
   // don't handle variable length yet
   if (name.equals("kmalloc_array") ||
-    name.equals("kcalloc"))
+    name.equals("kcalloc") ||
+    name.equals("kmalloc_array_node") ||
+    name.equals("kcalloc_node") ||
+    name.equals("krealloc_array"))
     return false;
 
   if (LLVM_STRING_STARTS_WITH(name, "kmalloc") ||
@@ -86,10 +89,30 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
     return true;
   }
 
-  // kmem_cache_alloc
+  // kmem_cache_alloc family
   if (LLVM_STRING_STARTS_WITH(name, "kmem_cache_alloc") ||
     name.equals("kmem_cache_zalloc")) {
     *size = -1;
+    *flag = 1;
+    return true;
+  }
+
+  // kvmalloc family (hybrid kmalloc/vmalloc)
+  if (LLVM_STRING_STARTS_WITH(name, "kvmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "kvzalloc") ||
+    name.equals("kvrealloc") ||
+    name.equals("kvcalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // vmalloc family
+  if (LLVM_STRING_STARTS_WITH(name, "vmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "vzalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "__vmalloc") ||
+    name.equals("vcalloc")) {
+    *size = 0;
     *flag = 1;
     return true;
   }
@@ -111,9 +134,12 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
     *flag = 2;
     return true;
   }
-  
-  // driver/base
-  if (name.equals("devm_kzalloc") ||
+
+  // Device-managed allocators (devm_*)
+  if (LLVM_STRING_STARTS_WITH(name, "devm_kmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "devm_kzalloc") ||
+    name.equals("devm_krealloc") ||
+    name.equals("devm_kmemdup") ||
     name.equals("alloc_dr") ||
     name.equals("__devres_alloc") ||
     name.equals("devres_alloc")) {
@@ -122,92 +148,40 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
     return true;
   }
 
-#if 0
-  // page alloc
-  if (name.equals("__get_free_pages") ||
-    name.equals("get_zeroed_page"))
-    return 1;
+  // DRM-managed allocators (drmm_*)
+  if (LLVM_STRING_STARTS_WITH(name, "drmm_kmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "drmm_kzalloc")) {
+    *size = 1;
+    *flag = 2;
+    return true;
+  }
 
-  if (name.equals("__alloc_pages_nodemask") ||
-    name.equals("__alloc_pages") ||
-    name.equals("alloc_pages_current") ||
-    name.equals("alloc_pages") ||
-    name.equals("alloc_pages_vma"))
-    return 1;
-
-  if (name.equals("alloc_pages_node") ||
-    name.equals("alloc_pages_exact_node") ||
-    name.equals("alloc_pages_exact") ||
-    name.equals("alloc_pages_exact_nid"))
-    return 2;
-
-  // pagemap
-  if (name.equals("__page_cache_alloc"))
-    return 1;
-
-  if (name.equals("find_or_create_page"))
-    return 3;
-
-  // vmalloc
-  if (LLVM_STRING_STARTS_WITH(name, "vmalloc") ||
-    LLVM_STRING_STARTS_WITH(name, "vzalloc"))
-    return -1; // don't really have flags
-
-  if (name.equals("__vmalloc"))
-    return 2;
-
-  if (name.equals("__vmalloc_node_range"))
-    return 5;
-
-#if 0
-  // DMA related
-  if (name.equals("dmam_alloc_coherent") ||
-    name.equals("dmam_alloc_noncoherent") ||
-    name.equals("dma_alloc_coherent") ||
-    name.equals("dma_alloc_at_attrs") ||
-    name.equals("dma_alloc_attrs") ||
-    name.equals("arm_dma_alloc") ||
-    name.equals("dma_alloc_writecombine") ||
-    (name.find("swiotlb_alloc_coherent") != llvm::StringRef::npos) ||
-    name.equals("arm_coherent_dma_alloc"))
-    return 4;
-
-  if (name.equals("dma_pool_alloc"))
-    return 2;
-#endif
-
-  // bootmem
-  if (name.find("alloc_bootmem") != llvm::StringRef::npos)
-    return -1;
-#endif
-
-  // bio
-  if (name.equals("bio_alloc_bioset")) {
+  // Page allocators
+  if (name.equals("alloc_pages") ||
+    name.equals("alloc_pages_node") ||
+    name.equals("alloc_pages_mpol") ||
+    name.equals("alloc_page") ||
+    name.equals("alloc_page_vma") ||
+    name.equals("__get_free_pages") ||
+    name.equals("__get_free_page") ||
+    name.equals("__get_dma_pages")) {
     *size = -1;
     *flag = 0;
     return true;
   }
 
-  if (name.equals("hcd_buffer_alloc")) {
+  // DMA allocators
+  if (name.equals("dma_alloc_attrs") ||
+    name.equals("dma_alloc_coherent") ||
+    name.equals("dma_alloc_noncoherent") ||
+    name.equals("dma_alloc_wc") ||
+    name.equals("dma_alloc_from_global_coherent")) {
     *size = 1;
     *flag = 2;
-    return false;
-  }
-
-  if (name.equals("sk_prot_alloc")) {
-    *size = -1;
-    *flag = 1;
     return true;
   }
 
-  if (name.equals("sk_alloc")) {
-    *size = -1;
-    *flag = 2;
-    return true;
-  }
-
-  // mempool
-  // XXX needs special care
+  // Memory pool allocators
   if (name.equals("mempool_alloc")) {
     *size = -1;
     *flag = 1;
@@ -223,6 +197,252 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
 
   if (name.equals("mempool_alloc_pages"))
     return false;
+
+  // Bio/block allocators
+  if (name.equals("bio_alloc") ||
+    name.equals("bio_kmalloc")) {
+    *size = -1;
+    *flag = 0;
+    return true;
+  }
+
+  if (name.equals("bio_alloc_bioset")) {
+    *size = -1;
+    *flag = 0;
+    return true;
+  }
+
+  // Networking allocators
+  if (name.equals("sk_prot_alloc")) {
+    *size = -1;
+    *flag = 1;
+    return true;
+  }
+
+  if (name.equals("sk_alloc")) {
+    *size = -1;
+    *flag = 2;
+    return true;
+  }
+
+  if (name.equals("sock_kmalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  if (name.equals("__netdev_alloc_skb") ||
+    name.equals("__dev_alloc_page") ||
+    name.equals("dev_alloc_page")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // Filesystem-specific wrappers
+  // F2FS
+  if (LLVM_STRING_STARTS_WITH(name, "f2fs_kmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "f2fs_kzalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "f2fs_kvmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "f2fs_kvzalloc") ||
+    name.equals("f2fs_kmem_cache_alloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // Bcachefs
+  if (name.equals("bch2_trans_kmalloc") ||
+    name.equals("__bch2_trans_kmalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // NTFS
+  if (name.equals("__ntfs_malloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // BPF allocators
+  if (name.equals("bpf_map_kzalloc") ||
+    name.equals("bpf_map_kvcalloc") ||
+    name.equals("bpf_map_kmalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // KUnit test allocators
+  if (LLVM_STRING_STARTS_WITH(name, "kunit_kmalloc") ||
+    LLVM_STRING_STARTS_WITH(name, "kunit_kzalloc") ||
+    name.equals("kunit_kcalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // Per-CPU allocators
+  if (name.equals("alloc_percpu") ||
+    name.equals("__alloc_percpu") ||
+    name.equals("__alloc_percpu_gfp")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // KASAN/KFENCE instrumented
+  if (name.equals("__kfence_alloc") ||
+    name.equals("kfence_alloc") ||
+    name.equals("__kasan_kmalloc") ||
+    name.equals("__kasan_slab_alloc") ||
+    name.equals("kasan_kmalloc_large")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // Driver-specific allocators
+  if (name.equals("flexcop_device_kmalloc") ||
+    name.equals("tasdevice_kzalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // Crypto allocators
+  if (name.equals("jent_kvzalloc") ||
+    name.equals("jent_zalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  // Architecture-specific
+  if (name.equals("uml_kmalloc")) {
+    *size = 0;
+    *flag = 1;
+    return true;
+  }
+
+  return false;
+}
+
+bool isFreeFn(StringRef name) {
+  // Core slab/kmalloc free functions
+  if (name.equals("kfree") ||
+      name.equals("kfree_sensitive") ||
+      name.equals("kzfree")) {
+    return true;
+  }
+
+  // kvmalloc free
+  if (name.equals("kvfree")) {
+    return true;
+  }
+
+  // vmalloc free
+  if (name.equals("vfree") ||
+      name.equals("vfree_atomic")) {
+    return true;
+  }
+
+  // Cache free
+  if (name.equals("kmem_cache_free")) {
+    return true;
+  }
+
+  // Device-managed free (typically auto-freed, but can be explicit)
+  if (name.equals("devm_kfree")) {
+    return true;
+  }
+
+  // DRM-managed free
+  if (name.equals("drmm_kfree")) {
+    return true;
+  }
+
+  // Page free
+  if (name.equals("__free_pages") ||
+      name.equals("free_pages") ||
+      name.equals("free_page") ||
+      name.equals("put_page") ||
+      name.equals("__free_page")) {
+    return true;
+  }
+
+  // DMA free
+  if (name.equals("dma_free_coherent") ||
+      name.equals("dma_free_attrs") ||
+      name.equals("dma_free_noncoherent") ||
+      name.equals("dma_free_wc")) {
+    return true;
+  }
+
+  // Memory pool free
+  if (name.equals("mempool_free")) {
+    return true;
+  }
+
+  // Bio/block free
+  if (name.equals("bio_put") ||
+      name.equals("bio_free")) {
+    return true;
+  }
+
+  // Networking free
+  if (name.equals("sock_kfree_s") ||
+      name.equals("kfree_skb") ||
+      name.equals("__kfree_skb") ||
+      name.equals("consume_skb") ||
+      name.equals("kfree_skb_reason") ||
+      name.equals("__kfree_skb_defer") ||
+      name.equals("dev_kfree_skb") ||
+      name.equals("dev_kfree_skb_any") ||
+      name.equals("dev_kfree_skb_irq")) {
+    return true;
+  }
+
+  // Per-CPU free
+  if (name.equals("free_percpu")) {
+    return true;
+  }
+
+  // KUnit test free
+  if (name.equals("kunit_kfree")) {
+    return true;
+  }
+
+  // Filesystem-specific free
+  if (LLVM_STRING_STARTS_WITH(name, "f2fs_kfree") ||
+      LLVM_STRING_STARTS_WITH(name, "f2fs_kvfree")) {
+    return true;
+  }
+
+  // BPF free
+  if (name.equals("bpf_map_kfree") ||
+      name.equals("bpf_map_kvfree")) {
+    return true;
+  }
+
+  // Crypto free
+  if (name.equals("jent_zfree") ||
+      name.equals("jent_kvzfree")) {
+    return true;
+  }
+
+  // String free
+  if (name.equals("kfree_const")) {
+    return true;
+  }
+
+  // RCU-based free (deferred)
+  if (name.equals("kfree_rcu") ||
+      name.equals("kvfree_rcu")) {
+    return true;
+  }
 
   return false;
 }
@@ -271,6 +491,68 @@ bool isPrintFn(StringRef name) {
     name.find("dmsg") != StringRef::npos)
     return true;
   else return false;
+}
+
+bool isKernelUtilityFn(StringRef name) {
+  // Common kernel utility functions that create high-degree nodes
+  // These functions don't contribute to meaningful points-to analysis
+
+  // Printing and debug functions
+  if (name.equals("_printk") ||
+      name.equals("printk") ||
+      name.equals("__warn_printk") ||
+      name.equals("seq_printf"))
+    return true;
+
+  // Lock/unlock operations (just synchronization, no data flow)
+  if (name.equals("mutex_lock") ||
+      name.equals("mutex_unlock") ||
+      name.equals("mutex_lock_nested") ||
+      LLVM_STRING_STARTS_WITH(name, "_raw_spin_") ||
+      LLVM_STRING_STARTS_WITH(name, "_raw_read_") ||
+      LLVM_STRING_STARTS_WITH(name, "_raw_write_") ||
+      name.equals("spin_lock") ||
+      name.equals("spin_unlock"))
+    return true;
+
+  // RCU and lockdep (debug/validation, no data flow)
+  if (LLVM_STRING_STARTS_WITH(name, "lockdep_") ||
+      LLVM_STRING_STARTS_WITH(name, "lock_") ||
+      LLVM_STRING_STARTS_WITH(name, "rcu_"))
+    return true;
+
+  // String operations (utility, high fan-out)
+  if (name.equals("strlen") ||
+      name.equals("strcmp") ||
+      name.equals("strncmp") ||
+      name.equals("strcpy") ||
+      name.equals("strncpy"))
+    return true;
+
+  // Reference counting (just increment/decrement)
+  if (LLVM_STRING_STARTS_WITH(name, "refcount_") ||
+      LLVM_STRING_STARTS_WITH(name, "atomic_") ||
+      LLVM_STRING_STARTS_WITH(name, "atomic64_"))
+    return true;
+
+  return false;
+}
+
+bool isCompilerIntroducedValue(const Value *V) {
+  if (!V || !V->hasName())
+    return false;
+
+  StringRef name = V->getName();
+
+  // LLVM compiler-introduced globals
+  if (name.equals("llvm.compiler.used") ||
+      name.equals("llvm.used") ||
+      name.equals("llvm.global_ctors") ||
+      name.equals("llvm.global_dtors") ||
+      LLVM_STRING_STARTS_WITH(name, "llvm."))
+    return true;
+
+  return false;
 }
 
 std::string getStoreId(StoreInst *SI) {

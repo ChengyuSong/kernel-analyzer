@@ -175,9 +175,13 @@ static inline bool isAllocFn(llvm::StringRef name) {
   return isAllocFn(name, &size, &flag);
 }
 
+extern bool isFreeFn(llvm::StringRef name);
+
 extern bool isEntryFn(llvm::StringRef name);
 extern bool isExitFn(llvm::StringRef name);
 extern bool isPrintFn(llvm::StringRef name);
+extern bool isKernelUtilityFn(llvm::StringRef name);
+extern bool isCompilerIntroducedValue(const llvm::Value *V);
 
 extern std::string getAnnotation(llvm::Value *V, llvm::Module *M);
 extern std::string getLoadId(llvm::LoadInst *LI);

@@ -365,7 +365,11 @@ unsigned AndersNodeFactory::constGEPtoFieldNum(const llvm::ConstantExpr* expr) c
                         ptr = itr->second;
                 }
                 auto itr2 = objNodeMap.find(ptr);
-                assert(itr2 != objNodeMap.end() && "const gep expr ptr should have a node!");
+                // assert(itr2 != objNodeMap.end() && "const gep expr ptr should have a node!");
+                if (itr2 == objNodeMap.end()) {
+                    WARNING("const gep expr ptr " << *ptr << " has no node!\n");
+                    return 0;
+                }
                 const Type *ATy = nodes[itr2->second].getAllocationType();
                 return offsetToFieldNum(ATy, offset, dataLayout, *structAnalyzer, module);
             } else {
@@ -493,27 +497,38 @@ static void dumpLocation(const Value *val) {
 
 void AndersNodeFactory::dumpNode(NodeIndex idx) const {
 
-    const AndersNode& n = nodes.at(idx);
+    const AndersNode *n = &nodes.at(idx);
 
-    if (n.type == AndersNode::VALUE_NODE)
+    if (n->type == AndersNode::VALUE_NODE)
         AA_LOG("V ");
-    else if (n.type == AndersNode::OBJ_NODE)
+    else if (n->type == AndersNode::OBJ_NODE)
         AA_LOG("O ");
-    else if (n.type == AndersNode::DEREF_NODE)
+    else if (n->type == AndersNode::DEREF_NODE)
         AA_LOG("D ");
     else
         assert(false && "Wrong type number!");
-    AA_LOG("#" << n.idx << "\t");
+    AA_LOG("#" << n->idx << "\t");
+
+    if (n->type == AndersNode::DEREF_NODE) {
+        // idx is the value in derefMap, find the corresponding ptr
+        for (auto const& p: derefMap) {
+            if (p.second == idx) {
+                AA_LOG("of Node #" << p.first << ", ");
+                n = &nodes.at(p.first);
+                break;
+            }
+        }
+    }
 
     // Dump node value info.
-    const Value* val = n.getValue();
+    const Value* val = n->getValue();
     if (val == nullptr) {
-        NodeIndex offset = n.getOffset();
+        NodeIndex offset = n->getOffset();
         if (offset == 0)
            AA_LOG("nullptr>");
         else
         {
-            NodeIndex baseIdx = n.getIndex() - offset;
+            NodeIndex baseIdx = n->getIndex() - offset;
             const Value* base = nodes.at(baseIdx).getValue();
             assert(base != nullptr);
 
@@ -529,6 +544,10 @@ void AndersNodeFactory::dumpNode(NodeIndex idx) const {
     }
     else if (isa<Function>(val))
         AA_LOG("f> " << val->getName());
+    else if (isa<GlobalValue>(val))
+        AA_LOG("g> " << val->getName());
+    else if (const Argument *arg = dyn_cast<Argument>(val))
+        AA_LOG("a> " << *arg << " of " << arg->getParent()->getName());
     else
         AA_LOG("v> " << *val);
     AA_LOG("\n");

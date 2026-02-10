@@ -88,6 +88,51 @@ static StringRef stripStructNameSuffix(StringRef Name) {
   return Name;
 }
 
+// Walk GEP indexed type chain to find the innermost named struct field access.
+// Returns true if a named non-union struct field was found, with structName
+// and fieldIdx set to the stripped struct name and field index respectively.
+bool CallGraphPass::getGEPStructField(const GEPOperator *GEP,
+                                       std::string &structName,
+                                       unsigned &fieldIdx) {
+  bool found = false;
+  Type *CurTy = GEP->getSourceElementType();
+
+  // Skip the first index (pointer/array offset into base type)
+  auto idx = GEP->idx_begin();
+  if (idx == GEP->idx_end())
+    return false;
+  ++idx; // skip first index
+
+  while (idx != GEP->idx_end()) {
+    if (StructType *STy = dyn_cast<StructType>(CurTy)) {
+      ConstantInt *CI = dyn_cast<ConstantInt>(*idx);
+      if (!CI)
+        break; // non-constant index, give up
+      unsigned fIdx = CI->getZExtValue();
+      // Record if this is a named, non-union struct
+      if (!STy->isLiteral() && STy->hasName() &&
+          !LLVM_STRING_STARTS_WITH(STy->getStructName(), "union")) {
+        structName = stripStructNameSuffix(STy->getStructName()).str();
+        fieldIdx = fIdx;
+        found = true;
+      }
+      if (fIdx < STy->getNumElements())
+        CurTy = STy->getElementType(fIdx);
+      else
+        break;
+    } else if (ArrayType *ATy = dyn_cast<ArrayType>(CurTy)) {
+      CurTy = ATy->getElementType();
+    } else if (VectorType *VTy = dyn_cast<VectorType>(CurTy)) {
+      CurTy = VTy->getElementType();
+    } else {
+      break;
+    }
+    ++idx;
+  }
+
+  return found;
+}
+
 bool CallGraphPass::isStructLayoutCompatible(const StructType *ST1,
                                               const StructType *ST2) {
   unsigned numEl = ST1->getNumElements();
@@ -565,6 +610,18 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   }
 
   CGP.EB.addAssignmentEdges(valNode, derefNode);
+
+  // Record struct field store for field-aware indirect call filtering.
+  // Strip pointer casts (bitcasts) to see through patterns like:
+  //   %gep = getelementptr %struct, %ptr, 0, 7
+  //   %bc  = bitcast %gep to <other_type>*
+  //   store %val, %bc
+  if (auto *GEP = dyn_cast<GEPOperator>(ptr->stripPointerCasts())) {
+    std::string sName;
+    unsigned fIdx;
+    if (CGP.getGEPStructField(GEP, sName, fIdx))
+      CGP.fieldStoreRecords.push_back({valNode, sName, fIdx});
+  }
 }
 
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
@@ -733,7 +790,9 @@ void CallGraphPass::InstHandler::visitMemSetInst(MemSetInst &I) {
 }
 
 // Process global variable initializer in field-insensitive way
-void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init) {
+void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
+                                        const std::string &enclosingStruct,
+                                        int enclosingFieldIdx) {
   if (!init)
     return;
 
@@ -756,6 +815,9 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init) {
     }
     // ptr = &globalvar: add assignment edges globalvar_val -> ptr
     EB.addAssignmentEdges(valNode, ptrNode);
+    // Record field store if enclosing struct is known
+    if (!enclosingStruct.empty() && enclosingFieldIdx >= 0)
+      fieldStoreRecords.push_back({valNode, enclosingStruct, (unsigned)enclosingFieldIdx});
     CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (isa<Function>(init)) {
     NodeIndex valNode = NF.getValueNodeFor(init);
@@ -764,43 +826,67 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init) {
     }
     // ptr = &function: add assignment edges function_val -> ptr
     EB.addAssignmentEdges(valNode, ptrNode);
+    // Record direct function store into struct field
+    if (!enclosingStruct.empty() && enclosingFieldIdx >= 0)
+      funcFieldStores[cast<Function>(init)].insert({enclosingStruct, (unsigned)enclosingFieldIdx});
     CG_DEBUG("add CFL assignment edges for function " << cast<Function>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
     // Field-insensitive: all array elements assign to the same ptr
     for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
-      processInitializer(ptrNode, CA->getOperand(i));
+      processInitializer(ptrNode, CA->getOperand(i), enclosingStruct, enclosingFieldIdx);
     }
   } else if (ConstantStruct *CS = dyn_cast<ConstantStruct>(init)) {
     // Field-insensitive: all struct fields assign to the same ptr
+    StructType *STy = CS->getType();
     for (unsigned i = 0; i != CS->getNumOperands(); ++i) {
-      processInitializer(ptrNode, CS->getOperand(i));
+      std::string curStruct = enclosingStruct;
+      int curField = enclosingFieldIdx;
+      if (STy && !STy->isLiteral() && STy->hasName() &&
+          !LLVM_STRING_STARTS_WITH(STy->getStructName(), "union")) {
+        curStruct = stripStructNameSuffix(STy->getStructName()).str();
+        curField = i;
+      }
+      processInitializer(ptrNode, CS->getOperand(i), curStruct, curField);
     }
   } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
     Type *Ty = CAZ->getType();
     if (isa<ArrayType>(Ty) || isa<VectorType>(Ty)) {
-      processInitializer(ptrNode, CAZ->getSequentialElement());
+      processInitializer(ptrNode, CAZ->getSequentialElement(), enclosingStruct, enclosingFieldIdx);
     } else if (StructType *CSTy = dyn_cast<StructType>(Ty)) {
       for (unsigned i = 0; i != CSTy->getNumElements(); ++i) {
+        std::string curStruct = enclosingStruct;
+        int curField = enclosingFieldIdx;
+        if (!CSTy->isLiteral() && CSTy->hasName() &&
+            !LLVM_STRING_STARTS_WITH(CSTy->getStructName(), "union")) {
+          curStruct = stripStructNameSuffix(CSTy->getStructName()).str();
+          curField = i;
+        }
         Constant *elem = CAZ->getStructElement(i);
-        processInitializer(ptrNode, elem);
+        processInitializer(ptrNode, elem, curStruct, curField);
       }
     }
   } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(init)) {
     switch (CE->getOpcode()) {
       case Instruction::GetElementPtr: {
         // Field-insensitive: get the base pointer with casts stripped
-        const Value* basePtr = cast<GEPOperator>(CE)->getPointerOperand()->stripPointerCasts();
+        const GEPOperator *GEPOp = cast<GEPOperator>(CE);
+        const Value* basePtr = GEPOp->getPointerOperand()->stripPointerCasts();
         NodeIndex baseNode = NF.getValueNodeFor(basePtr);
         if (baseNode == AndersNodeFactory::InvalidIndex) {
           baseNode = NF.createValueNode(basePtr);
         }
         // ptr = base_ptr: add assignment edges base_ptr -> ptr
         EB.addAssignmentEdges(baseNode, ptrNode);
+        // Check if GEP accesses a struct field, update enclosing info
+        std::string gepStruct;
+        unsigned gepField;
+        if (getGEPStructField(GEPOp, gepStruct, gepField))
+          fieldStoreRecords.push_back({baseNode, gepStruct, gepField});
         break;
       }
       case Instruction::BitCast: {
         // BitCast: process the operand directly
-        processInitializer(ptrNode, CE->getOperand(0));
+        processInitializer(ptrNode, CE->getOperand(0), enclosingStruct, enclosingFieldIdx);
         break;
       }
       case Instruction::IntToPtr: {
@@ -1004,6 +1090,35 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
   return foundNewAlloc;
 }
 
+void CallGraphPass::buildFieldStoreMap(cfl_result_t &outputCFLGraph) {
+  unsigned labelV = EB.getLabelV();
+  size_t funcFieldPairs = 0;
+
+  for (const auto &rec : fieldStoreRecords) {
+    // For each store record, query the CFL V-relation to find which
+    // function value nodes V-reach the stored value node
+    if (rec.valNode >= outputCFLGraph.size())
+      continue;
+    auto &cflSet = outputCFLGraph[rec.valNode][labelV];
+    for (auto idx : cflSet) {
+      if (NF.isSpecialNode(idx))
+        continue;
+      const Value *CV = NF.getValueForNode(idx);
+      if (!CV)
+        continue;
+      const Function *F = dyn_cast<Function>(CV);
+      if (!F)
+        continue;
+      if (funcFieldStores[F].insert({rec.structName, rec.fieldIdx}).second)
+        funcFieldPairs++;
+    }
+  }
+
+  CG_LOG("FieldStore map: " << fieldStoreRecords.size() << " records, "
+         << funcFieldPairs << " function-field pairs, "
+         << funcFieldStores.size() << " distinct functions\n");
+}
+
 void CallGraphPass::queryAllocatorCandidatesWithLLM() {
   if (!LLM || PtrReturnFuncs.empty())
     return;
@@ -1081,33 +1196,72 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       WARNING("FuncPtr for " << *CS << " node not found!\n");
       continue;
     }
+
+    // Extract call-site struct field info: trace through LoadInst → GEP
+    std::string callSiteStruct;
+    unsigned callSiteFieldIdx = 0;
+    bool hasCallSiteField = false;
+    if (auto *Load = dyn_cast<LoadInst>(fptr)) {
+      Value *loadPtr = Load->getPointerOperand()->stripPointerCasts();
+      if (auto *GEP = dyn_cast<GEPOperator>(loadPtr)) {
+        hasCallSiteField = getGEPStructField(GEP, callSiteStruct, callSiteFieldIdx);
+      }
+    }
+
     auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelV()];
+    CG_DEBUG("  fptr node " << fptrNode << " V-set size: " << cflSet.size() << "\n");
     for (auto idx : cflSet) {
-      // CG_DEBUG("FuncPtr: node: " << fptrNode << " -> ptr: " << idx << "\n");
-      // ptsSet.insert(idx);
       if (NF.isSpecialNode(idx)) {
         WARNING("Indirect Call: " << *CS << " callee is a special node: " << idx << "\n");
         continue;
       }
+      // Return nodes and vararg nodes also store Function* as their value,
+      // but they represent the return value / vararg slot, not the function
+      // pointer itself. Skip them — only true value nodes are function ptrs.
+      if (NF.isReturnNode(idx)) {
+        // CG_DEBUG("  V-alias node " << idx << ": return node for "
+        //          << cast<Function>(NF.getValueForNode(idx))->getName() << "\n");
+        continue;
+      }
+      if (NF.isVarargNode(idx)) {
+        // CG_DEBUG("  V-alias node " << idx << ": vararg node for "
+        //          << cast<Function>(NF.getValueForNode(idx))->getName() << "\n");
+        continue;
+      }
       const Value *CV = NF.getValueForNode(idx);
       if (CV == NULL) {
-        // WARNING("No value for function node!\n");
+        // CG_DEBUG("  V-alias node " << idx << ": no value\n");
         continue;
       }
       const Function *CF = dyn_cast<Function>(CV);
       if (CF == NULL) {
-        // WARNING("Function pointer " << *fptr << " points to non-function: " << *CV << "\n");
+        // CG_DEBUG("  V-alias node " << idx << ": non-function: " << *CV << "\n");
         continue;
       }
       // due to field insensitivity, we may have FPs, do a type match
       if (!isCompatible(CS, CF)) {
-        // WARNING("Function pointer " << *CS << " type mismatch: " << CF->getName() << "\n");
         continue;
+      }
+      // Struct-field-aware filtering:
+      // If we know the call site loads from a specific struct field,
+      // and we have positive evidence of which fields this function is
+      // stored into, reject if none match.
+      if (hasCallSiteField) {
+        auto it = funcFieldStores.find(CF);
+        if (it != funcFieldStores.end()) {
+          const auto &fieldSet = it->second;
+          if (fieldSet.find({callSiteStruct, callSiteFieldIdx}) == fieldSet.end()) {
+            CG_LOG("FieldFilter: reject " << CF->getName()
+                   << " for " << callSiteStruct << " field " << callSiteFieldIdx << "\n");
+            continue;
+          }
+        }
+        // If function has no entries in funcFieldStores, keep it (conservative)
       }
       if (Ctx->Callees[CS].insert(CF).second) {
         // if new callee added, we need to rerun
         Changed = true;
-        CG_LOG("Handle indirect Call: callee: " << CF->getName() << "\n");
+        CG_LOG("Handle indirect target: " << CF->getName() << "\n");
         handleCall(CS, CF);
       }
     }
@@ -1182,12 +1336,16 @@ bool CallGraphPass::doModulePass(Module *M) {
     auto outputCFLGraph = solver->getGraph();
 
     // handle custom allocators
-    if (findCustomAllocators(outputCFLGraph)) {
+    findCustomAllocators(outputCFLGraph);
+    // if () {
       // if new allocators found, we need to rerun
       // solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
       // solver->runCFL();
       // outputCFLGraph = solver->getGraph();
-    }
+    // }
+
+    // build field-store map for struct-field-aware filtering
+    buildFieldStoreMap(outputCFLGraph);
 
     // parse results and update call edges
     Changed |= handleIndirectCall(outputCFLGraph);

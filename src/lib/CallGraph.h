@@ -4,6 +4,7 @@
 #include <llvm/IR/Value.h>
 #include <llvm/IR/InstVisitor.h>
 
+#include <unordered_map>
 #include <unordered_set>
 
 #include "Global.h"
@@ -51,7 +52,13 @@ private:
   bool isStructLayoutCompatible(const llvm::StructType *ST1, const llvm::StructType *ST2);
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
-  void processInitializer(NodeIndex obj, llvm::Constant *init);
+  void processInitializer(NodeIndex obj, llvm::Constant *init,
+                          const std::string &enclosingStruct = "",
+                          int enclosingFieldIdx = -1);
+
+  static bool getGEPStructField(const llvm::GEPOperator *GEP,
+                                 std::string &structName, unsigned &fieldIdx);
+  void buildFieldStoreMap(cfl_result_t &outputCFLGraph);
   void queryAllocatorCandidatesWithLLM();
   bool findCustomAllocators(cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(cfl_result_t &outputCFLGraph);
@@ -66,6 +73,23 @@ private:
   std::vector<llvm::Function*> PtrReturnFuncs;
 
   CalleeMap calleeByType;
+
+  // Field-store tracking for struct-field-aware indirect call filtering
+  struct FieldStoreRecord {
+    NodeIndex valNode;
+    std::string structName;  // stripped name (no LLVM suffix)
+    unsigned fieldIdx;
+  };
+  std::vector<FieldStoreRecord> fieldStoreRecords;
+
+  using FieldStoreKey = std::pair<std::string, unsigned>;
+  struct FieldStoreKeyHash {
+    size_t operator()(const FieldStoreKey &k) const {
+      return std::hash<std::string>()(k.first) ^ (std::hash<unsigned>()(k.second) << 16);
+    }
+  };
+  std::unordered_map<const llvm::Function*,
+                     std::unordered_set<FieldStoreKey, FieldStoreKeyHash>> funcFieldStores;
 
 public:
   CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_ = nullptr)

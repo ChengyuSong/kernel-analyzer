@@ -168,6 +168,25 @@ public:
     NodeIndex getVarargNodeFor(const llvm::Function* f);
     NodeIndex getDereferenceNodeFor(const NodeIndex ptr);
 
+    // Node classification: distinguish function value nodes from
+    // return/vararg nodes (all three store Function* as their value)
+    bool isReturnNode(NodeIndex i) const {
+        const llvm::Value *v = nodes.at(i).getValue();
+        if (!v) return false;
+        const auto *f = llvm::dyn_cast<llvm::Function>(v);
+        if (!f) return false;
+        auto it = returnMap.find(f);
+        return it != returnMap.end() && it->second == i;
+    }
+    bool isVarargNode(NodeIndex i) const {
+        const llvm::Value *v = nodes.at(i).getValue();
+        if (!v) return false;
+        const auto *f = llvm::dyn_cast<llvm::Function>(v);
+        if (!f) return false;
+        auto it = varargMap.find(f);
+        return it != varargMap.end() && it->second == i;
+    }
+
     // Node merge interfaces
     void mergeNode(NodeIndex n0, NodeIndex n1);	// Merge n1 into n0
     NodeIndex getMergeTarget(NodeIndex n);

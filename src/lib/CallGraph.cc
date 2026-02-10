@@ -646,44 +646,63 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitExtractValueInst(ExtractValueInst &EVI) {
-  if (!EVI.getType()->isPointerTy()) {
-    // XXX only consider pointer type
-    return;
-  }
-  // field insensitive, just connect the aggregate
+  bool resultIsPtr = EVI.getType()->isPointerTy();
+
+  // Check if the aggregate operand already has tracked pointer content.
+  // Skip constants (undef, zeroinitializer, etc.) — they map to ConstantIntIndex
+  // which doesn't carry useful pointer information.
   Value *agg = EVI.getAggregateOperand();
-  NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
-  if (aggNode == AndersNodeFactory::InvalidIndex) {
-    aggNode = CGP.NF.createValueNode(agg);
-    CG_DEBUG("Create value node " << aggNode << " for ExtractValue " << *agg << "\n");
-  }
+  NodeIndex aggNode = AndersNodeFactory::InvalidIndex;
+  if (!isa<Constant>(agg))
+    aggNode = CGP.NF.getValueNodeFor(agg);
+
+  // Nothing to track if the result isn't a pointer and the aggregate
+  // has no tracked pointer content to propagate through nested extracts
+  if (!resultIsPtr && aggNode == AndersNodeFactory::InvalidIndex)
+    return;
+
+  // field insensitive, just connect the aggregate
   NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find extractvalue val node");
-  CGP.EB.addAssignmentEdges(aggNode, valNode);
+  if (valNode == AndersNodeFactory::InvalidIndex)
+    valNode = CGP.NF.createValueNode(&EVI);
+
+  if (aggNode != AndersNodeFactory::InvalidIndex)
+    CGP.EB.addAssignmentEdges(aggNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
   // field insensitive, just connect the aggregate
   Value *val = IVI.getInsertedValueOperand();
-  if (!val->getType()->isPointerTy()) {
-    // XXX only consider pointer type
-    return;
-  }
-  NodeIndex valNode = CGP.NF.getValueNodeFor(val);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
-  // if (valNode == AndersNodeFactory::InvalidIndex) {
-  //   valNode = CGP.NF.createValueNode(val);
-  //   CG_DEBUG("Create value node " << valNode << " for InsertValue val " << *val << "\n");
-  // }
+  bool valIsPtr = val->getType()->isPointerTy();
+
+  // Check if the aggregate operand already has tracked pointer content
+  // (e.g., from a prior insertvalue that inserted a pointer).
+  // Skip constants (undef, zeroinitializer, etc.) — they map to ConstantIntIndex
+  // which doesn't carry useful pointer information.
   Value *agg = IVI.getAggregateOperand();
-  NodeIndex aggNode = CGP.NF.getValueNodeFor(agg);
-  if (aggNode == AndersNodeFactory::InvalidIndex) {
-    aggNode = CGP.NF.createValueNode(agg);
-    CG_DEBUG("Create value node " << aggNode << " for InsertValue agg " << *agg << "\n");
+  NodeIndex aggNode = AndersNodeFactory::InvalidIndex;
+  if (!isa<Constant>(agg))
+    aggNode = CGP.NF.getValueNodeFor(agg);
+
+  // Nothing to track if the inserted value isn't a pointer and the aggregate
+  // has no tracked pointer content
+  if (!valIsPtr && aggNode == AndersNodeFactory::InvalidIndex)
+    return;
+
+  NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
+  if (resNode == AndersNodeFactory::InvalidIndex)
+    resNode = CGP.NF.createValueNode(&IVI);
+
+  // Propagate aggregate's pointer content to result
+  if (aggNode != AndersNodeFactory::InvalidIndex)
+    CGP.EB.addAssignmentEdges(aggNode, resNode);
+
+  // Propagate inserted value if it's a pointer
+  if (valIsPtr) {
+    NodeIndex valNode = CGP.NF.getValueNodeFor(val);
+    assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
+    CGP.EB.addAssignmentEdges(valNode, resNode);
   }
-  NodeIndex resNode = CGP.NF.createValueNode(&IVI);
-  CGP.EB.addAssignmentEdges(aggNode, resNode);
-  CGP.EB.addAssignmentEdges(valNode, resNode);
 }
 
 void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {

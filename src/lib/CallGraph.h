@@ -48,6 +48,7 @@ private:
   bool handleCall(const llvm::CallBase*, const llvm::Function*);
   bool removeCallEdges(const llvm::CallBase*, const llvm::Function*);
   bool isCompatibleType(const llvm::Type *T1, const llvm::Type *T2);
+  bool isStructLayoutCompatible(const llvm::StructType *ST1, const llvm::StructType *ST2);
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void processInitializer(NodeIndex obj, llvm::Constant *init);

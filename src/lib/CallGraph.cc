@@ -74,36 +74,51 @@ Function* CallGraphPass::getFuncDef(Function *F) {
     return F;
 }
 
+// Strip LLVM's numeric suffix (e.g., ".0", ".123") from struct names.
+// When linking multiple modules, LLVM appends these suffixes to avoid
+// name collisions, but they represent the same C struct type.
+static StringRef stripStructNameSuffix(StringRef Name) {
+  size_t DotPos = Name.rfind('.');
+  if (DotPos == StringRef::npos || DotPos == 0)
+    return Name;
+  // Only strip if everything after the last '.' is digits
+  StringRef Suffix = Name.substr(DotPos + 1);
+  if (!Suffix.empty() && Suffix.find_first_not_of("0123456789") == StringRef::npos)
+    return Name.substr(0, DotPos);
+  return Name;
+}
+
+bool CallGraphPass::isStructLayoutCompatible(const StructType *ST1,
+                                              const StructType *ST2) {
+  unsigned numEl = ST1->getNumElements();
+  if (numEl != ST2->getNumElements())
+    return false;
+
+  for (unsigned i = 0; i < numEl; ++i) {
+    if (!isCompatibleType(ST1->getElementType(i), ST2->getElementType(i)))
+      return false;
+  }
+  return true;
+}
+
 bool CallGraphPass::isCompatibleType(const Type *T1, const Type *T2) {
   if (T1 == T2) {
       return true;
   } else if (T1->isVoidTy()) {
     return T2->isVoidTy();
   } else if (T1->isIntegerTy()) {
-    // assume pointer can be cased to the address space size
-    if (T2->isPointerTy() && T1->getIntegerBitWidth() == T2->getPointerAddressSpace())
-      return true;
-
-    // assume all integer type are compatible
+    // All integer types are compatible (C allows implicit conversions)
     if (T2->isIntegerTy())
       return true;
-    else
-      return false;
-  } else if (T1->isPointerTy()) {
-    if (!T2->isPointerTy())
-      return false;
 
-#if LLVM_VERSION_MAJOR > 12
-    return true;
-#else
-    Type *ElT1 = T1->getPointerElementType();
-    Type *ElT2 = T2->getPointerElementType();
-    // assume "void *" and "char *" are equivalent to any pointer type
-    if (ElT1->isIntegerTy(8) || ElT2->isIntegerTy(8))
+    return false;
+  } else if (T1->isPointerTy()) {
+    // All pointer types are compatible (opaque pointers in LLVM 13+,
+    // and C allows implicit void* conversions)
+    if (T2->isPointerTy())
       return true;
 
-    return isCompatibleType(ElT1, ElT2);
-#endif
+    return false;
   } else if (T1->isArrayTy()) {
     if (!T2->isArrayTy())
       return false;
@@ -117,25 +132,19 @@ bool CallGraphPass::isCompatibleType(const Type *T1, const Type *T2) {
     if (!ST2)
       return false;
 
-    // literal has to be equal
+    // Both literal: compare structurally
+    if (ST1->isLiteral() && ST2->isLiteral())
+      return isStructLayoutCompatible(ST1, ST2);
+
+    // One literal, one named: not compatible
     if (ST1->isLiteral() != ST2->isLiteral())
       return false;
 
-    // literal, compare content
-    if (ST1->isLiteral()) {
-      unsigned numEl1 = ST1->getNumElements();
-      if (numEl1 != ST2->getNumElements())
-        return false;
-
-      for (unsigned i = 0; i < numEl1; ++i) {
-        if (!isCompatibleType(ST1->getElementType(i), ST2->getElementType(i)))
-          return false;
-      }
-      return true;
-    }
-
-    // not literal, use name?
-    return ST1->getStructName().equals(ST2->getStructName());
+    // Both named: compare names after stripping LLVM's numeric suffixes
+    // (LLVM appends .0, .1, etc. when linking modules with same-named structs)
+    StringRef Name1 = stripStructNameSuffix(ST1->getStructName());
+    StringRef Name2 = stripStructNameSuffix(ST2->getStructName());
+    return Name1.equals(Name2);
   } else if (T1->isFunctionTy()) {
     const FunctionType *FT1 = cast<FunctionType>(T1);
     const FunctionType *FT2 = dyn_cast<FunctionType>(T2);
@@ -172,43 +181,41 @@ bool CallGraphPass::isCompatibleType(const Type *T1, const Type *T2) {
 }
 
 bool CallGraphPass::isCompatible(const CallBase *CS, const Function *F) {
-  // just compare known args
-  if (F->getFunctionType()->isVarArg()) {
-    errs() << "VarArg: " << F->getName() << "\n";
-    //report_fatal_error("VarArg address taken function\n");
-    // FIXME: handle vararg function
+  if (F->isIntrinsic())
     return false;
-  } else if (F->arg_size() != CS->arg_size()) {
-    //errs() << "ArgNum mismatch: " << F.getName() << "\n";
-    return false;
-  } else if (!isCompatibleType(F->getReturnType(), CS->getType())) {
-    return false;
+
+  const FunctionType *FTy = F->getFunctionType();
+  unsigned NumFixedParams = FTy->getNumParams();
+  unsigned NumActualArgs = CS->arg_size();
+
+  // For vararg functions, callsite must provide at least the fixed parameters
+  if (FTy->isVarArg()) {
+    if (NumActualArgs < NumFixedParams)
+      return false;
+  } else {
+    // For non-vararg, require exact argument count match
+    if (NumActualArgs != NumFixedParams)
+      return false;
   }
 
-  if (F->isIntrinsic()) {
-    //errs() << "Intrinsic: " << F.getName() << "\n";
-    return false;
+  // Return type: if the callsite result is unused, accept any return type.
+  // Otherwise require compatibility.
+  if (!CS->use_empty() && !CS->getType()->isVoidTy()) {
+    if (!isCompatibleType(F->getReturnType(), CS->getType()))
+      return false;
   }
 
-  // type matching on args
-  bool Matched = true;
+  // Type matching on the fixed parameters
   auto AI = CS->arg_begin();
-  for (auto FI = F->arg_begin(), FE = F->arg_end();
-       FI != FE; ++FI, ++AI) {
-    // check type mis-match
-    Type *FormalTy = FI->getType();
-    assert(AI != CS->arg_end() && "Argument number mismatch!");
+  for (unsigned i = 0; i < NumFixedParams; ++i, ++AI) {
+    Type *FormalTy = FTy->getParamType(i);
     Type *ActualTy = (*AI)->getType();
 
-    if (isCompatibleType(FormalTy, ActualTy))
-      continue;
-    else {
-      Matched = false;
-      break;
-    }
+    if (!isCompatibleType(FormalTy, ActualTy))
+      return false;
   }
 
-  return Matched;
+  return true;
 }
 
 bool CallGraphPass::findCalleesByType(const CallBase *CS, FuncSet &FS) {
@@ -298,11 +305,11 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       EB.addAssignmentEdges(argNode, formalNode);
     }
   } else {
-    if (numArgs != CF->arg_size()) {
-      WARNING("Call argument number mismatch! " << *CS << " -> " << CF->getName() << "\n");
-      return false;
-    }
-    for (unsigned i = 0; i < numArgs; i++) {
+    // Only match up to the number of formal parameters; extra actual
+    // arguments at the callsite are ignored (permitted by permissive matching).
+    unsigned numFormals = CF->arg_size();
+    unsigned minArgs = std::min(numArgs, numFormals);
+    for (unsigned i = 0; i < minArgs; i++) {
       Value *arg = CS->getArgOperand(i);
       if (!arg->getType()->isPointerTy())
         continue; // skip non-pointer args
@@ -327,9 +334,11 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   if (CF->getReturnType()->isPointerTy()) {
     NodeIndex retNode = NF.getReturnNodeFor(CF);
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
+    // The callsite may not have a value node if it discards the return value
+    // (e.g., void-typed callsite matched via permissive isCompatible)
     NodeIndex callNode = NF.getValueNodeFor(CS);
-    assert(callNode != AndersNodeFactory::InvalidIndex && "Call node not found!");
-    EB.addAssignmentEdges(retNode, callNode);
+    if (callNode != AndersNodeFactory::InvalidIndex)
+      EB.addAssignmentEdges(retNode, callNode);
   }
 
   return false;
@@ -340,6 +349,7 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
 
   // handle args
   unsigned numArgs = CS->arg_size();
+  unsigned numFormals = CF->arg_size();
   if (CF->isVarArg()) {
     NodeIndex formalNode = NF.getVarargNodeFor(CF);
     assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
@@ -353,11 +363,9 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
       EB.removeAssignmentEdges(argNode, formalNode);
     }
   } else {
-    if (numArgs != CF->arg_size()) {
-      WARNING("Call argument number mismatch! " << *CS << " -> " << CF->getName() << "\n");
-      return false;
-    }
-    for (unsigned i = 0; i < numArgs; i++) {
+    // Only iterate over the minimum of actual and formal args
+    unsigned minArgs = std::min(numArgs, numFormals);
+    for (unsigned i = 0; i < minArgs; i++) {
       Value *arg = CS->getArgOperand(i);
       if (!arg->getType()->isPointerTy())
         continue; // skip non-pointer args
@@ -375,8 +383,8 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     NodeIndex retNode = NF.getReturnNodeFor(CF);
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
     NodeIndex callNode = NF.getValueNodeFor(CS);
-    assert(callNode != AndersNodeFactory::InvalidIndex && "Call node not found!");
-    EB.removeAssignmentEdges(retNode, callNode);
+    if (callNode != AndersNodeFactory::InvalidIndex)
+      EB.removeAssignmentEdges(retNode, callNode);
   }
 
   return false;
@@ -1046,7 +1054,8 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
   // resolve indirect calls
   bool Changed = false;
   for (auto *CS : Ctx->IndirectCallInsts) {
-    CG_DEBUG("Handle indirect CallSite: " << *CS << "\n");
+    CG_DEBUG("Handle indirect CallSite: " << *CS << " in function "
+        << CS->getFunction()->getName() << "\n");
     Value *fptr = CS->getCalledOperand()->stripPointerCasts();
     NodeIndex fptrNode = NF.getValueNodeFor(fptr);
     if (fptrNode == AndersNodeFactory::InvalidIndex) {
@@ -1073,7 +1082,7 @@ bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
       }
       // due to field insensitivity, we may have FPs, do a type match
       if (!isCompatible(CS, CF)) {
-        WARNING("Function pointer " << *CS << " type mismatch: " << CF->getName() << "\n");
+        // WARNING("Function pointer " << *CS << " type mismatch: " << CF->getName() << "\n");
         continue;
       }
       if (Ctx->Callees[CS].insert(CF).second) {
@@ -1167,7 +1176,6 @@ bool CallGraphPass::doModulePass(Module *M) {
     iteration++;
   }
 
-  Changed = false; // only run once
   return Changed;
 }
 

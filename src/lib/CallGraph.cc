@@ -531,6 +531,17 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       auto RCF = CGP.getFuncDef(CF);
       CGP.Ctx->Callees[&CS].insert(RCF);
       CGP.handleCall(&CS, RCF);
+    } else if (auto *IF = dyn_cast<GlobalIFunc>(CO)) {
+      auto it = CGP.IFuncTargets.find(IF);
+      if (it != CGP.IFuncTargets.end()) {
+        for (const Function *CF : it->second) {
+          CGP.Ctx->Callees[&CS].insert(CF);
+          CGP.handleCall(&CS, CF);
+          CG_LOG("IFunc call: " << IF->getName() << " -> " << CF->getName() << "\n");
+        }
+      } else {
+        CG_DEBUG("IFunc call: " << IF->getName() << " has no resolved targets\n");
+      }
     } else {
       CGP.Ctx->IndirectCallInsts.insert(&CS);
     }
@@ -900,6 +911,62 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
   }
 }
 
+void CallGraphPass::processCtorsDtors(Module *M) {
+  for (StringRef Name : {"llvm.global_ctors", "llvm.global_dtors"}) {
+    GlobalVariable *GV = M->getGlobalVariable(Name);
+    if (!GV || !GV->hasInitializer())
+      continue;
+    ConstantArray *CA = dyn_cast<ConstantArray>(GV->getInitializer());
+    if (!CA)
+      continue;
+    for (auto &Op : CA->operands()) {
+      if (isa<ConstantAggregateZero>(Op))
+        continue;
+      ConstantStruct *CS = cast<ConstantStruct>(Op);
+      // Operand 1 is the function pointer
+      if (Function *F = dyn_cast<Function>(CS->getOperand(1))) {
+        auto *RF = getFuncDef(F);
+        if (Ctx->CtorDtorFuncs.insert(RF).second)
+          CG_LOG("CtorDtor: " << Name << " -> " << RF->getName() << "\n");
+      }
+    }
+  }
+}
+
+void CallGraphPass::collectIFuncTargets(const GlobalIFunc *IF) {
+  Function *Resolver = const_cast<GlobalIFunc*>(IF)->getResolverFunction();
+  if (!Resolver || Resolver->isDeclaration()) {
+    CG_DEBUG("IFunc: " << IF->getName() << " resolver not available\n");
+    return;
+  }
+  FuncSet &Targets = IFuncTargets[IF];
+  for (auto &BB : *Resolver) {
+    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+      if (!RI->getReturnValue())
+        continue;
+      Value *RV = RI->getReturnValue()->stripPointerCasts();
+      if (auto *F = dyn_cast<Function>(RV)) {
+        Targets.insert(getFuncDef(F));
+      } else if (auto *LI = dyn_cast<LoadInst>(RV)) {
+        // Handle pattern: store @func, %alloca; ... %rv = load %alloca; ret %rv
+        Value *Ptr = LI->getPointerOperand();
+        for (User *U : Ptr->users()) {
+          if (auto *SI = dyn_cast<StoreInst>(U)) {
+            if (SI->getPointerOperand() == Ptr) {
+              if (auto *F = dyn_cast<Function>(SI->getValueOperand()->stripPointerCasts()))
+                Targets.insert(getFuncDef(F));
+            }
+          }
+        }
+      }
+    }
+  }
+  CG_LOG("IFunc: " << IF->getName() << " resolved via " << Resolver->getName()
+         << " to " << Targets.size() << " target(s)\n");
+  for (const Function *T : Targets)
+    CG_LOG("  IFunc target: " << T->getName() << "\n");
+}
+
 bool CallGraphPass::doInitialization(Module *M) {
 
   for (auto &GV : M->globals()) {
@@ -959,6 +1026,13 @@ bool CallGraphPass::doInitialization(Module *M) {
       }
     }
   }
+
+  // Collect global constructors/destructors
+  processCtorsDtors(M);
+
+  // Collect ifunc resolver targets
+  for (const GlobalIFunc &IF : M->ifuncs())
+    collectIFuncTargets(&IF);
 
   if (M == Ctx->Modules.back().first) {
     for (auto const &itr: Ctx->ExtGobjs) {

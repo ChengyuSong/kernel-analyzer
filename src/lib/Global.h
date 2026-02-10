@@ -89,6 +89,9 @@ public:
   // functions whose addresses are taken
   FuncSet AddressTakenFuncs;
 
+  // Functions implicitly called as global constructors/destructors
+  FuncSet CtorDtorFuncs;
+
   // allocation functions
   FuncSet AllocFuncs;
   FuncSet CandidateAllocFuncs;

@@ -3,6 +3,7 @@
 
 #include <llvm/IR/Value.h>
 #include <llvm/IR/InstVisitor.h>
+#include <llvm/IR/GlobalIFunc.h>
 
 #include <unordered_map>
 #include <unordered_set>
@@ -73,6 +74,12 @@ private:
   std::vector<llvm::Function*> PtrReturnFuncs;
 
   CalleeMap calleeByType;
+
+  // ifunc symbol -> resolved target functions
+  llvm::DenseMap<const llvm::GlobalIFunc*, FuncSet> IFuncTargets;
+
+  void collectIFuncTargets(const llvm::GlobalIFunc *IF);
+  void processCtorsDtors(llvm::Module *M);
 
   // Field-store tracking for struct-field-aware indirect call filtering
   struct FieldStoreRecord {

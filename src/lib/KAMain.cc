@@ -4,7 +4,7 @@
  * Copyright (C) 2012 Xi Wang, Haogang Chen, Nickolai Zeldovich
  * Copyright (C) 2015 Byoungyoung Lee
  * Copyright (C) 2016 Kangjie Lu
- * Copyright (C) 2015 - 2025 Chengyu Song
+ * Copyright (C) 2015 - 2026 Chengyu Song
  *
  * For licensing details see LICENSE
  */
@@ -33,6 +33,7 @@
 #include "PointTo.h"
 #include "CallGraph.h"
 #include "Reachable.h"
+#include "LLMClient.h"
 
 using namespace llvm;
 
@@ -41,21 +42,6 @@ cl::list<std::string> InputFilenames(
 
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
-
-cl::opt<bool> UseTypeBasedCallGraph(
-  "type-based-callgraph", cl::desc("Use type-based call graph"), cl::init(false));
-
-cl::opt<std::string> TargetList(
-  "target-list", cl::desc("Target list"), cl::init(""));
-
-cl::opt<std::string> EntryList(
-  "entry-list", cl::desc("Entry list"), cl::init(""));
-
-cl::opt<std::string> DumpPolicy(
-  "dump-policy", cl::desc("Dump static policy"), cl::init(""));
-
-cl::opt<std::string> DumpDistance(
-  "dump-distance", cl::desc("Dump distance"), cl::init(""));
 
 cl::opt<std::string> DumpBidMapping(
   "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum"), cl::init(""));
@@ -71,6 +57,12 @@ cl::opt<std::string> GrammarFile(
 
 cl::opt<std::string> CFLEdgeOutput(
   "cfl-edge-output", cl::desc("Output file for CFL-reachability edges"), cl::init(""));
+
+cl::opt<std::string> LLMServerHost(
+  "llm-server-host", cl::desc("Hostname of local LLM server"), cl::init(""));
+
+cl::opt<unsigned> LLMServerPort(
+  "llm-server-port", cl::desc("Port of local LLM server"), cl::init(0));
 
 GlobalContext GlobalCtx;
 
@@ -246,7 +238,6 @@ int main(int argc, char **argv) {
   GlobalCtx.nodeFactory.setExtFuncMap(&GlobalCtx.ExtFuncs);
 
   // Main workflow
-  populateNodeFactory(GlobalCtx);
 
   // CFL-reachability edge construction
   if (GrammarFile.empty()) {
@@ -259,7 +250,23 @@ int main(int argc, char **argv) {
     }
   }
 
-  CallGraphPass CGPass(&GlobalCtx);
+  std::unique_ptr<LLMClient> LLM;
+  if (!LLMServerHost.empty()) {
+    if (LLMServerPort == 0) {
+      WARNING("Ignoring --llm-server-host because --llm-server-port is 0\n");
+    } else {
+      std::string Endpoint = "http://" + LLMServerHost + ":" +
+                             std::to_string(LLMServerPort) +
+                             "/v1/chat/completions";
+      LLMClientConfig LLMConfig;
+      LLMConfig.Enabled = true;
+      LLMConfig.Endpoint = Endpoint;
+      LLM = std::make_unique<LLMClient>(std::move(LLMConfig));
+      Diag << "LLM server endpoint: " << Endpoint << "\n";
+    }
+  }
+
+  CallGraphPass CGPass(&GlobalCtx, LLM.get());
   CGPass.run(GlobalCtx.Modules);
 
   if (!CFLEdgeOutput.empty()) {
@@ -268,6 +275,7 @@ int main(int argc, char **argv) {
 
   // ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
   // RCGPass.run(GlobalCtx.Modules);
+  // RCGPass.dumpCallees();
 
   // if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
   //   std::ofstream bbLocs(DumpBidMapping);

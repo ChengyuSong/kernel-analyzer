@@ -1260,69 +1260,126 @@ void CallGraphPass::buildFieldStoreMap(cfl_result_t &outputCFLGraph) {
          << funcFieldStores.size() << " distinct functions\n");
 }
 
+// Process a single LLM response for allocator candidates.  Returns the
+// number of newly added candidates.
+size_t CallGraphPass::processAllocatorLLMResponse(
+    StringRef RespText, ArrayRef<Function *> Batch) {
+  size_t Added = 0;
+
+  // Try to parse as JSON first.
+  bool ParsedJSON = false;
+  Expected<json::Value> Parsed =
+      json::parse(LLMClient::stripMarkdownFence(RespText));
+  if (Parsed) {
+    const json::Array *Candidates = nullptr;
+    if (const json::Object *Obj = Parsed->getAsObject()) {
+      Candidates = Obj->getArray("candidates");
+      if (!Candidates)
+        Candidates = Obj->getArray("functions");
+    } else {
+      Candidates = Parsed->getAsArray();
+    }
+    if (Candidates) {
+      ParsedJSON = true;
+      for (const json::Value &V : *Candidates) {
+        std::optional<StringRef> Name = V.getAsString();
+        if (!Name)
+          continue;
+        for (Function *F : Batch) {
+          if (F->getName() == *Name &&
+              Ctx->AllocFuncs.count(F) == 0 &&
+              Ctx->CandidateAllocFuncs.insert(F).second) {
+            Added++;
+          }
+        }
+      }
+    }
+  } else {
+    consumeError(Parsed.takeError());
+  }
+
+  // Fallback: scan raw text for known function names from the batch.
+  if (!ParsedJSON) {
+    WARNING("LLM response is not valid JSON, falling back to text matching\n");
+    for (Function *F : Batch) {
+      StringRef Name = F->getName();
+      size_t Pos = 0;
+      while ((Pos = RespText.find(Name, Pos)) != StringRef::npos) {
+        bool LeftOk = (Pos == 0) ||
+                      (!isAlnum(RespText[Pos - 1]) && RespText[Pos - 1] != '_');
+        size_t End = Pos + Name.size();
+        bool RightOk = (End >= RespText.size()) ||
+                       (!isAlnum(RespText[End]) && RespText[End] != '_');
+        if (LeftOk && RightOk) {
+          if (Ctx->AllocFuncs.count(F) == 0 &&
+              Ctx->CandidateAllocFuncs.insert(F).second) {
+            Added++;
+          }
+          break;
+        }
+        Pos = End;
+      }
+    }
+  }
+  return Added;
+}
+
 void CallGraphPass::queryAllocatorCandidatesWithLLM() {
   if (!LLM || PtrReturnFuncs.empty())
     return;
 
-  const StringRef SystemPrompt = "You classify allocator-like functions conservatively.";
-  std::string UserPrompt;
-  raw_string_ostream PromptOS(UserPrompt);
-  PromptOS << "Given function declarations only (no bodies), identify likely custom allocator functions.\n";
-  PromptOS << "Return strict JSON only in this format: {\"candidates\":[\"func_name1\",\"func_name2\"]}\n";
-  PromptOS << "Only include names from the provided list.\n\n";
-  PromptOS << "Declarations:\n";
-  for (const Function *F : PtrReturnFuncs) {
-    std::string FuncTy;
-    raw_string_ostream FOS(FuncTy);
-    FOS << *F->getFunctionType();
-    FOS.flush();
-    PromptOS << "- " << F->getName() << " : " << FuncTy << "\n";
-  }
-  PromptOS.flush();
-  CG_DEBUG("LLM allocator query system prompt:\n" << SystemPrompt << "\n");
-  CG_DEBUG("LLM allocator query user prompt:\n" << UserPrompt << "\n");
+  const StringRef SystemPrompt =
+      "You classify allocator-like functions conservatively.";
 
-  auto Resp = LLM->requestJSON(
-      SystemPrompt,
-      UserPrompt);
-  if (!Resp) {
-    WARNING("LLM allocator candidate query failed: " << toString(Resp.takeError()) << "\n");
-    return;
-  }
-  std::string RespText;
-  raw_string_ostream RespOS(RespText);
-  RespOS << formatv("{0}", *Resp);
-  RespOS.flush();
-  CG_DEBUG("LLM allocator response:\n" << RespText << "\n");
+  // Process PtrReturnFuncs in batches to stay within the LLM context window.
+  const unsigned BatchSize = 100;
+  size_t TotalAdded = 0;
+  unsigned NumBatches =
+      (PtrReturnFuncs.size() + BatchSize - 1) / BatchSize;
 
-  const json::Array *Candidates = nullptr;
-  if (const json::Object *Obj = Resp->getAsObject()) {
-    Candidates = Obj->getArray("candidates");
-    if (!Candidates)
-      Candidates = Obj->getArray("functions");
-  } else {
-    Candidates = Resp->getAsArray();
-  }
+  for (unsigned B = 0; B < NumBatches; ++B) {
+    unsigned Begin = B * BatchSize;
+    unsigned End = std::min(Begin + BatchSize, (unsigned)PtrReturnFuncs.size());
+    ArrayRef<Function *> Batch(&PtrReturnFuncs[Begin], End - Begin);
 
-  if (!Candidates) {
-    WARNING("LLM allocator candidate response missing 'candidates' array\n");
-    return;
-  }
-
-  size_t Added = 0;
-  for (const json::Value &V : *Candidates) {
-    std::optional<StringRef> Name = V.getAsString();
-    if (!Name)
-      continue;
-    for (Function *F : PtrReturnFuncs) {
-      if (F->getName() == *Name &&
-          Ctx->AllocFuncs.count(F) == 0 &&
-          Ctx->CandidateAllocFuncs.insert(F).second) {
-        Added++;
-      }
+    std::string UserPrompt;
+    raw_string_ostream PromptOS(UserPrompt);
+    PromptOS << "Given function declarations only (no bodies), identify likely "
+                "custom allocator functions.\n";
+    PromptOS << "Return strict JSON only in this format: "
+                "{\"candidates\":[\"func_name1\",\"func_name2\"]}\n";
+    PromptOS << "Only include names from the provided list.\n\n";
+    PromptOS << "Declarations:\n";
+    for (const Function *F : Batch) {
+      std::string FuncTy;
+      raw_string_ostream FOS(FuncTy);
+      FOS << *F->getFunctionType();
+      FOS.flush();
+      PromptOS << "- " << F->getName() << " : " << FuncTy << "\n";
     }
+    PromptOS.flush();
+
+    CG_DEBUG("LLM allocator query batch " << B + 1 << "/" << NumBatches
+             << " (" << Batch.size() << " functions)\n");
+    CG_DEBUG("LLM allocator query user prompt:\n" << UserPrompt << "\n");
+
+    // Estimate token budget for the response.
+    unsigned MaxTok = std::max(512u, (unsigned)Batch.size() * 5 + 50);
+    // Scale timeout: ~1 second per 10 tokens, minimum 30s.
+    unsigned Timeout = std::max(30u, MaxTok / 10);
+    auto RespText = LLM->requestText(SystemPrompt, UserPrompt, MaxTok, Timeout);
+    if (!RespText) {
+      WARNING("LLM allocator candidate query batch " << B + 1
+              << " failed: " << toString(RespText.takeError()) << "\n");
+      continue;
+    }
+    CG_DEBUG("LLM allocator response (batch " << B + 1 << "):\n"
+             << *RespText << "\n");
+
+    TotalAdded += processAllocatorLLMResponse(*RespText, Batch);
   }
-  CG_LOG("LLM added " << Added << " candidate allocator(s)\n");
+  CG_LOG("LLM added " << TotalAdded << " candidate allocator(s) ("
+         << NumBatches << " batch(es))\n");
 }
 
 bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {

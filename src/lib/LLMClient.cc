@@ -16,7 +16,8 @@ using namespace llvm;
 
 LLMClient::LLMClient(LLMClientConfig Config) : Cfg(std::move(Config)) {}
 
-Expected<std::string> LLMClient::runCurl(StringRef RequestBody) const {
+Expected<std::string> LLMClient::runCurl(StringRef RequestBody,
+                                         unsigned TimeoutOverride) const {
   if (!Cfg.Enabled) {
     return createStringError(inconvertibleErrorCode(),
                              "LLM client is disabled");
@@ -72,8 +73,9 @@ Expected<std::string> LLMClient::runCurl(StringRef RequestBody) const {
     ArgStorage.emplace_back("-H");
     ArgStorage.emplace_back("Authorization: Bearer " + Cfg.ApiKey);
   }
+  unsigned Timeout = TimeoutOverride ? TimeoutOverride : Cfg.TimeoutSeconds;
   ArgStorage.emplace_back("--max-time");
-  ArgStorage.emplace_back(std::to_string(Cfg.TimeoutSeconds));
+  ArgStorage.emplace_back(std::to_string(Timeout));
   ArgStorage.emplace_back("--data-binary");
   ArgStorage.emplace_back("@" + ReqPath.str().str());
   ArgStorage.emplace_back("-o");
@@ -150,7 +152,9 @@ Expected<std::string> LLMClient::extractMessageContent(StringRef ResponseBody) c
 }
 
 Expected<std::string> LLMClient::requestText(StringRef SystemPrompt,
-                                             StringRef UserPrompt) const {
+                                             StringRef UserPrompt,
+                                             unsigned MaxTokensOverride,
+                                             unsigned TimeoutOverride) const {
   json::Array Messages;
   if (!SystemPrompt.empty()) {
     Messages.emplace_back(json::Object{
@@ -167,7 +171,7 @@ Expected<std::string> LLMClient::requestText(StringRef SystemPrompt,
       {"messages", std::move(Messages)},
       {"stream", false},
       {"temperature", Cfg.Temperature},
-      {"max_tokens", static_cast<int64_t>(Cfg.MaxTokens)},
+      {"max_tokens", static_cast<int64_t>(MaxTokensOverride ? MaxTokensOverride : Cfg.MaxTokens)},
   };
   if (!Cfg.Model.empty()) {
     Req["model"] = Cfg.Model;
@@ -181,7 +185,7 @@ Expected<std::string> LLMClient::requestText(StringRef SystemPrompt,
   OS << formatv("{0}", json::Value(std::move(Req)));
   OS.flush();
 
-  Expected<std::string> Resp = runCurl(ReqBody);
+  Expected<std::string> Resp = runCurl(ReqBody, TimeoutOverride);
   if (!Resp) {
     return Resp.takeError();
   }

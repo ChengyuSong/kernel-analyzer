@@ -26,17 +26,23 @@ public:
 
   // Sends a chat completion request to a llama.cpp server and returns
   // choices[0].message.content.
+  // MaxTokensOverride/TimeoutOverride, if non-zero, replace Cfg defaults
+  // for this request.
   llvm::Expected<std::string> requestText(llvm::StringRef SystemPrompt,
-                                          llvm::StringRef UserPrompt) const;
+                                          llvm::StringRef UserPrompt,
+                                          unsigned MaxTokensOverride = 0,
+                                          unsigned TimeoutOverride = 0) const;
 
   // Same as requestText() but expects the model output to be JSON text.
   llvm::Expected<llvm::json::Value> requestJSON(llvm::StringRef SystemPrompt,
                                                 llvm::StringRef UserPrompt) const;
 
-private:
-  llvm::Expected<std::string> runCurl(llvm::StringRef RequestBody) const;
-  llvm::Expected<std::string> extractMessageContent(llvm::StringRef ResponseBody) const;
   static std::string stripMarkdownFence(llvm::StringRef Text);
+
+private:
+  llvm::Expected<std::string> runCurl(llvm::StringRef RequestBody,
+                                      unsigned TimeoutOverride = 0) const;
+  llvm::Expected<std::string> extractMessageContent(llvm::StringRef ResponseBody) const;
 
   LLMClientConfig Cfg;
 };

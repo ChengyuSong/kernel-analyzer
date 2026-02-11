@@ -62,6 +62,8 @@ private:
                                  std::string &structName, unsigned &fieldIdx);
   void buildFieldStoreMap(cfl_result_t &outputCFLGraph);
   void queryAllocatorCandidatesWithLLM();
+  size_t processAllocatorLLMResponse(llvm::StringRef RespText,
+                                     llvm::ArrayRef<llvm::Function *> Batch);
   bool findCustomAllocators(cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(cfl_result_t &outputCFLGraph);
 

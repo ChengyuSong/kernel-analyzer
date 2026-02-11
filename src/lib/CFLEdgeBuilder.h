@@ -110,6 +110,11 @@ public:
   void printEdges() const;
 
   /**
+   * @brief Reserve capacity for the edge vector to avoid reallocations
+   */
+  void reserve(size_t n) { edges.reserve(n); }
+
+  /**
    * @brief Clear accumulated edges
    */
   void clear() { edges.clear(); }

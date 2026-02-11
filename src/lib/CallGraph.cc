@@ -1417,6 +1417,17 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {
+    // Pre-size edge vector on first module to avoid repeated reallocations.
+    // Estimate ~4 edges per instruction (each add{Assignment,Dereference}Edges
+    // emits 2 edges, and most instructions trigger at least one call).
+    if (M == Ctx->Modules.front().first) {
+      size_t totalInsts = 0;
+      for (auto &[Mod, _] : Ctx->Modules)
+        for (Function &F : *Mod)
+          totalInsts += F.getInstructionCount();
+      EB.reserve(totalInsts * 4);
+    }
+
     for (auto &GV : M->globals()) {
       // Skip compiler-introduced globals
       if (shouldSkipValue(&GV)) {

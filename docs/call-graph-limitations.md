@@ -72,16 +72,15 @@ This causes two categories of missing edges:
 
 `visitPtrToIntInst` creates assignment edges from the pointer operand to
 the integer result, and `visitIntToPtrInst` creates assignment edges from
-the integer operand to the pointer result. Direct `ptrtoint`/`inttoptr`
-pairs (without intermediate arithmetic) are fully tracked.
+the integer operand to the pointer result. `visitBinaryOperator`
+propagates pointer identity through `ptr op const` patterns (integer
+binary ops where one operand is pointer-derived and the other is a
+constant).
 
-**Remaining limitation**: Binary operations on pointer-derived integers
-(e.g., `add`, `or`, `xor`) are not handled — there is no
-`visitBinaryOperator`. If a `ptrtoint` result passes through integer
-arithmetic before reaching `inttoptr`, the pointer identity is lost.
-Handling this soundly is non-trivial: `ptr + const` preserves pointer
-identity, but `ptr - ptr` produces a plain offset, and `ptr + var`
-is ambiguous without provenance tracking.
+**Remaining limitation**: Binary operations where both operands are
+non-constant (e.g., `ptr - ptr`, `ptr + var`) are not handled and
+produce a warning. Distinguishing these cases soundly requires pointer
+provenance tracking.
 
 ## 6. `va_arg` extraction
 

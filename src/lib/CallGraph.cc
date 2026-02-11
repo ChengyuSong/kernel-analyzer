@@ -803,6 +803,37 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 
+void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
+  if (!I.getType()->isIntegerTy())
+    return;
+
+  // Check if exactly one operand is pointer-derived and the other is constant.
+  NodeIndex srcNode = AndersNodeFactory::InvalidIndex;
+  bool otherIsConst = false;
+  for (unsigned i = 0; i < 2; i++) {
+    NodeIndex n = CGP.NF.getValueNodeFor(I.getOperand(i));
+    if (n != AndersNodeFactory::InvalidIndex && !CGP.NF.isSpecialNode(n)) {
+      srcNode = n;
+      otherIsConst = isa<Constant>(I.getOperand(1 - i));
+    }
+  }
+  if (srcNode == AndersNodeFactory::InvalidIndex)
+    return;
+
+  if (!otherIsConst) {
+    WARNING("BinOp on pointer-derived integer with non-constant operand: " << I << "\n");
+    return;
+  }
+
+  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  if (dstNode == AndersNodeFactory::InvalidIndex) {
+    dstNode = CGP.NF.createValueNode(&I);
+    CG_DEBUG("BinOp: created value node " << dstNode << " for " << I << "\n");
+  }
+  CG_DEBUG("BinOp: " << srcNode << " -> " << dstNode << " for " << I << "\n");
+  CGP.EB.addAssignmentEdges(srcNode, dstNode);
+}
+
 void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
   if (!I.getType()->isPointerTy())
     return;

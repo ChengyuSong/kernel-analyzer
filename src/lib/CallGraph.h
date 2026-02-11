@@ -34,6 +34,7 @@ private:
     void visitInsertValueInst(llvm::InsertValueInst &I);
     void visitIntToPtrInst(llvm::IntToPtrInst &I);
     void visitPtrToIntInst(llvm::PtrToIntInst &I);
+    void visitBinaryOperator(llvm::BinaryOperator &I);
     void visitVAArgInst(llvm::VAArgInst &I);
     void visitMemTransferInst(llvm::MemTransferInst &I);
     void visitMemSetInst(llvm::MemSetInst &I);

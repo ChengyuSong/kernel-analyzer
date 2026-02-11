@@ -68,17 +68,20 @@ This causes two categories of missing edges:
 
 ## 5. `inttoptr` / integer-cast function pointers
 
-**Status**: Not handled.
+**Status**: Partially handled.
 
-`visitIntToPtrInst` (`CallGraph.cc:765`) only logs a warning; no CFL edges
-are created. If a function pointer is cast to an integer and later cast back
-via `inttoptr`, the points-to information is lost. This pattern appears in
-some kernel code paths.
+`visitPtrToIntInst` creates assignment edges from the pointer operand to
+the integer result, and `visitIntToPtrInst` creates assignment edges from
+the integer operand to the pointer result. Direct `ptrtoint`/`inttoptr`
+pairs (without intermediate arithmetic) are fully tracked.
 
-**Fix**: Difficult to handle soundly. Options:
-- Track `ptrtoint`/`inttoptr` pairs and create assignment edges between them.
-- Conservatively treat `inttoptr` results as potentially pointing to any
-  address-taken function (expensive).
+**Remaining limitation**: Binary operations on pointer-derived integers
+(e.g., `add`, `or`, `xor`) are not handled — there is no
+`visitBinaryOperator`. If a `ptrtoint` result passes through integer
+arithmetic before reaching `inttoptr`, the pointer identity is lost.
+Handling this soundly is non-trivial: `ptr + const` preserves pointer
+identity, but `ptr - ptr` produces a plain offset, and `ptr + var`
+is ambiguous without provenance tracking.
 
 ## 6. `va_arg` extraction
 

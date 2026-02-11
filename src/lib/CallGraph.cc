@@ -774,14 +774,33 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
 }
 
 void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
-  // Handle int to ptr conversion - treat as creating a special node
-  // Could track the integer value, but for now just mark as unknown
-  WARNING("IntToPtr instruction: " << I << "\n");
+  NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
+  if (srcNode == AndersNodeFactory::InvalidIndex) {
+    WARNING("IntToPtr: src node not found: " << I << "\n");
+    return;
+  }
+  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  if (dstNode == AndersNodeFactory::InvalidIndex) {
+    WARNING("IntToPtr: dst node not found: " << I << "\n");
+    return;
+  }
+  CG_DEBUG("IntToPtr: " << srcNode << " -> " << dstNode << " for " << I << "\n");
+  CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
-  // Handle ptr to int conversion - lose pointer information
-  WARNING("PtrToInt instruction: " << I << "\n");
+  NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
+  if (srcNode == AndersNodeFactory::InvalidIndex) {
+    WARNING("PtrToInt: src node not found: " << I << "\n");
+    return;
+  }
+  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  if (dstNode == AndersNodeFactory::InvalidIndex) {
+    dstNode = CGP.NF.createValueNode(&I);
+    CG_DEBUG("PtrToInt: created value node " << dstNode << " for " << I << "\n");
+  }
+  CG_DEBUG("PtrToInt: " << srcNode << " -> " << dstNode << " for " << I << "\n");
+  CGP.EB.addAssignmentEdges(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {

@@ -96,6 +96,14 @@ public:
   FuncSet AllocFuncs;
   FuncSet CandidateAllocFuncs;
 
+  // container function summaries
+  struct ContainerFuncInfo {
+    int containerArg;           // index of the container object parameter
+    std::vector<int> storeArgs; // indices of value params stored INTO container
+    bool loadReturn;            // true if return value is loaded FROM container
+  };
+  std::unordered_map<const llvm::Function*, ContainerFuncInfo> ContainerFuncs;
+
   // Map a callsite to all potential callee functions.
   CalleeMap Callees;
 

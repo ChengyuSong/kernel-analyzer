@@ -64,6 +64,10 @@ private:
   void queryAllocatorCandidatesWithLLM();
   size_t processAllocatorLLMResponse(llvm::StringRef RespText,
                                      llvm::ArrayRef<llvm::Function *> Batch);
+  void queryContainerCandidatesWithLLM();
+  size_t processContainerLLMResponse(llvm::StringRef RespText,
+                                     llvm::ArrayRef<llvm::Function *> Batch);
+  bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool findCustomAllocators(cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(cfl_result_t &outputCFLGraph);
 
@@ -75,6 +79,7 @@ private:
 
   std::unordered_set<NodeIndex> AllocSites;
   std::vector<llvm::Function*> PtrReturnFuncs;
+  std::vector<llvm::Function*> ContainerCandidateFuncs;
 
   CalleeMap calleeByType;
 

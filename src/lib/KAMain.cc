@@ -34,6 +34,7 @@
 #include "CallGraph.h"
 #include "Reachable.h"
 #include "LLMClient.h"
+#include "LLMAnalysis.h"
 
 using namespace llvm;
 
@@ -63,6 +64,15 @@ cl::opt<std::string> LLMServerHost(
 
 cl::opt<unsigned> LLMServerPort(
   "llm-server-port", cl::desc("Port of local LLM server"), cl::init(0));
+
+cl::opt<bool> QueryLLM(
+  "query-llm", cl::desc("Run LLM queries, save results to files, then exit"), cl::init(false));
+
+cl::opt<std::string> AllocatorFile(
+  "allocator-file", cl::desc("Path to allocator candidates JSON file (read or write)"), cl::init(""));
+
+cl::opt<std::string> ContainerFile(
+  "container-file", cl::desc("Path to container functions JSON file (read or write)"), cl::init(""));
 
 GlobalContext GlobalCtx;
 
@@ -263,6 +273,41 @@ int main(int argc, char **argv) {
       LLMConfig.Endpoint = Endpoint;
       LLM = std::make_unique<LLMClient>(std::move(LLMConfig));
       Diag << "LLM server endpoint: " << Endpoint << "\n";
+    }
+  }
+
+  // LLM query / file loading for allocator and container candidates
+  if (QueryLLM) {
+    if (!LLM) {
+      errs() << "Error: --query-llm requires --llm-server-host and --llm-server-port\n";
+      return 1;
+    }
+    for (auto &[M, Name] : GlobalCtx.Modules) {
+      queryAllocatorCandidates(&GlobalCtx, LLM.get(), M);
+      queryContainerCandidates(&GlobalCtx, LLM.get(), M);
+    }
+    if (!AllocatorFile.empty())
+      saveAllocatorResults(&GlobalCtx, AllocatorFile);
+    if (!ContainerFile.empty())
+      saveContainerResults(&GlobalCtx, ContainerFile);
+    return 0;
+  } else {
+    // If not querying LLM, load candidates from files if provided
+    if (!AllocatorFile.empty()) {
+      loadAllocatorFile(&GlobalCtx, AllocatorFile);
+    } else if (LLM) {
+      // otherwise, if LLM is available, query allocator candidates
+      for (auto &[M, Name] : GlobalCtx.Modules) {
+        queryAllocatorCandidates(&GlobalCtx, LLM.get(), M);
+      }
+    }
+    // load container candidates from file or query LLM
+    if (!ContainerFile.empty()) {
+      loadContainerFile(&GlobalCtx, ContainerFile);
+    } else if (LLM) {
+      for (auto &[M, Name] : GlobalCtx.Modules) {
+        queryContainerCandidates(&GlobalCtx, LLM.get(), M);
+      }
     }
   }
 

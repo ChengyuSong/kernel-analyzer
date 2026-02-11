@@ -5,6 +5,7 @@ set (KASource
   NodeFactory.cc
   PointTo.cc
   LLMClient.cc
+  LLMAnalysis.cc
   CFLEdgeBuilder.cc
   CallGraph.cc
   Reachable.cc

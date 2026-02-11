@@ -28,6 +28,7 @@
 
 #include "CallGraph.h"
 #include "Annotation.h"
+#include "LLMClient.h"
 
 #include "gracfl/include/solvers/Solver.hpp"
 
@@ -1148,24 +1149,8 @@ bool CallGraphPass::doInitialization(Module *M) {
       int size = 0, flag = 0;
       if (isAllocFn(F.getName(), &size, &flag)) {
         Ctx->AllocFuncs.insert(&F);
-      } else if (F.getReturnType()->isPointerTy()) {
-        // collect pointer returning functions
-        PtrReturnFuncs.push_back(&F);
       }
 
-      // Collect container function candidates: functions with >=2 pointer
-      // params, or >=1 pointer param + pointer return.  These are broad
-      // candidates for the LLM to filter.
-      if (!Ctx->AllocFuncs.count(&F)) {
-        unsigned ptrParams = 0;
-        for (auto &arg : F.args())
-          if (arg.getType()->isPointerTy())
-            ptrParams++;
-        bool ptrReturn = F.getReturnType()->isPointerTy();
-        if (ptrParams >= 2 || (ptrParams >= 1 && ptrReturn))
-          ContainerCandidateFuncs.push_back(&F);
-      }
-      
       // create nodes for function arguments and return value
       if (F.getFunctionType()->isVarArg())
         NF.createVarargNode(&F);
@@ -1345,295 +1330,6 @@ void CallGraphPass::buildFieldStoreMap(cfl_result_t &outputCFLGraph) {
          << funcFieldStores.size() << " distinct functions\n");
 }
 
-// Process a single LLM response for allocator candidates.  Returns the
-// number of newly added candidates.
-size_t CallGraphPass::processAllocatorLLMResponse(
-    StringRef RespText, ArrayRef<Function *> Batch) {
-  size_t Added = 0;
-
-  // Try to parse as JSON first.
-  bool ParsedJSON = false;
-  Expected<json::Value> Parsed =
-      json::parse(LLMClient::stripMarkdownFence(RespText));
-  if (Parsed) {
-    const json::Array *Candidates = nullptr;
-    if (const json::Object *Obj = Parsed->getAsObject()) {
-      Candidates = Obj->getArray("candidates");
-      if (!Candidates)
-        Candidates = Obj->getArray("functions");
-    } else {
-      Candidates = Parsed->getAsArray();
-    }
-    if (Candidates) {
-      ParsedJSON = true;
-      for (const json::Value &V : *Candidates) {
-        std::optional<StringRef> Name = V.getAsString();
-        if (!Name)
-          continue;
-        for (Function *F : Batch) {
-          if (F->getName() == *Name &&
-              Ctx->AllocFuncs.count(F) == 0 &&
-              Ctx->CandidateAllocFuncs.insert(F).second) {
-            Added++;
-          }
-        }
-      }
-    }
-  } else {
-    consumeError(Parsed.takeError());
-  }
-
-  // Fallback: scan raw text for known function names from the batch.
-  if (!ParsedJSON) {
-    WARNING("LLM response is not valid JSON, falling back to text matching\n");
-    for (Function *F : Batch) {
-      StringRef Name = F->getName();
-      size_t Pos = 0;
-      while ((Pos = RespText.find(Name, Pos)) != StringRef::npos) {
-        bool LeftOk = (Pos == 0) ||
-                      (!isAlnum(RespText[Pos - 1]) && RespText[Pos - 1] != '_');
-        size_t End = Pos + Name.size();
-        bool RightOk = (End >= RespText.size()) ||
-                       (!isAlnum(RespText[End]) && RespText[End] != '_');
-        if (LeftOk && RightOk) {
-          if (Ctx->AllocFuncs.count(F) == 0 &&
-              Ctx->CandidateAllocFuncs.insert(F).second) {
-            Added++;
-          }
-          break;
-        }
-        Pos = End;
-      }
-    }
-  }
-  return Added;
-}
-
-void CallGraphPass::queryAllocatorCandidatesWithLLM() {
-  if (!LLM || PtrReturnFuncs.empty())
-    return;
-
-  const StringRef SystemPrompt =
-      "You classify allocator-like functions conservatively.";
-
-  // Process PtrReturnFuncs in batches to stay within the LLM context window.
-  const unsigned BatchSize = 100;
-  size_t TotalAdded = 0;
-  unsigned NumBatches =
-      (PtrReturnFuncs.size() + BatchSize - 1) / BatchSize;
-
-  for (unsigned B = 0; B < NumBatches; ++B) {
-    unsigned Begin = B * BatchSize;
-    unsigned End = std::min(Begin + BatchSize, (unsigned)PtrReturnFuncs.size());
-    ArrayRef<Function *> Batch(&PtrReturnFuncs[Begin], End - Begin);
-
-    std::string UserPrompt;
-    raw_string_ostream PromptOS(UserPrompt);
-    PromptOS << "Given function declarations only (no bodies), identify likely "
-                "custom allocator functions.\n";
-    PromptOS << "Return strict JSON only in this format: "
-                "{\"candidates\":[\"func_name1\",\"func_name2\"]}\n";
-    PromptOS << "Only include names from the provided list.\n\n";
-    PromptOS << "Declarations:\n";
-    for (const Function *F : Batch) {
-      std::string FuncTy;
-      raw_string_ostream FOS(FuncTy);
-      FOS << *F->getFunctionType();
-      FOS.flush();
-      PromptOS << "- " << F->getName() << " : " << FuncTy << "\n";
-    }
-    PromptOS.flush();
-
-    CG_DEBUG("LLM allocator query batch " << B + 1 << "/" << NumBatches
-             << " (" << Batch.size() << " functions)\n");
-    CG_DEBUG("LLM allocator query user prompt:\n" << UserPrompt << "\n");
-
-    // Estimate token budget for the response.
-    unsigned MaxTok = std::max(512u, (unsigned)Batch.size() * 5 + 50);
-    // Scale timeout: ~1 second per 10 tokens, minimum 30s.
-    unsigned Timeout = std::max(30u, MaxTok / 10);
-    auto RespText = LLM->requestText(SystemPrompt, UserPrompt, MaxTok, Timeout);
-    if (!RespText) {
-      WARNING("LLM allocator candidate query batch " << B + 1
-              << " failed: " << toString(RespText.takeError()) << "\n");
-      continue;
-    }
-    CG_DEBUG("LLM allocator response (batch " << B + 1 << "):\n"
-             << *RespText << "\n");
-
-    TotalAdded += processAllocatorLLMResponse(*RespText, Batch);
-  }
-  CG_LOG("LLM added " << TotalAdded << " candidate allocator(s) ("
-         << NumBatches << " batch(es))\n");
-}
-
-size_t CallGraphPass::processContainerLLMResponse(
-    StringRef RespText, ArrayRef<Function *> Batch) {
-  size_t Added = 0;
-
-  Expected<json::Value> Parsed =
-      json::parse(LLMClient::stripMarkdownFence(RespText));
-  if (!Parsed) {
-    consumeError(Parsed.takeError());
-    WARNING("LLM container response is not valid JSON, skipping\n");
-    return 0;
-  }
-
-  const json::Object *Obj = Parsed->getAsObject();
-  if (!Obj)
-    return 0;
-  const json::Array *Containers = Obj->getArray("containers");
-  if (!Containers)
-    return 0;
-
-  for (const json::Value &V : *Containers) {
-    const json::Object *Entry = V.getAsObject();
-    if (!Entry)
-      continue;
-
-    auto NameVal = Entry->getString("name");
-    if (!NameVal)
-      continue;
-    StringRef Name = *NameVal;
-
-    // Find the matching function in this batch
-    Function *MatchF = nullptr;
-    for (Function *F : Batch) {
-      if (F->getName() == Name) {
-        MatchF = F;
-        break;
-      }
-    }
-    if (!MatchF || Ctx->ContainerFuncs.count(MatchF))
-      continue;
-
-    auto ContainerArgVal = Entry->getInteger("container_arg");
-    if (!ContainerArgVal)
-      continue;
-    int containerArg = (int)*ContainerArgVal;
-
-    // Validate container_arg index and pointer type
-    if (containerArg < 0 || (unsigned)containerArg >= MatchF->arg_size())
-      continue;
-    if (!MatchF->getArg(containerArg)->getType()->isPointerTy())
-      continue;
-
-    // Parse store_args
-    std::vector<int> storeArgs;
-    if (const json::Array *SA = Entry->getArray("store_args")) {
-      for (const json::Value &SV : *SA) {
-        auto idx = SV.getAsInteger();
-        if (!idx)
-          continue;
-        int si = (int)*idx;
-        if (si < 0 || (unsigned)si >= MatchF->arg_size())
-          continue;
-        if (!MatchF->getArg(si)->getType()->isPointerTy())
-          continue;
-        storeArgs.push_back(si);
-      }
-    }
-
-    // Parse load_return
-    bool loadReturn = false;
-    if (auto LR = Entry->getBoolean("load_return"))
-      loadReturn = *LR;
-
-    // Validate: if load_return is true, function must return a pointer
-    if (loadReturn && !MatchF->getReturnType()->isPointerTy())
-      loadReturn = false;
-
-    // Must have at least one store_arg or load_return to be useful
-    if (storeArgs.empty() && !loadReturn)
-      continue;
-
-    GlobalContext::ContainerFuncInfo Info;
-    Info.containerArg = containerArg;
-    Info.storeArgs = std::move(storeArgs);
-    Info.loadReturn = loadReturn;
-    Ctx->ContainerFuncs[MatchF] = std::move(Info);
-    Added++;
-
-    CG_LOG("Container function: " << Name
-           << " container_arg=" << containerArg
-           << " store_args=[");
-    for (size_t i = 0; i < Ctx->ContainerFuncs[MatchF].storeArgs.size(); i++) {
-      if (i > 0) CG_LOG(",");
-      CG_LOG(Ctx->ContainerFuncs[MatchF].storeArgs[i]);
-    }
-    CG_LOG("] load_return=" << (Ctx->ContainerFuncs[MatchF].loadReturn ? "true" : "false") << "\n");
-  }
-
-  return Added;
-}
-
-void CallGraphPass::queryContainerCandidatesWithLLM() {
-  if (!LLM || ContainerCandidateFuncs.empty())
-    return;
-
-  const StringRef SystemPrompt =
-      "You identify container/collection functions that store and retrieve "
-      "pointer values. Examples: hash table insert/find, list add/remove, "
-      "tree insert/search, map put/get, queue push/pop, cache store/fetch.";
-
-  const unsigned BatchSize = 50;
-  size_t TotalAdded = 0;
-  unsigned NumBatches =
-      (ContainerCandidateFuncs.size() + BatchSize - 1) / BatchSize;
-
-  for (unsigned B = 0; B < NumBatches; ++B) {
-    unsigned Begin = B * BatchSize;
-    unsigned End = std::min(Begin + BatchSize,
-                            (unsigned)ContainerCandidateFuncs.size());
-    ArrayRef<Function *> Batch(&ContainerCandidateFuncs[Begin], End - Begin);
-
-    std::string UserPrompt;
-    raw_string_ostream PromptOS(UserPrompt);
-    PromptOS << "Given function declarations, identify container/collection "
-                "functions that store or retrieve pointer values (hash tables, "
-                "linked lists, trees, maps, caches, queues, etc.).\n\n";
-    PromptOS << "For each container function, specify:\n";
-    PromptOS << "- name: function name\n";
-    PromptOS << "- container_arg: 0-based index of the container object parameter\n";
-    PromptOS << "- store_args: list of 0-based indices of value parameters stored INTO the container\n";
-    PromptOS << "- load_return: true if the return value is loaded FROM the container\n\n";
-    PromptOS << "Return strict JSON only:\n";
-    PromptOS << "{\"containers\":[\n";
-    PromptOS << "  {\"name\":\"func\",\"container_arg\":0,\"store_args\":[2],\"load_return\":false}\n";
-    PromptOS << "]}\n";
-    PromptOS << "If no container functions are found, return {\"containers\":[]}.\n";
-    PromptOS << "Only include names from the provided list.\n\n";
-    PromptOS << "Declarations:\n";
-    for (const Function *F : Batch) {
-      std::string FuncTy;
-      raw_string_ostream FOS(FuncTy);
-      FOS << *F->getFunctionType();
-      FOS.flush();
-      PromptOS << "- " << F->getName() << " : " << FuncTy << "\n";
-    }
-    PromptOS.flush();
-
-    CG_DEBUG("LLM container query batch " << B + 1 << "/" << NumBatches
-             << " (" << Batch.size() << " functions)\n");
-
-    // Richer response per function, so allow more tokens
-    unsigned MaxTok = std::max(1024u, (unsigned)Batch.size() * 20 + 100);
-    unsigned Timeout = std::max(60u, MaxTok / 10);
-    auto RespText = LLM->requestText(SystemPrompt, UserPrompt, MaxTok, Timeout);
-    if (!RespText) {
-      WARNING("LLM container candidate query batch " << B + 1
-              << " failed: " << toString(RespText.takeError()) << "\n");
-      continue;
-    }
-    CG_DEBUG("LLM container response (batch " << B + 1 << "):\n"
-             << *RespText << "\n");
-
-    TotalAdded += processContainerLLMResponse(*RespText, Batch);
-  }
-  CG_LOG("LLM added " << TotalAdded << " container function(s) ("
-         << NumBatches << " batch(es))\n");
-}
-
 bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
   // resolve indirect calls
   bool Changed = false;
@@ -1758,13 +1454,6 @@ bool CallGraphPass::doModulePass(Module *M) {
       }
     }
 
-    // query LLM for allocator and container candidates before processing functions
-    if (LLM && M == Ctx->Modules.front().first) {
-      CG_LOG("LLM-assisted filtering is enabled.\n");
-      queryAllocatorCandidatesWithLLM();
-      queryContainerCandidatesWithLLM();
-    }
-
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
           Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
@@ -1795,7 +1484,6 @@ bool CallGraphPass::doModulePass(Module *M) {
     // std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGram>(EB.getEdges(), *EB.getGrammar());
     auto initEdges = solver->getEdgeCount();
     CG_LOG("CFL Init Edges: " << initEdges << "\n");
-    exit(0);
     solver->runCFL();
     auto finalEdges = solver->getEdgeCount();
     CG_LOG("CFL Final Edges: " << finalEdges << "\n");

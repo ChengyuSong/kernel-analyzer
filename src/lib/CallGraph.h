@@ -9,7 +9,8 @@
 #include <unordered_set>
 
 #include "Global.h"
-#include "LLMClient.h"
+
+class LLMClient;
 
 class CallGraphPass : public IterativeModulePass {
 private:
@@ -61,12 +62,6 @@ private:
   static bool getGEPStructField(const llvm::GEPOperator *GEP,
                                  std::string &structName, unsigned &fieldIdx);
   void buildFieldStoreMap(cfl_result_t &outputCFLGraph);
-  void queryAllocatorCandidatesWithLLM();
-  size_t processAllocatorLLMResponse(llvm::StringRef RespText,
-                                     llvm::ArrayRef<llvm::Function *> Batch);
-  void queryContainerCandidatesWithLLM();
-  size_t processContainerLLMResponse(llvm::StringRef RespText,
-                                     llvm::ArrayRef<llvm::Function *> Batch);
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool findCustomAllocators(cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(cfl_result_t &outputCFLGraph);
@@ -78,8 +73,6 @@ private:
   unsigned iteration;
 
   std::unordered_set<NodeIndex> AllocSites;
-  std::vector<llvm::Function*> PtrReturnFuncs;
-  std::vector<llvm::Function*> ContainerCandidateFuncs;
 
   CalleeMap calleeByType;
 

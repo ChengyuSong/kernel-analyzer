@@ -785,8 +785,25 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
-  // Handle variable argument access
-  WARNING("VAArg instruction: " << I << "\n");
+  if (!I.getType()->isPointerTy())
+    return;
+
+  NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
+  if (valNode == AndersNodeFactory::InvalidIndex) {
+    WARNING("VAArg: result node not found: " << I << "\n");
+    return;
+  }
+
+  Function *F = I.getParent()->getParent();
+  NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
+  if (varargNode == AndersNodeFactory::InvalidIndex) {
+    WARNING("VAArg: vararg node not found for function: " << F->getName() << "\n");
+    return;
+  }
+
+  CG_DEBUG("VAArg: " << F->getName() << ": vararg node " << varargNode
+           << " -> val node " << valNode << " for " << I << "\n");
+  CGP.EB.addAssignmentEdges(varargNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitMemTransferInst(MemTransferInst &I) {

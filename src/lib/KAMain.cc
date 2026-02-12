@@ -290,10 +290,9 @@ int main(int argc, char **argv) {
     return 0;
   } else {
     // If not querying LLM, load candidates from files if provided
-    if (!AllocatorFile.empty()) {
-      loadAllocatorFile(&GlobalCtx, AllocatorFile);
-    } else if (LLM) {
-      // otherwise, if LLM is available, query allocator candidates
+    // loadAllocatorFile returns: 1 = loaded, 0 = file not available, -1 = parse error
+    bool allocLoaded = !AllocatorFile.empty() && loadAllocatorFile(&GlobalCtx, AllocatorFile) > 0;
+    if (!allocLoaded && LLM) {
       for (auto &[M, Name] : GlobalCtx.Modules) {
         queryAllocatorCandidates(&GlobalCtx, LLM.get(), M);
       }
@@ -331,6 +330,9 @@ int main(int argc, char **argv) {
   // if (!DumpAnnotatedIR.empty()) {
   //   RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
   // }
+
+  if (!AllocatorFile.empty())
+    saveAllocatorResults(&GlobalCtx, AllocatorFile);
 
   return 0;
 }

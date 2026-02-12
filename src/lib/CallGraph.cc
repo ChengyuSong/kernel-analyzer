@@ -314,9 +314,9 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     return false;
   }
 
-  // Skip kernel utility functions to reduce edge explosion
+  // Skip utility functions to reduce edge explosion
   if (shouldSkipFunction(CF)) {
-    CG_DEBUG("Skipping kernel utility function: " << CF->getName() << "\n");
+    CG_DEBUG("Skipping utility function: " << CF->getName() << "\n");
     return false;
   }
 
@@ -512,8 +512,7 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
     if (const CallBase *CB = dyn_cast<CallBase>(I)) {
       if (const Function *CF = CB->getCalledFunction()) {
-        int size, flag;
-        if (isAllocFn(CF->getName(), &size, &flag))
+        if (Ctx->AllocFuncs.count(CF))
           Ctx->AllocSites.insert(CB);
       }
     }
@@ -552,8 +551,12 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
 void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
   if (CS.isInlineAsm()) return; // FIXME handle inline assembly
   if (CGP.Ctx->AllocSites.count(&CS)) {
-    // record allocation sites
-    CGP.AllocSites.insert(CGP.NF.getValueNodeFor(&CS));
+    // record allocation sites and create heap object node
+    NodeIndex valNode = CGP.NF.getValueNodeFor(&CS);
+    CGP.AllocSites.insert(valNode);
+    NodeIndex heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
+    CGP.EB.addDereferenceEdges(valNode, heapObj);
+    CG_DEBUG("Create heap obj node " << heapObj << " for " << CS << "\n");
     return; // skip allocation sites
   }
 
@@ -1144,13 +1147,15 @@ bool CallGraphPass::doInitialization(Module *M) {
       (void)valNode;
     }
 
-    if (!F.isDeclaration() && !F.isIntrinsic() && !F.empty()) {
-      // AllocFuncs is empty when skipping populating nodes
+    // Populate AllocFuncs for all functions matching known allocator names,
+    // regardless of whether they are declarations or definitions
+    {
       int size = 0, flag = 0;
-      if (isAllocFn(F.getName(), &size, &flag)) {
+      if (isAllocFn(F.getName(), &size, &flag))
         Ctx->AllocFuncs.insert(&F);
-      }
+    }
 
+    if (!F.isDeclaration() && !F.isIntrinsic() && !F.empty()) {
       // create nodes for function arguments and return value
       if (F.getFunctionType()->isVarArg())
         NF.createVarargNode(&F);
@@ -1280,6 +1285,9 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
               assert(callNode != AndersNodeFactory::InvalidIndex && "CallBase node not found for candidate alloc func!");
               Ctx->AllocSites.insert(CI);
               AllocSites.insert(callNode);
+              // create heap object node
+              NodeIndex heapObj = NF.createOpaqueObjectNode(CI, true);
+              EB.addDereferenceEdges(callNode, heapObj);
               // remove call edges
               removeCallEdges(CI, F);
               CG_LOG("Update custom allocator call: " << *CI << "\n");

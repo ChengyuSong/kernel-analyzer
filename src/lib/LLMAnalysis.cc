@@ -439,11 +439,17 @@ bool saveAllocatorResults(GlobalContext *Ctx, StringRef Path) {
   for (const Function *F : Ctx->CandidateAllocFuncs)
     Candidates.push_back(F->getName().str());
 
+  json::Array Confirmed;
+  for (const Function *F : Ctx->AllocFuncs)
+    Confirmed.push_back(F->getName().str());
+
   json::Object Root;
   Root["candidates"] = std::move(Candidates);
+  Root["confirmed"] = std::move(Confirmed);
   OS << json::Value(std::move(Root)) << "\n";
   LLM_LOG("Saved " << Ctx->CandidateAllocFuncs.size()
-         << " allocator candidate(s) to " << Path << "\n");
+         << " allocator candidate(s) and " << Ctx->AllocFuncs.size()
+         << " confirmed allocator(s) to " << Path << "\n");
   return true;
 }
 
@@ -476,18 +482,23 @@ bool saveContainerResults(GlobalContext *Ctx, StringRef Path) {
   return true;
 }
 
-bool loadAllocatorFile(GlobalContext *Ctx, StringRef Path) {
+int loadAllocatorFile(GlobalContext *Ctx, StringRef Path) {
   auto BufOrErr = MemoryBuffer::getFile(Path);
   if (!BufOrErr) {
-    WARNING("Failed to open allocator file: " << Path << ": "
+    LLM_LOG("Allocator file not available: " << Path << ": "
             << BufOrErr.getError().message() << "\n");
-    return false;
+    return 0;
+  }
+
+  if ((*BufOrErr)->getBufferSize() == 0) {
+    LLM_LOG("Allocator file is empty: " << Path << "\n");
+    return 0;
   }
 
   Expected<json::Value> Parsed = json::parse((*BufOrErr)->getBuffer());
   if (!Parsed) {
     WARNING("Failed to parse allocator JSON: " << toString(Parsed.takeError()) << "\n");
-    return false;
+    return -1;
   }
 
   // Build name -> Function* map for lookup
@@ -496,39 +507,61 @@ bool loadAllocatorFile(GlobalContext *Ctx, StringRef Path) {
     NameToFunc[F->getName().str()] = F;
 
   const json::Object *Obj = Parsed->getAsObject();
-  if (!Obj) return false;
-  const json::Array *Candidates = Obj->getArray("candidates");
-  if (!Candidates) return false;
+  if (!Obj) return -1;
 
-  size_t Loaded = 0;
-  for (const json::Value &V : *Candidates) {
-    auto Name = V.getAsString();
-    if (!Name) continue;
-    auto it = NameToFunc.find(Name->str());
-    if (it == NameToFunc.end()) {
-      LLM_DEBUG("Allocator candidate not found in module: " << *Name << "\n");
-      continue;
+  size_t LoadedCandidates = 0;
+  if (const json::Array *Candidates = Obj->getArray("candidates")) {
+    for (const json::Value &V : *Candidates) {
+      auto Name = V.getAsString();
+      if (!Name) continue;
+      auto it = NameToFunc.find(Name->str());
+      if (it == NameToFunc.end()) {
+        LLM_DEBUG("Allocator candidate not found in module: " << *Name << "\n");
+        continue;
+      }
+      if (Ctx->AllocFuncs.count(it->second) == 0 &&
+          Ctx->CandidateAllocFuncs.insert(it->second).second)
+        LoadedCandidates++;
     }
-    if (Ctx->AllocFuncs.count(it->second) == 0 &&
-        Ctx->CandidateAllocFuncs.insert(it->second).second)
-      Loaded++;
   }
-  LLM_LOG("Loaded " << Loaded << " allocator candidate(s) from " << Path << "\n");
-  return true;
+
+  size_t LoadedConfirmed = 0;
+  if (const json::Array *Confirmed = Obj->getArray("confirmed")) {
+    for (const json::Value &V : *Confirmed) {
+      auto Name = V.getAsString();
+      if (!Name) continue;
+      auto it = NameToFunc.find(Name->str());
+      if (it == NameToFunc.end()) {
+        LLM_DEBUG("Confirmed allocator not found in module: " << *Name << "\n");
+        continue;
+      }
+      if (Ctx->AllocFuncs.insert(it->second).second)
+        LoadedConfirmed++;
+    }
+  }
+
+  LLM_LOG("Loaded " << LoadedCandidates << " allocator candidate(s) and "
+         << LoadedConfirmed << " confirmed allocator(s) from " << Path << "\n");
+  return 1;
 }
 
-bool loadContainerFile(GlobalContext *Ctx, StringRef Path) {
+int loadContainerFile(GlobalContext *Ctx, StringRef Path) {
   auto BufOrErr = MemoryBuffer::getFile(Path);
   if (!BufOrErr) {
-    WARNING("Failed to open container file: " << Path << ": "
+    LLM_LOG("Container file not available: " << Path << ": "
             << BufOrErr.getError().message() << "\n");
-    return false;
+    return 0;
+  }
+
+  if ((*BufOrErr)->getBufferSize() == 0) {
+    LLM_LOG("Container file is empty: " << Path << "\n");
+    return 0;
   }
 
   Expected<json::Value> Parsed = json::parse((*BufOrErr)->getBuffer());
   if (!Parsed) {
     WARNING("Failed to parse container JSON: " << toString(Parsed.takeError()) << "\n");
-    return false;
+    return -1;
   }
 
   // Build name -> Function* map for lookup
@@ -538,9 +571,9 @@ bool loadContainerFile(GlobalContext *Ctx, StringRef Path) {
 
   // Reuse processContainerResponse by constructing a batch from matched names
   const json::Object *Obj = Parsed->getAsObject();
-  if (!Obj) return false;
+  if (!Obj) return -1;
   const json::Array *Containers = Obj->getArray("containers");
-  if (!Containers) return false;
+  if (!Containers) return -1;
 
   // Collect matching functions for the batch
   std::vector<Function*> Batch;
@@ -562,5 +595,5 @@ bool loadContainerFile(GlobalContext *Ctx, StringRef Path) {
 
   size_t Added = processContainerResponse(Ctx, JsonStr, Batch);
   LLM_LOG("Loaded " << Added << " container function(s) from " << Path << "\n");
-  return true;
+  return 1;
 }

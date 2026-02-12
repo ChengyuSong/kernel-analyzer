@@ -15,7 +15,8 @@ void queryContainerCandidates(GlobalContext *Ctx, LLMClient *LLM, llvm::Module *
 // File save/load
 bool saveAllocatorResults(GlobalContext *Ctx, llvm::StringRef Path);
 bool saveContainerResults(GlobalContext *Ctx, llvm::StringRef Path);
-bool loadAllocatorFile(GlobalContext *Ctx, llvm::StringRef Path);
-bool loadContainerFile(GlobalContext *Ctx, llvm::StringRef Path);
+// Returns: 1 = loaded OK, 0 = file not available (fallback to LLM), -1 = parse error
+int loadAllocatorFile(GlobalContext *Ctx, llvm::StringRef Path);
+int loadContainerFile(GlobalContext *Ctx, llvm::StringRef Path);
 
 #endif

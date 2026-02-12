@@ -74,6 +74,9 @@ cl::opt<std::string> AllocatorFile(
 cl::opt<std::string> ContainerFile(
   "container-file", cl::desc("Path to container functions JSON file (read or write)"), cl::init(""));
 
+cl::opt<std::string> CallGraphJSON(
+  "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));
+
 GlobalContext GlobalCtx;
 
 #define Diag llvm::errs()
@@ -310,26 +313,9 @@ int main(int argc, char **argv) {
     GlobalCtx.edgeBuilder.outputEdgesToFile(CFLEdgeOutput);
   }
 
-  // ReachableCallGraphPass RCGPass(&GlobalCtx, TargetList, EntryList, UseTypeBasedCallGraph);
-  // RCGPass.run(GlobalCtx.Modules);
-  // RCGPass.dumpCallees();
-
-  // if (!DumpBidMapping.empty() && !DumpFuncInfo.empty()){
-  //   std::ofstream bbLocs(DumpBidMapping);
-  //   std::ofstream funcInfo(DumpFuncInfo);
-  //   RCGPass.dumpIDMapping(GlobalCtx.Modules, bbLocs, funcInfo);
-  // }
-  // if (!DumpPolicy.empty()) {
-  //   std::ofstream policy(DumpPolicy);
-  //   RCGPass.dumpPolicy(policy);
-  // }
-  // if (!DumpDistance.empty()) {
-  //   std::ofstream distance(DumpDistance);
-  //   RCGPass.dumpDistance(distance, true, false);
-  // }
-  // if (!DumpAnnotatedIR.empty()) {
-  //   RCGPass.annotateModules(GlobalCtx.Modules, DumpAnnotatedIR);
-  // }
+  if (!CallGraphJSON.empty()) {
+    CGPass.dumpCallGraphJSON(CallGraphJSON);
+  }
 
   if (!AllocatorFile.empty())
     saveAllocatorResults(&GlobalCtx, AllocatorFile);

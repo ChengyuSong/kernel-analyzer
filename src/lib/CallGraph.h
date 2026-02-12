@@ -110,9 +110,10 @@ public:
 
   // debug
   void dumpFuncPtrs(llvm::raw_ostream &OS);
-  void dumpCallees(llvm::raw_ostream &OS);
-  void dumpCallers(llvm::raw_ostream &OS);
   void dumpGlobals(llvm::raw_ostream &OS);
+
+  // export
+  void dumpCallGraphJSON(llvm::StringRef Path);
 };
 
 #endif

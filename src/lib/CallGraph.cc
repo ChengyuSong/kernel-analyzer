@@ -22,6 +22,7 @@
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FormatVariadic.h>
+#include <llvm/Support/JSON.h>
 
 #include <vector>
 #include <algorithm>
@@ -1535,87 +1536,196 @@ void CallGraphPass::dumpFuncPtrs(raw_ostream &OS) {
   }
 }
 
-void CallGraphPass::dumpCallees(raw_ostream &OS) {
-  CG_LOG("\n[dumpCallees]\n");
-  CG_LOG("Num of Callees: " << Ctx->Callees.size() << "\n");
+// ---- JSON call graph export helpers ----
 
-  size_t empty = 0;
-  for (CalleeMap::iterator i = Ctx->Callees.begin(),
-       e = Ctx->Callees.end(); i != e; ++i) {
-
-    auto CI = i->first;
-    FuncSet &v = i->second;
-    // only dump indirect call?
-    if (CI->isInlineAsm() || CI->getCalledFunction())
-      continue;
-
-    if (v.empty()) {
-      empty++;
-      continue;
-    }
-
-    // OS << "CS:" << *CI << "\n";
-    // const DebugLoc &LOC = CI->getDebugLoc();
-    // OS << "LOC: ";
-    // LOC.print(OS);
-    // OS << "^@^";
-    std::string prefix = "<" + CI->getParent()->getParent()->getParent()->getName().str() + ">"
-      + CI->getParent()->getParent()->getName().str() + "::";
-#if 1
-    for (FuncSet::iterator j = v.begin(), ej = v.end();
-         j != ej; ++j) {
-      // OS << "\t" << ((*j)->hasInternalLinkage() ? "f" : "F")
-      //    << " " << (*j)->getName() << "\n";
-      OS << prefix << *CI << "\t";
-      OS << (*j)->getName() << "\n";
-    }
-#endif
-  }
-
-  CG_LOG("[Empty Callees: " << empty << "]\n");
-  for (CalleeMap::iterator i = Ctx->Callees.begin(),
-       e = Ctx->Callees.end(); i != e; ++i) {
-    auto CI = i->first;
-    FuncSet &v = i->second;
-    if (CI->isInlineAsm() || CI->getCalledFunction())
-      continue;
-    auto caller = CI->getParent()->getParent();
-    if (v.empty()) {
-      OS << "!!EMPTY =>" << *CI << " @@" << caller->getName() << "\n";
-      // OS << "Uninitialized function pointer is dereferenced!\n";
-      auto &tv = calleeByType[CI];
-      if (!tv.empty()) {
-        OS << "TypeMatch: ";
-        for (auto *F : tv) {
-          OS << F->getName() << " ";
+// Extract source file path from debug info for a function.
+// Iterates instructions to find DILocation, falls back to module source filename.
+static std::string getFuncSourceFile(const Function *F) {
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (DILocation *Loc = I.getDebugLoc()) {
+        StringRef Dir = Loc->getDirectory();
+        StringRef File = Loc->getFilename();
+        if (File.empty()) {
+          if (DILocation *IL = Loc->getInlinedAt()) {
+            Dir = IL->getDirectory();
+            File = IL->getFilename();
+          }
         }
-        OS << "\n";
+        if (!File.empty()) {
+          if (sys::path::is_absolute(File))
+            return File.str();
+          SmallString<256> FullPath;
+          if (!Dir.empty())
+            FullPath = Dir;
+          sys::path::append(FullPath, File);
+          sys::path::remove_dots(FullPath, true);
+          return std::string(FullPath);
+        }
       }
     }
   }
-  CG_LOG("\n[End of dumpCallees]\n");
+  // Fallback to module source filename
+  return F->getParent()->getSourceFileName();
 }
 
-void CallGraphPass::dumpCallers(raw_ostream &OS) {
-  CG_LOG("\n[dumpCallers]\n");
-  for (auto M : Ctx->Callers) {
-    const Function *F = M.first;
-    CallInstSet &CIS = M.second;
-    OS << "F : " << getScopeName(F) << "\n";
+// Return a function ID: bare name for external linkage, "file:name" for internal.
+static std::string getFuncId(const Function *F) {
+  if (F->hasExternalLinkage())
+    return F->getName().str();
+  return getFuncSourceFile(F) + ":" + F->getName().str();
+}
 
-    for (auto *CI : CIS) {
-      const Function *CallerF = CI->getParent()->getParent();
-      OS << "\t";
-      if (CallerF && CallerF->hasName()) {
-        OS << "(" << getScopeName(CallerF) << ") ";
-      } else {
-        OS << "(anonymous) ";
+// Extract source line from a CallBase's debug location.
+// Returns 0 if no debug info available.
+static unsigned getCallLine(const CallBase *CI) {
+  if (DILocation *Loc = CI->getDebugLoc()) {
+    unsigned L = Loc->getLine();
+    if (L == 0) {
+      if (DILocation *IL = Loc->getInlinedAt())
+        L = IL->getLine();
+    }
+    return L;
+  }
+  return 0;
+}
+
+// Get the min/max line range of a function from debug info.
+static std::pair<unsigned, unsigned> getFuncLineRange(const Function *F) {
+  unsigned minLine = UINT_MAX, maxLine = 0;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      if (DILocation *Loc = I.getDebugLoc()) {
+        unsigned L = Loc->getLine();
+        if (L > 0) {
+          if (L < minLine) minLine = L;
+          if (L > maxLine) maxLine = L;
+        }
       }
-
-      OS << *CI << "\n";
     }
   }
-  CG_LOG("\n[End of dumpCallers]\n");
+  if (minLine == UINT_MAX)
+    minLine = 0;
+  return {minLine, maxLine};
+}
+
+void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
+  std::error_code EC;
+  raw_fd_ostream OS(Path, EC);
+  if (EC) {
+    WARNING("Failed to open call graph JSON file for writing: " << Path
+            << ": " << EC.message() << "\n");
+    return;
+  }
+
+  // Collect all functions that appear in Callees or Callers
+  DenseSet<const Function *> AllFuncs;
+  for (auto &[CS, FS] : Ctx->Callees) {
+    const Function *Caller = CS->getFunction();
+    if (Caller && !Caller->isDeclaration() && !Caller->isIntrinsic())
+      AllFuncs.insert(Caller);
+    for (const Function *F : FS) {
+      if (F && !F->isIntrinsic())
+        AllFuncs.insert(F);
+    }
+  }
+  for (auto &[F, CIS] : Ctx->Callers) {
+    if (F && !F->isDeclaration() && !F->isIntrinsic())
+      AllFuncs.insert(F);
+  }
+
+  json::Object Functions;
+  size_t totalEdges = 0, directEdges = 0, indirectEdges = 0;
+
+  for (const Function *F : AllFuncs) {
+    if (F->isDeclaration() || F->isIntrinsic())
+      continue;
+
+    std::string FuncID = getFuncId(F);
+    std::string SrcFile = getFuncSourceFile(F);
+    auto [LineStart, LineEnd] = getFuncLineRange(F);
+
+    json::Object FuncObj;
+    FuncObj["file"] = SrcFile;
+    if (LineStart > 0)
+      FuncObj["line_start"] = static_cast<int64_t>(LineStart);
+    if (LineEnd > 0)
+      FuncObj["line_end"] = static_cast<int64_t>(LineEnd);
+    FuncObj["linkage"] = F->hasExternalLinkage() ? "external" : "internal";
+
+    // Build callees array by iterating call instructions in this function
+    json::Array CalleesArr;
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        const CallBase *CI = dyn_cast<CallBase>(&I);
+        if (!CI || CI->isInlineAsm())
+          continue;
+
+        auto it = Ctx->Callees.find(CI);
+        if (it == Ctx->Callees.end())
+          continue;
+
+        bool isDirect = (CI->getCalledFunction() != nullptr);
+        unsigned line = getCallLine(CI);
+
+        for (const Function *Callee : it->second) {
+          if (Callee->isIntrinsic())
+            continue;
+          json::Object Edge;
+          Edge["callee"] = getFuncId(Callee);
+          Edge["call_type"] = isDirect ? "direct" : "indirect";
+          if (line > 0)
+            Edge["line"] = static_cast<int64_t>(line);
+          CalleesArr.push_back(std::move(Edge));
+          totalEdges++;
+          if (isDirect) directEdges++;
+          else indirectEdges++;
+        }
+      }
+    }
+    FuncObj["callees"] = std::move(CalleesArr);
+
+    // Build callers array
+    json::Array CallersArr;
+    auto callerIt = Ctx->Callers.find(F);
+    if (callerIt != Ctx->Callers.end()) {
+      for (const CallBase *CI : callerIt->second) {
+        const Function *CallerF = CI->getFunction();
+        if (!CallerF || CallerF->isIntrinsic())
+          continue;
+        bool isDirect = (CI->getCalledFunction() != nullptr);
+        unsigned line = getCallLine(CI);
+
+        json::Object Edge;
+        Edge["caller"] = getFuncId(CallerF);
+        Edge["call_type"] = isDirect ? "direct" : "indirect";
+        if (line > 0)
+          Edge["line"] = static_cast<int64_t>(line);
+        CallersArr.push_back(std::move(Edge));
+      }
+    }
+    FuncObj["callers"] = std::move(CallersArr);
+
+    Functions[FuncID] = std::move(FuncObj);
+  }
+
+  json::Object Metadata;
+  Metadata["version"] = 1;
+  Metadata["total_functions"] = static_cast<int64_t>(Functions.size());
+  Metadata["total_call_edges"] = static_cast<int64_t>(totalEdges);
+  Metadata["total_direct_calls"] = static_cast<int64_t>(directEdges);
+  Metadata["total_indirect_calls"] = static_cast<int64_t>(indirectEdges);
+
+  json::Object Root;
+  Root["metadata"] = std::move(Metadata);
+  Root["functions"] = std::move(Functions);
+
+  OS << json::Value(std::move(Root)) << "\n";
+  CG_LOG("Exported call graph JSON to " << Path << ": "
+         << AllFuncs.size() << " functions, "
+         << totalEdges << " edges ("
+         << directEdges << " direct, "
+         << indirectEdges << " indirect)\n");
 }
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {

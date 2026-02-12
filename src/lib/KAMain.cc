@@ -276,7 +276,7 @@ int main(int argc, char **argv) {
     }
   }
 
-  // LLM query / file loading for allocator and container candidates
+  // LLM query / file loading for allocator candidates
   if (QueryLLM) {
     if (!LLM) {
       errs() << "Error: --query-llm requires --llm-server-host and --llm-server-port\n";
@@ -284,12 +284,9 @@ int main(int argc, char **argv) {
     }
     for (auto &[M, Name] : GlobalCtx.Modules) {
       queryAllocatorCandidates(&GlobalCtx, LLM.get(), M);
-      queryContainerCandidates(&GlobalCtx, LLM.get(), M);
     }
     if (!AllocatorFile.empty())
       saveAllocatorResults(&GlobalCtx, AllocatorFile);
-    if (!ContainerFile.empty())
-      saveContainerResults(&GlobalCtx, ContainerFile);
     return 0;
   } else {
     // If not querying LLM, load candidates from files if provided
@@ -301,14 +298,10 @@ int main(int argc, char **argv) {
         queryAllocatorCandidates(&GlobalCtx, LLM.get(), M);
       }
     }
-    // load container candidates from file or query LLM
-    if (!ContainerFile.empty()) {
-      loadContainerFile(&GlobalCtx, ContainerFile);
-    } else if (LLM) {
-      for (auto &[M, Name] : GlobalCtx.Modules) {
-        queryContainerCandidates(&GlobalCtx, LLM.get(), M);
-      }
-    }
+  }
+  // load container candidates from file or query LLM
+  if (!ContainerFile.empty()) {
+    loadContainerFile(&GlobalCtx, ContainerFile);
   }
 
   CallGraphPass CGPass(&GlobalCtx, LLM.get());

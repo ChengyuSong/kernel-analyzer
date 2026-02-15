@@ -26,7 +26,9 @@
 #include <memory>
 #include <vector>
 #include <sstream>
+#include <new>
 #include <sys/resource.h>
+#include <unistd.h>
 
 #include "Global.h"
 #include "Pass.h"
@@ -76,6 +78,9 @@ cl::opt<std::string> ContainerFile(
 
 cl::opt<std::string> CallGraphJSON(
   "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));
+
+cl::opt<int> MemLimitPct(
+  "mem-limit", cl::desc("Memory limit as percentage of physical RAM (0 = unlimited, default 80)"), cl::init(80));
 
 GlobalContext GlobalCtx;
 
@@ -213,6 +218,31 @@ int main(int argc, char **argv) {
   llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
 
   cl::ParseCommandLineOptions(argc, argv, "global analysis\n");
+
+  if (MemLimitPct > 0) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long pageSize = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && pageSize > 0) {
+      rlim_t totalBytes = (rlim_t)pages * pageSize;
+      rlim_t limitBytes = totalBytes * std::min(MemLimitPct.getValue(), 100) / 100;
+      struct rlimit rl;
+      rl.rlim_cur = rl.rlim_max = limitBytes;
+      if (setrlimit(RLIMIT_AS, &rl) == 0) {
+        Diag << "Memory limit set to " << (limitBytes >> 30) << " GB ("
+             << MemLimitPct << "% of " << (totalBytes >> 30) << " GB RAM)\n";
+      } else {
+        errs() << "Warning: failed to set memory limit\n";
+      }
+      // Disable core dumps — a core from a memory-exhausted process is huge
+      rl.rlim_cur = rl.rlim_max = 0;
+      setrlimit(RLIMIT_CORE, &rl);
+      // Handle allocation failure in any thread (including solver workers)
+      std::set_new_handler([] {
+        errs() << "ERROR: Out of memory. Increase --mem-limit or reduce input size.\n";
+        _exit(1);
+      });
+    }
+  }
   SMDiagnostic Err;
 
   // Loading modules

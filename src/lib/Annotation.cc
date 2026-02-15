@@ -331,6 +331,18 @@ bool isAllocFn(StringRef name, int *size, int *flag) {
 }
 
 bool isFreeFn(StringRef name) {
+  // C standard library free
+  if (name.equals("free") ||
+      name.equals("cfree")) {
+    return true;
+  }
+
+  // C++ delete operators: operator delete / operator delete[]
+  if (LLVM_STRING_STARTS_WITH(name, "_ZdlPv") ||   // operator delete(void*, ...)
+      LLVM_STRING_STARTS_WITH(name, "_ZdaPv")) {    // operator delete[](void*, ...)
+    return true;
+  }
+
   // Core slab/kmalloc free functions
   if (name.equals("kfree") ||
       name.equals("kfree_sensitive") ||

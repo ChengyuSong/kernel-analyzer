@@ -50,16 +50,13 @@ namespace gracfl
          * @param grammar3indexLeft Index-based access for binary grammar rules (left-child driven).
          * @param labelSize Number of unique grammar labels.
          * @param nodeSize Total number of nodes in the graph.
-         * @param terminate Flag indicating whether convergence has been reached.
          */
         void runSingleIterationParallel(
             std::vector<std::vector<TemporalVector>>& outEdges,
-            std::vector<std::vector<std::unordered_set<ull>>>& hashset,
             const std::vector<std::vector<uint>>& grammar2index,
             const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
             uint labelSize,
-            uint nodeSize,
-            bool& terminate);
+            uint nodeSize);
 
         void addSelfEdgesParallel();
     };

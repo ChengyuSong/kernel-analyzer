@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "Global.h"
+#include "gracfl/include/utils/Reachability.hpp"
 
 class LLMClient;
 
@@ -44,7 +45,7 @@ private:
 
   friend class InstHandler;
 
-  using cfl_result_t = std::vector<std::vector<std::unordered_set<unsigned long long>>>;
+  using cfl_result_t = gracfl::ReachabilityMatrix;
 
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
@@ -61,10 +62,10 @@ private:
 
   static bool getGEPStructField(const llvm::GEPOperator *GEP,
                                  std::string &structName, unsigned &fieldIdx);
-  void buildFieldStoreMap(cfl_result_t &outputCFLGraph);
+  void buildFieldStoreMap(const cfl_result_t &outputCFLGraph);
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
-  bool findCustomAllocators(cfl_result_t &outputCFLGraph);
-  bool handleIndirectCall(cfl_result_t &outputCFLGraph);
+  bool findCustomAllocators(const cfl_result_t &outputCFLGraph);
+  bool handleIndirectCall(const cfl_result_t &outputCFLGraph);
 
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;

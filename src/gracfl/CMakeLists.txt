@@ -3,6 +3,10 @@ project(GraCFL)
 
 set(LIB_NAME graCFLlib)
 
+# Toggle to compare memory/behavior against the original std::unordered_set-based
+# reachability representation.
+option(GRACFL_USE_STD_UNORDERED_SET "Use std::unordered_set for reachability sets" OFF)
+
 # C++ Standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -18,6 +22,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 include_directories(${INCLUDE_DIR})
+set(VENDORED_BOOST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..") # provides boost/* under src/boost
 
 # Find OpenMP
 find_package(OpenMP)
@@ -97,6 +102,11 @@ endforeach()
 # Build the static library
 add_library(${LIB_NAME} STATIC ${LIB_SOURCES})
 target_include_directories(${LIB_NAME} PUBLIC ${INCLUDE_DIR})
+target_include_directories(${LIB_NAME} PUBLIC ${VENDORED_BOOST_ROOT})
+
+if(GRACFL_USE_STD_UNORDERED_SET)
+    target_compile_definitions(${LIB_NAME} PUBLIC GRACFL_USE_STD_UNORDERED_SET=1)
+endif()
 
 # Add dependencies on external builds
 if(TARGET libjemalloc)
@@ -129,4 +139,3 @@ endif()
 # if(TARGET libTBB)
 #     add_dependencies(${EXE_NAME} libTBB)
 # endif()
-

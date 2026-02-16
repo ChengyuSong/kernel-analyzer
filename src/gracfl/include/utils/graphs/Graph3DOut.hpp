@@ -1,9 +1,9 @@
 #pragma once
 
 #include <vector>
-#include <unordered_set>
 #include "../Edges.hpp"
 #include "Graph.hpp"
+#include "../Reachability.hpp"
 #include "../Types.hpp"
 
 namespace gracfl {
@@ -19,7 +19,7 @@ namespace gracfl {
     {
     public:
         std::vector<std::vector<TemporalVector>> outEdges_;
-        std::vector<std::vector<std::unordered_set<ull>>> hashset_;
+        ReachabilityMatrix hashset_;
         
         Graph3DOut(std::string& graphfilepath, const Grammar& grammar);
         Graph3DOut(const std::vector<Edge>& edges, const Grammar& grammar);
@@ -27,10 +27,11 @@ namespace gracfl {
         void addInitialEdges();
         void clearContainers();
         void addSelfEdge(Edge& edge);
-        void checkAndAddEdge(Edge& edge, bool& terminate);
+        bool checkAndAddEdge(const Edge& edge);
         ull countEdge();
 
         inline std::vector<std::vector<TemporalVector>>& getOutEdges() { return outEdges_; }
-        inline std::vector<std::vector<std::unordered_set<ull>>>& getHashset() { return hashset_; }
+        inline ReachabilityMatrix& getHashset() { return hashset_; }
+        inline const ReachabilityMatrix& getHashset() const { return hashset_; }
     };
 }

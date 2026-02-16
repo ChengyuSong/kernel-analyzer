@@ -6,6 +6,7 @@
 #include "utils/Types.hpp"
 #include "utils/Config.hpp"
 #include "utils/Grammar.hpp"
+#include "utils/Reachability.hpp"
 #include "solvers/SolverBase.hpp"
 
 namespace gracfl 
@@ -64,23 +65,24 @@ namespace gracfl
          * @param grammar3indexLeft Index-based access for binary grammar rules (left-child driven).
          * @param labelSize Number of unique grammar labels.
          * @param nodeSize Total number of nodes in the graph.
-         * @param terminate Flag indicating whether convergence has been reached.
+         * @return True if any new edges were added in this iteration.
          */
-        void runSingleIteration(
+        bool runSingleIteration(
             std::vector<std::vector<TemporalVector>>& outEdges,
-            std::vector<std::vector<std::unordered_set<ull>>>& hashset,
             const std::vector<std::vector<uint>>& grammar2index,
             const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
             uint labelSize,
-            uint nodeSize,
-            bool& terminate);
+            uint nodeSize);
 
         /**
          * @brief Adds self-loop epsilon edges to support epsilon productions.
          */
         void addSelfEdges();
 
-        std::vector<std::vector<std::unordered_set<ull>>> getGraph() override { return graph_->getHashset(); }
+        std::vector<std::vector<std::unordered_set<ull>>> getGraph() override;
+
+        // Preferred access for in-tree users: avoids materializing a huge copy.
+        inline const ReachabilityMatrix& getReachability() const { return graph_->getHashset(); }
 
         /**
          * @brief Retrieves the total number of CFL-reachable edges in the graph.

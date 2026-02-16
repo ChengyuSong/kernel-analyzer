@@ -1263,7 +1263,7 @@ bool CallGraphPass::doFinalization(Module *M) {
   return false;
 }
 
-bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
+bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
   bool foundNewAlloc = false;
   FuncSet newAllocFuncs;
   for (auto *F : Ctx->CandidateAllocFuncs) {
@@ -1310,7 +1310,7 @@ bool CallGraphPass::findCustomAllocators(cfl_result_t &outputCFLGraph) {
   return foundNewAlloc;
 }
 
-void CallGraphPass::buildFieldStoreMap(cfl_result_t &outputCFLGraph) {
+void CallGraphPass::buildFieldStoreMap(const cfl_result_t &outputCFLGraph) {
   unsigned labelV = EB.getLabelV();
   size_t funcFieldPairs = 0;
 
@@ -1339,7 +1339,7 @@ void CallGraphPass::buildFieldStoreMap(cfl_result_t &outputCFLGraph) {
          << funcFieldStores.size() << " distinct functions\n");
 }
 
-bool CallGraphPass::handleIndirectCall(cfl_result_t &outputCFLGraph) {
+bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
   // resolve indirect calls
   bool Changed = false;
   for (auto *CS : Ctx->IndirectCallInsts) {
@@ -1489,15 +1489,14 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     // solve CFL constraints after processing the last module
-    std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
-    // std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGram>(EB.getEdges(), *EB.getGrammar());
+    auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
     auto initEdges = solver->getEdgeCount();
     CG_LOG("CFL Init Edges: " << initEdges << "\n");
     solver->runCFL();
     auto finalEdges = solver->getEdgeCount();
     CG_LOG("CFL Final Edges: " << finalEdges << "\n");
 
-    auto outputCFLGraph = solver->getGraph();
+    const auto &outputCFLGraph = solver->getReachability();
 
     // handle custom allocators
     findCustomAllocators(outputCFLGraph);
@@ -1730,9 +1729,9 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {
   CG_LOG("\n[dumpGlobals]\n");
-  std::unique_ptr<gracfl::SolverBase> solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
+  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
   solver->runCFL();
-  auto outputCFLGraph = solver->getGraph();
+  const auto &outputCFLGraph = solver->getReachability();
   for (auto &it : Ctx->Gobjs) {
     Value *GV = it.second;
     NodeIndex valNode = NF.getValueNodeFor(GV);

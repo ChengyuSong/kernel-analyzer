@@ -18,18 +18,21 @@ namespace gracfl {
     void Graph3DOut::initContainers()
     {
         outEdges_.assign(getNodeSize(), std::vector<TemporalVector>(getLabelSize()));
-        hashset_.assign(getNodeSize(), std::vector<std::unordered_set<ull>>(getLabelSize(), std::unordered_set<ull>()));
+        hashset_.assign(getNodeSize(), std::vector<ReachabilitySet>(getLabelSize(), ReachabilitySet()));
     }
 
     void Graph3DOut::addInitialEdges()
     {
-        for (Edge edge : getEdges())
+        for (const Edge& edge : getEdges())
         {
-            hashset_[edge.from][edge.label].insert(edge.to);
-            outEdges_[edge.from][edge.label].vertexList.push_back(edge.to);
+            auto& set = hashset_[edge.from][edge.label];
+            auto it = set.insert(edge.to);
+            if (it.second) {
+                outEdges_[edge.from][edge.label].vertexList.push_back(edge.to);
 
-            // update the sliding pointers
-            outEdges_[edge.from][edge.label].NEW_END++;
+                // update the sliding pointers
+                outEdges_[edge.from][edge.label].NEW_END++;
+            }
         }
     }
 
@@ -39,20 +42,22 @@ namespace gracfl {
         hashset_.clear();
     }
 
-    void Graph3DOut::checkAndAddEdge(Edge& edge, bool& terminate)
+    bool Graph3DOut::checkAndAddEdge(const Edge& edge)
     {
-        if (hashset_[edge.from][edge.label].find(edge.to) == hashset_[edge.from][edge.label].end()) {
-            hashset_[edge.from][edge.label].insert(edge.to);
+        auto& set = hashset_[edge.from][edge.label];
+        auto it = set.insert(edge.to);
+        if (it.second) {
             outEdges_[edge.from][edge.label].vertexList.push_back(edge.to);
-            terminate = false;
+            return true;
         }
+        return false;
     }
 
     void Graph3DOut::addSelfEdge(Edge& edge)
     {
-        if (hashset_[edge.from][edge.label].find(edge.to) == hashset_[edge.from][edge.label].end())
-        {
-            hashset_[edge.from][edge.label].insert(edge.to);
+        auto& set = hashset_[edge.from][edge.label];
+        auto it = set.insert(edge.to);
+        if (it.second) {
             outEdges_[edge.from][edge.label].vertexList.push_back(edge.to);
             outEdges_[edge.from][edge.label].NEW_END++;
         }
@@ -60,6 +65,14 @@ namespace gracfl {
 
     ull Graph3DOut::countEdge()
     {
-        return countEdgeHelper(hashset_);
+        ull size = 0;
+        for (uint i = 0; i < hashset_.size(); i++)
+        {
+            for (uint j = 0; j < hashset_[i].size(); j++)
+            {
+                size += hashset_[i][j].size();
+            }
+        }
+        return size;
     }
 }

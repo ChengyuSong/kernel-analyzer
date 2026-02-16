@@ -23,7 +23,6 @@ namespace gracfl
     void  SolverFWGram::runCFL()
     { 
         uint itr = 0;
-        bool terminate;
         auto& outEdges = graph_->outEdges_;
         auto& hashset = graph_->hashset_;
         auto& grammar2index = grammar_.grammar2index_;
@@ -32,30 +31,27 @@ namespace gracfl
         auto nodeSize = graph_->getNodeSize();
 
         addSelfEdges(); // add epsilon edges
+        bool changed;
         do {
             itr++;
-            terminate = true;
-            runSingleIteration(
+            changed = runSingleIteration(
                 outEdges,
-                hashset, 
                 grammar2index,
                 grammar3indexLeft,
                 labelSize,
-                nodeSize,
-                terminate);
+                nodeSize);
             std::cout << "Iteration " << itr << std::endl;
-        } while(!terminate);
+        } while(changed);
     }
 
-    void SolverFWGram::runSingleIteration(
+    bool SolverFWGram::runSingleIteration(
         std::vector<std::vector<TemporalVector>>& outEdges,
-        std::vector<std::vector<std::unordered_set<ull>>>& hashset,
         const std::vector<std::vector<uint>>& grammar2index,
         const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
         uint labelSize,
-        uint nodeSize,
-        bool& terminate)
+        uint nodeSize)
     {
+        bool changed = false;
         for (uint i = 0; i < nodeSize; i++)
         {
             for (uint g = 0; g < labelSize; g++)
@@ -71,7 +67,7 @@ namespace gracfl
                     {
                         uint A = grammar2index[g][m];
                         Edge newEdge(i, nbr, A);
-                        graph_->checkAndAddEdge(newEdge, terminate);
+                        changed |= graph_->checkAndAddEdge(newEdge);
                     }
 
                     for (uint m = 0; m < grammar3indexLeft[g].size(); m++)
@@ -85,7 +81,7 @@ namespace gracfl
                         {
                             uint outNbr = outEdges[nbr][C].vertexList[h];
                             Edge newEdge(i, outNbr, A);
-                            graph_->checkAndAddEdge(newEdge, terminate);
+                            changed |= graph_->checkAndAddEdge(newEdge);
                         }
                     }
                 }
@@ -106,7 +102,7 @@ namespace gracfl
                         {
                             uint outNbr = outEdges[nbr][C].vertexList[h];
                             Edge newEdge(i, outNbr, A);
-                            graph_->checkAndAddEdge(newEdge, terminate);
+                            changed |= graph_->checkAndAddEdge(newEdge);
                         }
                     }
                 }
@@ -122,6 +118,8 @@ namespace gracfl
                 outEdges[i][g].NEW_END = outEdges[i][g].vertexList.size();
             }
         }
+
+        return changed;
     }
 
     void SolverFWGram::addSelfEdges()
@@ -140,4 +138,22 @@ namespace gracfl
     { 
         return graph_->countEdge();
     };
-}
+
+    std::vector<std::vector<std::unordered_set<ull>>> SolverFWGram::getGraph()
+    {
+        const auto& hs = graph_->getHashset();
+        std::vector<std::vector<std::unordered_set<ull>>> result;
+        result.resize(hs.size());
+
+        for (size_t i = 0; i < hs.size(); i++)
+        {
+            result[i].resize(hs[i].size());
+            for (size_t j = 0; j < hs[i].size(); j++)
+            {
+                // Note: This can be very large. Prefer getReachability().
+                result[i][j].insert(hs[i][j].begin(), hs[i][j].end());
+            }
+        }
+        return result;
+    }
+} 

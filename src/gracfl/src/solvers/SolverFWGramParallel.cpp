@@ -1,8 +1,35 @@
 #include <iostream>
+#include <chrono>
 #include "solvers/SolverFWGramParallel.hpp"
+#include "utils/Stats.hpp"
 
 namespace gracfl 
 {
+    static ull count_total_edges(const std::vector<std::vector<TemporalVector>>& outEdges)
+    {
+        ull total = 0;
+        for (size_t i = 0; i < outEdges.size(); i++) {
+            for (size_t g = 0; g < outEdges[i].size(); g++) {
+                total += outEdges[i][g].vertexList.size();
+            }
+        }
+        return total;
+    }
+
+    // After sliding pointers are updated, NEW_END - OLD_END is exactly the
+    // "frontier" (edges discovered in the last iteration).
+    static ull count_frontier_edges(const std::vector<std::vector<TemporalVector>>& outEdges)
+    {
+        ull frontier = 0;
+        for (size_t i = 0; i < outEdges.size(); i++) {
+            for (size_t g = 0; g < outEdges[i].size(); g++) {
+                const auto& tv = outEdges[i][g];
+                frontier += static_cast<ull>(tv.NEW_END) - static_cast<ull>(tv.OLD_END);
+            }
+        }
+        return frontier;
+    }
+
     SolverFWGramParallel::SolverFWGramParallel(std::string graphfilepath, const Grammar& grammar, uint numOfThreads)
     : SolverFWGram(graphfilepath, grammar)
     {
@@ -26,31 +53,64 @@ namespace gracfl
         auto labelSize = grammar_.getLabelSize();
         auto nodeSize = graph_->getNodeSize();
 
+        const bool enableStats = stats::getenv_bool("GRACFL_STATS", false);
+        const int statsInterval = std::max(1, stats::getenv_int("GRACFL_STATS_INTERVAL", 1));
+
         addSelfEdges(); // add epsilon edges
+
+        if (enableStats) {
+            const double rssMb = stats::rss_kb() / 1024.0;
+            const ull initOut = count_total_edges(outEdges);
+            const ull initSet = graph_->countEdge();
+            std::cout << "[GraCFL] FWGramParallel threads=" << numOfThreads_
+                      << " reachability=" << kReachabilitySetKind
+                      << " nodes=" << nodeSize << " labels=" << labelSize
+                      << " initial_out=" << initOut
+                      << " initial_set=" << initSet
+                      << " rss_mb=" << rssMb
+                      << std::endl;
+        }
 
         do {
             itr++;
-            terminate = true;
+            const auto t0 = std::chrono::steady_clock::now();
             runSingleIterationParallel(
                 outEdges,
-                hashset, 
                 grammar2index,
                 grammar3indexLeft,
                 labelSize,
-                nodeSize,
-                terminate);
-            std::cout << "Iteration " << itr << std::endl;
+                nodeSize);
+            const auto t1 = std::chrono::steady_clock::now();
+
+            // Compute progress from sliding pointers rather than relying on
+            // the racy shared 'terminate' flag.
+            const ull frontierEdges = count_frontier_edges(outEdges);
+            terminate = (frontierEdges == 0);
+
+            if (enableStats && (itr % static_cast<uint>(statsInterval) == 0 || terminate)) {
+                const ull totalOut = count_total_edges(outEdges);
+                const ull totalSet = graph_->countEdge();
+                const double rssMb = stats::rss_kb() / 1024.0;
+                const double iterSec = std::chrono::duration<double>(t1 - t0).count();
+                std::cout << "[GraCFL] itr=" << itr
+                          << " +edges=" << frontierEdges
+                          << " total_out=" << totalOut
+                          << " total_set=" << totalSet
+                          << " rss_mb=" << rssMb
+                          << " iter_s=" << iterSec
+                          << std::endl;
+            } else {
+                std::cout << "Iteration " << itr << std::endl;
+            }
         } while(!terminate);
     }
 
     void SolverFWGramParallel::runSingleIterationParallel(
         std::vector<std::vector<TemporalVector>>& outEdges,
-        std::vector<std::vector<std::unordered_set<ull>>>& hashset,
         const std::vector<std::vector<uint>>& grammar2index,
         const std::vector<std::vector<std::pair<uint, uint>>>& grammar3indexLeft,
         uint labelSize,
-        uint nodeSize,
-        bool& terminate)
+        uint nodeSize)
     {
         #pragma omp parallel for schedule(static, 512) num_threads(numOfThreads_)
         for (uint i = 0; i < nodeSize; i++)
@@ -68,7 +128,7 @@ namespace gracfl
                     {
                         uint A = grammar2index[g][m];
                         Edge newEdge(i, nbr, A);
-                        graph_->checkAndAddEdge(newEdge, terminate);
+                        graph_->checkAndAddEdge(newEdge);
                     }
 
                     for (uint m = 0; m < grammar3indexLeft[g].size(); m++)
@@ -82,7 +142,7 @@ namespace gracfl
                         {
                             uint outNbr = outEdges[nbr][C].vertexList[h];
                             Edge newEdge(i, outNbr, A);
-                            graph_->checkAndAddEdge(newEdge, terminate);
+                            graph_->checkAndAddEdge(newEdge);
                         }
                     }
                 }
@@ -103,7 +163,7 @@ namespace gracfl
                         {
                             uint outNbr = outEdges[nbr][C].vertexList[h];
                             Edge newEdge(i, outNbr, A);
-                            graph_->checkAndAddEdge(newEdge, terminate);
+                            graph_->checkAndAddEdge(newEdge);
                         }
                     }
                 }

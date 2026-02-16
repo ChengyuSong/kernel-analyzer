@@ -26,6 +26,10 @@
 
 #include <vector>
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <set>
+#include <thread>
 
 #include "CallGraph.h"
 #include "Annotation.h"
@@ -67,6 +71,83 @@ static bool shouldSkipFunction(const Function *F) {
 
   return false;
 }
+
+static unsigned detectPhysicalCoreCount() {
+  if (const char *override = std::getenv("KACFL_THREADS")) {
+    char *end = nullptr;
+    long value = std::strtol(override, &end, 10);
+    if (end != override && value > 0)
+      return static_cast<unsigned>(value);
+  }
+
+  std::ifstream cpuinfo("/proc/cpuinfo");
+  if (cpuinfo.is_open()) {
+    std::set<std::pair<int, int>> physicalCores;
+    int physicalId = -1;
+    int coreId = -1;
+    std::string line;
+
+    auto flushProcessor = [&]() {
+      if (coreId >= 0) {
+        if (physicalId < 0)
+          physicalId = 0;
+        physicalCores.emplace(physicalId, coreId);
+      }
+      physicalId = -1;
+      coreId = -1;
+    };
+
+    while (std::getline(cpuinfo, line)) {
+      if (line.empty()) {
+        flushProcessor();
+        continue;
+      }
+
+      const size_t colon = line.find(':');
+      if (colon == std::string::npos)
+        continue;
+
+      std::string key = line.substr(0, colon);
+      std::string value = line.substr(colon + 1);
+      auto ltrim = [](std::string &s) {
+        const size_t pos = s.find_first_not_of(" \t");
+        s.erase(0, pos == std::string::npos ? s.size() : pos);
+      };
+      auto rtrim = [](std::string &s) {
+        const size_t pos = s.find_last_not_of(" \t");
+        if (pos == std::string::npos)
+          s.clear();
+        else
+          s.erase(pos + 1);
+      };
+      ltrim(key);
+      rtrim(key);
+      ltrim(value);
+      rtrim(value);
+
+      if (key == "physical id") {
+        physicalId = std::atoi(value.c_str());
+      } else if (key == "core id") {
+        coreId = std::atoi(value.c_str());
+      }
+    }
+    flushProcessor();
+
+    if (!physicalCores.empty())
+      return static_cast<unsigned>(physicalCores.size());
+  }
+
+  const unsigned logical = std::thread::hardware_concurrency();
+  return logical > 0 ? logical : 1;
+}
+
+CallGraphPass::CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_)
+    : IterativeModulePass(Ctx_, "CallGraph"),
+      NF(Ctx->nodeFactory),
+      EB(Ctx->edgeBuilder),
+      LLM(LLMClient_),
+      cflThreads(detectPhysicalCoreCount()),
+      iteration(0) {}
 
 Function* CallGraphPass::getFuncDef(Function *F) {
   FuncMap::iterator it = Ctx->Funcs.find(F->getGUID());
@@ -1491,7 +1572,8 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     // solve CFL constraints after processing the last module
-    auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
+    CG_LOG("Using " << cflThreads << " threads for FWGramParallel\n");
+    auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), cflThreads);
     auto initEdges = solver->getEdgeCount();
     CG_LOG("CFL Init Edges: " << initEdges << "\n");
     solver->runCFL();
@@ -1731,7 +1813,7 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {
   CG_LOG("\n[dumpGlobals]\n");
-  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
+  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), cflThreads);
   solver->runCFL();
   const auto &outputCFLGraph = solver->getReachability();
   for (auto &it : Ctx->Gobjs) {

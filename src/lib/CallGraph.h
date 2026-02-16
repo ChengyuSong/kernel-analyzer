@@ -70,6 +70,7 @@ private:
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
   LLMClient *LLM;
+  unsigned cflThreads;
 
   unsigned iteration;
 
@@ -101,10 +102,7 @@ private:
                      std::unordered_set<FieldStoreKey, FieldStoreKeyHash>> funcFieldStores;
 
 public:
-  CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_ = nullptr)
-      : IterativeModulePass(Ctx_, "CallGraph"),
-        NF(Ctx->nodeFactory), EB(Ctx->edgeBuilder), LLM(LLMClient_), iteration(0)
-        { }
+  CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_ = nullptr);
   virtual bool doInitialization(llvm::Module *);
   virtual bool doFinalization(llvm::Module *);
   virtual bool doModulePass(llvm::Module *);

@@ -47,7 +47,6 @@ namespace gracfl
         uint itr = 0;
         bool terminate;
         auto& outEdges = graph_->outEdges_;
-        auto& hashset = graph_->hashset_;
         auto& grammar2index = grammar_.grammar2index_;
         auto& grammar3indexLeft  = grammar_.grammar3indexLeft_;
         auto labelSize = grammar_.getLabelSize();
@@ -55,19 +54,24 @@ namespace gracfl
 
         const bool enableStats = stats::getenv_bool("GRACFL_STATS", false);
         const int statsInterval = std::max(1, stats::getenv_int("GRACFL_STATS_INTERVAL", 1));
+        const bool deepStats = stats::getenv_bool("GRACFL_STATS_DEEP", false);
 
         addSelfEdges(); // add epsilon edges
 
         if (enableStats) {
             const double rssMb = stats::rss_kb() / 1024.0;
-            const ull initOut = count_total_edges(outEdges);
-            const ull initSet = graph_->countEdge();
             std::cout << "[GraCFL] FWGramParallel threads=" << numOfThreads_
                       << " reachability=" << kReachabilitySetKind
-                      << " nodes=" << nodeSize << " labels=" << labelSize
-                      << " initial_out=" << initOut
-                      << " initial_set=" << initSet
-                      << " rss_mb=" << rssMb
+                      << " nodes=" << nodeSize
+                      << " labels=" << labelSize
+                      << " rss_mb=" << rssMb;
+            if (deepStats) {
+                const ull initOut = count_total_edges(outEdges);
+                const ull initSet = graph_->countEdge();
+                std::cout << " initial_out=" << initOut
+                          << " initial_set=" << initSet;
+            }
+            std::cout
                       << std::endl;
         }
 
@@ -82,23 +86,23 @@ namespace gracfl
                 nodeSize);
             const auto t1 = std::chrono::steady_clock::now();
 
-            // Compute progress from sliding pointers rather than relying on
-            // the racy shared 'terminate' flag.
             const ull frontierEdges = count_frontier_edges(outEdges);
             terminate = (frontierEdges == 0);
 
             if (enableStats && (itr % static_cast<uint>(statsInterval) == 0 || terminate)) {
-                const ull totalOut = count_total_edges(outEdges);
-                const ull totalSet = graph_->countEdge();
                 const double rssMb = stats::rss_kb() / 1024.0;
                 const double iterSec = std::chrono::duration<double>(t1 - t0).count();
                 std::cout << "[GraCFL] itr=" << itr
                           << " +edges=" << frontierEdges
-                          << " total_out=" << totalOut
-                          << " total_set=" << totalSet
                           << " rss_mb=" << rssMb
-                          << " iter_s=" << iterSec
-                          << std::endl;
+                          << " iter_s=" << iterSec;
+                if (deepStats) {
+                    const ull totalOut = count_total_edges(outEdges);
+                    const ull totalSet = graph_->countEdge();
+                    std::cout << " total_out=" << totalOut
+                              << " total_set=" << totalSet;
+                }
+                std::cout << std::endl;
             } else {
                 std::cout << "Iteration " << itr << std::endl;
             }

@@ -26,6 +26,7 @@ namespace gracfl {
         void initContainers();
         void addInitialEdges();
         void clearContainers();
+        bool addInputEdge(const Edge& edge);
         void addSelfEdge(Edge& edge);
         bool checkAndAddEdge(const Edge& edge);
         ull countEdge();

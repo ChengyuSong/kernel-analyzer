@@ -23,6 +23,7 @@ namespace gracfl
     protected:
         const Grammar& grammar_;  ///< Reference to the grammar defining CFL rules.
         Graph3DOut* graph_; ///< Pointer to the graph structure supporting forward traversal.
+        bool selfEdgesInitialized_ = false;
     public:
         /**
          * @brief Constructs a SolverFWGram instance.
@@ -78,11 +79,25 @@ namespace gracfl
          * @brief Adds self-loop epsilon edges to support epsilon productions.
          */
         void addSelfEdges();
+        void ensureSelfEdges();
+
+        /**
+         * @brief Incrementally add input edges and expose them as frontier.
+         *
+         * Edges are treated as newly discovered facts for the next runCFL()
+         * invocation. Duplicate edges are ignored.
+         *
+         * @param edges Full edge list from the client.
+         * @param beginIndex Start index in edges to ingest.
+         * @return Number of truly new edges added to the graph.
+         */
+        size_t addInputEdges(const std::vector<Edge>& edges, size_t beginIndex = 0);
 
         std::vector<std::vector<std::unordered_set<ull>>> getGraph() override;
 
         // Preferred access for in-tree users: avoids materializing a huge copy.
         inline const ReachabilityMatrix& getReachability() const { return graph_->getHashset(); }
+        inline size_t getNodeCount() const { return graph_->getNodeSize(); }
 
         /**
          * @brief Retrieves the total number of CFL-reachable edges in the graph.

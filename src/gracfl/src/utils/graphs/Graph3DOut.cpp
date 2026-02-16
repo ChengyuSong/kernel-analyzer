@@ -42,6 +42,19 @@ namespace gracfl {
         hashset_.clear();
     }
 
+    bool Graph3DOut::addInputEdge(const Edge& edge)
+    {
+        auto& set = hashset_[edge.from][edge.label];
+        auto it = set.insert(edge.to);
+        if (it.second) {
+            outEdges_[edge.from][edge.label].vertexList.push_back(edge.to);
+            // Mark as "new frontier" for the next incremental run.
+            outEdges_[edge.from][edge.label].NEW_END++;
+            return true;
+        }
+        return false;
+    }
+
     bool Graph3DOut::checkAndAddEdge(const Edge& edge)
     {
         auto& set = hashset_[edge.from][edge.label];

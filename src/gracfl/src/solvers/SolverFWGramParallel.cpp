@@ -56,7 +56,7 @@ namespace gracfl
         const int statsInterval = std::max(1, stats::getenv_int("GRACFL_STATS_INTERVAL", 1));
         const bool deepStats = stats::getenv_bool("GRACFL_STATS_DEEP", false);
 
-        addSelfEdges(); // add epsilon edges
+        ensureSelfEdges();
 
         if (enableStats) {
             const double rssMb = stats::rss_kb() / 1024.0;

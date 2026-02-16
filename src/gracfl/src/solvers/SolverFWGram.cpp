@@ -30,7 +30,7 @@ namespace gracfl
         auto labelSize = grammar_.getLabelSize();
         auto nodeSize = graph_->getNodeSize();
 
-        addSelfEdges(); // add epsilon edges
+        ensureSelfEdges();
         bool changed;
         do {
             itr++;
@@ -132,6 +132,30 @@ namespace gracfl
                 graph_->addSelfEdge(edge);
             }
         }
+    }
+
+    void SolverFWGram::ensureSelfEdges()
+    {
+        if (selfEdgesInitialized_) {
+            return;
+        }
+        addSelfEdges();
+        selfEdgesInitialized_ = true;
+    }
+
+    size_t SolverFWGram::addInputEdges(const std::vector<Edge>& edges, size_t beginIndex)
+    {
+        if (beginIndex >= edges.size()) {
+            return 0;
+        }
+
+        size_t added = 0;
+        for (size_t i = beginIndex; i < edges.size(); i++) {
+            if (graph_->addInputEdge(edges[i])) {
+                added++;
+            }
+        }
+        return added;
     }
 
     ull SolverFWGram::getEdgeCount()  

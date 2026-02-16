@@ -147,6 +147,8 @@ CallGraphPass::CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_)
       EB(Ctx->edgeBuilder),
       LLM(LLMClient_),
       cflThreads(detectPhysicalCoreCount()),
+      cflSolvedInputEdgeCount(0),
+      cflForceRebuild(true),
       iteration(0) {}
 
 Function* CallGraphPass::getFuncDef(Function *F) {
@@ -1546,8 +1548,7 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
-          // well, custom allocators may have function pointers too, we can still analyze them
-          // Ctx->AllocFuncs.count(&F) ||
+          Ctx->AllocFuncs.count(&F) ||
           Ctx->ContainerFuncs.count(&F))
         continue;
       if (shouldSkipFunction(&F))
@@ -1573,23 +1574,61 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     // solve CFL constraints after processing the last module
     CG_LOG("Using " << cflThreads << " threads for FWGramParallel\n");
-    auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), cflThreads);
-    auto initEdges = solver->getEdgeCount();
-    CG_LOG("CFL Init Edges: " << initEdges << "\n");
-    solver->runCFL();
-    auto finalEdges = solver->getEdgeCount();
-    CG_LOG("CFL Final Edges: " << finalEdges << "\n");
+    const auto &inputEdges = EB.getEdges();
+    const size_t inputEdgeCount = inputEdges.size();
 
-    const auto &outputCFLGraph = solver->getReachability();
+    bool rebuildSolver = false;
+    if (!cflSolver || cflForceRebuild || cflSolvedInputEdgeCount > inputEdgeCount) {
+      rebuildSolver = true;
+    } else {
+      // If new edges reference nodes beyond the existing solver graph,
+      // rebuild with a resized graph.
+      const size_t nodeCount = cflSolver->getNodeCount();
+      for (size_t i = cflSolvedInputEdgeCount; i < inputEdgeCount; i++) {
+        const auto &E = inputEdges[i];
+        if (E.from >= nodeCount || E.to >= nodeCount) {
+          rebuildSolver = true;
+          break;
+        }
+      }
+    }
+
+    size_t incrementalAdded = 0;
+    if (rebuildSolver) {
+      cflSolver = std::make_unique<gracfl::SolverFWGramParallel>(inputEdges, *EB.getGrammar(), cflThreads);
+      cflSolvedInputEdgeCount = inputEdgeCount;
+      cflForceRebuild = false;
+      CG_LOG("CFL Mode: full rebuild\n");
+    } else if (inputEdgeCount > cflSolvedInputEdgeCount) {
+      const size_t rawNewEdges = inputEdgeCount - cflSolvedInputEdgeCount;
+      incrementalAdded = cflSolver->addInputEdges(inputEdges, cflSolvedInputEdgeCount);
+      cflSolvedInputEdgeCount = inputEdgeCount;
+      CG_LOG("CFL Mode: incremental resume with " << incrementalAdded
+             << " new frontier edges (" << rawNewEdges
+             << " raw additions)\n");
+    } else {
+      CG_LOG("CFL Mode: reusing cached fixed-point (no new input edges)\n");
+    }
+
+    if (rebuildSolver || incrementalAdded > 0) {
+      auto initEdges = cflSolver->getEdgeCount();
+      CG_LOG("CFL Init Edges: " << initEdges << "\n");
+      cflSolver->runCFL();
+      auto finalEdges = cflSolver->getEdgeCount();
+      CG_LOG("CFL Final Edges: " << finalEdges << "\n");
+    }
+
+    const auto &outputCFLGraph = cflSolver->getReachability();
 
     // handle custom allocators
-    findCustomAllocators(outputCFLGraph);
-    // if () {
-      // if new allocators found, we need to rerun
-      // solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), 16);
-      // solver->runCFL();
-      // outputCFLGraph = solver->getGraph();
-    // }
+    const bool allocatorRewritten = findCustomAllocators(outputCFLGraph);
+    if (allocatorRewritten) {
+      // custom allocator discovery may rewrite/remove call edges;
+      // trigger a full rebuild on the next iteration.
+      cflForceRebuild = true;
+      cflSolvedInputEdgeCount = 0;
+    }
+    Changed |= allocatorRewritten;
 
     // build field-store map for struct-field-aware filtering
     buildFieldStoreMap(outputCFLGraph);

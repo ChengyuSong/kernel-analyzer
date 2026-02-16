@@ -5,11 +5,13 @@
 #include <llvm/IR/InstVisitor.h>
 #include <llvm/IR/GlobalIFunc.h>
 
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "Global.h"
 #include "gracfl/include/utils/Reachability.hpp"
+#include "gracfl/include/solvers/SolverFWGramParallel.hpp"
 
 class LLMClient;
 
@@ -71,6 +73,9 @@ private:
   CFLEdgeBuilder &EB;
   LLMClient *LLM;
   unsigned cflThreads;
+  std::unique_ptr<gracfl::SolverFWGramParallel> cflSolver;
+  size_t cflSolvedInputEdgeCount;
+  bool cflForceRebuild;
 
   unsigned iteration;
 

@@ -171,29 +171,45 @@ void doBasicInitialization(Module *M) {
 
   // collect global function definitions
   for (Function &F : *M) {
-    if (F.hasExternalLinkage()) {
-      // external linkage always ends up with the function name
+    // Accept external, linkonce_odr, and weak_odr linkage.
+    // C++ constructors/destructors often have linkonce_odr or weak_odr
+    // linkage (e.g., inline definitions, template instantiations).
+    if (!F.hasLocalLinkage()) {
       auto FID = F.getGUID();
       if (!F.isDeclaration() && !F.empty()) {
         if (GlobalCtx.Funcs.count(FID) != 0) {
-          // check for weak linkage
-          if (F.hasWeakLinkage()) {
-            // keep the previous definition, even if it's weak too
+          // check for weak/linkonce linkage
+          if (F.isWeakForLinker()) {
+            // keep the previous definition
             continue;
-          } else if (!GlobalCtx.Funcs[FID]->hasWeakLinkage()) {
-            // both are not weak
+          } else if (!GlobalCtx.Funcs[FID]->isWeakForLinker()) {
+            // both are strong definitions
             WARNING("Function " << F.getName()
                 << " has been defined multiple times, previously in "
                 << GlobalCtx.Funcs[FID]->getParent()->getModuleIdentifier()
                 << ", and now in " << M->getModuleIdentifier() << "\n");
             continue;
-          } // else fall through to replace weak definition
+          } // else fall through to replace weak/linkonce definition
         }
         GlobalCtx.Funcs[FID] = &F;
       } else {
         GlobalCtx.ExtFuncs[FID] = &F;
       }
     }
+  }
+
+  // Resolve global aliases (e.g., Itanium ABI C1->C2 constructor aliases)
+  for (GlobalAlias &GA : M->aliases()) {
+    if (GA.hasLocalLinkage())
+      continue;
+    auto *Aliasee = dyn_cast<Function>(GA.getAliasee()->stripPointerCasts());
+    if (!Aliasee || Aliasee->isDeclaration() || Aliasee->empty())
+      continue;
+    auto AliasID = GA.getGUID();
+    if (GlobalCtx.Funcs.count(AliasID) == 0)
+      GlobalCtx.Funcs[AliasID] = Aliasee;
+    // also remove from ExtFuncs if present
+    GlobalCtx.ExtFuncs.erase(AliasID);
   }
 }
 

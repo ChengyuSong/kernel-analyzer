@@ -1465,7 +1465,9 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
-          Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+          // well, custom allocators may have function pointers too, we can still analyze them
+          // Ctx->AllocFuncs.count(&F) ||
+          Ctx->ContainerFuncs.count(&F))
         continue;
       if (shouldSkipFunction(&F))
         continue;

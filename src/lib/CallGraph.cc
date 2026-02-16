@@ -646,7 +646,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
 
   // Check for function pointer cycles
   if (!CS.getCalledFunction()) {
-    Value *CO = CS.getCalledOperand()->stripPointerCasts();
+    Value *CO = CS.getCalledOperand()->stripPointerCastsAndAliases();
     if (auto *Load = dyn_cast<LoadInst>(CO)) {
       CG_DEBUG("Indirect call through loaded function pointer: " << *Load->getPointerOperand() << "\n");
     }
@@ -661,14 +661,14 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     else
       CGP.handleCall(&CS, RCF);
   } else {
-    // indirect call
-    Value *CO = CS.getCalledOperand()->stripPointerCasts();
+    // indirect call (or direct call through alias/bitcast)
+    Value *CO = CS.getCalledOperand()->stripPointerCastsAndAliases();
     // resolve constant expr
     if (auto *CE = dyn_cast<ConstantExpr>(CO)) {
       switch (CE->getOpcode()) {
         case Instruction::GetElementPtr: {
           GEPOperator* GEP = dyn_cast<GEPOperator>(CE);
-          CO = GEP->getPointerOperand()->stripPointerCasts();
+          CO = GEP->getPointerOperand()->stripPointerCastsAndAliases();
           break;
         }
         case Instruction::BitCast: {
@@ -680,7 +680,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       }
     }
     if (Function *CF = dyn_cast<Function>(CO)) {
-      // direct call through bitcast
+      // direct call through bitcast/alias
       auto RCF = CGP.getFuncDef(CF);
       CGP.Ctx->Callees[&CS].insert(RCF);
       if (CGP.Ctx->ContainerFuncs.count(RCF))
@@ -1282,19 +1282,19 @@ bool CallGraphPass::doFinalization(Module *M) {
 
     for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
       // map callsite to possible callees
-      if (CallInst *CI = dyn_cast<CallInst>(&*i)) {
-        if (CI->isInlineAsm())
+      if (CallBase *CB = dyn_cast<CallBase>(&*i)) {
+        if (CB->isInlineAsm())
           continue;
-        FuncSet &FS = Ctx->Callees[CI];
+        FuncSet &FS = Ctx->Callees[CB];
         // calculate the caller info here
         for (const Function *CF : FS) {
           CallInstSet &CIS = Ctx->Callers[CF];
-          CIS.insert(CI);
+          CIS.insert(CB);
         }
         // collect indirect call targets by type
-        if (Ctx->IndirectCallInsts.find(CI) != Ctx->IndirectCallInsts.end()) {
-          FuncSet &TS = calleeByType[CI];
-          findCalleesByType(CI, TS);
+        if (Ctx->IndirectCallInsts.find(CB) != Ctx->IndirectCallInsts.end()) {
+          FuncSet &TS = calleeByType[CB];
+          findCalleesByType(CB, TS);
         }
       }
     }
@@ -1428,7 +1428,7 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
   for (auto *CS : Ctx->IndirectCallInsts) {
     CG_DEBUG("Handle indirect CallSite: " << *CS << " in function "
         << CS->getFunction()->getName() << "\n");
-    Value *fptr = CS->getCalledOperand()->stripPointerCasts();
+    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fptrNode = NF.getValueNodeFor(fptr);
     if (fptrNode == AndersNodeFactory::InvalidIndex) {
       WARNING("FuncPtr for " << *CS << " node not found!\n");

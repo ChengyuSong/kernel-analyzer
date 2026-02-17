@@ -8,6 +8,7 @@
 
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/StringExtras.h>
+#include <llvm/ADT/StringSet.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/Support/MemoryBuffer.h>
@@ -435,13 +436,17 @@ bool saveAllocatorResults(GlobalContext *Ctx, StringRef Path) {
     return false;
   }
 
+  StringSet<> Seen;
   json::Array Candidates;
   for (const Function *F : Ctx->CandidateAllocFuncs)
-    Candidates.push_back(F->getName().str());
+    if (Seen.insert(F->getName()).second)
+      Candidates.push_back(F->getName().str());
 
+  Seen.clear();
   json::Array Confirmed;
   for (const Function *F : Ctx->AllocFuncs)
-    Confirmed.push_back(F->getName().str());
+    if (Seen.insert(F->getName()).second)
+      Confirmed.push_back(F->getName().str());
 
   json::Object Root;
   Root["candidates"] = std::move(Candidates);

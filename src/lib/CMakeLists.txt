@@ -8,7 +8,6 @@ set (KASource
   LLMAnalysis.cc
   CFLEdgeBuilder.cc
   CallGraph.cc
-  Reachable.cc
 )
 
 # Build executable, KAMain.

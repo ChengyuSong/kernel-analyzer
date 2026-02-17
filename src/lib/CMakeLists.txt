@@ -7,6 +7,7 @@ set (KASource
   LLMClient.cc
   LLMAnalysis.cc
   CFLEdgeBuilder.cc
+  VSnapshot.cc
   CallGraph.cc
 )
 

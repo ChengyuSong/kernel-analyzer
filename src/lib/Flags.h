@@ -10,5 +10,6 @@ extern cl::list<std::string> InputFilenames;
 extern cl::opt<unsigned> VerboseLevel;
 extern cl::opt<bool> CFLLocalRepMerge;
 extern cl::opt<bool> CFLLocalAllocaSummary;
+extern cl::opt<std::string> VSnapshotOutput;
 
 #endif

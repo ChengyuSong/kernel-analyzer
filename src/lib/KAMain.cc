@@ -71,6 +71,9 @@ cl::opt<std::string> GrammarFile(
 cl::opt<std::string> CFLEdgeOutput(
   "cfl-edge-output", cl::desc("Output file for CFL-reachability edges"), cl::init(""));
 
+cl::opt<std::string> VSnapshotOutput(
+  "v-snapshot", cl::desc("Output file for compact CFL V-relation snapshot"), cl::init(""));
+
 cl::opt<std::string> LLMServerHost(
   "llm-server-host", cl::desc("Hostname of local LLM server"), cl::init(""));
 
@@ -371,6 +374,9 @@ int main(int argc, char **argv) {
 
   if (!CallGraphJSON.empty()) {
     CGPass.dumpCallGraphJSON(CallGraphJSON);
+  }
+  if (!VSnapshotOutput.empty()) {
+    CGPass.dumpVSnapshot(VSnapshotOutput);
   }
 
   if (!AllocatorFile.empty())

@@ -36,6 +36,7 @@
 #include "CallGraph.h"
 #include "Annotation.h"
 #include "LLMClient.h"
+#include "VSnapshot.h"
 
 #include "gracfl/include/solvers/Solver.hpp"
 
@@ -108,6 +109,7 @@ static bool isIgnorableAllocaIntrinsic(const CallBase *CB) {
       return false;
   }
 }
+
 } // namespace
 
 // Helper to check if we should skip creating edges for a value
@@ -2470,6 +2472,176 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
          << totalEdges << " edges ("
          << directEdges << " direct, "
          << indirectEdges << " indirect)\n");
+}
+
+void CallGraphPass::dumpVSnapshot(StringRef Path) {
+  const cfl_result_t *GraphPtr = nullptr;
+  std::unique_ptr<gracfl::SolverFWGramParallel> TmpSolver;
+  if (cflSolver) {
+    GraphPtr = &cflSolver->getReachability();
+  } else {
+    TmpSolver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), cflThreads);
+    TmpSolver->runCFL();
+    GraphPtr = &TmpSolver->getReachability();
+  }
+  if (!GraphPtr || GraphPtr->empty()) {
+    WARNING("VSnapshot: empty CFL graph, skip export to " << Path << "\n");
+    return;
+  }
+
+  const auto &Graph = *GraphPtr;
+  const uint32_t LabelV = EB.getLabelV();
+  if (Graph[0].size() <= LabelV) {
+    WARNING("VSnapshot: V label index " << LabelV << " is out of range\n");
+    return;
+  }
+
+  const uint32_t NodeCount = NF.getNumNodes();
+  if (Graph.size() < NodeCount) {
+    WARNING("VSnapshot: CFL graph node count " << Graph.size()
+            << " is smaller than NodeFactory node count " << NodeCount << "\n");
+    return;
+  }
+
+  std::unordered_map<NodeIndex, uint32_t> RootToDense;
+  RootToDense.reserve(NodeCount);
+  std::vector<uint32_t> NodeToRepDense(NodeCount, 0);
+  std::vector<uint32_t> RepToNode;
+  RepToNode.reserve(NodeCount);
+  std::vector<std::vector<uint32_t>> MembersByRep;
+  MembersByRep.reserve(NodeCount);
+  for (uint32_t N = 0; N < NodeCount; N++) {
+    NodeIndex Root = getCanonicalNode(N);
+    auto It = RootToDense.find(Root);
+    uint32_t Dense = 0;
+    if (It == RootToDense.end()) {
+      Dense = static_cast<uint32_t>(RepToNode.size());
+      RootToDense.emplace(Root, Dense);
+      RepToNode.push_back(Root);
+      MembersByRep.emplace_back();
+    } else {
+      Dense = It->second;
+    }
+    NodeToRepDense[N] = Dense;
+    MembersByRep[Dense].push_back(N);
+  }
+  const uint32_t RepCount = static_cast<uint32_t>(RepToNode.size());
+
+  std::vector<VSnapshotNamedEntry> NamedEntries;
+  NamedEntries.reserve(NodeCount / 8 + 32);
+  for (uint32_t N = 0; N < NodeCount; N++) {
+    const Value *V = NF.getValueForNode(N);
+    if (!V)
+      continue;
+
+    VSnapshotNamedEntry E;
+    E.node = N;
+
+    if (NF.isReturnNode(N)) {
+      const Function *F = dyn_cast<Function>(V);
+      if (!F)
+        continue;
+      E.kind = 6; // return node
+      E.name = ("ret:" + F->getName()).str();
+      NamedEntries.push_back(std::move(E));
+      continue;
+    }
+    if (NF.isVarargNode(N)) {
+      const Function *F = dyn_cast<Function>(V);
+      if (!F)
+        continue;
+      E.kind = 7; // vararg node
+      E.name = ("vararg:" + F->getName()).str();
+      NamedEntries.push_back(std::move(E));
+      continue;
+    }
+
+    if (const Function *F = dyn_cast<Function>(V)) {
+      E.kind = 1;
+      E.name = F->getName().str();
+    } else if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(V)) {
+      E.kind = 2;
+      E.name = GV->getName().str();
+    } else if (const Argument *A = dyn_cast<Argument>(V)) {
+      E.kind = 3;
+      const Function *F = A->getParent();
+      std::string FName = F ? F->getName().str() : std::string("<unknown>");
+      if (A->hasName())
+        E.name = FName + "::arg:" + A->getName().str();
+      else
+        E.name = FName + "::arg#" + std::to_string(A->getArgNo());
+    } else if (const Instruction *I = dyn_cast<Instruction>(V)) {
+      if (!I->hasName())
+        continue;
+      E.kind = 4;
+      const Function *F = I->getFunction();
+      std::string FName = F ? F->getName().str() : std::string("<unknown>");
+      E.name = FName + "::%" + I->getName().str();
+    } else if (V->hasName()) {
+      E.kind = 5;
+      E.name = V->getName().str();
+    } else {
+      continue;
+    }
+
+    if (!E.name.empty())
+      NamedEntries.push_back(std::move(E));
+  }
+
+  std::sort(NamedEntries.begin(), NamedEntries.end(),
+            [](const VSnapshotNamedEntry &A, const VSnapshotNamedEntry &B) {
+              if (A.name != B.name)
+                return A.name < B.name;
+              if (A.kind != B.kind)
+                return A.kind < B.kind;
+              return A.node < B.node;
+            });
+
+  json::Object MetaObj;
+  MetaObj["tool"] = "kanalyzer";
+  MetaObj["snapshot_type"] = "V-relation";
+  MetaObj["version"] = static_cast<int64_t>(VSnapshotData::kVersion);
+  MetaObj["label_v"] = static_cast<int64_t>(LabelV);
+  MetaObj["local_rep_merge"] = static_cast<bool>(CFLLocalRepMerge);
+  MetaObj["local_alloca_summary"] = static_cast<bool>(CFLLocalAllocaSummary);
+  MetaObj["node_count"] = static_cast<int64_t>(NodeCount);
+  MetaObj["rep_count"] = static_cast<int64_t>(RepCount);
+
+  VSnapshotData Data;
+  Data.labelV = LabelV;
+  Data.flags = 0;
+  Data.metadataJson = formatv("{0}", json::Value(std::move(MetaObj))).str();
+  Data.nodeToRep = std::move(NodeToRepDense);
+  Data.repToNode = std::move(RepToNode);
+  Data.namedEntries = std::move(NamedEntries);
+
+  std::string ErrMsg;
+  uint64_t EdgeCount = 0;
+  auto RowProvider = [&](uint32_t Rep, std::vector<uint32_t> &RowOut) {
+    std::unordered_set<uint32_t> Dsts;
+    for (uint32_t Member : MembersByRep[Rep]) {
+      assert(Member < Graph.size() && "member node out of CFL graph range");
+      const auto &VSet = Graph[Member][LabelV];
+      Dsts.reserve(Dsts.size() + VSet.size());
+      for (NodeIndex D : VSet) {
+        if (D >= NodeCount)
+          continue;
+        Dsts.insert(Data.nodeToRep[D]);
+      }
+    }
+    RowOut.assign(Dsts.begin(), Dsts.end());
+    EdgeCount += RowOut.size();
+  };
+
+  if (!saveVSnapshotWithRowProvider(Path, Data, RowProvider, &ErrMsg)) {
+    WARNING("VSnapshot: failed to export " << Path << ": " << ErrMsg << "\n");
+    return;
+  }
+  CG_LOG("Exported V snapshot to " << Path
+         << ": nodes=" << Data.nodeToRep.size()
+         << ", reps=" << Data.repToNode.size()
+         << ", V-edges=" << EdgeCount
+         << ", names=" << Data.namedEntries.size() << "\n");
 }
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {

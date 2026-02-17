@@ -144,6 +144,7 @@ public:
 
   // export
   void dumpCallGraphJSON(llvm::StringRef Path);
+  void dumpVSnapshot(llvm::StringRef Path);
 };
 
 #endif

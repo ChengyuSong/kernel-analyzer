@@ -2,6 +2,13 @@
 
 This is a static kernel analyzer forked from [KINT](https://github.com/CRYPTOlab/kint).
 
+## Documentation
+
+- CFL-reachability architecture, optimizations, and VSnapshot serialization:
+  `docs/cfl-reachability-vsnapshot.md`
+- Known call graph limitations:
+  `docs/call-graph-limitations.md`
+
 ### Referece
 
 If you like our code, please kindly acknowledge the usage of our tool by citing the following paper:

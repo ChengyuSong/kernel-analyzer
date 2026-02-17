@@ -6,6 +6,8 @@
 #include <llvm/IR/GlobalIFunc.h>
 
 #include <memory>
+#include <cstdint>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -68,6 +70,21 @@ private:
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(const cfl_result_t &outputCFLGraph);
+  void beginLocalRepMode();
+  void persistLocalRepClasses();
+  void endLocalRepMode();
+  void collectLocalMustMerges(const llvm::Function *F);
+  void collectLocalAllocaSummaries(const llvm::Function *F);
+  bool isSummarizableAlloca(const llvm::AllocaInst *AI) const;
+  bool resolveSummarizedAllocaSlot(const llvm::Value *Ptr, NodeIndex &slotRep);
+  void emitLocalAllocaSummaryEdges();
+  NodeIndex getRepNode(NodeIndex n);
+  NodeIndex getRepNodeForValue(const llvm::Value *V);
+  NodeIndex getCanonicalNode(NodeIndex n) const;
+  void collectCanonicalMembers(NodeIndex n, std::vector<NodeIndex> &out) const;
+  bool mergeRepNodes(NodeIndex a, NodeIndex b);
+  NodeIndex getRepDerefNode(NodeIndex ptrNode);
+  void addAssignmentEdge(NodeIndex src, NodeIndex dst);
 
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
@@ -76,6 +93,15 @@ private:
   std::unique_ptr<gracfl::SolverFWGramParallel> cflSolver;
   size_t cflSolvedInputEdgeCount;
   bool cflForceRebuild;
+  bool localRepMode;
+  std::unordered_map<NodeIndex, NodeIndex> localRepParent;
+  std::unordered_map<NodeIndex, uint8_t> localRepRank;
+  std::unordered_map<NodeIndex, NodeIndex> localRepDerefNode;
+  std::unordered_map<NodeIndex, NodeIndex> canonicalNodeMap;
+  std::unordered_map<NodeIndex, std::unordered_set<NodeIndex>> canonicalClassMembers;
+  std::unordered_set<NodeIndex> localSummarizedAllocaSlots;
+  std::unordered_map<NodeIndex, std::vector<NodeIndex>> localAllocaStoreVals;
+  std::unordered_map<NodeIndex, std::vector<NodeIndex>> localAllocaLoadVals;
 
   unsigned iteration;
 

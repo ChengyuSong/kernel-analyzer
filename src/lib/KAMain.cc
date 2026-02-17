@@ -46,6 +46,16 @@ cl::list<std::string> InputFilenames(
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
 
+cl::opt<bool> CFLLocalRepMerge(
+  "cfl-local-rep-merge",
+  cl::desc("Enable must-like local representative merges in CFL edge construction"),
+  cl::init(true));
+
+cl::opt<bool> CFLLocalAllocaSummary(
+  "cfl-local-alloca-summary",
+  cl::desc("Enable non-escaping local alloca store/load summarization in CFL edge construction"),
+  cl::init(true));
+
 cl::opt<std::string> DumpBidMapping(
   "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum"), cl::init(""));
 

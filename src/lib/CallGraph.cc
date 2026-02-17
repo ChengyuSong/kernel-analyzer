@@ -30,6 +30,8 @@
 #include <fstream>
 #include <set>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "CallGraph.h"
 #include "Annotation.h"
@@ -41,6 +43,72 @@
 #define CG_DEBUG(stmt) KA_LOG(3, "CallGraph: " << stmt)
 
 using namespace llvm;
+
+namespace {
+struct EdgeKey {
+  uint from;
+  uint to;
+  uint label;
+
+  bool operator==(const EdgeKey &Other) const {
+    return from == Other.from && to == Other.to && label == Other.label;
+  }
+};
+
+struct EdgeKeyHash {
+  size_t operator()(const EdgeKey &K) const {
+    size_t H = static_cast<size_t>(K.from);
+    H ^= static_cast<size_t>(K.to) + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
+    H ^= static_cast<size_t>(K.label) + 0x9e3779b97f4a7c15ULL + (H << 6) + (H >> 2);
+    return H;
+  }
+};
+
+static bool isZeroOffsetGEP(const Value *V) {
+  const auto *GEP = dyn_cast<GEPOperator>(V);
+  if (!GEP)
+    return false;
+  for (const Use &IdxU : GEP->indices()) {
+    const Value *Idx = IdxU.get();
+    const auto *CI = dyn_cast<ConstantInt>(Idx);
+    if (!CI || !CI->isZero())
+      return false;
+  }
+  return true;
+}
+
+static const Value *stripAllocaAliasBase(const Value *V) {
+  const Value *Cur = V;
+  while (Cur) {
+    const Value *Stripped = Cur->stripPointerCasts();
+    if (Stripped != Cur) {
+      Cur = Stripped;
+      continue;
+    }
+    const auto *GEP = dyn_cast<GEPOperator>(Cur);
+    if (!GEP || !isZeroOffsetGEP(GEP))
+      break;
+    Cur = GEP->getPointerOperand();
+  }
+  return Cur;
+}
+
+static bool isIgnorableAllocaIntrinsic(const CallBase *CB) {
+  const Function *CF = CB ? CB->getCalledFunction() : nullptr;
+  if (!CF || !CF->isIntrinsic())
+    return false;
+  switch (CF->getIntrinsicID()) {
+    case Intrinsic::dbg_declare:
+    case Intrinsic::dbg_value:
+    case Intrinsic::dbg_assign:
+    case Intrinsic::lifetime_start:
+    case Intrinsic::lifetime_end:
+      return true;
+    default:
+      return false;
+  }
+}
+} // namespace
 
 // Helper to check if we should skip creating edges for a value
 static bool shouldSkipValue(const Value *V) {
@@ -149,6 +217,7 @@ CallGraphPass::CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_)
       cflThreads(detectPhysicalCoreCount()),
       cflSolvedInputEdgeCount(0),
       cflForceRebuild(true),
+      localRepMode(false),
       iteration(0) {}
 
 Function* CallGraphPass::getFuncDef(Function *F) {
@@ -362,32 +431,22 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   Value *dst = CS->getArgOperand(0);
   Value *src = CS->getArgOperand(1);
   CG_LOG("Memcpy: " << *dst << " = " << *src << "\n");
-  NodeIndex dstNode = NF.getValueNodeFor(dst);
+  NodeIndex dstNode = getRepNodeForValue(dst);
   assert(dstNode != AndersNodeFactory::InvalidIndex && "Memcpy dst node not found!");
   // if (dstNode == AndersNodeFactory::InvalidIndex) {
   //   dstNode = NF.createValueNode(dst);
   //   CG_DEBUG("Create value node " << dstNode << " for memcpy dst " << *dst << "\n");
   // }
-  NodeIndex srcNode = NF.getValueNodeFor(src);
+  NodeIndex srcNode = getRepNodeForValue(src);
   assert(srcNode != AndersNodeFactory::InvalidIndex && "Memcpy src node not found!");
   // if (srcNode == AndersNodeFactory::InvalidIndex) {
   //   srcNode = NF.createValueNode(src);
   //   CG_DEBUG("Create value node " << srcNode << " for memcpy src " << *src << "\n");
   // }
   // field-insensitive: *dst = *src
-  NodeIndex derefDst = NF.getDereferenceNodeFor(dstNode);
-  if (derefDst == AndersNodeFactory::InvalidIndex) {
-    derefDst = NF.createDereferenceNode(dstNode);
-    CG_DEBUG("Create deref node " << derefDst << " for " << *dst << "\n");
-    EB.addDereferenceEdges(dstNode, derefDst);
-  }
-  NodeIndex derefSrc = NF.getDereferenceNodeFor(srcNode);
-  if (derefSrc == AndersNodeFactory::InvalidIndex) {
-    derefSrc = NF.createDereferenceNode(srcNode);
-    CG_DEBUG("Create deref node " << derefSrc << " for " << *src << "\n");
-    EB.addDereferenceEdges(srcNode, derefSrc);
-  }
-  EB.addAssignmentEdges(derefSrc, derefDst);
+  NodeIndex derefDst = getRepDerefNode(dstNode);
+  NodeIndex derefSrc = getRepDerefNode(srcNode);
+  addAssignmentEdge(derefSrc, derefDst);
 
   return false;
 }
@@ -417,7 +476,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   // handle args
   unsigned numArgs = CS->arg_size();
   if (CF->isVarArg()) {
-    NodeIndex formalNode = NF.getVarargNodeFor(CF);
+    NodeIndex formalNode = getCanonicalNode(NF.getVarargNodeFor(CF));
     assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
     for (unsigned i = 0; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
@@ -427,12 +486,12 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
         CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
         continue;
       }
-      NodeIndex argNode = NF.getValueNodeFor(arg);
+      NodeIndex argNode = getRepNodeForValue(arg);
       if (argNode == AndersNodeFactory::InvalidIndex) {
         WARNING("VarArg: actual (" << i << ") " << *arg << " node not found!\n");
         continue;
       }
-      EB.addAssignmentEdges(argNode, formalNode);
+      addAssignmentEdge(argNode, formalNode);
     }
   } else {
     // Only match up to the number of formal parameters; extra actual
@@ -447,28 +506,29 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
         CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
         continue;
       }
-      NodeIndex argNode = NF.getValueNodeFor(arg);
+      NodeIndex argNode = getRepNodeForValue(arg);
       // assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
       if (argNode == AndersNodeFactory::InvalidIndex) {
         argNode = NF.createValueNode(arg);
+        argNode = getRepNode(getCanonicalNode(argNode));
         CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
       }
       Value *farg = CF->getArg(i);
-      NodeIndex formalNode = NF.getValueNodeFor(farg);
+      NodeIndex formalNode = getRepNodeForValue(farg);
       assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
-      EB.addAssignmentEdges(argNode, formalNode);
+      addAssignmentEdge(argNode, formalNode);
     }
   }
 
   // handle return
   if (CF->getReturnType()->isPointerTy()) {
-    NodeIndex retNode = NF.getReturnNodeFor(CF);
+    NodeIndex retNode = getCanonicalNode(NF.getReturnNodeFor(CF));
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
     // The callsite may not have a value node if it discards the return value
     // (e.g., void-typed callsite matched via permissive isCompatible)
-    NodeIndex callNode = NF.getValueNodeFor(CS);
+    NodeIndex callNode = getRepNodeForValue(CS);
     if (callNode != AndersNodeFactory::InvalidIndex)
-      EB.addAssignmentEdges(retNode, callNode);
+      addAssignmentEdge(retNode, callNode);
   }
 
   return false;
@@ -489,21 +549,16 @@ bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) 
   Value *containerArg = CS->getArgOperand(containerIdx);
   if (!containerArg->getType()->isPointerTy())
     return false;
-  NodeIndex containerNode = NF.getValueNodeFor(containerArg);
+  NodeIndex containerNode = getRepNodeForValue(containerArg);
   if (containerNode == AndersNodeFactory::InvalidIndex) {
     containerNode = NF.createValueNode(containerArg);
+    containerNode = getRepNode(getCanonicalNode(containerNode));
     CG_DEBUG("Create value node " << containerNode
              << " for container arg " << *containerArg << "\n");
   }
 
   // Get or create dereference node for the container (represents "*container")
-  NodeIndex derefNode = NF.getDereferenceNodeFor(containerNode);
-  if (derefNode == AndersNodeFactory::InvalidIndex) {
-    derefNode = NF.createDereferenceNode(containerNode);
-    CG_DEBUG("Create deref node " << derefNode
-             << " for container " << *containerArg << "\n");
-    EB.addDereferenceEdges(containerNode, derefNode);
-  }
+  NodeIndex derefNode = getRepDerefNode(containerNode);
 
   // Handle store args: val -> *container (assignment edges)
   for (int storeIdx : Info.storeArgs) {
@@ -514,21 +569,22 @@ bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) 
       continue;
     if (shouldSkipValue(val))
       continue;
-    NodeIndex valNode = NF.getValueNodeFor(val);
+    NodeIndex valNode = getRepNodeForValue(val);
     if (valNode == AndersNodeFactory::InvalidIndex) {
       valNode = NF.createValueNode(val);
+      valNode = getRepNode(getCanonicalNode(valNode));
       CG_DEBUG("Create value node " << valNode
                << " for store arg " << *val << "\n");
     }
-    EB.addAssignmentEdges(valNode, derefNode);
+    addAssignmentEdge(valNode, derefNode);
     CG_DEBUG("ContainerStore: " << valNode << " -> " << derefNode << "\n");
   }
 
   // Handle load return: *container -> callsite result
   if (Info.loadReturn && CF->getReturnType()->isPointerTy()) {
-    NodeIndex callNode = NF.getValueNodeFor(CS);
+    NodeIndex callNode = getRepNodeForValue(CS);
     if (callNode != AndersNodeFactory::InvalidIndex) {
-      EB.addAssignmentEdges(derefNode, callNode);
+      addAssignmentEdge(derefNode, callNode);
       CG_DEBUG("ContainerLoad: " << derefNode << " -> " << callNode << "\n");
     }
   }
@@ -543,16 +599,16 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   unsigned numArgs = CS->arg_size();
   unsigned numFormals = CF->arg_size();
   if (CF->isVarArg()) {
-    NodeIndex formalNode = NF.getVarargNodeFor(CF);
+    NodeIndex formalNode = getCanonicalNode(NF.getVarargNodeFor(CF));
     assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
     for (unsigned i = 0; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
-      NodeIndex argNode = NF.getValueNodeFor(arg);
+      NodeIndex argNode = getRepNodeForValue(arg);
       if (argNode == AndersNodeFactory::InvalidIndex) {
         WARNING("VarArg: actual (" << i << ") " << *arg << " node not found!\n");
         continue;
       }
-      EB.removeAssignmentEdges(argNode, formalNode);
+      EB.removeAssignmentEdges(getCanonicalNode(argNode), getCanonicalNode(formalNode));
     }
   } else {
     // Only iterate over the minimum of actual and formal args
@@ -561,25 +617,453 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
       Value *arg = CS->getArgOperand(i);
       if (!arg->getType()->isPointerTy())
         continue; // skip non-pointer args
-      NodeIndex argNode = NF.getValueNodeFor(arg);
+      NodeIndex argNode = getRepNodeForValue(arg);
       assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
       Value *farg = CF->getArg(i);
-      NodeIndex formalNode = NF.getValueNodeFor(farg);
+      NodeIndex formalNode = getRepNodeForValue(farg);
       assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
-      EB.removeAssignmentEdges(argNode, formalNode);
+      EB.removeAssignmentEdges(getCanonicalNode(argNode), getCanonicalNode(formalNode));
     }
   }
 
   // handle return
   if (CF->getReturnType()->isPointerTy()) {
-    NodeIndex retNode = NF.getReturnNodeFor(CF);
+    NodeIndex retNode = getCanonicalNode(NF.getReturnNodeFor(CF));
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
-    NodeIndex callNode = NF.getValueNodeFor(CS);
+    NodeIndex callNode = getRepNodeForValue(CS);
     if (callNode != AndersNodeFactory::InvalidIndex)
-      EB.removeAssignmentEdges(retNode, callNode);
+      EB.removeAssignmentEdges(getCanonicalNode(retNode), getCanonicalNode(callNode));
   }
 
   return false;
+}
+
+void CallGraphPass::beginLocalRepMode() {
+  localRepMode = true;
+  localRepParent.clear();
+  localRepRank.clear();
+  localRepDerefNode.clear();
+  localSummarizedAllocaSlots.clear();
+  localAllocaStoreVals.clear();
+  localAllocaLoadVals.clear();
+}
+
+NodeIndex CallGraphPass::getCanonicalNode(NodeIndex n) const {
+  if (n == AndersNodeFactory::InvalidIndex)
+    return n;
+
+  auto it = canonicalNodeMap.find(n);
+  if (it == canonicalNodeMap.end())
+    return n;
+
+  NodeIndex root = it->second;
+  while (root != AndersNodeFactory::InvalidIndex) {
+    auto next = canonicalNodeMap.find(root);
+    if (next == canonicalNodeMap.end() || next->second == root)
+      break;
+    root = next->second;
+  }
+  return root;
+}
+
+void CallGraphPass::collectCanonicalMembers(NodeIndex n, std::vector<NodeIndex> &out) const {
+  out.clear();
+  if (n == AndersNodeFactory::InvalidIndex)
+    return;
+
+  NodeIndex root = getCanonicalNode(n);
+  auto it = canonicalClassMembers.find(root);
+  if (it == canonicalClassMembers.end() || it->second.empty()) {
+    out.push_back(root);
+    return;
+  }
+
+  out.reserve(it->second.size());
+  for (NodeIndex member : it->second)
+    out.push_back(member);
+}
+
+void CallGraphPass::persistLocalRepClasses() {
+  if (!localRepMode || localRepParent.empty())
+    return;
+
+  std::unordered_map<NodeIndex, std::unordered_set<NodeIndex>> localClasses;
+  localClasses.reserve(localRepParent.size());
+  for (const auto &kv : localRepParent) {
+    NodeIndex node = kv.first;
+    NodeIndex root = getRepNode(node);
+    if (root == AndersNodeFactory::InvalidIndex)
+      continue;
+    localClasses[root].insert(node);
+  }
+
+  for (auto &kv : localClasses) {
+    NodeIndex localRoot = kv.first;
+    auto &members = kv.second;
+    members.insert(localRoot);
+    if (members.size() <= 1)
+      continue; // no canonical remap needed for singleton classes
+
+    NodeIndex canonicalRoot = getCanonicalNode(localRoot);
+    if (canonicalRoot == localRoot) {
+      for (NodeIndex m : members) {
+        auto it = canonicalNodeMap.find(m);
+        if (it != canonicalNodeMap.end()) {
+          canonicalRoot = getCanonicalNode(m);
+          break;
+        }
+      }
+    }
+
+    auto &rootMembers = canonicalClassMembers[canonicalRoot];
+    rootMembers.insert(canonicalRoot);
+
+    for (NodeIndex m : members) {
+      auto it = canonicalNodeMap.find(m);
+      if (it != canonicalNodeMap.end()) {
+        NodeIndex oldRoot = getCanonicalNode(m);
+        if (oldRoot != canonicalRoot) {
+          auto oldMembersIt = canonicalClassMembers.find(oldRoot);
+          if (oldMembersIt != canonicalClassMembers.end()) {
+            rootMembers.insert(oldMembersIt->second.begin(), oldMembersIt->second.end());
+            canonicalClassMembers.erase(oldMembersIt);
+          } else {
+            rootMembers.insert(oldRoot);
+          }
+          canonicalNodeMap[oldRoot] = canonicalRoot;
+        }
+      }
+      canonicalNodeMap[m] = canonicalRoot;
+      rootMembers.insert(m);
+    }
+    canonicalNodeMap[canonicalRoot] = canonicalRoot;
+  }
+}
+
+void CallGraphPass::endLocalRepMode() {
+  persistLocalRepClasses();
+  localRepMode = false;
+  localRepParent.clear();
+  localRepRank.clear();
+  localRepDerefNode.clear();
+  localSummarizedAllocaSlots.clear();
+  localAllocaStoreVals.clear();
+  localAllocaLoadVals.clear();
+}
+
+NodeIndex CallGraphPass::getRepNode(NodeIndex n) {
+  if (!localRepMode || n == AndersNodeFactory::InvalidIndex)
+    return n;
+
+  auto it = localRepParent.find(n);
+  if (it == localRepParent.end()) {
+    localRepParent.emplace(n, n);
+    localRepRank.emplace(n, 0);
+    return n;
+  }
+
+  NodeIndex root = n;
+  while (localRepParent[root] != root)
+    root = localRepParent[root];
+
+  NodeIndex cur = n;
+  while (localRepParent[cur] != cur) {
+    NodeIndex parent = localRepParent[cur];
+    localRepParent[cur] = root;
+    cur = parent;
+  }
+
+  return root;
+}
+
+NodeIndex CallGraphPass::getRepNodeForValue(const Value *V) {
+  if (!V)
+    return AndersNodeFactory::InvalidIndex;
+  NodeIndex n = NF.getValueNodeFor(V);
+  if (n == AndersNodeFactory::InvalidIndex)
+    return n;
+  return getRepNode(getCanonicalNode(n));
+}
+
+bool CallGraphPass::mergeRepNodes(NodeIndex a, NodeIndex b) {
+  if (!localRepMode ||
+      a == AndersNodeFactory::InvalidIndex ||
+      b == AndersNodeFactory::InvalidIndex)
+    return false;
+
+  NodeIndex ra = getRepNode(a);
+  NodeIndex rb = getRepNode(b);
+  if (ra == rb)
+    return false;
+
+  auto rankA = localRepRank[ra];
+  auto rankB = localRepRank[rb];
+  if (rankA < rankB)
+    std::swap(ra, rb);
+
+  localRepParent[rb] = ra;
+  if (rankA == rankB)
+    localRepRank[ra]++;
+
+  auto itA = localRepDerefNode.find(ra);
+  auto itB = localRepDerefNode.find(rb);
+  if (itA == localRepDerefNode.end() && itB != localRepDerefNode.end()) {
+    localRepDerefNode[ra] = itB->second;
+  }
+  if (itB != localRepDerefNode.end())
+    localRepDerefNode.erase(itB);
+
+  return true;
+}
+
+NodeIndex CallGraphPass::getRepDerefNode(NodeIndex ptrNode) {
+  if (ptrNode == AndersNodeFactory::InvalidIndex)
+    return AndersNodeFactory::InvalidIndex;
+
+  NodeIndex repPtr = getRepNode(ptrNode);
+  if (localRepMode) {
+    auto it = localRepDerefNode.find(repPtr);
+    if (it != localRepDerefNode.end())
+      return it->second;
+  }
+
+  NodeIndex derefNode = NF.getDereferenceNodeFor(repPtr);
+  if (derefNode == AndersNodeFactory::InvalidIndex) {
+    derefNode = NF.createDereferenceNode(repPtr);
+    CG_DEBUG("Create deref node " << derefNode << " for rep node " << repPtr << "\n");
+    EB.addDereferenceEdges(repPtr, derefNode);
+  }
+
+  if (localRepMode)
+    localRepDerefNode[repPtr] = derefNode;
+  return derefNode;
+}
+
+void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex)
+    return;
+  EB.addAssignmentEdges(getRepNode(src), getRepNode(dst));
+}
+
+void CallGraphPass::collectLocalMustMerges(const Function *F) {
+  if (!localRepMode || !F)
+    return;
+
+  bool changed = false;
+  do {
+    changed = false;
+    for (const Instruction &I : instructions(F)) {
+      if (const auto *BC = dyn_cast<BitCastInst>(&I)) {
+        if (!BC->getType()->isPointerTy())
+          continue;
+        Value *src = BC->getOperand(0);
+        if (!src->getType()->isPointerTy())
+          continue;
+        changed |= mergeRepNodes(getRepNodeForValue(src), getRepNodeForValue(BC));
+        continue;
+      }
+
+      if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        if (!GEP->getType()->isPointerTy() || !isZeroOffsetGEP(GEP))
+          continue;
+        const Value *base = GEP->getPointerOperand();
+        changed |= mergeRepNodes(getRepNodeForValue(base), getRepNodeForValue(GEP));
+        continue;
+      }
+
+      if (const auto *PHI = dyn_cast<PHINode>(&I)) {
+        if (!PHI->getType()->isPointerTy())
+          continue;
+        NodeIndex dst = getRepNodeForValue(PHI);
+        if (dst == AndersNodeFactory::InvalidIndex)
+          continue;
+
+        NodeIndex classRep = AndersNodeFactory::InvalidIndex;
+        bool allSame = true;
+        for (unsigned i = 0, e = PHI->getNumIncomingValues(); i != e; i++) {
+          Value *src = PHI->getIncomingValue(i);
+          if (shouldSkipValue(src)) {
+            allSame = false;
+            break;
+          }
+          NodeIndex srcRep = getRepNodeForValue(src);
+          if (srcRep == AndersNodeFactory::InvalidIndex) {
+            allSame = false;
+            break;
+          }
+          if (classRep == AndersNodeFactory::InvalidIndex)
+            classRep = srcRep;
+          else if (classRep != srcRep) {
+            allSame = false;
+            break;
+          }
+        }
+        if (allSame && classRep != AndersNodeFactory::InvalidIndex)
+          changed |= mergeRepNodes(dst, classRep);
+        continue;
+      }
+
+      if (const auto *Sel = dyn_cast<SelectInst>(&I)) {
+        if (!Sel->getType()->isPointerTy())
+          continue;
+        const Value *tVal = Sel->getTrueValue();
+        const Value *fVal = Sel->getFalseValue();
+        if (shouldSkipValue(tVal) || shouldSkipValue(fVal))
+          continue;
+        NodeIndex tRep = getRepNodeForValue(tVal);
+        NodeIndex fRep = getRepNodeForValue(fVal);
+        NodeIndex dst = getRepNodeForValue(Sel);
+        if (tRep != AndersNodeFactory::InvalidIndex &&
+            tRep == fRep &&
+            dst != AndersNodeFactory::InvalidIndex)
+          changed |= mergeRepNodes(dst, tRep);
+      }
+    }
+  } while (changed);
+}
+
+bool CallGraphPass::isSummarizableAlloca(const AllocaInst *AI) const {
+  if (!AI || !AI->getAllocatedType()->isPointerTy())
+    return false;
+
+  std::vector<const Value *> worklist;
+  std::unordered_set<const Value *> seen;
+  worklist.push_back(AI);
+  seen.insert(AI);
+
+  while (!worklist.empty()) {
+    const Value *cur = worklist.back();
+    worklist.pop_back();
+
+    for (const User *U : cur->users()) {
+      const Instruction *I = dyn_cast<Instruction>(U);
+      if (I && I->getFunction() != AI->getFunction())
+        return false;
+
+      if (const auto *BC = dyn_cast<BitCastInst>(U)) {
+        if (BC->getOperand(0) != cur)
+          return false;
+        if (seen.insert(BC).second)
+          worklist.push_back(BC);
+        continue;
+      }
+
+      if (const auto *ASC = dyn_cast<AddrSpaceCastInst>(U)) {
+        if (ASC->getOperand(0) != cur)
+          return false;
+        if (seen.insert(ASC).second)
+          worklist.push_back(ASC);
+        continue;
+      }
+
+      if (const auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        if (GEP->getPointerOperand() != cur || !isZeroOffsetGEP(GEP))
+          return false;
+        if (seen.insert(GEP).second)
+          worklist.push_back(GEP);
+        continue;
+      }
+
+      if (const auto *LI = dyn_cast<LoadInst>(U)) {
+        if (LI->getPointerOperand() != cur)
+          return false;
+        if (LI->isVolatile() || !LI->getType()->isPointerTy())
+          return false;
+        continue;
+      }
+
+      if (const auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getPointerOperand() == cur) {
+          if (SI->isVolatile())
+            return false;
+          const Value *stored = SI->getValueOperand();
+          if (!stored->getType()->isPointerTy() && !shouldSkipValue(stored))
+            return false;
+          continue;
+        }
+        if (SI->getValueOperand() == cur)
+          return false; // alloca address escapes
+        return false;
+      }
+
+      if (const auto *CB = dyn_cast<CallBase>(U)) {
+        if (isIgnorableAllocaIntrinsic(CB))
+          continue;
+        return false;
+      }
+
+      // Any other use is conservatively treated as escape/unmodeled behavior.
+      return false;
+    }
+  }
+
+  return true;
+}
+
+void CallGraphPass::collectLocalAllocaSummaries(const Function *F) {
+  localSummarizedAllocaSlots.clear();
+  localAllocaStoreVals.clear();
+  localAllocaLoadVals.clear();
+
+  if (!F)
+    return;
+
+  for (const Instruction &I : instructions(F)) {
+    const auto *AI = dyn_cast<AllocaInst>(&I);
+    if (!AI || !isSummarizableAlloca(AI))
+      continue;
+    NodeIndex slotRep = getRepNodeForValue(AI);
+    if (slotRep == AndersNodeFactory::InvalidIndex)
+      continue;
+    localSummarizedAllocaSlots.insert(slotRep);
+  }
+
+  if (!localSummarizedAllocaSlots.empty()) {
+    CG_DEBUG("Local alloca summaries in " << F->getName() << ": "
+             << localSummarizedAllocaSlots.size() << "\n");
+  }
+}
+
+bool CallGraphPass::resolveSummarizedAllocaSlot(const Value *Ptr, NodeIndex &slotRep) {
+  slotRep = AndersNodeFactory::InvalidIndex;
+  if (!localRepMode || !Ptr)
+    return false;
+
+  const Value *base = stripAllocaAliasBase(Ptr);
+  if (!isa<AllocaInst>(base))
+    return false;
+
+  NodeIndex node = getRepNodeForValue(base);
+  if (node == AndersNodeFactory::InvalidIndex)
+    return false;
+
+  if (!localSummarizedAllocaSlots.count(node))
+    return false;
+
+  slotRep = node;
+  return true;
+}
+
+void CallGraphPass::emitLocalAllocaSummaryEdges() {
+  for (NodeIndex slot : localSummarizedAllocaSlots) {
+    auto storesIt = localAllocaStoreVals.find(slot);
+    auto loadsIt = localAllocaLoadVals.find(slot);
+    if (storesIt == localAllocaStoreVals.end() || loadsIt == localAllocaLoadVals.end())
+      continue;
+
+    const auto &stores = storesIt->second;
+    const auto &loads = loadsIt->second;
+    if (stores.empty() || loads.empty())
+      continue;
+
+    std::unordered_set<NodeIndex> uniqueStores(stores.begin(), stores.end());
+    std::unordered_set<NodeIndex> uniqueLoads(loads.begin(), loads.end());
+
+    for (NodeIndex s : uniqueStores) {
+      for (NodeIndex l : uniqueLoads)
+        addAssignmentEdge(s, l);
+    }
+  }
 }
 
 bool CallGraphPass::runOnFunction(Function *F) {
@@ -602,9 +1086,25 @@ bool CallGraphPass::runOnFunction(Function *F) {
     }
   }
 
-  // Use InstVisitor to handle instructions
+  const bool enableLocalRep = CFLLocalRepMerge;
+  const bool enableLocalAllocaSummary = CFLLocalAllocaSummary;
+  const bool enableLocalCompression = enableLocalRep || enableLocalAllocaSummary;
+  if (enableLocalCompression) {
+    beginLocalRepMode();
+    if (enableLocalRep)
+      collectLocalMustMerges(F);
+    if (enableLocalAllocaSummary)
+      collectLocalAllocaSummaries(F);
+  }
+
+  // Use InstVisitor to handle instructions.
   InstHandler visitor(*this, F);
   visitor.visit(F);
+  if (enableLocalCompression) {
+    if (enableLocalAllocaSummary)
+      emitLocalAllocaSummaryEdges();
+    endLocalRepMode();
+  }
 
   return false;
 }
@@ -624,11 +1124,11 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
       return;
     }
 
-    NodeIndex rvNode = CGP.NF.getValueNodeFor(rv);
+    NodeIndex rvNode = CGP.getRepNodeForValue(rv);
     assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
     NodeIndex RT = CGP.NF.getReturnNodeFor(F);
     assert(RT != AndersNodeFactory::InvalidIndex && "Return node not found!");
-    CGP.EB.addAssignmentEdges(rvNode, RT);
+    CGP.addAssignmentEdge(rvNode, RT);
   }
 }
 
@@ -636,7 +1136,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
   if (CS.isInlineAsm()) return; // FIXME handle inline assembly
   if (CGP.Ctx->AllocSites.count(&CS)) {
     // record allocation sites and create heap object node
-    NodeIndex valNode = CGP.NF.getValueNodeFor(&CS);
+    NodeIndex valNode = CGP.getRepNodeForValue(&CS);
     CGP.AllocSites.insert(valNode);
     NodeIndex heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
     CGP.EB.addDereferenceEdges(valNode, heapObj);
@@ -708,12 +1208,14 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
 }
 
 void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
+  NodeIndex slotRep;
+  if (CGP.resolveSummarizedAllocaSlot(&I, slotRep))
+    return;
+
   // create a deref node for base ptr of alloca
-  NodeIndex ptrNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex ptrNode = CGP.getRepNodeForValue(&I);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
-  NodeIndex derefNode = CGP.NF.createDereferenceNode(ptrNode);
-  CG_DEBUG("Create deref node " << derefNode << " for " << I << "\n");
-  CGP.EB.addDereferenceEdges(ptrNode, derefNode);
+  (void)CGP.getRepDerefNode(ptrNode);
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
@@ -721,21 +1223,21 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
     // XXX only consider pointer type
     return;
   }
-  NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex valNode = CGP.getRepNodeForValue(&I);
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find load value node");
 
   Value *ptr = I.getOperand(0);
-  NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+  NodeIndex slotRep;
+  if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
+    CGP.localAllocaLoadVals[slotRep].push_back(valNode);
+    return;
+  }
+  NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find load ptr node");
 
-  NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptrNode);
-  if (derefNode == AndersNodeFactory::InvalidIndex) {
-    derefNode = CGP.NF.createDereferenceNode(ptrNode);
-    CG_DEBUG("Create deref node " << derefNode << " for " << *ptr << "\n");
-    CGP.EB.addDereferenceEdges(ptrNode, derefNode);
-  }
+  NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
-  CGP.EB.addAssignmentEdges(derefNode, valNode);
+  CGP.addAssignmentEdge(derefNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
@@ -761,25 +1263,26 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     }
   }
 
-  NodeIndex valNode = CGP.NF.getValueNodeFor(val);
+  NodeIndex valNode = CGP.getRepNodeForValue(val);
   // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
   if (valNode == AndersNodeFactory::InvalidIndex) {
     valNode = CGP.NF.createValueNode(val);
+    valNode = CGP.getRepNode(valNode);
     CG_DEBUG("Create value node " << valNode << " for store " << *val << "\n");
   }
 
   Value *ptr = I.getOperand(1);
-  NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+  NodeIndex slotRep;
+  if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
+    CGP.localAllocaStoreVals[slotRep].push_back(valNode);
+    return;
+  }
+  NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find store ptr node");
 
-  NodeIndex derefNode = CGP.NF.getDereferenceNodeFor(ptrNode);
-  if (derefNode == AndersNodeFactory::InvalidIndex) {
-    derefNode = CGP.NF.createDereferenceNode(ptrNode);
-    CG_DEBUG("Create deref node " << derefNode << " for " << *ptr << "\n");
-    CGP.EB.addDereferenceEdges(ptrNode, derefNode);
-  }
+  NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
-  CGP.EB.addAssignmentEdges(valNode, derefNode);
+  CGP.addAssignmentEdge(valNode, derefNode);
 
   // Record struct field store for field-aware indirect call filtering.
   // Strip pointer casts (bitcasts) to see through patterns like:
@@ -796,27 +1299,34 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
 
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   Value *ptr = GEP.getPointerOperand();
-  NodeIndex ptrNode = CGP.NF.getValueNodeFor(ptr);
+  NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP ptr node");
-  NodeIndex valNode = CGP.NF.getValueNodeFor(&GEP);
+  NodeIndex valNode = CGP.getRepNodeForValue(&GEP);
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
 
-  CGP.EB.addAssignmentEdges(ptrNode, valNode);
+  if (isZeroOffsetGEP(&GEP)) {
+    CGP.mergeRepNodes(ptrNode, valNode);
+    return;
+  }
+  CGP.addAssignmentEdge(ptrNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
-  NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
+  NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
     srcNode = CGP.NF.createValueNode(I.getOperand(0));
+    srcNode = CGP.getRepNode(srcNode);
     CG_DEBUG("Create value node " << srcNode << " for bitcast src " << *(I.getOperand(0)) << "\n");
   }
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   // assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
   if (dstNode == AndersNodeFactory::InvalidIndex) {
     dstNode = CGP.NF.createValueNode(&I);
+    dstNode = CGP.getRepNode(dstNode);
     WARNING("Create value node " << dstNode << " for bitcast dst " << I << "\n");
   }
-  CGP.EB.addAssignmentEdges(srcNode, dstNode);
+  if (!CGP.mergeRepNodes(srcNode, dstNode))
+    CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
@@ -824,7 +1334,7 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
     // XXX only consider pointer type
     return;
   }
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&PHI);
+  NodeIndex dstNode = CGP.getRepNodeForValue(&PHI);
   assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find phi dst node");
   for (unsigned i = 0, e = PHI.getNumIncomingValues(); i != e; ++i) {
     Value *src = PHI.getIncomingValue(i);
@@ -835,13 +1345,13 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
       continue;
     }
 
-    NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
+    NodeIndex srcNode = CGP.getRepNodeForValue(src);
     assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
     // if (srcNode == AndersNodeFactory::InvalidIndex) {
     //   srcNode = CGP.NF.createValueNode(src);
     //   CG_DEBUG("Create value node " << srcNode << " for PHI src " << *src << "\n");
     // }
-    CGP.EB.addAssignmentEdges(srcNode, dstNode);
+    CGP.addAssignmentEdge(srcNode, dstNode);
   }
 }
 
@@ -850,7 +1360,7 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
     // XXX only consider pointer type
     return;
   }
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find select dst node");
   // NodeIndex dstNode = CGP.NF.createValueNode(&I);
   for (unsigned i = 1; i < I.getNumOperands(); i++) {
@@ -862,13 +1372,13 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
       continue;
     }
 
-    NodeIndex srcNode = CGP.NF.getValueNodeFor(src);
+    NodeIndex srcNode = CGP.getRepNodeForValue(src);
     assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
     // if (srcNode == AndersNodeFactory::InvalidIndex) {
     //   srcNode = CGP.NF.createValueNode(src);
     //   CG_DEBUG("Create value node " << srcNode << " for select src " << *src << "\n");
     // }
-    CGP.EB.addAssignmentEdges(srcNode, dstNode);
+    CGP.addAssignmentEdge(srcNode, dstNode);
   }
 }
 
@@ -892,9 +1402,10 @@ void CallGraphPass::InstHandler::visitExtractValueInst(ExtractValueInst &EVI) {
   NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
   if (valNode == AndersNodeFactory::InvalidIndex)
     valNode = CGP.NF.createValueNode(&EVI);
+  valNode = CGP.getRepNode(valNode);
 
   if (aggNode != AndersNodeFactory::InvalidIndex)
-    CGP.EB.addAssignmentEdges(aggNode, valNode);
+    CGP.addAssignmentEdge(aggNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
@@ -919,47 +1430,49 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
   NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
   if (resNode == AndersNodeFactory::InvalidIndex)
     resNode = CGP.NF.createValueNode(&IVI);
+  resNode = CGP.getRepNode(resNode);
 
   // Propagate aggregate's pointer content to result
   if (aggNode != AndersNodeFactory::InvalidIndex)
-    CGP.EB.addAssignmentEdges(aggNode, resNode);
+    CGP.addAssignmentEdge(aggNode, resNode);
 
   // Propagate inserted value if it's a pointer
   if (valIsPtr) {
     NodeIndex valNode = CGP.NF.getValueNodeFor(val);
     assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find insertvalue val node");
-    CGP.EB.addAssignmentEdges(valNode, resNode);
+    CGP.addAssignmentEdge(valNode, resNode);
   }
 }
 
 void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
-  NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
+  NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
     WARNING("IntToPtr: src node not found: " << I << "\n");
     return;
   }
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   if (dstNode == AndersNodeFactory::InvalidIndex) {
     WARNING("IntToPtr: dst node not found: " << I << "\n");
     return;
   }
   CG_DEBUG("IntToPtr: " << srcNode << " -> " << dstNode << " for " << I << "\n");
-  CGP.EB.addAssignmentEdges(srcNode, dstNode);
+  CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
-  NodeIndex srcNode = CGP.NF.getValueNodeFor(I.getOperand(0));
+  NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
     WARNING("PtrToInt: src node not found: " << I << "\n");
     return;
   }
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   if (dstNode == AndersNodeFactory::InvalidIndex) {
     dstNode = CGP.NF.createValueNode(&I);
+    dstNode = CGP.getRepNode(dstNode);
     CG_DEBUG("PtrToInt: created value node " << dstNode << " for " << I << "\n");
   }
   CG_DEBUG("PtrToInt: " << srcNode << " -> " << dstNode << " for " << I << "\n");
-  CGP.EB.addAssignmentEdges(srcNode, dstNode);
+  CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
@@ -970,7 +1483,7 @@ void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
   NodeIndex srcNode = AndersNodeFactory::InvalidIndex;
   bool otherIsConst = false;
   for (unsigned i = 0; i < 2; i++) {
-    NodeIndex n = CGP.NF.getValueNodeFor(I.getOperand(i));
+    NodeIndex n = CGP.getRepNodeForValue(I.getOperand(i));
     if (n != AndersNodeFactory::InvalidIndex && !CGP.NF.isSpecialNode(n)) {
       srcNode = n;
       otherIsConst = isa<Constant>(I.getOperand(1 - i));
@@ -984,13 +1497,14 @@ void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
     return;
   }
 
-  NodeIndex dstNode = CGP.NF.getValueNodeFor(&I);
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   if (dstNode == AndersNodeFactory::InvalidIndex) {
     dstNode = CGP.NF.createValueNode(&I);
+    dstNode = CGP.getRepNode(dstNode);
     CG_DEBUG("BinOp: created value node " << dstNode << " for " << I << "\n");
   }
   CG_DEBUG("BinOp: " << srcNode << " -> " << dstNode << " for " << I << "\n");
-  CGP.EB.addAssignmentEdges(srcNode, dstNode);
+  CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
@@ -1012,7 +1526,7 @@ void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
 
   CG_DEBUG("VAArg: " << F->getName() << ": vararg node " << varargNode
            << " -> val node " << valNode << " for " << I << "\n");
-  CGP.EB.addAssignmentEdges(varargNode, valNode);
+  CGP.addAssignmentEdge(varargNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitMemTransferInst(MemTransferInst &I) {
@@ -1194,6 +1708,10 @@ void CallGraphPass::collectIFuncTargets(const GlobalIFunc *IF) {
 }
 
 bool CallGraphPass::doInitialization(Module *M) {
+  if (iteration == 0 && M == Ctx->Modules.front().first) {
+    canonicalNodeMap.clear();
+    canonicalClassMembers.clear();
+  }
 
   for (auto &GV : M->globals()) {
     if (Ctx->ExtGobjs.find(GV.getGUID()) != Ctx->ExtGobjs.end())
@@ -1349,13 +1867,28 @@ bool CallGraphPass::doFinalization(Module *M) {
 bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
   bool foundNewAlloc = false;
   FuncSet newAllocFuncs;
+  std::vector<NodeIndex> memberNodes;
   for (auto *F : Ctx->CandidateAllocFuncs) {
     // get return value
-    NodeIndex retNode = NF.getReturnNodeFor(F);
+    NodeIndex retNode = getCanonicalNode(NF.getReturnNodeFor(F));
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found for candidate alloc func!");
+    assert(retNode < outputCFLGraph.size() && "Canonical return node out of CFL graph range");
     auto &cflSet = outputCFLGraph[retNode][EB.getLabelV()]; // find the alias set
+    std::unordered_set<NodeIndex> seenRoots;
     for (auto idx : cflSet) {
-      if (AllocSites.count(idx)) {
+      NodeIndex root = getCanonicalNode(idx);
+      if (!seenRoots.insert(root).second)
+        continue;
+      bool reachesAllocSite = false;
+      collectCanonicalMembers(root, memberNodes);
+      for (NodeIndex member : memberNodes) {
+        NodeIndex canonicalMember = getCanonicalNode(member);
+        if (AllocSites.count(member) || AllocSites.count(canonicalMember)) {
+          reachesAllocSite = true;
+          break;
+        }
+      }
+      if (reachesAllocSite) {
         // if return value is from a known allocation site
         CG_LOG("Custom allocator " << F->getName() << " return value from alloc site: " << idx << "\n");
         Ctx->AllocFuncs.insert(F);
@@ -1365,7 +1898,7 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
         for (auto const& U : F->users()) {
           if (const CallBase *CI = dyn_cast<CallBase>(U)) {
             if (CI->getCalledFunction() == F) {
-              NodeIndex callNode = NF.getValueNodeFor(CI);
+              NodeIndex callNode = getCanonicalNode(NF.getValueNodeFor(CI));
               assert(callNode != AndersNodeFactory::InvalidIndex && "CallBase node not found for candidate alloc func!");
               Ctx->AllocSites.insert(CI);
               AllocSites.insert(callNode);
@@ -1396,24 +1929,32 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
 void CallGraphPass::buildFieldStoreMap(const cfl_result_t &outputCFLGraph) {
   unsigned labelV = EB.getLabelV();
   size_t funcFieldPairs = 0;
+  std::vector<NodeIndex> memberNodes;
 
   for (const auto &rec : fieldStoreRecords) {
     // For each store record, query the CFL V-relation to find which
     // function value nodes V-reach the stored value node
-    if (rec.valNode >= outputCFLGraph.size())
-      continue;
-    auto &cflSet = outputCFLGraph[rec.valNode][labelV];
+    NodeIndex valNode = getCanonicalNode(rec.valNode);
+    assert(valNode < outputCFLGraph.size() && "Canonical field-store node out of CFL graph range");
+    auto &cflSet = outputCFLGraph[valNode][labelV];
+    std::unordered_set<NodeIndex> seenRoots;
     for (auto idx : cflSet) {
-      if (NF.isSpecialNode(idx))
+      NodeIndex root = getCanonicalNode(idx);
+      if (!seenRoots.insert(root).second)
         continue;
-      const Value *CV = NF.getValueForNode(idx);
-      if (!CV)
-        continue;
-      const Function *F = dyn_cast<Function>(CV);
-      if (!F)
-        continue;
-      if (funcFieldStores[F].insert({rec.structName, rec.fieldIdx}).second)
-        funcFieldPairs++;
+      collectCanonicalMembers(root, memberNodes);
+      for (NodeIndex member : memberNodes) {
+        if (NF.isSpecialNode(member))
+          continue;
+        const Value *CV = NF.getValueForNode(member);
+        if (!CV)
+          continue;
+        const Function *F = dyn_cast<Function>(CV);
+        if (!F)
+          continue;
+        if (funcFieldStores[F].insert({rec.structName, rec.fieldIdx}).second)
+          funcFieldPairs++;
+      }
     }
   }
 
@@ -1425,15 +1966,17 @@ void CallGraphPass::buildFieldStoreMap(const cfl_result_t &outputCFLGraph) {
 bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
   // resolve indirect calls
   bool Changed = false;
+  std::vector<NodeIndex> memberNodes;
   for (auto *CS : Ctx->IndirectCallInsts) {
     CG_DEBUG("Handle indirect CallSite: " << *CS << " in function "
         << CS->getFunction()->getName() << "\n");
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
-    NodeIndex fptrNode = NF.getValueNodeFor(fptr);
+    NodeIndex fptrNode = getCanonicalNode(NF.getValueNodeFor(fptr));
     if (fptrNode == AndersNodeFactory::InvalidIndex) {
       WARNING("FuncPtr for " << *CS << " node not found!\n");
       continue;
     }
+    assert(fptrNode < outputCFLGraph.size() && "Canonical func-ptr node out of CFL graph range");
 
     // Extract call-site struct field info: trace through LoadInst → GEP
     std::string callSiteStruct;
@@ -1448,62 +1991,65 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
 
     auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelV()];
     CG_DEBUG("  fptr node " << fptrNode << " V-set size: " << cflSet.size() << "\n");
+    std::unordered_set<const Function *> seenFuncs;
+    std::unordered_set<NodeIndex> seenRoots;
     for (auto idx : cflSet) {
-      if (NF.isSpecialNode(idx)) {
-        WARNING("Indirect Call: " << *CS << " callee is a special node: " << idx << "\n");
+      NodeIndex root = getCanonicalNode(idx);
+      if (!seenRoots.insert(root).second)
         continue;
-      }
-      // Return nodes and vararg nodes also store Function* as their value,
-      // but they represent the return value / vararg slot, not the function
-      // pointer itself. Skip them — only true value nodes are function ptrs.
-      if (NF.isReturnNode(idx)) {
-        // CG_DEBUG("  V-alias node " << idx << ": return node for "
-        //          << cast<Function>(NF.getValueForNode(idx))->getName() << "\n");
-        continue;
-      }
-      if (NF.isVarargNode(idx)) {
-        // CG_DEBUG("  V-alias node " << idx << ": vararg node for "
-        //          << cast<Function>(NF.getValueForNode(idx))->getName() << "\n");
-        continue;
-      }
-      const Value *CV = NF.getValueForNode(idx);
-      if (CV == NULL) {
-        // CG_DEBUG("  V-alias node " << idx << ": no value\n");
-        continue;
-      }
-      const Function *CF = dyn_cast<Function>(CV);
-      if (CF == NULL) {
-        // CG_DEBUG("  V-alias node " << idx << ": non-function: " << *CV << "\n");
-        continue;
-      }
-      // due to field insensitivity, we may have FPs, do a type match
-      if (!isCompatible(CS, CF)) {
-        continue;
-      }
-      // Struct-field-aware filtering:
-      // If we know the call site loads from a specific struct field,
-      // and we have positive evidence of which fields this function is
-      // stored into, reject if none match.
-      if (hasCallSiteField) {
-        auto it = funcFieldStores.find(CF);
-        if (it != funcFieldStores.end()) {
-          const auto &fieldSet = it->second;
-          if (fieldSet.find({callSiteStruct, callSiteFieldIdx}) == fieldSet.end()) {
-            CG_LOG("FieldFilter: reject " << CF->getName()
-                   << " for " << callSiteStruct << " field " << callSiteFieldIdx << "\n");
-            continue;
-          }
+      collectCanonicalMembers(root, memberNodes);
+      for (NodeIndex member : memberNodes) {
+        if (NF.isSpecialNode(member)) {
+          WARNING("Indirect Call: " << *CS << " callee is a special node: " << member << "\n");
+          continue;
         }
-        // If function has no entries in funcFieldStores, keep it (conservative)
-      }
-      if (Ctx->Callees[CS].insert(CF).second) {
-        // if new callee added, we need to rerun
-        Changed = true;
-        CG_LOG("Handle indirect target: " << CF->getName() << "\n");
-        if (Ctx->ContainerFuncs.count(CF))
-          handleContainerCall(CS, CF);
-        else
-          handleCall(CS, CF);
+        // Return nodes and vararg nodes also store Function* as their value,
+        // but they represent the return value / vararg slot, not the function
+        // pointer itself. Skip them — only true value nodes are function ptrs.
+        if (NF.isReturnNode(member))
+          continue;
+        if (NF.isVarargNode(member))
+          continue;
+
+        const Value *CV = NF.getValueForNode(member);
+        if (CV == NULL)
+          continue;
+
+        const Function *CF = dyn_cast<Function>(CV);
+        if (CF == NULL)
+          continue;
+        if (!seenFuncs.insert(CF).second)
+          continue;
+
+        // due to field insensitivity, we may have FPs, do a type match
+        if (!isCompatible(CS, CF)) {
+          continue;
+        }
+        // Struct-field-aware filtering:
+        // If we know the call site loads from a specific struct field,
+        // and we have positive evidence of which fields this function is
+        // stored into, reject if none match.
+        if (hasCallSiteField) {
+          auto it = funcFieldStores.find(CF);
+          if (it != funcFieldStores.end()) {
+            const auto &fieldSet = it->second;
+            if (fieldSet.find({callSiteStruct, callSiteFieldIdx}) == fieldSet.end()) {
+              CG_LOG("FieldFilter: reject " << CF->getName()
+                     << " for " << callSiteStruct << " field " << callSiteFieldIdx << "\n");
+              continue;
+            }
+          }
+          // If function has no entries in funcFieldStores, keep it (conservative)
+        }
+        if (Ctx->Callees[CS].insert(CF).second) {
+          // if new callee added, we need to rerun
+          Changed = true;
+          CG_LOG("Handle indirect target: " << CF->getName() << "\n");
+          if (Ctx->ContainerFuncs.count(CF))
+            handleContainerCall(CS, CF);
+          else
+            handleCall(CS, CF);
+        }
       }
     }
   }
@@ -1576,16 +2122,57 @@ bool CallGraphPass::doModulePass(Module *M) {
     CG_LOG("Using " << cflThreads << " threads for FWGramParallel\n");
     const auto &inputEdges = EB.getEdges();
     const size_t inputEdgeCount = inputEdges.size();
+    const auto *Grammar = EB.getGrammar();
+    const std::vector<gracfl::Edge> *solverInputEdges = &inputEdges;
+    const size_t solverInputEdgeCount = solverInputEdges->size();
+
+    if (VerboseLevel >= 2 && Grammar) {
+      std::vector<size_t> rawLabelCounts(Grammar->getLabelSize(), 0);
+      std::unordered_set<EdgeKey, EdgeKeyHash> uniqueInputEdges;
+      uniqueInputEdges.reserve(inputEdgeCount + (inputEdgeCount >> 1) + 1);
+
+      for (const auto &E : inputEdges) {
+        if (E.label < rawLabelCounts.size())
+          rawLabelCounts[E.label]++;
+        uniqueInputEdges.insert(EdgeKey{E.from, E.to, E.label});
+      }
+
+      const size_t uniqueInputEdgeCount = uniqueInputEdges.size();
+      CG_LOG("CFL Input Edges: raw=" << inputEdgeCount
+             << ", unique=" << uniqueInputEdgeCount
+             << ", duplicates=" << (inputEdgeCount - uniqueInputEdgeCount) << "\n");
+
+      std::vector<std::pair<uint, size_t>> nonZeroLabels;
+      nonZeroLabels.reserve(rawLabelCounts.size());
+      for (uint L = 0; L < rawLabelCounts.size(); L++) {
+        if (rawLabelCounts[L] > 0)
+          nonZeroLabels.emplace_back(L, rawLabelCounts[L]);
+      }
+      std::sort(nonZeroLabels.begin(), nonZeroLabels.end(),
+                [](const auto &A, const auto &B) { return A.second > B.second; });
+
+      const auto &idToSymbol = Grammar->getIDToSymbolMap();
+      const size_t toReport = std::min<size_t>(8, nonZeroLabels.size());
+      CG_LOG("CFL Input Label Distribution (top " << toReport << "/"
+             << nonZeroLabels.size() << "):\n");
+      for (size_t i = 0; i < toReport; i++) {
+        const auto [Label, Count] = nonZeroLabels[i];
+        auto It = idToSymbol.find(Label);
+        StringRef LabelName = (It != idToSymbol.end()) ? StringRef(It->second) : StringRef("unknown");
+        CG_LOG("  " << LabelName << " (" << Label << "): " << Count << "\n");
+      }
+    }
 
     bool rebuildSolver = false;
-    if (!cflSolver || cflForceRebuild || cflSolvedInputEdgeCount > inputEdgeCount) {
+    if (!cflSolver || cflForceRebuild || cflSolvedInputEdgeCount > solverInputEdgeCount) {
       rebuildSolver = true;
     } else {
       // If new edges reference nodes beyond the existing solver graph,
       // rebuild with a resized graph.
       const size_t nodeCount = cflSolver->getNodeCount();
-      for (size_t i = cflSolvedInputEdgeCount; i < inputEdgeCount; i++) {
-        const auto &E = inputEdges[i];
+      const size_t beginCheck = cflSolvedInputEdgeCount;
+      for (size_t i = beginCheck; i < solverInputEdgeCount; i++) {
+        const auto &E = (*solverInputEdges)[i];
         if (E.from >= nodeCount || E.to >= nodeCount) {
           rebuildSolver = true;
           break;
@@ -1595,14 +2182,14 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     size_t incrementalAdded = 0;
     if (rebuildSolver) {
-      cflSolver = std::make_unique<gracfl::SolverFWGramParallel>(inputEdges, *EB.getGrammar(), cflThreads);
-      cflSolvedInputEdgeCount = inputEdgeCount;
+      cflSolver = std::make_unique<gracfl::SolverFWGramParallel>(*solverInputEdges, *EB.getGrammar(), cflThreads);
+      cflSolvedInputEdgeCount = solverInputEdgeCount;
       cflForceRebuild = false;
       CG_LOG("CFL Mode: full rebuild\n");
-    } else if (inputEdgeCount > cflSolvedInputEdgeCount) {
-      const size_t rawNewEdges = inputEdgeCount - cflSolvedInputEdgeCount;
-      incrementalAdded = cflSolver->addInputEdges(inputEdges, cflSolvedInputEdgeCount);
-      cflSolvedInputEdgeCount = inputEdgeCount;
+    } else if (solverInputEdgeCount > cflSolvedInputEdgeCount) {
+      const size_t rawNewEdges = solverInputEdgeCount - cflSolvedInputEdgeCount;
+      incrementalAdded = cflSolver->addInputEdges(*solverInputEdges, cflSolvedInputEdgeCount);
+      cflSolvedInputEdgeCount = solverInputEdgeCount;
       CG_LOG("CFL Mode: incremental resume with " << incrementalAdded
              << " new frontier edges (" << rawNewEdges
              << " raw additions)\n");
@@ -1619,6 +2206,41 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     const auto &outputCFLGraph = cflSolver->getReachability();
+
+    if (VerboseLevel >= 2 && Grammar && !outputCFLGraph.empty()) {
+      std::vector<unsigned long long> finalLabelCounts(outputCFLGraph[0].size(), 0);
+      for (const auto &PerNode : outputCFLGraph) {
+        for (size_t L = 0; L < PerNode.size(); L++)
+          finalLabelCounts[L] += static_cast<unsigned long long>(PerNode[L].size());
+      }
+
+      std::vector<std::pair<uint, unsigned long long>> nonZeroLabels;
+      nonZeroLabels.reserve(finalLabelCounts.size());
+      for (uint L = 0; L < finalLabelCounts.size(); L++) {
+        if (finalLabelCounts[L] > 0)
+          nonZeroLabels.emplace_back(L, finalLabelCounts[L]);
+      }
+      std::sort(nonZeroLabels.begin(), nonZeroLabels.end(),
+                [](const auto &A, const auto &B) { return A.second > B.second; });
+
+      const auto &idToSymbol = Grammar->getIDToSymbolMap();
+      const size_t toReport = std::min<size_t>(10, nonZeroLabels.size());
+      CG_LOG("CFL Final Label Distribution (top " << toReport << "/"
+             << nonZeroLabels.size() << "):\n");
+      for (size_t i = 0; i < toReport; i++) {
+        const auto [Label, Count] = nonZeroLabels[i];
+        auto It = idToSymbol.find(Label);
+        StringRef LabelName = (It != idToSymbol.end()) ? StringRef(It->second) : StringRef("unknown");
+        CG_LOG("  " << LabelName << " (" << Label << "): " << Count << "\n");
+      }
+
+      if (EB.getLabelV() < finalLabelCounts.size()) {
+        CG_LOG("CFL Final V edges: " << finalLabelCounts[EB.getLabelV()] << "\n");
+      }
+      if (EB.getLabelM() < finalLabelCounts.size()) {
+        CG_LOG("CFL Final M edges: " << finalLabelCounts[EB.getLabelM()] << "\n");
+      }
+    }
 
     // handle custom allocators
     const bool allocatorRewritten = findCustomAllocators(outputCFLGraph);
@@ -1857,7 +2479,7 @@ void CallGraphPass::dumpGlobals(raw_ostream &OS) {
   const auto &outputCFLGraph = solver->getReachability();
   for (auto &it : Ctx->Gobjs) {
     Value *GV = it.second;
-    NodeIndex valNode = NF.getValueNodeFor(GV);
+    NodeIndex valNode = getCanonicalNode(NF.getValueNodeFor(GV));
     if (valNode != AndersNodeFactory::InvalidIndex) {
       // auto &alledges = outputCFLGraph[valNode];
       // for (size_t i = 0; i < alledges.size(); i++) {
@@ -1880,6 +2502,7 @@ void CallGraphPass::dumpGlobals(raw_ostream &OS) {
       //     CG_DEBUG("\t" << *CV << " : " << idx << "\n");
       //   }
       // }
+      assert(valNode < outputCFLGraph.size() && "Canonical global node out of CFL graph range");
       auto &cflSect = outputCFLGraph[valNode][EB.getLabelV()];
       if (cflSect.empty())
         continue;

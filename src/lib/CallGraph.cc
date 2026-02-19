@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <unordered_map>
@@ -219,7 +220,6 @@ CallGraphPass::CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_)
       cflThreads(detectPhysicalCoreCount()),
       cflSolvedInputEdgeCount(0),
       cflForceRebuild(true),
-      localRepMode(false),
       iteration(0) {}
 
 Function* CallGraphPass::getFuncDef(Function *F) {
@@ -512,7 +512,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       // assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
       if (argNode == AndersNodeFactory::InvalidIndex) {
         argNode = NF.createValueNode(arg);
-        argNode = getRepNode(getCanonicalNode(argNode));
+        argNode = getCanonicalNode(argNode);
         CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
       }
       Value *farg = CF->getArg(i);
@@ -554,7 +554,7 @@ bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) 
   NodeIndex containerNode = getRepNodeForValue(containerArg);
   if (containerNode == AndersNodeFactory::InvalidIndex) {
     containerNode = NF.createValueNode(containerArg);
-    containerNode = getRepNode(getCanonicalNode(containerNode));
+    containerNode = getCanonicalNode(containerNode);
     CG_DEBUG("Create value node " << containerNode
              << " for container arg " << *containerArg << "\n");
   }
@@ -574,7 +574,7 @@ bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) 
     NodeIndex valNode = getRepNodeForValue(val);
     if (valNode == AndersNodeFactory::InvalidIndex) {
       valNode = NF.createValueNode(val);
-      valNode = getRepNode(getCanonicalNode(valNode));
+      valNode = getCanonicalNode(valNode);
       CG_DEBUG("Create value node " << valNode
                << " for store arg " << *val << "\n");
     }
@@ -640,16 +640,6 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   return false;
 }
 
-void CallGraphPass::beginLocalRepMode() {
-  localRepMode = true;
-  localRepParent.clear();
-  localRepRank.clear();
-  localRepDerefNode.clear();
-  localSummarizedAllocaSlots.clear();
-  localAllocaStoreVals.clear();
-  localAllocaLoadVals.clear();
-}
-
 NodeIndex CallGraphPass::getCanonicalNode(NodeIndex n) const {
   if (n == AndersNodeFactory::InvalidIndex)
     return n;
@@ -685,243 +675,37 @@ void CallGraphPass::collectCanonicalMembers(NodeIndex n, std::vector<NodeIndex> 
     out.push_back(member);
 }
 
-void CallGraphPass::persistLocalRepClasses() {
-  if (!localRepMode || localRepParent.empty())
-    return;
-
-  std::unordered_map<NodeIndex, std::unordered_set<NodeIndex>> localClasses;
-  localClasses.reserve(localRepParent.size());
-  for (const auto &kv : localRepParent) {
-    NodeIndex node = kv.first;
-    NodeIndex root = getRepNode(node);
-    if (root == AndersNodeFactory::InvalidIndex)
-      continue;
-    localClasses[root].insert(node);
-  }
-
-  for (auto &kv : localClasses) {
-    NodeIndex localRoot = kv.first;
-    auto &members = kv.second;
-    members.insert(localRoot);
-    if (members.size() <= 1)
-      continue; // no canonical remap needed for singleton classes
-
-    NodeIndex canonicalRoot = getCanonicalNode(localRoot);
-    if (canonicalRoot == localRoot) {
-      for (NodeIndex m : members) {
-        auto it = canonicalNodeMap.find(m);
-        if (it != canonicalNodeMap.end()) {
-          canonicalRoot = getCanonicalNode(m);
-          break;
-        }
-      }
-    }
-
-    auto &rootMembers = canonicalClassMembers[canonicalRoot];
-    rootMembers.insert(canonicalRoot);
-
-    for (NodeIndex m : members) {
-      auto it = canonicalNodeMap.find(m);
-      if (it != canonicalNodeMap.end()) {
-        NodeIndex oldRoot = getCanonicalNode(m);
-        if (oldRoot != canonicalRoot) {
-          auto oldMembersIt = canonicalClassMembers.find(oldRoot);
-          if (oldMembersIt != canonicalClassMembers.end()) {
-            rootMembers.insert(oldMembersIt->second.begin(), oldMembersIt->second.end());
-            canonicalClassMembers.erase(oldMembersIt);
-          } else {
-            rootMembers.insert(oldRoot);
-          }
-          canonicalNodeMap[oldRoot] = canonicalRoot;
-        }
-      }
-      canonicalNodeMap[m] = canonicalRoot;
-      rootMembers.insert(m);
-    }
-    canonicalNodeMap[canonicalRoot] = canonicalRoot;
-  }
-}
-
-void CallGraphPass::endLocalRepMode() {
-  persistLocalRepClasses();
-  localRepMode = false;
-  localRepParent.clear();
-  localRepRank.clear();
-  localRepDerefNode.clear();
-  localSummarizedAllocaSlots.clear();
-  localAllocaStoreVals.clear();
-  localAllocaLoadVals.clear();
-}
-
-NodeIndex CallGraphPass::getRepNode(NodeIndex n) {
-  if (!localRepMode || n == AndersNodeFactory::InvalidIndex)
-    return n;
-
-  auto it = localRepParent.find(n);
-  if (it == localRepParent.end()) {
-    localRepParent.emplace(n, n);
-    localRepRank.emplace(n, 0);
-    return n;
-  }
-
-  NodeIndex root = n;
-  while (localRepParent[root] != root)
-    root = localRepParent[root];
-
-  NodeIndex cur = n;
-  while (localRepParent[cur] != cur) {
-    NodeIndex parent = localRepParent[cur];
-    localRepParent[cur] = root;
-    cur = parent;
-  }
-
-  return root;
-}
-
 NodeIndex CallGraphPass::getRepNodeForValue(const Value *V) {
   if (!V)
     return AndersNodeFactory::InvalidIndex;
   NodeIndex n = NF.getValueNodeFor(V);
   if (n == AndersNodeFactory::InvalidIndex)
     return n;
-  return getRepNode(getCanonicalNode(n));
-}
-
-bool CallGraphPass::mergeRepNodes(NodeIndex a, NodeIndex b) {
-  if (!localRepMode ||
-      a == AndersNodeFactory::InvalidIndex ||
-      b == AndersNodeFactory::InvalidIndex)
-    return false;
-
-  NodeIndex ra = getRepNode(a);
-  NodeIndex rb = getRepNode(b);
-  if (ra == rb)
-    return false;
-
-  auto rankA = localRepRank[ra];
-  auto rankB = localRepRank[rb];
-  if (rankA < rankB)
-    std::swap(ra, rb);
-
-  localRepParent[rb] = ra;
-  if (rankA == rankB)
-    localRepRank[ra]++;
-
-  auto itA = localRepDerefNode.find(ra);
-  auto itB = localRepDerefNode.find(rb);
-  if (itA == localRepDerefNode.end() && itB != localRepDerefNode.end()) {
-    localRepDerefNode[ra] = itB->second;
-  }
-  if (itB != localRepDerefNode.end())
-    localRepDerefNode.erase(itB);
-
-  return true;
+  return getCanonicalNode(n);
 }
 
 NodeIndex CallGraphPass::getRepDerefNode(NodeIndex ptrNode) {
   if (ptrNode == AndersNodeFactory::InvalidIndex)
     return AndersNodeFactory::InvalidIndex;
 
-  NodeIndex repPtr = getRepNode(ptrNode);
-  if (localRepMode) {
-    auto it = localRepDerefNode.find(repPtr);
-    if (it != localRepDerefNode.end())
-      return it->second;
-  }
-
-  NodeIndex derefNode = NF.getDereferenceNodeFor(repPtr);
+  NodeIndex canonical = getCanonicalNode(ptrNode);
+  NodeIndex derefNode = NF.getDereferenceNodeFor(canonical);
   if (derefNode == AndersNodeFactory::InvalidIndex) {
-    derefNode = NF.createDereferenceNode(repPtr);
-    CG_DEBUG("Create deref node " << derefNode << " for rep node " << repPtr << "\n");
-    EB.addDereferenceEdges(repPtr, derefNode);
+    derefNode = NF.createDereferenceNode(canonical);
+    CG_DEBUG("Create deref node " << derefNode << " for canonical node " << canonical << "\n");
+    EB.addDereferenceEdges(canonical, derefNode);
   }
 
-  if (localRepMode)
-    localRepDerefNode[repPtr] = derefNode;
   return derefNode;
 }
 
 void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
   if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex)
     return;
-  EB.addAssignmentEdges(getRepNode(src), getRepNode(dst));
-}
-
-void CallGraphPass::collectLocalMustMerges(const Function *F) {
-  if (!localRepMode || !F)
-    return;
-
-  bool changed = false;
-  do {
-    changed = false;
-    for (const Instruction &I : instructions(F)) {
-      if (const auto *BC = dyn_cast<BitCastInst>(&I)) {
-        if (!BC->getType()->isPointerTy())
-          continue;
-        Value *src = BC->getOperand(0);
-        if (!src->getType()->isPointerTy())
-          continue;
-        changed |= mergeRepNodes(getRepNodeForValue(src), getRepNodeForValue(BC));
-        continue;
-      }
-
-      if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-        if (!GEP->getType()->isPointerTy() || !isZeroOffsetGEP(GEP))
-          continue;
-        const Value *base = GEP->getPointerOperand();
-        changed |= mergeRepNodes(getRepNodeForValue(base), getRepNodeForValue(GEP));
-        continue;
-      }
-
-      if (const auto *PHI = dyn_cast<PHINode>(&I)) {
-        if (!PHI->getType()->isPointerTy())
-          continue;
-        NodeIndex dst = getRepNodeForValue(PHI);
-        if (dst == AndersNodeFactory::InvalidIndex)
-          continue;
-
-        NodeIndex classRep = AndersNodeFactory::InvalidIndex;
-        bool allSame = true;
-        for (unsigned i = 0, e = PHI->getNumIncomingValues(); i != e; i++) {
-          Value *src = PHI->getIncomingValue(i);
-          if (shouldSkipValue(src)) {
-            allSame = false;
-            break;
-          }
-          NodeIndex srcRep = getRepNodeForValue(src);
-          if (srcRep == AndersNodeFactory::InvalidIndex) {
-            allSame = false;
-            break;
-          }
-          if (classRep == AndersNodeFactory::InvalidIndex)
-            classRep = srcRep;
-          else if (classRep != srcRep) {
-            allSame = false;
-            break;
-          }
-        }
-        if (allSame && classRep != AndersNodeFactory::InvalidIndex)
-          changed |= mergeRepNodes(dst, classRep);
-        continue;
-      }
-
-      if (const auto *Sel = dyn_cast<SelectInst>(&I)) {
-        if (!Sel->getType()->isPointerTy())
-          continue;
-        const Value *tVal = Sel->getTrueValue();
-        const Value *fVal = Sel->getFalseValue();
-        if (shouldSkipValue(tVal) || shouldSkipValue(fVal))
-          continue;
-        NodeIndex tRep = getRepNodeForValue(tVal);
-        NodeIndex fRep = getRepNodeForValue(fVal);
-        NodeIndex dst = getRepNodeForValue(Sel);
-        if (tRep != AndersNodeFactory::InvalidIndex &&
-            tRep == fRep &&
-            dst != AndersNodeFactory::InvalidIndex)
-          changed |= mergeRepNodes(dst, tRep);
-      }
-    }
-  } while (changed);
+  NodeIndex s = getCanonicalNode(src);
+  NodeIndex d = getCanonicalNode(dst);
+  if (s == d) return;
+  EB.addAssignmentEdges(s, d);
 }
 
 bool CallGraphPass::isSummarizableAlloca(const AllocaInst *AI) const {
@@ -1028,7 +812,7 @@ void CallGraphPass::collectLocalAllocaSummaries(const Function *F) {
 
 bool CallGraphPass::resolveSummarizedAllocaSlot(const Value *Ptr, NodeIndex &slotRep) {
   slotRep = AndersNodeFactory::InvalidIndex;
-  if (!localRepMode || !Ptr)
+  if (localSummarizedAllocaSlots.empty() || !Ptr)
     return false;
 
   const Value *base = stripAllocaAliasBase(Ptr);
@@ -1072,6 +856,8 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
   CG_LOG("######\nProcessing Func: " << F->getName() << "\n");
 
+  // Per-instruction node creation is idempotent (already done in doInitialization
+  // when CFLGlobalDedup is active), but we still need it for the non-dedup path.
   for (auto itr = inst_begin(F), ite = inst_end(F); itr != ite; ++itr) {
     const Instruction *I = &*itr;
     if (I->getType()->isPointerTy()) {
@@ -1088,25 +874,22 @@ bool CallGraphPass::runOnFunction(Function *F) {
     }
   }
 
-  const bool enableLocalRep = CFLLocalRepMerge;
-  const bool enableLocalAllocaSummary = CFLLocalAllocaSummary;
-  const bool enableLocalCompression = enableLocalRep || enableLocalAllocaSummary;
-  if (enableLocalCompression) {
-    beginLocalRepMode();
-    if (enableLocalRep)
-      collectLocalMustMerges(F);
-    if (enableLocalAllocaSummary)
-      collectLocalAllocaSummaries(F);
+  bool allocaSummaryActive = CFLLocalAllocaSummary;
+  if (allocaSummaryActive) {
+    collectLocalAllocaSummaries(F);
   }
 
   // Use InstVisitor to handle instructions.
   InstHandler visitor(*this, F);
   visitor.visit(F);
-  if (enableLocalCompression) {
-    if (enableLocalAllocaSummary)
-      emitLocalAllocaSummaryEdges();
-    endLocalRepMode();
+
+  if (allocaSummaryActive) {
+    emitLocalAllocaSummaryEdges();
   }
+  // Clear alloca tracking structures
+  localSummarizedAllocaSlots.clear();
+  localAllocaStoreVals.clear();
+  localAllocaLoadVals.clear();
 
   return false;
 }
@@ -1268,8 +1051,7 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   NodeIndex valNode = CGP.getRepNodeForValue(val);
   // assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find store value node");
   if (valNode == AndersNodeFactory::InvalidIndex) {
-    valNode = CGP.NF.createValueNode(val);
-    valNode = CGP.getRepNode(valNode);
+    valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(val));
     CG_DEBUG("Create value node " << valNode << " for store " << *val << "\n");
   }
 
@@ -1306,29 +1088,21 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   NodeIndex valNode = CGP.getRepNodeForValue(&GEP);
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
 
-  if (isZeroOffsetGEP(&GEP)) {
-    CGP.mergeRepNodes(ptrNode, valNode);
-    return;
-  }
   CGP.addAssignmentEdge(ptrNode, valNode);
 }
 
 void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
   NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
-    srcNode = CGP.NF.createValueNode(I.getOperand(0));
-    srcNode = CGP.getRepNode(srcNode);
+    srcNode = CGP.getCanonicalNode(CGP.NF.createValueNode(I.getOperand(0)));
     CG_DEBUG("Create value node " << srcNode << " for bitcast src " << *(I.getOperand(0)) << "\n");
   }
   NodeIndex dstNode = CGP.getRepNodeForValue(&I);
-  // assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find bitcast dst node");
   if (dstNode == AndersNodeFactory::InvalidIndex) {
-    dstNode = CGP.NF.createValueNode(&I);
-    dstNode = CGP.getRepNode(dstNode);
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
     WARNING("Create value node " << dstNode << " for bitcast dst " << I << "\n");
   }
-  if (!CGP.mergeRepNodes(srcNode, dstNode))
-    CGP.addAssignmentEdge(srcNode, dstNode);
+  CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
@@ -1404,7 +1178,7 @@ void CallGraphPass::InstHandler::visitExtractValueInst(ExtractValueInst &EVI) {
   NodeIndex valNode = CGP.NF.getValueNodeFor(&EVI);
   if (valNode == AndersNodeFactory::InvalidIndex)
     valNode = CGP.NF.createValueNode(&EVI);
-  valNode = CGP.getRepNode(valNode);
+  valNode = CGP.getCanonicalNode(valNode);
 
   if (aggNode != AndersNodeFactory::InvalidIndex)
     CGP.addAssignmentEdge(aggNode, valNode);
@@ -1432,7 +1206,7 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
   NodeIndex resNode = CGP.NF.getValueNodeFor(&IVI);
   if (resNode == AndersNodeFactory::InvalidIndex)
     resNode = CGP.NF.createValueNode(&IVI);
-  resNode = CGP.getRepNode(resNode);
+  resNode = CGP.getCanonicalNode(resNode);
 
   // Propagate aggregate's pointer content to result
   if (aggNode != AndersNodeFactory::InvalidIndex)
@@ -1469,8 +1243,7 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   }
   NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   if (dstNode == AndersNodeFactory::InvalidIndex) {
-    dstNode = CGP.NF.createValueNode(&I);
-    dstNode = CGP.getRepNode(dstNode);
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
     CG_DEBUG("PtrToInt: created value node " << dstNode << " for " << I << "\n");
   }
   CG_DEBUG("PtrToInt: " << srcNode << " -> " << dstNode << " for " << I << "\n");
@@ -1501,8 +1274,7 @@ void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
 
   NodeIndex dstNode = CGP.getRepNodeForValue(&I);
   if (dstNode == AndersNodeFactory::InvalidIndex) {
-    dstNode = CGP.NF.createValueNode(&I);
-    dstNode = CGP.getRepNode(dstNode);
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
     CG_DEBUG("BinOp: created value node " << dstNode << " for " << I << "\n");
   }
   CG_DEBUG("BinOp: " << srcNode << " -> " << dstNode << " for " << I << "\n");
@@ -1775,6 +1547,27 @@ bool CallGraphPass::doInitialization(Module *M) {
       if (!F.getReturnType()->isVoidTy()) {
         NF.createReturnNode(&F);
       }
+
+      // Create per-instruction value nodes early (for global dedup).
+      // Skip alloc/container functions to match doModulePass filtering.
+      if (CFLGlobalDedup &&
+          !Ctx->AllocFuncs.count(&F) &&
+          !Ctx->ContainerFuncs.count(&F) &&
+          !shouldSkipFunction(&F)) {
+        for (auto itr = inst_begin(F), ite = inst_end(F); itr != ite; ++itr) {
+          const Instruction *I = &*itr;
+          if (I->getType()->isPointerTy())
+            NF.createValueNode(I);
+          if (const ReturnInst *RI = dyn_cast<ReturnInst>(I))
+            Ctx->RetSites[&F] = RI;
+          if (const CallBase *CB = dyn_cast<CallBase>(I)) {
+            if (const Function *CF = CB->getCalledFunction()) {
+              if (Ctx->AllocFuncs.count(CF))
+                Ctx->AllocSites.insert(CB);
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1876,15 +1669,25 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
   bool foundNewAlloc = false;
   FuncSet newAllocFuncs;
   std::vector<NodeIndex> memberNodes;
+  const bool useDense = CFLGlobalDedup && !origToDense.empty();
   for (auto *F : Ctx->CandidateAllocFuncs) {
     // get return value
-    NodeIndex retNode = getCanonicalNode(NF.getReturnNodeFor(F));
-    assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found for candidate alloc func!");
-    assert(retNode < outputCFLGraph.size() && "Canonical return node out of CFL graph range");
+    NodeIndex retNode;
+    if (useDense) {
+      retNode = getDenseID(NF.getReturnNodeFor(F));
+    } else {
+      retNode = getCanonicalNode(NF.getReturnNodeFor(F));
+    }
+    if (retNode == AndersNodeFactory::InvalidIndex ||
+        (useDense && retNode == UINT32_MAX))
+      continue;
+    assert(retNode < outputCFLGraph.size() && "Return node out of CFL graph range");
     auto &cflSet = outputCFLGraph[retNode][EB.getLabelV()]; // find the alias set
     std::unordered_set<NodeIndex> seenRoots;
     for (auto idx : cflSet) {
-      NodeIndex root = getCanonicalNode(idx);
+      // Map back to original node if using dense mapping
+      NodeIndex origIdx = useDense ? denseToOrig[idx] : idx;
+      NodeIndex root = getCanonicalNode(origIdx);
       if (!seenRoots.insert(root).second)
         continue;
       bool reachesAllocSite = false;
@@ -1938,16 +1741,24 @@ void CallGraphPass::buildFieldStoreMap(const cfl_result_t &outputCFLGraph) {
   unsigned labelV = EB.getLabelV();
   size_t funcFieldPairs = 0;
   std::vector<NodeIndex> memberNodes;
+  const bool useDense = CFLGlobalDedup && !origToDense.empty();
 
   for (const auto &rec : fieldStoreRecords) {
     // For each store record, query the CFL V-relation to find which
     // function value nodes V-reach the stored value node
-    NodeIndex valNode = getCanonicalNode(rec.valNode);
-    assert(valNode < outputCFLGraph.size() && "Canonical field-store node out of CFL graph range");
+    NodeIndex valNode;
+    if (useDense) {
+      valNode = getDenseID(rec.valNode);
+      if (valNode == UINT32_MAX) continue;
+    } else {
+      valNode = getCanonicalNode(rec.valNode);
+    }
+    assert(valNode < outputCFLGraph.size() && "Field-store node out of CFL graph range");
     auto &cflSet = outputCFLGraph[valNode][labelV];
     std::unordered_set<NodeIndex> seenRoots;
     for (auto idx : cflSet) {
-      NodeIndex root = getCanonicalNode(idx);
+      NodeIndex origIdx = useDense ? denseToOrig[idx] : idx;
+      NodeIndex root = getCanonicalNode(origIdx);
       if (!seenRoots.insert(root).second)
         continue;
       collectCanonicalMembers(root, memberNodes);
@@ -1975,16 +1786,26 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
   // resolve indirect calls
   bool Changed = false;
   std::vector<NodeIndex> memberNodes;
+  const bool useDense = CFLGlobalDedup && !origToDense.empty();
   for (auto *CS : Ctx->IndirectCallInsts) {
     CG_DEBUG("Handle indirect CallSite: " << *CS << " in function "
         << CS->getFunction()->getName() << "\n");
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
-    NodeIndex fptrNode = getCanonicalNode(NF.getValueNodeFor(fptr));
-    if (fptrNode == AndersNodeFactory::InvalidIndex) {
-      WARNING("FuncPtr for " << *CS << " node not found!\n");
-      continue;
+    NodeIndex fptrNode;
+    if (useDense) {
+      fptrNode = getDenseID(NF.getValueNodeFor(fptr));
+      if (fptrNode == UINT32_MAX) {
+        WARNING("FuncPtr for " << *CS << " dense node not found!\n");
+        continue;
+      }
+    } else {
+      fptrNode = getCanonicalNode(NF.getValueNodeFor(fptr));
+      if (fptrNode == AndersNodeFactory::InvalidIndex) {
+        WARNING("FuncPtr for " << *CS << " node not found!\n");
+        continue;
+      }
     }
-    assert(fptrNode < outputCFLGraph.size() && "Canonical func-ptr node out of CFL graph range");
+    assert(fptrNode < outputCFLGraph.size() && "Func-ptr node out of CFL graph range");
 
     // Extract call-site struct field info: trace through LoadInst → GEP
     std::string callSiteStruct;
@@ -2002,7 +1823,8 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
     std::unordered_set<const Function *> seenFuncs;
     std::unordered_set<NodeIndex> seenRoots;
     for (auto idx : cflSet) {
-      NodeIndex root = getCanonicalNode(idx);
+      NodeIndex origIdx = useDense ? denseToOrig[idx] : idx;
+      NodeIndex root = getCanonicalNode(origIdx);
       if (!seenRoots.insert(root).second)
         continue;
       collectCanonicalMembers(root, memberNodes);
@@ -2065,6 +1887,374 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
   return Changed;
 }
 
+// ---- Global union-find dedup ----
+
+NodeIndex CallGraphPass::globalFind(NodeIndex n) {
+  NodeIndex root = n;
+  while (globalUFParent[root] != root)
+    root = globalUFParent[root];
+  // Path compression
+  while (globalUFParent[n] != root) {
+    NodeIndex parent = globalUFParent[n];
+    globalUFParent[n] = root;
+    n = parent;
+  }
+  return root;
+}
+
+bool CallGraphPass::globalUnion(NodeIndex a, NodeIndex b) {
+  if (a == AndersNodeFactory::InvalidIndex || b == AndersNodeFactory::InvalidIndex)
+    return false;
+  NodeIndex ra = globalFind(a);
+  NodeIndex rb = globalFind(b);
+  if (ra == rb)
+    return false;
+
+  if (globalUFRank[ra] < globalUFRank[rb])
+    std::swap(ra, rb);
+  globalUFParent[rb] = ra;
+  if (globalUFRank[ra] == globalUFRank[rb])
+    globalUFRank[ra]++;
+  return true;
+}
+
+void CallGraphPass::globalDedupScanFunction(const Function *F) {
+  if (!F)
+    return;
+
+  bool changed = false;
+  do {
+    changed = false;
+    for (const Instruction &I : instructions(F)) {
+      if (const auto *BC = dyn_cast<BitCastInst>(&I)) {
+        if (!BC->getType()->isPointerTy())
+          continue;
+        Value *src = BC->getOperand(0);
+        if (!src->getType()->isPointerTy())
+          continue;
+        NodeIndex srcNode = NF.getValueNodeFor(src);
+        NodeIndex dstNode = NF.getValueNodeFor(BC);
+        if (srcNode != AndersNodeFactory::InvalidIndex &&
+            dstNode != AndersNodeFactory::InvalidIndex)
+          changed |= globalUnion(srcNode, dstNode);
+        continue;
+      }
+
+      if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        if (!GEP->getType()->isPointerTy() || !isZeroOffsetGEP(GEP))
+          continue;
+        const Value *base = GEP->getPointerOperand();
+        NodeIndex baseNode = NF.getValueNodeFor(base);
+        NodeIndex gepNode = NF.getValueNodeFor(GEP);
+        if (baseNode != AndersNodeFactory::InvalidIndex &&
+            gepNode != AndersNodeFactory::InvalidIndex)
+          changed |= globalUnion(baseNode, gepNode);
+        continue;
+      }
+
+      if (const auto *PHI = dyn_cast<PHINode>(&I)) {
+        if (!PHI->getType()->isPointerTy())
+          continue;
+        NodeIndex dstNode = NF.getValueNodeFor(PHI);
+        if (dstNode == AndersNodeFactory::InvalidIndex)
+          continue;
+
+        NodeIndex classRep = AndersNodeFactory::InvalidIndex;
+        bool allSame = true;
+        for (unsigned i = 0, e = PHI->getNumIncomingValues(); i != e; i++) {
+          Value *src = PHI->getIncomingValue(i);
+          if (shouldSkipValue(src)) {
+            allSame = false;
+            break;
+          }
+          NodeIndex srcNode = NF.getValueNodeFor(src);
+          if (srcNode == AndersNodeFactory::InvalidIndex) {
+            allSame = false;
+            break;
+          }
+          NodeIndex srcRoot = globalFind(srcNode);
+          if (classRep == AndersNodeFactory::InvalidIndex)
+            classRep = srcRoot;
+          else if (classRep != srcRoot) {
+            allSame = false;
+            break;
+          }
+        }
+        if (allSame && classRep != AndersNodeFactory::InvalidIndex)
+          changed |= globalUnion(dstNode, classRep);
+        continue;
+      }
+
+      if (const auto *Sel = dyn_cast<SelectInst>(&I)) {
+        if (!Sel->getType()->isPointerTy())
+          continue;
+        const Value *tVal = Sel->getTrueValue();
+        const Value *fVal = Sel->getFalseValue();
+        if (shouldSkipValue(tVal) || shouldSkipValue(fVal))
+          continue;
+        NodeIndex tNode = NF.getValueNodeFor(tVal);
+        NodeIndex fNode = NF.getValueNodeFor(fVal);
+        NodeIndex dstNode = NF.getValueNodeFor(Sel);
+        if (tNode != AndersNodeFactory::InvalidIndex &&
+            fNode != AndersNodeFactory::InvalidIndex &&
+            dstNode != AndersNodeFactory::InvalidIndex &&
+            globalFind(tNode) == globalFind(fNode))
+          changed |= globalUnion(dstNode, tNode);
+      }
+    }
+  } while (changed);
+}
+
+// Resolve a CallBase to its callee definition, or nullptr if unresolvable.
+const Function *CallGraphPass::resolveDirectCallee(const CallBase *CS) {
+  const Function *CF = CS->getCalledFunction();
+  if (!CF) {
+    Value *CO = CS->getCalledOperand()->stripPointerCastsAndAliases();
+    if (auto *CE = dyn_cast<ConstantExpr>(CO)) {
+      switch (CE->getOpcode()) {
+        case Instruction::GetElementPtr: {
+          GEPOperator *GEP = dyn_cast<GEPOperator>(CE);
+          CO = GEP->getPointerOperand()->stripPointerCastsAndAliases();
+          break;
+        }
+        case Instruction::BitCast:
+          CO = CE->getOperand(0);
+          break;
+        default:
+          return nullptr;
+      }
+    }
+    CF = dyn_cast<Function>(CO);
+  }
+  if (!CF)
+    return nullptr;
+
+  // Resolve to definition
+  auto it = Ctx->Funcs.find(CF->getGUID());
+  if (it != Ctx->Funcs.end())
+    CF = it->second;
+
+  if (CF->isIntrinsic() || CF->empty())
+    return nullptr;
+  if (Ctx->AllocFuncs.count(CF) || Ctx->ContainerFuncs.count(CF))
+    return nullptr;
+  if (shouldSkipFunction(CF))
+    return nullptr;
+
+  return CF;
+}
+
+void CallGraphPass::globalDedupScanCallEdges(
+    const Function *F,
+    const DenseSet<const Function *> &singleCallsiteCallees) {
+  if (!F || F->isDeclaration() || F->isIntrinsic() || F->empty())
+    return;
+
+  for (const Instruction &I : instructions(F)) {
+    const CallBase *CS = dyn_cast<CallBase>(&I);
+    if (!CS || CS->isInlineAsm())
+      continue;
+
+    if (Ctx->AllocSites.count(CS))
+      continue;
+
+    const Function *CF = resolveDirectCallee(CS);
+    if (!CF)
+      continue;
+
+    // Only merge for callees with exactly 1 callsite
+    if (!singleCallsiteCallees.count(CF))
+      continue;
+
+    // Merge pointer args: actual → formal
+    unsigned numArgs = CS->arg_size();
+    if (CF->isVarArg()) {
+      NodeIndex formalNode = NF.getVarargNodeFor(CF);
+      if (formalNode == AndersNodeFactory::InvalidIndex)
+        continue;
+      for (unsigned i = 0; i < numArgs; i++) {
+        Value *arg = CS->getArgOperand(i);
+        if (!arg->getType()->isPointerTy())
+          continue;
+        if (shouldSkipValue(arg))
+          continue;
+        NodeIndex argNode = NF.getValueNodeFor(arg);
+        if (argNode != AndersNodeFactory::InvalidIndex)
+          globalUnion(argNode, formalNode);
+      }
+    } else {
+      unsigned numFormals = CF->arg_size();
+      unsigned minArgs = std::min(numArgs, numFormals);
+      for (unsigned i = 0; i < minArgs; i++) {
+        Value *arg = CS->getArgOperand(i);
+        if (!arg->getType()->isPointerTy())
+          continue;
+        if (shouldSkipValue(arg))
+          continue;
+        NodeIndex argNode = NF.getValueNodeFor(arg);
+        if (argNode == AndersNodeFactory::InvalidIndex)
+          continue;
+        Value *farg = CF->getArg(i);
+        NodeIndex formalNode = NF.getValueNodeFor(farg);
+        if (formalNode != AndersNodeFactory::InvalidIndex)
+          globalUnion(argNode, formalNode);
+      }
+    }
+
+    // Merge return: returnNode → callsite
+    if (CF->getReturnType()->isPointerTy()) {
+      NodeIndex retNode = NF.getReturnNodeFor(CF);
+      NodeIndex callNode = NF.getValueNodeFor(CS);
+      if (retNode != AndersNodeFactory::InvalidIndex &&
+          callNode != AndersNodeFactory::InvalidIndex)
+        globalUnion(retNode, callNode);
+    }
+  }
+}
+
+void CallGraphPass::globalDedupFinalize() {
+  canonicalNodeMap.clear();
+  canonicalClassMembers.clear();
+
+  size_t mergedNodes = 0;
+  for (NodeIndex i = 0; i < globalUFParent.size(); i++) {
+    NodeIndex root = globalFind(i);
+    if (root != i) {
+      canonicalNodeMap[i] = root;
+      mergedNodes++;
+    }
+    canonicalClassMembers[root].insert(i);
+  }
+
+  CG_LOG("Global dedup: " << globalUFParent.size() << " nodes, "
+         << mergedNodes << " merged, "
+         << canonicalClassMembers.size() << " equivalence classes\n");
+}
+
+void CallGraphPass::runGlobalDedup() {
+  const size_t numNodes = NF.getNumNodes();
+  globalUFParent.resize(numNodes);
+  std::iota(globalUFParent.begin(), globalUFParent.end(), 0);
+  globalUFRank.assign(numNodes, 0);
+
+  // Intra-procedural copy merges
+  for (auto &[M, _] : Ctx->Modules) {
+    for (Function &F : *M) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+        continue;
+      if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+        continue;
+      if (shouldSkipFunction(&F))
+        continue;
+      globalDedupScanFunction(&F);
+    }
+  }
+
+  // Count direct callsites per callee to find single-callsite functions
+  DenseMap<const Function *, unsigned> callsiteCount;
+  for (auto &[M, _] : Ctx->Modules) {
+    for (Function &F : *M) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+        continue;
+      if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+        continue;
+      if (shouldSkipFunction(&F))
+        continue;
+      for (const Instruction &I : instructions(F)) {
+        const CallBase *CS = dyn_cast<CallBase>(&I);
+        if (!CS || CS->isInlineAsm())
+          continue;
+        if (Ctx->AllocSites.count(CS))
+          continue;
+        const Function *CF = resolveDirectCallee(CS);
+        if (CF)
+          callsiteCount[CF]++;
+      }
+    }
+  }
+
+  DenseSet<const Function *> singleCallsiteCallees;
+  size_t totalCallees = 0, multiCallees = 0;
+  for (auto &[CF, Count] : callsiteCount) {
+    totalCallees++;
+    if (Count == 1)
+      singleCallsiteCallees.insert(CF);
+    else
+      multiCallees++;
+  }
+  CG_LOG("Global dedup inter-proc: " << totalCallees << " callees, "
+         << singleCallsiteCallees.size() << " single-callsite, "
+         << multiCallees << " multi-callsite (skipped)\n");
+
+  // Inter-procedural merges (only for single-callsite functions)
+  for (auto &[M, _] : Ctx->Modules) {
+    for (Function &F : *M) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+        continue;
+      if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+        continue;
+      if (shouldSkipFunction(&F))
+        continue;
+      globalDedupScanCallEdges(&F, singleCallsiteCallees);
+    }
+  }
+
+  globalDedupFinalize();
+
+  // Free UF vectors
+  globalUFParent.clear();
+  globalUFParent.shrink_to_fit();
+  globalUFRank.clear();
+  globalUFRank.shrink_to_fit();
+}
+
+void CallGraphPass::buildDenseMapping() {
+  const auto &rawEdges = EB.getEdges();
+  origToDense.assign(NF.getNumNodes(), UINT32_MAX);
+  denseToOrig.clear();
+  numDenseNodes = 0;
+
+  // Assign dense IDs to nodes appearing in edges
+  for (const auto &E : rawEdges) {
+    if (origToDense[E.from] == UINT32_MAX) {
+      origToDense[E.from] = numDenseNodes;
+      denseToOrig.push_back(E.from);
+      numDenseNodes++;
+    }
+    if (origToDense[E.to] == UINT32_MAX) {
+      origToDense[E.to] = numDenseNodes;
+      denseToOrig.push_back(E.to);
+      numDenseNodes++;
+    }
+  }
+
+  // Remap + dedup
+  std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+  seen.reserve(rawEdges.size());
+  denseEdges.clear();
+  denseEdges.reserve(rawEdges.size());
+  for (const auto &E : rawEdges) {
+    uint32_t from = origToDense[E.from];
+    uint32_t to = origToDense[E.to];
+    if (from == to) continue; // self-loop
+    EdgeKey key{from, to, E.label};
+    if (seen.insert(key).second)
+      denseEdges.emplace_back(from, to, E.label);
+  }
+
+  CG_LOG("Dense mapping: " << NF.getNumNodes() << " orig nodes -> "
+         << numDenseNodes << " dense nodes, "
+         << rawEdges.size() << " raw edges -> "
+         << denseEdges.size() << " dense edges\n");
+}
+
+uint32_t CallGraphPass::getDenseID(NodeIndex origNode) const {
+  NodeIndex canonical = getCanonicalNode(origNode);
+  if (canonical < origToDense.size())
+    return origToDense[canonical];
+  return UINT32_MAX;
+}
+
 bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
@@ -2080,6 +2270,10 @@ bool CallGraphPass::doModulePass(Module *M) {
         for (Function &F : *Mod)
           totalInsts += F.getInstructionCount();
       EB.reserve(totalInsts * 4);
+
+      // Run global dedup on first module (all nodes exist from doInitialization)
+      if (CFLGlobalDedup)
+        runGlobalDedup();
     }
 
     for (auto &GV : M->globals()) {
@@ -2126,12 +2320,16 @@ bool CallGraphPass::doModulePass(Module *M) {
       }
     }
 
+    // Build dense mapping if global dedup is active
+    if (CFLGlobalDedup)
+      buildDenseMapping();
+
     // solve CFL constraints after processing the last module
     CG_LOG("Using " << cflThreads << " threads for FWGramParallel\n");
     const auto &inputEdges = EB.getEdges();
     const size_t inputEdgeCount = inputEdges.size();
     const auto *Grammar = EB.getGrammar();
-    const std::vector<gracfl::Edge> *solverInputEdges = &inputEdges;
+    const std::vector<gracfl::Edge> *solverInputEdges = CFLGlobalDedup ? &denseEdges : &inputEdges;
     const size_t solverInputEdgeCount = solverInputEdges->size();
 
     if (VerboseLevel >= 2 && Grammar) {
@@ -2508,8 +2706,10 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
     return;
   }
 
+  const bool useDense = CFLGlobalDedup && !origToDense.empty();
   const uint32_t NodeCount = NF.getNumNodes();
-  if (Graph.size() < NodeCount) {
+
+  if (!useDense && Graph.size() < NodeCount) {
     WARNING("VSnapshot: CFL graph node count " << Graph.size()
             << " is smaller than NodeFactory node count " << NodeCount << "\n");
     return;
@@ -2614,7 +2814,7 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
   MetaObj["snapshot_type"] = "V-relation";
   MetaObj["version"] = static_cast<int64_t>(VSnapshotData::kVersion);
   MetaObj["label_v"] = static_cast<int64_t>(LabelV);
-  MetaObj["local_rep_merge"] = static_cast<bool>(CFLLocalRepMerge);
+  MetaObj["global_dedup"] = static_cast<bool>(CFLGlobalDedup);
   MetaObj["local_alloca_summary"] = static_cast<bool>(CFLLocalAllocaSummary);
   MetaObj["node_count"] = static_cast<int64_t>(NodeCount);
   MetaObj["rep_count"] = static_cast<int64_t>(RepCount);
@@ -2632,13 +2832,29 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
   auto RowProvider = [&](uint32_t Rep, std::vector<uint32_t> &RowOut) {
     std::unordered_set<uint32_t> Dsts;
     for (uint32_t Member : MembersByRep[Rep]) {
-      assert(Member < Graph.size() && "member node out of CFL graph range");
-      const auto &VSet = Graph[Member][LabelV];
-      Dsts.reserve(Dsts.size() + VSet.size());
-      for (NodeIndex D : VSet) {
-        if (D >= NodeCount)
+      if (useDense) {
+        // Map original node → dense CFL graph index
+        uint32_t denseIdx = (Member < origToDense.size()) ? origToDense[Member] : UINT32_MAX;
+        if (denseIdx == UINT32_MAX || denseIdx >= Graph.size())
           continue;
-        Dsts.insert(Data.nodeToRep[D]);
+        const auto &VSet = Graph[denseIdx][LabelV];
+        Dsts.reserve(Dsts.size() + VSet.size());
+        for (NodeIndex D : VSet) {
+          // Map dense result back to original node, then to rep
+          if (D >= denseToOrig.size()) continue;
+          NodeIndex origD = denseToOrig[D];
+          if (origD >= NodeCount) continue;
+          Dsts.insert(Data.nodeToRep[origD]);
+        }
+      } else {
+        assert(Member < Graph.size() && "member node out of CFL graph range");
+        const auto &VSet = Graph[Member][LabelV];
+        Dsts.reserve(Dsts.size() + VSet.size());
+        for (NodeIndex D : VSet) {
+          if (D >= NodeCount)
+            continue;
+          Dsts.insert(Data.nodeToRep[D]);
+        }
       }
     }
     RowOut.assign(Dsts.begin(), Dsts.end());
@@ -2658,52 +2874,40 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {
   CG_LOG("\n[dumpGlobals]\n");
-  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), cflThreads);
+  const bool useDense = CFLGlobalDedup && !origToDense.empty();
+  const auto &solverEdges = useDense ? denseEdges : EB.getEdges();
+  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(solverEdges, *EB.getGrammar(), cflThreads);
   solver->runCFL();
   const auto &outputCFLGraph = solver->getReachability();
   for (auto &it : Ctx->Gobjs) {
     Value *GV = it.second;
-    NodeIndex valNode = getCanonicalNode(NF.getValueNodeFor(GV));
+    NodeIndex valNode;
+    if (useDense) {
+      valNode = getDenseID(NF.getValueNodeFor(GV));
+      if (valNode == UINT32_MAX) continue;
+    } else {
+      valNode = getCanonicalNode(NF.getValueNodeFor(GV));
+    }
     if (valNode != AndersNodeFactory::InvalidIndex) {
-      // auto &alledges = outputCFLGraph[valNode];
-      // for (size_t i = 0; i < alledges.size(); i++) {
-      //   auto &cflSect = alledges[i];
-      //   auto label = EB.getGrammar()->getIDToSymbolMap().find(i)->second;
-      //   if (cflSect.empty()) continue;
-      //   CG_DEBUG("GlobalVar: " << GV->getName() << " : " << valNode << ", label " << label << "\n");
-      //   for (auto idx : cflSect) {
-      //     if (idx == valNode)
-      //       continue;
-      //     if (NF.isSpecialNode(idx)) {
-      //       CG_DEBUG("\tSpecialNode: " << idx << "\n");
-      //       continue;
-      //     }
-      //     const Value *CV = NF.getValueForNode(idx);
-      //     if (CV == NULL) {
-      //       CG_DEBUG("\tNoValue: " << idx << "\n");
-      //       continue;
-      //     }
-      //     CG_DEBUG("\t" << *CV << " : " << idx << "\n");
-      //   }
-      // }
-      assert(valNode < outputCFLGraph.size() && "Canonical global node out of CFL graph range");
+      assert(valNode < outputCFLGraph.size() && "Global node out of CFL graph range");
       auto &cflSect = outputCFLGraph[valNode][EB.getLabelV()];
       if (cflSect.empty())
         continue;
       CG_DEBUG("GlobalVar: " << GV->getName() << " : " << valNode << " ->\n");
       for (auto idx : cflSect) {
-        if (idx == valNode)
+        NodeIndex origIdx = useDense ? denseToOrig[idx] : idx;
+        if (origIdx == valNode)
           continue;
-        if (NF.isSpecialNode(idx)) {
-          CG_DEBUG("\tSpecialNode: " << idx << "\n");
+        if (NF.isSpecialNode(origIdx)) {
+          CG_DEBUG("\tSpecialNode: " << origIdx << "\n");
           continue;
         }
-        const Value *CV = NF.getValueForNode(idx);
+        const Value *CV = NF.getValueForNode(origIdx);
         if (CV == NULL) {
-          CG_DEBUG("\tNoValue: " << idx << "\n");
+          CG_DEBUG("\tNoValue: " << origIdx << "\n");
           continue;
         }
-        CG_DEBUG("\t" << *CV << " : " << idx << "\n");
+        CG_DEBUG("\t" << *CV << " : " << origIdx << "\n");
       }
     }
   }

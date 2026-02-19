@@ -46,9 +46,9 @@ cl::list<std::string> InputFilenames(
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
 
-cl::opt<bool> CFLLocalRepMerge(
-  "cfl-local-rep-merge",
-  cl::desc("Enable must-like local representative merges in CFL edge construction"),
+cl::opt<bool> CFLGlobalDedup(
+  "cfl-global-dedup",
+  cl::desc("Enable global union-find dedup with dense ID remapping for CFL edge construction"),
   cl::init(true));
 
 cl::opt<bool> CFLLocalAllocaSummary(

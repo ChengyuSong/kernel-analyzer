@@ -129,6 +129,14 @@ static bool shouldSkipValue(const Value *V) {
   return false;
 }
 
+// Helper: returns true if T is a pointer or a vector-of-pointer type.
+static bool containsPointerType(Type *T) {
+  if (T->isPointerTy()) return true;
+  if (auto *VT = dyn_cast<VectorType>(T))
+    return VT->getElementType()->isPointerTy();
+  return false;
+}
+
 // Helper to check if we should skip creating edges for a function call
 static bool shouldSkipFunction(const Function *F) {
   if (!F || !F->hasName())
@@ -860,7 +868,7 @@ bool CallGraphPass::runOnFunction(Function *F) {
   // when CFLGlobalDedup is active), but we still need it for the non-dedup path.
   for (auto itr = inst_begin(F), ite = inst_end(F); itr != ite; ++itr) {
     const Instruction *I = &*itr;
-    if (I->getType()->isPointerTy()) {
+    if (containsPointerType(I->getType())) {
       NF.createValueNode(I);
     }
     if (const ReturnInst *RI = dyn_cast<ReturnInst>(I))
@@ -898,7 +906,7 @@ bool CallGraphPass::runOnFunction(Function *F) {
 void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
   if (I.getNumOperands() > 0) {
     Value *rv = I.getOperand(0);
-    if (!rv->getType()->isPointerTy()) {
+    if (!containsPointerType(rv->getType())) {
       // XXX only consider pointer type
       return;
     }
@@ -1004,7 +1012,7 @@ void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
-  if (!I.getType()->isPointerTy()) {
+  if (!containsPointerType(I.getType())) {
     // XXX only consider pointer type
     return;
   }
@@ -1027,7 +1035,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
 
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   Value *val = I.getOperand(0);
-  if (!val->getType()->isPointerTy()) {
+  if (!containsPointerType(val->getType())) {
     // XXX only consider pointer type
     return;
   }
@@ -1083,10 +1091,22 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
 
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   Value *ptr = GEP.getPointerOperand();
+
+  // Only handle GEPs on pointer or vector-of-pointer types
+  if (!containsPointerType(ptr->getType()))
+    return;
+
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
-  assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP ptr node");
+  if (ptrNode == AndersNodeFactory::InvalidIndex) {
+    // On-the-fly node creation for unhandled operands (e.g., constant vectors)
+    ptrNode = CGP.getCanonicalNode(CGP.NF.createValueNode(ptr));
+    CG_DEBUG("Create value node " << ptrNode << " for GEP ptr " << *ptr << "\n");
+  }
   NodeIndex valNode = CGP.getRepNodeForValue(&GEP);
-  assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find GEP value node");
+  if (valNode == AndersNodeFactory::InvalidIndex) {
+    valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&GEP));
+    CG_DEBUG("Create value node " << valNode << " for GEP result " << GEP << "\n");
+  }
 
   CGP.addAssignmentEdge(ptrNode, valNode);
 }
@@ -1106,7 +1126,7 @@ void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
-  if (!PHI.getType()->isPointerTy()) {
+  if (!containsPointerType(PHI.getType())) {
     // XXX only consider pointer type
     return;
   }
@@ -1132,7 +1152,7 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
 }
 
 void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
-  if (!I.getType()->isPointerTy()) {
+  if (!containsPointerType(I.getType())) {
     // XXX only consider pointer type
     return;
   }
@@ -1318,6 +1338,69 @@ void CallGraphPass::InstHandler::visitMemSetInst(MemSetInst &I) {
   // Record call graph edge for the intrinsic
   if (Function *CF = I.getCalledFunction())
     CGP.Ctx->Callees[&I].insert(CF);
+}
+
+void CallGraphPass::InstHandler::visitExtractElementInst(ExtractElementInst &I) {
+  // Only when extracting a pointer from <N x ptr>
+  if (!I.getType()->isPointerTy())
+    return;
+
+  Value *vec = I.getVectorOperand();
+  NodeIndex vecNode = CGP.getRepNodeForValue(vec);
+  if (vecNode == AndersNodeFactory::InvalidIndex) {
+    CG_DEBUG("ExtractElement: vec node not found for " << *vec << "\n");
+    return;
+  }
+  NodeIndex resNode = CGP.getRepNodeForValue(&I);
+  if (resNode == AndersNodeFactory::InvalidIndex) {
+    resNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  }
+  CGP.addAssignmentEdge(vecNode, resNode);
+}
+
+void CallGraphPass::InstHandler::visitInsertElementInst(InsertElementInst &I) {
+  if (!containsPointerType(I.getType()))
+    return;
+
+  NodeIndex resNode = CGP.getRepNodeForValue(&I);
+  if (resNode == AndersNodeFactory::InvalidIndex) {
+    resNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  }
+
+  // Propagate the scalar pointer element into the vector
+  Value *elt = I.getOperand(1);
+  if (containsPointerType(elt->getType())) {
+    NodeIndex eltNode = CGP.getRepNodeForValue(elt);
+    if (eltNode != AndersNodeFactory::InvalidIndex)
+      CGP.addAssignmentEdge(eltNode, resNode);
+  }
+
+  // Propagate existing elements from the source vector
+  Value *vec = I.getOperand(0);
+  if (!isa<UndefValue>(vec)) {
+    NodeIndex vecNode = CGP.getRepNodeForValue(vec);
+    if (vecNode != AndersNodeFactory::InvalidIndex)
+      CGP.addAssignmentEdge(vecNode, resNode);
+  }
+}
+
+void CallGraphPass::InstHandler::visitShuffleVectorInst(ShuffleVectorInst &I) {
+  if (!containsPointerType(I.getType()))
+    return;
+
+  NodeIndex resNode = CGP.getRepNodeForValue(&I);
+  if (resNode == AndersNodeFactory::InvalidIndex) {
+    resNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  }
+
+  for (unsigned i = 0; i < 2; i++) {
+    Value *vec = I.getOperand(i);
+    if (isa<UndefValue>(vec))
+      continue;
+    NodeIndex vecNode = CGP.getRepNodeForValue(vec);
+    if (vecNode != AndersNodeFactory::InvalidIndex)
+      CGP.addAssignmentEdge(vecNode, resNode);
+  }
 }
 
 // Process global variable initializer in field-insensitive way
@@ -1556,7 +1639,7 @@ bool CallGraphPass::doInitialization(Module *M) {
           !shouldSkipFunction(&F)) {
         for (auto itr = inst_begin(F), ite = inst_end(F); itr != ite; ++itr) {
           const Instruction *I = &*itr;
-          if (I->getType()->isPointerTy())
+          if (containsPointerType(I->getType()))
             NF.createValueNode(I);
           if (const ReturnInst *RI = dyn_cast<ReturnInst>(I))
             Ctx->RetSites[&F] = RI;

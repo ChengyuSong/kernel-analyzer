@@ -36,6 +36,9 @@ private:
     void visitBitCastInst(llvm::BitCastInst &I);
     void visitPHINode(llvm::PHINode &I);
     void visitSelectInst(llvm::SelectInst &I);
+    void visitExtractElementInst(llvm::ExtractElementInst &I);
+    void visitInsertElementInst(llvm::InsertElementInst &I);
+    void visitShuffleVectorInst(llvm::ShuffleVectorInst &I);
     void visitExtractValueInst(llvm::ExtractValueInst &I);
     void visitInsertValueInst(llvm::InsertValueInst &I);
     void visitIntToPtrInst(llvm::IntToPtrInst &I);

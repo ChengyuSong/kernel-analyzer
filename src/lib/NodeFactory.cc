@@ -156,12 +156,27 @@ NodeIndex AndersNodeFactory::getValueNodeFor(const Value* val) {
 }
 
 NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
-    if (!isa<PointerType>(c->getType()))
+    // Accept pointer types and vector-of-pointer types (e.g., <2 x ptr>)
+    Type *cTy = c->getType();
+    bool isPtr = isa<PointerType>(cTy);
+    if (!isPtr) {
+        if (auto *VT = dyn_cast<VectorType>(cTy))
+            isPtr = VT->getElementType()->isPointerTy();
+    }
+    if (!isPtr)
         return ConstantIntIndex;
 
-    if (isa<ConstantPointerNull>(c) || isa<UndefValue>(c))
+    if (isa<ConstantPointerNull>(c) || isa<UndefValue>(c) ||
+        isa<ConstantAggregateZero>(c))
         return NullPtrIndex;
-    else if (const GlobalValue* gv = dyn_cast<GlobalValue>(c))
+    // Vector-of-pointer constants: look up or create a collapsed value node
+    if (isa<VectorType>(cTy)) {
+        auto itr = valueNodeMap.find(c);
+        if (itr != valueNodeMap.end())
+            return itr->second;
+        return createValueNode(c);
+    }
+    if (const GlobalValue* gv = dyn_cast<GlobalValue>(c))
         return getValueNodeFor(gv);
     else if (const ConstantExpr* ce = dyn_cast<ConstantExpr>(c)) {
         switch (ce->getOpcode()){
@@ -261,8 +276,10 @@ NodeIndex AndersNodeFactory::getObjectNodeFor(const Value* val) {
 }
 
 NodeIndex AndersNodeFactory::getObjectNodeForConstant(const llvm::Constant* c) {
-    if(!isa<PointerType>(c->getType()))
+    if(!isa<PointerType>(c->getType())) {
+        // Vector-of-pointer constants don't have meaningful object nodes
         return getUniversalPtrNode();
+    }
 
     if (isa<ConstantPointerNull>(c))
         return NullObjectIndex;

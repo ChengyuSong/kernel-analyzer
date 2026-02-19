@@ -1534,12 +1534,18 @@ void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
 void CallGraphPass::InstHandler::visitMemTransferInst(MemTransferInst &I) {
   // MemTransferInst covers memcpy and memmove intrinsics
   CGP.handleMemcpy(&I);
+  // Record call graph edge for the intrinsic
+  if (Function *CF = I.getCalledFunction())
+    CGP.Ctx->Callees[&I].insert(CF);
 }
 
 void CallGraphPass::InstHandler::visitMemSetInst(MemSetInst &I) {
   // MemSetInst covers memset intrinsics
   // For pointer analysis, memset doesn't transfer pointers, so we can ignore it
   CG_DEBUG("MemSet instruction (ignored for pointer analysis): " << I << "\n");
+  // Record call graph edge for the intrinsic
+  if (Function *CF = I.getCalledFunction())
+    CGP.Ctx->Callees[&I].insert(CF);
 }
 
 // Process global variable initializer in field-insensitive way
@@ -2317,6 +2323,10 @@ static std::string getFuncSourceFile(const Function *F) {
 
 // Return a function ID: bare name for external linkage, "file:name" for internal.
 static std::string getFuncId(const Function *F) {
+  // For intrinsics, use the base name without type suffixes
+  // e.g., "llvm.memcpy.p0.p0.i64" -> "llvm.memcpy"
+  if (F->isIntrinsic())
+    return Intrinsic::getBaseName(F->getIntrinsicID()).str();
   if (F->hasExternalLinkage())
     return F->getName().str();
   return getFuncSourceFile(F) + ":" + F->getName().str();
@@ -2371,7 +2381,7 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     if (Caller && !Caller->isDeclaration() && !Caller->isIntrinsic())
       AllFuncs.insert(Caller);
     for (const Function *F : FS) {
-      if (F && !F->isIntrinsic())
+      if (F && (!F->isIntrinsic() || isImportantIntrinsic(F)))
         AllFuncs.insert(F);
     }
   }
@@ -2384,7 +2394,9 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
   size_t totalEdges = 0, directEdges = 0, indirectEdges = 0;
 
   for (const Function *F : AllFuncs) {
-    if (F->isDeclaration() || F->isIntrinsic())
+    if (F->isIntrinsic() && !isImportantIntrinsic(F))
+      continue;
+    if (F->isDeclaration() && !isImportantIntrinsic(F))
       continue;
 
     std::string FuncID = getFuncId(F);
@@ -2415,7 +2427,7 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
         unsigned line = getCallLine(CI);
 
         for (const Function *Callee : it->second) {
-          if (Callee->isIntrinsic())
+          if (Callee->isIntrinsic() && !isImportantIntrinsic(Callee))
             continue;
           json::Object Edge;
           Edge["callee"] = getFuncId(Callee);
@@ -2437,7 +2449,7 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     if (callerIt != Ctx->Callers.end()) {
       for (const CallBase *CI : callerIt->second) {
         const Function *CallerF = CI->getFunction();
-        if (!CallerF || CallerF->isIntrinsic())
+        if (!CallerF || (CallerF->isIntrinsic() && !isImportantIntrinsic(CallerF)))
           continue;
         bool isDirect = (CI->getCalledFunction() != nullptr);
         unsigned line = getCallLine(CI);

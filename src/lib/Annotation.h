@@ -169,6 +169,24 @@ static inline std::string getValueId(llvm::Value *V) {
   return "";
 }
 
+// Returns true for LLVM intrinsics that represent meaningful function calls
+// worth tracking in the call graph (memory operations that map to real libc
+// functions and matter for data-flow / taint / vulnerability analysis).
+static inline bool isImportantIntrinsic(const llvm::Function *F) {
+  if (!F->isIntrinsic())
+    return false;
+  switch (F->getIntrinsicID()) {
+  case llvm::Intrinsic::memcpy:
+  case llvm::Intrinsic::memcpy_inline:
+  case llvm::Intrinsic::memmove:
+  case llvm::Intrinsic::memset:
+  case llvm::Intrinsic::memset_inline:
+    return true;
+  default:
+    return false;
+  }
+}
+
 extern bool isAllocFn(llvm::StringRef name, int *size, int *flag);
 static inline bool isAllocFn(llvm::StringRef name) {
   int size, flag;

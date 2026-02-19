@@ -26,6 +26,7 @@
 #include <memory>
 #include <vector>
 #include <sstream>
+#include <fstream>
 #include <new>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -41,7 +42,10 @@
 using namespace llvm;
 
 cl::list<std::string> InputFilenames(
-  cl::Positional, cl::OneOrMore, cl::desc("<input bitcode files>"));
+  cl::Positional, cl::ZeroOrMore, cl::desc("<input bitcode files>"));
+
+cl::opt<std::string> BCListFile(
+  "bc-list", cl::desc("File containing input bitcode file paths, one per line"), cl::init(""));
 
 cl::opt<unsigned> VerboseLevel(
   "verbose", cl::desc("Verbose level"), cl::init(0));
@@ -247,6 +251,24 @@ int main(int argc, char **argv) {
   llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
 
   cl::ParseCommandLineOptions(argc, argv, "global analysis\n");
+
+  if (!BCListFile.empty()) {
+    std::ifstream ListFile(BCListFile);
+    if (!ListFile.is_open()) {
+      errs() << argv[0] << ": error opening bc-list file '" << BCListFile << "'\n";
+      return 1;
+    }
+    std::string Line;
+    while (std::getline(ListFile, Line)) {
+      if (!Line.empty())
+        InputFilenames.push_back(Line);
+    }
+  }
+
+  if (InputFilenames.empty()) {
+    errs() << argv[0] << ": no input files specified (use positional args or --bc-list)\n";
+    return 1;
+  }
 
   if (MemLimitPct > 0) {
     long pages = sysconf(_SC_PHYS_PAGES);

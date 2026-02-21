@@ -23,6 +23,7 @@
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/Path.h>
 
+#include <chrono>
 #include <memory>
 #include <vector>
 #include <sstream>
@@ -92,6 +93,20 @@ cl::opt<std::string> AllocatorFile(
 
 cl::opt<std::string> ContainerFile(
   "container-file", cl::desc("Path to container functions JSON file (read or write)"), cl::init(""));
+
+cl::opt<std::string> CompressedGraphOutput(
+  "cfl-compressed-output",
+  cl::desc("Output compressed CFL constraint graph"),
+  cl::init(""));
+
+cl::list<std::string> CompressedGraphInputs(
+  "cfl-compressed-input",
+  cl::desc("Compressed graph files for compositional solving"));
+
+cl::opt<bool> CFLCompositional(
+  "cfl-compositional",
+  cl::desc("Run compositional CFL solving from compressed inputs"),
+  cl::init(false));
 
 cl::opt<std::string> CallGraphJSON(
   "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));
@@ -388,7 +403,22 @@ int main(int argc, char **argv) {
   }
 
   CallGraphPass CGPass(&GlobalCtx, LLM.get());
+  auto tRun = std::chrono::steady_clock::now();
   CGPass.run(GlobalCtx.Modules);
+  auto tRunEnd = std::chrono::steady_clock::now();
+  Diag << "TIMER CGPass.run "
+       << std::chrono::duration_cast<std::chrono::milliseconds>(tRunEnd - tRun).count()
+       << " ms\n";
+
+  // Run compositional CFL solve if requested
+  if (CFLCompositional && !CompressedGraphInputs.empty()) {
+    auto tComp = std::chrono::steady_clock::now();
+    CGPass.runCompositionalSolve();
+    Diag << "TIMER runCompositionalSolve "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tComp).count()
+         << " ms\n";
+  }
 
   if (!CFLEdgeOutput.empty()) {
     GlobalCtx.edgeBuilder.outputEdgesToFile(CFLEdgeOutput);

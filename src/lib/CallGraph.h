@@ -12,6 +12,7 @@
 #include <unordered_set>
 
 #include "Global.h"
+#include "CompressedGraph.h"
 #include "gracfl/include/utils/Reachability.hpp"
 #include "gracfl/include/solvers/SolverFWGramParallel.hpp"
 
@@ -23,6 +24,7 @@ private:
   private:
     CallGraphPass &CGP;
     llvm::Function *F;
+    unsigned icallCounter = 0;
 
   public:
     InstHandler(CallGraphPass &cgp, llvm::Function *func) : CGP(cgp), F(func) {}
@@ -103,6 +105,14 @@ private:
   void buildDenseMapping();
   uint32_t getDenseID(NodeIndex origNode) const;
 
+  // V-SCC computation and constraint graph compression
+  void computeVSCC(const cfl_result_t &outputCFLGraph, unsigned labelV,
+                   std::vector<uint32_t> &nodeToSCC, uint32_t &numSCCs);
+  void compressConstraintGraph(const cfl_result_t &outputCFLGraph,
+                               const std::vector<uint32_t> &nodeToSCC,
+                               uint32_t numSCCs,
+                               CompressedGraphData &out);
+
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
   LLMClient *LLM;
@@ -158,6 +168,8 @@ public:
   // export
   void dumpCallGraphJSON(llvm::StringRef Path);
   void dumpVSnapshot(llvm::StringRef Path);
+  void exportCompressedGraph(llvm::StringRef Path);
+  bool runCompositionalSolve();
 };
 
 #endif

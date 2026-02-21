@@ -26,6 +26,7 @@
 
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <numeric>
@@ -473,19 +474,21 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     return false;
   }
 
-  // assumes CF is the function definition
   if (CF->empty()) {
-    // external function, nothing to do
+    // External function — handle memcpy/memmove specially.
     WARNING("Call: " << CF->getName() << " is empty!\n");
     if (CF->getName() == "memcpy" || CF->getName() == "memmove")
       handleMemcpy(CS);
-    return false;
+
+    // In compositional mode, fall through to create on-demand arg/ret nodes
+    // so cross-TU data flow is captured in the compressed graph.
+    if (CompressedGraphOutput.empty())
+      return false;
   }
-  // CG_DEBUG("Call: " << *CS << " -> " << CF->getName() << "\n");
 
   // handle args
   unsigned numArgs = CS->arg_size();
-  if (CF->isVarArg()) {
+  if (!CF->empty() && CF->isVarArg()) {
     NodeIndex formalNode = getCanonicalNode(NF.getVarargNodeFor(CF));
     assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
     for (unsigned i = 0; i < numArgs; i++) {
@@ -517,7 +520,6 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
         continue;
       }
       NodeIndex argNode = getRepNodeForValue(arg);
-      // assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
       if (argNode == AndersNodeFactory::InvalidIndex) {
         argNode = NF.createValueNode(arg);
         argNode = getCanonicalNode(argNode);
@@ -525,15 +527,24 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       }
       Value *farg = CF->getArg(i);
       NodeIndex formalNode = getRepNodeForValue(farg);
-      assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
+      if (formalNode == AndersNodeFactory::InvalidIndex) {
+        // On-demand node for declared function formal argument.
+        formalNode = NF.createValueNode(farg);
+        formalNode = getCanonicalNode(formalNode);
+      }
       addAssignmentEdge(argNode, formalNode);
     }
   }
 
   // handle return
   if (CF->getReturnType()->isPointerTy()) {
-    NodeIndex retNode = getCanonicalNode(NF.getReturnNodeFor(CF));
-    assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
+    NodeIndex retNode = NF.getReturnNodeFor(CF);
+    if (retNode == AndersNodeFactory::InvalidIndex ||
+        retNode == NF.getUniversalPtrNode()) {
+      // On-demand return node for declared function.
+      retNode = NF.createReturnNode(CF);
+    }
+    retNode = getCanonicalNode(retNode);
     // The callsite may not have a value node if it discards the return value
     // (e.g., void-typed callsite matched via permissive isCompatible)
     NodeIndex callNode = getRepNodeForValue(CS);
@@ -996,6 +1007,17 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       }
     } else {
       CGP.Ctx->IndirectCallInsts.insert(&CS);
+      // Attach deterministic icall ID as LLVM metadata.
+      // Use module source + function name for uniqueness across TUs.
+      std::string id;
+      if (F->hasLocalLinkage())
+        id = F->getParent()->getSourceFileName() + ":" +
+             F->getName().str() + "#" + std::to_string(icallCounter++);
+      else
+        id = F->getName().str() + "#" + std::to_string(icallCounter++);
+      CS.setMetadata("ka.icall.id",
+          MDNode::get(CS.getContext(),
+                      {MDString::get(CS.getContext(), id)}));
     }
   }
 }
@@ -2407,6 +2429,16 @@ bool CallGraphPass::doModulePass(Module *M) {
     if (CFLGlobalDedup)
       buildDenseMapping();
 
+    // In compositional mode with compressed graph inputs, skip the expensive
+    // full CFL solve — runCompositionalSolve() will use composed results.
+    if (CFLCompositional && !CompressedGraphInputs.empty()) {
+      CG_LOG("Compositional mode: skipping full CFL solve\n");
+      if (!CompressedGraphOutput.empty())
+        exportCompressedGraph(CompressedGraphOutput);
+      iteration++;
+      return false;
+    }
+
     // solve CFL constraints after processing the last module
     CG_LOG("Using " << cflThreads << " threads for FWGramParallel\n");
     const auto &inputEdges = EB.getEdges();
@@ -2489,9 +2521,14 @@ bool CallGraphPass::doModulePass(Module *M) {
     if (rebuildSolver || incrementalAdded > 0) {
       auto initEdges = cflSolver->getEdgeCount();
       CG_LOG("CFL Init Edges: " << initEdges << "\n");
+      auto cflStart = std::chrono::steady_clock::now();
       cflSolver->runCFL();
+      auto cflEnd = std::chrono::steady_clock::now();
       auto finalEdges = cflSolver->getEdgeCount();
       CG_LOG("CFL Final Edges: " << finalEdges << "\n");
+      CG_LOG("TIMER cfl-solve "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(cflEnd - cflStart).count()
+             << " ms\n");
     }
 
     const auto &outputCFLGraph = cflSolver->getReachability();
@@ -2546,6 +2583,10 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     // parse results and update call edges
     Changed |= handleIndirectCall(outputCFLGraph);
+
+    // Export compressed graph if requested
+    if (!CompressedGraphOutput.empty())
+      exportCompressedGraph(CompressedGraphOutput);
 
     iteration++;
   }
@@ -2953,6 +2994,813 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
          << ", reps=" << Data.repToNode.size()
          << ", V-edges=" << EdgeCount
          << ", names=" << Data.namedEntries.size() << "\n");
+}
+
+void CallGraphPass::computeVSCC(const cfl_result_t &outputCFLGraph,
+                                unsigned labelV,
+                                std::vector<uint32_t> &nodeToSCC,
+                                uint32_t &numSCCs) {
+  const uint32_t N = static_cast<uint32_t>(outputCFLGraph.size());
+  nodeToSCC.assign(N, UINT32_MAX);
+  numSCCs = 0;
+
+  if (N == 0 || outputCFLGraph[0].size() <= labelV)
+    return;
+
+  // Iterative Tarjan's SCC on V-reachability adjacency
+  std::vector<uint32_t> sccIndex(N, UINT32_MAX);
+  std::vector<uint32_t> sccLowlink(N, UINT32_MAX);
+  std::vector<bool> onStack(N, false);
+  std::vector<uint32_t> sccStack;
+  uint32_t index = 0;
+
+  // Frame for iterative DFS
+  struct Frame {
+    uint32_t node;
+    // Iterator state: we iterate over V-reachable neighbors
+    std::vector<uint32_t> neighbors;
+    size_t neighborIdx;
+  };
+
+  std::vector<Frame> dfsStack;
+
+  for (uint32_t startNode = 0; startNode < N; startNode++) {
+    if (sccIndex[startNode] != UINT32_MAX)
+      continue;
+
+    // Push start node
+    dfsStack.push_back(Frame{startNode, {}, 0});
+    {
+      auto &f = dfsStack.back();
+      sccIndex[startNode] = sccLowlink[startNode] = index++;
+      onStack[startNode] = true;
+      sccStack.push_back(startNode);
+      // Collect V-reachable neighbors
+      const auto &VSet = outputCFLGraph[startNode][labelV];
+      f.neighbors.reserve(VSet.size());
+      for (uint32_t w : VSet) {
+        if (w < N)
+          f.neighbors.push_back(w);
+      }
+    }
+
+    while (!dfsStack.empty()) {
+      auto &frame = dfsStack.back();
+      bool pushed = false;
+
+      while (frame.neighborIdx < frame.neighbors.size()) {
+        uint32_t w = frame.neighbors[frame.neighborIdx];
+        frame.neighborIdx++;
+
+        if (sccIndex[w] == UINT32_MAX) {
+          // Not yet visited: push onto DFS stack
+          sccIndex[w] = sccLowlink[w] = index++;
+          onStack[w] = true;
+          sccStack.push_back(w);
+
+          Frame newFrame;
+          newFrame.node = w;
+          newFrame.neighborIdx = 0;
+          const auto &WSet = outputCFLGraph[w][labelV];
+          newFrame.neighbors.reserve(WSet.size());
+          for (uint32_t x : WSet) {
+            if (x < N)
+              newFrame.neighbors.push_back(x);
+          }
+          dfsStack.push_back(std::move(newFrame));
+          pushed = true;
+          break;
+        } else if (onStack[w]) {
+          sccLowlink[frame.node] = std::min(sccLowlink[frame.node], sccIndex[w]);
+        }
+      }
+
+      if (pushed)
+        continue;
+
+      // All neighbors processed
+      uint32_t v = frame.node;
+      if (sccLowlink[v] == sccIndex[v]) {
+        // Root of SCC
+        uint32_t sccId = numSCCs++;
+        uint32_t w;
+        do {
+          w = sccStack.back();
+          sccStack.pop_back();
+          onStack[w] = false;
+          nodeToSCC[w] = sccId;
+        } while (w != v);
+      }
+
+      dfsStack.pop_back();
+
+      // Update parent lowlink
+      if (!dfsStack.empty()) {
+        auto &parent = dfsStack.back();
+        sccLowlink[parent.node] = std::min(sccLowlink[parent.node], sccLowlink[v]);
+      }
+    }
+  }
+
+  CG_LOG("V-SCC computation: " << N << " nodes -> " << numSCCs << " SCCs\n");
+}
+
+void CallGraphPass::compressConstraintGraph(
+    const cfl_result_t &outputCFLGraph,
+    const std::vector<uint32_t> &nodeToSCC,
+    uint32_t numSCCs,
+    CompressedGraphData &out) {
+  out = CompressedGraphData();
+  out.numNodes = numSCCs;
+
+  const bool useDense = CFLGlobalDedup && !origToDense.empty();
+
+  // Helper: map an original NF node to its SCC ID
+  auto origNodeToSCC = [&](NodeIndex origNode) -> uint32_t {
+    NodeIndex canon = getCanonicalNode(origNode);
+    uint32_t graphNode;
+    if (useDense) {
+      if (canon >= origToDense.size()) return UINT32_MAX;
+      graphNode = origToDense[canon];
+    } else {
+      graphNode = canon;
+    }
+    if (graphNode == UINT32_MAX || graphNode >= nodeToSCC.size())
+      return UINT32_MAX;
+    return nodeToSCC[graphNode];
+  };
+
+  // Step 1: Remap edges through SCC and deduplicate
+  const auto &rawEdges = useDense ? denseEdges : EB.getEdges();
+  std::unordered_set<EdgeKey, EdgeKeyHash> edgeSeen;
+  edgeSeen.reserve(rawEdges.size());
+  out.edges.reserve(rawEdges.size() / 2);
+
+  for (const auto &E : rawEdges) {
+    uint32_t sccFrom = (E.from < nodeToSCC.size()) ? nodeToSCC[E.from] : UINT32_MAX;
+    uint32_t sccTo = (E.to < nodeToSCC.size()) ? nodeToSCC[E.to] : UINT32_MAX;
+    if (sccFrom == UINT32_MAX || sccTo == UINT32_MAX)
+      continue;
+    if (sccFrom == sccTo)
+      continue; // skip self-loops
+    EdgeKey key{sccFrom, sccTo, E.label};
+    if (edgeSeen.insert(key).second)
+      out.edges.emplace_back(sccFrom, sccTo, E.label);
+  }
+
+  // Step 2: Build symbol table from boundary nodes
+  // Functions with external linkage
+  for (const auto &[guid, F] : Ctx->Funcs) {
+    if (!F || F->hasLocalLinkage())
+      continue;
+    std::string guidStr = std::to_string(guid);
+
+    // Function value node
+    NodeIndex valNode = NF.getValueNodeFor(F);
+    if (valNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(valNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{"func:" + guidStr}] = scc;
+    }
+
+    // Arg nodes
+    for (const auto &Arg : F->args()) {
+      NodeIndex argNode = NF.getValueNodeFor(&Arg);
+      if (argNode != AndersNodeFactory::InvalidIndex) {
+        uint32_t scc = origNodeToSCC(argNode);
+        if (scc != UINT32_MAX)
+          out.symbolTable[BoundarySymbol{
+            "arg:" + guidStr + ":" + std::to_string(Arg.getArgNo())}] = scc;
+      }
+    }
+
+    // Return node
+    NodeIndex retNode = NF.getReturnNodeFor(F);
+    if (retNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(retNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{"ret:" + guidStr}] = scc;
+    }
+
+    // Vararg node
+    NodeIndex vaNode = NF.getVarargNodeFor(F);
+    if (vaNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(vaNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{"vararg:" + guidStr}] = scc;
+    }
+  }
+
+  // External function references (declared but not defined in this TU set).
+  // These are needed for compositional analysis to connect cross-TU calls.
+  for (const auto &[guid, F] : Ctx->ExtFuncs) {
+    if (!F)
+      continue;
+    std::string guidStr = std::to_string(guid);
+
+    NodeIndex valNode = NF.getValueNodeFor(F);
+    if (valNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(valNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{"func:" + guidStr}] = scc;
+    }
+
+    for (const auto &Arg : F->args()) {
+      NodeIndex argNode = NF.getValueNodeFor(&Arg);
+      if (argNode != AndersNodeFactory::InvalidIndex) {
+        uint32_t scc = origNodeToSCC(argNode);
+        if (scc != UINT32_MAX)
+          out.symbolTable[BoundarySymbol{
+            "arg:" + guidStr + ":" + std::to_string(Arg.getArgNo())}] = scc;
+      }
+    }
+
+    NodeIndex retNode = NF.getReturnNodeFor(F);
+    if (retNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(retNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{"ret:" + guidStr}] = scc;
+    }
+
+    NodeIndex vaNode = NF.getVarargNodeFor(F);
+    if (vaNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(vaNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{"vararg:" + guidStr}] = scc;
+    }
+  }
+
+  // Global objects
+  for (const auto &[guid, GV] : Ctx->Gobjs) {
+    if (!GV)
+      continue;
+    NodeIndex valNode = NF.getValueNodeFor(GV);
+    if (valNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(valNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{
+          "glob:" + std::to_string(guid)}] = scc;
+    }
+  }
+
+  // External global object references
+  for (const auto &[guid, GV] : Ctx->ExtGobjs) {
+    if (!GV)
+      continue;
+    NodeIndex valNode = NF.getValueNodeFor(GV);
+    if (valNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(valNode);
+      if (scc != UINT32_MAX)
+        out.symbolTable[BoundarySymbol{
+          "glob:" + std::to_string(guid)}] = scc;
+    }
+  }
+
+  // Indirect call fptr nodes as boundary symbols
+  size_t icallTotal = 0, icallNoMD = 0, icallNoNode = 0, icallNoSCC = 0, icallAdded = 0;
+  for (auto *CS : Ctx->IndirectCallInsts) {
+    icallTotal++;
+    auto *MD = CS->getMetadata("ka.icall.id");
+    if (!MD) { icallNoMD++; continue; }
+    auto *S = dyn_cast<MDString>(MD->getOperand(0));
+    if (!S) { icallNoMD++; continue; }
+    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+    NodeIndex fptrNode = NF.getValueNodeFor(fptr);
+    if (fptrNode == AndersNodeFactory::InvalidIndex) { icallNoNode++; continue; }
+    uint32_t scc = origNodeToSCC(fptrNode);
+    if (scc == UINT32_MAX) { icallNoSCC++; continue; }
+    out.symbolTable[BoundarySymbol{"icall:" + S->getString().str()}] = scc;
+    icallAdded++;
+  }
+  CG_LOG("Icall boundary: total=" << icallTotal << " noMD=" << icallNoMD
+         << " noNode=" << icallNoNode << " noSCC=" << icallNoSCC
+         << " added=" << icallAdded << "\n");
+
+  // Field store value nodes as boundary symbols for cross-TU field store rebuild
+  unsigned storCounter = 0;
+  for (const auto &rec : fieldStoreRecords) {
+    uint32_t scc = origNodeToSCC(rec.valNode);
+    if (scc == UINT32_MAX) continue;
+    std::string sym = "stor:" + rec.structName + "#" +
+                      std::to_string(rec.fieldIdx) + "#" +
+                      std::to_string(storCounter++);
+    out.symbolTable[BoundarySymbol{sym}] = scc;
+  }
+  CG_LOG("Field store boundary: " << storCounter << " symbols from "
+         << fieldStoreRecords.size() << " records\n");
+
+  // Step 3: Build funcNodes - scan all nodes for Function* values
+  const uint32_t nodeCount = useDense ? numDenseNodes
+                                      : NF.getNumNodes();
+  for (uint32_t n = 0; n < nodeCount; n++) {
+    NodeIndex origIdx = useDense ? denseToOrig[n] : n;
+    const Value *V = NF.getValueForNode(origIdx);
+    if (!V) continue;
+    const Function *F = dyn_cast<Function>(V);
+    if (!F) continue;
+    // Only include address-taken functions (those that can be indirect targets)
+    if (!Ctx->AddressTakenFuncs.count(F))
+      continue;
+    // Don't count return/vararg nodes
+    if (NF.isReturnNode(origIdx) || NF.isVarargNode(origIdx))
+      continue;
+    uint32_t sccId = (n < nodeToSCC.size()) ? nodeToSCC[n] : UINT32_MAX;
+    if (sccId != UINT32_MAX)
+      out.funcNodes[sccId].push_back(F->getName().str());
+  }
+
+  // Deduplicate function names within each SCC
+  for (auto &[sccId, names] : out.funcNodes) {
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+  }
+
+  CG_LOG("Compressed graph: " << numSCCs << " SCC nodes, "
+         << out.edges.size() << " edges, "
+         << out.symbolTable.size() << " boundary symbols, "
+         << out.funcNodes.size() << " func-bearing nodes\n");
+}
+
+void CallGraphPass::exportCompressedGraph(StringRef Path) {
+  auto tTotal = std::chrono::steady_clock::now();
+
+  const cfl_result_t *GraphPtr = nullptr;
+  std::unique_ptr<gracfl::SolverFWGramParallel> TmpSolver;
+  if (cflSolver) {
+    GraphPtr = &cflSolver->getReachability();
+  } else {
+    CG_LOG("TIMER export-cfl-solve: solving CFL for compressed graph export...\n");
+    auto tSolve = std::chrono::steady_clock::now();
+    const auto &solverEdges = (CFLGlobalDedup && !denseEdges.empty())
+                                  ? denseEdges : EB.getEdges();
+    TmpSolver = std::make_unique<gracfl::SolverFWGramParallel>(
+        solverEdges, *EB.getGrammar(), cflThreads);
+    TmpSolver->runCFL();
+    GraphPtr = &TmpSolver->getReachability();
+    CG_LOG("TIMER export-cfl-solve "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tSolve).count()
+           << " ms\n");
+  }
+  if (!GraphPtr || GraphPtr->empty()) {
+    WARNING("CompressedGraph: empty CFL graph, skip export to " << Path << "\n");
+    return;
+  }
+
+  const auto &Graph = *GraphPtr;
+  const uint32_t LabelV = EB.getLabelV();
+  if (Graph[0].size() <= LabelV) {
+    WARNING("CompressedGraph: V label index " << LabelV << " is out of range\n");
+    return;
+  }
+
+  auto tVSCC = std::chrono::steady_clock::now();
+  std::vector<uint32_t> nodeToSCC;
+  uint32_t numSCCs = 0;
+  computeVSCC(Graph, LabelV, nodeToSCC, numSCCs);
+  CG_LOG("TIMER export-vscc "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tVSCC).count()
+         << " ms\n");
+
+  auto tCompress = std::chrono::steady_clock::now();
+  CompressedGraphData data;
+  compressConstraintGraph(Graph, nodeToSCC, numSCCs, data);
+  CG_LOG("TIMER export-compress "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tCompress).count()
+         << " ms\n");
+
+  // Serialize funcFieldStores into metadata JSON
+  if (!funcFieldStores.empty()) {
+    json::Object fsObj;
+    for (const auto &[F, fieldSet] : funcFieldStores) {
+      json::Array fields;
+      for (const auto &[structName, fieldIdx] : fieldSet)
+        fields.push_back(json::Array{structName, static_cast<int64_t>(fieldIdx)});
+      fsObj[F->getName().str()] = std::move(fields);
+    }
+    json::Object root;
+    root["fieldStores"] = std::move(fsObj);
+    std::string jsonStr;
+    raw_string_ostream jsonOS(jsonStr);
+    jsonOS << json::Value(std::move(root));
+    data.metadataJson = std::move(jsonStr);
+    CG_LOG("Serialized " << funcFieldStores.size()
+           << " funcFieldStores entries into metadata ("
+           << data.metadataJson.size() << " bytes)\n");
+  }
+
+  auto tSave = std::chrono::steady_clock::now();
+  std::string ErrMsg;
+  if (!saveCompressedGraph(Path, data, &ErrMsg)) {
+    WARNING("CompressedGraph: failed to export " << Path << ": " << ErrMsg << "\n");
+    return;
+  }
+  CG_LOG("TIMER export-save "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tSave).count()
+         << " ms\n");
+
+  CG_LOG("Exported compressed graph to " << Path
+         << ": nodes=" << data.numNodes
+         << ", edges=" << data.edges.size()
+         << ", symbols=" << data.symbolTable.size() << "\n");
+  CG_LOG("TIMER export-total "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tTotal).count()
+         << " ms\n");
+}
+
+bool CallGraphPass::runCompositionalSolve() {
+  extern cl::list<std::string> CompressedGraphInputs;
+
+  if (CompressedGraphInputs.empty()) {
+    WARNING("Compositional solve: no compressed graph inputs specified\n");
+    return false;
+  }
+
+  CG_LOG("Compositional CFL solve: loading " << CompressedGraphInputs.size()
+         << " compressed graphs\n");
+
+  // Step 1: Load all compressed graphs
+  auto tLoad = std::chrono::steady_clock::now();
+  std::vector<CompressedGraphData> graphs(CompressedGraphInputs.size());
+  for (size_t i = 0; i < CompressedGraphInputs.size(); i++) {
+    std::string ErrMsg;
+    if (!loadCompressedGraph(CompressedGraphInputs[i], graphs[i], &ErrMsg)) {
+      errs() << "Failed to load compressed graph '"
+             << CompressedGraphInputs[i] << "': " << ErrMsg << "\n";
+      return false;
+    }
+    CG_LOG("  Loaded " << CompressedGraphInputs[i]
+           << ": nodes=" << graphs[i].numNodes
+           << ", edges=" << graphs[i].edges.size()
+           << ", symbols=" << graphs[i].symbolTable.size() << "\n");
+  }
+  CG_LOG("TIMER comp-load "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tLoad).count()
+         << " ms\n");
+
+  // Step 2: Assign node offsets and build unified ID space
+  auto tBuild = std::chrono::steady_clock::now();
+  std::vector<uint32_t> nodeOffsets(graphs.size());
+  uint32_t totalNodes = 0;
+  for (size_t i = 0; i < graphs.size(); i++) {
+    nodeOffsets[i] = totalNodes;
+    totalNodes += graphs[i].numNodes;
+  }
+
+  CG_LOG("Unified node space: " << totalNodes << " nodes\n");
+
+  // Step 3: Build boundary symbol -> list<(graph_idx, unified_node_id)> map
+  std::unordered_map<std::string,
+                     std::vector<std::pair<size_t, uint32_t>>> symbolOccurrences;
+  for (size_t i = 0; i < graphs.size(); i++) {
+    for (const auto &[sym, localId] : graphs[i].symbolTable) {
+      uint32_t unifiedId = nodeOffsets[i] + localId;
+      symbolOccurrences[sym.symbol].emplace_back(i, unifiedId);
+    }
+  }
+
+  // Step 4: Merge matching boundary nodes with union-find
+  std::vector<uint32_t> ufParent(totalNodes);
+  std::vector<uint8_t> ufRank(totalNodes, 0);
+  std::iota(ufParent.begin(), ufParent.end(), 0);
+
+  auto ufFind = [&](uint32_t n) -> uint32_t {
+    uint32_t root = n;
+    while (ufParent[root] != root)
+      root = ufParent[root];
+    while (ufParent[n] != root) {
+      uint32_t parent = ufParent[n];
+      ufParent[n] = root;
+      n = parent;
+    }
+    return root;
+  };
+
+  auto ufUnion = [&](uint32_t a, uint32_t b) {
+    uint32_t ra = ufFind(a);
+    uint32_t rb = ufFind(b);
+    if (ra == rb) return;
+    if (ufRank[ra] < ufRank[rb]) std::swap(ra, rb);
+    ufParent[rb] = ra;
+    if (ufRank[ra] == ufRank[rb]) ufRank[ra]++;
+  };
+
+  size_t mergeCount = 0;
+  for (const auto &[symbol, occurrences] : symbolOccurrences) {
+    if (occurrences.size() < 2)
+      continue;
+    uint32_t first = occurrences[0].second;
+    for (size_t j = 1; j < occurrences.size(); j++) {
+      ufUnion(first, occurrences[j].second);
+      mergeCount++;
+    }
+  }
+
+  CG_LOG("Boundary merges: " << mergeCount << " unions across "
+         << symbolOccurrences.size() << " symbols\n");
+
+  // Step 5: Build dense remapping through union-find
+  std::unordered_map<uint32_t, uint32_t> rootToDense;
+  rootToDense.reserve(totalNodes);
+  uint32_t numDense = 0;
+  std::vector<uint32_t> unifiedToDense(totalNodes);
+  for (uint32_t n = 0; n < totalNodes; n++) {
+    uint32_t root = ufFind(n);
+    auto it = rootToDense.find(root);
+    if (it == rootToDense.end()) {
+      rootToDense[root] = numDense;
+      unifiedToDense[n] = numDense;
+      numDense++;
+    } else {
+      unifiedToDense[n] = it->second;
+    }
+  }
+
+  CG_LOG("After union-find: " << totalNodes << " unified -> "
+         << numDense << " dense nodes\n");
+
+  // Step 6: Remap all edges through union-find and deduplicate
+  std::unordered_set<EdgeKey, EdgeKeyHash> edgeSeen;
+  std::vector<gracfl::Edge> combinedEdges;
+  size_t totalInputEdges = 0;
+  for (size_t i = 0; i < graphs.size(); i++) {
+    totalInputEdges += graphs[i].edges.size();
+  }
+  edgeSeen.reserve(totalInputEdges);
+  combinedEdges.reserve(totalInputEdges);
+
+  for (size_t i = 0; i < graphs.size(); i++) {
+    uint32_t offset = nodeOffsets[i];
+    for (const auto &E : graphs[i].edges) {
+      uint32_t from = unifiedToDense[offset + E.from];
+      uint32_t to = unifiedToDense[offset + E.to];
+      if (from == to) continue;
+      EdgeKey key{from, to, E.label};
+      if (edgeSeen.insert(key).second)
+        combinedEdges.emplace_back(from, to, E.label);
+    }
+  }
+
+  CG_LOG("Combined edges: " << totalInputEdges << " input -> "
+         << combinedEdges.size() << " deduplicated\n");
+  CG_LOG("TIMER comp-build "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tBuild).count()
+         << " ms\n");
+
+  // Step 7: Solve CFL on combined graph
+  if (!EB.getGrammar()) {
+    errs() << "Compositional solve: grammar not initialized\n";
+    return false;
+  }
+
+  CG_LOG("Running CFL solver on combined graph (" << numDense
+         << " nodes, " << combinedEdges.size() << " edges)...\n");
+  auto tSolve = std::chrono::steady_clock::now();
+  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(
+      combinedEdges, *EB.getGrammar(), cflThreads);
+  solver->runCFL();
+  CG_LOG("CFL solve complete. Final edges: " << solver->getEdgeCount() << "\n");
+  CG_LOG("TIMER comp-solve "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tSolve).count()
+         << " ms\n");
+
+  // Result graph available via solver->getReachability() for future use
+  const uint32_t LabelV = EB.getLabelV();
+
+  // Step 8: Build reverse map from dense node -> function names
+  std::unordered_map<uint32_t, std::vector<std::string>> denseToFuncNames;
+  for (size_t i = 0; i < graphs.size(); i++) {
+    uint32_t offset = nodeOffsets[i];
+    for (const auto &[localId, names] : graphs[i].funcNodes) {
+      uint32_t denseId = unifiedToDense[offset + localId];
+      auto &merged = denseToFuncNames[denseId];
+      merged.insert(merged.end(), names.begin(), names.end());
+    }
+  }
+  // Deduplicate
+  for (auto &[id, names] : denseToFuncNames) {
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+  }
+
+  // Step 9: Resolve indirect calls using composed results
+
+  // Build function name -> Function* map for resolving.
+  // Include all functions from all modules (not just Ctx->Funcs) so that
+  // local-linkage (static) functions and declared external functions can
+  // also be resolved by name from the compressed graph funcNodes.
+  std::unordered_map<std::string, Function *> nameToFunc;
+  for (auto &[M, _] : Ctx->Modules) {
+    for (Function &F : *M) {
+      if (!F.isIntrinsic())
+        nameToFunc.emplace(F.getName().str(), &F);
+    }
+  }
+
+  // Deserialize per-TU funcFieldStores from each graph's metadata.
+  // This captures "function F performs a store to struct S field N" (intra-TU).
+  using FieldStoreKey = std::pair<std::string, unsigned>;
+  struct FSKeyHash {
+    size_t operator()(const FieldStoreKey &k) const {
+      return std::hash<std::string>()(k.first) ^
+             (std::hash<unsigned>()(k.second) << 16);
+    }
+  };
+  std::unordered_map<const Function*,
+                     std::unordered_set<FieldStoreKey, FSKeyHash>> composedFieldStores;
+  for (const auto &g : graphs) {
+    if (g.metadataJson.empty())
+      continue;
+    auto parsed = json::parse(g.metadataJson);
+    if (!parsed) {
+      consumeError(parsed.takeError());
+      continue;
+    }
+    auto *root = parsed->getAsObject();
+    if (!root) continue;
+    auto *fsObj = root->getObject("fieldStores");
+    if (!fsObj) continue;
+    for (const auto &[funcName, fieldsVal] : *fsObj) {
+      auto it = nameToFunc.find(funcName.str());
+      if (it == nameToFunc.end()) continue;
+      const Function *F = it->second;
+      auto *fields = fieldsVal.getAsArray();
+      if (!fields) continue;
+      for (const auto &entry : *fields) {
+        auto *pair = entry.getAsArray();
+        if (!pair || pair->size() != 2) continue;
+        auto structNameOpt = (*pair)[0].getAsString();
+        auto fieldIdxOpt = (*pair)[1].getAsInteger();
+        if (!structNameOpt || !fieldIdxOpt) continue;
+        composedFieldStores[F].insert(
+            {structNameOpt->str(), static_cast<unsigned>(*fieldIdxOpt)});
+      }
+    }
+  }
+  CG_LOG("Deserialized funcFieldStores: " << composedFieldStores.size()
+         << " functions from metadata\n");
+
+  // Augment with cross-TU field store information from V-reachability.
+  // Parse stor: boundary symbols to find field store value nodes, then query
+  // V-reachability at those nodes to discover which function addresses flow
+  // to each field store location — this crosses TU boundaries.
+  std::unordered_map<uint32_t, std::vector<FieldStoreKey>> denseToFieldStores;
+  for (const auto &[symbol, occurrences] : symbolOccurrences) {
+    if (symbol.compare(0, 5, "stor:") != 0)
+      continue;
+    // Parse "stor:structName#fieldIdx#counter"
+    auto payload = symbol.substr(5);
+    auto hash1 = payload.find('#');
+    if (hash1 == std::string::npos) continue;
+    auto hash2 = payload.find('#', hash1 + 1);
+    if (hash2 == std::string::npos) hash2 = payload.size();
+    std::string structName = payload.substr(0, hash1);
+    unsigned fieldIdx = std::stoul(payload.substr(hash1 + 1, hash2 - hash1 - 1));
+    uint32_t denseNode = unifiedToDense[ufFind(occurrences[0].second)];
+    denseToFieldStores[denseNode].emplace_back(structName, fieldIdx);
+  }
+
+  // Only add V-reachability entries for functions that have NO per-TU entry.
+  // Functions with per-TU entries already have precise field info; adding
+  // V-reachability results from the less-precise composed graph would
+  // introduce false field matches and weaken the filter.
+  const auto &composedGraph = solver->getReachability();
+  size_t crossTUFuncs = 0;
+  for (const auto &[denseNode, fieldKeys] : denseToFieldStores) {
+    if (denseNode >= composedGraph.size()) continue;
+    const auto &VSet = composedGraph[denseNode][LabelV];
+    for (uint32_t target : VSet) {
+      auto fnIt = denseToFuncNames.find(target);
+      if (fnIt == denseToFuncNames.end()) continue;
+      for (const auto &funcName : fnIt->second) {
+        auto fIt = nameToFunc.find(funcName);
+        if (fIt == nameToFunc.end()) continue;
+        // Skip functions that already have per-TU field store entries
+        if (composedFieldStores.count(fIt->second))
+          continue;
+        for (const auto &fk : fieldKeys)
+          composedFieldStores[fIt->second].insert(fk);
+        crossTUFuncs++;
+      }
+    }
+  }
+  CG_LOG("Cross-TU field store augmentation: " << denseToFieldStores.size()
+         << " stor: nodes, " << crossTUFuncs << " new functions, "
+         << composedFieldStores.size() << " total functions\n");
+
+  // Build icall symbol -> dense node lookup from composed symbols
+  // The icall boundary symbols were remapped through unifiedToDense during
+  // Steps 3-5, so we look them up in symbolOccurrences.
+  std::unordered_map<std::string, uint32_t> icallSymbolToDense;
+  for (const auto &[symbol, occurrences] : symbolOccurrences) {
+    if (symbol.compare(0, 6, "icall:") != 0)
+      continue;
+    // Use the first occurrence's unified ID, remapped through union-find
+    icallSymbolToDense[symbol] = unifiedToDense[ufFind(occurrences[0].second)];
+  }
+  CG_LOG("Composed icall symbols: " << icallSymbolToDense.size() << "\n");
+
+  size_t resolvedCalls = 0;
+  size_t totalTargets = 0;
+  size_t skippedNoSymbol = 0;
+
+  for (auto *CS : Ctx->IndirectCallInsts) {
+    // Read the deterministic icall ID from metadata
+    auto *MD = CS->getMetadata("ka.icall.id");
+    if (!MD) continue;
+    auto *S = dyn_cast<MDString>(MD->getOperand(0));
+    if (!S) continue;
+    std::string icallKey = "icall:" + S->getString().str();
+
+    auto symIt = icallSymbolToDense.find(icallKey);
+    if (symIt == icallSymbolToDense.end()) {
+      skippedNoSymbol++;
+      continue;
+    }
+    uint32_t denseNode = symIt->second;
+
+    if (denseNode >= composedGraph.size())
+      continue;
+
+    // Extract call-site struct field info for field-sensitive filtering
+    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+    std::string callSiteStruct;
+    unsigned callSiteFieldIdx = 0;
+    bool hasCallSiteField = false;
+    if (auto *Load = dyn_cast<LoadInst>(fptr)) {
+      Value *loadPtr = Load->getPointerOperand()->stripPointerCasts();
+      if (auto *GEP = dyn_cast<GEPOperator>(loadPtr)) {
+        hasCallSiteField = getGEPStructField(GEP, callSiteStruct, callSiteFieldIdx);
+      }
+    }
+
+    const auto &VSet = composedGraph[denseNode][LabelV];
+    // Count how many V-set entries have funcNames
+    size_t vWithFunc = 0;
+    for (uint32_t t : VSet)
+      if (denseToFuncNames.count(t)) vWithFunc++;
+    CG_DEBUG("Icall " << icallKey << " dense=" << denseNode
+             << " VSet=" << VSet.size()
+             << " withFunc=" << vWithFunc << "\n");
+    if (VSet.size() <= 5) {
+      for (uint32_t t : VSet) {
+        auto fn = denseToFuncNames.find(t);
+        if (fn != denseToFuncNames.end()) {
+          for (const auto &n : fn->second)
+            CG_DEBUG("  VSet[" << t << "] -> " << n << "\n");
+        }
+      }
+    }
+    FuncSet targets;
+    for (uint32_t target : VSet) {
+      // Look up function names from the composed funcNodes map
+      auto fnIt = denseToFuncNames.find(target);
+      if (fnIt == denseToFuncNames.end())
+        continue;
+      for (const auto &funcName : fnIt->second) {
+        auto fIt = nameToFunc.find(funcName);
+        if (fIt == nameToFunc.end())
+          continue;
+        Function *F = fIt->second;
+        if (!isCompatible(CS, F))
+          continue;
+        // Struct-field-aware filtering using deserialized metadata
+        if (hasCallSiteField) {
+          auto fsIt = composedFieldStores.find(F);
+          if (fsIt != composedFieldStores.end()) {
+            if (fsIt->second.find({callSiteStruct, callSiteFieldIdx})
+                == fsIt->second.end()) {
+              CG_LOG("FieldFilter: reject " << F->getName()
+                     << " for " << callSiteStruct << " field "
+                     << callSiteFieldIdx << "\n");
+              continue;
+            }
+          }
+          // No entries = conservative keep
+        }
+        targets.insert(F);
+      }
+    }
+
+    if (!targets.empty()) {
+      Ctx->Callees[CS].insert(targets.begin(), targets.end());
+      resolvedCalls++;
+      totalTargets += targets.size();
+    }
+  }
+
+  CG_LOG("Compositional solve: resolved " << resolvedCalls
+         << " indirect calls with " << totalTargets << " total targets"
+         << " (skipped " << skippedNoSymbol << " without symbol)\n");
+
+  return resolvedCalls > 0;
 }
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {

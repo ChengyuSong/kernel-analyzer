@@ -11,5 +11,8 @@ extern cl::opt<unsigned> VerboseLevel;
 extern cl::opt<bool> CFLGlobalDedup;
 extern cl::opt<bool> CFLLocalAllocaSummary;
 extern cl::opt<std::string> VSnapshotOutput;
+extern cl::opt<std::string> CompressedGraphOutput;
+extern cl::list<std::string> CompressedGraphInputs;
+extern cl::opt<bool> CFLCompositional;
 
 #endif

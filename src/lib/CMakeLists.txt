@@ -8,6 +8,7 @@ set (KASource
   LLMAnalysis.cc
   CFLEdgeBuilder.cc
   VSnapshot.cc
+  CompressedGraph.cc
   CallGraph.cc
 )
 

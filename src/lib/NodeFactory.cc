@@ -323,9 +323,14 @@ NodeIndex AndersNodeFactory::getReturnNodeFor(const llvm::Function* f) {
     auto rf = funcMap->find(FID);
     if (rf != funcMap->end())
         f = rf->second;
-    else if (extFuncMap->find(FID) != extFuncMap->end())
-        // XXX: return universal ptr?
+    else if (extFuncMap->find(FID) != extFuncMap->end()) {
+        // Check returnMap first — an on-demand return node may have been
+        // created for this ext func (e.g., for compositional CFL export).
+        auto itr = returnMap.find(f);
+        if (itr != returnMap.end())
+            return itr->second;
         return getUniversalPtrNode();
+    }
     auto itr = returnMap.find(f);
     if (itr == returnMap.end())
         return InvalidIndex;

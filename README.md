@@ -2,10 +2,45 @@
 
 This is a static kernel analyzer forked from [KINT](https://github.com/CRYPTOlab/kint).
 
+## Compositional CFL Analysis
+
+The `--cfl-compositional` flag enables per-TU CFL solving with V-SCC
+compression and whole-program composition. This avoids building a single
+monolithic constraint graph and allows caching per-library results.
+
+### Quick start
+
+```bash
+# All-in-one: per-TU solve + compose (no intermediate files)
+kanalyzer tu1.o tu2.o tu3.o --cfl-compositional --callgraph-json cg.json
+
+# Two-phase with cached compressed graphs:
+kanalyzer lib_tu1.o lib_tu2.o --cfl-compressed-output lib.cflcg
+kanalyzer app.o               --cfl-compressed-output app.cflcg
+
+kanalyzer lib_tu1.o lib_tu2.o app.o \
+  --cfl-compositional \
+  --cfl-compressed-input lib.cflcg \
+  --cfl-compressed-input app.cflcg \
+  --callgraph-json cg.json
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--cfl-compositional` | Enable per-TU CFL solving and whole-program composition |
+| `--cfl-compressed-output <path>` | Export compressed constraint graph to a `.cflcg` file |
+| `--cfl-compressed-input <path>` | Load a pre-built `.cflcg` file (repeatable) |
+
+See `docs/compositional-cfl-analysis.md` for the full design.
+
 ## Documentation
 
 - CFL-reachability architecture, optimizations, and VSnapshot serialization:
   `docs/cfl-reachability-vsnapshot.md`
+- Compositional CFL analysis design:
+  `docs/compositional-cfl-analysis.md`
 - Known call graph limitations:
   `docs/call-graph-limitations.md`
 

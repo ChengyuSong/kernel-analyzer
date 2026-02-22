@@ -411,7 +411,7 @@ int main(int argc, char **argv) {
        << " ms\n";
 
   // Run compositional CFL solve if requested
-  if (CFLCompositional && !CompressedGraphInputs.empty()) {
+  if (CFLCompositional) {
     auto tComp = std::chrono::steady_clock::now();
     CGPass.runCompositionalSolve();
     Diag << "TIMER runCompositionalSolve "

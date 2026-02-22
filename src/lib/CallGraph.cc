@@ -1097,18 +1097,6 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
   CGP.addAssignmentEdge(valNode, derefNode);
-
-  // Record struct field store for field-aware indirect call filtering.
-  // Strip pointer casts (bitcasts) to see through patterns like:
-  //   %gep = getelementptr %struct, %ptr, 0, 7
-  //   %bc  = bitcast %gep to <other_type>*
-  //   store %val, %bc
-  if (auto *GEP = dyn_cast<GEPOperator>(ptr->stripPointerCasts())) {
-    std::string sName;
-    unsigned fIdx;
-    if (CGP.getGEPStructField(GEP, sName, fIdx))
-      CGP.fieldStoreRecords.push_back({valNode, sName, fIdx});
-  }
 }
 
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
@@ -1451,9 +1439,6 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     }
     // ptr = &globalvar: add assignment edges globalvar_val -> ptr
     EB.addAssignmentEdges(valNode, ptrNode);
-    // Record field store if enclosing struct is known
-    if (!enclosingStruct.empty() && enclosingFieldIdx >= 0)
-      fieldStoreRecords.push_back({valNode, enclosingStruct, (unsigned)enclosingFieldIdx});
     CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (isa<Function>(init)) {
     NodeIndex valNode = NF.getValueNodeFor(init);
@@ -1513,11 +1498,6 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         }
         // ptr = base_ptr: add assignment edges base_ptr -> ptr
         EB.addAssignmentEdges(baseNode, ptrNode);
-        // Check if GEP accesses a struct field, update enclosing info
-        std::string gepStruct;
-        unsigned gepField;
-        if (getGEPStructField(GEPOp, gepStruct, gepField))
-          fieldStoreRecords.push_back({baseNode, gepStruct, gepField});
         break;
       }
       case Instruction::BitCast: {
@@ -1842,49 +1822,105 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
   return foundNewAlloc;
 }
 
-void CallGraphPass::buildFieldStoreMap(const cfl_result_t &outputCFLGraph) {
-  unsigned labelV = EB.getLabelV();
-  size_t funcFieldPairs = 0;
-  std::vector<NodeIndex> memberNodes;
-  const bool useDense = CFLGlobalDedup && !origToDense.empty();
+void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
+  size_t directStores = 0, callbackStores = 0;
 
-  for (const auto &rec : fieldStoreRecords) {
-    // For each store record, query the CFL V-relation to find which
-    // function value nodes V-reach the stored value node
-    NodeIndex valNode;
-    if (useDense) {
-      valNode = getDenseID(rec.valNode);
-      if (valNode == UINT32_MAX) continue;
-    } else {
-      valNode = getCanonicalNode(rec.valNode);
-    }
-    assert(valNode < outputCFLGraph.size() && "Field-store node out of CFL graph range");
-    auto &cflSet = outputCFLGraph[valNode][labelV];
-    std::unordered_set<NodeIndex> seenRoots;
-    for (auto idx : cflSet) {
-      NodeIndex origIdx = useDense ? denseToOrig[idx] : idx;
-      NodeIndex root = getCanonicalNode(origIdx);
-      if (!seenRoots.insert(root).second)
+  for (Function &F : *M) {
+    if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+      continue;
+    if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+      continue;
+    if (shouldSkipFunction(&F))
+      continue;
+
+    for (inst_iterator II = inst_begin(F), IE = inst_end(F); II != IE; ++II) {
+      // Case 1: Direct store of function pointer to struct field
+      //   store @func, (getelementptr %struct, %ptr, 0, N)
+      if (auto *SI = dyn_cast<StoreInst>(&*II)) {
+        auto *StoredFunc = dyn_cast<Function>(
+            SI->getValueOperand()->stripPointerCasts());
+        if (!StoredFunc) continue;
+        Value *ptr = SI->getPointerOperand()->stripPointerCasts();
+        if (auto *GEP = dyn_cast<GEPOperator>(ptr)) {
+          std::string sName;
+          unsigned fIdx;
+          if (getGEPStructField(GEP, sName, fIdx)) {
+            funcFieldStores[StoredFunc].insert({sName, fIdx});
+            directStores++;
+          }
+        }
         continue;
-      collectCanonicalMembers(root, memberNodes);
-      for (NodeIndex member : memberNodes) {
-        if (NF.isSpecialNode(member))
-          continue;
-        const Value *CV = NF.getValueForNode(member);
-        if (!CV)
-          continue;
-        const Function *F = dyn_cast<Function>(CV);
-        if (!F)
-          continue;
-        if (funcFieldStores[F].insert({rec.structName, rec.fieldIdx}).second)
-          funcFieldPairs++;
+      }
+
+      // Case 3: Function pointer passed as callback argument
+      //   call @setter(%obj, @func) where setter stores param to struct field
+      auto *CB = dyn_cast<CallBase>(&*II);
+      if (!CB || CB->isInlineAsm()) continue;
+
+      for (unsigned i = 0; i < CB->arg_size(); i++) {
+        auto *ArgFunc = dyn_cast<Function>(
+            CB->getArgOperand(i)->stripPointerCasts());
+        if (!ArgFunc) continue;
+
+        // Find the callee's definition (may be in another module)
+        Function *callee = CB->getCalledFunction();
+        if (!callee) continue;
+        if (callee->isDeclaration()) {
+          callee = getFuncDef(callee);
+          if (callee->isDeclaration()) continue;
+        }
+        if (callee->empty()) continue;
+        if (i >= callee->arg_size()) continue;
+
+        // Trace parameter's uses in callee's body (one level only).
+        // Handle the common -O0 pattern where params are stored to allocas:
+        //   store %param, %alloca
+        //   ...
+        //   %val = load %alloca
+        //   store %val, (GEP %struct, field N)
+        Argument *param = callee->getArg(i);
+        // Collect values that carry the parameter: the param itself,
+        // casts of it, and loads from allocas it was stored to.
+        SmallVector<Value*, 8> paramValues;
+        paramValues.push_back(param);
+        for (User *U : param->users()) {
+          if (isa<CastInst>(U))
+            paramValues.push_back(cast<Value>(U));
+        }
+        // Check for alloca spill pattern: param → store to alloca → load
+        for (User *U : param->users()) {
+          auto *SI = dyn_cast<StoreInst>(U);
+          if (!SI || SI->getValueOperand() != param) continue;
+          Value *allocaPtr = SI->getPointerOperand();
+          if (!isa<AllocaInst>(allocaPtr)) continue;
+          // Collect all loads from this alloca
+          for (User *AU : allocaPtr->users()) {
+            if (auto *LI = dyn_cast<LoadInst>(AU))
+              paramValues.push_back(LI);
+          }
+        }
+        for (Value *PV : paramValues) {
+          for (User *U : PV->users()) {
+            auto *PSI = dyn_cast<StoreInst>(U);
+            if (!PSI || PSI->getValueOperand() != PV) continue;
+            Value *pptr = PSI->getPointerOperand()->stripPointerCasts();
+            if (auto *PGEP = dyn_cast<GEPOperator>(pptr)) {
+              std::string sName;
+              unsigned fIdx;
+              if (getGEPStructField(PGEP, sName, fIdx)) {
+                funcFieldStores[ArgFunc].insert({sName, fIdx});
+                callbackStores++;
+              }
+            }
+          }
+        }
       }
     }
   }
 
-  CG_LOG("FieldStore map: " << fieldStoreRecords.size() << " records, "
-         << funcFieldPairs << " function-field pairs, "
-         << funcFieldStores.size() << " distinct functions\n");
+  CG_LOG("FieldStore IR [" << M->getModuleIdentifier() << "]: "
+         << directStores << " direct, " << callbackStores << " callback, "
+         << funcFieldStores.size() << " functions total\n");
 }
 
 bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
@@ -2360,6 +2396,111 @@ uint32_t CallGraphPass::getDenseID(NodeIndex origNode) const {
   return UINT32_MAX;
 }
 
+void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart) {
+  auto tTotal = std::chrono::steady_clock::now();
+  const auto &allEdges = EB.getEdges();
+  const size_t edgeEnd = allEdges.size();
+
+  assert(edgeStart < edgeEnd &&
+         "solveAndCompressPerTU: no edges for module");
+  assert(EB.getGrammar() && "solveAndCompressPerTU: grammar not initialized");
+
+  CG_LOG("Per-TU solve [" << M->getModuleIdentifier()
+         << "]: edges [" << edgeStart << ", " << edgeEnd << ")\n");
+
+  // Step 1: Build local dense mapping from this module's edge range
+  origToDense.assign(NF.getNumNodes(), UINT32_MAX);
+  denseToOrig.clear();
+  numDenseNodes = 0;
+
+  for (size_t i = edgeStart; i < edgeEnd; i++) {
+    const auto &E = allEdges[i];
+    if (origToDense[E.from] == UINT32_MAX) {
+      origToDense[E.from] = numDenseNodes;
+      denseToOrig.push_back(E.from);
+      numDenseNodes++;
+    }
+    if (origToDense[E.to] == UINT32_MAX) {
+      origToDense[E.to] = numDenseNodes;
+      denseToOrig.push_back(E.to);
+      numDenseNodes++;
+    }
+  }
+
+  assert(numDenseNodes > 0 && "solveAndCompressPerTU: dense mapping produced 0 nodes");
+
+  // Remap + dedup edges to dense IDs
+  std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+  seen.reserve(edgeEnd - edgeStart);
+  denseEdges.clear();
+  denseEdges.reserve(edgeEnd - edgeStart);
+  for (size_t i = edgeStart; i < edgeEnd; i++) {
+    const auto &E = allEdges[i];
+    uint32_t from = origToDense[E.from];
+    uint32_t to = origToDense[E.to];
+    if (from == to) continue;
+    EdgeKey key{from, to, E.label};
+    if (seen.insert(key).second)
+      denseEdges.emplace_back(from, to, E.label);
+  }
+
+  assert(!denseEdges.empty() && "solveAndCompressPerTU: no dense edges after remapping");
+
+  CG_LOG("Per-TU dense mapping: " << numDenseNodes << " nodes, "
+         << (edgeEnd - edgeStart) << " raw edges -> "
+         << denseEdges.size() << " dense edges\n");
+
+  // Step 2: Solve CFL
+  auto tSolve = std::chrono::steady_clock::now();
+  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(
+      denseEdges, *EB.getGrammar(), cflThreads);
+  solver->runCFL();
+  CG_LOG("Per-TU CFL solve: " << solver->getEdgeCount() << " final edges\n");
+  CG_LOG("TIMER per-tu-cfl-solve "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tSolve).count()
+         << " ms\n");
+
+  const auto &graph = solver->getReachability();
+  assert(!graph.empty() && "solveAndCompressPerTU: solver produced empty graph");
+  assert(graph[0].size() > EB.getLabelV() &&
+         "solveAndCompressPerTU: V label out of range");
+
+  // Step 3: V-SCC compression for graph size reduction.
+  // Field store map was already built from IR (buildFieldStoreMapFromIR)
+  // before this function was called.
+  const uint32_t LabelV = EB.getLabelV();
+  std::vector<uint32_t> nodeToSCC;
+  uint32_t numSCCs = 0;
+  computeVSCC(graph, LabelV, nodeToSCC, numSCCs);
+
+  CompressedGraphData data;
+  compressConstraintGraph(graph, nodeToSCC, numSCCs, data);
+
+  assert(data.numNodes > 0 && "solveAndCompressPerTU: compression produced 0 SCC nodes");
+
+  // Field store map is IR-derived (buildFieldStoreMapFromIR) and accumulated
+  // in funcFieldStores across modules — no need to serialize per-TU.
+
+  CG_LOG("Per-TU compressed: " << numSCCs << " SCC nodes, "
+         << data.edges.size() << " edges, "
+         << data.symbolTable.size() << " symbols\n");
+
+  // Step 5: Store result
+  perTUGraphs.push_back(std::move(data));
+
+  // Clean up dense mapping state for next module
+  origToDense.clear();
+  denseToOrig.clear();
+  numDenseNodes = 0;
+  denseEdges.clear();
+
+  CG_LOG("TIMER per-tu-total [" << M->getModuleIdentifier() << "] "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tTotal).count()
+         << " ms\n");
+}
+
 bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
@@ -2376,9 +2517,18 @@ bool CallGraphPass::doModulePass(Module *M) {
           totalInsts += F.getInstructionCount();
       EB.reserve(totalInsts * 4);
 
-      // Run global dedup on first module (all nodes exist from doInitialization)
-      if (CFLGlobalDedup)
+      // Run global dedup on first module (all nodes exist from doInitialization).
+      // Skip in compositional mode: per-TU solving uses per-module dense mappings,
+      // incompatible with global dedup which iterates ALL modules.
+      if (CFLGlobalDedup && !CFLCompositional)
         runGlobalDedup();
+    }
+
+    // In per-TU compositional mode (no pre-built .cflcg files), track edge start.
+    const bool perTUMode = CFLCompositional && CompressedGraphInputs.empty();
+    size_t edgeStart = 0;
+    if (perTUMode) {
+      edgeStart = EB.getEdges().size();
     }
 
     for (auto &GV : M->globals()) {
@@ -2408,6 +2558,17 @@ bool CallGraphPass::doModulePass(Module *M) {
         continue;
       runOnFunction(&F);
     }
+
+    // Build field-store map from IR uses (direct stores + one-level callbacks).
+    // In per-TU mode, funcFieldStores was cleared above; in monolithic mode
+    // it accumulates across modules.  processInitializer already added
+    // global-initializer entries for this module.
+    buildFieldStoreMapFromIR(M);
+
+    // Per-TU: solve and compress this module's edges
+    if (perTUMode && EB.getEdges().size() > edgeStart) {
+      solveAndCompressPerTU(M, edgeStart);
+    }
   }
 
   bool Changed = false;
@@ -2425,15 +2586,18 @@ bool CallGraphPass::doModulePass(Module *M) {
       }
     }
 
-    // Build dense mapping if global dedup is active
-    if (CFLGlobalDedup)
+    // Build dense mapping if global dedup is active.
+    // Skip in per-TU mode: per-TU graphs already have their own dense mappings.
+    if (CFLGlobalDedup && perTUGraphs.empty())
       buildDenseMapping();
 
-    // In compositional mode with compressed graph inputs, skip the expensive
-    // full CFL solve — runCompositionalSolve() will use composed results.
-    if (CFLCompositional && !CompressedGraphInputs.empty()) {
+    // In compositional mode, skip the expensive monolithic CFL solve —
+    // runCompositionalSolve() will compose per-TU or loaded graphs.
+    if (CFLCompositional) {
       CG_LOG("Compositional mode: skipping full CFL solve\n");
-      if (!CompressedGraphOutput.empty())
+      // In per-TU mode, export happens during runCompositionalSolve.
+      // In loaded-cflcg mode (perTUGraphs empty), export the monolithic result.
+      if (!CompressedGraphOutput.empty() && perTUGraphs.empty())
         exportCompressedGraph(CompressedGraphOutput);
       iteration++;
       return false;
@@ -2577,9 +2741,6 @@ bool CallGraphPass::doModulePass(Module *M) {
       cflSolvedInputEdgeCount = 0;
     }
     Changed |= allocatorRewritten;
-
-    // build field-store map for struct-field-aware filtering
-    buildFieldStoreMap(outputCFLGraph);
 
     // parse results and update call edges
     Changed |= handleIndirectCall(outputCFLGraph);
@@ -3276,18 +3437,6 @@ void CallGraphPass::compressConstraintGraph(
          << " noNode=" << icallNoNode << " noSCC=" << icallNoSCC
          << " added=" << icallAdded << "\n");
 
-  // Field store value nodes as boundary symbols for cross-TU field store rebuild
-  unsigned storCounter = 0;
-  for (const auto &rec : fieldStoreRecords) {
-    uint32_t scc = origNodeToSCC(rec.valNode);
-    if (scc == UINT32_MAX) continue;
-    std::string sym = "stor:" + rec.structName + "#" +
-                      std::to_string(rec.fieldIdx) + "#" +
-                      std::to_string(storCounter++);
-    out.symbolTable[BoundarySymbol{sym}] = scc;
-  }
-  CG_LOG("Field store boundary: " << storCounter << " symbols from "
-         << fieldStoreRecords.size() << " records\n");
 
   // Step 3: Build funcNodes - scan all nodes for Function* values
   const uint32_t nodeCount = useDense ? numDenseNodes
@@ -3371,26 +3520,6 @@ void CallGraphPass::exportCompressedGraph(StringRef Path) {
                 std::chrono::steady_clock::now() - tCompress).count()
          << " ms\n");
 
-  // Serialize funcFieldStores into metadata JSON
-  if (!funcFieldStores.empty()) {
-    json::Object fsObj;
-    for (const auto &[F, fieldSet] : funcFieldStores) {
-      json::Array fields;
-      for (const auto &[structName, fieldIdx] : fieldSet)
-        fields.push_back(json::Array{structName, static_cast<int64_t>(fieldIdx)});
-      fsObj[F->getName().str()] = std::move(fields);
-    }
-    json::Object root;
-    root["fieldStores"] = std::move(fsObj);
-    std::string jsonStr;
-    raw_string_ostream jsonOS(jsonStr);
-    jsonOS << json::Value(std::move(root));
-    data.metadataJson = std::move(jsonStr);
-    CG_LOG("Serialized " << funcFieldStores.size()
-           << " funcFieldStores entries into metadata ("
-           << data.metadataJson.size() << " bytes)\n");
-  }
-
   auto tSave = std::chrono::steady_clock::now();
   std::string ErrMsg;
   if (!saveCompressedGraph(Path, data, &ErrMsg)) {
@@ -3415,33 +3544,41 @@ void CallGraphPass::exportCompressedGraph(StringRef Path) {
 bool CallGraphPass::runCompositionalSolve() {
   extern cl::list<std::string> CompressedGraphInputs;
 
-  if (CompressedGraphInputs.empty()) {
-    WARNING("Compositional solve: no compressed graph inputs specified\n");
-    return false;
-  }
+  // Step 1: Collect all compressed graphs (in-memory per-TU + loaded from files)
+  std::vector<CompressedGraphData> graphs;
 
-  CG_LOG("Compositional CFL solve: loading " << CompressedGraphInputs.size()
-         << " compressed graphs\n");
+  // Add in-memory per-TU graphs
+  for (auto &g : perTUGraphs)
+    graphs.push_back(std::move(g));
+  perTUGraphs.clear();
 
-  // Step 1: Load all compressed graphs
+  CG_LOG("Compositional CFL solve: " << graphs.size() << " in-memory per-TU graphs, "
+         << CompressedGraphInputs.size() << " file inputs\n");
+
+  // Load from files (existing code)
   auto tLoad = std::chrono::steady_clock::now();
-  std::vector<CompressedGraphData> graphs(CompressedGraphInputs.size());
   for (size_t i = 0; i < CompressedGraphInputs.size(); i++) {
+    graphs.emplace_back();
     std::string ErrMsg;
-    if (!loadCompressedGraph(CompressedGraphInputs[i], graphs[i], &ErrMsg)) {
+    if (!loadCompressedGraph(CompressedGraphInputs[i], graphs.back(), &ErrMsg)) {
       errs() << "Failed to load compressed graph '"
              << CompressedGraphInputs[i] << "': " << ErrMsg << "\n";
       return false;
     }
     CG_LOG("  Loaded " << CompressedGraphInputs[i]
-           << ": nodes=" << graphs[i].numNodes
-           << ", edges=" << graphs[i].edges.size()
-           << ", symbols=" << graphs[i].symbolTable.size() << "\n");
+           << ": nodes=" << graphs.back().numNodes
+           << ", edges=" << graphs.back().edges.size()
+           << ", symbols=" << graphs.back().symbolTable.size() << "\n");
   }
   CG_LOG("TIMER comp-load "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tLoad).count()
          << " ms\n");
+
+  if (graphs.empty()) {
+    WARNING("Compositional solve: no graphs (need per-TU or --cfl-compressed-input)\n");
+    return false;
+  }
 
   // Step 2: Assign node offsets and build unified ID space
   auto tBuild = std::chrono::steady_clock::now();
@@ -3590,7 +3727,9 @@ bool CallGraphPass::runCompositionalSolve() {
     names.erase(std::unique(names.begin(), names.end()), names.end());
   }
 
-  // Step 9: Resolve indirect calls using composed results
+  // Step 8b: Build nameToFunc, fieldStoreMap, and export composed graph.
+  // These are computed before export so the .cflcg metadata includes
+  // cross-TU augmented field stores.
 
   // Build function name -> Function* map for resolving.
   // Include all functions from all modules (not just Ctx->Funcs) so that
@@ -3604,96 +3743,74 @@ bool CallGraphPass::runCompositionalSolve() {
     }
   }
 
-  // Deserialize per-TU funcFieldStores from each graph's metadata.
-  // This captures "function F performs a store to struct S field N" (intra-TU).
-  using FieldStoreKey = std::pair<std::string, unsigned>;
-  struct FSKeyHash {
-    size_t operator()(const FieldStoreKey &k) const {
-      return std::hash<std::string>()(k.first) ^
-             (std::hash<unsigned>()(k.second) << 16);
-    }
-  };
-  std::unordered_map<const Function*,
-                     std::unordered_set<FieldStoreKey, FSKeyHash>> composedFieldStores;
-  for (const auto &g : graphs) {
-    if (g.metadataJson.empty())
-      continue;
-    auto parsed = json::parse(g.metadataJson);
-    if (!parsed) {
-      consumeError(parsed.takeError());
-      continue;
-    }
-    auto *root = parsed->getAsObject();
-    if (!root) continue;
-    auto *fsObj = root->getObject("fieldStores");
-    if (!fsObj) continue;
-    for (const auto &[funcName, fieldsVal] : *fsObj) {
-      auto it = nameToFunc.find(funcName.str());
-      if (it == nameToFunc.end()) continue;
-      const Function *F = it->second;
-      auto *fields = fieldsVal.getAsArray();
-      if (!fields) continue;
-      for (const auto &entry : *fields) {
-        auto *pair = entry.getAsArray();
-        if (!pair || pair->size() != 2) continue;
-        auto structNameOpt = (*pair)[0].getAsString();
-        auto fieldIdxOpt = (*pair)[1].getAsInteger();
-        if (!structNameOpt || !fieldIdxOpt) continue;
-        composedFieldStores[F].insert(
-            {structNameOpt->str(), static_cast<unsigned>(*fieldIdxOpt)});
-      }
-    }
-  }
-  CG_LOG("Deserialized funcFieldStores: " << composedFieldStores.size()
-         << " functions from metadata\n");
+  // Field store map was built from IR during doModulePass
+  // (buildFieldStoreMapFromIR).  Since all input TUs are loaded, the map
+  // covers all modules including cross-TU callback tracing.
+  CG_LOG("Field store map (IR-based): " << funcFieldStores.size()
+         << " functions\n");
 
-  // Augment with cross-TU field store information from V-reachability.
-  // Parse stor: boundary symbols to find field store value nodes, then query
-  // V-reachability at those nodes to discover which function addresses flow
-  // to each field store location — this crosses TU boundaries.
-  std::unordered_map<uint32_t, std::vector<FieldStoreKey>> denseToFieldStores;
-  for (const auto &[symbol, occurrences] : symbolOccurrences) {
-    if (symbol.compare(0, 5, "stor:") != 0)
-      continue;
-    // Parse "stor:structName#fieldIdx#counter"
-    auto payload = symbol.substr(5);
-    auto hash1 = payload.find('#');
-    if (hash1 == std::string::npos) continue;
-    auto hash2 = payload.find('#', hash1 + 1);
-    if (hash2 == std::string::npos) hash2 = payload.size();
-    std::string structName = payload.substr(0, hash1);
-    unsigned fieldIdx = std::stoul(payload.substr(hash1 + 1, hash2 - hash1 - 1));
-    uint32_t denseNode = unifiedToDense[ufFind(occurrences[0].second)];
-    denseToFieldStores[denseNode].emplace_back(structName, fieldIdx);
-  }
-
-  // Only add V-reachability entries for functions that have NO per-TU entry.
-  // Functions with per-TU entries already have precise field info; adding
-  // V-reachability results from the less-precise composed graph would
-  // introduce false field matches and weaken the filter.
   const auto &composedGraph = solver->getReachability();
-  size_t crossTUFuncs = 0;
-  for (const auto &[denseNode, fieldKeys] : denseToFieldStores) {
-    if (denseNode >= composedGraph.size()) continue;
-    const auto &VSet = composedGraph[denseNode][LabelV];
-    for (uint32_t target : VSet) {
-      auto fnIt = denseToFuncNames.find(target);
-      if (fnIt == denseToFuncNames.end()) continue;
-      for (const auto &funcName : fnIt->second) {
-        auto fIt = nameToFunc.find(funcName);
-        if (fIt == nameToFunc.end()) continue;
-        // Skip functions that already have per-TU field store entries
-        if (composedFieldStores.count(fIt->second))
-          continue;
-        for (const auto &fk : fieldKeys)
-          composedFieldStores[fIt->second].insert(fk);
-        crossTUFuncs++;
-      }
+  extern cl::opt<std::string> CompressedGraphOutput;
+
+  if (!CompressedGraphOutput.empty()) {
+    auto tExport = std::chrono::steady_clock::now();
+
+    // V-SCC compress the composed graph for export
+    std::vector<uint32_t> nodeToSCC;
+    uint32_t numSCCs = 0;
+    computeVSCC(composedGraph, LabelV, nodeToSCC, numSCCs);
+
+    CompressedGraphData exportData;
+    exportData.numNodes = numSCCs;
+
+    // Remap edges through SCC
+    std::unordered_set<EdgeKey, EdgeKeyHash> exportEdgeSeen;
+    exportEdgeSeen.reserve(combinedEdges.size());
+    exportData.edges.reserve(combinedEdges.size() / 2);
+    for (const auto &E : combinedEdges) {
+      uint32_t sccFrom = (E.from < nodeToSCC.size()) ? nodeToSCC[E.from] : UINT32_MAX;
+      uint32_t sccTo = (E.to < nodeToSCC.size()) ? nodeToSCC[E.to] : UINT32_MAX;
+      if (sccFrom == UINT32_MAX || sccTo == UINT32_MAX || sccFrom == sccTo)
+        continue;
+      EdgeKey key{sccFrom, sccTo, E.label};
+      if (exportEdgeSeen.insert(key).second)
+        exportData.edges.emplace_back(sccFrom, sccTo, E.label);
     }
+
+    // Build symbol table from composed boundary symbols
+    for (const auto &[symbol, occurrences] : symbolOccurrences) {
+      uint32_t denseNode = unifiedToDense[ufFind(occurrences[0].second)];
+      if (denseNode >= nodeToSCC.size()) continue;
+      uint32_t sccId = nodeToSCC[denseNode];
+      exportData.symbolTable[{symbol}] = sccId;
+    }
+
+    // Build funcNodes from composed function name map
+    for (const auto &[denseId, names] : denseToFuncNames) {
+      if (denseId >= nodeToSCC.size()) continue;
+      uint32_t sccId = nodeToSCC[denseId];
+      auto &existing = exportData.funcNodes[sccId];
+      existing.insert(existing.end(), names.begin(), names.end());
+    }
+    for (auto &[id, names] : exportData.funcNodes) {
+      std::sort(names.begin(), names.end());
+      names.erase(std::unique(names.begin(), names.end()), names.end());
+    }
+
+    std::string ErrMsg;
+    if (!saveCompressedGraph(CompressedGraphOutput, exportData, &ErrMsg)) {
+      WARNING("Failed to export composed graph: " << ErrMsg << "\n");
+    } else {
+      CG_LOG("Exported composed compressed graph to " << CompressedGraphOutput
+             << ": nodes=" << exportData.numNodes
+             << ", edges=" << exportData.edges.size()
+             << ", symbols=" << exportData.symbolTable.size() << "\n");
+    }
+    CG_LOG("TIMER comp-export "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tExport).count()
+           << " ms\n");
   }
-  CG_LOG("Cross-TU field store augmentation: " << denseToFieldStores.size()
-         << " stor: nodes, " << crossTUFuncs << " new functions, "
-         << composedFieldStores.size() << " total functions\n");
 
   // Build icall symbol -> dense node lookup from composed symbols
   // The icall boundary symbols were remapped through unifiedToDense during
@@ -3773,8 +3890,8 @@ bool CallGraphPass::runCompositionalSolve() {
           continue;
         // Struct-field-aware filtering using deserialized metadata
         if (hasCallSiteField) {
-          auto fsIt = composedFieldStores.find(F);
-          if (fsIt != composedFieldStores.end()) {
+          auto fsIt = funcFieldStores.find(F);
+          if (fsIt != funcFieldStores.end()) {
             if (fsIt->second.find({callSiteStruct, callSiteFieldIdx})
                 == fsIt->second.end()) {
               CG_LOG("FieldFilter: reject " << F->getName()

@@ -71,7 +71,7 @@ private:
 
   static bool getGEPStructField(const llvm::GEPOperator *GEP,
                                  std::string &structName, unsigned &fieldIdx);
-  void buildFieldStoreMap(const cfl_result_t &outputCFLGraph);
+  void buildFieldStoreMapFromIR(llvm::Module *M);
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph);
   bool handleIndirectCall(const cfl_result_t &outputCFLGraph);
@@ -113,6 +113,10 @@ private:
                                uint32_t numSCCs,
                                CompressedGraphData &out);
 
+  // Per-TU compositional solving
+  std::vector<CompressedGraphData> perTUGraphs;
+  void solveAndCompressPerTU(llvm::Module *M, size_t edgeStart);
+
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
   LLMClient *LLM;
@@ -139,13 +143,6 @@ private:
   void processCtorsDtors(llvm::Module *M);
 
   // Field-store tracking for struct-field-aware indirect call filtering
-  struct FieldStoreRecord {
-    NodeIndex valNode;
-    std::string structName;  // stripped name (no LLVM suffix)
-    unsigned fieldIdx;
-  };
-  std::vector<FieldStoreRecord> fieldStoreRecords;
-
   using FieldStoreKey = std::pair<std::string, unsigned>;
   struct FieldStoreKeyHash {
     size_t operator()(const FieldStoreKey &k) const {

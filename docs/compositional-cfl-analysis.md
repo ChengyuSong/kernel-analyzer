@@ -16,10 +16,11 @@ scalability problems:
 
 ## Approach
 
-Perform CFL solving at the library level (group of TUs), then use the solved
-V-reachability to compress the constraint graph via V-SCC (value-flow strongly
-connected component) merging. These compressed constraint graphs are serialized
-to `.cflcg` files and composed at link time for whole-program analysis.
+Perform CFL solving per translation unit, then use the solved V-reachability
+to compress each TU's constraint graph via V-SCC (value-flow strongly connected
+component) merging. These compressed constraint graphs are composed for
+whole-program analysis, either in-memory or serialized to `.cflcg` files for
+caching across builds.
 
 ### Why V-SCC merging is sound and precise
 
@@ -63,16 +64,18 @@ Level 1: Per-TU constraint graph construction
   2. On-demand nodes for declared (external) functions to capture
      cross-TU arg/ret data flow in compositional mode
 
-Level 2: Library-level compression (--cfl-compressed-output)
-  1. Build constraint graph from all TUs in the library group
-  2. Solve CFL on the combined per-library graph  (SolverFWGramParallel)
-  3. Compute V-SCCs from solved V-reachability    (computeVSCC)
-  4. Compress: remap edges through V-SCC, deduplicate, build symbol
+Level 2: Per-TU compression (inside doModulePass, after Level 1)
+  1. Build field store map from IR uses           (buildFieldStoreMapFromIR)
+  2. Build local dense mapping for the TU's edges
+  3. Solve CFL on the per-TU dense graph          (SolverFWGramParallel)
+  4. Compute V-SCCs from solved V-reachability    (computeVSCC)
+  5. Compress: remap edges through V-SCC, deduplicate, build symbol
      table and funcNodes metadata                 (compressConstraintGraph)
-  5. Serialize to .cflcg file with metadata JSON  (exportCompressedGraph)
+  6. Store compressed graph in memory              (perTUGraphs)
+  Optional: serialize to .cflcg file              (exportCompressedGraph)
 
-Level 3: Whole-program composition (--cfl-compositional --cfl-compressed-input)
-  1. Load compressed graphs from library .cflcg files
+Level 3: Whole-program composition (--cfl-compositional)
+  1. Collect compressed graphs (in-memory perTUGraphs and/or .cflcg files)
   2. Assign each graph a node offset in unified space
   3. Build boundary symbol occurrence map
   4. Union-find merge matching boundary nodes across graphs
@@ -80,10 +83,8 @@ Level 3: Whole-program composition (--cfl-compositional --cfl-compressed-input)
   6. Remap and deduplicate edges into combined graph
   7. Solve CFL on the combined compressed graph
   8. Build reverse map: dense node -> function names (denseToFuncNames)
-  9. Deserialize per-TU funcFieldStores from metadata + augment with
-     cross-TU V-reachability at stor: boundary symbols
-  10. Resolve indirect calls using composed V-reachability with
-      type-compatibility and field-store filtering
+  9. Resolve indirect calls using composed V-reachability with
+     type-compatibility and field-store filtering (funcFieldStores)
 ```
 
 ## Boundary nodes and symbol table
@@ -99,12 +100,10 @@ table maps boundary symbol strings to compressed (V-SCC) node IDs:
 | `vararg:`  | `vararg:<GUID>`               | Vararg nodes          |
 | `glob:`    | `glob:<GUID>`                 | `Ctx->Gobjs/ExtGobjs` |
 | `icall:`   | `icall:<icallID>`             | Indirect call fptrs   |
-| `stor:`    | `stor:<structName>#<fieldIdx>#<counter>` | Field store value nodes |
 
 GUIDs are numeric identifiers derived from symbol names. The `icall:` prefix
 uses deterministic IDs attached as `ka.icall.id` LLVM metadata during
-constraint graph construction. The `stor:` prefix encodes field store locations
-for cross-TU field store map reconstruction.
+constraint graph construction.
 
 Internal nodes (static functions, local variables, temporaries) do not need
 symbols -- they participate only through their edges in the compressed graph.
@@ -117,33 +116,48 @@ After composition and CFL re-solve, indirect calls are resolved by:
 2. Querying the V-set at that node in the composed reachability graph
 3. Mapping V-reachable nodes to function names via `denseToFuncNames`
 4. Filtering candidates by type-compatibility (`isCompatible`)
-5. Filtering by struct-field-aware field store map (`composedFieldStores`)
+5. Filtering by struct-field-aware field store map (`funcFieldStores`)
 
-### Cross-TU field store map
+### IR-based field store map
 
 The field store map tracks which (struct, field) pairs each function's address
 is stored to. It enables rejecting indirect call targets at call sites where
 the function pointer is loaded from a struct field the target was never stored
 to.
 
-Two sources populate `composedFieldStores`:
+The map (`funcFieldStores`) is built directly from LLVM IR during
+`buildFieldStoreMapFromIR`, using three strategies:
 
-1. **Per-TU metadata** (from `.cflcg` `fieldStores` JSON): captures functions
-   that syntactically perform stores to struct fields within their TU. This
-   covers 44 functions in the libpng test case and provides precise field info.
+1. **Direct stores**: a `store` instruction writes a function pointer to a
+   GEP-derived struct field (`store @func, gep(%struct, 0, fieldIdx)`).
 
-2. **Cross-TU V-reachability** at `stor:` boundary symbols: when a function's
-   address crosses a TU boundary before being stored to a struct field (e.g.,
-   fuzzer passes `&default_free` to `png_set_mem_fn` which stores it to
-   `png_struct_def` field 4), neither TU's per-TU analysis can connect the
-   function to the field store. The `stor:` symbols export field store value
-   nodes as boundary symbols; after composition, V-reachability at those nodes
-   discovers the cross-TU function-to-field-store flows.
+2. **Global initializers**: a `ConstantStruct` or `ConstantArray` initializer
+   contains a function pointer at a known struct field offset. Detected in
+   `processInitializer` during constraint graph construction.
 
-   **Guard**: V-reachability entries are only added for functions with **no**
-   existing per-TU entry. The composed V-relation is less precise than per-TU
-   analysis, so adding its results to functions that already have precise
-   entries would introduce false field matches and weaken the filter.
+3. **One-level callback tracing**: a function pointer is passed as an argument
+   to a call, and the callee stores that argument (or a cast/load through an
+   alloca spill) to a struct field. Only one level of interprocedural analysis
+   is performed — the callee's body is inspected but no further calls are
+   followed. This handles the common callback-registration pattern (e.g.,
+   `png_set_mem_fn(&png, &default_free)` where `png_set_mem_fn` stores the
+   argument to `png_struct_def` field 4).
+
+   The alloca spill pattern (`param -> store to alloca -> load -> store to GEP`)
+   is traced to handle unoptimized (`-O0`) IR where parameters are spilled to
+   stack slots before use.
+
+`funcFieldStores` accumulates across all modules during `doModulePass`. Since
+Level 3 composition loads all TU bitcode files, cross-TU callback tracing
+works naturally — `getFuncDef` resolves declarations to definitions across TU
+boundaries. No metadata serialization or CFL V-reachability is needed.
+
+**Design rationale**: the previous CFL-based approach (`buildFieldStoreMap`)
+queried V-reachability from store-site value nodes to discover which functions
+flow to each field. Due to field insensitivity, V is symmetric through shared
+struct dereference nodes, causing all functions stored anywhere in a struct to
+appear V-reachable from all store sites in that struct. The IR-based per-fptr
+approach avoids this imprecision by walking from each function pointer's uses.
 
 ## Serialization format
 
@@ -159,7 +173,7 @@ struct CompressedGraphData {
   // compressed node ID -> function names (address-taken functions only)
   std::unordered_map<uint32_t, std::vector<std::string>> funcNodes;
 
-  std::string metadataJson;              // JSON with fieldStores, etc.
+  std::string metadataJson;              // reserved for future metadata
 };
 ```
 
@@ -178,12 +192,19 @@ length-prefixed sections for edges, symbols, funcNodes, and metadata.
 Typical usage:
 
 ```bash
+# All-in-one: per-TU solve + compose (no intermediate files)
+kanalyzer tu1.o tu2.o tu3.o --cfl-compositional --callgraph-json output.json
+```
+
+```bash
+# Two-phase with cached compressed graphs:
+
 # Level 2: Generate compressed graphs per library
 kanalyzer lib1_tu1.o lib1_tu2.o --cfl-compressed-output lib1.cflcg
 kanalyzer lib2_tu1.o            --cfl-compressed-output lib2.cflcg
 kanalyzer app.o                 --cfl-compressed-output app.cflcg
 
-# Level 3: Whole-program composition
+# Level 3: Whole-program composition from pre-built graphs
 kanalyzer lib1_tu1.o lib1_tu2.o lib2_tu1.o app.o \
   --cfl-compositional \
   --cfl-compressed-input lib1.cflcg \
@@ -193,8 +214,9 @@ kanalyzer lib1_tu1.o lib1_tu2.o lib2_tu1.o app.o \
 ```
 
 Note: Level 3 loads all TU bitcode files (for module initialization, type info,
-and indirect call site metadata) but skips the expensive full CFL solve,
-using the composed compressed graph results instead.
+indirect call site metadata, and IR-based field store map construction) but
+skips the expensive full CFL solve, using the composed compressed graph
+results instead.
 
 ## Cost analysis
 
@@ -205,17 +227,15 @@ For a project with k translation units each of average size n/k:
   = O(n^3 / k^2) + O((n_compressed)^3)
 
 With compression ratios of 30-70%, the composition-level graph is substantially
-smaller than the monolithic graph. The per-TU solves are embarrassingly parallel.
+smaller than the monolithic graph.
+
+Per-TU solving avoids the edge explosion that occurred when all TUs were combined
+into a single Level 2 graph. Each TU's graph is small (hundreds to low thousands
+of nodes), so per-TU CFL solving is fast and the k per-TU solves are
+embarrassingly parallel.
 
 Additional savings from caching: when a TU/library does not change, its
-compressed graph is reused without re-solving.
-
-**Known issue**: Level 2 library analysis on separate TUs can be slower than
-monolithic analysis on LTO-merged IR because separate compilation produces more
-nodes (on-demand nodes for cross-TU function references) and the CFL fixed-point
-reaches more edges through the additional connectivity. In the libpng test case,
-Level 2 (512s) is ~4x slower than monolithic (135s) due to 18K vs 12.7K nodes
-and edge explosion in the second iteration (140M vs 92M final edges).
+compressed graph (`.cflcg` file) is reused without re-solving.
 
 ## Incremental rebuild
 
@@ -240,5 +260,5 @@ approach against the monolithic baseline on the libpng read fuzzer:
 
 Current results (libpng test case):
 - **SOUND**: 0 missing edges (compositional is a superset of monolithic)
-- **15 extra edges** (imprecision from field-insensitive cross-library flows)
-- Composition solve: ~100ms on 3137 dense nodes, 3274 edges
+- **14 extra edges** (imprecision from field-insensitive cross-library flows)
+- Composition solve: ~100ms on ~3K dense nodes

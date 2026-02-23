@@ -402,6 +402,11 @@ int main(int argc, char **argv) {
     loadContainerFile(&GlobalCtx, ContainerFile);
   }
 
+  if (CFLCompositional && !CFLGlobalDedup) {
+    WARNING("--cfl-compositional requires --cfl-global-dedup; forcing it on\n");
+    CFLGlobalDedup = true;
+  }
+
   CallGraphPass CGPass(&GlobalCtx, LLM.get());
   auto tRun = std::chrono::steady_clock::now();
   CGPass.run(GlobalCtx.Modules);

@@ -9,6 +9,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/ADT/Hashing.h>
 #include <llvm/Support/Path.h>
 #include <string>
 #include <llvm/Support/Debug.h>
@@ -57,21 +58,28 @@ static inline std::string getScopeName(const llvm::GlobalValue *GV) {
   if (llvm::GlobalValue::isExternalLinkage(GV->getLinkage()))
     return GV->getName().str();
   else {
-    llvm::StringRef moduleName = llvm::sys::path::stem(
-      GV->getParent()->getModuleIdentifier());
-    return "_" + moduleName.str() + "." + GV->getName().str();
+    // Keep scoped names human-readable but collision-resistant across modules
+    // with the same basename by appending a stable hash of module identifier.
+    llvm::StringRef moduleId = GV->getParent()->getModuleIdentifier();
+    llvm::StringRef moduleStem = llvm::sys::path::stem(moduleId);
+    uint64_t moduleHash = static_cast<uint64_t>(llvm::hash_value(moduleId));
+    return "_" + moduleStem.str() + "." + std::to_string(moduleHash) + "." +
+           GV->getName().str();
   }
 }
 
 static inline std::string getScopeName(const llvm::Instruction *I) {
   const llvm::Function *F = I->getParent()->getParent();
   assert(F && "Cannot get Function");
-  llvm::StringRef moduleName = llvm::sys::path::stem(
-      F->getParent()->getModuleIdentifier());
+  llvm::StringRef moduleId = F->getParent()->getModuleIdentifier();
+  llvm::StringRef moduleStem = llvm::sys::path::stem(moduleId);
+  uint64_t moduleHash = static_cast<uint64_t>(llvm::hash_value(moduleId));
   if (I->hasName())
-    return "_" + moduleName.str() + "." + F->getName().str() + "." + I->getName().str();
+    return "_" + moduleStem.str() + "." + std::to_string(moduleHash) + "." +
+           F->getName().str() + "." + I->getName().str();
 
-  return "_" + moduleName.str() + "." + F->getName().str() + ".anonymous";
+  return "_" + moduleStem.str() + "." + std::to_string(moduleHash) + "." +
+         F->getName().str() + ".anonymous";
 }
 
 // prefix anonymous struct name with module name
@@ -83,9 +91,10 @@ static inline std::string getScopeName(const llvm::StructType *Ty, const llvm::M
   if (M && (LLVM_STRING_STARTS_WITH(structName, "struct.anon") ||
     LLVM_STRING_STARTS_WITH(structName, "union.anon"))) {
     llvm::StringRef rest = structName.substr(6);
-    llvm::StringRef moduleName = llvm::sys::path::stem(
-      M->getModuleIdentifier());
-    return "struct._" + moduleName.str() + rest.str();
+    llvm::StringRef moduleId = M->getModuleIdentifier();
+    llvm::StringRef moduleStem = llvm::sys::path::stem(moduleId);
+    uint64_t moduleHash = static_cast<uint64_t>(llvm::hash_value(moduleId));
+    return "struct._" + moduleStem.str() + "." + std::to_string(moduleHash) + rest.str();
   }
   if (dotPos != 0 && dotPos != llvm::StringRef::npos &&
     structName.back() != '.' &&

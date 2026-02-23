@@ -1008,13 +1008,9 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     } else {
       CGP.Ctx->IndirectCallInsts.insert(&CS);
       // Attach deterministic icall ID as LLVM metadata.
-      // Use module source + function name for uniqueness across TUs.
+      // Use scoped caller name for uniqueness across TUs.
       std::string id;
-      if (F->hasLocalLinkage())
-        id = F->getParent()->getSourceFileName() + ":" +
-             F->getName().str() + "#" + std::to_string(icallCounter++);
-      else
-        id = F->getName().str() + "#" + std::to_string(icallCounter++);
+      id = getScopeName(F) + "#" + std::to_string(icallCounter++);
       CS.setMetadata("ka.icall.id",
           MDNode::get(CS.getContext(),
                       {MDString::get(CS.getContext(), id)}));
@@ -3455,7 +3451,7 @@ void CallGraphPass::compressConstraintGraph(
       continue;
     uint32_t sccId = (n < nodeToSCC.size()) ? nodeToSCC[n] : UINT32_MAX;
     if (sccId != UINT32_MAX)
-      out.funcNodes[sccId].push_back(F->getName().str());
+      out.funcNodes[sccId].push_back(getScopeName(F));
   }
 
   // Deduplicate function names within each SCC
@@ -3739,7 +3735,7 @@ bool CallGraphPass::runCompositionalSolve() {
   for (auto &[M, _] : Ctx->Modules) {
     for (Function &F : *M) {
       if (!F.isIntrinsic())
-        nameToFunc.emplace(F.getName().str(), &F);
+        nameToFunc.emplace(getScopeName(&F), &F);
     }
   }
 

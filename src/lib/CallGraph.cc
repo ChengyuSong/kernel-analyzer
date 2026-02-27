@@ -3965,6 +3965,33 @@ bool CallGraphPass::runCompositionalSolve() {
         exportData.edges.emplace_back(sccFrom, sccTo, E.label);
     }
 
+    // Match per-TU compression semantics: for each multi-node V-SCC, ensure
+    // terminal self-loops exist for a/-a/d/-d. These loops are required for
+    // CFL derivations (e.g., M -> -d V d, MA/AM chains) after SCC collapse,
+    // especially when this composed .cflcg is reused in another composition step.
+    {
+      const uint32_t labels[] = {
+        EB.getLabelAssign(), EB.getLabelAssignInv(),
+        EB.getLabelDeref(), EB.getLabelDerefInv()
+      };
+      std::vector<uint32_t> sccSize(numSCCs, 0);
+      for (uint32_t n = 0; n < nodeToSCC.size(); n++)
+        if (nodeToSCC[n] < numSCCs) sccSize[nodeToSCC[n]]++;
+      uint32_t loopsAdded = 0;
+      for (uint32_t scc = 0; scc < numSCCs; scc++) {
+        if (sccSize[scc] < 2) continue;
+        for (uint32_t lbl : labels) {
+          EdgeKey key{scc, scc, lbl};
+          if (exportEdgeSeen.insert(key).second) {
+            exportData.edges.emplace_back(scc, scc, lbl);
+            loopsAdded++;
+          }
+        }
+      }
+      CG_LOG("Composed export: added " << loopsAdded
+             << " terminal self-loops for multi-node V-SCCs\n");
+    }
+
     // Build symbol table from composed boundary symbols
     for (const auto &[symbol, occurrences] : symbolOccurrences) {
       uint32_t denseNode = unifiedToDense[ufFind(occurrences[0].second)];

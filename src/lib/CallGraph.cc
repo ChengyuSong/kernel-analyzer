@@ -3955,7 +3955,10 @@ bool CallGraphPass::runCompositionalSolve() {
     for (const auto &E : combinedEdges) {
       uint32_t sccFrom = (E.from < nodeToSCC.size()) ? nodeToSCC[E.from] : UINT32_MAX;
       uint32_t sccTo = (E.to < nodeToSCC.size()) ? nodeToSCC[E.to] : UINT32_MAX;
-      if (sccFrom == UINT32_MAX || sccTo == UINT32_MAX || sccFrom == sccTo)
+      // Keep self-loops after SCC remap: collapsing dense nodes into a VSCC
+      // can turn real intra-component relationships into self-loops, and
+      // dropping them can lose CFL derivations (e.g., M/MA/AM chains).
+      if (sccFrom == UINT32_MAX || sccTo == UINT32_MAX)
         continue;
       EdgeKey key{sccFrom, sccTo, E.label};
       if (exportEdgeSeen.insert(key).second)

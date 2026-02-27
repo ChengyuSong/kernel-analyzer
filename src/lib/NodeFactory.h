@@ -133,6 +133,9 @@ private:
     llvm::DenseMap<NodeIndex, std::pair<NodeIndex, unsigned> > gepNodeMap;
 
     unsigned constGEPtoFieldNum(const llvm::ConstantExpr* expr) const;
+    const llvm::GlobalVariable* canonicalizeGlobal(const llvm::GlobalVariable* gv) const;
+    const llvm::Function* canonicalizeFunction(const llvm::Function* f) const;
+    const llvm::Value* canonicalizeValueKey(const llvm::Value* v) const;
 public:
     AndersNodeFactory();
 

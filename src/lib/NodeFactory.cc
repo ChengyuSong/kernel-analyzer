@@ -46,14 +46,69 @@ AndersNodeFactory::AndersNodeFactory() {
     assert(nodes.size() == 5);
 }
 
+const GlobalVariable* AndersNodeFactory::canonicalizeGlobal(
+    const GlobalVariable* gv) const {
+    if (!gv)
+        return gv;
+    uint64_t gid = gv->getGUID();
+    if (gobjMap) {
+        auto it = gobjMap->find(gid);
+        if (it != gobjMap->end())
+            return it->second;
+    }
+    if (extGobjMap) {
+        auto it = extGobjMap->find(gid);
+        if (it != extGobjMap->end())
+            return it->second;
+    }
+    return gv;
+}
+
+const Function* AndersNodeFactory::canonicalizeFunction(
+    const Function* f) const {
+    if (!f)
+        return f;
+    uint64_t fid = f->getGUID();
+    if (funcMap) {
+        auto it = funcMap->find(fid);
+        if (it != funcMap->end())
+            return it->second;
+    }
+    if (extFuncMap) {
+        auto it = extFuncMap->find(fid);
+        if (it != extFuncMap->end())
+            return it->second;
+    }
+    return f;
+}
+
+const Value* AndersNodeFactory::canonicalizeValueKey(const Value* v) const {
+    if (const auto *arg = dyn_cast<Argument>(v)) {
+        const Function *parent = arg->getParent();
+        const Function *canonParent = canonicalizeFunction(parent);
+        if (canonParent && arg->getArgNo() < canonParent->arg_size())
+            return canonParent->getArg(arg->getArgNo());
+        return v;
+    }
+    if (const auto *gv = dyn_cast<GlobalVariable>(v))
+        return canonicalizeGlobal(gv);
+    if (const auto *f = dyn_cast<Function>(v))
+        return canonicalizeFunction(f);
+    return v;
+}
+
 NodeIndex AndersNodeFactory::createValueNode(const Value* val) {
+    val = canonicalizeValueKey(val);
+    if (val != nullptr) {
+        auto it = valueNodeMap.find(val);
+        if (it != valueNodeMap.end())
+            return it->second;
+    }
+
     unsigned nextIdx = nodes.size();
     nodes.emplace_back(AndersNode(AndersNode::VALUE_NODE, nextIdx, val));
-    if (val != nullptr) {
-        if (valueNodeMap.count(val))
-            return valueNodeMap[val];
+    if (val != nullptr)
         valueNodeMap[val] = nextIdx;
-    }
 
     return nextIdx;
 }
@@ -95,20 +150,28 @@ NodeIndex AndersNodeFactory::createObjectNode(const NodeIndex base, const unsign
 }
 
 NodeIndex AndersNodeFactory::createReturnNode(const llvm::Function* f) {
+    f = canonicalizeFunction(f);
+    auto existing = returnMap.find(f);
+    if (existing != returnMap.end())
+        return existing->second;
+
     unsigned nextIdx = nodes.size();
     nodes.emplace_back(AndersNode(AndersNode::VALUE_NODE, nextIdx, f));
 
-    assert(!returnMap.count(f) && "Trying to insert two mappings to returnMap!");
     returnMap[f] = nextIdx;
 
     return nextIdx;
 }
 
 NodeIndex AndersNodeFactory::createVarargNode(const llvm::Function* f) {
+    f = canonicalizeFunction(f);
+    auto existing = varargMap.find(f);
+    if (existing != varargMap.end())
+        return existing->second;
+
     unsigned nextIdx = nodes.size();
     nodes.emplace_back(AndersNode(AndersNode::OBJ_NODE, nextIdx, f));
 
-    assert(!varargMap.count(f) && "Trying to insert two mappings to varargMap!");
     varargMap[f] = nextIdx;
 
     return nextIdx;
@@ -132,20 +195,20 @@ NodeIndex AndersNodeFactory::getValueNodeFor(const Value* val) {
 
     if (const GlobalVariable *globalVar = dyn_cast<GlobalVariable>(val)) {
         auto GID = globalVar->getGUID();
-        auto itr = gobjMap->find(GID);
-        if (itr != gobjMap->end()) {
-            auto obj = itr->second;
-            val = obj;
-        } else if (extGobjMap->find(GID) != extGobjMap->end()) {
+        if (gobjMap) {
+            auto itr = gobjMap->find(GID);
+            if (itr != gobjMap->end()) {
+                val = itr->second;
+            } else if (extGobjMap && extGobjMap->find(GID) != extGobjMap->end()) {
+                // XXX: return universal ptr?
+                return getUniversalPtrNode();
+            }
+        } else if (extGobjMap && extGobjMap->find(GID) != extGobjMap->end()) {
             // XXX: return universal ptr?
             return getUniversalPtrNode();
         }
     }
-    // else if (const Function *func = dyn_cast<Function>(val)) {
-    //     auto itr = funcMap->find(func->getGUID());
-    //     if (itr != funcMap->end())
-    //         val = itr->second;
-    // }
+    val = canonicalizeValueKey(val);
 
     auto itr = valueNodeMap.find(val);
     if (itr == valueNodeMap.end()) {
@@ -247,25 +310,9 @@ NodeIndex AndersNodeFactory::getObjectNodeFor(const Value* val) {
             return getObjectNodeForConstant(c);
 
     if (const GlobalVariable *globalVar = dyn_cast<GlobalVariable>(val)) {
-        auto GID = globalVar->getGUID();
-        auto itr = gobjMap->find(GID);
-        if (itr != gobjMap->end()) {
-            val = itr->second;
-        } else {
-            itr = extGobjMap->find(GID);
-            if (itr != extGobjMap->end())
-                val = itr->second;
-        }
+        val = canonicalizeGlobal(globalVar);
     } else if (const Function *func = dyn_cast<Function>(val)) {
-        auto FID = func->getGUID();
-        auto itr = funcMap->find(FID);
-        if (itr != funcMap->end()) {
-            val = itr->second;
-        } else {
-            itr = extFuncMap->find(FID);
-            if (itr != extFuncMap->end())
-                val = itr->second;
-        }
+        val = canonicalizeFunction(func);
     }
 
     auto itr = objNodeMap.find(val);
@@ -319,26 +366,18 @@ NodeIndex AndersNodeFactory::getObjectNodeForConstant(const llvm::Constant* c) {
 }
 
 NodeIndex AndersNodeFactory::getReturnNodeFor(const llvm::Function* f) {
-    auto FID = f->getGUID();
-    auto rf = funcMap->find(FID);
-    if (rf != funcMap->end())
-        f = rf->second;
-    else if (extFuncMap->find(FID) != extFuncMap->end()) {
-        // Check returnMap first — an on-demand return node may have been
-        // created for this ext func (e.g., for compositional CFL export).
-        auto itr = returnMap.find(f);
-        if (itr != returnMap.end())
-            return itr->second;
-        return getUniversalPtrNode();
-    }
+    uint64_t fid = f->getGUID();
+    f = canonicalizeFunction(f);
     auto itr = returnMap.find(f);
-    if (itr == returnMap.end())
-        return InvalidIndex;
-    else
+    if (itr != returnMap.end())
         return itr->second;
+    if (extFuncMap && extFuncMap->find(fid) != extFuncMap->end())
+        return getUniversalPtrNode();
+    return InvalidIndex;
 }
 
 NodeIndex AndersNodeFactory::getVarargNodeFor(const llvm::Function* f) {
+    f = canonicalizeFunction(f);
     auto itr = varargMap.find(f);
     if (itr == varargMap.end())
         return InvalidIndex;

@@ -4268,7 +4268,7 @@ bool CallGraphPass::runCompositionalSolve() {
               CG_LOG("FieldFilter: reject " << F->getName()
                      << " for " << callSiteStruct << " field "
                      << callSiteFieldIdx << "\n");
-              return;
+              continue;
             }
           }
           // No entries = conservative keep

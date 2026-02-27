@@ -2975,15 +2975,13 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
 }
 
 void CallGraphPass::dumpVSnapshot(StringRef Path) {
-  const cfl_result_t *GraphPtr = nullptr;
-  std::unique_ptr<gracfl::SolverFWGramParallel> TmpSolver;
-  if (cflSolver) {
-    GraphPtr = &cflSolver->getReachability();
-  } else {
-    TmpSolver = std::make_unique<gracfl::SolverFWGramParallel>(EB.getEdges(), *EB.getGrammar(), cflThreads);
-    TmpSolver->runCFL();
-    GraphPtr = &TmpSolver->getReachability();
+  if (CFLCompositional) {
+    dumpComposedVSnapshot(Path);
+    return;
   }
+
+  assert(cflSolver && "dumpVSnapshot called without a solved CFL graph");
+  const cfl_result_t *GraphPtr = &cflSolver->getReachability();
   if (!GraphPtr || GraphPtr->empty()) {
     WARNING("VSnapshot: empty CFL graph, skip export to " << Path << "\n");
     return;
@@ -3123,14 +3121,12 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
     std::unordered_set<uint32_t> Dsts;
     for (uint32_t Member : MembersByRep[Rep]) {
       if (useDense) {
-        // Map original node → dense CFL graph index
         uint32_t denseIdx = (Member < origToDense.size()) ? origToDense[Member] : UINT32_MAX;
         if (denseIdx == UINT32_MAX || denseIdx >= Graph.size())
           continue;
         const auto &VSet = Graph[denseIdx][LabelV];
         Dsts.reserve(Dsts.size() + VSet.size());
         for (NodeIndex D : VSet) {
-          // Map dense result back to original node, then to rep
           if (D >= denseToOrig.size()) continue;
           NodeIndex origD = denseToOrig[D];
           if (origD >= NodeCount) continue;
@@ -3158,6 +3154,140 @@ void CallGraphPass::dumpVSnapshot(StringRef Path) {
   CG_LOG("Exported V snapshot to " << Path
          << ": nodes=" << Data.nodeToRep.size()
          << ", reps=" << Data.repToNode.size()
+         << ", V-edges=" << EdgeCount
+         << ", names=" << Data.namedEntries.size() << "\n");
+}
+
+void CallGraphPass::dumpComposedVSnapshot(StringRef Path) {
+  if (!composedSolver || composedSymbolToDense.empty()) {
+    WARNING("VSnapshot: no composed solver result, skip export to " << Path << "\n");
+    return;
+  }
+
+  const auto &Graph = composedSolver->getReachability();
+  const uint32_t LabelV = EB.getLabelV();
+  if (Graph.empty() || Graph[0].size() <= LabelV) {
+    WARNING("VSnapshot: empty or invalid composed graph\n");
+    return;
+  }
+
+  // In the composed graph, each dense ID is already a V-SCC representative.
+  // nodeToRep and repToNode are both identity mappings.
+  const uint32_t NumDense = composedNumDense;
+  std::vector<uint32_t> NodeToRep(NumDense);
+  std::vector<uint32_t> RepToNode(NumDense);
+  std::iota(NodeToRep.begin(), NodeToRep.end(), 0);
+  std::iota(RepToNode.begin(), RepToNode.end(), 0);
+
+  // Build GUID → Function*/GlobalVariable* reverse maps for name lookup
+  std::unordered_map<uint64_t, const Function *> guidToFunc;
+  for (const auto &[guid, F] : Ctx->Funcs)
+    if (F) guidToFunc[guid] = F;
+  for (const auto &[guid, F] : Ctx->ExtFuncs)
+    if (F) guidToFunc.emplace(guid, F);  // don't overwrite definitions
+
+  std::unordered_map<uint64_t, const GlobalVariable *> guidToGV;
+  for (const auto &[guid, GV] : Ctx->Gobjs)
+    if (GV) guidToGV[guid] = GV;
+  for (const auto &[guid, GV] : Ctx->ExtGobjs)
+    if (GV) guidToGV.emplace(guid, GV);
+
+  // Build named entries from boundary symbols
+  std::vector<VSnapshotNamedEntry> NamedEntries;
+  NamedEntries.reserve(composedSymbolToDense.size());
+
+  for (const auto &[symbol, denseId] : composedSymbolToDense) {
+    if (denseId >= NumDense)
+      continue;
+
+    VSnapshotNamedEntry E;
+    E.node = denseId;
+
+    if (symbol.compare(0, 5, "func:") == 0) {
+      uint64_t guid = std::stoull(symbol.substr(5));
+      auto it = guidToFunc.find(guid);
+      if (it == guidToFunc.end()) continue;
+      E.kind = 1;
+      E.name = it->second->getName().str();
+    } else if (symbol.compare(0, 4, "arg:") == 0) {
+      // Format: "arg:GUID:N"
+      size_t colon1 = 4;
+      size_t colon2 = symbol.find(':', colon1);
+      if (colon2 == std::string::npos) continue;
+      uint64_t guid = std::stoull(symbol.substr(colon1, colon2 - colon1));
+      unsigned argNo = std::stoul(symbol.substr(colon2 + 1));
+      auto it = guidToFunc.find(guid);
+      if (it == guidToFunc.end()) continue;
+      E.kind = 3;
+      E.name = it->second->getName().str() + "::arg#" + std::to_string(argNo);
+    } else if (symbol.compare(0, 4, "ret:") == 0) {
+      uint64_t guid = std::stoull(symbol.substr(4));
+      auto it = guidToFunc.find(guid);
+      if (it == guidToFunc.end()) continue;
+      E.kind = 6;
+      E.name = "ret:" + it->second->getName().str();
+    } else if (symbol.compare(0, 7, "vararg:") == 0) {
+      uint64_t guid = std::stoull(symbol.substr(7));
+      auto it = guidToFunc.find(guid);
+      if (it == guidToFunc.end()) continue;
+      E.kind = 7;
+      E.name = "vararg:" + it->second->getName().str();
+    } else if (symbol.compare(0, 5, "glob:") == 0) {
+      uint64_t guid = std::stoull(symbol.substr(5));
+      auto it = guidToGV.find(guid);
+      if (it == guidToGV.end()) continue;
+      E.kind = 2;
+      E.name = it->second->getName().str();
+    } else {
+      // Skip icall: and unknown symbols
+      continue;
+    }
+
+    if (!E.name.empty())
+      NamedEntries.push_back(std::move(E));
+  }
+
+  std::sort(NamedEntries.begin(), NamedEntries.end(),
+            [](const VSnapshotNamedEntry &A, const VSnapshotNamedEntry &B) {
+              if (A.name != B.name) return A.name < B.name;
+              if (A.kind != B.kind) return A.kind < B.kind;
+              return A.node < B.node;
+            });
+
+  json::Object MetaObj;
+  MetaObj["tool"] = "kanalyzer";
+  MetaObj["snapshot_type"] = "V-relation";
+  MetaObj["version"] = static_cast<int64_t>(VSnapshotData::kVersion);
+  MetaObj["label_v"] = static_cast<int64_t>(LabelV);
+  MetaObj["compositional"] = true;
+  MetaObj["node_count"] = static_cast<int64_t>(NumDense);
+  MetaObj["rep_count"] = static_cast<int64_t>(NumDense);
+
+  VSnapshotData Data;
+  Data.labelV = LabelV;
+  Data.flags = 0;
+  Data.metadataJson = formatv("{0}", json::Value(std::move(MetaObj))).str();
+  Data.nodeToRep = std::move(NodeToRep);
+  Data.repToNode = std::move(RepToNode);
+  Data.namedEntries = std::move(NamedEntries);
+
+  std::string ErrMsg;
+  uint64_t EdgeCount = 0;
+  auto RowProvider = [&](uint32_t Rep, std::vector<uint32_t> &RowOut) {
+    if (Rep >= Graph.size()) return;
+    const auto &VSet = Graph[Rep][LabelV];
+    RowOut.assign(VSet.begin(), VSet.end());
+    std::sort(RowOut.begin(), RowOut.end());
+    EdgeCount += RowOut.size();
+  };
+
+  if (!saveVSnapshotWithRowProvider(Path, Data, RowProvider, &ErrMsg)) {
+    WARNING("VSnapshot: failed to export composed snapshot " << Path
+            << ": " << ErrMsg << "\n");
+    return;
+  }
+  CG_LOG("Exported composed V snapshot to " << Path
+         << ": dense_nodes=" << NumDense
          << ", V-edges=" << EdgeCount
          << ", names=" << Data.namedEntries.size() << "\n");
 }
@@ -3755,7 +3885,15 @@ bool CallGraphPass::runCompositionalSolve() {
                 std::chrono::steady_clock::now() - tSolve).count()
          << " ms\n");
 
-  // Result graph available via solver->getReachability() for future use
+  // Store composed solver and symbol→dense mapping for V-snapshot export.
+  // Must happen before any code references composedSolver.
+  composedSolver = std::move(solver);
+  composedNumDense = numDense;
+  composedSymbolToDense.clear();
+  composedSymbolToDense.reserve(symbolOccurrences.size());
+  for (const auto &[symbol, occurrences] : symbolOccurrences)
+    composedSymbolToDense[symbol] = unifiedToDense[ufFind(occurrences[0].second)];
+
   const uint32_t LabelV = EB.getLabelV();
 
   // Step 8: Build reverse map from dense node -> function names
@@ -3796,7 +3934,7 @@ bool CallGraphPass::runCompositionalSolve() {
   CG_LOG("Field store map (IR-based): " << funcFieldStores.size()
          << " functions\n");
 
-  const auto &composedGraph = solver->getReachability();
+  const auto &composedGraph = composedSolver->getReachability();
   extern cl::opt<std::string> CompressedGraphOutput;
 
   if (!CompressedGraphOutput.empty()) {

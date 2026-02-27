@@ -117,6 +117,11 @@ private:
   std::vector<CompressedGraphData> perTUGraphs;
   void solveAndCompressPerTU(llvm::Module *M, size_t edgeStart);
 
+  // Compositional solve results (for V-snapshot export)
+  std::unique_ptr<gracfl::SolverFWGramParallel> composedSolver;
+  std::unordered_map<std::string, uint32_t> composedSymbolToDense;
+  uint32_t composedNumDense = 0;
+
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
   LLMClient *LLM;
@@ -165,6 +170,7 @@ public:
   // export
   void dumpCallGraphJSON(llvm::StringRef Path);
   void dumpVSnapshot(llvm::StringRef Path);
+  void dumpComposedVSnapshot(llvm::StringRef Path);
   void exportCompressedGraph(llvm::StringRef Path);
   bool runCompositionalSolve();
 };

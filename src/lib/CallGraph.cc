@@ -67,6 +67,105 @@ struct EdgeKeyHash {
   }
 };
 
+struct CflcgGrammarMeta {
+  uint32_t labelA = 0;
+  uint32_t labelNA = 0;
+  uint32_t labelD = 0;
+  uint32_t labelND = 0;
+  uint32_t labelM = 0;
+  uint32_t labelV = 0;
+  std::string grammarFingerprint;
+};
+
+static std::string computeGrammarFingerprint(const gracfl::Grammar *G) {
+  if (!G)
+    return "";
+  std::vector<std::pair<std::string, uint32_t>> entries;
+  const auto &symToId = G->getSymbolToIDMap();
+  entries.reserve(symToId.size());
+  for (const auto &[sym, id] : symToId)
+    entries.emplace_back(sym, static_cast<uint32_t>(id));
+  std::sort(entries.begin(), entries.end(),
+            [](const auto &A, const auto &B) { return A.first < B.first; });
+  std::string material;
+  material.reserve(entries.size() * 12);
+  for (const auto &[sym, id] : entries) {
+    material.append(sym);
+    material.push_back('=');
+    material.append(std::to_string(id));
+    material.push_back(';');
+  }
+  return std::to_string(std::hash<std::string>()(material));
+}
+
+static CflcgGrammarMeta getCurrentCflcgGrammarMeta(const CFLEdgeBuilder &EB) {
+  CflcgGrammarMeta M;
+  M.labelA = EB.getLabelAssign();
+  M.labelNA = EB.getLabelAssignInv();
+  M.labelD = EB.getLabelDeref();
+  M.labelND = EB.getLabelDerefInv();
+  M.labelM = EB.getLabelM();
+  M.labelV = EB.getLabelV();
+  M.grammarFingerprint = computeGrammarFingerprint(EB.getGrammar());
+  return M;
+}
+
+static std::string encodeCflcgMetadata(const CflcgGrammarMeta &M, StringRef stage) {
+  json::Object Obj;
+  Obj["schema"] = "cflcg";
+  Obj["version"] = 1;
+  Obj["stage"] = stage.str();
+  Obj["label_a"] = static_cast<int64_t>(M.labelA);
+  Obj["label_na"] = static_cast<int64_t>(M.labelNA);
+  Obj["label_d"] = static_cast<int64_t>(M.labelD);
+  Obj["label_nd"] = static_cast<int64_t>(M.labelND);
+  Obj["label_m"] = static_cast<int64_t>(M.labelM);
+  Obj["label_v"] = static_cast<int64_t>(M.labelV);
+  Obj["grammar_fingerprint"] = M.grammarFingerprint;
+  return formatv("{0}", json::Value(std::move(Obj))).str();
+}
+
+static bool parseCflcgMetadata(StringRef raw, CflcgGrammarMeta &Out) {
+  if (raw.empty())
+    return false;
+  auto Parsed = json::parse(raw);
+  if (!Parsed)
+    return false;
+  const auto *Obj = Parsed->getAsObject();
+  if (!Obj)
+    return false;
+  auto getU32 = [&](StringRef key, uint32_t &dst) -> bool {
+    auto v = Obj->getInteger(key);
+    if (!v || *v < 0 || *v > UINT32_MAX)
+      return false;
+    dst = static_cast<uint32_t>(*v);
+    return true;
+  };
+  auto fp = Obj->getString("grammar_fingerprint");
+  if (!fp)
+    return false;
+  if (!getU32("label_a", Out.labelA) ||
+      !getU32("label_na", Out.labelNA) ||
+      !getU32("label_d", Out.labelD) ||
+      !getU32("label_nd", Out.labelND) ||
+      !getU32("label_m", Out.labelM) ||
+      !getU32("label_v", Out.labelV))
+    return false;
+  Out.grammarFingerprint = fp->str();
+  return true;
+}
+
+static bool cflcgMetadataCompatible(const CflcgGrammarMeta &A,
+                                    const CflcgGrammarMeta &B) {
+  return A.labelA == B.labelA &&
+         A.labelNA == B.labelNA &&
+         A.labelD == B.labelD &&
+         A.labelND == B.labelND &&
+         A.labelM == B.labelM &&
+         A.labelV == B.labelV &&
+         A.grammarFingerprint == B.grammarFingerprint;
+}
+
 static bool isZeroOffsetGEP(const Value *V) {
   const auto *GEP = dyn_cast<GEPOperator>(V);
   if (!GEP)
@@ -3625,6 +3724,8 @@ void CallGraphPass::compressConstraintGraph(
     names.erase(std::unique(names.begin(), names.end()), names.end());
   }
 
+  out.metadataJson = encodeCflcgMetadata(getCurrentCflcgGrammarMeta(EB), "per-tu");
+
   CG_LOG("Compressed graph: " << numSCCs << " SCC nodes, "
          << out.edges.size() << " edges, "
          << out.symbolTable.size() << " boundary symbols, "
@@ -3716,6 +3817,41 @@ bool CallGraphPass::runCompositionalSolve() {
   CG_LOG("Compositional CFL solve: " << graphs.size() << " in-memory per-TU graphs, "
          << CompressedGraphInputs.size() << " file inputs\n");
 
+  const CflcgGrammarMeta expectedMeta = getCurrentCflcgGrammarMeta(EB);
+
+  auto verifyCflcgMetadata = [&](StringRef source, const CompressedGraphData &G) -> bool {
+    CflcgGrammarMeta got;
+    if (!parseCflcgMetadata(G.metadataJson, got)) {
+      WARNING("CompressedGraph: missing/invalid metadata in " << source
+              << "; skipping grammar compatibility check\n");
+      return true;
+    }
+    if (cflcgMetadataCompatible(got, expectedMeta))
+      return true;
+    errs() << "CompressedGraph metadata mismatch in '" << source << "'\n"
+           << "  expected labels: a=" << expectedMeta.labelA
+           << " -a=" << expectedMeta.labelNA
+           << " d=" << expectedMeta.labelD
+           << " -d=" << expectedMeta.labelND
+           << " M=" << expectedMeta.labelM
+           << " V=" << expectedMeta.labelV << "\n"
+           << "  actual labels:   a=" << got.labelA
+           << " -a=" << got.labelNA
+           << " d=" << got.labelD
+           << " -d=" << got.labelND
+           << " M=" << got.labelM
+           << " V=" << got.labelV << "\n"
+           << "  expected grammar_fingerprint=" << expectedMeta.grammarFingerprint << "\n"
+           << "  actual   grammar_fingerprint=" << got.grammarFingerprint << "\n";
+    return false;
+  };
+
+  for (size_t i = 0; i < graphs.size(); i++) {
+    std::string graphName = "in-memory graph #" + std::to_string(i);
+    if (!verifyCflcgMetadata(graphName, graphs[i]))
+      return false;
+  }
+
   // Load from files (existing code)
   auto tLoad = std::chrono::steady_clock::now();
   for (size_t i = 0; i < CompressedGraphInputs.size(); i++) {
@@ -3726,6 +3862,8 @@ bool CallGraphPass::runCompositionalSolve() {
              << CompressedGraphInputs[i] << "': " << ErrMsg << "\n";
       return false;
     }
+    if (!verifyCflcgMetadata(CompressedGraphInputs[i], graphs.back()))
+      return false;
     CG_LOG("  Loaded " << CompressedGraphInputs[i]
            << ": nodes=" << graphs.back().numNodes
            << ", edges=" << graphs.back().edges.size()
@@ -4011,6 +4149,8 @@ bool CallGraphPass::runCompositionalSolve() {
       std::sort(names.begin(), names.end());
       names.erase(std::unique(names.begin(), names.end()), names.end());
     }
+
+    exportData.metadataJson = encodeCflcgMetadata(expectedMeta, "composed-export");
 
     std::string ErrMsg;
     if (!saveCompressedGraph(CompressedGraphOutput, exportData, &ErrMsg)) {

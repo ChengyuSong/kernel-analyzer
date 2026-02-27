@@ -34,6 +34,9 @@ namespace gracfl {
                 outEdges_[edge.from][edge.label].NEW_END++;
             }
         }
+        // edges_ is only needed to populate outEdges_/hashset_; release it now.
+        getEdges().clear();
+        getEdges().shrink_to_fit();
     }
 
     void Graph3DOut::clearContainers()

@@ -129,6 +129,10 @@ public:
    */
   const uint getLabelM() const { return labelM; }
   const uint getLabelV() const { return labelV; }
+  const uint getLabelAssign() const { return labelAssign; }
+  const uint getLabelAssignInv() const { return labelAssignInv; }
+  const uint getLabelDeref() const { return labelDeref; }
+  const uint getLabelDerefInv() const { return labelDerefInv; }
 
   /**
    * @brief Detect and break cycles in the constraint graph

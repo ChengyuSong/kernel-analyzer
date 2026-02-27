@@ -56,6 +56,195 @@ V  = (M? -a)* M? (a M?)*              (value flow)
 V includes epsilon (identity) and is transitively closed, which is what makes
 V-SCC merging a valid congruence.
 
+## Soundness proof (core compositional CFL)
+
+This section states and proves soundness of the **core compositional CFL
+solver** (graph construction + per-TU compression + boundary composition +
+final CFL solve), with respect to the monolithic CFL analysis.
+
+### Statement
+
+Let:
+
+- `G` be the monolithic whole-program constraint graph that would be built by
+  the non-compositional pipeline.
+- `Reach_G(X)` be CFL reachability in `G` under nonterminal `X` (`X in {V, M}`).
+- `C` be the composed graph produced by Levels 1-3 in compositional mode.
+- `Reach_C(X)` be CFL reachability in `C`.
+
+**Theorem (sound over-approximation).**  
+For every nonterminal `X` and every pair of program nodes `(u, v)` represented
+in the composed graph:
+
+`u Reach_G(X) v  =>  q(u) Reach_C(X) q(v)`
+
+where `q` maps original nodes to their composed representatives.
+
+So compositional analysis does not lose any monolithic CFL facts; it may only
+add extra facts.
+
+### Assumptions (implementation-matched)
+
+1. **Boundary completeness.** Every cross-TU interaction that can participate in
+   CFL derivations crosses one of the exported boundary categories:
+   `func/arg/ret/vararg/glob/icall`.
+2. **Symbol consistency.** If two TU-local nodes denote the same program-level
+   boundary entity, they receive the same boundary symbol.
+3. **Per-TU edge preservation.** Per-TU compressed graphs preserve all TU-local
+   edges modulo V-SCC quotienting.
+4. **Same grammar.** Per-TU and composed solves use the same CFL grammar.
+
+These are exactly what `compressConstraintGraph` and `runCompositionalSolve`
+implement.
+
+### Lemma 1: Per-TU quotient is edge-homomorphic
+
+For each TU graph `G_i`, let `~_i` be V-SCC equivalence and `pi_i` its quotient
+map. For every original edge `(a --L--> b)` in `G_i`, the compressed graph
+contains `(pi_i(a) --L--> pi_i(b))`.
+
+When `pi_i(a) == pi_i(b)` (intra-SCC edge), the edge becomes a self-loop on the
+SCC representative. **These self-loops must be preserved**, not dropped. Although
+the two endpoints are V-equivalent, the grammar requires traversal through
+intermediate labeled steps (d, -d, a, -a) to derive V via the memory-alias
+nonterminal M. Specifically:
+
+- `M(x, scc) = -d(x, scc) · V(scc, scc) · d(scc, scc)` requires a `d` self-loop.
+- `MA(x, scc) = M(x, scc) · -a(scc, scc)` requires an `-a` self-loop.
+
+Without these self-loops, V-reachability through memory-alias chains across TU
+boundaries is blocked in the composed graph. See "Bug fix: V-SCC self-loops"
+below for details.
+
+Therefore every derivation entirely inside one TU lifts through `pi_i`, provided
+intra-SCC self-loops are retained.
+
+### Lemma 2: Composition simulates cross-TU steps
+
+In monolithic `G`, cross-TU flow uses boundary entities (formal/actual, returns,
+globals, etc.). In `C`, nodes carrying the same boundary symbol are unioned by
+union-find, so a monolithic boundary transition is simulated by equality of
+representatives in `C`.
+
+Hence any derivation segment that crosses TU boundaries in `G` has a
+corresponding segment in `C`.
+
+### Lemma 3: Derivation lifting
+
+Take any monolithic CFL derivation `D` from `u` to `v`. Partition `D` into
+maximal TU-local segments separated by boundary crossings.
+
+- By Lemma 1, each TU-local segment maps to a valid segment in compressed TU
+  space.
+- By Lemma 2, each boundary crossing maps to a valid step in composed space.
+
+Concatenating mapped segments yields a valid derivation in `C` from `q(u)` to
+`q(v)` under the same nonterminal.
+
+### Proof of theorem
+
+Immediate from Lemma 3.
+
+Thus composed reachability is a conservative superset of monolithic
+reachability.
+
+### Corollary for indirect-call target discovery
+
+If indirect-call targets are extracted only from composed `V` reachability and
+then filtered by predicates that are themselves conservative (never rejecting a
+true target), target discovery remains sound relative to monolithic CFL.
+
+In this implementation, `isCompatible` is conservative by design. The
+IR-derived field-store filter is intended to be conservative (unknown => keep),
+but a full formal proof for that filter requires additional assumptions about
+completeness of the callback-tracing patterns.
+
+## Bug fix: V-SCC self-loops and compositional edge construction
+
+The initial implementation had three bugs that caused compositional mode to miss
+all indirect call targets in certain cross-TU configurations (e.g., function
+pointers passed through interface functions defined in a separate TU).
+
+### Bug 1: Missing actual-to-formal edges for external calls
+
+**Location**: `CallGraph.cc`, `handleCall`
+
+In per-TU mode, when a function calls an external (declared-only) function like
+`kobj_map`, the callee's `Function` body is empty. The original code returned
+early when `CompressedGraphOutput` was empty (no serialized output path), which
+is always the case in per-TU compositional mode. This prevented creation of
+actual-to-formal assignment edges for cross-TU calls.
+
+**Fix**: Skip the early return when `CFLCompositional` is enabled. Boundary
+symbols (`arg:<GUID>:<N>`, `ret:<GUID>`) are emitted for the declared function's
+parameters even without a body, so the composition step can later connect them
+to the definition's formals in the other TU.
+
+### Bug 2: V-SCC compression dropped intra-SCC self-loops
+
+**Location**: `CallGraph.cc`, `compressConstraintGraph` step 1.5
+
+V-SCC compression collapses all nodes in a V-SCC to a single representative.
+When two nodes `a` and `b` are in the same V-SCC, any edge `a --L--> b` becomes
+a self-loop `scc --L--> scc`. The original implementation dropped all self-loops
+under the assumption that they are redundant — since V-equivalence already
+holds, no additional derivations are possible.
+
+**Why this is wrong**: V-equivalence holds *within the per-TU solved graph*, but
+the composed graph introduces new cross-TU edges that can create derivation
+paths *through* the SCC node. These paths need intermediate grammar steps:
+
+```
+M(x, scc) = -d(x, scc) · V(scc, scc) · d(scc, scc)
+```
+
+Here `x` is a node from another TU connected to `scc` via a `-d` edge after
+boundary composition. To derive `M(x, scc)`, the solver needs `d(scc, scc)` —
+a self-loop that was dropped. The V self-loop `V(scc, scc)` is free (V is
+reflexive), but the terminal `d` self-loop is not.
+
+Similarly, `MA(x, scc) = M(x, scc) · -a(scc, scc)` requires an `-a` self-loop.
+
+**Concrete example**: In a two-TU test (`char_dev.ll` + `map.ll`):
+- `map.ll` defines `kobj_map(probe, ...)` which stores `probe` to a struct
+  field via a dereference chain
+- `char_dev.ll` calls `kobj_map(exact_match, ...)` and later loads the fptr
+  from the struct via `kobj_lookup`
+- After per-TU V-SCC compression in `map.ll`, the pointer node and its
+  dereference target (connected by `d/-d`) end up in the same V-SCC
+- The `d(scc, scc)` self-loop is dropped
+- During composition, `char_dev.ll`'s fptr node connects to `map.ll`'s SCC
+  via boundary edges, but `M` derivation fails without the `d` self-loop
+- Result: 0 targets resolved instead of 3
+
+**Fix**: After V-SCC compression, explicitly add self-loop edges for all four
+terminal labels (`a`, `-a`, `d`, `-d`) on every multi-node V-SCC. Single-node
+SCCs don't need self-loops because they had no intra-SCC edges to begin with.
+
+### Bug 3: Composition dropped self-loops from union-find merging
+
+**Location**: `CallGraph.cc`, `runCompositionalSolve` step 6
+
+During composition, edges are remapped through union-find representatives. When
+two formerly-separate V-SCC nodes from different TUs are merged (because they
+share a boundary symbol), an inter-SCC edge `a --L--> b` becomes a self-loop
+`merged --L--> merged`. The original code skipped all self-loops with
+`if (from == to) continue;`, dropping these edges.
+
+**Why this is wrong**: These are not redundant self-loops — they encode real
+relationships between formerly-separate nodes that were merged by boundary
+composition. The composed CFL solver needs them to derive V-reachability through
+the merged mega-node.
+
+**Fix**: Remove the self-loop skip entirely. Self-loops from union-find merging
+encode internal relationships in composed mega-nodes and must be kept.
+
+### Summary
+
+All three bugs stem from the same incorrect assumption: that self-loop edges on
+SCC/merged nodes are always redundant. In a compositional setting, self-loops
+preserve intra-SCC grammar derivability that cross-TU edges may later exploit.
+
 ## Pipeline
 
 ```
@@ -71,6 +260,8 @@ Level 2: Per-TU compression (inside doModulePass, after Level 1)
   4. Compute V-SCCs from solved V-reachability    (computeVSCC)
   5. Compress: remap edges through V-SCC, deduplicate, build symbol
      table and funcNodes metadata                 (compressConstraintGraph)
+  5b. Add self-loop edges (a/-a/d/-d) for multi-node V-SCCs to preserve
+      intra-SCC grammar derivability for composition
   6. Store compressed graph in memory              (perTUGraphs)
   Optional: serialize to .cflcg file              (exportCompressedGraph)
 

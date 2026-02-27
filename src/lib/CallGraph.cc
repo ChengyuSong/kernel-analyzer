@@ -482,7 +482,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
 
     // In compositional mode, fall through to create on-demand arg/ret nodes
     // so cross-TU data flow is captured in the compressed graph.
-    if (CompressedGraphOutput.empty())
+    if (CompressedGraphOutput.empty() && !CFLCompositional)
       return false;
   }
 
@@ -2027,6 +2027,15 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
 // ---- Global union-find dedup ----
 
 NodeIndex CallGraphPass::globalFind(NodeIndex n) {
+  // getValueNodeForConstant lazily creates nodes (e.g. for ConstantExpr GEPs
+  // and vector-of-pointer constants) after globalUFParent was sized. Extend
+  // both arrays on demand so new nodes start as their own roots with rank 0.
+  if (n >= globalUFParent.size()) {
+    size_t old = globalUFParent.size();
+    globalUFParent.resize(n + 1);
+    globalUFRank.resize(n + 1, 0);
+    std::iota(globalUFParent.begin() + old, globalUFParent.end(), (NodeIndex)old);
+  }
   NodeIndex root = n;
   while (globalUFParent[root] != root)
     root = globalUFParent[root];
@@ -3305,6 +3314,32 @@ void CallGraphPass::compressConstraintGraph(
       out.edges.emplace_back(sccFrom, sccTo, E.label);
   }
 
+  // Step 1.5: Add self-loop edges for multi-node V-SCCs.
+  // V-SCC compression collapses all intra-SCC edges (a/-a AND d/-d) into
+  // self-loops that are dropped.  The composed CFL solver needs:
+  //   - self-loop a/-a for MA/AM derivation: MA(x, scc) = M(x, scc) -a(scc, scc)
+  //   - self-loop d/-d for M derivation:     M(x, scc) = -d(x, scc) V(scc, scc) d(scc, scc)
+  // Without these, V-reachability through memory-alias chains is blocked.
+  {
+    const uint32_t labels[] = {
+      EB.getLabelAssign(), EB.getLabelAssignInv(),
+      EB.getLabelDeref(), EB.getLabelDerefInv()
+    };
+    // Count nodes per SCC to find multi-node SCCs
+    std::vector<uint32_t> sccSize(numSCCs, 0);
+    for (uint32_t n = 0; n < nodeToSCC.size(); n++)
+      if (nodeToSCC[n] < numSCCs) sccSize[nodeToSCC[n]]++;
+    uint32_t selfLoopsAdded = 0;
+    for (uint32_t scc = 0; scc < numSCCs; scc++) {
+      if (sccSize[scc] < 2) continue;
+      for (uint32_t lbl : labels)
+        out.edges.emplace_back(scc, scc, lbl);
+      selfLoopsAdded++;
+    }
+    CG_LOG("Step 1.5: added self-loops (a/-a/d/-d) for "
+           << selfLoopsAdded << " multi-node SCCs\n");
+  }
+
   // Step 2: Build symbol table from boundary nodes
   // Functions with external linkage
   for (const auto &[guid, F] : Ctx->Funcs) {
@@ -3657,6 +3692,18 @@ bool CallGraphPass::runCompositionalSolve() {
   CG_LOG("After union-find: " << totalNodes << " unified -> "
          << numDense << " dense nodes\n");
 
+  // Debug: dump boundary symbol → dense mapping
+  for (const auto &[symbol, occurrences] : symbolOccurrences) {
+    if (occurrences.size() < 2) continue;
+    uint32_t denseId = unifiedToDense[ufFind(occurrences[0].second)];
+    CG_DEBUG("BoundaryMerge: " << symbol << " -> dense=" << denseId
+             << " (from graphs:");
+    for (const auto &[gi, uid] : occurrences)
+      CG_DEBUG(" g" << gi << ":local" << (uid - nodeOffsets[gi])
+               << "->unified" << uid);
+    CG_DEBUG(")\n");
+  }
+
   // Step 6: Remap all edges through union-find and deduplicate
   std::unordered_set<EdgeKey, EdgeKeyHash> edgeSeen;
   std::vector<gracfl::Edge> combinedEdges;
@@ -3672,7 +3719,11 @@ bool CallGraphPass::runCompositionalSolve() {
     for (const auto &E : graphs[i].edges) {
       uint32_t from = unifiedToDense[offset + E.from];
       uint32_t to = unifiedToDense[offset + E.to];
-      if (from == to) continue;
+      // Don't drop self-loops: union-find merging can collapse formerly
+      // separate V-SCCs into one mega-node.  Internal a/-a self-loops are
+      // needed for MA/AM derivation, and internal d/-d self-loops are needed
+      // for M derivation (M → -d V d) when the pointer and deref nodes
+      // end up in the same composed mega-node.
       EdgeKey key{from, to, E.label};
       if (edgeSeen.insert(key).second)
         combinedEdges.emplace_back(from, to, E.label);
@@ -3859,24 +3910,40 @@ bool CallGraphPass::runCompositionalSolve() {
     size_t vWithFunc = 0;
     for (uint32_t t : VSet)
       if (denseToFuncNames.count(t)) vWithFunc++;
+    // Also count denseNode itself (V is reflexive: V → AMs → ε)
+    bool selfHasFunc = denseToFuncNames.count(denseNode) > 0;
     CG_DEBUG("Icall " << icallKey << " dense=" << denseNode
              << " VSet=" << VSet.size()
-             << " withFunc=" << vWithFunc << "\n");
-    if (VSet.size() <= 5) {
+             << " withFunc=" << vWithFunc
+             << " selfFunc=" << selfHasFunc << "\n");
+    if (VSet.size() <= 10) {
       for (uint32_t t : VSet) {
         auto fn = denseToFuncNames.find(t);
         if (fn != denseToFuncNames.end()) {
           for (const auto &n : fn->second)
             CG_DEBUG("  VSet[" << t << "] -> " << n << "\n");
+        } else {
+          CG_DEBUG("  VSet[" << t << "] (no func)\n");
         }
       }
     }
+    if (selfHasFunc) {
+      for (const auto &n : denseToFuncNames.at(denseNode))
+        CG_DEBUG("  Self[" << denseNode << "] -> " << n << "\n");
+    }
+
+    // Helper lambda to resolve a candidate dense node to Function* targets.
+    // V is reflexive (V → AMs → ε), so denseNode itself is always a candidate
+    // in addition to the explicit V-set entries. This matters when per-TU
+    // V-SCC compression merges the fptr node and function nodes into the same
+    // SCC (their intra-SCC edges become self-loops and are dropped), and then
+    // cross-TU union-find merges that SCC with a function-node SCC from
+    // another TU — leaving funcNames at denseNode but no explicit V(x,x) edge.
     FuncSet targets;
-    for (uint32_t target : VSet) {
-      // Look up function names from the composed funcNodes map
+    auto resolveCandidate = [&](uint32_t target) {
       auto fnIt = denseToFuncNames.find(target);
       if (fnIt == denseToFuncNames.end())
-        continue;
+        return;
       for (const auto &funcName : fnIt->second) {
         auto fIt = nameToFunc.find(funcName);
         if (fIt == nameToFunc.end())
@@ -3893,14 +3960,20 @@ bool CallGraphPass::runCompositionalSolve() {
               CG_LOG("FieldFilter: reject " << F->getName()
                      << " for " << callSiteStruct << " field "
                      << callSiteFieldIdx << "\n");
-              continue;
+              return;
             }
           }
           // No entries = conservative keep
         }
         targets.insert(F);
       }
-    }
+    };
+
+    // Check denseNode itself first (handles V-SCC compression merging fptr
+    // with function nodes when they are mutually V-reachable within a TU).
+    resolveCandidate(denseNode);
+    for (uint32_t target : VSet)
+      resolveCandidate(target);
 
     if (!targets.empty()) {
       Ctx->Callees[CS].insert(targets.begin(), targets.end());

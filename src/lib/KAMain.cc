@@ -105,8 +105,8 @@ cl::list<std::string> CompressedGraphInputs(
 
 cl::opt<bool> CFLCompositional(
   "cfl-compositional",
-  cl::desc("Run compositional CFL solving from compressed inputs"),
-  cl::init(false));
+  cl::desc("Run per-TU CFL solving and compose compressed results (default on)"),
+  cl::init(true));
 
 cl::opt<std::string> CallGraphJSON(
   "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));

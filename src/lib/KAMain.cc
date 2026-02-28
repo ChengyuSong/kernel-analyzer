@@ -108,6 +108,21 @@ cl::opt<bool> CFLCompositional(
   cl::desc("Run per-TU CFL solving and compose compressed results (default on)"),
   cl::init(true));
 
+cl::opt<bool> CFLCGCacheStrict(
+  "cfl-cache-strict",
+  cl::desc("Strict compositional cache validation (coverage/freshness/compatibility)"),
+  cl::init(true));
+
+cl::opt<bool> CFLCGCacheRepair(
+  "cfl-cache-repair",
+  cl::desc("Repair compositional cache by recomputing missing/stale/incompatible modules"),
+  cl::init(false));
+
+cl::opt<bool> CFLCGAllowDuplicateCoverage(
+  "cfl-cache-allow-duplicate-coverage",
+  cl::desc("Allow multiple input .cflcg files to claim the same covered module"),
+  cl::init(false));
+
 cl::opt<std::string> CallGraphJSON(
   "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));
 
@@ -418,7 +433,10 @@ int main(int argc, char **argv) {
   // Run compositional CFL solve if requested
   if (CFLCompositional) {
     auto tComp = std::chrono::steady_clock::now();
-    CGPass.runCompositionalSolve();
+    if (!CGPass.runCompositionalSolve()) {
+      errs() << "Compositional solve failed\n";
+      return 1;
+    }
     Diag << "TIMER runCompositionalSolve "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tComp).count()

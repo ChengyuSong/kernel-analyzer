@@ -32,6 +32,33 @@ kanalyzer lib_tu1.o lib_tu2.o app.o \
 | `--cfl-compositional` | Enable per-TU CFL solving and whole-program composition |
 | `--cfl-compressed-output <path>` | Export compressed constraint graph to a `.cflcg` file |
 | `--cfl-compressed-input <path>` | Load a pre-built `.cflcg` file (repeatable) |
+| `--cfl-cache-strict=<true\|false>` | Strict cache validation for `.cflcg` inputs (default: `true`) |
+| `--cfl-cache-repair` | Recompute missing/stale/incompatible modules from current IR, then compose |
+| `--cfl-cache-allow-duplicate-coverage` | Allow multiple input `.cflcg` files to claim the same covered module |
+
+### Cache validation policy
+
+Compositional mode now validates `.cflcg` cache inputs against current bitcode
+inputs in strict mode (`--cfl-cache-strict=true`, default).
+
+Strict mode checks:
+
+- coverage: union of `covered_modules` equals current input module set
+- freshness: per-module SHA256 in `module_hashes` matches current bitcode
+- compatibility: `analysis_key` (grammar/labels/flags/schema) matches current run
+- duplicates: same module cannot be covered by multiple `.cflcg` inputs unless
+  `--cfl-cache-allow-duplicate-coverage` is set
+- boundary sanity: required boundary classes
+  (`func/arg/ret/vararg/glob/icall`) are present when expected from current IR
+
+On mismatch, diagnostics list `missing`, `stale`, `duplicate`, and
+`incompatible` entries, and the run fails closed.
+
+Use `--cfl-cache-repair` to rebuild invalid/missing modules from current IR and
+continue composition automatically.
+
+For legacy or handcrafted `.cflcg` fixtures without metadata, use
+`--cfl-cache-strict=false`.
 
 See `docs/compositional-cfl-analysis.md` for the full design.
 

@@ -364,7 +364,7 @@ struct CompressedGraphData {
   // compressed node ID -> function names (address-taken functions only)
   std::unordered_map<uint32_t, std::vector<std::string>> funcNodes;
 
-  std::string metadataJson;              // reserved for future metadata
+  std::string metadataJson;              // JSON metadata (analysis/cache key)
 };
 ```
 
@@ -372,12 +372,26 @@ Serialized to `.cflcg` files via `saveCompressedGraph()`/`loadCompressedGraph()`
 in `CompressedGraph.{h,cc}`. The format is a binary header followed by
 length-prefixed sections for edges, symbols, funcNodes, and metadata.
 
+Current `metadataJson` includes:
+
+- `analysis_key`:
+  - grammar labels (`a/-a/d/-d/M/V`)
+  - grammar signature + fingerprint
+  - analysis flags (`global_dedup`, `local_alloca_summary`)
+  - `.cflcg` schema/tool version
+- `covered_modules`: stable normalized module identifiers
+- `module_hashes`: per-module SHA256 of input bitcode bytes
+
 ## CLI options
 
 ```
 --cfl-compressed-output <path>    Export compressed graph to .cflcg file
 --cfl-compressed-input <path>     Load compressed graph (repeatable)
 --cfl-compositional               Run compositional solve from inputs
+--cfl-cache-strict=<true|false>   Strict cache validation (default: true)
+--cfl-cache-repair                Recompute invalid/missing modules from current IR
+--cfl-cache-allow-duplicate-coverage
+                                  Allow duplicate module coverage across inputs
 ```
 
 Typical usage:
@@ -408,6 +422,36 @@ Note: Level 3 loads all TU bitcode files (for module initialization, type info,
 indirect call site metadata, and IR-based field store map construction) but
 skips the expensive full CFL solve, using the composed compressed graph
 results instead.
+
+### Cache validity policy (strict by default)
+
+In compositional mode, cache inputs are validated against current bitcode
+inputs before composition:
+
+1. Coverage: union of all input `covered_modules` must exactly match the
+   current module set.
+2. Freshness: each covered module hash in `module_hashes` must match current
+   SHA256.
+3. Compatibility: `analysis_key` must match current grammar labels/signature
+   and relevant flags (`global_dedup`, `local_alloca_summary`).
+4. Duplicate ownership: a module may not be covered by multiple input caches
+   unless `--cfl-cache-allow-duplicate-coverage` is set.
+5. Boundary sanity: required boundary classes
+   (`func/arg/ret/vararg/glob/icall`) must be present when expected from
+   active IR/CFL boundary nodes.
+
+On mismatch, diagnostics explicitly list:
+
+- `missing`
+- `stale`
+- `duplicate`
+- `incompatible`
+
+and strict mode fails closed.
+
+`--cfl-cache-repair` recomputes modules from current IR and resumes
+composition. `--cfl-cache-strict=false` can be used for legacy/handcrafted
+`.cflcg` inputs that do not carry full metadata.
 
 ## Cost analysis
 

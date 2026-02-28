@@ -72,6 +72,7 @@ PY
 
 "$KA" "$WORK/dummy.bc" \
   --cfl-compositional \
+  --cfl-cache-strict=false \
   --cfl-compressed-input "$WORK/in.cflcg" \
   --cfl-compressed-output "$WORK/out.cflcg" \
   --verbose 0 >/dev/null 2>&1
@@ -128,6 +129,7 @@ check_self_loops "$WORK/out.cflcg"
 
 "$KA" "$WORK/dummy.bc" \
   --cfl-compositional \
+  --cfl-cache-strict=false \
   --cfl-compressed-input "$WORK/out.cflcg" \
   --cfl-compressed-output "$WORK/out2.cflcg" \
   --verbose 0 >/dev/null 2>&1
@@ -174,12 +176,14 @@ PY
 
 "$KA" "$WORK/dummy.bc" \
   --cfl-compositional \
+  --cfl-cache-strict=false \
   --cfl-compressed-input "$WORK/w_with_loop.cflcg" \
   --v-snapshot "$WORK/w_with_loop.vsnap" \
   --verbose 0 >/dev/null 2>&1
 
 "$KA" "$WORK/dummy.bc" \
   --cfl-compositional \
+  --cfl-cache-strict=false \
   --cfl-compressed-input "$WORK/w_no_loop.cflcg" \
   --v-snapshot "$WORK/w_no_loop.vsnap" \
   --verbose 0 >/dev/null 2>&1

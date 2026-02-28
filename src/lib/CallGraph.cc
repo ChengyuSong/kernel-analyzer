@@ -22,13 +22,19 @@
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FormatVariadic.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/JSON.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/Path.h>
+#include <llvm/Support/SHA256.h>
 
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <numeric>
 #include <set>
 #include <thread>
@@ -74,10 +80,58 @@ struct CflcgGrammarMeta {
   uint32_t labelND = 0;
   uint32_t labelM = 0;
   uint32_t labelV = 0;
+  uint32_t cflcgVersion = CompressedGraphData::kVersion;
+  bool globalDedup = false;
+  bool localAllocaSummary = false;
+  std::string grammarSignature;
   std::string grammarFingerprint;
 };
 
-static std::string computeGrammarFingerprint(const gracfl::Grammar *G) {
+struct CflcgMetadata {
+  uint32_t version = 2;
+  std::string stage;
+  CflcgGrammarMeta analysisKey;
+  std::vector<std::string> coveredModules;
+  std::unordered_map<std::string, std::string> moduleHashes;
+  bool hasAnalysisKey = false;
+  bool hasCoverage = false;
+  bool hasModuleHashes = false;
+};
+
+static std::string normalizeModuleIdentifier(StringRef rawId) {
+  if (rawId.empty())
+    return "<unknown-module>";
+  SmallString<256> normalized(rawId);
+  if (!sys::path::is_absolute(normalized)) {
+    std::error_code ec = sys::fs::make_absolute(normalized);
+    (void)ec;
+  }
+  sys::path::remove_dots(normalized, /*remove_dot_dot=*/true);
+  return normalized.str().str();
+}
+
+static std::string computeSHA256Hex(StringRef content) {
+  llvm::SHA256 hasher;
+  hasher.update(content);
+  auto digest = hasher.final();
+  return toHex(ArrayRef<uint8_t>(digest), /*LowerCase=*/true);
+}
+
+static bool computeFileSHA256(StringRef path, std::string &outHash, std::string *ErrMsg = nullptr) {
+  auto bufOrErr = MemoryBuffer::getFile(path, /*IsText=*/false,
+                                        /*RequiresNullTerminator=*/false);
+  if (!bufOrErr) {
+    if (ErrMsg) {
+      *ErrMsg = (Twine("failed to read module for hashing: ") + path + ": " +
+                 std::error_code(bufOrErr.getError()).message()).str();
+    }
+    return false;
+  }
+  outHash = computeSHA256Hex(bufOrErr.get()->getBuffer());
+  return true;
+}
+
+static std::string computeGrammarSignature(const gracfl::Grammar *G) {
   if (!G)
     return "";
   std::vector<std::pair<std::string, uint32_t>> entries;
@@ -95,7 +149,7 @@ static std::string computeGrammarFingerprint(const gracfl::Grammar *G) {
     material.append(std::to_string(id));
     material.push_back(';');
   }
-  return std::to_string(std::hash<std::string>()(material));
+  return material;
 }
 
 static CflcgGrammarMeta getCurrentCflcgGrammarMeta(const CFLEdgeBuilder &EB) {
@@ -106,26 +160,59 @@ static CflcgGrammarMeta getCurrentCflcgGrammarMeta(const CFLEdgeBuilder &EB) {
   M.labelND = EB.getLabelDerefInv();
   M.labelM = EB.getLabelM();
   M.labelV = EB.getLabelV();
-  M.grammarFingerprint = computeGrammarFingerprint(EB.getGrammar());
+  M.globalDedup = static_cast<bool>(CFLGlobalDedup);
+  M.localAllocaSummary = static_cast<bool>(CFLLocalAllocaSummary);
+  M.grammarSignature = computeGrammarSignature(EB.getGrammar());
+  M.grammarFingerprint = computeSHA256Hex(M.grammarSignature);
   return M;
 }
 
-static std::string encodeCflcgMetadata(const CflcgGrammarMeta &M, StringRef stage) {
+static std::string encodeCflcgMetadata(
+    const CflcgGrammarMeta &M,
+    StringRef stage,
+    const std::vector<std::string> &coveredModules,
+    const std::unordered_map<std::string, std::string> &moduleHashes) {
   json::Object Obj;
+  Obj["tool"] = "kanalyzer";
   Obj["schema"] = "cflcg";
-  Obj["version"] = 1;
+  Obj["version"] = 2;
   Obj["stage"] = stage.str();
-  Obj["label_a"] = static_cast<int64_t>(M.labelA);
-  Obj["label_na"] = static_cast<int64_t>(M.labelNA);
-  Obj["label_d"] = static_cast<int64_t>(M.labelD);
-  Obj["label_nd"] = static_cast<int64_t>(M.labelND);
-  Obj["label_m"] = static_cast<int64_t>(M.labelM);
-  Obj["label_v"] = static_cast<int64_t>(M.labelV);
-  Obj["grammar_fingerprint"] = M.grammarFingerprint;
+
+  json::Object analysis;
+  analysis["label_a"] = static_cast<int64_t>(M.labelA);
+  analysis["label_na"] = static_cast<int64_t>(M.labelNA);
+  analysis["label_d"] = static_cast<int64_t>(M.labelD);
+  analysis["label_nd"] = static_cast<int64_t>(M.labelND);
+  analysis["label_m"] = static_cast<int64_t>(M.labelM);
+  analysis["label_v"] = static_cast<int64_t>(M.labelV);
+  analysis["grammar_signature"] = M.grammarSignature;
+  analysis["grammar_fingerprint"] = M.grammarFingerprint;
+  analysis["global_dedup"] = M.globalDedup;
+  analysis["local_alloca_summary"] = M.localAllocaSummary;
+  analysis["cflcg_version"] = static_cast<int64_t>(M.cflcgVersion);
+  Obj["analysis_key"] = std::move(analysis);
+
+  std::vector<std::string> sortedModules = coveredModules;
+  std::sort(sortedModules.begin(), sortedModules.end());
+  sortedModules.erase(std::unique(sortedModules.begin(), sortedModules.end()),
+                      sortedModules.end());
+
+  json::Array coveredArr;
+  for (const auto &moduleId : sortedModules)
+    coveredArr.push_back(moduleId);
+  Obj["covered_modules"] = std::move(coveredArr);
+
+  json::Object hashObj;
+  for (const auto &moduleId : sortedModules) {
+    auto it = moduleHashes.find(moduleId);
+    if (it != moduleHashes.end())
+      hashObj[moduleId] = it->second;
+  }
+  Obj["module_hashes"] = std::move(hashObj);
   return formatv("{0}", json::Value(std::move(Obj))).str();
 }
 
-static bool parseCflcgMetadata(StringRef raw, CflcgGrammarMeta &Out) {
+static bool parseCflcgMetadata(StringRef raw, CflcgMetadata &Out) {
   if (raw.empty())
     return false;
   auto Parsed = json::parse(raw);
@@ -141,17 +228,90 @@ static bool parseCflcgMetadata(StringRef raw, CflcgGrammarMeta &Out) {
     dst = static_cast<uint32_t>(*v);
     return true;
   };
-  auto fp = Obj->getString("grammar_fingerprint");
-  if (!fp)
+  Out = CflcgMetadata();
+  if (auto Version = Obj->getInteger("version");
+      Version && *Version >= 0 && *Version <= UINT32_MAX) {
+    Out.version = static_cast<uint32_t>(*Version);
+  }
+  if (auto Stage = Obj->getString("stage"))
+    Out.stage = Stage->str();
+
+  bool parsedAnyAnalysis = false;
+
+  if (const auto *AnalysisObj = Obj->getObject("analysis_key")) {
+    auto getU32From = [&](const json::Object &Src, StringRef key, uint32_t &dst) -> bool {
+      auto v = Src.getInteger(key);
+      if (!v || *v < 0 || *v > UINT32_MAX)
+        return false;
+      dst = static_cast<uint32_t>(*v);
+      return true;
+    };
+    auto fp = AnalysisObj->getString("grammar_fingerprint");
+    auto sig = AnalysisObj->getString("grammar_signature");
+    auto dedup = AnalysisObj->getBoolean("global_dedup");
+    auto localAlloca = AnalysisObj->getBoolean("local_alloca_summary");
+    uint32_t cflcgVersion = CompressedGraphData::kVersion;
+    if (auto Ver = AnalysisObj->getInteger("cflcg_version");
+        Ver && *Ver >= 0 && *Ver <= UINT32_MAX) {
+      cflcgVersion = static_cast<uint32_t>(*Ver);
+    }
+    if (!fp || !sig || !dedup || !localAlloca ||
+        !getU32From(*AnalysisObj, "label_a", Out.analysisKey.labelA) ||
+        !getU32From(*AnalysisObj, "label_na", Out.analysisKey.labelNA) ||
+        !getU32From(*AnalysisObj, "label_d", Out.analysisKey.labelD) ||
+        !getU32From(*AnalysisObj, "label_nd", Out.analysisKey.labelND) ||
+        !getU32From(*AnalysisObj, "label_m", Out.analysisKey.labelM) ||
+        !getU32From(*AnalysisObj, "label_v", Out.analysisKey.labelV))
+      return false;
+    Out.analysisKey.grammarSignature = sig->str();
+    Out.analysisKey.grammarFingerprint = fp->str();
+    Out.analysisKey.globalDedup = *dedup;
+    Out.analysisKey.localAllocaSummary = *localAlloca;
+    Out.analysisKey.cflcgVersion = cflcgVersion;
+    Out.hasAnalysisKey = true;
+    parsedAnyAnalysis = true;
+  } else {
+    // Legacy metadata (version 1): labels + grammar fingerprint at top-level.
+    auto fp = Obj->getString("grammar_fingerprint");
+    if (fp &&
+        getU32("label_a", Out.analysisKey.labelA) &&
+        getU32("label_na", Out.analysisKey.labelNA) &&
+        getU32("label_d", Out.analysisKey.labelD) &&
+        getU32("label_nd", Out.analysisKey.labelND) &&
+        getU32("label_m", Out.analysisKey.labelM) &&
+        getU32("label_v", Out.analysisKey.labelV)) {
+      Out.analysisKey.grammarFingerprint = fp->str();
+      parsedAnyAnalysis = true;
+    }
+  }
+  if (!parsedAnyAnalysis)
     return false;
-  if (!getU32("label_a", Out.labelA) ||
-      !getU32("label_na", Out.labelNA) ||
-      !getU32("label_d", Out.labelD) ||
-      !getU32("label_nd", Out.labelND) ||
-      !getU32("label_m", Out.labelM) ||
-      !getU32("label_v", Out.labelV))
-    return false;
-  Out.grammarFingerprint = fp->str();
+
+  if (auto Covered = Obj->getArray("covered_modules")) {
+    Out.coveredModules.reserve(Covered->size());
+    for (const auto &v : *Covered) {
+      auto s = v.getAsString();
+      if (!s)
+        return false;
+      Out.coveredModules.push_back(normalizeModuleIdentifier(*s));
+    }
+    std::sort(Out.coveredModules.begin(), Out.coveredModules.end());
+    Out.coveredModules.erase(std::unique(Out.coveredModules.begin(),
+                                         Out.coveredModules.end()),
+                             Out.coveredModules.end());
+    Out.hasCoverage = true;
+  }
+
+  if (const auto *Hashes = Obj->getObject("module_hashes")) {
+    for (const auto &[k, v] : *Hashes) {
+      auto s = v.getAsString();
+      if (!s)
+        return false;
+      Out.moduleHashes[normalizeModuleIdentifier(k)] = s->str();
+    }
+    Out.hasModuleHashes = true;
+  }
+
   return true;
 }
 
@@ -163,6 +323,9 @@ static bool cflcgMetadataCompatible(const CflcgGrammarMeta &A,
          A.labelND == B.labelND &&
          A.labelM == B.labelM &&
          A.labelV == B.labelV &&
+         A.cflcgVersion == B.cflcgVersion &&
+         A.globalDedup == B.globalDedup &&
+         A.localAllocaSummary == B.localAllocaSummary &&
          A.grammarFingerprint == B.grammarFingerprint;
 }
 
@@ -2500,17 +2663,49 @@ uint32_t CallGraphPass::getDenseID(NodeIndex origNode) const {
   return UINT32_MAX;
 }
 
-void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart) {
+void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t edgeEnd) {
   auto tTotal = std::chrono::steady_clock::now();
   const auto &allEdges = EB.getEdges();
-  const size_t edgeEnd = allEdges.size();
-
-  assert(edgeStart < edgeEnd &&
-         "solveAndCompressPerTU: no edges for module");
+  assert(edgeStart <= edgeEnd &&
+         "solveAndCompressPerTU: invalid edge range");
+  assert(edgeEnd <= allEdges.size() &&
+         "solveAndCompressPerTU: edge range exceeds current edge list");
   assert(EB.getGrammar() && "solveAndCompressPerTU: grammar not initialized");
+
+  std::string moduleRawId = M ? M->getModuleIdentifier() : std::string("<null-module>");
+  if (M) {
+    auto it = Ctx->ModuleMaps.find(M);
+    if (it != Ctx->ModuleMaps.end() && !it->second.empty())
+      moduleRawId = it->second.str();
+  }
+  std::string moduleId = normalizeModuleIdentifier(moduleRawId);
+  std::vector<std::string> coveredModules{moduleId};
+  std::unordered_map<std::string, std::string> moduleHashes;
+  std::string moduleHash;
+  std::string hashErr;
+  if (computeFileSHA256(moduleId, moduleHash, &hashErr))
+    moduleHashes[moduleId] = moduleHash;
+  else
+    WARNING("Per-TU metadata: " << hashErr << "\n");
 
   CG_LOG("Per-TU solve [" << M->getModuleIdentifier()
          << "]: edges [" << edgeStart << ", " << edgeEnd << ")\n");
+
+  if (edgeStart >= edgeEnd) {
+    CompressedGraphData data;
+    data.numNodes = 0;
+    data.metadataJson = encodeCflcgMetadata(getCurrentCflcgGrammarMeta(EB),
+                                            "per-tu",
+                                            coveredModules,
+                                            moduleHashes);
+    perTUGraphs.push_back(std::move(data));
+    CG_LOG("Per-TU compressed: no CFL edges, emitted metadata-only graph\n");
+    CG_LOG("TIMER per-tu-total [" << M->getModuleIdentifier() << "] "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tTotal).count()
+           << " ms\n");
+    return;
+  }
 
   // Step 1: Build local dense mapping from this module's edge range
   origToDense.assign(NF.getNumNodes(), UINT32_MAX);
@@ -2580,6 +2775,10 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart) {
 
   CompressedGraphData data;
   compressConstraintGraph(graph, nodeToSCC, numSCCs, data);
+  data.metadataJson = encodeCflcgMetadata(getCurrentCflcgGrammarMeta(EB),
+                                          "per-tu",
+                                          coveredModules,
+                                          moduleHashes);
 
   assert(data.numNodes > 0 && "solveAndCompressPerTU: compression produced 0 SCC nodes");
 
@@ -2615,6 +2814,7 @@ bool CallGraphPass::doModulePass(Module *M) {
     // Estimate ~4 edges per instruction (each add{Assignment,Dereference}Edges
     // emits 2 edges, and most instructions trigger at least one call).
     if (M == Ctx->Modules.front().first) {
+      moduleEdgeRanges.clear();
       size_t totalInsts = 0;
       for (auto &[Mod, _] : Ctx->Modules)
         for (Function &F : *Mod)
@@ -2628,12 +2828,9 @@ bool CallGraphPass::doModulePass(Module *M) {
         runGlobalDedup();
     }
 
-    // In per-TU compositional mode (no pre-built .cflcg files), track edge start.
+    // Track per-module edge ranges so repair mode can recompute selected modules.
     const bool perTUMode = CFLCompositional && CompressedGraphInputs.empty();
-    size_t edgeStart = 0;
-    if (perTUMode) {
-      edgeStart = EB.getEdges().size();
-    }
+    const size_t edgeStart = EB.getEdges().size();
 
     for (auto &GV : M->globals()) {
       // Skip compiler-introduced globals
@@ -2669,10 +2866,13 @@ bool CallGraphPass::doModulePass(Module *M) {
     // global-initializer entries for this module.
     buildFieldStoreMapFromIR(M);
 
-    // Per-TU: solve and compress this module's edges
-    if (perTUMode && EB.getEdges().size() > edgeStart) {
-      solveAndCompressPerTU(M, edgeStart);
-    }
+    const size_t edgeEnd = EB.getEdges().size();
+    moduleEdgeRanges[M] = {edgeStart, edgeEnd};
+
+    // Per-TU: solve and compress this module's edges (including edge-empty modules
+    // so cache coverage metadata can represent the full input set).
+    if (perTUMode)
+      solveAndCompressPerTU(M, edgeStart, edgeEnd);
   }
 
   bool Changed = false;
@@ -3724,8 +3924,6 @@ void CallGraphPass::compressConstraintGraph(
     names.erase(std::unique(names.begin(), names.end()), names.end());
   }
 
-  out.metadataJson = encodeCflcgMetadata(getCurrentCflcgGrammarMeta(EB), "per-tu");
-
   CG_LOG("Compressed graph: " << numSCCs << " SCC nodes, "
          << out.edges.size() << " edges, "
          << out.symbolTable.size() << " boundary symbols, "
@@ -3777,6 +3975,28 @@ void CallGraphPass::exportCompressedGraph(StringRef Path) {
   auto tCompress = std::chrono::steady_clock::now();
   CompressedGraphData data;
   compressConstraintGraph(Graph, nodeToSCC, numSCCs, data);
+  std::vector<std::string> coveredModules;
+  std::unordered_map<std::string, std::string> moduleHashes;
+  coveredModules.reserve(Ctx->Modules.size());
+  for (const auto &[M, _] : Ctx->Modules) {
+    std::string rawId = M ? M->getModuleIdentifier() : std::string("<null-module>");
+    auto it = Ctx->ModuleMaps.find(M);
+    if (it != Ctx->ModuleMaps.end() && !it->second.empty())
+      rawId = it->second.str();
+    std::string moduleId = normalizeModuleIdentifier(rawId);
+    coveredModules.push_back(moduleId);
+
+    std::string moduleHash;
+    std::string hashErr;
+    if (computeFileSHA256(moduleId, moduleHash, &hashErr))
+      moduleHashes[moduleId] = moduleHash;
+    else
+      WARNING("CompressedGraph metadata: " << hashErr << "\n");
+  }
+  data.metadataJson = encodeCflcgMetadata(getCurrentCflcgGrammarMeta(EB),
+                                          "monolithic-export",
+                                          coveredModules,
+                                          moduleHashes);
   CG_LOG("TIMER export-compress "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tCompress).count()
@@ -3804,80 +4024,442 @@ void CallGraphPass::exportCompressedGraph(StringRef Path) {
 }
 
 bool CallGraphPass::runCompositionalSolve() {
-  extern cl::list<std::string> CompressedGraphInputs;
-
-  // Step 1: Collect all compressed graphs (in-memory per-TU + loaded from files)
-  std::vector<CompressedGraphData> graphs;
-
-  // Add in-memory per-TU graphs
-  for (auto &g : perTUGraphs)
-    graphs.push_back(std::move(g));
-  perTUGraphs.clear();
-
-  CG_LOG("Compositional CFL solve: " << graphs.size() << " in-memory per-TU graphs, "
-         << CompressedGraphInputs.size() << " file inputs\n");
-
-  const CflcgGrammarMeta expectedMeta = getCurrentCflcgGrammarMeta(EB);
-
-  auto verifyCflcgMetadata = [&](StringRef source, const CompressedGraphData &G) -> bool {
-    CflcgGrammarMeta got;
-    if (!parseCflcgMetadata(G.metadataJson, got)) {
-      WARNING("CompressedGraph: missing/invalid metadata in " << source
-              << "; skipping grammar compatibility check\n");
-      return true;
-    }
-    if (cflcgMetadataCompatible(got, expectedMeta))
-      return true;
-    errs() << "CompressedGraph metadata mismatch in '" << source << "'\n"
-           << "  expected labels: a=" << expectedMeta.labelA
-           << " -a=" << expectedMeta.labelNA
-           << " d=" << expectedMeta.labelD
-           << " -d=" << expectedMeta.labelND
-           << " M=" << expectedMeta.labelM
-           << " V=" << expectedMeta.labelV << "\n"
-           << "  actual labels:   a=" << got.labelA
-           << " -a=" << got.labelNA
-           << " d=" << got.labelD
-           << " -d=" << got.labelND
-           << " M=" << got.labelM
-           << " V=" << got.labelV << "\n"
-           << "  expected grammar_fingerprint=" << expectedMeta.grammarFingerprint << "\n"
-           << "  actual   grammar_fingerprint=" << got.grammarFingerprint << "\n";
-    return false;
+  struct GraphSource {
+    CompressedGraphData graph;
+    std::string source;
+    bool fromFile = false;
+    CflcgMetadata metadata;
+    bool metadataParsed = false;
   };
 
-  for (size_t i = 0; i < graphs.size(); i++) {
-    std::string graphName = "in-memory graph #" + std::to_string(i);
-    if (!verifyCflcgMetadata(graphName, graphs[i]))
-      return false;
-  }
+  struct CurrentModuleInfo {
+    Module *module = nullptr;
+    std::string moduleId;
+    std::string moduleHash;
+    size_t edgeStart = 0;
+    size_t edgeEnd = 0;
+  };
 
-  // Load from files (existing code)
+  const bool strictMode = static_cast<bool>(CFLCGCacheStrict);
+  const bool repairMode = static_cast<bool>(CFLCGCacheRepair);
+  const bool allowDuplicateCoverage =
+      static_cast<bool>(CFLCGAllowDuplicateCoverage);
+  const bool enforceCacheChecks = strictMode || repairMode;
+  const CflcgGrammarMeta expectedMeta = getCurrentCflcgGrammarMeta(EB);
+
+  std::vector<GraphSource> graphInputs;
+  graphInputs.reserve(perTUGraphs.size() + CompressedGraphInputs.size());
+  for (size_t i = 0; i < perTUGraphs.size(); i++) {
+    GraphSource inMem;
+    inMem.graph = std::move(perTUGraphs[i]);
+    inMem.source = "in-memory graph #" + std::to_string(i);
+    graphInputs.push_back(std::move(inMem));
+  }
+  perTUGraphs.clear();
+
+  CG_LOG("Compositional CFL solve: " << graphInputs.size()
+         << " in-memory per-TU graphs, "
+         << CompressedGraphInputs.size() << " file inputs"
+         << " (strict=" << strictMode
+         << ", repair=" << repairMode
+         << ", allow-duplicate-coverage=" << allowDuplicateCoverage << ")\n");
+
   auto tLoad = std::chrono::steady_clock::now();
   for (size_t i = 0; i < CompressedGraphInputs.size(); i++) {
-    graphs.emplace_back();
-    std::string ErrMsg;
-    if (!loadCompressedGraph(CompressedGraphInputs[i], graphs.back(), &ErrMsg)) {
+    GraphSource loaded;
+    loaded.source = CompressedGraphInputs[i];
+    loaded.fromFile = true;
+    std::string errMsg;
+    if (!loadCompressedGraph(CompressedGraphInputs[i], loaded.graph, &errMsg)) {
       errs() << "Failed to load compressed graph '"
-             << CompressedGraphInputs[i] << "': " << ErrMsg << "\n";
+             << CompressedGraphInputs[i] << "': " << errMsg << "\n";
       return false;
     }
-    if (!verifyCflcgMetadata(CompressedGraphInputs[i], graphs.back()))
-      return false;
     CG_LOG("  Loaded " << CompressedGraphInputs[i]
-           << ": nodes=" << graphs.back().numNodes
-           << ", edges=" << graphs.back().edges.size()
-           << ", symbols=" << graphs.back().symbolTable.size() << "\n");
+           << ": nodes=" << loaded.graph.numNodes
+           << ", edges=" << loaded.graph.edges.size()
+           << ", symbols=" << loaded.graph.symbolTable.size() << "\n");
+    graphInputs.push_back(std::move(loaded));
   }
   CG_LOG("TIMER comp-load "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tLoad).count()
          << " ms\n");
 
-  if (graphs.empty()) {
+  if (graphInputs.empty()) {
     WARNING("Compositional solve: no graphs (need per-TU or --cfl-compressed-input)\n");
     return false;
   }
+
+  for (auto &GI : graphInputs)
+    GI.metadataParsed = parseCflcgMetadata(GI.graph.metadataJson, GI.metadata);
+
+  std::map<std::string, CurrentModuleInfo> currentModules;
+  std::set<std::string> missingModules;
+  std::set<std::string> staleModules;
+  std::set<std::string> duplicateModules;
+  std::set<std::string> incompatibleItems;
+
+  for (const auto &[M, _] : Ctx->Modules) {
+    std::string rawId = M ? M->getModuleIdentifier() : std::string("<null-module>");
+    auto itPath = Ctx->ModuleMaps.find(M);
+    if (itPath != Ctx->ModuleMaps.end() && !itPath->second.empty())
+      rawId = itPath->second.str();
+    std::string moduleId = normalizeModuleIdentifier(rawId);
+
+    CurrentModuleInfo info;
+    info.module = M;
+    info.moduleId = moduleId;
+    std::string hashErr;
+    if (!computeFileSHA256(moduleId, info.moduleHash, &hashErr)) {
+      if (enforceCacheChecks)
+        incompatibleItems.insert("current-module-hash:" + moduleId + " (" + hashErr + ")");
+      else
+        WARNING("Compositional cache check (lenient): " << hashErr << "\n");
+    }
+
+    auto itRange = moduleEdgeRanges.find(M);
+    if (itRange != moduleEdgeRanges.end()) {
+      info.edgeStart = itRange->second.first;
+      info.edgeEnd = itRange->second.second;
+    }
+
+    auto inserted = currentModules.emplace(moduleId, std::move(info));
+    if (!inserted.second) {
+      incompatibleItems.insert("duplicate-current-module-id:" + moduleId);
+    }
+  }
+
+  auto emitSet = [&](StringRef name, const std::set<std::string> &items) {
+    errs() << "  " << name << " (" << items.size() << ")";
+    if (items.empty()) {
+      errs() << ": <none>\n";
+      return;
+    }
+    errs() << ":\n";
+    size_t shown = 0;
+    for (const auto &item : items) {
+      errs() << "    - " << item << "\n";
+      shown++;
+      if (shown >= 32 && items.size() > shown) {
+        errs() << "    ... +" << (items.size() - shown) << " more\n";
+        break;
+      }
+    }
+  };
+
+  auto recomputeAllModules = [&](std::vector<GraphSource> &outGraphs) -> bool {
+    outGraphs.clear();
+    perTUGraphs.clear();
+    for (const auto &[moduleId, info] : currentModules) {
+      solveAndCompressPerTU(info.module, info.edgeStart, info.edgeEnd);
+      if (perTUGraphs.empty()) {
+        errs() << "Repair mode failed: recomputation did not emit graph for "
+               << moduleId << "\n";
+        return false;
+      }
+      GraphSource rebuilt;
+      rebuilt.graph = std::move(perTUGraphs.back());
+      perTUGraphs.pop_back();
+      rebuilt.source = "repair:" + moduleId;
+      rebuilt.metadataParsed = parseCflcgMetadata(rebuilt.graph.metadataJson, rebuilt.metadata);
+      if (!rebuilt.metadataParsed) {
+        errs() << "Repair mode failed: invalid metadata in recomputed graph for "
+               << moduleId << "\n";
+        return false;
+      }
+      if (enforceCacheChecks &&
+          (!rebuilt.metadata.hasAnalysisKey ||
+           !rebuilt.metadata.hasCoverage ||
+           !rebuilt.metadata.hasModuleHashes)) {
+        errs() << "Repair mode failed: recomputed graph for " << moduleId
+               << " is missing strict metadata fields\n";
+        return false;
+      }
+      outGraphs.push_back(std::move(rebuilt));
+    }
+    perTUGraphs.clear();
+    return true;
+  };
+
+  if (enforceCacheChecks) {
+    std::unordered_map<std::string, size_t> coverageCounts;
+    std::set<std::string> coveredCurrentModules;
+
+    for (const auto &GI : graphInputs) {
+      if (!GI.metadataParsed) {
+        incompatibleItems.insert("invalid-metadata:" + GI.source);
+        continue;
+      }
+
+      const auto &MD = GI.metadata;
+      if (!MD.hasAnalysisKey) {
+        incompatibleItems.insert("missing-analysis_key:" + GI.source);
+      } else if (!cflcgMetadataCompatible(MD.analysisKey, expectedMeta)) {
+        incompatibleItems.insert("analysis-key-mismatch:" + GI.source);
+      }
+      if (!MD.hasCoverage)
+        incompatibleItems.insert("missing-covered_modules:" + GI.source);
+      if (!MD.hasModuleHashes)
+        incompatibleItems.insert("missing-module_hashes:" + GI.source);
+
+      if (!MD.hasCoverage)
+        continue;
+
+      for (const auto &moduleId : MD.coveredModules) {
+        auto itCur = currentModules.find(moduleId);
+        if (itCur == currentModules.end()) {
+          incompatibleItems.insert("unknown-covered-module:" + GI.source + ":" + moduleId);
+          continue;
+        }
+        coveredCurrentModules.insert(moduleId);
+        coverageCounts[moduleId]++;
+
+        if (!MD.hasModuleHashes) {
+          staleModules.insert(moduleId);
+          continue;
+        }
+        auto itHash = MD.moduleHashes.find(moduleId);
+        if (itHash == MD.moduleHashes.end() || itHash->second.empty()) {
+          staleModules.insert(moduleId);
+          continue;
+        }
+        if (itCur->second.moduleHash.empty() ||
+            itCur->second.moduleHash != itHash->second) {
+          staleModules.insert(moduleId);
+        }
+      }
+    }
+
+    for (const auto &[moduleId, _] : currentModules) {
+      if (!coveredCurrentModules.count(moduleId))
+        missingModules.insert(moduleId);
+    }
+
+    if (!allowDuplicateCoverage) {
+      for (const auto &[moduleId, count] : coverageCounts) {
+        if (count > 1)
+          duplicateModules.insert(moduleId);
+      }
+    }
+  } else {
+    for (const auto &GI : graphInputs) {
+      if (!GI.metadataParsed) {
+        WARNING("CompressedGraph: missing/invalid metadata in " << GI.source
+                << " (strict mode disabled)\n");
+        continue;
+      }
+      if (GI.metadata.hasAnalysisKey &&
+          !cflcgMetadataCompatible(GI.metadata.analysisKey, expectedMeta)) {
+        WARNING("CompressedGraph: analysis key mismatch in "
+                << GI.source << " (strict mode disabled)\n");
+      }
+    }
+  }
+
+  bool needRepair = enforceCacheChecks &&
+                    (!missingModules.empty() || !staleModules.empty() ||
+                     !duplicateModules.empty() || !incompatibleItems.empty());
+
+  if (needRepair) {
+    errs() << "Compositional cache validation failed:\n";
+    emitSet("missing", missingModules);
+    emitSet("stale", staleModules);
+    emitSet("duplicate", duplicateModules);
+    emitSet("incompatible", incompatibleItems);
+    if (!repairMode) {
+      errs() << "Hint: use --cfl-cache-repair to rebuild stale/missing cache inputs.\n";
+      return false;
+    }
+  }
+
+  std::vector<GraphSource> composeSources;
+  bool recomputedFromIR = false;
+  if (needRepair) {
+    CG_LOG("Repair mode: rebuilding compositional inputs from current IR\n");
+    if (!recomputeAllModules(composeSources))
+      return false;
+    recomputedFromIR = true;
+  } else {
+    composeSources = std::move(graphInputs);
+  }
+
+  if (composeSources.empty()) {
+    WARNING("Compositional solve: no usable graphs after cache validation/repair\n");
+    return false;
+  }
+
+  std::vector<std::string> currentModuleIds;
+  std::unordered_map<std::string, std::string> currentModuleHashes;
+  currentModuleIds.reserve(currentModules.size());
+  currentModuleHashes.reserve(currentModules.size());
+  for (const auto &[moduleId, info] : currentModules) {
+    currentModuleIds.push_back(moduleId);
+    if (!info.moduleHash.empty())
+      currentModuleHashes[moduleId] = info.moduleHash;
+  }
+
+  auto classifyBoundary = [](StringRef symbol) -> std::string {
+    if (symbol.starts_with("func:")) return "func";
+    if (symbol.starts_with("arg:")) return "arg";
+    if (symbol.starts_with("ret:")) return "ret";
+    if (symbol.starts_with("vararg:")) return "vararg";
+    if (symbol.starts_with("glob:")) return "glob";
+    if (symbol.starts_with("icall:")) return "icall";
+    return "other";
+  };
+
+  std::unordered_set<NodeIndex> activeCFLNodes;
+  activeCFLNodes.reserve(EB.getEdges().size() * 2 + 1);
+  for (const auto &E : EB.getEdges()) {
+    activeCFLNodes.insert(getCanonicalNode(E.from));
+    activeCFLNodes.insert(getCanonicalNode(E.to));
+  }
+  auto isActiveBoundaryNode = [&](NodeIndex N) -> bool {
+    if (N == AndersNodeFactory::InvalidIndex)
+      return false;
+    return activeCFLNodes.count(getCanonicalNode(N)) > 0;
+  };
+
+  auto collectExpectedBoundarySymbols =
+      [&](std::unordered_set<std::string> &expected,
+          std::unordered_map<std::string, size_t> &classCounts) {
+    expected.clear();
+    classCounts.clear();
+
+    auto addExpected = [&](const std::string &symbol) {
+      if (expected.insert(symbol).second)
+        classCounts[classifyBoundary(symbol)]++;
+    };
+
+    for (const auto &[guid, F] : Ctx->Funcs) {
+      if (!F || F->hasLocalLinkage())
+        continue;
+      std::string guidStr = std::to_string(guid);
+      if (isActiveBoundaryNode(NF.getValueNodeFor(F)))
+        addExpected("func:" + guidStr);
+      for (const auto &Arg : F->args()) {
+        if (isActiveBoundaryNode(NF.getValueNodeFor(&Arg))) {
+          addExpected("arg:" + guidStr + ":" + std::to_string(Arg.getArgNo()));
+        }
+      }
+      if (isActiveBoundaryNode(NF.getReturnNodeFor(F)))
+        addExpected("ret:" + guidStr);
+      if (isActiveBoundaryNode(NF.getVarargNodeFor(F)))
+        addExpected("vararg:" + guidStr);
+    }
+
+    for (const auto &[guid, F] : Ctx->ExtFuncs) {
+      if (!F)
+        continue;
+      std::string guidStr = std::to_string(guid);
+      if (isActiveBoundaryNode(NF.getValueNodeFor(F)))
+        addExpected("func:" + guidStr);
+      for (const auto &Arg : F->args()) {
+        if (isActiveBoundaryNode(NF.getValueNodeFor(&Arg))) {
+          addExpected("arg:" + guidStr + ":" + std::to_string(Arg.getArgNo()));
+        }
+      }
+      if (isActiveBoundaryNode(NF.getReturnNodeFor(F)))
+        addExpected("ret:" + guidStr);
+      if (isActiveBoundaryNode(NF.getVarargNodeFor(F)))
+        addExpected("vararg:" + guidStr);
+    }
+
+    for (const auto &[guid, GV] : Ctx->Gobjs) {
+      if (!GV)
+        continue;
+      if (isActiveBoundaryNode(NF.getValueNodeFor(GV)))
+        addExpected("glob:" + std::to_string(guid));
+    }
+    for (const auto &[guid, GV] : Ctx->ExtGobjs) {
+      if (!GV)
+        continue;
+      if (isActiveBoundaryNode(NF.getValueNodeFor(GV)))
+        addExpected("glob:" + std::to_string(guid));
+    }
+
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      auto *MD = CS->getMetadata("ka.icall.id");
+      if (!MD)
+        continue;
+      auto *S = dyn_cast<MDString>(MD->getOperand(0));
+      if (!S)
+        continue;
+      Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      if (!isActiveBoundaryNode(NF.getValueNodeFor(fptr)))
+        continue;
+      addExpected("icall:" + S->getString().str());
+    }
+  };
+
+  if (enforceCacheChecks) {
+    std::unordered_set<std::string> expectedSymbols;
+    std::unordered_map<std::string, size_t> expectedClassCounts;
+    collectExpectedBoundarySymbols(expectedSymbols, expectedClassCounts);
+
+    for (unsigned attempt = 0; attempt < 2; attempt++) {
+      std::unordered_set<std::string> availableSymbols;
+      std::unordered_map<std::string, size_t> availableClassCounts;
+      for (const auto &GS : composeSources) {
+        for (const auto &[sym, _] : GS.graph.symbolTable) {
+          if (availableSymbols.insert(sym.symbol).second)
+            availableClassCounts[classifyBoundary(sym.symbol)]++;
+        }
+      }
+
+      std::set<std::string> missingBoundarySymbols;
+      for (const auto &sym : expectedSymbols) {
+        if (!availableSymbols.count(sym))
+          missingBoundarySymbols.insert(sym);
+      }
+
+      std::set<std::string> missingBoundaryClasses;
+      const std::array<const char *, 6> requiredClasses =
+          {"func", "arg", "ret", "vararg", "glob", "icall"};
+      for (const char *C : requiredClasses) {
+        const size_t expectedCount = expectedClassCounts[C];
+        const size_t gotCount = availableClassCounts[C];
+        if (expectedCount > 0 && gotCount == 0)
+          missingBoundaryClasses.insert(C);
+      }
+
+      if (missingBoundarySymbols.empty() && missingBoundaryClasses.empty())
+        break;
+
+      errs() << "Compositional boundary cache sanity failed:\n";
+      errs() << "  missing-boundary-symbols: " << missingBoundarySymbols.size() << "\n";
+      size_t shown = 0;
+      for (const auto &sym : missingBoundarySymbols) {
+        errs() << "    - " << sym << "\n";
+        shown++;
+        if (shown >= 32 && missingBoundarySymbols.size() > shown) {
+          errs() << "    ... +" << (missingBoundarySymbols.size() - shown)
+                 << " more\n";
+          break;
+        }
+      }
+      errs() << "  missing-boundary-classes: " << missingBoundaryClasses.size() << "\n";
+      for (const auto &cls : missingBoundaryClasses)
+        errs() << "    - " << cls << "\n";
+
+      if (repairMode && !recomputedFromIR && attempt == 0) {
+        CG_LOG("Repair mode: boundary mismatch detected, rebuilding from current IR\n");
+        if (!recomputeAllModules(composeSources))
+          return false;
+        recomputedFromIR = true;
+        continue;
+      }
+      if (strictMode)
+        return false;
+      break;
+    }
+  }
+
+  std::vector<CompressedGraphData> graphs;
+  graphs.reserve(composeSources.size());
+  for (auto &GS : composeSources)
+    graphs.push_back(std::move(GS.graph));
 
   // Step 2: Assign node offsets and build unified ID space
   auto tBuild = std::chrono::steady_clock::now();
@@ -3895,6 +4477,8 @@ bool CallGraphPass::runCompositionalSolve() {
                      std::vector<std::pair<size_t, uint32_t>>> symbolOccurrences;
   for (size_t i = 0; i < graphs.size(); i++) {
     for (const auto &[sym, localId] : graphs[i].symbolTable) {
+      if (localId >= graphs[i].numNodes && graphs[i].numNodes != 0)
+        continue;
       uint32_t unifiedId = nodeOffsets[i] + localId;
       symbolOccurrences[sym.symbol].emplace_back(i, unifiedId);
     }
@@ -3960,7 +4544,7 @@ bool CallGraphPass::runCompositionalSolve() {
   CG_LOG("After union-find: " << totalNodes << " unified -> "
          << numDense << " dense nodes\n");
 
-  // Debug: dump boundary symbol → dense mapping
+  // Debug: dump boundary symbol -> dense mapping
   for (const auto &[symbol, occurrences] : symbolOccurrences) {
     if (occurrences.size() < 2) continue;
     uint32_t denseId = unifiedToDense[ufFind(occurrences[0].second)];
@@ -3976,22 +4560,20 @@ bool CallGraphPass::runCompositionalSolve() {
   std::unordered_set<EdgeKey, EdgeKeyHash> edgeSeen;
   std::vector<gracfl::Edge> combinedEdges;
   size_t totalInputEdges = 0;
-  for (size_t i = 0; i < graphs.size(); i++) {
-    totalInputEdges += graphs[i].edges.size();
-  }
+  for (const auto &G : graphs)
+    totalInputEdges += G.edges.size();
   edgeSeen.reserve(totalInputEdges);
   combinedEdges.reserve(totalInputEdges);
 
   for (size_t i = 0; i < graphs.size(); i++) {
     uint32_t offset = nodeOffsets[i];
     for (const auto &E : graphs[i].edges) {
+      if ((E.from >= graphs[i].numNodes || E.to >= graphs[i].numNodes) &&
+          graphs[i].numNodes != 0) {
+        continue;
+      }
       uint32_t from = unifiedToDense[offset + E.from];
       uint32_t to = unifiedToDense[offset + E.to];
-      // Don't drop self-loops: union-find merging can collapse formerly
-      // separate V-SCCs into one mega-node.  Internal a/-a self-loops are
-      // needed for MA/AM derivation, and internal d/-d self-loops are needed
-      // for M derivation (M → -d V d) when the pointer and deref nodes
-      // end up in the same composed mega-node.
       EdgeKey key{from, to, E.label};
       if (edgeSeen.insert(key).second)
         combinedEdges.emplace_back(from, to, E.label);
@@ -4004,6 +4586,30 @@ bool CallGraphPass::runCompositionalSolve() {
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tBuild).count()
          << " ms\n");
+
+  extern cl::opt<std::string> CompressedGraphOutput;
+  const uint32_t LabelV = EB.getLabelV();
+
+  if (numDense == 0) {
+    composedSolver.reset();
+    composedNumDense = 0;
+    composedSymbolToDense.clear();
+    CG_LOG("Compositional solve: no dense nodes after composition\n");
+
+    if (!CompressedGraphOutput.empty()) {
+      CompressedGraphData exportData;
+      exportData.numNodes = 0;
+      exportData.metadataJson = encodeCflcgMetadata(expectedMeta,
+                                                    "composed-export",
+                                                    currentModuleIds,
+                                                    currentModuleHashes);
+      std::string errMsg;
+      if (!saveCompressedGraph(CompressedGraphOutput, exportData, &errMsg)) {
+        WARNING("Failed to export empty composed graph: " << errMsg << "\n");
+      }
+    }
+    return true;
+  }
 
   // Step 7: Solve CFL on combined graph
   if (!EB.getGrammar()) {
@@ -4023,8 +4629,7 @@ bool CallGraphPass::runCompositionalSolve() {
                 std::chrono::steady_clock::now() - tSolve).count()
          << " ms\n");
 
-  // Store composed solver and symbol→dense mapping for V-snapshot export.
-  // Must happen before any code references composedSolver.
+  // Store composed solver and symbol->dense mapping for V-snapshot export.
   composedSolver = std::move(solver);
   composedNumDense = numDense;
   composedSymbolToDense.clear();
@@ -4032,32 +4637,24 @@ bool CallGraphPass::runCompositionalSolve() {
   for (const auto &[symbol, occurrences] : symbolOccurrences)
     composedSymbolToDense[symbol] = unifiedToDense[ufFind(occurrences[0].second)];
 
-  const uint32_t LabelV = EB.getLabelV();
-
   // Step 8: Build reverse map from dense node -> function names
   std::unordered_map<uint32_t, std::vector<std::string>> denseToFuncNames;
   for (size_t i = 0; i < graphs.size(); i++) {
     uint32_t offset = nodeOffsets[i];
     for (const auto &[localId, names] : graphs[i].funcNodes) {
+      if (localId >= graphs[i].numNodes && graphs[i].numNodes != 0)
+        continue;
       uint32_t denseId = unifiedToDense[offset + localId];
       auto &merged = denseToFuncNames[denseId];
       merged.insert(merged.end(), names.begin(), names.end());
     }
   }
-  // Deduplicate
   for (auto &[id, names] : denseToFuncNames) {
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
   }
 
-  // Step 8b: Build nameToFunc, fieldStoreMap, and export composed graph.
-  // These are computed before export so the .cflcg metadata includes
-  // cross-TU augmented field stores.
-
   // Build function name -> Function* map for resolving.
-  // Include all functions from all modules (not just Ctx->Funcs) so that
-  // local-linkage (static) functions and declared external functions can
-  // also be resolved by name from the compressed graph funcNodes.
   std::unordered_map<std::string, Function *> nameToFunc;
   for (auto &[M, _] : Ctx->Modules) {
     for (Function &F : *M) {
@@ -4066,19 +4663,14 @@ bool CallGraphPass::runCompositionalSolve() {
     }
   }
 
-  // Field store map was built from IR during doModulePass
-  // (buildFieldStoreMapFromIR).  Since all input TUs are loaded, the map
-  // covers all modules including cross-TU callback tracing.
   CG_LOG("Field store map (IR-based): " << funcFieldStores.size()
          << " functions\n");
 
   const auto &composedGraph = composedSolver->getReachability();
-  extern cl::opt<std::string> CompressedGraphOutput;
 
   if (!CompressedGraphOutput.empty()) {
     auto tExport = std::chrono::steady_clock::now();
 
-    // V-SCC compress the composed graph for export
     std::vector<uint32_t> nodeToSCC;
     uint32_t numSCCs = 0;
     computeVSCC(composedGraph, LabelV, nodeToSCC, numSCCs);
@@ -4086,16 +4678,12 @@ bool CallGraphPass::runCompositionalSolve() {
     CompressedGraphData exportData;
     exportData.numNodes = numSCCs;
 
-    // Remap edges through SCC
     std::unordered_set<EdgeKey, EdgeKeyHash> exportEdgeSeen;
     exportEdgeSeen.reserve(combinedEdges.size());
     exportData.edges.reserve(combinedEdges.size() / 2);
     for (const auto &E : combinedEdges) {
       uint32_t sccFrom = (E.from < nodeToSCC.size()) ? nodeToSCC[E.from] : UINT32_MAX;
       uint32_t sccTo = (E.to < nodeToSCC.size()) ? nodeToSCC[E.to] : UINT32_MAX;
-      // Keep self-loops after SCC remap: collapsing dense nodes into a VSCC
-      // can turn real intra-component relationships into self-loops, and
-      // dropping them can lose CFL derivations (e.g., M/MA/AM chains).
       if (sccFrom == UINT32_MAX || sccTo == UINT32_MAX)
         continue;
       EdgeKey key{sccFrom, sccTo, E.label};
@@ -4103,10 +4691,6 @@ bool CallGraphPass::runCompositionalSolve() {
         exportData.edges.emplace_back(sccFrom, sccTo, E.label);
     }
 
-    // Match per-TU compression semantics: for each multi-node V-SCC, ensure
-    // terminal self-loops exist for a/-a/d/-d. These loops are required for
-    // CFL derivations (e.g., M -> -d V d, MA/AM chains) after SCC collapse,
-    // especially when this composed .cflcg is reused in another composition step.
     {
       const uint32_t labels[] = {
         EB.getLabelAssign(), EB.getLabelAssignInv(),
@@ -4130,7 +4714,6 @@ bool CallGraphPass::runCompositionalSolve() {
              << " terminal self-loops for multi-node V-SCCs\n");
     }
 
-    // Build symbol table from composed boundary symbols
     for (const auto &[symbol, occurrences] : symbolOccurrences) {
       uint32_t denseNode = unifiedToDense[ufFind(occurrences[0].second)];
       if (denseNode >= nodeToSCC.size()) continue;
@@ -4138,7 +4721,6 @@ bool CallGraphPass::runCompositionalSolve() {
       exportData.symbolTable[{symbol}] = sccId;
     }
 
-    // Build funcNodes from composed function name map
     for (const auto &[denseId, names] : denseToFuncNames) {
       if (denseId >= nodeToSCC.size()) continue;
       uint32_t sccId = nodeToSCC[denseId];
@@ -4150,11 +4732,14 @@ bool CallGraphPass::runCompositionalSolve() {
       names.erase(std::unique(names.begin(), names.end()), names.end());
     }
 
-    exportData.metadataJson = encodeCflcgMetadata(expectedMeta, "composed-export");
+    exportData.metadataJson = encodeCflcgMetadata(expectedMeta,
+                                                  "composed-export",
+                                                  currentModuleIds,
+                                                  currentModuleHashes);
 
-    std::string ErrMsg;
-    if (!saveCompressedGraph(CompressedGraphOutput, exportData, &ErrMsg)) {
-      WARNING("Failed to export composed graph: " << ErrMsg << "\n");
+    std::string errMsg;
+    if (!saveCompressedGraph(CompressedGraphOutput, exportData, &errMsg)) {
+      WARNING("Failed to export composed graph: " << errMsg << "\n");
     } else {
       CG_LOG("Exported composed compressed graph to " << CompressedGraphOutput
              << ": nodes=" << exportData.numNodes
@@ -4167,14 +4752,10 @@ bool CallGraphPass::runCompositionalSolve() {
            << " ms\n");
   }
 
-  // Build icall symbol -> dense node lookup from composed symbols
-  // The icall boundary symbols were remapped through unifiedToDense during
-  // Steps 3-5, so we look them up in symbolOccurrences.
   std::unordered_map<std::string, uint32_t> icallSymbolToDense;
   for (const auto &[symbol, occurrences] : symbolOccurrences) {
     if (symbol.compare(0, 6, "icall:") != 0)
       continue;
-    // Use the first occurrence's unified ID, remapped through union-find
     icallSymbolToDense[symbol] = unifiedToDense[ufFind(occurrences[0].second)];
   }
   CG_LOG("Composed icall symbols: " << icallSymbolToDense.size() << "\n");
@@ -4184,7 +4765,6 @@ bool CallGraphPass::runCompositionalSolve() {
   size_t skippedNoSymbol = 0;
 
   for (auto *CS : Ctx->IndirectCallInsts) {
-    // Read the deterministic icall ID from metadata
     auto *MD = CS->getMetadata("ka.icall.id");
     if (!MD) continue;
     auto *S = dyn_cast<MDString>(MD->getOperand(0));
@@ -4201,24 +4781,20 @@ bool CallGraphPass::runCompositionalSolve() {
     if (denseNode >= composedGraph.size())
       continue;
 
-    // Extract call-site struct field info for field-sensitive filtering
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     std::string callSiteStruct;
     unsigned callSiteFieldIdx = 0;
     bool hasCallSiteField = false;
     if (auto *Load = dyn_cast<LoadInst>(fptr)) {
       Value *loadPtr = Load->getPointerOperand()->stripPointerCasts();
-      if (auto *GEP = dyn_cast<GEPOperator>(loadPtr)) {
+      if (auto *GEP = dyn_cast<GEPOperator>(loadPtr))
         hasCallSiteField = getGEPStructField(GEP, callSiteStruct, callSiteFieldIdx);
-      }
     }
 
     const auto &VSet = composedGraph[denseNode][LabelV];
-    // Count how many V-set entries have funcNames
     size_t vWithFunc = 0;
     for (uint32_t t : VSet)
       if (denseToFuncNames.count(t)) vWithFunc++;
-    // Also count denseNode itself (V is reflexive: V → AMs → ε)
     bool selfHasFunc = denseToFuncNames.count(denseNode) > 0;
     CG_DEBUG("Icall " << icallKey << " dense=" << denseNode
              << " VSet=" << VSet.size()
@@ -4240,13 +4816,6 @@ bool CallGraphPass::runCompositionalSolve() {
         CG_DEBUG("  Self[" << denseNode << "] -> " << n << "\n");
     }
 
-    // Helper lambda to resolve a candidate dense node to Function* targets.
-    // V is reflexive (V → AMs → ε), so denseNode itself is always a candidate
-    // in addition to the explicit V-set entries. This matters when per-TU
-    // V-SCC compression merges the fptr node and function nodes into the same
-    // SCC (their intra-SCC edges become self-loops and are dropped), and then
-    // cross-TU union-find merges that SCC with a function-node SCC from
-    // another TU — leaving funcNames at denseNode but no explicit V(x,x) edge.
     FuncSet targets;
     auto resolveCandidate = [&](uint32_t target) {
       auto fnIt = denseToFuncNames.find(target);
@@ -4259,7 +4828,6 @@ bool CallGraphPass::runCompositionalSolve() {
         Function *F = fIt->second;
         if (!isCompatible(CS, F))
           continue;
-        // Struct-field-aware filtering using deserialized metadata
         if (hasCallSiteField) {
           auto fsIt = funcFieldStores.find(F);
           if (fsIt != funcFieldStores.end()) {
@@ -4271,14 +4839,11 @@ bool CallGraphPass::runCompositionalSolve() {
               continue;
             }
           }
-          // No entries = conservative keep
         }
         targets.insert(F);
       }
     };
 
-    // Check denseNode itself first (handles V-SCC compression merging fptr
-    // with function nodes when they are mutually V-reachable within a TU).
     resolveCandidate(denseNode);
     for (uint32_t target : VSet)
       resolveCandidate(target);
@@ -4294,7 +4859,7 @@ bool CallGraphPass::runCompositionalSolve() {
          << " indirect calls with " << totalTargets << " total targets"
          << " (skipped " << skippedNoSymbol << " without symbol)\n");
 
-  return resolvedCalls > 0;
+  return true;
 }
 
 void CallGraphPass::dumpGlobals(raw_ostream &OS) {

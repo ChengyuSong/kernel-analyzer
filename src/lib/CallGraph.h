@@ -115,7 +115,8 @@ private:
 
   // Per-TU compositional solving
   std::vector<CompressedGraphData> perTUGraphs;
-  void solveAndCompressPerTU(llvm::Module *M, size_t edgeStart);
+  void solveAndCompressPerTU(llvm::Module *M, size_t edgeStart, size_t edgeEnd);
+  std::unordered_map<llvm::Module *, std::pair<size_t, size_t>> moduleEdgeRanges;
 
   // Compositional solve results (for V-snapshot export)
   std::unique_ptr<gracfl::SolverFWGramParallel> composedSolver;

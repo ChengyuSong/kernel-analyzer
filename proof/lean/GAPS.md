@@ -1,0 +1,59 @@
+# Lean vs Implementation Gaps
+
+This file tracks the major gaps between the Lean formal model in `proof/lean`
+and the current C++ implementation in `src/lib/CallGraph.cc`.
+
+Cross-links:
+- Implementation doc section:
+  [`docs/compositional-cfl-analysis.md`](../../docs/compositional-cfl-analysis.md)
+  under "Current mechanization gaps (Lean model vs implementation)"
+- Lean overview: [`README.md`](README.md)
+
+## Major gaps
+
+1. Obligations are assumed, not discharged from implementation code.
+- Lean proves soundness once graph-homomorphism obligations are provided.
+- We do not yet prove that `compressConstraintGraph` + `runCompositionalSolve`
+  construct those obligations for all inputs.
+
+2. Iteration model mismatch.
+- Lean models unbounded fixed-point closure (`iterClosure`).
+- Implementation uses explicit caps:
+  - per-TU: `kMaxPerTUIterations = 32`
+  - composed/global: `kMaxCompIterations = 8`
+- With finite monotone edge growth, convergence is guaranteed without caps, so
+  caps are defensive and can stop before the true fixed point.
+
+3. Compression model mismatch.
+- Lean quotient/composition is abstract edge remapping.
+- Implementation drops SCC self-loops during remap and then re-adds terminal
+  `a/-a/d/-d` loops for multi-node SCCs.
+- A proof that this concrete construction refines the abstract model is pending.
+
+4. Boundary completeness is assumed in Lean.
+- Lean assumes all cross-TU-relevant boundary facts are exported.
+- Implementation depends on extraction paths (metadata and pattern-based
+  discovery), plus cache sanity checks.
+- Completeness of these extraction paths is not formally proved.
+
+5. Target filters are not yet formalized.
+- Implementation applies `isCompatible` and field-store filtering
+  (`fieldFilterAccepts`).
+- Lean currently has no model/proof that these filters are conservative with
+  respect to monolithic truth.
+
+6. Allocator promotion logic is out of model.
+- `findCustomAllocators` and `findCustomAllocatorsComposed` mutate allocator
+  sets and may rewrite call-related edges in monolithic mode.
+- Lean does not model this state transition or prove its preservation properties.
+
+7. Solver implementation is trusted.
+- Lean reasons over declarative reachability.
+- `SolverFWGramParallel` is treated as an oracle in the end-to-end story.
+- A refinement proof (solver output implies declarative `Reach`) is missing.
+
+## Notes
+
+These gaps do not invalidate the current Lean schema proofs. They define the
+work needed to claim a full machine-checked proof for the exact production
+pipeline.

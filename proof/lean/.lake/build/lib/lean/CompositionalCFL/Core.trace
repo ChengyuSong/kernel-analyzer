@@ -1,0 +1,28 @@
+{"synthetic": false,
+ "schemaVersion": "2025-09-10",
+ "outputs":
+ {"o": ["9bc59188eb24b456.olean"],
+  "i": "27093a22151667f3.ilean",
+  "c": "bcd74b911de50ae2.c"},
+ "log":
+ [{"message":
+   ".> LEAN_PATH=/home/csong/project/kanalyzer/proof/lean/.lake/build/lib/lean /home/csong/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/csong/project/kanalyzer/proof/lean/CompositionalCFL/Core.lean -o /home/csong/project/kanalyzer/proof/lean/.lake/build/lib/lean/CompositionalCFL/Core.olean -i /home/csong/project/kanalyzer/proof/lean/.lake/build/lib/lean/CompositionalCFL/Core.ilean -c /home/csong/project/kanalyzer/proof/lean/.lake/build/ir/CompositionalCFL/Core.c --setup /home/csong/project/kanalyzer/proof/lean/.lake/build/ir/CompositionalCFL/Core.setup.json --json",
+   "level": "trace"}],
+ "inputs":
+ [["CompositionalCFL.Core:deps",
+   [["deps",
+     [["«compositional-cfl-proof»/CompositionalCFL:extraDep",
+       [["@«compositional-cfl-proof»:extraDep", "00000000000006bb"]]],
+      ["imports", "00000000000006bb"]]],
+    ["libs",
+     [["import dynlibs", "00000000000006bb"],
+      ["package external libraries", "00000000000006bb"],
+      ["module dynlibs", "00000000000006bb"],
+      ["module plugins", "00000000000006bb"]]]]],
+  ["Lean 4.28.0, commit 7e01a1bf5c70fc6167d49c345d3bf80596e9a79b",
+   "a96bc04a2e5e9630"],
+  ["/home/csong/project/kanalyzer/proof/lean/CompositionalCFL/Core.lean",
+   "2db6d4bcca2f01f1"],
+  ["options", "00000000000006bb"],
+  ["Module.leanArgs: #[]", "00000000000006bb"]],
+ "depHash": "5e49233d3274935a"}

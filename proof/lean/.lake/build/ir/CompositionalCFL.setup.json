@@ -1,0 +1,9 @@
+{"plugins": [],
+ "package": "compositional-cfl-proof",
+ "options": {},
+ "name": "CompositionalCFL",
+ "isModule": false,
+ "importArts":
+ {"CompositionalCFL.Core":
+  ["/home/csong/project/kanalyzer/proof/lean/.lake/build/lib/lean/CompositionalCFL/Core.olean"]},
+ "dynlibs": []}

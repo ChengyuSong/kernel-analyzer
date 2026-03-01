@@ -162,6 +162,25 @@ IR-derived field-store filter is intended to be conservative (unknown => keep),
 but a full formal proof for that filter requires additional assumptions about
 completeness of the callback-tracing patterns.
 
+### Current mechanization gaps (Lean model vs implementation)
+
+Canonical tracker: `proof/lean/GAPS.md`  
+See: [`../proof/lean/GAPS.md`](../proof/lean/GAPS.md)
+
+The Lean model in `proof/lean` currently proves a reusable **soundness schema**
+for compositional CFL, but not yet a full machine-checked proof of the exact
+`CallGraph.cc` pipeline. Detailed gap list and status live in
+`proof/lean/GAPS.md`.
+
+In short, remaining work is to:
+
+1. Discharge implementation-specific simulation obligations from code-level
+   construction (`compressConstraintGraph` / `runCompositionalSolve`).
+2. Align fixed-point modeling details (including current capped loops) with the
+   formal iteration story.
+3. Formalize and prove conservativeness of target filtering, allocator
+   promotion, and solver-to-spec refinement.
+
 ## Bug fix: V-SCC self-loops and compositional edge construction
 
 The initial implementation had three bugs that caused compositional mode to miss

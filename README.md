@@ -68,6 +68,9 @@ See `docs/compositional-cfl-analysis.md` for the full design.
   `docs/cfl-reachability-vsnapshot.md`
 - Compositional CFL analysis design:
   `docs/compositional-cfl-analysis.md`
+- Lean proof scaffold for compositional soundness:
+  `proof/lean/README.md`
+  (gap tracker: `proof/lean/GAPS.md`)
 - Known call graph limitations:
   `docs/call-graph-limitations.md`
 

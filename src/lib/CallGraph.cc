@@ -19,6 +19,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/ADT/StringExtras.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Support/Error.h>
 #include <llvm/Support/FormatVariadic.h>
@@ -393,11 +394,112 @@ static bool shouldSkipValue(const Value *V) {
 }
 
 // Helper: returns true if T is a pointer or a vector-of-pointer type.
-static bool containsPointerType(Type *T) {
-  if (T->isPointerTy()) return true;
+static bool containsPointerTypeImpl(Type *T, SmallPtrSetImpl<Type *> &Seen) {
+  if (!T)
+    return false;
+  if (!Seen.insert(T).second)
+    return false;
+
+  if (T->isPointerTy())
+    return true;
+
   if (auto *VT = dyn_cast<VectorType>(T))
-    return VT->getElementType()->isPointerTy();
+    return containsPointerTypeImpl(VT->getElementType(), Seen);
+
+  if (auto *AT = dyn_cast<ArrayType>(T))
+    return containsPointerTypeImpl(AT->getElementType(), Seen);
+
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    if (ST->isOpaque())
+      return false;
+    for (Type *ElemTy : ST->elements()) {
+      if (containsPointerTypeImpl(ElemTy, Seen))
+        return true;
+    }
+  }
+
   return false;
+}
+
+// Helper: returns true if T is a pointer, a vector-of-pointer type, or an
+// aggregate (array/struct) that recursively contains pointers.
+static bool containsPointerType(Type *T) {
+  SmallPtrSet<Type *, 16> Seen;
+  return containsPointerTypeImpl(T, Seen);
+}
+
+static bool isLoweredVAListType(Type *T) {
+  if (!T)
+    return false;
+
+  if (auto *AT = dyn_cast<ArrayType>(T))
+    return isLoweredVAListType(AT->getElementType());
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    if (ST->hasName()) {
+      StringRef N = ST->getName();
+      if (N.contains("va_list") || N.contains("__va_list_tag"))
+        return true;
+    }
+    if (ST->isOpaque())
+      return false;
+    for (Type *ElemTy : ST->elements()) {
+      if (isLoweredVAListType(ElemTy))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool derivesFromLoweredVAListImpl(const Value *V,
+                                         SmallPtrSetImpl<const Value *> &Seen,
+                                         unsigned Depth) {
+  if (!V || Depth > 64)
+    return false;
+  if (!Seen.insert(V).second)
+    return false;
+
+  V = V->stripPointerCasts();
+
+  if (const auto *AI = dyn_cast<AllocaInst>(V))
+    return isLoweredVAListType(AI->getAllocatedType());
+
+  if (const auto *GEP = dyn_cast<GEPOperator>(V))
+    return derivesFromLoweredVAListImpl(GEP->getPointerOperand(), Seen, Depth + 1);
+
+  if (const auto *LI = dyn_cast<LoadInst>(V))
+    return derivesFromLoweredVAListImpl(LI->getPointerOperand(), Seen, Depth + 1);
+
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    for (const Value *In : PN->incoming_values()) {
+      if (derivesFromLoweredVAListImpl(In, Seen, Depth + 1))
+        return true;
+    }
+    return false;
+  }
+
+  if (const auto *SI = dyn_cast<SelectInst>(V))
+    return derivesFromLoweredVAListImpl(SI->getTrueValue(), Seen, Depth + 1) ||
+           derivesFromLoweredVAListImpl(SI->getFalseValue(), Seen, Depth + 1);
+
+  if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+    switch (CE->getOpcode()) {
+      case Instruction::GetElementPtr:
+      case Instruction::BitCast:
+      case Instruction::AddrSpaceCast:
+        return derivesFromLoweredVAListImpl(CE->getOperand(0), Seen, Depth + 1);
+      default:
+        return false;
+    }
+  }
+
+  return false;
+}
+
+// Detect lowered vararg loads (e.g. loads from __va_list_tag-based state)
+// when frontends lower va_arg to memory operations instead of VAArgInst.
+static bool derivesFromLoweredVAList(const Value *V) {
+  SmallPtrSet<const Value *, 32> Seen;
+  return derivesFromLoweredVAListImpl(V, Seen, 0);
 }
 
 // Helper to check if we should skip creating edges for a function call
@@ -558,6 +660,84 @@ bool CallGraphPass::getGEPStructField(const GEPOperator *GEP,
   }
 
   return found;
+}
+
+bool CallGraphPass::getFieldKeyFromPointerOperand(const Value *Ptr,
+                                                  std::string &structName,
+                                                  unsigned &fieldIdx,
+                                                  Type *&fieldTy) const {
+  fieldTy = nullptr;
+  if (!Ptr)
+    return false;
+
+  const Value *Base = Ptr->stripPointerCastsAndAliases();
+  const auto *GEP = dyn_cast<GEPOperator>(Base);
+  if (!GEP)
+    return false;
+
+  if (!getGEPStructField(GEP, structName, fieldIdx))
+    return false;
+
+  fieldTy = GEP->getResultElementType();
+  return true;
+}
+
+bool CallGraphPass::getGlobalFieldBoundaryKey(const Value *V,
+                                              std::string &key) const {
+  const auto *CE = dyn_cast_or_null<ConstantExpr>(V);
+  if (!CE || CE->getOpcode() != Instruction::GetElementPtr)
+    return false;
+
+  const auto *GEP = dyn_cast<GEPOperator>(CE);
+  if (!GEP)
+    return false;
+
+  std::string structName;
+  unsigned fieldIdx = 0;
+  if (!getGEPStructField(GEP, structName, fieldIdx))
+    return false;
+
+  const Value *base = GEP->getPointerOperand()->stripPointerCasts();
+  const auto *GV = dyn_cast<GlobalVariable>(base);
+  if (!GV)
+    return false;
+
+  key = ("globfield:" + std::to_string(GV->getGUID()) + ":" +
+         std::to_string(fieldIdx));
+  return true;
+}
+
+bool CallGraphPass::getCallSiteFieldKey(const Value *FPtr,
+                                        std::string &structName,
+                                        unsigned &fieldIdx) const {
+  const auto *LI = dyn_cast_or_null<LoadInst>(FPtr);
+  if (!LI)
+    return false;
+
+  const Value *loadPtr = LI->getPointerOperand()->stripPointerCasts();
+  const auto *GEP = dyn_cast<GEPOperator>(loadPtr);
+  if (!GEP)
+    return false;
+
+  if (!getGEPStructField(GEP, structName, fieldIdx))
+    return false;
+
+  // Pattern: load ptr from a struct-typed field pointer without an explicit
+  // trailing ", 0" index (e.g. load ptr, ptr gep(..., i32 field)).
+  // In LLVM this loads the first element of that nested struct. Refine to the
+  // nested field key so field filtering can distinguish callback slots.
+  const auto *ST = dyn_cast<StructType>(GEP->getResultElementType());
+  if (!ST || ST->isLiteral() || !ST->hasName() || ST->isOpaque() ||
+      LLVM_STRING_STARTS_WITH(ST->getStructName(), "union"))
+    return true;
+  if (ST->getNumElements() == 0)
+    return true;
+  if (!ST->getElementType(0)->isPointerTy() || !LI->getType()->isPointerTy())
+    return true;
+
+  structName = stripStructNameSuffix(ST->getStructName()).str();
+  fieldIdx = 0;
+  return true;
 }
 
 bool CallGraphPass::isStructLayoutCompatible(const StructType *ST1,
@@ -748,53 +928,54 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       return false;
   }
 
-  // handle args
+  // handle args:
+  // - fixed arguments map to formal params
+  // - variadic tail (if any) maps to the callee's vararg summary node
   unsigned numArgs = CS->arg_size();
-  if (!CF->empty() && CF->isVarArg()) {
-    NodeIndex formalNode = getCanonicalNode(NF.getVarargNodeFor(CF));
-    assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
-    for (unsigned i = 0; i < numArgs; i++) {
-      Value *arg = CS->getArgOperand(i);
-      if (!arg->getType()->isPointerTy())
-        continue; // skip non-pointer args
-      if (shouldSkipValue(arg)) {
-        CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
-        continue;
-      }
-      NodeIndex argNode = getRepNodeForValue(arg);
-      if (argNode == AndersNodeFactory::InvalidIndex) {
-        WARNING("VarArg: actual (" << i << ") " << *arg << " node not found!\n");
-        continue;
-      }
-      addAssignmentEdge(argNode, formalNode);
+  unsigned numFormals = CF->arg_size();
+  unsigned minArgs = std::min(numArgs, numFormals);
+  for (unsigned i = 0; i < minArgs; i++) {
+    Value *arg = CS->getArgOperand(i);
+    if (!arg->getType()->isPointerTy())
+      continue; // skip non-pointer args
+    if (shouldSkipValue(arg)) {
+      CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
+      continue;
     }
-  } else {
-    // Only match up to the number of formal parameters; extra actual
-    // arguments at the callsite are ignored (permitted by permissive matching).
-    unsigned numFormals = CF->arg_size();
-    unsigned minArgs = std::min(numArgs, numFormals);
-    for (unsigned i = 0; i < minArgs; i++) {
+    NodeIndex argNode = getRepNodeForValue(arg);
+    if (argNode == AndersNodeFactory::InvalidIndex) {
+      argNode = NF.createValueNode(arg);
+      argNode = getCanonicalNode(argNode);
+      CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
+    }
+    Value *farg = CF->getArg(i);
+    NodeIndex formalNode = getRepNodeForValue(farg);
+    if (formalNode == AndersNodeFactory::InvalidIndex) {
+      // On-demand node for declared function formal argument.
+      formalNode = NF.createValueNode(farg);
+      formalNode = getCanonicalNode(formalNode);
+    }
+    addAssignmentEdge(argNode, formalNode);
+  }
+  if (CF->isVarArg()) {
+    NodeIndex varargNode = NF.getVarargNodeFor(CF);
+    if (varargNode == AndersNodeFactory::InvalidIndex)
+      varargNode = NF.createVarargNode(CF);
+    varargNode = getCanonicalNode(varargNode);
+    for (unsigned i = numFormals; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
       if (!arg->getType()->isPointerTy())
         continue; // skip non-pointer args
       if (shouldSkipValue(arg)) {
-        CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
+        CG_DEBUG("Skipping compiler-introduced variadic argument: " << *arg << "\n");
         continue;
       }
       NodeIndex argNode = getRepNodeForValue(arg);
       if (argNode == AndersNodeFactory::InvalidIndex) {
         argNode = NF.createValueNode(arg);
         argNode = getCanonicalNode(argNode);
-        CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
       }
-      Value *farg = CF->getArg(i);
-      NodeIndex formalNode = getRepNodeForValue(farg);
-      if (formalNode == AndersNodeFactory::InvalidIndex) {
-        // On-demand node for declared function formal argument.
-        formalNode = NF.createValueNode(farg);
-        formalNode = getCanonicalNode(formalNode);
-      }
-      addAssignmentEdge(argNode, formalNode);
+      addAssignmentEdge(argNode, varargNode);
     }
   }
 
@@ -881,31 +1062,33 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   // handle args
   unsigned numArgs = CS->arg_size();
   unsigned numFormals = CF->arg_size();
-  if (CF->isVarArg()) {
-    NodeIndex formalNode = getCanonicalNode(NF.getVarargNodeFor(CF));
+  // Remove fixed-arg edges
+  unsigned minArgs = std::min(numArgs, numFormals);
+  for (unsigned i = 0; i < minArgs; i++) {
+    Value *arg = CS->getArgOperand(i);
+    if (!arg->getType()->isPointerTy())
+      continue; // skip non-pointer args
+    NodeIndex argNode = getRepNodeForValue(arg);
+    assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
+    Value *farg = CF->getArg(i);
+    NodeIndex formalNode = getRepNodeForValue(farg);
     assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
-    for (unsigned i = 0; i < numArgs; i++) {
+    EB.removeAssignmentEdges(getCanonicalNode(argNode), getCanonicalNode(formalNode));
+  }
+  // Remove variadic-tail edges
+  if (CF->isVarArg()) {
+    NodeIndex varargNode = getCanonicalNode(NF.getVarargNodeFor(CF));
+    assert(varargNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
+    for (unsigned i = numFormals; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
+      if (!arg->getType()->isPointerTy())
+        continue;
       NodeIndex argNode = getRepNodeForValue(arg);
       if (argNode == AndersNodeFactory::InvalidIndex) {
         WARNING("VarArg: actual (" << i << ") " << *arg << " node not found!\n");
         continue;
       }
-      EB.removeAssignmentEdges(getCanonicalNode(argNode), getCanonicalNode(formalNode));
-    }
-  } else {
-    // Only iterate over the minimum of actual and formal args
-    unsigned minArgs = std::min(numArgs, numFormals);
-    for (unsigned i = 0; i < minArgs; i++) {
-      Value *arg = CS->getArgOperand(i);
-      if (!arg->getType()->isPointerTy())
-        continue; // skip non-pointer args
-      NodeIndex argNode = getRepNodeForValue(arg);
-      assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
-      Value *farg = CF->getArg(i);
-      NodeIndex formalNode = getRepNodeForValue(farg);
-      assert(formalNode != AndersNodeFactory::InvalidIndex && "Formal argument node not found!");
-      EB.removeAssignmentEdges(getCanonicalNode(argNode), getCanonicalNode(formalNode));
+      EB.removeAssignmentEdges(getCanonicalNode(argNode), varargNode);
     }
   }
 
@@ -974,8 +1157,13 @@ NodeIndex CallGraphPass::getRepDerefNode(NodeIndex ptrNode) {
   if (derefNode == AndersNodeFactory::InvalidIndex) {
     derefNode = NF.createDereferenceNode(canonical);
     CG_DEBUG("Create deref node " << derefNode << " for canonical node " << canonical << "\n");
-    EB.addDereferenceEdges(canonical, derefNode);
   }
+
+  // In compositional per-TU mode, canonical nodes may be shared across TUs.
+  // Re-emit ptr<->deref constraints once per module so each TU edge slice
+  // retains the local memory edge context after splitting.
+  if (moduleDerefEdgeRoots.insert(canonical).second)
+    EB.addDereferenceEdges(canonical, derefNode);
 
   return derefNode;
 }
@@ -1206,6 +1394,19 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     CGP.AllocSites.insert(valNode);
     NodeIndex heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
     CGP.EB.addDereferenceEdges(valNode, heapObj);
+    // Keep allocator return-node flow active for compositional promotion:
+    // known allocator return symbols must stay reachable even when alloc
+    // callsites are short-circuited as explicit AllocSites.
+    if (Function *CF = CS.getCalledFunction()) {
+      if (CF->getReturnType()->isPointerTy()) {
+        const Function *RCF = CGP.getFuncDef(CF);
+        NodeIndex retNode = CGP.NF.getReturnNodeFor(RCF);
+        if (retNode == AndersNodeFactory::InvalidIndex)
+          retNode = CGP.NF.createReturnNode(RCF);
+        retNode = CGP.getCanonicalNode(retNode);
+        CGP.addAssignmentEdge(retNode, valNode);
+      }
+    }
     CG_DEBUG("Create heap obj node " << heapObj << " for " << CS << "\n");
     return; // skip allocation sites
   }
@@ -1269,6 +1470,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       }
     } else {
       CGP.Ctx->IndirectCallInsts.insert(&CS);
+      CGP.moduleIndirectCallInsts[F->getParent()].insert(&CS);
       // Attach deterministic icall ID as LLVM metadata.
       // Use scoped caller name for uniqueness across TUs.
       std::string id;
@@ -1300,6 +1502,18 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find load value node");
 
   Value *ptr = I.getOperand(0);
+  // Frontends often lower va_arg to __va_list_tag memory accesses (no VAArgInst).
+  // Connect such pointer loads to the function's vararg summary node.
+  if (Function *F = I.getFunction()) {
+    NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
+    if (varargNode != AndersNodeFactory::InvalidIndex &&
+        derivesFromLoweredVAList(ptr)) {
+      CGP.addAssignmentEdge(varargNode, valNode);
+      CG_DEBUG("LoweredVAArg: " << F->getName() << ": vararg node " << varargNode
+               << " -> val node " << valNode << " for " << I << "\n");
+    }
+  }
+
   NodeIndex slotRep;
   if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
     CGP.localAllocaLoadVals[slotRep].push_back(valNode);
@@ -1834,6 +2048,8 @@ bool CallGraphPass::doInitialization(Module *M) {
   if (iteration == 0 && M == Ctx->Modules.front().first) {
     canonicalNodeMap.clear();
     canonicalClassMembers.clear();
+    moduleIndirectCallInsts.clear();
+    fieldAliasMap.clear();
   }
 
   for (auto &GV : M->globals()) {
@@ -2008,10 +2224,99 @@ bool CallGraphPass::doFinalization(Module *M) {
   return false;
 }
 
-bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
+bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph,
+                                         bool rewriteEdges) {
   bool foundNewAlloc = false;
   FuncSet newAllocFuncs;
   std::vector<NodeIndex> memberNodes;
+#if 0
+  DenseMap<const Function *, bool> returnsFromCallCache;
+  auto returnsFromCallLikeAllocator = [&](const Function *Cand) -> bool {
+    auto it = returnsFromCallCache.find(Cand);
+    if (it != returnsFromCallCache.end())
+      return it->second;
+
+    bool found = false;
+    SmallVector<const Value *, 32> work;
+    SmallPtrSet<const Value *, 32> seen;
+    size_t steps = 0;
+    constexpr size_t kMaxSteps = 4096;
+
+    auto pushValue = [&](const Value *V) {
+      if (!V)
+        return;
+      work.push_back(V->stripPointerCasts());
+    };
+
+    for (const BasicBlock &BB : *Cand) {
+      if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+        if (const Value *RV = RI->getReturnValue()) {
+          if (containsPointerType(RV->getType()))
+            pushValue(RV);
+        }
+      }
+    }
+
+    while (!work.empty() && steps++ < kMaxSteps) {
+      const Value *V = work.pop_back_val();
+      if (!seen.insert(V).second)
+        continue;
+      if (!containsPointerType(V->getType()))
+        continue;
+
+      if (isa<CallBase>(V)) {
+        found = true;
+        break;
+      }
+      if (isa<ConstantPointerNull>(V))
+        continue;
+
+      if (const auto *PN = dyn_cast<PHINode>(V)) {
+        for (const Value *Incoming : PN->incoming_values())
+          pushValue(Incoming);
+        continue;
+      }
+      if (const auto *SI = dyn_cast<SelectInst>(V)) {
+        pushValue(SI->getTrueValue());
+        pushValue(SI->getFalseValue());
+        continue;
+      }
+      if (const auto *LI = dyn_cast<LoadInst>(V)) {
+        const Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
+        if (const auto *AI = dyn_cast<AllocaInst>(Ptr)) {
+          for (const User *U : AI->users()) {
+            const auto *Store = dyn_cast<StoreInst>(U);
+            if (!Store)
+              continue;
+            if (Store->getPointerOperand()->stripPointerCasts() == AI)
+              pushValue(Store->getValueOperand());
+          }
+        }
+        continue;
+      }
+      if (const auto *BC = dyn_cast<BitCastOperator>(V)) {
+        pushValue(BC->getOperand(0));
+        continue;
+      }
+      if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+        pushValue(GEP->getPointerOperand());
+        continue;
+      }
+      if (const auto *Arg = dyn_cast<Argument>(V)) {
+        if (Arg->getParent() == Cand)
+          continue;
+      }
+    }
+
+    returnsFromCallCache[Cand] = found;
+    return found;
+  };
+#else
+  auto returnsFromCallLikeAllocator = [&](const Function *Cand) -> bool {
+    (void)Cand;
+    return false;
+  };
+#endif
   const bool useDense = CFLGlobalDedup && !origToDense.empty();
   for (auto *F : Ctx->CandidateAllocFuncs) {
     // get return value
@@ -2042,26 +2347,34 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
           break;
         }
       }
+      if (!reachesAllocSite && !rewriteEdges &&
+          returnsFromCallLikeAllocator(F)) {
+        reachesAllocSite = true;
+        CG_LOG("Custom allocator " << F->getName()
+               << " confirmed by compositional call-return heuristic\n");
+      }
       if (reachesAllocSite) {
         // if return value is from a known allocation site
         CG_LOG("Custom allocator " << F->getName() << " return value from alloc site: " << idx << "\n");
         Ctx->AllocFuncs.insert(F);
         newAllocFuncs.insert(F);
         foundNewAlloc = true;
-        // update edge
-        for (auto const& U : F->users()) {
-          if (const CallBase *CI = dyn_cast<CallBase>(U)) {
-            if (CI->getCalledFunction() == F) {
-              NodeIndex callNode = getCanonicalNode(NF.getValueNodeFor(CI));
-              assert(callNode != AndersNodeFactory::InvalidIndex && "CallBase node not found for candidate alloc func!");
-              Ctx->AllocSites.insert(CI);
-              AllocSites.insert(callNode);
-              // create heap object node
-              NodeIndex heapObj = NF.createOpaqueObjectNode(CI, true);
-              EB.addDereferenceEdges(callNode, heapObj);
-              // remove call edges
-              removeCallEdges(CI, F);
-              CG_LOG("Update custom allocator call: " << *CI << "\n");
+        if (rewriteEdges) {
+          // update edge
+          for (auto const& U : F->users()) {
+            if (const CallBase *CI = dyn_cast<CallBase>(U)) {
+              if (CI->getCalledFunction() == F) {
+                NodeIndex callNode = getCanonicalNode(NF.getValueNodeFor(CI));
+                assert(callNode != AndersNodeFactory::InvalidIndex && "CallBase node not found for candidate alloc func!");
+                Ctx->AllocSites.insert(CI);
+                AllocSites.insert(callNode);
+                // create heap object node
+                NodeIndex heapObj = NF.createOpaqueObjectNode(CI, true);
+                EB.addDereferenceEdges(callNode, heapObj);
+                // remove call edges
+                removeCallEdges(CI, F);
+                CG_LOG("Update custom allocator call: " << *CI << "\n");
+              }
             }
           }
         }
@@ -2080,8 +2393,194 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph) {
   return foundNewAlloc;
 }
 
+bool CallGraphPass::findCustomAllocatorsComposed(
+    const cfl_result_t &composedGraph,
+    const std::unordered_map<std::string, uint32_t> &symbolToDense) {
+  if (composedGraph.empty())
+    return false;
+  const uint32_t labelV = EB.getLabelV();
+  if (composedGraph[0].size() <= labelV) {
+    WARNING("Compositional custom allocator detection skipped: V label index "
+            << labelV << " is out of range\n");
+    return false;
+  }
+
+  auto getRetDense = [&](const Function *F, uint32_t &retDense) -> bool {
+    std::string retSym = "ret:" + std::to_string(F->getGUID());
+    auto itDense = symbolToDense.find(retSym);
+    if (itDense != symbolToDense.end() && itDense->second < composedGraph.size()) {
+      retDense = itDense->second;
+      return true;
+    }
+
+    std::string lretSym = "lret:" + getScopeName(F);
+    auto itDenseLocal = symbolToDense.find(lretSym);
+    if (itDenseLocal == symbolToDense.end() || itDenseLocal->second >= composedGraph.size())
+      return false;
+    retDense = itDenseLocal->second;
+    return true;
+  };
+
+  std::unordered_set<uint32_t> knownAllocRetNodes;
+  knownAllocRetNodes.reserve(Ctx->AllocFuncs.size() * 2 + 1);
+  for (const Function *F : Ctx->AllocFuncs) {
+    uint32_t retDense = UINT32_MAX;
+    if (getRetDense(F, retDense)) {
+      knownAllocRetNodes.insert(retDense);
+      CG_DEBUG("Known allocator ret node: " << F->getName()
+               << " -> " << retDense << "\n");
+    } else {
+      CG_DEBUG("Known allocator ret node missing in composed graph: "
+               << F->getName() << "\n");
+    }
+  }
+
+  bool foundNewAlloc = false;
+  size_t promoted = 0;
+  while (true) {
+    FuncSet newlyConfirmed;
+    for (const Function *F : Ctx->CandidateAllocFuncs) {
+      uint32_t candRetDense = UINT32_MAX;
+      if (!getRetDense(F, candRetDense)) {
+        CG_DEBUG("Candidate allocator ret node missing in composed graph: "
+                 << F->getName() << "\n");
+        continue;
+      }
+
+      bool reachesKnownAlloc = knownAllocRetNodes.count(candRetDense) > 0;
+      if (!reachesKnownAlloc) {
+        const auto &vSet = composedGraph[candRetDense][labelV];
+        for (uint32_t idx : vSet) {
+          if (knownAllocRetNodes.count(idx)) {
+            reachesKnownAlloc = true;
+            break;
+          }
+        }
+      }
+      if (reachesKnownAlloc)
+        newlyConfirmed.insert(F);
+    }
+
+    if (newlyConfirmed.empty())
+      break;
+
+    foundNewAlloc = true;
+    promoted += newlyConfirmed.size();
+    for (const Function *F : newlyConfirmed) {
+      Ctx->AllocFuncs.insert(F);
+      Ctx->CandidateAllocFuncs.erase(F);
+      uint32_t retDense = UINT32_MAX;
+      if (getRetDense(F, retDense))
+        knownAllocRetNodes.insert(retDense);
+      CG_LOG("Custom allocator (composed) " << F->getName()
+             << " return value aliases known allocator return\n");
+    }
+  }
+
+  if (foundNewAlloc) {
+    CG_LOG("Compositional custom allocator detection promoted " << promoted
+           << " allocator candidate(s)\n");
+  }
+
+  return foundNewAlloc;
+}
+
+bool CallGraphPass::addFieldAlias(const FieldStoreKey &A, const FieldStoreKey &B) {
+  if (A == B)
+    return false;
+  bool changed = false;
+  changed |= fieldAliasMap[A].insert(B).second;
+  changed |= fieldAliasMap[B].insert(A).second;
+  return changed;
+}
+
+bool CallGraphPass::fieldFilterAccepts(const Function *F,
+                                       const std::string &callSiteStruct,
+                                       unsigned callSiteFieldIdx) const {
+  auto it = funcFieldStores.find(F);
+  if (it == funcFieldStores.end())
+    return true;
+  const auto &fieldSet = it->second;
+  if (fieldSet.empty())
+    return true;
+
+  FieldStoreKey callSiteKey{callSiteStruct, callSiteFieldIdx};
+  if (fieldSet.count(callSiteKey))
+    return true;
+
+  SmallVector<FieldStoreKey, 16> work;
+  std::unordered_set<FieldStoreKey, FieldStoreKeyHash> seen;
+  work.push_back(callSiteKey);
+  seen.insert(callSiteKey);
+
+  constexpr size_t kMaxAliasVisits = 256;
+  size_t visits = 0;
+  while (!work.empty() && visits++ < kMaxAliasVisits) {
+    FieldStoreKey cur = work.pop_back_val();
+    auto aliasIt = fieldAliasMap.find(cur);
+    if (aliasIt == fieldAliasMap.end())
+      continue;
+    for (const auto &aliasKey : aliasIt->second) {
+      if (fieldSet.count(aliasKey))
+        return true;
+      if (seen.insert(aliasKey).second)
+        work.push_back(aliasKey);
+    }
+  }
+
+  return false;
+}
+
 void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
-  size_t directStores = 0, callbackStores = 0;
+  size_t directStores = 0, callbackStores = 0, copyAliases = 0;
+  auto addAggregateCopyAliases = [&](const Value *DstPtr, const Value *SrcPtr) {
+    std::string dstStruct, srcStruct;
+    unsigned dstField = 0, srcField = 0;
+    Type *dstFieldTy = nullptr;
+    Type *srcFieldTy = nullptr;
+
+    bool hasDst = getFieldKeyFromPointerOperand(DstPtr, dstStruct, dstField, dstFieldTy);
+    bool hasSrc = getFieldKeyFromPointerOperand(SrcPtr, srcStruct, srcField, srcFieldTy);
+    if (!hasDst && !hasSrc)
+      return;
+
+    auto addParentToNested = [&](const FieldStoreKey &parentKey, Type *fieldTy) {
+      auto *ST = dyn_cast_or_null<StructType>(fieldTy);
+      if (!ST || ST->isOpaque() || ST->isLiteral() || !ST->hasName())
+        return;
+      if (LLVM_STRING_STARTS_WITH(ST->getStructName(), "union"))
+        return;
+      std::string childStruct = stripStructNameSuffix(ST->getStructName()).str();
+      for (unsigned i = 0; i < ST->getNumElements(); i++) {
+        if (addFieldAlias(parentKey, {childStruct, i}))
+          copyAliases++;
+      }
+    };
+
+    if (hasDst && hasSrc && addFieldAlias({dstStruct, dstField}, {srcStruct, srcField}))
+      copyAliases++;
+    if (hasDst)
+      addParentToNested({dstStruct, dstField}, dstFieldTy);
+    if (hasSrc)
+      addParentToNested({srcStruct, srcField}, srcFieldTy);
+
+    auto *DstST = dyn_cast_or_null<StructType>(dstFieldTy);
+    auto *SrcST = dyn_cast_or_null<StructType>(srcFieldTy);
+    if (DstST && SrcST &&
+        !DstST->isOpaque() && !SrcST->isOpaque() &&
+        !DstST->isLiteral() && !SrcST->isLiteral() &&
+        DstST->hasName() && SrcST->hasName() &&
+        !LLVM_STRING_STARTS_WITH(DstST->getStructName(), "union") &&
+        !LLVM_STRING_STARTS_WITH(SrcST->getStructName(), "union") &&
+        isStructLayoutCompatible(DstST, SrcST)) {
+      std::string dstChild = stripStructNameSuffix(DstST->getStructName()).str();
+      std::string srcChild = stripStructNameSuffix(SrcST->getStructName()).str();
+      for (unsigned i = 0; i < DstST->getNumElements(); i++) {
+        if (addFieldAlias({dstChild, i}, {srcChild, i}))
+          copyAliases++;
+      }
+    }
+  };
 
   for (Function &F : *M) {
     if (F.isDeclaration() || F.isIntrinsic() || F.empty())
@@ -2110,10 +2609,25 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
         continue;
       }
 
+      if (auto *MTI = dyn_cast<MemTransferInst>(&*II)) {
+        addAggregateCopyAliases(MTI->getRawDest(), MTI->getRawSource());
+        continue;
+      }
+
       // Case 3: Function pointer passed as callback argument
       //   call @setter(%obj, @func) where setter stores param to struct field
       auto *CB = dyn_cast<CallBase>(&*II);
       if (!CB || CB->isInlineAsm()) continue;
+      if (Function *Callee = CB->getCalledFunction()) {
+        StringRef calleeName = Callee->getName();
+        if ((calleeName.startswith("llvm.memcpy.") ||
+             calleeName.startswith("llvm.memmove.") ||
+             calleeName == "memcpy" ||
+             calleeName == "memmove") &&
+            CB->arg_size() >= 2) {
+          addAggregateCopyAliases(CB->getArgOperand(0), CB->getArgOperand(1));
+        }
+      }
 
       for (unsigned i = 0; i < CB->arg_size(); i++) {
         auto *ArgFunc = dyn_cast<Function>(
@@ -2178,15 +2692,18 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
 
   CG_LOG("FieldStore IR [" << M->getModuleIdentifier() << "]: "
          << directStores << " direct, " << callbackStores << " callback, "
-         << funcFieldStores.size() << " functions total\n");
+         << copyAliases << " copy-aliases, "
+         << funcFieldStores.size() << " functions total, "
+         << fieldAliasMap.size() << " alias roots\n");
 }
 
-bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
+bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph,
+                                       const CallInstSet &indirectCalls) {
   // resolve indirect calls
   bool Changed = false;
   std::vector<NodeIndex> memberNodes;
   const bool useDense = CFLGlobalDedup && !origToDense.empty();
-  for (auto *CS : Ctx->IndirectCallInsts) {
+  for (auto *CS : indirectCalls) {
     CG_DEBUG("Handle indirect CallSite: " << *CS << " in function "
         << CS->getFunction()->getName() << "\n");
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
@@ -2209,13 +2726,7 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
     // Extract call-site struct field info: trace through LoadInst → GEP
     std::string callSiteStruct;
     unsigned callSiteFieldIdx = 0;
-    bool hasCallSiteField = false;
-    if (auto *Load = dyn_cast<LoadInst>(fptr)) {
-      Value *loadPtr = Load->getPointerOperand()->stripPointerCasts();
-      if (auto *GEP = dyn_cast<GEPOperator>(loadPtr)) {
-        hasCallSiteField = getGEPStructField(GEP, callSiteStruct, callSiteFieldIdx);
-      }
-    }
+    bool hasCallSiteField = getCallSiteFieldKey(fptr, callSiteStruct, callSiteFieldIdx);
 
     auto &cflSet = outputCFLGraph[fptrNode][EB.getLabelV()];
     CG_DEBUG("  fptr node " << fptrNode << " V-set size: " << cflSet.size() << "\n");
@@ -2259,25 +2770,31 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph) {
         // and we have positive evidence of which fields this function is
         // stored into, reject if none match.
         if (hasCallSiteField) {
-          auto it = funcFieldStores.find(CF);
-          if (it != funcFieldStores.end()) {
-            const auto &fieldSet = it->second;
-            if (fieldSet.find({callSiteStruct, callSiteFieldIdx}) == fieldSet.end()) {
-              CG_LOG("FieldFilter: reject " << CF->getName()
-                     << " for " << callSiteStruct << " field " << callSiteFieldIdx << "\n");
-              continue;
-            }
+          if (!fieldFilterAccepts(CF, callSiteStruct, callSiteFieldIdx)) {
+            CG_LOG("FieldFilter: reject " << CF->getName()
+                   << " for " << callSiteStruct << " field " << callSiteFieldIdx << "\n");
+            continue;
           }
-          // If function has no entries in funcFieldStores, keep it (conservative)
         }
         if (Ctx->Callees[CS].insert(CF).second) {
           // if new callee added, we need to rerun
           Changed = true;
-          CG_LOG("Handle indirect target: " << CF->getName() << "\n");
-          if (Ctx->ContainerFuncs.count(CF))
+          if (Ctx->AllocFuncs.count(CF)) {
+            Ctx->AllocSites.insert(CS);
+            NodeIndex callNode = getRepNodeForValue(CS);
+            assert(callNode != AndersNodeFactory::InvalidIndex &&
+                   "CallBase node not found for indirect allocator target");
+            AllocSites.insert(callNode);
+            NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
+            EB.addDereferenceEdges(callNode, heapObj);
+            CG_LOG("Handle indirect allocator target: " << CF->getName() << "\n");
+          } else if (Ctx->ContainerFuncs.count(CF)) {
+            CG_LOG("Handle indirect target: " << CF->getName() << " (container)\n");
             handleContainerCall(CS, CF);
-          else
+          } else {
+            CG_LOG("Handle indirect target: " << CF->getName() << "\n");
             handleCall(CS, CF);
+          }
         }
       }
     }
@@ -2474,13 +2991,29 @@ void CallGraphPass::globalDedupScanCallEdges(
     if (!singleCallsiteCallees.count(CF))
       continue;
 
-    // Merge pointer args: actual → formal
+    // Merge pointer args: fixed actual→formal, variadic tail→vararg node
     unsigned numArgs = CS->arg_size();
-    if (CF->isVarArg()) {
-      NodeIndex formalNode = NF.getVarargNodeFor(CF);
-      if (formalNode == AndersNodeFactory::InvalidIndex)
+    unsigned numFormals = CF->arg_size();
+    unsigned minArgs = std::min(numArgs, numFormals);
+    for (unsigned i = 0; i < minArgs; i++) {
+      Value *arg = CS->getArgOperand(i);
+      if (!arg->getType()->isPointerTy())
         continue;
-      for (unsigned i = 0; i < numArgs; i++) {
+      if (shouldSkipValue(arg))
+        continue;
+      NodeIndex argNode = NF.getValueNodeFor(arg);
+      if (argNode == AndersNodeFactory::InvalidIndex)
+        continue;
+      Value *farg = CF->getArg(i);
+      NodeIndex formalNode = NF.getValueNodeFor(farg);
+      if (formalNode != AndersNodeFactory::InvalidIndex)
+        globalUnion(argNode, formalNode);
+    }
+    if (CF->isVarArg()) {
+      NodeIndex varargNode = NF.getVarargNodeFor(CF);
+      if (varargNode == AndersNodeFactory::InvalidIndex)
+        continue;
+      for (unsigned i = numFormals; i < numArgs; i++) {
         Value *arg = CS->getArgOperand(i);
         if (!arg->getType()->isPointerTy())
           continue;
@@ -2488,24 +3021,7 @@ void CallGraphPass::globalDedupScanCallEdges(
           continue;
         NodeIndex argNode = NF.getValueNodeFor(arg);
         if (argNode != AndersNodeFactory::InvalidIndex)
-          globalUnion(argNode, formalNode);
-      }
-    } else {
-      unsigned numFormals = CF->arg_size();
-      unsigned minArgs = std::min(numArgs, numFormals);
-      for (unsigned i = 0; i < minArgs; i++) {
-        Value *arg = CS->getArgOperand(i);
-        if (!arg->getType()->isPointerTy())
-          continue;
-        if (shouldSkipValue(arg))
-          continue;
-        NodeIndex argNode = NF.getValueNodeFor(arg);
-        if (argNode == AndersNodeFactory::InvalidIndex)
-          continue;
-        Value *farg = CF->getArg(i);
-        NodeIndex formalNode = NF.getValueNodeFor(farg);
-        if (formalNode != AndersNodeFactory::InvalidIndex)
-          globalUnion(argNode, formalNode);
+          globalUnion(argNode, varargNode);
       }
     }
 
@@ -2707,63 +3223,134 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
     return;
   }
 
-  // Step 1: Build local dense mapping from this module's edge range
-  origToDense.assign(NF.getNumNodes(), UINT32_MAX);
-  denseToOrig.clear();
-  numDenseNodes = 0;
+  const CallInstSet *moduleIcalls = nullptr;
+  if (auto itIcalls = moduleIndirectCallInsts.find(M);
+      itIcalls != moduleIndirectCallInsts.end()) {
+    moduleIcalls = &itIcalls->second;
+  }
 
-  for (size_t i = edgeStart; i < edgeEnd; i++) {
-    const auto &E = allEdges[i];
-    if (origToDense[E.from] == UINT32_MAX) {
-      origToDense[E.from] = numDenseNodes;
-      denseToOrig.push_back(E.from);
-      numDenseNodes++;
+  // Per-TU fixed point:
+  // solve CFL -> resolve indirect calls in this TU -> append new call edges ->
+  // repeat until this TU contributes no new edges.
+  std::vector<size_t> tuEdgeIndices;
+  tuEdgeIndices.reserve((edgeEnd - edgeStart) + 256);
+  for (size_t i = edgeStart; i < edgeEnd; i++)
+    tuEdgeIndices.push_back(i);
+
+  constexpr size_t kMaxPerTUIterations = 32;
+  size_t perTUIter = 0;
+  std::unique_ptr<gracfl::SolverFWGramParallel> solver;
+
+  while (true) {
+    perTUIter++;
+    const auto &iterEdges = EB.getEdges();
+
+    // Step 1: Build local dense mapping from this TU's accumulated edge set.
+    origToDense.assign(NF.getNumNodes(), UINT32_MAX);
+    denseToOrig.clear();
+    numDenseNodes = 0;
+
+    for (size_t edgeIdx : tuEdgeIndices) {
+      assert(edgeIdx < iterEdges.size() &&
+             "solveAndCompressPerTU: edge index out of range");
+      const auto &E = iterEdges[edgeIdx];
+      if (origToDense[E.from] == UINT32_MAX) {
+        origToDense[E.from] = numDenseNodes;
+        denseToOrig.push_back(E.from);
+        numDenseNodes++;
+      }
+      if (origToDense[E.to] == UINT32_MAX) {
+        origToDense[E.to] = numDenseNodes;
+        denseToOrig.push_back(E.to);
+        numDenseNodes++;
+      }
     }
-    if (origToDense[E.to] == UINT32_MAX) {
-      origToDense[E.to] = numDenseNodes;
-      denseToOrig.push_back(E.to);
-      numDenseNodes++;
+
+    assert(numDenseNodes > 0 && "solveAndCompressPerTU: dense mapping produced 0 nodes");
+
+    // Remap + dedup edges to dense IDs
+    std::unordered_set<EdgeKey, EdgeKeyHash> seen;
+    seen.reserve(tuEdgeIndices.size());
+    denseEdges.clear();
+    denseEdges.reserve(tuEdgeIndices.size());
+    for (size_t edgeIdx : tuEdgeIndices) {
+      const auto &E = iterEdges[edgeIdx];
+      uint32_t from = origToDense[E.from];
+      uint32_t to = origToDense[E.to];
+      if (from == to)
+        continue;
+      EdgeKey key{from, to, E.label};
+      if (seen.insert(key).second)
+        denseEdges.emplace_back(from, to, E.label);
+    }
+
+    assert(!denseEdges.empty() && "solveAndCompressPerTU: no dense edges after remapping");
+
+    CG_LOG("Per-TU dense mapping [iter " << perTUIter << "]: "
+           << numDenseNodes << " nodes, "
+           << tuEdgeIndices.size() << " raw edges -> "
+           << denseEdges.size() << " dense edges\n");
+
+    // Step 2: Solve CFL for this iteration.
+    auto tSolve = std::chrono::steady_clock::now();
+    solver = std::make_unique<gracfl::SolverFWGramParallel>(
+        denseEdges, *EB.getGrammar(), cflThreads);
+    solver->runCFL();
+    CG_LOG("Per-TU CFL solve [iter " << perTUIter << "]: "
+           << solver->getEdgeCount() << " final edges\n");
+    CG_LOG("TIMER per-tu-cfl-solve [iter " << perTUIter << "] "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tSolve).count()
+           << " ms\n");
+
+    const auto &graph = solver->getReachability();
+    assert(!graph.empty() && "solveAndCompressPerTU: solver produced empty graph");
+    assert(graph[0].size() > EB.getLabelV() &&
+           "solveAndCompressPerTU: V label out of range");
+
+    // Keep allocator candidate/confirmed sets in sync in compositional mode.
+    // Per-TU dense mappings make this alloc-site-based check comparable to the
+    // monolithic detector, but we avoid mutating call edges here.
+    const bool perTUAllocUpdated = findCustomAllocators(graph, false);
+    if (perTUAllocUpdated) {
+      CG_LOG("Per-TU custom allocator detection [iter " << perTUIter
+             << "] updated allocator sets\n");
+    }
+
+    const size_t edgeCountBeforeResolve = iterEdges.size();
+    bool indirectChanged = false;
+    if (moduleIcalls && !moduleIcalls->empty())
+      indirectChanged = handleIndirectCall(graph, *moduleIcalls);
+    const auto &edgesAfterResolve = EB.getEdges();
+    const size_t edgeCountAfterResolve = edgesAfterResolve.size();
+    const size_t newEdges =
+        (edgeCountAfterResolve > edgeCountBeforeResolve)
+            ? (edgeCountAfterResolve - edgeCountBeforeResolve)
+            : 0;
+
+    if (newEdges > 0) {
+      tuEdgeIndices.reserve(tuEdgeIndices.size() + newEdges);
+      for (size_t i = edgeCountBeforeResolve; i < edgeCountAfterResolve; i++)
+        tuEdgeIndices.push_back(i);
+    }
+
+    CG_LOG("Per-TU iterate [" << M->getModuleIdentifier() << "] #" << perTUIter
+           << ": indirect-changed=" << (indirectChanged ? "yes" : "no")
+           << ", new-edges=" << newEdges << "\n");
+
+    if (newEdges == 0)
+      break;
+
+    if (perTUIter >= kMaxPerTUIterations) {
+      WARNING("Per-TU fixed point hit iteration cap (" << kMaxPerTUIterations
+              << ") for " << M->getModuleIdentifier()
+              << "; proceeding with current graph\n");
+      break;
     }
   }
 
-  assert(numDenseNodes > 0 && "solveAndCompressPerTU: dense mapping produced 0 nodes");
-
-  // Remap + dedup edges to dense IDs
-  std::unordered_set<EdgeKey, EdgeKeyHash> seen;
-  seen.reserve(edgeEnd - edgeStart);
-  denseEdges.clear();
-  denseEdges.reserve(edgeEnd - edgeStart);
-  for (size_t i = edgeStart; i < edgeEnd; i++) {
-    const auto &E = allEdges[i];
-    uint32_t from = origToDense[E.from];
-    uint32_t to = origToDense[E.to];
-    if (from == to) continue;
-    EdgeKey key{from, to, E.label};
-    if (seen.insert(key).second)
-      denseEdges.emplace_back(from, to, E.label);
-  }
-
-  assert(!denseEdges.empty() && "solveAndCompressPerTU: no dense edges after remapping");
-
-  CG_LOG("Per-TU dense mapping: " << numDenseNodes << " nodes, "
-         << (edgeEnd - edgeStart) << " raw edges -> "
-         << denseEdges.size() << " dense edges\n");
-
-  // Step 2: Solve CFL
-  auto tSolve = std::chrono::steady_clock::now();
-  auto solver = std::make_unique<gracfl::SolverFWGramParallel>(
-      denseEdges, *EB.getGrammar(), cflThreads);
-  solver->runCFL();
-  CG_LOG("Per-TU CFL solve: " << solver->getEdgeCount() << " final edges\n");
-  CG_LOG("TIMER per-tu-cfl-solve "
-         << std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - tSolve).count()
-         << " ms\n");
-
+  assert(solver && "solveAndCompressPerTU: solver not initialized");
   const auto &graph = solver->getReachability();
-  assert(!graph.empty() && "solveAndCompressPerTU: solver produced empty graph");
-  assert(graph[0].size() > EB.getLabelV() &&
-         "solveAndCompressPerTU: V label out of range");
 
   // Step 3: V-SCC compression for graph size reduction.
   // Field store map was already built from IR (buildFieldStoreMapFromIR)
@@ -2831,6 +3418,7 @@ bool CallGraphPass::doModulePass(Module *M) {
     // Track per-module edge ranges so repair mode can recompute selected modules.
     const bool perTUMode = CFLCompositional && CompressedGraphInputs.empty();
     const size_t edgeStart = EB.getEdges().size();
+    moduleDerefEdgeRoots.clear();
 
     for (auto &GV : M->globals()) {
       // Skip compiler-introduced globals
@@ -3047,7 +3635,7 @@ bool CallGraphPass::doModulePass(Module *M) {
     Changed |= allocatorRewritten;
 
     // parse results and update call edges
-    Changed |= handleIndirectCall(outputCFLGraph);
+    Changed |= handleIndirectCall(outputCFLGraph, Ctx->IndirectCallInsts);
 
     // Export compressed graph if requested
     if (!CompressedGraphOutput.empty())
@@ -3770,9 +4358,9 @@ void CallGraphPass::compressConstraintGraph(
   }
 
   // Step 2: Build symbol table from boundary nodes
-  // Functions with external linkage
+  // Functions (including local-linkage definitions)
   for (const auto &[guid, F] : Ctx->Funcs) {
-    if (!F || F->hasLocalLinkage())
+    if (!F)
       continue;
     std::string guidStr = std::to_string(guid);
 
@@ -3851,6 +4439,19 @@ void CallGraphPass::compressConstraintGraph(
     }
   }
 
+  // Local-linkage function return symbols (for compositional icall-ret summary).
+  for (const Function *F : Ctx->AddressTakenFuncs) {
+    if (!F || !F->hasLocalLinkage())
+      continue;
+    NodeIndex retNode = NF.getReturnNodeFor(F);
+    if (retNode == AndersNodeFactory::InvalidIndex)
+      continue;
+    uint32_t scc = origNodeToSCC(retNode);
+    if (scc == UINT32_MAX)
+      continue;
+    out.symbolTable[BoundarySymbol{"lret:" + getScopeName(F)}] = scc;
+  }
+
   // Global objects
   for (const auto &[guid, GV] : Ctx->Gobjs) {
     if (!GV)
@@ -3877,8 +4478,46 @@ void CallGraphPass::compressConstraintGraph(
     }
   }
 
-  // Indirect call fptr nodes as boundary symbols
+  // Canonical global-field pointer/deref nodes.
+  // These nodes are shared globally in monolithic mode (via canonicalized
+  // ConstantExpr GEP keys), but become disconnected across per-TU compressed
+  // graphs unless we expose them as boundary symbols.
+  size_t globFieldPtrAdded = 0;
+  size_t globFieldDerefAdded = 0;
+  const uint32_t nodeCount = useDense ? numDenseNodes : NF.getNumNodes();
+  for (uint32_t n = 0; n < nodeCount; n++) {
+    NodeIndex origIdx = useDense ? denseToOrig[n] : n;
+    const Value *V = NF.getValueForNode(origIdx);
+    if (!V)
+      continue;
+
+    std::string fieldKey;
+    if (!getGlobalFieldBoundaryKey(V, fieldKey))
+      continue;
+
+    uint32_t ptrSCC = (n < nodeToSCC.size()) ? nodeToSCC[n] : UINT32_MAX;
+    if (ptrSCC == UINT32_MAX)
+      continue;
+    out.symbolTable[BoundarySymbol{"gptr:" + fieldKey}] = ptrSCC;
+    globFieldPtrAdded++;
+
+    NodeIndex derefNode = NF.getDereferenceNodeFor(origIdx);
+    if (derefNode == AndersNodeFactory::InvalidIndex)
+      continue;
+    uint32_t derefSCC = origNodeToSCC(derefNode);
+    if (derefSCC == UINT32_MAX)
+      continue;
+    out.symbolTable[BoundarySymbol{"gderef:" + fieldKey}] = derefSCC;
+    globFieldDerefAdded++;
+  }
+  CG_LOG("Global-field boundary: gptr=" << globFieldPtrAdded
+         << ", gderef=" << globFieldDerefAdded << "\n");
+
+  // Indirect call nodes as boundary symbols
+  //   icall:<id>    -> function-pointer operand node
+  //   icallret:<id> -> call result value node (if pointer-typed and present)
   size_t icallTotal = 0, icallNoMD = 0, icallNoNode = 0, icallNoSCC = 0, icallAdded = 0;
+  size_t icallRetAdded = 0;
   for (auto *CS : Ctx->IndirectCallInsts) {
     icallTotal++;
     auto *MD = CS->getMetadata("ka.icall.id");
@@ -3892,15 +4531,25 @@ void CallGraphPass::compressConstraintGraph(
     if (scc == UINT32_MAX) { icallNoSCC++; continue; }
     out.symbolTable[BoundarySymbol{"icall:" + S->getString().str()}] = scc;
     icallAdded++;
+
+    if (containsPointerType(CS->getType())) {
+      NodeIndex retNode = NF.getValueNodeFor(CS);
+      if (retNode != AndersNodeFactory::InvalidIndex) {
+        uint32_t retSCC = origNodeToSCC(retNode);
+        if (retSCC != UINT32_MAX) {
+          out.symbolTable[BoundarySymbol{"icallret:" + S->getString().str()}] = retSCC;
+          icallRetAdded++;
+        }
+      }
+    }
   }
   CG_LOG("Icall boundary: total=" << icallTotal << " noMD=" << icallNoMD
          << " noNode=" << icallNoNode << " noSCC=" << icallNoSCC
-         << " added=" << icallAdded << "\n");
+         << " added=" << icallAdded
+         << " ret-added=" << icallRetAdded << "\n");
 
 
   // Step 3: Build funcNodes - scan all nodes for Function* values
-  const uint32_t nodeCount = useDense ? numDenseNodes
-                                      : NF.getNumNodes();
   for (uint32_t n = 0; n < nodeCount; n++) {
     NodeIndex origIdx = useDense ? denseToOrig[n] : n;
     const Value *V = NF.getValueForNode(origIdx);
@@ -4753,111 +5402,206 @@ bool CallGraphPass::runCompositionalSolve() {
   }
 
   std::unordered_map<std::string, uint32_t> icallSymbolToDense;
+  std::unordered_map<std::string, uint32_t> icallRetSymbolToDense;
   for (const auto &[symbol, occurrences] : symbolOccurrences) {
-    if (symbol.compare(0, 6, "icall:") != 0)
-      continue;
-    icallSymbolToDense[symbol] = unifiedToDense[ufFind(occurrences[0].second)];
+    uint32_t dense = unifiedToDense[ufFind(occurrences[0].second)];
+    if (symbol.compare(0, 6, "icall:") == 0)
+      icallSymbolToDense[symbol] = dense;
+    else if (symbol.compare(0, 9, "icallret:") == 0)
+      icallRetSymbolToDense[symbol] = dense;
   }
-  CG_LOG("Composed icall symbols: " << icallSymbolToDense.size() << "\n");
+  CG_LOG("Composed icall symbols: " << icallSymbolToDense.size()
+         << ", icallret symbols: " << icallRetSymbolToDense.size() << "\n");
+
+  auto getRetDenseForFunc = [&](const Function *F, uint32_t &retDense) -> bool {
+    std::string retSym = "ret:" + std::to_string(F->getGUID());
+    auto itDense = composedSymbolToDense.find(retSym);
+    if (itDense != composedSymbolToDense.end()) {
+      retDense = itDense->second;
+      return retDense < numDense;
+    }
+
+    // Local-linkage target fallback: use scoped local-return symbol.
+    std::string lretSym = "lret:" + getScopeName(F);
+    auto itDenseLocal = composedSymbolToDense.find(lretSym);
+    if (itDenseLocal == composedSymbolToDense.end())
+      return false;
+    retDense = itDenseLocal->second;
+    return retDense < numDense;
+  };
+
+  const uint32_t labelAssign = EB.getLabelAssign();
+  const uint32_t labelAssignInv = EB.getLabelAssignInv();
 
   size_t resolvedCalls = 0;
   size_t totalTargets = 0;
   size_t skippedNoSymbol = 0;
+  size_t newCalleePairs = 0;
+  size_t newSummaryEdges = 0;
 
-  for (auto *CS : Ctx->IndirectCallInsts) {
-    auto *MD = CS->getMetadata("ka.icall.id");
-    if (!MD) continue;
-    auto *S = dyn_cast<MDString>(MD->getOperand(0));
-    if (!S) continue;
-    std::string icallKey = "icall:" + S->getString().str();
+  constexpr size_t kMaxCompIterations = 8;
+  for (size_t iterNo = 1; iterNo <= kMaxCompIterations; iterNo++) {
+    const auto &iterGraph = composedSolver->getReachability();
+    size_t iterResolvedCalls = 0;
+    size_t iterTotalTargets = 0;
+    size_t iterSkippedNoSymbol = 0;
+    size_t iterNewCalleePairs = 0;
+    size_t iterNewSummaryEdges = 0;
 
-    auto symIt = icallSymbolToDense.find(icallKey);
-    if (symIt == icallSymbolToDense.end()) {
-      skippedNoSymbol++;
-      continue;
-    }
-    uint32_t denseNode = symIt->second;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      auto *MD = CS->getMetadata("ka.icall.id");
+      if (!MD) continue;
+      auto *S = dyn_cast<MDString>(MD->getOperand(0));
+      if (!S) continue;
+      std::string idStr = S->getString().str();
+      std::string icallKey = "icall:" + idStr;
+      std::string icallRetKey = "icallret:" + idStr;
 
-    if (denseNode >= composedGraph.size())
-      continue;
+      auto symIt = icallSymbolToDense.find(icallKey);
+      if (symIt == icallSymbolToDense.end()) {
+        iterSkippedNoSymbol++;
+        continue;
+      }
+      uint32_t denseNode = symIt->second;
+      if (denseNode >= iterGraph.size())
+        continue;
 
-    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
-    std::string callSiteStruct;
-    unsigned callSiteFieldIdx = 0;
-    bool hasCallSiteField = false;
-    if (auto *Load = dyn_cast<LoadInst>(fptr)) {
-      Value *loadPtr = Load->getPointerOperand()->stripPointerCasts();
-      if (auto *GEP = dyn_cast<GEPOperator>(loadPtr))
-        hasCallSiteField = getGEPStructField(GEP, callSiteStruct, callSiteFieldIdx);
-    }
+      Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      std::string callSiteStruct;
+      unsigned callSiteFieldIdx = 0;
+      bool hasCallSiteField = getCallSiteFieldKey(fptr, callSiteStruct, callSiteFieldIdx);
 
-    const auto &VSet = composedGraph[denseNode][LabelV];
-    size_t vWithFunc = 0;
-    for (uint32_t t : VSet)
-      if (denseToFuncNames.count(t)) vWithFunc++;
-    bool selfHasFunc = denseToFuncNames.count(denseNode) > 0;
-    CG_DEBUG("Icall " << icallKey << " dense=" << denseNode
-             << " VSet=" << VSet.size()
-             << " withFunc=" << vWithFunc
-             << " selfFunc=" << selfHasFunc << "\n");
-    if (VSet.size() <= 10) {
-      for (uint32_t t : VSet) {
-        auto fn = denseToFuncNames.find(t);
-        if (fn != denseToFuncNames.end()) {
-          for (const auto &n : fn->second)
-            CG_DEBUG("  VSet[" << t << "] -> " << n << "\n");
-        } else {
-          CG_DEBUG("  VSet[" << t << "] (no func)\n");
+      const auto &VSet = iterGraph[denseNode][LabelV];
+      size_t vWithFunc = 0;
+      for (uint32_t t : VSet)
+        if (denseToFuncNames.count(t)) vWithFunc++;
+      bool selfHasFunc = denseToFuncNames.count(denseNode) > 0;
+      CG_DEBUG("Icall " << icallKey << " dense=" << denseNode
+               << " VSet=" << VSet.size()
+               << " withFunc=" << vWithFunc
+               << " selfFunc=" << selfHasFunc << "\n");
+      if (VSet.size() <= 10) {
+        for (uint32_t t : VSet) {
+          auto fn = denseToFuncNames.find(t);
+          if (fn != denseToFuncNames.end()) {
+            for (const auto &n : fn->second)
+              CG_DEBUG("  VSet[" << t << "] -> " << n << "\n");
+          } else {
+            CG_DEBUG("  VSet[" << t << "] (no func)\n");
+          }
         }
       }
-    }
-    if (selfHasFunc) {
-      for (const auto &n : denseToFuncNames.at(denseNode))
-        CG_DEBUG("  Self[" << denseNode << "] -> " << n << "\n");
-    }
+      if (selfHasFunc) {
+        for (const auto &n : denseToFuncNames.at(denseNode))
+          CG_DEBUG("  Self[" << denseNode << "] -> " << n << "\n");
+      }
 
-    FuncSet targets;
-    auto resolveCandidate = [&](uint32_t target) {
-      auto fnIt = denseToFuncNames.find(target);
-      if (fnIt == denseToFuncNames.end())
-        return;
-      for (const auto &funcName : fnIt->second) {
-        auto fIt = nameToFunc.find(funcName);
-        if (fIt == nameToFunc.end())
-          continue;
-        Function *F = fIt->second;
-        if (!isCompatible(CS, F))
-          continue;
-        if (hasCallSiteField) {
-          auto fsIt = funcFieldStores.find(F);
-          if (fsIt != funcFieldStores.end()) {
-            if (fsIt->second.find({callSiteStruct, callSiteFieldIdx})
-                == fsIt->second.end()) {
+      FuncSet targets;
+      auto resolveCandidate = [&](uint32_t target) {
+        auto fnIt = denseToFuncNames.find(target);
+        if (fnIt == denseToFuncNames.end())
+          return;
+        for (const auto &funcName : fnIt->second) {
+          auto fIt = nameToFunc.find(funcName);
+          if (fIt == nameToFunc.end())
+            continue;
+          Function *F = fIt->second;
+          if (!isCompatible(CS, F))
+            continue;
+          if (hasCallSiteField) {
+            if (!fieldFilterAccepts(F, callSiteStruct, callSiteFieldIdx)) {
               CG_LOG("FieldFilter: reject " << F->getName()
                      << " for " << callSiteStruct << " field "
                      << callSiteFieldIdx << "\n");
               continue;
             }
           }
+          targets.insert(F);
         }
-        targets.insert(F);
+      };
+
+      resolveCandidate(denseNode);
+      for (uint32_t target : VSet)
+        resolveCandidate(target);
+
+      if (!targets.empty()) {
+        iterResolvedCalls++;
+        iterTotalTargets += targets.size();
       }
-    };
 
-    resolveCandidate(denseNode);
-    for (uint32_t target : VSet)
-      resolveCandidate(target);
+      for (const Function *F : targets) {
+        if (Ctx->Callees[CS].insert(F).second)
+          iterNewCalleePairs++;
+      }
 
-    if (!targets.empty()) {
-      Ctx->Callees[CS].insert(targets.begin(), targets.end());
-      resolvedCalls++;
-      totalTargets += targets.size();
+      auto retIt = icallRetSymbolToDense.find(icallRetKey);
+      if (retIt == icallRetSymbolToDense.end())
+        continue;
+      uint32_t icallRetDense = retIt->second;
+      if (icallRetDense >= numDense)
+        continue;
+
+      for (const Function *F : targets) {
+        if (!F->getReturnType()->isPointerTy())
+          continue;
+        uint32_t calleeRetDense = UINT32_MAX;
+        if (!getRetDenseForFunc(F, calleeRetDense)) {
+          CG_DEBUG("No composed ret symbol for target " << F->getName()
+                   << " at " << icallKey << "\n");
+          continue;
+        }
+        EdgeKey keyFwd{calleeRetDense, icallRetDense, labelAssign};
+        if (edgeSeen.insert(keyFwd).second) {
+          combinedEdges.emplace_back(calleeRetDense, icallRetDense, labelAssign);
+          iterNewSummaryEdges++;
+        }
+        EdgeKey keyRev{icallRetDense, calleeRetDense, labelAssignInv};
+        if (edgeSeen.insert(keyRev).second) {
+          combinedEdges.emplace_back(icallRetDense, calleeRetDense, labelAssignInv);
+          iterNewSummaryEdges++;
+        }
+      }
     }
+
+    resolvedCalls += iterResolvedCalls;
+    totalTargets += iterTotalTargets;
+    skippedNoSymbol += iterSkippedNoSymbol;
+    newCalleePairs += iterNewCalleePairs;
+    newSummaryEdges += iterNewSummaryEdges;
+
+    CG_LOG("Compositional iterate #" << iterNo
+           << ": resolved-calls=" << iterResolvedCalls
+           << ", total-targets=" << iterTotalTargets
+           << ", new-callee-pairs=" << iterNewCalleePairs
+           << ", new-summary-edges=" << iterNewSummaryEdges
+           << ", skipped-no-symbol=" << iterSkippedNoSymbol << "\n");
+
+    if (iterNewSummaryEdges == 0)
+      break;
+
+    auto tIterSolve = std::chrono::steady_clock::now();
+    auto nextSolver = std::make_unique<gracfl::SolverFWGramParallel>(
+        combinedEdges, *EB.getGrammar(), cflThreads);
+    nextSolver->runCFL();
+    composedSolver = std::move(nextSolver);
+    CG_LOG("TIMER comp-iter-solve #" << iterNo << " "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tIterSolve).count()
+           << " ms, final edges=" << composedSolver->getEdgeCount() << "\n");
   }
 
   CG_LOG("Compositional solve: resolved " << resolvedCalls
-         << " indirect calls with " << totalTargets << " total targets"
+         << " indirect-call observations with " << totalTargets
+         << " total targets, " << newCalleePairs << " new callee pairs, "
+         << newSummaryEdges << " new summary edges"
          << " (skipped " << skippedNoSymbol << " without symbol)\n");
+
+  const auto &finalComposedGraph = composedSolver->getReachability();
+  const bool allocatorUpdated =
+      findCustomAllocatorsComposed(finalComposedGraph, composedSymbolToDense);
+  if (allocatorUpdated) {
+    CG_LOG("Compositional solve: custom allocator candidates updated\n");
+  }
 
   return true;
 }

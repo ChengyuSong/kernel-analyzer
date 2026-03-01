@@ -55,6 +55,13 @@ private:
   friend class InstHandler;
 
   using cfl_result_t = gracfl::ReachabilityMatrix;
+  // Field-store tracking for struct-field-aware indirect call filtering
+  using FieldStoreKey = std::pair<std::string, unsigned>;
+  struct FieldStoreKeyHash {
+    size_t operator()(const FieldStoreKey &k) const {
+      return std::hash<std::string>()(k.first) ^ (std::hash<unsigned>()(k.second) << 16);
+    }
+  };
 
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
@@ -71,10 +78,28 @@ private:
 
   static bool getGEPStructField(const llvm::GEPOperator *GEP,
                                  std::string &structName, unsigned &fieldIdx);
+  bool getGlobalFieldBoundaryKey(const llvm::Value *V,
+                                 std::string &key) const;
+  bool getCallSiteFieldKey(const llvm::Value *FPtr,
+                           std::string &structName,
+                           unsigned &fieldIdx) const;
+  bool getFieldKeyFromPointerOperand(const llvm::Value *Ptr,
+                                     std::string &structName,
+                                     unsigned &fieldIdx,
+                                     llvm::Type *&fieldTy) const;
   void buildFieldStoreMapFromIR(llvm::Module *M);
+  bool addFieldAlias(const FieldStoreKey &A, const FieldStoreKey &B);
+  bool fieldFilterAccepts(const llvm::Function *F,
+                          const std::string &callSiteStruct,
+                          unsigned callSiteFieldIdx) const;
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
-  bool findCustomAllocators(const cfl_result_t &outputCFLGraph);
-  bool handleIndirectCall(const cfl_result_t &outputCFLGraph);
+  bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
+                            bool rewriteEdges = true);
+  bool findCustomAllocatorsComposed(
+      const cfl_result_t &composedGraph,
+      const std::unordered_map<std::string, uint32_t> &symbolToDense);
+  bool handleIndirectCall(const cfl_result_t &outputCFLGraph,
+                          const CallInstSet &indirectCalls);
   void collectLocalAllocaSummaries(const llvm::Function *F);
   bool isSummarizableAlloca(const llvm::AllocaInst *AI) const;
   bool resolveSummarizedAllocaSlot(const llvm::Value *Ptr, NodeIndex &slotRep);
@@ -117,6 +142,7 @@ private:
   std::vector<CompressedGraphData> perTUGraphs;
   void solveAndCompressPerTU(llvm::Module *M, size_t edgeStart, size_t edgeEnd);
   std::unordered_map<llvm::Module *, std::pair<size_t, size_t>> moduleEdgeRanges;
+  llvm::DenseMap<const llvm::Module *, CallInstSet> moduleIndirectCallInsts;
 
   // Compositional solve results (for V-snapshot export)
   std::unique_ptr<gracfl::SolverFWGramParallel> composedSolver;
@@ -135,6 +161,7 @@ private:
   std::unordered_set<NodeIndex> localSummarizedAllocaSlots;
   std::unordered_map<NodeIndex, std::vector<NodeIndex>> localAllocaStoreVals;
   std::unordered_map<NodeIndex, std::vector<NodeIndex>> localAllocaLoadVals;
+  std::unordered_set<NodeIndex> moduleDerefEdgeRoots;
 
   unsigned iteration;
 
@@ -148,15 +175,11 @@ private:
   void collectIFuncTargets(const llvm::GlobalIFunc *IF);
   void processCtorsDtors(llvm::Module *M);
 
-  // Field-store tracking for struct-field-aware indirect call filtering
-  using FieldStoreKey = std::pair<std::string, unsigned>;
-  struct FieldStoreKeyHash {
-    size_t operator()(const FieldStoreKey &k) const {
-      return std::hash<std::string>()(k.first) ^ (std::hash<unsigned>()(k.second) << 16);
-    }
-  };
   std::unordered_map<const llvm::Function*,
                      std::unordered_set<FieldStoreKey, FieldStoreKeyHash>> funcFieldStores;
+  std::unordered_map<FieldStoreKey,
+                     std::unordered_set<FieldStoreKey, FieldStoreKeyHash>,
+                     FieldStoreKeyHash> fieldAliasMap;
 
 public:
   CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_ = nullptr);

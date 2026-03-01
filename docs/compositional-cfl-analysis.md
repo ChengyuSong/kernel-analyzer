@@ -88,6 +88,9 @@ add extra facts.
 1. **Boundary completeness.** Every cross-TU interaction that can participate in
    CFL derivations crosses one of the exported boundary categories:
    `func/arg/ret/vararg/glob/icall`.
+   Additional precision symbols (`icallret`, `lret`, `gptr`, `gderef`) may be
+   exported and improve convergence/precision but are not required by the
+   minimal soundness argument above.
 2. **Symbol consistency.** If two TU-local nodes denote the same program-level
    boundary entity, they receive the same boundary symbol.
 3. **Per-TU edge preservation.** Per-TU compressed graphs preserve all TU-local
@@ -257,12 +260,16 @@ Level 2: Per-TU compression (inside doModulePass, after Level 1)
   1. Build field store map from IR uses           (buildFieldStoreMapFromIR)
   2. Build local dense mapping for the TU's edges
   3. Solve CFL on the per-TU dense graph          (SolverFWGramParallel)
-  4. Compute V-SCCs from solved V-reachability    (computeVSCC)
-  5. Compress: remap edges through V-SCC, deduplicate, build symbol
+  4. Resolve indirect calls for this TU and append new call edges
+     until TU-local fixed point                    (handleIndirectCall loop)
+  5. Compute V-SCCs from solved V-reachability    (computeVSCC)
+  6. Compress: remap edges through V-SCC, deduplicate, build symbol
      table and funcNodes metadata                 (compressConstraintGraph)
-  5b. Add self-loop edges (a/-a/d/-d) for multi-node V-SCCs to preserve
+  6b. Add self-loop edges (a/-a/d/-d) for multi-node V-SCCs to preserve
       intra-SCC grammar derivability for composition
-  6. Store compressed graph in memory              (perTUGraphs)
+  6c. Export optional precision symbols:
+      `icallret`, `lret`, `gptr`, `gderef`
+  7. Store compressed graph in memory              (perTUGraphs)
   Optional: serialize to .cflcg file              (exportCompressedGraph)
 
 Level 3: Whole-program composition (--cfl-compositional)
@@ -276,6 +283,9 @@ Level 3: Whole-program composition (--cfl-compositional)
   8. Build reverse map: dense node -> function names (denseToFuncNames)
   9. Resolve indirect calls using composed V-reachability with
      type-compatibility and field-store filtering (funcFieldStores)
+ 10. Add composed summary edges `ret(target)->icallret(callsite)` and
+     iterate composed solve until no new summary edges
+ 11. Run composed custom allocator confirmation using return-node aliasing
 ```
 
 ## Boundary nodes and symbol table
@@ -291,6 +301,21 @@ table maps boundary symbol strings to compressed (V-SCC) node IDs:
 | `vararg:`  | `vararg:<GUID>`               | Vararg nodes          |
 | `glob:`    | `glob:<GUID>`                 | `Ctx->Gobjs/ExtGobjs` |
 | `icall:`   | `icall:<icallID>`             | Indirect call fptrs   |
+| `icallret:`| `icallret:<icallID>`          | Indirect call results |
+| `lret:`    | `lret:<scopedFuncName>`       | Local-linkage returns |
+| `gptr:`    | `gptr:globfield:<GUID>:<idx>` | Canonical global-field ptr nodes |
+| `gderef:`  | `gderef:globfield:<GUID>:<idx>` | Canonical global-field deref nodes |
+
+Purpose of extra precision symbols:
+
+- `icallret:` anchors indirect-call result nodes so composed summary edges
+  `ret(target) -> icallret(callsite)` can be added and iterated.
+- `lret:` exposes return nodes for local-linkage targets that do not have a
+  reusable external `ret:<GUID>` path in composed inputs.
+- `gptr:` exposes canonical constant-GEP global-field pointer nodes for
+  cross-TU union-find merging.
+- `gderef:` exposes corresponding global-field dereference nodes so cross-TU
+  memory-flow paths through shared globals remain connected after compression.
 
 GUIDs are numeric identifiers derived from symbol names. The `icall:` prefix
 uses deterministic IDs attached as `ka.icall.id` LLVM metadata during
@@ -308,6 +333,12 @@ After composition and CFL re-solve, indirect calls are resolved by:
 3. Mapping V-reachable nodes to function names via `denseToFuncNames`
 4. Filtering candidates by type-compatibility (`isCompatible`)
 5. Filtering by struct-field-aware field store map (`funcFieldStores`)
+
+Callsite field keys are extracted from the fptr load operand. For the common
+pattern `load ptr, ptr gep(..., field)` where the GEP points to a nested struct
+value (no explicit trailing `, 0`), the key is refined to nested field `0` so
+callbacks in struct method tables (e.g., `sqlite3_mem_methods`) are
+distinguished by slot.
 
 ### IR-based field store map
 
@@ -342,6 +373,71 @@ The map (`funcFieldStores`) is built directly from LLVM IR during
 Level 3 composition loads all TU bitcode files, cross-TU callback tracing
 works naturally — `getFuncDef` resolves declarations to definitions across TU
 boundaries. No metadata serialization or CFL V-reachability is needed.
+
+The field filter is alias-expanded using aggregate-copy aliases discovered from
+`memcpy/memmove` on struct fields (`fieldAliasMap`), which prevents false
+rejections when method tables are copied through parent structs.
+
+## Bug fix: compositional sqlite allocator promotion
+
+The sqlite reduced repro (`main.bc + malloc.bc + mem1.bc`) exposed several
+composition-specific gaps that blocked confirmation of `sqlite3Malloc`.
+
+### 1) Missing cross-TU connectivity for canonical global-field nodes
+
+Canonical constant-GEP nodes (e.g., `@sqlite3Config` field pointers) can exist
+in multiple TUs, but without boundary symbols they stay disconnected after
+per-TU compression. Added boundary symbols for:
+
+- `gptr:globfield:<GUID>:<field>`
+- `gderef:globfield:<GUID>:<field>`
+
+This allows union-find composition to merge shared global-field flow roots.
+
+### 2) Per-TU edge slices dropped ptr<->deref edges for reused canonical nodes
+
+When a canonical deref node already existed from an earlier TU, later TUs could
+reuse it without re-emitting ptr<->deref constraints in that TU's edge range.
+Added per-module deref-edge re-emission (once per canonical ptr per module),
+so each TU compressed graph keeps local memory edge context.
+
+### 3) Composed summary-edge growth for indirect-call returns
+
+Composed solve now iterates:
+
+- resolve icall targets from composed V,
+- add `ret(target) -> icallret(callsite)` (+ inverse assign) edges,
+- re-solve CFL,
+- repeat until no new summary edges.
+
+This lets return flow discovered through indirect targets feed later facts.
+
+### 4) Local-linkage return symbols for composed summaries
+
+Static/internal indirect targets may not have reusable external `ret:<GUID>`
+symbols in cache combinations. Added `lret:<scopedFuncName>` for local
+address-taken functions and fallback lookup in composed summary building and
+composed allocator confirmation.
+
+### 5) Allocsite short-circuit previously hid known allocator return flow
+
+Treating known allocator calls as explicit allocsites is useful, but it
+removed/avoided call-return propagation needed by composed allocator promotion.
+Allocator call handling now also preserves `ret(callee) -> call-result` edges,
+so known allocator return nodes remain visible in composed alias checks.
+
+### 6) GUID-based ret lookup robustness
+
+Composed return symbol lookup now uses `F->getGUID()` directly (plus `lret`
+fallback), avoiding brittle `Function*` identity assumptions across
+declaration/definition objects.
+
+### Outcome
+
+In compositional mode, seeded candidate `sqlite3Malloc` is now promoted:
+
+- before: `{"candidates":["sqlite3Malloc"],"confirmed":["malloc"]}`
+- after:  `{"candidates":[],"confirmed":["malloc","sqlite3Malloc"]}`
 
 **Design rationale**: the previous CFL-based approach (`buildFieldStoreMap`)
 queried V-reachability from store-site value nodes to discover which functions
@@ -439,6 +535,10 @@ inputs before composition:
 5. Boundary sanity: required boundary classes
    (`func/arg/ret/vararg/glob/icall`) must be present when expected from
    active IR/CFL boundary nodes.
+
+Optional precision classes (`icallret`, `lret`, `gptr`, `gderef`) are not
+strictly required by this check, but strongly improve composed precision and
+allocator confirmation behavior.
 
 On mismatch, diagnostics explicitly list:
 

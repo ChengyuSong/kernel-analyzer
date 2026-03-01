@@ -1,7 +1,0 @@
-{"plugins": [],
- "package": "compositional-cfl-proof",
- "options": {},
- "name": "CompositionalCFL.Core",
- "isModule": false,
- "importArts": {},
- "dynlibs": []}

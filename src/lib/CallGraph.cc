@@ -428,12 +428,14 @@ static bool containsPointerType(Type *T) {
   return containsPointerTypeImpl(T, Seen);
 }
 
-static bool isLoweredVAListType(Type *T) {
+static bool isLoweredVAListTypeImpl(Type *T, SmallPtrSetImpl<Type *> &Seen) {
   if (!T)
+    return false;
+  if (!Seen.insert(T).second)
     return false;
 
   if (auto *AT = dyn_cast<ArrayType>(T))
-    return isLoweredVAListType(AT->getElementType());
+    return isLoweredVAListTypeImpl(AT->getElementType(), Seen);
   if (auto *ST = dyn_cast<StructType>(T)) {
     if (ST->hasName()) {
       StringRef N = ST->getName();
@@ -443,11 +445,16 @@ static bool isLoweredVAListType(Type *T) {
     if (ST->isOpaque())
       return false;
     for (Type *ElemTy : ST->elements()) {
-      if (isLoweredVAListType(ElemTy))
+      if (isLoweredVAListTypeImpl(ElemTy, Seen))
         return true;
     }
   }
   return false;
+}
+
+static bool isLoweredVAListType(Type *T) {
+  SmallPtrSet<Type *, 16> Seen;
+  return isLoweredVAListTypeImpl(T, Seen);
 }
 
 static bool derivesFromLoweredVAListImpl(const Value *V,
@@ -455,10 +462,11 @@ static bool derivesFromLoweredVAListImpl(const Value *V,
                                          unsigned Depth) {
   if (!V || Depth > 64)
     return false;
-  if (!Seen.insert(V).second)
-    return false;
 
   V = V->stripPointerCasts();
+
+  if (!Seen.insert(V).second)
+    return false;
 
   if (const auto *AI = dyn_cast<AllocaInst>(V))
     return isLoweredVAListType(AI->getAllocatedType());
@@ -2229,94 +2237,6 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph,
   bool foundNewAlloc = false;
   FuncSet newAllocFuncs;
   std::vector<NodeIndex> memberNodes;
-#if 0
-  DenseMap<const Function *, bool> returnsFromCallCache;
-  auto returnsFromCallLikeAllocator = [&](const Function *Cand) -> bool {
-    auto it = returnsFromCallCache.find(Cand);
-    if (it != returnsFromCallCache.end())
-      return it->second;
-
-    bool found = false;
-    SmallVector<const Value *, 32> work;
-    SmallPtrSet<const Value *, 32> seen;
-    size_t steps = 0;
-    constexpr size_t kMaxSteps = 4096;
-
-    auto pushValue = [&](const Value *V) {
-      if (!V)
-        return;
-      work.push_back(V->stripPointerCasts());
-    };
-
-    for (const BasicBlock &BB : *Cand) {
-      if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
-        if (const Value *RV = RI->getReturnValue()) {
-          if (containsPointerType(RV->getType()))
-            pushValue(RV);
-        }
-      }
-    }
-
-    while (!work.empty() && steps++ < kMaxSteps) {
-      const Value *V = work.pop_back_val();
-      if (!seen.insert(V).second)
-        continue;
-      if (!containsPointerType(V->getType()))
-        continue;
-
-      if (isa<CallBase>(V)) {
-        found = true;
-        break;
-      }
-      if (isa<ConstantPointerNull>(V))
-        continue;
-
-      if (const auto *PN = dyn_cast<PHINode>(V)) {
-        for (const Value *Incoming : PN->incoming_values())
-          pushValue(Incoming);
-        continue;
-      }
-      if (const auto *SI = dyn_cast<SelectInst>(V)) {
-        pushValue(SI->getTrueValue());
-        pushValue(SI->getFalseValue());
-        continue;
-      }
-      if (const auto *LI = dyn_cast<LoadInst>(V)) {
-        const Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
-        if (const auto *AI = dyn_cast<AllocaInst>(Ptr)) {
-          for (const User *U : AI->users()) {
-            const auto *Store = dyn_cast<StoreInst>(U);
-            if (!Store)
-              continue;
-            if (Store->getPointerOperand()->stripPointerCasts() == AI)
-              pushValue(Store->getValueOperand());
-          }
-        }
-        continue;
-      }
-      if (const auto *BC = dyn_cast<BitCastOperator>(V)) {
-        pushValue(BC->getOperand(0));
-        continue;
-      }
-      if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
-        pushValue(GEP->getPointerOperand());
-        continue;
-      }
-      if (const auto *Arg = dyn_cast<Argument>(V)) {
-        if (Arg->getParent() == Cand)
-          continue;
-      }
-    }
-
-    returnsFromCallCache[Cand] = found;
-    return found;
-  };
-#else
-  auto returnsFromCallLikeAllocator = [&](const Function *Cand) -> bool {
-    (void)Cand;
-    return false;
-  };
-#endif
   const bool useDense = CFLGlobalDedup && !origToDense.empty();
   for (auto *F : Ctx->CandidateAllocFuncs) {
     // get return value
@@ -2346,12 +2266,6 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph,
           reachesAllocSite = true;
           break;
         }
-      }
-      if (!reachesAllocSite && !rewriteEdges &&
-          returnsFromCallLikeAllocator(F)) {
-        reachesAllocSite = true;
-        CG_LOG("Custom allocator " << F->getName()
-               << " confirmed by compositional call-return heuristic\n");
       }
       if (reachesAllocSite) {
         // if return value is from a known allocation site
@@ -2393,6 +2307,25 @@ bool CallGraphPass::findCustomAllocators(const cfl_result_t &outputCFLGraph,
   return foundNewAlloc;
 }
 
+bool CallGraphPass::lookupRetDense(
+    const Function *F,
+    const std::unordered_map<std::string, uint32_t> &symMap,
+    uint32_t graphSize, uint32_t &retDense) const {
+  std::string retSym = "ret:" + std::to_string(F->getGUID());
+  auto itDense = symMap.find(retSym);
+  if (itDense != symMap.end() && itDense->second < graphSize) {
+    retDense = itDense->second;
+    return true;
+  }
+
+  std::string lretSym = "lret:" + getScopeName(F);
+  auto itDenseLocal = symMap.find(lretSym);
+  if (itDenseLocal == symMap.end() || itDenseLocal->second >= graphSize)
+    return false;
+  retDense = itDenseLocal->second;
+  return true;
+}
+
 bool CallGraphPass::findCustomAllocatorsComposed(
     const cfl_result_t &composedGraph,
     const std::unordered_map<std::string, uint32_t> &symbolToDense) {
@@ -2405,27 +2338,13 @@ bool CallGraphPass::findCustomAllocatorsComposed(
     return false;
   }
 
-  auto getRetDense = [&](const Function *F, uint32_t &retDense) -> bool {
-    std::string retSym = "ret:" + std::to_string(F->getGUID());
-    auto itDense = symbolToDense.find(retSym);
-    if (itDense != symbolToDense.end() && itDense->second < composedGraph.size()) {
-      retDense = itDense->second;
-      return true;
-    }
-
-    std::string lretSym = "lret:" + getScopeName(F);
-    auto itDenseLocal = symbolToDense.find(lretSym);
-    if (itDenseLocal == symbolToDense.end() || itDenseLocal->second >= composedGraph.size())
-      return false;
-    retDense = itDenseLocal->second;
-    return true;
-  };
+  const uint32_t graphSize = composedGraph.size();
 
   std::unordered_set<uint32_t> knownAllocRetNodes;
   knownAllocRetNodes.reserve(Ctx->AllocFuncs.size() * 2 + 1);
   for (const Function *F : Ctx->AllocFuncs) {
     uint32_t retDense = UINT32_MAX;
-    if (getRetDense(F, retDense)) {
+    if (lookupRetDense(F, symbolToDense, graphSize, retDense)) {
       knownAllocRetNodes.insert(retDense);
       CG_DEBUG("Known allocator ret node: " << F->getName()
                << " -> " << retDense << "\n");
@@ -2441,7 +2360,7 @@ bool CallGraphPass::findCustomAllocatorsComposed(
     FuncSet newlyConfirmed;
     for (const Function *F : Ctx->CandidateAllocFuncs) {
       uint32_t candRetDense = UINT32_MAX;
-      if (!getRetDense(F, candRetDense)) {
+      if (!lookupRetDense(F, symbolToDense, graphSize, candRetDense)) {
         CG_DEBUG("Candidate allocator ret node missing in composed graph: "
                  << F->getName() << "\n");
         continue;
@@ -2470,7 +2389,7 @@ bool CallGraphPass::findCustomAllocatorsComposed(
       Ctx->AllocFuncs.insert(F);
       Ctx->CandidateAllocFuncs.erase(F);
       uint32_t retDense = UINT32_MAX;
-      if (getRetDense(F, retDense))
+      if (lookupRetDense(F, symbolToDense, graphSize, retDense))
         knownAllocRetNodes.insert(retDense);
       CG_LOG("Custom allocator (composed) " << F->getName()
              << " return value aliases known allocator return\n");
@@ -2527,6 +2446,11 @@ bool CallGraphPass::fieldFilterAccepts(const Function *F,
         work.push_back(aliasKey);
     }
   }
+
+  // If the BFS was exhausted (worklist non-empty but visit limit reached),
+  // conservatively accept to avoid unsound rejections.
+  if (!work.empty())
+    return true;
 
   return false;
 }
@@ -2620,8 +2544,8 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
       if (!CB || CB->isInlineAsm()) continue;
       if (Function *Callee = CB->getCalledFunction()) {
         StringRef calleeName = Callee->getName();
-        if ((calleeName.startswith("llvm.memcpy.") ||
-             calleeName.startswith("llvm.memmove.") ||
+        if ((LLVM_STRING_STARTS_WITH(calleeName, "llvm.memcpy.") ||
+             LLVM_STRING_STARTS_WITH(calleeName, "llvm.memmove.") ||
              calleeName == "memcpy" ||
              calleeName == "memmove") &&
             CB->arg_size() >= 2) {
@@ -5413,23 +5337,6 @@ bool CallGraphPass::runCompositionalSolve() {
   CG_LOG("Composed icall symbols: " << icallSymbolToDense.size()
          << ", icallret symbols: " << icallRetSymbolToDense.size() << "\n");
 
-  auto getRetDenseForFunc = [&](const Function *F, uint32_t &retDense) -> bool {
-    std::string retSym = "ret:" + std::to_string(F->getGUID());
-    auto itDense = composedSymbolToDense.find(retSym);
-    if (itDense != composedSymbolToDense.end()) {
-      retDense = itDense->second;
-      return retDense < numDense;
-    }
-
-    // Local-linkage target fallback: use scoped local-return symbol.
-    std::string lretSym = "lret:" + getScopeName(F);
-    auto itDenseLocal = composedSymbolToDense.find(lretSym);
-    if (itDenseLocal == composedSymbolToDense.end())
-      return false;
-    retDense = itDenseLocal->second;
-    return retDense < numDense;
-  };
-
   const uint32_t labelAssign = EB.getLabelAssign();
   const uint32_t labelAssignInv = EB.getLabelAssignInv();
 
@@ -5545,7 +5452,7 @@ bool CallGraphPass::runCompositionalSolve() {
         if (!F->getReturnType()->isPointerTy())
           continue;
         uint32_t calleeRetDense = UINT32_MAX;
-        if (!getRetDenseForFunc(F, calleeRetDense)) {
+        if (!lookupRetDense(F, composedSymbolToDense, numDense, calleeRetDense)) {
           CG_DEBUG("No composed ret symbol for target " << F->getName()
                    << " at " << icallKey << "\n");
           continue;

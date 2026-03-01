@@ -98,6 +98,9 @@ private:
   bool findCustomAllocatorsComposed(
       const cfl_result_t &composedGraph,
       const std::unordered_map<std::string, uint32_t> &symbolToDense);
+  bool lookupRetDense(const llvm::Function *F,
+                      const std::unordered_map<std::string, uint32_t> &symMap,
+                      uint32_t graphSize, uint32_t &retDense) const;
   bool handleIndirectCall(const cfl_result_t &outputCFLGraph,
                           const CallInstSet &indirectCalls);
   void collectLocalAllocaSummaries(const llvm::Function *F);

@@ -13,6 +13,7 @@
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Support/Debug.h>
 #include <llvm/IR/InstIterator.h>
@@ -44,7 +45,6 @@
 
 #include "CallGraph.h"
 #include "Annotation.h"
-#include "LLMClient.h"
 #include "VSnapshot.h"
 
 #include "gracfl/include/solvers/Solver.hpp"
@@ -593,11 +593,10 @@ static unsigned detectPhysicalCoreCount() {
   return logical > 0 ? logical : 1;
 }
 
-CallGraphPass::CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_)
+CallGraphPass::CallGraphPass(GlobalContext *Ctx_)
     : IterativeModulePass(Ctx_, "CallGraph"),
       NF(Ctx->nodeFactory),
       EB(Ctx->edgeBuilder),
-      LLM(LLMClient_),
       cflThreads(detectPhysicalCoreCount()),
       cflSolvedInputEdgeCount(0),
       cflForceRebuild(true),
@@ -1198,6 +1197,195 @@ void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
   EB.addAssignmentEdges(s, d);
 }
 
+void CallGraphPass::handleInlineAsm(CallBase &CS) {
+  auto *IA = cast<InlineAsm>(CS.getCalledOperand());
+  auto Constraints = InlineAsm::ParseConstraints(IA->getConstraintString());
+  CG_DEBUG("InlineAsm: processing \"" << IA->getAsmString()
+           << "\" with " << Constraints.size() << " constraints\n");
+
+  // Build constraint-to-arg and constraint-to-ret mappings.
+  // hasArg() is true for inputs and indirect outputs (they consume a CallBase arg).
+  // Non-indirect outputs produce part of the return aggregate.
+  unsigned argIdx = 0, retIdx = 0;
+  std::vector<int> cToArg(Constraints.size(), -1);
+  std::vector<int> cToRet(Constraints.size(), -1);
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    auto &CI = Constraints[i];
+    if (CI.Type == InlineAsm::isClobber || CI.Type == InlineAsm::isLabel)
+      continue;
+    if (CI.hasArg())
+      cToArg[i] = argIdx++;
+    if (CI.Type == InlineAsm::isOutput && !CI.isIndirect)
+      cToRet[i] = retIdx++;
+  }
+
+  // 1. Tied constraints -> copy edges.
+  // If output constraint i has MatchingInput == j, the output gets the same
+  // value as the tied input. Only create edges for pointer-typed operands.
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    auto &CI = Constraints[i];
+    if (CI.Type != InlineAsm::isOutput || CI.MatchingInput < 0)
+      continue;
+    unsigned tied = CI.MatchingInput;
+    int srcArgIdx = cToArg[tied];
+    if (srcArgIdx < 0 || (unsigned)srcArgIdx >= CS.arg_size())
+      continue;
+    Value *srcVal = CS.getArgOperand(srcArgIdx);
+    if (!srcVal->getType()->isPointerTy())
+      continue;
+
+    NodeIndex srcNode = getRepNodeForValue(srcVal);
+    if (srcNode == AndersNodeFactory::InvalidIndex)
+      continue;
+
+    NodeIndex dstNode;
+    if (CI.isIndirect) {
+      // Indirect output: asm writes to *arg, so the destination is the arg pointer
+      int dstArgIdx = cToArg[i];
+      if (dstArgIdx < 0)
+        continue;
+      dstNode = getRepNodeForValue(CS.getArgOperand(dstArgIdx));
+    } else {
+      // Register output: result flows to the CallBase instruction itself
+      dstNode = getRepNodeForValue(&CS);
+    }
+    if (dstNode == AndersNodeFactory::InvalidIndex)
+      continue;
+
+    CG_DEBUG("InlineAsm: tied copy edge from arg " << srcArgIdx
+             << " to " << (CI.isIndirect ? "indirect output" : "result") << "\n");
+    addAssignmentEdge(srcNode, dstNode);
+  }
+
+  // 2. Indirect memory operands with pointer elementtype.
+  // =*m (output, indirect): asm writes to *arg. Conservatively, any pointer-typed
+  //   direct input could be stored there.
+  // *m (input, indirect): asm reads from *arg. Loaded value could flow to
+  //   pointer-typed outputs.
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    auto &CI = Constraints[i];
+    if (!CI.isIndirect)
+      continue;
+    int aIdx = cToArg[i];
+    if (aIdx < 0 || (unsigned)aIdx >= CS.arg_size())
+      continue;
+
+    Type *ET = CS.getParamElementType(aIdx);
+    if (!ET || !containsPointerType(ET))
+      continue;
+
+    NodeIndex ptrNode = getRepNodeForValue(CS.getArgOperand(aIdx));
+    if (ptrNode == AndersNodeFactory::InvalidIndex)
+      continue;
+    NodeIndex derefNode = getRepDerefNode(ptrNode);
+
+    if (CI.Type == InlineAsm::isOutput) {
+      // =*m: store to *ptr — conservatively, any ptr-typed direct input could be stored
+      for (unsigned j = 0; j < Constraints.size(); j++) {
+        if (Constraints[j].Type != InlineAsm::isInput)
+          continue;
+        int sIdx = cToArg[j];
+        if (sIdx < 0 || (unsigned)sIdx >= CS.arg_size())
+          continue;
+        Value *srcVal = CS.getArgOperand(sIdx);
+        if (!srcVal->getType()->isPointerTy() || Constraints[j].isIndirect)
+          continue;
+        NodeIndex srcNode = getRepNodeForValue(srcVal);
+        if (srcNode == AndersNodeFactory::InvalidIndex)
+          continue;
+        CG_DEBUG("InlineAsm: indirect store edge from input arg " << sIdx
+                 << " to deref of output arg " << aIdx << "\n");
+        addAssignmentEdge(srcNode, derefNode);
+      }
+    } else if (CI.Type == InlineAsm::isInput) {
+      // *m: load from *ptr — loaded value could flow to ptr-typed outputs
+      if (CS.getType()->isPointerTy() || containsPointerType(CS.getType())) {
+        NodeIndex dstNode = getRepNodeForValue(&CS);
+        if (dstNode != AndersNodeFactory::InvalidIndex) {
+          CG_DEBUG("InlineAsm: indirect load edge from deref of input arg " << aIdx
+                   << " to result\n");
+          addAssignmentEdge(derefNode, dstNode);
+        }
+      }
+    }
+  }
+
+  // 3. Call detection in asm text.
+  // Match "call[q] <funcname>" patterns and look up targets in Ctx->Funcs.
+  StringRef asmStr = IA->getAsmString();
+  size_t pos = 0;
+  while (pos < asmStr.size()) {
+    // Find "call" keyword
+    size_t callPos = asmStr.find("call", pos);
+    if (callPos == StringRef::npos)
+      break;
+
+    // Skip the "call" keyword and optional suffix (callq, etc.)
+    size_t cur = callPos + 4;
+    while (cur < asmStr.size() && isalpha(asmStr[cur]))
+      cur++;
+    // Skip whitespace
+    while (cur < asmStr.size() && (asmStr[cur] == ' ' || asmStr[cur] == '\t'))
+      cur++;
+    if (cur >= asmStr.size()) break;
+
+    // Skip optional '*' (indirect call indicator) — we can't resolve those
+    if (asmStr[cur] == '*' || asmStr[cur] == '%' || asmStr[cur] == '$') {
+      pos = cur + 1;
+      continue;
+    }
+
+    // Extract function name (alphanumeric + underscore + dot).
+    // Also handle ${N:P} operand substitutions by stripping them — these are
+    // LLVM asm operand placeholders (e.g., "call __put_user_${4:P}" where
+    // ${4:P} expands to a size suffix like "1", "2", "4", "8").
+    std::string funcName;
+    size_t nameStart = cur;
+    while (cur < asmStr.size()) {
+      if (isalnum(asmStr[cur]) || asmStr[cur] == '_' || asmStr[cur] == '.') {
+        funcName += asmStr[cur++];
+      } else if (asmStr[cur] == '$' && cur + 1 < asmStr.size() && asmStr[cur + 1] == '{') {
+        // Skip ${...} substitution
+        size_t end = asmStr.find('}', cur + 2);
+        if (end == StringRef::npos) break;
+        cur = end + 1;
+      } else {
+        break;
+      }
+    }
+
+    if (!funcName.empty()) {
+      // Try the exact name first, then also try common size-suffixed variants
+      // (e.g., __put_user_1, __put_user_2, __put_user_4, __put_user_8)
+      bool found = false;
+      uint64_t guid = GlobalValue::getGUID(funcName);
+      auto it = Ctx->Funcs.find(guid);
+      if (it != Ctx->Funcs.end()) {
+        CG_LOG("InlineAsm: detected call to " << funcName << " in asm text\n");
+        handleCall(&CS, it->second);
+        found = true;
+      } else {
+        CG_DEBUG("InlineAsm: call target \"" << funcName << "\" not found in Funcs\n");
+      }
+      // If the name ended with a ${...} substitution (stripped above),
+      // try common numeric suffixes for size-parameterized kernel helpers.
+      if (!found && cur > nameStart &&
+          cur <= asmStr.size() && nameStart < cur) {
+        for (const char *suffix : {"1", "2", "4", "8"}) {
+          std::string variant = funcName + suffix;
+          guid = GlobalValue::getGUID(variant);
+          it = Ctx->Funcs.find(guid);
+          if (it != Ctx->Funcs.end()) {
+            CG_LOG("InlineAsm: detected call to " << variant << " in asm text\n");
+            handleCall(&CS, it->second);
+          }
+        }
+      }
+    }
+    pos = cur;
+  }
+}
+
 bool CallGraphPass::isSummarizableAlloca(const AllocaInst *AI) const {
   if (!AI || !AI->getAllocatedType()->isPointerTy())
     return false;
@@ -1408,7 +1596,10 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
 }
 
 void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
-  if (CS.isInlineAsm()) return; // FIXME handle inline assembly
+  if (CS.isInlineAsm()) {
+    CGP.handleInlineAsm(CS);
+    return;
+  }
   if (CGP.Ctx->AllocSites.count(&CS)) {
     // record allocation sites and create heap object node
     NodeIndex valNode = CGP.getRepNodeForValue(&CS);

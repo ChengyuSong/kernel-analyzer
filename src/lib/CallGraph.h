@@ -16,8 +16,6 @@
 #include "gracfl/include/utils/Reachability.hpp"
 #include "gracfl/include/solvers/SolverFWGramParallel.hpp"
 
-class LLMClient;
-
 class CallGraphPass : public IterativeModulePass {
 private:
   class InstHandler : public llvm::InstVisitor<InstHandler> {
@@ -93,6 +91,7 @@ private:
                           const std::string &callSiteStruct,
                           unsigned callSiteFieldIdx) const;
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
+  void handleInlineAsm(llvm::CallBase &CS);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
                             bool rewriteEdges = true);
   bool findCustomAllocatorsComposed(
@@ -154,7 +153,6 @@ private:
 
   AndersNodeFactory &NF;
   CFLEdgeBuilder &EB;
-  LLMClient *LLM;
   unsigned cflThreads;
   std::unique_ptr<gracfl::SolverFWGramParallel> cflSolver;
   size_t cflSolvedInputEdgeCount;
@@ -185,7 +183,7 @@ private:
                      FieldStoreKeyHash> fieldAliasMap;
 
 public:
-  CallGraphPass(GlobalContext *Ctx_, LLMClient *LLMClient_ = nullptr);
+  CallGraphPass(GlobalContext *Ctx_);
   virtual bool doInitialization(llvm::Module *);
   virtual bool doFinalization(llvm::Module *);
   virtual bool doModulePass(llvm::Module *);

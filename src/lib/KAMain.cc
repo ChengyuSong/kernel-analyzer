@@ -422,7 +422,7 @@ int main(int argc, char **argv) {
     CFLGlobalDedup = true;
   }
 
-  CallGraphPass CGPass(&GlobalCtx, LLM.get());
+  CallGraphPass CGPass(&GlobalCtx);
   auto tRun = std::chrono::steady_clock::now();
   CGPass.run(GlobalCtx.Modules);
   auto tRunEnd = std::chrono::steady_clock::now();

@@ -678,16 +678,29 @@ bool CallGraphPass::getFieldKeyFromPointerOperand(const Value *Ptr,
   if (!Ptr)
     return false;
 
-  const Value *Base = Ptr->stripPointerCastsAndAliases();
-  const auto *GEP = dyn_cast<GEPOperator>(Base);
-  if (!GEP)
-    return false;
+  // Handle nested GEP chains by walking upward through pointer operands until
+  // we can recover a named struct field key.
+  const Value *Cur = Ptr;
+  SmallPtrSet<const Value *, 16> Seen;
+  constexpr unsigned kMaxDepth = 32;
+  for (unsigned Depth = 0; Cur && Depth < kMaxDepth; ++Depth) {
+    Cur = Cur->stripPointerCastsAndAliases();
+    if (!Seen.insert(Cur).second)
+      break;
 
-  if (!getGEPStructField(GEP, structName, fieldIdx))
-    return false;
+    const auto *GEP = dyn_cast<GEPOperator>(Cur);
+    if (!GEP)
+      break;
 
-  fieldTy = GEP->getResultElementType();
-  return true;
+    if (getGEPStructField(GEP, structName, fieldIdx)) {
+      fieldTy = GEP->getResultElementType();
+      return true;
+    }
+
+    Cur = GEP->getPointerOperand();
+  }
+
+  return false;
 }
 
 bool CallGraphPass::getGlobalFieldBoundaryKey(const Value *V,
@@ -2521,14 +2534,12 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
         auto *StoredFunc = dyn_cast<Function>(
             SI->getValueOperand()->stripPointerCasts());
         if (!StoredFunc) continue;
-        Value *ptr = SI->getPointerOperand()->stripPointerCasts();
-        if (auto *GEP = dyn_cast<GEPOperator>(ptr)) {
-          std::string sName;
-          unsigned fIdx;
-          if (getGEPStructField(GEP, sName, fIdx)) {
-            funcFieldStores[StoredFunc].insert({sName, fIdx});
-            directStores++;
-          }
+        std::string sName;
+        unsigned fIdx = 0;
+        Type *fieldTy = nullptr;
+        if (getFieldKeyFromPointerOperand(SI->getPointerOperand(), sName, fIdx, fieldTy)) {
+          funcFieldStores[StoredFunc].insert({sName, fIdx});
+          directStores++;
         }
         continue;
       }
@@ -2599,14 +2610,12 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
           for (User *U : PV->users()) {
             auto *PSI = dyn_cast<StoreInst>(U);
             if (!PSI || PSI->getValueOperand() != PV) continue;
-            Value *pptr = PSI->getPointerOperand()->stripPointerCasts();
-            if (auto *PGEP = dyn_cast<GEPOperator>(pptr)) {
-              std::string sName;
-              unsigned fIdx;
-              if (getGEPStructField(PGEP, sName, fIdx)) {
-                funcFieldStores[ArgFunc].insert({sName, fIdx});
-                callbackStores++;
-              }
+            std::string sName;
+            unsigned fIdx = 0;
+            Type *fieldTy = nullptr;
+            if (getFieldKeyFromPointerOperand(PSI->getPointerOperand(), sName, fIdx, fieldTy)) {
+              funcFieldStores[ArgFunc].insert({sName, fIdx});
+              callbackStores++;
             }
           }
         }

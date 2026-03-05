@@ -90,6 +90,8 @@ const Value* AndersNodeFactory::canonicalizeValueKey(const Value* v) const {
             return canonParent->getArg(arg->getArgNo());
         return v;
     }
+    if (const auto *ga = dyn_cast<GlobalAlias>(v))
+        return canonicalizeValueKey(ga->getAliasee()->stripPointerCasts());
     if (const auto *gv = dyn_cast<GlobalVariable>(v))
         return canonicalizeGlobal(gv);
     if (const auto *f = dyn_cast<Function>(v))

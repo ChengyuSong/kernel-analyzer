@@ -2125,6 +2125,8 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     EB.addAssignmentEdges(valNode, ptrNode);
     CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (isa<Function>(init)) {
+    auto *storedFunc = cast<Function>(init);
+    Function *canonStoredFunc = getFuncDef(storedFunc);
     NodeIndex valNode = NF.getValueNodeFor(init);
     if (valNode == AndersNodeFactory::InvalidIndex) {
       valNode = NF.createValueNode(init);
@@ -2133,8 +2135,10 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     EB.addAssignmentEdges(valNode, ptrNode);
     // Record direct function store into struct field
     if (!enclosingStruct.empty() && enclosingFieldIdx >= 0)
-      funcFieldStores[cast<Function>(init)].insert({enclosingStruct, (unsigned)enclosingFieldIdx});
-    CG_DEBUG("add CFL assignment edges for function " << cast<Function>(init)->getName() << " -> " << ptrNode << "\n");
+      funcFieldStores[canonStoredFunc].insert(
+          {enclosingStruct, static_cast<unsigned>(enclosingFieldIdx)});
+    CG_DEBUG("add CFL assignment edges for function " << storedFunc->getName()
+             << " -> " << ptrNode << "\n");
   } else if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
     // Field-insensitive: all array elements assign to the same ptr
     for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
@@ -2771,11 +2775,12 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
         auto *StoredFunc = dyn_cast<Function>(
             SI->getValueOperand()->stripPointerCasts());
         if (!StoredFunc) continue;
+        Function *canonStoredFunc = getFuncDef(StoredFunc);
         std::string sName;
         unsigned fIdx = 0;
         Type *fieldTy = nullptr;
         if (getFieldKeyFromPointerOperand(SI->getPointerOperand(), sName, fIdx, fieldTy)) {
-          funcFieldStores[StoredFunc].insert({sName, fIdx});
+          funcFieldStores[canonStoredFunc].insert({sName, fIdx});
           directStores++;
         }
         continue;
@@ -2805,6 +2810,7 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
         auto *ArgFunc = dyn_cast<Function>(
             CB->getArgOperand(i)->stripPointerCasts());
         if (!ArgFunc) continue;
+        Function *canonArgFunc = getFuncDef(ArgFunc);
 
         // Find the callee's definition (may be in another module)
         Function *callee = CB->getCalledFunction();
@@ -2851,7 +2857,7 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
             unsigned fIdx = 0;
             Type *fieldTy = nullptr;
             if (getFieldKeyFromPointerOperand(PSI->getPointerOperand(), sName, fIdx, fieldTy)) {
-              funcFieldStores[ArgFunc].insert({sName, fIdx});
+              funcFieldStores[canonArgFunc].insert({sName, fIdx});
               callbackStores++;
             }
           }

@@ -2519,6 +2519,7 @@ bool CallGraphPass::lookupRetDense(
     const Function *F,
     const std::unordered_map<std::string, uint32_t> &symMap,
     uint32_t graphSize, uint32_t &retDense) const {
+  assert(F && "lookupRetDense: null Function");
   std::string retSym = "ret:" + std::to_string(F->getGUID());
   auto itDense = symMap.find(retSym);
   if (itDense != symMap.end() && itDense->second < graphSize) {
@@ -2538,8 +2539,9 @@ bool CallGraphPass::lookupArgDense(
     const Function *F, unsigned argNo,
     const std::unordered_map<std::string, uint32_t> &symMap,
     uint32_t graphSize, uint32_t &argDense) const {
-  if (!F || argNo >= F->arg_size())
-    return false;
+  assert(F && "lookupArgDense: null Function");
+  assert(argNo < F->arg_size() && "lookupArgDense: argNo out of range");
+
 
   std::string argSym =
       "arg:" + std::to_string(F->getGUID()) + ":" + std::to_string(argNo);
@@ -2562,8 +2564,9 @@ bool CallGraphPass::lookupVarargDense(
     const Function *F,
     const std::unordered_map<std::string, uint32_t> &symMap,
     uint32_t graphSize, uint32_t &varargDense) const {
-  if (!F || !F->isVarArg())
-    return false;
+  assert(F && "lookupVarargDense: null Function");
+  assert(F->isVarArg() && "lookupVarargDense: Function is not vararg");
+
 
   std::string varargSym = "vararg:" + std::to_string(F->getGUID());
   auto itDense = symMap.find(varargSym);
@@ -5863,6 +5866,20 @@ bool CallGraphPass::runCompositionalSolve() {
           iterNewCalleePairs++;
       }
 
+      // Wire assign edges between an actual-arg dense node and a target dense node.
+      auto addAssignEdgePair = [&](uint32_t actualDense, uint32_t targetDense) {
+        EdgeKey keyFwd{actualDense, targetDense, labelAssign};
+        if (edgeSeen.insert(keyFwd).second) {
+          combinedEdges.emplace_back(actualDense, targetDense, labelAssign);
+          iterNewSummaryEdges++;
+        }
+        EdgeKey keyRev{targetDense, actualDense, labelAssignInv};
+        if (edgeSeen.insert(keyRev).second) {
+          combinedEdges.emplace_back(targetDense, actualDense, labelAssignInv);
+          iterNewSummaryEdges++;
+        }
+      };
+
       const unsigned numActualArgs = CS->arg_size();
       for (const Function *F : targets) {
         const unsigned numFormals = F->arg_size();
@@ -5885,16 +5902,7 @@ bool CallGraphPass::runCompositionalSolve() {
           if (!lookupArgDense(F, argNo, composedSymbolToDense, numDense, formalDense))
             continue;
 
-          EdgeKey keyFwd{actualDense, formalDense, labelAssign};
-          if (edgeSeen.insert(keyFwd).second) {
-            combinedEdges.emplace_back(actualDense, formalDense, labelAssign);
-            iterNewSummaryEdges++;
-          }
-          EdgeKey keyRev{formalDense, actualDense, labelAssignInv};
-          if (edgeSeen.insert(keyRev).second) {
-            combinedEdges.emplace_back(formalDense, actualDense, labelAssignInv);
-            iterNewSummaryEdges++;
-          }
+          addAssignEdgePair(actualDense, formalDense);
         }
 
         if (!F->isVarArg() || numActualArgs <= numFormals)
@@ -5917,16 +5925,7 @@ bool CallGraphPass::runCompositionalSolve() {
           if (actualDense >= numDense)
             continue;
 
-          EdgeKey keyFwd{actualDense, varargDense, labelAssign};
-          if (edgeSeen.insert(keyFwd).second) {
-            combinedEdges.emplace_back(actualDense, varargDense, labelAssign);
-            iterNewSummaryEdges++;
-          }
-          EdgeKey keyRev{varargDense, actualDense, labelAssignInv};
-          if (edgeSeen.insert(keyRev).second) {
-            combinedEdges.emplace_back(varargDense, actualDense, labelAssignInv);
-            iterNewSummaryEdges++;
-          }
+          addAssignEdgePair(actualDense, varargDense);
         }
       }
 

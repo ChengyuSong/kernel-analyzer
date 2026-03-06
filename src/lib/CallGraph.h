@@ -100,6 +100,12 @@ private:
   bool lookupRetDense(const llvm::Function *F,
                       const std::unordered_map<std::string, uint32_t> &symMap,
                       uint32_t graphSize, uint32_t &retDense) const;
+  bool lookupArgDense(const llvm::Function *F, unsigned argNo,
+                      const std::unordered_map<std::string, uint32_t> &symMap,
+                      uint32_t graphSize, uint32_t &argDense) const;
+  bool lookupVarargDense(const llvm::Function *F,
+                         const std::unordered_map<std::string, uint32_t> &symMap,
+                         uint32_t graphSize, uint32_t &varargDense) const;
   bool handleIndirectCall(const cfl_result_t &outputCFLGraph,
                           const CallInstSet &indirectCalls);
   void collectLocalAllocaSummaries(const llvm::Function *F);

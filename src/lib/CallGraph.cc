@@ -2530,6 +2530,52 @@ bool CallGraphPass::lookupRetDense(
   return true;
 }
 
+bool CallGraphPass::lookupArgDense(
+    const Function *F, unsigned argNo,
+    const std::unordered_map<std::string, uint32_t> &symMap,
+    uint32_t graphSize, uint32_t &argDense) const {
+  if (!F || argNo >= F->arg_size())
+    return false;
+
+  std::string argSym =
+      "arg:" + std::to_string(F->getGUID()) + ":" + std::to_string(argNo);
+  auto itDense = symMap.find(argSym);
+  if (itDense != symMap.end() && itDense->second < graphSize) {
+    argDense = itDense->second;
+    return true;
+  }
+
+  std::string largSym =
+      "larg:" + getScopeName(F) + ":" + std::to_string(argNo);
+  auto itDenseLocal = symMap.find(largSym);
+  if (itDenseLocal == symMap.end() || itDenseLocal->second >= graphSize)
+    return false;
+  argDense = itDenseLocal->second;
+  return true;
+}
+
+bool CallGraphPass::lookupVarargDense(
+    const Function *F,
+    const std::unordered_map<std::string, uint32_t> &symMap,
+    uint32_t graphSize, uint32_t &varargDense) const {
+  if (!F || !F->isVarArg())
+    return false;
+
+  std::string varargSym = "vararg:" + std::to_string(F->getGUID());
+  auto itDense = symMap.find(varargSym);
+  if (itDense != symMap.end() && itDense->second < graphSize) {
+    varargDense = itDense->second;
+    return true;
+  }
+
+  std::string lvarargSym = "lvararg:" + getScopeName(F);
+  auto itDenseLocal = symMap.find(lvarargSym);
+  if (itDenseLocal == symMap.end() || itDenseLocal->second >= graphSize)
+    return false;
+  varargDense = itDenseLocal->second;
+  return true;
+}
+
 bool CallGraphPass::findCustomAllocatorsComposed(
     const cfl_result_t &composedGraph,
     const std::unordered_map<std::string, uint32_t> &symbolToDense) {
@@ -3331,7 +3377,45 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
   CG_LOG("Per-TU solve [" << M->getModuleIdentifier()
          << "]: edges [" << edgeStart << ", " << edgeEnd << ")\n");
 
-  if (edgeStart >= edgeEnd) {
+  const CallInstSet *moduleIcalls = nullptr;
+  if (auto itIcalls = moduleIndirectCallInsts.find(M);
+      itIcalls != moduleIndirectCallInsts.end()) {
+    moduleIcalls = &itIcalls->second;
+  }
+
+  // Boundary nodes that must be exportable even if locally edge-isolated:
+  // keep them in the per-TU dense graph as singleton SCCs.
+  std::vector<NodeIndex> pinnedBoundaryNodes;
+  pinnedBoundaryNodes.reserve(moduleIcalls ? moduleIcalls->size() * 2 : 0);
+  std::unordered_set<NodeIndex> pinnedBoundarySet;
+  pinnedBoundarySet.reserve(moduleIcalls ? moduleIcalls->size() * 2 : 0);
+  auto pinBoundaryNode = [&](NodeIndex N) {
+    if (N == AndersNodeFactory::InvalidIndex)
+      return;
+    NodeIndex C = getCanonicalNode(N);
+    if (C == AndersNodeFactory::InvalidIndex)
+      return;
+    if (pinnedBoundarySet.insert(C).second)
+      pinnedBoundaryNodes.push_back(C);
+  };
+  if (moduleIcalls) {
+    for (auto *CS : *moduleIcalls) {
+      Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      pinBoundaryNode(NF.getValueNodeFor(fptr));
+      if (containsPointerType(CS->getType()))
+        pinBoundaryNode(NF.getValueNodeFor(CS));
+      for (unsigned argNo = 0; argNo < CS->arg_size(); argNo++) {
+        Value *arg = CS->getArgOperand(argNo);
+        if (!containsPointerType(arg->getType()))
+          continue;
+        if (shouldSkipValue(arg))
+          continue;
+        pinBoundaryNode(NF.getValueNodeFor(arg));
+      }
+    }
+  }
+
+  if (edgeStart >= edgeEnd && pinnedBoundaryNodes.empty()) {
     CompressedGraphData data;
     data.numNodes = 0;
     data.metadataJson = encodeCflcgMetadata(getCurrentCflcgGrammarMeta(EB),
@@ -3345,12 +3429,6 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
                   std::chrono::steady_clock::now() - tTotal).count()
            << " ms\n");
     return;
-  }
-
-  const CallInstSet *moduleIcalls = nullptr;
-  if (auto itIcalls = moduleIndirectCallInsts.find(M);
-      itIcalls != moduleIndirectCallInsts.end()) {
-    moduleIcalls = &itIcalls->second;
   }
 
   // Per-TU fixed point:
@@ -3390,6 +3468,16 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
       }
     }
 
+    for (NodeIndex pinned : pinnedBoundaryNodes) {
+      if (pinned >= origToDense.size())
+        continue;
+      if (origToDense[pinned] == UINT32_MAX) {
+        origToDense[pinned] = numDenseNodes;
+        denseToOrig.push_back(pinned);
+        numDenseNodes++;
+      }
+    }
+
     assert(numDenseNodes > 0 && "solveAndCompressPerTU: dense mapping produced 0 nodes");
 
     // Remap + dedup edges to dense IDs
@@ -3408,12 +3496,37 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
         denseEdges.emplace_back(from, to, E.label);
     }
 
+    // Keep pinned boundary nodes alive in the solver graph even if isolated.
+    // Use an epsilon/self-edge label so these nodes materialize as singleton SCCs
+    // without introducing new cross-node connectivity.
+    uint32_t boundarySeedLabel = EB.getLabelV();
+    if (const auto *G = EB.getGrammar()) {
+      const auto &Rule1 = G->getRule1();
+      if (!Rule1.empty() && !Rule1[0].empty())
+        boundarySeedLabel = Rule1[0][0];
+    }
+    size_t seededBoundarySelfEdges = 0;
+    for (NodeIndex pinned : pinnedBoundaryNodes) {
+      if (pinned >= origToDense.size())
+        continue;
+      uint32_t dense = origToDense[pinned];
+      if (dense == UINT32_MAX)
+        continue;
+      EdgeKey key{dense, dense, boundarySeedLabel};
+      if (seen.insert(key).second) {
+        denseEdges.emplace_back(dense, dense, boundarySeedLabel);
+        seededBoundarySelfEdges++;
+      }
+    }
+
     assert(!denseEdges.empty() && "solveAndCompressPerTU: no dense edges after remapping");
 
     CG_LOG("Per-TU dense mapping [iter " << perTUIter << "]: "
            << numDenseNodes << " nodes, "
            << tuEdgeIndices.size() << " raw edges -> "
-           << denseEdges.size() << " dense edges\n");
+           << denseEdges.size() << " dense edges"
+           << " (pinned-boundary-nodes=" << pinnedBoundaryNodes.size()
+           << ", seeded-self-edges=" << seededBoundarySelfEdges << ")\n");
 
     // Step 2: Solve CFL for this iteration.
     auto tSolve = std::chrono::steady_clock::now();
@@ -4564,17 +4677,47 @@ void CallGraphPass::compressConstraintGraph(
   }
 
   // Local-linkage function return symbols (for compositional icall-ret summary).
+  size_t localRetAdded = 0;
+  size_t localArgAdded = 0;
+  size_t localVarargAdded = 0;
   for (const Function *F : Ctx->AddressTakenFuncs) {
     if (!F || !F->hasLocalLinkage())
       continue;
+    std::string scope = getScopeName(F);
+
     NodeIndex retNode = NF.getReturnNodeFor(F);
-    if (retNode == AndersNodeFactory::InvalidIndex)
-      continue;
-    uint32_t scc = origNodeToSCC(retNode);
-    if (scc == UINT32_MAX)
-      continue;
-    out.symbolTable[BoundarySymbol{"lret:" + getScopeName(F)}] = scc;
+    if (retNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t scc = origNodeToSCC(retNode);
+      if (scc != UINT32_MAX) {
+        out.symbolTable[BoundarySymbol{"lret:" + scope}] = scc;
+        localRetAdded++;
+      }
+    }
+
+    for (const auto &Arg : F->args()) {
+      NodeIndex argNode = NF.getValueNodeFor(&Arg);
+      if (argNode == AndersNodeFactory::InvalidIndex)
+        continue;
+      uint32_t argScc = origNodeToSCC(argNode);
+      if (argScc == UINT32_MAX)
+        continue;
+      out.symbolTable[BoundarySymbol{
+          "larg:" + scope + ":" + std::to_string(Arg.getArgNo())}] = argScc;
+      localArgAdded++;
+    }
+
+    NodeIndex vaNode = NF.getVarargNodeFor(F);
+    if (vaNode != AndersNodeFactory::InvalidIndex) {
+      uint32_t vaScc = origNodeToSCC(vaNode);
+      if (vaScc != UINT32_MAX) {
+        out.symbolTable[BoundarySymbol{"lvararg:" + scope}] = vaScc;
+        localVarargAdded++;
+      }
+    }
   }
+  CG_LOG("Local-linkage boundary: lret=" << localRetAdded
+         << ", larg=" << localArgAdded
+         << ", lvararg=" << localVarargAdded << "\n");
 
   // Global objects
   for (const auto &[guid, GV] : Ctx->Gobjs) {
@@ -4639,8 +4782,10 @@ void CallGraphPass::compressConstraintGraph(
 
   // Indirect call nodes as boundary symbols
   //   icall:<id>    -> function-pointer operand node
+  //   icallarg:<id>:N -> callsite pointer-typed argument node
   //   icallret:<id> -> call result value node (if pointer-typed and present)
   size_t icallTotal = 0, icallNoMD = 0, icallNoNode = 0, icallNoSCC = 0, icallAdded = 0;
+  size_t icallArgAdded = 0;
   size_t icallRetAdded = 0;
   for (auto *CS : Ctx->IndirectCallInsts) {
     icallTotal++;
@@ -4656,6 +4801,23 @@ void CallGraphPass::compressConstraintGraph(
     out.symbolTable[BoundarySymbol{"icall:" + S->getString().str()}] = scc;
     icallAdded++;
 
+    for (unsigned argNo = 0; argNo < CS->arg_size(); argNo++) {
+      Value *arg = CS->getArgOperand(argNo);
+      if (!containsPointerType(arg->getType()))
+        continue;
+      if (shouldSkipValue(arg))
+        continue;
+      NodeIndex argNode = NF.getValueNodeFor(arg);
+      if (argNode == AndersNodeFactory::InvalidIndex)
+        continue;
+      uint32_t argScc = origNodeToSCC(argNode);
+      if (argScc == UINT32_MAX)
+        continue;
+      out.symbolTable[BoundarySymbol{
+          "icallarg:" + S->getString().str() + ":" + std::to_string(argNo)}] = argScc;
+      icallArgAdded++;
+    }
+
     if (containsPointerType(CS->getType())) {
       NodeIndex retNode = NF.getValueNodeFor(CS);
       if (retNode != AndersNodeFactory::InvalidIndex) {
@@ -4670,10 +4832,21 @@ void CallGraphPass::compressConstraintGraph(
   CG_LOG("Icall boundary: total=" << icallTotal << " noMD=" << icallNoMD
          << " noNode=" << icallNoNode << " noSCC=" << icallNoSCC
          << " added=" << icallAdded
+         << " arg-added=" << icallArgAdded
          << " ret-added=" << icallRetAdded << "\n");
 
 
-  // Step 3: Build funcNodes - scan all nodes for Function* values
+  // Step 3: Build funcNodes - scan all nodes for Function* values.
+  // Use GUID-based address-taken filtering instead of Function* identity.
+  // NodeFactory canonicalizes declaration values to defining Function* when
+  // available, so pointer-identity checks against AddressTakenFuncs can drop
+  // legitimate indirect targets in compositional mode.
+  std::unordered_set<uint64_t> addressTakenGuids;
+  addressTakenGuids.reserve(Ctx->AddressTakenFuncs.size());
+  for (const Function *AT : Ctx->AddressTakenFuncs) {
+    if (AT)
+      addressTakenGuids.insert(AT->getGUID());
+  }
   for (uint32_t n = 0; n < nodeCount; n++) {
     NodeIndex origIdx = useDense ? denseToOrig[n] : n;
     const Value *V = NF.getValueForNode(origIdx);
@@ -4681,7 +4854,7 @@ void CallGraphPass::compressConstraintGraph(
     const Function *F = dyn_cast<Function>(V);
     if (!F) continue;
     // Only include address-taken functions (those that can be indirect targets)
-    if (!Ctx->AddressTakenFuncs.count(F))
+    if (!addressTakenGuids.count(F->getGUID()))
       continue;
     // Don't count return/vararg nodes
     if (NF.isReturnNode(origIdx) || NF.isVarargNode(origIdx))
@@ -5075,10 +5248,15 @@ bool CallGraphPass::runCompositionalSolve() {
   auto classifyBoundary = [](StringRef symbol) -> std::string {
     if (symbol.starts_with("func:")) return "func";
     if (symbol.starts_with("arg:")) return "arg";
+    if (symbol.starts_with("larg:")) return "larg";
     if (symbol.starts_with("ret:")) return "ret";
+    if (symbol.starts_with("lret:")) return "lret";
     if (symbol.starts_with("vararg:")) return "vararg";
+    if (symbol.starts_with("lvararg:")) return "lvararg";
     if (symbol.starts_with("glob:")) return "glob";
     if (symbol.starts_with("icall:")) return "icall";
+    if (symbol.starts_with("icallarg:")) return "icallarg";
+    if (symbol.starts_with("icallret:")) return "icallret";
     return "other";
   };
 
@@ -5152,6 +5330,21 @@ bool CallGraphPass::runCompositionalSolve() {
         addExpected("glob:" + std::to_string(guid));
     }
 
+    for (const Function *F : Ctx->AddressTakenFuncs) {
+      if (!F || !F->hasLocalLinkage())
+        continue;
+      std::string scope = getScopeName(F);
+      for (const auto &Arg : F->args()) {
+        if (isActiveBoundaryNode(NF.getValueNodeFor(&Arg))) {
+          addExpected("larg:" + scope + ":" + std::to_string(Arg.getArgNo()));
+        }
+      }
+      if (isActiveBoundaryNode(NF.getReturnNodeFor(F)))
+        addExpected("lret:" + scope);
+      if (isActiveBoundaryNode(NF.getVarargNodeFor(F)))
+        addExpected("lvararg:" + scope);
+    }
+
     for (auto *CS : Ctx->IndirectCallInsts) {
       auto *MD = CS->getMetadata("ka.icall.id");
       if (!MD)
@@ -5162,7 +5355,22 @@ bool CallGraphPass::runCompositionalSolve() {
       Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
       if (!isActiveBoundaryNode(NF.getValueNodeFor(fptr)))
         continue;
-      addExpected("icall:" + S->getString().str());
+      std::string idStr = S->getString().str();
+      addExpected("icall:" + idStr);
+      for (unsigned argNo = 0; argNo < CS->arg_size(); argNo++) {
+        Value *arg = CS->getArgOperand(argNo);
+        if (!containsPointerType(arg->getType()))
+          continue;
+        if (shouldSkipValue(arg))
+          continue;
+        if (isActiveBoundaryNode(NF.getValueNodeFor(arg))) {
+          addExpected("icallarg:" + idStr + ":" + std::to_string(argNo));
+        }
+      }
+      if (containsPointerType(CS->getType()) &&
+          isActiveBoundaryNode(NF.getValueNodeFor(CS))) {
+        addExpected("icallret:" + idStr);
+      }
     }
   };
 
@@ -5188,8 +5396,9 @@ bool CallGraphPass::runCompositionalSolve() {
       }
 
       std::set<std::string> missingBoundaryClasses;
-      const std::array<const char *, 6> requiredClasses =
-          {"func", "arg", "ret", "vararg", "glob", "icall"};
+      const std::array<const char *, 11> requiredClasses = {
+          "func", "arg", "ret", "vararg", "glob", "icall",
+          "larg", "lret", "lvararg", "icallarg", "icallret"};
       for (const char *C : requiredClasses) {
         const size_t expectedCount = expectedClassCounts[C];
         const size_t gotCount = availableClassCounts[C];
@@ -5526,15 +5735,19 @@ bool CallGraphPass::runCompositionalSolve() {
   }
 
   std::unordered_map<std::string, uint32_t> icallSymbolToDense;
+  std::unordered_map<std::string, uint32_t> icallArgSymbolToDense;
   std::unordered_map<std::string, uint32_t> icallRetSymbolToDense;
   for (const auto &[symbol, occurrences] : symbolOccurrences) {
     uint32_t dense = unifiedToDense[ufFind(occurrences[0].second)];
     if (symbol.compare(0, 6, "icall:") == 0)
       icallSymbolToDense[symbol] = dense;
+    else if (symbol.compare(0, 9, "icallarg:") == 0)
+      icallArgSymbolToDense[symbol] = dense;
     else if (symbol.compare(0, 9, "icallret:") == 0)
       icallRetSymbolToDense[symbol] = dense;
   }
   CG_LOG("Composed icall symbols: " << icallSymbolToDense.size()
+         << ", icallarg symbols: " << icallArgSymbolToDense.size()
          << ", icallret symbols: " << icallRetSymbolToDense.size() << "\n");
 
   const uint32_t labelAssign = EB.getLabelAssign();
@@ -5563,6 +5776,9 @@ bool CallGraphPass::runCompositionalSolve() {
       std::string idStr = S->getString().str();
       std::string icallKey = "icall:" + idStr;
       std::string icallRetKey = "icallret:" + idStr;
+      auto makeIcallArgKey = [&](unsigned argNo) {
+        return "icallarg:" + idStr + ":" + std::to_string(argNo);
+      };
 
       auto symIt = icallSymbolToDense.find(icallKey);
       if (symIt == icallSymbolToDense.end()) {
@@ -5639,6 +5855,73 @@ bool CallGraphPass::runCompositionalSolve() {
       for (const Function *F : targets) {
         if (Ctx->Callees[CS].insert(F).second)
           iterNewCalleePairs++;
+      }
+
+      const unsigned numActualArgs = CS->arg_size();
+      for (const Function *F : targets) {
+        const unsigned numFormals = F->arg_size();
+        const unsigned minArgs = std::min(numActualArgs, numFormals);
+        for (unsigned argNo = 0; argNo < minArgs; argNo++) {
+          Value *actual = CS->getArgOperand(argNo);
+          if (!containsPointerType(actual->getType()))
+            continue;
+          if (shouldSkipValue(actual))
+            continue;
+
+          auto argIt = icallArgSymbolToDense.find(makeIcallArgKey(argNo));
+          if (argIt == icallArgSymbolToDense.end())
+            continue;
+          uint32_t actualDense = argIt->second;
+          if (actualDense >= numDense)
+            continue;
+
+          uint32_t formalDense = UINT32_MAX;
+          if (!lookupArgDense(F, argNo, composedSymbolToDense, numDense, formalDense))
+            continue;
+
+          EdgeKey keyFwd{actualDense, formalDense, labelAssign};
+          if (edgeSeen.insert(keyFwd).second) {
+            combinedEdges.emplace_back(actualDense, formalDense, labelAssign);
+            iterNewSummaryEdges++;
+          }
+          EdgeKey keyRev{formalDense, actualDense, labelAssignInv};
+          if (edgeSeen.insert(keyRev).second) {
+            combinedEdges.emplace_back(formalDense, actualDense, labelAssignInv);
+            iterNewSummaryEdges++;
+          }
+        }
+
+        if (!F->isVarArg() || numActualArgs <= numFormals)
+          continue;
+        uint32_t varargDense = UINT32_MAX;
+        if (!lookupVarargDense(F, composedSymbolToDense, numDense, varargDense))
+          continue;
+
+        for (unsigned argNo = numFormals; argNo < numActualArgs; argNo++) {
+          Value *actual = CS->getArgOperand(argNo);
+          if (!containsPointerType(actual->getType()))
+            continue;
+          if (shouldSkipValue(actual))
+            continue;
+
+          auto argIt = icallArgSymbolToDense.find(makeIcallArgKey(argNo));
+          if (argIt == icallArgSymbolToDense.end())
+            continue;
+          uint32_t actualDense = argIt->second;
+          if (actualDense >= numDense)
+            continue;
+
+          EdgeKey keyFwd{actualDense, varargDense, labelAssign};
+          if (edgeSeen.insert(keyFwd).second) {
+            combinedEdges.emplace_back(actualDense, varargDense, labelAssign);
+            iterNewSummaryEdges++;
+          }
+          EdgeKey keyRev{varargDense, actualDense, labelAssignInv};
+          if (edgeSeen.insert(keyRev).second) {
+            combinedEdges.emplace_back(varargDense, actualDense, labelAssignInv);
+            iterNewSummaryEdges++;
+          }
+        }
       }
 
       auto retIt = icallRetSymbolToDense.find(icallRetKey);

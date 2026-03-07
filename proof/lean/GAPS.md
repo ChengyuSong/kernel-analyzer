@@ -32,25 +32,46 @@ Cross-links:
 
 4. Boundary completeness is assumed in Lean.
 - Lean assumes all cross-TU-relevant boundary facts are exported.
+- The Lean kind set now includes implementation-required classes
+  (`func/arg/ret/vararg/glob/icall/larg/lret/lvararg/icallarg/icallret`),
+  but export completeness is still an assumption.
+- Lean now models boundary-node pinning (`pinBoundaryNodes`) and proves
+  soundness preservation under seed self-edge addition, matching the
+  edge-isolated-boundary fix direction in implementation.
 - Implementation depends on extraction paths (metadata and pattern-based
   discovery), plus cache sanity checks.
 - Completeness of these extraction paths is not formally proved.
 
-5. Target filters are not yet formalized.
+5. Summary bridge discovery is abstract in Lean.
+- Lean models assign-pair summary generation (`assignBridgeRule`) from an
+  abstract monotone bridge relation.
+- Implementation computes concrete bridges from resolved indirect-call targets,
+  `icallarg` symbols, and callee arg/vararg symbols.
+- A refinement proof connecting implementation bridge extraction to the Lean
+  bridge predicate is pending.
+
+6. Target filters are not yet formalized.
 - Implementation applies `isCompatible` and field-store filtering
   (`fieldFilterAccepts`).
 - Lean currently has no model/proof that these filters are conservative with
   respect to monolithic truth.
 
-6. Allocator promotion logic is out of model.
+7. Allocator promotion logic is out of model.
 - `findCustomAllocators` and `findCustomAllocatorsComposed` mutate allocator
   sets and may rewrite call-related edges in monolithic mode.
 - Lean does not model this state transition or prove its preservation properties.
 
-7. Solver implementation is trusted.
+8. Solver implementation is trusted.
 - Lean reasons over declarative reachability.
 - `SolverFWGramParallel` is treated as an oracle in the end-to-end story.
 - A refinement proof (solver output implies declarative `Reach`) is missing.
+
+9. Function-identity canonicalization is not modeled.
+- Implementation uses GUID-based identity in places where pointer identity can
+  diverge across declaration/definition forms (e.g., compositional func-node
+  collection and field-store correlation).
+- Lean currently abstracts over node/function identity and does not model this
+  declaration-vs-definition canonicalization step.
 
 ## Notes
 

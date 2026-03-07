@@ -13,7 +13,8 @@ inductive Label where
   | nd
   deriving DecidableEq, Repr
 
-/-- Minimal boundary categories required for sound cross-TU composition. -/
+/-- Boundary categories currently required by compositional merging and
+summary-edge wiring in the implementation. -/
 inductive CoreBoundaryKind where
   | func
   | arg
@@ -21,12 +22,15 @@ inductive CoreBoundaryKind where
   | vararg
   | glob
   | icall
+  | larg
+  | lret
+  | lvararg
+  | icallarg
+  | icallret
   deriving DecidableEq, Repr
 
 /-- Optional boundary categories used to improve precision/convergence. -/
 inductive PrecisionBoundaryKind where
-  | icallret
-  | lret
   | gptr
   | gderef
   deriving DecidableEq, Repr
@@ -151,6 +155,39 @@ def composedGraph {Q C : Type} (Gq : Graph Q) (merge : Q → C) : Graph C :=
 def graphUnion {N : Type} (G₁ G₂ : Graph N) : Graph N :=
   fun e => e ∈ G₁ ∨ e ∈ G₂
 
+/-- Add self-seed edges for boundary nodes so edge-isolated boundaries remain
+materialized (singleton SCCs) after remap/compression. This models the
+`pinnedBoundaryNodes` + seeded self-edge fix in `solveAndCompressPerTU`. -/
+def pinBoundaryNodes
+    {N : Type}
+    (seedLbl : Label)
+    (isBoundary : N → Prop)
+    (G : Graph N) : Graph N :=
+  fun e =>
+    e ∈ G ∨
+    ∃ n : N, isBoundary n ∧ e = ({ src := n, lbl := seedLbl, dst := n } : LEdge N)
+
+/-- Pinning is extensive: original edges are preserved. -/
+theorem pinBoundaryNodes_extensive
+    {N : Type}
+    (seedLbl : Label)
+    (isBoundary : N → Prop)
+    (G : Graph N) :
+    GraphLe G (pinBoundaryNodes seedLbl isBoundary G) := by
+  intro e hEdge
+  exact Or.inl hEdge
+
+/-- Every pinned boundary node gets a seed self-edge. -/
+theorem pinBoundaryNodes_seed_self
+    {N : Type}
+    (seedLbl : Label)
+    (isBoundary : N → Prop)
+    {n : N}
+    (hBoundary : isBoundary n) :
+    ({ src := n, lbl := seedLbl, dst := n } : LEdge N) ∈
+      pinBoundaryNodes seedLbl isBoundary (fun _ => False) := by
+  exact Or.inr ⟨n, hBoundary, rfl⟩
+
 /-- Summary-edge generation rule over the current graph. -/
 abbrev SummaryRule (N : Type) := Graph N → Graph N
 
@@ -158,6 +195,35 @@ abbrev SummaryRule (N : Type) := Graph N → Graph N
 keep existing edges and add summary edges inferred from the current graph. -/
 def summaryStep {N : Type} (rule : SummaryRule N) : Graph N → Graph N :=
   fun G => graphUnion G (rule G)
+
+/-- Directed bridge relation used to emit summary assignment edges. -/
+abbrev AssignBridge (N : Type) := Graph N → N → N → Prop
+
+/-- Summary edge pair emitted by compositional call/arg propagation:
+`a` models assign and `na` models inverse-assign. -/
+def assignEdgePair {N : Type} (actual target : N) : Graph N :=
+  fun e =>
+    e = { src := actual, lbl := Label.a, dst := target } ∨
+    e = { src := target, lbl := Label.na, dst := actual }
+
+/-- Generic summary rule that emits assign-edge pairs for bridge witnesses.
+This models `addAssignEdgePair` in `runCompositionalSolve`, instantiated with a
+bridge relation such as `icallarg -> (arg/larg/vararg/lvararg)`. -/
+def assignBridgeRule {N : Type} (bridge : AssignBridge N) : SummaryRule N :=
+  fun G e => ∃ actual target, bridge G actual target ∧ e ∈ assignEdgePair actual target
+
+/-- Monotonicity of assign-pair generation, assuming monotone bridge discovery. -/
+theorem assignBridgeRule_mono
+    {N : Type}
+    (bridge : AssignBridge N)
+    (hBridgeMono :
+      ∀ {G₁ G₂ : Graph N}, GraphLe G₁ G₂ →
+      ∀ {actual target : N}, bridge G₁ actual target → bridge G₂ actual target) :
+    ∀ {G₁ G₂ : Graph N}, GraphLe G₁ G₂ →
+      GraphLe (assignBridgeRule bridge G₁) (assignBridgeRule bridge G₂) := by
+  intro G₁ G₂ hSub e hEdge
+  rcases hEdge with ⟨actual, target, hBridge, hPair⟩
+  exact ⟨actual, target, hBridgeMono hSub hBridge, hPair⟩
 
 /-- Build an iterative step package from a monotone summary rule. -/
 structure IterStep (N : Type) where
@@ -317,6 +383,25 @@ theorem compositional_sound_iterative
     compositional_sound Gmono Gone q hSim hReach
   exact reach_mono hGrow hOne
 
+/-- If composition is sound before boundary pinning, it remains sound after
+pinning because pinning only adds edges. This models the per-TU fix that seeds
+self-edges for edge-isolated boundary nodes so they survive compression. -/
+theorem compositional_sound_with_pinned_boundaries
+    {Nmono Ncomp : Type}
+    (Gmono : Graph Nmono)
+    (Gcomp : Graph Ncomp)
+    (q : Nmono → Ncomp)
+    (hSim : GraphHom q Gmono Gcomp)
+    (seedLbl : Label)
+    (isBoundary : Ncomp → Prop)
+    {u v : Nmono}
+    {X : NT}
+    (hReach : Reach Gmono u X v) :
+    Reach (pinBoundaryNodes seedLbl isBoundary Gcomp) (q u) X (q v) := by
+  have hBase : Reach Gcomp (q u) X (q v) :=
+    compositional_sound Gmono Gcomp q hSim hReach
+  exact reach_mono (pinBoundaryNodes_extensive seedLbl isBoundary Gcomp) hBase
+
 /-- Running an extensive iterative closure on top of a sound one-shot composed
 graph remains sound. -/
 theorem compositional_sound_iterClosure
@@ -333,6 +418,33 @@ theorem compositional_sound_iterClosure
   have hSeed : Reach Gseed (q u) X (q v) :=
     compositional_sound Gmono Gseed q hSim hReach
   exact reach_mono (seed_subset_iterClosure it Gseed) hSeed
+
+/-- Specialization of iterative soundness to assign-pair summary rules.
+This captures the compositional icall-argument propagation pattern where
+summary edges are wired as `a`/`na` pairs. -/
+theorem compositional_sound_assignBridge_iterClosure
+    {Nmono Ncomp : Type}
+    (Gmono : Graph Nmono)
+    (Gseed : Graph Ncomp)
+    (bridge : AssignBridge Ncomp)
+    (hBridgeMono :
+      ∀ {G₁ G₂ : Graph Ncomp}, GraphLe G₁ G₂ →
+      ∀ {actual target : Ncomp}, bridge G₁ actual target → bridge G₂ actual target)
+    (q : Nmono → Ncomp)
+    (hSim : GraphHom q Gmono Gseed)
+    {u v : Nmono}
+    {X : NT}
+    (hReach : Reach Gmono u X v) :
+    Reach
+      (iterClosure
+        (mkSummaryIterStep (assignBridgeRule bridge)
+          (assignBridgeRule_mono bridge hBridgeMono))
+        Gseed)
+      (q u) X (q v) := by
+  let it : IterStep Ncomp :=
+    mkSummaryIterStep (assignBridgeRule bridge)
+      (assignBridgeRule_mono bridge hBridgeMono)
+  exact compositional_sound_iterClosure Gmono Gseed it q hSim hReach
 
 /-- Explicit model of per-TU quotienting (e.g., V-SCC compression). -/
 structure PerTUQuotient (N Q : Type) where

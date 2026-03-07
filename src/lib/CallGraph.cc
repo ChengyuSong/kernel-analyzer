@@ -2673,7 +2673,14 @@ bool CallGraphPass::addFieldAlias(const FieldStoreKey &A, const FieldStoreKey &B
 bool CallGraphPass::fieldFilterAccepts(const Function *F,
                                        const std::string &callSiteStruct,
                                        unsigned callSiteFieldIdx) const {
-  auto it = funcFieldStores.find(F);
+  const Function *canonF = F;
+  if (F) {
+    auto itDef = Ctx->Funcs.find(F->getGUID());
+    if (itDef != Ctx->Funcs.end())
+      canonF = itDef->second;
+  }
+
+  auto it = funcFieldStores.find(canonF);
   if (it == funcFieldStores.end())
     return true;
   const auto &fieldSet = it->second;
@@ -5649,8 +5656,12 @@ bool CallGraphPass::runCompositionalSolve() {
   std::unordered_map<std::string, Function *> nameToFunc;
   for (auto &[M, _] : Ctx->Modules) {
     for (Function &F : *M) {
-      if (!F.isIntrinsic())
-        nameToFunc.emplace(getScopeName(&F), &F);
+      if (F.isIntrinsic())
+        continue;
+      std::string scope = getScopeName(&F);
+      auto [it, inserted] = nameToFunc.emplace(scope, &F);
+      if (!inserted && it->second->isDeclaration() && !F.isDeclaration())
+        it->second = &F;
     }
   }
 
@@ -5837,7 +5848,7 @@ bool CallGraphPass::runCompositionalSolve() {
           auto fIt = nameToFunc.find(funcName);
           if (fIt == nameToFunc.end())
             continue;
-          Function *F = fIt->second;
+          Function *F = getFuncDef(fIt->second);
           if (!isCompatible(CS, F))
             continue;
           if (hasCallSiteField) {

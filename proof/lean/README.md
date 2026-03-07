@@ -8,15 +8,24 @@ This is a minimal Lean 4 project that mechanically checks a core soundness theor
 - A simplified CFL-style reachability judgment (`Reach`)
 - A graph-homomorphism/simulation notion (`GraphHom`)
 - Explicit boundary-symbol categories:
-  - core: `func`, `arg`, `ret`, `vararg`, `glob`, `icall`
-  - precision extras: `icallret`, `lret`, `gptr`, `gderef`
+  - core: `func`, `arg`, `ret`, `vararg`, `glob`, `icall`,
+    `larg`, `lret`, `lvararg`, `icallarg`, `icallret`
+  - precision extras: `gptr`, `gderef`
 - Iterative compositional augmentation model (`IterStep`, `iterClosure`) for
   summary-edge fixed-point solving
+- Boundary pinning model (`pinBoundaryNodes`) for keeping edge-isolated
+  boundary nodes materialized through compression
+- Assign-pair summary-rule schema (`assignBridgeRule`) for compositional
+  icall-arg propagation (`icallarg -> arg/larg/vararg/lvararg`)
 - A checked theorem:
   - `reach_map`: reachability is preserved under graph simulation
   - `reach_mono`: reachability is monotone under edge inclusion
   - `compositional_sound`: monolithic reachability implies composed reachability, given a simulation map `q`
   - `compositional_sound_iterative`: adding edges after one-shot composition remains sound
+  - `compositional_sound_with_pinned_boundaries`: soundness preserved when
+    boundary-seed self-edges are added before export/composition
+  - `compositional_sound_assignBridge_iterClosure`: iterative soundness
+    specialized to `a/-a` assign-pair summary wiring
   - `compositional_sound_two_stage_iterClosure`: per-TU quotient + boundary merge + global iterative closure remains sound
 
 The key idea is reusable: prove your concrete pipeline induces `GraphHom q Gmono Gcomp`, then soundness follows immediately.

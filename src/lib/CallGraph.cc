@@ -1610,8 +1610,10 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     // known allocator return symbols must stay reachable even when alloc
     // callsites are short-circuited as explicit AllocSites.
     if (Function *CF = CS.getCalledFunction()) {
+      // Record call edge so allocator calls appear in the callgraph export.
+      auto RCF = CGP.getFuncDef(CF);
+      CGP.Ctx->Callees[&CS].insert(RCF);
       if (CF->getReturnType()->isPointerTy()) {
-        const Function *RCF = CGP.getFuncDef(CF);
         NodeIndex retNode = CGP.NF.getReturnNodeFor(RCF);
         if (retNode == AndersNodeFactory::InvalidIndex)
           retNode = CGP.NF.createReturnNode(RCF);
@@ -2370,8 +2372,7 @@ bool CallGraphPass::doFinalization(Module *M) {
 
   // update callee mapping
   for (Function &F : *M) {
-    if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
-        Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+    if (F.isDeclaration() || F.isIntrinsic() || F.empty())
       continue;
 
     for (inst_iterator i = inst_begin(F), e = inst_end(F); i != e; ++i) {
@@ -2379,6 +2380,13 @@ bool CallGraphPass::doFinalization(Module *M) {
       if (CallBase *CB = dyn_cast<CallBase>(&*i)) {
         if (CB->isInlineAsm())
           continue;
+        // Ensure direct calls (including to alloc/container/skipped
+        // functions) are recorded so they appear in the callgraph export.
+        if (Function *CF = CB->getCalledFunction()) {
+          const Function *RCF = getFuncDef(CF);
+          if (!RCF->isIntrinsic())
+            Ctx->Callees[CB].insert(RCF);
+        }
         FuncSet &FS = Ctx->Callees[CB];
         // calculate the caller info here
         for (const Function *CF : FS) {
@@ -4002,20 +4010,32 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     return;
   }
 
-  // Collect all functions that appear in Callees or Callers
+  // Collect all functions that appear in Callees or Callers.
+  // Group by getFuncId to merge multiple Function* for the same symbol
+  // (e.g., external declarations appear in each module).
   DenseSet<const Function *> AllFuncs;
   for (auto &[CS, FS] : Ctx->Callees) {
     const Function *Caller = CS->getFunction();
     if (Caller && !Caller->isDeclaration() && !Caller->isIntrinsic())
       AllFuncs.insert(Caller);
     for (const Function *F : FS) {
-      if (F && (!F->isIntrinsic() || isImportantIntrinsic(F)))
+      if (F && !(F->isIntrinsic() && !isImportantIntrinsic(F)))
         AllFuncs.insert(F);
     }
   }
   for (auto &[F, CIS] : Ctx->Callers) {
-    if (F && !F->isDeclaration() && !F->isIntrinsic())
+    if (F && !(F->isIntrinsic() && !isImportantIntrinsic(F)))
       AllFuncs.insert(F);
+  }
+
+  // Build merged Callers map keyed by getFuncId string, since external
+  // declarations have separate Function* per module.
+  StringMap<CallInstSet> MergedCallers;
+  for (auto &[F, CIS] : Ctx->Callers) {
+    if (!F || (F->isIntrinsic() && !isImportantIntrinsic(F)))
+      continue;
+    auto &merged = MergedCallers[getFuncId(F)];
+    merged.insert(CIS.begin(), CIS.end());
   }
 
   json::Object Functions;
@@ -4024,10 +4044,12 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
   for (const Function *F : AllFuncs) {
     if (F->isIntrinsic() && !isImportantIntrinsic(F))
       continue;
-    if (F->isDeclaration() && !isImportantIntrinsic(F))
-      continue;
 
     std::string FuncID = getFuncId(F);
+    // Skip if already emitted (multiple Function* for the same symbol).
+    if (Functions.find(FuncID) != Functions.end())
+      continue;
+
     std::string SrcFile = getFuncSourceFile(F);
     auto [LineStart, LineEnd] = getFuncLineRange(F);
 
@@ -4041,40 +4063,42 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
 
     // Build callees array by iterating call instructions in this function
     json::Array CalleesArr;
-    for (auto &BB : *F) {
-      for (auto &I : BB) {
-        const CallBase *CI = dyn_cast<CallBase>(&I);
-        if (!CI || CI->isInlineAsm())
-          continue;
-
-        auto it = Ctx->Callees.find(CI);
-        if (it == Ctx->Callees.end())
-          continue;
-
-        bool isDirect = (CI->getCalledFunction() != nullptr);
-        unsigned line = getCallLine(CI);
-
-        for (const Function *Callee : it->second) {
-          if (Callee->isIntrinsic() && !isImportantIntrinsic(Callee))
+    if (!F->isDeclaration()) {
+      for (auto &BB : *F) {
+        for (auto &I : BB) {
+          const CallBase *CI = dyn_cast<CallBase>(&I);
+          if (!CI || CI->isInlineAsm())
             continue;
-          json::Object Edge;
-          Edge["callee"] = getFuncId(Callee);
-          Edge["call_type"] = isDirect ? "direct" : "indirect";
-          if (line > 0)
-            Edge["line"] = static_cast<int64_t>(line);
-          CalleesArr.push_back(std::move(Edge));
-          totalEdges++;
-          if (isDirect) directEdges++;
-          else indirectEdges++;
+
+          auto it = Ctx->Callees.find(CI);
+          if (it == Ctx->Callees.end())
+            continue;
+
+          bool isDirect = (CI->getCalledFunction() != nullptr);
+          unsigned line = getCallLine(CI);
+
+          for (const Function *Callee : it->second) {
+            if (Callee->isIntrinsic() && !isImportantIntrinsic(Callee))
+              continue;
+            json::Object Edge;
+            Edge["callee"] = getFuncId(Callee);
+            Edge["call_type"] = isDirect ? "direct" : "indirect";
+            if (line > 0)
+              Edge["line"] = static_cast<int64_t>(line);
+            CalleesArr.push_back(std::move(Edge));
+            totalEdges++;
+            if (isDirect) directEdges++;
+            else indirectEdges++;
+          }
         }
       }
     }
     FuncObj["callees"] = std::move(CalleesArr);
 
-    // Build callers array
+    // Build callers array from merged callers map
     json::Array CallersArr;
-    auto callerIt = Ctx->Callers.find(F);
-    if (callerIt != Ctx->Callers.end()) {
+    auto callerIt = MergedCallers.find(FuncID);
+    if (callerIt != MergedCallers.end()) {
       for (const CallBase *CI : callerIt->second) {
         const Function *CallerF = CI->getFunction();
         if (!CallerF || (CallerF->isIntrinsic() && !isImportantIntrinsic(CallerF)))

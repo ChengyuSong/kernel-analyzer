@@ -89,7 +89,7 @@ Expected<std::string> LLMClient::runCurl(StringRef RequestBody,
 
   std::string ErrMsg;
   bool ExecutionFailed = false;
-  int RC = sys::ExecuteAndWait(CurlPath.get(), Args, std::nullopt, std::nullopt, 0, 0,
+  int RC = sys::ExecuteAndWait(CurlPath.get(), Args, /*Env=*/None, /*Redirects=*/{}, 0, 0,
                                &ErrMsg, &ExecutionFailed);
   if (RC != 0 || ExecutionFailed) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> RespFile = MemoryBuffer::getFile(RespPath);
@@ -134,7 +134,7 @@ Expected<std::string> LLMClient::extractMessageContent(StringRef ResponseBody) c
     if (!Choices->empty()) {
       if (json::Object *Choice0 = (*Choices)[0].getAsObject()) {
         if (json::Object *Msg = Choice0->getObject("message")) {
-          if (std::optional<StringRef> Content = Msg->getString("content")) {
+          if (auto Content = Msg->getString("content")) {
             return Content->str();
           }
         }
@@ -143,7 +143,7 @@ Expected<std::string> LLMClient::extractMessageContent(StringRef ResponseBody) c
   }
 
   // Fallback for legacy /completion endpoint: {"content":"..."}
-  if (std::optional<StringRef> Content = Obj->getString("content")) {
+  if (auto Content = Obj->getString("content")) {
     return Content->str();
   }
 

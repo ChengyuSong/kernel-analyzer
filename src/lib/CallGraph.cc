@@ -115,7 +115,11 @@ static std::string computeSHA256Hex(StringRef content) {
   llvm::SHA256 hasher;
   hasher.update(content);
   auto digest = hasher.final();
+#if LLVM_VERSION_MAJOR >= 15
   return toHex(ArrayRef<uint8_t>(digest), /*LowerCase=*/true);
+#else
+  return toHex(arrayRefFromStringRef(digest), /*LowerCase=*/true);
+#endif
 }
 
 static bool computeFileSHA256(StringRef path, std::string &outHash, std::string *ErrMsg = nullptr) {

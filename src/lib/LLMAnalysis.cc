@@ -51,7 +51,7 @@ static size_t processAllocatorResponse(GlobalContext *Ctx,
     if (Candidates) {
       ParsedJSON = true;
       for (const json::Value &V : *Candidates) {
-        std::optional<StringRef> Name = V.getAsString();
+        auto Name = V.getAsString();
         if (!Name)
           continue;
         for (Function *F : Batch) {

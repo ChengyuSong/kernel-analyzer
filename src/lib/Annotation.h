@@ -189,7 +189,9 @@ static inline bool isImportantIntrinsic(const llvm::Function *F) {
   case llvm::Intrinsic::memcpy_inline:
   case llvm::Intrinsic::memmove:
   case llvm::Intrinsic::memset:
+#if LLVM_VERSION_MAJOR >= 15
   case llvm::Intrinsic::memset_inline:
+#endif
     return true;
   default:
     return false;

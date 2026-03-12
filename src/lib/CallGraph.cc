@@ -366,7 +366,9 @@ static bool isIgnorableAllocaIntrinsic(const CallBase *CB) {
   switch (CF->getIntrinsicID()) {
     case Intrinsic::dbg_declare:
     case Intrinsic::dbg_value:
+#if LLVM_VERSION_MAJOR >= 15
     case Intrinsic::dbg_assign:
+#endif
     case Intrinsic::lifetime_start:
     case Intrinsic::lifetime_end:
       return true;
@@ -1211,7 +1213,11 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
   std::vector<int> cToRet(Constraints.size(), -1);
   for (unsigned i = 0; i < Constraints.size(); i++) {
     auto &CI = Constraints[i];
-    if (CI.Type == InlineAsm::isClobber || CI.Type == InlineAsm::isLabel)
+    if (CI.Type == InlineAsm::isClobber
+#if LLVM_VERSION_MAJOR >= 15
+        || CI.Type == InlineAsm::isLabel
+#endif
+    )
       continue;
     if (CI.hasArg())
       cToArg[i] = argIdx++;
@@ -1270,7 +1276,13 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
     if (aIdx < 0 || (unsigned)aIdx >= CS.arg_size())
       continue;
 
+#if LLVM_VERSION_MAJOR >= 15
     Type *ET = CS.getParamElementType(aIdx);
+#else
+    Type *ET = CS.getArgOperand(aIdx)->getType()->isPointerTy()
+      ? CS.getArgOperand(aIdx)->getType()->getPointerElementType()
+      : nullptr;
+#endif
     if (!ET || !containsPointerType(ET))
       continue;
 
@@ -5286,17 +5298,17 @@ bool CallGraphPass::runCompositionalSolve() {
   }
 
   auto classifyBoundary = [](StringRef symbol) -> std::string {
-    if (symbol.starts_with("func:")) return "func";
-    if (symbol.starts_with("arg:")) return "arg";
-    if (symbol.starts_with("larg:")) return "larg";
-    if (symbol.starts_with("ret:")) return "ret";
-    if (symbol.starts_with("lret:")) return "lret";
-    if (symbol.starts_with("vararg:")) return "vararg";
-    if (symbol.starts_with("lvararg:")) return "lvararg";
-    if (symbol.starts_with("glob:")) return "glob";
-    if (symbol.starts_with("icall:")) return "icall";
-    if (symbol.starts_with("icallarg:")) return "icallarg";
-    if (symbol.starts_with("icallret:")) return "icallret";
+    if (LLVM_STRING_STARTS_WITH(symbol, "func:")) return "func";
+    if (LLVM_STRING_STARTS_WITH(symbol, "arg:")) return "arg";
+    if (LLVM_STRING_STARTS_WITH(symbol, "larg:")) return "larg";
+    if (LLVM_STRING_STARTS_WITH(symbol, "ret:")) return "ret";
+    if (LLVM_STRING_STARTS_WITH(symbol, "lret:")) return "lret";
+    if (LLVM_STRING_STARTS_WITH(symbol, "vararg:")) return "vararg";
+    if (LLVM_STRING_STARTS_WITH(symbol, "lvararg:")) return "lvararg";
+    if (LLVM_STRING_STARTS_WITH(symbol, "glob:")) return "glob";
+    if (LLVM_STRING_STARTS_WITH(symbol, "icall:")) return "icall";
+    if (LLVM_STRING_STARTS_WITH(symbol, "icallarg:")) return "icallarg";
+    if (LLVM_STRING_STARTS_WITH(symbol, "icallret:")) return "icallret";
     return "other";
   };
 

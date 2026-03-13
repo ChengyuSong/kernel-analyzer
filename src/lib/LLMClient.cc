@@ -89,7 +89,11 @@ Expected<std::string> LLMClient::runCurl(StringRef RequestBody,
 
   std::string ErrMsg;
   bool ExecutionFailed = false;
+#if LLVM_VERSION_MAJOR >= 15
+  int RC = sys::ExecuteAndWait(CurlPath.get(), Args, /*Env=*/std::nullopt, /*Redirects=*/{}, 0, 0,
+#else
   int RC = sys::ExecuteAndWait(CurlPath.get(), Args, /*Env=*/None, /*Redirects=*/{}, 0, 0,
+#endif
                                &ErrMsg, &ExecutionFailed);
   if (RC != 0 || ExecutionFailed) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> RespFile = MemoryBuffer::getFile(RespPath);

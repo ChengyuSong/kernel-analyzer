@@ -1619,6 +1619,12 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
   if (CGP.Ctx->AllocSites.count(&CS)) {
     // record allocation sites and create heap object node
     NodeIndex valNode = CGP.getRepNodeForValue(&CS);
+    if (valNode == AndersNodeFactory::InvalidIndex) {
+      // Allocator returns non-pointer type (e.g. unsigned long for
+      // __get_free_pages); create a value node on demand.
+      valNode = CGP.NF.createValueNode(&CS);
+      valNode = CGP.getCanonicalNode(valNode);
+    }
     CGP.AllocSites.insert(valNode);
     NodeIndex heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
     CGP.EB.addDereferenceEdges(valNode, heapObj);

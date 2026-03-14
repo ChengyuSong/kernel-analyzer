@@ -5246,8 +5246,19 @@ bool CallGraphPass::runCompositionalSolve() {
 
     if (!allowDuplicateCoverage) {
       for (const auto &[moduleId, count] : coverageCounts) {
-        if (count > 1)
-          duplicateModules.insert(moduleId);
+        if (count > 1) {
+          if (staleModules.count(moduleId)) {
+            // Hash conflict: different versions of the same module in different
+            // .cflcg files — this is a real error.
+            duplicateModules.insert(moduleId);
+          } else {
+            // Benign duplicate: all covering .cflcg files agree on the hash
+            // (same content). The composition step deduplicates edges, so this
+            // is safe to ignore.
+            CG_LOG("Duplicate coverage for " << moduleId
+                   << " (benign, all inputs agree on hash)\n");
+          }
+        }
       }
     }
   } else {

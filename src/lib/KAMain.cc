@@ -39,6 +39,7 @@
 #include "Reachable.h"
 #include "LLMClient.h"
 #include "LLMAnalysis.h"
+#include "IRSidecar.h"
 
 using namespace llvm;
 
@@ -125,6 +126,11 @@ cl::opt<bool> CFLCGAllowDuplicateCoverage(
 
 cl::opt<std::string> CallGraphJSON(
   "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));
+
+cl::opt<std::string> IRSidecarDir(
+  "ir-sidecar-dir",
+  cl::desc("Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)"),
+  cl::init(""));
 
 cl::opt<int> MemLimitPct(
   "mem-limit", cl::desc("Memory limit as percentage of physical RAM (0 = unlimited, default 80)"), cl::init(80));
@@ -452,6 +458,10 @@ int main(int argc, char **argv) {
   }
   if (!VSnapshotOutput.empty()) {
     CGPass.dumpVSnapshot(VSnapshotOutput);
+  }
+  if (!IRSidecarDir.empty()) {
+    IRSidecarExporter Sidecar(&GlobalCtx);
+    Sidecar.dump(IRSidecarDir);
   }
 
   if (!AllocatorFile.empty())

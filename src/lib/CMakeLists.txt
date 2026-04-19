@@ -10,6 +10,7 @@ set (KASource
   VSnapshot.cc
   CompressedGraph.cc
   CallGraph.cc
+  IRSidecar.cc
 )
 
 # Build executable, KAMain.

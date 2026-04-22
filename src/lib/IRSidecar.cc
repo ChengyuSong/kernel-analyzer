@@ -185,6 +185,11 @@ static json::Object attrListToJson(const AttributeList &AL, unsigned numArgs) {
   return O;
 }
 
+// Strip GEPs/casts/aliases to find the underlying GlobalVariable, or nullptr.
+static const GlobalVariable *ptrToGlobal(const Value *V) {
+  return dyn_cast<GlobalVariable>(getUnderlyingObject(V));
+}
+
 // Atomic ordering -> string. Empty for NotAtomic so callers can omit.
 static std::string atomicOrderingStr(AtomicOrdering AO) {
   switch (AO) {
@@ -319,6 +324,9 @@ private:
   unsigned shiftCount = 0;        // shl/ashr/lshr
   unsigned signCastCount = 0;     // trunc/sext/zext
 
+  // GlobalVariable -> access bitmask: 1=read, 2=write (3=readwrite).
+  DenseMap<const GlobalVariable *, unsigned> globalAccesses;
+
   std::string nextEId() { return "e" + std::to_string(++eIdCounter); }
   std::string nextBId() { return "b" + std::to_string(++bIdCounter); }
   std::string nextIoId() { return "io" + std::to_string(++ioIdCounter); }
@@ -385,6 +393,7 @@ void FuncEmitter::emitStore(const StoreInst &SI) {
   std::string ord = atomicOrderingStr(SI.getOrdering());
   if (!ord.empty()) E["atomic"] = ord;
   if (ptrIsInboundsGEP(SI.getPointerOperand())) E["inbounds"] = true;
+  if (auto *GV = ptrToGlobal(SI.getPointerOperand())) globalAccesses[GV] |= 2;
   effects.push_back(std::move(E));
 }
 
@@ -405,6 +414,7 @@ void FuncEmitter::emitLoad(const LoadInst &LI) {
   if (ptrIsInboundsGEP(LI.getPointerOperand())) E["inbounds"] = true;
   json::Object MD = loadMetadataToJson(LI);
   if (!MD.empty()) E["load_md"] = std::move(MD);
+  if (auto *GV = ptrToGlobal(LI.getPointerOperand())) globalAccesses[GV] |= 1;
   effects.push_back(std::move(E));
 }
 
@@ -424,6 +434,7 @@ void FuncEmitter::emitAtomicRMW(const AtomicRMWInst &AI) {
   std::string ord = atomicOrderingStr(AI.getOrdering());
   if (!ord.empty()) E["atomic"] = ord;
   if (ptrIsInboundsGEP(AI.getPointerOperand())) E["inbounds"] = true;
+  if (auto *GV = ptrToGlobal(AI.getPointerOperand())) globalAccesses[GV] |= 3;
   effects.push_back(std::move(E));
 }
 
@@ -444,6 +455,7 @@ void FuncEmitter::emitCmpXchg(const AtomicCmpXchgInst &CX) {
   if (!sord.empty()) E["atomic_success"] = sord;
   if (!ford.empty()) E["atomic_failure"] = ford;
   if (ptrIsInboundsGEP(CX.getPointerOperand())) E["inbounds"] = true;
+  if (auto *GV = ptrToGlobal(CX.getPointerOperand())) globalAccesses[GV] |= 3;
   effects.push_back(std::move(E));
 }
 
@@ -751,6 +763,25 @@ json::Object FuncEmitter::emit() {
   Features["arg_count"] = static_cast<int64_t>(F->arg_size());
   Features["is_vararg"] = F->isVarArg();
 
+  // Build globals array sorted by name for determinism.
+  json::Array Globals;
+  if (!globalAccesses.empty()) {
+    std::vector<std::pair<std::string, std::pair<const GlobalVariable *, unsigned>>> sorted;
+    sorted.reserve(globalAccesses.size());
+    for (auto &[GV, bits] : globalAccesses)
+      sorted.push_back({GV->getName().str(), {GV, bits}});
+    std::sort(sorted.begin(), sorted.end());
+    for (auto &[name, p] : sorted) {
+      const GlobalVariable *GV = p.first;
+      unsigned bits = p.second;
+      json::Object G;
+      G["name"] = "@" + name;
+      G["type"] = typeName(GV->getValueType());
+      G["access"] = (bits == 3) ? "readwrite" : (bits == 2) ? "write" : "read";
+      Globals.push_back(std::move(G));
+    }
+  }
+
   json::Object Out;
   Out["function"] = getFuncId(F);
   Out["ir_hash"] = ir_hash;
@@ -759,6 +790,7 @@ json::Object FuncEmitter::emit() {
   Out["branches"] = std::move(branches);
   Out["int_ops"] = std::move(int_ops);
   Out["ranges"] = std::move(ranges);
+  Out["globals"] = std::move(Globals);
   Out["features"] = std::move(Features);
   Out["attrs"] = attrListToJson(F->getAttributes(),
                                 static_cast<unsigned>(F->arg_size()));

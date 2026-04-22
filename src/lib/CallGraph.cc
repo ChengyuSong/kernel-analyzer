@@ -5468,6 +5468,31 @@ bool CallGraphPass::runCompositionalSolve() {
           missingBoundarySymbols.insert(sym);
       }
 
+      // A missing ret:GUID is benign when the function is in ExtFuncs (defined
+      // in another TU, not locally).  Two valid reasons it can be absent:
+      //   1. The library analyzed the function and its return value carries no
+      //      pointer aliasing (e.g., always-null), so ret:GUID was never active
+      //      and was not exported to the boundary cache.
+      //   2. The function is truly external (libc etc.) and not analyzed anywhere.
+      // In both cases the composition is sound: the return is treated as
+      // unconstrained, which over-approximates.  Keep the strict check for
+      // functions defined in the current TU (Ctx->Funcs) where an active return
+      // node MUST appear in the per-module cache.
+      if (!missingBoundarySymbols.empty()) {
+        std::unordered_set<std::string> extFuncGUIDs;
+        extFuncGUIDs.reserve(Ctx->ExtFuncs.size());
+        for (const auto &[guid, F] : Ctx->ExtFuncs)
+          extFuncGUIDs.insert(std::to_string(guid));
+        for (auto it = missingBoundarySymbols.begin();
+             it != missingBoundarySymbols.end(); ) {
+          StringRef S(*it);
+          if (LLVM_STRING_STARTS_WITH(S, "ret:") && extFuncGUIDs.count(S.drop_front(4).str()))
+            it = missingBoundarySymbols.erase(it);
+          else
+            ++it;
+        }
+      }
+
       std::set<std::string> missingBoundaryClasses;
       const std::array<const char *, 11> requiredClasses = {
           "func", "arg", "ret", "vararg", "glob", "icall",

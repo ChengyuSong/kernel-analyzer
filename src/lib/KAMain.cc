@@ -127,6 +127,12 @@ cl::opt<bool> CFLCGAllowDuplicateCoverage(
 cl::opt<std::string> CallGraphJSON(
   "callgraph-json", cl::desc("Export call graph to JSON file"), cl::init(""));
 
+cl::opt<bool> CFLDumpCalleeMismatch(
+  "cfl-dump-callee-mismatch",
+  cl::desc("Per-callsite WARNING for callees found by type but not by CFL "
+           "(can produce GBs of log on large inputs)"),
+  cl::init(false));
+
 cl::opt<std::string> IRSidecarDir(
   "ir-sidecar-dir",
   cl::desc("Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)"),

@@ -430,7 +430,7 @@ unsigned AndersNodeFactory::constGEPtoFieldNum(const llvm::ConstantExpr* expr) c
                 auto itr2 = objNodeMap.find(ptr);
                 // assert(itr2 != objNodeMap.end() && "const gep expr ptr should have a node!");
                 if (itr2 == objNodeMap.end()) {
-                    WARNING("const gep expr ptr " << *ptr << " has no node!\n");
+                    WARNING("const gep expr ptr @" << ptr->getName() << " has no node!\n");
                     return 0;
                 }
                 const Type *ATy = nodes[itr2->second].getAllocationType();

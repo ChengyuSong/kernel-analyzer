@@ -2432,10 +2432,11 @@ bool CallGraphPass::doFinalization(Module *M) {
       FuncSet &TS = it.second;
       FuncSet &FS = Ctx->Callees[CS];
       total += TS.size();
+      extern cl::opt<bool> CFLDumpCalleeMismatch;
       for (const Function *F : TS) {
         if (FS.find(F) != FS.end()) {
           match++;
-        } else {
+        } else if (CFLDumpCalleeMismatch) {
           // not found by CFL
           WARNING("Callee by type not found by CFL: " << F->getName() << " for " << *CS << "\n");
         }

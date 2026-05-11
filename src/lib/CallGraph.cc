@@ -3499,18 +3499,23 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
     denseToOrig.clear();
     numDenseNodes = 0;
 
+    // Route through getCanonicalNode so global-dedup union-find merges are
+    // visible to the solver: edges from merged-away nodes get folded into
+    // their canonical representative's dense slot.
     for (size_t edgeIdx : tuEdgeIndices) {
       assert(edgeIdx < iterEdges.size() &&
              "solveAndCompressPerTU: edge index out of range");
       const auto &E = iterEdges[edgeIdx];
-      if (origToDense[E.from] == UINT32_MAX) {
-        origToDense[E.from] = numDenseNodes;
-        denseToOrig.push_back(E.from);
+      NodeIndex fromCanon = getCanonicalNode(E.from);
+      NodeIndex toCanon = getCanonicalNode(E.to);
+      if (origToDense[fromCanon] == UINT32_MAX) {
+        origToDense[fromCanon] = numDenseNodes;
+        denseToOrig.push_back(fromCanon);
         numDenseNodes++;
       }
-      if (origToDense[E.to] == UINT32_MAX) {
-        origToDense[E.to] = numDenseNodes;
-        denseToOrig.push_back(E.to);
+      if (origToDense[toCanon] == UINT32_MAX) {
+        origToDense[toCanon] = numDenseNodes;
+        denseToOrig.push_back(toCanon);
         numDenseNodes++;
       }
     }
@@ -3534,8 +3539,8 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
     denseEdges.reserve(tuEdgeIndices.size());
     for (size_t edgeIdx : tuEdgeIndices) {
       const auto &E = iterEdges[edgeIdx];
-      uint32_t from = origToDense[E.from];
-      uint32_t to = origToDense[E.to];
+      uint32_t from = origToDense[getCanonicalNode(E.from)];
+      uint32_t to = origToDense[getCanonicalNode(E.to)];
       if (from == to)
         continue;
       EdgeKey key{from, to, E.label};
@@ -3693,9 +3698,12 @@ bool CallGraphPass::doModulePass(Module *M) {
       EB.reserve(totalInsts * 4);
 
       // Run global dedup on first module (all nodes exist from doInitialization).
-      // Skip in compositional mode: per-TU solving uses per-module dense mappings,
-      // incompatible with global dedup which iterates ALL modules.
-      if (CFLGlobalDedup && !CFLCompositional)
+      // The intra-procedural rules in globalDedupScanFunction are flow-insensitive-safe
+      // by construction; cross-call merges in globalDedupScanCallEdges only fire for
+      // single-callsite callees and are sound under per-TU solving as well.
+      // Per-TU dense mapping below uses getCanonicalNode() so dedup classes are
+      // visible to the solver.
+      if (CFLGlobalDedup)
         runGlobalDedup();
     }
 

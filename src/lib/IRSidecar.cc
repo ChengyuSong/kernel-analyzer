@@ -6,6 +6,13 @@
  * for the schema. v1 emits: effects, branches, int_ops, ranges,
  * features, ir_hash, cg_hash. (aliases/callsites/nondet_sources
  * are out of scope for v1.)
+ *
+ * v2 adds, per memory effect, an `access` object {base, base_kind
+ * (param|alloca|global|other), param, var_offset, const_offset, size} and,
+ * per bulk memory op (memcpy/memmove/memset/str*), a `mem` object {dest, src,
+ * len_ssa, len_range, var_len}. `var_offset`/`var_len` flag a runtime offset or
+ * length: the consumer demands a contract extent (valid(p, N)) only there — a
+ * plain deref / constant-offset access is safe under nonnull(p).
  */
 
 #include "IRSidecar.h"
@@ -376,6 +383,11 @@ private:
   void emitBranch(const BranchInst &BR);
   void emitBinOp(const BinaryOperator &BO);
   void emitCast(const CastInst &CI);
+
+  // Decompose a memory-access pointer into its underlying object + offset
+  // shape, so the consumer can demand a contract extent only where one is
+  // actually needed (a variable-offset GEP), not for a plain deref.
+  json::Object accessDesc(const Value *Ptr, Type *AccessTy);
 };
 
 void FuncEmitter::emitStore(const StoreInst &SI) {
@@ -393,6 +405,8 @@ void FuncEmitter::emitStore(const StoreInst &SI) {
   std::string ord = atomicOrderingStr(SI.getOrdering());
   if (!ord.empty()) E["atomic"] = ord;
   if (ptrIsInboundsGEP(SI.getPointerOperand())) E["inbounds"] = true;
+  E["access"] = accessDesc(SI.getPointerOperand(),
+                          SI.getValueOperand()->getType());
   if (auto *GV = ptrToGlobal(SI.getPointerOperand())) globalAccesses[GV] |= 2;
   effects.push_back(std::move(E));
 }
@@ -414,8 +428,67 @@ void FuncEmitter::emitLoad(const LoadInst &LI) {
   if (ptrIsInboundsGEP(LI.getPointerOperand())) E["inbounds"] = true;
   json::Object MD = loadMetadataToJson(LI);
   if (!MD.empty()) E["load_md"] = std::move(MD);
+  E["access"] = accessDesc(LI.getPointerOperand(), LI.getType());
   if (auto *GV = ptrToGlobal(LI.getPointerOperand())) globalAccesses[GV] |= 1;
   effects.push_back(std::move(E));
+}
+
+// Describe the object a memory access lands on + whether the offset is a
+// compile-time constant or a runtime value. The memsafety consumer uses this to
+// decide which accesses NEED a contract extent: a plain deref / constant-offset
+// access (offset bounded by the type) is safe under `nonnull(p)`, but a
+// VARIABLE-offset GEP (e.g. `p[i]`, pointer-walk) can run past the object and so
+// requires a `valid(p, N)` bound — absent one, the verdict must be INCOMPLETE,
+// not CHECKED.  Fields: base / base_kind (param|alloca|global|other) / param
+// index / var_offset (only when true) / const_offset (only when nonzero) / size.
+json::Object FuncEmitter::accessDesc(const Value *Ptr, Type *AccessTy) {
+  json::Object A;
+  const Value *UO = getUnderlyingObject(Ptr);
+  // -O0 param spill: `%a = alloca; store %param, %a; %v = load %a; gep %v, idx`.
+  // getUnderlyingObject stops at the load; peek through a single-store alloca to
+  // recover the original param/object so the consumer can name `valid(p, N)`.
+  if (auto *LI = dyn_cast<LoadInst>(UO)) {
+    if (auto *AI =
+            dyn_cast<AllocaInst>(getUnderlyingObject(LI->getPointerOperand()))) {
+      const Value *stored = nullptr;
+      bool unique = true;
+      for (const User *U : AI->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() != AI) continue;
+          if (stored && stored != SI->getValueOperand()) { unique = false; break; }
+          stored = SI->getValueOperand();
+        }
+      }
+      if (unique && stored)
+        UO = getUnderlyingObject(stored);
+    }
+  }
+  const char *baseKind = "other";
+  if (auto *Arg = dyn_cast<Argument>(UO)) {
+    baseKind = "param";
+    A["param"] = static_cast<int64_t>(Arg->getArgNo());
+  } else if (isa<AllocaInst>(UO)) {
+    baseKind = "alloca";
+  } else if (isa<GlobalVariable>(UO)) {
+    baseKind = "global";
+  } else {
+    A["base"] = ssaName(UO);
+  }
+  A["base_kind"] = baseKind;
+
+  // Strip constant-offset GEPs/casts, accumulating the byte offset. If a GEP
+  // with a non-constant index remains, the access has a variable offset.
+  unsigned IdxBits = DL.getIndexTypeSizeInBits(Ptr->getType());
+  APInt Off(IdxBits, 0);
+  const Value *B =
+      Ptr->stripAndAccumulateConstantOffsets(DL, Off, /*AllowNonInbounds=*/true);
+  if (isa<GEPOperator>(B))
+    A["var_offset"] = true;
+  if (Off != 0)
+    A["const_offset"] = static_cast<int64_t>(Off.getSExtValue());
+  if (AccessTy && AccessTy->isSized())
+    A["size"] = static_cast<int64_t>(DL.getTypeStoreSize(AccessTy).getFixedValue());
+  return A;
 }
 
 void FuncEmitter::emitAtomicRMW(const AtomicRMWInst &AI) {
@@ -538,6 +611,46 @@ void FuncEmitter::emitCall(const CallBase &CB) {
                                           static_cast<unsigned>(CB.arg_size()));
     if (!isAttrBlockEmpty(CSAttrs))
       E["callsite_attrs"] = std::move(CSAttrs);
+  }
+
+  // Bulk memory op (memcpy/memmove/memset/str*): record dest/src access shape +
+  // whether the length is a runtime value, so the consumer can demand
+  // valid(dest, len) when the length is not a compile-time constant (an
+  // unbounded copy past a too-small buffer — e.g. CVE-2023-37457).
+  const Value *memDest = nullptr, *memSrc = nullptr, *memLen = nullptr;
+  bool strFamily = false;
+  if (auto *MI = dyn_cast<MemIntrinsic>(&CB)) {
+    memDest = MI->getDest();
+    memLen = MI->getLength();
+    if (auto *MT = dyn_cast<MemTransferInst>(&CB)) memSrc = MT->getSource();
+  } else if (CF) {
+    StringRef N = CF->getName();
+    bool isMem = (N == "memcpy" || N == "memmove" || N == "memset" ||
+                  N == "mempcpy");
+    strFamily = (N == "strcpy" || N == "strncpy" || N == "strcat" ||
+                 N == "strncat" || N == "stpcpy");
+    if ((isMem || strFamily) && CB.arg_size() >= 2) {
+      memDest = CB.getArgOperand(0);
+      if (N != "memset") memSrc = CB.getArgOperand(1);
+      if (isMem && CB.arg_size() >= 3) memLen = CB.getArgOperand(2);
+      else if ((N == "strncpy" || N == "strncat") && CB.arg_size() >= 3)
+        memLen = CB.getArgOperand(2);
+    }
+  }
+  if (memDest) {
+    json::Object M;
+    M["dest"] = accessDesc(memDest, nullptr);
+    if (memSrc) M["src"] = accessDesc(memSrc, nullptr);
+    if (memLen) {
+      M["len_ssa"] = ssaName(memLen);
+      if (!isa<ConstantInt>(memLen)) M["var_len"] = true;
+      std::string rid = ensureRange(memLen);
+      if (!rid.empty()) M["len_range"] = rid;
+    } else if (strFamily) {
+      // strcpy/strcat/stpcpy: length = strlen(src), inherently a runtime value.
+      M["var_len"] = true;
+    }
+    E["mem"] = std::move(M);
   }
   effects.push_back(std::move(E));
 }
@@ -855,7 +968,7 @@ void IRSidecarExporter::dump(StringRef Dir) {
     }
 
     json::Object Metadata;
-    Metadata["version"] = 1;
+    Metadata["version"] = 2;
     Metadata["bc_path"] = bcPath.str();
     Metadata["total_functions"] = static_cast<int64_t>(funcCount);
 

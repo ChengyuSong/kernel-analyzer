@@ -1,0 +1,279 @@
+# CFL Graph Explosion: Diagnosis, Soundness Review, and Scaling Plan
+
+Date: 2026-07-03.
+Companion to [compositional-cfl-analysis.md](compositional-cfl-analysis.md).
+
+This doc records the analysis of three questions:
+
+1. Why does the LLVM-IR-based constraint graph explode (nodes, and edges added
+   during solving), causing OOM even on small programs?
+2. Is the compositional analysis sound?
+3. What should we do next, given the constraints below?
+
+Constraints adopted for the plan:
+
+- Keep GraCFL as-is: exhaustive (all-pairs), parallel, no on-demand mode, no
+  grammar changes. It is fast on graphs whose closure is sparse.
+- Data-flow-based target resolution only. Type/signature matching is not
+  trusted (opaque pointers, bad casts in real code), so scaling must come from
+  the graph, not from a type-based fallback.
+
+## 1. Why the graph explodes
+
+### The memory mechanism: closure size, not input size
+
+GraCFL stores results as a `ReachabilityMatrix`: per node, per label, a hash
+set of reached nodes (`src/gracfl/include/utils/Reachability.hpp`). Memory is
+therefore proportional to the number of *derived facts*. Dedup prevents
+storing a fact twice; it cannot compress a dense relation. **The materialized
+closure is a lower bound on memory for any exhaustive solver** — parallelism
+and dedup do not help when the answer itself does not fit.
+
+The dominant fact count is V. Under the grammar
+
+```
+M = -d V d
+V = (M? -a)* M? (a M?)*
+```
+
+a single `a` edge and a single `-a` edge are each complete V derivations, and
+`CFLEdgeBuilder::addAssignmentEdges` always inserts both directions. So **both
+endpoints of every assignment edge are mutually V-reachable by construction**,
+and `-a* a*` chains extend this across any assignment-connected region. M then
+fuses regions that share a deref node. The V relation over the graph
+decomposes into large "may-share-a-value" components; each node's V-set is
+roughly its component, so total V facts are
+
+```
+sum over components of |component|^2
+```
+
+One 100K-node component is ~10^10 facts. This is the OOM. It also explains why
+post-solve V-SCC compression achieves 30-70%: those SCCs *are* these
+components.
+
+### Why IR-level construction makes components enormous
+
+GraCFL's benchmark graphs are variable-level, pre-cleaned (SVF/Graspan-style).
+Our builder differs in four compounding ways:
+
+1. **Node per pointer-typed SSA temporary.** Every GEP, bitcast, phi, select,
+   and load result is a node joined to a component by an `a/-a` pair.
+   Source-level graphs have one node per variable; IR gives one per
+   *occurrence* (~5-10x), and every extra node enlarges some component.
+
+2. **Field-insensitive GEP + one deref node per canonical pointer.**
+   `visitGetElementPtrInst` wires `base -> result` with `a`;
+   `getRepDerefNode` gives one deref node per canonical pointer. All field
+   pointers of an object are V-fused with the base, all loads/stores through
+   *any* field meet at one memory node, and M fuses every producer and
+   consumer of the object into one component. Structs with many pointer
+   fields and widely shared objects are the worst case.
+
+3. **Global initializer collapse.** `processInitializer` folds an entire
+   `ConstantArray`/`ConstantStruct` into one deref node. A 300-entry ops
+   table becomes a hub with 300 function in-edges; everything touching that
+   global joins one component containing all 300 functions.
+
+4. **Pre-optimization IR.** If the input bitcode predates mem2reg/SROA, every
+   local variable is an alloca with load/store traffic — `d/-d` edges and
+   M-derivations for scalars that source-level graphs encode as plain
+   assignments.
+
+### Diagnostic experiment (run before investing further)
+
+Union-find over just the `a` edges of the input graph (seconds, no solver);
+print the component-size histogram and `sum(|component|^2)`. That number is a
+lower bound on final V facts (M only fuses components further):
+
+- If the top component is huge, the diagnosis above holds and the plan in §3
+  follows.
+- If not, the blowup is M-derivation churn instead, and the plan must be
+  revisited.
+
+## 2. Soundness review of the compositional pipeline
+
+**Verdict: the core architecture is sound.** V-SCC quotienting is
+edge-adding (a homomorphism), union-find boundary merging is edge-adding, and
+CFL-reachability is monotone, so composed reachability over-approximates
+monolithic reachability. The three self-loop fixes documented in
+`compositional-cfl-analysis.md` were the correct repairs. The composed
+iteration does wire actual-to-formal edges for newly resolved targets
+(`icallarg: -> arg:/larg:`, vararg, and `ret -> icallret` in
+`runCompositionalSolve`), so cross-TU parameter flow through indirect calls is
+closed under iteration. libpng validation (0 missing edges vs monolithic) is
+consistent.
+
+Four findings, in decreasing severity:
+
+### 2.1 Iteration caps can silently under-approximate (soundness hole)
+
+- `kMaxCompIterations = 8` in `runCompositionalSolve`: if the summary-edge
+  loop has not converged after 8 rounds, it stops without warning. A capped
+  fixpoint is not a fixpoint: missing summary edges mean missing V facts mean
+  missing callees.
+- `kMaxPerTUIterations = 32` in `solveAndCompressPerTU`: warns and proceeds.
+
+Per the project rule (no silent fallback), both should assert, or at minimum
+set a hard "result not sound" flag propagated to the output JSON.
+
+### 2.2 Field-store filter is unsound under partial knowledge
+
+`fieldFilterAccepts` returns `false` when `funcFieldStores[F]` is *non-empty*
+but lacks the callsite's field key. This is only correct if the map is
+complete per function, but callback tracing is explicitly one-level. A
+function whose address is stored directly somewhere (map becomes non-empty)
+*and* registered through a 2+-level helper chain elsewhere is wrongly rejected
+at the second site's callsites.
+
+Fix: a per-function completeness bit. While building the map, if any use of
+`F`'s address escapes classification (passed to an untraced call, stored
+through a non-GEP pointer, ...), mark `F` unknown => always accept. This makes
+the filter unconditionally sound instead of "sound if tracing is complete".
+
+### 2.3 V-SCC merging precision claim is overstated (soundness unaffected)
+
+The companion doc claims V-SCC members "have identical points-to sets" and
+that V "is transitively closed". Two corrections:
+
+- **V is not transitive.** The pattern `(M? -a)* M? (a M?)*` puts all `-a`
+  steps before all `a` steps, so `a` followed by `-a` (common-*sink*:
+  `z -a-> x <-a- y`) is deliberately excluded from V. But `computeVSCC` runs
+  Tarjan over V-*edges*, so SCC membership is mutual reachability through
+  V-chains — coarser than pairwise V. Concretely: `z -a-> x` gives mutual
+  V(z,x); `y -a-> x` gives mutual V(y,x); Tarjan merges {z,x,y}, yet V(z,y)
+  does not hold monolithically. Merging manufactures it — exactly the
+  common-sink smearing the grammar was designed to exclude, and a plausible
+  mechanistic source of the 14 extra libpng edges.
+- Even genuine mutual V means "may share a value", not equal points-to sets.
+
+Both effects only *add* facts, so soundness stands. The accurate statement is
+"sound, with bounded extra smearing". If the extra edges matter, the knob is
+restricting merging to pairwise-mutual-V cliques rather than chain SCCs.
+
+### 2.4 Boundary completeness is argued, not enforced
+
+The `func/arg/ret/vararg/glob/icall` inventory looks right for calls and
+globals. Channels to audit:
+
+- `GlobalAlias`: does a symbol referenced in TU A and defined via alias in
+  TU B land in `Gobjs`/`Funcs` under the same GUID?
+- `GlobalIFunc`: resolvers are handled locally by `collectIFuncTargets`, but a
+  resolver may live in another TU.
+
+A one-time assertion pass — "every ExternalLinkage value participating in any
+CFL edge has a boundary symbol" — would convert the doc's Assumption 1 into a
+checked invariant.
+
+## 3. Scaling plan (keeping GraCFL exhaustive)
+
+Ordering principle: constant-factor graph shrinking did not move the harfbuzz
+OOM (global dedup ungating, RSM-guided folding — both tried, see
+`cfl-scaling-plan` memory). The fix must shrink the *closure*, i.e. shatter
+the V components. All steps below keep GraCFL unmodified.
+
+### 3.1 Per-field memory nodes (headline change) — IMPLEMENTED 2026-07-03
+
+> **Status + design correction.** Implemented behind `--cfl-field-buckets=K`
+> (default 0 = off). The original claim below ("grammar stays a/-a/d/-d") was
+> wrong: node-keying alone cannot be sound, because two *different* pointer
+> expressions can address the same field of the same object, and only a
+> matched-parenthesis derivation can connect their field cells. The sound
+> design extends the *grammar data* (GraCFL solver code still unmodified)
+> with bucketed field terminals `f<i>/-f<i>` plus a wildcard `fx`, and rules
+> `Fld ::= -f<i> V f<i>` (the exact analogue of `M ::= -d V d`), `Mq ::= Fld`
+> (`buildP2GrammarWithFields` in `Global.h`). Construction changes:
+>
+> - GEPs are decomposed into per-struct-level offset steps
+>   (`decomposeGEPLevels`), so `&s->inner.f` matches `t = &s->inner; t->f`
+>   across helper functions. Level byte offsets hash into K buckets
+>   (collision = sound extra smearing).
+> - Unknown-offset accesses (i8/scalar pointer arithmetic, ptrtoint round
+>   trips, aggregate loads/stores, memcpy without layout, unions, container
+>   helpers) fall back to an assignment edge plus a `fx/-fx` self-loop on the
+>   base, which soundly absorbs field steps of any offset and nesting depth.
+> - Global initializers route values into per-field cells
+>   (`processInitializer` with `addrNode`), splitting the ops-table hubs.
+> - V-SCC compression retains intra-SCC field-label self-loops (same reason
+>   as the a/-a/d/-d self-loop bug fix in the compositional doc).
+>
+> Known precision gap (not a soundness gap): type-punned access paths with
+> *different nesting shapes* (flat `f_24` vs nested `f_8·f_16` from different
+> base pointers) do not match — the interleaved-Dyck undecidability tax.
+> K=0 (field-insensitive) remains the conservative reference mode.
+>
+> libpng validation (register merging also on): identical icall resolution,
+> monolithic and compositional; V closure 8.0M -> 4.5M, M closure 275K -> 24K
+> (11x).
+
+Original rationale (see correction above):
+
+- Key deref nodes by *(abstract object, byte offset)* instead of one deref
+  node per canonical pointer. A GEP with constant offsets produces a distinct
+  field-pointer node (not an `a` edge back to the base); loads/stores through
+  it use the per-field deref node. `StructAnalyzer` + `DataLayout` provide
+  the offset machinery (as in the field-sensitive Andersen side).
+- Conservative fallbacks stay local: variable-index GEP, unions, offset
+  overflow => collapse that access to the whole-object node. Degradation is
+  per-access, not global.
+- `processInitializer` gets the same treatment: initialize per-field deref
+  nodes instead of collapsing whole ops tables into one hub. This removes the
+  worst hubs and should also eliminate cross-field smearing among the 14
+  extra libpng edges.
+
+This is *not* the distrusted type matching: offset-based partitioning never
+consults type names, only the byte offsets the code actually computes. Bad
+casts just mean other code addresses the same object at the same offsets
+(still unified correctly); opaque pointers are irrelevant because GEPs carry a
+source element type and `DataLayout` resolves constant byte offsets.
+
+Why it is the headline: it attacks explosion and imprecision in one change.
+Mega-components exist because every field of a shared object funnels through
+one deref node; per-field nodes shatter them, so `sum(|component|^2)`
+collapses even though node count rises — feeding GraCFL a graph whose closure
+is small enough to solve exhaustively.
+
+Interaction: with field encoding, do NOT merge GEP results into the base
+(they become field nodes). Still merge bitcast/addrspacecast results and
+single-incoming phis into their operands (pre-solve unification of pure
+copies; zero precision loss, removes nodes before the memory peak).
+
+### 3.2 Function-pointer-relevance slicing
+
+For callgraph purposes, drop constraint nodes for values whose type provably
+cannot transitively carry a function pointer (`StructAnalyzer` knows which
+types can). Keep `void*`/inttoptr conservatively — this uses types only to
+prove impossibility, never to pick targets, so it is compatible with the
+no-type-trust stance. Directly shrinks components.
+
+### 3.3 Hierarchical composition
+
+The standing answer to "no demand solving": compositional + V-SCC compression
+bounds what the all-pairs solver ever sees at once. Compose in a merge tree
+(TU -> library -> program), re-compressing at each level (compose -> V-SCC ->
+export is already implemented), so no single solve sees the whole program.
+Also improves incremental rebuild and caching.
+
+### 3.4 Soundness fixes first
+
+Items 2.1 and 2.2 are small, independent, and should land before any scaling
+work so that eval comparisons stay meaningful.
+
+### 3.5 Fallback, only if still OOM after 3.1-3.3
+
+The pressure point would then be exactly one place: the final composed solve.
+Only then consider demand-driven V queries (V is consumed at only ~|icalls|
+fptr nodes plus allocator return nodes) or online mutual-V collapsing, scoped
+to that single level — not a GraCFL rewrite. Expectation: the component
+histogram moves enough under 3.1 that this is never needed.
+
+## 4. Suggested sequence
+
+1. Run the §1 diagnostic (a-edge component histogram) on harfbuzz to confirm
+   the quadratic-component theory. Cheap; falsifiable.
+2. Land 2.1 (caps -> assert/flag) and 2.2 (completeness bit).
+3. Implement 3.1 per-field memory nodes (+ initializer split, + copy
+   unification), validate against `test/libpng/eee13` baseline invariants and
+   `test/eval-compositional.sh`.
+4. Add 3.2 slicing if still needed; measure with the same histogram.
+5. Re-evaluate harfbuzz; only then consider 3.5.

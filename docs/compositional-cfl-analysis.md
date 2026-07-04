@@ -22,7 +22,7 @@ component) merging. These compressed constraint graphs are composed for
 whole-program analysis, either in-memory or serialized to `.cflcg` files for
 caching across builds.
 
-### Why V-SCC merging is sound and precise
+### Why V-SCC merging is sound (with a precision caveat)
 
 After per-TU CFL solving, nodes in the same V-SCC have mutual V-reachability,
 meaning they have identical points-to sets. Two properties guarantee that
@@ -53,8 +53,16 @@ M  = -d V d                           (memory alias)
 V  = (M? -a)* M? (a M?)*              (value flow)
 ```
 
-V includes epsilon (identity) and is transitively closed, which is what makes
-V-SCC merging a valid congruence.
+V includes epsilon (identity) and is symmetric, but it is **not** transitively
+closed: the pattern places all `-a` steps before all `a` steps, so `a`
+followed by `-a` (common-sink) is excluded. Since `computeVSCC` merges nodes
+that are mutually reachable through *chains* of V edges, an SCC can contain
+pairs that are not pairwise V-related monolithically. Merging them is still
+sound (it only adds derivations), but it can manufacture common-sink V facts
+that monolithic V excludes — a source of extra (not missing) edges. See
+[cfl-graph-explosion-and-scaling.md](cfl-graph-explosion-and-scaling.md) §2.3
+for details; the accurate claim for this section is "sound, with bounded
+extra smearing", not full precision preservation.
 
 ## Soundness proof (core compositional CFL)
 

@@ -341,6 +341,15 @@ products measured on harfbuzz are the concrete face of that squaring. The
 client reads V only at icall fptr nodes: the answer is rectangular
 (Function sources × fptr sinks); the squaring is pure scaffolding.
 
+*Caveat (important):* pts-shaped output is necessary, not sufficient.
+Andersen itself does NOT scale on whole kernels (confirmed by prior
+attempts here): when the abstraction collapses — field-insensitive cells,
+context-insensitive wrappers, murky heap identity — pts sets themselves go
+quadratic and Sigma|pts| approaches n*m, and propagation cost follows. Both
+formulations die with a collapsed abstraction; the alias-shaped one just
+dies squared-first. ORCFL is therefore paired with, not a substitute for,
+the precision levers (fields, cloning, slicing, heap identity).
+
 **Instance recast (flows-to form).** Sridharan-Bodík style:
   flowsTo ::= src ( a | put_f · alias · get_f )*
   alias   ::= flowsTo⁻¹ · flowsTo

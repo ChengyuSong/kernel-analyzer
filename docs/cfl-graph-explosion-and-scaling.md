@@ -315,3 +315,79 @@ template is a handful of boundary nodes; much smaller instantiation cost.
 Soundness: cloning only refines merging (each clone over-approximates its
 own context; the union of clones covers the original's behavior); per-clone
 allocation sites split, never fuse, may-facts.
+
+## 4. Research agenda (2026-07-04)
+
+Context: the literature's "CFL points-to is solved" impression rests on
+post-analysis benchmark graphs (§"benchmarks" discussion) and Java
+demand-driven systems. Raw IR-level PAGs (ours, and SVF's — student
+reproduced the same blowups on SVF PAG) are an unaddressed instance class.
+Five problems, ranked; R1 expanded as the concrete formulation.
+
+### R1. Output-restricted CFL-reachability (ORCFL) — core problem
+
+**Problem.** Given edge-labeled digraph G, normalized CFG with nonterminals
+NT, a designated answer nonterminal A, source set S ⊆ N, sink set T ⊆ N:
+compute A ∩ (S×T) with time/space parameterized by |E|, |answer|, and a
+structural width of the instance — NOT by the closure cardinality of
+scaffolding nonterminals. Standard saturation materializes every fact of
+every nonterminal; for pointer grammars the scaffolding (value-alias V) is
+quadratic even when the answer is tiny.
+
+**Why the current formulation loses.** Andersen materializes pts-shaped
+output (Σ|pts(v)|, rectangular). The V-based grammar materializes
+alias-shaped output (≈ pts ∘ pts⁻¹, square). Σ|comp|² and the s×l cell
+products measured on harfbuzz are the concrete face of that squaring. The
+client reads V only at icall fptr nodes: the answer is rectangular
+(Function sources × fptr sinks); the squaring is pure scaffolding.
+
+**Instance recast (flows-to form).** Sridharan-Bodík style:
+  flowsTo ::= src ( a | put_f · alias · get_f )*
+  alias   ::= flowsTo⁻¹ · flowsTo
+Answer = flowsTo ∩ (S×T), S = address-taken Function nodes (+ alloc sites
+for alias clients), T = icall fptr operands (or query roots). Key
+observation: alias is *consumed* only at (store-ptr, load-ptr) pairs whose
+accesses meet on a matching cell/field — a demand set D far smaller than
+all-pairs, further restricted by S-reachability and T-co-reachability.
+
+**Algorithm sketch to evaluate.** Bidirectional summary tabulation with
+answer-directed scheduling: maintain S-anchored forward flowsTo facts and
+T-anchored backward facts; form alias facts lazily as joins only when both
+sides reach a common cell, store only alias ∩ D. Storage target:
+O(S-reachable FT + T-co-reachable FT + |D|) — pts-shaped plus demanded
+alias, never V. Degenerate cheap prototype: |S| is small (10^2-10^4
+address-taken functions), so joint-frontier multi-source forward flows-to
+alone ("fptr-flows-to mode", generalizing the slicer's taint pass from
+components to derivations) bounds the answer without any V materialization.
+
+**Positioning.** Magic-sets/query-directed Datalog gives the generic
+transformation but reintroduces quadratic sideways bindings on alias
+grammars; Sridharan-Bodík/Boomerang are per-query with refinement, not
+exhaustive-answer with bounded scaffolding; GraCFL-style parallel solvers
+are all-nonterminal saturation. The delta: show which structure of PAG
+instances (bidirected a/-a, cell-local d-matching, mutual-V quotients from
+R3) makes answer-directed tabulation effective, implement on a parallel
+solver, evaluate on the R2 suite. Measurable hypothesis, testable today:
+storage ratio V-facts / FT-facts ≈ Σ|alias-class|² / Σ|pts| (libpng: V
+counts known; FT approximable by taint closure from Function nodes).
+
+### R2. Honest raw-PAG benchmark + instance-hardness metrics
+Release raw PAGs from two independent builders (KAnalyzer, SVF) with the
+hardness metrics (component histograms, Σ|comp|², label vocabulary census,
+cell-traffic distribution, chain depth) and show the frozen `.g` suites and
+raw PAGs are different instance classes. Measurement paper + artifact.
+
+### R3. Quotient solving with a precision theory for non-transitive V
+Online mutual-V collapse during solving (CFL analog of online cycle
+elimination); open theory: chain-SCCs over-merge because V is not
+transitive (§2.3) — when is quotienting precision-preserving, and what does
+common-sink smear cost on real code?
+
+### R4. Sound field sensitivity on raw IR under opaque pointers
+The per-level decomposition + wildcard-absorption encoding (§3.1) as a
+practical point between field collapse and undecidable interleaving, with
+an honest type-punning gap characterization. Evidence in hand.
+
+### R5. Closure-predictive selective context sensitivity
+Cloning budgeted by predicted closure reduction (fusion score, §3.6) vs
+uniform k-limits — introspective context sensitivity for CFL-over-PAG.

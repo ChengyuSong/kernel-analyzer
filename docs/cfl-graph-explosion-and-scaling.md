@@ -400,3 +400,95 @@ an honest type-punning gap characterization. Evidence in hand.
 ### R5. Closure-predictive selective context sensitivity
 Cloning budgeted by predicted closure reduction (fusion score, §3.6) vs
 uniform k-limits — introspective context sensitivity for CFL-over-PAG.
+
+## 5. Factored closure representation (FRI) — design sketch for a new solver
+
+Target: compute P2(+fields) closure with space linear-ish in graph size,
+never materializing pairwise scaffolding. Motivated by the measured
+structure of V: cliques (mutual-V components) + bicliques (per-cell
+store x load products) + transitive chains. All three have linear factored
+representations; only their extensional pairing is quadratic.
+
+### The factorization theorem (informal)
+
+In P2, V = (Mq -a)* Mq (a Mq)*: every -a step precedes every a step, with
+identity splices (M/Fld) between. So every V-derivation has valley shape:
+
+  V(x, y)  <=>  exists pivot chain p1 ≡ p2 ≡ ... ≡ pk (Id-edges) with
+                x in DownReach(p1)  and  y in UpReach(pk)
+
+where Down-steps are (-a) edges, Up-steps are (a) edges, and Id-edges are
+the identity nonterminals: M between cells of V-related pointers, Fld
+between same-bucket field nodes of V-related bases. Each pivot p thus
+*generates* the rectangle DownReach(p) x UpReach(p) ⊆ V. V is exactly a
+union of pivot-generated rectangles — store the generators, not the pairs.
+
+### Representation: three layers
+
+1. **Quotient (union-find).** Nodes collapse when mutually V-related; all
+   other layers operate on class reps. Precision knob (see §2.3): chain-SCC
+   collapse (coarser, cheap — subsumes the presolve merge, done online) vs
+   pairwise-mutual-only (precise, costlier). Soufflé's `eqrel` is the
+   precedent that this layer alone is a big win for equivalence-heavy
+   relations.
+
+2. **Pivot graph.** Nodes: classes, cells (deref nodes), field nodes.
+   Edges: a/-a between classes (Down/Up steps); Id-edges inserted by rule
+   firing:
+     M-rule:   cells c1,c2 with parents P1,P2:  V(P1,P2)  => Id(c1,c2)
+     Fld-rule: field nodes at same bucket with V-related bases => Id(f1,f2)
+   V(P1,P2) is *queried* (layer 3), never stored. The solver's fixpoint is:
+   insert Id-edges whose guard holds, until none fire. Facts live as edges
+   of a small graph, not tuples of a big relation.
+
+3. **Reachability index over the pivot graph.** Down*/Id/Up* queries are
+   plain reachability on the pivot graph (with the valley discipline:
+   Down-phase, then Id/peak, then Up-phase — a 3-state NFA product, still
+   single-relation reachability). Maintained incrementally under Id-edge
+   insertions: interval/tree/chain indices (POCR's spanning trees are the
+   precedent for factored transitive structure). Worst case is incremental
+   transitive closure — not free, but on a graph of #classes + #cells
+   (harfbuzz: ~15K after quotient, vs 10^9+ pairwise facts).
+
+### Answer extraction
+
+Callgraph: for each icall class t, enumerate function classes s with
+valley-reachability s ~> t — output is the rectangular answer directly.
+Aliasing: V(x,y) is a single reachability query; pts-style sets enumerate
+one rectangle at a time. Nothing pairwise is ever materialized unless a
+client asks for it.
+
+### Why this can work where saturation cannot
+
+Saturation cost >= closure cardinality (Sigma cliques^2 + Sigma s x l).
+FRI cost = pivot-graph size + #rule firings + index maintenance; the
+quadratic objects exist only as (generator, reachability) pairs. The
+open risks, honestly: (a) incremental reachability maintenance can degrade
+under dense Id-insertion waves (the a x M cascade reappears as Id-edge
+churn — but each cascade level is ONE Id-edge here, not s x l facts);
+(b) the precise (non-chain-SCC) quotient needs a pairwise-mutual test that
+is itself a reachability query — chicken-and-egg handled by starting coarse
+and refining, or accepting chain-SCC precision (= current compositional
+compression, empirically +14 edges on libpng).
+
+### Precedents to position against
+
+- Soufflé `eqrel` (union-find-backed relations): layer 1 exists in Datalog
+  engines; FRI generalizes to Dyck-generated rectangles.
+- BDDBDDB (Whaley/Lam): BDDs = generic factored relations; fragile variable
+  ordering. FRI is the domain-specific, predictable version.
+- POCR/Pearl spanning trees: factored transitive closure for one
+  nonterminal; FRI extends factoring to the mutually recursive V/M system.
+- Valiant / BMM: rectangle composition (U1 W1^T)(U2 W2^T) = U1 (W1^T U2) W2^T
+  is the algebraic core — factor-level joins, small middle products.
+
+### Validation plan
+
+1. Exact-answer equivalence vs GraCFL saturation on libpng (ground truth
+   captured: V counts, 27/9 tallies, per-icall targets).
+2. harfbuzz full-stack graph (26,317 nodes / 84,354 edges — the instance
+   that defeats saturation at 25+min): target = complete solve, report
+   pivot-graph size, Id-edge count, peak RSS.
+3. Ablations: quotient-only (= presolve merge), + pivot rectangles,
+   + incremental index. Each layer's contribution isolated.
+4. SVF PAG cross-check (student's second builder) for generality.

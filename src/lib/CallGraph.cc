@@ -1478,6 +1478,46 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tSolve).count()
          << " ms\n");
+
+  // Diagnostic: the largest V' classes are the copy/field components whose
+  // V-closure dominates solve cost; name their members to attribute the
+  // blowup to concrete code constructs.
+  if (VerboseLevel >= 2) {
+    std::unordered_map<uint32_t, uint32_t> classSize;
+    for (uint32_t ln = 0; ln < toCanon.size() && ln < nodeToSCC.size(); ln++)
+      if (nodeToSCC[ln] != UINT32_MAX)
+        classSize[nodeToSCC[ln]]++;
+    std::vector<std::pair<uint32_t, uint32_t>> ranked; // (size, scc)
+    ranked.reserve(classSize.size());
+    uint64_t sumSq = 0;
+    for (auto &[scc, sz] : classSize) {
+      ranked.emplace_back(sz, scc);
+      sumSq += (uint64_t)sz * sz;
+    }
+    std::sort(ranked.rbegin(), ranked.rend());
+    CG_LOG("Pre-solve merge: sum of squared class sizes = " << sumSq
+           << " (lower bound on V' facts)\n");
+    for (size_t r = 0; r < ranked.size() && r < 10; r++) {
+      CG_LOG("  V' class #" << r << ": " << ranked[r].first << " nodes;"
+             << " sample members:\n");
+      unsigned shown = 0;
+      for (uint32_t ln = 0; ln < toCanon.size() && shown < 4; ln++) {
+        if (nodeToSCC[ln] != ranked[r].second)
+          continue;
+        const Value *V = NF.getValueForNode(toCanon[ln]);
+        if (!V)
+          continue;
+        if (const auto *I = dyn_cast<Instruction>(V)) {
+          CG_LOG("    inst in " << I->getFunction()->getName() << ": " << *I << "\n");
+        } else if (V->hasName()) {
+          CG_LOG("    value: " << V->getName() << "\n");
+        } else {
+          continue;
+        }
+        shown++;
+      }
+    }
+  }
 }
 
 void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
@@ -3957,6 +3997,15 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
 
   if (CFLPreSolveMerge)
     preSolveCopyFieldMerge(EB.getEdges(), &tuEdgeIndices);
+
+  // Diagnostic: high-degree constraint nodes are the hubs whose deref cells
+  // drive M-fusion; dump them with their IR values for attribution.
+  if (VerboseLevel >= 2) {
+    std::vector<std::pair<NodeIndex, size_t>> topNodes;
+    EB.analyzeHighDegreeNodes(500, 15, &topNodes);
+    for (const auto &[nodeId, degree] : topNodes)
+      NF.dumpNode(nodeId);
+  }
 
   constexpr size_t kMaxPerTUIterations = 32;
   size_t perTUIter = 0;

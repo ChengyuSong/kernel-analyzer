@@ -8,6 +8,7 @@
 #include <memory>
 #include <cstdint>
 #include <map>
+#include <functional>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -94,6 +95,8 @@ private:
   void applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode);
   void addFieldWildcardLoop(NodeIndex n);
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
+  void sliceEdgesToFptrComponents(std::vector<size_t> &idx);
+  std::unordered_set<NodeIndex> fptrSliceKept;
   void emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
                               llvm::Type *Ty, unsigned depth);
 

@@ -1520,6 +1520,49 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   }
 }
 
+// Fptr-flow slicing (--cfl-fptr-slice): drop constraint-graph components
+// that cannot participate in any function-pointer derivation. Function
+// pointers originate only at address-taken Function value nodes (type-free
+// ground truth, robust to opaque pointers), and every CFL derivation follows
+// constraint edges; therefore a node in a weakly-connected component that
+// contains no Function node can never contribute a callee fact. Keep exactly
+// the seeded components.
+void CallGraphPass::sliceEdgesToFptrComponents(std::vector<size_t> &idx) {
+  const auto &edges = EB.getEdges();
+  std::unordered_map<NodeIndex, NodeIndex> parent;
+  std::function<NodeIndex(NodeIndex)> find = [&](NodeIndex n) {
+    auto it = parent.find(n);
+    if (it == parent.end()) { parent[n] = n; return n; }
+    NodeIndex root = n;
+    while (parent[root] != root) root = parent[root];
+    while (parent[n] != root) { NodeIndex p = parent[n]; parent[n] = root; n = p; }
+    return root;
+  };
+  for (size_t i : idx) {
+    NodeIndex a = find(getCanonicalNode(edges[i].from));
+    NodeIndex b = find(getCanonicalNode(edges[i].to));
+    if (a != b) parent[a] = b;
+  }
+  std::unordered_set<NodeIndex> seededRoots;
+  for (const Function *F : Ctx->AddressTakenFuncs) {
+    NodeIndex n = NF.getValueNodeFor(F);
+    if (n == AndersNodeFactory::InvalidIndex) continue;
+    NodeIndex c = getCanonicalNode(n);
+    if (parent.count(c)) seededRoots.insert(find(c));
+  }
+  size_t kept = 0, before = idx.size();
+  for (size_t i = 0; i < idx.size(); i++) {
+    if (seededRoots.count(find(getCanonicalNode(edges[idx[i]].from)))) {
+      fptrSliceKept.insert(getCanonicalNode(edges[idx[i]].from));
+      fptrSliceKept.insert(getCanonicalNode(edges[idx[i]].to));
+      idx[kept++] = idx[i];
+    }
+  }
+  idx.resize(kept);
+  CG_LOG("Fptr slice: " << before << " edges -> " << kept << " ("
+         << seededRoots.size() << " fptr components kept)\n");
+}
+
 void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
   if (!EB.hasFieldLabels() || !curDL)
     return;
@@ -2071,7 +2114,14 @@ void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
   if (CGP.resolveSummarizedAllocaSlot(&I, slotRep))
     return;
 
-  // create a deref node for base ptr of alloca
+  // Create a deref node eagerly only for pointer-bearing allocas. Cells of
+  // scalar allocas (bool/int out-params etc.) can never hold a function
+  // pointer under tracked (pointer-typed) accesses; creating them eagerly
+  // manufactured O(n^2) M-facts over empty cells (harfbuzz sanitize class).
+  // A pointer-typed access through such an alloca still creates the deref
+  // lazily in visitLoadInst/visitStoreInst, so this stays sound.
+  if (!containsPointerType(I.getAllocatedType()))
+    return;
   NodeIndex ptrNode = CGP.getRepNodeForValue(&I);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find alloca node");
   (void)CGP.getRepDerefNode(ptrNode);
@@ -3995,6 +4045,9 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
   for (size_t i = edgeStart; i < edgeEnd; i++)
     tuEdgeIndices.push_back(i);
 
+  if (CFLFptrSlice)
+    sliceEdgesToFptrComponents(tuEdgeIndices);
+
   if (CFLPreSolveMerge)
     preSolveCopyFieldMerge(EB.getEdges(), &tuEdgeIndices);
 
@@ -5903,7 +5956,11 @@ bool CallGraphPass::runCompositionalSolve() {
   auto isActiveBoundaryNode = [&](NodeIndex N) -> bool {
     if (N == AndersNodeFactory::InvalidIndex)
       return false;
-    return activeCFLNodes.count(getCanonicalNode(N)) > 0;
+    NodeIndex C = getCanonicalNode(N);
+    // Under fptr slicing, boundary symbols only exist for kept components.
+    if (CFLFptrSlice && !fptrSliceKept.count(C))
+      return false;
+    return activeCFLNodes.count(C) > 0;
   };
 
   auto collectExpectedBoundarySymbols =

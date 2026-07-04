@@ -115,6 +115,12 @@ cl::opt<bool> CFLPreSolveMerge(
            "classes before the full CFL solve (default off)"),
   cl::init(false));
 
+cl::opt<bool> CFLFptrSlice(
+  "cfl-fptr-slice",
+  cl::desc("Keep only constraint-graph components reachable from function "
+           "pointers (callgraph-only slicing, default off)"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "

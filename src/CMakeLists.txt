@@ -33,5 +33,7 @@ add_definitions(${LLVM_DEFINITIONS})
 
 include_directories(.)
 
+enable_testing()
+
 add_subdirectory(lib)
 add_subdirectory(gracfl)

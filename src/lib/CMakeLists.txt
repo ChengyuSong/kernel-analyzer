@@ -26,3 +26,11 @@ target_link_libraries(KAMain
   LLVMBitWriter
   graCFLlib
   )
+
+# Unit tests (run manually: <build>/lib/StructAnalyzerTest)
+add_executable(StructAnalyzerTest StructAnalyzerTest.cc StructAnalyzer.cc)
+target_link_libraries(StructAnalyzerTest
+  LLVMSupport
+  LLVMCore
+  )
+add_test(NAME StructAnalyzerTest COMMAND StructAnalyzerTest)

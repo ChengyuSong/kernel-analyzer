@@ -21,8 +21,8 @@ private:
 	std::vector<bool> unionFlags; // true if field is a union
 	std::vector<unsigned> fieldSize;
 	std::vector<unsigned> offsetMap; // field index to expanded field index
-	std::vector<unsigned> fieldOffset; // field index => offset in bytes
-	std::vector<unsigned> fieldRealSize; // field index => allocation size in bytes
+	std::vector<unsigned> fieldOffset; // expanded field index => offset in bytes
+	std::vector<unsigned> fieldRealSize; // expanded field index => allocation size in bytes
 
 	// field => type(s) map, stripping off arrays
 	std::unordered_map<unsigned, std::set<const llvm::Type*> > elementType;
@@ -74,16 +74,20 @@ private:
 	}
 	void appendFieldOffset(const StructInfo& other)
 	{
+		// The caller's addFieldOffset entry covers the sub-struct's expanded
+		// field 0 (always at sub-offset 0), so skip exactly that first entry.
+		// Skipping *by index* (not by value) keeps alignment when the sub has
+		// several zero-size members at offset 0.
 		unsigned base = fieldOffset.back();
-		for (auto i : other.fieldOffset) {
-			if (i == 0) continue;
-			fieldOffset.push_back(i + base);
-		}
+		for (size_t i = 1; i < other.fieldOffset.size(); ++i)
+			fieldOffset.push_back(other.fieldOffset[i] + base);
 	}
 	void addElementType(unsigned field, const llvm::Type* type) { elementType[field].insert(type); }
-	void appendElementType(const StructInfo& other)
+	void appendElementType(const StructInfo& other, unsigned base)
 	{
-		unsigned base = fieldSize.size();
+		// `base` is the sub-struct's first expanded index in this struct; it
+		// must be passed in because appendFields may already have grown the
+		// flag vectors past it.
 		for (auto item : other.elementType)
 			elementType[item.first + base].insert(item.second.begin(), item.second.end());
 	}
@@ -136,6 +140,10 @@ public:
 	const uint64_t getAllocSize() const { return allocSize; }
 	unsigned getFieldRealSize(unsigned field) const { return fieldRealSize.at(field); }
 	unsigned getFieldOffset(unsigned field) const { return fieldOffset.at(field); }
+	// Per-expanded-slot vector sizes, exposed for invariant checking/tests.
+	// Both must always equal getExpandedSize().
+	unsigned getNumFieldOffsets() const { return fieldOffset.size(); }
+	unsigned getNumFieldRealSizes() const { return fieldRealSize.size(); }
 	std::set<const llvm::Type*> getElementType(unsigned field) const
 	{
 		auto itr = elementType.find(field);

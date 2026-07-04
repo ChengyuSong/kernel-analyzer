@@ -88,6 +88,7 @@ StructInfo& StructAnalyzer::addStructInfo(const StructType* st, const Module* M,
   if (!st->isLiteral() && LLVM_STRING_STARTS_WITH(st->getName(), "union")) {
     // handle union
     stInfo.addFieldOffset(currentOffset);
+    stInfo.addRealSize(st->isSized() ? layout->getTypeAllocSize(const_cast<StructType*>(st)) : 0);
     stInfo.addField(1, false, false, true);
     stInfo.addOffsetMap(numField);
     //deal with the struct inside this union independently:
@@ -111,15 +112,13 @@ StructInfo& StructAnalyzer::addStructInfo(const StructType* st, const Module* M,
   } else {
     for (auto subType : st->elements()) {
       currentOffset = stLayout->getElementOffset(fieldIndex++); // byte offset
-      stInfo.addFieldOffset(currentOffset);
 
       // deal with array
       bool isArray = false;
+      uint64_t arrayRealSize = 0;
       if (const ArrayType* arrayType = dyn_cast<ArrayType>(subType)) {
-        stInfo.addRealSize(layout->getTypeAllocSize(arrayType->getElementType()) * arrayType->getNumElements());
+        arrayRealSize = layout->getTypeAllocSize(arrayType->getElementType()) * arrayType->getNumElements();
         isArray = true;
-      } else {
-        stInfo.addRealSize(layout->getTypeAllocSize(subType)); // record real size
       }
 
       // Treat an array field as a single element of its type
@@ -129,9 +128,6 @@ StructInfo& StructAnalyzer::addStructInfo(const StructType* st, const Module* M,
         subType = arrayType->getElementType();
       }
       if (arrayElements == 0) arrayElements = 1;
-
-      // record type after stripping array
-      stInfo.addElementType(numField, subType);
 
       // The offset is where this element will be placed in the expanded struct
       stInfo.addOffsetMap(numField);
@@ -146,13 +142,23 @@ StructInfo& StructAnalyzer::addStructInfo(const StructType* st, const Module* M,
         for (uint64_t i = 0; i < arrayElements; ++i)
           addContainer(st, subInfo, currentOffset + i * layout->getTypeAllocSize(subType), M);
 
-        // Copy information from this substruct
-        stInfo.appendFields(subInfo);
-        stInfo.appendFieldOffset(subInfo);
-        stInfo.appendElementType(subInfo);
-
-        numField += subInfo.getExpandedSize();
+        // Copy information from this substruct. Every per-expanded-slot
+        // vector gets exactly subInfo.getExpandedSize() entries: the field's
+        // own addFieldOffset entry stands in for the sub's expanded field 0,
+        // and empty subs contribute no entries at all (no dangling offset).
+        if (subInfo.getExpandedSize() > 0) {
+          stInfo.addFieldOffset(currentOffset);
+          stInfo.addElementType(numField, subType);
+          stInfo.appendFields(subInfo);
+          stInfo.appendFieldOffset(subInfo);
+          stInfo.appendElementType(subInfo, numField);
+          numField += subInfo.getExpandedSize();
+        }
       } else {
+        stInfo.addFieldOffset(currentOffset);
+        stInfo.addElementType(numField, subType);
+        stInfo.addRealSize(isArray ? arrayRealSize
+                                   : layout->getTypeAllocSize(subType));
         stInfo.addField(1, isArray, subType->isPointerTy(), false);
         ++numField;
       }
@@ -236,13 +242,18 @@ bool StructAnalyzer::getContainer(std::string stid, const Module* M, std::set<st
       continue;
     std::string id = container->getStructName().str();
     if (id.find("struct.anon") == 0 || id.find("union.anon") == 0) {
-      // anon struct, get its parent instead
-      id = getScopeName(container, M);
-      ret |= getContainer(id, M, out);
+      // Anon struct: recurse to its parent. Scope names of anon structs are
+      // module-qualified, so resolve with the container's defining module,
+      // not the query module.
+      const Module* CM = M;
+      auto cit = structInfoMap.find(container);
+      if (cit != structInfoMap.end() && cit->second.getModule())
+        CM = cit->second.getModule();
+      ret |= getContainer(getScopeName(container, CM), CM, out);
     } else {
       out.insert(id);
+      ret = true;
     }
-    ret = true;
   }
 
   return ret;

@@ -277,3 +277,41 @@ histogram moves enough under 3.1 that this is never needed.
    `test/eval-compositional.sh`.
 4. Add 3.2 slicing if still needed; measure with the same histogram.
 5. Re-evaluate harfbuzz; only then consider 3.5.
+
+### 3.6 Generic constraint-graph cloning (design, 2026-07-03)
+
+Cloning = inlining at the constraint-graph level. Like the compiler inliner,
+it is generic for any C/C++ because selection is metric-driven, never
+name/pattern-driven.
+
+**Selection (per function F):**
+- not in a call-graph SCC (no recursion; Tarjan over direct calls)
+- pointer-moving (pointer args/ret or pointer-typed stores) — else skip
+- template size |edges(F)| <= T (e.g. 64) after bottom-up composition
+- rank by fusion score: callsites(F) x cell-traffic(F) (the s x l product
+  the clone eliminates); spend a global edge budget top-down by score.
+  analyzeHighDegreeNodes supplies the ranking signal.
+
+**Mechanism (bottom-up over the clone DAG):**
+1. Record per-function edge ranges during runOnFunction (like
+   moduleEdgeRanges) => edge template per F. Bottom-up order composes
+   templates like inlining; the size cap bounds composition.
+2. At each direct callsite of a selected F (handleCall): instantiate fresh
+   node IDs for all F-local nodes (formals, locals, ret, deref cells),
+   remap the template, wire actuals->cloned formals and cloned ret->result.
+   Non-local nodes (globals, non-cloned callees) keep original IDs.
+3. Indirect callsites and cross-TU calls keep the shared original nodes
+   (sound: original stays fully wired). Virtual/resolved-icall cloning is a
+   later extension inside the fixpoint loop.
+4. Heap cloning falls out: AllocSites inside a clone get per-clone opaque
+   objects — the generalization of the allocator-wrapper special case.
+5. Compositional: cloning is per-TU at edge-build time; boundary symbols
+   remain on the originals, so composition is unchanged.
+
+**v2 option:** instantiate compressed summaries instead of raw templates —
+run per-function V'-quotient (reuse compressConstraintGraph) so a wrapper's
+template is a handful of boundary nodes; much smaller instantiation cost.
+
+Soundness: cloning only refines merging (each clone over-approximates its
+own context; the union of clones covers the original's behavior); per-clone
+allocation sites split, never fuse, may-facts.

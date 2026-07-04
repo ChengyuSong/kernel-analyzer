@@ -174,4 +174,30 @@ static const std::vector<std::string> DefaultP2Grammar = {
   "AM a Mq"
 };
 
+// Field-sensitive extension: K bucketed field-offset terminal pairs f<i>/-f<i>
+// plus a wildcard pair fx/-fx. A matched field step
+//   Fld ::= -f<i> V f<i>
+// relates two field pointers computed at the same (bucketed) offset from
+// value-aliasing bases -- the exact analogue of M ::= -d V d for dereference.
+// The wildcard fx matches any bucket on the other side; a fx/-fx self-loop on
+// a node soundly absorbs field steps of arbitrary offset and nesting depth
+// (used as the conservative fallback for unknown-offset accesses).
+inline std::vector<std::string> buildP2GrammarWithFields(unsigned numBuckets) {
+  std::vector<std::string> g = DefaultP2Grammar;
+  if (numBuckets == 0)
+    return g;
+  g.push_back("Mq Fld");
+  g.push_back("FVx -fx V");
+  g.push_back("Fld FVx fx");
+  for (unsigned i = 0; i < numBuckets; i++) {
+    std::string fi = "f" + std::to_string(i);
+    std::string FVi = "FV" + std::to_string(i);
+    g.push_back(FVi + " -" + fi + " V");
+    g.push_back("Fld " + FVi + " " + fi);
+    g.push_back("Fld " + FVi + " fx");
+    g.push_back("Fld FVx " + fi);
+  }
+  return g;
+}
+
 #endif

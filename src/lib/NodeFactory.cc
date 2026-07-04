@@ -83,6 +83,8 @@ const Function* AndersNodeFactory::canonicalizeFunction(
 }
 
 const Value* AndersNodeFactory::canonicalizeValueKey(const Value* v) const {
+    if (v == nullptr)
+        return nullptr; // anonymous nodes (e.g., synthetic field pointers)
     if (const auto *arg = dyn_cast<Argument>(v)) {
         const Function *parent = arg->getParent();
         const Function *canonParent = canonicalizeFunction(parent);

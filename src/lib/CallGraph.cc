@@ -11,6 +11,7 @@
 
 
 #include <llvm/IR/DebugInfo.h>
+#include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/InlineAsm.h>
@@ -927,7 +928,81 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   NodeIndex derefSrc = getRepDerefNode(srcNode);
   addAssignmentEdge(derefSrc, derefDst);
 
+  // Field mode: the deref-to-deref edge only links the offset-0 cells, but an
+  // aggregate copy moves every field. When both operands agree on the copied
+  // struct type, emit directional per-field cell copies (precise). Otherwise
+  // fall back to value-aliasing the two pointers plus wildcard loops (sound
+  // for any layout, but smears fields and directions).
+  if (EB.hasFieldLabels()) {
+    auto pointeeCopyType = [](const Value *P) -> Type * {
+      const Value *V = P->stripPointerCasts();
+      if (const auto *AI = dyn_cast<AllocaInst>(V))
+        return AI->getAllocatedType();
+      if (const auto *GV = dyn_cast<GlobalVariable>(V))
+        return GV->getValueType();
+      if (const auto *GEP = dyn_cast<GEPOperator>(V))
+        return GEP->getResultElementType();
+      return nullptr;
+    };
+    Type *dstTy = pointeeCopyType(dst);
+    Type *srcTy = pointeeCopyType(src);
+    while (dstTy && (isa<ArrayType>(dstTy) || isa<VectorType>(dstTy)))
+      dstTy = dstTy->getContainedType(0);
+    while (srcTy && (isa<ArrayType>(srcTy) || isa<VectorType>(srcTy)))
+      srcTy = srcTy->getContainedType(0);
+    if (dstTy && dstTy == srcTy && isa<StructType>(dstTy) && curDL) {
+      emitFieldwiseCopyEdges(srcNode, dstNode, dstTy, 0);
+    } else {
+      addAssignmentEdge(srcNode, dstNode);
+      addAssignmentEdge(dstNode, srcNode);
+      addFieldWildcardLoop(srcNode);
+      addFieldWildcardLoop(dstNode);
+    }
+  }
+
   return false;
+}
+
+// Directional per-field content copy for an aggregate copy of type `Ty` from
+// *srcAddr to *dstAddr: for every pointer-bearing field, connect the source
+// field cell to the destination field cell through matched f-edges. Arrays
+// collapse to their element; unions stop descent with wildcard loops.
+void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
+                                           Type *Ty, unsigned depth) {
+  while (Ty && (isa<ArrayType>(Ty) || isa<VectorType>(Ty)))
+    Ty = Ty->getContainedType(0);
+  auto *STy = dyn_cast_or_null<StructType>(Ty);
+  if (!STy) {
+    // Pointer-bearing scalar cell: copy the cell itself.
+    addAssignmentEdge(getRepDerefNode(getCanonicalNode(srcAddr)),
+                      getRepDerefNode(getCanonicalNode(dstAddr)));
+    return;
+  }
+  if (depth > 8 ||
+      (STy->hasName() && LLVM_STRING_STARTS_WITH(STy->getStructName(), "union"))) {
+    addFieldWildcardLoop(srcAddr);
+    addFieldWildcardLoop(dstAddr);
+    addAssignmentEdge(getRepDerefNode(getCanonicalNode(srcAddr)),
+                      getRepDerefNode(getCanonicalNode(dstAddr)));
+    return;
+  }
+  const StructLayout *SL = curDL->getStructLayout(STy);
+  for (unsigned i = 0; i < STy->getNumElements(); i++) {
+    Type *elemTy = STy->getElementType(i);
+    if (!containsPointerType(elemTy))
+      continue;
+    int64_t off = (int64_t)SL->getElementOffset(i);
+    NodeIndex sF = srcAddr, dF = dstAddr;
+    if (off != 0) {
+      NodeIndex sParent = getCanonicalNode(srcAddr);
+      NodeIndex dParent = getCanonicalNode(dstAddr);
+      sF = getFieldPtrNode(sParent, off);
+      dF = getFieldPtrNode(dParent, off);
+      EB.addFieldEdges(sParent, getCanonicalNode(sF), fieldBucket(off));
+      EB.addFieldEdges(dParent, getCanonicalNode(dF), fieldBucket(off));
+    }
+    emitFieldwiseCopyEdges(sF, dF, elemTy, depth + 1);
+  }
 }
 
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
@@ -1048,6 +1123,9 @@ bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) 
   }
 
   // Get or create dereference node for the container (represents "*container")
+  // Field mode: container helpers access arbitrary interior fields.
+  if (EB.hasFieldLabels())
+    addFieldWildcardLoop(containerNode);
   NodeIndex derefNode = getRepDerefNode(containerNode);
 
   // Handle store args: val -> *container (assignment edges)
@@ -1171,6 +1249,14 @@ NodeIndex CallGraphPass::getRepNodeForValue(const Value *V) {
   NodeIndex n = NF.getValueNodeFor(V);
   if (n == AndersNodeFactory::InvalidIndex)
     return n;
+  // In field mode, canonical ConstantExpr-GEP nodes need their field edges
+  // from the base emitted (once per module) wherever they appear as operands.
+  if (EB.hasFieldLabels()) {
+    if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+      if (CE->getOpcode() == Instruction::GetElementPtr)
+        ensureConstGEPFieldEdges(CE);
+    }
+  }
   return getCanonicalNode(n);
 }
 
@@ -1201,6 +1287,228 @@ void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
   NodeIndex d = getCanonicalNode(dst);
   if (s == d) return;
   EB.addAssignmentEdges(s, d);
+}
+
+// ---- Field-sensitive memory modeling helpers (--cfl-field-buckets > 0) ----
+
+int CallGraphPass::fieldBucket(int64_t off) const {
+  const unsigned K = EB.getNumFieldBuckets();
+  assert(K > 0 && "fieldBucket called without field labels");
+  return (int)((((uint64_t)off) * 0x9E3779B97F4A7C15ULL >> 32) % K);
+}
+
+NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
+  auto key = std::make_pair(parentCanon, off);
+  auto it = fieldPtrNodes.find(key);
+  if (it != fieldPtrNodes.end())
+    return it->second;
+  NodeIndex n = NF.createValueNode();
+  fieldPtrNodes.emplace(key, n);
+  CG_DEBUG("Create field ptr node " << n << " for (" << parentCanon
+           << ", +" << off << ")\n");
+  return n;
+}
+
+// Decompose a GEP into per-struct-level byte offsets:
+//   - struct index steps contribute their in-struct byte offset (0 skipped:
+//     field 0 shares the parent's address)
+//   - array/vector index steps are skipped (arrays are collapsed, matching
+//     the Andersen-side model in offsetToFieldNum)
+//   - a first index over a struct/array source strides whole objects, which
+//     preserves field structure under collapse, so it is skipped too
+//   - a nonzero or variable first index over a scalar source (i8-style byte
+//     arithmetic) has no recoverable field structure -> caller must use the
+//     wildcard fallback
+bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
+                                       const DataLayout &DL,
+                                       SmallVectorImpl<int64_t> &levels) const {
+  levels.clear();
+  bool first = true;
+  for (auto GTI = gep_type_begin(GEP), E = gep_type_end(GEP); GTI != E; ++GTI) {
+    const Value *idx = GTI.getOperand();
+    if (StructType *STy = GTI.getStructTypeOrNull()) {
+      const auto *CI = dyn_cast<ConstantInt>(idx);
+      if (!CI)
+        return false; // malformed; be conservative
+      const StructLayout *SL = DL.getStructLayout(STy);
+      int64_t off = (int64_t)SL->getElementOffset(CI->getZExtValue());
+      if (off != 0)
+        levels.push_back(off);
+    } else if (first) {
+      Type *Ty = GTI.getIndexedType();
+      if (!Ty->isStructTy() && !Ty->isArrayTy() && !Ty->isVectorTy()) {
+        const auto *CI = dyn_cast<ConstantInt>(idx);
+        if (!CI || !CI->isZero())
+          return false; // scalar/i8 pointer arithmetic -> wildcard fallback
+      }
+    }
+    first = false;
+  }
+  return true;
+}
+
+void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
+                                       ArrayRef<int64_t> levels) {
+  assert(!levels.empty() && "addFieldChainEdges requires at least one level");
+  NodeIndex cur = getCanonicalNode(baseNode);
+  for (size_t k = 0; k < levels.size(); k++) {
+    const bool last = (k + 1 == levels.size());
+    NodeIndex next = last ? getCanonicalNode(resultNode)
+                          : getFieldPtrNode(cur, levels[k]);
+    if (next == cur)
+      continue;
+    EB.addFieldEdges(cur, next, fieldBucket(levels[k]));
+    cur = next;
+  }
+}
+
+void CallGraphPass::addFieldWildcardLoop(NodeIndex n) {
+  if (n == AndersNodeFactory::InvalidIndex)
+    return;
+  NodeIndex canon = getCanonicalNode(n);
+  if (moduleFieldWildcardRoots.insert(canon).second)
+    EB.addFieldWildcardSelfLoop(canon);
+}
+
+void CallGraphPass::applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode) {
+  addAssignmentEdge(baseNode, resultNode);
+  addFieldWildcardLoop(baseNode);
+}
+
+void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
+  a = getCanonicalNode(a);
+  b = getCanonicalNode(b);
+  if (a == b)
+    return;
+  if (b < a)
+    std::swap(a, b); // smaller index as stable representative
+  auto &membersA = canonicalClassMembers[a];
+  if (membersA.empty())
+    membersA.insert(a);
+  auto itB = canonicalClassMembers.find(b);
+  if (itB != canonicalClassMembers.end()) {
+    for (NodeIndex m : itB->second) {
+      canonicalNodeMap[m] = a;
+      membersA.insert(m);
+    }
+    canonicalClassMembers.erase(b);
+  }
+  canonicalNodeMap[b] = a;
+  membersA.insert(b);
+}
+
+void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edges,
+                                           const std::vector<size_t> *idx) {
+  // Labels participating in the memory-free sublanguage.
+  const uint32_t la = EB.getLabelAssign(), lai = EB.getLabelAssignInv();
+  auto isCopyFieldLabel = [&](uint32_t l) {
+    if (l == la || l == lai)
+      return true;
+    if (!EB.hasFieldLabels())
+      return false;
+    if (l == EB.getLabelFieldAny() || l == EB.getLabelFieldAnyInv())
+      return true;
+    for (unsigned b = 0; b < EB.getNumFieldBuckets(); b++)
+      if (l == EB.getLabelField(b) || l == EB.getLabelFieldInv(b))
+        return true;
+    return false;
+  };
+  // Source values must not glue unrelated classes: two slots holding the
+  // same function/global would chain-merge through it (common-sink smear),
+  // manufacturing false targets. Drop their edges from the sublanguage.
+  auto isBarrierNode = [&](NodeIndex canon) {
+    if (NF.isSpecialNode(canon))
+      return true;
+    const Value *v = NF.getValueForNode(canon);
+    return v && (isa<Function>(v) || isa<GlobalVariable>(v));
+  };
+
+  std::unordered_map<NodeIndex, uint32_t> toLocal;
+  std::vector<NodeIndex> toCanon;
+  std::vector<gracfl::Edge> subEdges;
+  auto localId = [&](NodeIndex canon) -> uint32_t {
+    auto [it, inserted] = toLocal.emplace(canon, (uint32_t)toCanon.size());
+    if (inserted)
+      toCanon.push_back(canon);
+    return it->second;
+  };
+
+  const size_t n = idx ? idx->size() : edges.size();
+  for (size_t i = 0; i < n; i++) {
+    const auto &E = edges[idx ? (*idx)[i] : i];
+    if (!isCopyFieldLabel(E.label))
+      continue;
+    NodeIndex from = getCanonicalNode(E.from);
+    NodeIndex to = getCanonicalNode(E.to);
+    if (from == to)
+      continue;
+    if (isBarrierNode(from) || isBarrierNode(to))
+      continue;
+    subEdges.emplace_back(localId(from), localId(to), E.label);
+  }
+  if (subEdges.empty())
+    return;
+
+  CG_LOG("Pre-solve merge: sublanguage graph " << toCanon.size()
+         << " nodes, " << subEdges.size() << " edges\n");
+  auto tSolve = std::chrono::steady_clock::now();
+  gracfl::SolverFWGramParallel sub(subEdges, *EB.getGrammar(), cflThreads);
+  sub.runCFL();
+  const auto &graph = sub.getReachability();
+
+  std::vector<uint32_t> nodeToSCC;
+  uint32_t numSCCs = 0;
+  computeVSCC(graph, EB.getLabelV(), nodeToSCC, numSCCs);
+
+  std::vector<NodeIndex> sccRep(numSCCs, AndersNodeFactory::InvalidIndex);
+  size_t merged = 0;
+  for (uint32_t ln = 0; ln < toCanon.size() && ln < nodeToSCC.size(); ln++) {
+    uint32_t scc = nodeToSCC[ln];
+    if (scc == UINT32_MAX)
+      continue;
+    if (sccRep[scc] == AndersNodeFactory::InvalidIndex) {
+      sccRep[scc] = toCanon[ln];
+    } else {
+      mergeCanonicalClasses(sccRep[scc], toCanon[ln]);
+      merged++;
+    }
+  }
+  CG_LOG("Pre-solve merge: " << toCanon.size() << " nodes -> " << numSCCs
+         << " V' classes, " << merged << " merges, "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tSolve).count()
+         << " ms\n");
+}
+
+void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
+  if (!EB.hasFieldLabels() || !curDL)
+    return;
+  const auto *GEP = dyn_cast<GEPOperator>(CE);
+  if (!GEP)
+    return;
+  NodeIndex node = NF.getValueNodeFor(CE);
+  if (node == AndersNodeFactory::InvalidIndex)
+    return;
+  NodeIndex canon = getCanonicalNode(node);
+  if (!moduleConstGEPFieldDone.insert(canon).second)
+    return;
+
+  const Value *base = GEP->getPointerOperand()->stripPointerCasts();
+  NodeIndex baseNode = getRepNodeForValue(base); // recurses into nested CEs
+  if (baseNode == AndersNodeFactory::InvalidIndex)
+    return;
+  if (canon == getCanonicalNode(baseNode))
+    return; // field-0 GEPs canonicalize to the base node itself
+
+  SmallVector<int64_t, 4> levels;
+  if (!decomposeGEPLevels(GEP, *curDL, levels)) {
+    applyFieldFallback(baseNode, node);
+    return;
+  }
+  if (levels.empty())
+    addAssignmentEdge(baseNode, node);
+  else
+    addFieldChainEdges(baseNode, node, levels);
 }
 
 void CallGraphPass::handleInlineAsm(CallBase &CS) {
@@ -1758,6 +2066,11 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find load ptr node");
 
+  // Aggregate loads read every field through the whole-object cell; the
+  // wildcard loop keeps per-field stores reachable from it.
+  if (CGP.EB.hasFieldLabels() && I.getType()->isAggregateType())
+    CGP.addFieldWildcardLoop(ptrNode);
+
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
   CGP.addAssignmentEdge(derefNode, valNode);
@@ -1802,6 +2115,10 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find store ptr node");
 
+  // Aggregate stores write every field through the whole-object cell.
+  if (CGP.EB.hasFieldLabels() && val->getType()->isAggregateType())
+    CGP.addFieldWildcardLoop(ptrNode);
+
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
   CGP.addAssignmentEdge(valNode, derefNode);
@@ -1824,6 +2141,18 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   if (valNode == AndersNodeFactory::InvalidIndex) {
     valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&GEP));
     CG_DEBUG("Create value node " << valNode << " for GEP result " << GEP << "\n");
+  }
+
+  if (CGP.EB.hasFieldLabels()) {
+    SmallVector<int64_t, 4> levels;
+    const DataLayout &DL = GEP.getModule()->getDataLayout();
+    if (!CGP.decomposeGEPLevels(cast<GEPOperator>(&GEP), DL, levels))
+      CGP.applyFieldFallback(ptrNode, valNode);
+    else if (levels.empty())
+      CGP.addAssignmentEdge(ptrNode, valNode);
+    else
+      CGP.addFieldChainEdges(ptrNode, valNode, levels);
+    return;
   }
 
   CGP.addAssignmentEdge(ptrNode, valNode);
@@ -1985,6 +2314,10 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
     CG_DEBUG("PtrToInt: created value node " << dstNode << " for " << I << "\n");
   }
   CG_DEBUG("PtrToInt: " << srcNode << " -> " << dstNode << " for " << I << "\n");
+  // Field mode: integer arithmetic on the escaped pointer can rebase it to
+  // any field (disguised GEP); absorb with the wildcard loop at the source.
+  if (CGP.EB.hasFieldLabels())
+    CGP.addFieldWildcardLoop(srcNode);
   CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
@@ -2121,10 +2454,15 @@ void CallGraphPass::InstHandler::visitShuffleVectorInst(ShuffleVectorInst &I) {
   }
 }
 
-// Process global variable initializer in field-insensitive way
+// Process global variable initializer. Field-insensitive by default: every
+// pointer in the initializer assigns into `ptrNode` (the global's deref cell).
+// In field mode (`addrNode` valid), struct elements are routed into per-field
+// cells reached through matched f-edges from the global's address node, so
+// initializer contents stay field-separated like runtime stores.
 void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
                                         const std::string &enclosingStruct,
-                                        int enclosingFieldIdx) {
+                                        int enclosingFieldIdx,
+                                        NodeIndex addrNode) {
   if (!init)
     return;
 
@@ -2164,22 +2502,46 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     CG_DEBUG("add CFL assignment edges for function " << storedFunc->getName()
              << " -> " << ptrNode << "\n");
   } else if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
-    // Field-insensitive: all array elements assign to the same ptr
+    // Arrays are collapsed: all elements share the array's cell.
     for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
-      processInitializer(ptrNode, CA->getOperand(i), enclosingStruct, enclosingFieldIdx);
+      processInitializer(ptrNode, CA->getOperand(i), enclosingStruct,
+                         enclosingFieldIdx, addrNode);
     }
   } else if (ConstantStruct *CS = dyn_cast<ConstantStruct>(init)) {
-    // Field-insensitive: all struct fields assign to the same ptr
     StructType *STy = CS->getType();
+    const bool isUnion = STy && STy->hasName() &&
+                         LLVM_STRING_STARTS_WITH(STy->getStructName(), "union");
+    const bool fieldMode = EB.hasFieldLabels() &&
+                           addrNode != AndersNodeFactory::InvalidIndex &&
+                           curDL && STy;
+    const StructLayout *SL =
+        (fieldMode && !isUnion) ? curDL->getStructLayout(STy) : nullptr;
+    if (fieldMode && isUnion) {
+      // Union members overlay; keep them in the parent cell and absorb any
+      // deeper field access with the wildcard loop.
+      addFieldWildcardLoop(addrNode);
+    }
     for (unsigned i = 0; i != CS->getNumOperands(); ++i) {
       std::string curStruct = enclosingStruct;
       int curField = enclosingFieldIdx;
-      if (STy && !STy->isLiteral() && STy->hasName() &&
-          !LLVM_STRING_STARTS_WITH(STy->getStructName(), "union")) {
+      if (STy && !STy->isLiteral() && STy->hasName() && !isUnion) {
         curStruct = stripStructNameSuffix(STy->getStructName()).str();
         curField = i;
       }
-      processInitializer(ptrNode, CS->getOperand(i), curStruct, curField);
+      NodeIndex childCell = ptrNode;
+      NodeIndex childAddr = addrNode;
+      if (SL) {
+        int64_t off = (int64_t)SL->getElementOffset(i);
+        if (off != 0) {
+          NodeIndex parentCanon = getCanonicalNode(addrNode);
+          childAddr = getFieldPtrNode(parentCanon, off);
+          EB.addFieldEdges(parentCanon, getCanonicalNode(childAddr),
+                           fieldBucket(off));
+        }
+        childCell = getRepDerefNode(childAddr);
+      }
+      processInitializer(childCell, CS->getOperand(i), curStruct, curField,
+                         childAddr);
     }
   } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
     Type *Ty = CAZ->getType();
@@ -2201,6 +2563,16 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
   } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(init)) {
     switch (CE->getOpcode()) {
       case Instruction::GetElementPtr: {
+        // Field mode: store the canonical constant-GEP field pointer itself
+        // (its f-edges from the base are ensured on lookup), keeping the
+        // stored address field-precise.
+        if (EB.hasFieldLabels()) {
+          NodeIndex ceNode = getRepNodeForValue(CE);
+          if (ceNode != AndersNodeFactory::InvalidIndex) {
+            EB.addAssignmentEdges(ceNode, ptrNode);
+            break;
+          }
+        }
         // Field-insensitive: get the base pointer with casts stripped
         const GEPOperator *GEPOp = cast<GEPOperator>(CE);
         const Value* basePtr = GEPOp->getPointerOperand()->stripPointerCasts();
@@ -3060,22 +3432,23 @@ bool CallGraphPass::globalUnion(NodeIndex a, NodeIndex b) {
   return true;
 }
 
-void CallGraphPass::globalDedupScanFunction(const Function *F) {
+bool CallGraphPass::globalDedupScanFunction(const Function *F) {
   if (!F)
-    return;
+    return false;
 
+  bool anyChanged = false;
   bool changed = false;
   do {
     changed = false;
     for (const Instruction &I : instructions(F)) {
-      if (const auto *BC = dyn_cast<BitCastInst>(&I)) {
-        if (!BC->getType()->isPointerTy())
+      if (isa<BitCastInst>(&I) || isa<AddrSpaceCastInst>(&I)) {
+        if (!I.getType()->isPointerTy())
           continue;
-        Value *src = BC->getOperand(0);
+        Value *src = I.getOperand(0);
         if (!src->getType()->isPointerTy())
           continue;
         NodeIndex srcNode = NF.getValueNodeFor(src);
-        NodeIndex dstNode = NF.getValueNodeFor(BC);
+        NodeIndex dstNode = NF.getValueNodeFor(&I);
         if (srcNode != AndersNodeFactory::InvalidIndex &&
             dstNode != AndersNodeFactory::InvalidIndex)
           changed |= globalUnion(srcNode, dstNode);
@@ -3144,7 +3517,84 @@ void CallGraphPass::globalDedupScanFunction(const Function *F) {
           changed |= globalUnion(dstNode, tNode);
       }
     }
+    anyChanged |= changed;
   } while (changed);
+  return anyChanged;
+}
+
+// Merge value nodes that denote the same access path, across functions:
+//   - GEPs with all-constant indices on the same base class and the same
+//     accumulated byte offset compute the same address.
+//   - Loads through the same pointer class read the same abstract cell
+//     (flow-insensitively their only inflow is that cell's deref node).
+// Both are pure-copy equivalences: merging them changes no points-to facts,
+// it only removes duplicate registers from the constraint graph.
+bool CallGraphPass::globalDedupScanAccessPaths() {
+  struct GepKey {
+    NodeIndex baseRoot;
+    int64_t offset;
+    bool operator==(const GepKey &o) const {
+      return baseRoot == o.baseRoot && offset == o.offset;
+    }
+  };
+  struct GepKeyHash {
+    size_t operator()(const GepKey &k) const {
+      return std::hash<uint64_t>()((uint64_t)k.baseRoot * 0x9E3779B97F4A7C15ULL ^
+                                   (uint64_t)k.offset);
+    }
+  };
+
+  std::unordered_map<GepKey, NodeIndex, GepKeyHash> gepReps;
+  std::unordered_map<NodeIndex, NodeIndex> loadReps;
+  bool changed = false;
+
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+        continue;
+      if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+        continue;
+      if (shouldSkipFunction(&F))
+        continue;
+
+      for (const Instruction &I : instructions(F)) {
+        if (const auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+          if (!GEP->getType()->isPointerTy())
+            continue;
+          NodeIndex baseNode = NF.getValueNodeFor(GEP->getPointerOperand());
+          NodeIndex gepNode = NF.getValueNodeFor(GEP);
+          if (baseNode == AndersNodeFactory::InvalidIndex ||
+              gepNode == AndersNodeFactory::InvalidIndex)
+            continue;
+          APInt Off(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+          if (!GEP->accumulateConstantOffset(DL, Off))
+            continue;
+          GepKey key{globalFind(baseNode), Off.getSExtValue()};
+          auto [it, inserted] = gepReps.emplace(key, gepNode);
+          if (!inserted)
+            changed |= globalUnion(it->second, gepNode);
+          continue;
+        }
+
+        if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+          if (!containsPointerType(LI->getType()))
+            continue;
+          NodeIndex ptrNode = NF.getValueNodeFor(LI->getPointerOperand());
+          NodeIndex valNode = NF.getValueNodeFor(LI);
+          if (ptrNode == AndersNodeFactory::InvalidIndex ||
+              valNode == AndersNodeFactory::InvalidIndex)
+            continue;
+          auto [it, inserted] = loadReps.emplace(globalFind(ptrNode), valNode);
+          if (!inserted)
+            changed |= globalUnion(it->second, valNode);
+          continue;
+        }
+      }
+    }
+  }
+
+  return changed;
 }
 
 // Resolve a CallBase to its callee definition, or nullptr if unresolvable.
@@ -3278,17 +3728,32 @@ void CallGraphPass::runGlobalDedup() {
   std::iota(globalUFParent.begin(), globalUFParent.end(), 0);
   globalUFRank.assign(numNodes, 0);
 
-  // Intra-procedural copy merges
-  for (auto &[M, _] : Ctx->Modules) {
-    for (Function &F : *M) {
-      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
-        continue;
-      if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
-        continue;
-      if (shouldSkipFunction(&F))
-        continue;
-      globalDedupScanFunction(&F);
+  // Intra-procedural copy merges + cross-function access-path merges.
+  // Iterate to a fixpoint: access-path unions (same-offset GEPs, same-cell
+  // loads) can enable further phi/select merges and vice versa. Unions are
+  // monotone, so stopping at the cap only forgoes optimization, never
+  // soundness.
+  {
+    constexpr unsigned kMaxDedupRounds = 8;
+    unsigned round = 0;
+    bool anyChanged = true;
+    while (anyChanged && round++ < kMaxDedupRounds) {
+      anyChanged = false;
+      for (auto &[M, _] : Ctx->Modules) {
+        for (Function &F : *M) {
+          if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+            continue;
+          if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+            continue;
+          if (shouldSkipFunction(&F))
+            continue;
+          anyChanged |= globalDedupScanFunction(&F);
+        }
+      }
+      anyChanged |= globalDedupScanAccessPaths();
     }
+    CG_LOG("Global dedup: copy/access-path merges converged in "
+           << round << " round(s)\n");
   }
 
   // Count direct callsites per callee to find single-callsite functions
@@ -3355,21 +3820,26 @@ void CallGraphPass::buildDenseMapping() {
   denseToOrig.clear();
   numDenseNodes = 0;
 
-  // Assign dense IDs to nodes appearing in edges
+  // Assign dense IDs to nodes appearing in edges. Endpoints are canonicalized
+  // so merges applied after edge emission (pre-solve merge) take effect.
+  auto assignDense = [&](NodeIndex n) -> uint32_t {
+    NodeIndex canon = getCanonicalNode(n);
+    if (origToDense[canon] == UINT32_MAX) {
+      origToDense[canon] = numDenseNodes;
+      denseToOrig.push_back(canon);
+      numDenseNodes++;
+    }
+    if (canon != n)
+      origToDense[n] = origToDense[canon];
+    return origToDense[canon];
+  };
   for (const auto &E : rawEdges) {
-    if (origToDense[E.from] == UINT32_MAX) {
-      origToDense[E.from] = numDenseNodes;
-      denseToOrig.push_back(E.from);
-      numDenseNodes++;
-    }
-    if (origToDense[E.to] == UINT32_MAX) {
-      origToDense[E.to] = numDenseNodes;
-      denseToOrig.push_back(E.to);
-      numDenseNodes++;
-    }
+    assignDense(E.from);
+    assignDense(E.to);
   }
 
-  // Remap + dedup
+  // Remap + dedup. Self-loops are kept: they only arise from wildcard field
+  // loops and pre-solve class merges, both of which the solver needs.
   std::unordered_set<EdgeKey, EdgeKeyHash> seen;
   seen.reserve(rawEdges.size());
   denseEdges.clear();
@@ -3377,7 +3847,6 @@ void CallGraphPass::buildDenseMapping() {
   for (const auto &E : rawEdges) {
     uint32_t from = origToDense[E.from];
     uint32_t to = origToDense[E.to];
-    if (from == to) continue; // self-loop
     EdgeKey key{from, to, E.label};
     if (seen.insert(key).second)
       denseEdges.emplace_back(from, to, E.label);
@@ -3486,6 +3955,9 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
   for (size_t i = edgeStart; i < edgeEnd; i++)
     tuEdgeIndices.push_back(i);
 
+  if (CFLPreSolveMerge)
+    preSolveCopyFieldMerge(EB.getEdges(), &tuEdgeIndices);
+
   constexpr size_t kMaxPerTUIterations = 32;
   size_t perTUIter = 0;
   std::unique_ptr<gracfl::SolverFWGramParallel> solver;
@@ -3541,8 +4013,8 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
       const auto &E = iterEdges[edgeIdx];
       uint32_t from = origToDense[getCanonicalNode(E.from)];
       uint32_t to = origToDense[getCanonicalNode(E.to)];
-      if (from == to)
-        continue;
+      // Keep self-loops: wildcard field loops and collapsed-class edges are
+      // needed by the solver (M/Fld derivations through merged nodes).
       EdgeKey key{from, to, E.label};
       if (seen.insert(key).second)
         denseEdges.emplace_back(from, to, E.label);
@@ -3711,6 +4183,9 @@ bool CallGraphPass::doModulePass(Module *M) {
     const bool perTUMode = CFLCompositional && CompressedGraphInputs.empty();
     const size_t edgeStart = EB.getEdges().size();
     moduleDerefEdgeRoots.clear();
+    moduleFieldWildcardRoots.clear();
+    moduleConstGEPFieldDone.clear();
+    curDL = &M->getDataLayout();
 
     for (auto &GV : M->globals()) {
       // Skip compiler-introduced globals
@@ -3726,7 +4201,9 @@ bool CallGraphPass::doModulePass(Module *M) {
         EB.addDereferenceEdges(valNode, deref);
         CG_DEBUG("Processing initializer for GV " << GV.getName() << "\n");
         auto init = GV.getInitializer();
-        processInitializer(deref, init);
+        processInitializer(deref, init, "", -1,
+                           EB.hasFieldLabels() ? valNode
+                                               : AndersNodeFactory::InvalidIndex);
       }
     }
 
@@ -3769,6 +4246,10 @@ bool CallGraphPass::doModulePass(Module *M) {
         NF.dumpNode(nodeId);
       }
     }
+
+    // Pre-solve copy/field merge before the monolithic dense mapping.
+    if (CFLPreSolveMerge && !CFLCompositional)
+      preSolveCopyFieldMerge(EB.getEdges(), nullptr);
 
     // Build dense mapping if global dedup is active.
     // Skip in per-TU mode: per-TU graphs already have their own dense mappings.
@@ -4627,13 +5108,35 @@ void CallGraphPass::compressConstraintGraph(
   edgeSeen.reserve(rawEdges.size());
   out.edges.reserve(rawEdges.size() / 2);
 
+  // Field-label self-loops must be preserved through SCC collapse: like the
+  // a/-a/d/-d self-loops re-added in step 1.5, intra-SCC f-edges are needed
+  // for Fld derivations that cross the SCC after composition.
+  std::vector<bool> fieldLblMask;
+  if (EB.hasFieldLabels()) {
+    uint32_t maxL = std::max(EB.getLabelFieldAny(), EB.getLabelFieldAnyInv());
+    for (unsigned b = 0; b < EB.getNumFieldBuckets(); b++)
+      maxL = std::max({maxL, EB.getLabelField(b), EB.getLabelFieldInv(b)});
+    fieldLblMask.assign(maxL + 1, false);
+    fieldLblMask[EB.getLabelFieldAny()] = true;
+    fieldLblMask[EB.getLabelFieldAnyInv()] = true;
+    for (unsigned b = 0; b < EB.getNumFieldBuckets(); b++) {
+      fieldLblMask[EB.getLabelField(b)] = true;
+      fieldLblMask[EB.getLabelFieldInv(b)] = true;
+    }
+  }
+  auto isFieldLbl = [&](uint32_t lbl) {
+    return lbl < fieldLblMask.size() && fieldLblMask[lbl];
+  };
+
   for (const auto &E : rawEdges) {
     uint32_t sccFrom = (E.from < nodeToSCC.size()) ? nodeToSCC[E.from] : UINT32_MAX;
     uint32_t sccTo = (E.to < nodeToSCC.size()) ? nodeToSCC[E.to] : UINT32_MAX;
     if (sccFrom == UINT32_MAX || sccTo == UINT32_MAX)
       continue;
-    if (sccFrom == sccTo)
-      continue; // skip self-loops
+    if (sccFrom == sccTo && !isFieldLbl(E.label) &&
+        E.from != E.to)
+      continue; // drop SCC-collapsed self-loops (step 1.5 re-adds terminals),
+                // but keep pre-existing self-loops (fx loops, merged classes)
     EdgeKey key{sccFrom, sccTo, E.label};
     if (edgeSeen.insert(key).second)
       out.edges.emplace_back(sccFrom, sccTo, E.label);
@@ -5774,6 +6277,8 @@ bool CallGraphPass::runCompositionalSolve() {
     std::unordered_set<EdgeKey, EdgeKeyHash> exportEdgeSeen;
     exportEdgeSeen.reserve(combinedEdges.size());
     exportData.edges.reserve(combinedEdges.size() / 2);
+    // Note: self-loops (including field-label ones) are kept here — this loop
+    // has no self-loop skip, matching the compositional bug-fix #3 rationale.
     for (const auto &E : combinedEdges) {
       uint32_t sccFrom = (E.from < nodeToSCC.size()) ? nodeToSCC[E.from] : UINT32_MAX;
       uint32_t sccTo = (E.to < nodeToSCC.size()) ? nodeToSCC[E.to] : UINT32_MAX;

@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <cstdint>
+#include <map>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -72,7 +73,37 @@ private:
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void processInitializer(NodeIndex obj, llvm::Constant *init,
                           const std::string &enclosingStruct = "",
-                          int enclosingFieldIdx = -1);
+                          int enclosingFieldIdx = -1,
+                          NodeIndex addrNode = 0xffffffff /*InvalidIndex*/);
+
+  // Field-sensitive CFL memory modeling (--cfl-field-buckets > 0).
+  // Field pointers get matched f<bucket>/-f<bucket> edges instead of plain
+  // assignment edges; unknown-offset accesses fall back to an assignment edge
+  // plus a fx/-fx wildcard self-loop on the base (absorbs any field step).
+  const llvm::DataLayout *curDL = nullptr;
+  std::map<std::pair<NodeIndex, int64_t>, NodeIndex> fieldPtrNodes;
+  std::unordered_set<NodeIndex> moduleFieldWildcardRoots;
+  std::unordered_set<NodeIndex> moduleConstGEPFieldDone;
+  int fieldBucket(int64_t off) const;
+  NodeIndex getFieldPtrNode(NodeIndex parentCanon, int64_t off);
+  bool decomposeGEPLevels(const llvm::GEPOperator *GEP,
+                          const llvm::DataLayout &DL,
+                          llvm::SmallVectorImpl<int64_t> &levels) const;
+  void addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
+                          llvm::ArrayRef<int64_t> levels);
+  void applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode);
+  void addFieldWildcardLoop(NodeIndex n);
+  void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
+  void emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
+                              llvm::Type *Ty, unsigned depth);
+
+  // Pre-solve copy/field merge (--cfl-presolve-merge): solve the memory-free
+  // sublanguage (a/-a/f* edges only; M rules cannot fire without d edges),
+  // then collapse mutual-V' classes into canonicalNodeMap before the full
+  // solve, so the d/-d interaction runs on class representatives.
+  void preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edges,
+                              const std::vector<size_t> *idx);
+  void mergeCanonicalClasses(NodeIndex a, NodeIndex b);
 
   static bool getGEPStructField(const llvm::GEPOperator *GEP,
                                  std::string &structName, unsigned &fieldIdx);
@@ -122,7 +153,8 @@ private:
   std::vector<NodeIndex> globalUFParent;
   std::vector<uint8_t> globalUFRank;
   void runGlobalDedup();
-  void globalDedupScanFunction(const llvm::Function *F);
+  bool globalDedupScanFunction(const llvm::Function *F);
+  bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,
                                 const llvm::DenseSet<const llvm::Function *> &singleCallsiteCallees);
   const llvm::Function *resolveDirectCallee(const llvm::CallBase *CS);

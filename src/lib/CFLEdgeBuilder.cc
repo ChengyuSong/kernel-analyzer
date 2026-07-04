@@ -52,6 +52,25 @@ void CFLEdgeBuilder::initializeLabels() {
     labelDerefInv = findLabel("-d");
     labelM = findLabel("M");
     labelV = findLabel("V");
+
+    // Optional field-sensitive labels: present iff the grammar was built with
+    // buildP2GrammarWithFields(K > 0). Buckets are contiguous from f0.
+    labelField.clear();
+    labelFieldInv.clear();
+    if (symbolMap.count("fx")) {
+      labelFieldAny = findLabel("fx");
+      labelFieldAnyInv = findLabel("-fx");
+      for (unsigned i = 0; ; i++) {
+        std::string fi = "f" + std::to_string(i);
+        auto it = symbolMap.find(fi);
+        if (it == symbolMap.end())
+          break;
+        labelField.push_back(it->second);
+        labelFieldInv.push_back(findLabel("-" + fi));
+      }
+      EB_LOG("Field labels initialized: " << labelField.size()
+             << " buckets + wildcard fx=" << labelFieldAny << "\n");
+    }
     labelsInitialized = true;
 
     EB_LOG("CFL Labels initialized: a=" << labelAssign 
@@ -107,6 +126,36 @@ void CFLEdgeBuilder::addDereferenceEdges(NodeIndex src, NodeIndex dst) {
 
   // Add inverse dereference edge: dst -> src with label '-d'
   edges.emplace_back(dst, src, labelDerefInv);
+}
+
+void CFLEdgeBuilder::addFieldEdges(NodeIndex src, NodeIndex dst, int bucket) {
+  if (!labelsInitialized || labelField.empty()) {
+    throw std::runtime_error("Field labels not initialized");
+  }
+  if (src == AndersNodeFactory::InvalidIndex || dst == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for field edge");
+  }
+  uint fwd, inv;
+  if (bucket < 0) {
+    fwd = labelFieldAny;
+    inv = labelFieldAnyInv;
+  } else {
+    fwd = labelField[bucket % labelField.size()];
+    inv = labelFieldInv[bucket % labelField.size()];
+  }
+  edges.emplace_back(src, dst, fwd);
+  edges.emplace_back(dst, src, inv);
+}
+
+void CFLEdgeBuilder::addFieldWildcardSelfLoop(NodeIndex n) {
+  if (!labelsInitialized || labelField.empty()) {
+    throw std::runtime_error("Field labels not initialized");
+  }
+  if (n == AndersNodeFactory::InvalidIndex) {
+    throw std::runtime_error("Invalid node index for field wildcard loop");
+  }
+  edges.emplace_back(n, n, labelFieldAny);
+  edges.emplace_back(n, n, labelFieldAnyInv);
 }
 
 bool CFLEdgeBuilder::removeAssignmentEdges(NodeIndex src, NodeIndex dst) {

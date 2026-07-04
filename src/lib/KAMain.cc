@@ -109,6 +109,18 @@ cl::opt<bool> CFLCompositional(
   cl::desc("Run per-TU CFL solving and compose compressed results (default on)"),
   cl::init(true));
 
+cl::opt<bool> CFLPreSolveMerge(
+  "cfl-presolve-merge",
+  cl::desc("Solve the memory-free a/f sublanguage first and merge mutual-V' "
+           "classes before the full CFL solve (default off)"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLFieldBuckets(
+  "cfl-field-buckets",
+  cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "
+           "memory modeling (0 = field-insensitive, default)"),
+  cl::init(0));
+
 cl::opt<bool> CFLCGCacheStrict(
   "cfl-cache-strict",
   cl::desc("Strict compositional cache validation (coverage/freshness/compatibility)"),
@@ -377,7 +389,8 @@ int main(int argc, char **argv) {
 
   // CFL-reachability edge construction
   if (GrammarFile.empty()) {
-    if (!GlobalCtx.edgeBuilder.initializeGrammar(DefaultP2Grammar)) {
+    if (!GlobalCtx.edgeBuilder.initializeGrammar(
+            buildP2GrammarWithFields(CFLFieldBuckets))) {
       errs() << "Failed to initialize CFL edge builder with default grammar\n";
     }
   } else {

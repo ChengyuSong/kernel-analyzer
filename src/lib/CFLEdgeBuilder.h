@@ -33,6 +33,12 @@ private:
   uint labelM;          // 'M'
   uint labelV;          // 'V'
 
+  // Field-sensitive extension labels (empty when grammar has no field rules)
+  std::vector<uint> labelField;     // 'f<i>'
+  std::vector<uint> labelFieldInv;  // '-f<i>'
+  uint labelFieldAny;               // 'fx'
+  uint labelFieldAnyInv;            // '-fx'
+
   bool labelsInitialized;
 
   /**
@@ -123,6 +129,19 @@ public:
    * @brief Get grammar instance (for debugging)
    */
   const gracfl::Grammar* getGrammar() const { return grammar.get(); }
+
+  /**
+   * @brief Field-sensitive edge helpers.
+   * bucket < 0 means the wildcard label 'fx'.
+   */
+  unsigned getNumFieldBuckets() const { return labelField.size(); }
+  bool hasFieldLabels() const { return !labelField.empty(); }
+  void addFieldEdges(NodeIndex src, NodeIndex dst, int bucket);
+  void addFieldWildcardSelfLoop(NodeIndex n);
+  uint getLabelField(unsigned bucket) const { return labelField[bucket]; }
+  uint getLabelFieldInv(unsigned bucket) const { return labelFieldInv[bucket]; }
+  uint getLabelFieldAny() const { return labelFieldAny; }
+  uint getLabelFieldAnyInv() const { return labelFieldAnyInv; }
 
   /**
    * @brief Get label ID for aliasing labels

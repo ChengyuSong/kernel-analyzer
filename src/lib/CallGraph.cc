@@ -2568,6 +2568,16 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     return;
   }
 
+  // Aliases (e.g., aliased syscall wrappers) resolve to their aliasee so
+  // function/global addresses stored through an alias are not dropped.
+  if (auto *GA = dyn_cast<GlobalAlias>(init)) {
+    auto *Aliasee = dyn_cast<Constant>(GA->getAliasee()->stripPointerCasts());
+    assert(Aliasee && "GlobalAlias with non-constant aliasee in initializer");
+    processInitializer(ptrNode, Aliasee, enclosingStruct, enclosingFieldIdx,
+                       addrNode);
+    return;
+  }
+
   if (isa<GlobalVariable>(init)) {
     NodeIndex valNode = NF.getValueNodeFor(init);
     if (valNode == AndersNodeFactory::InvalidIndex) {

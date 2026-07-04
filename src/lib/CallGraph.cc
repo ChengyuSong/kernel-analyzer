@@ -3183,6 +3183,10 @@ bool CallGraphPass::fieldFilterAccepts(const Function *F,
       canonF = itDef->second;
   }
 
+  // A function with any unclassified address escape must never be rejected.
+  if (funcFieldStoresIncomplete.count(canonF))
+    return true;
+
   auto it = funcFieldStores.find(canonF);
   if (it == funcFieldStores.end())
     return true;
@@ -3362,6 +3366,7 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
               paramValues.push_back(LI);
           }
         }
+        bool traced = false;
         for (Value *PV : paramValues) {
           for (User *U : PV->users()) {
             auto *PSI = dyn_cast<StoreInst>(U);
@@ -3372,12 +3377,78 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
             if (getFieldKeyFromPointerOperand(PSI->getPointerOperand(), sName, fIdx, fieldTy)) {
               funcFieldStores[canonArgFunc].insert({sName, fIdx});
               callbackStores++;
+              traced = true;
             }
           }
         }
+        if (traced)
+          fieldTraceOK.insert({CB, i});
       }
     }
   }
+
+  // Completeness audit: the field filter may only reject a target if every
+  // escape of its address was classified above. Walk each function's users;
+  // any unclassified escape marks the function incomplete and the filter
+  // falls back to always-accept for it.
+  auto scannedFn = [&](const Function *PF) {
+    return PF && !PF->isDeclaration() && !PF->isIntrinsic() && !PF->empty() &&
+           !Ctx->AllocFuncs.count(PF) && !Ctx->ContainerFuncs.count(PF) &&
+           !shouldSkipFunction(PF);
+  };
+  size_t incompleteMarked = 0;
+  for (Function &F : *M) {
+    Function *canonF = getFuncDef(&F);
+    if (funcFieldStoresIncomplete.count(canonF))
+      continue;
+    bool incomplete = false;
+    SmallVector<const Value *, 16> vals;
+    SmallPtrSet<const Value *, 32> seenV;
+    vals.push_back(&F);
+    while (!vals.empty() && !incomplete) {
+      const Value *V = vals.pop_back_val();
+      if (!seenV.insert(V).second)
+        continue;
+      for (const Use &U : V->uses()) {
+        const User *Usr = U.getUser();
+        if (const auto *C = dyn_cast<Constant>(Usr)) {
+          if (isa<GlobalVariable>(C) || isa<GlobalAlias>(C))
+            continue; // initializer: recorded by processInitializer or keyless
+          if (const auto *CE = dyn_cast<ConstantExpr>(C)) {
+            if (CE->getOpcode() == Instruction::PtrToInt) { incomplete = true; break; }
+          }
+          vals.push_back(C); // aggregates / cast / gep exprs: follow users
+          continue;
+        }
+        const auto *I = dyn_cast<Instruction>(Usr);
+        if (!I) { incomplete = true; break; }
+        if (const auto *CB2 = dyn_cast<const CallBase>(I)) {
+          if (CB2->isCallee(&U))
+            continue; // direct call, no address flow
+          if (CB2->isArgOperand(&U) && scannedFn(I->getFunction()) &&
+              fieldTraceOK.count({CB2, CB2->getArgOperandNo(&U)}))
+            continue; // one-level callback trace succeeded for this use
+          incomplete = true; break;
+        }
+        if (const auto *SI2 = dyn_cast<StoreInst>(I)) {
+          std::string sN; unsigned fI = 0; Type *fT = nullptr;
+          if (SI2->getValueOperand() == V && scannedFn(I->getFunction()) &&
+              getFieldKeyFromPointerOperand(SI2->getPointerOperand(), sN, fI, fT))
+            continue; // classified as a direct field store above
+          incomplete = true; break;
+        }
+        if (isa<CastInst>(I)) { vals.push_back(I); continue; }
+        if (isa<CmpInst>(I)) continue; // comparison: no flow
+        incomplete = true; break;      // phi/select/return/ptrtoint/...
+      }
+    }
+    if (incomplete) {
+      funcFieldStoresIncomplete.insert(canonF);
+      incompleteMarked++;
+    }
+  }
+  CG_LOG("FieldStore completeness [" << M->getModuleIdentifier() << "]: "
+         << incompleteMarked << " functions marked incomplete (filter off)\n");
 
   CG_LOG("FieldStore IR [" << M->getModuleIdentifier() << "]: "
          << directStores << " direct, " << callbackStores << " callback, "
@@ -4215,9 +4286,10 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
       break;
 
     if (perTUIter >= kMaxPerTUIterations) {
-      WARNING("Per-TU fixed point hit iteration cap (" << kMaxPerTUIterations
-              << ") for " << M->getModuleIdentifier()
-              << "; proceeding with current graph\n");
+      errs() << "[UNSOUND-RISK] Per-TU fixed point hit iteration cap ("
+             << kMaxPerTUIterations << ") for " << M->getModuleIdentifier()
+             << "; result may under-approximate\n";
+      soundnessCapped = true;
       break;
     }
   }
@@ -4509,6 +4581,32 @@ bool CallGraphPass::doModulePass(Module *M) {
       }
     }
 
+    // R1/ORCFL hypothesis metric: alias-shaped scaffolding (V facts) vs
+    // answer-shaped facts (function flows-to pairs actually consumable by
+    // the callgraph client).
+    if (VerboseLevel >= 2 && !outputCFLGraph.empty() &&
+        EB.getLabelV() < outputCFLGraph[0].size()) {
+      std::vector<bool> funcDense(outputCFLGraph.size(), false);
+      for (uint32_t n = 0; n < outputCFLGraph.size(); n++) {
+        NodeIndex orig = (CFLGlobalDedup && n < denseToOrig.size()) ? denseToOrig[n] : n;
+        const Value *FV = NF.getValueForNode(orig);
+        if (FV && isa<Function>(FV))
+          funcDense[n] = true;
+      }
+      uint64_t vFacts = 0, ftFacts = 0;
+      for (uint32_t n = 0; n < outputCFLGraph.size(); n++) {
+        const auto &VS = outputCFLGraph[n][EB.getLabelV()];
+        vFacts += VS.size();
+        for (uint32_t mm : VS)
+          if (mm < funcDense.size() && funcDense[mm])
+            ftFacts++;
+      }
+      CG_LOG("ORCFL metric: V facts " << vFacts
+             << ", function-flows-to facts " << ftFacts
+             << ", scaffolding ratio "
+             << (ftFacts ? (double)vFacts / (double)ftFacts : 0.0) << "\n");
+    }
+
     // handle custom allocators
     const bool allocatorRewritten = findCustomAllocators(outputCFLGraph);
     if (allocatorRewritten) {
@@ -4749,6 +4847,7 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
   Metadata["total_call_edges"] = static_cast<int64_t>(totalEdges);
   Metadata["total_direct_calls"] = static_cast<int64_t>(directEdges);
   Metadata["total_indirect_calls"] = static_cast<int64_t>(indirectEdges);
+  Metadata["soundness_capped"] = soundnessCapped;
 
   json::Object Root;
   Root["metadata"] = std::move(Metadata);
@@ -6492,6 +6591,7 @@ bool CallGraphPass::runCompositionalSolve() {
   size_t newSummaryEdges = 0;
 
   constexpr size_t kMaxCompIterations = 8;
+  bool composedConverged = false;
   for (size_t iterNo = 1; iterNo <= kMaxCompIterations; iterNo++) {
     const auto &iterGraph = composedSolver->getReachability();
     size_t iterResolvedCalls = 0;
@@ -6694,8 +6794,10 @@ bool CallGraphPass::runCompositionalSolve() {
            << ", new-summary-edges=" << iterNewSummaryEdges
            << ", skipped-no-symbol=" << iterSkippedNoSymbol << "\n");
 
-    if (iterNewSummaryEdges == 0)
+    if (iterNewSummaryEdges == 0) {
+      composedConverged = true;
       break;
+    }
 
     auto tIterSolve = std::chrono::steady_clock::now();
     auto nextSolver = std::make_unique<gracfl::SolverFWGramParallel>(
@@ -6706,6 +6808,13 @@ bool CallGraphPass::runCompositionalSolve() {
            << std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - tIterSolve).count()
            << " ms, final edges=" << composedSolver->getEdgeCount() << "\n");
+  }
+
+  if (!composedConverged) {
+    errs() << "[UNSOUND-RISK] Composed summary loop hit iteration cap ("
+           << kMaxCompIterations << ") before fixed point; "
+           << "result may under-approximate\n";
+    soundnessCapped = true;
   }
 
   CG_LOG("Compositional solve: resolved " << resolvedCalls

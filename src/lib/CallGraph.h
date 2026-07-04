@@ -219,6 +219,13 @@ private:
 
   std::unordered_map<const llvm::Function*,
                      std::unordered_set<FieldStoreKey, FieldStoreKeyHash>> funcFieldStores;
+  // Soundness of the field filter requires per-function completeness: any
+  // unclassified escape of a function's address disables filtering for it.
+  std::unordered_set<const llvm::Function*> funcFieldStoresIncomplete;
+  llvm::DenseSet<std::pair<const llvm::CallBase*, unsigned>> fieldTraceOK;
+  // Set when any fixed-point loop stops at its iteration cap: the result may
+  // under-approximate. Reported in the callgraph JSON.
+  bool soundnessCapped = false;
   std::unordered_map<FieldStoreKey,
                      std::unordered_set<FieldStoreKey, FieldStoreKeyHash>,
                      FieldStoreKeyHash> fieldAliasMap;

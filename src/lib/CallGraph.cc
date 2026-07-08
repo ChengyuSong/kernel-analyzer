@@ -10,6 +10,7 @@
  */
 
 
+#include <llvm/ADT/BitVector.h>
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/Operator.h>
@@ -1834,23 +1835,16 @@ bool CallGraphPass::runFlowsToResolution() {
     if (std::find(cs.begin(), cs.end(), c) == cs.end()) cs.push_back(c);
   }
 
-  // Facts are (origin root, shift) packed as o * NSHIFT + s. Shift values:
-  // 0..NB-1 exact residues, NB = unknown (X). Field-insensitive (NB=0)
-  // degenerates to NSHIFT=1: facts are plain roots, byte-identical to v0.
+  // Facts are (origin root, shift) pairs, stored as NSHIFT bit planes per
+  // class: plane s is a bitset over origins present at shift s. Shift
+  // values: 0..NB-1 exact residues, NB = unknown (X). Field-insensitive
+  // (NB=0) degenerates to a single plane.
   const uint32_t NSHIFT = NB + 1;
   const uint32_t SHIFT_X = NB;
-  auto factOf = [&](uint32_t o, uint32_t s) { return o * NSHIFT + s; };
-  auto rootOf = [&](uint32_t f) { return f / NSHIFT; };
-  auto shiftOf = [&](uint32_t f) { return f % NSHIFT; };
 
   // Root ids: any origin class, plus function classes flagged for answers.
-  std::vector<boost::unordered_flat_set<uint32_t>> R(N);
   std::unordered_map<uint32_t, const Function *> funcRootOf;
-  std::vector<uint32_t> worklist;
-  std::vector<bool> inWL(N, false);
-  auto push = [&](uint32_t n) {
-    if (!inWL[n]) { inWL[n] = true; worklist.push_back(n); }
-  };
+  std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
@@ -1858,129 +1852,286 @@ bool CallGraphPass::runFlowsToResolution() {
     const bool isFunc = fit != funcOfCanon.end();
     if (!hasIn[n] || isFunc) {
       uint32_t rid = nextRoot++;
-      R[n].insert(factOf(rid, 0));
+      seeds.emplace_back(n, rid);
       if (isFunc) funcRootOf[rid] = fit->second;
-      push(n);
     }
   }
-  assert((uint64_t)nextRoot * NSHIFT < UINT32_MAX &&
-         "fact ids must fit 32 bits");
 
-  // Difference propagation: each pop processes only the facts added to a
-  // node since its last pop, and a new copy edge transfers the source's
-  // current facts exactly once — never a full re-propagation. Node ids
-  // >= N are hub nodes, one per fact cluster: cells whose parents share
-  // the fact (o, s) form a copy clique, encoded linearly as cell <-> hub
-  // (identical transitive closure). The (o, X) hub is cross-linked with
-  // every exact-shift hub of the same origin (VX: unknown may be any
-  // position) — links only between clusters that both have members.
+  // Solver core: union-find clusters + bit-plane difference propagation.
+  // Exact-fact joins are transitive (same (o, s) => same abstract cell),
+  // so cluster members MERGE into one class — no hub nodes, no duplicated
+  // fact sets, no k-fold re-propagation. The (o, X) cluster is unioned
+  // with every exact-shift cluster of the same origin when both exist
+  // (VX; identical fixpoint to the former bidirectional hub links, which
+  // equalized member fact sets anyway). Propagation is word-parallel:
+  // OR whole planes across a-edges, plane-rotated OR across f-edges.
   CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
          << funcRootOf.size() << " function), " << wildcardNodes.size()
-         << " wildcard nodes, " << NSHIFT << " shift values\n");
-  std::vector<std::vector<uint32_t>> delta(N);
-  uint64_t factCount = nextRoot; // running Σ|R| including hub nodes
-  auto addFact = [&](uint32_t n, uint32_t f) {
-    if (R[n].insert(f).second) { delta[n].push_back(f); push(n); factCount++; }
+         << " wildcard nodes, " << NSHIFT << " shift planes\n");
+  std::vector<uint32_t> ufp(N), ufrank(N, 0);
+  for (uint32_t i = 0; i < N; i++) ufp[i] = i;
+  auto find = [&](uint32_t x) {
+    while (ufp[x] != x) { ufp[x] = ufp[ufp[x]]; x = ufp[x]; }
+    return x;
   };
-  for (uint32_t n = 0; n < N; n++)
-    delta[n].assign(R[n].begin(), R[n].end());
-
-  auto allocNode = [&]() {
-    uint32_t id = (uint32_t)R.size();
-    R.emplace_back();
-    outA.emplace_back();
-    delta.emplace_back();
-    inWL.push_back(false);
-    return id;
+  // Per-class planes: R = all facts; dirty = propagation delta (facts the
+  // neighbors have not been offered); jdirty = join backlog (facts the
+  // cell list has not been swept with, refiltered by `joined`). They
+  // differ only at merges: propagation pushes just the true delta plus a
+  // one-time direct push along the loser's moved edges, while joins must
+  // reconsider the full merged fact set against the merged cell list.
+  std::vector<std::vector<llvm::BitVector>> R(N), dirty(N), jdirty(N),
+      joined(N);
+  for (uint32_t i = 0; i < N; i++) {
+    R[i].resize(NSHIFT);
+    dirty[i].resize(NSHIFT);
+    jdirty[i].resize(NSHIFT);
+    joined[i].resize(NSHIFT); // facts already pushed to ALL cells of class
+  }
+  std::vector<char> wflag(N, 0);
+  for (uint32_t w : wildcardNodes) wflag[w] = 1;
+  std::vector<uint32_t> worklist;
+  std::vector<bool> inWL(N, false);
+  auto push = [&](uint32_t n) {
+    if (!inWL[n]) { inWL[n] = true; worklist.push_back(n); }
   };
-  size_t joinEdges = 0;
-  auto wire = [&](uint32_t x, uint32_t y) {
-    outA[x].push_back(y);
-    joinEdges++;
-    for (uint32_t f : R[x]) addFact(y, f);
+  uint64_t factCount = 0;
+  auto ensure = [&](llvm::BitVector &bv) {
+    if (bv.size() < nextRoot) bv.resize(nextRoot);
   };
-  std::unordered_map<uint32_t, uint32_t> hubOf; // fact -> hub node
-  std::unordered_map<uint32_t, uint32_t> xHubOf; // origin -> (o, X) hub
-  std::unordered_map<uint32_t, std::vector<uint32_t>> shiftHubsOf;
-  auto getHub = [&](uint32_t fact) {
-    auto [it, ins] = hubOf.emplace(fact, 0);
-    if (!ins) return it->second;
-    uint32_t id = allocNode();
-    it->second = id;
-    if (NB > 0) {
-      uint32_t o = rootOf(fact);
-      if (shiftOf(fact) == SHIFT_X) {
-        xHubOf[o] = id;
-        for (uint32_t h : shiftHubsOf[o]) { wire(id, h); wire(h, id); }
+  // OR src into rep n's plane s; new bits enter both deltas.
+  auto addBits = [&](uint32_t n, uint32_t s, const llvm::BitVector &src) {
+    if (src.none()) return;
+    ensure(R[n][s]);
+    llvm::BitVector nb(src);
+    ensure(nb);
+    nb.reset(R[n][s]);
+    if (nb.none()) return;
+    R[n][s] |= nb;
+    ensure(dirty[n][s]);
+    dirty[n][s] |= nb;
+    ensure(jdirty[n][s]);
+    jdirty[n][s] |= nb;
+    factCount += nb.count();
+    push(n);
+  };
+  auto addFact = [&](uint32_t n, uint32_t s, uint32_t o) {
+    ensure(R[n][s]);
+    if (R[n][s].test(o)) return;
+    R[n][s].set(o);
+    ensure(dirty[n][s]);
+    dirty[n][s].set(o);
+    ensure(jdirty[n][s]);
+    jdirty[n][s].set(o);
+    factCount++;
+    push(n);
+  };
+  size_t mergeCount = 0;
+  auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
+    a = find(a); b = find(b);
+    if (a == b) return a;
+    if (ufrank[a] < ufrank[b]) std::swap(a, b);
+    if (ufrank[a] == ufrank[b]) ufrank[a]++;
+    ufp[b] = a;
+    mergeCount++;
+    for (uint32_t s = 0; s < NSHIFT; s++) {
+      // Propagation delta: only facts genuinely new to the keeper. The
+      // keeper's old facts reach the loser's former neighbors via the
+      // one-time direct push below, NOT via a full re-dirty (that made
+      // every merge re-offer the whole fact set on the whole edge list).
+      if (R[b][s].any()) {
+        llvm::BitVector nb(R[b][s]);
+        ensure(nb);
+        if (R[a][s].size()) nb.reset(R[a][s]);
+        if (nb.any()) {
+          ensure(R[a][s]);
+          R[a][s] |= nb;
+          ensure(dirty[a][s]);
+          dirty[a][s] |= nb;
+        }
+      }
+      if (dirty[b][s].any()) { ensure(dirty[a][s]); dirty[a][s] |= dirty[b][s]; }
+      R[b][s].clear();
+      dirty[b][s].clear();
+      // Join backlog: the merged cell list must be swept with the full
+      // merged fact set (filtered by `joined`, which keeps only facts
+      // that reached BOTH sides' cells).
+      if (R[a][s].size()) { ensure(jdirty[a][s]); jdirty[a][s] |= R[a][s]; }
+      jdirty[b][s].clear();
+      if (joined[a][s].size() && joined[b][s].size()) {
+        ensure(joined[a][s]); ensure(joined[b][s]);
+        joined[a][s] &= joined[b][s];
       } else {
-        shiftHubsOf[o].push_back(id);
-        auto xIt = xHubOf.find(o);
-        if (xIt != xHubOf.end()) { wire(id, xIt->second); wire(xIt->second, id); }
+        joined[a][s].clear();
+      }
+      joined[b][s].clear();
+    }
+    // One-time push of the merged fact set along the loser's moved edges
+    // (the keeper's old edges only ever need the delta).
+    for (uint32_t t : outA[b]) {
+      uint32_t tt = find(t);
+      if (tt == a) continue;
+      for (uint32_t s = 0; s < NSHIFT; s++)
+        if (R[a][s].any()) addBits(tt, s, R[a][s]);
+    }
+    for (auto [t, r] : outF[b]) {
+      uint32_t tt = find(t);
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        if (!R[a][s].any()) continue;
+        uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
+        if (tt != a || s2 != s) addBits(tt, s2, R[a][s]);
       }
     }
-    return id;
+    auto append = [](auto &dst, auto &src) {
+      dst.insert(dst.end(), src.begin(), src.end());
+      src.clear();
+      src.shrink_to_fit();
+    };
+    append(outA[a], outA[b]);
+    append(outF[a], outF[b]);
+    append(cellsOf[a], cellsOf[b]);
+    // Wildcard status arriving with the loser retroactively projects the
+    // keeper's existing exact facts onto the unknown-shift plane.
+    if (NB > 0 && wflag[b] && !wflag[a])
+      for (uint32_t s = 0; s < NB; s++)
+        if (R[a][s].any()) addBits(a, SHIFT_X, R[a][s]);
+    wflag[a] |= wflag[b];
+    push(a);
+    return a;
   };
-  boost::unordered_flat_set<uint64_t> cellReg; // (fact, cell) joined
-  auto joinCell = [&](uint32_t cell, uint32_t fact) {
-    if (!cellReg.insert(((uint64_t)fact << 32) | cell).second)
+  // Merged classes accumulate stale/duplicate edge and cell entries;
+  // compact when a list has grown well past its last compacted size.
+  std::vector<uint32_t> compactMark(N, 64);
+  auto compactLists = [&](uint32_t n) {
+    for (auto &t : outA[n]) t = find(t);
+    std::sort(outA[n].begin(), outA[n].end());
+    outA[n].erase(std::unique(outA[n].begin(), outA[n].end()), outA[n].end());
+    outA[n].erase(std::remove(outA[n].begin(), outA[n].end(), n),
+                  outA[n].end());
+    for (auto &[t, r] : outF[n]) t = find(t);
+    std::sort(outF[n].begin(), outF[n].end());
+    outF[n].erase(std::unique(outF[n].begin(), outF[n].end()), outF[n].end());
+    for (auto &c : cellsOf[n]) c = find(c);
+    std::sort(cellsOf[n].begin(), cellsOf[n].end());
+    cellsOf[n].erase(std::unique(cellsOf[n].begin(), cellsOf[n].end()),
+                     cellsOf[n].end());
+    compactMark[n] = (uint32_t)std::max<size_t>(
+        64, 2 * (outA[n].size() + outF[n].size() + cellsOf[n].size()));
+  };
+  // Cluster registry: fact (o, s) -> current representative class of the
+  // merged cell cluster. Entries may go stale under merges; resolve with
+  // find() on read.
+  boost::unordered_flat_map<uint64_t, uint32_t> clusterRep;
+  std::unordered_map<uint32_t, std::vector<uint64_t>> shiftKeysOf;
+  auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
+    const uint64_t key = (uint64_t)o * NSHIFT + s;
+    auto [it, ins] = clusterRep.emplace(key, find(cell));
+    if (!ins) {
+      it->second = merge(it->second, cell);
       return;
-    uint32_t hub = getHub(fact);
-    wire(cell, hub);
-    wire(hub, cell);
+    }
+    if (NB == 0) return;
+    // VX linking: union the (o, X) cluster with each exact cluster of o.
+    if (s == SHIFT_X) {
+      for (uint64_t ek : shiftKeysOf[o]) {
+        auto eIt = clusterRep.find(ek);
+        it = clusterRep.find(key); // re-find: map may rehash via [] below
+        it->second = merge(it->second, eIt->second);
+        eIt->second = it->second;
+      }
+    } else {
+      shiftKeysOf[o].push_back(key);
+      auto xIt = clusterRep.find((uint64_t)o * NSHIFT + SHIFT_X);
+      if (xIt != clusterRep.end()) {
+        it->second = merge(it->second, xIt->second);
+        xIt->second = it->second;
+      }
+    }
   };
+  for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
 
   size_t iterations = 0;
+  llvm::BitVector d;
   while (!worklist.empty()) {
     uint32_t n = worklist.back();
     worklist.pop_back();
     inWL[n] = false;
+    if (find(n) != n) continue; // merged away; keeper carries the state
     iterations++;
     if ((iterations & ((1u << 20) - 1)) == 0)
       CG_LOG("FlowsTo progress: " << iterations << " pops, " << factCount
-             << " facts, " << cellReg.size() << " registrations, "
-             << hubOf.size() << " hubs (" << xHubOf.size() << " X), "
+             << " facts, " << clusterRep.size() << " clusters, "
+             << mergeCount << " merges, "
              << std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - tStart).count()
              << " ms\n");
-    std::vector<uint32_t> newFacts;
-    std::swap(newFacts, delta[n]);
-    if (n < N) {
-      // Cell join (M ::= -d V d | -d VX d): this parent class holds these
-      // facts; its cells alias every cell whose parent shares one exactly
-      // (or at X, via the hub cross-links).
-      for (uint32_t f : newFacts)
-        for (uint32_t cell : cellsOf[n])
-          joinCell(cell, f);
-      // Wildcard (fx self-loop): every fact also holds at unknown shift.
-      if (NB > 0 && wildcardNodes.contains(n))
-        for (uint32_t f : newFacts)
-          if (shiftOf(f) != SHIFT_X)
-            addFact(n, factOf(rootOf(f), SHIFT_X));
-      // Field steps shift the fact's residue; X absorbs.
-      for (auto [t, r] : outF[n])
-        for (uint32_t f : newFacts) {
-          uint32_t s = shiftOf(f);
-          addFact(t, s == SHIFT_X ? f : factOf(rootOf(f), (s + r) % NB));
+    if (outA[n].size() + outF[n].size() + cellsOf[n].size() > compactMark[n])
+      compactLists(n);
+    for (uint32_t s = 0; s < NSHIFT && find(n) == n; s++) {
+      // Cell join (M ::= -d V d | -d VX d): sweep the join backlog —
+      // facts never yet pushed to this class's full cell list — against
+      // the per-fact clusters. A merge can absorb n itself: stop; the
+      // keeper inherits the backlog and is re-queued.
+      if (jdirty[n][s].any()) {
+        llvm::BitVector todo(jdirty[n][s]);
+        jdirty[n][s].reset();
+        if (!cellsOf[n].empty()) {
+          if (joined[n][s].size()) { ensure(todo); todo.reset(joined[n][s]); }
+          ensure(joined[n][s]);
+          for (int o = todo.find_first(); o != -1; o = todo.find_next(o)) {
+            bool aborted = false;
+            for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
+              joinCluster(cellsOf[n][ci], (uint32_t)o, s);
+              if (find(n) != n) { aborted = true; break; }
+            }
+            if (aborted) break;
+            // A merge that kept n may have intersected/cleared the
+            // plane; re-ensure. Cells appended mid-loop were covered
+            // (the inner bound re-reads cellsOf[n].size()).
+            ensure(joined[n][s]);
+            joined[n][s].set((unsigned)o);
+          }
+          if (find(n) != n) break;
         }
+      }
+      if (dirty[n][s].none()) continue;
+      d = dirty[n][s];
+      dirty[n][s].reset();
+      // Wildcard (fx self-loop): new exact facts also hold at unknown
+      // shift (retroactive projection on wflag acquisition is in merge).
+      if (NB > 0 && wflag[n] && s != SHIFT_X) addBits(n, SHIFT_X, d);
+      // Propagate the delta: whole-plane OR along a-edges, plane-rotated
+      // OR along f-edges (X absorbs).
+      for (uint32_t t : outA[n]) {
+        uint32_t tt = find(t);
+        if (tt != n) addBits(tt, s, d);
+      }
+      for (auto [t, r] : outF[n]) {
+        uint32_t tt = find(t);
+        uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
+        if (tt != n || s2 != s) addBits(tt, s2, d);
+      }
     }
-    for (uint32_t t : outA[n])
-      for (uint32_t f : newFacts)
-        addFact(t, f);
   }
 
   uint64_t totalR = 0;
-  for (uint32_t n = 0; n < N; n++) totalR += R[n].size();
-  CG_LOG("FlowsTo: " << N << " classes, " << nextRoot << " roots, "
+  uint32_t liveClasses = 0;
+  for (uint32_t n = 0; n < N; n++) {
+    if (find(n) != n) continue;
+    liveClasses++;
+    for (uint32_t s = 0; s < NSHIFT; s++) totalR += R[n][s].count();
+  }
+  CG_LOG("FlowsTo: " << N << " classes (" << liveClasses << " after "
+         << mergeCount << " merges), " << nextRoot << " roots, "
          << totalR << " facts (vs pairwise V), "
-         << joinEdges << " hub-join edges, "
+         << clusterRep.size() << " cell clusters, "
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");
 
-  // Resolution: facts at the fptr class whose origin is a function root
-  // and whose shift is zero or unknown (an exact nonzero shift is a
-  // provably misaligned pointer, not a call target), then the standard
-  // filters.
+  // Resolution: origins at the fptr class whose shift is zero or unknown
+  // (an exact nonzero shift is a provably misaligned pointer, not a call
+  // target), intersected with function roots, then the standard filters.
   size_t resolved = 0, totalTargets = 0;
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
@@ -1991,16 +2142,19 @@ bool CallGraphPass::runFlowsToResolution() {
     std::string csStruct; unsigned csField = 0;
     bool hasKey = getCallSiteFieldKey(fptr, csStruct, csField);
     FuncSet targets;
-    for (uint32_t f : R[dIt->second]) {
-      uint32_t s = shiftOf(f);
-      if (s != 0 && s != SHIFT_X) continue;
-      auto rIt = funcRootOf.find(rootOf(f));
-      if (rIt == funcRootOf.end()) continue;
-      Function *F = getFuncDef(const_cast<Function *>(rIt->second));
-      if (!isCompatible(CS, F)) continue;
-      if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) continue;
-      targets.insert(F);
-    }
+    const uint32_t rep = find(dIt->second);
+    auto collect = [&](const llvm::BitVector &plane) {
+      for (int o = plane.find_first(); o != -1; o = plane.find_next(o)) {
+        auto rIt = funcRootOf.find((uint32_t)o);
+        if (rIt == funcRootOf.end()) continue;
+        Function *F = getFuncDef(const_cast<Function *>(rIt->second));
+        if (!isCompatible(CS, F)) continue;
+        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) continue;
+        targets.insert(F);
+      }
+    };
+    collect(R[rep][0]);
+    if (NB > 0) collect(R[rep][SHIFT_X]);
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
     for (const Function *F : targets)
       Ctx->Callees[CS].insert(F);

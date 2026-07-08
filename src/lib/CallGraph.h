@@ -96,6 +96,7 @@ private:
   void addFieldWildcardLoop(NodeIndex n);
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
   void sliceEdgesToFptrComponents(std::vector<size_t> &idx);
+  bool runFlowsToResolution();
   std::unordered_set<NodeIndex> fptrSliceKept;
   void emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
                               llvm::Type *Ty, unsigned depth);

@@ -121,6 +121,19 @@ cl::opt<bool> CFLFptrSlice(
            "pointers (callgraph-only slicing, default off)"),
   cl::init(false));
 
+cl::opt<bool> CFLFlowsTo(
+  "cfl-flows-to",
+  cl::desc("Resolve icalls by answer-anchored root propagation instead of "
+           "all-pairs CFL saturation (v0: field-insensitive, monolithic)"),
+  cl::init(false));
+
+cl::opt<bool> CFLFlowsToSlice(
+  "cfl-flows-to-slice",
+  cl::desc("Before flows-to propagation, prune to the derivation slice: "
+           "1-bit function->fptr taint with Steensgaard-class memory "
+           "jumps, closed under alias-evidence origins"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "

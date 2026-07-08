@@ -1294,7 +1294,14 @@ void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
 int CallGraphPass::fieldBucket(int64_t off) const {
   const unsigned K = EB.getNumFieldBuckets();
   assert(K > 0 && "fieldBucket called without field labels");
-  return (int)((((uint64_t)off) * 0x9E3779B97F4A7C15ULL >> 32) % K);
+  // Modular residue, NOT a hash: bucket sums must track offset sums so the
+  // shift-indexed grammar can compose nested steps against flat ones
+  // ((a+b) mod K == (a mod K + b mod K) mod K). Signed-safe for
+  // container_of-style negative offsets. Prefer prime K: typical offsets
+  // are 8-aligned, and a prime modulus keeps them from collapsing onto a
+  // couple of residues.
+  int64_t r = off % (int64_t)K;
+  return (int)(r < 0 ? r + (int64_t)K : r);
 }
 
 NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
@@ -1338,8 +1345,15 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       Type *Ty = GTI.getIndexedType();
       if (!Ty->isStructTy() && !Ty->isArrayTy() && !Ty->isVectorTy()) {
         const auto *CI = dyn_cast<ConstantInt>(idx);
-        if (!CI || !CI->isZero())
-          return false; // scalar/i8 pointer arithmetic -> wildcard fallback
+        if (!CI)
+          return false; // variable scalar arithmetic -> wildcard fallback
+        // Constant scalar-typed offsets are known field steps, including
+        // the two container_of shapes: raw negative offsets and the
+        // -O1-folded positive byte offsets from mid-object pointers.
+        int64_t off =
+            CI->getSExtValue() * (int64_t)DL.getTypeAllocSize(Ty);
+        if (off != 0)
+          levels.push_back(off);
       }
     }
     first = false;
@@ -1561,6 +1575,439 @@ void CallGraphPass::sliceEdgesToFptrComponents(std::vector<size_t> &idx) {
   idx.resize(kept);
   CG_LOG("Fptr slice: " << before << " edges -> " << kept << " ("
          << seededRoots.size() << " fptr components kept)\n");
+}
+
+
+// Answer-anchored flows-to resolution (ORCFL prototype). After the
+// quotient (presolve merge collapses a-cycles so the copy graph is a DAG of
+// classes), V restricted to function sources is pure forward propagation:
+// functions have no incoming assignments. Facts are (origin root, net field
+// shift) pairs mirroring the shift-indexed grammar: a-edges and M-joins
+// preserve the shift, an f<r> edge adds r mod P, an fx wildcard absorbs to
+// the unknown shift X. The M splice is a join rule: two cells alias when
+// their parents share a fact exactly — same origin AND same shift (V), or
+// either side at X (VX). container_of round trips need no special casing:
+// down 8 then down 8 carries the same shift as flat down 16. Storage is
+// rectangular (fact sets), never pairwise V.
+bool CallGraphPass::runFlowsToResolution() {
+  auto tStart = std::chrono::steady_clock::now();
+  const auto &edges = EB.getEdges();
+  const uint32_t la = EB.getLabelAssign();
+  const uint32_t ld = EB.getLabelDeref();
+  const unsigned NB = EB.getNumFieldBuckets(); // 0 = field-insensitive
+  std::unordered_map<uint32_t, uint32_t> bucketOfLabel;
+  uint32_t lfx = UINT32_MAX;
+  if (NB > 0) {
+    for (unsigned b = 0; b < NB; b++)
+      bucketOfLabel[EB.getLabelField(b)] = b;
+    lfx = EB.getLabelFieldAny();
+  }
+
+  // Dense ids over canonical nodes.
+  std::unordered_map<NodeIndex, uint32_t> toDense;
+  std::vector<NodeIndex> toOrig;
+  auto dense = [&](NodeIndex canon) {
+    auto [it, ins] = toDense.emplace(canon, (uint32_t)toOrig.size());
+    if (ins) toOrig.push_back(canon);
+    return it->second;
+  };
+  std::vector<std::pair<uint32_t, uint32_t>> aEdges;
+  std::vector<std::pair<uint32_t, uint32_t>> dEdges; // parent -> cell
+  std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> fEdges; // base,res,bkt
+  boost::unordered_flat_set<uint32_t> wildcardNodes; // fx self-loop bases
+  for (const auto &E : edges) {
+    NodeIndex cf = getCanonicalNode(E.from), ct = getCanonicalNode(E.to);
+    if (E.label == la) {
+      if (cf != ct) aEdges.emplace_back(dense(cf), dense(ct));
+    } else if (E.label == ld) {
+      dEdges.emplace_back(dense(cf), dense(ct));
+    } else if (NB > 0 && E.label == lfx) {
+      wildcardNodes.insert(dense(cf));
+    } else if (NB > 0) {
+      auto bIt = bucketOfLabel.find(E.label);
+      if (bIt != bucketOfLabel.end())
+        fEdges.emplace_back(dense(cf), dense(ct), bIt->second);
+    }
+  }
+  const uint32_t N = toOrig.size();
+  std::vector<std::vector<uint32_t>> outA(N);
+  for (auto [s, t] : aEdges) outA[s].push_back(t);
+  // f-edges as shift transformers: (target, residue).
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> outF(N);
+  for (auto &[b, r, bk] : fEdges)
+    outF[b].emplace_back(r, bk);
+
+  // In-degree over the FULL a/f-graph, before any slicing: a node whose
+  // incoming edges are sliced away was not a value origin and must not be
+  // minted as a root; a field-pointer result is fully described by its
+  // base's facts plus the shift, so it is not an origin either.
+  std::vector<bool> hasIn(N, false);
+  for (auto [s, t] : aEdges) hasIn[t] = true;
+  for (auto &[b, r, bk] : fEdges) hasIn[r] = true;
+  std::unordered_map<NodeIndex, const Function *> funcOfCanon;
+  for (const Function *F : Ctx->AddressTakenFuncs) {
+    NodeIndex n = NF.getValueNodeFor(F);
+    if (n != AndersNodeFactory::InvalidIndex)
+      funcOfCanon[getCanonicalNode(n)] = F;
+  }
+
+  // Derivation slice (1-bit taint): keep only classes that can appear in
+  // some function->fptr derivation, or that supply alias evidence (shared
+  // value origins) for a memory join usable by one. Alias is
+  // over-approximated by Steensgaard classes (unification), which the
+  // precise shared-root join then refines on the slice.
+  std::vector<char> inSlice; // empty => no slicing
+  if (CFLFlowsToSlice) {
+    auto tSlice = std::chrono::steady_clock::now();
+    // Steensgaard: union a-edge endpoints; one representative cell per
+    // class, unioning cells whenever their owning classes merge.
+    std::vector<uint32_t> ufp(N);
+    for (uint32_t i = 0; i < N; i++) ufp[i] = i;
+    auto find = [&](uint32_t x) {
+      while (ufp[x] != x) { ufp[x] = ufp[ufp[x]]; x = ufp[x]; }
+      return x;
+    };
+    std::vector<uint32_t> cellRep(N, UINT32_MAX);
+    std::vector<std::pair<uint32_t, uint32_t>> pending;
+    auto unite = [&](uint32_t a, uint32_t b) {
+      a = find(a); b = find(b);
+      if (a == b) return;
+      ufp[b] = a;
+      if (cellRep[b] != UINT32_MAX) {
+        if (cellRep[a] != UINT32_MAX)
+          pending.emplace_back(cellRep[a], cellRep[b]);
+        else
+          cellRep[a] = cellRep[b];
+      }
+    };
+    auto drain = [&]() {
+      while (!pending.empty()) {
+        auto [x, y] = pending.back();
+        pending.pop_back();
+        unite(x, y);
+      }
+    };
+    for (auto [s, t] : aEdges) { unite(s, t); drain(); }
+    // Field steps fold to copies here (field-insensitive Steensgaard):
+    // Fld(r1,r2) implies V(b1,b2), so unifying result with base keeps the
+    // over-approximation valid for the field-sensitive join too.
+    for (auto &[b, r, bk] : fEdges) { unite(b, r); drain(); }
+    for (auto [p, c] : dEdges) {
+      uint32_t rp = find(p);
+      if (cellRep[rp] == UINT32_MAX) cellRep[rp] = find(c);
+      else { pending.emplace_back(cellRep[rp], c); drain(); }
+    }
+
+    std::vector<char> isCell(N, 0);
+    for (auto [p, c] : dEdges) isCell[c] = 1;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> classCells;
+    for (uint32_t c = 0; c < N; c++)
+      if (isCell[c]) classCells[find(c)].push_back(c);
+    std::vector<std::vector<uint32_t>> cellParents(N);
+    for (auto [p, c] : dEdges) cellParents[c].push_back(p);
+    // Facts flow through f-edges (shifted), so sweeps and the evidence
+    // closure treat them as plain flow edges.
+    std::vector<std::vector<uint32_t>> outAF(N), inA(N);
+    for (auto [s, t] : aEdges) { outAF[s].push_back(t); inA[t].push_back(s); }
+    for (auto &[b, r, bk] : fEdges) { outAF[b].push_back(r); inA[r].push_back(b); }
+
+    // 1-bit BFS with a memory jump: a marked cell marks every cell of its
+    // Steensgaard class (over-approximates the join copies, both ways —
+    // joins are bidirectional).
+    auto sweep = [&](std::vector<char> &mark,
+                     const std::vector<uint32_t> &seeds,
+                     const std::vector<std::vector<uint32_t>> &adj) {
+      boost::unordered_flat_set<uint32_t> jumped;
+      std::vector<uint32_t> q;
+      auto add = [&](uint32_t v) {
+        if (!mark[v]) { mark[v] = 1; q.push_back(v); }
+      };
+      for (uint32_t v : seeds) add(v);
+      while (!q.empty()) {
+        uint32_t v = q.back();
+        q.pop_back();
+        if (isCell[v]) {
+          uint32_t cls = find(v);
+          if (jumped.insert(cls).second)
+            for (uint32_t c : classCells[cls]) add(c);
+        }
+        for (uint32_t t : adj[v]) add(t);
+      }
+    };
+
+    std::vector<uint32_t> fSeeds, bSeeds;
+    for (const auto &kv : funcOfCanon) {
+      auto it = toDense.find(kv.first);
+      if (it != toDense.end()) fSeeds.push_back(it->second);
+    }
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto it = toDense.find(getCanonicalNode(fn));
+      if (it != toDense.end()) bSeeds.push_back(it->second);
+    }
+    std::vector<char> Fm(N, 0), Bm(N, 0);
+    sweep(Fm, fSeeds, outAF);
+    sweep(Bm, bSeeds, inA);
+
+    // Evidence closure: a memory join on a kept derivation is justified by
+    // value origins its two parents share, and those origins flow to the
+    // parents along paths that may cross further joins — recurse. Touching
+    // a cell class keeps its cells and walks backward from their parents;
+    // any cell reached backward touches its own class in turn.
+    std::vector<char> Em(N, 0);
+    boost::unordered_flat_set<uint32_t> touched;
+    std::vector<uint32_t> qE;
+    auto addE = [&](uint32_t v) {
+      if (!Em[v]) { Em[v] = 1; qE.push_back(v); }
+    };
+    auto touchClass = [&](uint32_t cls) {
+      if (!touched.insert(cls).second) return;
+      for (uint32_t c : classCells[cls]) {
+        addE(c);
+        for (uint32_t p : cellParents[c]) addE(p);
+      }
+    };
+    for (uint32_t c = 0; c < N; c++)
+      if (isCell[c] && Fm[c] && Bm[c]) touchClass(find(c));
+    while (!qE.empty()) {
+      uint32_t v = qE.back();
+      qE.pop_back();
+      if (isCell[v]) touchClass(find(v));
+      for (uint32_t u : inA[v]) addE(u);
+    }
+
+    inSlice.assign(N, 0);
+    size_t nCore = 0, nSlice = 0;
+    for (uint32_t v = 0; v < N; v++) {
+      bool core = Fm[v] && Bm[v];
+      nCore += core;
+      inSlice[v] = core || Em[v];
+      nSlice += inSlice[v];
+    }
+    size_t fullA = aEdges.size(), fullD = dEdges.size(), fullF = fEdges.size();
+    {
+      std::vector<std::pair<uint32_t, uint32_t>> keep;
+      keep.reserve(aEdges.size());
+      for (auto [s, t] : aEdges)
+        if (inSlice[s] && inSlice[t]) keep.emplace_back(s, t);
+      aEdges.swap(keep);
+    }
+    {
+      std::vector<std::pair<uint32_t, uint32_t>> keep;
+      for (auto [p, c] : dEdges)
+        if (inSlice[p] && inSlice[c]) keep.emplace_back(p, c);
+      dEdges.swap(keep);
+    }
+    {
+      std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> keep;
+      for (auto &[b, r, bk] : fEdges)
+        if (inSlice[b] && inSlice[r]) keep.emplace_back(b, r, bk);
+      fEdges.swap(keep);
+    }
+    {
+      boost::unordered_flat_set<uint32_t> keep;
+      for (uint32_t w : wildcardNodes)
+        if (inSlice[w]) keep.insert(w);
+      wildcardNodes.swap(keep);
+    }
+    for (auto &v : outA) v.clear();
+    for (auto [s, t] : aEdges) outA[s].push_back(t);
+    for (auto &v : outF) v.clear();
+    for (auto &[b, r, bk] : fEdges) outF[b].emplace_back(r, bk);
+    CG_LOG("FlowsTo slice: " << nSlice << "/" << N << " classes kept ("
+           << nCore << " core), " << aEdges.size() << "/" << fullA
+           << " a-edges, " << dEdges.size() << "/" << fullD << " d-edges, "
+           << fEdges.size() << "/" << fullF << " f-edges, "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tSlice).count()
+           << " ms\n");
+  }
+
+  // Every load/store has its own assistant cell node, so a pointer class
+  // carries one cell per access site — keep them all; the join rule must
+  // see the store-side and load-side cells of the same class.
+  std::vector<std::vector<uint32_t>> cellsOf(N);
+  for (auto [p, c] : dEdges) {
+    auto &cs = cellsOf[p];
+    if (std::find(cs.begin(), cs.end(), c) == cs.end()) cs.push_back(c);
+  }
+
+  // Facts are (origin root, shift) packed as o * NSHIFT + s. Shift values:
+  // 0..NB-1 exact residues, NB = unknown (X). Field-insensitive (NB=0)
+  // degenerates to NSHIFT=1: facts are plain roots, byte-identical to v0.
+  const uint32_t NSHIFT = NB + 1;
+  const uint32_t SHIFT_X = NB;
+  auto factOf = [&](uint32_t o, uint32_t s) { return o * NSHIFT + s; };
+  auto rootOf = [&](uint32_t f) { return f / NSHIFT; };
+  auto shiftOf = [&](uint32_t f) { return f % NSHIFT; };
+
+  // Root ids: any origin class, plus function classes flagged for answers.
+  std::vector<boost::unordered_flat_set<uint32_t>> R(N);
+  std::unordered_map<uint32_t, const Function *> funcRootOf;
+  std::vector<uint32_t> worklist;
+  std::vector<bool> inWL(N, false);
+  auto push = [&](uint32_t n) {
+    if (!inWL[n]) { inWL[n] = true; worklist.push_back(n); }
+  };
+  uint32_t nextRoot = 0;
+  for (uint32_t n = 0; n < N; n++) {
+    if (!inSlice.empty() && !inSlice[n]) continue;
+    auto fit = funcOfCanon.find(toOrig[n]);
+    const bool isFunc = fit != funcOfCanon.end();
+    if (!hasIn[n] || isFunc) {
+      uint32_t rid = nextRoot++;
+      R[n].insert(factOf(rid, 0));
+      if (isFunc) funcRootOf[rid] = fit->second;
+      push(n);
+    }
+  }
+  assert((uint64_t)nextRoot * NSHIFT < UINT32_MAX &&
+         "fact ids must fit 32 bits");
+
+  // Difference propagation: each pop processes only the facts added to a
+  // node since its last pop, and a new copy edge transfers the source's
+  // current facts exactly once — never a full re-propagation. Node ids
+  // >= N are hub nodes, one per fact cluster: cells whose parents share
+  // the fact (o, s) form a copy clique, encoded linearly as cell <-> hub
+  // (identical transitive closure). The (o, X) hub is cross-linked with
+  // every exact-shift hub of the same origin (VX: unknown may be any
+  // position) — links only between clusters that both have members.
+  CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
+         << funcRootOf.size() << " function), " << wildcardNodes.size()
+         << " wildcard nodes, " << NSHIFT << " shift values\n");
+  std::vector<std::vector<uint32_t>> delta(N);
+  uint64_t factCount = nextRoot; // running Σ|R| including hub nodes
+  auto addFact = [&](uint32_t n, uint32_t f) {
+    if (R[n].insert(f).second) { delta[n].push_back(f); push(n); factCount++; }
+  };
+  for (uint32_t n = 0; n < N; n++)
+    delta[n].assign(R[n].begin(), R[n].end());
+
+  auto allocNode = [&]() {
+    uint32_t id = (uint32_t)R.size();
+    R.emplace_back();
+    outA.emplace_back();
+    delta.emplace_back();
+    inWL.push_back(false);
+    return id;
+  };
+  size_t joinEdges = 0;
+  auto wire = [&](uint32_t x, uint32_t y) {
+    outA[x].push_back(y);
+    joinEdges++;
+    for (uint32_t f : R[x]) addFact(y, f);
+  };
+  std::unordered_map<uint32_t, uint32_t> hubOf; // fact -> hub node
+  std::unordered_map<uint32_t, uint32_t> xHubOf; // origin -> (o, X) hub
+  std::unordered_map<uint32_t, std::vector<uint32_t>> shiftHubsOf;
+  auto getHub = [&](uint32_t fact) {
+    auto [it, ins] = hubOf.emplace(fact, 0);
+    if (!ins) return it->second;
+    uint32_t id = allocNode();
+    it->second = id;
+    if (NB > 0) {
+      uint32_t o = rootOf(fact);
+      if (shiftOf(fact) == SHIFT_X) {
+        xHubOf[o] = id;
+        for (uint32_t h : shiftHubsOf[o]) { wire(id, h); wire(h, id); }
+      } else {
+        shiftHubsOf[o].push_back(id);
+        auto xIt = xHubOf.find(o);
+        if (xIt != xHubOf.end()) { wire(id, xIt->second); wire(xIt->second, id); }
+      }
+    }
+    return id;
+  };
+  boost::unordered_flat_set<uint64_t> cellReg; // (fact, cell) joined
+  auto joinCell = [&](uint32_t cell, uint32_t fact) {
+    if (!cellReg.insert(((uint64_t)fact << 32) | cell).second)
+      return;
+    uint32_t hub = getHub(fact);
+    wire(cell, hub);
+    wire(hub, cell);
+  };
+
+  size_t iterations = 0;
+  while (!worklist.empty()) {
+    uint32_t n = worklist.back();
+    worklist.pop_back();
+    inWL[n] = false;
+    iterations++;
+    if ((iterations & ((1u << 20) - 1)) == 0)
+      CG_LOG("FlowsTo progress: " << iterations << " pops, " << factCount
+             << " facts, " << cellReg.size() << " registrations, "
+             << hubOf.size() << " hubs (" << xHubOf.size() << " X), "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - tStart).count()
+             << " ms\n");
+    std::vector<uint32_t> newFacts;
+    std::swap(newFacts, delta[n]);
+    if (n < N) {
+      // Cell join (M ::= -d V d | -d VX d): this parent class holds these
+      // facts; its cells alias every cell whose parent shares one exactly
+      // (or at X, via the hub cross-links).
+      for (uint32_t f : newFacts)
+        for (uint32_t cell : cellsOf[n])
+          joinCell(cell, f);
+      // Wildcard (fx self-loop): every fact also holds at unknown shift.
+      if (NB > 0 && wildcardNodes.contains(n))
+        for (uint32_t f : newFacts)
+          if (shiftOf(f) != SHIFT_X)
+            addFact(n, factOf(rootOf(f), SHIFT_X));
+      // Field steps shift the fact's residue; X absorbs.
+      for (auto [t, r] : outF[n])
+        for (uint32_t f : newFacts) {
+          uint32_t s = shiftOf(f);
+          addFact(t, s == SHIFT_X ? f : factOf(rootOf(f), (s + r) % NB));
+        }
+    }
+    for (uint32_t t : outA[n])
+      for (uint32_t f : newFacts)
+        addFact(t, f);
+  }
+
+  uint64_t totalR = 0;
+  for (uint32_t n = 0; n < N; n++) totalR += R[n].size();
+  CG_LOG("FlowsTo: " << N << " classes, " << nextRoot << " roots, "
+         << totalR << " facts (vs pairwise V), "
+         << joinEdges << " hub-join edges, "
+         << iterations << " worklist pops, "
+         << std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - tStart).count() << " ms\n");
+
+  // Resolution: facts at the fptr class whose origin is a function root
+  // and whose shift is zero or unknown (an exact nonzero shift is a
+  // provably misaligned pointer, not a call target), then the standard
+  // filters.
+  size_t resolved = 0, totalTargets = 0;
+  for (auto *CS : Ctx->IndirectCallInsts) {
+    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+    NodeIndex fn = NF.getValueNodeFor(fptr);
+    if (fn == AndersNodeFactory::InvalidIndex) continue;
+    auto dIt = toDense.find(getCanonicalNode(fn));
+    if (dIt == toDense.end()) continue;
+    std::string csStruct; unsigned csField = 0;
+    bool hasKey = getCallSiteFieldKey(fptr, csStruct, csField);
+    FuncSet targets;
+    for (uint32_t f : R[dIt->second]) {
+      uint32_t s = shiftOf(f);
+      if (s != 0 && s != SHIFT_X) continue;
+      auto rIt = funcRootOf.find(rootOf(f));
+      if (rIt == funcRootOf.end()) continue;
+      Function *F = getFuncDef(const_cast<Function *>(rIt->second));
+      if (!isCompatible(CS, F)) continue;
+      if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) continue;
+      targets.insert(F);
+    }
+    if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
+    for (const Function *F : targets)
+      Ctx->Callees[CS].insert(F);
+  }
+  CG_LOG("FlowsTo: resolved " << resolved << " icalls, "
+         << totalTargets << " targets\n");
+  return true;
 }
 
 void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
@@ -2915,6 +3362,18 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Callee by type: total " << total << ", match by CFL " << match << "\n");
+    // Deterministic per-icall resolution dump (one line per pair; sort the
+    // lines to diff runs — FuncSet iteration order is not stable).
+    if (VerboseLevel >= 2) {
+      for (auto &it : Ctx->Callees) {
+        const CallBase *CS = it.first;
+        if (CS->isInlineAsm() || CS->getCalledFunction())
+          continue;
+        for (const Function *F : it.second)
+          errs() << "ICALL " << CS->getFunction()->getName() << " :: " << *CS
+                 << " -> " << F->getName() << "\n";
+      }
+    }
     // check if all address-taken functions are used in indirect calls
     size_t used = 0;
     for (const Function *F : Ctx->AddressTakenFuncs) {
@@ -4432,8 +4891,16 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     // Pre-solve copy/field merge before the monolithic dense mapping.
-    if (CFLPreSolveMerge && !CFLCompositional)
+    if ((CFLPreSolveMerge || CFLFlowsTo) && !CFLCompositional)
       preSolveCopyFieldMerge(EB.getEdges(), nullptr);
+
+    // ORCFL v0: answer-anchored resolution replaces the saturation solve.
+    if (CFLFlowsTo && !CFLCompositional) {
+      if (runFlowsToResolution()) {
+        iteration++;
+        return false;
+      }
+    }
 
     // Build dense mapping if global dedup is active.
     // Skip in per-TU mode: per-TU graphs already have their own dense mappings.

@@ -202,6 +202,71 @@ the V components. All steps below keep GraCFL unmodified.
 > base pointers) do not match — the interleaved-Dyck undecidability tax.
 > K=0 (field-insensitive) remains the conservative reference mode.
 >
+> **SOUNDNESS GAP found 2026-07-07 (`test/t_container.c`).** The
+> nesting-shape mismatch is NOT merely a precision gap: on the kernel's
+> dominant dispatch idiom it loses required callees. Minimal repro:
+> intrusive list (`struct widget { pad; list_head link; fptr handler }`),
+> store via `w->handler` (clean `f_16` step), call after traversal via
+> `container_of`. At -O1 LLVM folds container_of+access into
+> `gep i8, %member, 8` — a flat positive byte offset from the *middle* of
+> the object. Matching store (container+16) with load (member+8, member =
+> container+8) requires offset *composition* (8+8=16). Result: K=0 resolves
+> 2/2 handlers; K=16 resolves **0/2** — in saturation AND flows-to. Three
+> compounding causes: (1) constant scalar-typed GEPs (positive folded
+> offsets and container_of's negative offsets alike) all take the wildcard
+> fallback (`decomposeGEPLevels` rejects any non-zero first scalar index,
+> even constant); (2) the fallback's fx loop sits on the *member*, and no
+> grammar rule derives container alias from member alias — there is no
+> upward `FldInv ::= f_i V -f_i`, though field-address arithmetic is
+> injective so the rule is valid; (3) even FldInv can't match flat `f_8·f_8`
+> against `f_16` — composition is the fundamental requirement. libpng/the
+> smoke suite never exercise the pattern, which is why this shipped.
+>
+> **FIXED for saturation (2026-07-07)** by the shift-indexed valley
+> grammar (`buildP2GrammarWithFields` rewritten): field steps are residues
+> mod P (`fieldBucket` is now `offset mod P`, signed-safe, NOT a hash — 
+> prefer prime P since offsets are 8-aligned), chains `Dn<c>`/`Up<c>`
+> compose residues, `V ::= Up<a> Dn<a>` (exact shifts agree), `VX` covers
+> the absorbing unknown-shift element (fx fallback, which is now sound
+> as-is), `M ::= -d V d | -d VX d`. `decomposeGEPLevels` accepts constant
+> scalar-typed offsets (both container_of shapes). Only net-zero V and VX
+> are ever assembled — exact-mismatch pairs get no rule — so the closure
+> partitions by shift rather than multiplying. `V` keeps its name; every
+> consumer (presolve V'-SCC via GraCFL on the same grammar, snapshots,
+> compositional) works unchanged. Validation: t_container 2/2 in every
+> field config (was 0/2); libpng per-icall identical to K=0 across
+> saturation fi/fs16 and flows-to fi; smoke 4/4. Cost on libpng:
+> saturation fs16 6.5 s → 74 s (the composing closure is pricier).
+>
+> **Sound-grammar saturation OOMs harfbuzz** (P=13: out of memory at the
+> 49 GB cap after 5 h 38 m, vs 2 h 32 m / 18.2 GB under the unsound
+> grammar). The reading is exactly R1's thesis biting its own fix:
+> GraCFL materializes every nonterminal, and the sound grammar's
+> scaffolding — Dn<c>/Up<c> chain relations, one per shift — is
+> V-sized × (P+1). Soundness didn't just admit more answers; it
+> multiplied the scaffolding. Grammar-only sound field sensitivity on an
+> all-nonterminal saturation solver is measured dead at harfbuzz scale;
+> the viable paths are solver-side: the answer-anchored flows-to (which
+> never materializes chains) with its VX-transitivity fixed via
+> union-find + provenance clusters, and/or per-(object, byte-offset)
+> memory nodes. Both are approved to touch the solver.
+>
+> Flows-to under the shift grammar: facts become (origin, shift) pairs,
+> f-edges are shift transformers, cells join on exact fact (V) with
+> (o,X)-to-(o,s) hub cross-links (VX). Container-sound (t_container 2/2)
+> but blows up on real inputs (libpng >400 s vs 37 s): the hub *copy
+> encoding* makes VX bridging transitive — (o,s1)-members exchange facts
+> with (o,s2)-members through the shared X cluster, which the grammar's
+> pairwise VX never does — smearing every cell toward all P+1 shifts and
+> amplifying the per-cell join quadratic by ~(P+1)². Not a bug; an
+> inherent limit of encoding non-transitive alias as copy connectivity.
+> Next (user-approved to touch the solver): union-find clusters with
+> provenance-separated fact classes instead of hub copies.
+>
+> Alternative (b) — per-(object, byte-offset) memory nodes on the
+> Andersen side — remains open if the composed saturation closure proves
+> too costly at scale.
+>
 > libpng validation (register merging also on): identical icall resolution,
 > monolithic and compositional; V closure 8.0M -> 4.5M, M closure 275K -> 24K
 > (11x).
@@ -379,6 +444,113 @@ R3) makes answer-directed tabulation effective, implement on a parallel
 solver, evaluate on the R2 suite. Measurable hypothesis, testable today:
 storage ratio V-facts / FT-facts ≈ Σ|alias-class|² / Σ|pts| (libpng: V
 counts known; FT approximable by taint closure from Function nodes).
+
+**v0 prototype results (2026-07-04, `--cfl-flows-to`).** Implemented the
+degenerate cut: after presolve merge, propagate root ids (all no-in-degree
+value origins + address-taken Function classes) forward over a-edges; two
+cells join (bidirectional copy) when their parent pointer classes share a
+root; answers read at fptr classes.
+
+- *libpng:* precision exactly matches mono saturation — identical
+  per-symbol callgraph counts, `Callee by type: total 27, match by CFL 9`,
+  identical warning set. Storage: 192,784 root facts vs 7,475,876 final V
+  edges (~39×); runtime same ballpark (~6–11 s CGPass either way).
+  Rectangular-answer hypothesis confirmed on the well-conditioned instance.
+- *harfbuzz:* **first CFL-based resolution to complete on this input** —
+  8 h 13 m wall, peak RSS 1.67 GB (saturation OOMs at the 49 GB cap).
+  Presolve: 95,332 nodes → 10,511 V' classes, Σ|class|² = 1.78B. Final:
+  24,117 flows-to classes, 13,347 roots, 55.75M root facts, 40.4M hub-join
+  edges, 17.55M worklist pops; resolved 330 icalls / 2,795 targets
+  (`Callee by type: total 13231, match by CFL 2795`; address-taken 410,
+  used 379 — no independent ground truth yet). Reading: storage stayed
+  rectangular (55.7M facts ≈ 32× below the 1.78B V lower bound, 1.7 GB),
+  so memory is solved; *work* is now the blocker — in the giant
+  a-component every root reaches nearly every class, so propagation is
+  ~|E|·|roots| ≈ 10¹⁰ (hence 8 h single-threaded). Confirms the caveat
+  quantitatively: abstraction collapse, not closure shape, is the residual
+  cost driver — per-field memory nodes (lever #1) attack exactly that, and
+  the propagation itself is embarrassingly parallel/bitset-able if needed.
+
+**Derivation slice (2026-07-05, `--cfl-flows-to-slice`).** 1-bit
+bidirectional taint (forward from address-taken functions, backward from
+icall operands) with memory jumps over Steensgaard classes (unification =
+cheap sound over-approx of the shared-root join), closed under alias
+evidence: touching a cell class keeps its cells and walks backward from
+their parents, recursively — origins outside the source–sink flow must
+survive because they justify joins (slicing derivations, not paths).
+Near-linear; costs 0–15 ms.
+
+- *libpng:* callee sets identical to unsliced flows-to; 572/720 classes,
+  498/576 roots kept.
+- *harfbuzz:* 14,089/24,117 classes (58%, 9,524 core), 11,003/23,689
+  a-edges (46%), 8,674/11,688 cells kept — computed in 15 ms. Sliced
+  solve: 8 h 04 m (vs 8 h 13 m unsliced — **no real speedup**), identical
+  resolution (330 icalls / 2,795 targets; unused-address-taken and warning
+  sets diff-identical). The decisive diagnostic: hub-join edges are
+  40,420,490 sliced vs 40,426,616 unsliced — the slice removed the half of
+  the graph that carried almost none of the work. Root facts only dropped
+  55.7M → 45.6M. The cost lives in the entangled core the slice keeps *by
+  definition*: ~20.2M (root × cell) registrations over 8,674 cells means
+  the average kept cell's parent is reached by ~2,300 of the 7,938 kept
+  roots. Lesson sharpened: on a collapsed abstraction the fptr-relevant
+  core IS the giant component; pruning attacks |graph|, but the cost is
+  the density of the core, and only field sensitivity (per-field cells
+  shrinking the alias over-approx and shattering the component) attacks
+  density. The slice remains nearly free (15 ms) and answer-preserving,
+  so keep it as a standard pre-pass — its payoff should grow once
+  per-field cells make the core sparse.
+
+**Field-sensitive flows-to (2026-07-06/07).** Extended the flows-to solver
+to consume the §3.1 field encoding (previously it required buckets=0).
+The grammar's `Mq ::= M | Fld` symmetry maps directly: deref cells and
+field-pointer results are *tagged children*; the join clusters are keyed
+(root, tag) instead of (root); a fx-wildcard parent registers under a
+per-root ANY cluster that is cross-linked to that root's bucket clusters
+(links only between clusters that both have members). Nesting needs no
+path tracking — joins cascade level by level like the grammar's
+derivations. Validated on libpng with a new deterministic `ICALL` dump
+(verbose≥2; earlier "identical callee set" diffs based on per-symbol
+count lines were vacuous — those lines don't exist; re-verified for all
+prior claims): saturation-fi == saturation-fs16 == flows-to-fi ==
+flows-to-fs16 == flows-to-fs16-sliced, 9 icall pairs each.
+
+- *harfbuzz:* field sensitivity made it WORSE — killed after >9 h at
+  5.3 GB (FI: 8h13m, 1.67 GB). Cause measured, not guessed: 1,697
+  wildcard (fx) nodes from C++ unknown-offset accesses (containers,
+  memcpy, i8 arithmetic); at 1M pops already 64,610 wildcard
+  registrations across 2,020 ANY clusters — i.e., 2,020 roots have their
+  ~16 bucket clusters legally re-bridged. The wildcard fallback is
+  semantically required (unknown offset must alias every field). BUT the
+  attribution run corrects the first-draft diagnosis: field-sensitive
+  *saturation* COMPLETES harfbuzz (2 h 32 m, 18.2 GB peak, V closure 295M
+  edges, `match by CFL 2811`) where field-insensitive saturation OOMs at
+  49 GB — so the encoding genuinely shatters the V closure despite the
+  wildcards. The flows-to fs16 blowup is therefore specific to the
+  cluster machinery (per-(root,tag) hub nodes duplicate root sets across
+  22k+ hubs; 2× class inflation, presolve merges less: 10,511 → 15,785
+  V'), fixable by the union-find cluster collapse. Caveat: all K>0
+  numbers carry the §3.1 soundness-gap asterisk — the missing offset
+  composition that loses container_of callees is also what keeps the
+  closure this small; a sound composing encoding will grow it.
+- Consequence for the plan: lever #1 is not unconditional. It should pay
+  where unknown-offset access density is low (kernel-style C with
+  explicit struct fields) and be neutralized where it is high (template
+  C++). PHP unserialize (50 MB C, 146k classes, 96k roots, Σ|class|² =
+  26.5B — far beyond saturation) is running as the C-side test.
+  Remaining levers if wildcards dominate: reduce unknown-offset
+  fallbacks at the edge-builder (fieldwise memcpy expansion via
+  StructAnalyzer, container summaries), and the union-find cluster
+  collapse + co-occurring-root dedup (join clusters are SCCs by
+  construction; k co-occurring roots do k× redundant propagation work).
+
+Implementation notes: (1) every access site has its own assistant cell, so
+a pointer class carries many cells — the join must register all of them,
+not one (v0 bug: single `cellOf` slot silently dropped all memory flow).
+(2) The per-root cell clique linearizes to a hub node (cell ↔ hub_o)
+with identical transitive closure — kills the |cells(o)|² edge blowup.
+(3) Join copies are bidirectional, so joined cell clusters are de facto
+union-find merges; a future solver can union instead of propagate, but the
+#cells·#roots registration bound stands.
 
 ### R2. Honest raw-PAG benchmark + instance-hardness metrics
 Release raw PAGs from two independent builders (KAnalyzer, SVF) with the

@@ -1874,20 +1874,28 @@ bool CallGraphPass::runFlowsToResolution() {
     while (ufp[x] != x) { ufp[x] = ufp[ufp[x]]; x = ufp[x]; }
     return x;
   };
-  // Per-class planes: R = all facts; dirty = propagation delta (facts the
-  // neighbors have not been offered); jdirty = join backlog (facts the
-  // cell list has not been swept with, refiltered by `joined`). They
-  // differ only at merges: propagation pushes just the true delta plus a
-  // one-time direct push along the loser's moved edges, while joins must
-  // reconsider the full merged fact set against the merged cell list.
-  std::vector<std::vector<llvm::BitVector>> R(N), dirty(N), jdirty(N),
-      joined(N);
+  // Per-class planes: R = native facts; RB = bridged facts (arrived over
+  // a VX bridge; disjoint from R). Bridged facts behave identically in
+  // joins, a/f propagation (emitting native downstream — a load out of
+  // the cell is genuine value flow), and wildcard projection; the single
+  // restriction is that they may not cross another bridge. This encodes
+  // the grammar's pairwise VX exactly: M-hops never chain without value
+  // flow in between, so one provenance bit suffices (bridges are
+  // bipartite between the (o,X) cluster and exact clusters).
+  // Deltas: dirty = a/f-propagation backlog (both kinds), jdirty = join
+  // backlog (both kinds, refiltered by `joined`), dirtyBr = bridge-
+  // crossing backlog (native only).
+  std::vector<std::vector<llvm::BitVector>> R(N), RB(N), dirty(N),
+      jdirty(N), dirtyBr(N), joined(N);
   for (uint32_t i = 0; i < N; i++) {
     R[i].resize(NSHIFT);
+    RB[i].resize(NSHIFT);
     dirty[i].resize(NSHIFT);
     jdirty[i].resize(NSHIFT);
+    dirtyBr[i].resize(NSHIFT);
     joined[i].resize(NSHIFT); // facts already pushed to ALL cells of class
   }
+  std::vector<std::vector<uint32_t>> bridgesOf(N); // VX partners (class ids)
   std::vector<char> wflag(N, 0);
   for (uint32_t w : wildcardNodes) wflag[w] = 1;
   std::vector<uint32_t> worklist;
@@ -1899,7 +1907,9 @@ bool CallGraphPass::runFlowsToResolution() {
   auto ensure = [&](llvm::BitVector &bv) {
     if (bv.size() < nextRoot) bv.resize(nextRoot);
   };
-  // OR src into rep n's plane s; new bits enter both deltas.
+  // OR src natively into rep n's plane s. Bits new to the class enter all
+  // three deltas; bits previously only bridged are promoted (their joins
+  // and a/f propagation already ran — only bridge-crossing is new).
   auto addBits = [&](uint32_t n, uint32_t s, const llvm::BitVector &src) {
     if (src.none()) return;
     ensure(R[n][s]);
@@ -1907,23 +1917,68 @@ bool CallGraphPass::runFlowsToResolution() {
     ensure(nb);
     nb.reset(R[n][s]);
     if (nb.none()) return;
+    llvm::BitVector promoted;
+    if (RB[n][s].size()) {
+      promoted = nb;
+      promoted &= RB[n][s];
+      RB[n][s].reset(nb);
+      nb.reset(promoted); // truly-new bits only
+    }
     R[n][s] |= nb;
-    ensure(dirty[n][s]);
-    dirty[n][s] |= nb;
-    ensure(jdirty[n][s]);
-    jdirty[n][s] |= nb;
-    factCount += nb.count();
+    if (promoted.size() && promoted.any()) {
+      R[n][s] |= promoted;
+      ensure(dirtyBr[n][s]);
+      dirtyBr[n][s] |= promoted;
+    }
+    if (nb.any()) {
+      ensure(dirty[n][s]);
+      dirty[n][s] |= nb;
+      ensure(jdirty[n][s]);
+      jdirty[n][s] |= nb;
+      ensure(dirtyBr[n][s]);
+      dirtyBr[n][s] |= nb;
+      factCount += nb.count();
+    }
     push(n);
   };
   auto addFact = [&](uint32_t n, uint32_t s, uint32_t o) {
     ensure(R[n][s]);
     if (R[n][s].test(o)) return;
+    if (RB[n][s].size() && RB[n][s].test(o)) {
+      RB[n][s].reset(o);
+      R[n][s].set(o);
+      ensure(dirtyBr[n][s]);
+      dirtyBr[n][s].set(o);
+      push(n);
+      return;
+    }
     R[n][s].set(o);
     ensure(dirty[n][s]);
     dirty[n][s].set(o);
     ensure(jdirty[n][s]);
     jdirty[n][s].set(o);
+    ensure(dirtyBr[n][s]);
+    dirtyBr[n][s].set(o);
     factCount++;
+    push(n);
+  };
+  // OR src as bridged: skipped where already known either way; bridged
+  // bits run joins and a/f propagation but never dirtyBr.
+  auto addBitsBridged = [&](uint32_t n, uint32_t s,
+                            const llvm::BitVector &src) {
+    if (src.none()) return;
+    ensure(RB[n][s]);
+    llvm::BitVector nb(src);
+    ensure(nb);
+    nb.reset(RB[n][s]);
+    if (R[n][s].size()) nb.reset(R[n][s]);
+    if (nb.none()) return;
+    RB[n][s] |= nb;
+    ensure(dirty[n][s]);
+    dirty[n][s] |= nb;
+    ensure(jdirty[n][s]);
+    jdirty[n][s] |= nb;
+    factCount += nb.count();
     push(n);
   };
   size_t mergeCount = 0;
@@ -1942,21 +1997,50 @@ bool CallGraphPass::runFlowsToResolution() {
       if (R[b][s].any()) {
         llvm::BitVector nb(R[b][s]);
         ensure(nb);
-        if (R[a][s].size()) nb.reset(R[a][s]);
+        nb.reset(R[a][s]);
         if (nb.any()) {
+          // Split: bits only bridged at the keeper are promotions
+          // (bridge-crossing newly allowed); the rest are fully new.
+          llvm::BitVector promoted(nb);
+          promoted &= RB[a][s];
+          RB[a][s].reset(nb);
+          nb.reset(promoted);
           ensure(R[a][s]);
           R[a][s] |= nb;
+          R[a][s] |= promoted;
+          ensure(dirty[a][s]);
+          dirty[a][s] |= nb;
+          ensure(dirtyBr[a][s]);
+          dirtyBr[a][s] |= nb;
+          dirtyBr[a][s] |= promoted;
+        }
+      }
+      if (RB[b][s].any()) {
+        llvm::BitVector nb(RB[b][s]);
+        ensure(nb);
+        nb.reset(R[a][s]);
+        nb.reset(RB[a][s]);
+        if (nb.any()) {
+          ensure(RB[a][s]);
+          RB[a][s] |= nb;
           ensure(dirty[a][s]);
           dirty[a][s] |= nb;
         }
       }
       if (dirty[b][s].any()) { ensure(dirty[a][s]); dirty[a][s] |= dirty[b][s]; }
+      if (dirtyBr[b][s].any()) {
+        ensure(dirtyBr[a][s]);
+        dirtyBr[a][s] |= dirtyBr[b][s];
+      }
       R[b][s].clear();
+      RB[b][s].clear();
       dirty[b][s].clear();
+      dirtyBr[b][s].clear();
       // Join backlog: the merged cell list must be swept with the full
       // merged fact set (filtered by `joined`, which keeps only facts
       // that reached BOTH sides' cells).
       if (R[a][s].size()) { ensure(jdirty[a][s]); jdirty[a][s] |= R[a][s]; }
+      if (RB[a][s].size()) { ensure(jdirty[a][s]); jdirty[a][s] |= RB[a][s]; }
       jdirty[b][s].clear();
       if (joined[a][s].size() && joined[b][s].size()) {
         ensure(joined[a][s]); ensure(joined[b][s]);
@@ -1966,21 +2050,31 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       joined[b][s].clear();
     }
-    // One-time push of the merged fact set along the loser's moved edges
-    // (the keeper's old edges only ever need the delta).
+    // One-time pushes along the loser's moved lists (keeper's old lists
+    // only ever need deltas): merged facts along a/f edges (emission is
+    // native — value flow launders provenance), natives across bridges.
     for (uint32_t t : outA[b]) {
       uint32_t tt = find(t);
       if (tt == a) continue;
-      for (uint32_t s = 0; s < NSHIFT; s++)
+      for (uint32_t s = 0; s < NSHIFT; s++) {
         if (R[a][s].any()) addBits(tt, s, R[a][s]);
+        if (RB[a][s].any()) addBits(tt, s, RB[a][s]);
+      }
     }
     for (auto [t, r] : outF[b]) {
       uint32_t tt = find(t);
       for (uint32_t s = 0; s < NSHIFT; s++) {
-        if (!R[a][s].any()) continue;
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
-        if (tt != a || s2 != s) addBits(tt, s2, R[a][s]);
+        if (tt == a && s2 == s) continue;
+        if (R[a][s].any()) addBits(tt, s2, R[a][s]);
+        if (RB[a][s].any()) addBits(tt, s2, RB[a][s]);
       }
+    }
+    for (uint32_t br : bridgesOf[b]) {
+      uint32_t bb = find(br);
+      if (bb == a) continue;
+      for (uint32_t s = 0; s < NSHIFT; s++)
+        if (R[a][s].any()) addBitsBridged(bb, s, R[a][s]);
     }
     auto append = [](auto &dst, auto &src) {
       dst.insert(dst.end(), src.begin(), src.end());
@@ -1990,11 +2084,14 @@ bool CallGraphPass::runFlowsToResolution() {
     append(outA[a], outA[b]);
     append(outF[a], outF[b]);
     append(cellsOf[a], cellsOf[b]);
+    append(bridgesOf[a], bridgesOf[b]);
     // Wildcard status arriving with the loser retroactively projects the
-    // keeper's existing exact facts onto the unknown-shift plane.
+    // keeper's existing facts onto the unknown-shift plane, per kind.
     if (NB > 0 && wflag[b] && !wflag[a])
-      for (uint32_t s = 0; s < NB; s++)
+      for (uint32_t s = 0; s < NB; s++) {
         if (R[a][s].any()) addBits(a, SHIFT_X, R[a][s]);
+        if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s]);
+      }
     wflag[a] |= wflag[b];
     push(a);
     return a;
@@ -2015,14 +2112,38 @@ bool CallGraphPass::runFlowsToResolution() {
     std::sort(cellsOf[n].begin(), cellsOf[n].end());
     cellsOf[n].erase(std::unique(cellsOf[n].begin(), cellsOf[n].end()),
                      cellsOf[n].end());
+    for (auto &br : bridgesOf[n]) br = find(br);
+    std::sort(bridgesOf[n].begin(), bridgesOf[n].end());
+    bridgesOf[n].erase(
+        std::unique(bridgesOf[n].begin(), bridgesOf[n].end()),
+        bridgesOf[n].end());
+    bridgesOf[n].erase(
+        std::remove(bridgesOf[n].begin(), bridgesOf[n].end(), n),
+        bridgesOf[n].end());
     compactMark[n] = (uint32_t)std::max<size_t>(
-        64, 2 * (outA[n].size() + outF[n].size() + cellsOf[n].size()));
+        64, 2 * (outA[n].size() + outF[n].size() + cellsOf[n].size() +
+                 bridgesOf[n].size()));
   };
   // Cluster registry: fact (o, s) -> current representative class of the
   // merged cell cluster. Entries may go stale under merges; resolve with
   // find() on read.
   boost::unordered_flat_map<uint64_t, uint32_t> clusterRep;
   std::unordered_map<uint32_t, std::vector<uint64_t>> shiftKeysOf;
+  size_t bridgeCount = 0;
+  // VX bridge: pairwise fact exchange between two cluster classes, native
+  // facts crossing as bridged. NOT a merge — the grammar's VX is not
+  // transitive across the X cluster.
+  auto addBridge = [&](uint32_t x, uint32_t y) {
+    x = find(x); y = find(y);
+    if (x == y) return; // already one class; exchange is implicit
+    bridgesOf[x].push_back(y);
+    bridgesOf[y].push_back(x);
+    bridgeCount++;
+    for (uint32_t s = 0; s < NSHIFT; s++) {
+      if (R[x][s].any()) addBitsBridged(y, s, R[x][s]);
+      if (R[y][s].any()) addBitsBridged(x, s, R[y][s]);
+    }
+  };
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     const uint64_t key = (uint64_t)o * NSHIFT + s;
     auto [it, ins] = clusterRep.emplace(key, find(cell));
@@ -2031,21 +2152,17 @@ bool CallGraphPass::runFlowsToResolution() {
       return;
     }
     if (NB == 0) return;
-    // VX linking: union the (o, X) cluster with each exact cluster of o.
+    // VX linking: bridge the (o, X) cluster with each exact cluster of o.
     if (s == SHIFT_X) {
       for (uint64_t ek : shiftKeysOf[o]) {
         auto eIt = clusterRep.find(ek);
-        it = clusterRep.find(key); // re-find: map may rehash via [] below
-        it->second = merge(it->second, eIt->second);
-        eIt->second = it->second;
+        addBridge(clusterRep.find(key)->second, eIt->second);
       }
     } else {
       shiftKeysOf[o].push_back(key);
       auto xIt = clusterRep.find((uint64_t)o * NSHIFT + SHIFT_X);
-      if (xIt != clusterRep.end()) {
-        it->second = merge(it->second, xIt->second);
-        xIt->second = it->second;
-      }
+      if (xIt != clusterRep.end())
+        addBridge(it->second, xIt->second);
     }
   };
   for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
@@ -2065,7 +2182,9 @@ bool CallGraphPass::runFlowsToResolution() {
              << std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - tStart).count()
              << " ms\n");
-    if (outA[n].size() + outF[n].size() + cellsOf[n].size() > compactMark[n])
+    if (outA[n].size() + outF[n].size() + cellsOf[n].size() +
+            bridgesOf[n].size() >
+        compactMark[n])
       compactLists(n);
     for (uint32_t s = 0; s < NSHIFT && find(n) == n; s++) {
       // Cell join (M ::= -d V d | -d VX d): sweep the join backlog —
@@ -2094,14 +2213,34 @@ bool CallGraphPass::runFlowsToResolution() {
           if (find(n) != n) break;
         }
       }
+      // Bridge crossings: native backlog only, arriving bridged.
+      if (dirtyBr[n][s].any() && !bridgesOf[n].empty()) {
+        llvm::BitVector db(dirtyBr[n][s]);
+        dirtyBr[n][s].reset();
+        for (uint32_t br : bridgesOf[n]) {
+          uint32_t bb = find(br);
+          if (bb != n) addBitsBridged(bb, s, db);
+        }
+      } else {
+        dirtyBr[n][s].reset();
+      }
       if (dirty[n][s].none()) continue;
       d = dirty[n][s];
       dirty[n][s].reset();
-      // Wildcard (fx self-loop): new exact facts also hold at unknown
-      // shift (retroactive projection on wflag acquisition is in merge).
-      if (NB > 0 && wflag[n] && s != SHIFT_X) addBits(n, SHIFT_X, d);
+      // Wildcard (fx self-loop): new facts also hold at unknown shift,
+      // kind preserved (retroactive projection on wflag gain is in merge).
+      if (NB > 0 && wflag[n] && s != SHIFT_X) {
+        llvm::BitVector dNat(d), dBr(d);
+        ensure(dNat); ensure(dBr);
+        dNat &= R[n][s];
+        dBr &= RB[n][s];
+        if (dNat.any()) addBits(n, SHIFT_X, dNat);
+        if (dBr.any()) addBitsBridged(n, SHIFT_X, dBr);
+      }
       // Propagate the delta: whole-plane OR along a-edges, plane-rotated
-      // OR along f-edges (X absorbs).
+      // OR along f-edges (X absorbs). Emission is native — value flow
+      // launders bridge provenance, exactly like the grammar (M-hops
+      // are separated by a-steps in every V derivation).
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
         if (tt != n) addBits(tt, s, d);
@@ -2114,17 +2253,21 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
 
-  uint64_t totalR = 0;
+  uint64_t totalR = 0, totalRB = 0;
   uint32_t liveClasses = 0;
   for (uint32_t n = 0; n < N; n++) {
     if (find(n) != n) continue;
     liveClasses++;
-    for (uint32_t s = 0; s < NSHIFT; s++) totalR += R[n][s].count();
+    for (uint32_t s = 0; s < NSHIFT; s++) {
+      totalR += R[n][s].count();
+      totalRB += RB[n][s].count();
+    }
   }
   CG_LOG("FlowsTo: " << N << " classes (" << liveClasses << " after "
          << mergeCount << " merges), " << nextRoot << " roots, "
-         << totalR << " facts (vs pairwise V), "
-         << clusterRep.size() << " cell clusters, "
+         << totalR << " native + " << totalRB << " bridged facts "
+         << "(vs pairwise V), " << clusterRep.size() << " cell clusters, "
+         << bridgeCount << " VX bridges, "
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");
@@ -2154,7 +2297,11 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     };
     collect(R[rep][0]);
-    if (NB > 0) collect(R[rep][SHIFT_X]);
+    if (RB[rep][0].size()) collect(RB[rep][0]);
+    if (NB > 0) {
+      collect(R[rep][SHIFT_X]);
+      if (RB[rep][SHIFT_X].size()) collect(RB[rep][SHIFT_X]);
+    }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
     for (const Function *F : targets)
       Ctx->Callees[CS].insert(F);

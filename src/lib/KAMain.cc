@@ -134,6 +134,14 @@ cl::opt<bool> CFLFlowsToSlice(
            "jumps, closed under alias-evidence origins"),
   cl::init(false));
 
+cl::opt<bool> CFLResidueCopies(
+  "cfl-residue-copies",
+  cl::desc("Encode unknown-layout memcpy and aggregate accesses as per-"
+           "residue field copies instead of wildcard loops (flows-to "
+           "only; precise for struct-copy idioms, costly on container-"
+           "churn C++ — evaluate per target codebase)"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "

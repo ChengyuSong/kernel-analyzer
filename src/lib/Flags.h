@@ -21,6 +21,7 @@ extern cl::opt<bool> CFLPreSolveMerge;
 extern cl::opt<bool> CFLFptrSlice;
 extern cl::opt<bool> CFLFlowsTo;
 extern cl::opt<bool> CFLFlowsToSlice;
+extern cl::opt<bool> CFLResidueCopies;
 extern cl::opt<unsigned> CFLFieldBuckets;
 
 #endif

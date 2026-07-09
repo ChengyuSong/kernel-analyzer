@@ -92,8 +92,10 @@ private:
                           llvm::SmallVectorImpl<int64_t> &levels) const;
   void addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                           llvm::ArrayRef<int64_t> levels);
-  void applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode);
-  void addFieldWildcardLoop(NodeIndex n);
+  void applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode,
+                          const char *why);
+  void addFieldWildcardLoop(NodeIndex n, const char *why);
+  std::map<std::string, size_t> wildcardReasons; // fallback category tally
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
   void sliceEdgesToFptrComponents(std::vector<size_t> &idx);
   bool runFlowsToResolution();

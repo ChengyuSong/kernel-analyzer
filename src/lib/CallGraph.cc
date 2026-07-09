@@ -951,13 +951,44 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
       dstTy = dstTy->getContainedType(0);
     while (srcTy && (isa<ArrayType>(srcTy) || isa<VectorType>(srcTy)))
       srcTy = srcTy->getContainedType(0);
+    // Size gate for the residue copy: small constant-length copies are
+    // the struct-copy idiom (assignment lowering, copy_from_user-style
+    // targets) and deserve the precise encoding; large or variable
+    // lengths are bulk data moves (container backing stores), where
+    // faithfully chaining residue cells through every reallocation
+    // explodes fact volume for zero callgraph value (measured on
+    // harfbuzz: >646M facts and climbing vs 570M with the wildcard).
+    const auto *lenCI = CS->arg_size() > 2
+                            ? dyn_cast<ConstantInt>(CS->getArgOperand(2))
+                            : nullptr;
+    const bool smallCopy = lenCI && lenCI->getZExtValue() <= 512;
     if (dstTy && dstTy == srcTy && isa<StructType>(dstTy) && curDL) {
       emitFieldwiseCopyEdges(srcNode, dstNode, dstTy, 0);
+    } else if (CFLResidueCopies && CFLFlowsTo && smallCopy) {
+      // Layout-free residue copy: a byte copy preserves offsets, so under
+      // the mod-P encoding "for every residue r: *(dst+r) = *(src+r)" is
+      // sound for any length and any opaque pointee — no type info, no
+      // wildcard smear, and directional (the old fallback value-aliased
+      // both pointers bidirectionally). Residue 0 is the deref-to-deref
+      // edge already emitted above. Flows-to only: the extra f-edges
+      // multiply the Dn/Up chain scaffolding the saturation solver
+      // materializes (8x+ solve blowup measured on libpng).
+      const unsigned P = EB.getNumFieldBuckets();
+      NodeIndex sParent = getCanonicalNode(srcNode);
+      NodeIndex dParent = getCanonicalNode(dstNode);
+      for (unsigned r = 1; r < P; r++) {
+        NodeIndex sF = getFieldPtrNode(sParent, (int64_t)r);
+        NodeIndex dF = getFieldPtrNode(dParent, (int64_t)r);
+        EB.addFieldEdges(sParent, getCanonicalNode(sF), (int)r);
+        EB.addFieldEdges(dParent, getCanonicalNode(dF), (int)r);
+        addAssignmentEdge(getRepDerefNode(getCanonicalNode(sF)),
+                          getRepDerefNode(getCanonicalNode(dF)));
+      }
     } else {
       addAssignmentEdge(srcNode, dstNode);
       addAssignmentEdge(dstNode, srcNode);
-      addFieldWildcardLoop(srcNode);
-      addFieldWildcardLoop(dstNode);
+      addFieldWildcardLoop(srcNode, "memcpy-bulk-or-nonflowsto");
+      addFieldWildcardLoop(dstNode, "memcpy-bulk-or-nonflowsto");
     }
   }
 
@@ -981,8 +1012,8 @@ void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
   }
   if (depth > 8 ||
       (STy->hasName() && LLVM_STRING_STARTS_WITH(STy->getStructName(), "union"))) {
-    addFieldWildcardLoop(srcAddr);
-    addFieldWildcardLoop(dstAddr);
+    addFieldWildcardLoop(srcAddr, "fieldwise-copy-depth-cap");
+    addFieldWildcardLoop(dstAddr, "fieldwise-copy-depth-cap");
     addAssignmentEdge(getRepDerefNode(getCanonicalNode(srcAddr)),
                       getRepDerefNode(getCanonicalNode(dstAddr)));
     return;
@@ -1126,7 +1157,7 @@ bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) 
   // Get or create dereference node for the container (represents "*container")
   // Field mode: container helpers access arbitrary interior fields.
   if (EB.hasFieldLabels())
-    addFieldWildcardLoop(containerNode);
+    addFieldWildcardLoop(containerNode, "container-helper");
   NodeIndex derefNode = getRepDerefNode(containerNode);
 
   // Handle store args: val -> *container (assignment edges)
@@ -1377,17 +1408,20 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
   }
 }
 
-void CallGraphPass::addFieldWildcardLoop(NodeIndex n) {
+void CallGraphPass::addFieldWildcardLoop(NodeIndex n, const char *why) {
   if (n == AndersNodeFactory::InvalidIndex)
     return;
   NodeIndex canon = getCanonicalNode(n);
-  if (moduleFieldWildcardRoots.insert(canon).second)
+  if (moduleFieldWildcardRoots.insert(canon).second) {
     EB.addFieldWildcardSelfLoop(canon);
+    wildcardReasons[why]++;
+  }
 }
 
-void CallGraphPass::applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode) {
+void CallGraphPass::applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode,
+                                       const char *why) {
   addAssignmentEdge(baseNode, resultNode);
-  addFieldWildcardLoop(baseNode);
+  addFieldWildcardLoop(baseNode, why);
 }
 
 void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
@@ -1868,6 +1902,8 @@ bool CallGraphPass::runFlowsToResolution() {
   CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
          << funcRootOf.size() << " function), " << wildcardNodes.size()
          << " wildcard nodes, " << NSHIFT << " shift planes\n");
+  for (auto &[why, cnt] : wildcardReasons)
+    CG_LOG("FlowsTo wildcard[" << why << "]: " << cnt << "\n");
   std::vector<uint32_t> ufp(N), ufrank(N, 0);
   for (uint32_t i = 0; i < N; i++) ufp[i] = i;
   auto find = [&](uint32_t x) {
@@ -2333,7 +2369,7 @@ void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
 
   SmallVector<int64_t, 4> levels;
   if (!decomposeGEPLevels(GEP, *curDL, levels)) {
-    applyFieldFallback(baseNode, node);
+    applyFieldFallback(baseNode, node, "constexpr-gep-variable");
     return;
   }
   if (levels.empty())
@@ -2904,10 +2940,23 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find load ptr node");
 
-  // Aggregate loads read every field through the whole-object cell; the
-  // wildcard loop keeps per-field stores reachable from it.
-  if (CGP.EB.hasFieldLabels() && I.getType()->isAggregateType())
-    CGP.addFieldWildcardLoop(ptrNode);
+  // Aggregate loads read every field: pull every residue cell into the
+  // aggregate SSA value (residue 0 via the normal deref edge below). No
+  // pointer wildcard — that smeared every access through this pointer's
+  // aliases, not just this load.
+  if (CGP.EB.hasFieldLabels() && I.getType()->isAggregateType()) {
+    if (CFLResidueCopies && CFLFlowsTo) {
+      const unsigned P = CGP.EB.getNumFieldBuckets();
+      for (unsigned r = 1; r < P; r++) {
+        NodeIndex pF = CGP.getFieldPtrNode(ptrNode, (int64_t)r);
+        CGP.EB.addFieldEdges(ptrNode, CGP.getCanonicalNode(pF), (int)r);
+        CGP.addAssignmentEdge(CGP.getRepDerefNode(CGP.getCanonicalNode(pF)),
+                              valNode);
+      }
+    } else {
+      CGP.addFieldWildcardLoop(ptrNode, "aggregate-load");
+    }
+  }
 
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
@@ -2953,9 +3002,21 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
   assert(ptrNode != AndersNodeFactory::InvalidIndex && "Failed to find store ptr node");
 
-  // Aggregate stores write every field through the whole-object cell.
-  if (CGP.EB.hasFieldLabels() && val->getType()->isAggregateType())
-    CGP.addFieldWildcardLoop(ptrNode);
+  // Aggregate stores write every field: push the aggregate SSA value into
+  // every residue cell (residue 0 via the normal deref edge below).
+  if (CGP.EB.hasFieldLabels() && val->getType()->isAggregateType()) {
+    if (CFLResidueCopies && CFLFlowsTo) {
+      const unsigned P = CGP.EB.getNumFieldBuckets();
+      for (unsigned r = 1; r < P; r++) {
+        NodeIndex pF = CGP.getFieldPtrNode(ptrNode, (int64_t)r);
+        CGP.EB.addFieldEdges(ptrNode, CGP.getCanonicalNode(pF), (int)r);
+        CGP.addAssignmentEdge(valNode,
+                              CGP.getRepDerefNode(CGP.getCanonicalNode(pF)));
+      }
+    } else {
+      CGP.addFieldWildcardLoop(ptrNode, "aggregate-store");
+    }
+  }
 
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
@@ -2985,7 +3046,7 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
     SmallVector<int64_t, 4> levels;
     const DataLayout &DL = GEP.getModule()->getDataLayout();
     if (!CGP.decomposeGEPLevels(cast<GEPOperator>(&GEP), DL, levels))
-      CGP.applyFieldFallback(ptrNode, valNode);
+      CGP.applyFieldFallback(ptrNode, valNode, "gep-variable-offset");
     else if (levels.empty())
       CGP.addAssignmentEdge(ptrNode, valNode);
     else
@@ -3155,7 +3216,7 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   // Field mode: integer arithmetic on the escaped pointer can rebase it to
   // any field (disguised GEP); absorb with the wildcard loop at the source.
   if (CGP.EB.hasFieldLabels())
-    CGP.addFieldWildcardLoop(srcNode);
+    CGP.addFieldWildcardLoop(srcNode, "ptrtoint-escape");
   CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
@@ -3367,7 +3428,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     if (fieldMode && isUnion) {
       // Union members overlay; keep them in the parent cell and absorb any
       // deeper field access with the wildcard loop.
-      addFieldWildcardLoop(addrNode);
+      addFieldWildcardLoop(addrNode, "union-initializer");
     }
     for (unsigned i = 0; i != CS->getNumOperands(); ++i) {
       std::string curStruct = enclosingStruct;

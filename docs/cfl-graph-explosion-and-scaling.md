@@ -267,6 +267,96 @@ the V components. All steps below keep GraCFL unmodified.
 > Andersen side — remains open if the composed saturation closure proves
 > too costly at scale.
 >
+> **Solver rework phase 1 (2026-07-08) — union-find + bit planes.** The
+> flows-to core now merges exact-fact join clusters via union-find (same
+> (o,s) => same abstract cell; no hub nodes, no k duplicated member fact
+> sets) and stores facts as per-shift llvm::BitVector planes with
+> word-parallel difference propagation. Two hazards found and fixed en
+> route: (i) full re-dirty on merge caused a merge-cascade quadratic —
+> split into a propagation delta (true new facts only, plus a one-time
+> direct push of the merged set along the loser's moved edges) and a
+> join backlog filtered by a per-class `joined` plane intersected on
+> merge; (ii) list bloat on merged classes — compacted via find()+dedup
+> when grown past a watermark. Results (identical per-icall resolution
+> everywhere):
+>
+> - libpng: FI 144 ms, fs16 620 ms (hub version: 11.5 s / >400 s).
+> - harfbuzz FI: **8 h 13 m → 4 m 56 s wall, 703 MB** (162x), same
+>   330/2,795 resolution as the 8 h ground truth.
+> - harfbuzz fs13 (prime P): **first sound field-sensitive result on
+>   this input — 32 m 54 s, 1.27 GB**, 2,766 targets, a strict subset of
+>   FI's 2,795 (29 spurious targets pruned; ICALL-diff verified). For
+>   contrast: sound saturation OOMs at 49 GB; unsound saturation took
+>   2 h 32 m / 18.2 GB.
+>
+> Remaining cost in fs13 is the VX smear (570M facts ≈ every root at
+> most shifts on wildcard-touched classes).
+>
+> **Phase 2 (2026-07-08) — pairwise VX via bridges + 1-bit provenance:
+> implemented, validated, and a clean negative result.** VX links became
+> bridge edges (native facts cross as 'bridged'; bridged facts join and
+> propagate normally — value flow launders provenance, mirroring the
+> grammar where M-hops are separated by value steps — but never cross a
+> second bridge). Outcome on BOTH libpng and harfbuzz: fixpoints
+> identical to the phase-1 unions and zero residual bridged facts —
+> load/store round trips legally launder everything, so the smear is
+> licensed by the grammar, not an artifact of union transitivity. The
+> 570M facts are the true cost of wildcard density. Machinery kept as
+> the grammar-faithful encoding (free when wildcards are rare — the
+> kernel case; ~20% on harfbuzz fs13: 40 m vs 33 m, same 2,766 targets).
+> Consequence: further fs gains on C++ come from the ENCODING (fewer
+> unknown-offset fallbacks: fieldwise memcpy expansion, container
+> summaries via StructAnalyzer), not from the solver.
+>
+> **Encoding round (2026-07-08, committed b3a8843).** Wildcard census on
+> harfbuzz: memcpy-unknown-layout 43%, ptrtoint-escape 31%, variable-
+> offset GEP 15%, aggregate load/store 10%. Implemented per-residue
+> copies for the memcpy/aggregate categories (sound with zero type info:
+> byte copies preserve offsets mod P) — and measured them NET NEGATIVE
+> on harfbuzz: C++ struct-assignment memcpys mint ~12k synthetic
+> residue-cell origins and the resulting fact volume exceeds the
+> wildcard smear it replaces (>646M facts and climbing vs 570M). Even a
+> small-constant-length gate doesn't help — small struct copies ARE the
+> dominant sites. Kept opt-in as `--cfl-residue-copies` for kernel
+> evaluation, where fptr-bearing structs genuinely transit memcpy and
+> the trade may invert. Lesson: fallback-elimination is not free
+> precision — each eliminated wildcard adds origin-bearing structure,
+> and on container-churn C++ the wildcard is the CHEAPER sound encoding.
+>
+> **LLM source-audit round (2026-07-08) — lacking ground truth, four
+> Sonnet agents audited icall-callee pairs against the harfbuzz 13.2.0
+> source (/data/csong/opensource/harfbuzz).** Results:
+> - 29 FI-vs-fs13 pruned pairs: 25 verified CORRECT-PRUNE with file:line
+>   evidence (unicode-funcs / cmap-accelerator callees correctly separated
+>   from the match_func_t slot; these have pointer-compatible signatures,
+>   so the type filter could never catch them — flow-earned precision).
+> - **4-6 pairs = CONFIRMED fs SOUNDNESS BUG**: at the single
+>   `would_match_input` instantiation, fs13 keeps ONLY match_coverage of
+>   the ~7 legitimate match functions (match_glyph/match_class/
+>   match_always/match_class_cached{,1,2} all stored into the same
+>   ContextApplyFuncs/ChainContextApplyFuncs::match slots per source,
+>   gsubgpos.hh:2558/2751/2797/4041-3). FI resolves all. Keeping coverage
+>   while dropping glyph — same store mechanism — is internally
+>   inconsistent. Localization so far: simple repros PASS
+>   (test/t_ctxfuncs.c: struct-literal contexts, const-global + memcpy +
+>   by-ref helper chain, both modes 4/4); a 145-function llvm-extract of
+>   the real chain does NOT reproduce (both modes agree on the subset) —
+>   the break is a full-module interaction. Next tool:
+>   --cfl-trace-func=<name> to log where a function root's fact stops.
+> - 12 sampled resolved pairs: 10 plausible, 2 measured false positives
+>   (a cross-slot smear inside hb_unicode_funcs_t — the memcpy-wildcard
+>   at work — and one paint-vs-shaper conflation).
+> - 12 sampled type-matched-but-CFL-rejected pairs: 12/12 CORRECT-REJECT.
+> Method note: agent auditing (~40 min wall, 4 parallel Sonnets) found a
+> real soundness bug that all mechanical baselines missed — worth keeping
+> in the validation loop.
+>
+> Known coarsening in the shift grammar (noted, unfixed): `DS0 ::= a | M`
+> permits adjacent M-hops in chains, which the original valley grammar's
+> `(Mq -a)*` shape forbade — a precision over-approximation, empirically
+> free on libpng (per-icall identical to K=0). Restoring strict
+> alternation would double the chain nonterminals.
+>
 > libpng validation (register merging also on): identical icall resolution,
 > monolithic and compositional; V closure 8.0M -> 4.5M, M closure 275K -> 24K
 > (11x).

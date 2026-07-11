@@ -1069,7 +1069,9 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   unsigned minArgs = std::min(numArgs, numFormals);
   for (unsigned i = 0; i < minArgs; i++) {
     Value *arg = CS->getArgOperand(i);
-    if (!arg->getType()->isPointerTy())
+    // First-class aggregates ({ptr,ptr} closures, coerced small structs)
+    // carry pointer identity by value — skip only pointer-free types.
+    if (!containsPointerType(arg->getType()))
       continue; // skip non-pointer args
     if (shouldSkipValue(arg)) {
       CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
@@ -1097,7 +1099,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     varargNode = getCanonicalNode(varargNode);
     for (unsigned i = numFormals; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
-      if (!arg->getType()->isPointerTy())
+      if (!containsPointerType(arg->getType()))
         continue; // skip non-pointer args
       if (shouldSkipValue(arg)) {
         CG_DEBUG("Skipping compiler-introduced variadic argument: " << *arg << "\n");
@@ -1112,8 +1114,8 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     }
   }
 
-  // handle return
-  if (CF->getReturnType()->isPointerTy()) {
+  // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
+  if (containsPointerType(CF->getReturnType())) {
     NodeIndex retNode = NF.getReturnNodeFor(CF);
     if (retNode == AndersNodeFactory::InvalidIndex ||
         retNode == NF.getUniversalPtrNode()) {
@@ -1202,8 +1204,11 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   unsigned minArgs = std::min(numArgs, numFormals);
   for (unsigned i = 0; i < minArgs; i++) {
     Value *arg = CS->getArgOperand(i);
-    if (!arg->getType()->isPointerTy())
+    // Must mirror handleCall: pointer-bearing aggregates are wired too.
+    if (!containsPointerType(arg->getType()))
       continue; // skip non-pointer args
+    if (shouldSkipValue(arg))
+      continue; // handleCall never wired these
     NodeIndex argNode = getRepNodeForValue(arg);
     assert(argNode != AndersNodeFactory::InvalidIndex && "Actual argument node not found!");
     Value *farg = CF->getArg(i);
@@ -1217,8 +1222,10 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     assert(varargNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
     for (unsigned i = numFormals; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
-      if (!arg->getType()->isPointerTy())
+      if (!containsPointerType(arg->getType()))
         continue;
+      if (shouldSkipValue(arg))
+        continue; // handleCall never wired these
       NodeIndex argNode = getRepNodeForValue(arg);
       if (argNode == AndersNodeFactory::InvalidIndex) {
         WARNING("VarArg: actual (" << i << ") " << *arg << " node not found!\n");
@@ -1228,8 +1235,8 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     }
   }
 
-  // handle return
-  if (CF->getReturnType()->isPointerTy()) {
+  // handle return (must mirror handleCall)
+  if (containsPointerType(CF->getReturnType())) {
     NodeIndex retNode = getCanonicalNode(NF.getReturnNodeFor(CF));
     assert(retNode != AndersNodeFactory::InvalidIndex && "Return node not found!");
     NodeIndex callNode = getRepNodeForValue(CS);
@@ -1877,16 +1884,42 @@ bool CallGraphPass::runFlowsToResolution() {
   const uint32_t SHIFT_X = NB;
 
   // Root ids: any origin class, plus function classes flagged for answers.
+  // Presolve copy/field merges can union an alloca/global/alloc-site value
+  // class with in-edged nodes; such a class still names a distinct object
+  // and must be minted even with hasIn set — otherwise the object's
+  // identity is silently erased (harfbuzz hb_map_iter sret/memcpy chains).
+  auto valueIsOrigin = [&](NodeIndex m) {
+    if (!NF.isValueNode(m))
+      return false;
+    if (AllocSites.count(m))
+      return true;
+    const Value *v = NF.getValueForNode(m);
+    return v && (isa<AllocaInst>(v) || isa<GlobalVariable>(v));
+  };
+  std::vector<char> hasOrigin(N, 0);
+  for (uint32_t n = 0; n < N; n++) {
+    NodeIndex canon = toOrig[n];
+    bool org = valueIsOrigin(canon);
+    if (!org) {
+      auto mit = canonicalClassMembers.find(canon);
+      if (mit != canonicalClassMembers.end())
+        for (NodeIndex m : mit->second)
+          if (valueIsOrigin(m)) { org = true; break; }
+    }
+    hasOrigin[n] = org;
+  }
   std::unordered_map<uint32_t, const Function *> funcRootOf;
+  std::vector<uint32_t> rootClassOf; // rid -> minted class
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
     auto fit = funcOfCanon.find(toOrig[n]);
     const bool isFunc = fit != funcOfCanon.end();
-    if (!hasIn[n] || isFunc) {
+    if (!hasIn[n] || isFunc || hasOrigin[n]) {
       uint32_t rid = nextRoot++;
       seeds.emplace_back(n, rid);
+      rootClassOf.push_back(n); // rid-indexed
       if (isFunc) funcRootOf[rid] = fit->second;
     }
   }
@@ -1904,6 +1937,28 @@ bool CallGraphPass::runFlowsToResolution() {
          << " wildcard nodes, " << NSHIFT << " shift planes\n");
   for (auto &[why, cnt] : wildcardReasons)
     CG_LOG("FlowsTo wildcard[" << why << "]: " << cnt << "\n");
+  // --cfl-trace-func: follow one function root's fact through the solve.
+  int64_t traceRoot = -1;
+  if (!CFLTraceFunc.empty()) {
+    for (auto &[rid, F] : funcRootOf)
+      if (F->getName().contains(CFLTraceFunc)) {
+        traceRoot = rid;
+        errs() << "TRACE root " << rid << " = " << F->getName() << "\n";
+        break;
+      }
+    if (traceRoot < 0)
+      errs() << "TRACE: no function root matches '" << CFLTraceFunc << "'\n";
+  }
+  size_t traceEvents = 0;
+  const char *tHow = "seed";
+  uint32_t tFrom = UINT32_MAX;
+  auto traceHit = [&](uint32_t n, uint32_t s, bool bridged) {
+    if (traceEvents++ > 200000) return;
+    errs() << "TRACE + c" << n << " s" << s << (bridged ? " [br]" : "")
+           << " via " << tHow << " from c";
+    if (tFrom == UINT32_MAX) errs() << "?"; else errs() << tFrom;
+    errs() << "\n";
+  };
   std::vector<uint32_t> ufp(N), ufrank(N, 0);
   for (uint32_t i = 0; i < N; i++) ufp[i] = i;
   auto find = [&](uint32_t x) {
@@ -1974,6 +2029,9 @@ bool CallGraphPass::runFlowsToResolution() {
       ensure(dirtyBr[n][s]);
       dirtyBr[n][s] |= nb;
       factCount += nb.count();
+      if (traceRoot >= 0 && nb.size() > (uint32_t)traceRoot &&
+          nb.test((unsigned)traceRoot))
+        traceHit(n, s, false);
     }
     push(n);
   };
@@ -1996,6 +2054,7 @@ bool CallGraphPass::runFlowsToResolution() {
     ensure(dirtyBr[n][s]);
     dirtyBr[n][s].set(o);
     factCount++;
+    if (traceRoot >= 0 && o == (uint32_t)traceRoot) traceHit(n, s, false);
     push(n);
   };
   // OR src as bridged: skipped where already known either way; bridged
@@ -2015,6 +2074,9 @@ bool CallGraphPass::runFlowsToResolution() {
     ensure(jdirty[n][s]);
     jdirty[n][s] |= nb;
     factCount += nb.count();
+    if (traceRoot >= 0 && nb.size() > (uint32_t)traceRoot &&
+        nb.test((unsigned)traceRoot))
+      traceHit(n, s, true);
     push(n);
   };
   size_t mergeCount = 0;
@@ -2025,6 +2087,7 @@ bool CallGraphPass::runFlowsToResolution() {
     if (ufrank[a] == ufrank[b]) ufrank[a]++;
     ufp[b] = a;
     mergeCount++;
+    tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
       // keeper's old facts reach the loser's former neighbors via the
@@ -2089,6 +2152,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // One-time pushes along the loser's moved lists (keeper's old lists
     // only ever need deltas): merged facts along a/f edges (emission is
     // native — value flow launders provenance), natives across bridges.
+    tHow = "merge-move-a"; tFrom = a;
     for (uint32_t t : outA[b]) {
       uint32_t tt = find(t);
       if (tt == a) continue;
@@ -2097,6 +2161,7 @@ bool CallGraphPass::runFlowsToResolution() {
         if (RB[a][s].any()) addBits(tt, s, RB[a][s]);
       }
     }
+    tHow = "merge-move-f"; tFrom = a;
     for (auto [t, r] : outF[b]) {
       uint32_t tt = find(t);
       for (uint32_t s = 0; s < NSHIFT; s++) {
@@ -2106,6 +2171,7 @@ bool CallGraphPass::runFlowsToResolution() {
         if (RB[a][s].any()) addBits(tt, s2, RB[a][s]);
       }
     }
+    tHow = "merge-move-br"; tFrom = a;
     for (uint32_t br : bridgesOf[b]) {
       uint32_t bb = find(br);
       if (bb == a) continue;
@@ -2175,6 +2241,7 @@ bool CallGraphPass::runFlowsToResolution() {
     bridgesOf[x].push_back(y);
     bridgesOf[y].push_back(x);
     bridgeCount++;
+    tHow = "bridge-init"; tFrom = x;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       if (R[x][s].any()) addBitsBridged(y, s, R[x][s]);
       if (R[y][s].any()) addBitsBridged(x, s, R[y][s]);
@@ -2201,6 +2268,7 @@ bool CallGraphPass::runFlowsToResolution() {
         addBridge(it->second, xIt->second);
     }
   };
+  tHow = "seed"; tFrom = UINT32_MAX;
   for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
 
   size_t iterations = 0;
@@ -2253,6 +2321,7 @@ bool CallGraphPass::runFlowsToResolution() {
       if (dirtyBr[n][s].any() && !bridgesOf[n].empty()) {
         llvm::BitVector db(dirtyBr[n][s]);
         dirtyBr[n][s].reset();
+        tHow = "bridge"; tFrom = n;
         for (uint32_t br : bridgesOf[n]) {
           uint32_t bb = find(br);
           if (bb != n) addBitsBridged(bb, s, db);
@@ -2270,6 +2339,7 @@ bool CallGraphPass::runFlowsToResolution() {
         ensure(dNat); ensure(dBr);
         dNat &= R[n][s];
         dBr &= RB[n][s];
+        tHow = "wflag"; tFrom = n;
         if (dNat.any()) addBits(n, SHIFT_X, dNat);
         if (dBr.any()) addBitsBridged(n, SHIFT_X, dBr);
       }
@@ -2277,10 +2347,12 @@ bool CallGraphPass::runFlowsToResolution() {
       // OR along f-edges (X absorbs). Emission is native — value flow
       // launders bridge provenance, exactly like the grammar (M-hops
       // are separated by a-steps in every V derivation).
+      tHow = "a-prop"; tFrom = n;
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
         if (tt != n) addBits(tt, s, d);
       }
+      tHow = "f-prop"; tFrom = n;
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
@@ -2308,6 +2380,82 @@ bool CallGraphPass::runFlowsToResolution() {
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");
 
+  if (traceRoot >= 0) {
+    errs() << "TRACE final reach of root " << traceRoot << " ("
+           << traceEvents << " events):\n";
+    unsigned shown = 0;
+    for (uint32_t n = 0; n < N && shown < 100000; n++) {
+      if (find(n) != n) continue;
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        bool inR = R[n][s].size() > (uint32_t)traceRoot &&
+                   R[n][s].test((unsigned)traceRoot);
+        bool inB = RB[n][s].size() > (uint32_t)traceRoot &&
+                   RB[n][s].test((unsigned)traceRoot);
+        if (!inR && !inB) continue;
+        errs() << "TRACE reach c" << n << " s" << s << (inB ? " [br]" : "")
+               << " ";
+        const Value *V = NF.getValueForNode(toOrig[n]);
+        if (V && V->hasName()) errs() << V->getName();
+        else if (V) {
+          if (const auto *I = dyn_cast<Instruction>(V))
+            errs() << I->getFunction()->getName() << "::" << I->getOpcodeName();
+        }
+        errs() << "\n";
+        shown++;
+      }
+    }
+  }
+
+  if (!CFLTraceValue.empty()) {
+    for (auto &Mpair : Ctx->Modules) {
+      for (Function &F2 : *Mpair.first) {
+        if (!F2.getName().contains(CFLTraceValue) || F2.isDeclaration())
+          continue;
+        errs() << "TRACE-VAL fn " << F2.getName() << "\n";
+        auto dumpV = [&](const Value *V3, const char *tag) {
+          NodeIndex vn = NF.getValueNodeFor(V3);
+          if (vn == AndersNodeFactory::InvalidIndex) return;
+          auto dIt2 = toDense.find(getCanonicalNode(vn));
+          if (dIt2 == toDense.end()) { errs() << "TRACE-VAL  " << tag
+              << " <not-in-graph>\n"; return; }
+          uint32_t cl2 = find(dIt2->second);
+          errs() << "TRACE-VAL  " << tag << " c" << cl2 << " facts:";
+          size_t fShown = 0;
+          for (uint32_t s4 = 0; s4 < NSHIFT; s4++) {
+            if (!R[cl2][s4].size()) continue;
+            for (int o4 = R[cl2][s4].find_first(); o4 != -1;
+                 o4 = R[cl2][s4].find_next(o4)) {
+              if (fShown++ > 10) { errs() << " ..."; break; }
+              errs() << " (r" << o4 << ",s" << s4 << ")";
+            }
+            if (fShown > 10) break;
+          }
+          bool hasTr2 = false;
+          if (traceRoot >= 0)
+            for (uint32_t s4 = 0; s4 < NSHIFT && !hasTr2; s4++)
+              hasTr2 = (R[cl2][s4].size() > (uint32_t)traceRoot &&
+                        R[cl2][s4].test((unsigned)traceRoot)) ||
+                       (RB[cl2][s4].size() > (uint32_t)traceRoot &&
+                        RB[cl2][s4].test((unsigned)traceRoot));
+          errs() << " traced=" << hasTr2 << " cells:" << cellsOf[cl2].size()
+                 << "\n";
+        };
+        for (const Argument &A3 : F2.args()) {
+          if (!A3.getType()->isPointerTy()) continue;
+          std::string as = ("arg" + std::to_string(A3.getArgNo()));
+          dumpV(&A3, as.c_str());
+        }
+        for (const Instruction &I3 : instructions(F2)) {
+          if (!containsPointerType(I3.getType())) continue;
+          std::string is;
+          llvm::raw_string_ostream oss(is);
+          oss << I3;
+          dumpV(&I3, is.substr(0, 90).c_str());
+        }
+      }
+    }
+  }
+
   // Resolution: origins at the fptr class whose shift is zero or unknown
   // (an exact nonzero shift is a provably misaligned pointer, not a call
   // target), intersected with function roots, then the standard filters.
@@ -2322,6 +2470,134 @@ bool CallGraphPass::runFlowsToResolution() {
     bool hasKey = getCallSiteFieldKey(fptr, csStruct, csField);
     FuncSet targets;
     const uint32_t rep = find(dIt->second);
+    if (!CFLTraceFptr.empty() &&
+        CS->getFunction()->getName().contains(CFLTraceFptr)) {
+      // Backward slice over the post-merge graph: reverse a/f edges plus
+      // bridges. The has-root boundary is the severed link.
+      errs() << "TRACE-BWD icall in " << CS->getFunction()->getName()
+             << " fptr c" << rep << "\n";
+      std::unordered_map<uint32_t, std::vector<std::string>> inEdges;
+      for (uint32_t n2 = 0; n2 < N; n2++) {
+        if (find(n2) != n2) continue;
+        for (uint32_t t : outA[n2])
+          inEdges[find(t)].push_back("a<-c" + std::to_string(n2));
+        for (auto [t, r] : outF[n2])
+          inEdges[find(t)].push_back("f" + std::to_string(r) + "<-c" +
+                                     std::to_string(n2));
+        for (uint32_t br : bridgesOf[n2])
+          inEdges[find(br)].push_back("br<-c" + std::to_string(n2));
+      }
+      auto nameOfClass = [&](uint32_t cls) -> std::string {
+        const Value *V2 = cls < N ? NF.getValueForNode(toOrig[cls]) : nullptr;
+        if (!V2) return "<synthetic>";
+        if (V2->hasName()) return V2->getName().str();
+        if (const auto *I2 = dyn_cast<Instruction>(V2))
+          return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
+              .str();
+        return "<unnamed>";
+      };
+      size_t ckShown = 0;
+      for (auto &[key, crep] : clusterRep) {
+        if (find(crep) != rep || ckShown++ > 40) continue;
+        uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
+        errs() << "TRACE-BWD   cluster-key origin=r" << o2 << " (c"
+               << rootClassOf[o2] << " " << nameOfClass(rootClassOf[o2])
+               << ") shift=" << s2 << " origin-in:[";
+        uint32_t oc = find(rootClassOf[o2]);
+        auto oie = inEdges.find(oc);
+        size_t oShown = 0;
+        if (oie != inEdges.end())
+          for (auto &e : oie->second) {
+            if (oShown++ > 8) { errs() << " ..."; break; }
+            errs() << " " << e;
+            uint32_t sc = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
+            errs() << "(" << nameOfClass(sc).substr(0, 50) << ")";
+          }
+        errs() << " ]\n";
+        // Members of the origin class: what merged into this orphan?
+        NodeIndex ocanon = toOrig[rootClassOf[o2]];
+        auto mIt = canonicalClassMembers.find(ocanon);
+        if (mIt != canonicalClassMembers.end()) {
+          size_t mShown = 0;
+          for (NodeIndex m : mIt->second) {
+            if (mShown++ > 15) { errs() << "TRACE-BWD     ...more members\n"; break; }
+            const Value *MV = NF.getValueForNode(m);
+            errs() << "TRACE-BWD     member n" << m << " ";
+            if (MV && MV->hasName()) errs() << MV->getName().substr(0, 70);
+            else if (MV) {
+              if (const auto *MI = dyn_cast<Instruction>(MV))
+                errs() << MI->getFunction()->getName().substr(0, 46) << "::"
+                       << *MI;
+            } else {
+              errs() << (NF.isObjectNode(m) ? "<obj/cell>" : "<synthetic>");
+            }
+            errs() << "\n";
+          }
+        } else {
+          errs() << "TRACE-BWD     (singleton class)\n";
+        }
+      }
+      // Where did the traced function's stores land? Its class's cells and
+      // their cluster keys.
+      if (traceRoot >= 0) {
+        for (auto &[key, crep] : clusterRep) {
+          uint32_t cr = find(crep);
+          bool hasTr = false;
+          for (uint32_t s3 = 0; s3 < NSHIFT && !hasTr; s3++)
+            hasTr = R[cr][s3].size() > (uint32_t)traceRoot &&
+                    R[cr][s3].test((unsigned)traceRoot);
+          if (!hasTr) continue;
+          uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
+          static size_t trShown = 0;
+          if (trShown++ > 60) break;
+          errs() << "TRACE-BWD   root-in-cluster c" << cr << " key=(r" << o2
+                 << " " << nameOfClass(rootClassOf[o2]).substr(0, 50) << ", s"
+                 << s2 << ")\n";
+        }
+      }
+      std::vector<uint32_t> q{rep};
+      boost::unordered_flat_set<uint32_t> vis{rep};
+      size_t printed = 0;
+      for (size_t qi = 0; qi < q.size() && printed < 300; qi++) {
+        uint32_t v = q[qi];
+        bool has = false;
+        for (uint32_t s = 0; s < NSHIFT && !has; s++)
+          has = (R[v][s].size() > (uint32_t)traceRoot &&
+                 R[v][s].test((unsigned)traceRoot)) ||
+                (RB[v][s].size() > (uint32_t)traceRoot &&
+                 RB[v][s].test((unsigned)traceRoot));
+        errs() << "TRACE-BWD c" << v << " root=" << has << " ";
+        const Value *VV = v < N ? NF.getValueForNode(toOrig[v]) : nullptr;
+        if (VV && VV->hasName()) errs() << VV->getName().substr(0, 60);
+        else if (VV) {
+          if (const auto *II = dyn_cast<Instruction>(VV))
+            errs() << II->getFunction()->getName().substr(0, 40) << "::"
+                   << II->getOpcodeName();
+        }
+        errs() << " in:[";
+        auto ie = inEdges.find(v);
+        size_t shownE = 0;
+        if (ie != inEdges.end())
+          for (auto &e : ie->second) {
+            if (shownE++ > 200) { errs() << " ..."; break; }
+            errs() << " " << e;
+            uint32_t src2 = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
+            if (vis.insert(src2).second && q.size() < 3000) q.push_back(src2);
+          }
+        errs() << " ]\n";
+        printed++;
+      }
+    }
+    if (traceRoot >= 0) {
+      bool has = false;
+      for (uint32_t s = 0; s < NSHIFT && !has; s++)
+        has = (R[rep][s].size() > (uint32_t)traceRoot &&
+               R[rep][s].test((unsigned)traceRoot)) ||
+              (RB[rep][s].size() > (uint32_t)traceRoot &&
+               RB[rep][s].test((unsigned)traceRoot));
+      errs() << "TRACE icall " << CS->getFunction()->getName() << " fptr c"
+             << rep << " has-root=" << has << "\n";
+    }
     auto collect = [&](const llvm::BitVector &plane) {
       for (int o = plane.find_first(); o != -1; o = plane.find_next(o)) {
         auto rIt = funcRootOf.find((uint32_t)o);
@@ -4656,7 +4932,7 @@ void CallGraphPass::globalDedupScanCallEdges(
     unsigned minArgs = std::min(numArgs, numFormals);
     for (unsigned i = 0; i < minArgs; i++) {
       Value *arg = CS->getArgOperand(i);
-      if (!arg->getType()->isPointerTy())
+      if (!containsPointerType(arg->getType()))
         continue;
       if (shouldSkipValue(arg))
         continue;
@@ -4674,7 +4950,7 @@ void CallGraphPass::globalDedupScanCallEdges(
         continue;
       for (unsigned i = numFormals; i < numArgs; i++) {
         Value *arg = CS->getArgOperand(i);
-        if (!arg->getType()->isPointerTy())
+        if (!containsPointerType(arg->getType()))
           continue;
         if (shouldSkipValue(arg))
           continue;
@@ -4685,7 +4961,7 @@ void CallGraphPass::globalDedupScanCallEdges(
     }
 
     // Merge return: returnNode → callsite
-    if (CF->getReturnType()->isPointerTy()) {
+    if (containsPointerType(CF->getReturnType())) {
       NodeIndex retNode = NF.getReturnNodeFor(CF);
       NodeIndex callNode = NF.getValueNodeFor(CS);
       if (retNode != AndersNodeFactory::InvalidIndex &&

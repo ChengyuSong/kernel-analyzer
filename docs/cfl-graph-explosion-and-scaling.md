@@ -754,3 +754,49 @@ compression, empirically +14 edges on libpng).
 3. Ablations: quotient-only (= presolve merge), + pivot rectangles,
    + incremental index. Each layer's contribution isolated.
 4. SVF PAG cross-check (student's second builder) for generality.
+
+## 2026-07-11: would_match_input soundness bug — two root causes, both fixed
+
+The audit-flagged harfbuzz fs13 miss (`would_match_input` kept 1 of 30
+pairs) decomposed into two independent, mode-independent identity losses
+in the closure relay (`RuleSet::would_apply` → `$_21`/`hb_map` →
+`operator|` → `hb_map_iter_factory_t::operator()` → `hb_map_iter_t`):
+
+1. **Aggregate call args/returns dropped** (`handleCall`,
+   `removeCallEdges`, single-callsite dedup): actuals and return types
+   were gated on `isPointerTy`, so first-class `{ptr,ptr}` aggregates —
+   exactly how clang returns 16-byte closures/factories by value —
+   created no actual→formal / return→callsite edges.
+   `visitReturnInst`/load/store already used `containsPointerType`; the
+   call boundary now does too. Regression: `test/t_aggrelay.c`
+   (0/2 → 2/2 in K=0 and K=13).
+
+2. **Flows-to root minting dropped merged origins**: roots were minted
+   only for classes with no incoming a/f edges (`!hasIn`). Presolve
+   copy/field merges (memcpy modeling) can union an alloca's class with
+   in-edged nodes (this-spill reloads), after which the alloca is never
+   minted and the object's identity is erased — visible in traces as an
+   alloca whose class has zero facts (not even its own seed). Now any
+   class containing an alloca / GlobalVariable / alloc-site value is
+   minted regardless of in-degree.
+
+Result: harfbuzz fs13 = 2808 pairs, exactly == FI (would_match_input
+30/30); libpng all-config parity unchanged; smoke 4/4; t_container 2/2.
+Cost: roots 13,025→13,376, facts 277M→745M (2.7×), fs13 runtime
+33m→67m. Note fs13 now buys zero final-answer precision over FI on
+harfbuzz (template C++ + wildcard smear); the fs payoff hypothesis
+lives on kernel C.
+
+### Open: coredump.bc sysctl proc_handlers (21 pairs) — external-boundary identity split
+
+NOT residue arithmetic: both sides compute `sysctl_entry` at s7. The
+write goes through the `new_inode()` return phantom (r727), the read
+through the `file->f_inode` load phantom (r884); only external VFS code
+connects the two objects. ft-FI and **saturation fs13 both resolve**
+(via conflation / universal-node conservatism); flows-to fs13 cannot —
+its cells are keyed by exact (origin, shift) and no in-module pointer
+ever carries both origins. Bridge-semantics experiment (VX bridges →
+phase-1 unions) changed nothing. Fix requires an explicit
+external-boundary policy for flows-to (e.g., unify phantom objects that
+cross the same external interface, or a bounded universal blob) — a
+soundness/precision design decision, deferred.

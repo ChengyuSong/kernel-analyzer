@@ -142,6 +142,28 @@ cl::opt<bool> CFLResidueCopies(
            "churn C++ — evaluate per target codebase)"),
   cl::init(false));
 
+cl::opt<std::string> CFLTraceFunc(
+  "cfl-trace-func",
+  cl::desc("Trace flows-to fact propagation for the address-taken function "
+           "whose name contains this substring: log every class its root "
+           "reaches (capped) and the final reach set, to localize where a "
+           "flow is lost"),
+  cl::init(""));
+
+cl::opt<std::string> CFLTraceFptr(
+  "cfl-trace-fptr",
+  cl::desc("After the flows-to fixpoint, dump a backward slice from the "
+           "fptr class of icalls in functions whose name contains this "
+           "substring, annotated with traced-root presence, to localize "
+           "where a flow is severed"),
+  cl::init(""));
+
+cl::opt<std::string> CFLTraceValue(
+  "cfl-trace-value",
+  cl::desc("At the flows-to fixpoint, dump class/facts/cells for every "
+           "pointer value in functions whose name contains this substring"),
+  cl::init(""));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "

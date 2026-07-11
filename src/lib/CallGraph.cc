@@ -2456,6 +2456,74 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
 
+  // --cfl-cotravel-stats: bound the root-bundling win. Roots whose
+  // (class, shift) incidence columns are identical could share one plane
+  // bit; classes whose fact sets are identical could share plane storage.
+  // Hashes are Zobrist-style (XOR of mixed cell keys) — set-equality up
+  // to 64-bit collisions, adequate for a sizing diagnostic. R only; RB
+  // (bridged) planes are excluded.
+  if (CFLCoTravelStats) {
+    auto mix64 = [](uint64_t x) {
+      x += 0x9E3779B97F4A7C15ULL;
+      x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+      x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+      return x ^ (x >> 31);
+    };
+    std::vector<uint64_t> colHash(nextRoot, 0), colCnt(nextRoot, 0);
+    std::unordered_map<uint64_t, uint64_t> rowSigCount; // sig -> classes
+    uint64_t totalFacts = 0, rowsWithFacts = 0;
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      uint64_t rowHash = 0;
+      bool any = false;
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        const auto &bv = R[n][s];
+        if (!bv.size()) continue;
+        for (int r = bv.find_first(); r != -1; r = bv.find_next(r)) {
+          const uint64_t cellKey = (uint64_t)n * NSHIFT + s;
+          colHash[r] ^= mix64(cellKey);
+          colCnt[r]++;
+          rowHash ^= mix64(((uint64_t)r << 8) | s);
+          any = true;
+          totalFacts++;
+        }
+      }
+      if (any) { rowsWithFacts++; rowSigCount[rowHash]++; }
+    }
+    // Distinct columns keyed by (hash, count) to guard weak collisions.
+    std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>>
+        bundles; // key -> (root count, column size)
+    uint64_t activeRoots = 0;
+    for (uint32_t r = 0; r < nextRoot; r++) {
+      if (!colCnt[r]) continue;
+      activeRoots++;
+      auto &b = bundles[mix64(colHash[r]) ^ mix64(colCnt[r])];
+      b.first++;
+      b.second = colCnt[r];
+    }
+    uint64_t compressedFacts = 0, maxBundle = 0;
+    for (auto &[k, b] : bundles) {
+      compressedFacts += b.second;
+      maxBundle = std::max(maxBundle, b.first);
+    }
+    uint64_t sharedRows = 0;
+    for (auto &[sig, cnt] : rowSigCount) sharedRows += cnt - 1;
+    errs() << "CoTravel: facts " << totalFacts
+           << ", active roots " << activeRoots
+           << ", distinct columns (bundles) " << bundles.size()
+           << ", root ratio "
+           << (bundles.empty() ? 0.0
+                               : (double)activeRoots / bundles.size())
+           << ", max bundle " << maxBundle << "\n";
+    errs() << "CoTravel: bundled facts " << compressedFacts
+           << ", fact compression "
+           << (compressedFacts ? (double)totalFacts / compressedFacts : 0.0)
+           << "x\n";
+    errs() << "CoTravel: classes with facts " << rowsWithFacts
+           << ", distinct row signatures " << rowSigCount.size()
+           << ", rows sharable " << sharedRows << "\n";
+  }
+
   // Resolution: origins at the fptr class whose shift is zero or unknown
   // (an exact nonzero shift is a provably misaligned pointer, not a call
   // target), intersected with function roots, then the standard filters.

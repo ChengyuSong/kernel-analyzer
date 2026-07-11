@@ -800,3 +800,26 @@ phase-1 unions) changed nothing. Fix requires an explicit
 external-boundary policy for flows-to (e.g., unify phantom objects that
 cross the same external interface, or a bounded universal blob) — a
 soundness/precision design decision, deferred.
+
+## 2026-07-11: root co-travel measurement (`--cfl-cotravel-stats`)
+
+Sizing diagnostic for root bundling (one plane bit per bundle of roots
+with identical (class, shift) incidence). Zobrist set-hashes over final
+R planes, exact-equality lower bound:
+
+| input        | facts | active roots | distinct columns | fact compression | max bundle |
+|--------------|-------|--------------|------------------|------------------|------------|
+| libpng FI    | 17.1k | 585          | 259              | 2.8x             | 327        |
+| harfbuzz FI  | 35.0M | 12,516       | 7,470            | 8.8x             | 4,707      |
+| harfbuzz fs13| 770M  | 13,376       | 7,225            | **10.5x**        | **5,653**  |
+
+Reading: 42% of all fs13 roots share ONE identical incidence column —
+the "entangled core" (R1: every root reaches ~every class) is made of
+roots the analysis literally cannot distinguish, so solving with one
+representative per bundle is lossless there. Secondary: ~60% of classes
+duplicate another class's full fact set (row hash-consing, ~2.4x,
+composes with bundling). Both numbers are exact-equality lower bounds;
+dynamic bundling (start merged, split on divergence) should exceed
+them. Also fixes the GPU question's matrix width: ~7.2k columns
+post-bundling. Conclusion: bundling is a confirmed >=10x lever on facts
+(memory AND propagation work) — build it before considering GPU.

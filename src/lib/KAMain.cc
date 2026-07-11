@@ -164,6 +164,14 @@ cl::opt<std::string> CFLTraceValue(
            "pointer value in functions whose name contains this substring"),
   cl::init(""));
 
+cl::opt<bool> CFLCoTravelStats(
+  "cfl-cotravel-stats",
+  cl::desc("After the flows-to fixpoint, report root co-travel statistics: "
+           "roots with identical (class, shift) incidence columns are "
+           "bundleable into one plane bit — the ratio bounds the root-"
+           "bundling win (native R planes only, bridged RB excluded)"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "

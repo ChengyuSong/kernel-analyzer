@@ -2276,6 +2276,76 @@ bool CallGraphPass::runFlowsToResolution() {
         addBridge(it->second, xIt->second);
     }
   };
+  // Dynamic a-SCC collapse: classes mutually reachable over the current
+  // (post-merge) shift-preserving edge graph — a-edges plus residue-0
+  // f-edges — receive each other's every fact, so their planes are equal
+  // at fixpoint; merging them is precision-neutral and both dedups the
+  // entangled core's identical planes (stored once) and removes its
+  // internal a-prop churn. Tarjan is O(N+E) (~ms); run periodically as
+  // the graph coarsens (merges create new cycles).
+  auto collapseSCCs = [&]() -> size_t {
+    std::vector<uint32_t> low(N), dfn(N, 0);
+    std::vector<uint32_t> tarjanStack;
+    std::vector<std::pair<uint32_t, size_t>> callStack;
+    std::vector<bool> onStk(N, false);
+    std::vector<std::vector<uint32_t>> sccs;
+    uint32_t timer = 1;
+    auto edgeAt = [&](uint32_t u, size_t i) -> uint32_t {
+      // Unified edge index: outA first, then residue-0 outF entries.
+      if (i < outA[u].size()) return find(outA[u][i]);
+      auto &[t, r] = outF[u][i - outA[u].size()];
+      return r == 0 ? find(t) : UINT32_MAX;
+    };
+    for (uint32_t start = 0; start < N; start++) {
+      if (find(start) != start || dfn[start]) continue;
+      callStack.emplace_back(start, 0);
+      dfn[start] = low[start] = timer++;
+      tarjanStack.push_back(start);
+      onStk[start] = true;
+      while (!callStack.empty()) {
+        auto &[u, ei] = callStack.back();
+        if (ei < outA[u].size() + outF[u].size()) {
+          uint32_t v = edgeAt(u, ei++);
+          if (v == UINT32_MAX || v == u) continue;
+          if (!dfn[v]) {
+            dfn[v] = low[v] = timer++;
+            tarjanStack.push_back(v);
+            onStk[v] = true;
+            callStack.emplace_back(v, 0);
+          } else if (onStk[v]) {
+            low[u] = std::min(low[u], dfn[v]);
+          }
+        } else {
+          if (low[u] == dfn[u]) {
+            std::vector<uint32_t> scc;
+            while (true) {
+              uint32_t w = tarjanStack.back();
+              tarjanStack.pop_back();
+              onStk[w] = false;
+              scc.push_back(w);
+              if (w == u) break;
+            }
+            if (scc.size() > 1) sccs.push_back(std::move(scc));
+          }
+          uint32_t uu = u;
+          callStack.pop_back();
+          if (!callStack.empty())
+            low[callStack.back().first] =
+                std::min(low[callStack.back().first], low[uu]);
+        }
+      }
+    }
+    size_t collapsed = 0;
+    for (auto &scc : sccs) {
+      uint32_t rep = find(scc[0]);
+      for (size_t i = 1; i < scc.size(); i++) {
+        rep = merge(rep, scc[i]);
+        collapsed++;
+      }
+      compactLists(rep);
+    }
+    return collapsed;
+  };
   tHow = "seed"; tFrom = UINT32_MAX;
   for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
 
@@ -2296,6 +2366,13 @@ bool CallGraphPass::runFlowsToResolution() {
     inWL[n] = false;
     if (find(n) != n) continue; // merged away; keeper carries the state
     iterations++;
+    if ((iterations & ((1u << 18) - 1)) == 0) {
+      size_t collapsed = collapseSCCs();
+      if (collapsed)
+        CG_LOG("FlowsTo: a-SCC collapse merged " << collapsed
+               << " classes at " << iterations << " pops\n");
+      if (find(n) != n) continue; // n itself collapsed into its SCC rep
+    }
     if ((iterations & ((1u << 20) - 1)) == 0)
       CG_LOG("FlowsTo progress: " << iterations << " pops, " << factCount
              << " facts, " << clusterRep.size() << " clusters, "
@@ -2584,6 +2661,78 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "CoTravel: classes with facts " << rowsWithFacts
            << ", distinct row signatures " << rowSigCount.size()
            << ", rows sharable " << sharedRows << "\n";
+    // Dynamic a-SCC census: classes mutually reachable over the POST-MERGE
+    // a-graph have provably equal fact planes at fixpoint, so they are
+    // mergeable with the existing merge() machinery — plane dedup and
+    // removal of SCC-internal a-prop churn without a new representation.
+    {
+      std::vector<uint32_t> comp(N, UINT32_MAX), low(N), dfn(N, 0);
+      std::vector<uint32_t> stk, tarjanStack;
+      std::vector<std::pair<uint32_t, size_t>> callStack;
+      std::vector<bool> onStk(N, false);
+      uint32_t timer = 1, nComp = 0;
+      std::unordered_map<uint32_t, uint64_t> compSize;
+      for (uint32_t start = 0; start < N; start++) {
+        if (find(start) != start || dfn[start]) continue;
+        callStack.emplace_back(start, 0);
+        dfn[start] = low[start] = timer++;
+        tarjanStack.push_back(start);
+        onStk[start] = true;
+        while (!callStack.empty()) {
+          auto &[u, ei] = callStack.back();
+          if (ei < outA[u].size()) {
+            uint32_t v = find(outA[u][ei++]);
+            if (v == u) continue;
+            if (!dfn[v]) {
+              dfn[v] = low[v] = timer++;
+              tarjanStack.push_back(v);
+              onStk[v] = true;
+              callStack.emplace_back(v, 0);
+            } else if (onStk[v]) {
+              low[u] = std::min(low[u], dfn[v]);
+            }
+          } else {
+            if (low[u] == dfn[u]) {
+              uint32_t c = nComp++;
+              uint64_t sz = 0;
+              while (true) {
+                uint32_t w = tarjanStack.back();
+                tarjanStack.pop_back();
+                onStk[w] = false;
+                comp[w] = c;
+                sz++;
+                if (w == u) break;
+              }
+              compSize[c] = sz;
+            }
+            uint32_t uu = u;
+            callStack.pop_back();
+            if (!callStack.empty())
+              low[callStack.back().first] =
+                  std::min(low[callStack.back().first], low[uu]);
+          }
+        }
+      }
+      uint64_t nontrivial = 0, collapsible = 0, maxScc = 0;
+      for (auto &[c, sz] : compSize) {
+        if (sz > 1) { nontrivial++; collapsible += sz - 1; }
+        maxScc = std::max(maxScc, sz);
+      }
+      uint64_t intraEdges = 0, totalEdges = 0;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n) continue;
+        for (uint32_t t : outA[n]) {
+          uint32_t tt = find(t);
+          if (tt == n) continue;
+          totalEdges++;
+          if (comp[tt] == comp[n]) intraEdges++;
+        }
+      }
+      errs() << "CoTravel: dynamic a-SCCs — nontrivial " << nontrivial
+             << ", max size " << maxScc << ", collapsible classes "
+             << collapsible << ", intra-SCC a-edges " << intraEdges << "/"
+             << totalEdges << "\n";
+    }
   }
 
   // Resolution: origins at the fptr class whose shift is zero or unknown

@@ -823,3 +823,30 @@ dynamic bundling (start merged, split on divergence) should exceed
 them. Also fixes the GPU question's matrix width: ~7.2k columns
 post-bundling. Conclusion: bundling is a confirmed >=10x lever on facts
 (memory AND propagation work) — build it before considering GPU.
+
+## 2026-07-12: solver profile + 19x FI speedup (commit 3e7a512)
+
+`--cfl-solver-profile` (rdtsc phase accounting; perf is locked down on
+this box) before any optimization:
+
+- harfbuzz FI: join sweep = 94.9% of solve — 8.4B cluster lookups for
+  35M facts. Cause: each fact swept the raw cellsOf list (~240 stale
+  entries aliasing 1-2 live reps). NOT the plane ORs, NOT the hash map
+  per se.
+
+Fixes: (1) dedup cellsOf to live union-find reps at sweep start + after
+the first fact of each sweep (which provably merges all cells of that
+(class, shift)); (2) persistent scratch planes in addBits /
+addBitsBridged / wflag (heap churn was ~29k cycles per addBits).
+
+Results (identical resolution everywhere): harfbuzz FI 1275s -> 66.5s
+(19x), fs13 67min -> 37min (1.8x — fs13 is fact-volume bound across 14
+shift planes). Post-fix profile: a-prop = 88%, ~21k cycles per addBits
+over ~200-word planes = cache-miss bound on ~235MB of scattered planes.
+
+Implication for root bundling (task #10): implement as INTERNED SHARED
+planes, not just narrower ones — the entangled-core classes hold the
+same fact set, so one physical plane serves thousands of classes;
+subset checks become pointer equality and the working set collapses
+into cache. Width reduction alone (13.4k -> 7.2k roots) would only buy
+<2x on the OR path.

@@ -172,6 +172,13 @@ cl::opt<bool> CFLCoTravelStats(
            "bundling win (native R planes only, bridged RB excluded)"),
   cl::init(false));
 
+cl::opt<bool> CFLSolverProfile(
+  "cfl-solver-profile",
+  cl::desc("rdtsc phase accounting inside the flows-to pop loop (join / "
+           "bridge / scan / wflag / a-prop / f-prop) to locate the time "
+           "sink before optimizing"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "

@@ -1998,17 +1998,24 @@ bool CallGraphPass::runFlowsToResolution() {
   auto ensure = [&](llvm::BitVector &bv) {
     if (bv.size() < nextRoot) bv.resize(nextRoot);
   };
+  // Persistent scratch for the hot add paths: copy-assignment reuses the
+  // buffer, so the per-call BitVector heap churn (the former a-prop
+  // hotspot) disappears after warmup. Safe because addBits and
+  // addBitsBridged never call themselves or each other.
+  llvm::BitVector nbA, promA, nbB;
   // OR src natively into rep n's plane s. Bits new to the class enter all
   // three deltas; bits previously only bridged are promoted (their joins
   // and a/f propagation already ran — only bridge-crossing is new).
   auto addBits = [&](uint32_t n, uint32_t s, const llvm::BitVector &src) {
     if (src.none()) return;
     ensure(R[n][s]);
-    llvm::BitVector nb(src);
+    llvm::BitVector &nb = nbA;
+    nb = src;
     ensure(nb);
     nb.reset(R[n][s]);
     if (nb.none()) return;
-    llvm::BitVector promoted;
+    llvm::BitVector &promoted = promA;
+    promoted.clear();
     if (RB[n][s].size()) {
       promoted = nb;
       promoted &= RB[n][s];
@@ -2063,7 +2070,8 @@ bool CallGraphPass::runFlowsToResolution() {
                             const llvm::BitVector &src) {
     if (src.none()) return;
     ensure(RB[n][s]);
-    llvm::BitVector nb(src);
+    llvm::BitVector &nb = nbB;
+    nb = src;
     ensure(nb);
     nb.reset(RB[n][s]);
     if (R[n][s].size()) nb.reset(R[n][s]);
@@ -2272,7 +2280,16 @@ bool CallGraphPass::runFlowsToResolution() {
   for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
 
   size_t iterations = 0;
-  llvm::BitVector d;
+  llvm::BitVector d, todoS, dbS, dNatS, dBrS; // loop scratch, capacity reused
+  // --cfl-solver-profile: rdtsc phase accounting inside the pop loop.
+  // Attribution: join = jdirty sweep incl. cluster lookups/merges;
+  // bridge = dirtyBr crossings; scan = guard checks on clean shifts;
+  // wflag/aprop/fprop = delta emission (addBits cost lands in its
+  // calling phase).
+  const bool prof = CFLSolverProfile;
+  uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
+  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
+  auto rd = [&]() -> uint64_t { return prof ? __builtin_ia32_rdtsc() : 0; };
   while (!worklist.empty()) {
     uint32_t n = worklist.back();
     worklist.pop_back();
@@ -2291,35 +2308,56 @@ bool CallGraphPass::runFlowsToResolution() {
         compactMark[n])
       compactLists(n);
     for (uint32_t s = 0; s < NSHIFT && find(n) == n; s++) {
+      uint64_t tp0 = rd();
       // Cell join (M ::= -d V d | -d VX d): sweep the join backlog —
       // facts never yet pushed to this class's full cell list — against
       // the per-fact clusters. A merge can absorb n itself: stop; the
       // keeper inherits the backlog and is re-queued.
       if (jdirty[n][s].any()) {
-        llvm::BitVector todo(jdirty[n][s]);
+        llvm::BitVector &todo = todoS;
+        todo = jdirty[n][s];
         jdirty[n][s].reset();
         if (!cellsOf[n].empty()) {
+          // Dedup stale cell entries to live union-find reps. Sweeping
+          // every fact over the raw list was the dominant cost (~95% of
+          // solve time): after the FIRST fact of a shift joins the cells
+          // they all share one rep, so each further fact needs one
+          // lookup, not |list|. Dedup once up front (prior sweeps'
+          // merges), and again after the first fact of this sweep.
+          auto dedupCells = [&]() {
+            auto &cs = cellsOf[n];
+            for (auto &c : cs) c = find(c);
+            std::sort(cs.begin(), cs.end());
+            cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
+          };
+          dedupCells();
           if (joined[n][s].size()) { ensure(todo); todo.reset(joined[n][s]); }
           ensure(joined[n][s]);
+          bool firstFact = true;
           for (int o = todo.find_first(); o != -1; o = todo.find_next(o)) {
             bool aborted = false;
             for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
+              nJoinLk++;
               joinCluster(cellsOf[n][ci], (uint32_t)o, s);
               if (find(n) != n) { aborted = true; break; }
             }
             if (aborted) break;
+            if (firstFact) { dedupCells(); firstFact = false; }
             // A merge that kept n may have intersected/cleared the
             // plane; re-ensure. Cells appended mid-loop were covered
             // (the inner bound re-reads cellsOf[n].size()).
             ensure(joined[n][s]);
             joined[n][s].set((unsigned)o);
           }
-          if (find(n) != n) break;
+          if (find(n) != n) { cyJoin += rd() - tp0; break; }
         }
       }
+      uint64_t tp1 = rd();
+      cyJoin += tp1 - tp0;
       // Bridge crossings: native backlog only, arriving bridged.
       if (dirtyBr[n][s].any() && !bridgesOf[n].empty()) {
-        llvm::BitVector db(dirtyBr[n][s]);
+        llvm::BitVector &db = dbS;
+        db = dirtyBr[n][s];
         dirtyBr[n][s].reset();
         tHow = "bridge"; tFrom = n;
         for (uint32_t br : bridgesOf[n]) {
@@ -2329,13 +2367,17 @@ bool CallGraphPass::runFlowsToResolution() {
       } else {
         dirtyBr[n][s].reset();
       }
-      if (dirty[n][s].none()) continue;
+      uint64_t tp2 = rd();
+      cyBridge += tp2 - tp1;
+      if (dirty[n][s].none()) { cyScan += rd() - tp2; continue; }
       d = dirty[n][s];
       dirty[n][s].reset();
+      uint64_t tp3 = rd();
       // Wildcard (fx self-loop): new facts also hold at unknown shift,
       // kind preserved (retroactive projection on wflag gain is in merge).
       if (NB > 0 && wflag[n] && s != SHIFT_X) {
-        llvm::BitVector dNat(d), dBr(d);
+        llvm::BitVector &dNat = dNatS, &dBr = dBrS;
+        dNat = d; dBr = d;
         ensure(dNat); ensure(dBr);
         dNat &= R[n][s];
         dBr &= RB[n][s];
@@ -2343,6 +2385,8 @@ bool CallGraphPass::runFlowsToResolution() {
         if (dNat.any()) addBits(n, SHIFT_X, dNat);
         if (dBr.any()) addBitsBridged(n, SHIFT_X, dBr);
       }
+      uint64_t tp4 = rd();
+      cyW += tp4 - tp3;
       // Propagate the delta: whole-plane OR along a-edges, plane-rotated
       // OR along f-edges (X absorbs). Emission is native — value flow
       // launders bridge provenance, exactly like the grammar (M-hops
@@ -2350,15 +2394,33 @@ bool CallGraphPass::runFlowsToResolution() {
       tHow = "a-prop"; tFrom = n;
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
-        if (tt != n) addBits(tt, s, d);
+        if (tt != n) { nAOr++; addBits(tt, s, d); }
       }
+      uint64_t tp5 = rd();
+      cyA += tp5 - tp4;
+      orWords += (uint64_t)(d.size() / 64 + 1) * outA[n].size();
       tHow = "f-prop"; tFrom = n;
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
-        if (tt != n || s2 != s) addBits(tt, s2, d);
+        if (tt != n || s2 != s) { nFOr++; addBits(tt, s2, d); }
       }
+      cyF += rd() - tp5;
     }
+  }
+  if (prof) {
+    const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
+    auto pct = [&](uint64_t c) { return cyTot ? (double)c * 100.0 / cyTot : 0.0; };
+    errs() << "SolverProf: total " << cyTot << " cycles in pop loop\n";
+    errs() << "SolverProf: join   " << cyJoin << " (" << pct(cyJoin)
+           << "%), lookups " << nJoinLk << "\n";
+    errs() << "SolverProf: bridge " << cyBridge << " (" << pct(cyBridge) << "%)\n";
+    errs() << "SolverProf: scan   " << cyScan << " (" << pct(cyScan) << "%)\n";
+    errs() << "SolverProf: wflag  " << cyW << " (" << pct(cyW) << "%)\n";
+    errs() << "SolverProf: a-prop " << cyA << " (" << pct(cyA)
+           << "%), ORs " << nAOr << "\n";
+    errs() << "SolverProf: f-prop " << cyF << " (" << pct(cyF)
+           << "%), ORs " << nFOr << ", a-plane words " << orWords << "\n";
   }
 
   uint64_t totalR = 0, totalRB = 0;

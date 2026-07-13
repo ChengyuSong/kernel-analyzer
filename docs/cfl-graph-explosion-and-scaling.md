@@ -850,3 +850,28 @@ same fact set, so one physical plane serves thousands of classes;
 subset checks become pointer equality and the working set collapses
 into cache. Width reduction alone (13.4k -> 7.2k roots) would only buy
 <2x on the OR path.
+
+## 2026-07-13: dynamic a-SCC collapse (commit 6d85667)
+
+The SCC census (added to `--cfl-cotravel-stats`) showed the entangled
+core is ONE dynamic SCC of 3,629 classes over shift-preserving edges
+(a + residue-0 f), holding 1/3 of all a-edges. Mutually-reaching
+classes receive each other's every fact, so their planes are equal at
+fixpoint; merging them mid-solve (Tarjan every 256k pops, existing
+merge()) is precision-neutral, dedups the core's planes to one copy,
+and removes its internal delta churn.
+
+Cumulative solver-round results (identical resolution everywhere):
+
+| run          | before round | after |
+|--------------|--------------|-------|
+| harfbuzz FI  | 1275 s       | 33.8 s (38x) |
+| harfbuzz fs13| 67 min       | 25 min (2.7x) |
+
+fs13's residual entanglement is glued by shift-CHANGING f-edges and VX
+bridges, which cannot be SCC-merged soundly (planes differ by rotation
+/ provenance). Attacking that needs the interned-shared-planes
+representation (or bundle-aware rotation), still queued as the bundling
+task. Kernel-scale outlook: FI at 34 s for a 24.5k-class module makes
+the whole-kernel FI run plausible without further work; fs13 wants one
+more representation round.

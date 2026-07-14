@@ -2192,6 +2192,7 @@ bool CallGraphPass::runFlowsToResolution() {
     push(n);
   };
   size_t mergeCount = 0;
+  std::vector<uint32_t> mergeHits(N, 0); // absorbed-class lineage per keeper
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
@@ -2200,6 +2201,7 @@ bool CallGraphPass::runFlowsToResolution() {
     if (ufrank[a] == ufrank[b]) ufrank[a]++;
     ufp[b] = a;
     mergeCount++;
+    mergeHits[a] += 1 + mergeHits[b];
     tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
@@ -2611,6 +2613,59 @@ bool CallGraphPass::runFlowsToResolution() {
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");
+
+  // Name the hub/web culprits: widest classes (fact volume, fan-out
+  // amplifiers like void* container formals and allocator returns) and
+  // merge-churn centers (container webs whose cluster coalescing drives
+  // the convergence tail).
+  if (VerboseLevel >= 2) {
+    std::vector<uint32_t> memberCnt(N, 0);
+    for (uint32_t i = 0; i < N; i++) memberCnt[find(i)]++;
+    auto describe = [&](uint32_t n) {
+      const Value *V = NF.getValueForNode(toOrig[n]);
+      if (const auto *Arg = dyn_cast_or_null<Argument>(V))
+        errs() << Arg->getParent()->getName().substr(0, 60) << "::arg"
+               << Arg->getArgNo();
+      else if (V && V->hasName())
+        errs() << V->getName().substr(0, 70);
+      else if (const auto *I = dyn_cast_or_null<Instruction>(V))
+        errs() << I->getFunction()->getName().substr(0, 50) << "::"
+               << I->getOpcodeName();
+      else
+        errs() << (NF.isObjectNode(toOrig[n]) ? "<obj/cell>" : "<synthetic>");
+    };
+    auto dumpTop = [&](const char *tag, auto keyOf) {
+      std::vector<std::pair<uint64_t, uint32_t>> ranked;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n) continue;
+        uint64_t k = keyOf(n);
+        if (k) ranked.emplace_back(k, n);
+      }
+      size_t K = std::min<size_t>(20, ranked.size());
+      std::partial_sort(ranked.begin(), ranked.begin() + K, ranked.end(),
+                        std::greater<>());
+      for (size_t i = 0; i < K; i++) {
+        auto [k, n] = ranked[i];
+        uint64_t f = 0;
+        for (uint32_t s = 0; s < NSHIFT; s++)
+          f += R[n][s].count() + RB[n][s].count();
+        errs() << tag << ": c" << n << " facts=" << f
+               << " merges=" << mergeHits[n] << " members=" << memberCnt[n]
+               << " cells=" << cellsOf[n].size()
+               << " outA=" << outA[n].size()
+               << (wflag[n] ? " wflag " : " ");
+        describe(n);
+        errs() << "\n";
+      }
+    };
+    dumpTop("TopClass", [&](uint32_t n) {
+      uint64_t f = 0;
+      for (uint32_t s = 0; s < NSHIFT; s++)
+        f += R[n][s].count() + RB[n][s].count();
+      return f;
+    });
+    dumpTop("TopMerge", [&](uint32_t n) { return (uint64_t)mergeHits[n]; });
+  }
 
   if (traceRoot >= 0) {
     errs() << "TRACE final reach of root " << traceRoot << " ("

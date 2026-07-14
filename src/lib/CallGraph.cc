@@ -1620,6 +1620,131 @@ void CallGraphPass::sliceEdgesToFptrComponents(std::vector<size_t> &idx) {
 }
 
 
+namespace {
+// Hybrid sparse/dense root-fact set for the flows-to solver. Sparse mode
+// is a sorted unique u32 vector; past kPromote elements it promotes to a
+// dense BitVector over [0, Universe) and never demotes. Semantics are
+// identical to the former per-plane BitVectors; the representation
+// matters because at kernel scale (333k roots) a dense plane is 41.6KB
+// and even seeding OOMs, while most kernel classes hold a handful of
+// facts. clear() empties but keeps a dense buffer (hot delta planes);
+// release() frees it (merged-away losers).
+class FactSet {
+  llvm::SmallVector<uint32_t, 2> S; // sorted, unique (sparse mode)
+  std::unique_ptr<llvm::BitVector> D; // non-null => dense mode
+  static constexpr size_t kPromote = 128;
+  void promote() {
+    D = std::make_unique<llvm::BitVector>(Universe);
+    for (uint32_t o : S) D->set(o);
+    S.clear();
+  }
+
+public:
+  static uint32_t Universe;
+  bool none() const { return D ? D->none() : S.empty(); }
+  bool any() const { return !none(); }
+  size_t count() const { return D ? D->count() : S.size(); }
+  bool test(uint32_t o) const {
+    if (D) return o < D->size() && D->test(o);
+    return std::binary_search(S.begin(), S.end(), o);
+  }
+  void set(uint32_t o) {
+    if (D) { D->set(o); return; }
+    auto it = std::lower_bound(S.begin(), S.end(), o);
+    if (it != S.end() && *it == o) return;
+    S.insert(it, o);
+    if (S.size() > kPromote) promote();
+  }
+  void reset(uint32_t o) {
+    if (D) { if (o < D->size()) D->reset(o); return; }
+    auto it = std::lower_bound(S.begin(), S.end(), o);
+    if (it != S.end() && *it == o) S.erase(it);
+  }
+  void clear() {
+    if (D) D->reset();
+    S.clear();
+  }
+  void release() {
+    D.reset();
+    llvm::SmallVector<uint32_t, 2>().swap(S); // drop heap capacity too
+  }
+  void copyFrom(const FactSet &o) {
+    if (o.D) {
+      if (D) *D = *o.D; else D = std::make_unique<llvm::BitVector>(*o.D);
+      S.clear();
+    } else if (D) {
+      D->reset();
+      for (uint32_t x : o.S) D->set(x);
+    } else {
+      S = o.S;
+    }
+  }
+  void unionWith(const FactSet &o) {
+    if (o.none()) return;
+    if (o.D) {
+      if (!D) promote();
+      *D |= *o.D;
+    } else if (D) {
+      for (uint32_t x : o.S) D->set(x);
+    } else {
+      llvm::SmallVector<uint32_t, 8> merged;
+      merged.reserve(S.size() + o.S.size());
+      std::set_union(S.begin(), S.end(), o.S.begin(), o.S.end(),
+                     std::back_inserter(merged));
+      S = std::move(merged);
+      if (S.size() > kPromote) promote();
+    }
+  }
+  void subtract(const FactSet &o) { // this \= o
+    if (none() || o.none()) return;
+    if (D) {
+      if (o.D) D->reset(*o.D);
+      else for (uint32_t x : o.S) if (x < D->size()) D->reset(x);
+    } else if (o.D) {
+      S.erase(std::remove_if(S.begin(), S.end(),
+                             [&](uint32_t x) { return o.test(x); }),
+              S.end());
+    } else {
+      llvm::SmallVector<uint32_t, 8> kept;
+      std::set_difference(S.begin(), S.end(), o.S.begin(), o.S.end(),
+                          std::back_inserter(kept));
+      S = std::move(kept);
+    }
+  }
+  void intersectWith(const FactSet &o) {
+    if (none()) return;
+    if (o.none()) { clear(); return; }
+    if (D && o.D) {
+      *D &= *o.D;
+    } else if (D) { // dense this, sparse other
+      llvm::SmallVector<uint32_t, kPromote> surv;
+      for (uint32_t x : o.S)
+        if (test(x)) surv.push_back(x);
+      D->reset();
+      for (uint32_t x : surv) D->set(x);
+    } else if (o.D) {
+      S.erase(std::remove_if(S.begin(), S.end(),
+                             [&](uint32_t x) { return !o.test(x); }),
+              S.end());
+    } else {
+      llvm::SmallVector<uint32_t, 8> kept;
+      std::set_intersection(S.begin(), S.end(), o.S.begin(), o.S.end(),
+                            std::back_inserter(kept));
+      S = std::move(kept);
+    }
+  }
+  template <typename F> void forEach(F f) const {
+    if (D) {
+      for (int i = D->find_first(); i != -1; i = D->find_next(i))
+        f((uint32_t)i);
+    } else {
+      for (uint32_t x : S) f(x);
+    }
+  }
+};
+uint32_t FactSet::Universe = 0;
+} // namespace
+
 // Answer-anchored flows-to resolution (ORCFL prototype). After the
 // quotient (presolve merge collapses a-cycles so the copy graph is a DAG of
 // classes), V restricted to function sources is pure forward propagation:
@@ -1932,6 +2057,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // (VX; identical fixpoint to the former bidirectional hub links, which
   // equalized member fact sets anyway). Propagation is word-parallel:
   // OR whole planes across a-edges, plane-rotated OR across f-edges.
+  FactSet::Universe = nextRoot;
   CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
          << funcRootOf.size() << " function), " << wildcardNodes.size()
          << " wildcard nodes, " << NSHIFT << " shift planes\n");
@@ -1976,7 +2102,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // Deltas: dirty = a/f-propagation backlog (both kinds), jdirty = join
   // backlog (both kinds, refiltered by `joined`), dirtyBr = bridge-
   // crossing backlog (native only).
-  std::vector<std::vector<llvm::BitVector>> R(N), RB(N), dirty(N),
+  std::vector<std::vector<FactSet>> R(N), RB(N), dirty(N),
       jdirty(N), dirtyBr(N), joined(N);
   for (uint32_t i = 0; i < N; i++) {
     R[i].resize(NSHIFT);
@@ -1995,70 +2121,54 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!inWL[n]) { inWL[n] = true; worklist.push_back(n); }
   };
   uint64_t factCount = 0;
-  auto ensure = [&](llvm::BitVector &bv) {
-    if (bv.size() < nextRoot) bv.resize(nextRoot);
-  };
-  // Persistent scratch for the hot add paths: copy-assignment reuses the
-  // buffer, so the per-call BitVector heap churn (the former a-prop
-  // hotspot) disappears after warmup. Safe because addBits and
-  // addBitsBridged never call themselves or each other.
-  llvm::BitVector nbA, promA, nbB;
+  // Persistent scratch for the hot add paths: copyFrom reuses buffers,
+  // so no per-call heap churn. Safe because addBits and addBitsBridged
+  // never call themselves or each other.
+  FactSet nbA, promA, nbB;
   // OR src natively into rep n's plane s. Bits new to the class enter all
   // three deltas; bits previously only bridged are promoted (their joins
   // and a/f propagation already ran — only bridge-crossing is new).
-  auto addBits = [&](uint32_t n, uint32_t s, const llvm::BitVector &src) {
+  auto addBits = [&](uint32_t n, uint32_t s, const FactSet &src) {
     if (src.none()) return;
-    ensure(R[n][s]);
-    llvm::BitVector &nb = nbA;
-    nb = src;
-    ensure(nb);
-    nb.reset(R[n][s]);
+    FactSet &nb = nbA;
+    nb.copyFrom(src);
+    nb.subtract(R[n][s]);
     if (nb.none()) return;
-    llvm::BitVector &promoted = promA;
+    FactSet &promoted = promA;
     promoted.clear();
-    if (RB[n][s].size()) {
-      promoted = nb;
-      promoted &= RB[n][s];
-      RB[n][s].reset(nb);
-      nb.reset(promoted); // truly-new bits only
+    if (!RB[n][s].none()) {
+      promoted.copyFrom(nb);
+      promoted.intersectWith(RB[n][s]);
+      RB[n][s].subtract(nb);
+      nb.subtract(promoted); // truly-new bits only
     }
-    R[n][s] |= nb;
-    if (promoted.size() && promoted.any()) {
-      R[n][s] |= promoted;
-      ensure(dirtyBr[n][s]);
-      dirtyBr[n][s] |= promoted;
+    R[n][s].unionWith(nb);
+    if (!promoted.none()) {
+      R[n][s].unionWith(promoted);
+      dirtyBr[n][s].unionWith(promoted);
     }
-    if (nb.any()) {
-      ensure(dirty[n][s]);
-      dirty[n][s] |= nb;
-      ensure(jdirty[n][s]);
-      jdirty[n][s] |= nb;
-      ensure(dirtyBr[n][s]);
-      dirtyBr[n][s] |= nb;
+    if (!nb.none()) {
+      dirty[n][s].unionWith(nb);
+      jdirty[n][s].unionWith(nb);
+      dirtyBr[n][s].unionWith(nb);
       factCount += nb.count();
-      if (traceRoot >= 0 && nb.size() > (uint32_t)traceRoot &&
-          nb.test((unsigned)traceRoot))
+      if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
         traceHit(n, s, false);
     }
     push(n);
   };
   auto addFact = [&](uint32_t n, uint32_t s, uint32_t o) {
-    ensure(R[n][s]);
     if (R[n][s].test(o)) return;
-    if (RB[n][s].size() && RB[n][s].test(o)) {
+    if (RB[n][s].test(o)) {
       RB[n][s].reset(o);
       R[n][s].set(o);
-      ensure(dirtyBr[n][s]);
       dirtyBr[n][s].set(o);
       push(n);
       return;
     }
     R[n][s].set(o);
-    ensure(dirty[n][s]);
     dirty[n][s].set(o);
-    ensure(jdirty[n][s]);
     jdirty[n][s].set(o);
-    ensure(dirtyBr[n][s]);
     dirtyBr[n][s].set(o);
     factCount++;
     if (traceRoot >= 0 && o == (uint32_t)traceRoot) traceHit(n, s, false);
@@ -2066,28 +2176,23 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   // OR src as bridged: skipped where already known either way; bridged
   // bits run joins and a/f propagation but never dirtyBr.
-  auto addBitsBridged = [&](uint32_t n, uint32_t s,
-                            const llvm::BitVector &src) {
+  auto addBitsBridged = [&](uint32_t n, uint32_t s, const FactSet &src) {
     if (src.none()) return;
-    ensure(RB[n][s]);
-    llvm::BitVector &nb = nbB;
-    nb = src;
-    ensure(nb);
-    nb.reset(RB[n][s]);
-    if (R[n][s].size()) nb.reset(R[n][s]);
+    FactSet &nb = nbB;
+    nb.copyFrom(src);
+    nb.subtract(RB[n][s]);
+    nb.subtract(R[n][s]);
     if (nb.none()) return;
-    RB[n][s] |= nb;
-    ensure(dirty[n][s]);
-    dirty[n][s] |= nb;
-    ensure(jdirty[n][s]);
-    jdirty[n][s] |= nb;
+    RB[n][s].unionWith(nb);
+    dirty[n][s].unionWith(nb);
+    jdirty[n][s].unionWith(nb);
     factCount += nb.count();
-    if (traceRoot >= 0 && nb.size() > (uint32_t)traceRoot &&
-        nb.test((unsigned)traceRoot))
+    if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
       traceHit(n, s, true);
     push(n);
   };
   size_t mergeCount = 0;
+  FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
     if (a == b) return a;
@@ -2102,60 +2207,48 @@ bool CallGraphPass::runFlowsToResolution() {
       // one-time direct push below, NOT via a full re-dirty (that made
       // every merge re-offer the whole fact set on the whole edge list).
       if (R[b][s].any()) {
-        llvm::BitVector nb(R[b][s]);
-        ensure(nb);
-        nb.reset(R[a][s]);
+        FactSet &nb = mnbS;
+        nb.copyFrom(R[b][s]);
+        nb.subtract(R[a][s]);
         if (nb.any()) {
           // Split: bits only bridged at the keeper are promotions
           // (bridge-crossing newly allowed); the rest are fully new.
-          llvm::BitVector promoted(nb);
-          promoted &= RB[a][s];
-          RB[a][s].reset(nb);
-          nb.reset(promoted);
-          ensure(R[a][s]);
-          R[a][s] |= nb;
-          R[a][s] |= promoted;
-          ensure(dirty[a][s]);
-          dirty[a][s] |= nb;
-          ensure(dirtyBr[a][s]);
-          dirtyBr[a][s] |= nb;
-          dirtyBr[a][s] |= promoted;
+          FactSet &promoted = mprS;
+          promoted.copyFrom(nb);
+          promoted.intersectWith(RB[a][s]);
+          RB[a][s].subtract(nb);
+          nb.subtract(promoted);
+          R[a][s].unionWith(nb);
+          R[a][s].unionWith(promoted);
+          dirty[a][s].unionWith(nb);
+          dirtyBr[a][s].unionWith(nb);
+          dirtyBr[a][s].unionWith(promoted);
         }
       }
       if (RB[b][s].any()) {
-        llvm::BitVector nb(RB[b][s]);
-        ensure(nb);
-        nb.reset(R[a][s]);
-        nb.reset(RB[a][s]);
+        FactSet &nb = mnbS;
+        nb.copyFrom(RB[b][s]);
+        nb.subtract(R[a][s]);
+        nb.subtract(RB[a][s]);
         if (nb.any()) {
-          ensure(RB[a][s]);
-          RB[a][s] |= nb;
-          ensure(dirty[a][s]);
-          dirty[a][s] |= nb;
+          RB[a][s].unionWith(nb);
+          dirty[a][s].unionWith(nb);
         }
       }
-      if (dirty[b][s].any()) { ensure(dirty[a][s]); dirty[a][s] |= dirty[b][s]; }
-      if (dirtyBr[b][s].any()) {
-        ensure(dirtyBr[a][s]);
-        dirtyBr[a][s] |= dirtyBr[b][s];
-      }
-      R[b][s].clear();
-      RB[b][s].clear();
-      dirty[b][s].clear();
-      dirtyBr[b][s].clear();
+      if (dirty[b][s].any()) dirty[a][s].unionWith(dirty[b][s]);
+      if (dirtyBr[b][s].any()) dirtyBr[a][s].unionWith(dirtyBr[b][s]);
+      R[b][s].release();
+      RB[b][s].release();
+      dirty[b][s].release();
+      dirtyBr[b][s].release();
       // Join backlog: the merged cell list must be swept with the full
       // merged fact set (filtered by `joined`, which keeps only facts
       // that reached BOTH sides' cells).
-      if (R[a][s].size()) { ensure(jdirty[a][s]); jdirty[a][s] |= R[a][s]; }
-      if (RB[a][s].size()) { ensure(jdirty[a][s]); jdirty[a][s] |= RB[a][s]; }
-      jdirty[b][s].clear();
-      if (joined[a][s].size() && joined[b][s].size()) {
-        ensure(joined[a][s]); ensure(joined[b][s]);
-        joined[a][s] &= joined[b][s];
-      } else {
-        joined[a][s].clear();
-      }
-      joined[b][s].clear();
+      jdirty[a][s].unionWith(R[a][s]);
+      jdirty[a][s].unionWith(RB[a][s]);
+      jdirty[b][s].release();
+      joined[a][s].intersectWith(joined[b][s]);
+      joined[b][s].release();
     }
     // One-time pushes along the loser's moved lists (keeper's old lists
     // only ever need deltas): merged facts along a/f edges (emission is
@@ -2350,7 +2443,8 @@ bool CallGraphPass::runFlowsToResolution() {
   for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
 
   size_t iterations = 0;
-  llvm::BitVector d, todoS, dbS, dNatS, dBrS; // loop scratch, capacity reused
+  FactSet d, todoS, dbS, dNatS, dBrS; // loop scratch, capacity reused
+  std::vector<uint32_t> sweepElems;   // join-sweep snapshot (break support)
   // --cfl-solver-profile: rdtsc phase accounting inside the pop loop.
   // Attribution: join = jdirty sweep incl. cluster lookups/merges;
   // bridge = dirtyBr crossings; scan = guard checks on clean shifts;
@@ -2391,9 +2485,9 @@ bool CallGraphPass::runFlowsToResolution() {
       // the per-fact clusters. A merge can absorb n itself: stop; the
       // keeper inherits the backlog and is re-queued.
       if (jdirty[n][s].any()) {
-        llvm::BitVector &todo = todoS;
-        todo = jdirty[n][s];
-        jdirty[n][s].reset();
+        FactSet &todo = todoS;
+        todo.copyFrom(jdirty[n][s]);
+        jdirty[n][s].clear();
         if (!cellsOf[n].empty()) {
           // Dedup stale cell entries to live union-find reps. Sweeping
           // every fact over the raw list was the dominant cost (~95% of
@@ -2408,23 +2502,23 @@ bool CallGraphPass::runFlowsToResolution() {
             cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
           };
           dedupCells();
-          if (joined[n][s].size()) { ensure(todo); todo.reset(joined[n][s]); }
-          ensure(joined[n][s]);
+          todo.subtract(joined[n][s]);
+          // Snapshot: joinCluster can merge and mutate the backing set.
+          sweepElems.clear();
+          todo.forEach([&](uint32_t o) { sweepElems.push_back(o); });
           bool firstFact = true;
-          for (int o = todo.find_first(); o != -1; o = todo.find_next(o)) {
+          for (uint32_t o : sweepElems) {
             bool aborted = false;
             for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
               nJoinLk++;
-              joinCluster(cellsOf[n][ci], (uint32_t)o, s);
+              joinCluster(cellsOf[n][ci], o, s);
               if (find(n) != n) { aborted = true; break; }
             }
             if (aborted) break;
             if (firstFact) { dedupCells(); firstFact = false; }
-            // A merge that kept n may have intersected/cleared the
-            // plane; re-ensure. Cells appended mid-loop were covered
-            // (the inner bound re-reads cellsOf[n].size()).
-            ensure(joined[n][s]);
-            joined[n][s].set((unsigned)o);
+            // Cells appended mid-loop were covered (the inner bound
+            // re-reads cellsOf[n].size()).
+            joined[n][s].set(o);
           }
           if (find(n) != n) { cyJoin += rd() - tp0; break; }
         }
@@ -2433,31 +2527,30 @@ bool CallGraphPass::runFlowsToResolution() {
       cyJoin += tp1 - tp0;
       // Bridge crossings: native backlog only, arriving bridged.
       if (dirtyBr[n][s].any() && !bridgesOf[n].empty()) {
-        llvm::BitVector &db = dbS;
-        db = dirtyBr[n][s];
-        dirtyBr[n][s].reset();
+        FactSet &db = dbS;
+        db.copyFrom(dirtyBr[n][s]);
+        dirtyBr[n][s].clear();
         tHow = "bridge"; tFrom = n;
         for (uint32_t br : bridgesOf[n]) {
           uint32_t bb = find(br);
           if (bb != n) addBitsBridged(bb, s, db);
         }
       } else {
-        dirtyBr[n][s].reset();
+        dirtyBr[n][s].clear();
       }
       uint64_t tp2 = rd();
       cyBridge += tp2 - tp1;
       if (dirty[n][s].none()) { cyScan += rd() - tp2; continue; }
-      d = dirty[n][s];
-      dirty[n][s].reset();
+      d.copyFrom(dirty[n][s]);
+      dirty[n][s].clear();
       uint64_t tp3 = rd();
       // Wildcard (fx self-loop): new facts also hold at unknown shift,
       // kind preserved (retroactive projection on wflag gain is in merge).
       if (NB > 0 && wflag[n] && s != SHIFT_X) {
-        llvm::BitVector &dNat = dNatS, &dBr = dBrS;
-        dNat = d; dBr = d;
-        ensure(dNat); ensure(dBr);
-        dNat &= R[n][s];
-        dBr &= RB[n][s];
+        FactSet &dNat = dNatS, &dBr = dBrS;
+        dNat.copyFrom(d); dBr.copyFrom(d);
+        dNat.intersectWith(R[n][s]);
+        dBr.intersectWith(RB[n][s]);
         tHow = "wflag"; tFrom = n;
         if (dNat.any()) addBits(n, SHIFT_X, dNat);
         if (dBr.any()) addBitsBridged(n, SHIFT_X, dBr);
@@ -2475,7 +2568,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       uint64_t tp5 = rd();
       cyA += tp5 - tp4;
-      orWords += (uint64_t)(d.size() / 64 + 1) * outA[n].size();
+      if (prof) orWords += (uint64_t)d.count() * outA[n].size();
       tHow = "f-prop"; tFrom = n;
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
@@ -2526,10 +2619,8 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t n = 0; n < N && shown < 100000; n++) {
       if (find(n) != n) continue;
       for (uint32_t s = 0; s < NSHIFT; s++) {
-        bool inR = R[n][s].size() > (uint32_t)traceRoot &&
-                   R[n][s].test((unsigned)traceRoot);
-        bool inB = RB[n][s].size() > (uint32_t)traceRoot &&
-                   RB[n][s].test((unsigned)traceRoot);
+        bool inR = R[n][s].test((uint32_t)traceRoot);
+        bool inB = RB[n][s].test((uint32_t)traceRoot);
         if (!inR && !inB) continue;
         errs() << "TRACE reach c" << n << " s" << s << (inB ? " [br]" : "")
                << " ";
@@ -2560,22 +2651,18 @@ bool CallGraphPass::runFlowsToResolution() {
           uint32_t cl2 = find(dIt2->second);
           errs() << "TRACE-VAL  " << tag << " c" << cl2 << " facts:";
           size_t fShown = 0;
-          for (uint32_t s4 = 0; s4 < NSHIFT; s4++) {
-            if (!R[cl2][s4].size()) continue;
-            for (int o4 = R[cl2][s4].find_first(); o4 != -1;
-                 o4 = R[cl2][s4].find_next(o4)) {
-              if (fShown++ > 10) { errs() << " ..."; break; }
+          for (uint32_t s4 = 0; s4 < NSHIFT && fShown <= 10; s4++) {
+            R[cl2][s4].forEach([&](uint32_t o4) {
+              if (fShown > 10) return;
+              if (fShown++ == 10) { errs() << " ..."; return; }
               errs() << " (r" << o4 << ",s" << s4 << ")";
-            }
-            if (fShown > 10) break;
+            });
           }
           bool hasTr2 = false;
           if (traceRoot >= 0)
             for (uint32_t s4 = 0; s4 < NSHIFT && !hasTr2; s4++)
-              hasTr2 = (R[cl2][s4].size() > (uint32_t)traceRoot &&
-                        R[cl2][s4].test((unsigned)traceRoot)) ||
-                       (RB[cl2][s4].size() > (uint32_t)traceRoot &&
-                        RB[cl2][s4].test((unsigned)traceRoot));
+              hasTr2 = R[cl2][s4].test((uint32_t)traceRoot) ||
+                       RB[cl2][s4].test((uint32_t)traceRoot);
           errs() << " traced=" << hasTr2 << " cells:" << cellsOf[cl2].size()
                  << "\n";
         };
@@ -2616,16 +2703,14 @@ bool CallGraphPass::runFlowsToResolution() {
       uint64_t rowHash = 0;
       bool any = false;
       for (uint32_t s = 0; s < NSHIFT; s++) {
-        const auto &bv = R[n][s];
-        if (!bv.size()) continue;
-        for (int r = bv.find_first(); r != -1; r = bv.find_next(r)) {
-          const uint64_t cellKey = (uint64_t)n * NSHIFT + s;
+        const uint64_t cellKey = (uint64_t)n * NSHIFT + s;
+        R[n][s].forEach([&](uint32_t r) {
           colHash[r] ^= mix64(cellKey);
           colCnt[r]++;
           rowHash ^= mix64(((uint64_t)r << 8) | s);
           any = true;
           totalFacts++;
-        }
+        });
       }
       if (any) { rowsWithFacts++; rowSigCount[rowHash]++; }
     }
@@ -2823,8 +2908,7 @@ bool CallGraphPass::runFlowsToResolution() {
           uint32_t cr = find(crep);
           bool hasTr = false;
           for (uint32_t s3 = 0; s3 < NSHIFT && !hasTr; s3++)
-            hasTr = R[cr][s3].size() > (uint32_t)traceRoot &&
-                    R[cr][s3].test((unsigned)traceRoot);
+            hasTr = R[cr][s3].test((uint32_t)traceRoot);
           if (!hasTr) continue;
           uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
           static size_t trShown = 0;
@@ -2841,10 +2925,8 @@ bool CallGraphPass::runFlowsToResolution() {
         uint32_t v = q[qi];
         bool has = false;
         for (uint32_t s = 0; s < NSHIFT && !has; s++)
-          has = (R[v][s].size() > (uint32_t)traceRoot &&
-                 R[v][s].test((unsigned)traceRoot)) ||
-                (RB[v][s].size() > (uint32_t)traceRoot &&
-                 RB[v][s].test((unsigned)traceRoot));
+          has = R[v][s].test((uint32_t)traceRoot) ||
+                RB[v][s].test((uint32_t)traceRoot);
         errs() << "TRACE-BWD c" << v << " root=" << has << " ";
         const Value *VV = v < N ? NF.getValueForNode(toOrig[v]) : nullptr;
         if (VV && VV->hasName()) errs() << VV->getName().substr(0, 60);
@@ -2870,28 +2952,26 @@ bool CallGraphPass::runFlowsToResolution() {
     if (traceRoot >= 0) {
       bool has = false;
       for (uint32_t s = 0; s < NSHIFT && !has; s++)
-        has = (R[rep][s].size() > (uint32_t)traceRoot &&
-               R[rep][s].test((unsigned)traceRoot)) ||
-              (RB[rep][s].size() > (uint32_t)traceRoot &&
-               RB[rep][s].test((unsigned)traceRoot));
+        has = R[rep][s].test((uint32_t)traceRoot) ||
+              RB[rep][s].test((uint32_t)traceRoot);
       errs() << "TRACE icall " << CS->getFunction()->getName() << " fptr c"
              << rep << " has-root=" << has << "\n";
     }
-    auto collect = [&](const llvm::BitVector &plane) {
-      for (int o = plane.find_first(); o != -1; o = plane.find_next(o)) {
-        auto rIt = funcRootOf.find((uint32_t)o);
-        if (rIt == funcRootOf.end()) continue;
+    auto collect = [&](const FactSet &plane) {
+      plane.forEach([&](uint32_t o) {
+        auto rIt = funcRootOf.find(o);
+        if (rIt == funcRootOf.end()) return;
         Function *F = getFuncDef(const_cast<Function *>(rIt->second));
-        if (!isCompatible(CS, F)) continue;
-        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) continue;
+        if (!isCompatible(CS, F)) return;
+        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) return;
         targets.insert(F);
-      }
+      });
     };
     collect(R[rep][0]);
-    if (RB[rep][0].size()) collect(RB[rep][0]);
+    collect(RB[rep][0]);
     if (NB > 0) {
       collect(R[rep][SHIFT_X]);
-      if (RB[rep][SHIFT_X].size()) collect(RB[rep][SHIFT_X]);
+      collect(RB[rep][SHIFT_X]);
     }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
     for (const Function *F : targets)

@@ -2878,7 +2878,10 @@ bool CallGraphPass::runFlowsToResolution() {
   // Resolution: origins at the fptr class whose shift is zero or unknown
   // (an exact nonzero shift is a provably misaligned pointer, not a call
   // target), intersected with function roots, then the standard filters.
-  size_t resolved = 0, totalTargets = 0;
+  // Newly discovered pairs are wired (arg/ret flows via handleCall, same
+  // as the saturation fixpoint) and force another outer iteration —
+  // a resolved callee's flows can enable further resolutions.
+  size_t resolved = 0, totalTargets = 0, newPairs = 0, topOnlyPairs = 0;
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -3024,16 +3027,48 @@ bool CallGraphPass::runFlowsToResolution() {
     };
     collect(R[rep][0]);
     collect(RB[rep][0]);
+    const size_t exactTargets = targets.size();
     if (NB > 0) {
       collect(R[rep][SHIFT_X]);
       collect(RB[rep][SHIFT_X]);
     }
+    topOnlyPairs += targets.size() - exactTargets;
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
-    for (const Function *F : targets)
-      Ctx->Callees[CS].insert(F);
+    for (const Function *F : targets) {
+      if (!Ctx->Callees[CS].insert(F).second)
+        continue; // wired in an earlier iteration
+      newPairs++;
+      // Wire the callee's flows exactly as the saturation fixpoint does;
+      // the new edges enter the NEXT iteration's solve.
+      Function *CF = const_cast<Function *>(F);
+      if (Ctx->AllocFuncs.count(CF)) {
+        Ctx->AllocSites.insert(CS);
+        NodeIndex callNode = getRepNodeForValue(CS);
+        assert(callNode != AndersNodeFactory::InvalidIndex &&
+               "CallBase node not found for indirect allocator target");
+        AllocSites.insert(callNode);
+        NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
+        EB.addDereferenceEdges(callNode, heapObj);
+      } else if (Ctx->ContainerFuncs.count(CF)) {
+        handleContainerCall(CS, CF);
+      } else {
+        handleCall(CS, CF);
+      }
+    }
   }
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, "
-         << totalTargets << " targets\n");
+         << totalTargets << " targets (" << newPairs << " new pairs wired, "
+         << topOnlyPairs << " via wildcard plane only), iteration "
+         << iteration << "\n");
+  if (newPairs == 0)
+    return false; // converged: no callee flows were added
+  if (iteration + 1 >= (int)CFLFlowsToMaxIters) {
+    WARNING("[UNSOUND-RISK] FlowsTo fixpoint hit iteration cap ("
+            << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
+            << " newly wired pairs unprocessed; results may miss flows "
+            << "through those callees\n");
+    return false;
+  }
   return true;
 }
 
@@ -5947,11 +5982,13 @@ bool CallGraphPass::doModulePass(Module *M) {
       preSolveCopyFieldMerge(EB.getEdges(), nullptr);
 
     // ORCFL v0: answer-anchored resolution replaces the saturation solve.
+    // Outer fixpoint: re-solve while resolution wires new callee flows
+    // (the iterative driver re-enters doModulePass while we return true;
+    // iteration >= 1 skips the edge build and goes straight to the solve).
     if (CFLFlowsTo && !CFLCompositional) {
-      if (runFlowsToResolution()) {
-        iteration++;
-        return false;
-      }
+      bool again = runFlowsToResolution();
+      iteration++;
+      return again;
     }
 
     // Build dense mapping if global dedup is active.

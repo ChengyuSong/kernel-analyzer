@@ -172,6 +172,13 @@ cl::opt<bool> CFLCoTravelStats(
            "bundling win (native R planes only, bridged RB excluded)"),
   cl::init(false));
 
+cl::opt<unsigned> CFLFlowsToMaxIters(
+  "cfl-flows-to-max-iters",
+  cl::desc("Cap on flows-to outer fixpoint iterations (resolve icalls -> "
+           "wire callee arg/ret flows -> re-solve). Hitting the cap with "
+           "unprocessed wirings is reported as an UNSOUND-RISK warning"),
+  cl::init(10));
+
 cl::opt<bool> CFLSolverProfile(
   "cfl-solver-profile",
   cl::desc("rdtsc phase accounting inside the flows-to pop loop (join / "

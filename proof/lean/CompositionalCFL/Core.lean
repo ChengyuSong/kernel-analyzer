@@ -139,7 +139,7 @@ theorem graphHom_id_of_subset
     (hSub : GraphLe G₁ G₂) :
     GraphHom (fun x => x) G₁ G₂ := by
   intro e hEdge
-  simpa [GraphLe, mapEdge] using hSub e hEdge
+  exact hSub e hEdge
 
 /-- Quotient graph obtained by remapping all edges through `q`.
 Set semantics already performs deduplication. -/
@@ -272,7 +272,7 @@ theorem first_step_subset_iterClosure
     (G0 : Graph N) :
     GraphLe (it.step G0) (iterClosure it G0) := by
   intro e hEdge
-  exact ⟨1, by simpa [iterGraph] using hEdge⟩
+  exact ⟨1, hEdge⟩
 
 /-- `q` is a graph homomorphism from `G` into its quotient image. -/
 theorem quotientGraph_hom

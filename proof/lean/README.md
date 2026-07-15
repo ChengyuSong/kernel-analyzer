@@ -1,8 +1,42 @@
-# Lean Scaffold: Compositional CFL Soundness
+# Lean Scaffold: CFL Callgraph Soundness
 
-This is a minimal Lean 4 project that mechanically checks a core soundness theorem schema for compositional CFL analysis.
+This is a minimal Lean 4 project that mechanically checks core soundness
+theorem schemas for the two analysis pipelines:
 
-## What is formalized
+- `CompositionalCFL/Core.lean` — the compositional (per-TU compress +
+  boundary merge + iterative closure) pipeline over the field-insensitive
+  grammar (Feb 2026).
+- `CompositionalCFL/FlowsTo.lean` — the flows-to (ORCFL) solver over the
+  shift-indexed field grammar (Jul 2026, branch `orcfl`), now the primary
+  scaling path.
+
+## What is formalized (flows-to, `FlowsTo.lean`)
+
+- Shift monoid with absorbing `⊤` (`ShiftMonoid`, `Shift`, `shiftComp`);
+  exact-`Nat`-offset instance (`natShifts`); the production `Z_P` bucketing
+  is a monoid quotient of it (formalization pending, gap F5)
+- Declarative shift-indexed flows-to derivations (`FDeriv`):
+  value flow with net shift (`a`/`f r`/`fx` steps, memory hops through
+  aliased cells), and cell aliasing by exact-shift join (V) or `⊤` (VX)
+- Checked theorems:
+  - `fderiv_mono`: derivability monotone under edge growth — covers the
+    outer icall fixpoint (wiring only adds edges)
+  - `fderiv_map` / `fderiv_quotient`: derivability preserved under node
+    quotients — covers presolve merges, union-find cell merges, and the
+    dynamic a-SCC collapse (soundness direction)
+  - `solver_complete`: the minted-root solver abstraction (`SolverModel`)
+    derives every grammar-derivable fact and alias GIVEN the `coverage`
+    invariant (every node reached by some minted root). The 2026-07-13
+    minting bug is precisely a `coverage` violation.
+  - `answers_complete`: icall answers (shift 0 or ⊤ at the fptr) are found
+    whenever function nodes are minted and coverage holds
+
+See the "Flows-to (ORCFL) model gaps" section of `GAPS.md` for what remains
+assumed (coverage discharge from the minting criterion, SCC-collapse
+precision-neutrality, bridge provenance, `Z_P` quotient, FactSet refinement,
+target filters).
+
+## What is formalized (compositional, `Core.lean`)
 
 - A small labeled-graph model (`Graph`, `LEdge`, `Label`)
 - A simplified CFL-style reachability judgment (`Reach`)

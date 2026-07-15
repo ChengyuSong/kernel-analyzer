@@ -3295,6 +3295,17 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
   CG_DEBUG("InlineAsm: processing \"" << IA->getAsmString()
            << "\" with " << Constraints.size() << " constraints\n");
 
+  // UNMODELED: calls executed inside the asm body. Only operand data flow
+  // is wired below — an asm string containing a call mnemonic (kernel
+  // static_call "call __SCT__*", paravirt "call *%..." under
+  // CONFIG_PARAVIRT) produces no callee edge. Census-count loudly until
+  // the static_call pattern handler (icall on __SCK__<name>.func) lands.
+  if (IA->getAsmString().find("call") != std::string::npos) {
+    WARNING("InlineAsm with embedded call left unmodeled: \""
+            << IA->getAsmString() << "\" in "
+            << CS.getFunction()->getName() << "\n");
+  }
+
   // Build constraint-to-arg and constraint-to-ret mappings.
   // hasArg() is true for inputs and indirect outputs (they consume a CallBase arg).
   // Non-indirect outputs produce part of the return aggregate.

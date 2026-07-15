@@ -2199,6 +2199,12 @@ bool CallGraphPass::runFlowsToResolution() {
   // anchoring other keys coalesces key-clusters the grammar keeps apart.
   std::vector<uint32_t> keyCount(N, 0);
   size_t transKeyMerges = 0;
+  // Churn attribution: what triggers merges, how much join work is
+  // merge-triggered re-offer, and which classes get re-popped — the data
+  // that sizes the delta-precision fix and names summarization targets.
+  size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
+  uint64_t reofferedFacts = 0, sweepOffered = 0, sweepKept = 0;
+  std::vector<uint32_t> popCount(N, 0);
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
@@ -2256,6 +2262,8 @@ bool CallGraphPass::runFlowsToResolution() {
       // that reached BOTH sides' cells).
       jdirty[a][s].unionWith(R[a][s]);
       jdirty[a][s].unionWith(RB[a][s]);
+      if (CFLSolverProfile)
+        reofferedFacts += R[a][s].count() + RB[a][s].count();
       jdirty[b][s].release();
       joined[a][s].intersectWith(joined[b][s]);
       joined[b][s].release();
@@ -2363,9 +2371,14 @@ bool CallGraphPass::runFlowsToResolution() {
     auto [it, ins] = clusterRep.emplace(key, find(cell));
     if (!ins) {
       const uint32_t cellRep = find(cell);
-      if (cellRep != find(it->second) && keyCount[cellRep] > 0)
+      if (cellRep == find(it->second)) {
+        redundantJoins++; // already one cluster: pure lookup, no work
+      } else if (keyCount[cellRep] > 0) {
         transKeyMerges++; // cell anchors other keys: key-clusters coalesce
+      }
+      const size_t mc0 = mergeCount;
       it->second = merge(it->second, cell);
+      if (mergeCount > mc0) mergesFromJoin++;
       return;
     }
     keyCount[find(cell)]++;
@@ -2474,8 +2487,10 @@ bool CallGraphPass::runFlowsToResolution() {
     inWL[n] = false;
     if (find(n) != n) continue; // merged away; keeper carries the state
     iterations++;
+    popCount[n]++;
     if ((iterations & ((1u << 18) - 1)) == 0) {
       size_t collapsed = collapseSCCs();
+      mergesFromSCC += collapsed;
       if (collapsed)
         CG_LOG("FlowsTo: a-SCC collapse merged " << collapsed
                << " classes at " << iterations << " pops\n");
@@ -2516,7 +2531,9 @@ bool CallGraphPass::runFlowsToResolution() {
             cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
           };
           dedupCells();
+          if (prof) sweepOffered += todo.count();
           todo.subtract(joined[n][s]);
+          if (prof) sweepKept += todo.count();
           // Snapshot: joinCluster can merge and mutate the backing set.
           sweepElems.clear();
           todo.forEach([&](uint32_t o) { sweepElems.push_back(o); });
@@ -2766,6 +2783,38 @@ bool CallGraphPass::runFlowsToResolution() {
       return f;
     });
     dumpTop("TopMerge", [&](uint32_t n) { return (uint64_t)mergeHits[n]; });
+    dumpTop("TopPop", [&](uint32_t n) { return (uint64_t)popCount[n]; });
+    // Sample absorbed members of the top merge-churn classes: these name
+    // the web constructs (list helpers, registries, alloc wrappers) that
+    // ContainerFuncs/AllocFuncs coverage should summarize away.
+    {
+      std::vector<std::pair<uint64_t, uint32_t>> byMerge;
+      for (uint32_t n = 0; n < N; n++)
+        if (find(n) == n && mergeHits[n])
+          byMerge.emplace_back(mergeHits[n], n);
+      size_t K = std::min<size_t>(8, byMerge.size());
+      std::partial_sort(byMerge.begin(), byMerge.begin() + K, byMerge.end(),
+                        std::greater<>());
+      std::unordered_map<uint32_t, std::vector<uint32_t>> samples;
+      for (size_t i = 0; i < K; i++) samples[byMerge[i].second] = {};
+      for (uint32_t i = 0; i < N && !samples.empty(); i++) {
+        uint32_t r = find(i);
+        if (r == i) continue;
+        auto sIt = samples.find(r);
+        if (sIt != samples.end() && sIt->second.size() < 4)
+          sIt->second.push_back(i);
+      }
+      for (size_t i = 0; i < K; i++) {
+        uint32_t n = byMerge[i].second;
+        errs() << "MergeMembers c" << n << " (" << mergeHits[n] << "):";
+        for (uint32_t m : samples[n]) {
+          errs() << "  [";
+          describe(m);
+          errs() << "]";
+        }
+        errs() << "\n";
+      }
+    }
     // Cluster-transitivity audit: union-find clusters are coarser-or-equal
     // vs the grammar's per-witness M; multi-key clusters and transitive
     // key-coalescing merges bound the over-approximation (Lean gap F3).
@@ -2783,6 +2832,13 @@ bool CallGraphPass::runFlowsToResolution() {
              << ", transitive key-coalescing merges " << transKeyMerges
              << "\n";
     }
+    errs() << "ChurnStats: merges join=" << mergesFromJoin
+           << " scc=" << mergesFromSCC
+           << ", redundant join lookups " << redundantJoins
+           << ", merge-reoffered " << reofferedFacts
+           << " facts, sweeps offered " << sweepOffered << " kept "
+           << sweepKept
+           << " (volume fields need --cfl-solver-profile)\n";
   }
 
   if (traceRoot >= 0) {
@@ -3000,6 +3056,10 @@ bool CallGraphPass::runFlowsToResolution() {
   // as the saturation fixpoint) and force another outer iteration —
   // a resolved callee's flows can enable further resolutions.
   size_t resolved = 0, totalTargets = 0, newPairs = 0, topOnlyPairs = 0;
+  // Per-filter pruning tallies: every rejection is potential unsoundness
+  // exposure and, symmetrically, the filter's precision contribution —
+  // the retirement criterion once CFL-side precision drives them to zero.
+  size_t filtCandidates = 0, filtTypeRej = 0, filtFieldRej = 0;
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -3138,8 +3198,12 @@ bool CallGraphPass::runFlowsToResolution() {
         auto rIt = funcRootOf.find(o);
         if (rIt == funcRootOf.end()) return;
         Function *F = getFuncDef(const_cast<Function *>(rIt->second));
-        if (!isCompatible(CS, F)) return;
-        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) return;
+        filtCandidates++;
+        if (!isCompatible(CS, F)) { filtTypeRej++; return; }
+        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
+          filtFieldRej++;
+          return;
+        }
         targets.insert(F);
       });
     };
@@ -3178,6 +3242,10 @@ bool CallGraphPass::runFlowsToResolution() {
          << totalTargets << " targets (" << newPairs << " new pairs wired, "
          << topOnlyPairs << " via wildcard plane only), iteration "
          << iteration << "\n");
+  CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
+         << filtTypeRej << " type-rejected, " << filtFieldRej
+         << " field-rejected (each rejection = unsoundness exposure; "
+         << "zero = filter retirable)\n");
   if (newPairs == 0)
     return false; // converged: no callee flows were added
   if (iteration + 1 >= (int)CFLFlowsToMaxIters) {
@@ -4247,10 +4315,18 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     }
     // ptr = &function: add assignment edges function_val -> ptr
     EB.addAssignmentEdges(valNode, ptrNode);
-    // Record direct function store into struct field
+    // Record direct function store into struct field. A store WITHOUT a
+    // derivable key (literal-struct initializer like sysctl tables, plain
+    // global, top-level array) must mark the function evidence-incomplete:
+    // otherwise named-struct evidence collected elsewhere would wrongly
+    // reject callsites that load from the keyless location (the access
+    // side may still see a named struct type, e.g. kern_table's literal
+    // [38 x {ptr,...}] read through %struct.ctl_table geps).
     if (!enclosingStruct.empty() && enclosingFieldIdx >= 0)
       funcFieldStores[canonStoredFunc].insert(
           {enclosingStruct, static_cast<unsigned>(enclosingFieldIdx)});
+    else
+      funcFieldStoresIncomplete.insert(canonStoredFunc);
     CG_DEBUG("add CFL assignment edges for function " << storedFunc->getName()
              << " -> " << ptrNode << "\n");
   } else if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {

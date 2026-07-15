@@ -99,13 +99,18 @@ The primary solver is now `runFlowsToResolution` (branch `orcfl`), modeled in
 
 ## Flows-to gaps
 
-F1. Coverage is an assumption, not discharged from the minting code.
-- The 2026-07-13 minting bug is the empirical violation: minting only
-  `!hasIn` classes missed alloca classes captured by presolve merges.
-- The current criterion (no-in-edge classes + origin-bearing classes +
-  functions) is believed to imply coverage under the invariant "every
-  source-SCC of the value graph contains an origin or is value-empty";
-  that implication is not yet formalized.
+F1. [REVISED 2026-07-14] The grammar is now ROOTED at origins
+(`FDeriv`'s `origin` parameter), and the solver hypothesis is
+`origins_minted : origin ⊆ minted` — dischargeable, since the
+implementation mints every origin-bearing class. The July-13 minting
+bug is a violation of exactly this hypothesis. Remaining code-level
+gap: the correspondence between Lean origins and the implemented
+criterion (canonicalClassMembers sweep over alloca / global /
+alloc-site values) is informal. Note the rooting DEFINES a semantic
+difference from pairwise saturation: saturation admits unrooted valley
+apexes (φ-cycles, entry-less store/load loops = undef values), so
+flows-to ⊆ saturation on such patterns is principled, not a bug —
+exact saturation parity is the wrong validation target.
 
 F2. a-SCC collapse precision-neutrality (the converse of `fderiv_quotient`)
 is unproved. Soundness needs only the proved direction; the claim that
@@ -113,10 +118,17 @@ collapsing mutually shift-preserving-reachable classes loses no precision
 rests on the cycle-insertion argument, checked only empirically
 (identical per-icall results on libpng/harfbuzz).
 
-F3. The Lean `SAlias`/cluster model is non-transitive per join witness;
-the implementation's union-find clusters are transitively closed, i.e.
-coarser-or-equal. Fine for completeness (solver ⊇ grammar); the model does
-not bound the implementation's over-approximation.
+F3. [DOWNGRADED 2026-07-14] Union-find cluster transitivity was
+suspected to over-approximate the grammar's per-witness M; writing the
+model shows it is FACT-EQUIVALENT: `flow_m` steps chain across aliased
+cells, so fact sets equalize transitively in the grammar too — the
+solver never consumes the alias judgment itself, only the fact flow.
+Residual: cluster merges also unify cell lists and edges of the merged
+content classes; believed equivalent by the same chaining argument at
+each pointer level, not formally checked. `ClusterTrans` runtime stats
+(keys/cluster, transitive key-coalescing merges) monitor the coarsening
+empirically (libpng FI: 506/546 keys in one cluster, resolution still
+exactly matches saturation).
 
 F4. VX bridge provenance (bridged facts never cross a second bridge) is
 abstracted away: the model's `⊤` joins are unrestricted, i.e. at least as
@@ -135,6 +147,16 @@ implementation; no refinement proof.
 F7. Iteration cap `--cfl-flows-to-max-iters` can stop before the outer
 fixpoint; the implementation warns ([UNSOUND-RISK]) when it triggers.
 Model assumes full closure.
+
+F10. [ADDED 2026-07-14] The SolverModel closure fields (seed/step_a/
+step_f/step_fx/step_mal) assume the worklist algorithm reaches
+saturation — the delta/backlog machinery (jdirty refill on merge,
+joined-plane intersection, merge-abort requeue) is where historical
+solver bugs lived and is below the model. Practical discharge:
+`--cfl-verify-closure` runs one full non-delta scan post-fixpoint and
+asserts no rule fires (C0 backlogs drained, C1 a-prop, C2 f-prop,
+C3 wildcard projection, C4 fact x cell joins, C5 bridge crossings) —
+a per-run certificate of the model's assumption.
 
 F8. Target filters (`isCompatible`, `fieldFilterAccepts`) still unmodeled
 (same as compositional gap 6): they subtract from the sound answer set,

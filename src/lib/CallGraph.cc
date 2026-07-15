@@ -2193,6 +2193,12 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   size_t mergeCount = 0;
   std::vector<uint32_t> mergeHits(N, 0); // absorbed-class lineage per keeper
+  // Cluster-transitivity audit: grammar M is per-witness, but union-find
+  // closes clusters transitively (coarser-or-equal). keyCount tracks how
+  // many cluster keys a class anchors; a join that merges a cell already
+  // anchoring other keys coalesces key-clusters the grammar keeps apart.
+  std::vector<uint32_t> keyCount(N, 0);
+  size_t transKeyMerges = 0;
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
@@ -2202,6 +2208,8 @@ bool CallGraphPass::runFlowsToResolution() {
     ufp[b] = a;
     mergeCount++;
     mergeHits[a] += 1 + mergeHits[b];
+    keyCount[a] += keyCount[b];
+    keyCount[b] = 0;
     tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
@@ -2354,9 +2362,13 @@ bool CallGraphPass::runFlowsToResolution() {
     const uint64_t key = (uint64_t)o * NSHIFT + s;
     auto [it, ins] = clusterRep.emplace(key, find(cell));
     if (!ins) {
+      const uint32_t cellRep = find(cell);
+      if (cellRep != find(it->second) && keyCount[cellRep] > 0)
+        transKeyMerges++; // cell anchors other keys: key-clusters coalesce
       it->second = merge(it->second, cell);
       return;
     }
+    keyCount[find(cell)]++;
     if (NB == 0) return;
     // VX linking: bridge the (o, X) cluster with each exact cluster of o.
     if (s == SHIFT_X) {
@@ -2595,6 +2607,95 @@ bool CallGraphPass::runFlowsToResolution() {
            << "%), ORs " << nFOr << ", a-plane words " << orWords << "\n";
   }
 
+  // --cfl-verify-closure: certify the fixpoint. One full non-delta scan of
+  // every rule; any rule that would still fire is a violation. This checks
+  // the closure property the delta/backlog machinery must maintain — the
+  // Lean SolverModel's central assumption, and the layer where the
+  // historical solver bugs (joined-marking, merge cascades) lived.
+  if (CFLVerifyClosure) {
+    uint64_t viol = 0;
+    auto report = [&](const char *rule, uint32_t n, uint32_t s,
+                      uint32_t extra) {
+      if (viol++ < 20)
+        errs() << "CLOSURE " << rule << " violation: c" << n << " s" << s
+               << " (-> " << extra << ")\n";
+    };
+    FactSet uniS, tgtS;
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      // dedup cells once for the join check
+      if (!cellsOf[n].empty()) {
+        auto &cs = cellsOf[n];
+        for (auto &c : cs) c = find(c);
+        std::sort(cs.begin(), cs.end());
+        cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
+      }
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        // C0: all delta backlogs drained.
+        if (dirty[n][s].any()) report("C0-dirty", n, s, 0);
+        if (jdirty[n][s].any() && !cellsOf[n].empty())
+          report("C0-jdirty", n, s, 0);
+        if (dirtyBr[n][s].any() && !bridgesOf[n].empty())
+          report("C0-dirtyBr", n, s, 0);
+        if (R[n][s].none() && RB[n][s].none()) continue;
+        uniS.copyFrom(R[n][s]);
+        uniS.unionWith(RB[n][s]);
+        auto subsetViol = [&](const FactSet &a, const FactSet &b) {
+          bool bad = false;
+          a.forEach([&](uint32_t o) { if (!b.test(o)) bad = true; });
+          return bad;
+        };
+        // C1: a-edges emit native at same shift.
+        for (uint32_t t : outA[n]) {
+          uint32_t tt = find(t);
+          if (tt == n) continue;
+          if (subsetViol(uniS, R[tt][s])) report("C1-a", n, s, tt);
+        }
+        // C2: f-edges emit native at rotated shift (X absorbs).
+        for (auto [t, r] : outF[n]) {
+          uint32_t tt = find(t);
+          uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
+          if (tt == n && s2 == s) continue;
+          if (subsetViol(uniS, R[tt][s2])) report("C2-f", n, s, tt);
+        }
+        // C3: wildcard projection onto the X plane, kind-preserving.
+        if (NB > 0 && wflag[n] && s != SHIFT_X) {
+          if (subsetViol(R[n][s], R[n][SHIFT_X])) report("C3-wR", n, s, n);
+          tgtS.copyFrom(R[n][SHIFT_X]);
+          tgtS.unionWith(RB[n][SHIFT_X]);
+          if (subsetViol(RB[n][s], tgtS)) report("C3-wB", n, s, n);
+        }
+        // C5: native facts crossed every bridge (arriving as either kind).
+        if (!bridgesOf[n].empty() && R[n][s].any()) {
+          for (uint32_t br : bridgesOf[n]) {
+            uint32_t bb = find(br);
+            if (bb == n) continue;
+            tgtS.copyFrom(R[bb][s]);
+            tgtS.unionWith(RB[bb][s]);
+            if (subsetViol(R[n][s], tgtS)) report("C5-br", n, s, bb);
+          }
+        }
+        // C4: every fact joined every cell of its class: the (o, s)
+        // cluster exists and contains all the cells.
+        if (!cellsOf[n].empty()) {
+          uniS.forEach([&](uint32_t o) {
+            auto it = clusterRep.find((uint64_t)o * NSHIFT + s);
+            if (it == clusterRep.end()) { report("C4-key", n, s, o); return; }
+            uint32_t rep = find(it->second);
+            for (uint32_t c : cellsOf[n])
+              if (find(c) != rep) { report("C4-cell", n, s, o); return; }
+          });
+        }
+      }
+    }
+    if (viol) {
+      errs() << "CLOSURE: " << viol << " violations — fixpoint NOT closed\n";
+      assert(false && "flows-to fixpoint failed closure verification");
+    } else {
+      CG_LOG("Closure verified: all rules saturated (0 violations)\n");
+    }
+  }
+
   uint64_t totalR = 0, totalRB = 0;
   uint32_t liveClasses = 0;
   for (uint32_t n = 0; n < N; n++) {
@@ -2665,6 +2766,23 @@ bool CallGraphPass::runFlowsToResolution() {
       return f;
     });
     dumpTop("TopMerge", [&](uint32_t n) { return (uint64_t)mergeHits[n]; });
+    // Cluster-transitivity audit: union-find clusters are coarser-or-equal
+    // vs the grammar's per-witness M; multi-key clusters and transitive
+    // key-coalescing merges bound the over-approximation (Lean gap F3).
+    {
+      std::unordered_map<uint32_t, uint32_t> keysPer;
+      for (auto &[k, rep] : clusterRep) keysPer[find(rep)]++;
+      uint64_t multi = 0, maxK = 0;
+      for (auto &[cls, kc] : keysPer) {
+        if (kc > 1) multi++;
+        maxK = std::max<uint64_t>(maxK, kc);
+      }
+      errs() << "ClusterTrans: " << clusterRep.size() << " keys in "
+             << keysPer.size() << " clusters, multi-key clusters " << multi
+             << ", max keys/cluster " << maxK
+             << ", transitive key-coalescing merges " << transKeyMerges
+             << "\n";
+    }
   }
 
   if (traceRoot >= 0) {

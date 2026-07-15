@@ -179,6 +179,15 @@ cl::opt<unsigned> CFLFlowsToMaxIters(
            "unprocessed wirings is reported as an UNSOUND-RISK warning"),
   cl::init(10));
 
+cl::opt<bool> CFLVerifyClosure(
+  "cfl-verify-closure",
+  cl::desc("After the flows-to fixpoint, run one full non-delta scan of all "
+           "propagation/join/bridge rules and assert none still fires — a "
+           "per-run certificate of the closure property the delta/backlog "
+           "machinery is supposed to maintain (the Lean SolverModel "
+           "assumption)"),
+  cl::init(false));
+
 cl::opt<bool> CFLSolverProfile(
   "cfl-solver-profile",
   cl::desc("rdtsc phase accounting inside the flows-to pop loop (join / "

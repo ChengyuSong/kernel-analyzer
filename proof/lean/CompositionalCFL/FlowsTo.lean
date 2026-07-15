@@ -10,7 +10,7 @@ declarative shift-indexed field grammar, replacing pairwise V saturation:
   commutative monoid `S` (byte offsets; the production `Z_P` residue bucketing
   is a monoid quotient of it) extended with an absorbing unknown `⊤`
   (`Option S` with `none = ⊤`), produced by `fx` wildcard edges.
-- Declarative judgment `FDeriv`:
+- Declarative judgment `FDeriv`, ROOTED at `origin` nodes:
   `flow z c x` — a value originating at `z` reaches `x` with net shift `c`
   (steps: `a` shift-preserving, `f r` adds `r`, `fx` absorbs to `⊤`, and
   memory hops through `mal`);
@@ -19,11 +19,15 @@ declarative shift-indexed field grammar, replacing pairwise V saturation:
 - Solver abstraction `SolverModel`: fact relation `SF` rooted at MINTED nodes
   only, closed under the propagation steps and cluster joins (`SAlias`).
 
-Main theorem `solver_complete`: if minting COVERS the graph (every node is
-reached by some minted root), the solver derives every grammar-derivable
-fact and alias. The July 2026 minting bug (presolve merges left alloca
-classes unminted, silently erasing object identity) is exactly a violation
-of the `coverage` hypothesis — `answers_complete` fails without it.
+Main theorem `solver_complete`: if minting covers ORIGINS (`origins_minted`),
+the solver derives every grammar-derivable fact and alias. The July 2026
+minting bug (presolve merges left alloca classes unminted, silently erasing
+object identity) is exactly a violation of `origins_minted`. Rooting the
+grammar at origins (instead of `flow_refl` at every node) is both the honest
+runtime semantics — unrooted witnesses are undef values — and what makes the
+minting obligation dischargeable: pairwise saturation solvers admit unrooted
+valley apexes (φ-cycles, entry-less store/load loops) and thus legitimately
+over-approximate flows-to on such patterns.
 -/
 
 namespace FlowsToCFL
@@ -101,45 +105,64 @@ inductive FJudg (N S : Type) where
   | flow (z : N) (c : Option S) (x : N)
   | mal (x y : N)
 
-/-- Declarative shift-indexed flows-to derivations. -/
-inductive FDeriv (M : ShiftMonoid) {N : Type} (G : FGraph N M.S) :
-    FJudg N M.S → Prop where
-  | flow_refl (z : N) :
-      FDeriv M G (.flow z (some M.zero) z)
+/-- Declarative shift-indexed flows-to derivations, ROOTED at `origin`
+nodes (allocas / globals / functions / heap sites). -/
+inductive FDeriv (M : ShiftMonoid) {N : Type} (origin : N → Prop)
+    (G : FGraph N M.S) : FJudg N M.S → Prop where
+  | flow_refl (z : N) (hz : origin z) :
+      FDeriv M origin G (.flow z (some M.zero) z)
   | flow_a {z : N} {c : Shift M} {x y : N} :
-      FDeriv M G (.flow z c x) →
+      FDeriv M origin G (.flow z c x) →
       ({ src := x, lbl := .a, dst := y } : FEdge N M.S) ∈ G →
-      FDeriv M G (.flow z c y)
+      FDeriv M origin G (.flow z c y)
   | flow_f {z : N} {c : Shift M} {x y : N} {r : M.S} :
-      FDeriv M G (.flow z c x) →
+      FDeriv M origin G (.flow z c x) →
       ({ src := x, lbl := .f r, dst := y } : FEdge N M.S) ∈ G →
-      FDeriv M G (.flow z (shiftComp M c (some r)) y)
+      FDeriv M origin G (.flow z (shiftComp M c (some r)) y)
   | flow_fx {z : N} {c : Shift M} {x y : N} :
-      FDeriv M G (.flow z c x) →
+      FDeriv M origin G (.flow z c x) →
       ({ src := x, lbl := .fx, dst := y } : FEdge N M.S) ∈ G →
-      FDeriv M G (.flow z none y)
+      FDeriv M origin G (.flow z none y)
   | flow_m {z : N} {c : Shift M} {x y : N} :
-      FDeriv M G (.flow z c x) →
-      FDeriv M G (.mal x y) →
-      FDeriv M G (.flow z c y)
+      FDeriv M origin G (.flow z c x) →
+      FDeriv M origin G (.mal x y) →
+      FDeriv M origin G (.flow z c y)
   | mal_join {p q cx cy : N} {z : N} {c : Shift M} :
       ({ src := p, lbl := .d, dst := cx } : FEdge N M.S) ∈ G →
       ({ src := q, lbl := .d, dst := cy } : FEdge N M.S) ∈ G →
-      FDeriv M G (.flow z c p) →
-      FDeriv M G (.flow z c q) →
-      FDeriv M G (.mal cx cy)
+      FDeriv M origin G (.flow z c p) →
+      FDeriv M origin G (.flow z c q) →
+      FDeriv M origin G (.mal cx cy)
   | mal_joinXL {p q cx cy : N} {z : N} {c : Shift M} :
       ({ src := p, lbl := .d, dst := cx } : FEdge N M.S) ∈ G →
       ({ src := q, lbl := .d, dst := cy } : FEdge N M.S) ∈ G →
-      FDeriv M G (.flow z none p) →
-      FDeriv M G (.flow z c q) →
-      FDeriv M G (.mal cx cy)
+      FDeriv M origin G (.flow z none p) →
+      FDeriv M origin G (.flow z c q) →
+      FDeriv M origin G (.mal cx cy)
   | mal_joinXR {p q cx cy : N} {z : N} {c : Shift M} :
       ({ src := p, lbl := .d, dst := cx } : FEdge N M.S) ∈ G →
       ({ src := q, lbl := .d, dst := cy } : FEdge N M.S) ∈ G →
-      FDeriv M G (.flow z c p) →
-      FDeriv M G (.flow z none q) →
-      FDeriv M G (.mal cx cy)
+      FDeriv M origin G (.flow z c p) →
+      FDeriv M origin G (.flow z none q) →
+      FDeriv M origin G (.mal cx cy)
+
+/-- Every flow judgment is rooted: its source is an origin. -/
+theorem fderiv_flow_origin
+    (M : ShiftMonoid) {N : Type} {origin : N → Prop} {G : FGraph N M.S} :
+    ∀ {j : FJudg N M.S}, FDeriv M origin G j →
+      (match j with
+       | .flow z _ _ => origin z
+       | .mal _ _ => True) := by
+  intro j h
+  induction h with
+  | flow_refl z hz => exact hz
+  | flow_a _ _ ih => exact ih
+  | flow_f _ _ ih => exact ih
+  | flow_fx _ _ ih => exact ih
+  | flow_m _ _ ih₁ _ => exact ih₁
+  | mal_join _ _ _ _ _ _ => trivial
+  | mal_joinXL _ _ _ _ _ _ => trivial
+  | mal_joinXR _ _ _ _ _ _ => trivial
 
 /-- Edge-wise graph inclusion. -/
 abbrev FGraphLe {N S : Type} (G₁ G₂ : FGraph N S) : Prop := ∀ e, e ∈ G₁ → e ∈ G₂
@@ -148,12 +171,12 @@ abbrev FGraphLe {N S : Type} (G₁ G₂ : FGraph N S) : Prop := ∀ e, e ∈ G�
 resolve icalls, wire callee flows, re-solve — only ADDS edges, so earlier
 derivations survive). -/
 theorem fderiv_mono
-    (M : ShiftMonoid) {N : Type} {G₁ G₂ : FGraph N M.S}
+    (M : ShiftMonoid) {N : Type} {origin : N → Prop} {G₁ G₂ : FGraph N M.S}
     (hSub : FGraphLe G₁ G₂) :
-    ∀ {j : FJudg N M.S}, FDeriv M G₁ j → FDeriv M G₂ j := by
+    ∀ {j : FJudg N M.S}, FDeriv M origin G₁ j → FDeriv M origin G₂ j := by
   intro j h
   induction h with
-  | flow_refl z => exact FDeriv.flow_refl z
+  | flow_refl z hz => exact FDeriv.flow_refl z hz
   | flow_a _ hE ih => exact FDeriv.flow_a ih (hSub _ hE)
   | flow_f _ hE ih => exact FDeriv.flow_f ih (hSub _ hE)
   | flow_fx _ hE ih => exact FDeriv.flow_fx ih (hSub _ hE)
@@ -179,19 +202,23 @@ def mapFJudg {N1 N2 S : Type} (f : N1 → N2) : FJudg N1 S → FJudg N2 S
   | .flow z c x => .flow (f z) c (f x)
   | .mal x y => .mal (f x) (f y)
 
-/-- Simulation preserves derivability. This is the soundness core for every
-class-merging step the solver performs: presolve copy/field merges, the
-in-solve dynamic a-SCC collapse, and cell-cluster union-find merges are all
-node quotients, i.e. graph homomorphisms. -/
+/-- Simulation preserves derivability, provided origins map to origins.
+This is the soundness core for every class-merging step the solver
+performs: presolve copy/field merges, the in-solve dynamic a-SCC collapse,
+and cell-cluster union-find merges are all node quotients, i.e. graph
+homomorphisms. -/
 theorem fderiv_map
     (M : ShiftMonoid) {N1 N2 : Type}
+    {origin₁ : N1 → Prop} {origin₂ : N2 → Prop}
     {G₁ : FGraph N1 M.S} {G₂ : FGraph N2 M.S}
     (f : N1 → N2)
-    (hHom : FGraphHom f G₁ G₂) :
-    ∀ {j : FJudg N1 M.S}, FDeriv M G₁ j → FDeriv M G₂ (mapFJudg f j) := by
+    (hHom : FGraphHom f G₁ G₂)
+    (hOrigin : ∀ z, origin₁ z → origin₂ (f z)) :
+    ∀ {j : FJudg N1 M.S}, FDeriv M origin₁ G₁ j →
+      FDeriv M origin₂ G₂ (mapFJudg f j) := by
   intro j h
   induction h with
-  | flow_refl z => exact FDeriv.flow_refl (f z)
+  | flow_refl z hz => exact FDeriv.flow_refl (f z) (hOrigin z hz)
   | flow_a _ hE ih => exact FDeriv.flow_a ih (hHom _ hE)
   | flow_f _ hE ih => exact FDeriv.flow_f ih (hHom _ hE)
   | flow_fx _ hE ih => exact FDeriv.flow_fx ih (hHom _ hE)
@@ -212,25 +239,32 @@ theorem fquotientGraph_hom {N Q S : Type} (G : FGraph N S) (q : N → Q) :
   intro e hEdge
   exact ⟨e, hEdge, rfl⟩
 
+/-- Image of the origin predicate under a quotient map. -/
+def imageOrigin {N Q : Type} (origin : N → Prop) (q : N → Q) : Q → Prop :=
+  fun oq => ∃ z, origin z ∧ q z = oq
+
 /-- Quotienting (any class merge) preserves derivability. Precision-neutrality
 of the a-SCC collapse (the converse direction, requiring mutual
 shift-preserving reachability) is a separate, pending obligation — see
 GAPS.md. -/
 theorem fderiv_quotient
-    (M : ShiftMonoid) {N Q : Type}
+    (M : ShiftMonoid) {N Q : Type} {origin : N → Prop}
     (G : FGraph N M.S) (q : N → Q)
     {j : FJudg N M.S}
-    (h : FDeriv M G j) :
-    FDeriv M (fquotientGraph G q) (mapFJudg q j) :=
-  fderiv_map M q (fquotientGraph_hom G q) h
+    (h : FDeriv M origin G j) :
+    FDeriv M (imageOrigin origin q) (fquotientGraph G q) (mapFJudg q j) :=
+  fderiv_map M q (fquotientGraph_hom G q)
+    (fun z hz => ⟨z, hz, rfl⟩) h
 
 /-!
 ## Solver abstraction: minted-root fact propagation
 
 The implementation stores facts `(origin, shift)` only for MINTED origins and
 joins cells on exact fact equality (or `⊤`). `SolverModel` captures the
-closure properties of the fact relation `SF`; `coverage` is the minting
-completeness invariant.
+closure properties of the fact relation `SF` (certified per-run by
+`--cfl-verify-closure`); `origins_minted` is the minting invariant the
+implementation's criterion (origin-bearing classes + no-in-edge classes +
+functions) must discharge.
 -/
 
 /-- Cluster-join alias induced by the solver's fact relation: the two cells'
@@ -249,8 +283,9 @@ def SAlias (M : ShiftMonoid) {N : Type} (G : FGraph N M.S)
        ((∃ c, SF m c p) ∧ SF m none q))
 
 /-- Abstract solver: minted roots, fact relation, closure under the
-propagation rules, and the minting-coverage invariant. -/
-structure SolverModel (M : ShiftMonoid) {N : Type} (G : FGraph N M.S) where
+propagation rules, and the minting invariant. -/
+structure SolverModel (M : ShiftMonoid) {N : Type} (origin : N → Prop)
+    (G : FGraph N M.S) where
   minted : N → Prop
   SF : N → Shift M → N → Prop
   seed : ∀ m, minted m → SF m (some M.zero) m
@@ -270,19 +305,20 @@ structure SolverModel (M : ShiftMonoid) {N : Type} (G : FGraph N M.S) where
     SF m c x →
     SAlias M G minted SF x y →
     SF m c y
-  /-- Minting completeness: every node is reached by some minted root.
+  /-- Minting completeness FOR ORIGINS — dischargeable: the implementation
+  mints every origin-bearing class (plus no-in-edge classes and functions).
   The July 2026 minting bug (`!hasIn`-only minting after presolve merges)
-  violated exactly this — an alloca class merged with in-edged nodes was
+  violated exactly this: an alloca class merged with in-edged nodes was
   never minted, no root reached it, and its object identity vanished. -/
-  coverage : ∀ z : N, ∃ m c, minted m ∧ SF m c z
+  origins_minted : ∀ z, origin z → minted z
 
-/-- Completeness of the solver against the declarative grammar, given
-coverage: every grammar-derivable flow re-rooted at any minted fact is a
+/-- Completeness of the solver against the origin-rooted declarative
+grammar: every grammar-derivable flow re-rooted at any minted fact is a
 solver fact, and every grammar-derivable alias is a solver cluster join. -/
 theorem solver_complete
-    (M : ShiftMonoid) {N : Type} {G : FGraph N M.S}
-    (SM : SolverModel M G) :
-    ∀ {j : FJudg N M.S}, FDeriv M G j →
+    (M : ShiftMonoid) {N : Type} {origin : N → Prop} {G : FGraph N M.S}
+    (SM : SolverModel M origin G) :
+    ∀ {j : FJudg N M.S}, FDeriv M origin G j →
       (match j with
        | .flow z c x =>
            ∀ (m : N) (c0 : Shift M),
@@ -290,7 +326,7 @@ theorem solver_complete
        | .mal x y => SAlias M G SM.minted SM.SF x y) := by
   intro j h
   induction h with
-  | flow_refl z =>
+  | flow_refl z hz =>
       intro m c0 _ hSF
       simpa [shiftComp_zero_right] using hSF
   | flow_a _ hE ih =>
@@ -308,45 +344,47 @@ theorem solver_complete
       intro m c0 hm hSF
       exact SM.step_mal (ih₁ m c0 hm hSF) ih₂
   | mal_join hEp hEq hp hq ihp ihq =>
-      -- Re-root the two matching-shift branches at a minted witness
-      -- covering the grammar's origin z; shifts stay equal.
+      -- Re-root both matching-shift branches at the (minted) grammar
+      -- origin itself; shifts are preserved exactly.
       rename_i p q cx cy z c
-      obtain ⟨m, c0, hm, hSF⟩ := SM.coverage z
-      refine ⟨p, q, hEp, hEq, m, hm, Or.inl ⟨shiftComp M c0 c, ?_, ?_⟩⟩
-      · exact ihp m c0 hm hSF
-      · exact ihq m c0 hm hSF
+      have hz : origin z := fderiv_flow_origin M hp
+      have hm : SM.minted z := SM.origins_minted z hz
+      have hp' := ihp z (some M.zero) hm (SM.seed z hm)
+      have hq' := ihq z (some M.zero) hm (SM.seed z hm)
+      rw [shiftComp_zero_left] at hp' hq'
+      exact ⟨p, q, hEp, hEq, z, hm, Or.inl ⟨c, hp', hq'⟩⟩
   | mal_joinXL hEp hEq hp hq ihp ihq =>
       rename_i p q cx cy z c
-      obtain ⟨m, c0, hm, hSF⟩ := SM.coverage z
-      have hp' := ihp m c0 hm hSF
-      have hq' := ihq m c0 hm hSF
-      rw [shiftComp_none_right] at hp'
-      exact ⟨p, q, hEp, hEq, m, hm,
-             Or.inr (Or.inl ⟨hp', shiftComp M c0 c, hq'⟩)⟩
+      have hz : origin z := fderiv_flow_origin M hp
+      have hm : SM.minted z := SM.origins_minted z hz
+      have hp' := ihp z (some M.zero) hm (SM.seed z hm)
+      have hq' := ihq z (some M.zero) hm (SM.seed z hm)
+      rw [shiftComp_zero_left] at hp' hq'
+      exact ⟨p, q, hEp, hEq, z, hm, Or.inr (Or.inl ⟨hp', c, hq'⟩)⟩
   | mal_joinXR hEp hEq hp hq ihp ihq =>
       rename_i p q cx cy z c
-      obtain ⟨m, c0, hm, hSF⟩ := SM.coverage z
-      have hp' := ihp m c0 hm hSF
-      have hq' := ihq m c0 hm hSF
-      rw [shiftComp_none_right] at hq'
-      exact ⟨p, q, hEp, hEq, m, hm,
-             Or.inr (Or.inr ⟨⟨shiftComp M c0 c, hp'⟩, hq'⟩)⟩
+      have hz : origin z := fderiv_flow_origin M hp
+      have hm : SM.minted z := SM.origins_minted z hz
+      have hp' := ihp z (some M.zero) hm (SM.seed z hm)
+      have hq' := ihq z (some M.zero) hm (SM.seed z hm)
+      rw [shiftComp_zero_left] at hp' hq'
+      exact ⟨p, q, hEp, hEq, z, hm, Or.inr (Or.inr ⟨⟨c, hp'⟩, hq'⟩)⟩
 
-/-- Indirect-call answer completeness: a function whose value flows to the
-fptr at shift zero (or unknown) is found by the solver, provided function
-nodes are minted (they are, unconditionally, in the implementation) and
-coverage holds. Resolution accepts exactly these two shifts. -/
+/-- Indirect-call answer completeness: a function (an origin) whose value
+flows to the fptr at shift zero (or unknown) is found by the solver.
+Resolution accepts exactly these two shifts. -/
 theorem answers_complete
-    (M : ShiftMonoid) {N : Type} {G : FGraph N M.S}
-    (SM : SolverModel M G)
+    (M : ShiftMonoid) {N : Type} {origin : N → Prop} {G : FGraph N M.S}
+    (SM : SolverModel M origin G)
     {fnode fptr : N}
-    (hFuncMinted : SM.minted fnode)
     {c : Shift M}
     (hAccept : c = some M.zero ∨ c = none)
-    (hReach : FDeriv M G (.flow fnode c fptr)) :
+    (hReach : FDeriv M origin G (.flow fnode c fptr)) :
     SM.SF fnode c fptr := by
-  have h := solver_complete M SM hReach fnode (some M.zero) hFuncMinted
-              (SM.seed fnode hFuncMinted)
+  have hz : origin fnode := fderiv_flow_origin M hReach
+  have hm : SM.minted fnode := SM.origins_minted fnode hz
+  have h := solver_complete M SM hReach fnode (some M.zero) hm
+              (SM.seed fnode hm)
   cases hAccept with
   | inl h0 => subst h0; simpa [shiftComp_zero_left] using h
   | inr hTop => subst hTop; simpa [shiftComp_none_right, shiftComp_zero_left] using h

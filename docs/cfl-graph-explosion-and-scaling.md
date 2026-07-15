@@ -875,3 +875,31 @@ representation (or bundle-aware rotation), still queued as the bundling
 task. Kernel-scale outlook: FI at 34 s for a 24.5k-class module makes
 the whole-kernel FI run plausible without further work; fs13 wants one
 more representation round.
+
+## 2026-07-14: whole-kernel FI attempt #1 — stopped at 25h, diagnosis complete
+
+First whole-kernel flows-to run (2,618 modules, FactSet planes, one-pass
+binary predating the fixpoint/TopClass/closure-checker). Stopped
+deliberately at 25h; log preserved at ~/kernel-fi-attempt1-partial.log.
+State at stop: 218M pops, 1.40B facts, 212k clusters, 115k merges,
+19.6GB RSS — memory comfortable, convergence tail unbounded in practice
+(facts +40M/h, merges still active at hour 25).
+
+What it established:
+- FactSet planes hold kernel scale in memory (the dense-plane OOM is
+  gone; 333k roots, 1.4B facts, under 20GB).
+- The wall is merge-churn convergence, not memory and not per-fact cost:
+  115k merges (harfbuzz needs 6.3k) with cluster coalescing still active
+  at hour 25 — the intrusive-container / type-erased-hub / allocator-
+  wrapper webs as predicted.
+
+Plan for attempt #2 (in order):
+1. Merge-churn fixes first: extend ContainerFuncs/AllocFuncs coverage
+   over kernel registry APIs and alloc wrappers (kmalloc_wrapper yaml),
+   and cut the merge -> full-backlog re-offer cost (delta-precise
+   re-offers or interned planes).
+2. Iterate on a SUBSET bclist (~200-400 modules, e.g. fs/ + kernel/ +
+   mm/) to get TopClass culprit names, ClusterTrans, and rank census in
+   ~1h loops instead of days.
+3. Full 2,618-module rerun with --cfl-verify-closure + TopClass + the
+   outer fixpoint, once subset iteration converges on the churn fixes.

@@ -28,6 +28,7 @@ extern cl::opt<std::string> CFLTraceValue;
 extern cl::opt<bool> CFLCoTravelStats;
 extern cl::opt<bool> CFLSolverProfile;
 extern cl::opt<bool> CFLVerifyClosure;
+extern cl::opt<bool> CFLPrintfVarargSink;
 extern cl::opt<unsigned> CFLFlowsToMaxIters;
 extern cl::opt<unsigned> CFLFieldBuckets;
 

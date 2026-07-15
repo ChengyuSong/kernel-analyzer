@@ -386,6 +386,83 @@ static bool isIgnorableAllocaIntrinsic(const CallBase *CB) {
 } // namespace
 
 // Helper to check if we should skip creating edges for a value
+// --- printf-family vararg sink classification -------------------------
+// A variadic callsite whose (constant) format string proves the varargs
+// are only read — never captured, dispatched, or forwarded — does not
+// need its tail wired into the callee's vararg summary node. On kernel
+// code the printf family is the dominant vararg population and its
+// summary nodes glue unrelated objects together (kernel/mm subset: the
+// printf vararg web accounted for 91% of cell-cluster merges and the
+// widest fact classes). Relies on the __printf convention: the format is
+// the LAST FIXED parameter. Conservative fallbacks: non-constant format,
+// unknown conversion, %n (writes through a pointer), and %pV (captures a
+// va_list inside struct va_format) all keep full wiring.
+static uint64_t printfSinkCallsites = 0, printfSinkArgsSkipped = 0;
+static uint64_t printfNonConstFmt = 0, printfNonBenignFmt = 0;
+
+static bool getConstantFmtString(const Value *V, StringRef &out) {
+  V = V->stripPointerCasts();
+  if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+    if (!GEP->hasAllZeroIndices())
+      return false;
+    V = GEP->getPointerOperand()->stripPointerCasts();
+  }
+  const auto *GV = dyn_cast<GlobalVariable>(V);
+  if (!GV || !GV->hasInitializer())
+    return false;
+  const auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer());
+  if (!CDA || !CDA->isCString())
+    return false;
+  out = CDA->getAsCString();
+  return true;
+}
+
+static bool formatVarargsBenign(StringRef fmt) {
+  for (size_t i = 0; i < fmt.size(); i++) {
+    if (fmt[i] != '%')
+      continue;
+    if (++i >= fmt.size())
+      return false; // trailing '%': malformed
+    if (fmt[i] == '%')
+      continue;
+    while (i < fmt.size() &&
+           (isDigit(fmt[i]) || StringRef("-+ #0'.*").contains(fmt[i])))
+      i++;
+    while (i < fmt.size() && StringRef("hlLzjtq").contains(fmt[i]))
+      i++;
+    if (i >= fmt.size())
+      return false;
+    const char c = fmt[i];
+    if (c == 'p') {
+      // %p extensions are read-only symbol/address renderers EXCEPT %pV.
+      if (i + 1 < fmt.size() && fmt[i + 1] == 'V')
+        return false;
+      continue;
+    }
+    if (StringRef("diouxXcCsSeEfgGaA").contains(c))
+      continue;
+    return false; // %n or unknown conversion: keep full wiring
+  }
+  return true;
+}
+
+static bool printfVarargSinkCallsite(const CallBase *CS, const Function *CF,
+                                     bool countStats = false) {
+  const unsigned numFormals = CF->arg_size();
+  if (numFormals == 0 || CS->arg_size() <= numFormals)
+    return false; // no variadic tail to skip
+  StringRef fmt;
+  if (!getConstantFmtString(CS->getArgOperand(numFormals - 1), fmt)) {
+    if (countStats) printfNonConstFmt++;
+    return false;
+  }
+  if (!formatVarargsBenign(fmt)) {
+    if (countStats) printfNonBenignFmt++;
+    return false;
+  }
+  return true;
+}
+
 static bool shouldSkipValue(const Value *V) {
   if (!V)
     return true;
@@ -1093,24 +1170,31 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     addAssignmentEdge(argNode, formalNode);
   }
   if (CF->isVarArg()) {
-    NodeIndex varargNode = NF.getVarargNodeFor(CF);
-    if (varargNode == AndersNodeFactory::InvalidIndex)
-      varargNode = NF.createVarargNode(CF);
-    varargNode = getCanonicalNode(varargNode);
-    for (unsigned i = numFormals; i < numArgs; i++) {
-      Value *arg = CS->getArgOperand(i);
-      if (!containsPointerType(arg->getType()))
-        continue; // skip non-pointer args
-      if (shouldSkipValue(arg)) {
-        CG_DEBUG("Skipping compiler-introduced variadic argument: " << *arg << "\n");
-        continue;
+    if (CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF, true)) {
+      // Benign printf-style callsite: varargs are read-only renderer
+      // inputs; skip the vararg-summary wiring entirely.
+      printfSinkCallsites++;
+      printfSinkArgsSkipped += numArgs - numFormals;
+    } else {
+      NodeIndex varargNode = NF.getVarargNodeFor(CF);
+      if (varargNode == AndersNodeFactory::InvalidIndex)
+        varargNode = NF.createVarargNode(CF);
+      varargNode = getCanonicalNode(varargNode);
+      for (unsigned i = numFormals; i < numArgs; i++) {
+        Value *arg = CS->getArgOperand(i);
+        if (!containsPointerType(arg->getType()))
+          continue; // skip non-pointer args
+        if (shouldSkipValue(arg)) {
+          CG_DEBUG("Skipping compiler-introduced variadic argument: " << *arg << "\n");
+          continue;
+        }
+        NodeIndex argNode = getRepNodeForValue(arg);
+        if (argNode == AndersNodeFactory::InvalidIndex) {
+          argNode = NF.createValueNode(arg);
+          argNode = getCanonicalNode(argNode);
+        }
+        addAssignmentEdge(argNode, varargNode);
       }
-      NodeIndex argNode = getRepNodeForValue(arg);
-      if (argNode == AndersNodeFactory::InvalidIndex) {
-        argNode = NF.createValueNode(arg);
-        argNode = getCanonicalNode(argNode);
-      }
-      addAssignmentEdge(argNode, varargNode);
     }
   }
 
@@ -1217,7 +1301,8 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     EB.removeAssignmentEdges(getCanonicalNode(argNode), getCanonicalNode(formalNode));
   }
   // Remove variadic-tail edges
-  if (CF->isVarArg()) {
+  if (CF->isVarArg() &&
+      !(CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF))) {
     NodeIndex varargNode = getCanonicalNode(NF.getVarargNodeFor(CF));
     assert(varargNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
     for (unsigned i = numFormals; i < numArgs; i++) {
@@ -4650,6 +4735,10 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Callee by type: total " << total << ", match by CFL " << match << "\n");
+    CG_LOG("PrintfSink: " << printfSinkCallsites << " benign vararg callsites ("
+           << printfSinkArgsSkipped << " tail args unwired), "
+           << printfNonConstFmt << " non-constant fmt kept, "
+           << printfNonBenignFmt << " non-benign fmt kept\n");
     // Deterministic per-icall resolution dump (one line per pair; sort the
     // lines to diff runs — FuncSet iteration order is not stable).
     if (VerboseLevel >= 2) {
@@ -5594,7 +5683,8 @@ void CallGraphPass::globalDedupScanCallEdges(
       if (formalNode != AndersNodeFactory::InvalidIndex)
         globalUnion(argNode, formalNode);
     }
-    if (CF->isVarArg()) {
+    if (CF->isVarArg() &&
+        !(CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF))) {
       NodeIndex varargNode = NF.getVarargNodeFor(CF);
       if (varargNode == AndersNodeFactory::InvalidIndex)
         continue;

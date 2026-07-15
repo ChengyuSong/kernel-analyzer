@@ -179,6 +179,15 @@ cl::opt<unsigned> CFLFlowsToMaxIters(
            "unprocessed wirings is reported as an UNSOUND-RISK warning"),
   cl::init(10));
 
+cl::opt<bool> CFLPrintfVarargSink(
+  "cfl-printf-vararg-sink",
+  cl::desc("Skip vararg-summary wiring at variadic callsites whose constant "
+           "format string (last fixed param, __printf convention) proves the "
+           "varargs are read-only renderer inputs: no capture, no dispatch, "
+           "no %pV forwarding, no %n. Non-constant or non-benign formats "
+           "keep full wiring"),
+  cl::init(true));
+
 cl::opt<bool> CFLVerifyClosure(
   "cfl-verify-closure",
   cl::desc("After the flows-to fixpoint, run one full non-delta scan of all "

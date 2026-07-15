@@ -3295,16 +3295,6 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
   CG_DEBUG("InlineAsm: processing \"" << IA->getAsmString()
            << "\" with " << Constraints.size() << " constraints\n");
 
-  // UNMODELED: calls executed inside the asm body. Only operand data flow
-  // is wired below — an asm string containing a call mnemonic (kernel
-  // static_call "call __SCT__*", paravirt "call *%..." under
-  // CONFIG_PARAVIRT) produces no callee edge. Census-count loudly until
-  // the static_call pattern handler (icall on __SCK__<name>.func) lands.
-  if (IA->getAsmString().find("call") != std::string::npos) {
-    WARNING("InlineAsm with embedded call left unmodeled: \""
-            << IA->getAsmString() << "\" in "
-            << CS.getFunction()->getName() << "\n");
-  }
 
   // Build constraint-to-arg and constraint-to-ret mappings.
   // hasArg() is true for inputs and indirect outputs (they consume a CallBase arg).
@@ -3478,7 +3468,13 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
         handleCall(&CS, it->second);
         found = true;
       } else {
-        CG_DEBUG("InlineAsm: call target \"" << funcName << "\" not found in Funcs\n");
+        // Census the unresolved residue loudly: static_call trampolines
+        // (__SCT__* — needs the __SCK__<name>.func icall model, task
+        // pending) and targets defined only in .S assembly (no IR body,
+        // e.g. __get_user_N) land here.
+        WARNING("InlineAsm: embedded call target \"" << funcName
+                << "\" has no IR definition (unmodeled) in "
+                << CS.getFunction()->getName() << "\n");
       }
       // If the name ended with a ${...} substitution (stripped above),
       // try common numeric suffixes for size-parameterized kernel helpers.

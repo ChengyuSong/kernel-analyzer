@@ -903,3 +903,25 @@ Plan for attempt #2 (in order):
    ~1h loops instead of days.
 3. Full 2,618-module rerun with --cfl-verify-closure + TopClass + the
    outer fixpoint, once subset iteration converges on the churn fixes.
+
+## 2026-07-15: delta-precise merge re-offer — NEGATIVE result (reverted)
+
+Implemented and validated (closure-certified, identical resolution on
+all inputs): cell-rep unification queue + joined-mark union + cell-
+parity-only re-offers. Volume metrics collapsed exactly as designed on
+the kernel subset — re-offered facts 121M -> 5.9M (20x), sweep offers
+35M -> 6.9M, join merges 18.3k -> 6.6k. Wall time nevertheless REGRESSED
+26% (kernel subset iter0 299s -> 377s; harfbuzz FI 42s -> 54s).
+
+Profiler post-mortem: the join phase those volumes live in was only 14%
+of cycles; a-prop (76%) GREW 29% because eager cell unification forms
+the mega-cell class early, and every subsequent fact delta fans out
+over its concatenated load-edge list, versus the old lazy order where
+cells absorb facts separately and merge later with bulk one-time
+pushes. Lesson recorded: optimize where the cycles are, not where the
+bookkeeping volume is — the cycle profile said a-prop throughout.
+
+Consequence: the generic time lever for both harfbuzz fs13 and kernel
+is the a-prop representation (interned/shared planes, delta-narrowed
+ORs — task #10), not join bookkeeping. Merge machinery stays as
+committed (4788d33 state).

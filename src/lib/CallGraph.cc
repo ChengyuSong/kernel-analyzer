@@ -2200,6 +2200,63 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::vector<uint32_t>> bridgesOf(N); // VX partners (class ids)
   std::vector<char> wflag(N, 0);
   for (uint32_t w : wildcardNodes) wflag[w] = 1;
+  // Wave scheduling: pop classes in topological order of the initial
+  // propagation graph's condensation, so deltas flow downhill and each
+  // plane is touched once per wave with its full accumulated delta,
+  // instead of once per scattered arrival (a-prop is cold-miss latency
+  // bound; access ORDER is the cheapest locality lever). Ranks are a
+  // static heuristic — any pop order converges to the same fixpoint.
+  std::vector<uint32_t> topoRank(N, 0);
+  {
+    std::vector<uint32_t> low(N), dfn(N, 0), tstk;
+    std::vector<std::pair<uint32_t, size_t>> cstk;
+    std::vector<bool> onS(N, false);
+    uint32_t timer = 1, nComp = 0;
+    auto succAt = [&](uint32_t u, size_t i) -> uint32_t {
+      if (i < outA[u].size()) return outA[u][i];
+      return outF[u][i - outA[u].size()].first;
+    };
+    for (uint32_t st = 0; st < N; st++) {
+      if (dfn[st]) continue;
+      cstk.emplace_back(st, 0);
+      dfn[st] = low[st] = timer++;
+      tstk.push_back(st);
+      onS[st] = true;
+      while (!cstk.empty()) {
+        auto &[u, ei] = cstk.back();
+        if (ei < outA[u].size() + outF[u].size()) {
+          uint32_t v = succAt(u, ei++);
+          if (!dfn[v]) {
+            dfn[v] = low[v] = timer++;
+            tstk.push_back(v);
+            onS[v] = true;
+            cstk.emplace_back(v, 0);
+          } else if (onS[v]) {
+            low[u] = std::min(low[u], dfn[v]);
+          }
+        } else {
+          if (low[u] == dfn[u]) {
+            while (true) {
+              uint32_t w = tstk.back();
+              tstk.pop_back();
+              onS[w] = false;
+              topoRank[w] = nComp;
+              if (w == u) break;
+            }
+            nComp++;
+          }
+          uint32_t uu = u;
+          cstk.pop_back();
+          if (!cstk.empty())
+            low[cstk.back().first] =
+                std::min(low[cstk.back().first], low[uu]);
+        }
+      }
+    }
+    // Tarjan emits SCCs in reverse topological order: invert so sources
+    // carry the smallest ranks.
+    for (uint32_t i = 0; i < N; i++) topoRank[i] = nComp - 1 - topoRank[i];
+  }
   std::vector<uint32_t> worklist;
   std::vector<bool> inWL(N, false);
   auto push = [&](uint32_t n) {
@@ -2566,9 +2623,23 @@ bool CallGraphPass::runFlowsToResolution() {
   uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
   uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
   auto rd = [&]() -> uint64_t { return prof ? __builtin_ia32_rdtsc() : 0; };
-  while (!worklist.empty()) {
-    uint32_t n = worklist.back();
-    worklist.pop_back();
+  // Drain in rank-sorted waves: swap out the pending list, sort by
+  // topological rank, process; pushes during a wave land in the next.
+  std::vector<uint32_t> waveBuf;
+  size_t waveIdx = 0, waveCount = 0;
+  while (true) {
+    if (waveIdx >= waveBuf.size()) {
+      if (worklist.empty()) break;
+      waveBuf.clear();
+      waveIdx = 0;
+      waveBuf.swap(worklist);
+      std::sort(waveBuf.begin(), waveBuf.end(),
+                [&](uint32_t x, uint32_t y) {
+                  return topoRank[x] < topoRank[y];
+                });
+      waveCount++;
+    }
+    uint32_t n = waveBuf[waveIdx++];
     inWL[n] = false;
     if (find(n) != n) continue; // merged away; keeper carries the state
     iterations++;
@@ -2812,7 +2883,7 @@ bool CallGraphPass::runFlowsToResolution() {
          << mergeCount << " merges), " << nextRoot << " roots, "
          << totalR << " native + " << totalRB << " bridged facts "
          << "(vs pairwise V), " << clusterRep.size() << " cell clusters, "
-         << bridgeCount << " VX bridges, "
+         << bridgeCount << " VX bridges, " << waveCount << " waves, "
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");

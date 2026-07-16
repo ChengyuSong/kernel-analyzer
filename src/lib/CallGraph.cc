@@ -3382,8 +3382,12 @@ bool CallGraphPass::runFlowsToResolution() {
       if (Ctx->AllocFuncs.count(CF)) {
         Ctx->AllocSites.insert(CS);
         NodeIndex callNode = getRepNodeForValue(CS);
-        assert(callNode != AndersNodeFactory::InvalidIndex &&
-               "CallBase node not found for indirect allocator target");
+        if (callNode == AndersNodeFactory::InvalidIndex) {
+          // Allocator resolved at a callsite with no value node (result
+          // unused or non-pointer-typed, e.g. type-compat match on a
+          // void callsite): create on demand, as handleCall does.
+          callNode = getCanonicalNode(NF.createValueNode(CS));
+        }
         AllocSites.insert(callNode);
         NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
         EB.addDereferenceEdges(callNode, heapObj);
@@ -5449,8 +5453,11 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph,
           if (Ctx->AllocFuncs.count(CF)) {
             Ctx->AllocSites.insert(CS);
             NodeIndex callNode = getRepNodeForValue(CS);
-            assert(callNode != AndersNodeFactory::InvalidIndex &&
-                   "CallBase node not found for indirect allocator target");
+            if (callNode == AndersNodeFactory::InvalidIndex) {
+              // Result unused / non-pointer callsite: on-demand node,
+              // mirroring handleCall (fired first on whole-kernel run).
+              callNode = getCanonicalNode(NF.createValueNode(CS));
+            }
             AllocSites.insert(callNode);
             NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
             EB.addDereferenceEdges(callNode, heapObj);

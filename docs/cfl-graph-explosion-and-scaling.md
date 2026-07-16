@@ -941,3 +941,32 @@ here, not more solver speed. The 4x iteration cost (re-solve from
 scratch per fixpoint round; iteration 1 wired a genuine 77,610 pairs)
 makes incremental cross-iteration solving the next-best generic time
 win after the a-prop representation.
+
+## 2026-07-15 (later): content-addressed delta blocks — second a-prop negative (reverted)
+
+Tried: per-plane incremental Zobrist hash of dirty content; popped dense
+deltas carry a content id; per-(class, shift) ring of absorbed ids gives
+O(1) skip for identical re-arrivals. Correct (closure-certified,
+identical resolution), but skip rate only 8.9% (kernel subset) / 11%
+(harfbuzz) and the per-insertion hash-fold pass made runs 10-15% SLOWER
+net. Root cause of the low hit rate: content identity is temporally
+brittle — by the time another predecessor re-emits "the same" core
+block, its dirty has drifted by a few bits, so hashes no longer match.
+Dynamic content-addressing cannot capture co-travel; co-travel is an
+END-STATE property (the co-travel census measures the fixpoint), not an
+in-flight one.
+
+Standing conclusions for the a-prop wall after two reverted attempts:
+1. In-flight dedup tricks (id caches, delta-precise re-offers) do not
+   pay: the cycles are memory-bandwidth on full-width plane ops, and
+   arrival contents drift.
+2. The structural levers left are: (a) parallelization — the plane ORs
+   are embarrassingly parallel and bandwidth spreads across cores
+   (task #11); (b) static width reduction if a sound PRE-solve root
+   grouping exists (open); (c) fewer rounds via scheduling (topological
+   pop order on the condensed a-DAG so classes pop once per wave).
+3. Scheduling note from the data: pops process shifts round-robin per
+   class; a topological order would turn the mega-set's diffusion into
+   one wave instead of many partial arrivals — worth measuring before
+   parallelizing, as it also reduces the drift that defeated (this)
+   block dedup.

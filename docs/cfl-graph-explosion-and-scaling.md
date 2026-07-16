@@ -970,3 +970,33 @@ Standing conclusions for the a-prop wall after two reverted attempts:
    one wave instead of many partial arrivals — worth measuring before
    parallelizing, as it also reduces the drift that defeated (this)
    block dedup.
+
+## 2026-07-16: topological wave scheduling — the a-prop lever found (commit 336440d)
+
+Third attempt on the a-prop wall succeeded, and it was pure access
+ORDER: static Tarjan condensation of the initial a/f graph assigns
+topological ranks; the worklist drains as rank-sorted waves (pushes
+land in the next wave). Deltas flow downhill; each plane is touched
+~once per wave with its full accumulated delta, converting the
+cold-miss scatter (76-88% of cycles) into ~one streaming pass per wave.
+Pop order does not affect the fixpoint; ranks are only a heuristic.
+
+Measured, identical per-icall resolution + closure certificates on all:
+
+| input          | solve before      | solve after       | speedup |
+|----------------|-------------------|-------------------|---------|
+| harfbuzz FI    | 42 s/iter         | 2.1 s/iter        | 20x     |
+| harfbuzz fs13  | 74 min total      | 6.7 min total     | 11x     |
+| kernel subset  | 280 s/iter        | 12.5 s/iter       | 22x     |
+| PHP unserialize| 232 min total     | 6 min total       | 39x     |
+
+Pops collapse accordingly (harfbuzz FI 4.1M -> 69k; 37 waves). The two
+reverted in-flight dedup attempts and this result together make the
+diagnosis airtight: the cost was never redundant WORK, it was
+fragmented ORDER. Cumulative solver history, harfbuzz FI one-pass:
+1275 s (pre-July) -> 2.1 s = 600x, all generic, all certified.
+
+Arena layout (spatial locality) not yet needed — order alone removed
+the wall; keep as a card if parallelization exposes bandwidth limits.
+Whole-kernel attempt #2 launched (expected ~hour-scale vs the 25h+
+unbounded attempt #1).

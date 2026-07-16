@@ -925,3 +925,19 @@ Consequence: the generic time lever for both harfbuzz fs13 and kernel
 is the a-prop representation (interned/shared planes, delta-narrowed
 ORs — task #10), not join bookkeeping. Merge machinery stays as
 committed (4788d33 state).
+
+## 2026-07-15: PHP unserialize completes — first full sound run
+
+`unserialize.0.0.preopt.bc`, flows-to FI with outer fixpoint and closure
+certification: 4 iterations x ~58 min (3.9h total), 3.5GB peak RSS,
+closure verified on every iteration. Resolved 2,311 icalls / 395,639
+targets; 197M final facts (the pre-solver-work estimate was 1.6B).
+Historical context: saturation never completed this input, and the v0
+flows-to prototype was deferred after partial 8h+ attempts.
+
+Reading: 171 avg targets/icall says FI is coarse on the zend handler
+tables — field sensitivity plus the filters are the precision lever
+here, not more solver speed. The 4x iteration cost (re-solve from
+scratch per fixpoint round; iteration 1 wired a genuine 77,610 pairs)
+makes incremental cross-iteration solving the next-best generic time
+win after the a-prop representation.

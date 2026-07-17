@@ -1000,3 +1000,36 @@ Arena layout (spatial locality) not yet needed — order alone removed
 the wall; keep as a card if parallelization exposes bandwidth limits.
 Whole-kernel attempt #2 launched (expected ~hour-scale vs the 25h+
 unbounded attempt #1).
+
+## 2026-07-16: whole-kernel FI CONVERGES — first full-kernel sound run
+
+Attempt #3 (after the on-demand allocator-callsite-node fix, 4133e31)
+completed on the full 2618-module bclist (linux-6.8.2), FI flows-to,
+5 outer iterations to fixpoint:
+
+- **14,799 icalls resolved, 5,107,435 (callsite, callee) pairs**;
+  iteration 4 wired 0 new pairs (converged, not capped).
+- Solve: 291/214/240/216/215 s per iteration = **~19.6 min total
+  solve**; 13-14 waves, ~375k pops, ~1.46B native facts, 393k classes
+  / 321k roots after merges, 0 VX bridges (FI). RSS ~12.4 GB.
+- Precision vs type-based: type matching admits **52,845,869** pairs;
+  CFL confirms 4,879,335 of them — **~10.8x tighter**. Fan-out: median
+  bucket 21-100 targets/icall (7131 sites), avg 345, max 4756; 851
+  sites >1000 (dominated by known conflation: shared heap identities,
+  static_call not yet modeled, mm page identity).
+- PrintfSink: 9925 benign vararg callsites sunk (21,442 tail args
+  unwired); 10,354 non-constant-fmt + 25 non-benign kept (sound).
+- Wall time was NOT solve-bound: after convergence the run spent hours
+  in log diagnostics — 5.1M ICALL lines plus the unused-address-taken
+  check (O(|AT|x|callsites|) scan + full global-initializer dumps,
+  12,842 warnings, multi-GB). Fixed in a7d9cff: ICALL dump now behind
+  `--cfl-dump-icalls`, flattened callee set for the AT check, User:
+  dumps at verbose>=3. Next full run should be ~40-50 min end to end.
+- Artifacts: /tmp/kernel-full3-icalls.sort.gz (sorted pairs, 37 MB),
+  /tmp/kernel-full3-stats.txt (per-iteration stats).
+
+Compare attempt #1: 25h+ with no convergence in sight. Wave scheduling
+is what made whole-kernel tractable. Next levers: parallelization
+(task #11, bulk-synchronous supersteps), then kernel-specific modeling
+(static_call, seq_open wrappers, page identity) for the >1000 fan-out
+tail.

@@ -234,6 +234,12 @@ cl::opt<bool> CFLDumpCalleeMismatch(
            "(can produce GBs of log on large inputs)"),
   cl::init(false));
 
+cl::opt<bool> CFLDumpICalls(
+  "cfl-dump-icalls",
+  cl::desc("Dump one ICALL line per resolved (callsite, callee) pair; sort "
+           "the lines to diff runs (5M+ lines on whole-kernel inputs)"),
+  cl::init(false));
+
 cl::opt<std::string> IRSidecarDir(
   "ir-sidecar-dir",
   cl::desc("Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)"),

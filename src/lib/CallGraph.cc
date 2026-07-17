@@ -4816,7 +4816,8 @@ bool CallGraphPass::doFinalization(Module *M) {
            << printfNonBenignFmt << " non-benign fmt kept\n");
     // Deterministic per-icall resolution dump (one line per pair; sort the
     // lines to diff runs — FuncSet iteration order is not stable).
-    if (VerboseLevel >= 2) {
+    extern cl::opt<bool> CFLDumpICalls;
+    if (CFLDumpICalls) {
       for (auto &it : Ctx->Callees) {
         const CallBase *CS = it.first;
         if (CS->isInlineAsm() || CS->getCalledFunction())
@@ -4827,24 +4828,22 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     // check if all address-taken functions are used in indirect calls
+    FuncSet allCallees;
+    for (auto &it : Ctx->Callees)
+      allCallees.insert(it.second.begin(), it.second.end());
     size_t used = 0;
     for (const Function *F : Ctx->AddressTakenFuncs) {
-      bool found = false;
-      for (auto &it : Ctx->Callees) {
-        FuncSet &FS = it.second;
-        if (FS.find(F) != FS.end()) {
-          found = true;
-          break;
-        }
-      }
-      if (found) {
+      if (allCallees.find(F) != allCallees.end()) {
         used++;
       } else {
         WARNING("Address-taken function not used in indirect calls: " << F->getName() << "\n");
-        // print all users
-        for (auto *U : F->users()) {
-          if (!isa<Function>(U)) // skip personality
-            errs() << "  User: " << *U << "\n";
+        // full-constant user dump serializes entire global initializers —
+        // multi-GB on kernel inputs, so keep it at debug verbosity
+        if (VerboseLevel >= 3) {
+          for (auto *U : F->users()) {
+            if (!isa<Function>(U)) // skip personality
+              errs() << "  User: " << *U << "\n";
+          }
         }
       }
     }

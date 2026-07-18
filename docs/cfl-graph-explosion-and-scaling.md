@@ -1033,3 +1033,52 @@ is what made whole-kernel tractable. Next levers: parallelization
 (task #11, bulk-synchronous supersteps), then kernel-specific modeling
 (static_call, seq_open wrappers, page identity) for the >1000 fan-out
 tail.
+
+## 2026-07-17/18: solver parallelization (--cfl-solver-threads, a7b54b6)
+
+Bulk-synchronous wave phases: rank-sorted waves drain in rank-contiguous
+blocks (--cfl-solver-block, default 8192); within a block, bridge/
+wildcard/a/f propagation runs data-parallel (per-class spinlocks on
+foreign-plane writes, frozen union-find with read-only find, per-thread
+contexts flushed at barriers); joins run as a sequential sub-phase per
+block using the unchanged in-sweep code path. At T=1 the solver is the
+old algorithm exactly (joins fused per class visit).
+
+Two designs tried and REJECTED before landing on this:
+1. Separate parallel join-filter pass (filter probes + deferred
+   requests): doubled per-wave streaming traffic — join 1.8B -> 6.5B
+   cycles on harfbuzz even after restoring the cells-dedup micro-opt.
+2. Deferred per-fact join requests with a batched 3-pass apply (seq
+   heads / parallel confirms via a sharded cluster registry / seq
+   leftovers): first-offer facts re-touched cold at ~5x cycles; on the
+   kernel subset merge churn ballooned to 3M deferred requests / 21B
+   apply cycles and T=8 LOST to T=1. Lesson: the join sweep's value is
+   that it runs while the fact's planes are hot; any deferral pays the
+   full cold-miss chain again.
+
+Measured (identical per-icall + closure certificates at T=1/8/16 on
+libpng FI+fs13, harfbuzz FI+fs13 vs pinned baselines, all micro tests;
+smoke 4/4; T=1 == pre-parallelization performance):
+
+| input           | T=1        | T=8        | speedup |
+|-----------------|------------|------------|---------|
+| harfbuzz FI     | 2.34 s/iter| 1.29 s/iter| 1.8x    |
+| harfbuzz fs13   | 6.7 min    | 2.7 min    | 2.5x    |
+| kernel subset   | 7.7 s/iter | 5.5 s/iter | 1.4x    |
+| WHOLE KERNEL T16| 215-290 s  | 430-450 s  | 0.5x — LOSS |
+
+Whole-kernel T=16 REGRESSES (and RSS 12-14 -> 27.2 GB): at 333k roots
+the dense planes are 41.6KB, propagation is bandwidth-bound, and locked
+ORs into hot hub classes serialize + ping-pong plane lines across 16
+cores; per-thread malloc arenas inflate RSS. fs13 scales BEST because
+its work spreads over 14 shift planes with VX bridges (less hub
+contention). Joins are the Amdahl wall everywhere (kernel subset: 63%
+of cycles, sequential).
+
+Guidance: use --cfl-solver-threads=8 for library-scale and fs inputs;
+whole-kernel stays sequential until (a) target-partitioned exchange
+replaces locked scatter ORs (each thread owns a class range, deltas
+routed via per-thread outboxes — kills both contention and coherence
+traffic) and/or (b) joins parallelize (concurrent union-find + batched
+plane moves). T=8 + MALLOC_ARENA_MAX run pending to separate contention
+from arena bloat.

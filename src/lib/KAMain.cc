@@ -210,6 +210,19 @@ cl::opt<unsigned> CFLFieldBuckets(
            "memory modeling (0 = field-insensitive, default)"),
   cl::init(0));
 
+cl::opt<unsigned> CFLSolverThreads(
+  "cfl-solver-threads",
+  cl::desc("Worker threads for the flows-to solver's bulk-synchronous "
+           "wave phases (1 = sequential, 0 = hardware concurrency)"),
+  cl::init(1));
+
+cl::opt<unsigned> CFLSolverBlock(
+  "cfl-solver-block",
+  cl::desc("Classes per rank-ordered block within a solver wave; smaller "
+           "blocks keep more within-wave downhill forwarding, larger "
+           "blocks expose more parallelism"),
+  cl::init(8192));
+
 cl::opt<bool> CFLCGCacheStrict(
   "cfl-cache-strict",
   cl::desc("Strict compositional cache validation (coverage/freshness/compatibility)"),

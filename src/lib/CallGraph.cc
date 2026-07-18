@@ -37,8 +37,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <atomic>
+#include <condition_variable>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <thread>
@@ -1828,6 +1831,62 @@ public:
   }
 };
 uint32_t FactSet::Universe = 0;
+
+// Bulk-synchronous worker pool for the flows-to wave phases: run(f)
+// executes f(tid) on all T threads (the caller participates as tid 0)
+// and returns only after every worker finished — a full barrier, so
+// phase boundaries are also happens-before edges for the shared solver
+// state toggled between phases (union-find freeze, lock discipline).
+class WavePool {
+  unsigned T;
+  std::vector<std::thread> workers;
+  std::mutex m;
+  std::condition_variable cvGo, cvDone;
+  uint64_t epoch = 0;
+  unsigned pending = 0;
+  bool quit = false;
+  std::function<void(unsigned)> fn;
+
+public:
+  explicit WavePool(unsigned T_) : T(T_) {
+    for (unsigned t = 1; t < T; t++)
+      workers.emplace_back([this, t] {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lk(m);
+        while (true) {
+          cvGo.wait(lk, [&] { return quit || epoch != seen; });
+          if (quit) return;
+          seen = epoch;
+          lk.unlock();
+          fn(t);
+          lk.lock();
+          if (--pending == 0) cvDone.notify_all();
+        }
+      });
+  }
+  unsigned size() const { return T; }
+  void run(std::function<void(unsigned)> f) {
+    if (T == 1) { f(0); return; }
+    {
+      std::lock_guard<std::mutex> lk(m);
+      fn = std::move(f);
+      pending = T - 1;
+      epoch++;
+    }
+    cvGo.notify_all();
+    fn(0);
+    std::unique_lock<std::mutex> lk(m);
+    cvDone.wait(lk, [&] { return pending == 0; });
+  }
+  ~WavePool() {
+    {
+      std::lock_guard<std::mutex> lk(m);
+      quit = true;
+    }
+    cvGo.notify_all();
+    for (auto &w : workers) w.join();
+  }
+};
 } // namespace
 
 // Answer-anchored flows-to resolution (ORCFL prototype). After the
@@ -2170,9 +2229,41 @@ bool CallGraphPass::runFlowsToResolution() {
     if (tFrom == UINT32_MAX) errs() << "?"; else errs() << tFrom;
     errs() << "\n";
   };
+  // Threading: parallel phases freeze the union-find (no merges, no path
+  // compression — find is a pure read walk) and guard every write to
+  // another class's planes with that class's spinlock. Merges, cluster
+  // registry inserts and SCC collapses run only between phases, on the
+  // main thread; WavePool::run barriers give the happens-before edges.
+  unsigned solverThreads = CFLSolverThreads == 0
+                               ? std::max(1u, std::thread::hardware_concurrency())
+                               : (unsigned)CFLSolverThreads;
+  if (traceRoot >= 0 && solverThreads > 1) {
+    CG_LOG("FlowsTo: --cfl-trace-func is single-threaded; forcing "
+           "--cfl-solver-threads=1\n");
+    solverThreads = 1;
+  }
+  bool parallelPhase = false; // true only inside a parallel wave phase
+  std::unique_ptr<std::atomic<uint8_t>[]> classLk(
+      new std::atomic<uint8_t>[N]);
+  for (uint32_t i = 0; i < N; i++)
+    classLk[i].store(0, std::memory_order_relaxed);
+  auto lockC = [&](uint32_t n) {
+    if (!parallelPhase) return;
+    while (classLk[n].exchange(1, std::memory_order_acquire))
+      while (classLk[n].load(std::memory_order_relaxed))
+        __builtin_ia32_pause();
+  };
+  auto unlockC = [&](uint32_t n) {
+    if (!parallelPhase) return;
+    classLk[n].store(0, std::memory_order_release);
+  };
   std::vector<uint32_t> ufp(N), ufrank(N, 0);
   for (uint32_t i = 0; i < N; i++) ufp[i] = i;
   auto find = [&](uint32_t x) {
+    if (parallelPhase) { // frozen: read-only walk, no compression writes
+      while (ufp[x] != x) x = ufp[x];
+      return x;
+    }
     while (ufp[x] != x) { ufp[x] = ufp[ufp[x]]; x = ufp[x]; }
     return x;
   };
@@ -2258,25 +2349,56 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t i = 0; i < N; i++) topoRank[i] = nComp - 1 - topoRank[i];
   }
   std::vector<uint32_t> worklist;
-  std::vector<bool> inWL(N, false);
-  auto push = [&](uint32_t n) {
-    if (!inWL[n]) { inWL[n] = true; worklist.push_back(n); }
-  };
+  std::unique_ptr<std::atomic<uint8_t>[]> inWL(new std::atomic<uint8_t>[N]);
+  for (uint32_t i = 0; i < N; i++)
+    inWL[i].store(0, std::memory_order_relaxed);
   uint64_t factCount = 0;
-  // Persistent scratch for the hot add paths: copyFrom reuses buffers,
-  // so no per-call heap churn. Safe because addBits and addBitsBridged
-  // never call themselves or each other.
-  FactSet nbA, promA, nbB;
+  uint64_t iterations = 0;
+  // Per-thread solver context: scratch planes for the hot add paths
+  // (copyFrom reuses buffers — no per-call heap churn; safe because
+  // addBits and addBitsBridged never call themselves or each other),
+  // local worklist/fact deltas flushed at phase barriers, deferred join
+  // requests, and profile counters. Sequential code paths (seeding,
+  // merges, join apply, SCC collapse) always use ctxs[0].
+  struct SolverCtx {
+    FactSet nbA, promA, nbB;                 // add-path scratch
+    FactSet d, todoS, dbS, dNatS, dBrS;      // pop-loop scratch
+    std::vector<uint32_t> sweepElems;
+    std::vector<uint32_t> localWork;
+    uint64_t localFacts = 0, pops = 0;
+    uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0,
+             cyF = 0;
+    uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
+    uint64_t sweepOffered = 0, sweepKept = 0;
+  };
+  std::vector<SolverCtx> ctxs(solverThreads);
+  SolverCtx &ctx0 = ctxs[0];
+  auto push = [&](uint32_t n, SolverCtx &ctx) {
+    if (!inWL[n].exchange(1, std::memory_order_relaxed))
+      ctx.localWork.push_back(n);
+  };
+  auto flushCtx = [&](SolverCtx &ctx) {
+    factCount += ctx.localFacts;
+    ctx.localFacts = 0;
+    iterations += ctx.pops;
+    ctx.pops = 0;
+    worklist.insert(worklist.end(), ctx.localWork.begin(),
+                    ctx.localWork.end());
+    ctx.localWork.clear();
+  };
   // OR src natively into rep n's plane s. Bits new to the class enter all
   // three deltas; bits previously only bridged are promoted (their joins
   // and a/f propagation already ran — only bridge-crossing is new).
-  auto addBits = [&](uint32_t n, uint32_t s, const FactSet &src) {
+  // In parallel phases the whole plane update runs under n's spinlock.
+  auto addBits = [&](uint32_t n, uint32_t s, const FactSet &src,
+                     SolverCtx &ctx) {
     if (src.none()) return;
-    FactSet &nb = nbA;
+    FactSet &nb = ctx.nbA;
+    lockC(n);
     nb.copyFrom(src);
     nb.subtract(R[n][s]);
-    if (nb.none()) return;
-    FactSet &promoted = promA;
+    if (nb.none()) { unlockC(n); return; }
+    FactSet &promoted = ctx.promA;
     promoted.clear();
     if (!RB[n][s].none()) {
       promoted.copyFrom(nb);
@@ -2293,45 +2415,52 @@ bool CallGraphPass::runFlowsToResolution() {
       dirty[n][s].unionWith(nb);
       jdirty[n][s].unionWith(nb);
       dirtyBr[n][s].unionWith(nb);
-      factCount += nb.count();
+      ctx.localFacts += nb.count();
       if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
         traceHit(n, s, false);
     }
-    push(n);
+    unlockC(n);
+    push(n, ctx);
   };
-  auto addFact = [&](uint32_t n, uint32_t s, uint32_t o) {
-    if (R[n][s].test(o)) return;
+  auto addFact = [&](uint32_t n, uint32_t s, uint32_t o, SolverCtx &ctx) {
+    lockC(n);
+    if (R[n][s].test(o)) { unlockC(n); return; }
     if (RB[n][s].test(o)) {
       RB[n][s].reset(o);
       R[n][s].set(o);
       dirtyBr[n][s].set(o);
-      push(n);
+      unlockC(n);
+      push(n, ctx);
       return;
     }
     R[n][s].set(o);
     dirty[n][s].set(o);
     jdirty[n][s].set(o);
     dirtyBr[n][s].set(o);
-    factCount++;
+    ctx.localFacts++;
     if (traceRoot >= 0 && o == (uint32_t)traceRoot) traceHit(n, s, false);
-    push(n);
+    unlockC(n);
+    push(n, ctx);
   };
   // OR src as bridged: skipped where already known either way; bridged
   // bits run joins and a/f propagation but never dirtyBr.
-  auto addBitsBridged = [&](uint32_t n, uint32_t s, const FactSet &src) {
+  auto addBitsBridged = [&](uint32_t n, uint32_t s, const FactSet &src,
+                            SolverCtx &ctx) {
     if (src.none()) return;
-    FactSet &nb = nbB;
+    FactSet &nb = ctx.nbB;
+    lockC(n);
     nb.copyFrom(src);
     nb.subtract(RB[n][s]);
     nb.subtract(R[n][s]);
-    if (nb.none()) return;
+    if (nb.none()) { unlockC(n); return; }
     RB[n][s].unionWith(nb);
     dirty[n][s].unionWith(nb);
     jdirty[n][s].unionWith(nb);
-    factCount += nb.count();
+    ctx.localFacts += nb.count();
     if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
       traceHit(n, s, true);
-    push(n);
+    unlockC(n);
+    push(n, ctx);
   };
   size_t mergeCount = 0;
   std::vector<uint32_t> mergeHits(N, 0); // absorbed-class lineage per keeper
@@ -2339,7 +2468,10 @@ bool CallGraphPass::runFlowsToResolution() {
   // closes clusters transitively (coarser-or-equal). keyCount tracks how
   // many cluster keys a class anchors; a join that merges a cell already
   // anchoring other keys coalesces key-clusters the grammar keeps apart.
-  std::vector<uint32_t> keyCount(N, 0);
+  std::unique_ptr<std::atomic<uint32_t>[]> keyCount(
+      new std::atomic<uint32_t>[N]);
+  for (uint32_t i = 0; i < N; i++)
+    keyCount[i].store(0, std::memory_order_relaxed);
   size_t transKeyMerges = 0;
   // Churn attribution: what triggers merges, how much join work is
   // merge-triggered re-offer, and which classes get re-popped — the data
@@ -2348,16 +2480,23 @@ bool CallGraphPass::runFlowsToResolution() {
   uint64_t reofferedFacts = 0, sweepOffered = 0, sweepKept = 0;
   std::vector<uint32_t> popCount(N, 0);
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
+  uint64_t cyMerge = 0;
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
     if (a == b) return a;
+    struct MergeTimer {
+      uint64_t &acc, t0;
+      MergeTimer(uint64_t &a_) : acc(a_), t0(__builtin_ia32_rdtsc()) {}
+      ~MergeTimer() { acc += __builtin_ia32_rdtsc() - t0; }
+    } mt(cyMerge);
     if (ufrank[a] < ufrank[b]) std::swap(a, b);
     if (ufrank[a] == ufrank[b]) ufrank[a]++;
     ufp[b] = a;
     mergeCount++;
     mergeHits[a] += 1 + mergeHits[b];
-    keyCount[a] += keyCount[b];
-    keyCount[b] = 0;
+    keyCount[a].fetch_add(keyCount[b].load(std::memory_order_relaxed),
+                          std::memory_order_relaxed);
+    keyCount[b].store(0, std::memory_order_relaxed);
     tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
@@ -2418,8 +2557,8 @@ bool CallGraphPass::runFlowsToResolution() {
       uint32_t tt = find(t);
       if (tt == a) continue;
       for (uint32_t s = 0; s < NSHIFT; s++) {
-        if (R[a][s].any()) addBits(tt, s, R[a][s]);
-        if (RB[a][s].any()) addBits(tt, s, RB[a][s]);
+        if (R[a][s].any()) addBits(tt, s, R[a][s], ctx0);
+        if (RB[a][s].any()) addBits(tt, s, RB[a][s], ctx0);
       }
     }
     tHow = "merge-move-f"; tFrom = a;
@@ -2428,8 +2567,8 @@ bool CallGraphPass::runFlowsToResolution() {
       for (uint32_t s = 0; s < NSHIFT; s++) {
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
         if (tt == a && s2 == s) continue;
-        if (R[a][s].any()) addBits(tt, s2, R[a][s]);
-        if (RB[a][s].any()) addBits(tt, s2, RB[a][s]);
+        if (R[a][s].any()) addBits(tt, s2, R[a][s], ctx0);
+        if (RB[a][s].any()) addBits(tt, s2, RB[a][s], ctx0);
       }
     }
     tHow = "merge-move-br"; tFrom = a;
@@ -2437,7 +2576,7 @@ bool CallGraphPass::runFlowsToResolution() {
       uint32_t bb = find(br);
       if (bb == a) continue;
       for (uint32_t s = 0; s < NSHIFT; s++)
-        if (R[a][s].any()) addBitsBridged(bb, s, R[a][s]);
+        if (R[a][s].any()) addBitsBridged(bb, s, R[a][s], ctx0);
     }
     auto append = [](auto &dst, auto &src) {
       dst.insert(dst.end(), src.begin(), src.end());
@@ -2452,11 +2591,11 @@ bool CallGraphPass::runFlowsToResolution() {
     // keeper's existing facts onto the unknown-shift plane, per kind.
     if (NB > 0 && wflag[b] && !wflag[a])
       for (uint32_t s = 0; s < NB; s++) {
-        if (R[a][s].any()) addBits(a, SHIFT_X, R[a][s]);
-        if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s]);
+        if (R[a][s].any()) addBits(a, SHIFT_X, R[a][s], ctx0);
+        if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s], ctx0);
       }
     wflag[a] |= wflag[b];
-    push(a);
+    push(a, ctx0);
     return a;
   };
   // Merged classes accumulate stale/duplicate edge and cell entries;
@@ -2489,8 +2628,43 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   // Cluster registry: fact (o, s) -> current representative class of the
   // merged cell cluster. Entries may go stale under merges; resolve with
-  // find() on read.
-  boost::unordered_flat_map<uint64_t, uint32_t> clusterRep;
+  // find() on read. Sharded with per-shard spinlocks so the parallel
+  // join filter can create FI clusters in-sweep (hot) — first-offer
+  // facts are the majority of sweep volume, and deferring their
+  // creation to the sequential apply step re-touches them cold at ~5x
+  // the cycles. Cross-cluster merges still defer to the apply step.
+  struct ClusterShard {
+    boost::unordered_flat_map<uint64_t, uint32_t> map;
+    std::atomic<uint8_t> lk{0};
+  };
+  constexpr uint32_t kClusterShards = 256;
+  std::vector<ClusterShard> clusterShards(kClusterShards);
+  auto shardOf = [&](uint64_t key) -> ClusterShard & {
+    return clusterShards[(key * 0x9E3779B97F4A7C15ull) >> 56];
+  };
+  auto shardLock = [&](ClusterShard &sh) {
+    if (!parallelPhase) return;
+    while (sh.lk.exchange(1, std::memory_order_acquire))
+      while (sh.lk.load(std::memory_order_relaxed))
+        __builtin_ia32_pause();
+  };
+  auto shardUnlock = [&](ClusterShard &sh) {
+    if (!parallelPhase) return;
+    sh.lk.store(0, std::memory_order_release);
+  };
+  auto clusterFind = [&](uint64_t key) -> uint32_t { // UINT32_MAX = absent
+    auto &sh = shardOf(key);
+    shardLock(sh);
+    auto it = sh.map.find(key);
+    const uint32_t r = it == sh.map.end() ? UINT32_MAX : it->second;
+    shardUnlock(sh);
+    return r;
+  };
+  auto clusterCount = [&]() {
+    size_t c = 0;
+    for (auto &sh : clusterShards) c += sh.map.size();
+    return c;
+  };
   std::unordered_map<uint32_t, std::vector<uint64_t>> shiftKeysOf;
   size_t bridgeCount = 0;
   // VX bridge: pairwise fact exchange between two cluster classes, native
@@ -2504,18 +2678,19 @@ bool CallGraphPass::runFlowsToResolution() {
     bridgeCount++;
     tHow = "bridge-init"; tFrom = x;
     for (uint32_t s = 0; s < NSHIFT; s++) {
-      if (R[x][s].any()) addBitsBridged(y, s, R[x][s]);
-      if (R[y][s].any()) addBitsBridged(x, s, R[y][s]);
+      if (R[x][s].any()) addBitsBridged(y, s, R[x][s], ctx0);
+      if (R[y][s].any()) addBitsBridged(x, s, R[y][s], ctx0);
     }
   };
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     const uint64_t key = (uint64_t)o * NSHIFT + s;
-    auto [it, ins] = clusterRep.emplace(key, find(cell));
+    auto &sh = shardOf(key); // sequential context: shard locks are no-ops
+    auto [it, ins] = sh.map.emplace(key, find(cell));
     if (!ins) {
       const uint32_t cellRep = find(cell);
       if (cellRep == find(it->second)) {
         redundantJoins++; // already one cluster: pure lookup, no work
-      } else if (keyCount[cellRep] > 0) {
+      } else if (keyCount[cellRep].load(std::memory_order_relaxed) > 0) {
         transKeyMerges++; // cell anchors other keys: key-clusters coalesce
       }
       const size_t mc0 = mergeCount;
@@ -2523,19 +2698,20 @@ bool CallGraphPass::runFlowsToResolution() {
       if (mergeCount > mc0) mergesFromJoin++;
       return;
     }
-    keyCount[find(cell)]++;
+    keyCount[find(cell)].fetch_add(1, std::memory_order_relaxed);
     if (NB == 0) return;
     // VX linking: bridge the (o, X) cluster with each exact cluster of o.
     if (s == SHIFT_X) {
       for (uint64_t ek : shiftKeysOf[o]) {
-        auto eIt = clusterRep.find(ek);
-        addBridge(clusterRep.find(key)->second, eIt->second);
+        const uint32_t er = clusterFind(ek);
+        assert(er != UINT32_MAX && "shiftKeysOf names a missing cluster");
+        addBridge(it->second, er);
       }
     } else {
       shiftKeysOf[o].push_back(key);
-      auto xIt = clusterRep.find((uint64_t)o * NSHIFT + SHIFT_X);
-      if (xIt != clusterRep.end())
-        addBridge(it->second, xIt->second);
+      const uint32_t xr = clusterFind((uint64_t)o * NSHIFT + SHIFT_X);
+      if (xr != UINT32_MAX)
+        addBridge(it->second, xr);
     }
   };
   // Dynamic a-SCC collapse: classes mutually reachable over the current
@@ -2609,168 +2785,265 @@ bool CallGraphPass::runFlowsToResolution() {
     return collapsed;
   };
   tHow = "seed"; tFrom = UINT32_MAX;
-  for (auto [n, rid] : seeds) addFact(find(n), 0, rid);
+  for (auto [n, rid] : seeds) addFact(find(n), 0, rid, ctx0);
+  flushCtx(ctx0);
 
-  size_t iterations = 0;
-  FactSet d, todoS, dbS, dNatS, dBrS; // loop scratch, capacity reused
-  std::vector<uint32_t> sweepElems;   // join-sweep snapshot (break support)
-  // --cfl-solver-profile: rdtsc phase accounting inside the pop loop.
-  // Attribution: join = jdirty sweep incl. cluster lookups/merges;
-  // bridge = dirtyBr crossings; scan = guard checks on clean shifts;
-  // wflag/aprop/fprop = delta emission (addBits cost lands in its
-  // calling phase).
+  // --cfl-solver-profile: rdtsc phase accounting inside the wave phases,
+  // accumulated per thread and summed at the end. Attribution: join =
+  // jdirty filter incl. cluster lookups plus the sequential apply
+  // (merges); bridge = dirtyBr crossings; scan = guard checks on clean
+  // shifts; wflag/aprop/fprop = delta emission (addBits cost lands in
+  // its calling phase).
   const bool prof = CFLSolverProfile;
-  uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
-  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
   auto rd = [&]() -> uint64_t { return prof ? __builtin_ia32_rdtsc() : 0; };
-  // Drain in rank-sorted waves: swap out the pending list, sort by
-  // topological rank, process; pushes during a wave land in the next.
-  std::vector<uint32_t> waveBuf;
-  size_t waveIdx = 0, waveCount = 0;
-  while (true) {
-    if (waveIdx >= waveBuf.size()) {
-      if (worklist.empty()) break;
-      waveBuf.clear();
-      waveIdx = 0;
-      waveBuf.swap(worklist);
-      std::sort(waveBuf.begin(), waveBuf.end(),
-                [&](uint32_t x, uint32_t y) {
-                  return topoRank[x] < topoRank[y];
-                });
-      waveCount++;
+  // Phase A — join filter (parallel-safe: union-find frozen, cluster
+  // registry read-only, only n's own planes/lists mutated). Cell join
+  // (M ::= -d V d | -d VX d): sweep the join backlog — facts never yet
+  // pushed to this class's full cell list — against the per-fact
+  // clusters. Facts whose (o, s) cluster already equals the class's
+  // single deduped cell rep are confirmed here (the overwhelming
+  // majority: merge re-offers re-confirming an existing cluster); the
+  // rest become requests for the sequential apply step, which performs
+  // the actual cluster inserts, VX bridging and merges.
+  // Join sweep (M ::= -d V d | -d VX d): drain the join backlog against
+  // the class's cells via the per-fact clusters. ALWAYS sequential —
+  // joins merge union-find classes and move planes, which cannot overlap
+  // the frozen parallel phases. At T>1 the driver runs this as its own
+  // sequential sub-phase right after each block's parallel propagation,
+  // while the block's planes are still warm; deferring per-fact requests
+  // instead (tried) re-touched every first-offer fact cold at ~5x the
+  // cycles and lost on kernel-shaped merge churn. A merge can absorb n
+  // itself: stop; the keeper inherits the backlog and is re-queued.
+  auto joinSweep = [&](uint32_t n, SolverCtx &ctx) {
+    if (find(n) != n) return; // merged away; keeper carries the state
+    for (uint32_t s = 0; s < NSHIFT; s++) {
+      if (jdirty[n][s].none()) continue;
+      uint64_t tp0 = rd();
+      FactSet &todo = ctx.todoS;
+      todo.copyFrom(jdirty[n][s]);
+      jdirty[n][s].clear();
+      if (cellsOf[n].empty()) { ctx.cyJoin += rd() - tp0; continue; }
+      // Dedup stale cell entries to live union-find reps: after the
+      // FIRST fact of a shift joins the cells they all share one rep,
+      // so each further fact needs one lookup, not |list| (dropping
+      // this was the original 95%-of-solve-time mistake). Dedup once up
+      // front (prior sweeps' merges), and again after the first fact.
+      auto &cs = cellsOf[n];
+      auto dedupCells = [&]() {
+        for (auto &c : cs) c = find(c);
+        std::sort(cs.begin(), cs.end());
+        cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
+      };
+      dedupCells();
+      if (prof) ctx.sweepOffered += todo.count();
+      todo.subtract(joined[n][s]);
+      if (prof) ctx.sweepKept += todo.count();
+      // Snapshot: joinCluster can merge and mutate backing state.
+      ctx.sweepElems.clear();
+      todo.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
+      bool firstFact = true;
+      for (uint32_t o : ctx.sweepElems) {
+        bool aborted = false;
+        for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
+          ctx.nJoinLk++;
+          joinCluster(cellsOf[n][ci], o, s);
+          if (find(n) != n) { aborted = true; break; }
+        }
+        if (aborted) break;
+        if (firstFact) { dedupCells(); firstFact = false; }
+        // Cells appended mid-loop were covered (the inner bound
+        // re-reads cellsOf[n].size()).
+        joined[n][s].set(o);
+      }
+      ctx.cyJoin += rd() - tp0;
+      if (find(n) != n) return;
     }
-    uint32_t n = waveBuf[waveIdx++];
-    inWL[n] = false;
-    if (find(n) != n) continue; // merged away; keeper carries the state
-    iterations++;
+  };
+  WavePool pool(solverThreads);
+  uint64_t seqJoinCy = 0; // T>1: cycles in the sequential join sub-phase
+  // Phase B — bridge crossings, wildcard projection and a/f delta
+  // propagation. Parallel-safe under the lock discipline: the owner
+  // snapshots and clears its own delta planes under its lock; every
+  // write to another class's planes goes through addBits/addBitsBridged
+  // which lock the target. No merges here.
+  auto propagate = [&](uint32_t n, SolverCtx &ctx) {
+    if (find(n) != n) return; // merged away; keeper carries the state
+    ctx.pops++;
     popCount[n]++;
-    if ((iterations & ((1u << 18) - 1)) == 0) {
-      size_t collapsed = collapseSCCs();
-      mergesFromSCC += collapsed;
-      if (collapsed)
-        CG_LOG("FlowsTo: a-SCC collapse merged " << collapsed
-               << " classes at " << iterations << " pops\n");
-      if (find(n) != n) continue; // n itself collapsed into its SCC rep
-    }
-    if ((iterations & ((1u << 20) - 1)) == 0)
-      CG_LOG("FlowsTo progress: " << iterations << " pops, " << factCount
-             << " facts, " << clusterRep.size() << " clusters, "
-             << mergeCount << " merges, "
-             << std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - tStart).count()
-             << " ms\n");
     if (outA[n].size() + outF[n].size() + cellsOf[n].size() +
             bridgesOf[n].size() >
         compactMark[n])
       compactLists(n);
-    for (uint32_t s = 0; s < NSHIFT && find(n) == n; s++) {
-      uint64_t tp0 = rd();
-      // Cell join (M ::= -d V d | -d VX d): sweep the join backlog —
-      // facts never yet pushed to this class's full cell list — against
-      // the per-fact clusters. A merge can absorb n itself: stop; the
-      // keeper inherits the backlog and is re-queued.
-      if (jdirty[n][s].any()) {
-        FactSet &todo = todoS;
-        todo.copyFrom(jdirty[n][s]);
-        jdirty[n][s].clear();
-        if (!cellsOf[n].empty()) {
-          // Dedup stale cell entries to live union-find reps. Sweeping
-          // every fact over the raw list was the dominant cost (~95% of
-          // solve time): after the FIRST fact of a shift joins the cells
-          // they all share one rep, so each further fact needs one
-          // lookup, not |list|. Dedup once up front (prior sweeps'
-          // merges), and again after the first fact of this sweep.
-          auto dedupCells = [&]() {
-            auto &cs = cellsOf[n];
-            for (auto &c : cs) c = find(c);
-            std::sort(cs.begin(), cs.end());
-            cs.erase(std::unique(cs.begin(), cs.end()), cs.end());
-          };
-          dedupCells();
-          if (prof) sweepOffered += todo.count();
-          todo.subtract(joined[n][s]);
-          if (prof) sweepKept += todo.count();
-          // Snapshot: joinCluster can merge and mutate the backing set.
-          sweepElems.clear();
-          todo.forEach([&](uint32_t o) { sweepElems.push_back(o); });
-          bool firstFact = true;
-          for (uint32_t o : sweepElems) {
-            bool aborted = false;
-            for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
-              nJoinLk++;
-              joinCluster(cellsOf[n][ci], o, s);
-              if (find(n) != n) { aborted = true; break; }
-            }
-            if (aborted) break;
-            if (firstFact) { dedupCells(); firstFact = false; }
-            // Cells appended mid-loop were covered (the inner bound
-            // re-reads cellsOf[n].size()).
-            joined[n][s].set(o);
-          }
-          if (find(n) != n) { cyJoin += rd() - tp0; break; }
+    // Sequential run: join fused into the same class visit — the wave
+    // scheduler's win is ONE streaming pass over the hot planes per
+    // wave. At T>1 the driver runs the joins as a sequential sub-phase
+    // after this block's parallel propagation instead.
+    if (solverThreads == 1) {
+      joinSweep(n, ctx);
+      if (find(n) != n) return; // absorbed by an in-sweep join
+    }
+    for (uint32_t s = 0; s < NSHIFT; s++) {
+      uint64_t tp1 = rd();
+      // Snapshot and clear this shift's delta planes under n's lock:
+      // concurrent addBits from other classes' owners mutate these same
+      // planes under the same lock, so even the emptiness peeks must be
+      // inside it (a torn sparse-vector read is a crash, not staleness).
+      FactSet &db = ctx.dbS;
+      FactSet &d = ctx.d;
+      const bool wproj = NB > 0 && wflag[n] && s != SHIFT_X;
+      lockC(n);
+      const bool doBr = dirtyBr[n][s].any() && !bridgesOf[n].empty();
+      if (doBr) db.copyFrom(dirtyBr[n][s]);
+      dirtyBr[n][s].clear();
+      const bool hasD = dirty[n][s].any();
+      if (hasD) {
+        d.copyFrom(dirty[n][s]);
+        dirty[n][s].clear();
+        if (wproj) {
+          // Wildcard (fx self-loop): new facts also hold at unknown
+          // shift, kind preserved (retroactive projection on wflag gain
+          // is in merge). Split by kind under the same lock as the
+          // snapshot so the R/RB reads are coherent.
+          ctx.dNatS.copyFrom(d);
+          ctx.dNatS.intersectWith(R[n][s]);
+          ctx.dBrS.copyFrom(d);
+          ctx.dBrS.intersectWith(RB[n][s]);
         }
       }
-      uint64_t tp1 = rd();
-      cyJoin += tp1 - tp0;
+      unlockC(n);
       // Bridge crossings: native backlog only, arriving bridged.
-      if (dirtyBr[n][s].any() && !bridgesOf[n].empty()) {
-        FactSet &db = dbS;
-        db.copyFrom(dirtyBr[n][s]);
-        dirtyBr[n][s].clear();
-        tHow = "bridge"; tFrom = n;
+      if (doBr) {
+        if (traceRoot >= 0) { tHow = "bridge"; tFrom = n; }
         for (uint32_t br : bridgesOf[n]) {
           uint32_t bb = find(br);
-          if (bb != n) addBitsBridged(bb, s, db);
+          if (bb != n) addBitsBridged(bb, s, db, ctx);
         }
-      } else {
-        dirtyBr[n][s].clear();
       }
       uint64_t tp2 = rd();
-      cyBridge += tp2 - tp1;
-      if (dirty[n][s].none()) { cyScan += rd() - tp2; continue; }
-      d.copyFrom(dirty[n][s]);
-      dirty[n][s].clear();
+      ctx.cyBridge += tp2 - tp1;
+      if (!hasD) { ctx.cyScan += rd() - tp2; continue; }
       uint64_t tp3 = rd();
-      // Wildcard (fx self-loop): new facts also hold at unknown shift,
-      // kind preserved (retroactive projection on wflag gain is in merge).
-      if (NB > 0 && wflag[n] && s != SHIFT_X) {
-        FactSet &dNat = dNatS, &dBr = dBrS;
-        dNat.copyFrom(d); dBr.copyFrom(d);
-        dNat.intersectWith(R[n][s]);
-        dBr.intersectWith(RB[n][s]);
-        tHow = "wflag"; tFrom = n;
-        if (dNat.any()) addBits(n, SHIFT_X, dNat);
-        if (dBr.any()) addBitsBridged(n, SHIFT_X, dBr);
+      if (wproj) {
+        if (traceRoot >= 0) { tHow = "wflag"; tFrom = n; }
+        if (ctx.dNatS.any()) addBits(n, SHIFT_X, ctx.dNatS, ctx);
+        if (ctx.dBrS.any()) addBitsBridged(n, SHIFT_X, ctx.dBrS, ctx);
       }
       uint64_t tp4 = rd();
-      cyW += tp4 - tp3;
+      ctx.cyW += tp4 - tp3;
       // Propagate the delta: whole-plane OR along a-edges, plane-rotated
       // OR along f-edges (X absorbs). Emission is native — value flow
       // launders bridge provenance, exactly like the grammar (M-hops
       // are separated by a-steps in every V derivation).
-      tHow = "a-prop"; tFrom = n;
+      if (traceRoot >= 0) { tHow = "a-prop"; tFrom = n; }
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
-        if (tt != n) { nAOr++; addBits(tt, s, d); }
+        if (tt != n) { ctx.nAOr++; addBits(tt, s, d, ctx); }
       }
       uint64_t tp5 = rd();
-      cyA += tp5 - tp4;
-      if (prof) orWords += (uint64_t)d.count() * outA[n].size();
-      tHow = "f-prop"; tFrom = n;
+      ctx.cyA += tp5 - tp4;
+      if (prof) ctx.orWords += (uint64_t)d.count() * outA[n].size();
+      if (traceRoot >= 0) { tHow = "f-prop"; tFrom = n; }
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
-        if (tt != n || s2 != s) { nFOr++; addBits(tt, s2, d); }
+        if (tt != n || s2 != s) { ctx.nFOr++; addBits(tt, s2, d, ctx); }
       }
-      cyF += rd() - tp5;
+      ctx.cyF += rd() - tp5;
     }
+  };
+  // Drain in rank-sorted waves, each wave in rank-contiguous blocks:
+  // per block, phase A (join filter) runs data-parallel over classes,
+  // the deferred joins apply sequentially, then phase B (bridge/
+  // wildcard/a/f propagation) runs data-parallel. Cross-block pushes
+  // inside a wave still land downhill — later blocks pick up the
+  // accumulated deltas — preserving the wave scheduler's one-touch-per-
+  // wave locality; only intra-block forwarding defers to the next wave.
+  const uint32_t blockSz = std::max(1u, (unsigned)CFLSolverBlock);
+  constexpr uint32_t kGrain = 16;
+  std::vector<uint32_t> waveBuf;
+  size_t waveCount = 0;
+  uint64_t nextSCC = 1u << 18, nextProg = 1u << 20;
+  while (true) {
+    for (auto &c : ctxs) flushCtx(c);
+    if (worklist.empty()) break;
+    waveBuf.clear();
+    waveBuf.swap(worklist);
+    std::sort(waveBuf.begin(), waveBuf.end(),
+              [&](uint32_t x, uint32_t y) {
+                return topoRank[x] < topoRank[y];
+              });
+    for (uint32_t n : waveBuf)
+      inWL[n].store(0, std::memory_order_relaxed);
+    waveCount++;
+    for (size_t b0 = 0; b0 < waveBuf.size(); b0 += blockSz) {
+      const uint32_t lo = (uint32_t)b0;
+      const uint32_t hi =
+          (uint32_t)std::min(waveBuf.size(), b0 + (size_t)blockSz);
+      std::atomic<uint32_t> cursor{lo};
+      auto runPhase = [&](auto &&body) {
+        cursor.store(lo, std::memory_order_relaxed);
+        parallelPhase = solverThreads > 1;
+        pool.run([&](unsigned tid) {
+          SolverCtx &ctx = ctxs[tid];
+          while (true) {
+            uint32_t i = cursor.fetch_add(kGrain, std::memory_order_relaxed);
+            if (i >= hi) break;
+            const uint32_t e = std::min(i + kGrain, hi);
+            for (; i < e; i++) body(waveBuf[i], ctx);
+          }
+        });
+        parallelPhase = false;
+      };
+      runPhase(propagate); // bridge/wildcard/a/f prop (+joins at T==1)
+      if (solverThreads > 1) {
+        // Sequential join sub-phase for this block, while its planes
+        // are still warm; workers idle here — joins mutate the
+        // union-find and move planes, which the frozen parallel phases
+        // cannot tolerate. Parallel joins are a future, separate lever.
+        uint64_t tj0 = rd();
+        for (size_t i = b0; i < (size_t)hi; i++)
+          joinSweep(waveBuf[i], ctx0);
+        seqJoinCy += rd() - tj0;
+      }
+      for (auto &c : ctxs) flushCtx(c);
+      if (iterations >= nextSCC) {
+        nextSCC += 1u << 18;
+        size_t collapsed = collapseSCCs();
+        mergesFromSCC += collapsed;
+        if (collapsed)
+          CG_LOG("FlowsTo: a-SCC collapse merged " << collapsed
+                 << " classes at " << iterations << " pops\n");
+        flushCtx(ctx0);
+      }
+      if (iterations >= nextProg) {
+        nextProg += 1u << 20;
+        CG_LOG("FlowsTo progress: " << iterations << " pops, " << factCount
+               << " facts, " << clusterCount() << " clusters, "
+               << mergeCount << " merges, "
+               << std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - tStart).count()
+               << " ms\n");
+      }
+    }
+  }
+  // Reduce per-thread counters into the reporting totals.
+  uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
+  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
+  for (auto &c : ctxs) {
+    cyJoin += c.cyJoin; cyBridge += c.cyBridge; cyScan += c.cyScan;
+    cyW += c.cyW; cyA += c.cyA; cyF += c.cyF;
+    nJoinLk += c.nJoinLk; nAOr += c.nAOr; nFOr += c.nFOr;
+    orWords += c.orWords;
+    sweepOffered += c.sweepOffered;
+    sweepKept += c.sweepKept;
   }
   if (prof) {
     const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
     auto pct = [&](uint64_t c) { return cyTot ? (double)c * 100.0 / cyTot : 0.0; };
     errs() << "SolverProf: total " << cyTot << " cycles in pop loop\n";
     errs() << "SolverProf: join   " << cyJoin << " (" << pct(cyJoin)
-           << "%), lookups " << nJoinLk << "\n";
+           << "%), lookups " << nJoinLk << " (seq sub-phase " << seqJoinCy
+           << ", merge " << cyMerge << " cycles)\n";
     errs() << "SolverProf: bridge " << cyBridge << " (" << pct(cyBridge) << "%)\n";
     errs() << "SolverProf: scan   " << cyScan << " (" << pct(cyScan) << "%)\n";
     errs() << "SolverProf: wflag  " << cyW << " (" << pct(cyW) << "%)\n";
@@ -2852,9 +3125,9 @@ bool CallGraphPass::runFlowsToResolution() {
         // cluster exists and contains all the cells.
         if (!cellsOf[n].empty()) {
           uniS.forEach([&](uint32_t o) {
-            auto it = clusterRep.find((uint64_t)o * NSHIFT + s);
-            if (it == clusterRep.end()) { report("C4-key", n, s, o); return; }
-            uint32_t rep = find(it->second);
+            const uint32_t cr = clusterFind((uint64_t)o * NSHIFT + s);
+            if (cr == UINT32_MAX) { report("C4-key", n, s, o); return; }
+            uint32_t rep = find(cr);
             for (uint32_t c : cellsOf[n])
               if (find(c) != rep) { report("C4-cell", n, s, o); return; }
           });
@@ -2882,7 +3155,7 @@ bool CallGraphPass::runFlowsToResolution() {
   CG_LOG("FlowsTo: " << N << " classes (" << liveClasses << " after "
          << mergeCount << " merges), " << nextRoot << " roots, "
          << totalR << " native + " << totalRB << " bridged facts "
-         << "(vs pairwise V), " << clusterRep.size() << " cell clusters, "
+         << "(vs pairwise V), " << clusterCount() << " cell clusters, "
          << bridgeCount << " VX bridges, " << waveCount << " waves, "
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2976,13 +3249,14 @@ bool CallGraphPass::runFlowsToResolution() {
     // key-coalescing merges bound the over-approximation (Lean gap F3).
     {
       std::unordered_map<uint32_t, uint32_t> keysPer;
-      for (auto &[k, rep] : clusterRep) keysPer[find(rep)]++;
+      for (auto &sh : clusterShards)
+        for (auto &[k, rep] : sh.map) keysPer[find(rep)]++;
       uint64_t multi = 0, maxK = 0;
       for (auto &[cls, kc] : keysPer) {
         if (kc > 1) multi++;
         maxK = std::max<uint64_t>(maxK, kc);
       }
-      errs() << "ClusterTrans: " << clusterRep.size() << " keys in "
+      errs() << "ClusterTrans: " << clusterCount() << " keys in "
              << keysPer.size() << " clusters, multi-key clusters " << multi
              << ", max keys/cluster " << maxK
              << ", transitive key-coalescing merges " << transKeyMerges
@@ -3253,7 +3527,8 @@ bool CallGraphPass::runFlowsToResolution() {
         return "<unnamed>";
       };
       size_t ckShown = 0;
-      for (auto &[key, crep] : clusterRep) {
+      for (auto &sh0 : clusterShards)
+      for (auto &[key, crep] : sh0.map) {
         if (find(crep) != rep || ckShown++ > 40) continue;
         uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
         errs() << "TRACE-BWD   cluster-key origin=r" << o2 << " (c"
@@ -3296,7 +3571,8 @@ bool CallGraphPass::runFlowsToResolution() {
       // Where did the traced function's stores land? Its class's cells and
       // their cluster keys.
       if (traceRoot >= 0) {
-        for (auto &[key, crep] : clusterRep) {
+        for (auto &sh0 : clusterShards)
+        for (auto &[key, crep] : sh0.map) {
           uint32_t cr = find(crep);
           bool hasTr = false;
           for (uint32_t s3 = 0; s3 < NSHIFT && !hasTr; s3++)

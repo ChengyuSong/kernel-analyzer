@@ -1737,7 +1737,13 @@ public:
     return std::binary_search(S.begin(), S.end(), o);
   }
   void set(uint32_t o) {
-    if (D) { D->set(o); return; }
+    if (D) {
+      // Universe can grow between drains (incrementally minted roots);
+      // dense buffers widen lazily on first touch past their old width.
+      if (o >= D->size()) D->resize(std::max<uint32_t>(Universe, o + 1));
+      D->set(o);
+      return;
+    }
     auto it = std::lower_bound(S.begin(), S.end(), o);
     if (it != S.end() && *it == o) return;
     S.insert(it, o);
@@ -1762,7 +1768,10 @@ public:
       S.clear();
     } else if (D) {
       D->reset();
-      for (uint32_t x : o.S) D->set(x);
+      for (uint32_t x : o.S) {
+        if (x >= D->size()) D->resize(std::max<uint32_t>(Universe, x + 1));
+        D->set(x);
+      }
     } else {
       S = o.S;
     }
@@ -1773,7 +1782,10 @@ public:
       if (!D) promote();
       *D |= *o.D;
     } else if (D) {
-      for (uint32_t x : o.S) D->set(x);
+      for (uint32_t x : o.S) {
+        if (x >= D->size()) D->resize(std::max<uint32_t>(Universe, x + 1));
+        D->set(x);
+      }
     } else {
       llvm::SmallVector<uint32_t, 8> merged;
       merged.reserve(S.size() + o.S.size());
@@ -1940,7 +1952,12 @@ bool CallGraphPass::runFlowsToResolution() {
         fEdges.emplace_back(dense(cf), dense(ct), bIt->second);
     }
   }
-  const uint32_t N = toOrig.size();
+  uint32_t N = toOrig.size(); // grows when resolution wiring adds nodes
+  // Fixed-capacity headroom for the atomic per-class arrays (they cannot
+  // be resized in place): incremental wiring adds at most a few classes
+  // per resolved callsite (allocator callsite values, heap objects,
+  // previously edge-less formals).
+  const uint32_t solverCapN = N + (1u << 18);
   std::vector<std::vector<uint32_t>> outA(N);
   for (auto [s, t] : aEdges) outA[s].push_back(t);
   // f-edges as shift transformers: (target, residue).
@@ -2179,6 +2196,7 @@ bool CallGraphPass::runFlowsToResolution() {
   }
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
+  std::vector<char> rootParkable;    // rid -> pure no-in identity
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   for (uint32_t n = 0; n < N; n++) {
@@ -2190,8 +2208,21 @@ bool CallGraphPass::runFlowsToResolution() {
       seeds.emplace_back(n, rid);
       rootClassOf.push_back(n); // rid-indexed
       if (isFunc) funcRootOf[rid] = fit->second;
+      // Parkable: minted only because no in-edge exists YET. When
+      // resolution wiring gives the class an in-edge, a from-scratch
+      // rebuild would not mint it (its identity becomes derived from
+      // its callers); incremental solving instead PARKS the root —
+      // stops seeding its bit across newly wired edges — so obsolete
+      // formal identities don't double the fact volume.
+      rootParkable.push_back(!isFunc && !hasOrigin[n]);
     }
   }
+
+  // Root-class tracking so incremental wiring can mint identity roots
+  // for classes that BECOME origins mid-fixpoint (new allocation sites)
+  // without duplicating existing ones.
+  std::vector<char> isRoot(N, 0);
+  for (auto &sd : seeds) isRoot[sd.first] = 1;
 
   // Solver core: union-find clusters + bit-plane difference propagation.
   // Exact-fact joins are transitive (same (o, s) => same abstract cell),
@@ -2244,8 +2275,8 @@ bool CallGraphPass::runFlowsToResolution() {
   }
   bool parallelPhase = false; // true only inside a parallel wave phase
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
-      new std::atomic<uint8_t>[N]);
-  for (uint32_t i = 0; i < N; i++)
+      new std::atomic<uint8_t>[solverCapN]);
+  for (uint32_t i = 0; i < solverCapN; i++)
     classLk[i].store(0, std::memory_order_relaxed);
   auto lockC = [&](uint32_t n) {
     if (!parallelPhase) return;
@@ -2349,8 +2380,8 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t i = 0; i < N; i++) topoRank[i] = nComp - 1 - topoRank[i];
   }
   std::vector<uint32_t> worklist;
-  std::unique_ptr<std::atomic<uint8_t>[]> inWL(new std::atomic<uint8_t>[N]);
-  for (uint32_t i = 0; i < N; i++)
+  std::unique_ptr<std::atomic<uint8_t>[]> inWL(new std::atomic<uint8_t>[solverCapN]);
+  for (uint32_t i = 0; i < solverCapN; i++)
     inWL[i].store(0, std::memory_order_relaxed);
   uint64_t factCount = 0;
   uint64_t iterations = 0;
@@ -2469,8 +2500,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // many cluster keys a class anchors; a join that merges a cell already
   // anchoring other keys coalesces key-clusters the grammar keeps apart.
   std::unique_ptr<std::atomic<uint32_t>[]> keyCount(
-      new std::atomic<uint32_t>[N]);
-  for (uint32_t i = 0; i < N; i++)
+      new std::atomic<uint32_t>[solverCapN]);
+  for (uint32_t i = 0; i < solverCapN; i++)
     keyCount[i].store(0, std::memory_order_relaxed);
   size_t transKeyMerges = 0;
   // Churn attribution: what triggers merges, how much join work is
@@ -2497,6 +2528,7 @@ bool CallGraphPass::runFlowsToResolution() {
     keyCount[a].fetch_add(keyCount[b].load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
     keyCount[b].store(0, std::memory_order_relaxed);
+    isRoot[a] |= isRoot[b];
     tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
@@ -2788,6 +2820,194 @@ bool CallGraphPass::runFlowsToResolution() {
   for (auto [n, rid] : seeds) addFact(find(n), 0, rid, ctx0);
   flushCtx(ctx0);
 
+  // ---- Incremental cross-iteration wiring ----
+  // The outer fixpoint used to re-solve from scratch after every round
+  // of callee wiring (5 full solves on the kernel; iterations past the
+  // first mostly re-derive the previous fixpoint). Facts are monotone
+  // and resolution only ADDS edges, so instead: translate the EB edges
+  // appended by the wiring into solver form, seed them from the planes
+  // already computed, and continue draining from the previous fixpoint.
+  std::vector<NodeIndex> newAllocNodes; // callsites turned AllocSites
+  FactSet parkedRoots; // obsolete identity roots, masked out of seeding
+  auto growTo = [&](uint32_t N2) {
+    assert(N2 <= solverCapN &&
+           "flows-to incremental wiring exceeded class headroom");
+    if (N2 <= N) return;
+    R.resize(N2); RB.resize(N2); dirty.resize(N2); jdirty.resize(N2);
+    dirtyBr.resize(N2); joined.resize(N2);
+    for (uint32_t i = N; i < N2; i++) {
+      R[i].resize(NSHIFT); RB[i].resize(NSHIFT); dirty[i].resize(NSHIFT);
+      jdirty[i].resize(NSHIFT); dirtyBr[i].resize(NSHIFT);
+      joined[i].resize(NSHIFT);
+    }
+    outA.resize(N2); outF.resize(N2); cellsOf.resize(N2);
+    bridgesOf.resize(N2);
+    wflag.resize(N2, 0);
+    hasIn.resize(N2, false);
+    topoRank.resize(N2, 0); // rank is an order heuristic only
+    ufp.resize(N2); ufrank.resize(N2, 0);
+    for (uint32_t i = N; i < N2; i++) ufp[i] = i;
+    compactMark.resize(N2, 64);
+    popCount.resize(N2, 0);
+    mergeHits.resize(N2, 0);
+    isRoot.resize(N2, 0);
+    if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
+    N = N2;
+  };
+  auto originBearing = [&](NodeIndex canon) {
+    if (valueIsOrigin(canon)) return true;
+    auto mit = canonicalClassMembers.find(canon);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m : mit->second)
+        if (valueIsOrigin(m)) return true;
+    return false;
+  };
+  auto mintRoot = [&](uint32_t cls) {
+    uint32_t rep = find(cls);
+    if (isRoot[rep]) return;
+    isRoot[rep] = 1;
+    uint32_t rid = nextRoot++;
+    FactSet::Universe = nextRoot; // widen BEFORE the first set of this bit
+    rootClassOf.push_back(rep);
+    rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
+    tHow = "inc-mint"; tFrom = rep;
+    addFact(rep, 0, rid, ctx0);
+  };
+  auto wireIncremental = [&](size_t lo) {
+    const uint32_t oldN = N;
+    const uint32_t rootsBefore = nextRoot;
+    // Phase 1: classify the appended EB edges (dense() grows the id
+    // space; per-class arrays follow in growTo before any indexing).
+    struct NewEdge { uint32_t kind, a, b, c; }; // 0=a 1=d 2=f 3=fx
+    std::vector<NewEdge> batch;
+    for (size_t i = lo; i < edges.size(); i++) {
+      const auto &E = edges[i];
+      NodeIndex cf = getCanonicalNode(E.from), ct = getCanonicalNode(E.to);
+      if (E.label == la) {
+        uint32_t x = dense(cf), y = dense(ct);
+        if (x != y) batch.push_back({0, x, y, 0});
+      } else if (E.label == ld) {
+        batch.push_back({1, dense(cf), dense(ct), 0});
+      } else if (NB > 0 && E.label == lfx) {
+        batch.push_back({3, dense(cf), 0, 0});
+      } else if (NB > 0) {
+        auto bIt = bucketOfLabel.find(E.label);
+        if (bIt != bucketOfLabel.end())
+          batch.push_back({2, dense(cf), dense(ct), bIt->second});
+      }
+    }
+    growTo((uint32_t)toOrig.size());
+    // Park obsolete identity roots: any parkable root whose class is the
+    // target of a new a/f edge is exactly a root the from-scratch
+    // rebuild would stop minting. Its bit stays where drain 0 already
+    // put it (joins made from it remain — sound over-approximation) but
+    // is masked out of all further edge seeding.
+    {
+      boost::unordered_flat_set<uint32_t> tgtReps;
+      for (const NewEdge &e : batch)
+        if (e.kind == 0 || e.kind == 2) tgtReps.insert(find(e.b));
+      size_t parked = 0;
+      for (uint32_t rid = 0; rid < (uint32_t)rootClassOf.size(); rid++) {
+        if (!rootParkable[rid] || parkedRoots.test(rid)) continue;
+        if (tgtReps.count(find(rootClassOf[rid]))) {
+          parkedRoots.set(rid);
+          parked++;
+        }
+      }
+      if (parked)
+        CG_LOG("FlowsTo incremental: parked " << parked
+               << " obsolete identity roots\n");
+    }
+    FactSet seedScratch;
+    auto seedBits = [&](uint32_t tgt, uint32_t s2, const FactSet &plane) {
+      if (plane.none()) return;
+      if (parkedRoots.none()) { addBits(tgt, s2, plane, ctx0); return; }
+      seedScratch.copyFrom(plane);
+      seedScratch.subtract(parkedRoots);
+      if (seedScratch.any()) addBits(tgt, s2, seedScratch, ctx0);
+    };
+    // Phase 2: apply. Edge lists live on the current rep (a merged-away
+    // class's lists were already moved); targets stay raw and resolve
+    // with find() at use, exactly like the initial build. Each new edge
+    // is seeded with the source class's full current planes — the same
+    // one-time push merge() does for moved edges.
+    size_t nA = 0, nD = 0, nF = 0, nW = 0;
+    for (const NewEdge &e : batch) {
+      if (e.kind == 0) {
+        hasIn[e.b] = true;
+        uint32_t x = find(e.a), y = find(e.b);
+        if (x == y) continue;
+        outA[x].push_back(e.b);
+        nA++;
+        if (traceRoot >= 0) { tHow = "inc-wire-a"; tFrom = x; }
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          seedBits(y, s, R[x][s]);
+          seedBits(y, s, RB[x][s]);
+        }
+      } else if (e.kind == 1) {
+        uint32_t p = find(e.a);
+        auto &cs = cellsOf[p];
+        if (std::find(cs.begin(), cs.end(), e.b) == cs.end()) {
+          cs.push_back(e.b);
+          nD++;
+          // A new cell invalidates the all-cells joined marks: re-offer
+          // the class's full fact set; old cells re-confirm via the
+          // one-lookup fast path.
+          for (uint32_t s = 0; s < NSHIFT; s++) {
+            joined[p][s].clear();
+            if (R[p][s].any()) jdirty[p][s].unionWith(R[p][s]);
+            if (RB[p][s].any()) jdirty[p][s].unionWith(RB[p][s]);
+          }
+          push(p, ctx0);
+        }
+      } else if (e.kind == 2) {
+        hasIn[e.b] = true;
+        uint32_t b = find(e.a);
+        outF[b].emplace_back(e.b, e.c);
+        nF++;
+        if (traceRoot >= 0) { tHow = "inc-wire-f"; tFrom = b; }
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          uint32_t tt = find(e.b);
+          uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + e.c) % NB;
+          if (tt == b && s2 == s) continue;
+          seedBits(tt, s2, R[b][s]);
+          seedBits(tt, s2, RB[b][s]);
+        }
+      } else {
+        uint32_t w = find(e.a);
+        if (!wflag[w]) {
+          wflag[w] = 1;
+          nW++;
+          if (traceRoot >= 0) { tHow = "inc-wire-fx"; tFrom = w; }
+          for (uint32_t s = 0; s < NB; s++) {
+            if (R[w][s].any()) addBits(w, SHIFT_X, R[w][s], ctx0);
+            if (RB[w][s].any()) addBitsBridged(w, SHIFT_X, RB[w][s], ctx0);
+          }
+        }
+      }
+    }
+    // Phase 3: mint identity roots — new classes by the initial-minting
+    // criterion (heap objects, allocator callsite values, previously
+    // edge-less formals), plus existing classes that just became
+    // allocation sites (their identity was not origin-bearing when the
+    // initial mint ran).
+    for (uint32_t n2 = oldN; n2 < N; n2++)
+      if (!hasIn[n2] || originBearing(toOrig[n2]))
+        mintRoot(n2);
+    for (NodeIndex an : newAllocNodes) {
+      auto dIt = toDense.find(getCanonicalNode(an));
+      assert(dIt != toDense.end() &&
+             "allocator callsite class missing from dense map");
+      mintRoot(dIt->second);
+    }
+    newAllocNodes.clear();
+    flushCtx(ctx0);
+    CG_LOG("FlowsTo incremental: +" << (N - oldN) << " classes, +" << nA
+           << " a / +" << nD << " d / +" << nF << " f / +" << nW
+           << " fx edges, +" << (nextRoot - rootsBefore) << " roots ("
+           << nextRoot << " total)\n");
+  };
+
   // --cfl-solver-profile: rdtsc phase accounting inside the wave phases,
   // accumulated per thread and summed at the end. Attribution: join =
   // jdirty filter incl. cluster lookups plus the sequential apply
@@ -2963,6 +3183,12 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<uint32_t> waveBuf;
   size_t waveCount = 0;
   uint64_t nextSCC = 1u << 18, nextProg = 1u << 20;
+  size_t edgesConsumed = edges.size();
+  int fpIter = 0;
+  // Outer resolution fixpoint: drain -> resolve -> wire the new callee
+  // edges incrementally -> drain again from the reached fixpoint. The
+  // heavy diagnostics run once, after convergence.
+  for (;;) {
   while (true) {
     for (auto &c : ctxs) flushCtx(c);
     if (worklist.empty()) break;
@@ -3026,33 +3252,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
-  // Reduce per-thread counters into the reporting totals.
-  uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
-  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
-  for (auto &c : ctxs) {
-    cyJoin += c.cyJoin; cyBridge += c.cyBridge; cyScan += c.cyScan;
-    cyW += c.cyW; cyA += c.cyA; cyF += c.cyF;
-    nJoinLk += c.nJoinLk; nAOr += c.nAOr; nFOr += c.nFOr;
-    orWords += c.orWords;
-    sweepOffered += c.sweepOffered;
-    sweepKept += c.sweepKept;
-  }
-  if (prof) {
-    const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
-    auto pct = [&](uint64_t c) { return cyTot ? (double)c * 100.0 / cyTot : 0.0; };
-    errs() << "SolverProf: total " << cyTot << " cycles in pop loop\n";
-    errs() << "SolverProf: join   " << cyJoin << " (" << pct(cyJoin)
-           << "%), lookups " << nJoinLk << " (seq sub-phase " << seqJoinCy
-           << ", merge " << cyMerge << " cycles)\n";
-    errs() << "SolverProf: bridge " << cyBridge << " (" << pct(cyBridge) << "%)\n";
-    errs() << "SolverProf: scan   " << cyScan << " (" << pct(cyScan) << "%)\n";
-    errs() << "SolverProf: wflag  " << cyW << " (" << pct(cyW) << "%)\n";
-    errs() << "SolverProf: a-prop " << cyA << " (" << pct(cyA)
-           << "%), ORs " << nAOr << "\n";
-    errs() << "SolverProf: f-prop " << cyF << " (" << pct(cyF)
-           << "%), ORs " << nFOr << ", a-plane words " << orWords << "\n";
-  }
-
   // --cfl-verify-closure: certify the fixpoint. One full non-delta scan of
   // every rule; any rule that would still fire is a violation. This checks
   // the closure property the delta/backlog machinery must maintain — the
@@ -3088,7 +3287,13 @@ bool CallGraphPass::runFlowsToResolution() {
         uniS.unionWith(RB[n][s]);
         auto subsetViol = [&](const FactSet &a, const FactSet &b) {
           bool bad = false;
-          a.forEach([&](uint32_t o) { if (!b.test(o)) bad = true; });
+          a.forEach([&](uint32_t o) {
+            // Parked identity roots are exempt: they are deliberately
+            // masked out of incremental edge seeding (retired by the
+            // equivalent from-scratch rebuild).
+            if (parkedRoots.test(o)) return;
+            if (!b.test(o)) bad = true;
+          });
           return bad;
         };
         // C1: a-edges emit native at same shift.
@@ -3160,6 +3365,251 @@ bool CallGraphPass::runFlowsToResolution() {
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");
+
+  // Resolution: origins at the fptr class whose shift is zero or unknown
+  // (an exact nonzero shift is a provably misaligned pointer, not a call
+  // target), intersected with function roots, then the standard filters.
+  // Newly discovered pairs are wired (arg/ret flows via handleCall, same
+  // as the saturation fixpoint) and force another outer iteration —
+  // a resolved callee's flows can enable further resolutions.
+  size_t resolved = 0, totalTargets = 0, newPairs = 0, topOnlyPairs = 0;
+  // Per-filter pruning tallies: every rejection is potential unsoundness
+  // exposure and, symmetrically, the filter's precision contribution —
+  // the retirement criterion once CFL-side precision drives them to zero.
+  size_t filtCandidates = 0, filtTypeRej = 0, filtFieldRej = 0;
+  for (auto *CS : Ctx->IndirectCallInsts) {
+    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
+    NodeIndex fn = NF.getValueNodeFor(fptr);
+    if (fn == AndersNodeFactory::InvalidIndex) continue;
+    auto dIt = toDense.find(getCanonicalNode(fn));
+    if (dIt == toDense.end()) continue;
+    std::string csStruct; unsigned csField = 0;
+    bool hasKey = getCallSiteFieldKey(fptr, csStruct, csField);
+    FuncSet targets;
+    const uint32_t rep = find(dIt->second);
+    if (!CFLTraceFptr.empty() &&
+        CS->getFunction()->getName().contains(CFLTraceFptr)) {
+      // Backward slice over the post-merge graph: reverse a/f edges plus
+      // bridges. The has-root boundary is the severed link.
+      errs() << "TRACE-BWD icall in " << CS->getFunction()->getName()
+             << " fptr c" << rep << "\n";
+      std::unordered_map<uint32_t, std::vector<std::string>> inEdges;
+      for (uint32_t n2 = 0; n2 < N; n2++) {
+        if (find(n2) != n2) continue;
+        for (uint32_t t : outA[n2])
+          inEdges[find(t)].push_back("a<-c" + std::to_string(n2));
+        for (auto [t, r] : outF[n2])
+          inEdges[find(t)].push_back("f" + std::to_string(r) + "<-c" +
+                                     std::to_string(n2));
+        for (uint32_t br : bridgesOf[n2])
+          inEdges[find(br)].push_back("br<-c" + std::to_string(n2));
+      }
+      auto nameOfClass = [&](uint32_t cls) -> std::string {
+        const Value *V2 = cls < N ? NF.getValueForNode(toOrig[cls]) : nullptr;
+        if (!V2) return "<synthetic>";
+        if (V2->hasName()) return V2->getName().str();
+        if (const auto *I2 = dyn_cast<Instruction>(V2))
+          return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
+              .str();
+        return "<unnamed>";
+      };
+      size_t ckShown = 0;
+      for (auto &sh0 : clusterShards)
+      for (auto &[key, crep] : sh0.map) {
+        if (find(crep) != rep || ckShown++ > 40) continue;
+        uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
+        errs() << "TRACE-BWD   cluster-key origin=r" << o2 << " (c"
+               << rootClassOf[o2] << " " << nameOfClass(rootClassOf[o2])
+               << ") shift=" << s2 << " origin-in:[";
+        uint32_t oc = find(rootClassOf[o2]);
+        auto oie = inEdges.find(oc);
+        size_t oShown = 0;
+        if (oie != inEdges.end())
+          for (auto &e : oie->second) {
+            if (oShown++ > 8) { errs() << " ..."; break; }
+            errs() << " " << e;
+            uint32_t sc = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
+            errs() << "(" << nameOfClass(sc).substr(0, 50) << ")";
+          }
+        errs() << " ]\n";
+        // Members of the origin class: what merged into this orphan?
+        NodeIndex ocanon = toOrig[rootClassOf[o2]];
+        auto mIt = canonicalClassMembers.find(ocanon);
+        if (mIt != canonicalClassMembers.end()) {
+          size_t mShown = 0;
+          for (NodeIndex m : mIt->second) {
+            if (mShown++ > 15) { errs() << "TRACE-BWD     ...more members\n"; break; }
+            const Value *MV = NF.getValueForNode(m);
+            errs() << "TRACE-BWD     member n" << m << " ";
+            if (MV && MV->hasName()) errs() << MV->getName().substr(0, 70);
+            else if (MV) {
+              if (const auto *MI = dyn_cast<Instruction>(MV))
+                errs() << MI->getFunction()->getName().substr(0, 46) << "::"
+                       << *MI;
+            } else {
+              errs() << (NF.isObjectNode(m) ? "<obj/cell>" : "<synthetic>");
+            }
+            errs() << "\n";
+          }
+        } else {
+          errs() << "TRACE-BWD     (singleton class)\n";
+        }
+      }
+      // Where did the traced function's stores land? Its class's cells and
+      // their cluster keys.
+      if (traceRoot >= 0) {
+        for (auto &sh0 : clusterShards)
+        for (auto &[key, crep] : sh0.map) {
+          uint32_t cr = find(crep);
+          bool hasTr = false;
+          for (uint32_t s3 = 0; s3 < NSHIFT && !hasTr; s3++)
+            hasTr = R[cr][s3].test((uint32_t)traceRoot);
+          if (!hasTr) continue;
+          uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
+          static size_t trShown = 0;
+          if (trShown++ > 60) break;
+          errs() << "TRACE-BWD   root-in-cluster c" << cr << " key=(r" << o2
+                 << " " << nameOfClass(rootClassOf[o2]).substr(0, 50) << ", s"
+                 << s2 << ")\n";
+        }
+      }
+      std::vector<uint32_t> q{rep};
+      boost::unordered_flat_set<uint32_t> vis{rep};
+      size_t printed = 0;
+      for (size_t qi = 0; qi < q.size() && printed < 300; qi++) {
+        uint32_t v = q[qi];
+        bool has = false;
+        for (uint32_t s = 0; s < NSHIFT && !has; s++)
+          has = R[v][s].test((uint32_t)traceRoot) ||
+                RB[v][s].test((uint32_t)traceRoot);
+        errs() << "TRACE-BWD c" << v << " root=" << has << " ";
+        const Value *VV = v < N ? NF.getValueForNode(toOrig[v]) : nullptr;
+        if (VV && VV->hasName()) errs() << VV->getName().substr(0, 60);
+        else if (VV) {
+          if (const auto *II = dyn_cast<Instruction>(VV))
+            errs() << II->getFunction()->getName().substr(0, 40) << "::"
+                   << II->getOpcodeName();
+        }
+        errs() << " in:[";
+        auto ie = inEdges.find(v);
+        size_t shownE = 0;
+        if (ie != inEdges.end())
+          for (auto &e : ie->second) {
+            if (shownE++ > 200) { errs() << " ..."; break; }
+            errs() << " " << e;
+            uint32_t src2 = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
+            if (vis.insert(src2).second && q.size() < 3000) q.push_back(src2);
+          }
+        errs() << " ]\n";
+        printed++;
+      }
+    }
+    if (traceRoot >= 0) {
+      bool has = false;
+      for (uint32_t s = 0; s < NSHIFT && !has; s++)
+        has = R[rep][s].test((uint32_t)traceRoot) ||
+              RB[rep][s].test((uint32_t)traceRoot);
+      errs() << "TRACE icall " << CS->getFunction()->getName() << " fptr c"
+             << rep << " has-root=" << has << "\n";
+    }
+    auto collect = [&](const FactSet &plane) {
+      plane.forEach([&](uint32_t o) {
+        auto rIt = funcRootOf.find(o);
+        if (rIt == funcRootOf.end()) return;
+        Function *F = getFuncDef(const_cast<Function *>(rIt->second));
+        filtCandidates++;
+        if (!isCompatible(CS, F)) { filtTypeRej++; return; }
+        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
+          filtFieldRej++;
+          return;
+        }
+        targets.insert(F);
+      });
+    };
+    collect(R[rep][0]);
+    collect(RB[rep][0]);
+    const size_t exactTargets = targets.size();
+    if (NB > 0) {
+      collect(R[rep][SHIFT_X]);
+      collect(RB[rep][SHIFT_X]);
+    }
+    topOnlyPairs += targets.size() - exactTargets;
+    if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
+    for (const Function *F : targets) {
+      if (!Ctx->Callees[CS].insert(F).second)
+        continue; // wired in an earlier iteration
+      newPairs++;
+      // Wire the callee's flows exactly as the saturation fixpoint does;
+      // the new edges enter the NEXT iteration's solve.
+      Function *CF = const_cast<Function *>(F);
+      if (Ctx->AllocFuncs.count(CF)) {
+        Ctx->AllocSites.insert(CS);
+        NodeIndex callNode = getRepNodeForValue(CS);
+        if (callNode == AndersNodeFactory::InvalidIndex) {
+          // Allocator resolved at a callsite with no value node (result
+          // unused or non-pointer-typed, e.g. type-compat match on a
+          // void callsite): create on demand, as handleCall does.
+          callNode = getCanonicalNode(NF.createValueNode(CS));
+        }
+        AllocSites.insert(callNode);
+        newAllocNodes.push_back(callNode);
+        NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
+        EB.addDereferenceEdges(callNode, heapObj);
+      } else if (Ctx->ContainerFuncs.count(CF)) {
+        handleContainerCall(CS, CF);
+      } else {
+        handleCall(CS, CF);
+      }
+    }
+  }
+  CG_LOG("FlowsTo: resolved " << resolved << " icalls, "
+         << totalTargets << " targets (" << newPairs << " new pairs wired, "
+         << topOnlyPairs << " via wildcard plane only), iteration "
+         << fpIter << "\n");
+  CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
+         << filtTypeRej << " type-rejected, " << filtFieldRej
+         << " field-rejected (each rejection = unsoundness exposure; "
+         << "zero = filter retirable)\n");
+  if (newPairs == 0)
+    break; // converged: no callee flows were added
+  if (fpIter + 1 >= (int)CFLFlowsToMaxIters) {
+    WARNING("[UNSOUND-RISK] FlowsTo fixpoint hit iteration cap ("
+            << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
+            << " newly wired pairs unprocessed; results may miss flows "
+            << "through those callees\n");
+    break;
+  }
+  wireIncremental(edgesConsumed);
+  edgesConsumed = edges.size();
+  fpIter++;
+  } // outer resolution fixpoint
+
+  // Reduce per-thread counters into the reporting totals.
+  uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
+  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
+  for (auto &c : ctxs) {
+    cyJoin += c.cyJoin; cyBridge += c.cyBridge; cyScan += c.cyScan;
+    cyW += c.cyW; cyA += c.cyA; cyF += c.cyF;
+    nJoinLk += c.nJoinLk; nAOr += c.nAOr; nFOr += c.nFOr;
+    orWords += c.orWords;
+    sweepOffered += c.sweepOffered;
+    sweepKept += c.sweepKept;
+  }
+  if (prof) {
+    const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
+    auto pct = [&](uint64_t c) { return cyTot ? (double)c * 100.0 / cyTot : 0.0; };
+    errs() << "SolverProf: total " << cyTot << " cycles in pop loop\n";
+    errs() << "SolverProf: join   " << cyJoin << " (" << pct(cyJoin)
+           << "%), lookups " << nJoinLk << " (seq sub-phase " << seqJoinCy
+           << ", merge " << cyMerge << " cycles)\n";
+    errs() << "SolverProf: bridge " << cyBridge << " (" << pct(cyBridge) << "%)\n";
+    errs() << "SolverProf: scan   " << cyScan << " (" << pct(cyScan) << "%)\n";
+    errs() << "SolverProf: wflag  " << cyW << " (" << pct(cyW) << "%)\n";
+    errs() << "SolverProf: a-prop " << cyA << " (" << pct(cyA)
+           << "%), ORs " << nAOr << "\n";
+    errs() << "SolverProf: f-prop " << cyF << " (" << pct(cyF)
+           << "%), ORs " << nFOr << ", a-plane words " << orWords << "\n";
+  }
 
   // Name the hub/web culprits: widest classes (fact volume, fan-out
   // amplifiers like void* container formals and allocator returns) and
@@ -3479,219 +3929,7 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
 
-  // Resolution: origins at the fptr class whose shift is zero or unknown
-  // (an exact nonzero shift is a provably misaligned pointer, not a call
-  // target), intersected with function roots, then the standard filters.
-  // Newly discovered pairs are wired (arg/ret flows via handleCall, same
-  // as the saturation fixpoint) and force another outer iteration —
-  // a resolved callee's flows can enable further resolutions.
-  size_t resolved = 0, totalTargets = 0, newPairs = 0, topOnlyPairs = 0;
-  // Per-filter pruning tallies: every rejection is potential unsoundness
-  // exposure and, symmetrically, the filter's precision contribution —
-  // the retirement criterion once CFL-side precision drives them to zero.
-  size_t filtCandidates = 0, filtTypeRej = 0, filtFieldRej = 0;
-  for (auto *CS : Ctx->IndirectCallInsts) {
-    Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
-    NodeIndex fn = NF.getValueNodeFor(fptr);
-    if (fn == AndersNodeFactory::InvalidIndex) continue;
-    auto dIt = toDense.find(getCanonicalNode(fn));
-    if (dIt == toDense.end()) continue;
-    std::string csStruct; unsigned csField = 0;
-    bool hasKey = getCallSiteFieldKey(fptr, csStruct, csField);
-    FuncSet targets;
-    const uint32_t rep = find(dIt->second);
-    if (!CFLTraceFptr.empty() &&
-        CS->getFunction()->getName().contains(CFLTraceFptr)) {
-      // Backward slice over the post-merge graph: reverse a/f edges plus
-      // bridges. The has-root boundary is the severed link.
-      errs() << "TRACE-BWD icall in " << CS->getFunction()->getName()
-             << " fptr c" << rep << "\n";
-      std::unordered_map<uint32_t, std::vector<std::string>> inEdges;
-      for (uint32_t n2 = 0; n2 < N; n2++) {
-        if (find(n2) != n2) continue;
-        for (uint32_t t : outA[n2])
-          inEdges[find(t)].push_back("a<-c" + std::to_string(n2));
-        for (auto [t, r] : outF[n2])
-          inEdges[find(t)].push_back("f" + std::to_string(r) + "<-c" +
-                                     std::to_string(n2));
-        for (uint32_t br : bridgesOf[n2])
-          inEdges[find(br)].push_back("br<-c" + std::to_string(n2));
-      }
-      auto nameOfClass = [&](uint32_t cls) -> std::string {
-        const Value *V2 = cls < N ? NF.getValueForNode(toOrig[cls]) : nullptr;
-        if (!V2) return "<synthetic>";
-        if (V2->hasName()) return V2->getName().str();
-        if (const auto *I2 = dyn_cast<Instruction>(V2))
-          return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
-              .str();
-        return "<unnamed>";
-      };
-      size_t ckShown = 0;
-      for (auto &sh0 : clusterShards)
-      for (auto &[key, crep] : sh0.map) {
-        if (find(crep) != rep || ckShown++ > 40) continue;
-        uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
-        errs() << "TRACE-BWD   cluster-key origin=r" << o2 << " (c"
-               << rootClassOf[o2] << " " << nameOfClass(rootClassOf[o2])
-               << ") shift=" << s2 << " origin-in:[";
-        uint32_t oc = find(rootClassOf[o2]);
-        auto oie = inEdges.find(oc);
-        size_t oShown = 0;
-        if (oie != inEdges.end())
-          for (auto &e : oie->second) {
-            if (oShown++ > 8) { errs() << " ..."; break; }
-            errs() << " " << e;
-            uint32_t sc = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
-            errs() << "(" << nameOfClass(sc).substr(0, 50) << ")";
-          }
-        errs() << " ]\n";
-        // Members of the origin class: what merged into this orphan?
-        NodeIndex ocanon = toOrig[rootClassOf[o2]];
-        auto mIt = canonicalClassMembers.find(ocanon);
-        if (mIt != canonicalClassMembers.end()) {
-          size_t mShown = 0;
-          for (NodeIndex m : mIt->second) {
-            if (mShown++ > 15) { errs() << "TRACE-BWD     ...more members\n"; break; }
-            const Value *MV = NF.getValueForNode(m);
-            errs() << "TRACE-BWD     member n" << m << " ";
-            if (MV && MV->hasName()) errs() << MV->getName().substr(0, 70);
-            else if (MV) {
-              if (const auto *MI = dyn_cast<Instruction>(MV))
-                errs() << MI->getFunction()->getName().substr(0, 46) << "::"
-                       << *MI;
-            } else {
-              errs() << (NF.isObjectNode(m) ? "<obj/cell>" : "<synthetic>");
-            }
-            errs() << "\n";
-          }
-        } else {
-          errs() << "TRACE-BWD     (singleton class)\n";
-        }
-      }
-      // Where did the traced function's stores land? Its class's cells and
-      // their cluster keys.
-      if (traceRoot >= 0) {
-        for (auto &sh0 : clusterShards)
-        for (auto &[key, crep] : sh0.map) {
-          uint32_t cr = find(crep);
-          bool hasTr = false;
-          for (uint32_t s3 = 0; s3 < NSHIFT && !hasTr; s3++)
-            hasTr = R[cr][s3].test((uint32_t)traceRoot);
-          if (!hasTr) continue;
-          uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
-          static size_t trShown = 0;
-          if (trShown++ > 60) break;
-          errs() << "TRACE-BWD   root-in-cluster c" << cr << " key=(r" << o2
-                 << " " << nameOfClass(rootClassOf[o2]).substr(0, 50) << ", s"
-                 << s2 << ")\n";
-        }
-      }
-      std::vector<uint32_t> q{rep};
-      boost::unordered_flat_set<uint32_t> vis{rep};
-      size_t printed = 0;
-      for (size_t qi = 0; qi < q.size() && printed < 300; qi++) {
-        uint32_t v = q[qi];
-        bool has = false;
-        for (uint32_t s = 0; s < NSHIFT && !has; s++)
-          has = R[v][s].test((uint32_t)traceRoot) ||
-                RB[v][s].test((uint32_t)traceRoot);
-        errs() << "TRACE-BWD c" << v << " root=" << has << " ";
-        const Value *VV = v < N ? NF.getValueForNode(toOrig[v]) : nullptr;
-        if (VV && VV->hasName()) errs() << VV->getName().substr(0, 60);
-        else if (VV) {
-          if (const auto *II = dyn_cast<Instruction>(VV))
-            errs() << II->getFunction()->getName().substr(0, 40) << "::"
-                   << II->getOpcodeName();
-        }
-        errs() << " in:[";
-        auto ie = inEdges.find(v);
-        size_t shownE = 0;
-        if (ie != inEdges.end())
-          for (auto &e : ie->second) {
-            if (shownE++ > 200) { errs() << " ..."; break; }
-            errs() << " " << e;
-            uint32_t src2 = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
-            if (vis.insert(src2).second && q.size() < 3000) q.push_back(src2);
-          }
-        errs() << " ]\n";
-        printed++;
-      }
-    }
-    if (traceRoot >= 0) {
-      bool has = false;
-      for (uint32_t s = 0; s < NSHIFT && !has; s++)
-        has = R[rep][s].test((uint32_t)traceRoot) ||
-              RB[rep][s].test((uint32_t)traceRoot);
-      errs() << "TRACE icall " << CS->getFunction()->getName() << " fptr c"
-             << rep << " has-root=" << has << "\n";
-    }
-    auto collect = [&](const FactSet &plane) {
-      plane.forEach([&](uint32_t o) {
-        auto rIt = funcRootOf.find(o);
-        if (rIt == funcRootOf.end()) return;
-        Function *F = getFuncDef(const_cast<Function *>(rIt->second));
-        filtCandidates++;
-        if (!isCompatible(CS, F)) { filtTypeRej++; return; }
-        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
-          filtFieldRej++;
-          return;
-        }
-        targets.insert(F);
-      });
-    };
-    collect(R[rep][0]);
-    collect(RB[rep][0]);
-    const size_t exactTargets = targets.size();
-    if (NB > 0) {
-      collect(R[rep][SHIFT_X]);
-      collect(RB[rep][SHIFT_X]);
-    }
-    topOnlyPairs += targets.size() - exactTargets;
-    if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
-    for (const Function *F : targets) {
-      if (!Ctx->Callees[CS].insert(F).second)
-        continue; // wired in an earlier iteration
-      newPairs++;
-      // Wire the callee's flows exactly as the saturation fixpoint does;
-      // the new edges enter the NEXT iteration's solve.
-      Function *CF = const_cast<Function *>(F);
-      if (Ctx->AllocFuncs.count(CF)) {
-        Ctx->AllocSites.insert(CS);
-        NodeIndex callNode = getRepNodeForValue(CS);
-        if (callNode == AndersNodeFactory::InvalidIndex) {
-          // Allocator resolved at a callsite with no value node (result
-          // unused or non-pointer-typed, e.g. type-compat match on a
-          // void callsite): create on demand, as handleCall does.
-          callNode = getCanonicalNode(NF.createValueNode(CS));
-        }
-        AllocSites.insert(callNode);
-        NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
-        EB.addDereferenceEdges(callNode, heapObj);
-      } else if (Ctx->ContainerFuncs.count(CF)) {
-        handleContainerCall(CS, CF);
-      } else {
-        handleCall(CS, CF);
-      }
-    }
-  }
-  CG_LOG("FlowsTo: resolved " << resolved << " icalls, "
-         << totalTargets << " targets (" << newPairs << " new pairs wired, "
-         << topOnlyPairs << " via wildcard plane only), iteration "
-         << iteration << "\n");
-  CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
-         << filtTypeRej << " type-rejected, " << filtFieldRej
-         << " field-rejected (each rejection = unsoundness exposure; "
-         << "zero = filter retirable)\n");
-  if (newPairs == 0)
-    return false; // converged: no callee flows were added
-  if (iteration + 1 >= (int)CFLFlowsToMaxIters) {
-    WARNING("[UNSOUND-RISK] FlowsTo fixpoint hit iteration cap ("
-            << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
-            << " newly wired pairs unprocessed; results may miss flows "
-            << "through those callees\n");
-    return false;
-  }
-  return true;
+  return false; // fixpoint reached (or cap warned) — driver runs once
 }
 
 void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {

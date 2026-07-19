@@ -1158,7 +1158,19 @@ ancestor merges} — a SUFFICIENT set to replay this run's answers.
 | libpng        | 584          | 177 (30%)     | 36%       | 192/357 (54%)    |
 | harfbuzz FI   | 12,233       | 1,653 (13.5%) | 10.3%     | 5,651/18,112 (31%)|
 | kernel subset | 62,929       | 9,288 (14.8%) | 21.5%     | 5,030/59,699 (8.4%)|
-| whole kernel  | (running)    |               |           |                  |
+| whole kernel  | 321,484      | 74,052 (23.0%)| 30.2%     | 47,791/262,916 (18.2%)|
+
+Whole kernel (2026-07-19, resolution identical 14,799/5,107,435):
+sufficient set 23% of roots / 30% of fact mass — a solid 3-4x
+reduction, though less extreme than the subset ratio (the full kernel
+has proportionally more fptr-reaching structure: 18.2% ancestor
+classes vs 8.4%, and 36k function roots are 11% of all roots by
+themselves). Function roots actually read at icall planes: 17,522 of
+36,242 — half the function-root alphabet never appears in any fptr
+plane. The sufficient set is computed against all-function-roots;
+restricting to the 17.5k observed answer roots is not sound a priori
+(which functions surface depends on the solve), but a two-phase
+schedule (solve, restrict, certify) could exploit it.
 
 ~80-90% of fact volume is provably irrelevant to the answers at real
 scale. Contrast the old derivation-slice negative: its STATIC

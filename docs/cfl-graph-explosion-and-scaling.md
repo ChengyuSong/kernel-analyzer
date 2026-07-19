@@ -1291,3 +1291,34 @@ per-side offer machinery (jdirty entries scoped to cell subsets),
 whose bookkeeping exceeds the 6% the joined-filter currently saves.
 Delta-precise merge re-offers are now CLOSED-NEGATIVE in both cost
 regimes (pre- and post-wave-scheduling).
+
+## 2026-07-19: BidirectedReach oracle (--cfl-bidi-prune) — roots pruned, mass untouched, kernel-shaped WIN (task #19)
+
+Field-matched bidirected partition (union-find; colliding d / f<r>
+labels unify targets; wildcard bases fold f labels; a-edges unify
+endpoints) computed pre-solve in O(m·α): an origin whose partition's
+forward d/f cone never meets an fptr partition cannot influence any
+answer — its joins live inside the cone and every consequence stays
+there — so its root is not minted. Sound per-iteration: the oracle
+recomputes on the grown graph each outer iteration, so newly wired
+callee edges re-admit origins whose cone grew.
+
+Results (per-icall identical + closure certified everywhere):
+
+| input         | prunable roots | oracle cost | fact mass | solve      |
+|---------------|----------------|-------------|-----------|------------|
+| libpng        | 13.5%          | 0 ms        | flat      | wash       |
+| harfbuzz FI   | 35.2%          | 12 ms       | flat      | wash       |
+| kernel subset | 38.3%          | 48 ms       | flat      | 7.7->5.4 s/iter (-30%) |
+| whole kernel  | (running)      |             |           |            |
+
+TWO findings. (1) Static pruning cannot cut FACT MASS: the entangled
+core is statically coupled to everything, so the prunable 35-38% of
+roots carry ~0% of facts — the measured gap between the static oracle
+(38%) and the exact irrelevance bound (77-86%) is exactly the part
+only dynamic/lazy evidence can claim. The demand-driven mass win
+still requires the lazy-minting loop. (2) The oracle still pays on
+kernel-shaped inputs through a different channel: the ROOT UNIVERSE
+shrinks 38%, so dense planes narrow proportionally (subset: 63k->39k
+bits) — -30% solve on the subset where planes are dense-heavy;
+harfbuzz (sparse-heavy) is a wash. Free at 48 ms, on by flag.

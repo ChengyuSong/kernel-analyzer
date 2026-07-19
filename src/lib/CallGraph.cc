@@ -2194,16 +2194,127 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     hasOrigin[n] = org;
   }
+  // --cfl-bidi-prune: field-matched bidirected partition oracle
+  // (BidirectedReach / field-sensitive-Steensgaard style, O(m a(n))):
+  // unify a-edge endpoints; per-partition label->target out-maps where
+  // colliding d / f<r> labels unify their targets (wildcard bases fold
+  // all f labels into one). SOUND relevance cone (FI argument in the
+  // scaling doc): an origin's facts can only key joins at cells inside
+  // the forward d/f closure of its partition, and every downstream
+  // consequence stays inside that closure; if the closure never meets
+  // an fptr partition, the origin cannot influence any answer.
+  // Measurement mode: report the statically prunable origin fraction.
+  std::vector<char> bidiMarked; // partition-class relevance (by class id)
+  std::vector<uint32_t> bidiUF;
+  if (CFLBidiPrune) {
+    auto tBidi = std::chrono::steady_clock::now();
+    bidiUF.resize(N);
+    for (uint32_t i = 0; i < N; i++) bidiUF[i] = i;
+    std::function<uint32_t(uint32_t)> bfind = [&](uint32_t x) {
+      while (bidiUF[x] != x) { bidiUF[x] = bidiUF[bidiUF[x]]; x = bidiUF[x]; }
+      return x;
+    };
+    // label 0 = deref (d); label 1+r = field residue r; wildcard bases
+    // fold every field label to 1 (unknown shift matches all).
+    std::vector<boost::unordered_flat_map<uint32_t, uint32_t>> omap(N);
+    std::vector<char> blind(N, 0);
+    for (uint32_t w : wildcardNodes) blind[w] = 1;
+    std::vector<std::pair<uint32_t, uint32_t>> pend;
+    std::function<void(uint32_t, uint32_t, uint32_t)> addLbl =
+        [&](uint32_t x, uint32_t l, uint32_t y) {
+          x = bfind(x);
+          if (blind[x] && l >= 1) l = 1;
+          auto [it, ins] = omap[x].try_emplace(l, y);
+          if (!ins && bfind(it->second) != bfind(y))
+            pend.emplace_back(it->second, y);
+        };
+    auto bunite = [&](uint32_t x, uint32_t y) {
+      x = bfind(x); y = bfind(y);
+      if (x == y) return;
+      if (omap[x].size() < omap[y].size()) std::swap(x, y);
+      bidiUF[y] = x;
+      if (blind[y] && !blind[x]) {
+        blind[x] = 1;
+        // fold x's field labels together under the new blindness
+        std::vector<uint32_t> ftgts;
+        for (auto it = omap[x].begin(); it != omap[x].end();) {
+          if (it->first >= 1) { ftgts.push_back(it->second); it = omap[x].erase(it); }
+          else ++it;
+        }
+        for (uint32_t t : ftgts) addLbl(x, 1, t);
+      }
+      for (auto &[l, t] : omap[y]) addLbl(x, l, t);
+      omap[y].clear();
+    };
+    for (auto [s2, t2] : aEdges) bunite(s2, t2);
+    for (auto [p2, c2] : dEdges) addLbl(p2, 0, c2);
+    for (auto &[b2, r2, bk2] : fEdges) addLbl(b2, 1 + bk2, r2);
+    while (!pend.empty()) {
+      auto [x, y] = pend.back();
+      pend.pop_back();
+      bunite(x, y);
+    }
+    // Backward BFS from fptr partitions over reversed partition edges.
+    std::vector<std::vector<uint32_t>> rev(N);
+    for (uint32_t n = 0; n < N; n++) {
+      if (bfind(n) != n) continue;
+      for (auto &[l, t] : omap[n]) rev[bfind(t)].push_back(n);
+    }
+    bidiMarked.assign(N, 0);
+    std::vector<uint32_t> bfs;
+    size_t fptrParts = 0;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn2 = NF.getValueNodeFor(fp);
+      if (fn2 == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt = toDense.find(getCanonicalNode(fn2));
+      if (dIt == toDense.end()) continue;
+      uint32_t rp = bfind(dIt->second);
+      if (!bidiMarked[rp]) { bidiMarked[rp] = 1; bfs.push_back(rp); fptrParts++; }
+    }
+    while (!bfs.empty()) {
+      uint32_t n = bfs.back();
+      bfs.pop_back();
+      for (uint32_t p2 : rev[n]) {
+        uint32_t rp = bfind(p2);
+        if (!bidiMarked[rp]) { bidiMarked[rp] = 1; bfs.push_back(rp); }
+      }
+    }
+    size_t parts = 0, markedParts = 0;
+    for (uint32_t n = 0; n < N; n++) {
+      if (bfind(n) != n) continue;
+      parts++;
+      if (bidiMarked[n]) markedParts++;
+    }
+    CG_LOG("BidiPrune: " << parts << " partitions over " << N
+           << " classes, " << markedParts << " in the fptr cone ("
+           << fptrParts << " fptr partitions), "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tBidi).count()
+           << " ms\n");
+    // expose relevance per CLASS for the mint loop's tally
+    for (uint32_t n = 0; n < N; n++) bidiMarked[n] = bidiMarked[bfind(n)];
+  }
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
   std::vector<char> rootParkable;    // rid -> pure no-in identity
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
+  size_t bidiPrunable = 0;
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
     auto fit = funcOfCanon.find(toOrig[n]);
     const bool isFunc = fit != funcOfCanon.end();
     if (!hasIn[n] || isFunc || hasOrigin[n]) {
+      if (!bidiMarked.empty() && !isFunc && !bidiMarked[n]) {
+        // Outside the fptr cone: this origin's facts can key joins only
+        // at cells inside its partition's d/f closure, which never
+        // meets an fptr partition — it cannot influence any answer.
+        // The oracle recomputes per outer iteration, so cone growth
+        // from newly wired callee edges re-admits origins as needed.
+        bidiPrunable++;
+        continue;
+      }
       uint32_t rid = nextRoot++;
       seeds.emplace_back(n, rid);
       rootClassOf.push_back(n); // rid-indexed
@@ -2233,6 +2344,11 @@ bool CallGraphPass::runFlowsToResolution() {
   // equalized member fact sets anyway). Propagation is word-parallel:
   // OR whole planes across a-edges, plane-rotated OR across f-edges.
   FactSet::Universe = nextRoot;
+  if (!bidiMarked.empty())
+    CG_LOG("BidiPrune: pruned " << bidiPrunable << " origins outside the "
+           << "fptr cone; minted " << nextRoot << " roots ("
+           << (100.0 * bidiPrunable / std::max<size_t>(1, bidiPrunable + nextRoot))
+           << "% pruned)\n");
   CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
          << funcRootOf.size() << " function), " << wildcardNodes.size()
          << " wildcard nodes, " << NSHIFT << " shift planes\n");

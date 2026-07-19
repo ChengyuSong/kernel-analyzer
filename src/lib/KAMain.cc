@@ -210,6 +210,15 @@ cl::opt<unsigned> CFLFieldBuckets(
            "memory modeling (0 = field-insensitive, default)"),
   cl::init(0));
 
+cl::opt<bool> CFLBidiPrune(
+  "cfl-bidi-prune",
+  cl::desc("Before the flows-to solve, compute the field-matched "
+           "bidirected partition (union-find with label-collision "
+           "unification, O(m a(n))) and report how many origin roots are "
+           "statically prunable: their partition's d/f cone never touches "
+           "an fptr partition. Measurement only; minting unchanged"),
+  cl::init(false));
+
 cl::opt<bool> CFLRootRelevance(
   "cfl-root-relevance",
   cl::desc("After the flows-to fixpoint, measure the answer-relevant root "

@@ -31,6 +31,7 @@ extern cl::opt<bool> CFLVerifyClosure;
 extern cl::opt<bool> CFLPrintfVarargSink;
 extern cl::opt<unsigned> CFLFlowsToMaxIters;
 extern cl::opt<unsigned> CFLFieldBuckets;
+extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLRootRelevance;
 extern cl::opt<bool> CFLFlowsToIncremental;
 extern cl::opt<unsigned> CFLSolverThreads;

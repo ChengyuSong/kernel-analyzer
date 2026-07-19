@@ -210,6 +210,15 @@ cl::opt<unsigned> CFLFieldBuckets(
            "memory modeling (0 = field-insensitive, default)"),
   cl::init(0));
 
+cl::opt<bool> CFLFlowsToIncremental(
+  "cfl-flows-to-incremental",
+  cl::desc("Continue the flows-to solve across resolution iterations "
+           "instead of re-solving from scratch (wins at library scale; "
+           "NEGATIVE at whole-kernel scale — plane duplication at wired "
+           "call boundaries — and has an open answer-set discrepancy "
+           "there; see docs/cfl-graph-explosion-and-scaling.md)"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLSolverThreads(
   "cfl-solver-threads",
   cl::desc("Worker threads for the flows-to solver's bulk-synchronous "

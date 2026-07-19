@@ -3565,20 +3565,22 @@ bool CallGraphPass::runFlowsToResolution() {
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, "
          << totalTargets << " targets (" << newPairs << " new pairs wired, "
          << topOnlyPairs << " via wildcard plane only), iteration "
-         << fpIter << "\n");
+         << (iteration + fpIter) << "\n");
   CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
          << filtTypeRej << " type-rejected, " << filtFieldRej
          << " field-rejected (each rejection = unsoundness exposure; "
          << "zero = filter retirable)\n");
   if (newPairs == 0)
     break; // converged: no callee flows were added
-  if (fpIter + 1 >= (int)CFLFlowsToMaxIters) {
+  if (iteration + fpIter + 1 >= (int)CFLFlowsToMaxIters) {
     WARNING("[UNSOUND-RISK] FlowsTo fixpoint hit iteration cap ("
             << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
             << " newly wired pairs unprocessed; results may miss flows "
             << "through those callees\n");
     break;
   }
+  if (!CFLFlowsToIncremental)
+    return true; // from-scratch mode: driver rebuilds and re-solves
   wireIncremental(edgesConsumed);
   edgesConsumed = edges.size();
   fpIter++;

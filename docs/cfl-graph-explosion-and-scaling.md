@@ -1080,5 +1080,64 @@ whole-kernel stays sequential until (a) target-partitioned exchange
 replaces locked scatter ORs (each thread owns a class range, deltas
 routed via per-thread outboxes — kills both contention and coherence
 traffic) and/or (b) joins parallelize (concurrent union-find + batched
-plane moves). T=8 + MALLOC_ARENA_MAX run pending to separate contention
-from arena bloat.
+plane moves). Follow-up (2026-07-18): whole-kernel T=8 with
+MALLOC_ARENA_MAX=4 still runs 390-430 s/iter — the loss is lock
+contention + bandwidth on hub planes, not malloc arenas. Parallel
+verdict final for now: use threads up to library/subset scale only.
+
+## 2026-07-18: incremental cross-iteration solving — WIN at library scale, NEGATIVE at whole-kernel (a6896d0, opt-in)
+
+Sequential-performance lever after the parallel round: the outer
+fixpoint re-solved from scratch each iteration (kernel: 5 x ~215 s
+where iteration 4 wires 0 new pairs). Implementation: the fixpoint
+loop moved inside runFlowsToResolution — resolution's newly appended
+EB edges are translated in place (dense-id growth for new nodes),
+seeded from the existing planes, new cells re-offer with cleared
+joined marks, and the drain continues from the reached fixpoint.
+Obsolete identity roots (pure no-in mints that gain callers — exactly
+what a rebuild stops minting) are PARKED: masked out of new-edge
+seeding; the closure verifier exempts parked bits on C1/C2.
+
+Results (per-icall identity + closure certificate per drain at
+library scale):
+
+| input          | from-scratch | incremental | facts        |
+|----------------|--------------|-------------|--------------|
+| libpng         | identical    | identical   | flat         |
+| harfbuzz FI    | ~7 s         | 3.3 s (2.1x)| 35.0->36.0M  |
+| kernel subset  | ~31 s        | 27 s (1.15x)| 33.8->65.4M  |
+| WHOLE KERNEL   | ~18 min      | ~82 min     | 1.44->4.09B  |
+
+Whole-kernel is a hard NEGATIVE on two axes:
+1. TIME/MEMORY: iteration-1 drain alone took ~43 min; facts 2.8x, RSS
+   30 GB. Cause is structural: every wired formal materializes a COPY
+   of the union of its callers' planes. From-scratch avoids this by
+   re-running presolve copy-merge on the grown graph (single-in
+   actual/formal chains collapse into one class). 829k wired pairs x
+   dense caller planes at kernel scale = +2.9B facts. Parking removed
+   the obsolete-root spread (103k roots parked) but not this.
+2. ANSWER DISCREPANCY (open bug): converged at 14,780 icalls /
+   5,090,540 pairs vs from-scratch 14,799 / 5,107,435. Fewer pairs =
+   soundness-affecting. Prime suspect: a pure no-in root whose class
+   LATER becomes an allocation site gets parked when it gains an
+   in-edge, killing the heap object's identity (mintRoot no-ops since
+   the class is already a root, but that root is parked). Subset and
+   harfbuzz converge identical, so the interaction needs kernel-scale
+   allocator wiring to manifest.
+
+DISPOSITION: opt-in via --cfl-flows-to-incremental (default OFF =
+exact previous from-scratch behavior, revalidated). Structural
+follow-ups if incremental is to reach kernel scale:
+- shared/COW planes or plane interning (kills the duplication AND is
+  the standing fs13 lever);
+- incremental single-in copy-merge at wire time (only safe when the
+  formal can never gain a second caller — needs a retirement story);
+- unpark-and-reseed when a parked class becomes origin-bearing (fixes
+  the discrepancy suspect).
+
+Sequential-performance scoreboard after this round: from-scratch
+whole-kernel remains the production configuration (~18-20 min solve,
+5 iterations); the next generic levers on it are plane interning/COW
+(join+memory), delta-precise merge re-offers (join, worth re-testing
+now that join is 63% of kernel cycles post-wave-scheduling), and
+static_call modeling (task #14) to shrink the graph itself.

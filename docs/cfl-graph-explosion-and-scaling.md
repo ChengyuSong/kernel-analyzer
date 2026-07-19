@@ -1141,3 +1141,57 @@ whole-kernel remains the production configuration (~18-20 min solve,
 (join+memory), delta-precise merge re-offers (join, worth re-testing
 now that join is 63% of kernel cycles post-wave-scheduling), and
 static_call modeling (task #14) to shrink the graph itself.
+
+## 2026-07-18: answer-relevant root measurement (--cfl-root-relevance) — the demand-driven door is OPEN
+
+Motivation: solver work scales with |E| x |roots|; kernel mints 333k
+roots. How many does the ANSWER need? A root can influence resolution
+only as (a) a function root read at an icall plane or (b) a merge
+witness — joins are the only consumer of individual bits; a-prop is
+blind unioning. So: log the (root, keeper) of every join-triggered
+merge, compute fptr-ancestor classes (reverse a/f + bridges over the
+final quotient), and report {function roots} ∪ {witnesses of
+ancestor merges} — a SUFFICIENT set to replay this run's answers.
+
+| input         | roots minted | sufficient    | fact mass | ancestor classes |
+|---------------|--------------|---------------|-----------|------------------|
+| libpng        | 584          | 177 (30%)     | 36%       | 192/357 (54%)    |
+| harfbuzz FI   | 12,233       | 1,653 (13.5%) | 10.3%     | 5,651/18,112 (31%)|
+| kernel subset | 62,929       | 9,288 (14.8%) | 21.5%     | 5,030/59,699 (8.4%)|
+| whole kernel  | (running)    |               |           |                  |
+
+~80-90% of fact volume is provably irrelevant to the answers at real
+scale. Contrast the old derivation-slice negative: its STATIC
+Steensgaard alias closure kept 58% of harfbuzz classes (and bought no
+time) because it must over-approximate which joins could matter. The
+exact set is 4-6x smaller — the gap is dynamic evidence.
+
+### Design sketch: lazy origin introduction (demand-driven roots)
+
+1. A := reverse-{a,f}* ancestors of all fptr classes (initial quotient).
+   Mint function roots + origins whose class ∈ A. Drain.
+2. Expand: mint any origin found in the plane of a POINTER that owns a
+   cell in A (cellsOf is static; pointer planes are dynamic — origins
+   are introduced by observed potential, not static alias closure).
+   Seed new roots (monotone: addFact + continue draining — the cheap
+   direction of incrementality, no wiring involved).
+3. Merges coarsen the quotient -> recompute A (coalesced classes can
+   join in-edges of one side to out-edges of the other, so A grows).
+   Repeat 2-3 until A and the root set are stable; then resolve icalls
+   as usual (outer wiring fixpoint composes with this inner loop).
+
+Soundness sketch (FI): take the first missed join, in derivation
+order, whose consequences reach an fptr plane. By minimality all
+earlier flows/joins are present, so the witness origin o reaches the
+join's pointer parent in the restricted solve too; that parent owns a
+cell in A at the fixpoint (its consequence path exists in the final
+quotient); so rule 2 minted o and the join fired — contradiction.
+fs mode needs one extra coupling (VX bridges create connectivity, so
+A-closure must add same-origin exact/X cluster coupling); FI has zero
+bridges on every run to date.
+
+Expected payoff at kernel scale if the subset ratios hold: fact mass
+-> ~20% (planes, join sweeps, a-prop words all scale with it), memory
+~12 GB -> ~3-4 GB, and the solve time dimension |roots| drops ~7x.
+Validation gate as always: per-icall identity vs the full solve +
+closure certificate restricted to minted roots.

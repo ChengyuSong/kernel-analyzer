@@ -2508,6 +2508,11 @@ bool CallGraphPass::runFlowsToResolution() {
   // merge-triggered re-offer, and which classes get re-popped — the data
   // that sizes the delta-precision fix and names summarization targets.
   size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
+  // --cfl-root-relevance: (root, keeper class) per join-triggered merge —
+  // joins are the only consumer of individual root bits besides the final
+  // icall answer read, so these witnesses + function roots form a
+  // sufficient root set for reproducing this run's answers.
+  std::vector<std::pair<uint32_t, uint32_t>> mergeWitness;
   uint64_t reofferedFacts = 0, sweepOffered = 0, sweepKept = 0;
   std::vector<uint32_t> popCount(N, 0);
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
@@ -2727,7 +2732,11 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       const size_t mc0 = mergeCount;
       it->second = merge(it->second, cell);
-      if (mergeCount > mc0) mergesFromJoin++;
+      if (mergeCount > mc0) {
+        mergesFromJoin++;
+        if (CFLRootRelevance)
+          mergeWitness.emplace_back(o, find(it->second));
+      }
       return;
     }
     keyCount[find(cell)].fetch_add(1, std::memory_order_relaxed);
@@ -3799,6 +3808,128 @@ bool CallGraphPass::runFlowsToResolution() {
   // Hashes are Zobrist-style (XOR of mixed cell keys) — set-equality up
   // to 64-bit collisions, adequate for a sizing diagnostic. R only; RB
   // (bridged) planes are excluded.
+  // --cfl-root-relevance: how many of the minted roots does the ANSWER
+  // actually need? A root matters only as (a) a function root read at an
+  // icall fptr plane, or (b) a merge witness whose merged class lies on a
+  // backward flow path (reverse a/f edges + bridges over the final
+  // quotient graph) from some fptr class. {all function roots} union
+  // {ancestor merge witnesses} is a sufficient set to reproduce this
+  // run's resolution — the demand-driven-roots upper bound.
+  if (CFLRootRelevance) {
+    // Backward-reachable (ancestor) classes from all icall fptr classes.
+    std::vector<std::vector<uint32_t>> rin(N);
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      for (uint32_t t : outA[n]) {
+        uint32_t tt = find(t);
+        if (tt != n) rin[tt].push_back(n);
+      }
+      for (auto [t, r] : outF[n]) {
+        uint32_t tt = find(t);
+        if (tt != n) rin[tt].push_back(n);
+      }
+    }
+    std::vector<char> anc(N, 0);
+    std::vector<uint32_t> bfs;
+    size_t fptrClasses = 0;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt = toDense.find(getCanonicalNode(fn));
+      if (dIt == toDense.end()) continue;
+      uint32_t rep = find(dIt->second);
+      if (!anc[rep]) { anc[rep] = 1; bfs.push_back(rep); fptrClasses++; }
+    }
+    while (!bfs.empty()) {
+      uint32_t n = bfs.back();
+      bfs.pop_back();
+      for (uint32_t p2 : rin[n])
+        if (!anc[p2]) { anc[p2] = 1; bfs.push_back(p2); }
+      for (uint32_t br : bridgesOf[n]) { // pairwise exchange: both ways
+        uint32_t bb = find(br);
+        if (!anc[bb]) { anc[bb] = 1; bfs.push_back(bb); }
+      }
+    }
+    size_t ancClasses = 0, liveCls = 0;
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      liveCls++;
+      if (anc[n]) ancClasses++;
+    }
+    // Answer roots: function roots present at some fptr class's answer
+    // planes (shift 0 and X, native or bridged) — what resolution reads.
+    std::vector<char> isAns(nextRoot, 0), isWitAny(nextRoot, 0),
+        isWitAnc(nextRoot, 0);
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n || !anc[n]) continue; // fptr classes are ancestors
+      // (only fptr classes need scanning, but ancestor scan is cheap and
+      // fptr membership is a subset; restrict via a second mark instead)
+    }
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt = toDense.find(getCanonicalNode(fn));
+      if (dIt == toDense.end()) continue;
+      uint32_t rep = find(dIt->second);
+      auto mark = [&](const FactSet &pl) {
+        pl.forEach([&](uint32_t o) {
+          if (funcRootOf.count(o)) isAns[o] = 1;
+        });
+      };
+      mark(R[rep][0]);
+      mark(RB[rep][0]);
+      if (NB > 0) {
+        mark(R[rep][SHIFT_X]);
+        mark(RB[rep][SHIFT_X]);
+      }
+    }
+    for (auto &[o, keeper] : mergeWitness) {
+      isWitAny[o] = 1;
+      if (anc[find(keeper)]) isWitAnc[o] = 1;
+    }
+    // Fact mass per category over the final planes.
+    std::vector<char> inSuff(nextRoot, 0);
+    for (auto &[rid, F] : funcRootOf) inSuff[rid] = 1;
+    size_t funcRoots = funcRootOf.size();
+    for (uint32_t o = 0; o < nextRoot; o++)
+      if (isWitAnc[o]) inSuff[o] = 1;
+    uint64_t factsTotal = 0, factsSuff = 0;
+    size_t nAns = 0, nWitAny = 0, nWitAnc = 0, nSuff = 0;
+    for (uint32_t o = 0; o < nextRoot; o++) {
+      nAns += isAns[o];
+      nWitAny += isWitAny[o];
+      nWitAnc += isWitAnc[o];
+      nSuff += inSuff[o];
+    }
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        auto tally = [&](const FactSet &pl) {
+          pl.forEach([&](uint32_t o) {
+            factsTotal++;
+            if (inSuff[o]) factsSuff++;
+          });
+        };
+        tally(R[n][s]);
+        tally(RB[n][s]);
+      }
+    }
+    errs() << "RootRel: " << nextRoot << " roots minted; " << funcRoots
+           << " function, " << nAns << " read at icall planes\n";
+    errs() << "RootRel: fptr-ancestor classes " << ancClasses << "/"
+           << liveCls << " live (" << fptrClasses << " fptr classes)\n";
+    errs() << "RootRel: merge witnesses " << nWitAny << " any, " << nWitAnc
+           << " on fptr-ancestor classes (of " << mergeWitness.size()
+           << " witnessed merges)\n";
+    errs() << "RootRel: SUFFICIENT SET " << nSuff << "/" << nextRoot
+           << " roots (" << (nextRoot ? 100.0 * nSuff / nextRoot : 0.0)
+           << "%), fact mass " << factsSuff << "/" << factsTotal << " ("
+           << (factsTotal ? 100.0 * factsSuff / factsTotal : 0.0)
+           << "%) — demand-driven upper bound\n";
+  }
+
   if (CFLCoTravelStats) {
     auto mix64 = [](uint64_t x) {
       x += 0x9E3779B97F4A7C15ULL;

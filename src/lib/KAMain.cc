@@ -210,6 +210,15 @@ cl::opt<unsigned> CFLFieldBuckets(
            "memory modeling (0 = field-insensitive, default)"),
   cl::init(0));
 
+cl::opt<bool> CFLRootRelevance(
+  "cfl-root-relevance",
+  cl::desc("After the flows-to fixpoint, measure the answer-relevant root "
+           "fraction: function roots read at icall planes plus roots whose "
+           "cluster key triggered a merge whose class lies on a backward "
+           "path from some fptr class. Sizes the demand-driven-roots "
+           "lever (solver work ~ |E| x |roots|)"),
+  cl::init(false));
+
 cl::opt<bool> CFLFlowsToIncremental(
   "cfl-flows-to-incremental",
   cl::desc("Continue the flows-to solve across resolution iterations "

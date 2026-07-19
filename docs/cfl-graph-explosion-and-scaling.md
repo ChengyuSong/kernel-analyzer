@@ -1195,3 +1195,30 @@ Expected payoff at kernel scale if the subset ratios hold: fact mass
 ~12 GB -> ~3-4 GB, and the solve time dimension |roots| drops ~7x.
 Validation gate as always: per-icall identity vs the full solve +
 closure certificate restricted to minted roots.
+
+## 2026-07-18: POPL'18 consistency check + novelty ledger
+
+Read Chatterjee–Choudhary–Pavlogiannis, "Optimal Dyck Reachability"
+(POPL'18) against our results: fully consistent, and it retroactively
+explains two empirical findings — (1) our join layer independently
+reinvented `BidirectedReach` (bidirected Dyck = equivalence, optimal
+via union-find; our Lean fact-equivalence = their soundness/
+completeness pair), and (2) their partition-vs-relation split is our
+"OOM = closure size" diagnosis: the partition is O(m), enumerating
+all pairs is the quadratic part — which is what flows-to avoids.
+Their BMM-hardness for general Dyck (even constant treewidth)
+justifies output-sensitivity (demand-driven roots) over hunting a
+uniform algorithm, and their Lemma 3.4 potential argument says a
+merge layer with delta-precise re-offers is the amortized-correct
+form of ours — supporting that retry. Their Dyck-paren field model is
+Java-only (cannot express container_of), which is exactly where our
+Z_P shift encoding deviates.
+
+Full classification — rediscovered (wave scheduling = Pereira–Pearce
+wave propagation; a-SCC collapse = online cycle elimination; deltas =
+semi-naive) vs defensible novelties (witness-exact unification inside
+a directional solver; sound C fields as quotient-group weights at
+scale; certificate-carrying runs; the measurement set; 1-bit VX
+provenance) — recorded in docs/novelty-and-related-work.md, with the
+pre-drafting diligence list (InterDyck/mutual refinement 2024–26,
+Kelp/TFA kernel icall lineage, group-weighted Dyck instantiations).

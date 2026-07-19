@@ -1234,3 +1234,29 @@ scale; certificate-carrying runs; the measurement set; 1-bit VX
 provenance) — recorded in docs/novelty-and-related-work.md, with the
 pre-drafting diligence list (InterDyck/mutual refinement 2024–26,
 Kelp/TFA kernel icall lineage, group-weighted Dyck instantiations).
+
+## 2026-07-19: terminology correction + heap-identity directive (task #17)
+
+CLARIFICATION (recorded so the paper doesn't overclaim): the solver is
+ANSWER-ANCHORED (relation restricted to origin facts), NOT
+demand-driven — all roots are minted and fully propagated. The
+root-relevance measurement sizes the demand-driven opportunity (23%
+of roots / 30% of fact mass at whole-kernel); the lazy-minting
+mechanism is designed (§2026-07-18) but unimplemented. Subset ratios
+UNDER-estimate relevance for the same reason coredump's sysctl pairs
+need out-of-module VFS flow: cut boundaries sever data-flow.
+
+Heap-identity conflation, micro-evidence (test/t_allocinit.c): a
+wrapper that mallocs, stores a callback into the object, and hands it
+out (return or out-param) is analyzed SOUNDLY by flows-to (both
+icalls resolve; the saturation-path removeCallEdges/opaque treatment
+does not fire in flows-to mode) but CONFLATED: one internal alloc
+site = one object for every wrapper caller, so 2 callsites x 2
+callbacks = 4 pairs instead of 2, at K=0 AND K=13 (field sensitivity
+cannot split same-object smear). This is seq_open/devm_kzalloc in
+miniature and scales with wrapper fan-in. Fix = task #17: selective
+per-callsite cloning of wrapper constraint subgraphs (automatic
+detection + yaml override, transitive with depth/size budgets, sound
+shared-treatment fallback, loud). Expected: precision (fan-out tail)
+AND time (closure law: splitting a shared identity shrinks
+Sum|component|^2 quadratically).

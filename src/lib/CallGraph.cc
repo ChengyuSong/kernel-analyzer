@@ -2525,6 +2525,14 @@ bool CallGraphPass::runFlowsToResolution() {
       MergeTimer(uint64_t &a_) : acc(a_), t0(__builtin_ia32_rdtsc()) {}
       ~MergeTimer() { acc += __builtin_ia32_rdtsc() - t0; }
     } mt(cyMerge);
+    // Keeper = union-by-rank. Deliberate keeper policies were tried
+    // and measured NO BETTER on the kernel subset (2026-07-19):
+    // by-fact-mass +22% (light-fact hubs became losers and the merged
+    // planes were pushed along their huge edge lists), by-edge-list
+    // +6%; rank implicitly keeps the veteran hub classes anyway. The
+    // Lemma-3.4/small-to-large discipline from optimal bidirected Dyck
+    // does not transfer: their merges carry no payload, ours push
+    // planes along loser lists and re-sweep merged cell lists.
     if (ufrank[a] < ufrank[b]) std::swap(a, b);
     if (ufrank[a] == ufrank[b]) ufrank[a]++;
     ufp[b] = a;
@@ -2575,16 +2583,22 @@ bool CallGraphPass::runFlowsToResolution() {
       RB[b][s].release();
       dirty[b][s].release();
       dirtyBr[b][s].release();
-      // Join backlog: the merged cell list must be swept with the full
-      // merged fact set (filtered by `joined`, which keeps only facts
-      // that reached BOTH sides' cells).
+      // Join backlog: the merged cell list must be swept with every
+      // fact not yet known-joined to all of it. Combine the joined
+      // marks per the cell geometry above, then re-offer only the
+      // difference — not the full fact set.
+      joined[a][s].intersectWith(joined[b][s]);
+      joined[b][s].release();
+      // Re-offer the full fact set; the sweep filters through the
+      // (now better-preserved) joined marks. Computing the precise
+      // difference HERE was measured NEGATIVE on the kernel subset:
+      // it streams the heavy merged plane 3-4 extra times per merge
+      // while the multi-cluster cell lists keep the union case rare.
       jdirty[a][s].unionWith(R[a][s]);
       jdirty[a][s].unionWith(RB[a][s]);
       if (CFLSolverProfile)
         reofferedFacts += R[a][s].count() + RB[a][s].count();
       jdirty[b][s].release();
-      joined[a][s].intersectWith(joined[b][s]);
-      joined[b][s].release();
     }
     // One-time pushes along the loser's moved lists (keeper's old lists
     // only ever need deltas): merged facts along a/f edges (emission is

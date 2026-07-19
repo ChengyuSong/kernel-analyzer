@@ -1260,3 +1260,34 @@ detection + yaml override, transitive with depth/size budgets, sound
 shared-treatment fallback, loud). Expected: precision (fan-out tail)
 AND time (closure law: splitting a shared identity shrinks
 Sum|component|^2 quadratically).
+
+## 2026-07-19: Lemma-3.4 merge discipline — NEGATIVE, does not transfer (task #18)
+
+Tried the POPL'18-derived merge layer on the kernel subset (baseline
+19.7B total / 12.4B join / 3.5B merge cycles). Four variants:
+1. keeper by fact mass + joined-union-when-one-cluster + merge-time
+   delta re-offer: 23.2B (+18%). Re-offers UNCHANGED (121M -> 123M):
+   kernel cell lists span multiple clusters (container webs), so the
+   exact-union case rarely fires and intersect still destroys marks;
+   meanwhile the delta computation streams the heavy merged plane 3-4
+   extra times per merge.
+2. keeper by fact mass, no delta computation: 24.0B (+22%). The
+   keeper policy itself is the regression: light-FACT hub classes
+   with huge fan-out become losers, and the one-time pushes stream
+   the merged planes along their edge lists.
+3. keeper by edge-list size + eligibility scan: 22.1B (+12%) — the
+   per-merge cell-list scan (find() per entry over veteran classes'
+   thousands of cells) is itself ~1.5-2B.
+4. keeper by edge-list size alone: 20.8B (+6%) — never better than
+   rank.
+REVERTED to union-by-rank + intersect (exact baseline restored,
+19.6B). WHY the theory does not transfer: BidirectedReach merges are
+payload-free (edge lists splice in O(1), nothing re-derives), so
+small-to-large amortizes; our merges push merged fact planes along
+the loser's moved edges and re-sweep merged cell lists — the cost
+model the potential function assumes does not include either. Rank
+already keeps veteran hubs implicitly. Mark preservation would need
+per-side offer machinery (jdirty entries scoped to cell subsets),
+whose bookkeeping exceeds the 6% the joined-filter currently saves.
+Delta-precise merge re-offers are now CLOSED-NEGATIVE in both cost
+regimes (pre- and post-wave-scheduling).

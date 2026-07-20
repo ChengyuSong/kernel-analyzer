@@ -1339,3 +1339,33 @@ kernel-shaped inputs through a different channel: the ROOT UNIVERSE
 shrinks 38%, so dense planes narrow proportionally (subset: 63k->39k
 bits) — -30% solve on the subset where planes are dense-heavy;
 harfbuzz (sparse-heavy) is a wash. Free at 48 ms, on by flag.
+
+## 2026-07-19/20: kernel regression diagnosed and fixed — new production best (task #20, 9971899)
+
+A/B with the July-16 binary (worktree at a7d9cff), single-iteration
+whole-kernel, SolverProf both sides: work IDENTICAL (272M lookups,
+275M offered facts, 123k+2.2k merges, same fixpoint), a-prop
+IDENTICAL (185B cycles both), RSS IDENTICAL (27.2GB both — the old
+"12.4GB" was a phase-of-run artifact; no memory regression ever
+existed). The entire 239 -> 515 s delta was the JOIN phase: 358B ->
+1072B cycles at equal volume. Cause: the 256-shard cluster registry
+(introduced for the deferred-join parallel experiments, vestigial
+since joins went sequential-only) — 272M redundant-confirm probes
+chase hash-distributed shard headers spread over 16KB instead of one
+flat_map header staying hot in L1, adding 1-2 dependent misses per
+probe. Library-scale maps are small enough either way, which is why
+the harfbuzz/subset T=1 parity gates missed it. De-sharded: 243 s
+single-iteration = parity with July-16 (within 3%).
+
+CAPSTONE (de-shard + --cfl-bidi-prune, full bclist): resolution
+identical (14,799 icalls / 5,107,435 pairs, converged iter 4),
+iterations 158.6/173.0/177.6/172.2/171.9 s = **14.2 min total solve**
+(vs 19.6 min July-16 best, vs 41-46 min regressed+unpruned), wall
+1:10:37 end-to-end, RSS 27.3GB. New production configuration:
+sequential + --cfl-bidi-prune.
+
+Meta-lesson for the falsified-hypothesis catalog: infrastructure left
+behind by a rejected experiment is not free — the shards cost nothing
+in the experiments' own gates and 2.1x at the scale the gates didn't
+cover. Scale-dependent regressions need a whole-kernel timing gate
+(single-iteration, ~4 min of solve) in the validation loop.

@@ -333,6 +333,70 @@ AsmCat classifyAsm(const CallBase *CB, const InlineAsm *IA,
   return AsmPure;
 }
 
+// ---- module-level constructs (linker-mediated pointer plumbing) -------
+// Kernel initcalls/tracepoints/static_call are MODULE-LEVEL inline asm
+// on x86-64 (PREL32: .section X + .long fn - .), invisible to the
+// instruction walk; consumption reads linker-defined __start_/__stop_
+// extern globals. This pass makes both halves loud.
+
+// strip the kmod/LTO uniquification suffix: ".initcall5.init..kmod_x"
+// -> ".initcall5.init"; also clang's ".llvm." suffixes
+std::string normalizeSection(StringRef S) {
+  size_t p = S.find("..");
+  if (p != StringRef::npos) S = S.take_front(p);
+  p = S.find(".llvm.");
+  if (p != StringRef::npos) S = S.take_front(p);
+  return S.str();
+}
+
+struct ModAsmSec {
+  uint64_t modules = 0, symEntries = 0;
+  std::set<std::string> exampleSyms; // first few referenced symbols
+};
+
+// one pass over a module's inline-asm blob: track the active section
+// via .section/.pushsection/.previous/.popsection, count .long/.quad
+// entries that reference a symbol
+void walkModuleAsm(StringRef Blob, std::map<std::string, ModAsmSec> &secs,
+                   std::set<std::string> &touched) {
+  std::vector<std::string> stack;
+  std::string cur;
+  SmallVector<StringRef, 64> lines;
+  Blob.split(lines, '\n');
+  for (StringRef L : lines) {
+    StringRef T = L.trim(" \t");
+    if (T.starts_with(".section") || T.starts_with(".pushsection")) {
+      StringRef Rest = T.drop_front(T.starts_with(".pushsection") ? 12 : 8)
+                           .trim(" \t");
+      StringRef Name = Rest.split(',').first.trim(" \t\"");
+      if (T.starts_with(".pushsection")) stack.push_back(cur);
+      cur = normalizeSection(Name);
+      touched.insert(cur);
+    } else if (T.starts_with(".previous") || T.starts_with(".popsection")) {
+      cur = stack.empty() ? std::string() : stack.back();
+      if (!stack.empty()) stack.pop_back();
+    } else if (!cur.empty() &&
+               (T.starts_with(".long") || T.starts_with(".quad"))) {
+      StringRef Expr = T.drop_front(5).trim(" \t");
+      // first token that looks like a symbol (not a bare number)
+      StringRef Sym = Expr.split(' ').first.split('-').first.trim(" \t");
+      if (!Sym.empty() && !isdigit(Sym.front())) {
+        ModAsmSec &ms = secs[cur];
+        ms.symEntries++;
+        if (ms.exampleSyms.size() < 3) ms.exampleSyms.insert(Sym.str());
+      }
+    }
+  }
+}
+
+// linker-array bounds symbol? (__start_X/__stop_X or the initcall/setup
+// families the kernel lds defines by hand)
+bool isLinkerBoundsName(StringRef N) {
+  return N.starts_with("__start_") || N.starts_with("__stop_") ||
+         (N.starts_with("__") &&
+          (N.ends_with("_start") || N.ends_with("_end")));
+}
+
 // ---- JSON emission ----------------------------------------------------
 void jsonEsc(raw_ostream &os, StringRef s) {
   for (unsigned char c : s) {
@@ -378,7 +442,46 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
           walkCE(OC);
   };
 
+  // module-level tallies
+  std::map<std::string, ModAsmSec> modAsmSecs;
+  std::set<std::string> modAsmSections;
+  uint64_t modAsmModules = 0;
+  struct SecTally { uint64_t count = 0, ptrBearing = 0; };
+  std::map<std::string, SecTally> sectionedGlobals;
+  struct ExtGV { uint64_t uses = 0; bool bounds = false; };
+  std::map<std::string, ExtGV> externGlobals; // declared, defined nowhere
+  uint64_t addressableStubs = 0;
+  std::set<const Function *> addressableTargets;
+  uint64_t nAliases = 0, nIFuncs = 0;
+
   for (auto &[M, Name] : Ctx->Modules) {
+    // -- module-level constructs --
+    if (!M->getModuleInlineAsm().empty()) {
+      modAsmModules++;
+      walkModuleAsm(M->getModuleInlineAsm(), modAsmSecs, modAsmSections);
+    }
+    nAliases += std::distance(M->alias_begin(), M->alias_end());
+    nIFuncs += std::distance(M->ifunc_begin(), M->ifunc_end());
+    for (GlobalVariable &GV : M->globals()) {
+      if (GV.hasSection()) {
+        std::string sec = normalizeSection(GV.getSection());
+        SecTally &st = sectionedGlobals[sec];
+        st.count++;
+        if (typeHasPointer(GV.getValueType())) st.ptrBearing++;
+        if (sec == ".discard.addressable" && GV.hasInitializer()) {
+          addressableStubs++;
+          if (auto *F = dyn_cast<Function>(
+                  GV.getInitializer()->stripPointerCasts()))
+            addressableTargets.insert(F);
+        }
+      }
+      if (GV.isDeclaration() &&
+          Ctx->Gobjs.find(GV.getGUID()) == Ctx->Gobjs.end()) {
+        ExtGV &e = externGlobals[GV.getName().str()];
+        e.uses += GV.getNumUses();
+        e.bounds = isLinkerBoundsName(GV.getName());
+      }
+    }
     for (GlobalVariable &GV : M->globals())
       if (GV.hasInitializer())
         walkCE(GV.getInitializer());
@@ -539,6 +642,54 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
   errs() << "CENSUS asm exposure: " << asmExposedSites << " of " << asmSites
          << " sites can move a pointer (categories ptr-out/mem-ptr/"
             "ptr-in-reg/mem-ptr-width)\n";
+  // module-level constructs — always printed: linker-mediated pointer
+  // plumbing is invisible to the instruction walk by construction
+  errs() << "CENSUS ================ module-level ================\n";
+  {
+    uint64_t totEntries = 0;
+    for (auto &[s, ms] : modAsmSecs) totEntries += ms.symEntries;
+    errs() << "CENSUS module-asm: " << modAsmModules
+           << " modules with blobs, " << modAsmSecs.size()
+           << " distinct sections, " << totEntries << " symbol entries\n";
+    std::vector<std::pair<uint64_t, std::string>> v;
+    for (auto &[s, ms] : modAsmSecs) v.push_back({ms.symEntries, s});
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < std::min<size_t>(15, v.size()); i++) {
+      auto &ms = modAsmSecs[v[i].second];
+      errs() << "CENSUS module-asm-sec " << v[i].second << " entries "
+             << v[i].first << " e.g.";
+      for (auto &s : ms.exampleSyms) errs() << " " << s;
+      errs() << "\n";
+    }
+  }
+  {
+    std::vector<std::pair<uint64_t, std::string>> v;
+    for (auto &[s, st] : sectionedGlobals) v.push_back({st.count, s});
+    std::sort(v.rbegin(), v.rend());
+    errs() << "CENSUS sectioned globals: " << sectionedGlobals.size()
+           << " distinct sections\n";
+    for (size_t i = 0; i < std::min<size_t>(15, v.size()); i++)
+      errs() << "CENSUS global-sec " << v[i].second << " count "
+             << v[i].first << " ptr-bearing "
+             << sectionedGlobals[v[i].second].ptrBearing << "\n";
+  }
+  {
+    uint64_t nBounds = 0;
+    std::vector<std::pair<uint64_t, std::string>> v;
+    for (auto &[n, e] : externGlobals) {
+      if (e.bounds) { nBounds++; v.push_back({e.uses, n}); }
+    }
+    std::sort(v.rbegin(), v.rend());
+    errs() << "CENSUS extern globals (defined nowhere): "
+           << externGlobals.size() << ", linker-array bounds " << nBounds
+           << "  [LEDGER: loads from bounds yield nothing today]\n";
+    for (size_t i = 0; i < std::min<size_t>(15, v.size()); i++)
+      errs() << "CENSUS linker-bounds " << v[i].second << " uses "
+             << v[i].first << "\n";
+  }
+  errs() << "CENSUS addressable-stubs " << addressableStubs
+         << " distinct-targets " << addressableTargets.size()
+         << " aliases " << nAliases << " ifuncs " << nIFuncs << "\n";
   errs() << "CENSUS ================ summary ================\n";
   errs() << "CENSUS summary funcs " << totalFuncs << " insts " << totalInsts
          << " asm-sites " << asmSites << " asm-distinct " << asmTable.size()
@@ -642,9 +793,55 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
         os << "\"}" << (i + 1 < byCount.size() ? "," : "") << "\n";
       }
     }
+    // module-level: linker-mediated pointer plumbing
+    os << "  ],\n  \"module_level\": {\n";
+    os << "    \"module_asm_modules\": " << modAsmModules
+       << ",\n    \"addressable_stubs\": " << addressableStubs
+       << ",\n    \"addressable_distinct_targets\": "
+       << addressableTargets.size() << ",\n    \"aliases\": " << nAliases
+       << ",\n    \"ifuncs\": " << nIFuncs << ",\n";
+    os << "    \"module_asm_sections\": [\n";
+    {
+      size_t i = 0;
+      for (auto &[s, ms] : modAsmSecs) {
+        os << "      {\"section\": \"";
+        jsonEsc(os, s);
+        os << "\", \"sym_entries\": " << ms.symEntries << ", \"examples\": [";
+        size_t j = 0;
+        for (auto &e : ms.exampleSyms) {
+          os << (j++ ? ", " : "") << "\"";
+          jsonEsc(os, e);
+          os << "\"";
+        }
+        os << "]}" << (++i < modAsmSecs.size() ? "," : "") << "\n";
+      }
+    }
+    os << "    ],\n    \"sectioned_globals\": [\n";
+    {
+      size_t i = 0;
+      for (auto &[s, st] : sectionedGlobals) {
+        os << "      {\"section\": \"";
+        jsonEsc(os, s);
+        os << "\", \"count\": " << st.count << ", \"ptr_bearing\": "
+           << st.ptrBearing << "}"
+           << (++i < sectionedGlobals.size() ? "," : "") << "\n";
+      }
+    }
+    os << "    ],\n    \"extern_globals\": [\n";
+    {
+      size_t i = 0;
+      for (auto &[n, e] : externGlobals) {
+        os << "      {\"name\": \"";
+        jsonEsc(os, n);
+        os << "\", \"uses\": " << e.uses << ", \"linker_bounds\": "
+           << (e.bounds ? "true" : "false") << "}"
+           << (++i < externGlobals.size() ? "," : "") << "\n";
+      }
+    }
+    os << "    ]\n  },\n";
     // the ledger: every construct class the encoder does NOT model,
     // with instance counts — the per-corpus unsoundness bill
-    os << "  ],\n  \"ledger\": [\n";
+    os << "  \"ledger\": [\n";
     {
       std::vector<std::string> rows;
       for (auto &[cnt, op] : ops) {

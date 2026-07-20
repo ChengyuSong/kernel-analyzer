@@ -92,6 +92,71 @@ template first):
 4. Everything else is either justified-NOOP-by-family (bitops, flags)
    or covered by a stated assumption (uaccess).
 
+## Module-level: linker-mediated pointer flows (2026-07-20, second pass)
+
+The instruction-level census above is structurally blind to a second
+exposure: pointer bindings assembled by the LINKER, not by IR
+instructions. On x86-64 (PREL32 relocations), `__initcall(fn)` emits
+**module-level** inline asm (`.section .initcallN.init` + `.long fn -
+.`); consumption reads linker-defined `__start_X`/`__stop_X` extern
+globals that have no definition in any TU — so today a flows-to load
+from them yields ∅ and e.g. `do_one_initcall`'s indirect call resolves
+to nothing. The census now walks `getModuleInlineAsm()`, sectioned
+globals, and undefined extern globals (`module_level` object in the
+JSON artifact).
+
+Kernel numbers:
+- **module asm**: 1,494 modules carry blobs; 27 distinct target
+  sections; 3,490 symbol entries. By family: pci_fixup_\* 1,671,
+  __tracepoints_ptrs 964, .initcall\*.init 646, __ex_table 32.
+- **sectioned globals** (regular IR globals the encoder already sees;
+  only the linker-array *read* is unconnected): __param 534,
+  __tracepoints 964, __bpf_raw_tp_map 964, _ftrace_events 1,828,
+  .init.setup 314, _ftrace_eval_map 549, .x86_cpu_dev.init 5,
+  .apicdrivers 1.
+- **undefined extern globals**: 199, of which **106 are linker-array
+  bounds** (`__start_/__stop_/..._start/_end`) — with real IR loads:
+  `__start___param` (5 uses), `__start_builtin_fw` (6),
+  `__stop___jump_table` (6), `__start_static_call_sites` (4), …
+- **`.discard.addressable` stubs**: 16,915 stubs naming **12,597
+  distinct functions** (21.8% of all 57,661) — the IR-visible catalog
+  of everything referenced from asm/linker plumbing, and the key that
+  makes the model below possible without parsing asm text.
+
+### vmlinux cross-reference: what the linked image says the arrays hold
+
+Sampling each bounds-delimited array in the built vmlinux (content
+classified as ABS64 kernel VAs vs PREL32 offsets vs data):
+
+| array | bytes | content | fptr-relevant? |
+|---|---:|---|---|
+| initcall0–7/rootfs | 2,449 | PREL32 fn offsets | **yes — do_one_initcall** |
+| setup (`.init.setup`) | 7,536 | ABS64 (obs_kernel_param.setup_func) | **yes — obsolete_checksetup** |
+| __param | 21,520 | ABS64 (kernel_param → ops->set/get) | **yes** |
+| pci_fixup_\* | ~14,800 | PREL32 fn offsets (quirk hooks) | **yes — pci_do_fixups** |
+| ftrace_events | 14,888 | ABS64 (trace_event_call → class ops) | **yes** |
+| _bpf_raw_tp | 31,904 | ABS64 (bpf_raw_event_map.bpf_func) | **yes** |
+| __tracepoints_ptrs | 3,988 | PREL32 → tracepoint structs | partial — probe funcs register via IR-visible calls |
+| static_call_sites | 105,032 | PREL32 call-site addrs | task #14 (patching, not data flow) |
+| mcount_loc | 396,920 | ABS64 code addrs | no — ftrace patch points, control only |
+| __ksymtab/_gpl | 142,956 | PREL32 export offsets | only for out-of-tree module loading |
+| orc_\*, __bug_table, __ex_table, __jump_table | ~5.8 MB | PREL32 metadata | no — unwind/traps/patching |
+
+So the fptr-relevant linker arrays are: **initcalls, setup, __param,
+pci_fixup, ftrace_events, bpf_raw_tp** (≈6,100 pointer entries total),
+plus the tracepoint iteration side. Everything larger is unwind/patch
+metadata with no pointer-value flow.
+
+### The model (phase B, task #22)
+
+Section-array unification: for each `__start_X`/`__stop_X` (and
+initcall/setup families), alias the extern bounds symbol to a
+synthetic array node into which every section-X global flows; module-
+asm PREL32 entries contribute their target functions (recoverable via
+`.discard.addressable` stubs — no asm-text parsing needed). One
+mechanism covers all six families. Differential test:
+`do_one_initcall`'s V-set goes from ∅ to the ~646 initstubs.
+
 ## The full residual ledger (per-corpus unsoundness bill)
 
 From this census plus the 2026-07-20 whole-kernel solve run:

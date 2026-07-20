@@ -1456,3 +1456,32 @@ study in docs/kernel-census/):
 Residual kernel ledger after classification: 171 ptr-capable asm
 templates, 22,794 declined interprocedural int-provenance accesses,
 1,136 extern decls (top mass __SCT__), 16 SUSPECT intrinsic instances.
+
+## 2026-07-20 (later still): module-level census — linker-mediated pointer flows (task #22 phase A)
+
+User-flagged gap: linker-introduced/setup pointers (kernel initcalls,
+userspace ctors/PLT). Status check: llvm.global_ctors/dtors and ifunc
+resolvers already handled (CallGraph.cc:5585/5606); PLT is sub-IR. The
+kernel hole is real and DOUBLY invisible: x86-64 initcalls are
+MODULE-LEVEL inline asm (PREL32 .section + .long fn-.), unseen by both
+the instruction census and the edge builder (no getModuleInlineAsm
+handler existed anywhere); consumption loads linker-defined
+__start_/__stop_ externs (ExtGobjs) that flows-to resolves to ∅.
+
+Census extended (module_level in the JSON artifact): module-asm blobs
+by target section, sectioned globals with ptr-bearing counts, undefined
+extern globals with linker-bounds flag + use counts, .discard.
+addressable stub tally. Kernel: 1,494 modules with blobs / 27 sections
+/ 3,490 sym entries (pci_fixup 1,671, tracepoints_ptrs 964, initcalls
+646); 106 linker-bounds externs WITH real IR loads (__start___param 5,
+__start_builtin_fw 6, ...); 16,915 addressable stubs naming 12,597
+distinct functions = 21.8% of the corpus referenced via linker
+plumbing. vmlinux content cross-ref (ABS64 vs PREL32 sampling of every
+bounds pair in the linked image): fptr-relevant arrays = initcalls,
+.init.setup (314), __param (534), pci_fixup, ftrace_events (1,828),
+__bpf_raw_tp_map (964) ≈ 6,100 pointer entries; the multi-MB arrays
+(orc, bug/ex/jump tables, mcount) are patch/unwind metadata — no
+value flow. Phase B model: section-array unification (__start_X/
+__stop_X extern ↔ synthetic node fed by section-X globals + module-asm
+targets via addressable stubs); differential test = do_one_initcall
+V-set ∅ → ~646 initstubs. Study: docs/kernel-census/README.md.

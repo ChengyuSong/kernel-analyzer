@@ -2821,6 +2821,56 @@ CENSUS asm-cat imm-ptr sites 23132 distinct 5
 CENSUS asm-cat barrier sites 57955 distinct 4594
 CENSUS asm-cat pure sites 4948 distinct 32
 CENSUS asm exposure: 17804 of 129812 sites can move a pointer (categories ptr-out/mem-ptr/ptr-in-reg/mem-ptr-width)
+CENSUS ================ module-level ================
+CENSUS module-asm: 1494 modules with blobs, 27 distinct sections, 3490 symbol entries
+CENSUS module-asm-sec __tracepoints_ptrs entries 964 e.g. __tracepoint_initcall_finish __tracepoint_initcall_level __tracepoint_initcall_start
+CENSUS module-asm-sec .pci_fixup_final entries 662 e.g. (~0), __UNIQUE_ID_quirk_intel_irqbalance473 __UNIQUE_ID_via_no_dac490
+CENSUS module-asm-sec .pci_fixup_header entries 634 e.g. (~0), __UNIQUE_ID_ich_force_enable_hpet481 __UNIQUE_ID_ich_force_enable_hpet483
+CENSUS module-asm-sec .initcall6.init entries 232 e.g. __initstub__kmod_ibs__560_1547_amd_ibs_init6 __initstub__kmod_rapl__528_863_rapl_pmu_init6 __initstub__kmod_vdso32_setup__400_77_ia32_binfmt_init6
+CENSUS module-asm-sec .pci_fixup_early entries 193 e.g. (~0), __UNIQUE_ID_quirk_intel_brickland_xeon_ras_cap585 __UNIQUE_ID_quirk_intel_brickland_xeon_ras_cap587
+CENSUS module-asm-sec .discard.ibt_endbr_noseal entries 162 e.g. setc setno seto
+CENSUS module-asm-sec .initcall4.init entries 112 e.g. __initstub__kmod_core__833_7032_fixup_ht_bug4 __initstub__kmod_vdso_image_32__125_662_init_vdso_image_324 __initstub__kmod_vdso_image_64__125_508_init_vdso_image_644
+CENSUS module-asm-sec .initcall7.init entries 92 e.g. __initstub__kmod_intel__650_1018_sld_mitigate_sysctl_init7 __initstub__kmod_intel_epb__424_240_intel_epb_init7 __initstub__kmod_mounts__629_40_kernel_do_mounts_initrd_sysctls_init7
+CENSUS module-asm-sec .pci_fixup_resume entries 88 e.g. (~0), __UNIQUE_ID_quirk_passive_release600 __UNIQUE_ID_quirk_vialatency624
+CENSUS module-asm-sec .pci_fixup_resume_early entries 70 e.g. (~0), __UNIQUE_ID_quirk_via_ioapic742 __UNIQUE_ID_quirk_via_vt8237_bypass_apic_deassert746
+CENSUS module-asm-sec .initcall5.init entries 64 e.g. __initstub__kmod_amd_nb__483_543_init_amd_nbs5 __initstub__kmod_hpet__432_1167_hpet_late_init5 __initstub__kmod_nmi__665_112_nmi_warning_debugfs5
+CENSUS module-asm-sec .initcall1.init entries 42 e.g. __initstub__kmod_apic__1262_2706_init_lapic_sysfs1 __initstub__kmod_e820__618_792_e820__register_nvs_regions1 __initstub__kmod_reboot__706_517_reboot_init1
+CENSUS module-asm-sec .initcallearly.init entries 36 e.g. __initstub__kmod_core__643_2200_init_hw_perf_eventsearly __initstub__kmod_init__448_220_do_init_real_modeearly __initstub__kmod_signal__634_201_init_sigframe_sizeearly
+CENSUS module-asm-sec __ex_table entries 32 e.g. (10b) (11b) \type
+CENSUS module-asm-sec .initcall2.init entries 25 e.g. __initstub__kmod_backing_dev__1041_363_bdi_class_init2 __initstub__kmod_irqdesc__428_366_irq_sysfs_init2 __initstub__kmod_tracepoint__427_140_release_early_probes2
+CENSUS sectioned globals: 39 distinct sections
+CENSUS global-sec .discard.addressable count 16915 ptr-bearing 16915
+CENSUS global-sec .data count 3664 ptr-bearing 1396
+CENSUS global-sec .data.unlikely count 2518 ptr-bearing 0
+CENSUS global-sec .modinfo count 2121 ptr-bearing 0
+CENSUS global-sec _ftrace_events count 1828 ptr-bearing 1828
+CENSUS global-sec llvm.metadata count 1786 ptr-bearing 1786
+CENSUS global-sec __tracepoints_strings count 964 ptr-bearing 0
+CENSUS global-sec __tracepoints count 964 ptr-bearing 964
+CENSUS global-sec __bpf_raw_tp_map count 964 ptr-bearing 964
+CENSUS global-sec .data.once count 888 ptr-bearing 0
+CENSUS global-sec .init.data count 847 ptr-bearing 630
+CENSUS global-sec .ref.data count 713 ptr-bearing 713
+CENSUS global-sec _ftrace_eval_map count 549 ptr-bearing 549
+CENSUS global-sec __param count 534 ptr-bearing 534
+CENSUS global-sec .init.rodata count 470 ptr-bearing 97
+CENSUS extern globals (defined nowhere): 199, linker-array bounds 106  [LEDGER: loads from bounds yield nothing today]
+CENSUS linker-bounds __start_rodata uses 21
+CENSUS linker-bounds __init_end uses 21
+CENSUS linker-bounds __start_orc_unwind_ip uses 18
+CENSUS linker-bounds __bss_start uses 12
+CENSUS linker-bounds __start_orc_unwind uses 7
+CENSUS linker-bounds __stop___jump_table uses 6
+CENSUS linker-bounds __start_builtin_fw uses 6
+CENSUS linker-bounds __start___tracepoint_str uses 6
+CENSUS linker-bounds __start___param uses 5
+CENSUS linker-bounds __start___jump_table uses 5
+CENSUS linker-bounds __start___ex_table uses 5
+CENSUS linker-bounds __governor_thermal_table_end uses 5
+CENSUS linker-bounds __stop_static_call_sites uses 4
+CENSUS linker-bounds __start_notes uses 4
+CENSUS linker-bounds __start___trace_bprintk_fmt uses 4
+CENSUS addressable-stubs 16915 distinct-targets 12597 aliases 45 ifuncs 0
 CENSUS ================ summary ================
 CENSUS summary funcs 57661 insts 4802515 asm-sites 129812 asm-distinct 4921 extern-decls 1136 agg/vec-ptr-load-store 0 vec-ptr-ops 0
 CENSUS summary UNDISPOSITIONED kinds 0, SUSPECT ptr-relevant instances 16

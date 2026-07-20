@@ -2795,43 +2795,19 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   // Cluster registry: fact (o, s) -> current representative class of the
   // merged cell cluster. Entries may go stale under merges; resolve with
-  // find() on read. Sharded with per-shard spinlocks so the parallel
-  // join filter can create FI clusters in-sweep (hot) — first-offer
-  // facts are the majority of sweep volume, and deferring their
-  // creation to the sequential apply step re-touches them cold at ~5x
-  // the cycles. Cross-cluster merges still defer to the apply step.
-  struct ClusterShard {
-    boost::unordered_flat_map<uint64_t, uint32_t> map;
-    std::atomic<uint8_t> lk{0};
-  };
-  constexpr uint32_t kClusterShards = 256;
-  std::vector<ClusterShard> clusterShards(kClusterShards);
-  auto shardOf = [&](uint64_t key) -> ClusterShard & {
-    return clusterShards[(key * 0x9E3779B97F4A7C15ull) >> 56];
-  };
-  auto shardLock = [&](ClusterShard &sh) {
-    if (!parallelPhase) return;
-    while (sh.lk.exchange(1, std::memory_order_acquire))
-      while (sh.lk.load(std::memory_order_relaxed))
-        __builtin_ia32_pause();
-  };
-  auto shardUnlock = [&](ClusterShard &sh) {
-    if (!parallelPhase) return;
-    sh.lk.store(0, std::memory_order_release);
-  };
+  // find() on read. ONE flat map, deliberately: joins are sequential in
+  // every shipped configuration, and the sharded variant (256 maps with
+  // per-shard spinlocks, built for the deferred-join experiments) was
+  // measured to TRIPLE the redundant-confirm probe cost at whole-kernel
+  // scale — 272M probes walk shard headers scattered across 16KB
+  // instead of one map header hot in L1 (join phase 358B -> 1072B
+  // cycles, the 291->497 s/iter kernel regression).
+  boost::unordered_flat_map<uint64_t, uint32_t> clusterRep;
   auto clusterFind = [&](uint64_t key) -> uint32_t { // UINT32_MAX = absent
-    auto &sh = shardOf(key);
-    shardLock(sh);
-    auto it = sh.map.find(key);
-    const uint32_t r = it == sh.map.end() ? UINT32_MAX : it->second;
-    shardUnlock(sh);
-    return r;
+    auto it = clusterRep.find(key);
+    return it == clusterRep.end() ? UINT32_MAX : it->second;
   };
-  auto clusterCount = [&]() {
-    size_t c = 0;
-    for (auto &sh : clusterShards) c += sh.map.size();
-    return c;
-  };
+  auto clusterCount = [&]() { return clusterRep.size(); };
   std::unordered_map<uint32_t, std::vector<uint64_t>> shiftKeysOf;
   size_t bridgeCount = 0;
   // VX bridge: pairwise fact exchange between two cluster classes, native
@@ -2851,8 +2827,7 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     const uint64_t key = (uint64_t)o * NSHIFT + s;
-    auto &sh = shardOf(key); // sequential context: shard locks are no-ops
-    auto [it, ins] = sh.map.emplace(key, find(cell));
+    auto [it, ins] = clusterRep.emplace(key, find(cell));
     if (!ins) {
       const uint32_t cellRep = find(cell);
       if (cellRep == find(it->second)) {
@@ -3553,8 +3528,7 @@ bool CallGraphPass::runFlowsToResolution() {
         return "<unnamed>";
       };
       size_t ckShown = 0;
-      for (auto &sh0 : clusterShards)
-      for (auto &[key, crep] : sh0.map) {
+      for (auto &[key, crep] : clusterRep) {
         if (find(crep) != rep || ckShown++ > 40) continue;
         uint32_t o2 = (uint32_t)(key / NSHIFT), s2 = (uint32_t)(key % NSHIFT);
         errs() << "TRACE-BWD   cluster-key origin=r" << o2 << " (c"
@@ -3597,8 +3571,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // Where did the traced function's stores land? Its class's cells and
       // their cluster keys.
       if (traceRoot >= 0) {
-        for (auto &sh0 : clusterShards)
-        for (auto &[key, crep] : sh0.map) {
+        for (auto &[key, crep] : clusterRep) {
           uint32_t cr = find(crep);
           bool hasTr = false;
           for (uint32_t s3 = 0; s3 < NSHIFT && !hasTr; s3++)
@@ -3840,8 +3813,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // key-coalescing merges bound the over-approximation (Lean gap F3).
     {
       std::unordered_map<uint32_t, uint32_t> keysPer;
-      for (auto &sh : clusterShards)
-        for (auto &[k, rep] : sh.map) keysPer[find(rep)]++;
+      for (auto &[k, rep] : clusterRep) keysPer[find(rep)]++;
       uint64_t multi = 0, maxK = 0;
       for (auto &[cls, kc] : keysPer) {
         if (kc > 1) multi++;

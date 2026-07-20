@@ -1410,3 +1410,14 @@ kernel post-census run in flight; its icall set becomes the new pinned
 baseline. Remaining ledger entries (per run, machine-readable-ish):
 inline asm data-flow (kernel), __SCT__ (task #14), landingpad/resume
 (C++ EH), va_copy, interprocedural int provenance counts.
+
+Whole-kernel post-census run (2026-07-20, de-shard + bidi-prune +
+census fixes): **14,824 icalls / 5,135,527 pairs** (+25 icalls,
++28,092 pairs vs the pre-census 14,799/5,107,435 — recovered
+long-laundered flows at full scale), converged iteration 4, solve
+190/210/210/213/212 s = 17.6 min (the missing edges cost ~+20% over
+the 14.2 min pre-fix best — soundness first), RSS 28.2 GB, wall
+1:13:57. IntProvenance at kernel scale: 47,676 accesses modeled,
+LEDGER 22,794 unmodeled interprocedural (explicit). These numbers are
+the NEW pinned baseline; regenerate the sorted per-icall artifact
+(--cfl-dump-icalls) on the next full run.

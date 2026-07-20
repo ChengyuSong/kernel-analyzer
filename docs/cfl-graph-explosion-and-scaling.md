@@ -1369,3 +1369,44 @@ behind by a rejected experiment is not free — the shards cost nothing
 in the experiments' own gates and 2.1x at the scale the gates didn't
 cover. Scale-dependent regressions need a whole-kernel timing gate
 (single-iteration, ~4 min of solve) in the validation loop.
+
+## 2026-07-20: IR-construct census (--ir-census) + the encoder gaps it found (task #13, ba5890d)
+
+The encoder totality audit. Tool: enumerate every opcode/intrinsic/
+external-callee/asm/constexpr kind in the corpus; classify against a
+disposition table sourced from InstHandler (whose default handler is a
+SILENT no-op — the exact failure mode the census exists to make loud).
+
+Census findings:
+- 0 UNDISPOSITIONED kinds on libpng / harfbuzz / whole kernel: the
+  table is total over the real corpora.
+- Kernel IR contains ZERO atomicrmw/cmpxchg/addrspacecast/landingpad —
+  x86 kernel atomics are ALL inline asm (129,812 sites, 4,900 distinct
+  strings): the asm ledger is the kernel's true atomics exposure.
+- The external-callee ranking independently rediscovers static_call as
+  the #1 boundary assumption (__SCT__might_resched 963 calls, ...).
+- SUSPECT ptr-relevant instances were rare in IR form: kernel 18,
+  harfbuzz 4, libpng 11 (landingpad/resume, C++ EH — ledgered).
+
+Encoder fixes the census drove:
+1. Four missing visitors: freeze, addrspacecast (copies), atomicrmw +
+   cmpxchg on pointer slots (fused store+load).
+2. THE REAL FIND — integer-laundered provenance dies at memory: clang
+   lowers _Atomic function pointers to i64 atomics with ptrtoint
+   constants and inttoptr reads; the load/store int-type guards
+   dropped the whole idiom (test/t_atomicptr.c resolved 0/2 icalls).
+   Register-side int provenance was already modeled (ptrtoint/binop
+   visitors); the MEMORY hop was not. Fix: pointer-width int stores/
+   loads emit deref edges under a bounded def/use provenance witness
+   (ptrtoint upstream / inttoptr-or-store-onward downstream);
+   interprocedural cases the witness declines are counted as explicit
+   IntProvenance LEDGER lines — the census's no-silent-drop contract.
+
+Impact: t_atomicptr 0/2 -> 2/2; libpng/harfbuzz answers unchanged;
+KERNEL SUBSET RESOLUTION GREW 1045 -> 1049 icalls / 57,143 -> 58,132
+pairs (+34% facts, +18% solve — the cost of edges that were missing).
+First measured soundness recovery attributable to the census. Whole-
+kernel post-census run in flight; its icall set becomes the new pinned
+baseline. Remaining ledger entries (per run, machine-readable-ish):
+inline asm data-flow (kernel), __SCT__ (task #14), landingpad/resume
+(C++ EH), va_copy, interprocedural int provenance counts.

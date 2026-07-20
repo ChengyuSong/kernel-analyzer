@@ -40,6 +40,7 @@
 #include "LLMClient.h"
 #include "LLMAnalysis.h"
 #include "IRSidecar.h"
+#include "IRCensus.h"
 
 using namespace llvm;
 
@@ -209,6 +210,14 @@ cl::opt<unsigned> CFLFieldBuckets(
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "
            "memory modeling (0 = field-insensitive, default)"),
   cl::init(0));
+
+cl::opt<bool> IRCensusOpt(
+  "ir-census",
+  cl::desc("Enumerate every IR construct kind in the corpus, classify "
+           "each against the edge builder's disposition table (handled / "
+           "justified no-op / suspect / undispositioned), print the "
+           "census, then exit — the encoder totality audit"),
+  cl::init(false));
 
 cl::opt<bool> CFLBidiPrune(
   "cfl-bidi-prune",
@@ -548,6 +557,11 @@ int main(int argc, char **argv) {
       LLM = std::make_unique<LLMClient>(std::move(LLMConfig));
       Diag << "LLM server endpoint: " << Endpoint << "\n";
     }
+  }
+
+  if (IRCensusOpt) {
+    runIRCensus(&GlobalCtx);
+    return 0;
   }
 
   // LLM query / file loading for allocator candidates

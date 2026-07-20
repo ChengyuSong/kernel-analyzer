@@ -47,6 +47,10 @@ private:
     void visitPtrToIntInst(llvm::PtrToIntInst &I);
     void visitBinaryOperator(llvm::BinaryOperator &I);
     void visitVAArgInst(llvm::VAArgInst &I);
+    void visitFreezeInst(llvm::FreezeInst &I);
+    void visitAddrSpaceCastInst(llvm::AddrSpaceCastInst &I);
+    void visitAtomicRMWInst(llvm::AtomicRMWInst &I);
+    void visitAtomicCmpXchgInst(llvm::AtomicCmpXchgInst &I);
     void visitMemTransferInst(llvm::MemTransferInst &I);
     void visitMemSetInst(llvm::MemSetInst &I);
     void visitInstruction(llvm::Instruction &I) {} // Default handler for unhandled instructions

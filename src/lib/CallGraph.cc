@@ -4738,9 +4738,108 @@ void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
   (void)CGP.getRepDerefNode(ptrNode);
 }
 
+// ---- integer-laundered pointer provenance through MEMORY ----
+// ptrtoint/inttoptr/binop visitors track provenance while it stays in
+// SSA registers, but the load/store guards skip integer types, so
+// provenance dies at memory. Clang lowers _Atomic function pointers to
+// exactly this shape (atomicrmw/cmpxchg on i64 with ptrtoint constants,
+// inttoptr on the way out — see test/t_atomicptr.c), and long-carried
+// pointers hit it too. Witness-based repair: a pointer-width integer
+// store/load emits deref edges when a bounded def/use scan finds
+// pointer provenance; the interprocedural cases the scan declines
+// (int arguments, int call results, escapes via ret/call) are COUNTED
+// as explicit ledger entries, never dropped silently.
+static size_t g_intProvStores = 0, g_intProvLoads = 0;
+static size_t g_intStoreUnmodeled = 0, g_intLoadUnmodeled = 0;
+
+static bool constantHasPtrToInt(const Constant *C, unsigned depth) {
+  if (depth == 0) return true; // bail conservative
+  if (const auto *CE = dyn_cast<ConstantExpr>(C)) {
+    if (CE->getOpcode() == Instruction::PtrToInt) return true;
+    for (const Use &U : CE->operands())
+      if (const auto *OC = dyn_cast<Constant>(U.get()))
+        if (constantHasPtrToInt(OC, depth - 1)) return true;
+  }
+  return false;
+}
+
+// Def-side witness: could this integer value carry pointer provenance?
+static bool mayCarryPtrProvenance(const Value *V, unsigned depth,
+                                  bool &declined) {
+  if (depth == 0) return true; // depth exhaustion: conservative yes
+  if (isa<PtrToIntInst>(V)) return true;
+  if (const auto *C = dyn_cast<Constant>(V)) {
+    if (isa<ConstantInt>(C) || isa<ConstantData>(C)) return false;
+    return constantHasPtrToInt(C, 6);
+  }
+  if (isa<LoadInst>(V)) return true; // slot-to-slot int copies stay live
+  if (isa<Argument>(V)) { declined = true; return false; } // ledger
+  if (const auto *CB2 = dyn_cast<CallBase>(V)) {
+    (void)CB2;
+    declined = true; // int-returning call may launder a pointer: ledger
+    return false;
+  }
+  if (const auto *I = dyn_cast<Instruction>(V)) {
+    if (isa<BinaryOperator>(I) || isa<CastInst>(I) || isa<PHINode>(I) ||
+        isa<SelectInst>(I) || isa<FreezeInst>(I)) {
+      for (const Use &U : I->operands())
+        if (U->getType()->isIntegerTy() || U->getType()->isPointerTy())
+          if (mayCarryPtrProvenance(U.get(), depth - 1, declined))
+            return true;
+      return false;
+    }
+  }
+  return false;
+}
+
+// Use-side witness: could this loaded integer become a pointer again?
+static bool mayBecomePointer(const Value *V, unsigned depth, bool &declined) {
+  if (depth == 0) return true;
+  for (const User *U : V->users()) {
+    if (isa<IntToPtrInst>(U)) return true;
+    if (const auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getValueOperand() == V) return true; // flows onward via memory
+      continue;
+    }
+    if (isa<ReturnInst>(U) || isa<CallBase>(U)) { declined = true; continue; }
+    if (isa<BinaryOperator>(U) || isa<CastInst>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<FreezeInst>(U) || isa<ExtractValueInst>(U))
+      if (mayBecomePointer(U, depth - 1, declined))
+        return true;
+  }
+  return false;
+}
+
+static bool isPtrWidthInt(const Type *T, const DataLayout &DL) {
+  return T->isIntegerTy() &&
+         T->getIntegerBitWidth() >= DL.getPointerSizeInBits();
+}
+
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   if (!containsPointerType(I.getType())) {
-    // XXX only consider pointer type
+    // Integer-laundered provenance: a pointer-width int load whose value
+    // can become a pointer again (inttoptr downstream, or stored onward)
+    // must read the cell.
+    bool declined = false;
+    if (CGP.curDL && isPtrWidthInt(I.getType(), *CGP.curDL)) {
+      if (mayBecomePointer(&I, 8, declined)) {
+        NodeIndex valNode = CGP.getRepNodeForValue(&I);
+        if (valNode == AndersNodeFactory::InvalidIndex)
+          valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+        Value *lp = I.getOperand(0);
+        NodeIndex slotRep;
+        if (CGP.resolveSummarizedAllocaSlot(lp, slotRep)) {
+          CGP.localAllocaLoadVals[slotRep].push_back(valNode);
+        } else {
+          NodeIndex pN = CGP.getRepNodeForValue(lp);
+          if (pN != AndersNodeFactory::InvalidIndex)
+            CGP.addAssignmentEdge(CGP.getRepDerefNode(pN), valNode);
+        }
+        g_intProvLoads++;
+      } else if (declined) {
+        g_intLoadUnmodeled++; // ledger
+      }
+    }
     return;
   }
   NodeIndex valNode = CGP.getRepNodeForValue(&I);
@@ -4793,7 +4892,35 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   Value *val = I.getOperand(0);
   if (!containsPointerType(val->getType())) {
-    // XXX only consider pointer type
+    // Integer-laundered provenance: a pointer-width int store with a
+    // def-side witness (ptrtoint upstream) still moves a pointer.
+    bool declined = false;
+    if (CGP.curDL && isPtrWidthInt(val->getType(), *CGP.curDL) &&
+        !shouldSkipValue(val)) {
+      if (mayCarryPtrProvenance(val, 8, declined)) {
+        NodeIndex valNode = CGP.getRepNodeForValue(val);
+        if (valNode == AndersNodeFactory::InvalidIndex)
+          valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(val));
+        if (auto *CE = dyn_cast<ConstantExpr>(val))
+          if (CE->getOpcode() == Instruction::PtrToInt) {
+            NodeIndex srcN = CGP.getRepNodeForValue(CE->getOperand(0));
+            if (srcN != AndersNodeFactory::InvalidIndex)
+              CGP.addAssignmentEdge(srcN, valNode);
+          }
+        Value *sp = I.getOperand(1);
+        NodeIndex slotRep;
+        if (CGP.resolveSummarizedAllocaSlot(sp, slotRep)) {
+          CGP.localAllocaStoreVals[slotRep].push_back(valNode);
+        } else {
+          NodeIndex pN = CGP.getRepNodeForValue(sp);
+          if (pN != AndersNodeFactory::InvalidIndex)
+            CGP.addAssignmentEdge(valNode, CGP.getRepDerefNode(pN));
+        }
+        g_intProvStores++;
+      } else if (declined) {
+        g_intStoreUnmodeled++; // ledger: interprocedural int provenance
+      }
+    }
     return;
   }
 
@@ -4896,6 +5023,116 @@ void CallGraphPass::InstHandler::visitBitCastInst(BitCastInst &I) {
     WARNING("Create value node " << dstNode << " for bitcast dst " << I << "\n");
   }
   CGP.addAssignmentEdge(srcNode, dstNode);
+}
+
+// freeze forwards its operand unchanged (poison stopper) — a plain copy
+// for pointer-carrying values. Census: kernel 106 freezes, 2 on pointer
+// paths; silently dropped before this visitor existed.
+void CallGraphPass::InstHandler::visitFreezeInst(FreezeInst &I) {
+  if (!containsPointerType(I.getType()))
+    return;
+  NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
+  if (srcNode == AndersNodeFactory::InvalidIndex)
+    srcNode = CGP.getCanonicalNode(CGP.NF.createValueNode(I.getOperand(0)));
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
+  if (dstNode == AndersNodeFactory::InvalidIndex)
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  CGP.addAssignmentEdge(srcNode, dstNode);
+}
+
+// addrspacecast is ptr->ptr value flow; visitBitCastInst does not catch
+// it (distinct opcode). Zero instances in current corpora — defensive.
+void CallGraphPass::InstHandler::visitAddrSpaceCastInst(AddrSpaceCastInst &I) {
+  NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
+  if (srcNode == AndersNodeFactory::InvalidIndex)
+    srcNode = CGP.getCanonicalNode(CGP.NF.createValueNode(I.getOperand(0)));
+  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
+  if (dstNode == AndersNodeFactory::InvalidIndex)
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  CGP.addAssignmentEdge(srcNode, dstNode);
+}
+
+// atomicrmw on a pointer slot (xchg — the lockless fptr-swap idiom) is a
+// fused store+load: new value into the cell, old value out to the result.
+void CallGraphPass::InstHandler::visitAtomicRMWInst(AtomicRMWInst &I) {
+  Value *val = I.getValOperand();
+  if (!containsPointerType(val->getType())) {
+    // _Atomic fptr slots lower to i64 xchg with ptrtoint/inttoptr —
+    // accept when either side carries a provenance witness.
+    bool dv = false, du = false;
+    if (!(CGP.curDL && isPtrWidthInt(val->getType(), *CGP.curDL)))
+      return;
+    if (!mayCarryPtrProvenance(val, 8, dv) && !mayBecomePointer(&I, 8, du)) {
+      if (dv || du) g_intStoreUnmodeled++;
+      return;
+    }
+  }
+  NodeIndex valNode = CGP.getRepNodeForValue(val);
+  if (valNode == AndersNodeFactory::InvalidIndex)
+    valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(val));
+  NodeIndex resNode = CGP.getRepNodeForValue(&I);
+  if (resNode == AndersNodeFactory::InvalidIndex)
+    resNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  if (auto *CE = dyn_cast<ConstantExpr>(val))
+    if (CE->getOpcode() == Instruction::PtrToInt) {
+      NodeIndex srcN = CGP.getRepNodeForValue(CE->getOperand(0));
+      if (srcN != AndersNodeFactory::InvalidIndex)
+        CGP.addAssignmentEdge(srcN, valNode);
+    }
+  Value *ptr = I.getPointerOperand();
+  NodeIndex slotRep;
+  if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
+    CGP.localAllocaStoreVals[slotRep].push_back(valNode);
+    CGP.localAllocaLoadVals[slotRep].push_back(resNode);
+    return;
+  }
+  NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex &&
+         "Failed to find atomicrmw ptr node");
+  NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
+  CGP.addAssignmentEdge(valNode, derefNode);
+  CGP.addAssignmentEdge(derefNode, resNode);
+}
+
+// cmpxchg on a pointer slot: conditional store of the new value plus the
+// old value loaded into the {old, i1} aggregate result (extractvalue
+// projects it — sound to wire both directions unconditionally).
+void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
+  Value *nv = I.getNewValOperand();
+  if (!containsPointerType(nv->getType())) {
+    bool dv = false, du = false;
+    if (!(CGP.curDL && isPtrWidthInt(nv->getType(), *CGP.curDL)))
+      return;
+    if (!mayCarryPtrProvenance(nv, 8, dv) && !mayBecomePointer(&I, 8, du)) {
+      if (dv || du) g_intStoreUnmodeled++;
+      return;
+    }
+  }
+  NodeIndex valNode = CGP.getRepNodeForValue(nv);
+  if (valNode == AndersNodeFactory::InvalidIndex)
+    valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(nv));
+  NodeIndex resNode = CGP.getRepNodeForValue(&I);
+  if (resNode == AndersNodeFactory::InvalidIndex)
+    resNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  if (auto *CE = dyn_cast<ConstantExpr>(nv))
+    if (CE->getOpcode() == Instruction::PtrToInt) {
+      NodeIndex srcN = CGP.getRepNodeForValue(CE->getOperand(0));
+      if (srcN != AndersNodeFactory::InvalidIndex)
+        CGP.addAssignmentEdge(srcN, valNode);
+    }
+  Value *ptr = I.getPointerOperand();
+  NodeIndex slotRep;
+  if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
+    CGP.localAllocaStoreVals[slotRep].push_back(valNode);
+    CGP.localAllocaLoadVals[slotRep].push_back(resNode);
+    return;
+  }
+  NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
+  assert(ptrNode != AndersNodeFactory::InvalidIndex &&
+         "Failed to find cmpxchg ptr node");
+  NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
+  CGP.addAssignmentEdge(valNode, derefNode);
+  CGP.addAssignmentEdge(derefNode, resNode);
 }
 
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
@@ -5559,6 +5796,10 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Callee by type: total " << total << ", match by CFL " << match << "\n");
+    CG_LOG("IntProvenance: modeled " << g_intProvStores << " int stores + "
+           << g_intProvLoads << " int loads (witnessed); LEDGER unmodeled "
+           << g_intStoreUnmodeled << " stores / " << g_intLoadUnmodeled
+           << " loads with interprocedural int provenance\n");
     CG_LOG("PrintfSink: " << printfSinkCallsites << " benign vararg callsites ("
            << printfSinkArgsSkipped << " tail args unwired), "
            << printfNonConstFmt << " non-constant fmt kept, "

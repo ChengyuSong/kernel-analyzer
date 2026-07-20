@@ -11,6 +11,7 @@ set (KASource
   CompressedGraph.cc
   CallGraph.cc
   IRSidecar.cc
+  IRCensus.cc
 )
 
 # Build executable, KAMain.

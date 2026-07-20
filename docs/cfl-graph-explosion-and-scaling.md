@@ -1421,3 +1421,38 @@ the 14.2 min pre-fix best — soundness first), RSS 28.2 GB, wall
 LEDGER 22,794 unmodeled interprocedural (explicit). These numbers are
 the NEW pinned baseline; regenerate the sorted per-icall artifact
 (--cfl-dump-icalls) on the next full run.
+
+## 2026-07-20 (later): census remainder — strict gate, asm classification, ledger artifact (task #13 complete)
+
+Three deliverables closing the census cycle (commit 0cf2783; full
+study in docs/kernel-census/):
+
+1. **`--ir-census-strict` (closed-world enforcement).** Aborts if any
+   construct kind lacks a disposition; usable standalone or as a gate
+   before a real analysis run (census tables suppressed, summary
+   kept). Kernel passes with 0 undispositioned kinds — the "default
+   visitor is a silent no-op" failure mode is now mechanically
+   impossible to reintroduce unnoticed.
+2. **Inline-asm classification by constraint signature.** The
+   129,812-site "dominant untyped exposure" splits by what each
+   template is PHYSICALLY able to do (outputs, indirect elementtype
+   widths, reg-vs-immediate ptr args, memory clobbers): only
+   **17,804 sites (13.7%) / 171 distinct templates are ptr-capable**;
+   86.3% provably cannot move a pointer (narrow slots, immediate
+   metadata symbols, pure barriers). Family analysis: bitops 7,336 /
+   percpu %gs 5,918 / atomic RMW 1,310 / uaccess 1,149 / paravirt-ALT
+   calls 293. Top modelable levers: percpu ptr slots (11 templates),
+   asm ptr xchg/cmpxchg (~600 sites), ALT call templates (→ #14).
+   Key refinement: imm-ptr (pointer bound to i/s/n/X constraint, no
+   memory clobber) = link-time symbols in __bug_table/__jump_table —
+   23,132 sites excluded from exposure honestly (with-clobber variant
+   stays ptr-in-reg).
+3. **`--ir-census-out=<json>` ledger artifact.** Full census as JSON:
+   dispositions + counts, ALL extern callees, constexprs, the
+   classified asm table, and a `ledger` array = the per-corpus
+   unsoundness bill. Kernel artifact pinned at
+   docs/kernel-census/linux-6.8.2-ir-census.json.gz.
+
+Residual kernel ledger after classification: 171 ptr-capable asm
+templates, 22,794 declined interprocedural int-provenance accesses,
+1,136 extern decls (top mass __SCT__), 16 SUSPECT intrinsic instances.

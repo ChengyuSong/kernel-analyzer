@@ -1310,7 +1310,24 @@ Results (per-icall identical + closure certified everywhere):
 | libpng        | 13.5%          | 0 ms        | flat      | wash       |
 | harfbuzz FI   | 35.2%          | 12 ms       | flat      | wash       |
 | kernel subset | 38.3%          | 48 ms       | flat      | 7.7->5.4 s/iter (-30%) |
-| whole kernel  | (running)      |             |           |            |
+| whole kernel  | ~30% (95-110k) | ~2 s        | flat      | 497-553 -> 364-407 s/iter (-25%) |
+
+Whole kernel (2026-07-19): resolution IDENTICAL (14,799 / 5,107,435)
+across all 5 iterations — the cone argument holds at full scale. RSS
+27.3 GB.
+
+CAUGHT IN PASSING, needs its own diagnosis: the current-code
+SEQUENTIAL whole-kernel baseline is 497-553 s/iter (root-relevance
+run) vs 291/214-240 s/iter on the July-16 pre-refactor code — a ~1.7x
+kernel-scale-only regression introduced somewhere in the parallel/
+incremental refactor arc (harfbuzz and subset T=1 were verified at
+parity, so it escaped the gates; pops are within 7%, so it is per-pop
+cost, not scheduling). RSS is also up (27.3 GB vs ~12-19 GB era).
+Candidates: FactSet width-guard branches on dense hot paths, the
+fused-sweep restructure's cache behavior at 40KB planes, atomic
+inWL/keyCount traffic. Action: SolverProf single-iteration
+(--cfl-flows-to-max-iters=1) whole-kernel run against the old
+profile, then bisect the refactor commits if needed.
 
 TWO findings. (1) Static pruning cannot cut FACT MASS: the entangled
 core is statically coupled to everything, so the prunable 35-38% of

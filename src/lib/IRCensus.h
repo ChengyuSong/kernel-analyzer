@@ -10,6 +10,20 @@
 // pointer emits edges"; this pass makes that claim auditable — the
 // default InstVisitor handler is a silent no-op, so an unlisted
 // construct contributes nothing without a trace.
-void runIRCensus(GlobalContext *Ctx);
+//
+// jsonOut: if non-empty, the full census — dispositions, intrinsics,
+// constexprs, all external callees, the classified inline-asm table,
+// and the unsoundness ledger — is written there as JSON (the
+// machine-readable per-corpus ledger artifact).
+// printTables: emit the full per-kind CENSUS lines to stderr; the
+// summary is always printed. Pass false when the census runs as a
+// pre-analysis gate (--ir-census-strict without --ir-census).
+struct IRCensusResult {
+  uint64_t undispKinds = 0;
+  uint64_t suspectPtrInsts = 0;
+  std::vector<std::string> undispNames; // for the strict-mode report
+};
+IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
+                           bool printTables);
 
 #endif

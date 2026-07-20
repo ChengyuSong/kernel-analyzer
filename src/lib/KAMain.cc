@@ -219,6 +219,23 @@ cl::opt<bool> IRCensusOpt(
            "census, then exit — the encoder totality audit"),
   cl::init(false));
 
+cl::opt<bool> IRCensusStrict(
+  "ir-census-strict",
+  cl::desc("Closed-world enforcement: run the census and ABORT if any "
+           "construct kind in the corpus lacks a disposition. With "
+           "--ir-census: audit-and-exit (exit 1 on violation). Alone: "
+           "gate — census summary runs before the analysis and a "
+           "violation kills the run instead of silently dropping edges"),
+  cl::init(false));
+
+cl::opt<std::string> IRCensusOut(
+  "ir-census-out",
+  cl::desc("Write the full census as JSON to this path: dispositions, "
+           "intrinsics, constexprs, ALL external callees, the classified "
+           "inline-asm table, and the unsoundness ledger (implies "
+           "running the census)"),
+  cl::init(""));
+
 cl::opt<bool> CFLBidiPrune(
   "cfl-bidi-prune",
   cl::desc("Before the flows-to solve, compute the field-matched "
@@ -559,9 +576,22 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (IRCensusOpt) {
-    runIRCensus(&GlobalCtx);
-    return 0;
+  if (IRCensusOpt || IRCensusStrict || !IRCensusOut.empty()) {
+    IRCensusResult CR =
+        runIRCensus(&GlobalCtx, IRCensusOut, /*printTables=*/IRCensusOpt);
+    if (IRCensusStrict && CR.undispKinds > 0) {
+      errs() << "IR-CENSUS STRICT: closed-world violated — "
+             << CR.undispKinds << " undispositioned construct kind(s):\n";
+      for (const std::string &N : CR.undispNames)
+        errs() << "IR-CENSUS STRICT:   " << N << "\n";
+      errs() << "IR-CENSUS STRICT: the edge builder's default visitor is a "
+                "silent no-op; refusing to analyze a corpus it has no "
+                "disposition for\n";
+      abort();
+    }
+    if (IRCensusOpt)
+      return CR.undispKinds > 0 ? 1 : 0;
+    // strict/out without --ir-census: gate passed, continue to analysis
   }
 
   // LLM query / file loading for allocator candidates

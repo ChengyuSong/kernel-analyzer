@@ -5264,6 +5264,74 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
   }
   CG_DEBUG("IntToPtr: " << srcNode << " -> " << dstNode << " for " << I << "\n");
   CGP.addAssignmentEdge(srcNode, dstNode);
+
+  // offset_to_ptr rule: inttoptr(add/sub-chain containing ptrtoint p)
+  // computes a pointer FROM an array entry — semantically a read of
+  // the array (kernel PREL32 idiom: initcalls, pci_fixup, __ksymtab).
+  // Pull deref(p) into the result so members wired store-like into the
+  // array reach exactly these consumers and no one else. Bounded walk
+  // through the integer-arithmetic chain; every ptrtoint leaf counts.
+  {
+    SmallVector<const Value *, 8> stack{I.getOperand(0)};
+    SmallPtrSet<const Value *, 8> seen;
+    SmallVector<const PtrToIntOperator *, 4> ptiLeaves;
+    SmallVector<const LoadInst *, 4> loadLeaves;
+    unsigned steps = 0;
+    while (!stack.empty() && steps++ < 16) {
+      const Value *V = stack.pop_back_val();
+      if (!seen.insert(V).second) continue;
+      if (const auto *PTI = dyn_cast<PtrToIntOperator>(V)) {
+        ptiLeaves.push_back(PTI);
+        continue;
+      }
+      if (const auto *LI = dyn_cast<LoadInst>(V)) {
+        loadLeaves.push_back(LI);
+        continue;
+      }
+      if (const auto *BO = dyn_cast<BinaryOperator>(V)) {
+        unsigned op = BO->getOpcode();
+        if (op == Instruction::Add || op == Instruction::Sub ||
+            op == Instruction::Or) {
+          stack.push_back(BO->getOperand(0));
+          stack.push_back(BO->getOperand(1));
+        }
+        continue;
+      }
+      if (const auto *CI2 = dyn_cast<CastInst>(V)) {
+        stack.push_back(CI2->getOperand(0));
+        continue;
+      }
+      if (const auto *PN = dyn_cast<PHINode>(V)) {
+        for (const Value *IV : PN->incoming_values()) stack.push_back(IV);
+        continue;
+      }
+    }
+    // The pull applies only to the self-relative read p + *p: some
+    // load in the chain must read THROUGH the same pointer that was
+    // ptrtoint'ed (same value class). Without this the rule fires on
+    // percpu rebasing (inttoptr(add(ptrtoint &var, cpu_offset))) where
+    // the offset comes from another object and the array pull is
+    // noise (subset: value-leak removed but pairs flat until gated).
+    for (const PtrToIntOperator *PTI : ptiLeaves) {
+      NodeIndex base = CGP.getRepNodeForValue(PTI->getPointerOperand());
+      if (base == AndersNodeFactory::InvalidIndex ||
+          CGP.NF.isSpecialNode(base))
+        continue;
+      bool selfRead = false;
+      for (const LoadInst *LI : loadLeaves) {
+        NodeIndex lp = CGP.getRepNodeForValue(
+            LI->getPointerOperand()->stripPointerCasts());
+        if (lp != AndersNodeFactory::InvalidIndex &&
+            CGP.getCanonicalNode(lp) == CGP.getCanonicalNode(base)) {
+          selfRead = true;
+          break;
+        }
+      }
+      if (selfRead)
+        CGP.addAssignmentEdge(
+            CGP.getRepDerefNode(CGP.getCanonicalNode(base)), dstNode);
+    }
+  }
 }
 
 void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
@@ -5682,11 +5750,35 @@ void CallGraphPass::wireLinkerSectionArrays() {
     }
     return true;
   };
+  // Families whose IN-CORPUS consumers treat entries as code/symbol
+  // METADATA, not data-flow pointers: (a) patching machinery
+  // (static_call, jump_label, extable fixups, mcount) — modeled as
+  // control transforms, static_call = task #14; (b) loadable-module
+  // linking (__ksymtab/__kcrctab) — resolve_symbol runs on out-of-
+  // corpus modules; wiring would inject EVERY exported symbol into
+  // the alias world; (c) pure string/metadata tables. Excluded and
+  // LEDGERed as explicit boundary assumptions.
+  auto excludedFamily = [](StringRef K) {
+    return K.contains("ksymtab") || K.contains("kcrctab") ||
+           K.contains("static_call") || K.contains("jump_table") ||
+           K.contains("ex_table") || K.contains("bug_table") ||
+           K.contains("orc_") || K.contains("mcount") ||
+           K.contains("tracepoint_str") || K.contains("bprintk") ||
+           K.contains("dyndbg") || K.contains("modver") ||
+           K.contains("kprobe_blacklist") || K.contains("notes");
+  };
   size_t wired = 0, matched = 0, unmatched = 0, nodeless = 0;
+  size_t excluded = 0;
   for (const auto &[guid, EGV] : Ctx->ExtGobjs) {
     StringRef N = EGV->getName();
     std::vector<std::string> exact, prefix;
     if (!keysFor(N, exact, prefix)) continue;
+    if (excludedFamily(N)) {
+      excluded++;
+      CG_DEBUG("LinkerArrays: bounds " << N
+               << " excluded (metadata/patching/module-linking family)\n");
+      continue;
+    }
     std::set<const GlobalValue *> sources;
     for (const std::string &k : exact) {
       auto it = linkerSectionMembers.find(k);
@@ -5724,7 +5816,16 @@ void CallGraphPass::wireLinkerSectionArrays() {
           continue;
         }
       }
-      addAssignmentEdge(sNode, eNode);
+      // STORE-LIKE wiring: members flow into deref(bounds), not into
+      // the bounds VALUE class. Wiring the value class leaked every
+      // member into any icall a-reachable from the array ADDRESS
+      // (sort/memcpy hubs pass array pointers everywhere): whole
+      // kernel +2.7M pairs, 72% of them pci-quirk stubs at unrelated
+      // icalls. With deref wiring only actual reads yield members:
+      // ABS64 arrays via their loads (gep keeps the base class), and
+      // PREL32 arrays via the offset_to_ptr deref-pull rule in
+      // visitIntToPtrInst.
+      addAssignmentEdge(sNode, getRepDerefNode(getCanonicalNode(eNode)));
       wired++;
     }
     if (wired > before) matched++;
@@ -5733,8 +5834,9 @@ void CallGraphPass::wireLinkerSectionArrays() {
   }
   CG_LOG("LinkerArrays: " << matched << " bounds symbols wired, " << wired
          << " member flows; LEDGER " << unmatched
-         << " bounds without IR-visible members, " << nodeless
-         << " nodeless members skipped\n");
+         << " bounds without IR-visible members, " << excluded
+         << " excluded metadata/patching/module-linking bounds, "
+         << nodeless << " nodeless members skipped\n");
 }
 
 bool CallGraphPass::doInitialization(Module *M) {

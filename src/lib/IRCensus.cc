@@ -339,9 +339,16 @@ AsmCat classifyAsm(const CallBase *CB, const InlineAsm *IA,
 // instruction walk; consumption reads linker-defined __start_/__stop_
 // extern globals. This pass makes both halves loud.
 
+struct ModAsmSec {
+  uint64_t modules = 0, symEntries = 0;
+  std::set<std::string> exampleSyms; // first few referenced symbols
+};
+
+} // namespace
+
 // strip the kmod/LTO uniquification suffix: ".initcall5.init..kmod_x"
 // -> ".initcall5.init"; also clang's ".llvm." suffixes
-std::string normalizeSection(StringRef S) {
+std::string cflNormalizeSection(StringRef S) {
   size_t p = S.find("..");
   if (p != StringRef::npos) S = S.take_front(p);
   p = S.find(".llvm.");
@@ -349,16 +356,11 @@ std::string normalizeSection(StringRef S) {
   return S.str();
 }
 
-struct ModAsmSec {
-  uint64_t modules = 0, symEntries = 0;
-  std::set<std::string> exampleSyms; // first few referenced symbols
-};
-
 // one pass over a module's inline-asm blob: track the active section
-// via .section/.pushsection/.previous/.popsection, count .long/.quad
-// entries that reference a symbol
-void walkModuleAsm(StringRef Blob, std::map<std::string, ModAsmSec> &secs,
-                   std::set<std::string> &touched) {
+// via .section/.pushsection/.previous/.popsection, report every
+// .long/.quad entry that references a symbol
+void cflWalkModuleAsm(StringRef Blob,
+                      function_ref<void(StringRef, StringRef)> cb) {
   std::vector<std::string> stack;
   std::string cur;
   SmallVector<StringRef, 64> lines;
@@ -370,8 +372,8 @@ void walkModuleAsm(StringRef Blob, std::map<std::string, ModAsmSec> &secs,
                            .trim(" \t");
       StringRef Name = Rest.split(',').first.trim(" \t\"");
       if (T.starts_with(".pushsection")) stack.push_back(cur);
-      cur = normalizeSection(Name);
-      touched.insert(cur);
+      cur = cflNormalizeSection(Name);
+      cb(cur, StringRef()); // section touched, no symbol
     } else if (T.starts_with(".previous") || T.starts_with(".popsection")) {
       cur = stack.empty() ? std::string() : stack.back();
       if (!stack.empty()) stack.pop_back();
@@ -380,14 +382,13 @@ void walkModuleAsm(StringRef Blob, std::map<std::string, ModAsmSec> &secs,
       StringRef Expr = T.drop_front(5).trim(" \t");
       // first token that looks like a symbol (not a bare number)
       StringRef Sym = Expr.split(' ').first.split('-').first.trim(" \t");
-      if (!Sym.empty() && !isdigit(Sym.front())) {
-        ModAsmSec &ms = secs[cur];
-        ms.symEntries++;
-        if (ms.exampleSyms.size() < 3) ms.exampleSyms.insert(Sym.str());
-      }
+      if (!Sym.empty() && !isdigit(Sym.front()))
+        cb(cur, Sym);
     }
   }
 }
+
+namespace {
 
 // linker-array bounds symbol? (__start_X/__stop_X or the initcall/setup
 // families the kernel lds defines by hand)
@@ -458,13 +459,21 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
     // -- module-level constructs --
     if (!M->getModuleInlineAsm().empty()) {
       modAsmModules++;
-      walkModuleAsm(M->getModuleInlineAsm(), modAsmSecs, modAsmSections);
+      cflWalkModuleAsm(M->getModuleInlineAsm(),
+                       [&](StringRef sec, StringRef sym) {
+                         modAsmSections.insert(sec.str());
+                         if (sym.empty()) return;
+                         ModAsmSec &ms = modAsmSecs[sec.str()];
+                         ms.symEntries++;
+                         if (ms.exampleSyms.size() < 3)
+                           ms.exampleSyms.insert(sym.str());
+                       });
     }
     nAliases += std::distance(M->alias_begin(), M->alias_end());
     nIFuncs += std::distance(M->ifunc_begin(), M->ifunc_end());
     for (GlobalVariable &GV : M->globals()) {
       if (GV.hasSection()) {
-        std::string sec = normalizeSection(GV.getSection());
+        std::string sec = cflNormalizeSection(GV.getSection());
         SecTally &st = sectionedGlobals[sec];
         st.count++;
         if (typeHasPointer(GV.getValueType())) st.ptrBearing++;

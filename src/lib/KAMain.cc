@@ -236,6 +236,17 @@ cl::opt<std::string> IRCensusOut(
            "running the census)"),
   cl::init(""));
 
+cl::opt<bool> CFLLinkerArrays(
+  "cfl-linker-arrays",
+  cl::desc("Model linker-materialized pointer arrays: alias each "
+           "undefined __start_X/__stop_X extern global to the union of "
+           "section-X members (IR globals with that section attribute "
+           "plus module-asm PREL32 entry targets), and treat module-asm-"
+           "referenced functions as address-taken. Kernel initcalls / "
+           "__param / pci_fixup / ftrace_events / setup / bpf_raw_tp. "
+           "Off = those loads resolve to nothing (pre-#22 behavior)"),
+  cl::init(true));
+
 cl::opt<bool> CFLBidiPrune(
   "cfl-bidi-prune",
   cl::desc("Before the flows-to solve, compute the field-matched "

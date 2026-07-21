@@ -224,6 +224,14 @@ private:
   void collectIFuncTargets(const llvm::GlobalIFunc *IF);
   void processCtorsDtors(llvm::Module *M);
 
+  // Linker-mediated pointer arrays (task #22): section name -> members
+  // (IR globals carrying that section attribute + module-asm PREL32
+  // entry targets). Consumed by wireLinkerSectionArrays(), which
+  // aliases each undefined __start_X/__stop_X extern to its members so
+  // loads through the bounds symbols stop resolving to nothing.
+  std::map<std::string, std::set<const llvm::GlobalValue*>> linkerSectionMembers;
+  void wireLinkerSectionArrays();
+
   std::unordered_map<const llvm::Function*,
                      std::unordered_set<FieldStoreKey, FieldStoreKeyHash>> funcFieldStores;
   // Soundness of the field filter requires per-function completeness: any

@@ -18,6 +18,7 @@ extern cl::opt<std::string> CompressedGraphOutput;
 extern cl::list<std::string> CompressedGraphInputs;
 extern cl::opt<bool> CFLCompositional;
 extern cl::opt<bool> CFLPreSolveMerge;
+extern cl::opt<bool> CFLLinkerArrays;
 extern cl::opt<bool> CFLFptrSlice;
 extern cl::opt<bool> CFLFlowsTo;
 extern cl::opt<bool> CFLFlowsToSlice;

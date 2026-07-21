@@ -49,6 +49,7 @@
 #include <unordered_set>
 
 #include "CallGraph.h"
+#include "IRCensus.h"
 #include "Annotation.h"
 #include "VSnapshot.h"
 
@@ -5288,31 +5289,26 @@ void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
   if (!I.getType()->isIntegerTy())
     return;
 
-  // Check if exactly one operand is pointer-derived and the other is constant.
-  NodeIndex srcNode = AndersNodeFactory::InvalidIndex;
-  bool otherIsConst = false;
+  // Emit a-edges from EVERY pointer-derived operand to the result, per
+  // the encoding spec (operand_i -> result). The previous "other
+  // operand must be constant" guard WARNed-and-dropped exactly the
+  // offset_to_ptr / PREL32 consumer shape the kernel uses for
+  // initcalls and pci_fixup: fn = add(ptrtoint base, sext(*entry)).
+  NodeIndex dstNode = AndersNodeFactory::InvalidIndex;
   for (unsigned i = 0; i < 2; i++) {
     NodeIndex n = CGP.getRepNodeForValue(I.getOperand(i));
-    if (n != AndersNodeFactory::InvalidIndex && !CGP.NF.isSpecialNode(n)) {
-      srcNode = n;
-      otherIsConst = isa<Constant>(I.getOperand(1 - i));
+    if (n == AndersNodeFactory::InvalidIndex || CGP.NF.isSpecialNode(n))
+      continue;
+    if (dstNode == AndersNodeFactory::InvalidIndex) {
+      dstNode = CGP.getRepNodeForValue(&I);
+      if (dstNode == AndersNodeFactory::InvalidIndex) {
+        dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+        CG_DEBUG("BinOp: created value node " << dstNode << " for " << I << "\n");
+      }
     }
+    CG_DEBUG("BinOp: " << n << " -> " << dstNode << " for " << I << "\n");
+    CGP.addAssignmentEdge(n, dstNode);
   }
-  if (srcNode == AndersNodeFactory::InvalidIndex)
-    return;
-
-  if (!otherIsConst) {
-    WARNING("BinOp on pointer-derived integer with non-constant operand: " << I << "\n");
-    return;
-  }
-
-  NodeIndex dstNode = CGP.getRepNodeForValue(&I);
-  if (dstNode == AndersNodeFactory::InvalidIndex) {
-    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
-    CG_DEBUG("BinOp: created value node " << dstNode << " for " << I << "\n");
-  }
-  CG_DEBUG("BinOp: " << srcNode << " -> " << dstNode << " for " << I << "\n");
-  CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
 void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
@@ -5637,12 +5633,145 @@ void CallGraphPass::collectIFuncTargets(const GlobalIFunc *IF) {
     CG_LOG("  IFunc target: " << T->getName() << "\n");
 }
 
+// task #22 phase B: alias undefined linker-array bounds externs to their
+// section members. The linker concatenates section-X items between
+// __start_X/__stop_X; consumers iterate from the bounds symbol and
+// either load members directly (ABS64 arrays: __param, .init.setup,
+// _ftrace_events) or compute fn = entry + *entry (PREL32: initcalls,
+// pci_fixup) — there the register-provenance chain (ptrtoint/add/
+// inttoptr, all visited) carries the bounds symbol's VALUE to the
+// consumer, so a-edges member -> bounds cover both shapes under the
+// field-insensitive memory model.
+void CallGraphPass::wireLinkerSectionArrays() {
+  if (!CFLLinkerArrays) return;
+  // candidate section keys for a bounds symbol name; kernel bounds are
+  // either generic (__start_X/__stop_X <-> section X modulo _/. prefix)
+  // or hand-written in vmlinux.lds (the irregulars below)
+  auto keysFor = [](StringRef N, std::vector<std::string> &exact,
+                    std::vector<std::string> &prefix) -> bool {
+    StringRef K;
+    if (N.starts_with("__start_")) {
+      K = N.drop_front(8);
+    } else if (N.starts_with("__stop_")) {
+      K = N.drop_front(7);
+    } else if (N.starts_with("__") &&
+               (N.ends_with("_start") || N.ends_with("_end"))) {
+      K = N.drop_back(N.ends_with("_start") ? 6 : 4);
+      exact.push_back(K.str()); // e.g. __governor_thermal_table
+      K = K.drop_front(2);      // e.g. initcall5, setup, con_initcall
+    } else {
+      return false;
+    }
+    exact.push_back(K.str());         // __param, __tracepoints_ptrs
+    exact.push_back(("_" + K).str()); // _ftrace_events
+    exact.push_back(("." + K).str()); // .apicdrivers
+    if (K.starts_with("initcall")) {
+      // per-level bounds delimit a contiguous run of .initcallN.init
+      // sections; the union of all levels over-approximates soundly
+      prefix.push_back(".initcall");
+    } else if (K == "setup") {
+      exact.push_back(".init.setup");
+    } else if (K == "con_initcall") {
+      exact.push_back(".con_initcall.init");
+    } else if (K == "_bpf_raw_tp") {
+      exact.push_back("__bpf_raw_tp_map");
+    } else if (K.starts_with("pci_fixups_")) {
+      exact.push_back((".pci_fixup_" + K.drop_front(11)).str());
+    } else if (K == "ftrace_eval_maps") {
+      exact.push_back("_ftrace_eval_map");
+    }
+    return true;
+  };
+  size_t wired = 0, matched = 0, unmatched = 0, nodeless = 0;
+  for (const auto &[guid, EGV] : Ctx->ExtGobjs) {
+    StringRef N = EGV->getName();
+    std::vector<std::string> exact, prefix;
+    if (!keysFor(N, exact, prefix)) continue;
+    std::set<const GlobalValue *> sources;
+    for (const std::string &k : exact) {
+      auto it = linkerSectionMembers.find(k);
+      if (it != linkerSectionMembers.end())
+        sources.insert(it->second.begin(), it->second.end());
+    }
+    for (const std::string &p : prefix)
+      for (auto it = linkerSectionMembers.lower_bound(p);
+           it != linkerSectionMembers.end() &&
+           StringRef(it->first).starts_with(p);
+           ++it)
+        sources.insert(it->second.begin(), it->second.end());
+    if (sources.empty()) {
+      // bounds over metadata sections (orc, bug/ex tables) or arrays
+      // with no member in the corpus — ledgered, not silently dropped
+      unmatched++;
+      CG_DEBUG("LinkerArrays: bounds " << N
+               << " has no IR-visible members\n");
+      continue;
+    }
+    NodeIndex eNode = NF.getValueNodeFor(EGV);
+    assert(eNode != AndersNodeFactory::InvalidIndex &&
+           "ExtGobj without value node");
+    size_t before = wired;
+    for (const GlobalValue *S : sources) {
+      NodeIndex sNode = NF.getValueNodeFor(S);
+      if (sNode == AndersNodeFactory::InvalidIndex) {
+        if (auto *F = dyn_cast<Function>(S)) {
+          // cross-module asm reference whose defining module was
+          // initialized before the reference was seen — mint now
+          sNode = NF.createValueNode(F);
+          Ctx->AddressTakenFuncs.insert(F);
+        } else {
+          nodeless++; // skipped compiler global — ledgered
+          continue;
+        }
+      }
+      addAssignmentEdge(sNode, eNode);
+      wired++;
+    }
+    if (wired > before) matched++;
+    CG_DEBUG("LinkerArrays: " << N << " <- " << (wired - before)
+             << " members\n");
+  }
+  CG_LOG("LinkerArrays: " << matched << " bounds symbols wired, " << wired
+         << " member flows; LEDGER " << unmatched
+         << " bounds without IR-visible members, " << nodeless
+         << " nodeless members skipped\n");
+}
+
 bool CallGraphPass::doInitialization(Module *M) {
   if (iteration == 0 && M == Ctx->Modules.front().first) {
     canonicalNodeMap.clear();
     canonicalClassMembers.clear();
     moduleIndirectCallInsts.clear();
     fieldAliasMap.clear();
+    linkerSectionMembers.clear();
+  }
+
+  // Linker-mediated arrays (task #22): module-level asm places PREL32
+  // entries (.long fn - .) into linker-gathered sections (initcalls,
+  // pci_fixup, tracepoints_ptrs). The referenced functions ARE
+  // address-taken — the linker embeds their address — even though no
+  // IR user exists, and they are members of the section array consumed
+  // via __start_X/__stop_X (wireLinkerSectionArrays).
+  std::set<const Function *> asmTaken;
+  if (CFLLinkerArrays && !M->getModuleInlineAsm().empty()) {
+    cflWalkModuleAsm(
+        M->getModuleInlineAsm(), [&](StringRef sec, StringRef sym) {
+          if (sym.empty()) return;
+          GlobalValue *GVal = M->getNamedValue(sym);
+          if (!GVal) return; // local labels / literal operands
+          if (auto *GA = dyn_cast<GlobalAlias>(GVal))
+            GVal = dyn_cast_or_null<GlobalValue>(
+                GA->getAliasee()->stripPointerCasts());
+          if (!GVal) return;
+          if (auto *F = dyn_cast<Function>(GVal)) {
+            if (F->isIntrinsic()) return;
+            asmTaken.insert(F);
+            linkerSectionMembers[sec.str()].insert(getFuncDef(F));
+          } else if (auto *G = dyn_cast<GlobalVariable>(GVal)) {
+            if (!G->isDeclaration())
+              linkerSectionMembers[sec.str()].insert(G);
+          }
+        });
   }
 
   for (auto &GV : M->globals()) {
@@ -5658,6 +5787,14 @@ bool CallGraphPass::doInitialization(Module *M) {
     }
 
     NF.createValueNode(&GV);
+
+    // section-attributed globals are linker-array members (__param,
+    // .init.setup, _ftrace_events, __tracepoints, ...)
+    if (CFLLinkerArrays && GV.hasSection()) {
+      StringRef sec = GV.getSection();
+      if (!sec.starts_with(".discard.") && sec != "llvm.metadata")
+        linkerSectionMembers[cflNormalizeSection(sec)].insert(&GV);
+    }
   }
 
   for (Function &F : *M) {
@@ -5671,8 +5808,9 @@ bool CallGraphPass::doInitialization(Module *M) {
       }
     }
 
-    // collect address-taken functions
-    if (F.hasAddressTaken()) {
+    // collect address-taken functions (module-asm references count:
+    // the linker materializes their address into a section array)
+    if (F.hasAddressTaken() || asmTaken.count(&F)) {
       Ctx->AddressTakenFuncs.insert(&F);
 
       // only add fval -> fobj edge in call graph analysis?
@@ -7318,6 +7456,14 @@ bool CallGraphPass::doModulePass(Module *M) {
     // so cache coverage metadata can represent the full input set).
     if (perTUMode)
       solveAndCompressPerTU(M, edgeStart, edgeEnd);
+
+    // Linker-array wiring needs every module's section members and asm
+    // targets: run once, after the last module's own edges. In per-TU
+    // compositional mode these edges are cross-module by nature and
+    // fall outside all module ranges — repair mode won't recompute
+    // them; monolithic flows-to/saturation consume them normally.
+    if (M == Ctx->Modules.back().first)
+      wireLinkerSectionArrays();
   }
 
   bool Changed = false;

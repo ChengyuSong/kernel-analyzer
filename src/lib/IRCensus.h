@@ -18,6 +18,15 @@
 // printTables: emit the full per-kind CENSUS lines to stderr; the
 // summary is always printed. Pass false when the census runs as a
 // pre-analysis gate (--ir-census-strict without --ir-census).
+// Shared with the edge builder (linker-array wiring): normalize a
+// section name (strip kmod/LTO uniquification suffixes) and walk a
+// module-level inline-asm blob, reporting every ".long/.quad SYM"
+// entry with its target section via the callback.
+std::string cflNormalizeSection(llvm::StringRef s);
+void cflWalkModuleAsm(
+    llvm::StringRef blob,
+    llvm::function_ref<void(llvm::StringRef sec, llvm::StringRef sym)> cb);
+
 struct IRCensusResult {
   uint64_t undispKinds = 0;
   uint64_t suspectPtrInsts = 0;

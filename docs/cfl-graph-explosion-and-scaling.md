@@ -1485,3 +1485,45 @@ value flow. Phase B model: section-array unification (__start_X/
 __stop_X extern ↔ synthetic node fed by section-X globals + module-asm
 targets via addressable stubs); differential test = do_one_initcall
 V-set ∅ → ~646 initstubs. Study: docs/kernel-census/README.md.
+
+## 2026-07-22: section-array model shipped — linker flows closed, universal-extern lesson (task #22 phase B, 4907f3b)
+
+The model: (1) module-asm-referenced functions are address-taken (the
+linker embeds their address; 12,597 fns minted); (2) each undefined
+__start_X/__stop_X extern with fully-enumerated contents gets its OWN
+node identity (NodeFactory extGobjOverrides — closed world justifies
+leaving the universal fallback); (3) dual wiring by member provenance:
+section-attributed globals ARE the elements (value edges: bounds
+aliases their objects), module-asm PREL32 targets are ENCODED (deref
+edges, read out by the gated offset_to_ptr rule: inttoptr(add-chain
+with ptrtoint p) pulls deref(p) IFF the chain loads through p itself);
+(4) metadata/patching/module-linking families (static_call -> #14,
+ksymtab, jump/ex/bug/orc/mcount) excluded + LEDGERed; unresolved-entry
+sections keep universal + LEDGERed. Companion spec fix: binop visitor
+now emits a-edges from EVERY pointer-derived operand (the old
+"other operand must be constant" guard WARNed-and-dropped the
+offset_to_ptr consumer shape; per-corpus cost: km +399 pairs).
+
+Debugging lessons, measured:
+- FIRST DESIGNS LEAKED +2.7M pairs (72% = 1,671 pci-quirk stubs at
+  ~1,500 unrelated icalls; fuse_conn_put -> quirk). Value-side vs
+  deref-side wiring produced BIT-IDENTICAL results — the tell that
+  neither was the channel: getValueNodeFor returns the UNIVERSAL node
+  for every ExtGobj, so all wiring landed in the unknown-memory hub
+  that every unmodeled extern load reads. Own-identity override killed
+  it: UNIQUE_ID pairs 1,935,100 -> 925 (exactly pci_do_fixups).
+- Under own identity, ABS64 vs PREL32 need DIFFERENT encodings
+  (in-place aliasing vs encoded deref) — universal conflation had
+  masked the distinction (both "worked" in the micro test).
+- km A/B: minting 12.6k roots alone = +26 pairs (free); wired flows
+  +15.6k = real store chains (param->sysfs attrs, trace registration)
+  spread by the KNOWN field-insensitive hub joins (#17/#21).
+
+NEW PIN (test/baselines/kernel-full6-*): whole kernel 14,850 icalls /
+5,866,561 pairs (+26 icalls, +731k pairs over pre-#22; superset
+verified, 0 removed), converged iter 4, solve 19.9 min (238-242 s/it),
+RSS 31.9 GB. do_one_initcall 85 -> 735 targets (649 initstubs) — the
+flagship differential. Residual growth decomposition: initstubs 62k,
+SCT 142k (real &tramp flows into __static_call_update void* params),
+other 553k (trace/param members through registration stores + hub
+spread) — the quantified motivation for #17/#21.

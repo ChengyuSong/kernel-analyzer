@@ -157,6 +157,17 @@ asm PREL32 entries contribute their target functions (recoverable via
 mechanism covers all six families. Differential test:
 `do_one_initcall`'s V-set goes from ∅ to the ~646 initstubs.
 
+**Shipped 2026-07-22 (commit 4907f3b), with two corrections the
+implementation forced:** (1) wired bounds symbols need their OWN node
+identity — `getValueNodeFor` returns the universal unknown-memory node
+for every undefined extern, and wiring members into it leaked them to
+every unmodeled-extern read in the kernel (+2.7M pairs before the
+fix); (2) in-place (ABS64) and encoded (PREL32) members need different
+edges — value aliasing vs deref + a gated `offset_to_ptr` pull.
+Result: `do_one_initcall` 85 → 735 targets (649 initstubs), whole
+kernel pinned at 14,850 icalls / 5,866,561 pairs (superset, +26
+icalls). static_call/ksymtab families stay excluded + LEDGERed.
+
 ## The full residual ledger (per-corpus unsoundness bill)
 
 From this census plus the 2026-07-20 whole-kernel solve run:

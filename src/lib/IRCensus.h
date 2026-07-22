@@ -35,4 +35,9 @@ struct IRCensusResult {
 IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
                            bool printTables);
 
+// Language-totality check: opcodes defined by Instruction.def that
+// lack a disposition (empty = table is total over the LANGUAGE, not
+// merely over observed corpora).
+std::vector<std::string> opcodeTableGaps();
+
 #endif

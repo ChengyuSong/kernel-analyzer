@@ -130,9 +130,28 @@ const std::map<unsigned, Disposition> &opcodeTable() {
        "yields {exn ptr, sel} — thrown-object flow (C++ corpora)"}},
     {Instruction::Resume, {"SUSPECT",
        "rethrow consumes {exn ptr, sel}"}},
+    {Instruction::UserOp1, {"NOOP", "pass-internal, never in serialized IR"}},
+    {Instruction::UserOp2, {"NOOP", "pass-internal, never in serialized IR"}},
   };
   return T;
 }
+
+} // namespace
+
+// LANGUAGE totality (not just observed-corpus totality): every opcode
+// LLVM defines must have a disposition, checked mechanically against
+// Instruction.def — so a new corpus (C++ EH, coroutines, ...) cannot
+// surface an instruction KIND we have no verdict on. Returns the gaps.
+std::vector<std::string> opcodeTableGaps() {
+  std::vector<std::string> gaps;
+  auto &OT = opcodeTable();
+#define FIRST_TERM_INST(N)
+#define HANDLE_INST(N, OPC, CLASS)                                          if (!OT.count(N))                                                           gaps.push_back(#OPC);
+#include "llvm/IR/Instruction.def"
+  return gaps;
+}
+
+namespace {
 
 // prefix -> disposition for intrinsics
 const std::vector<std::pair<const char *, Disposition>> &intrinsicTable() {
@@ -197,6 +216,66 @@ const std::vector<std::pair<const char *, Disposition>> &intrinsicTable() {
     {"llvm.read_register", {"NOOP", "opaque"}},
     {"llvm.write_register", {"NOOP", "opaque"}},
     {"llvm.x86.", {"SUSPECT", "target intrinsic — review per name"}},
+    // --- LangRef families never observed in our corpora: dispositioned
+    // ahead of contact so a C++/coroutine/GC/managed corpus reports a
+    // verdict, not just UNDISP. All pointer-moving ones are SUSPECT =
+    // encoder work required before results on such a corpus are sound.
+    {"llvm.coro.", {"SUSPECT",
+       "coroutine frame pointer flows (C++20 coroutines) — unmodeled"}},
+    {"llvm.experimental.gc.", {"SUSPECT",
+       "GC statepoint relocation MOVES pointers — unmodeled"}},
+    {"llvm.gcroot", {"SUSPECT", "GC root registration"}},
+    {"llvm.gcread", {"SUSPECT", "GC heap load"}},
+    {"llvm.gcwrite", {"SUSPECT", "GC heap store"}},
+    {"llvm.vp.", {"SUSPECT",
+       "vector-predicated memory/gather ops — no d-edges today"}},
+    {"llvm.wasm.", {"SUSPECT", "wasm EH / reference types"}},
+    {"llvm.seh.", {"SUSPECT", "windows SEH state"}},
+    {"llvm.eh.", {"SUSPECT", "EH machinery (catch-all prefix)"}},
+    {"llvm.ptrauth.", {"SUSPECT",
+       "signs/authenticates pointers — forwards them"}},
+    {"llvm.threadlocal.address", {"SUSPECT",
+       "returns ptr to TLS global (LLVM 16+ TLS lowering) — should "
+       "alias the operand; encoder work when first observed"}},
+    {"llvm.matrix.", {"SUSPECT", "matrix load/store variants touch memory"}},
+    {"llvm.experimental.convergence.", {"NOOP", "token control only"}},
+    {"llvm.ssa.copy", {"SUSPECT", "forwards operand (copy)"}},
+    {"llvm.experimental.deoptimize", {"SUSPECT", "deopt state capture"}},
+    {"llvm.experimental.guard", {"SUSPECT", "deopt state capture"}},
+    {"llvm.experimental.widenable.condition", {"NOOP", "i1 result"}},
+    {"llvm.icall.branch.funnel", {"SUSPECT",
+       "CFI fptr dispatch funnel — CALLGRAPH-relevant"}},
+    {"llvm.load.relative", {"SUSPECT",
+       "PREL32-style relative load (relative vtables) — the intrinsic "
+       "form of offset_to_ptr; wire like the inttoptr pull rule"}},
+    {"llvm.type.test", {"NOOP", "i1 CFI check"}},
+    {"llvm.type.checked.load", {"SUSPECT",
+       "RETURNS A FUNCTION POINTER from a vtable — CALLGRAPH-relevant"}},
+    {"llvm.public.type.test", {"NOOP", "i1 CFI check"}},
+    {"llvm.arithmetic.fence", {"NOOP", "float"}},
+    {"llvm.fptrunc.round", {"NOOP", "float"}},
+    {"llvm.canonicalize", {"NOOP", "float"}},
+    {"llvm.set.rounding", {"NOOP", "fp env"}},
+    {"llvm.get.rounding", {"NOOP", "fp env"}},
+    {"llvm.experimental.stepvector", {"NOOP", "int vector"}},
+    {"llvm.experimental.vector.", {"SUSPECT", "vector shuffles of ptr vectors"}},
+    {"llvm.vector.insert", {"SUSPECT", "may carry ptr lanes"}},
+    {"llvm.vector.extract", {"SUSPECT", "may carry ptr lanes"}},
+    {"llvm.aarch64.", {"SUSPECT", "target intrinsic — review per name"}},
+    {"llvm.arm.", {"SUSPECT", "target intrinsic — review per name"}},
+    {"llvm.riscv.", {"SUSPECT", "target intrinsic — review per name"}},
+    {"llvm.amdgcn.", {"SUSPECT", "target intrinsic — review per name"}},
+    {"llvm.nvvm.", {"SUSPECT", "target intrinsic — review per name"}},
+    {"llvm.instrprof.", {"NOOP", "profiling counters"}},
+    {"llvm.pcmarker", {"NOOP", "marker"}},
+    {"llvm.clear_cache", {"NOOP", "icache maintenance"}},
+    {"llvm.codeview.annotation", {"NOOP", "debug"}},
+    {"llvm.sideeffect", {"NOOP", "marker"}},
+    {"llvm.seteh", {"NOOP", "legacy"}},
+    {"llvm.localescape", {"SUSPECT", "captures frame slot addresses (SEH)"}},
+    {"llvm.localrecover", {"SUSPECT", "recovers frame slot addresses (SEH)"}},
+    {"llvm.sponentry", {"NOOP", "opaque sp"}},
+    {"llvm.addressofreturnaddress", {"SUSPECT", "frame slot address"}},
   };
   return T;
 }
@@ -428,6 +507,7 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
   std::map<std::string, uint64_t> extCallees; // declared, non-intrinsic
   std::map<unsigned, uint64_t> constExprTally;
   uint64_t asmSites = 0;
+  std::map<std::string, uint64_t> bundleTally; // operand-bundle tags
   std::map<std::string, AsmInfo> asmTable; // key = constraints \x1f text
   uint64_t asmCatSites[AsmNumCats] = {0};
   uint64_t aggLoadStore = 0, vecPtrOps = 0, totalInsts = 0, totalFuncs = 0;
@@ -519,6 +599,8 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
         if (I.getType()->isVectorTy() && typeHasPointer(I.getType()))
           vecPtrOps++;
         if (auto *CB = dyn_cast<CallBase>(&I)) {
+          for (unsigned bi = 0; bi < CB->getNumOperandBundles(); bi++)
+            bundleTally[CB->getOperandBundleAt(bi).getTagName().str()]++;
           if (CB->isInlineAsm()) {
             asmSites++;
             auto *IA = cast<InlineAsm>(CB->getCalledOperand());
@@ -707,6 +789,21 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
          << vecPtrOps << "\n";
   errs() << "CENSUS summary UNDISPOSITIONED kinds " << R.undispKinds
          << ", SUSPECT ptr-relevant instances " << R.suspectPtrInsts << "\n";
+  {
+    std::vector<std::string> gaps = opcodeTableGaps();
+    errs() << "CENSUS langref opcode totality: "
+           << (gaps.empty() ? "TOTAL — every opcode LLVM defines has a "
+                              "disposition (corpus-independent)"
+                            : "GAPS:")
+           << "\n";
+    for (const std::string &g : gaps) {
+      errs() << "CENSUS langref MISSING opcode " << g << "\n";
+      R.undispKinds++;
+      R.undispNames.push_back("langref op " + g + " (never observed)");
+    }
+    for (auto &[tag, cnt] : bundleTally)
+      errs() << "CENSUS operand-bundle " << tag << " " << cnt << "\n";
+  }
 
   // ---- machine-readable ledger artifact ----
   if (!jsonOut.empty()) {
@@ -726,7 +823,20 @@ IRCensusResult runIRCensus(GlobalContext *Ctx, const std::string &jsonOut,
        << ", \"agg_vec_ptr_load_store\": " << aggLoadStore
        << ", \"vec_ptr_ops\": " << vecPtrOps
        << ", \"undisp_kinds\": " << R.undispKinds
-       << ", \"suspect_ptr_instances\": " << R.suspectPtrInsts << "},\n";
+       << ", \"suspect_ptr_instances\": " << R.suspectPtrInsts
+       << ", \"langref_opcode_total\": "
+       << (opcodeTableGaps().empty() ? "true" : "false") << "},\n";
+    os << "  \"operand_bundles\": [\n";
+    {
+      size_t i = 0;
+      for (auto &[tag, cnt] : bundleTally) {
+        os << "    {\"tag\": \"";
+        jsonEsc(os, tag);
+        os << "\", \"count\": " << cnt << "}"
+           << (++i < bundleTally.size() ? "," : "") << "\n";
+      }
+    }
+    os << "  ],\n";
     // opcodes
     os << "  \"opcodes\": [\n";
     for (size_t i = 0; i < ops.size(); i++) {

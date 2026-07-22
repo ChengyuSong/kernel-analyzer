@@ -2874,4 +2874,5 @@ CENSUS addressable-stubs 16915 distinct-targets 12597 aliases 45 ifuncs 0
 CENSUS ================ summary ================
 CENSUS summary funcs 57661 insts 4802515 asm-sites 129812 asm-distinct 4921 extern-decls 1136 agg/vec-ptr-load-store 0 vec-ptr-ops 0
 CENSUS summary UNDISPOSITIONED kinds 0, SUSPECT ptr-relevant instances 16
+CENSUS langref opcode totality: TOTAL — every opcode LLVM defines has a disposition (corpus-independent)
 CENSUS ledger artifact written: /home/csong/project/kanalyzer/docs/kernel-census/linux-6.8.2-ir-census.json

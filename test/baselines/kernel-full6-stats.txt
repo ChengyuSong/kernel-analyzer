@@ -1,0 +1,9 @@
+Whole-kernel flows-to pinned baseline (2026-07-22, commit 4907f3b, task #22)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune --cfl-dump-icalls --bc-list bclist (from ~/fast/linux/linux-6.8.2)
+resolved: 14850 icalls / 5866561 pairs, converged iteration 4
+solve: 238911 239588 237862 241763 239304 ms (~19.9 min)
+wall: 2:40:43 (incl. 5.9M-line icall dump)  RSS: 31.9 GB
+LinkerArrays: 37 bounds wired (17713 member flows), LEDGER 37 memberless + 32 excluded (metadata/patching/module-linking) + 0 unresolved
+vs pre-#22 pin (14824/5135527): +26 icalls, +731034 pairs (superset verified, 0 removed)
+do_one_initcall: 735 targets (649 initstubs)
+subsets: bclist-subset-km 1072/74185; bclist-subset 1919/209914; harfbuzz 333/2811 (zero diff); libpng smoke 4/4

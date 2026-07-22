@@ -13,6 +13,7 @@
 #include "PtsSet.h"
 
 #include <map>
+#include <unordered_set>
 #include <vector>
 #include <set>
 
@@ -99,6 +100,7 @@ private:
     std::set<NodeIndex> taintedNodes;
 
     // Some special indices
+    std::unordered_set<uint64_t> extGobjOverrides;
     static const NodeIndex UniversalPtrIndex = 0;
     static const NodeIndex UniversalObjIndex = 1;
     static const NodeIndex NullPtrIndex = 2;
@@ -262,6 +264,16 @@ public:
 
     // Special node getters
     NodeIndex getUniversalPtrNode() const { return UniversalPtrIndex; }
+    // Linker-array bounds symbols (task #22): undefined externs whose
+    // contents ARE known (closed world: the linker concatenates the
+    // enumerated section members). Overridden GUIDs bypass the
+    // universal-ptr fallback and resolve to their own value node, so
+    // wiring members into deref(bounds) reaches exactly the reads of
+    // that array instead of the universal unknown-memory hub.
+    void addExtGobjOverride(uint64_t guid) { extGobjOverrides.insert(guid); }
+    bool isExtGobjOverride(uint64_t guid) const {
+        return extGobjOverrides.count(guid) != 0;
+    }
     NodeIndex getUniversalObjNode() const { return UniversalObjIndex; }
     NodeIndex getNullPtrNode() const { return NullPtrIndex; }
     NodeIndex getNullObjectNode() const { return NullObjectIndex; }

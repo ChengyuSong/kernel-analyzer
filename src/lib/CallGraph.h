@@ -229,7 +229,22 @@ private:
   // entry targets). Consumed by wireLinkerSectionArrays(), which
   // aliases each undefined __start_X/__stop_X extern to its members so
   // loads through the bounds symbols stop resolving to nothing.
-  std::map<std::string, std::set<const llvm::GlobalValue*>> linkerSectionMembers;
+  // in-place members: IR globals carrying the section attribute — the
+  // linker lays THEM OUT as the array elements, so the bounds symbol
+  // aliases the member objects (value edges).
+  std::map<std::string, std::set<const llvm::GlobalValue*>> linkerSectionInPlace;
+  // encoded members: module-asm PREL32 entry targets — the array holds
+  // offsets ENCODING them, so they live in deref(bounds), read out by
+  // the offset_to_ptr pull rule in visitIntToPtrInst.
+  std::map<std::string, std::set<const llvm::GlobalValue*>> linkerSectionEncoded;
+  // wired sections with module-asm entries that LOOK like symbols but
+  // resolve to nothing: membership may be incomplete, so the bounds
+  // symbol keeps the universal fallback (no override, no wiring)
+  std::map<std::string, size_t> linkerSectionUnresolved;
+  bool linkerArraySources(llvm::StringRef boundsName,
+                          std::set<const llvm::GlobalValue*> &inPlace,
+                          std::set<const llvm::GlobalValue*> &encoded,
+                          bool *unresolved);
   void wireLinkerSectionArrays();
 
   std::unordered_map<const llvm::Function*,

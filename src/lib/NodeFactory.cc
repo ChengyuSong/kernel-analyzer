@@ -204,12 +204,16 @@ NodeIndex AndersNodeFactory::getValueNodeFor(const Value* val) {
             if (itr != gobjMap->end()) {
                 val = itr->second;
             } else if (extGobjMap && extGobjMap->find(GID) != extGobjMap->end()) {
-                // XXX: return universal ptr?
-                return getUniversalPtrNode();
+                if (extGobjOverrides.count(GID))
+                    val = extGobjMap->find(GID)->second; // own identity
+                else
+                    return getUniversalPtrNode();
             }
         } else if (extGobjMap && extGobjMap->find(GID) != extGobjMap->end()) {
-            // XXX: return universal ptr?
-            return getUniversalPtrNode();
+            if (extGobjOverrides.count(GID))
+                val = extGobjMap->find(GID)->second; // own identity
+            else
+                return getUniversalPtrNode();
         }
     }
     val = canonicalizeValueKey(val);

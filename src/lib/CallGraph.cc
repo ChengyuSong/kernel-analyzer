@@ -5710,13 +5710,11 @@ void CallGraphPass::collectIFuncTargets(const GlobalIFunc *IF) {
 // inttoptr, all visited) carries the bounds symbol's VALUE to the
 // consumer, so a-edges member -> bounds cover both shapes under the
 // field-insensitive memory model.
-void CallGraphPass::wireLinkerSectionArrays() {
-  if (!CFLLinkerArrays) return;
-  // candidate section keys for a bounds symbol name; kernel bounds are
-  // either generic (__start_X/__stop_X <-> section X modulo _/. prefix)
-  // or hand-written in vmlinux.lds (the irregulars below)
-  auto keysFor = [](StringRef N, std::vector<std::string> &exact,
-                    std::vector<std::string> &prefix) -> bool {
+// candidate section keys for a bounds symbol name; kernel bounds are
+// either generic (__start_X/__stop_X <-> section X modulo _/. prefix)
+// or hand-written in vmlinux.lds (the irregulars below)
+static bool linkerBoundsSectionKeys(StringRef N, std::vector<std::string> &exact,
+                                    std::vector<std::string> &prefix) {
     StringRef K;
     if (N.starts_with("__start_")) {
       K = N.drop_front(8);
@@ -5749,16 +5747,17 @@ void CallGraphPass::wireLinkerSectionArrays() {
       exact.push_back("_ftrace_eval_map");
     }
     return true;
-  };
-  // Families whose IN-CORPUS consumers treat entries as code/symbol
+}
+
+// Families whose IN-CORPUS consumers treat entries as code/symbol
   // METADATA, not data-flow pointers: (a) patching machinery
   // (static_call, jump_label, extable fixups, mcount) — modeled as
   // control transforms, static_call = task #14; (b) loadable-module
   // linking (__ksymtab/__kcrctab) — resolve_symbol runs on out-of-
   // corpus modules; wiring would inject EVERY exported symbol into
   // the alias world; (c) pure string/metadata tables. Excluded and
-  // LEDGERed as explicit boundary assumptions.
-  auto excludedFamily = [](StringRef K) {
+// LEDGERed as explicit boundary assumptions.
+static bool linkerExcludedFamily(StringRef K) {
     return K.contains("ksymtab") || K.contains("kcrctab") ||
            K.contains("static_call") || K.contains("jump_table") ||
            K.contains("ex_table") || K.contains("bug_table") ||
@@ -5766,32 +5765,70 @@ void CallGraphPass::wireLinkerSectionArrays() {
            K.contains("tracepoint_str") || K.contains("bprintk") ||
            K.contains("dyndbg") || K.contains("modver") ||
            K.contains("kprobe_blacklist") || K.contains("notes");
+}
+
+// union of members over the bounds symbol's candidate sections; sets
+// *unresolved when any matched section had symbol-looking module-asm
+// entries that resolve to nothing (membership incomplete)
+bool CallGraphPass::linkerArraySources(StringRef boundsName,
+                                       std::set<const GlobalValue *> &inPlace,
+                                       std::set<const GlobalValue *> &encoded,
+                                       bool *unresolved) {
+  if (unresolved) *unresolved = false;
+  std::vector<std::string> exact, prefix;
+  if (!linkerBoundsSectionKeys(boundsName, exact, prefix)) return false;
+  auto take = [&](const std::string &sec) {
+    auto ip = linkerSectionInPlace.find(sec);
+    if (ip != linkerSectionInPlace.end())
+      inPlace.insert(ip->second.begin(), ip->second.end());
+    auto en = linkerSectionEncoded.find(sec);
+    if (en != linkerSectionEncoded.end())
+      encoded.insert(en->second.begin(), en->second.end());
+    if (unresolved && linkerSectionUnresolved.count(sec))
+      *unresolved = true;
   };
+  auto takePrefix = [&](const std::string &p,
+                        const std::map<std::string,
+                                       std::set<const GlobalValue *>> &m) {
+    for (auto it = m.lower_bound(p);
+         it != m.end() && StringRef(it->first).starts_with(p); ++it)
+      take(it->first);
+  };
+  for (const std::string &k : exact) take(k);
+  for (const std::string &p : prefix) {
+    takePrefix(p, linkerSectionInPlace);
+    takePrefix(p, linkerSectionEncoded);
+  }
+  return true;
+}
+
+void CallGraphPass::wireLinkerSectionArrays() {
+  if (!CFLLinkerArrays) return;
   size_t wired = 0, matched = 0, unmatched = 0, nodeless = 0;
-  size_t excluded = 0;
+  size_t excluded = 0, keptUniversal = 0;
   for (const auto &[guid, EGV] : Ctx->ExtGobjs) {
     StringRef N = EGV->getName();
     std::vector<std::string> exact, prefix;
-    if (!keysFor(N, exact, prefix)) continue;
-    if (excludedFamily(N)) {
+    if (!linkerBoundsSectionKeys(N, exact, prefix)) continue;
+    if (linkerExcludedFamily(N)) {
       excluded++;
       CG_DEBUG("LinkerArrays: bounds " << N
                << " excluded (metadata/patching/module-linking family)\n");
       continue;
     }
-    std::set<const GlobalValue *> sources;
-    for (const std::string &k : exact) {
-      auto it = linkerSectionMembers.find(k);
-      if (it != linkerSectionMembers.end())
-        sources.insert(it->second.begin(), it->second.end());
+    bool unresolved = false;
+    std::set<const GlobalValue *> inPlace, encoded;
+    linkerArraySources(N, inPlace, encoded, &unresolved);
+    if (unresolved) {
+      // membership incomplete: symbol keeps the universal fallback,
+      // which already over-approximates its reads — wiring would only
+      // re-inject members into the universal hub
+      keptUniversal++;
+      CG_LOG("LinkerArrays: LEDGER bounds " << N
+             << " kept universal (unresolved section entries)\n");
+      continue;
     }
-    for (const std::string &p : prefix)
-      for (auto it = linkerSectionMembers.lower_bound(p);
-           it != linkerSectionMembers.end() &&
-           StringRef(it->first).starts_with(p);
-           ++it)
-        sources.insert(it->second.begin(), it->second.end());
-    if (sources.empty()) {
+    if (inPlace.empty() && encoded.empty()) {
       // bounds over metadata sections (orc, bug/ex tables) or arrays
       // with no member in the corpus — ledgered, not silently dropped
       unmatched++;
@@ -5803,7 +5840,7 @@ void CallGraphPass::wireLinkerSectionArrays() {
     assert(eNode != AndersNodeFactory::InvalidIndex &&
            "ExtGobj without value node");
     size_t before = wired;
-    for (const GlobalValue *S : sources) {
+    auto resolveNode = [&](const GlobalValue *S) -> NodeIndex {
       NodeIndex sNode = NF.getValueNodeFor(S);
       if (sNode == AndersNodeFactory::InvalidIndex) {
         if (auto *F = dyn_cast<Function>(S)) {
@@ -5813,18 +5850,26 @@ void CallGraphPass::wireLinkerSectionArrays() {
           Ctx->AddressTakenFuncs.insert(F);
         } else {
           nodeless++; // skipped compiler global — ledgered
-          continue;
         }
       }
-      // STORE-LIKE wiring: members flow into deref(bounds), not into
-      // the bounds VALUE class. Wiring the value class leaked every
-      // member into any icall a-reachable from the array ADDRESS
-      // (sort/memcpy hubs pass array pointers everywhere): whole
-      // kernel +2.7M pairs, 72% of them pci-quirk stubs at unrelated
-      // icalls. With deref wiring only actual reads yield members:
-      // ABS64 arrays via their loads (gep keeps the base class), and
-      // PREL32 arrays via the offset_to_ptr deref-pull rule in
-      // visitIntToPtrInst.
+      return sNode;
+    };
+    // In-place members ARE the array elements: the bounds symbol
+    // aliases their objects (value edges). Encoded (PREL32) members
+    // live in deref(bounds), read out by the offset_to_ptr pull rule.
+    // Precision rests on the bounds symbol having its OWN identity
+    // (extGobjOverride) — wiring into the universal fallback leaked
+    // every member into all unmodeled-extern reads (whole kernel
+    // +2.7M pairs, 72% pci-quirk stubs at unrelated icalls).
+    for (const GlobalValue *S : inPlace) {
+      NodeIndex sNode = resolveNode(S);
+      if (sNode == AndersNodeFactory::InvalidIndex) continue;
+      addAssignmentEdge(sNode, eNode);
+      wired++;
+    }
+    for (const GlobalValue *S : encoded) {
+      NodeIndex sNode = resolveNode(S);
+      if (sNode == AndersNodeFactory::InvalidIndex) continue;
       addAssignmentEdge(sNode, getRepDerefNode(getCanonicalNode(eNode)));
       wired++;
     }
@@ -5836,6 +5881,7 @@ void CallGraphPass::wireLinkerSectionArrays() {
          << " member flows; LEDGER " << unmatched
          << " bounds without IR-visible members, " << excluded
          << " excluded metadata/patching/module-linking bounds, "
+         << keptUniversal << " kept universal (unresolved entries), "
          << nodeless << " nodeless members skipped\n");
 }
 
@@ -5845,7 +5891,9 @@ bool CallGraphPass::doInitialization(Module *M) {
     canonicalClassMembers.clear();
     moduleIndirectCallInsts.clear();
     fieldAliasMap.clear();
-    linkerSectionMembers.clear();
+    linkerSectionInPlace.clear();
+    linkerSectionEncoded.clear();
+    linkerSectionUnresolved.clear();
   }
 
   // Linker-mediated arrays (task #22): module-level asm places PREL32
@@ -5860,7 +5908,12 @@ bool CallGraphPass::doInitialization(Module *M) {
         M->getModuleInlineAsm(), [&](StringRef sec, StringRef sym) {
           if (sym.empty()) return;
           GlobalValue *GVal = M->getNamedValue(sym);
-          if (!GVal) return; // local labels / literal operands
+          if (!GVal) {
+            char c0 = sym.front();
+            if (isalpha((unsigned char)c0) || c0 == '_' || c0 == '$')
+              linkerSectionUnresolved[sec.str()]++;
+            return; // local labels / literal operands
+          }
           if (auto *GA = dyn_cast<GlobalAlias>(GVal))
             GVal = dyn_cast_or_null<GlobalValue>(
                 GA->getAliasee()->stripPointerCasts());
@@ -5868,10 +5921,10 @@ bool CallGraphPass::doInitialization(Module *M) {
           if (auto *F = dyn_cast<Function>(GVal)) {
             if (F->isIntrinsic()) return;
             asmTaken.insert(F);
-            linkerSectionMembers[sec.str()].insert(getFuncDef(F));
+            linkerSectionEncoded[sec.str()].insert(getFuncDef(F));
           } else if (auto *G = dyn_cast<GlobalVariable>(GVal)) {
             if (!G->isDeclaration())
-              linkerSectionMembers[sec.str()].insert(G);
+              linkerSectionEncoded[sec.str()].insert(G);
           }
         });
   }
@@ -5895,7 +5948,7 @@ bool CallGraphPass::doInitialization(Module *M) {
     if (CFLLinkerArrays && GV.hasSection()) {
       StringRef sec = GV.getSection();
       if (!sec.starts_with(".discard.") && sec != "llvm.metadata")
-        linkerSectionMembers[cflNormalizeSection(sec)].insert(&GV);
+        linkerSectionInPlace[cflNormalizeSection(sec)].insert(&GV);
     }
   }
 
@@ -5972,6 +6025,22 @@ bool CallGraphPass::doInitialization(Module *M) {
 
   if (M == Ctx->Modules.back().first) {
     for (auto const &itr: Ctx->ExtGobjs) {
+      // linker-array bounds with complete, enumerable contents get
+      // their OWN identity (closed world) instead of the universal
+      // fallback — registered BEFORE any edges are built so every
+      // load of the symbol resolves to the dedicated node
+      if (CFLLinkerArrays) {
+        StringRef N = itr.second->getName();
+        std::vector<std::string> exact, prefix;
+        if (linkerBoundsSectionKeys(N, exact, prefix) &&
+            !linkerExcludedFamily(N)) {
+          bool unresolved = false;
+          std::set<const GlobalValue *> ip, en;
+          linkerArraySources(N, ip, en, &unresolved);
+          if ((!ip.empty() || !en.empty()) && !unresolved)
+            NF.addExtGobjOverride(itr.first);
+        }
+      }
       NF.createValueNode(itr.second);
     }
     for (auto const &itr: Ctx->ExtFuncs) {

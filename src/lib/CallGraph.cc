@@ -1388,7 +1388,16 @@ NodeIndex CallGraphPass::getRepNodeForValue(const Value *V) {
   return getCanonicalNode(n);
 }
 
+// Universal-ptr exposure ledger (task #22 postmortem): the universal
+// fallback silently absorbed 17.7k wired edges once — every touch is
+// now counted and reported so a repeat is loud, not a 3h kernel run.
+static size_t g_uniEdgeTouches = 0, g_uniDerefTouches = 0,
+              g_uniFptrIcalls = 0;
+
 NodeIndex CallGraphPass::getRepDerefNode(NodeIndex ptrNode) {
+  if (ptrNode == NF.getUniversalPtrNode() ||
+      ptrNode == NF.getUniversalObjNode())
+    g_uniDerefTouches++; // memory modeled through unknown-extern hub
   if (ptrNode == AndersNodeFactory::InvalidIndex)
     return AndersNodeFactory::InvalidIndex;
 
@@ -1414,6 +1423,9 @@ void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
   NodeIndex s = getCanonicalNode(src);
   NodeIndex d = getCanonicalNode(dst);
   if (s == d) return;
+  if (s == NF.getUniversalPtrNode() || d == NF.getUniversalPtrNode() ||
+      s == NF.getUniversalObjNode() || d == NF.getUniversalObjNode())
+    g_uniEdgeTouches++;
   EB.addAssignmentEdges(s, d);
 }
 
@@ -1521,6 +1533,12 @@ void CallGraphPass::applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode,
 }
 
 void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
+  // merging anything with the universal class would conflate the
+  // unknown-extern hub with a real object — catastrophic and silent;
+  // refuse loudly (no silent fallback)
+  assert(a != NF.getUniversalPtrNode() && b != NF.getUniversalPtrNode() &&
+         a != NF.getUniversalObjNode() && b != NF.getUniversalObjNode() &&
+         "attempt to canonical-merge the universal class");
   a = getCanonicalNode(a);
   b = getCanonicalNode(b);
   if (a == b)
@@ -3496,6 +3514,8 @@ bool CallGraphPass::runFlowsToResolution() {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
     if (fn == AndersNodeFactory::InvalidIndex) continue;
+    if (getCanonicalNode(fn) == NF.getUniversalPtrNode())
+      g_uniFptrIcalls++; // fptr IS unknown extern memory — boundary
     auto dIt = toDense.find(getCanonicalNode(fn));
     if (dIt == toDense.end()) continue;
     std::string csStruct; unsigned csField = 0;
@@ -6109,6 +6129,16 @@ bool CallGraphPass::doFinalization(Module *M) {
            << g_intProvLoads << " int loads (witnessed); LEDGER unmodeled "
            << g_intStoreUnmodeled << " stores / " << g_intLoadUnmodeled
            << " loads with interprocedural int provenance\n");
+    {
+      uint64_t uniExtGobj = 0, uniOther = 0;
+      NF.getUniversalLedger(uniExtGobj, uniOther);
+      CG_LOG("UniversalPtr LEDGER: " << uniExtGobj
+             << " extern-global value resolutions + " << uniOther
+             << " other fallbacks; " << g_uniEdgeTouches
+             << " edges touch universal, " << g_uniDerefTouches
+             << " deref-throughs, " << g_uniFptrIcalls
+             << " icalls read unknown extern memory directly\n");
+    }
     CG_LOG("PrintfSink: " << printfSinkCallsites << " benign vararg callsites ("
            << printfSinkArgsSkipped << " tail args unwired), "
            << printfNonConstFmt << " non-constant fmt kept, "

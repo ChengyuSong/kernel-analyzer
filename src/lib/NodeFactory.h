@@ -101,6 +101,7 @@ private:
 
     // Some special indices
     std::unordered_set<uint64_t> extGobjOverrides;
+    uint64_t uniExtGobjHits = 0, uniOtherHits = 0;
     static const NodeIndex UniversalPtrIndex = 0;
     static const NodeIndex UniversalObjIndex = 1;
     static const NodeIndex NullPtrIndex = 2;
@@ -271,6 +272,10 @@ public:
     // wiring members into deref(bounds) reaches exactly the reads of
     // that array instead of the universal unknown-memory hub.
     void addExtGobjOverride(uint64_t guid) { extGobjOverrides.insert(guid); }
+    // universal-fallback exposure counters (no silent conflation)
+    void getUniversalLedger(uint64_t &extGobj, uint64_t &other) const {
+        extGobj = uniExtGobjHits; other = uniOtherHits;
+    }
     bool isExtGobjOverride(uint64_t guid) const {
         return extGobjOverrides.count(guid) != 0;
     }

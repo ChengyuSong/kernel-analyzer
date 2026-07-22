@@ -206,14 +206,18 @@ NodeIndex AndersNodeFactory::getValueNodeFor(const Value* val) {
             } else if (extGobjMap && extGobjMap->find(GID) != extGobjMap->end()) {
                 if (extGobjOverrides.count(GID))
                     val = extGobjMap->find(GID)->second; // own identity
-                else
+                else {
+                    uniExtGobjHits++;
                     return getUniversalPtrNode();
+                }
             }
         } else if (extGobjMap && extGobjMap->find(GID) != extGobjMap->end()) {
             if (extGobjOverrides.count(GID))
                 val = extGobjMap->find(GID)->second; // own identity
-            else
+            else {
+                uniExtGobjHits++;
                 return getUniversalPtrNode();
+            }
         }
     }
     val = canonicalizeValueKey(val);
@@ -333,6 +337,7 @@ NodeIndex AndersNodeFactory::getObjectNodeFor(const Value* val) {
 NodeIndex AndersNodeFactory::getObjectNodeForConstant(const llvm::Constant* c) {
     if(!isa<PointerType>(c->getType())) {
         // Vector-of-pointer constants don't have meaningful object nodes
+        uniOtherHits++;
         return getUniversalPtrNode();
     }
 
@@ -379,8 +384,10 @@ NodeIndex AndersNodeFactory::getReturnNodeFor(const llvm::Function* f) {
     auto itr = returnMap.find(f);
     if (itr != returnMap.end())
         return itr->second;
-    if (extFuncMap && extFuncMap->find(fid) != extFuncMap->end())
+    if (extFuncMap && extFuncMap->find(fid) != extFuncMap->end()) {
+        uniOtherHits++; // extern-fn return conflates in universal
         return getUniversalPtrNode();
+    }
     return InvalidIndex;
 }
 

@@ -236,6 +236,16 @@ cl::opt<std::string> IRCensusOut(
            "running the census)"),
   cl::init(""));
 
+cl::opt<bool> CFLStaticCall(
+  "cfl-static-call",
+  cl::desc("Model kernel static_call: direct calls to undefined "
+           "__SCT__X trampolines dispatch through __SCK__X's func "
+           "slot (initializer + in-corpus __static_call_update stores "
+           "are already IR-visible); the callsite becomes an icall "
+           "resolved by flows-to. Off = trampoline stays an opaque "
+           "extern call (pre-#14 boundary assumption)"),
+  cl::init(true));
+
 cl::opt<bool> CFLLinkerArrays(
   "cfl-linker-arrays",
   cl::desc("Model linker-materialized pointer arrays: alias each "

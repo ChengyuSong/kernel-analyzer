@@ -3650,6 +3650,9 @@ bool CallGraphPass::runFlowsToResolution() {
         auto rIt = funcRootOf.find(o);
         if (rIt == funcRootOf.end()) return;
         Function *F = getFuncDef(const_cast<Function *>(rIt->second));
+        // static_call sites are direct-form icalls: the trampoline's
+        // own root is the dispatch point, not a callee
+        if (F == CS->getCalledFunction()) return;
         filtCandidates++;
         if (!isCompatible(CS, F)) { filtTypeRej++; return; }
         if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
@@ -4229,6 +4232,9 @@ static bool isPtrWidthInt(const llvm::Type *T, const llvm::DataLayout &DL);
 // inline-asm interface-closure ledger (census: 17,804 ptr-capable
 // sites / 171 templates; the families modeled here are percpu ptr
 // slots, asm atomics on ptr-width ints, raw-ptr register throughs)
+static size_t g_staticCallWired = 0, g_staticCallNoKey = 0,
+              g_staticCallUpdates = 0, g_staticCallDynUpdate = 0,
+              g_tracepointProbes = 0, g_staticCallTpIter = 0;
 static size_t g_asmSlotLoads = 0, g_asmSlotStores = 0,
               g_asmWidthWitnessed = 0, g_asmLaunderDeclined = 0,
               g_asmRegLoads = 0, g_asmRegStores = 0, g_asmRegCopies = 0;
@@ -4806,6 +4812,159 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     Value *CO = CS.getCalledOperand()->stripPointerCastsAndAliases();
     if (auto *Load = dyn_cast<LoadInst>(CO)) {
       CG_DEBUG("Indirect call through loaded function pointer: " << *Load->getPointerOperand() << "\n");
+    }
+  }
+
+  // static_call updater as a MODELED PRIMITIVE (task #14): letting the
+  // generic actual-to-formal wiring run on __static_call_update
+  // conflates EVERY key through the shared 'key' parameter (k->func =
+  // func on the param unions all keys' planes: km subset showed
+  // __SCT__cond_resched "resolving" to alloc_insn_page). Per-callsite
+  // wiring func -> deref(key-global) is exact and covers the body's
+  // only pointer effect; non-global keys fall through to the generic
+  // path + LEDGER.
+  if (CFLStaticCall) {
+    Function *UF = CS.getCalledFunction();
+    if (UF && UF->getName() == "__static_call_update" &&
+        CS.arg_size() >= 3) {
+      Value *KeyV = CS.getArgOperand(0)->stripPointerCasts();
+      if (auto *KeyG = dyn_cast<GlobalVariable>(KeyV)) {
+        NodeIndex keyNode = CGP.getRepNodeForValue(KeyG);
+        NodeIndex funcNode =
+            CGP.getRepNodeForValue(CS.getArgOperand(2)->stripPointerCasts());
+        if (keyNode != AndersNodeFactory::InvalidIndex &&
+            funcNode != AndersNodeFactory::InvalidIndex &&
+            !CGP.NF.isSpecialNode(funcNode)) {
+          CGP.addAssignmentEdge(
+              funcNode, CGP.getRepDerefNode(CGP.getCanonicalNode(keyNode)));
+          auto RUF = CGP.getFuncDef(UF);
+          CGP.Ctx->Callees[&CS].insert(RUF); // keep the export edge
+          g_staticCallUpdates++;
+          return; // primitive modeled; skip generic arg wiring
+        }
+      }
+      // dynamic key (tracepoint_update_call, bpf dispatcher): the
+      // generic actual-to-formal wiring would conflate EVERY key
+      // through the shared param — suppress it and LEDGER. The
+      // tracepoint family (the dominant user) is covered exactly by
+      // the tracepoint_probe_register primitive below; anything else
+      // is an explicit, counted boundary assumption.
+      g_staticCallDynUpdate++;
+      CG_DEBUG("StaticCall: dynamic-key update suppressed at "
+               << F->getName() << "\n");
+      auto RUF = CGP.getFuncDef(UF);
+      CGP.Ctx->Callees[&CS].insert(RUF);
+      return;
+    }
+    // tracepoint registration primitive: register_trace_X(probe) calls
+    // tracepoint_probe_register*(&__tracepoint_X, probe, data). The
+    // probe becomes a target of the paired static call
+    // __SCT__tp_func_X (via tracepoint_update_call's dynamic-key
+    // update, suppressed above) — wire probe -> deref(__SCK__tp_func_X)
+    // per callsite. Normal handleCall still runs: tp->funcs flows keep
+    // feeding the __traceiter_X iterator path.
+    if (UF && UF->getName().starts_with("tracepoint_probe_register") &&
+        CS.arg_size() >= 2) {
+      if (auto *TP = dyn_cast<GlobalVariable>(
+              CS.getArgOperand(0)->stripPointerCasts())) {
+        if (TP->getName().starts_with("__tracepoint_")) {
+          std::string sckName =
+              ("__SCK__tp_func_" + TP->getName().drop_front(13)).str();
+          GlobalValue *Key = F->getParent()->getNamedValue(sckName);
+          if (!Key || Key->isDeclaration()) {
+            auto git = CGP.Ctx->Gobjs.find(GlobalValue::getGUID(sckName));
+            if (git != CGP.Ctx->Gobjs.end())
+              Key = const_cast<GlobalVariable *>(git->second);
+          }
+          NodeIndex probeNode = CGP.getRepNodeForValue(
+              CS.getArgOperand(1)->stripPointerCasts());
+          if (Key && !Key->isDeclaration() &&
+              probeNode != AndersNodeFactory::InvalidIndex &&
+              !CGP.NF.isSpecialNode(probeNode)) {
+            NodeIndex keyNode = CGP.getRepNodeForValue(Key);
+            if (keyNode != AndersNodeFactory::InvalidIndex) {
+              CGP.addAssignmentEdge(
+                  probeNode,
+                  CGP.getRepDerefNode(CGP.getCanonicalNode(keyNode)));
+              g_tracepointProbes++;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // static_call (task #14): a direct call to the undefined __SCT__X
+  // trampoline dispatches through __SCK__X's func slot — the key is a
+  // real IR global whose initializer (DEFINE_STATIC_CALL) and updates
+  // (__static_call_update stores key->func in-corpus) are already
+  // modeled. Wire deref(key) -> value(trampoline) and treat the site
+  // as an icall so standard resolution + arg/ret wiring apply.
+  {
+    Function *SCT = CS.getCalledFunction();
+    if (!SCT)
+      SCT = dyn_cast<Function>(
+          CS.getCalledOperand()->stripPointerCastsAndAliases());
+    if (CFLStaticCall && SCT && SCT->isDeclaration() &&
+        SCT->getName().starts_with("__SCT__")) {
+      StringRef Suffix = SCT->getName().drop_front(7);
+      // Tracepoint static calls dispatch to __traceiter_X or a probe
+      // registered on X; probes are transitively reachable through the
+      // iterator's own indirect call over tp->funcs, so the syntactic
+      // edge SCT -> __traceiter_X is callgraph-sound AND avoids reading
+      // the key plane (tp keys route through tracepoint structs that
+      // live in the type-erased hub — reading them imported the whole
+      // hub: km showed __SCT__tp_func_sched_wakeup "resolving" to
+      // array_map ops).
+      if (Suffix.starts_with("tp_func_")) {
+        std::string iterName =
+            ("__traceiter_" + Suffix.drop_front(8)).str();
+        Function *Iter = F->getParent()->getFunction(iterName);
+        if (!Iter || Iter->isDeclaration()) {
+          auto fit = CGP.Ctx->Funcs.find(GlobalValue::getGUID(iterName));
+          if (fit != CGP.Ctx->Funcs.end()) Iter = fit->second;
+        }
+        if (Iter) {
+          auto RIter = CGP.getFuncDef(Iter);
+          CGP.Ctx->Callees[&CS].insert(RIter);
+          if (Function *RSCT = CS.getCalledFunction())
+            CGP.Ctx->Callees[&CS].insert(CGP.getFuncDef(RSCT));
+          g_staticCallTpIter++;
+          return; // probes covered transitively via the iterator icall
+        }
+        g_staticCallNoKey++; // LEDGER: tp_func without visible iterator
+        // fall through to the key-based path as backstop
+      }
+      std::string sckName = ("__SCK__" + Suffix).str();
+      GlobalValue *Key = F->getParent()->getNamedValue(sckName);
+      if (!Key || Key->isDeclaration()) {
+        auto git = CGP.Ctx->Gobjs.find(GlobalValue::getGUID(sckName));
+        if (git != CGP.Ctx->Gobjs.end())
+          Key = const_cast<GlobalVariable *>(git->second);
+      }
+      if (Key && !Key->isDeclaration()) {
+        NodeIndex keyNode = CGP.getRepNodeForValue(Key);
+        NodeIndex sctNode = CGP.NF.getValueNodeFor(SCT);
+        if (sctNode == AndersNodeFactory::InvalidIndex)
+          sctNode = CGP.NF.createValueNode(SCT);
+        if (keyNode != AndersNodeFactory::InvalidIndex) {
+          CGP.addAssignmentEdge(
+              CGP.getRepDerefNode(CGP.getCanonicalNode(keyNode)),
+              CGP.getCanonicalNode(sctNode));
+          CGP.Ctx->IndirectCallInsts.insert(&CS);
+          CGP.moduleIndirectCallInsts[F->getParent()].insert(&CS);
+          if (!CS.getMetadata("ka.icall.id")) {
+            std::string id =
+                getScopeName(F) + "#" + std::to_string(icallCounter++);
+            CS.setMetadata("ka.icall.id",
+                           MDNode::get(CS.getContext(),
+                                       {MDString::get(CS.getContext(), id)}));
+          }
+          g_staticCallWired++;
+          return; // resolved via flows-to, not as an opaque extern call
+        }
+      }
+      g_staticCallNoKey++; // LEDGER: trampoline without visible key
     }
   }
 
@@ -6260,6 +6419,15 @@ bool CallGraphPass::doFinalization(Module *M) {
            << g_intProvLoads << " int loads (witnessed); LEDGER unmodeled "
            << g_intStoreUnmodeled << " stores / " << g_intLoadUnmodeled
            << " loads with interprocedural int provenance\n");
+    CG_LOG("StaticCall LEDGER: " << g_staticCallWired
+           << " __SCT__ callsites wired through their keys, "
+           << g_staticCallUpdates << " updates wired per-callsite; "
+           << g_staticCallNoKey << " without a visible key + "
+           << g_staticCallDynUpdate
+           << " dynamic-key updates SUPPRESSED (tracepoints covered by "
+           << g_tracepointProbes << " probe-registration wirings); "
+           << g_staticCallTpIter
+           << " tp_func sites -> iterator (probes transitive)\n");
     CG_LOG("InlineAsm LEDGER: modeled " << g_asmSlotLoads
            << " slot loads + " << g_asmSlotStores << " slot stores ("
            << g_asmWidthWitnessed << " width-witnessed), " << g_asmRegLoads
@@ -6286,7 +6454,11 @@ bool CallGraphPass::doFinalization(Module *M) {
     if (CFLDumpICalls) {
       for (auto &it : Ctx->Callees) {
         const CallBase *CS = it.first;
-        if (CS->isInlineAsm() || CS->getCalledFunction())
+        // direct-form sites stay out UNLESS they were reclassified as
+        // icalls (static_call trampolines dispatch through their key)
+        if (CS->isInlineAsm() ||
+            (CS->getCalledFunction() &&
+             !Ctx->IndirectCallInsts.count(const_cast<CallBase *>(CS))))
           continue;
         for (const Function *F : it.second)
           errs() << "ICALL " << CS->getFunction()->getName() << " :: " << *CS

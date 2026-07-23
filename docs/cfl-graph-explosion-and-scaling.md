@@ -1527,3 +1527,39 @@ flagship differential. Residual growth decomposition: initstubs 62k,
 SCT 142k (real &tramp flows into __static_call_update void* params),
 other 553k (trace/param members through registration stores + hub
 spread) — the quantified motivation for #17/#21.
+
+## 2026-07-23: soundness items closed — asm interface closure + static_call (tasks #23 + #14, 4295575/9fc2994)
+
+Inline asm (census top levers): handleInlineAsm extended with (a)
+ptr-WIDTH indirect slots under the laundering witnesses (asm atomics
+xchgq/cmpxchgq on i64 fptr slots; ptrtoint-CE inputs unwrapped — the
+i64 CE otherwise lands on the shared ConstantInt node), (b) raw-ptr
+register/address inputs: reads unconditional (this_cpu_read_stable),
+writes/copies gated on declared memory effects; per-run InlineAsm
+LEDGER. t_asmpercpu.c 1/3 -> 3/3 exact; km +41 icalls (bpf prog
+invocation, tick broadcast, kprobes, user-return notifiers).
+
+static_call: __SCT__X calls become icalls reading deref(__SCK__X).
+TWO conflation battles, both param-sharing: (1) __static_call_update
+modeled as a PRIMITIVE (per-callsite func -> deref(key)) — generic
+wiring unioned every key through the shared param (cond_resched
+"resolving" to alloc_insn_page); (2) tracepoint keys live in the hub,
+so tp_func sites take the syntactic edge to __traceiter_X (probes
+transitively covered by the iterator icall) + tracepoint_probe_
+register wired per-callsite; dynamic-key updates suppressed+LEDGERed.
+cond_resched = exactly {__cond_resched, klp_cond_resched,
+__static_call_return0}.
+
+NEW PIN (kernel-full7): **16,720 icalls / 5,644,481 pairs** — +1,870
+resolved icalls with NET -222k pairs vs full6: the updater primitive
+DRAINED 611k hub pairs (SCT trampolines + escaped funcs no longer
+enter the hub through the shared param — most of the 142k SCT channel
+from the #22 postmortem reversed), asm closure added 391k recovered
+flows. Solve 20.1 min, RSS 40.1GB. Residual: 151k tp_func-tramp-as-
+target pairs from tracepoint-struct hub residency (pre-existing,
+quantified; #17/#21). Ladder green: micro exact, smoke 4/4, harfbuzz
+zero-diff. LESSON (twice now): shared-parameter conflation through
+tiny utility functions (sort, __static_call_update) is the single
+biggest precision channel in the kernel — the strongest evidence yet
+that #17-style selective cloning of a HANDFUL of functions buys
+outsized precision.

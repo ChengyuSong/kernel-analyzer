@@ -1,0 +1,11 @@
+Whole-kernel flows-to pinned baseline (2026-07-23, commit 9fc2994, tasks #14+#23)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune --cfl-dump-icalls --bc-list bclist
+resolved: 16720 icalls / 5644481 pairs, converged iteration 4
+solve: 223667 244773 245272 245108 245544 ms (~20.1 min)  wall 2:40:04 (incl 5.6M-line dump)  RSS 40.1 GB
+vs full6 (14850/5866561): +1870 icalls, NET -222080 pairs (610877 removed / 390984 added)
+  removed = static_call updater-channel drained (276k SCT + 321k escaped-func hub pairs)
+  added   = asm-closure recoveries (percpu/bpf/atomic families) + true SCT targets
+StaticCall LEDGER: 2187 key-wired + 1865 tp->iterator sites, 220 update primitives, 0 no-key, 6 dynamic-key suppressed (39 probe wirings)
+InlineAsm LEDGER: 2217 slot loads + 479 stores (2806 width-witnessed), 5942 reg loads + 1209 stores + 338 copies, 7253 declined (LEDGER)
+known residual: 151k __SCT__tp_func-as-target pairs = tracepoint-struct hub residency (pre-existing; #17/#21)
+subsets: km 1479/81286; harfbuzz 333/2811 zero-diff; smoke 4/4; micro tests exact

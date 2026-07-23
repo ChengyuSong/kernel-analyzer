@@ -3858,8 +3858,34 @@ bool CallGraphPass::runFlowsToResolution() {
          << filtTypeRej << " type-rejected, " << filtFieldRej
          << " field-rejected (each rejection = unsoundness exposure; "
          << "zero = filter retirable)\n");
-  if (newPairs == 0)
+  if (newPairs == 0) {
+    // Lazy-mint catch-up: the A-loop cannot admit CYCLIC witness
+    // dependences — e.g. circular list_head chains, where each node's
+    // join needs the neighbor's merge for its consequence path to
+    // reach an fptr (whole-kernel evidence: tcp_ulp/9p-transport ops
+    // registration lists, -5737 pairs without this). At convergence,
+    // mint EVERY still-deferred root and drain to the closure over
+    // the full root set — by confluence of the monotone rules this is
+    // exactly the eager fixpoint, so answers are identical by
+    // construction; the restricted middle iterations keep their win.
+    if (!lazyDeferred.empty()) {
+      const size_t nDef = lazyDeferred.size();
+      size_t minted = 0;
+      for (uint32_t c : lazyDeferred) {
+        uint32_t rep = find(c);
+        if (!isRoot[rep]) { mintRoot(rep); minted++; }
+      }
+      lazyDeferred.clear();
+      flushCtx(ctx0);
+      CG_LOG("LazyMint: CATCH-UP minted " << minted << "/" << nDef
+             << " deferred roots at convergence (cyclic witness "
+             << "dependences are unreachable by the A-loop); draining "
+             << "to the full closure\n");
+      fpIter++;
+      continue; // re-drain with the full root set, then re-resolve
+    }
     break; // converged: no callee flows were added
+  }
   if (iteration + fpIter + 1 >= (int)CFLFlowsToMaxIters) {
     WARNING("[UNSOUND-RISK] FlowsTo fixpoint hit iteration cap ("
             << CFLFlowsToMaxIters.getValue() << ") with " << newPairs

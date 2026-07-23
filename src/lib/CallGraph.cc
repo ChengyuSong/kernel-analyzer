@@ -2314,6 +2314,62 @@ bool CallGraphPass::runFlowsToResolution() {
     // expose relevance per CLASS for the mint loop's tally
     for (uint32_t n = 0; n < N; n++) bidiMarked[n] = bidiMarked[bfind(n)];
   }
+  // --cfl-lazy-mint (task #21): demand-driven roots to the exact bound.
+  // A = classes backward-reachable from any fptr class over a/f flow
+  // edges PLUS cell->owner hops: a cell in A makes every origin
+  // reaching its owning pointer a potential join witness on an answer
+  // path, and the owner hop must apply to the whole closure — not only
+  // to fptr-feeding cells — or the witnesses of intermediate joins
+  // (merges an answer path's connectivity depends on) are missed.
+  // Origin/identity candidates outside A are DEFERRED, never dropped:
+  // every drain fixpoint recomputes A on the merge-coarsened quotient
+  // (facts propagate over a/f edges exactly as reachability, so
+  // "observed potential" = this closure on the LIVE quotient) and
+  // mints the newly admitted ones; stability of A and the root set is
+  // the restricted fixpoint (first-missed-join induction, scaling doc
+  // §2026-07-18). Function roots are always minted: answer alphabet.
+  std::vector<uint32_t> lazyDeferred; // deferred candidate classes (dense)
+  std::vector<char> lazyA;            // initial-quotient closure
+  if (CFLLazyMint) {
+    if (NB > 0)
+      WARNING("[UNSOUND-RISK] --cfl-lazy-mint with field buckets: the "
+              "A-closure has no same-origin exact/X coupling, so VX "
+              "bridges creatable only by unminted origins are missed; "
+              "existing bridges are traversed\n");
+    auto tLazy = std::chrono::steady_clock::now();
+    std::vector<std::vector<uint32_t>> rin(N);
+    for (auto [s, t] : aEdges) rin[t].push_back(s);
+    for (auto &[b, r, bk] : fEdges) rin[r].push_back(b);
+    for (auto [p, c] : dEdges) rin[c].push_back(p); // cell -> owner hop
+    lazyA.assign(N, 0);
+    std::vector<uint32_t> bfs;
+    size_t fptrCls = 0;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt = toDense.find(getCanonicalNode(fn));
+      if (dIt == toDense.end()) continue;
+      if (!lazyA[dIt->second]) {
+        lazyA[dIt->second] = 1;
+        bfs.push_back(dIt->second);
+        fptrCls++;
+      }
+    }
+    while (!bfs.empty()) {
+      uint32_t n = bfs.back();
+      bfs.pop_back();
+      for (uint32_t p : rin[n])
+        if (!lazyA[p]) { lazyA[p] = 1; bfs.push_back(p); }
+    }
+    size_t inA = 0;
+    for (uint32_t n = 0; n < N; n++) inA += lazyA[n];
+    CG_LOG("LazyMint: initial A " << inA << "/" << N << " classes ("
+           << fptrCls << " fptr classes), "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tLazy).count()
+           << " ms\n");
+  }
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
   std::vector<char> rootParkable;    // rid -> pure no-in identity
@@ -2332,6 +2388,13 @@ bool CallGraphPass::runFlowsToResolution() {
         // The oracle recomputes per outer iteration, so cone growth
         // from newly wired callee edges re-admits origins as needed.
         bidiPrunable++;
+        continue;
+      }
+      if (!lazyA.empty() && !isFunc && !lazyA[n]) {
+        // Not backward-reachable from any answer on the initial
+        // quotient: defer — the post-drain expansion re-checks on the
+        // live quotient and mints the moment the class enters A.
+        lazyDeferred.push_back(n);
         continue;
       }
       uint32_t rid = nextRoot++;
@@ -2371,6 +2434,12 @@ bool CallGraphPass::runFlowsToResolution() {
   CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
          << funcRootOf.size() << " function), " << wildcardNodes.size()
          << " wildcard nodes, " << NSHIFT << " shift planes\n");
+  if (!lazyA.empty())
+    CG_LOG("LazyMint: deferred " << lazyDeferred.size()
+           << " candidate roots outside initial A ("
+           << (100.0 * lazyDeferred.size() /
+               std::max<size_t>(1, lazyDeferred.size() + nextRoot))
+           << "% of candidates)\n");
   for (auto &[why, cnt] : wildcardReasons)
     CG_LOG("FlowsTo wildcard[" << why << "]: " << cnt << "\n");
   // --cfl-trace-func: follow one function root's fact through the solve.
@@ -3125,13 +3194,18 @@ bool CallGraphPass::runFlowsToResolution() {
     // allocation sites (their identity was not origin-bearing when the
     // initial mint ran).
     for (uint32_t n2 = oldN; n2 < N; n2++)
-      if (!hasIn[n2] || originBearing(toOrig[n2]))
-        mintRoot(n2);
+      if (!hasIn[n2] || originBearing(toOrig[n2])) {
+        // Lazy mode defers exactly like the initial mint: the
+        // post-drain expansion admits the class if/when it enters A.
+        if (CFLLazyMint) lazyDeferred.push_back(n2);
+        else mintRoot(n2);
+      }
     for (NodeIndex an : newAllocNodes) {
       auto dIt = toDense.find(getCanonicalNode(an));
       assert(dIt != toDense.end() &&
              "allocator callsite class missing from dense map");
-      mintRoot(dIt->second);
+      if (CFLLazyMint) lazyDeferred.push_back(dIt->second);
+      else mintRoot(dIt->second);
     }
     newAllocNodes.clear();
     flushCtx(ctx0);
@@ -3139,6 +3213,79 @@ bool CallGraphPass::runFlowsToResolution() {
            << " a / +" << nD << " d / +" << nF << " f / +" << nW
            << " fx edges, +" << (nextRoot - rootsBefore) << " roots ("
            << nextRoot << " total)\n");
+  };
+
+  // Lazy-mint expansion (task #21, rules 2+3): recompute A on the
+  // CURRENT quotient — merges only coarsen it, so A only grows — and
+  // mint every deferred candidate that entered it. Runs at each drain
+  // fixpoint; a round that mints nothing means A and the root set are
+  // stable (the restricted fixpoint). Seeding is monotone addFact —
+  // the cheap direction of incrementality, no wiring involved.
+  size_t lazyRounds = 0, lazyLateMints = 0;
+  auto lazyExpand = [&]() -> size_t {
+    if (lazyDeferred.empty()) return 0;
+    auto tExp = std::chrono::steady_clock::now();
+    std::vector<std::vector<uint32_t>> rin(N);
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      for (uint32_t t : outA[n]) {
+        uint32_t tt = find(t);
+        if (tt != n) rin[tt].push_back(n);
+      }
+      for (auto [t, r] : outF[n]) {
+        uint32_t tt = find(t);
+        if (tt != n) rin[tt].push_back(n);
+      }
+      for (uint32_t c : cellsOf[n]) { // cell -> owner hop
+        uint32_t cc = find(c);
+        if (cc != n) rin[cc].push_back(n);
+      }
+    }
+    std::vector<char> A(N, 0);
+    std::vector<uint32_t> bfs;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt = toDense.find(getCanonicalNode(fn));
+      if (dIt == toDense.end()) continue;
+      uint32_t rep = find(dIt->second);
+      if (!A[rep]) { A[rep] = 1; bfs.push_back(rep); }
+    }
+    while (!bfs.empty()) {
+      uint32_t n = bfs.back();
+      bfs.pop_back();
+      for (uint32_t p : rin[n])
+        if (!A[p]) { A[p] = 1; bfs.push_back(p); }
+      for (uint32_t br : bridgesOf[n]) { // pairwise exchange: both ways
+        uint32_t bb = find(br);
+        if (!A[bb]) { A[bb] = 1; bfs.push_back(bb); }
+      }
+    }
+    size_t minted = 0;
+    std::vector<uint32_t> still;
+    still.reserve(lazyDeferred.size());
+    for (uint32_t n : lazyDeferred) {
+      uint32_t rep = find(n);
+      if (isRoot[rep]) continue; // merged into a minted identity
+      if (A[rep]) {
+        mintRoot(rep);
+        minted++;
+      } else {
+        still.push_back(n);
+      }
+    }
+    lazyDeferred.swap(still);
+    lazyRounds++;
+    lazyLateMints += minted;
+    if (minted) flushCtx(ctx0);
+    CG_LOG("LazyMint: round " << lazyRounds << " minted +" << minted
+           << " roots (" << lazyLateMints << " late total, "
+           << lazyDeferred.size() << " still deferred), "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tExp).count()
+           << " ms\n");
+    return minted;
   };
 
   // --cfl-solver-profile: rdtsc phase accounting inside the wave phases,
@@ -3322,6 +3469,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // edges incrementally -> drain again from the reached fixpoint. The
   // heavy diagnostics run once, after convergence.
   for (;;) {
+  do { // lazy-mint: drain, expand deferred roots, drain again to stability
   while (true) {
     for (auto &c : ctxs) flushCtx(c);
     if (worklist.empty()) break;
@@ -3385,6 +3533,10 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
+  // At every drain fixpoint, re-admit deferred roots whose classes
+  // entered A on the merge-coarsened quotient, then drain the new
+  // identity bits; stable A + empty backlog = restricted fixpoint.
+  } while (lazyExpand() > 0);
   // --cfl-verify-closure: certify the fixpoint. One full non-delta scan of
   // every rule; any rule that would still fire is a violation. This checks
   // the closure property the delta/backlog machinery must maintain — the

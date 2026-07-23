@@ -266,6 +266,16 @@ cl::opt<bool> CFLBidiPrune(
            "an fptr partition. Measurement only; minting unchanged"),
   cl::init(false));
 
+cl::opt<bool> CFLLazyMint(
+  "cfl-lazy-mint",
+  cl::desc("Demand-driven flows-to roots: mint only origin/identity roots "
+           "backward-reachable from an fptr class (a/f flow edges plus "
+           "cell->owner hops), re-expanding at every drain fixpoint as "
+           "merges coarsen the quotient. Function roots (the answer "
+           "alphabet) are always minted. Answers must be IDENTICAL to "
+           "the full mint; only the propagated fact mass shrinks"),
+  cl::init(false));
+
 cl::opt<bool> CFLRootRelevance(
   "cfl-root-relevance",
   cl::desc("After the flows-to fixpoint, measure the answer-relevant root "

@@ -96,6 +96,12 @@ The primary solver is now `runFlowsToResolution` (branch `orcfl`), modeled in
   grammar-derivable flow and alias.
 - `answers_complete`: icall answers (shift zero or ⊤ at the fptr) are found
   whenever function nodes are minted and coverage holds.
+- `sderiv_catchup` / `catchup_answers_complete`: staged (lazy-mint)
+  solving with a final catch-up to full minting equals the from-scratch
+  closure — exactness of task #21's catch-up round.
+- `answer_not_derivable_restricted`: restricted minting genuinely loses
+  answers (counterexample), so `origins_minted` cannot be weakened
+  without a sufficiency proof for the restricted set (open, F11).
 
 ## Flows-to gaps
 
@@ -157,6 +163,28 @@ solver bugs lived and is below the model. Practical discharge:
 asserts no rule fires (C0 backlogs drained, C1 a-prop, C2 f-prop,
 C3 wildcard projection, C4 fact x cell joins, C5 bridge crossings) —
 a per-run certificate of the model's assumption.
+
+F11. [ADDED 2026-07-23, task #21] Lazy minting. Machine-checked:
+`SDeriv` (least staged closure with a `base` fact relation),
+`sderiv_catchup` (staging confluence: restricted drain → mint more →
+continue = from-scratch closure over the final root set — the
+exactness of the catch-up round, commit 446f35b),
+`catchup_answers_complete` (end-to-end: staged solve with final
+minting ⊇ origins finds every accepted answer), and
+`answer_not_derivable_restricted` (necessity: a 5-node graph where
+minting a strict subset of origins loses a grammar-derivable answer —
+the July-23 whole-kernel deficit, -5737 pairs through tcp_ulp/9p ops
+registration lists, is this shape at scale). OPEN: characterizing a
+SUFFICIENT restricted root set. The implemented A-closure
+(backward {a,f} + cell→owner hops on the live quotient, recomputed
+per drain fixpoint) was conjectured sufficient by the first-missed-
+join induction (scaling doc §2026-07-18) and is empirically REFUTED
+at kernel scale — the induction breaks when a witness's consequence
+path and another witness's occurrence path each need the other's
+merge (cyclic dependence through circular list structure). The
+catch-up round makes the conjecture moot for exactness; a formal
+minimal-sufficient-set characterization would recover the ~3x
+fact-mass savings without the catch-up's final-round cost.
 
 F8. Target filters (`isCompatible`, `fieldFilterAccepts`) still unmodeled
 (same as compositional gap 6): they subtract from the sound answer set,

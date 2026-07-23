@@ -282,10 +282,14 @@ def SAlias (M : ShiftMonoid) {N : Type} (G : FGraph N M.S)
        (SF m none p ∧ ∃ c, SF m c q) ∨
        ((∃ c, SF m c p) ∧ SF m none q))
 
-/-- Abstract solver: minted roots, fact relation, closure under the
-propagation rules, and the minting invariant. -/
-structure SolverModel (M : ShiftMonoid) {N : Type} (origin : N → Prop)
-    (G : FGraph N M.S) where
+/-- Closure rules alone — what one drain loop guarantees for WHATEVER root
+set is currently minted (the `--cfl-verify-closure` certificate checks
+exactly these fields over the final planes). Split out of `SolverModel` so
+RESTRICTED minting (lazy-mint stages, task #21) is expressible: a
+`SolverClosure` with `minted ⊊ origins` is a legal solver state, it just
+loses the completeness theorem — see `answer_not_derivable_restricted`
+below for a concrete witness of that loss. -/
+structure SolverClosure (M : ShiftMonoid) {N : Type} (G : FGraph N M.S) where
   minted : N → Prop
   SF : N → Shift M → N → Prop
   seed : ∀ m, minted m → SF m (some M.zero) m
@@ -305,11 +309,20 @@ structure SolverModel (M : ShiftMonoid) {N : Type} (origin : N → Prop)
     SF m c x →
     SAlias M G minted SF x y →
     SF m c y
+
+/-- Abstract solver: closure rules PLUS the minting invariant. -/
+structure SolverModel (M : ShiftMonoid) {N : Type} (origin : N → Prop)
+    (G : FGraph N M.S) extends SolverClosure M G where
   /-- Minting completeness FOR ORIGINS — dischargeable: the implementation
   mints every origin-bearing class (plus no-in-edge classes and functions).
   The July 2026 minting bug (`!hasIn`-only minting after presolve merges)
   violated exactly this: an alloca class merged with in-edged nodes was
-  never minted, no root reached it, and its object identity vanished. -/
+  never minted, no root reached it, and its object identity vanished.
+  The July 2026 whole-kernel LAZY-MINT deficit (task #21: -5737 pairs,
+  tcp_ulp / 9p-transport ops registration lists) is the second violation
+  in the wild: witness origins outside the demand-driven ancestor closure
+  stayed unminted. The catch-up round restores this invariant at
+  convergence; `sderiv_catchup` proves that restores the full closure. -/
   origins_minted : ∀ z, origin z → minted z
 
 /-- Completeness of the solver against the origin-rooted declarative
@@ -388,5 +401,338 @@ theorem answers_complete
   cases hAccept with
   | inl h0 => subst h0; simpa [shiftComp_zero_left] using h
   | inr hTop => subst hTop; simpa [shiftComp_none_right, shiftComp_zero_left] using h
+
+/-!
+## Lazy minting (task #21): staged least closures and the catch-up theorem
+
+The implementation's lazy mode drains to the least closure over a RESTRICTED
+root set, mints more roots, drains again, and finishes with a CATCH-UP round
+that mints everything still deferred. Two facts must hold:
+
+1. `sderiv_catchup` — staging is confluent: draining restricted and then
+   continuing from the reached facts with a larger root set lands EXACTLY on
+   the from-scratch closure over the larger set. This is why the catch-up
+   round's answers are identical to the eager solve by construction.
+2. `answer_not_derivable_restricted` — the catch-up is NECESSARY:
+   `origins_minted` cannot be dropped, because an unminted witness origin
+   loses grammar-derivable answers (a five-node counterexample; the
+   whole-kernel -5737-pair deficit is this shape at scale).
+-/
+
+/-- Empty base fact relation (a from-scratch stage). -/
+def noBase (M : ShiftMonoid) (N : Type) : N → Shift M → N → Prop :=
+  fun _ _ _ => False
+
+/-- Least solver closure over root set `minted`, starting from carried-over
+facts `base` (the previous stage's planes; `noBase` for stage one). Joins are
+flattened into the three witness-shift cases of `SAlias` so induction stays
+elementary. This is the relation one drain loop actually computes. -/
+inductive SDeriv (M : ShiftMonoid) {N : Type} (G : FGraph N M.S)
+    (minted : N → Prop) (base : N → Shift M → N → Prop) :
+    N → Shift M → N → Prop where
+  | ofBase {m : N} {c : Shift M} {x : N} :
+      base m c x → SDeriv M G minted base m c x
+  | seed (m : N) (hm : minted m) :
+      SDeriv M G minted base m (some M.zero) m
+  | step_a {m : N} {c : Shift M} {x y : N} :
+      SDeriv M G minted base m c x →
+      ({ src := x, lbl := .a, dst := y } : FEdge N M.S) ∈ G →
+      SDeriv M G minted base m c y
+  | step_f {m : N} {c : Shift M} {x y : N} {r : M.S} :
+      SDeriv M G minted base m c x →
+      ({ src := x, lbl := .f r, dst := y } : FEdge N M.S) ∈ G →
+      SDeriv M G minted base m (shiftComp M c (some r)) y
+  | step_fx {m : N} {c : Shift M} {x y : N} :
+      SDeriv M G minted base m c x →
+      ({ src := x, lbl := .fx, dst := y } : FEdge N M.S) ∈ G →
+      SDeriv M G minted base m none y
+  | join_e {m : N} {c : Shift M} {x y p q w : N} {cw : Shift M} :
+      ({ src := p, lbl := .d, dst := x } : FEdge N M.S) ∈ G →
+      ({ src := q, lbl := .d, dst := y } : FEdge N M.S) ∈ G →
+      minted w →
+      SDeriv M G minted base w cw p →
+      SDeriv M G minted base w cw q →
+      SDeriv M G minted base m c x →
+      SDeriv M G minted base m c y
+  | join_xl {m : N} {c : Shift M} {x y p q w : N} {cw : Shift M} :
+      ({ src := p, lbl := .d, dst := x } : FEdge N M.S) ∈ G →
+      ({ src := q, lbl := .d, dst := y } : FEdge N M.S) ∈ G →
+      minted w →
+      SDeriv M G minted base w none p →
+      SDeriv M G minted base w cw q →
+      SDeriv M G minted base m c x →
+      SDeriv M G minted base m c y
+  | join_xr {m : N} {c : Shift M} {x y p q w : N} {cw : Shift M} :
+      ({ src := p, lbl := .d, dst := x } : FEdge N M.S) ∈ G →
+      ({ src := q, lbl := .d, dst := y } : FEdge N M.S) ∈ G →
+      minted w →
+      SDeriv M G minted base w cw p →
+      SDeriv M G minted base w none q →
+      SDeriv M G minted base m c x →
+      SDeriv M G minted base m c y
+
+/-- Monotonicity in both the root set and the carried-over base. -/
+theorem sderiv_mono (M : ShiftMonoid) {N : Type} {G : FGraph N M.S}
+    {m₁ m₂ : N → Prop} {b₁ b₂ : N → Shift M → N → Prop}
+    (hm : ∀ n, m₁ n → m₂ n)
+    (hb : ∀ m c x, b₁ m c x → b₂ m c x) :
+    ∀ {m : N} {c : Shift M} {x : N},
+      SDeriv M G m₁ b₁ m c x → SDeriv M G m₂ b₂ m c x := by
+  intro m c x h
+  induction h with
+  | ofBase hB => exact .ofBase (hb _ _ _ hB)
+  | seed n hn => exact .seed n (hm n hn)
+  | step_a _ hE ih => exact .step_a ih hE
+  | step_f _ hE ih => exact .step_f ih hE
+  | step_fx _ hE ih => exact .step_fx ih hE
+  | join_e hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact .join_e hEp hEq (hm _ hw) ihp ihq ihx
+  | join_xl hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact .join_xl hEp hEq (hm _ hw) ihp ihq ihx
+  | join_xr hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact .join_xr hEp hEq (hm _ hw) ihp ihq ihx
+
+/-- Flattening: re-deriving over an already-derived base adds nothing
+(the monad-join law of the closure). -/
+theorem sderiv_bind (M : ShiftMonoid) {N : Type} {G : FGraph N M.S}
+    {minted : N → Prop} {base : N → Shift M → N → Prop} :
+    ∀ {m : N} {c : Shift M} {x : N},
+      SDeriv M G minted (SDeriv M G minted base) m c x →
+      SDeriv M G minted base m c x := by
+  intro m c x h
+  induction h with
+  | ofBase hB => exact hB
+  | seed n hn => exact .seed n hn
+  | step_a _ hE ih => exact .step_a ih hE
+  | step_f _ hE ih => exact .step_f ih hE
+  | step_fx _ hE ih => exact .step_fx ih hE
+  | join_e hEp hEq hw _ _ _ ihp ihq ihx => exact .join_e hEp hEq hw ihp ihq ihx
+  | join_xl hEp hEq hw _ _ _ ihp ihq ihx => exact .join_xl hEp hEq hw ihp ihq ihx
+  | join_xr hEp hEq hw _ _ _ ihp ihq ihx => exact .join_xr hEp hEq hw ihp ihq ihx
+
+/-- CATCH-UP CONFLUENCE (task #21, the exactness theorem behind commit
+446f35b): drain to the closure over restricted roots `m₁`, then mint up to
+`m₂ ⊇ m₁` and continue draining from the reached facts — the result is
+EXACTLY the from-scratch closure over `m₂`. Seeding order is irrelevant to
+the least fixpoint, so the staged (lazy + catch-up) solve returns the eager
+answers by construction; no soundness argument about WHICH roots the lazy
+stages picked is needed. -/
+theorem sderiv_catchup (M : ShiftMonoid) {N : Type} {G : FGraph N M.S}
+    {m₁ m₂ : N → Prop} {base : N → Shift M → N → Prop}
+    (h12 : ∀ n, m₁ n → m₂ n)
+    {m : N} {c : Shift M} {x : N} :
+    SDeriv M G m₂ (SDeriv M G m₁ base) m c x ↔ SDeriv M G m₂ base m c x := by
+  constructor
+  · intro h
+    exact sderiv_bind M
+      (sderiv_mono M (fun n hn => hn)
+        (fun m c x hB => sderiv_mono M h12 (fun _ _ _ hb => hb) hB) h)
+  · intro h
+    exact sderiv_mono M (fun n hn => hn)
+      (fun m c x hB => SDeriv.ofBase hB) h
+
+/-- `SDeriv` is the LEAST closure: it embeds into any `SolverClosure`
+containing its roots and base. Used both to transfer completeness and to
+prove NON-derivability by exhibiting a small closed relation. -/
+theorem sderiv_le_closure (M : ShiftMonoid) {N : Type} {G : FGraph N M.S}
+    {minted : N → Prop} {base : N → Shift M → N → Prop}
+    (C : SolverClosure M G)
+    (hm : ∀ n, minted n → C.minted n)
+    (hb : ∀ m c x, base m c x → C.SF m c x) :
+    ∀ {m : N} {c : Shift M} {x : N},
+      SDeriv M G minted base m c x → C.SF m c x := by
+  intro m c x h
+  induction h with
+  | ofBase hB => exact hb _ _ _ hB
+  | seed n hn => exact C.seed n (hm n hn)
+  | step_a _ hE ih => exact C.step_a ih hE
+  | step_f _ hE ih => exact C.step_f ih hE
+  | step_fx _ hE ih => exact C.step_fx ih hE
+  | join_e hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact C.step_mal ihx ⟨_, _, hEp, hEq, _, hm _ hw, Or.inl ⟨_, ihp, ihq⟩⟩
+  | join_xl hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact C.step_mal ihx
+        ⟨_, _, hEp, hEq, _, hm _ hw, Or.inr (Or.inl ⟨ihp, _, ihq⟩)⟩
+  | join_xr hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact C.step_mal ihx
+        ⟨_, _, hEp, hEq, _, hm _ hw, Or.inr (Or.inr ⟨⟨_, ihp⟩, ihq⟩)⟩
+
+/-- The least closure is itself a `SolverClosure`. -/
+def sderivClosure (M : ShiftMonoid) {N : Type} (G : FGraph N M.S)
+    (minted : N → Prop) : SolverClosure M G where
+  minted := minted
+  SF := SDeriv M G minted (noBase M N)
+  seed := fun m hm => .seed m hm
+  step_a := fun h hE => .step_a h hE
+  step_f := fun h hE => .step_f h hE
+  step_fx := fun h hE => .step_fx h hE
+  step_mal := fun h hAl => by
+    obtain ⟨p, q, hEp, hEq, w, hw, hDisj⟩ := hAl
+    rcases hDisj with ⟨cw, hp, hq⟩ | ⟨hp, cw, hq⟩ | ⟨⟨cw, hp⟩, hq⟩
+    · exact .join_e hEp hEq hw hp hq h
+    · exact .join_xl hEp hEq hw hp hq h
+    · exact .join_xr hEp hEq hw hp hq h
+
+/-- End-to-end exactness of the staged solve: run the lazy stage over ANY
+restricted root set `m₁`, catch up to `m₂` covering the origins, keep
+draining — every grammar-accepted answer is in the final planes. -/
+theorem catchup_answers_complete (M : ShiftMonoid) {N : Type}
+    {origin : N → Prop} {G : FGraph N M.S} {m₁ m₂ : N → Prop}
+    (h12 : ∀ n, m₁ n → m₂ n)
+    (hOrig : ∀ z, origin z → m₂ z)
+    {fnode fptr : N} {c : Shift M}
+    (hAccept : c = some M.zero ∨ c = none)
+    (hReach : FDeriv M origin G (.flow fnode c fptr)) :
+    SDeriv M G m₂ (SDeriv M G m₁ (noBase M N)) fnode c fptr := by
+  rw [sderiv_catchup M h12]
+  exact answers_complete M
+    (SM := { toSolverClosure := sderivClosure M G m₂, origins_minted := hOrig })
+    hAccept hReach
+
+/-!
+## Necessity of the catch-up: restricted minting loses answers
+
+Five-node counterexample (field-insensitive): function `fn` is stored
+through pointer `pp` (cell `cs`) and loaded through pointer `qq` (cell
+`cl`) into the fptr; the aliasing witness is origin `ww`, which flows to
+both pointers. Minting only `fn` — a strict subset of the origins — the
+least closure never fires the join and the answer `fn ⟶ fp` is lost,
+while the declarative grammar derives it. So `origins_minted` cannot be
+weakened to any root set missing a live witness: a lazy stage must either
+prove its deferred origins are dead or catch them up before answering.
+(The whole-kernel deficit — tcp_ulp / 9p ops registration chains,
+-5737 pairs — is this shape reached through circular list structure.) -/
+namespace CounterExample
+
+inductive CE where
+  | fn | ww | pp | qq | cs | cl | fp
+  deriving DecidableEq, Repr
+
+open CE
+
+/-- Edges: `ww →a pp`, `ww →a qq` (witness reaches both pointers),
+`pp →d cs`, `qq →d cl` (store/load cells), `fn →a cs` (store),
+`cl →a fp` (load feeds the fptr). -/
+def G : FGraph CE Nat := fun e =>
+  e = ⟨ww, .a, pp⟩ ∨ e = ⟨ww, .a, qq⟩ ∨ e = ⟨pp, .d, cs⟩ ∨
+  e = ⟨qq, .d, cl⟩ ∨ e = ⟨fn, .a, cs⟩ ∨ e = ⟨cl, .a, fp⟩
+
+def origin : CE → Prop := fun n => n = fn ∨ n = ww
+
+/-- Convenience: the six edges of `G` as membership facts. -/
+theorem eWP : ({ src := ww, lbl := .a, dst := pp } : FEdge CE Nat) ∈ G :=
+  Or.inl rfl
+theorem eWQ : ({ src := ww, lbl := .a, dst := qq } : FEdge CE Nat) ∈ G :=
+  Or.inr (Or.inl rfl)
+theorem ePD : ({ src := pp, lbl := .d, dst := cs } : FEdge CE Nat) ∈ G :=
+  Or.inr (Or.inr (Or.inl rfl))
+theorem eQD : ({ src := qq, lbl := .d, dst := cl } : FEdge CE Nat) ∈ G :=
+  Or.inr (Or.inr (Or.inr (Or.inl rfl)))
+theorem eFS : ({ src := fn, lbl := .a, dst := cs } : FEdge CE Nat) ∈ G :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inl rfl))))
+theorem eLF : ({ src := cl, lbl := .a, dst := fp } : FEdge CE Nat) ∈ G :=
+  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr rfl))))
+
+/-- The grammar derives the answer: `fn` flows to `fp` at shift zero. -/
+theorem answer_derivable :
+    FDeriv natShifts origin G (.flow fn (some natShifts.zero) fp) := by
+  have hfn : FDeriv natShifts origin G (.flow fn (some natShifts.zero) cs) :=
+    .flow_a (.flow_refl fn (Or.inl rfl)) eFS
+  have hwp : FDeriv natShifts origin G (.flow ww (some natShifts.zero) pp) :=
+    .flow_a (.flow_refl ww (Or.inr rfl)) eWP
+  have hwq : FDeriv natShifts origin G (.flow ww (some natShifts.zero) qq) :=
+    .flow_a (.flow_refl ww (Or.inr rfl)) eWQ
+  have hmal : FDeriv natShifts origin G (.mal cs cl) :=
+    .mal_join ePD eQD hwp hwq
+  exact .flow_a (.flow_m hfn hmal) eLF
+
+/-- With full minting the solver finds it (sanity control). -/
+theorem answer_derivable_full :
+    SDeriv natShifts G origin (noBase natShifts CE)
+      fn (some natShifts.zero) fp :=
+  answers_complete natShifts
+    (SM := { toSolverClosure := sderivClosure natShifts G origin,
+             origins_minted := fun _ hz => hz })
+    (Or.inl rfl) answer_derivable
+
+/-- A closed relation over minted = {fn} that lacks the answer: `fn`'s
+facts reach only `fn` and `cs`; no minted witness ever reaches both
+pointers, so no join fires. -/
+def blockedSF : CE → Shift natShifts → CE → Prop :=
+  fun m c x => m = fn ∧ c = some natShifts.zero ∧ (x = fn ∨ x = cs)
+
+def blockedClosure : SolverClosure natShifts G where
+  minted := fun n => n = fn
+  SF := blockedSF
+  seed := fun m hm => ⟨hm, rfl, Or.inl hm⟩
+  step_a := by
+    rintro m c x y ⟨hm, hc, hx⟩ hE
+    rcases hE with h | h | h | h | h | h
+    · -- ww →a pp : source ww carries no blocked fact
+      injection h with h1 h2 h3
+      subst h1
+      rcases hx with hx | hx <;> exact absurd hx (by decide)
+    · injection h with h1 h2 h3
+      subst h1
+      rcases hx with hx | hx <;> exact absurd hx (by decide)
+    · -- pp →d cs : label mismatch
+      injection h with h1 h2 h3
+      cases h2
+    · injection h with h1 h2 h3
+      cases h2
+    · -- fn →a cs : the one real propagation
+      injection h with h1 h2 h3
+      subst h3
+      exact ⟨hm, hc, Or.inr rfl⟩
+    · -- cl →a fp : source cl carries no blocked fact
+      injection h with h1 h2 h3
+      subst h1
+      rcases hx with hx | hx <;> exact absurd hx (by decide)
+  step_f := by
+    rintro m c x y r ⟨_, _, _⟩ hE
+    rcases hE with h | h | h | h | h | h <;>
+      (injection h with h1 h2 h3; cases h2)
+  step_fx := by
+    rintro m c x y ⟨_, _, _⟩ hE
+    rcases hE with h | h | h | h | h | h <;>
+      (injection h with h1 h2 h3; cases h2)
+  step_mal := by
+    rintro m c x y hSF ⟨p', q', hEp, hEq, w', hw', hDisj⟩
+    subst hw'
+    exfalso
+    -- every disjunct puts a blocked fact of fn at p'; extract where p' is
+    have hpx : p' = fn ∨ p' = cs := by
+      rcases hDisj with ⟨cw, hp, _⟩ | ⟨hp, _⟩ | ⟨⟨cw, hp⟩, _⟩
+      · exact hp.2.2
+      · exact absurd hp.2.1 (by simp)
+      · exact hp.2.2
+    -- but a join parent must own a d-edge, i.e. be pp or qq
+    rcases hEp with h | h | h | h | h | h
+    · injection h with h1 h2 h3; cases h2
+    · injection h with h1 h2 h3; cases h2
+    · injection h with h1 h2 h3
+      subst h1
+      rcases hpx with hx | hx <;> exact absurd hx (by decide)
+    · injection h with h1 h2 h3
+      subst h1
+      rcases hpx with hx | hx <;> exact absurd hx (by decide)
+    · injection h with h1 h2 h3; cases h2
+    · injection h with h1 h2 h3; cases h2
+
+/-- THE NECESSITY THEOREM: minting only `fn` (a strict subset of the
+origins — the witness `ww` stays deferred), the least solver closure does
+NOT derive the grammar-derivable answer. `origins_minted` is load-bearing;
+a lazy solve that never catches up is incomplete. -/
+theorem answer_not_derivable_restricted :
+    ¬ SDeriv natShifts G (fun n => n = fn) (noBase natShifts CE)
+        fn (some natShifts.zero) fp := by
+  intro h
+  have hIn : blockedSF fn (some natShifts.zero) fp :=
+    sderiv_le_closure natShifts (minted := fun n => n = fn)
+      (base := noBase natShifts CE) blockedClosure
+      (fun n hn => hn) (fun _ _ _ hB => hB.elim) h
+  rcases hIn with ⟨_, _, hx | hx⟩ <;> exact absurd hx (by decide)
+
+end CounterExample
 
 end FlowsToCFL

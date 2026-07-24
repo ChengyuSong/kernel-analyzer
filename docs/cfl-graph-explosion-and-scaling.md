@@ -1855,3 +1855,25 @@ by the isAllocFn body-skip hole), -1,659 ret-bridge smear removals
 (sysfs attribute cross-kobject, drm_flip_work, ACPI SCI lists,
 crypto ctx), -188 icalls that only ever resolved to smear. Reviewed
 both directions; no genuine flow lost.
+
+### Rodata-join estimator probe (km, 2026-07-24) — #25 upper bound: ~16%, not the lever
+
+--cfl-probe-rodata-joins (skip ALL joins keyed by rodata-bearing
+witness classes; measurement-only over-removal): 9.17M join offers
+skipped; merges 24,974 vs 29,592 (-15.6%); hub facts 28,344 vs
+34,045 (-17%); total facts 58.2M (-19%); answers -20,198 (25% of km,
+all removals — const ops-table reads ride the skipped joins; the
+real copy-not-unify would preserve those, keeping answers while
+capping the closure win at the numbers above).
+
+VERDICT: the copy-not-unify refinement is bounded at ~16% closure
+reduction (km) — real but NOT the fs-mode savior the witness
+histogram suggested. Over-determination again: writable-object
+witnesses co-key most rodata-keyed merges. The hub is an ensemble
+property. Disposition: #25 downgraded to a modest-win refinement,
+NOT the next big build. The closure-size lever hierarchy is now:
+per-field cells (field sensitivity shrinks what every join
+conflates — the original plan) + identity splitting (#17 confirmer
+sweep + cloning), jointly; single witness-class rules cannot split
+an ensemble-glued hub. Three probes, three falsified sizing
+hypotheses — the measurement stack is earning its keep.

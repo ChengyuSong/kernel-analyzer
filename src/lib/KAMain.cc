@@ -276,6 +276,15 @@ cl::opt<bool> CFLLazyMint(
            "the full mint; only the propagated fact mass shrinks"),
   cl::init(false));
 
+cl::opt<bool> CFLProbeRodataJoins(
+  "cfl-probe-rodata-joins",
+  cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: skip cluster joins keyed by "
+           "witness classes containing a constant (rodata) global — "
+           "upper-bounds the closure-size win of the copy-not-unify "
+           "refinement (task #25). Over-removes const-table read paths; "
+           "answers WILL drop. Do not combine with --cfl-verify-closure"),
+  cl::init(false));
+
 cl::opt<std::string> CFLAblateMints(
   "cfl-ablate-mints",
   cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: comma-separated names; skip "

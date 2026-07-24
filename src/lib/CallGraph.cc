@@ -1944,6 +1944,8 @@ public:
 // either side at X (VX). container_of round trips need no special casing:
 // down 8 then down 8 carries the same shift as flat down 16. Storage is
 // rectangular (fact sets), never pairwise V.
+
+static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
   const auto &edges = EB.getEdges();
@@ -2206,6 +2208,26 @@ bool CallGraphPass::runFlowsToResolution() {
   // class with in-edged nodes; such a class still names a distinct object
   // and must be minted even with hasIn set — otherwise the object's
   // identity is silently erased (harfbuzz hb_map_iter sret/memcpy chains).
+  // --cfl-probe-rodata-joins: does this class contain a link-time
+  // constant global? Such an origin's identity keys joins between
+  // READERS of immutable memory — the aliasing carries no store->load
+  // flow (no runtime stores into rodata). The probe skips those joins
+  // wholesale to UPPER-BOUND the closure-size win of the copy-not-unify
+  // refinement (task #25); it over-removes (const-table home-cell reads
+  // also ride these joins), so answers may drop — measurement only.
+  auto valueIsRodata = [&](NodeIndex m) {
+    const Value *v = NF.getValueForNode(m);
+    const auto *GV = dyn_cast_or_null<GlobalVariable>(v);
+    return GV && GV->isConstant();
+  };
+  auto classIsRodata = [&](NodeIndex canon) {
+    if (valueIsRodata(canon)) return true;
+    auto mit = canonicalClassMembers.find(canon);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m : mit->second)
+        if (valueIsRodata(m)) return true;
+    return false;
+  };
   auto valueIsOrigin = [&](NodeIndex m) {
     if (!NF.isValueNode(m))
       return false;
@@ -2386,6 +2408,7 @@ bool CallGraphPass::runFlowsToResolution() {
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
   std::vector<char> rootParkable;    // rid -> pure no-in identity
+  std::vector<char> rootRodata;      // rid -> class holds a const global
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   size_t bidiPrunable = 0;
@@ -2453,6 +2476,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // stops seeding its bit across newly wired edges — so obsolete
       // formal identities don't double the fact volume.
       rootParkable.push_back(!isFunc && !hasOrigin[n]);
+      rootRodata.push_back(!isFunc && classIsRodata(toOrig[n]));
     }
   }
 
@@ -2959,6 +2983,10 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   };
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
+    if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
+      g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
+      return;
+    }
     const uint64_t key = (uint64_t)o * NSHIFT + s;
     auto [it, ins] = clusterRep.emplace(key, find(cell));
     if (!ins) {
@@ -3117,6 +3145,7 @@ bool CallGraphPass::runFlowsToResolution() {
     FactSet::Universe = nextRoot; // widen BEFORE the first set of this bit
     rootClassOf.push_back(rep);
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
+    rootRodata.push_back(classIsRodata(toOrig[rep]));
     tHow = "inc-mint"; tFrom = rep;
     addFact(rep, 0, rid, ctx0);
   };
@@ -3909,6 +3938,10 @@ bool CallGraphPass::runFlowsToResolution() {
          << totalTargets << " targets (" << newPairs << " new pairs wired, "
          << topOnlyPairs << " via wildcard plane only), iteration "
          << (iteration + fpIter) << "\n");
+  if (CFLProbeRodataJoins)
+    CG_LOG("RodataProbe: " << g_rodataJoinsSkipped
+           << " joins skipped for rodata-bearing witness classes "
+           << "(MEASUREMENT-ONLY over-removal)\n");
   CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
          << filtTypeRej << " type-rejected, " << filtFieldRej
          << " field-rejected (each rejection = unsoundness exposure; "

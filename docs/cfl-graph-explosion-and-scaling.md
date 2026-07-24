@@ -2038,3 +2038,21 @@ anatomy (24), then re-measure. vm_area_alloc is the canonical
 all-features test case (extract pinned at /tmp/vaa.ll shape:
 formal store + global store + volatile self-linkage + sub-alloc +
 error-path free).
+
+### Step B v4: FreshSub atom (2026-07-24) — FIRST kernel conversions
+
+FreshSub = a fresh anonymous sub-object stored into *ret
+(vm_area_alloc's vma_lock shape): per-callsite anonymous value+object
+pair (createValueNode(NULL)/createOpaqueObjectNode(NULL) are
+multi-call-safe — no NodeFactory change needed), AllocSites identity
+for minting, sub-result tolerated when its other uses are null checks
+and error-path frees; isFreeFn also exempted in R3. km: 27 promoted,
+4 ALLOC-INIT CONVERSIONS (the funnel's first), 34 FRESHSUB edges,
+escapes 130->120; answers stable; t_freshwrap 6/6.
+
+Remaining funnel: call-escape 50 (non-init/non-free callees —
+sample next), other-use 24 (suspect refcount atomics), init-other
+12, store-other 6. Incremental-mode note: FreshSub AllocSites
+created during resolution-time application are not pushed to
+newAllocNodes (from-scratch default unaffected; wire before enabling
+incremental+confirm-fresh together).

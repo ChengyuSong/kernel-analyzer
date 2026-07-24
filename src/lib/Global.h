@@ -116,7 +116,8 @@ public:
       Cpy,   // shift-preserving cell copy: deref(src) -> deref(dst)
       Alias, // dst value aliases src value (interior/identity return)
       Store, // *container <- value
-      Load   // dst value <- *container
+      Load,  // dst value <- *container
+      FreshSub // a fresh anonymous sub-object stored into *dst
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)

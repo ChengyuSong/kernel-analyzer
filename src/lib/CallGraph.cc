@@ -7081,6 +7081,7 @@ void CallGraphPass::confirmFreshWrappers() {
         SmallPtrSet<const Instruction *, 4> initCalls; // composed helpers
         SmallVector<int, 4> initArgs;
         SmallVector<const GlobalValue *, 4> initGlobals;
+        unsigned subAllocs = 0;
         bool selfStore = false;
         bool escaped = false, untracedInit = false;
         const char *rejWhy = nullptr; // escape-anatomy bucket
@@ -7151,6 +7152,30 @@ void CallGraphPass::confirmFreshWrappers() {
                   initStores.insert(SI); // ops table / named fn into fresh
                   initGlobals.push_back(GVs);
                   continue;
+                }
+                if (const auto *SubCB = dyn_cast<CallBase>(sv)) {
+                  // second allocation stored into the object
+                  // (vm_area_alloc's vma_lock): FreshSub atom, provided
+                  // the sub-result's other uses are only null checks
+                  // and error-path frees
+                  const Function *SubF = SubCB->getCalledFunction();
+                  if (SubF && Ctx->AllocFuncs.count(SubF)) {
+                    bool subOk = true;
+                    for (const User *SU : SubCB->users()) {
+                      if (SU == SI || isa<ICmpInst>(SU)) continue;
+                      if (const auto *FC = dyn_cast<CallBase>(SU)) {
+                        const Function *FF = FC->getCalledFunction();
+                        if (FF && isFreeFn(FF->getName())) continue;
+                      }
+                      subOk = false;
+                      break;
+                    }
+                    if (subOk) {
+                      initStores.insert(SI);
+                      subAllocs++;
+                      continue;
+                    }
+                  }
                 }
                 untracedInit = true; // ptr from load/call: reject
                 rejWhy = isa<GlobalValue>(sv)   ? "init-from-global"
@@ -7252,7 +7277,8 @@ void CallGraphPass::confirmFreshWrappers() {
           if (const auto *CB = dyn_cast<CallBase>(I2)) {
             if (initCalls.count(I2)) continue; // composed init helper
             const Function *CF = CB->getCalledFunction();
-            if (CF && (isNoopIntrinsic(CF) || Ctx->AllocFuncs.count(CF)))
+            if (CF && (isNoopIntrinsic(CF) || Ctx->AllocFuncs.count(CF) ||
+                       isFreeFn(CF->getName())))
               continue;
             bool ptrInvolved =
                 containsPointerType(CB->getType()) && !onRetPath.count(CB);
@@ -7269,7 +7295,8 @@ void CallGraphPass::confirmFreshWrappers() {
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
-        if (initArgs.empty() && initGlobals.empty() && !selfStore) {
+        if (initArgs.empty() && initGlobals.empty() && !selfStore &&
+            subAllocs == 0) {
           Ctx->FuncSummaries[&F] = &pureFresh;
         } else {
           Ctx->OwnedSummaries.emplace_back();
@@ -7290,6 +7317,12 @@ void CallGraphPass::confirmFreshWrappers() {
             A.kind = GlobalContext::SummaryAtom::Store;
             A.dst = -1;
             A.src = -1; // object interior stored into itself
+            S.atoms.push_back(A);
+          }
+          for (unsigned si2 = 0; si2 < subAllocs; si2++) {
+            GlobalContext::SummaryAtom A{};
+            A.kind = GlobalContext::SummaryAtom::FreshSub;
+            A.dst = -1; // sub-object into *ret
             S.atoms.push_back(A);
           }
           {
@@ -7431,7 +7464,7 @@ summaryForName(GlobalContext *Ctx, StringRef name) {
 // aligned whole-buffer dups (kmemdup family); prefix copies
 // over-approximate soundly.
 static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
-              g_sumSkipped = 0;
+              g_sumSkipped = 0, g_sumFreshSub = 0;
 void CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S) {
   auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
@@ -7481,6 +7514,17 @@ void CallGraphPass::applySummaryAtoms(const CallBase *CS,
       addAssignmentEdge(getCanonicalNode(v),
                         getRepDerefNode(getCanonicalNode(c)));
       g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::FreshSub: {
+      NodeIndex d = nodeForRef(A.dst, true);
+      if (d == AndersNodeFactory::InvalidIndex) break;
+      NodeIndex subVal = getCanonicalNode(NF.createValueNode());
+      NodeIndex subObj = NF.createOpaqueObjectNode(nullptr, true);
+      EB.addDereferenceEdges(subVal, subObj);
+      AllocSites.insert(subVal); // origin identity for the mint loop
+      addAssignmentEdge(subVal, getRepDerefNode(getCanonicalNode(d)));
+      g_sumFreshSub++;
       break;
     }
     case GlobalContext::SummaryAtom::Load: {
@@ -7749,7 +7793,7 @@ bool CallGraphPass::doFinalization(Module *M) {
       CG_LOG("FuncSummary LEDGER: " << Ctx->FuncSummaries.size()
              << " functions summarized; applied " << g_sumCpy << " CPY, "
              << g_sumAlias << " ALIAS, " << g_sumSt << " ST, " << g_sumLd
-             << " LD edges; " << g_sumSkipped
+             << " LD, " << g_sumFreshSub << " FRESHSUB edges; " << g_sumSkipped
              << " atom refs skipped (missing arg/node)\n");
     {
       uint64_t uniExtGobj = 0, uniOther = 0;

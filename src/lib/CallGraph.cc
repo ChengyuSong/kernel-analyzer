@@ -4333,6 +4333,74 @@ bool CallGraphPass::runFlowsToResolution() {
                << h.members[j].first << ")";
       errs() << "\n";
     }
+    // Hub decomposition: for the top classes, histogram the member
+    // values by CONTAINING FUNCTION and kind. The functions whose
+    // instructions/cells dominate a hub's membership are the GLUERS —
+    // the tiny utilities whose formals/loads bridged thousands of
+    // otherwise-unrelated formals into one class (the sort/
+    // __static_call_update channel). They, plus any global-variable
+    // members, are the first summary/clone targets.
+    for (size_t hi2 = 0; hi2 < std::min<size_t>(3, hubRank.size()); hi2++) {
+      const uint32_t hubRep = find(hubRank[hi2].second);
+      struct GlueRow { uint32_t vals = 0, formals = 0, insts = 0; };
+      std::map<const Function *, GlueRow> byFn;
+      size_t mFormals = 0, mInsts = 0, mGlobals = 0, mObjCell = 0,
+             mSynth = 0, mDense = 0, mExpanded = 0;
+      std::vector<std::string> globalNames;
+      auto classify = [&](const Value *V, NodeIndex orig) {
+        mExpanded++;
+        if (const auto *Arg = dyn_cast_or_null<Argument>(V)) {
+          mFormals++;
+          auto &g = byFn[Arg->getParent()];
+          g.vals++;
+          g.formals++;
+        } else if (const auto *I2 = dyn_cast_or_null<Instruction>(V)) {
+          mInsts++;
+          auto &g = byFn[I2->getFunction()];
+          g.vals++;
+          g.insts++;
+        } else if (const auto *GV = dyn_cast_or_null<GlobalVariable>(V)) {
+          mGlobals++;
+          if (globalNames.size() < 12)
+            globalNames.push_back(GV->getName().str());
+        } else {
+          (NF.isObjectNode(orig) ? mObjCell : mSynth)++;
+        }
+      };
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != hubRep) continue;
+        mDense++;
+        NodeIndex orig = toOrig[n];
+        classify(NF.getValueForNode(orig), orig);
+        auto mit = canonicalClassMembers.find(orig);
+        if (mit != canonicalClassMembers.end())
+          for (NodeIndex m2 : mit->second)
+            classify(NF.getValueForNode(m2), m2);
+      }
+      errs() << "HubMembers: c" << hubRank[hi2].second << " dense="
+             << mDense << " values=" << mExpanded << " (formals="
+             << mFormals << " insts=" << mInsts << " globals=" << mGlobals
+             << " obj/cell=" << mObjCell << " synth=" << mSynth << ")\n";
+      if (!globalNames.empty()) {
+        errs() << "HubMembers: c" << hubRank[hi2].second << " globals:";
+        for (auto &gn : globalNames) errs() << " " << gn;
+        errs() << "\n";
+      }
+      std::vector<std::pair<uint32_t, const Function *>> glue;
+      for (auto &bf : byFn) glue.emplace_back(bf.second.vals, bf.first);
+      size_t KG = std::min<size_t>(20, glue.size());
+      std::partial_sort(glue.begin(), glue.begin() + KG, glue.end(),
+                        std::greater<>());
+      errs() << "HubGlue: c" << hubRank[hi2].second << " " << byFn.size()
+             << " functions contribute members; top " << KG
+             << " by member count (fn totalVals/formals/insts):\n";
+      for (size_t j = 0; j < KG; j++) {
+        const GlueRow &g = byFn[glue[j].second];
+        errs() << "HubGlue: " << glue[j].second->getName() << " "
+               << g.vals << "/" << g.formals << "/" << g.insts << "\n";
+      }
+    }
+
     // Table 2: allocation-site identity spread. One sweep accumulates,
     // per root id, the number of live classes whose planes carry it.
     std::vector<uint32_t> spreadOf(nextRoot, 0);

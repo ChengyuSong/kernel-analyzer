@@ -1673,3 +1673,32 @@ bridged 5.7k functions into one class — TopMerge/absorbed-member
 samples name them) -> those utilities are the first summary/clone
 targets; rerun the report at whole-kernel scale alongside the next
 pinned run.
+
+### c513 gluer decomposition (km, 2026-07-23)
+
+HubMembers: c513 = 28,397 merged dense classes / 203,246 values —
+11,184 formals, 146,730 instructions, 45,327 assistant nodes, only 4
+globals (console_sem, alarm_bases, kmod_concurrent_max,
+cpuhp_hp_states). 8,669 functions contribute members. Top
+contributors by member count: ___bpf_prog_run (1,265 — the BPF
+interpreter's untyped register file is a structural blender:
+everything reaching BPF unifies through it), ___slab_alloc /
+pcpu_get_vm_areas (allocator internals — the classic freelist
+channel: free-pointer writes INTO object memory chain every slab
+object of every cache into one memory web), __lock_acquire (lockdep
+generic key/pointer stores), page-table walkers
+(handle_mm_fault/copy_page_range — int-provenance pte words),
+build_sched_domains/load_balance (per-cpu scheduler webs).
+
+CAVEAT: member count measures hub RESIDENCY, not causality — big
+functions rank high just by instruction count. Causal confirmation =
+ablation probes (measurement-only body-edge exclusion per suspect,
+rerun km ~5 min, measure c513 size): the ranked suspects are
+ 1. slab/percpu allocator internals (freelist channel — known
+    points-to killer; candidate treatment: allocator-internals
+    summary, i.e. object memory is opaque to the allocator's own
+    bookkeeping accesses),
+ 2. ___bpf_prog_run (interpreter — candidate: model BPF program
+    invocation at the bpf_prog level, exclude the interpreter body),
+ 3. __lock_acquire/lockdep (debug machinery, likely excludable),
+ 4. pte walkers (int-provenance interplay).

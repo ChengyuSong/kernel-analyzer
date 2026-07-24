@@ -1786,3 +1786,30 @@ Hub c513 persists as expected (string glue = #25's job).
 Whole-kernel run with summaries = next pinned baseline (answers
 change: +dup flows, -ret-bridge conflation); rides after the
 in-flight kernel conflation-report run.
+
+### Whole-kernel conflation report (2026-07-24, eager, 2:02 wall)
+
+Same structure as km, bigger: hub c5500 holds the hottest formal/ret
+of 44,259 of ~57k functions (78%), 164,473 merged classes / 1.2M
+values; 161,002 of 168,779 witnessed joins (95%) land in it (3,483
+from a-SCC collapse). RootRel at current features: sufficient set
+37.96% of roots / 34.5% of fact mass. Top witnesses:
+
+  x92798  guc_wq_item_append::load   <- ONE i915 GuC ring-buffer load
+          identity = 55% of ALL kernel merges. A !hasIn load-result
+          identity (unmodeled io/ring memory) spreading through the
+          type-erased drm/i915 request web.
+  x2161   __tpstrtab_initcall_level  (rodata string tier, as at km:
+          .str.1/.str.45 among the hub's 9 global members)
+  x784    __per_cpu_offset           (percpu base array)
+  x690/663/532  initcall tracepoint statics/allocas
+  x438/299/59   kmalloc_trace/__kmalloc/kmem_cache_alloc rets
+          (drop with --func-summaries)
+
+CAVEAT (applies to km .str.5 too): witness counts conflate SEEDING
+the hub with RIDING it — an early-merged witness keys joins the
+grown hub makes downstream. Causal probe before designing #25:
+targeted no-mint ablation of the top witnesses (measurement-only
+flag), km-fast then kernel. The GuC load may also be its own bug
+class (identity minted for loads from unmodeled device/ring memory —
+compare universal-ptr handling).

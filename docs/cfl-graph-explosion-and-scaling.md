@@ -1939,3 +1939,23 @@ CONCLUSIONS:
    Roadmap: #17 confirmer sweep + cloning FIRST, fs re-evaluated
    after, #25 stays downgraded (its keys are over-determined for
    discrimination too — measured twice now).
+
+## 2026-07-24: confirmer sweep step A shipped (--cfl-confirm-fresh, task #17)
+
+Body-confirms PURE-FRESH wrappers (returns trace only to fresh
+sources through phi/select/cast; no escapes; no pointer side
+effects — the strict criteria make the allocator body-skip sound)
+and promotes them to allocator status, to fixpoint over wrapper
+chains. t_freshwrap.c: 4 cross-smeared pairs -> 2/2 exact. Micro
+suite unchanged; hb 45 promoted, answers unchanged (its cluster is
+array/memcpy-glued, per diagnosis); km 19 promoted, answers/hub
+unchanged.
+
+MEASURED SIZING for step B (cloning): km rejections = 1,742
+ret-not-fresh (mostly genuine: pool/cache returns, interior
+pointers, wrapper-of-failed-wrapper cascades), 140 ESCAPES (fresh
+pointer stored/passed = the alloc-init wrapper class, t_allocinit
+shape at scale — THE cloning queue), 16 ptr-side-effects. Step B =
+per-callsite cloning of the escape class with depth/size budgets;
+the 140-function km queue (kernel-scale count TBD on next full run)
+is small enough for exhaustive cloning.

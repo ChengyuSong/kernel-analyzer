@@ -39,6 +39,7 @@ extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;
 extern cl::opt<std::string> FuncSummaryFile;
 extern cl::opt<std::string> CFLAblateMints;
+extern cl::opt<bool> CFLConfirmFresh;
 extern cl::opt<bool> CFLProbeRodataJoins;
 extern cl::opt<bool> CFLRootRelevance;
 extern cl::opt<bool> CFLFlowsToIncremental;

@@ -285,6 +285,15 @@ cl::opt<bool> CFLProbeRodataJoins(
            "answers WILL drop. Do not combine with --cfl-verify-closure"),
   cl::init(false));
 
+cl::opt<bool> CFLConfirmFresh(
+  "cfl-confirm-fresh",
+  cl::desc("Body-confirm PURE-FRESH allocation wrappers (returns trace "
+           "only to fresh sources, no escapes, no pointer side effects) "
+           "and promote them to allocator status, to fixpoint over "
+           "wrapper chains — per-callsite object identities for their "
+           "callers (task #17). Rejections tallied by reason"),
+  cl::init(false));
+
 cl::opt<std::string> CFLAblateMints(
   "cfl-ablate-mints",
   cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: comma-separated names; skip "

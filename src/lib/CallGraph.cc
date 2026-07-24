@@ -6792,6 +6792,147 @@ void CallGraphPass::wireLinkerSectionArrays() {
          << nodeless << " nodeless members skipped\n");
 }
 
+// --cfl-confirm-fresh (task #17 step A): promote PURE-FRESH wrappers to
+// allocator status by body confirmation, to fixpoint over wrapper
+// chains. A promoted function's callers get per-callsite object
+// identities (the discrimination/closure lever: fewer shared
+// identities = fewer co-occurring join witnesses). Promotion implies
+// the existing allocator treatment — body SKIPPED, ret edge suppressed
+// via a fresh-only summary — so the criteria must make the skip sound:
+//   R1 every returned value traces (phi/select/casts only; no GEP —
+//      interior returns excluded) to calls of already-fresh functions,
+//      null, constant inttoptr (ERR_PTR), or undef;
+//   R2 the fresh callsite results are consumed only by that return
+//      path plus null-checks (no stores, no escaping args, no
+//      ptrtoint);
+//   R3 no pointer side effects anywhere else: no store of a
+//      pointer-typed value, no non-intrinsic call taking or returning
+//      pointers unless the callee is itself fresh/allocator (its
+//      formals are dead ends), intrinsics limited to the NOOP set +
+//      memset. Rejections are tallied by reason (LEDGER).
+static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
+              g_freshRejSide = 0;
+void CallGraphPass::confirmFreshWrappers() {
+  static GlobalContext::FuncSummary pureFresh; // stable address for the map
+  pureFresh.fresh = true;
+  auto isNoopIntrinsic = [](const Function *IF) {
+    if (!IF->isIntrinsic()) return false;
+    StringRef n = IF->getName();
+    return n.starts_with("llvm.dbg") || n.starts_with("llvm.lifetime") ||
+           n.starts_with("llvm.assume") || n.starts_with("llvm.expect") ||
+           n.starts_with("llvm.memset") || n.starts_with("llvm.experimental");
+  };
+  size_t round = 0;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    round++;
+    for (auto &mp : Ctx->Modules) {
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
+        if (!F.getReturnType()->isPointerTy()) continue;
+        if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
+          continue;
+        if (Ctx->FuncSummaries.count(&F)) continue;
+        auto calleeFresh = [&](const CallBase *CB) {
+          const Function *CF = CB->getCalledFunction();
+          return CF && Ctx->AllocFuncs.count(CF);
+        };
+        // R1: trace returns to fresh sources.
+        SmallPtrSet<const Value *, 16> onRetPath;
+        SmallVector<const Value *, 8> work;
+        bool ok = true;
+        for (auto &BB : F)
+          if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            if (RI->getReturnValue()) work.push_back(RI->getReturnValue());
+        if (work.empty()) continue; // no pointer actually returned
+        while (!work.empty() && ok) {
+          const Value *v = work.pop_back_val();
+          if (!onRetPath.insert(v).second) continue;
+          if (isa<ConstantPointerNull>(v) || isa<UndefValue>(v)) continue;
+          if (const auto *CE = dyn_cast<ConstantExpr>(v)) {
+            if (CE->getOpcode() == Instruction::IntToPtr) continue; // ERR_PTR
+            ok = false;
+            continue;
+          }
+          if (const auto *CB = dyn_cast<CallBase>(v)) {
+            if (!calleeFresh(CB)) ok = false;
+            continue;
+          }
+          if (const auto *PN = dyn_cast<PHINode>(v)) {
+            for (const Value *iv : PN->incoming_values()) work.push_back(iv);
+            continue;
+          }
+          if (const auto *Sel = dyn_cast<SelectInst>(v)) {
+            work.push_back(Sel->getTrueValue());
+            work.push_back(Sel->getFalseValue());
+            continue;
+          }
+          if (const auto *Cast = dyn_cast<CastInst>(v)) {
+            if (Cast->getOpcode() == Instruction::BitCast ||
+                Cast->getOpcode() == Instruction::AddrSpaceCast) {
+              work.push_back(Cast->getOperand(0));
+              continue;
+            }
+          }
+          ok = false; // GEP, load, argument, anything else: not pure fresh
+        }
+        if (!ok) { g_freshRejRet++; continue; }
+        // R2: fresh results consumed only by the return path + icmp.
+        for (const Value *v : onRetPath) {
+          if (!isa<CallBase>(v)) continue;
+          for (const User *U : v->users()) {
+            if (onRetPath.count(cast<Value>(U))) continue;
+            if (isa<ICmpInst>(U)) continue;
+            if (isa<ReturnInst>(U)) continue;
+            ok = false;
+            break;
+          }
+          if (!ok) break;
+        }
+        if (!ok) { g_freshRejEscape++; continue; }
+        // R3: no pointer side effects elsewhere in the body.
+        for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
+             ++II) {
+          const Instruction *I2 = &*II;
+          if (const auto *SI = dyn_cast<StoreInst>(I2)) {
+            if (containsPointerType(SI->getValueOperand()->getType()))
+              ok = false;
+            continue;
+          }
+          if (const auto *CB = dyn_cast<CallBase>(I2)) {
+            const Function *CF = CB->getCalledFunction();
+            if (CF && (isNoopIntrinsic(CF) || Ctx->AllocFuncs.count(CF)))
+              continue;
+            bool ptrInvolved =
+                containsPointerType(CB->getType()) && !onRetPath.count(CB);
+            for (const Value *a2 : CB->args())
+              if (containsPointerType(a2->getType())) ptrInvolved = true;
+            if (!CF || ptrInvolved) ok = false; // indirect or ptr-carrying
+            continue;
+          }
+          if (isa<PtrToIntInst>(I2) || isa<AtomicRMWInst>(I2) ||
+              isa<AtomicCmpXchgInst>(I2))
+            ok = false;
+        }
+        if (!ok) { g_freshRejSide++; continue; }
+        // Promote: allocator mechanics + ret-edge suppression.
+        Ctx->AllocFuncs.insert(&F);
+        Ctx->FuncSummaries[&F] = &pureFresh;
+        g_freshPromoted++;
+        changed = true;
+        if (g_freshPromoted <= 20)
+          CG_LOG("ConfirmFresh: promoted " << F.getName() << " (round "
+                 << round << ")\n");
+      }
+    }
+  }
+  CG_LOG("ConfirmFresh: " << g_freshPromoted << " pure-fresh wrappers "
+         << "promoted in " << round << " rounds; rejected " << g_freshRejRet
+         << " ret-not-fresh, " << g_freshRejEscape << " escapes, "
+         << g_freshRejSide << " ptr-side-effects\n");
+}
+
 // --func-summaries: parse the transfer-summary file. Line format:
 //   <name>[*] ATOM [ATOM...]   ('*' suffix = prefix match; '#' comments)
 // Atoms: FRESH | NONE | CPY(ret<-argN) | CPY(argM<-argN) |
@@ -8671,6 +8812,9 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
 bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
+
+  if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
+    confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

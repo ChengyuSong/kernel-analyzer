@@ -155,3 +155,33 @@ measurement methodology section: sound-by-construction probes
 (LEDGERed, answer-diffed) that attribute closure growth causally
 BEFORE committing engineering effort — the counterpart to the
 certificate-carrying-run story on the soundness side.
+
+## The paper's spine: code semantics -> graph structure -> solving bottleneck (2026-07-24)
+
+Existing work silos into algorithm (Dyck/CFL complexity, POPL'18),
+graph processing (GraCFL/Graspan/POCR), or end results (callgraph
+precision/soundness tables). None traces the causal chain from
+SOURCE IDIOM through the GRAPH PATHOLOGY it induces to the SOLVER
+SYMPTOM it causes — which is where both precision and scalability
+are actually decided. Our catalog, every edge probe-established:
+
+| code idiom | graph structure induced | solver bottleneck | evidence / fix layer |
+|---|---|---|---|
+| shared string literals, const ops tables | shared-witness ensemble joins | whole-object merges under FI; hub formation (closure size + precision) | witness provenance + rodata probe (bounded ~16% — ENSEMBLE, no single class causal); fix: field cells, not witness rules |
+| alloc wrappers, kmemdup/dup family | shared ret-node identity + shared internal objects | cross-caller witness bridges; copy-loss soundness hole | summaries arc: -763 km / -1,659+5,802 kernel pairs; ALSO the negative: wrapper identity does NOT drive the km hub |
+| circular list_head registration | cyclic witness dependence | demand-driven root minting INCOMPLETE (algorithm-level!) | lazy-mint kernel deficit -5,737 pairs; catch-up round; Lean necessity counterexample + F11 |
+| type-erasing interpreters/rings (BPF regfile, GuC wq) | single identity spreading through connected webs | hub riding inflates witness counts (residency != causality) | ablations null at <0.5%; first-firer bias in provenance |
+| kthread/work/timer void* payload channel | 92% of formals' hottest class = one hub | fs planes cannot discriminate across merged classes | fs13 == FI on hb; discrimination requires identity splitting BEFORE field sensitivity pays |
+| container_of / intrusive structs | offset composition requirement (interleaved Dyck) | sound grammar scaffolding is V x (P+1): saturation OOMs; answer-anchored survives | shift-residue grammar; solver-side encoding |
+| C++ struct-copy churn (memcpy) | residue-copy origins vs wildcard smear | fallback elimination is NOT free precision (net-negative fact volume) | --cfl-residue-copies measured negative on hb |
+| kernel patching idioms (static_call, tracepoints) | shared-param conflation via tiny utilities | 600k+ phantom pairs through 3-line updaters | per-idiom primitives; the 'tiny utility' law |
+
+The unifying law: closure cost and precision loss are both governed
+by Sum(|a-connected component|^2) over the quotient, and the
+quotient is shaped by IDENTITY CO-OCCURRENCE — which is a property
+of source idioms, not of the solver. Papers that tune solvers or
+grammars without this layer optimize the wrong variable; papers
+that report precision tables without it cannot say WHY numbers
+move. Our probes (witness provenance, no-mint ablation, rule-class
+upper bounds, funnel telemetry) are the instruments that make the
+middle layer measurable.

@@ -1627,3 +1627,22 @@ removes the class (km: -367, zero other changes; kernel: -1,794).
 Deterministic subset counts from this commit: km 1,482/81,293,
 harfbuzz 2,824. The kernel-full7-stats.txt subset numbers were stale
 artifacts of this nondeterminism.
+
+### 2026-07-23 addendum: #24 scoping — where lazy minting actually pays
+
+Since kernel peak RSS is the front-end in both modes, kernel-FI alone
+does not justify further lazy-mint optimization: even a proportional
+catch-up (~1-2 min instead of 578+702 s) lands at ~12-17 min vs eager
+20 — parity to modest. Scoping decision: #24 runs two cheap
+experiments (incremental-mode single catch-up — noting #15's kernel
+negatives may not transfer; profile the 2.9x-overpriced top-up drain,
+suspect jdirty/joined re-offer rescans), then gates on the regimes
+where the SOLVER is the peak: field-sensitive mode (the original
+harfbuzz/K=13 closure blowup — lazy's 48-52% mass cut applies there)
+and #17 cloning (demand-driven minting = clone only identities in A).
+If the experiments disappoint: lazy-mint stays non-default for kernel
+FI, kept as the fs/#17 enabler, negative result documented. Separate
+levers noted: front-end peak reduction (per-module edge extraction,
+release IR) would make solver mass the true peak — turning lazy's
+fact-mass cut into a peak-RSS cut; F11 (provable sufficient root set)
+removes the catch-up and keeps the 2.06x solve win.

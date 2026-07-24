@@ -6811,7 +6811,9 @@ void CallGraphPass::wireLinkerSectionArrays() {
 //      formals are dead ends), intrinsics limited to the NOOP set +
 //      memset. Rejections are tallied by reason (LEDGER).
 static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
-              g_freshRejSide = 0, g_freshInit = 0;
+              g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
+              g_freshHelperComposed = 0;
+static std::map<std::string, size_t> g_escapeBuckets;
 void CallGraphPass::confirmFreshWrappers() {
   static GlobalContext::FuncSummary pureFresh; // stable address for the map
   pureFresh.fresh = true;
@@ -6821,6 +6823,128 @@ void CallGraphPass::confirmFreshWrappers() {
     return n.starts_with("llvm.dbg") || n.starts_with("llvm.lifetime") ||
            n.starts_with("llvm.assume") || n.starts_with("llvm.expect") ||
            n.starts_with("llvm.memset") || n.starts_with("llvm.experimental");
+  };
+  // Init-helper analysis (step B v2, the dominant call-escape bucket):
+  // a helper is INIT-ONLY in pointer param j if param j is used solely
+  // as a store base (through GEP/bitcast chains, plus null checks), and
+  // every stored value is one of: the helper's own formal m (recorded
+  // as a mapping), a non-pointer, null, or a param-j-derived pointer
+  // (self-linkage, e.g. INIT_LIST_HEAD). No other pointer side effects
+  // anywhere in the helper, all other ptr params unused for stores,
+  // void-or-unused result. The wrapper then composes the helper's
+  // stores through the callsite into its own ST atoms — one level of
+  // summary composition, still zero graph duplication.
+  struct InitInfo {
+    bool valid = false;
+    int objParam = -1;
+    SmallVector<int, 4> srcFormals; // helper formal indices stored into obj
+    bool selfStore = false;         // obj-interior stored into obj
+  };
+  static std::map<const Function *, InitInfo> initCache;
+  auto initOnlyInfo = [&](const Function *C) -> const InitInfo & {
+    auto it = initCache.find(C);
+    if (it != initCache.end()) return it->second;
+    InitInfo &inf = initCache[C];
+    if (C->isDeclaration() || C->isVarArg()) return inf;
+    if (!C->getReturnType()->isVoidTy()) return inf; // keep v1 strict
+    // classify each pointer param's use graph
+    int obj = -1;
+    bool bad = false;
+    SmallPtrSet<const Value *, 16> objGraph;
+    SmallVector<int, 4> srcs;
+    bool self = false;
+    for (const Argument &A2 : C->args()) {
+      if (!A2.getType()->isPointerTy()) continue;
+      // walk this param's derived-pointer graph
+      SmallVector<const Value *, 8> w2{&A2};
+      SmallPtrSet<const Value *, 16> g2;
+      bool storedInto = false, escapes = false;
+      SmallVector<int, 4> mySrcs;
+      bool mySelf = false;
+      while (!w2.empty() && !escapes) {
+        const Value *v2 = w2.pop_back_val();
+        if (!g2.insert(v2).second) continue;
+        for (const User *U2 : v2->users()) {
+          if (isa<ICmpInst>(U2)) continue;
+          if (isa<GetElementPtrInst>(U2) || isa<BitCastInst>(U2)) {
+            w2.push_back(cast<Value>(U2));
+            continue;
+          }
+          if (const auto *SI2 = dyn_cast<StoreInst>(U2)) {
+            if (SI2->getValueOperand() == v2) {
+              // param-derived ptr stored: self-linkage iff the target
+              // is also param-derived; a DIRECT formal stored into a
+              // sibling param's memory is the init itself (recorded by
+              // the sibling's walk as an Argument-source store-into);
+              // any other target is an escape.
+              const Value *tb = SI2->getPointerOperand()->stripPointerCasts();
+              while (const auto *G3 = dyn_cast<GetElementPtrInst>(tb))
+                tb = G3->getPointerOperand()->stripPointerCasts();
+              if (g2.count(tb) || tb == &A2) { mySelf = true; storedInto = true; continue; }
+              if (v2 == &A2) {
+                if (const auto *TA = dyn_cast<Argument>(tb)) {
+                  if (TA->getParent() == C && TA != &A2)
+                    continue; // sibling records this as its init store
+                }
+              }
+              escapes = true;
+              break;
+            }
+            // store INTO param memory
+            storedInto = true;
+            const Value *sv2 = SI2->getValueOperand()->stripPointerCasts();
+            if (!containsPointerType(sv2->getType())) continue;
+            if (isa<ConstantPointerNull>(sv2)) continue;
+            if (g2.count(sv2)) { mySelf = true; continue; }
+            if (const auto *SA = dyn_cast<Argument>(sv2)) {
+              if (SA->getParent() == C) { mySrcs.push_back((int)SA->getArgNo()); continue; }
+            }
+            escapes = true; // derived value: reject helper
+            break;
+          }
+          escapes = true;
+          break;
+        }
+      }
+      if (escapes) { bad = true; break; }
+      if (storedInto) {
+        if (obj >= 0) { bad = true; break; } // one stored-into param only
+        obj = (int)A2.getArgNo();
+        objGraph = g2;
+        srcs = mySrcs;
+        self = mySelf;
+      }
+    }
+    if (bad || obj < 0) return inf;
+    // no other pointer side effects in the helper body
+    for (auto II2 = inst_begin(*C), IE2 = inst_end(*C); II2 != IE2; ++II2) {
+      const Instruction *I3 = &*II2;
+      if (const auto *SI3 = dyn_cast<StoreInst>(I3)) {
+        const Value *pb3 = SI3->getPointerOperand()->stripPointerCasts();
+        while (const auto *G4 = dyn_cast<GetElementPtrInst>(pb3))
+          pb3 = G4->getPointerOperand()->stripPointerCasts();
+        if (!objGraph.count(pb3) &&
+            !(isa<Argument>(pb3) &&
+              cast<Argument>(pb3)->getArgNo() == (unsigned)obj)) {
+          if (containsPointerType(SI3->getValueOperand()->getType()))
+            return inf;
+        }
+        continue;
+      }
+      if (const auto *CB3 = dyn_cast<CallBase>(I3)) {
+        const Function *CF3 = CB3->getCalledFunction();
+        if (CF3 && isNoopIntrinsic(CF3)) continue;
+        return inf; // any real call: reject helper (v1)
+      }
+      if (isa<PtrToIntInst>(I3) || isa<AtomicRMWInst>(I3) ||
+          isa<AtomicCmpXchgInst>(I3) || isa<LoadInst>(I3))
+        ; // loads are fine (reads don't move pointers outward)
+    }
+    inf.valid = true;
+    inf.objParam = obj;
+    inf.srcFormals = srcs;
+    inf.selfStore = self;
+    return inf;
   };
   size_t round = 0;
   bool changed = true;
@@ -6887,8 +7011,11 @@ void CallGraphPass::confirmFreshWrappers() {
         // duplication). Anything else remains an escape.
         SmallPtrSet<const Value *, 16> freshGraph; // fresh ptr + GEPs
         SmallPtrSet<const Instruction *, 8> initStores;
+        SmallPtrSet<const Instruction *, 4> initCalls; // composed helpers
         SmallVector<int, 4> initArgs;
+        bool selfStore = false;
         bool escaped = false, untracedInit = false;
+        const char *rejWhy = nullptr; // escape-anatomy bucket
         {
           SmallVector<const Value *, 8> gwork;
           for (const Value *v : onRetPath)
@@ -6909,8 +7036,25 @@ void CallGraphPass::confirmFreshWrappers() {
               }
               if (const auto *SI = dyn_cast<StoreInst>(U)) {
                 // store INTO the fresh graph is init; storing the fresh
-                // pointer ITSELF somewhere else is an escape.
-                if (SI->getValueOperand() == v) { escaped = true; break; }
+                // pointer ITSELF somewhere else is an escape — bucket
+                // it by where it lands.
+                if (SI->getValueOperand() == v) {
+                  const Value *pb =
+                      SI->getPointerOperand()->stripPointerCasts();
+                  while (const auto *G2 = dyn_cast<GetElementPtrInst>(pb))
+                    pb = G2->getPointerOperand()->stripPointerCasts();
+                  if (const auto *PA = dyn_cast<Argument>(pb))
+                    rejWhy = PA->getParent() == &F ? "outparam-store"
+                                                   : "store-foreign-arg";
+                  else if (isa<GlobalVariable>(pb))
+                    rejWhy = "global-store";
+                  else if (isa<LoadInst>(pb))
+                    rejWhy = "store-into-loaded"; // list linkage shape
+                  else
+                    rejWhy = "store-other";
+                  escaped = true;
+                  break;
+                }
                 const Value *sv =
                     SI->getValueOperand()->stripPointerCasts();
                 if (!containsPointerType(sv->getType())) {
@@ -6929,14 +7073,83 @@ void CallGraphPass::confirmFreshWrappers() {
                   continue;
                 }
                 untracedInit = true; // ptr from load/global/call: reject
+                rejWhy = isa<GlobalValue>(sv)   ? "init-from-global"
+                         : isa<LoadInst>(sv)    ? "init-from-load"
+                         : isa<CallBase>(sv)    ? "init-from-call"
+                         : isa<PHINode>(sv)     ? "init-from-phi"
+                                                : "init-other";
                 break;
               }
+              if (const auto *CB2 = dyn_cast<CallBase>(U)) {
+                const Function *EC = CB2->getCalledFunction();
+                bool composed = false;
+                if (EC && CB2->getCalledOperand()->stripPointerCasts() != v) {
+                  const InitInfo &inf = initOnlyInfo(EC);
+                  bool posOk = inf.valid &&
+                               inf.objParam < (int)CB2->arg_size() &&
+                               CB2->getArgOperand(inf.objParam)
+                                       ->stripPointerCasts() == v;
+                  if (posOk)
+                    for (unsigned ai = 0; ai < CB2->arg_size(); ai++)
+                      if ((int)ai != inf.objParam &&
+                          CB2->getArgOperand(ai)->stripPointerCasts() == v)
+                        posOk = false; // fresh escapes via a second slot
+                  if (posOk) {
+                    bool mapOk = true;
+                    SmallVector<int, 4> mapped;
+                    for (int m2 : inf.srcFormals) {
+                      if (m2 >= (int)CB2->arg_size()) { mapOk = false; break; }
+                      const Value *av =
+                          CB2->getArgOperand(m2)->stripPointerCasts();
+                      if (!containsPointerType(av->getType())) continue;
+                      if (isa<ConstantPointerNull>(av)) continue;
+                      if (const auto *AA = dyn_cast<Argument>(av)) {
+                        if (AA->getParent() == &F) {
+                          mapped.push_back((int)AA->getArgNo());
+                          continue;
+                        }
+                      }
+                      mapOk = false;
+                      break;
+                    }
+                    if (mapOk) {
+                      for (int g3 : mapped) initArgs.push_back(g3);
+                      if (inf.selfStore) selfStore = true;
+                      initCalls.insert(CB2);
+                      composed = true;
+                      g_freshHelperComposed++;
+                    }
+                  }
+                }
+                if (!composed) {
+                  rejWhy = EC ? "call-escape" : "icall-escape";
+                  escaped = true;
+                  break;
+                }
+                continue;
+              }
+              if (isa<PHINode>(U) || isa<SelectInst>(U)) {
+                rejWhy = "phi-route";
+                escaped = true;
+                break;
+              }
+              if (isa<PtrToIntInst>(U)) rejWhy = "ptrtoint";
+              else rejWhy = "other-use";
               escaped = true;
               break;
             }
           }
         }
-        if (escaped || untracedInit) { g_freshRejEscape++; continue; }
+        if (escaped || untracedInit) {
+          g_freshRejEscape++;
+          g_escapeBuckets[rejWhy ? rejWhy : "unknown"]++;
+          if (g_escapeSamples < 40 && rejWhy) {
+            g_escapeSamples++;
+            CG_LOG("ConfirmFresh ESCAPE: " << F.getName() << " ["
+                   << rejWhy << "]\n");
+          }
+          continue;
+        }
         // R3: no pointer side effects elsewhere (classified init stores
         // are exempt — they become atoms).
         for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
@@ -6949,6 +7162,7 @@ void CallGraphPass::confirmFreshWrappers() {
             continue;
           }
           if (const auto *CB = dyn_cast<CallBase>(I2)) {
+            if (initCalls.count(I2)) continue; // composed init helper
             const Function *CF = CB->getCalledFunction();
             if (CF && (isNoopIntrinsic(CF) || Ctx->AllocFuncs.count(CF)))
               continue;
@@ -6967,7 +7181,7 @@ void CallGraphPass::confirmFreshWrappers() {
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
-        if (initArgs.empty()) {
+        if (initArgs.empty() && !selfStore) {
           Ctx->FuncSummaries[&F] = &pureFresh;
         } else {
           Ctx->OwnedSummaries.emplace_back();
@@ -6981,6 +7195,13 @@ void CallGraphPass::confirmFreshWrappers() {
             A.kind = GlobalContext::SummaryAtom::Store;
             A.dst = -1; // *ret
             A.src = an;
+            S.atoms.push_back(A);
+          }
+          if (selfStore) {
+            GlobalContext::SummaryAtom A{};
+            A.kind = GlobalContext::SummaryAtom::Store;
+            A.dst = -1;
+            A.src = -1; // object interior stored into itself
             S.atoms.push_back(A);
           }
           Ctx->FuncSummaries[&F] = &S;
@@ -6997,9 +7218,13 @@ void CallGraphPass::confirmFreshWrappers() {
   }
   CG_LOG("ConfirmFresh: " << g_freshPromoted << " wrappers promoted ("
          << g_freshInit << " alloc-init with ST atoms) in " << round
-         << " rounds; rejected " << g_freshRejRet << " ret-not-fresh, "
+         << " rounds; " << g_freshHelperComposed << " init-helper calls "
+         << "composed; rejected " << g_freshRejRet << " ret-not-fresh, "
          << g_freshRejEscape << " escapes, " << g_freshRejSide
          << " ptr-side-effects\n");
+  for (auto &eb : g_escapeBuckets)
+    CG_LOG("ConfirmFresh escape-bucket[" << eb.first << "]: " << eb.second
+           << "\n");
 }
 
 // --func-summaries: parse the transfer-summary file. Line format:

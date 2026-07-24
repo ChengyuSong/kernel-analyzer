@@ -1989,3 +1989,28 @@ out-param atom, @global ST sources) vs true budgeted cloning.
 Identity-splitting scoreboard so far: summaries drained answer-level
 conflation (-763 km, -1,659 kernel) but the ensemble hub needs the
 escape class converted before fs re-evaluation makes sense.
+
+### Step B v2: init-helper composition (2026-07-24) — proven on micro; kernel needs two extensions
+
+The confirmer now composes ONE level of init helpers: a helper is
+INIT-ONLY in param j (param used solely as store base; stored values
+= own formals / non-ptr / null / self-linkage; no other ptr side
+effects; void return), and the wrapper maps the helper's stores
+through the callsite into its own ST atoms. t_freshwrap extended
+with the vm_area_alloc/vma_init shape: 6/6 EXACT (was cross-smeared).
+Micro suite unchanged. One walk bug found en route: a formal stored
+into a SIBLING param's memory is init, not an escape of the formal.
+
+km: still 0 compositions — real kernel init helpers (vma_init,
+desc_set_defaults) fail on exactly two missing capabilities:
+ 1. stores of GLOBALS into the object (vma->vm_ops =
+    &vma_dummy_vm_ops — the fptr-relevant init!): needs a
+    ST(*ret <- @global) atom variant (SummaryAtom gains an optional
+    GlobalValue* source; applySummaryAtoms edge from the global's
+    value node).
+ 2. NESTED init helpers (vma_init calls vma_numab_state_init(vma)):
+    needs InitInfo composition to fixpoint (helper valid if its
+    callees on the obj param are themselves init-only — same
+    recursion the wrapper level already does once).
+Both mechanical; the call-escape bucket (80 of 130 at km) is the
+prize. After those: whole-kernel eval + re-pin, then fs re-check.

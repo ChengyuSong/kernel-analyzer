@@ -39,6 +39,21 @@ __attribute__((noinline)) static struct S *make(void (*f)(void)) {
 static void cb3(void) {}
 static void cb4(void) {}
 
+/* init-HELPER composition (step B v2): the kernel idiom — alloc, then
+ * call a helper that does the stores (vm_area_alloc/vma_init shape). */
+__attribute__((noinline)) static void s_init(struct S *s, void (*f)(void)) {
+  s->fn = f;
+  s->x = 1;
+}
+__attribute__((noinline)) static struct S *make2(void (*f)(void)) {
+  struct S *s = xmalloc(sizeof(struct S));
+  if (s)
+    s_init(s, f);
+  return s;
+}
+static void cb5(void) {}
+static void cb6(void) {}
+
 int main(void) {
   struct S *a = xmalloc(sizeof(struct S));
   a->fn = cb1;
@@ -54,5 +69,11 @@ int main(void) {
   struct S *d = make(cb4);
   opaque(d);
   d->fn(); /* expect cb4 only */
+  struct S *e = make2(cb5);
+  opaque(e);
+  e->fn(); /* expect cb5 only */
+  struct S *g = make2(cb6);
+  opaque(g);
+  g->fn(); /* expect cb6 only */
   return 0;
 }

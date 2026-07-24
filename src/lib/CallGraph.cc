@@ -2410,6 +2410,38 @@ bool CallGraphPass::runFlowsToResolution() {
         lazyDeferred.push_back(n);
         continue;
       }
+      // --cfl-ablate-mints: MEASUREMENT-ONLY UNSOUND PROBE — skip
+      // minting identity roots whose canonical value matches a named
+      // global, or is an instruction inside a named function. Used to
+      // causally separate hub-SEEDING witnesses from hub-RIDING ones
+      // (task #25: .str.5 / guc_wq_item_append candidates).
+      if (!CFLAblateMints.empty() && !isFunc) {
+        const Value *cv = NF.getValueForNode(toOrig[n]);
+        StringRef key;
+        if (cv) {
+          if (const auto *I2 = dyn_cast<Instruction>(cv))
+            key = I2->getFunction()->getName();
+          else if (cv->hasName())
+            key = cv->getName();
+        }
+        bool hit = false;
+        if (!key.empty()) {
+          StringRef spec(CFLAblateMints);
+          while (!spec.empty() && !hit) {
+            auto [head, rest] = spec.split(',');
+            hit = !head.empty() && key == head;
+            spec = rest;
+          }
+        }
+        if (hit) {
+          static size_t g_mintAblated = 0;
+          if (++g_mintAblated <= 5 || g_mintAblated % 1000 == 0)
+            WARNING("[MEASUREMENT-ONLY UNSOUND] mint ablated for class of "
+                    << (cv ? cv->getName() : StringRef("<inst>")) << " ("
+                    << g_mintAblated << " total)\n");
+          continue;
+        }
+      }
       uint32_t rid = nextRoot++;
       seeds.emplace_back(n, rid);
       rootClassOf.push_back(n); // rid-indexed
@@ -4454,6 +4486,45 @@ bool CallGraphPass::runFlowsToResolution() {
       for (size_t j = 0; j < KW; j++)
         errs() << "HubMerge: x" << witRank[j].first << " "
                << ridName(witRank[j].second) << "\n";
+      // Top-witness class anatomy: the printed name is only the CANONICAL
+      // representative of the minted class — presolve merges can fold a
+      // load result together with real origins. Dump the member-kind
+      // tally so "guc_wq_item_append::load"-style labels can be read as
+      // what the class actually contains.
+      for (size_t j = 0; j < std::min<size_t>(5, KW); j++) {
+        uint32_t rid = witRank[j].second;
+        uint32_t cls = rootClassOf[rid];
+        NodeIndex canon = toOrig[cls];
+        size_t mAlloca = 0, mGlob = 0, mCall = 0, mLoad = 0, mArg = 0,
+               mOther = 0;
+        std::vector<std::string> gnames;
+        auto tally = [&](NodeIndex m2) {
+          const Value *V2 = NF.getValueForNode(m2);
+          if (!V2) { mOther++; return; }
+          if (isa<AllocaInst>(V2)) mAlloca++;
+          else if (const auto *GV = dyn_cast<GlobalVariable>(V2)) {
+            mGlob++;
+            if (gnames.size() < 8) gnames.push_back(GV->getName().str());
+          } else if (isa<CallBase>(V2)) mCall++;
+          else if (isa<LoadInst>(V2)) mLoad++;
+          else if (isa<Argument>(V2)) mArg++;
+          else mOther++;
+        };
+        tally(canon);
+        auto mit2 = canonicalClassMembers.find(canon);
+        if (mit2 != canonicalClassMembers.end())
+          for (NodeIndex m2 : mit2->second) tally(m2);
+        errs() << "HubWitness: x" << witRank[j].first << " "
+               << ridName(rid) << " class-members: alloca=" << mAlloca
+               << " global=" << mGlob << " call=" << mCall << " load="
+               << mLoad << " arg=" << mArg << " other=" << mOther;
+        if (!gnames.empty()) {
+          errs() << " globals:[";
+          for (auto &g2 : gnames) errs() << " " << g2;
+          errs() << " ]";
+        }
+        errs() << "\n";
+      }
     }
 
     // Table 2: allocation-site identity spread. One sweep accumulates,

@@ -276,6 +276,14 @@ cl::opt<bool> CFLLazyMint(
            "the full mint; only the propagated fact mass shrinks"),
   cl::init(false));
 
+cl::opt<std::string> CFLAblateMints(
+  "cfl-ablate-mints",
+  cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: comma-separated names; skip "
+           "minting identity roots whose canonical value is the named "
+           "global or an instruction inside the named function. Separates "
+           "hub-seeding witnesses from hub-riding ones (task #25)"),
+  cl::init(""));
+
 cl::opt<std::string> FuncSummaryFile(
   "func-summaries",
   cl::desc("Transfer-summary file (atoms: FRESH/CPY/ALIAS/ST/LD/NONE, "

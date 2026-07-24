@@ -1813,3 +1813,32 @@ targeted no-mint ablation of the top witnesses (measurement-only
 flag), km-fast then kernel. The GuC load may also be its own bug
 class (identity minted for loads from unmodeled device/ring memory —
 compare universal-ptr handling).
+
+### Witness over-determination (2026-07-24) — single-witness ablation is the wrong knife
+
+Probes added: HubWitness (member anatomy of top witness classes) and
+--cfl-ablate-mints (MEASUREMENT-ONLY no-mint by global name /
+containing function). Results:
+- intel_guc_submission.o analyzed ALONE (single-module runs work;
+  extern boundary goes universal): guc_wq_item_append::load keys just
+  7 local joins, class = 3 folded loads + assistant nodes, ablation
+  changes nothing. Its kernel-scale x92798 is therefore mostly
+  cross-module class content + hub-riding — kernel HubWitness anatomy
+  rides the next kernel report run.
+- km .str.5 no-mint ablation: NULL. Hub 28,323 vs 28,385 joins,
+  answers IDENTICAL. The 13,946 count was ~99.6% ride-along.
+- Even the allocator-ret channel: summaries suppressed it and the km
+  hub moved 28,396 -> 28,385, yet answers improved by -763 pairs.
+
+LESSONS: (1) joins are massively over-determined — the hub is glued
+by a witness ENSEMBLE (10k+ at km), so removing individuals moves
+nothing; the mergeWitness histogram records first-firer, not
+necessity. (2) Answer precision and closure size are different
+currencies: summaries bought answers by cutting FLOW conduits
+without shrinking the hub. (3) #25 must change the JOIN RULE for a
+whole witness class (rodata copy-not-unify), not remove witnesses;
+its win cannot be read off the histogram. Cheap upper-bound
+estimator before building it: a probe that skips joins keyed by
+isConstant()-global origins entirely (over-removes: also breaks
+const-table home-cell reads, so answers drop; gives upper bound on
+hub reduction).

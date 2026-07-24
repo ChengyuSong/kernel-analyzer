@@ -137,3 +137,21 @@ unavailable from the analysis environment):
 - group-/lattice-weighted Dyck reachability for C field sensitivity
   (WPDS instantiations) — whether the Z_P quotient has been used for
   interior pointers before.
+
+## Measurement/ablation catalog as a contribution (2026-07-24, user-flagged)
+
+No existing CFL-reachability / kernel-callgraph paper reports the
+kind of causal instrumentation this project now runs routinely:
+merge-witness provenance (which origin keyed each unification),
+witness over-determination (single-witness ablations are null —
+ensembles glue hubs), residency-vs-causality (top hub residents
+ablate to <0.5%), rule-class upper-bound probes (rodata-join skip
+bounds a refinement at ~16% before building it), and the
+identity-splitting funnel (five confirmable wrapper shapes, per-
+feature conversion telemetry, and the negative: wrapper identity is
+not the km hub driver). Four falsified sizing hypotheses in one
+day, each from a <15-min probe. Position in the paper as the
+measurement methodology section: sound-by-construction probes
+(LEDGERed, answer-diffed) that attribute closure growth causally
+BEFORE committing engineering effort — the counterpart to the
+certificate-carrying-run story on the soundness side.

@@ -3803,8 +3803,15 @@ bool CallGraphPass::runFlowsToResolution() {
         if (rIt == funcRootOf.end()) return;
         Function *F = getFuncDef(const_cast<Function *>(rIt->second));
         // static_call sites are direct-form icalls: the trampoline's
-        // own root is the dispatch point, not a callee
-        if (F == CS->getCalledFunction()) return;
+        // own root is the dispatch point, not a callee. Compare by
+        // GUID, not pointer: __SCT__ symbols have no IR definition, so
+        // funcRootOf holds an arbitrary per-TU declaration object
+        // (pointer-ordered container iteration) — pointer equality
+        // fired nondeterministically across runs (1-pair dump flap,
+        // full7 vs lazy2) and missed 2547 trampoline-self pairs.
+        if (Function *called = CS->getCalledFunction())
+          if (F == called || F->getGUID() == called->getGUID())
+            return;
         filtCandidates++;
         if (!isCompatible(CS, F)) { filtTypeRej++; return; }
         if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {

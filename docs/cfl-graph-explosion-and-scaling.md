@@ -1563,3 +1563,67 @@ tiny utility functions (sort, __static_call_update) is the single
 biggest precision channel in the kernel — the strongest evidence yet
 that #17-style selective cloning of a HANDFUL of functions buys
 outsized precision.
+
+## 2026-07-23: lazy minting shipped (task #21) — catch-up round required; A-loop sufficiency REFUTED
+
+Implemented `--cfl-lazy-mint` (7da46aa): A := backward reachability
+from fptr classes over reversed {a, f} edges PLUS cell->owner hops
+(the owner hop must apply to the WHOLE closure, not only fptr-feeding
+cells, or witnesses of intermediate joins are missed); origins and
+identity candidates outside A are deferred, and every drain fixpoint
+recomputes A on the merge-coarsened quotient and mints new entrants
+(the "observed potential" of the design sketch reduces to exactly
+this closure on the live quotient, because fact propagation over a/f
+edges IS graph reachability). Function roots always minted.
+
+Sub-kernel validation: bit-identical everywhere (8 micro, libpng,
+harfbuzz, km subset), fact mass 32-42% of eager, solve ~2x faster.
+
+WHOLE KERNEL REFUTED THE SUFFICIENCY CONJECTURE (§2026-07-18's
+first-missed-join induction): -5 icalls / -5,737 pairs, strictly
+one-sided, all in ops-struct registrations consumed through circular
+list_head walks (tcp_ulp subflow/espintcp/cls_cgroup, 9p transport,
+decompressor callbacks). The A-loop stabilized (8 rounds) with the
+needed witnesses still deferred: on a cycle, each node's join needs
+the neighbor's merge for its consequence path to reach an fptr —
+mutual witness dependence the demand-driven loop can never enter.
+The induction's gap: a witness's OCCURRENCE path and another
+witness's CONSEQUENCE path can each require the other's merge; small
+shapes resolve through owner-hops (we could not build a <=7-node
+counterexample against the A-loop — constructing one is open), the
+kernel's circular lists do not.
+
+FIX (446f35b): catch-up round at convergence — mint every
+still-deferred root, keep draining. Exact BY CONSTRUCTION via closure
+confluence, machine-checked (proof/lean daf04ba: `sderiv_catchup`
+staging theorem, `catchup_answers_complete`, plus the necessity
+counterexample `answer_not_derivable_restricted`; GAPS.md F11 records
+the open sufficiency problem).
+
+Whole-kernel scorecard (from-scratch driver mode, pinned in
+test/baselines/kernel-lazy-*):
+- answers: identical (16,720 icalls; dump pinned at 5,644,875 lines)
+- fact mass: 921M final vs 1,913M eager = 48% — catch-up mints only
+  the never-merged residue (21,168 roots), not the 125k deferred
+  classes that merged into minted ones; end-state win SURVIVES
+- roots: 141,271 vs 245,858
+- restricted solve iterations: 120-139 s vs eager 224-246 s (2.0x)
+- BUT catch-up drains cost 578 + 702 s (two, one per driver rebuild
+  reaching convergence) -> total 36.4 min vs eager 20.1 min: the
+  catch-up currently EATS the time win (task #24: single catch-up via
+  incremental mode; diagnose why a 21k-root/48M-fact top-up drain
+  costs 2.9x a full eager iteration — suspected joined/jdirty
+  re-offer rescans on the warm state)
+- peak RSS 40.0 GB = eager's 40.1: kernel peak is front-end loading,
+  not the solver, in BOTH modes; solver-phase RSS observed 14.9 GB
+
+BONUS BUG the identity gate caught: the SCT trampoline-self filter
+compared Function* pointers, but __SCT__ symbols have no IR def, so
+funcRootOf holds an arbitrary per-TU decl (pointer-ordered container
+iteration — deterministic per binary, flapping ACROSS binaries).
+full7-vs-lazy dumps differed by exactly 1 such line; km pin drift
+81,286 -> 81,660 was 367 leaked self-pair copies. GUID-based filter
+removes the class (km: -367, zero other changes; kernel: -1,794).
+Deterministic subset counts from this commit: km 1,482/81,293,
+harfbuzz 2,824. The kernel-full7-stats.txt subset numbers were stale
+artifacts of this nondeterminism.

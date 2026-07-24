@@ -1,0 +1,62 @@
+Whole-kernel flows-to LAZY-MINT pinned baseline (2026-07-23, task #21)
+commits: 7da46aa (lazy mint) + 446f35b (catch-up) + GUID self-filter (this commit)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune --cfl-lazy-mint
+        --cfl-dump-icalls --bc-list bclist   (from-scratch driver mode, the default)
+
+pinned dump: kernel-lazy-icalls.sort.gz — 5,644,875 lines / 17,073 icall sites
+  (lines = Callees export incl. SCT direct-form syntactic edges; the CFL-resolved
+   tally is 16,720 icalls / 5,644,480 plane-derived pairs at convergence)
+  Constructed as the 2026-07-23 lazy+catch-up run's dump with collect-leak SCT
+  self-pair copies collapsed (1,794 lines) — exactly what the GUID-filter binary
+  emits; fixed-binary confirmation run: see note at bottom.
+
+ANSWERS vs eager (full7): identical modulo two root-caused artifacts, both fixed:
+ (1) lazy v1 (no catch-up) deficit: -5 icalls / -5,737 pairs, strictly one-sided.
+     Forensics: ops structs registered on circular list_head chains and consumed
+     by list walks — tcp_ulp ops (subflow_ulp_*, espintcp_init_sk, cls_cgroup_init),
+     9p transport ops (p9_virtio_*/p9_fd_*), decompressor callbacks, e1000/i915.
+     The demand-driven A-loop (backward a/f + cell->owner hops on the live
+     quotient) stabilized after 8 rounds with 21,168 candidates still deferred —
+     the needed witnesses were among them and can never be admitted (cyclic
+     witness dependence; Lean F11). FIX: catch-up round at convergence mints all
+     still-deferred roots and re-drains; exact by closure confluence
+     (proof/lean: sderiv_catchup). Recovers all 5,737 pairs.
+ (2) dump nondeterminism ACROSS BINARIES: the SCT trampoline-self filter compared
+     Function* pointers, but __SCT__ symbols have no IR def, so funcRootOf holds
+     an arbitrary per-TU decl chosen by pointer-ordered container iteration
+     (deterministic per binary, flapping across binaries: full7 vs lazy runs
+     differed by 1 line; km counts moved 81,286 -> 81,660 across pins for the
+     same reason). FIX: GUID-based filter; removes the whole class (km: exactly
+     367 self-pair copies removed, zero other changes; kernel: 1,794).
+     Historic subset counts in kernel-full7-stats.txt (km 1479/81286, hb 2811)
+     are therefore stale artifacts of the pre-fix nondeterminism; deterministic
+     counts from this commit: km 1,482 icalls / 81,293 pairs, hb 2,824 pairs.
+
+RUN (from-scratch driver mode): wall 3:20:09, peak RSS 40.0 GB
+  peak RSS = front-end loading/pre-solve, identical to eager 40.1 GB; the solver
+  is not the kernel-scale memory peak in either mode.
+solve phases: restricted iters 119.6 138.8 127.4 119.6 122.3 s
+  (vs eager 223.7-245.5 s/iter: restricted solving is 2.0x faster)
+  catch-up drains: 578.1 s + 701.8 s (from-scratch reruns the restricted solve
+  AND a catch-up per driver rebuild after new pairs wire; two rebuilds hit
+  convergence -> two catch-ups). TOTAL ~36.4 min vs eager 20.1 min — the
+  catch-up drain cost currently EATS the restricted-phase win (task #24).
+fact mass: restricted fixpoint 873.0M native; final post-catch-up 921.2M
+  vs eager 1,913.2M = 48% END-STATE (catch-up mints only the never-merged
+  residue: 21,168 roots, not the 125k merged-away deferred classes).
+roots: eager 245,858; lazy initial 90,232 (origins in A0 = 61,317/424,360
+  classes, 14.4%) + 8 expansion rounds -> 120,116 at restricted fixpoint;
+  catch-up +21,168 -> 141,271 final. Mid-solve solver RSS observed 14.9 GB.
+
+subsets (GUID-filter binary, eager==lazy bit-identical, closure verified):
+  km 1,482/81,293; harfbuzz 2,824 (catch-up 264); libpng 9 (Callee-by-type 27/9);
+  8 micro tests exact; saturation smoke 4/4.
+
+Lean (proof/lean/CompositionalCFL/FlowsTo.lean, commit daf04ba): sderiv_catchup
+  (staging confluence = catch-up exactness), catchup_answers_complete,
+  answer_not_derivable_restricted (necessity counterexample). Open: F11 —
+  a provably sufficient restricted root set (would drop the catch-up cost).
+
+CONFIRMATION RUN: a fixed-binary whole-kernel lazy run must reproduce
+kernel-lazy-icalls.sort.gz byte-for-byte; launched 2026-07-23 evening as
+kernel-lazy3 (result recorded in the follow-up commit touching this file).

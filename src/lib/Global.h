@@ -104,6 +104,32 @@ public:
   };
   std::unordered_map<const llvm::Function*, ContainerFuncInfo> ContainerFuncs;
 
+  // Transfer-summary vocabulary (--func-summaries): callsite-applied
+  // atoms replacing the hardcoded isAllocFn table. A summary applied at
+  // a callsite is a zero-cost infinite clone (per-callsite identity for
+  // FRESH; no shared-formal/ret mixing). File is the authoritative,
+  // checked-in artifact of the proposer+confirmer loop.
+  struct SummaryAtom {
+    enum Kind {
+      Fresh, // per-callsite heap object identity (via AllocFuncs paths)
+      Cpy,   // shift-preserving cell copy: deref(src) -> deref(dst)
+      Alias, // dst value aliases src value (interior/identity return)
+      Store, // *container <- value
+      Load   // dst value <- *container
+    } kind;
+    int dst = -1; // arg index, or -1 = callsite return value
+    int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)
+  };
+  struct FuncSummary {
+    std::vector<SummaryAtom> atoms;
+    bool fresh = false; // has a Fresh atom
+    bool none = false;  // explicit NONE: no summary, stop matching
+  };
+  // Ordered specs (first match wins; trailing '*' = prefix match) and
+  // the per-Function resolution filled during doInitialization.
+  std::vector<std::pair<std::string, FuncSummary>> SummarySpecs;
+  std::unordered_map<const llvm::Function*, const FuncSummary*> FuncSummaries;
+
   // Map a callsite to all potential callee functions.
   CalleeMap Callees;
 

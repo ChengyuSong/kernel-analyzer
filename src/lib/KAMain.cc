@@ -276,6 +276,15 @@ cl::opt<bool> CFLLazyMint(
            "the full mint; only the propagated fact mass shrinks"),
   cl::init(false));
 
+cl::opt<std::string> FuncSummaryFile(
+  "func-summaries",
+  cl::desc("Transfer-summary file (atoms: FRESH/CPY/ALIAS/ST/LD/NONE, "
+           "ordered, first-match-wins, trailing '*' = prefix). When set, "
+           "it is AUTHORITATIVE: replaces the hardcoded isAllocFn "
+           "allocator table and adds copy/alias/container semantics at "
+           "summarized callsites. See func_summaries.txt"),
+  cl::init(""));
+
 cl::opt<std::string> CFLAblateFuncs(
   "cfl-ablate-funcs",
   cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: comma-separated function "

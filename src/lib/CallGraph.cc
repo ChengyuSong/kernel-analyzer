@@ -1124,6 +1124,19 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     return false;
   }
 
+  // Transfer summary: the atoms fully describe the interface — apply
+  // them and skip arg/ret wiring (per-callsite semantics, no shared
+  // formal/ret mixing). FRESH-bearing summaries normally short-circuit
+  // earlier via the AllocSites branch; this path serves non-fresh
+  // summaries and fresh ones reached through indirect resolution.
+  {
+    auto sit = Ctx->FuncSummaries.find(CF);
+    if (sit != Ctx->FuncSummaries.end()) {
+      applySummaryAtoms(CS, *sit->second);
+      return false;
+    }
+  }
+
   // Skip utility functions to reduce edge explosion
   if (shouldSkipFunction(CF)) {
     CG_DEBUG("Skipping utility function: " << CF->getName() << "\n");
@@ -3850,6 +3863,9 @@ bool CallGraphPass::runFlowsToResolution() {
         newAllocNodes.push_back(callNode);
         NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
         EB.addDereferenceEdges(callNode, heapObj);
+        auto sit = Ctx->FuncSummaries.find(CF);
+        if (sit != Ctx->FuncSummaries.end())
+          applySummaryAtoms(CS, *sit->second); // CPY etc. for dup family
       } else if (Ctx->ContainerFuncs.count(CF)) {
         handleContainerCall(CS, CF);
       } else {
@@ -5262,7 +5278,17 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       // Record call edge so allocator calls appear in the callgraph export.
       auto RCF = CGP.getFuncDef(CF);
       CGP.Ctx->Callees[&CS].insert(RCF);
-      if (CF->getReturnType()->isPointerTy()) {
+      auto sit = CGP.Ctx->FuncSummaries.find(RCF);
+      if (sit == CGP.Ctx->FuncSummaries.end())
+        sit = CGP.Ctx->FuncSummaries.find(CF);
+      if (sit != CGP.Ctx->FuncSummaries.end()) {
+        // Summarized allocator: the callsite's identity IS the fresh
+        // object; the shared return-node edge is exactly the measured
+        // cross-caller conflation channel (~470 witnessed joins at km)
+        // — suppress it, then apply the remaining atoms (CPY for the
+        // dup family restores the copy the skipped body drops).
+        CGP.applySummaryAtoms(&CS, *sit->second);
+      } else if (CF->getReturnType()->isPointerTy()) {
         NodeIndex retNode = CGP.NF.getReturnNodeFor(RCF);
         if (retNode == AndersNodeFactory::InvalidIndex)
           retNode = CGP.NF.createReturnNode(RCF);
@@ -6662,8 +6688,175 @@ void CallGraphPass::wireLinkerSectionArrays() {
          << nodeless << " nodeless members skipped\n");
 }
 
+// --func-summaries: parse the transfer-summary file. Line format:
+//   <name>[*] ATOM [ATOM...]   ('*' suffix = prefix match; '#' comments)
+// Atoms: FRESH | NONE | CPY(ret<-argN) | CPY(argM<-argN) |
+//        ALIAS(ret=argN) | ST(*argC<-argV) | LD(ret<-*argC)
+// Ordered, first match wins (NONE entries carve exclusions out of a
+// following prefix rule, mirroring the legacy isAllocFn ordering).
+// Parse errors are FATAL: a silently dropped summary is a silent
+// soundness/precision change.
+static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
+  std::ifstream in(path);
+  if (!in) {
+    errs() << "FuncSummary: cannot open " << path << "\n";
+    assert(false && "--func-summaries file unreadable");
+    return;
+  }
+  auto parseRef = [](StringRef tok, int &out) -> bool {
+    if (tok == "ret") { out = -1; return true; }
+    if (tok.consume_front("arg")) {
+      unsigned v;
+      if (!tok.getAsInteger(10, v)) { out = (int)v; return true; }
+    }
+    return false;
+  };
+  std::string line;
+  size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
+         nNone = 0;
+  while (std::getline(in, line)) {
+    lineNo++;
+    StringRef L = StringRef(line).trim();
+    if (L.empty() || L.starts_with("#")) continue;
+    SmallVector<StringRef, 6> toks;
+    L.split(toks, ' ', -1, false);
+    GlobalContext::FuncSummary S;
+    bool bad = toks.size() < 2;
+    for (size_t i = 1; i < toks.size() && !bad; i++) {
+      StringRef t = toks[i].trim();
+      if (t.empty()) continue;
+      GlobalContext::SummaryAtom A{};
+      if (t == "FRESH") {
+        A.kind = GlobalContext::SummaryAtom::Fresh;
+        S.fresh = true;
+        nFresh++;
+      } else if (t == "NONE") {
+        S.none = true;
+        nNone++;
+        continue;
+      } else if (t.consume_front("CPY(") && t.consume_back(")")) {
+        auto [d, s] = t.split("<-");
+        A.kind = GlobalContext::SummaryAtom::Cpy;
+        bad = !parseRef(d, A.dst) || !parseRef(s, A.src) || A.src < 0;
+        nCpy++;
+      } else if (t.consume_front("ALIAS(") && t.consume_back(")")) {
+        auto [d, s] = t.split("=");
+        A.kind = GlobalContext::SummaryAtom::Alias;
+        bad = !parseRef(d, A.dst) || !parseRef(s, A.src) || A.src < 0;
+        nAlias++;
+      } else if (t.consume_front("ST(*") && t.consume_back(")")) {
+        auto [c, v] = t.split("<-");
+        A.kind = GlobalContext::SummaryAtom::Store;
+        bad = !parseRef(c, A.dst) || !parseRef(v, A.src) || A.dst < 0;
+        nSt++;
+      } else if (t.consume_front("LD(") && t.consume_back(")")) {
+        auto [d, c] = t.split("<-*");
+        A.kind = GlobalContext::SummaryAtom::Load;
+        bad = !parseRef(d, A.dst) || !parseRef(c, A.src) || A.src < 0;
+        nLd++;
+      } else {
+        bad = true;
+      }
+      if (!bad && !S.none) S.atoms.push_back(A);
+    }
+    if (bad) {
+      errs() << "FuncSummary: parse error at " << path << ":" << lineNo
+             << ": '" << line << "'\n";
+      assert(false && "malformed func-summaries line");
+      continue;
+    }
+    Ctx->SummarySpecs.emplace_back(toks[0].str(), std::move(S));
+  }
+  CG_LOG("FuncSummary: loaded " << Ctx->SummarySpecs.size() << " specs from "
+         << path << " (" << nFresh << " FRESH, " << nCpy << " CPY, "
+         << nAlias << " ALIAS, " << nSt << " ST, " << nLd << " LD, "
+         << nNone << " NONE)\n");
+}
+
+// First-match-wins spec lookup ('*' suffix = prefix).
+static const GlobalContext::FuncSummary *
+summaryForName(GlobalContext *Ctx, StringRef name) {
+  for (const auto &sp : Ctx->SummarySpecs) {
+    StringRef pat(sp.first);
+    bool hit = pat.consume_back("*") ? name.starts_with(pat) : name == pat;
+    if (hit) return sp.second.none ? nullptr : &sp.second;
+  }
+  return nullptr;
+}
+
+// Apply the non-FRESH atoms of a summary at a callsite. FRESH itself is
+// carried by the existing AllocFuncs machinery (per-callsite AllocSite +
+// opaque heap object). Cell-copy edges are shift-preserving by
+// construction (a-edge between deref nodes), which is exactly right for
+// aligned whole-buffer dups (kmemdup family); prefix copies
+// over-approximate soundly.
+static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
+              g_sumSkipped = 0;
+void CallGraphPass::applySummaryAtoms(const CallBase *CS,
+                                      const GlobalContext::FuncSummary &S) {
+  auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
+    const Value *v =
+        ref < 0 ? (const Value *)CS
+                : ((unsigned)ref < CS->arg_size() ? CS->getArgOperand(ref)
+                                                  : nullptr);
+    if (!v) { g_sumSkipped++; return AndersNodeFactory::InvalidIndex; }
+    NodeIndex n = getRepNodeForValue(v);
+    if (n == AndersNodeFactory::InvalidIndex && create)
+      n = getCanonicalNode(NF.createValueNode(v));
+    if (n == AndersNodeFactory::InvalidIndex) g_sumSkipped++;
+    return n;
+  };
+  for (const auto &A : S.atoms) {
+    switch (A.kind) {
+    case GlobalContext::SummaryAtom::Fresh:
+      break; // AllocFuncs path owns object creation
+    case GlobalContext::SummaryAtom::Cpy: {
+      NodeIndex d = nodeForRef(A.dst, true), s = nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          s == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(getRepDerefNode(getCanonicalNode(s)),
+                        getRepDerefNode(getCanonicalNode(d)));
+      g_sumCpy++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Alias: {
+      NodeIndex d = nodeForRef(A.dst, true), s = nodeForRef(A.src, false);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          s == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(getCanonicalNode(s), getCanonicalNode(d));
+      g_sumAlias++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Store: {
+      NodeIndex c = nodeForRef(A.dst, true), v = nodeForRef(A.src, false);
+      if (c == AndersNodeFactory::InvalidIndex ||
+          v == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(getCanonicalNode(v),
+                        getRepDerefNode(getCanonicalNode(c)));
+      g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Load: {
+      NodeIndex d = nodeForRef(A.dst, true), c = nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          c == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(getRepDerefNode(getCanonicalNode(c)),
+                        getCanonicalNode(d));
+      g_sumLd++;
+      break;
+    }
+    }
+  }
+}
+
 bool CallGraphPass::doInitialization(Module *M) {
   if (iteration == 0 && M == Ctx->Modules.front().first) {
+    if (!FuncSummaryFile.empty() && Ctx->SummarySpecs.empty())
+      loadFuncSummaries(Ctx, FuncSummaryFile);
     canonicalNodeMap.clear();
     canonicalClassMembers.clear();
     moduleIndirectCallInsts.clear();
@@ -6751,9 +6944,16 @@ bool CallGraphPass::doInitialization(Module *M) {
       (void)valNode;
     }
 
-    // Populate AllocFuncs for all functions matching known allocator names,
-    // regardless of whether they are declarations or definitions
-    {
+    // Populate AllocFuncs. When --func-summaries is loaded, the file is
+    // AUTHORITATIVE (FRESH entries drive all existing allocator paths;
+    // the legacy hardcoded isAllocFn table is not consulted). Without
+    // it, legacy behavior is unchanged.
+    if (!Ctx->SummarySpecs.empty()) {
+      if (const auto *S = summaryForName(Ctx, F.getName())) {
+        Ctx->FuncSummaries[&F] = S;
+        if (S->fresh) Ctx->AllocFuncs.insert(&F);
+      }
+    } else {
       int size = 0, flag = 0;
       if (isAllocFn(F.getName(), &size, &flag))
         Ctx->AllocFuncs.insert(&F);
@@ -6901,6 +7101,12 @@ bool CallGraphPass::doFinalization(Module *M) {
            << " reg-through loads + " << g_asmRegStores << " stores + "
            << g_asmRegCopies << " copies; declined " << g_asmLaunderDeclined
            << " unwitnessed launder candidates\n");
+    if (!Ctx->SummarySpecs.empty())
+      CG_LOG("FuncSummary LEDGER: " << Ctx->FuncSummaries.size()
+             << " functions summarized; applied " << g_sumCpy << " CPY, "
+             << g_sumAlias << " ALIAS, " << g_sumSt << " ST, " << g_sumLd
+             << " LD edges; " << g_sumSkipped
+             << " atom refs skipped (missing arg/node)\n");
     {
       uint64_t uniExtGobj = 0, uniOther = 0;
       NF.getUniversalLedger(uniExtGobj, uniOther);
@@ -7565,6 +7771,9 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph,
             AllocSites.insert(callNode);
             NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
             EB.addDereferenceEdges(callNode, heapObj);
+            auto sit = Ctx->FuncSummaries.find(CF);
+            if (sit != Ctx->FuncSummaries.end())
+              applySummaryAtoms(CS, *sit->second);
             CG_LOG("Handle indirect allocator target: " << CF->getName() << "\n");
           } else if (Ctx->ContainerFuncs.count(CF)) {
             CG_LOG("Handle indirect target: " << CF->getName() << " (container)\n");

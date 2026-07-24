@@ -132,6 +132,8 @@ private:
                           const std::string &callSiteStruct,
                           unsigned callSiteFieldIdx) const;
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
+  void applySummaryAtoms(const llvm::CallBase *CS,
+                         const GlobalContext::FuncSummary &S);
   void handleInlineAsm(llvm::CallBase &CS);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
                             bool rewriteEdges = true);

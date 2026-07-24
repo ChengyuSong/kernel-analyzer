@@ -1,0 +1,141 @@
+# Transfer summaries (--func-summaries): callsite-applied atoms.
+# Line: <name>[*] ATOM [ATOM...]    '*' suffix = prefix match.
+# Ordered, FIRST MATCH WINS (NONE lines carve exclusions out of a
+# following prefix rule). Atoms:
+#   FRESH            per-callsite heap object (drives AllocFuncs paths)
+#   CPY(ret<-argN)   shift-preserving cell copy into the result
+#   ALIAS(ret=argN)  result aliases the argument value
+#   ST(*argC<-argV)  store value argV into *argC
+#   LD(ret<-*argC)   result loaded from *argC
+#   NONE             explicitly no summary (body analyzed)
+#
+# Provenance: migrated 2026-07-24 from the hardcoded isAllocFn table
+# (src/lib/Annotation.cc) — task #26 — plus the dup family with copy
+# semantics (CPY), fixing the measured copy-loss (t_kmemdup.c was 0/2:
+# kmemdup sat in isAllocFn, its body was skipped, the memcpy dropped)
+# and suppressing the shared allocator return-node channel (~470
+# witnessed cross-caller joins at km).
+#
+# ASSUMPTIONS (recorded):
+# - CPY models aligned whole-buffer dup from offset 0; prefix copies
+#   over-approximate soundly.
+# - *_user dup/copy sources are userspace memory: kernel fptrs must
+#   never round-trip through user memory (same assumption as uaccess
+#   asm), so those get FRESH without CPY.
+
+# ---- userspace ----
+malloc FRESH
+calloc FRESH
+_Znwj FRESH
+_ZnwjRKSt9nothrow_t FRESH
+_Znwm FRESH
+_ZnwmRKSt9nothrow_t FRESH
+_Znaj FRESH
+_ZnajRKSt9nothrow_t FRESH
+_Znam FRESH
+_ZnamRKSt9nothrow_t FRESH
+realloc FRESH CPY(ret<-arg0)
+strdup FRESH CPY(ret<-arg0)
+strndup FRESH CPY(ret<-arg0)
+
+# ---- kernel: dup family (FRESH + copy semantics) ----
+kmemdup FRESH CPY(ret<-arg0)
+kmemdup_nul FRESH CPY(ret<-arg0)
+kmemdup_array FRESH CPY(ret<-arg0)
+kstrdup FRESH CPY(ret<-arg0)
+kstrdup_const FRESH CPY(ret<-arg0)
+kstrndup FRESH CPY(ret<-arg0)
+kvmemdup FRESH CPY(ret<-arg0)
+krealloc FRESH CPY(ret<-arg0)
+__krealloc FRESH CPY(ret<-arg0)
+kvrealloc FRESH CPY(ret<-arg0)
+devm_kmemdup FRESH CPY(ret<-arg1)
+devm_krealloc FRESH CPY(ret<-arg1)
+# user-memory sources: no CPY by the uaccess assumption
+memdup_user FRESH
+vmemdup_user FRESH
+memdup_user_nul FRESH
+strndup_user FRESH
+
+# ---- kernel: slab/kmalloc families (legacy isAllocFn migration) ----
+# variable-length array forms were excluded in the legacy table
+kmalloc_array NONE
+kcalloc NONE
+kmalloc_array_node NONE
+kcalloc_node NONE
+krealloc_array NONE
+kmalloc* FRESH
+__kmalloc* FRESH
+kzalloc* FRESH
+kmem_cache_alloc* FRESH
+kmem_cache_zalloc FRESH
+kvmalloc* FRESH
+kvzalloc* FRESH
+kvcalloc FRESH
+vmalloc* FRESH
+vzalloc* FRESH
+__vmalloc* FRESH
+vcalloc FRESH
+
+# ---- kernel: managed / subsystem allocators (legacy migration) ----
+devm_kmalloc* FRESH
+devm_kzalloc* FRESH
+alloc_dr FRESH
+__devres_alloc FRESH
+devres_alloc FRESH
+drmm_kmalloc* FRESH
+drmm_kzalloc* FRESH
+alloc_pages FRESH
+alloc_pages_node FRESH
+alloc_pages_mpol FRESH
+alloc_page FRESH
+alloc_page_vma FRESH
+__get_free_pages FRESH
+__get_free_page FRESH
+__get_dma_pages FRESH
+dma_alloc_attrs FRESH
+dma_alloc_coherent FRESH
+dma_alloc_noncoherent FRESH
+dma_alloc_wc FRESH
+dma_alloc_from_global_coherent FRESH
+# legacy: mempool_alloc and mempool_alloc_pages excluded
+mempool_alloc NONE
+mempool_alloc_pages NONE
+mempool_alloc_slab FRESH
+mempool_kmalloc FRESH
+bio_alloc FRESH
+bio_kmalloc FRESH
+bio_alloc_bioset FRESH
+sk_prot_alloc FRESH
+sk_alloc FRESH
+sock_kmalloc FRESH
+__netdev_alloc_skb FRESH
+__dev_alloc_page FRESH
+dev_alloc_page FRESH
+f2fs_kmalloc* FRESH
+f2fs_kzalloc* FRESH
+f2fs_kvmalloc* FRESH
+f2fs_kvzalloc* FRESH
+f2fs_kmem_cache_alloc FRESH
+bch2_trans_kmalloc FRESH
+__bch2_trans_kmalloc FRESH
+__ntfs_malloc FRESH
+bpf_map_kzalloc FRESH
+bpf_map_kvcalloc FRESH
+bpf_map_kmalloc FRESH
+kunit_kmalloc* FRESH
+kunit_kzalloc* FRESH
+kunit_kcalloc FRESH
+alloc_percpu FRESH
+__alloc_percpu FRESH
+__alloc_percpu_gfp FRESH
+__kfence_alloc FRESH
+kfence_alloc FRESH
+__kasan_kmalloc FRESH
+__kasan_slab_alloc FRESH
+kasan_kmalloc_large FRESH
+flexcop_device_kmalloc FRESH
+tasdevice_kzalloc FRESH
+jent_kvzalloc FRESH
+jent_zalloc FRESH
+uml_kmalloc FRESH

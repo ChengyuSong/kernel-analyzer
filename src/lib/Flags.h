@@ -37,6 +37,7 @@ extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLLazyMint;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;
+extern cl::opt<std::string> FuncSummaryFile;
 extern cl::opt<bool> CFLRootRelevance;
 extern cl::opt<bool> CFLFlowsToIncremental;
 extern cl::opt<unsigned> CFLSolverThreads;

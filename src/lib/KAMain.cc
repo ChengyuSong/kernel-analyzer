@@ -276,6 +276,15 @@ cl::opt<bool> CFLLazyMint(
            "the full mint; only the propagated fact mass shrinks"),
   cl::init(false));
 
+cl::opt<bool> CFLConflationReport(
+  "cfl-conflation-report",
+  cl::desc("After the flows-to fixpoint, rank functions as summary/clone "
+           "candidates: shared-formal conflation (callers x facts in a "
+           "pointer-formal's class) and allocation-site identity spread "
+           "(classes carrying an internal alloc root x wrapper callers). "
+           "The input queue for the offline proposer+confirmer loop"),
+  cl::init(false));
+
 cl::opt<bool> CFLRootRelevance(
   "cfl-root-relevance",
   cl::desc("After the flows-to fixpoint, measure the answer-relevant root "

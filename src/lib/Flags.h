@@ -35,6 +35,7 @@ extern cl::opt<unsigned> CFLFlowsToMaxIters;
 extern cl::opt<unsigned> CFLFieldBuckets;
 extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLLazyMint;
+extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<bool> CFLRootRelevance;
 extern cl::opt<bool> CFLFlowsToIncremental;
 extern cl::opt<unsigned> CFLSolverThreads;

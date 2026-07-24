@@ -4241,6 +4241,159 @@ bool CallGraphPass::runFlowsToResolution() {
            << "%) — demand-driven upper bound\n";
   }
 
+  // --cfl-conflation-report: rank FUNCTIONS (not classes) as candidates
+  // for the summary/clone pipeline (task #17). Two tables:
+  //  Conflate:    shared-formal conflation — callers x facts resident in
+  //               a pointer-formal's class. This product is what a
+  //               per-callsite summary or clone would de-mix (the
+  //               sort/__static_call_update/kmemdup channel). Facts are
+  //               counted on the formal's MERGED class, so they are an
+  //               upper bound for the formal itself — fine for ranking.
+  //  AllocSpread: identity spread of each allocation-site root — how
+  //               many live classes carry it, attributed to the wrapper
+  //               function owning the callsite and its caller count
+  //               (one internal site serving many callers = the
+  //               t_allocinit/kmemdup conflation shape).
+  // The report is the input queue for the offline proposer+confirmer
+  // loop: symptomatic AND summary-confirmable -> summarize; symptomatic
+  // and not -> clone candidate (#17); neither -> leave the body alone.
+  if (CFLConflationReport) {
+    auto tConf = std::chrono::steady_clock::now();
+    std::unordered_map<const Function *, uint32_t> callerCnt;
+    for (auto &ce : Ctx->Callees)
+      for (const Function *tf : ce.second) callerCnt[tf]++;
+    auto classFacts = [&](uint32_t rep) {
+      uint64_t f = 0;
+      for (uint32_t s = 0; s < NSHIFT; s++)
+        f += R[rep][s].count() + RB[rep][s].count();
+      return f;
+    };
+    auto denseRepOf = [&](NodeIndex v) -> int64_t {
+      if (v == AndersNodeFactory::InvalidIndex) return -1;
+      auto dIt = toDense.find(getCanonicalNode(v));
+      if (dIt == toDense.end()) return -1;
+      return (int64_t)find(dIt->second);
+    };
+    // Table 1: shared-formal conflation, GROUPED BY CLASS — hub classes
+    // absorb thousands of formals, so per-function rows would print one
+    // mega-class fifty times. Each row = one class: its fact mass, total
+    // caller weight of the functions whose formals live in it, and the
+    // top member functions (the de-mix targets).
+    struct HubRow {
+      uint64_t facts = 0, callerWeight = 0;
+      std::vector<std::pair<uint32_t, const Function *>> members; // callers
+    };
+    std::unordered_map<uint32_t, HubRow> hubs;
+    size_t fnRows = 0;
+    for (auto &cc : callerCnt) {
+      const Function *F2 = cc.first;
+      if (!F2 || F2->isDeclaration()) continue;
+      int64_t best = -1;
+      uint64_t bestF = 0;
+      for (const Argument &A2 : F2->args()) {
+        if (!A2.getType()->isPointerTy()) continue;
+        int64_t rep = denseRepOf(NF.getValueNodeFor(&A2));
+        if (rep < 0) continue;
+        uint64_t f = classFacts((uint32_t)rep);
+        if (f > bestF) { bestF = f; best = rep; }
+      }
+      {
+        int64_t rep = denseRepOf(NF.getReturnNodeFor(F2));
+        if (rep >= 0) {
+          uint64_t f = classFacts((uint32_t)rep);
+          if (f > bestF) { bestF = f; best = rep; }
+        }
+      }
+      if (best < 0 || bestF == 0) continue;
+      fnRows++;
+      HubRow &h = hubs[(uint32_t)best];
+      h.facts = bestF;
+      h.callerWeight += cc.second;
+      h.members.emplace_back(cc.second, F2);
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> hubRank;
+    for (auto &hv : hubs)
+      hubRank.emplace_back(hv.second.facts * hv.second.callerWeight,
+                           hv.first);
+    size_t K1 = std::min<size_t>(25, hubRank.size());
+    std::partial_sort(hubRank.begin(), hubRank.begin() + K1, hubRank.end(),
+                      std::greater<>());
+    errs() << "Conflate: " << fnRows << " called+defined functions with "
+           << "fact-bearing pointer formals/ret in " << hubs.size()
+           << " classes; top " << K1 << " classes by facts x callerWeight:\n";
+    for (size_t i = 0; i < K1; i++) {
+      HubRow &h = hubs[hubRank[i].second];
+      std::sort(h.members.begin(), h.members.end(),
+                [](auto &a, auto &b) { return a.first > b.first; });
+      errs() << "Conflate: c" << hubRank[i].second << " facts=" << h.facts
+             << " memberFns=" << h.members.size() << " callerWeight="
+             << h.callerWeight << " top:";
+      for (size_t j = 0; j < std::min<size_t>(6, h.members.size()); j++)
+        errs() << " " << h.members[j].second->getName() << "("
+               << h.members[j].first << ")";
+      errs() << "\n";
+    }
+    // Table 2: allocation-site identity spread. One sweep accumulates,
+    // per root id, the number of live classes whose planes carry it.
+    std::vector<uint32_t> spreadOf(nextRoot, 0);
+    {
+      FactSet uni;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n) continue;
+        bool any = false;
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          if (R[n][s].none() && RB[n][s].none()) continue;
+          if (!any) { uni.copyFrom(R[n][s]); any = true; }
+          else uni.unionWith(R[n][s]);
+          uni.unionWith(RB[n][s]);
+        }
+        if (any) uni.forEach([&](uint32_t o) { spreadOf[o]++; });
+      }
+    }
+    std::unordered_map<uint32_t, uint32_t> ridOfRep;
+    for (uint32_t rid = 0; rid < (uint32_t)rootClassOf.size(); rid++)
+      ridOfRep[find(rootClassOf[rid])] = rid; // merged classes: one rid wins
+    struct ARow {
+      const Function *wrapper;
+      uint32_t rid, spread, wcallers;
+    };
+    std::vector<ARow> arows;
+    for (NodeIndex an : AllocSites) {
+      int64_t rep = denseRepOf(an);
+      if (rep < 0) continue;
+      auto rit = ridOfRep.find((uint32_t)rep);
+      if (rit == ridOfRep.end()) continue; // unminted (lazy) or merged away
+      const Value *v = NF.getValueForNode(toOrig[(uint32_t)rep]);
+      const auto *inst = v ? dyn_cast<Instruction>(v) : nullptr;
+      const Function *wrapper = inst ? inst->getFunction() : nullptr;
+      uint32_t wc = 0;
+      if (wrapper) {
+        auto wit = callerCnt.find(wrapper);
+        if (wit != callerCnt.end()) wc = wit->second;
+      }
+      arows.push_back({wrapper, rit->second, spreadOf[rit->second], wc});
+    }
+    size_t K2 = std::min<size_t>(50, arows.size());
+    std::partial_sort(arows.begin(), arows.begin() + K2, arows.end(),
+                      [](const ARow &a, const ARow &b) {
+                        return (uint64_t)a.spread * (a.wcallers + 1) >
+                               (uint64_t)b.spread * (b.wcallers + 1);
+                      });
+    errs() << "AllocSpread: " << arows.size() << " allocation-site roots; "
+           << "top " << K2 << " by spread x (wrapperCallers+1):\n";
+    for (size_t i = 0; i < K2; i++) {
+      const ARow &a2 = arows[i];
+      errs() << "AllocSpread: "
+             << (a2.wrapper ? a2.wrapper->getName() : StringRef("<none>"))
+             << " rid=" << a2.rid << " spread=" << a2.spread
+             << " classes, wrapperCallers=" << a2.wcallers << "\n";
+    }
+    errs() << "ConflationReport: done in "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tConf).count()
+           << " ms\n";
+  }
+
   if (CFLCoTravelStats) {
     auto mix64 = [](uint64_t x) {
       x += 0x9E3779B97F4A7C15ULL;

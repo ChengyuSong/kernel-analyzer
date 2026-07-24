@@ -1646,3 +1646,30 @@ levers noted: front-end peak reduction (per-module edge extraction,
 release IR) would make solver mass the true peak — turning lazy's
 fact-mass cut into a peak-RSS cut; F11 (provable sufficient root set)
 removes the catch-up and keeps the 2.06x solve win.
+
+## 2026-07-23: conflation report v1 (--cfl-conflation-report) — the summary/clone input queue
+
+New post-solve measurement ranking FUNCTIONS as summary/clone
+candidates: (1) shared-formal conflation grouped by CLASS (callers x
+facts resident in a pointer-formal's merged class = what a
+per-callsite summary would de-mix); (2) allocation-site identity
+spread (classes carrying an internal alloc root, attributed to the
+wrapper + its caller count). Runs in ~3 s at km scale.
+
+km subset verdict (deterministic binary, eager):
+- ONE mega-class c513 holds the hottest formal/ret of 5,698 of the
+  6,184 called+defined functions (92%), callerWeight 90,709, 34,051
+  facts — the type-erased void*/callback-data channel (kthread fns,
+  trace callbacks, workqueue/timer payloads). Every other top class
+  carries the SAME 34,051-fact plane: the hub's fact set saturates
+  the entire hot region. Splitting c513 is not one lever among many
+  at km scale — it is the only lever visible above the noise floor.
+- AllocSpread confirms the dup family as the secondary, immediately
+  actionable tier: kstrdup(35 callers), bpf_map_area_alloc(23),
+  kmemdup_nul, kstrndup, shmem_alloc_inode(30) — every top alloc
+  root's spread saturates at ~2,100 classes = hub satellites.
+Next: decompose c513 membership (which tiny utilities' formals
+bridged 5.7k functions into one class — TopMerge/absorbed-member
+samples name them) -> those utilities are the first summary/clone
+targets; rerun the report at whole-kernel scale alongside the next
+pinned run.

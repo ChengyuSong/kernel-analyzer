@@ -6811,7 +6811,7 @@ void CallGraphPass::wireLinkerSectionArrays() {
 //      formals are dead ends), intrinsics limited to the NOOP set +
 //      memset. Rejections are tallied by reason (LEDGER).
 static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
-              g_freshRejSide = 0;
+              g_freshRejSide = 0, g_freshInit = 0;
 void CallGraphPass::confirmFreshWrappers() {
   static GlobalContext::FuncSummary pureFresh; // stable address for the map
   pureFresh.fresh = true;
@@ -6878,24 +6878,72 @@ void CallGraphPass::confirmFreshWrappers() {
           ok = false; // GEP, load, argument, anything else: not pure fresh
         }
         if (!ok) { g_freshRejRet++; continue; }
-        // R2: fresh results consumed only by the return path + icmp.
-        for (const Value *v : onRetPath) {
-          if (!isa<CallBase>(v)) continue;
-          for (const User *U : v->users()) {
-            if (onRetPath.count(cast<Value>(U))) continue;
-            if (isa<ICmpInst>(U)) continue;
-            if (isa<ReturnInst>(U)) continue;
-            ok = false;
-            break;
+        // R2/B: classify every use of the fresh object graph. Allowed:
+        // the return path, null checks, and — the STEP-B extension —
+        // GEP chains off the fresh pointer whose leaves are stores of
+        // FORMAL ARGUMENTS (or non-pointer values) into the object:
+        // the alloc-init shape, expressible as ST(*ret <- argI) atoms
+        // applied per callsite (an infinite clone with no graph
+        // duplication). Anything else remains an escape.
+        SmallPtrSet<const Value *, 16> freshGraph; // fresh ptr + GEPs
+        SmallPtrSet<const Instruction *, 8> initStores;
+        SmallVector<int, 4> initArgs;
+        bool escaped = false, untracedInit = false;
+        {
+          SmallVector<const Value *, 8> gwork;
+          for (const Value *v : onRetPath)
+            if (isa<CallBase>(v)) gwork.push_back(v);
+          SmallPtrSet<const Value *, 16> seen;
+          while (!gwork.empty() && !escaped) {
+            const Value *v = gwork.pop_back_val();
+            if (!seen.insert(v).second) continue;
+            freshGraph.insert(v);
+            for (const User *U : v->users()) {
+              const Value *uv = cast<Value>(U);
+              if (onRetPath.count(uv) || isa<ICmpInst>(U) ||
+                  isa<ReturnInst>(U))
+                continue;
+              if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
+                gwork.push_back(uv);
+                continue;
+              }
+              if (const auto *SI = dyn_cast<StoreInst>(U)) {
+                // store INTO the fresh graph is init; storing the fresh
+                // pointer ITSELF somewhere else is an escape.
+                if (SI->getValueOperand() == v) { escaped = true; break; }
+                const Value *sv =
+                    SI->getValueOperand()->stripPointerCasts();
+                if (!containsPointerType(sv->getType())) {
+                  initStores.insert(SI);
+                  continue;
+                }
+                if (const auto *A2 = dyn_cast<Argument>(sv)) {
+                  if (A2->getParent() == &F) {
+                    initStores.insert(SI);
+                    initArgs.push_back((int)A2->getArgNo());
+                    continue;
+                  }
+                }
+                if (isa<ConstantPointerNull>(sv)) {
+                  initStores.insert(SI);
+                  continue;
+                }
+                untracedInit = true; // ptr from load/global/call: reject
+                break;
+              }
+              escaped = true;
+              break;
+            }
           }
-          if (!ok) break;
         }
-        if (!ok) { g_freshRejEscape++; continue; }
-        // R3: no pointer side effects elsewhere in the body.
+        if (escaped || untracedInit) { g_freshRejEscape++; continue; }
+        // R3: no pointer side effects elsewhere (classified init stores
+        // are exempt — they become atoms).
         for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
              ++II) {
           const Instruction *I2 = &*II;
           if (const auto *SI = dyn_cast<StoreInst>(I2)) {
+            if (initStores.count(I2)) continue;
             if (containsPointerType(SI->getValueOperand()->getType()))
               ok = false;
             continue;
@@ -6916,21 +6964,42 @@ void CallGraphPass::confirmFreshWrappers() {
             ok = false;
         }
         if (!ok) { g_freshRejSide++; continue; }
-        // Promote: allocator mechanics + ret-edge suppression.
+        // Promote. Pure fresh -> shared static summary; alloc-init ->
+        // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
-        Ctx->FuncSummaries[&F] = &pureFresh;
+        if (initArgs.empty()) {
+          Ctx->FuncSummaries[&F] = &pureFresh;
+        } else {
+          Ctx->OwnedSummaries.emplace_back();
+          GlobalContext::FuncSummary &S = Ctx->OwnedSummaries.back();
+          S.fresh = true;
+          std::sort(initArgs.begin(), initArgs.end());
+          initArgs.erase(std::unique(initArgs.begin(), initArgs.end()),
+                         initArgs.end());
+          for (int an : initArgs) {
+            GlobalContext::SummaryAtom A{};
+            A.kind = GlobalContext::SummaryAtom::Store;
+            A.dst = -1; // *ret
+            A.src = an;
+            S.atoms.push_back(A);
+          }
+          Ctx->FuncSummaries[&F] = &S;
+          g_freshInit++;
+        }
         g_freshPromoted++;
         changed = true;
         if (g_freshPromoted <= 20)
-          CG_LOG("ConfirmFresh: promoted " << F.getName() << " (round "
+          CG_LOG("ConfirmFresh: promoted " << F.getName()
+                 << (initArgs.empty() ? "" : " [alloc-init]") << " (round "
                  << round << ")\n");
       }
     }
   }
-  CG_LOG("ConfirmFresh: " << g_freshPromoted << " pure-fresh wrappers "
-         << "promoted in " << round << " rounds; rejected " << g_freshRejRet
-         << " ret-not-fresh, " << g_freshRejEscape << " escapes, "
-         << g_freshRejSide << " ptr-side-effects\n");
+  CG_LOG("ConfirmFresh: " << g_freshPromoted << " wrappers promoted ("
+         << g_freshInit << " alloc-init with ST atoms) in " << round
+         << " rounds; rejected " << g_freshRejRet << " ret-not-fresh, "
+         << g_freshRejEscape << " escapes, " << g_freshRejSide
+         << " ptr-side-effects\n");
 }
 
 // --func-summaries: parse the transfer-summary file. Line format:

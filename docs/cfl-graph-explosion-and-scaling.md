@@ -1969,3 +1969,23 @@ fs13 at this cost = days per run. Confirms the post-#27 ordering
 twice over: fs currently buys zero discrimination AND is unaffordable
 before identity splitting shrinks the clusters; re-evaluate fs after
 #17 step B.
+
+### Step B v1: alloc-init auto-summaries (2026-07-24) — mechanism proven, kernel shape mismatch
+
+The confirmer now classifies stores into the fresh object graph:
+non-pointer/null stores are tolerated, stores of FORMAL pointers
+generate {FRESH, ST(*ret <- argI)} summaries (per-callsite infinite
+clone, no graph duplication — the ST atom applicator already
+existed). t_freshwrap extended with an alloc-init wrapper x2
+callers: 16 smeared pairs -> 4/4 EXACT. Micro suite/hb unchanged.
+
+km: 23 promoted (+4 from non-ptr-store tolerance), but ZERO
+alloc-init conversions — the kernel's 130 remaining escape-class
+wrappers do not fit the direct store-formal shape (out-params,
+registration calls, values derived through phis/calls). Next
+decision needs their anatomy: sample the escape rejections (add
+name+reason dump), then choose richer shapes (FRESH(argJ*)
+out-param atom, @global ST sources) vs true budgeted cloning.
+Identity-splitting scoreboard so far: summaries drained answer-level
+conflation (-763 km, -1,659 kernel) but the ensemble hub needs the
+escape class converted before fs re-evaluation makes sense.

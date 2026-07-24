@@ -26,6 +26,19 @@ static void cb2(void) {}
 
 #define opaque(p) __asm__ volatile("" : : "r"(p) : "memory")
 
+/* alloc-INIT wrapper (step B): store a formal into the fresh object.
+ * Confirms as {FRESH, ST(*ret <- arg0)}; two callers must not
+ * cross-smear (4 pairs without, 2/2 with --cfl-confirm-fresh). */
+__attribute__((noinline)) static struct S *make(void (*f)(void)) {
+  struct S *s = xmalloc(sizeof(struct S));
+  if (s)
+    s->fn = f;
+  return s;
+}
+
+static void cb3(void) {}
+static void cb4(void) {}
+
 int main(void) {
   struct S *a = xmalloc(sizeof(struct S));
   a->fn = cb1;
@@ -35,5 +48,11 @@ int main(void) {
   b->fn = cb2;
   opaque(b);
   b->fn(); /* expect cb2 only */
+  struct S *c = make(cb3);
+  opaque(c);
+  c->fn(); /* expect cb3 only */
+  struct S *d = make(cb4);
+  opaque(d);
+  d->fn(); /* expect cb4 only */
   return 0;
 }

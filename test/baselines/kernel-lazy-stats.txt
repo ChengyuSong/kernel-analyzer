@@ -57,6 +57,9 @@ Lean (proof/lean/CompositionalCFL/FlowsTo.lean, commit daf04ba): sderiv_catchup
   answer_not_derivable_restricted (necessity counterexample). Open: F11 —
   a provably sufficient restricted root set (would drop the catch-up cost).
 
-CONFIRMATION RUN: a fixed-binary whole-kernel lazy run must reproduce
-kernel-lazy-icalls.sort.gz byte-for-byte; launched 2026-07-23 evening as
-kernel-lazy3 (result recorded in the follow-up commit touching this file).
+CONFIRMATION RUN (kernel-lazy3, commit 1f5ff6e binary, completed
+2026-07-24): rc=0, wall 2:58:09, peak RSS 40.05 GB; ICALL dump
+BYTE-IDENTICAL to kernel-lazy-icalls.sort.gz — the GUID-filter binary
+reproduces the pinned canonical dump exactly, closing the loop on the
+constructed-pin methodology. (Wall was shared with concurrent km-scale
+measurement runs; the 2:24 lazy2 figure is the cleaner wall number.)

@@ -2056,3 +2056,32 @@ sample next), other-use 24 (suspect refcount atomics), init-other
 created during resolution-time application are not pushed to
 newAllocNodes (from-scratch default unaffected; wire before enabling
 incremental+confirm-fresh together).
+
+### Step B asymptote (2026-07-24) — funnel converged at km; wrapper identity is NOT the km hub driver
+
+Callee sampling showed a long tail (top x8 __raw_spin_lock_init);
+added noop-intrinsic + curated benign-init tolerances (lock/waitqueue
+/completion initializers — no fptrs at init time). Three tolerance
+rounds: escapes 130->120->118, conversions PLATEAUED at 27 promoted
+/ 4 alloc-init. The residue is multi-feature complex bodies
+(mempool_init_node, rb_allocate_cpu_buffer) — summary composition
+has captured what it cleanly can.
+
+BIGGER FINDING: all 27 conversions produced ZERO km answer/hub
+change. Combined with the summaries arc (whose ret-bridge fix
+already drained the answer-level allocator conflation), the km
+evidence says ALLOCATION-WRAPPER IDENTITY IS NOT THE km HUB'S
+DRIVER — a partial falsification of the #27 'identity splitting is
+the lever' reading: the ensemble glue is dominated by non-heap
+witnesses (formal/no-in identities, arrays, strings). Open paths,
+in decreasing expected value:
+ 1. whole-kernel eval of --cfl-confirm-fresh (drivers/fs have far
+    more wrapper layering than the km core — the real test, rides
+    the next pinned run);
+ 2. budgeted body CLONING for the 118-residue (different mechanism;
+    only worth building if (1) shows wrapper conflation at scale);
+ 3. accept that hub splitting requires attacking formal/no-in
+    identity webs (the 44k-member kernel hub's formals) — context
+    sensitivity beyond heap cloning, the expensive frontier.
+The confirmer machinery (5 shapes, atoms, funnel telemetry) stands
+regardless: sound, validated, and the whole-kernel run decides.

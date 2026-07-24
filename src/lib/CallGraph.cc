@@ -6814,6 +6814,7 @@ static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
               g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
               g_freshHelperComposed = 0;
 static std::map<std::string, size_t> g_escapeBuckets;
+static std::map<std::string, size_t> g_escapeCallees;
 void CallGraphPass::confirmFreshWrappers() {
   static GlobalContext::FuncSummary pureFresh; // stable address for the map
   pureFresh.fresh = true;
@@ -7187,6 +7188,28 @@ void CallGraphPass::confirmFreshWrappers() {
               }
               if (const auto *CB2 = dyn_cast<CallBase>(U)) {
                 const Function *EC = CB2->getCalledFunction();
+                if (EC && (EC->getName().starts_with("llvm.memset") ||
+                           EC->getName().starts_with("llvm.lifetime") ||
+                           EC->getName().starts_with("llvm.dbg"))) {
+                  continue; // zeroing/markers: no pointer content moved
+                }
+                // Curated benign-init callees: lock/waitqueue/completion
+                // initializers store no program function pointers at
+                // init time (lockdep names/keys are rodata metadata).
+                // LEDGERed via the promotion log; extend deliberately.
+                static const char *kBenignInit[] = {
+                    "__raw_spin_lock_init", "lockdep_init_map_type",
+                    "__init_waitqueue_head", "__mutex_init",
+                    "init_completion", "__init_swait_queue_head",
+                    "__init_rwsem", "seqcount_init", "__seqcount_init"};
+                bool benign = false;
+                if (EC)
+                  for (const char *bn : kBenignInit)
+                    if (EC->getName() == bn) { benign = true; break; }
+                if (benign) {
+                  initCalls.insert(CB2);
+                  continue;
+                }
                 if (EC && isFreeFn(EC->getName())) {
                   // fresh freed on an error path: the object dies; the
                   // summary's fresh-object over-approximation is sound
@@ -7236,6 +7259,7 @@ void CallGraphPass::confirmFreshWrappers() {
                 }
                 if (!composed) {
                   rejWhy = EC ? "call-escape" : "icall-escape";
+                  if (EC) g_escapeCallees[EC->getName().str()]++;
                   escaped = true;
                   break;
                 }
@@ -7359,6 +7383,17 @@ void CallGraphPass::confirmFreshWrappers() {
   for (auto &eb : g_escapeBuckets)
     CG_LOG("ConfirmFresh escape-bucket[" << eb.first << "]: " << eb.second
            << "\n");
+  {
+    std::vector<std::pair<size_t, std::string>> ce;
+    for (auto &kv : g_escapeCallees) ce.emplace_back(kv.second, kv.first);
+    std::sort(ce.begin(), ce.end(), std::greater<>());
+    size_t shown = 0;
+    for (auto &kv : ce) {
+      if (shown++ >= 25) break;
+      CG_LOG("ConfirmFresh escape-callee x" << kv.first << " " << kv.second
+             << "\n");
+    }
+  }
 }
 
 // --func-summaries: parse the transfer-summary file. Line format:

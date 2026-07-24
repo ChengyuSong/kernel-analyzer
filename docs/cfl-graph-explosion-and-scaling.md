@@ -1748,3 +1748,41 @@ TWO causal mechanisms, each with a principled treatment:
 Order: (2) first — small, sound, immediately confirmable; then (1)
 as the big lever, in tandem with per-field cells (fs mode shrinks
 what a merge conflates even before the rodata refinement).
+
+## 2026-07-24: transfer summaries shipped (task #26) — isAllocFn retired, two defects fixed
+
+--func-summaries=func_summaries.txt: callsite-applied atom summaries
+(FRESH/CPY/ALIAS/ST/LD/NONE; ordered, first-match-wins, prefix
+support), AUTHORITATIVE over the legacy hardcoded isAllocFn table
+when loaded (without the flag, legacy path bit-identical). A summary
+at a callsite is a zero-cost infinite clone — per-callsite identity,
+no shared formal/ret mixing. Seeded with the full isAllocFn migration
++ the dup family with CPY.
+
+Two measured defects fixed:
+1. LIVE SOUNDNESS HOLE: kmemdup was in isAllocFn, allocator bodies
+   are skipped, so every dup's memcpy was DROPPED — kmemdup'd ops
+   never resolved (t_kmemdup.c: 0/2 legacy). CPY(ret<-arg0) restores
+   the copy as a shift-preserving cell edge: 2/2 EXACT.
+2. ALLOCATOR-RET WITNESS BRIDGE (the km ~470-join channel): the
+   alloc branch wired the allocator's shared return-node class to
+   every callsite; that class's identity root keyed joins bridging
+   ALL callers' objects. Suppressed for summarized allocators.
+   t_allocinit: 4/2 conflated -> 2/2 EXACT — the baseline conflation
+   micro test's smear was THIS bridge, not the wrapper-internal
+   site; no cloning needed. Task #17's cloning scope shrinks to
+   genuinely non-summarizable wrappers.
+
+km eval (vs 81,293 pin): 80,531 pairs = -763 conflation removals
+(tracing_stat_open seq-ops smear 375, shmem/bpf fs_context ops
+cross-contamination, swap bio callbacks — all ret-bridge shapes),
++1 dup recovery (__cgroup_bpf_run_filter_sysctl ->
+proc_doulongvec_minmax: the kmemdup'd sysctl-table class; kernel
+scale will surface many more from drivers/fs). 433 functions
+summarized, 70 CPY edges. harfbuzz identical; libpng identical;
+micro suite identical except the two intended fixes; smoke 4/4.
+Hub c513 persists as expected (string glue = #25's job).
+
+Whole-kernel run with summaries = next pinned baseline (answers
+change: +dup flows, -ret-bridge conflation); rides after the
+in-flight kernel conflation-report run.

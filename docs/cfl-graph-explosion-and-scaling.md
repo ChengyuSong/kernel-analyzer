@@ -1904,3 +1904,38 @@ the 25 known-infeasible pairs (names + source evidence in the
 the wildcard chain on the path names the smear source. hb fs13 at
 40 s makes this a fast-iteration debug loop. Kernel-side fs cost:
 km fs13 measurement in flight.
+
+### fs discrimination loss DIAGNOSED (task #27, 2026-07-24) — it is the hub, and it is one problem
+
+Trace (--cfl-trace-func=hb_ucd_script --cfl-trace-fptr=
+would_match_input, fs13): the root reaches the fptr class c8813 via
+BRIDGE-INIT as bridged facts at ALL shifts, from an already-smeared
+partner class. c8813 is the fptr class of 270 icalls (paint funcs,
+shape features, match slots — one merged class); its cluster keys
+include .str.18 (string literal, shift 0) and the
+hb_accelerate_subtables apply-array origins (variable-index GEP →
+fx wildcard). Rodata-probe control: skipping all rodata-keyed joins
+drops hb fs13 to 1,876 pairs but ALL 30 would_match_input targets
+survive — the mega-cluster re-forms through its other keys.
+
+CONCLUSIONS:
+1. fs discrimination died because the fptr CLASSES merged — shift
+   planes cannot discriminate what unification has already conflated.
+   Not a solver bug: every join is grammar-licensed; the Jul 8-17
+   convergence with FI was the closure getting more complete, not
+   less sound.
+2. The hb fptr mega-cluster is ensemble-glued (strings + variable-
+   index fptr arrays + memcpy'd func tables), same over-determination
+   as the km/kernel hubs. fs discrimination, closure size, and answer
+   conflation are ONE problem: witness-keyed cell unification is
+   inherently hub-forming on real code, and union-find transitivity
+   across keys makes the ensemble effect unavoidable within this
+   solver shape (phase-2 already proved the grammar licenses the
+   equivalent smear via load/store laundering).
+3. The discrimination lever is therefore IDENTITY SPLITTING (#17):
+   fewer co-occurring witnesses = fewer cross-keys = smaller
+   clusters. Per-field cells remain necessary (same-shift keying) but
+   are not sufficient; they pay off only after identities split.
+   Roadmap: #17 confirmer sweep + cloning FIRST, fs re-evaluated
+   after, #25 stays downgraded (its keys are over-determined for
+   discrimination too — measured twice now).

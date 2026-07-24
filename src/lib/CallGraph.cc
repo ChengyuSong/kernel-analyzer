@@ -6838,10 +6838,12 @@ void CallGraphPass::confirmFreshWrappers() {
     bool valid = false;
     int objParam = -1;
     SmallVector<int, 4> srcFormals; // helper formal indices stored into obj
+    SmallVector<const GlobalValue *, 4> srcGlobals; // globals stored into obj
     bool selfStore = false;         // obj-interior stored into obj
   };
   static std::map<const Function *, InitInfo> initCache;
-  auto initOnlyInfo = [&](const Function *C) -> const InitInfo & {
+  std::function<const InitInfo &(const Function *)> initOnlyInfoRef;
+  initOnlyInfoRef = [&](const Function *C) -> const InitInfo & {
     auto it = initCache.find(C);
     if (it != initCache.end()) return it->second;
     InitInfo &inf = initCache[C];
@@ -6852,6 +6854,8 @@ void CallGraphPass::confirmFreshWrappers() {
     bool bad = false;
     SmallPtrSet<const Value *, 16> objGraph;
     SmallVector<int, 4> srcs;
+    SmallVector<const GlobalValue *, 4> gsrcs;
+    SmallPtrSet<const Instruction *, 4> nestedInit;
     bool self = false;
     for (const Argument &A2 : C->args()) {
       if (!A2.getType()->isPointerTy()) continue;
@@ -6860,6 +6864,8 @@ void CallGraphPass::confirmFreshWrappers() {
       SmallPtrSet<const Value *, 16> g2;
       bool storedInto = false, escapes = false;
       SmallVector<int, 4> mySrcs;
+      SmallVector<const GlobalValue *, 4> myGsrcs;
+      SmallPtrSet<const Instruction *, 4> myNested;
       bool mySelf = false;
       while (!w2.empty() && !escapes) {
         const Value *v2 = w2.pop_back_val();
@@ -6899,8 +6905,64 @@ void CallGraphPass::confirmFreshWrappers() {
             if (const auto *SA = dyn_cast<Argument>(sv2)) {
               if (SA->getParent() == C) { mySrcs.push_back((int)SA->getArgNo()); continue; }
             }
+            if (const auto *SG = dyn_cast<GlobalValue>(sv2)) {
+              myGsrcs.push_back(SG); // ops tables etc.
+              continue;
+            }
             escapes = true; // derived value: reject helper
             break;
+          }
+          if (const auto *NC = dyn_cast<CallBase>(U2)) {
+            // nested init helper on this param (vma_init ->
+            // vma_numab_state_init shape): recurse. The cache entry is
+            // default-invalid while in flight, so cycles reject
+            // naturally.
+            const Function *C2 = NC->getCalledFunction();
+            bool okNested = false;
+            if (C2 && NC->getCalledOperand()->stripPointerCasts() != v2 &&
+                NC->getType()->isVoidTy()) {
+              const InitInfo &ni = initOnlyInfoRef(C2);
+              bool pOk = ni.valid && ni.objParam < (int)NC->arg_size() &&
+                         NC->getArgOperand(ni.objParam)
+                                 ->stripPointerCasts() == v2;
+              if (pOk)
+                for (unsigned ai2 = 0; ai2 < NC->arg_size(); ai2++)
+                  if ((int)ai2 != ni.objParam &&
+                      NC->getArgOperand(ai2)->stripPointerCasts() == v2)
+                    pOk = false;
+              if (pOk) {
+                okNested = true;
+                for (int m3 : ni.srcFormals) {
+                  if (m3 >= (int)NC->arg_size()) { okNested = false; break; }
+                  const Value *av2 =
+                      NC->getArgOperand(m3)->stripPointerCasts();
+                  if (!containsPointerType(av2->getType())) continue;
+                  if (isa<ConstantPointerNull>(av2)) continue;
+                  if (g2.count(av2)) { mySelf = true; continue; }
+                  if (const auto *NA = dyn_cast<Argument>(av2)) {
+                    if (NA->getParent() == C) {
+                      mySrcs.push_back((int)NA->getArgNo());
+                      continue;
+                    }
+                  }
+                  if (const auto *NG = dyn_cast<GlobalValue>(av2)) {
+                    myGsrcs.push_back(NG);
+                    continue;
+                  }
+                  okNested = false;
+                  break;
+                }
+                if (okNested) {
+                  for (const GlobalValue *NG2 : ni.srcGlobals)
+                    myGsrcs.push_back(NG2);
+                  if (ni.selfStore) mySelf = true;
+                  storedInto = true;
+                  myNested.insert(NC);
+                }
+              }
+            }
+            if (!okNested) { escapes = true; break; }
+            continue;
           }
           escapes = true;
           break;
@@ -6912,6 +6974,8 @@ void CallGraphPass::confirmFreshWrappers() {
         obj = (int)A2.getArgNo();
         objGraph = g2;
         srcs = mySrcs;
+        gsrcs = myGsrcs;
+        for (const Instruction *NI2 : myNested) nestedInit.insert(NI2);
         self = mySelf;
       }
     }
@@ -6932,6 +6996,7 @@ void CallGraphPass::confirmFreshWrappers() {
         continue;
       }
       if (const auto *CB3 = dyn_cast<CallBase>(I3)) {
+        if (nestedInit.count(I3)) continue; // composed nested init
         const Function *CF3 = CB3->getCalledFunction();
         if (CF3 && isNoopIntrinsic(CF3)) continue;
         return inf; // any real call: reject helper (v1)
@@ -6943,9 +7008,11 @@ void CallGraphPass::confirmFreshWrappers() {
     inf.valid = true;
     inf.objParam = obj;
     inf.srcFormals = srcs;
+    inf.srcGlobals = gsrcs;
     inf.selfStore = self;
     return inf;
   };
+  auto &initOnlyInfo = initOnlyInfoRef;
   size_t round = 0;
   bool changed = true;
   while (changed) {
@@ -7013,6 +7080,7 @@ void CallGraphPass::confirmFreshWrappers() {
         SmallPtrSet<const Instruction *, 8> initStores;
         SmallPtrSet<const Instruction *, 4> initCalls; // composed helpers
         SmallVector<int, 4> initArgs;
+        SmallVector<const GlobalValue *, 4> initGlobals;
         bool selfStore = false;
         bool escaped = false, untracedInit = false;
         const char *rejWhy = nullptr; // escape-anatomy bucket
@@ -7043,6 +7111,13 @@ void CallGraphPass::confirmFreshWrappers() {
                       SI->getPointerOperand()->stripPointerCasts();
                   while (const auto *G2 = dyn_cast<GetElementPtrInst>(pb))
                     pb = G2->getPointerOperand()->stripPointerCasts();
+                  if (seen.count(pb) || freshGraph.count(pb)) {
+                    // self-linkage (INIT_LIST_HEAD): object interior
+                    // stored into the object itself
+                    initStores.insert(SI);
+                    selfStore = true;
+                    continue;
+                  }
                   if (const auto *PA = dyn_cast<Argument>(pb))
                     rejWhy = PA->getParent() == &F ? "outparam-store"
                                                    : "store-foreign-arg";
@@ -7072,7 +7147,12 @@ void CallGraphPass::confirmFreshWrappers() {
                   initStores.insert(SI);
                   continue;
                 }
-                untracedInit = true; // ptr from load/global/call: reject
+                if (const auto *GVs = dyn_cast<GlobalValue>(sv)) {
+                  initStores.insert(SI); // ops table / named fn into fresh
+                  initGlobals.push_back(GVs);
+                  continue;
+                }
+                untracedInit = true; // ptr from load/call: reject
                 rejWhy = isa<GlobalValue>(sv)   ? "init-from-global"
                          : isa<LoadInst>(sv)    ? "init-from-load"
                          : isa<CallBase>(sv)    ? "init-from-call"
@@ -7082,6 +7162,12 @@ void CallGraphPass::confirmFreshWrappers() {
               }
               if (const auto *CB2 = dyn_cast<CallBase>(U)) {
                 const Function *EC = CB2->getCalledFunction();
+                if (EC && isFreeFn(EC->getName())) {
+                  // fresh freed on an error path: the object dies; the
+                  // summary's fresh-object over-approximation is sound
+                  initCalls.insert(CB2);
+                  continue;
+                }
                 bool composed = false;
                 if (EC && CB2->getCalledOperand()->stripPointerCasts() != v) {
                   const InitInfo &inf = initOnlyInfo(EC);
@@ -7114,6 +7200,8 @@ void CallGraphPass::confirmFreshWrappers() {
                     }
                     if (mapOk) {
                       for (int g3 : mapped) initArgs.push_back(g3);
+                      for (const GlobalValue *G5 : inf.srcGlobals)
+                        initGlobals.push_back(G5);
                       if (inf.selfStore) selfStore = true;
                       initCalls.insert(CB2);
                       composed = true;
@@ -7181,7 +7269,7 @@ void CallGraphPass::confirmFreshWrappers() {
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
-        if (initArgs.empty() && !selfStore) {
+        if (initArgs.empty() && initGlobals.empty() && !selfStore) {
           Ctx->FuncSummaries[&F] = &pureFresh;
         } else {
           Ctx->OwnedSummaries.emplace_back();
@@ -7203,6 +7291,19 @@ void CallGraphPass::confirmFreshWrappers() {
             A.dst = -1;
             A.src = -1; // object interior stored into itself
             S.atoms.push_back(A);
+          }
+          {
+            std::sort(initGlobals.begin(), initGlobals.end());
+            initGlobals.erase(
+                std::unique(initGlobals.begin(), initGlobals.end()),
+                initGlobals.end());
+            for (const GlobalValue *G5 : initGlobals) {
+              GlobalContext::SummaryAtom A{};
+              A.kind = GlobalContext::SummaryAtom::Store;
+              A.dst = -1; // *ret
+              A.gsrc = G5;
+              S.atoms.push_back(A);
+            }
           }
           Ctx->FuncSummaries[&F] = &S;
           g_freshInit++;
@@ -7369,7 +7470,11 @@ void CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::Store: {
-      NodeIndex c = nodeForRef(A.dst, true), v = nodeForRef(A.src, false);
+      NodeIndex c = nodeForRef(A.dst, true);
+      NodeIndex v = A.gsrc ? getRepNodeForValue(A.gsrc)
+                           : nodeForRef(A.src, false);
+      if (A.gsrc && v == AndersNodeFactory::InvalidIndex)
+        v = getCanonicalNode(NF.createValueNode(A.gsrc));
       if (c == AndersNodeFactory::InvalidIndex ||
           v == AndersNodeFactory::InvalidIndex)
         break;

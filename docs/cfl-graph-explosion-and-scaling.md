@@ -2014,3 +2014,27 @@ desc_set_defaults) fail on exactly two missing capabilities:
     recursion the wrapper level already does once).
 Both mechanical; the call-escape bucket (80 of 130 at km) is the
 prize. After those: whole-kernel eval + re-pin, then fs re-check.
+
+### Step B v3 tolerances (2026-07-24): funnel converging, kernel wrappers stack features
+
+Added: ST(*ret <- @global) atoms (ops-table init — applicator +
+walk + helper + composition), recursive InitInfo (nested init
+helpers, cycle-safe via in-flight cache default), wrapper-level
+self-linkage stores (INIT_LIST_HEAD), free-family call tolerance
+(error-path kfree). t_freshwrap still 6/6; micro suite/km answers
+unchanged.
+
+km funnel state: escapes still 130 / 0 conversions, but buckets
+migrate as tolerances land: call-escape 80->50, store-other 22->6;
+now other-use 24 (sample suggests refcount/atomic ops on object
+fields), init-from-call 12 (SUB-ALLOCATIONS: vm_area_alloc stores a
+second kmem_cache_alloc result into the object — needs a FreshSub
+atom: per-callsite opaque sub-object stored into *ret; NodeFactory
+needs a keyed multi-object-per-callsite API), init-other 12.
+READING: real kernel alloc wrappers stack 3-5 features each; the
+funnel converges only when the LAST feature of each wrapper is
+tolerated. Next features by measured size: FreshSub (12+), other-use
+anatomy (24), then re-measure. vm_area_alloc is the canonical
+all-features test case (extract pinned at /tmp/vaa.ll shape:
+formal store + global store + volatile self-linkage + sub-alloc +
+error-path free).

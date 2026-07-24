@@ -120,6 +120,8 @@ public:
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)
+    const llvm::GlobalValue *gsrc = nullptr; // Store: global-value source
+                                             // (generated atoms only)
   };
   struct FuncSummary {
     std::vector<SummaryAtom> atoms;

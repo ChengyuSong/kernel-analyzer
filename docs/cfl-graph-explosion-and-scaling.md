@@ -1877,3 +1877,30 @@ conflates — the original plan) + identity splitting (#17 confirmer
 sweep + cloning), jointly; single witness-class rules cannot split
 an ensemble-glued hub. Three probes, three falsified sizing
 hypotheses — the measurement stack is earning its keep.
+
+## 2026-07-24: per-field-cells workstream reopened — fs status corrected
+
+Re-measured hb fs13 with the current stack (summaries, bidi, all
+task #14-#26 machinery): 40 s wall (was 33 min on 2026-07-08 —
+bidi-prune mints 7,834 vs 12,233 roots, plus the accumulated solver
+work), 673M native facts, 259 VX bridges. TWO STALE NARRATIVES
+CORRECTED:
+1. The would_match_input fs soundness bug is GONE — all 7 match
+   functions resolve, identical to FI, and today's dump is
+   byte-identical to the July-17 hb-fs13 pinned baseline.
+2. That baseline was ALREADY identical to FI: fs13 has bought ZERO
+   precision on harfbuzz since mid-July. The July-8 "29 pruned (25
+   source-verified correct)" state was transient; whatever fix landed
+   in the Jul 8-17 window (incremental solving / bridge rework era)
+   both cured the soundness drops and re-admitted the 25 infeasible
+   pairs. Not summaries (fs13 without --func-summaries: same 2,824).
+
+The per-field-cells problem statement is therefore NOT "fix the fs
+bug" but RECOVER DISCRIMINATION: find which shift-plane flow admits
+the 25 known-infeasible pairs (names + source evidence in the
+2026-07-08 LLM-audit section). Entry point: trace one audited pair
+(hb_ucd_script -> would_match_input's match slot) via
+--cfl-trace-func/--cfl-trace-fptr; if it arrives via the X plane,
+the wildcard chain on the path names the smear source. hb fs13 at
+40 s makes this a fast-iteration debug loop. Kernel-side fs cost:
+km fs13 measurement in flight.

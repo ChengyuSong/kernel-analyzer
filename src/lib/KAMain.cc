@@ -276,6 +276,14 @@ cl::opt<bool> CFLLazyMint(
            "the full mint; only the propagated fact mass shrinks"),
   cl::init(false));
 
+cl::opt<std::string> CFLAblateFuncs(
+  "cfl-ablate-funcs",
+  cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: comma-separated function "
+           "names whose bodies emit no edges (treated as opaque), to "
+           "causally attribute hub-class gluing in the conflation "
+           "report. Every ablation is WARNED loudly"),
+  cl::init(""));
+
 cl::opt<bool> CFLConflationReport(
   "cfl-conflation-report",
   cl::desc("After the flows-to fixpoint, rank functions as summary/clone "

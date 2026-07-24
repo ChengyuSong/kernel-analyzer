@@ -1702,3 +1702,49 @@ rerun km ~5 min, measure c513 size): the ranked suspects are
     invocation at the bpf_prog level, exclude the interpreter body),
  3. __lock_acquire/lockdep (debug machinery, likely excludable),
  4. pte walkers (int-provenance interplay).
+
+### c513 CAUSAL attribution — merge-witness provenance (km, 2026-07-23)
+
+Residency was a red herring: ablating the top residents
+(___bpf_prog_run, ___slab_alloc+__slab_free, __lock_acquire) each
+moved c513 by <0.5% — three null results. HubMerge (join-witness
+provenance, needs --cfl-root-relevance) gives causality: 28,396 of
+the run's 29,583 joins (96%) landed in c513, 10,187 distinct
+witnesses, 0 from a-SCC collapse. Top witnesses:
+
+  x13946  .str.5            <- ONE anonymous string literal = 47% of
+                               ALL joins in the program
+  x508    <synthetic c517>
+  x285/270/262  __bpf_trace_tp_map_task_newtask / __tracepoint_ /
+                __tpstrtab_task_newtask   (tracepoint static trio)
+  x227    kmalloc_trace     \
+  x143    __kmalloc          |  internal heap objects of the BASE
+  x57     kmem_cache_alloc   |  allocators' own bodies
+  x41     __alloc_percpu    /
+  x45     .str.1            (more rodata strings)
+
+TWO causal mechanisms, each with a principled treatment:
+
+1. RODATA WITNESSES (strings, __tpstrtab, const tables): shared
+   literals sit in thousands of `const char *name` pointers; under
+   FI cells a join keyed by a shared literal merges whole-object
+   memory of unrelated structs. Treatment sketch: a rodata object's
+   home cell is IMMUTABLE (no runtime stores into rodata), so reader
+   cells can COPY from the home cell (directional a-edge) instead of
+   UNIFYING with it — read flows (const ops tables -> icalls) are
+   preserved, reader<->reader unification disappears. Grammar-level
+   refinement: needs the no-rodata-stores assumption stated, a
+   solve-time LEDGER for stores whose base carries a rodata origin
+   (violation counter), and a Lean look (mal restricted to writable
+   witnesses). Expected: kills ~half of km joins outright.
+
+2. BASE-ALLOCATOR INTERNAL IDENTITY (#17 confirmed causally): the
+   internal object of __kmalloc's own body flows to every caller and
+   keys cross-caller joins — t_allocinit at the root of the heap.
+   Treatment: FRESH summary for base allocators with definitions
+   (suppress the internal identity, per-callsite AllocSites already
+   exist) — the summary pipeline's first confirmed entry, cheap.
+
+Order: (2) first — small, sound, immediately confirmable; then (1)
+as the big lever, in tandem with per-field cells (fs mode shrinks
+what a merge conflates even before the rodata refinement).

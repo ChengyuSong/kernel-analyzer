@@ -4399,6 +4399,45 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << "HubGlue: " << glue[j].second->getName() << " "
                << g.vals << "/" << g.formals << "/" << g.insts << "\n";
       }
+      // Merge provenance: the joins that BUILT this class, keyed by
+      // witness origin (a-SCC collapses carry no witness — their share
+      // is the remainder). Residency histograms proved non-causal
+      // (bpf/slab/lockdep ablations: null); witnesses are causal by
+      // construction — each entry is a merge that actually fired keyed
+      // by that origin.
+      std::unordered_map<uint32_t, uint32_t> witHits;
+      size_t hubJoins = 0;
+      for (auto &mw : mergeWitness)
+        if ((uint32_t)find(mw.second) == hubRep) {
+          witHits[mw.first]++;
+          hubJoins++;
+        }
+      auto ridName = [&](uint32_t rid) -> std::string {
+        auto fit2 = funcRootOf.find(rid);
+        if (fit2 != funcRootOf.end())
+          return ("fn:" + fit2->second->getName()).str();
+        uint32_t cls = rootClassOf[rid];
+        const Value *V2 = NF.getValueForNode(toOrig[cls]);
+        if (!V2) return "<synthetic c" + std::to_string(cls) + ">";
+        if (V2->hasName()) return V2->getName().str();
+        if (const auto *I2 = dyn_cast<Instruction>(V2))
+          return (I2->getFunction()->getName().str() + "::" +
+                  I2->getOpcodeName());
+        return "<anon>";
+      };
+      std::vector<std::pair<uint32_t, uint32_t>> witRank; // (count, rid)
+      for (auto &wh : witHits) witRank.emplace_back(wh.second, wh.first);
+      size_t KW = std::min<size_t>(20, witRank.size());
+      std::partial_sort(witRank.begin(), witRank.begin() + KW, witRank.end(),
+                        std::greater<>());
+      errs() << "HubMerge: c" << hubRank[hi2].second << " " << hubJoins
+             << " witnessed joins into this class by " << witHits.size()
+             << " distinct witnesses (run totals: " << mergeCount
+             << " merges, " << mergesFromSCC << " from a-SCC collapse); "
+             << "top witnesses:\n";
+      for (size_t j = 0; j < KW; j++)
+        errs() << "HubMerge: x" << witRank[j].first << " "
+               << ridName(witRank[j].second) << "\n";
     }
 
     // Table 2: allocation-site identity spread. One sweep accumulates,
@@ -5115,6 +5154,28 @@ void CallGraphPass::emitLocalAllocaSummaryEdges() {
 bool CallGraphPass::runOnFunction(Function *F) {
 
   CG_LOG("######\nProcessing Func: " << F->getName() << "\n");
+
+  // --cfl-ablate-funcs: MEASUREMENT-ONLY UNSOUND PROBE. Skip body-edge
+  // emission for the named functions (exact name, or name up to a '.'
+  // uniquification suffix) to attribute hub-class gluing causally
+  // (conflation report). The function stays a call target — callers
+  // still wire actuals to its formals — but its body contributes no
+  // flows, exactly "treat as opaque". Never use for real analysis.
+  if (!CFLAblateFuncs.empty()) {
+    static size_t g_ablated = 0;
+    StringRef fname = F->getName();
+    StringRef base = fname.take_front(fname.find('.'));
+    StringRef spec(CFLAblateFuncs);
+    while (!spec.empty()) {
+      auto [head, rest] = spec.split(',');
+      if (!head.empty() && (fname == head || base == head)) {
+        WARNING("[MEASUREMENT-ONLY UNSOUND] ablating body of "
+                << fname << " (" << ++g_ablated << " ablations)\n");
+        return false;
+      }
+      spec = rest;
+    }
+  }
 
   // Per-instruction node creation is idempotent (already done in doInitialization
   // when CFLGlobalDedup is active), but we still need it for the non-dedup path.

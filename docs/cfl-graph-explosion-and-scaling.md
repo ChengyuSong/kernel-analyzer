@@ -1842,3 +1842,16 @@ estimator before building it: a probe that skips joins keyed by
 isConstant()-global origins entirely (over-removes: also breaks
 const-table home-cell reads, so answers drop; gives upper bound on
 hub reduction).
+
+### Whole-kernel pin with transfer summaries (2026-07-24, task #26 closed)
+
+New pinned baseline test/baselines/kernel-summ-*: 16,532 icalls /
+5,646,829 pairs, wall 3:02, solve ~250 s/iter (summaries cost
+nothing), 2,248 functions summarized / 383 CPY edges. vs the lazy
+pin: +5,802 dup-flow recoveries (per-netns kmemdup'd fib rule ops =
+919 pairs at call_fib_notifier alone, MSI descriptor ops,
+decompressor/driver contexts, sysctl tables — all previously DROPPED
+by the isAllocFn body-skip hole), -1,659 ret-bridge smear removals
+(sysfs attribute cross-kobject, drm_flip_work, ACPI SCI lists,
+crypto ctx), -188 icalls that only ever resolved to smear. Reviewed
+both directions; no genuine flow lost.

@@ -1,0 +1,32 @@
+Whole-kernel flows-to baseline WITH TRANSFER SUMMARIES (2026-07-24, task #26)
+commits: b9468f4 (summary infrastructure) on top of the task #21 line
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
+        --func-summaries=func_summaries.txt --cfl-dump-icalls --bc-list bclist
+        (EAGER minting; lazy==eager equivalence pinned separately in
+         kernel-lazy-stats.txt)
+
+resolved: 16,532 icalls / 5,646,829 plane-derived pairs, converged iteration 4
+dump: kernel-summ-icalls.sort.gz
+run: wall 3:02:07, peak RSS 40.08 GB (front-end, as always)
+solve: 252.1 259.8 251.1 244.1 247.5 s/iter (~21 min — summaries cost ~nothing)
+FuncSummary LEDGER: 106 specs -> 2,248 functions summarized, 383 CPY edges,
+0 atom refs skipped
+
+vs kernel-lazy pin (16,720/5,644,480; dump 5,644,875 lines):
+  +5,802 pairs ADDED — dup-flow recoveries (kmemdup CPY): per-netns fib
+   rule ops (fib4_rule_*/fib4_seq_read at call_fib_notifier, 919), MSI
+   descriptor ops (pci_irq_mask/unmask_msi[x]), decompressor and
+   e1000/i915 driver contexts, sysctl tables. These flows were DROPPED
+   before (kmemdup sat in isAllocFn with its body skipped — live
+   soundness hole, t_kmemdup.c 0/2 -> 2/2).
+  -1,659 pairs REMOVED — allocator-ret witness-bridge conflation: sysfs
+   attribute ops cross-kobject smear (subcaches/pt_cap/_iommu_event
+   *_show/_store, 92 each), drm_flip_work_queue (458), ACPI SCI handler
+   lists (400), crypto_acomp ctx (195). All smear signatures; reviewed.
+  -188 resolved icalls: sites whose ONLY former targets were ret-bridge
+   smear now resolve to nothing (honest empties, no genuine flow lost
+   in review).
+
+Micro/subsets at this commit: t_kmemdup 2/2 exact (was 0/2);
+t_allocinit 2/2 EXACT (was 4/2 conflated); other micros identical;
+km 80,531 (-763/+1 reviewed); harfbuzz/libpng identical; smoke 4/4.

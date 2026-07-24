@@ -1959,3 +1959,13 @@ shape at scale — THE cloning queue), 16 ptr-side-effects. Step B =
 per-callsite cloning of the escape class with depth/size budgets;
 the 140-function km queue (kernel-scale count TBD on next full run)
 is small enough for exhaustive cloning.
+
+### km fs13 cost (partial, 2026-07-24): first drain 2,261 s vs FI ~10 s
+
+km fs13 (summaries config) killed after iteration-1 drain: 37.7 min
+for one drain at km subset scale (~200x FI), 4,852 wildcard nodes
+(ptrtoint-escape 3,467, union-initializer 1,777 dominant). Kernel
+fs13 at this cost = days per run. Confirms the post-#27 ordering
+twice over: fs currently buys zero discrimination AND is unaffordable
+before identity splitting shrinks the clusters; re-evaluate fs after
+#17 step B.

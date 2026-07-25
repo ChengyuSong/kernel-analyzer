@@ -2162,3 +2162,62 @@ dispatch formal = the decorrelation ratio directly). Family 2/3
 (INIT_WORK-style stores into work_struct/timer/ops containers) is
 the larger population and needs an IR store-side census — next,
 alongside the kthread pair-root prototype (step b).
+
+### INVOKE: pair correlation as a transfer summary (2026-07-25)
+
+Step (b) shipped not as a bespoke pair-root mechanism but as a new
+atom in the transfer-summary vocabulary (commit cedcd1c):
+`INVOKE(argF:fK<-argD)` — "the fn at argF will be invoked with argD
+bound to its formal K". Creatable by hand/census/proposer, imported
+from func_summaries.txt, applied at callsites like every other atom.
+Semantics at a summarized registration callsite:
+
+- constant fn operand: assignment edge data -> fn's formal K
+  (per-pair binding, no pooled mixing) + the invocation edge
+  RE-ATTRIBUTED to the registration callsite (Callees insert;
+  precedent: tp_func->__traceiter). No actual->formal edges feed the
+  registration body, so the pooled dispatcher container drains
+  naturally wherever all feeders are summarized.
+- NULL fn: skipped (never invoked).
+- non-constant fn: per-callsite fallback to the pooled arg/ret
+  wiring (applySummaryAtoms returns needPooled; LEDGERed as
+  "dynamic-fn pooled fallbacks") — sound degradation, measured.
+
+Micro t_pairs.c is the decorrelation in miniature: reg() stores
+(fn,data) into a table, dispatch() icalls fn(data). Baseline: 6
+pairs — dispatcher {cb1,cb2} plus BOTH inner icalls cross-smeared
+to {f1,f2}. With `reg INVOKE(arg0:f0<-arg1)`: 2/2 exact (cb1->f1,
+cb2->f2), dispatcher channel drained (invocations live at the
+registration sites). Regression ladder green: t_kmemdup 2/2,
+t_allocinit 2/2, libpng smoke 4/4.
+
+Kernel seeds (signatures verified against 6.8.2 source):
+kthread_create_on_node (+FRESH for the ret task_struct — assumption
+recorded in the file), init_timer_key (data = the timer itself; the
+callback's container_of correlation rides the same binding),
+call_rcu/_hurry/_tasks/_tasks_trace/_tasks_rude, call_srcu,
+request_threaded_irq (dev_id -> formal 1 of both handler and
+thread_fn). NOT seedable as INVOKE v1: notifier chains (fn behind
+nb->notifier_call — needs field indirection), hrtimer_init and
+smpboot (fn not a parameter — family 2/3 store-side territory).
+
+km A/B vs the km-summ baseline (80,531 pairs) running; the
+hypothesis under test: the kthread/timer/rcu pooled channels crack
+(c17037-class callerWeight drops, rescuer_thread-style members
+leave the hub) and per-registration data precision appears in the
+answer diff.
+
+Ops note from the km A/B launch (2026-07-25): km/kernel flows-to
+runs REQUIRE `--cfl-compositional=false`. The first km INVOKE run
+omitted it, fell into per-TU compositional mode, and died at the
+boundary-cache sanity check with 6 missing `glob:` symbols — all
+linker bounds externs (__start_rodata, __stop___param,
+__stop___tracepoints_ptrs, ...). That is a PRE-EXISTING, documented
+gap, not a regression: wireLinkerSectionArrays runs once after the
+last module, so its cross-module edges fall outside every per-TU
+graph and no TU exports the bounds symbols the compose-time
+expected-set demands (the code comment at the call site says
+exactly this). Verified by bisect: cda6fd9 (the km-summ pin commit)
+fails identically in compositional mode on the same input. The
+strict sanity check caught the mode mismatch loudly instead of
+composing over missing linker-array flows — working as designed.

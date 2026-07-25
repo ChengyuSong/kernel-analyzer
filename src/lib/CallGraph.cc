@@ -6745,6 +6745,21 @@ void CallGraphPass::wireLinkerSectionArrays() {
                << " has no IR-visible members\n");
       continue;
     }
+    if (CFLCompositional && CompressedGraphInputs.empty()) {
+      // Per-TU compositional mode cannot compose these flows: the
+      // member->bounds edges are added once, after the last module,
+      // and belong to no TU's graph, so no TU exports the bounds
+      // symbol the compose-time boundary sanity check demands — the
+      // composed solve is guaranteed to be rejected many minutes from
+      // now. Fail here, at the first wireable bounds symbol.
+      errs() << "wireLinkerSectionArrays: bounds symbol " << N
+             << " has IR-visible members, but per-TU compositional mode "
+                "cannot compose linker-section-array flows. Rerun with "
+                "--cfl-compositional=false, or drop the flows explicitly "
+                "with --cfl-linker-arrays=false (UNSOUND for kernel "
+                "corpora).\n";
+      exit(1);
+    }
     NodeIndex eNode = NF.getValueNodeFor(EGV);
     assert(eNode != AndersNodeFactory::InvalidIndex &&
            "ExtGobj without value node");

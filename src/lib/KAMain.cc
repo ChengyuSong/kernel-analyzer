@@ -568,6 +568,46 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // CLI mode sanity: reject combinations where a requested feature would
+  // be SILENTLY ignored by the selected solver mode. A misconfigured
+  // whole-kernel run wastes tens of minutes before the mismatch surfaces
+  // (or worse, reports answers from the wrong solver) — fail here.
+  {
+    std::vector<std::string> cliErrors;
+    const bool flowsToActive = CFLFlowsTo && !CFLCompositional;
+    if (CFLFlowsTo && CFLCompositional)
+      cliErrors.push_back(
+          "--cfl-flows-to requires --cfl-compositional=false: the flows-to "
+          "solver is monolithic, and per-TU compositional mode (the "
+          "default) silently ignores it");
+    auto requireFlowsTo = [&](bool isSet, const char *flag) {
+      if (isSet && !flowsToActive)
+        cliErrors.push_back(std::string(flag) +
+                            " only affects the flows-to solver and would be "
+                            "silently ignored: add --cfl-flows-to "
+                            "--cfl-compositional=false");
+    };
+    requireFlowsTo(CFLLazyMint, "--cfl-lazy-mint");
+    requireFlowsTo(CFLFlowsToIncremental, "--cfl-flows-to-incremental");
+    requireFlowsTo(CFLFlowsToSlice, "--cfl-flows-to-slice");
+    requireFlowsTo(CFLResidueCopies, "--cfl-residue-copies");
+    requireFlowsTo(CFLConflationReport, "--cfl-conflation-report");
+    requireFlowsTo(CFLRootRelevance, "--cfl-root-relevance");
+    requireFlowsTo(CFLProbeRodataJoins, "--cfl-probe-rodata-joins");
+    requireFlowsTo(!CFLAblateMints.empty(), "--cfl-ablate-mints");
+    requireFlowsTo(CFLFlowsToMaxIters.getNumOccurrences() > 0,
+                   "--cfl-flows-to-max-iters");
+    requireFlowsTo(CFLSolverThreads.getNumOccurrences() > 0,
+                   "--cfl-solver-threads");
+    requireFlowsTo(CFLSolverBlock.getNumOccurrences() > 0,
+                   "--cfl-solver-block");
+    if (!cliErrors.empty()) {
+      for (const auto &e : cliErrors)
+        errs() << argv[0] << ": CLI sanity: " << e << "\n";
+      return 1;
+    }
+  }
+
   if (MemLimitPct > 0) {
     long pages = sysconf(_SC_PHYS_PAGES);
     long pageSize = sysconf(_SC_PAGE_SIZE);

@@ -2085,3 +2085,38 @@ in decreasing expected value:
     sensitivity beyond heap cloning, the expensive frontier.
 The confirmer machinery (5 shapes, atoms, funnel telemetry) stands
 regardless: sound, validated, and the whole-kernel run decides.
+
+## 2026-07-25: whole-kernel confirm-fresh verdict — falsification COMPLETE, ordering inverted
+
+Kernel decision run (--cfl-confirm-fresh + pinned-summ config,
+3:08 wall / 40 GB): 125 wrappers promoted (16 alloc-init), 2,366 ST
++ 457 FRESHSUB atom applications, escape funnel 656 (call-escape
+294, other-use 106, init-other 62, store-into-loaded 40,
+init-from-call 34, outparam 28). So conversions DO scale with the
+corpus — and the answers got WORSE: vs the kernel-summ pin,
++11,088 pairs / -59, fact mass 1.91B -> 2.57B, hub joins 161k ->
+165k. The +11k is ONE ops family (ring-buffer page iterators
+direct_/cache_first/next/finish_page) smeared across hub icalls
+(handle_edge_irq, percpu_ref_put, css_put): a converted wrapper's
+per-callsite object is hub-RESIDENT — its callers' pointers live in
+the mega-class, so every fresh object they touch joins the hub and
+its contents reach every hub reader. Per-callsite identity
+MULTIPLIED hub content instead of splitting it.
+
+VERDICT (task #17 decision): allocation-wrapper identity splitting
+does not improve — and at kernel scale actively worsens — precision
+while the type-erasure hub stands. The causal ordering is the
+INVERSE of the naive one: the formal-identity hub (44k functions'
+void*/callback channels, 92-96% of all joins) must be attacked
+FIRST; heap-identity work only pays afterward. Nobody in the
+literature reports this ordering because nobody measures the middle
+layer (code idiom -> graph structure -> bottleneck); 'context
+sensitivity/heap cloning improves precision' is unconditionally
+assumed. PAPER MATERIAL: the full funnel telemetry, the km-null,
+and the kernel-regression triptych.
+
+Disposition: --cfl-confirm-fresh stays OFF in pinned configs (kept
+as validated machinery + measurement instrument); kernel-summ pin
+UNCHANGED; frontier = the formal-identity channel (kthread/work/
+timer void* payloads and equivalent), which is context sensitivity
+on FORMALS, not heap cloning.

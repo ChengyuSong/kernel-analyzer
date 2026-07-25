@@ -2221,3 +2221,43 @@ exactly this). Verified by bisect: cda6fd9 (the km-summ pin commit)
 fails identically in compositional mode on the same input. The
 strict sanity check caught the mode mismatch loudly instead of
 composing over missing linker-array flows — working as designed.
+
+### km A/B: INVOKE pair summaries drain the kthread/irq/timer/rcu pools (2026-07-25)
+
+Config = km-summ baseline + the 8 INVOKE seed specs (10 atoms).
+LEDGER: 135 INVOKE bindings applied, 348 dynamic-fn pooled fallbacks
+(sound), 0 refs skipped.
+
+Answers: 80,531 -> 70,876 pairs (-9,655, -12.0%); removed and added
+sets reviewed both directions:
+- REMOVED = precisely the pooled dispatch smear. Every kthread
+  threadfn (worker_thread, rescuer_thread, kswapd, kcompactd,
+  irq_thread, watchdog, oom_reaper, ...) lost its ~395-site fan-in;
+  caller side is the irq/timer pools (handle_edge_irq 216,
+  clocksource_watchdog 190, handle_fasteoi_irq 168, free_irq 144,
+  __setup_irq 109, ...).
+- ADDED = 2 pairs, both sound re-attribution accounting:
+  __wait_rcu_gp/synchronize_rcu_tasks_generic icalls resolve to the
+  summarized call_rcu family, whose constant fn operand THERE is
+  wakeme_after_rcu — the INVOKE re-attribution lands on the icall
+  itself. The callback edge is real; it is now accounted at the
+  registration site.
+
+Hub metrics: the c17037-class hub callerWeight 89,956 -> 80,664
+(-10.3%), memberFns 5,679 -> 5,675, conflation classes 339 -> 434
+(finer quotient); rescuer_thread-style threadfns LEFT the hub member
+list entirely. Still resident at 395: multi_cpu_stop,
+migration_cpu_stop, softlockup_fn — stop-machine/smpboot channels,
+whose fn travels inside structs (family 2/3, not seedable as INVOKE
+v1). That is the next tranche, not a failure of this one.
+
+Cost: neutral-to-better. CGPass 204.7s -> 196.7s; per-drain solve
+9.4s -> 12.5s on a finer quotient (cell clusters 40.2k -> 53.4k,
+roots 45.0k -> 68.3k — the drained hub un-merges memory classes).
+Fact mass flat (71.1M -> 70.8M): the hub's other 5,675 members still
+carry the class facts, consistent with the over-determination
+finding — draining ONE channel family shrinks answers, not closure.
+
+Whole-kernel run with the pinned kernel-summ config + seeds is in
+flight; candidate results go to ka-scratch for review before any
+baseline pin moves.

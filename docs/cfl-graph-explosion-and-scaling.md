@@ -2149,3 +2149,16 @@ fact/shift machinery. Family (3) = same-origin at the container.
 Evaluation order: measure recognizable registration sites (census
 of the ~10 dispatcher idioms), then a pair-root prototype on the
 kthread channel (the c513/c5500 core), km ladder, kernel.
+
+### Pair-root census, family 1 (km subset, 2026-07-25)
+
+Explicit (fn,data) registration API callsites over the 338 km
+modules: call_rcu 88, hrtimer_init 22, init_timer_key 21,
+kthread_create_on_node 17, notifier-chain register 17, smpboot 4,
+request_threaded_irq 3 — 177 sites total. The profile pair roots
+wants: tiny, mechanically recognizable populations feeding huge
+pooled channels (17 kthread registrations -> the ~398-caller c513
+dispatch formal = the decorrelation ratio directly). Family 2/3
+(INIT_WORK-style stores into work_struct/timer/ops containers) is
+the larger population and needs an IR store-side census — next,
+alongside the kthread pair-root prototype (step b).

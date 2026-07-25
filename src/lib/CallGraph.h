@@ -132,7 +132,7 @@ private:
                           const std::string &callSiteStruct,
                           unsigned callSiteFieldIdx) const;
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
-  void applySummaryAtoms(const llvm::CallBase *CS,
+  bool applySummaryAtoms(const llvm::CallBase *CS,
                          const GlobalContext::FuncSummary &S);
   void confirmFreshWrappers();
   void handleInlineAsm(llvm::CallBase &CS);

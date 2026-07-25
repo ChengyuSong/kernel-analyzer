@@ -1132,8 +1132,10 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
   {
     auto sit = Ctx->FuncSummaries.find(CF);
     if (sit != Ctx->FuncSummaries.end()) {
-      applySummaryAtoms(CS, *sit->second);
-      return false;
+      if (!applySummaryAtoms(CS, *sit->second))
+        return false;
+      // Invoke atom with dynamic fn at this callsite: fall through to
+      // the pooled arg/ret wiring (sound, LEDGERed).
     }
   }
 
@@ -7421,7 +7423,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   };
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
-         nNone = 0;
+         nNone = 0, nInv = 0;
   while (std::getline(in, line)) {
     lineNo++;
     StringRef L = StringRef(line).trim();
@@ -7457,6 +7459,19 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         A.kind = GlobalContext::SummaryAtom::Store;
         bad = !parseRef(c, A.dst) || !parseRef(v, A.src) || A.dst < 0;
         nSt++;
+      } else if (t.consume_front("INVOKE(") && t.consume_back(")")) {
+        auto [fnp, rest2] = t.split(":");
+        auto [fk, dp] = rest2.split("<-");
+        A.kind = GlobalContext::SummaryAtom::Invoke;
+        bad = !parseRef(fnp, A.dst) || A.dst < 0 || !parseRef(dp, A.src) ||
+              A.src < 0;
+        unsigned fkv = 0;
+        if (!bad) {
+          StringRef fks = fk;
+          bad = !fks.consume_front("f") || fks.getAsInteger(10, fkv);
+          A.aux = (int)fkv;
+        }
+        nInv++;
       } else if (t.consume_front("LD(") && t.consume_back(")")) {
         auto [d, c] = t.split("<-*");
         A.kind = GlobalContext::SummaryAtom::Load;
@@ -7478,7 +7493,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   CG_LOG("FuncSummary: loaded " << Ctx->SummarySpecs.size() << " specs from "
          << path << " (" << nFresh << " FRESH, " << nCpy << " CPY, "
          << nAlias << " ALIAS, " << nSt << " ST, " << nLd << " LD, "
-         << nNone << " NONE)\n");
+         << nInv << " INVOKE, " << nNone << " NONE)\n");
 }
 
 // First-match-wins spec lookup ('*' suffix = prefix).
@@ -7499,9 +7514,14 @@ summaryForName(GlobalContext *Ctx, StringRef name) {
 // aligned whole-buffer dups (kmemdup family); prefix copies
 // over-approximate soundly.
 static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
-              g_sumSkipped = 0, g_sumFreshSub = 0;
-void CallGraphPass::applySummaryAtoms(const CallBase *CS,
+              g_sumSkipped = 0, g_sumFreshSub = 0, g_sumInvoke = 0,
+              g_sumInvokeDyn = 0;
+// Returns true when an Invoke atom's fn operand is not a constant
+// function at this callsite — the caller must fall back to the pooled
+// arg/ret wiring for soundness (LEDGERed).
+bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S) {
+  bool needPooled = false;
   auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
     const Value *v =
         ref < 0 ? (const Value *)CS
@@ -7551,6 +7571,38 @@ void CallGraphPass::applySummaryAtoms(const CallBase *CS,
       g_sumSt++;
       break;
     }
+    case GlobalContext::SummaryAtom::Invoke: {
+      // pair-correlated dispatch: bind data to the registered fn's
+      // formal directly and re-attribute the invocation to this
+      // registration site (Callees export edge). The pooled container
+      // path drains because the summarized registration no longer
+      // feeds it.
+      if ((unsigned)A.dst >= CS->arg_size() ||
+          (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
+      const Value *fv = CS->getArgOperand(A.dst)->stripPointerCasts();
+      if (isa<ConstantPointerNull>(fv))
+        break; // null fn: never invoked, nothing to bind
+      const auto *RF = dyn_cast<Function>(fv);
+      if (!RF) {
+        // dynamic fn: cannot bind statically — signal pooled fallback
+        g_sumInvokeDyn++;
+        needPooled = true;
+        break;
+      }
+      Function *DF = getFuncDef(const_cast<Function *>(RF));
+      if ((unsigned)A.aux < DF->arg_size()) {
+        NodeIndex dn = nodeForRef(A.src, false);
+        NodeIndex fn2 = getRepNodeForValue(DF->getArg(A.aux));
+        if (fn2 == AndersNodeFactory::InvalidIndex)
+          fn2 = getCanonicalNode(NF.createValueNode(DF->getArg(A.aux)));
+        if (dn != AndersNodeFactory::InvalidIndex) {
+          addAssignmentEdge(getCanonicalNode(dn), getCanonicalNode(fn2));
+          g_sumInvoke++;
+        }
+      }
+      Ctx->Callees[CS].insert(DF); // re-attributed callgraph edge
+      break;
+    }
     case GlobalContext::SummaryAtom::FreshSub: {
       NodeIndex d = nodeForRef(A.dst, true);
       if (d == AndersNodeFactory::InvalidIndex) break;
@@ -7574,6 +7626,7 @@ void CallGraphPass::applySummaryAtoms(const CallBase *CS,
     }
     }
   }
+  return needPooled;
 }
 
 bool CallGraphPass::doInitialization(Module *M) {
@@ -7828,7 +7881,9 @@ bool CallGraphPass::doFinalization(Module *M) {
       CG_LOG("FuncSummary LEDGER: " << Ctx->FuncSummaries.size()
              << " functions summarized; applied " << g_sumCpy << " CPY, "
              << g_sumAlias << " ALIAS, " << g_sumSt << " ST, " << g_sumLd
-             << " LD, " << g_sumFreshSub << " FRESHSUB edges; " << g_sumSkipped
+             << " LD, " << g_sumFreshSub << " FRESHSUB, " << g_sumInvoke
+             << " INVOKE (" << g_sumInvokeDyn
+             << " dynamic-fn pooled fallbacks); " << g_sumSkipped
              << " atom refs skipped (missing arg/node)\n");
     {
       uint64_t uniExtGobj = 0, uniOther = 0;

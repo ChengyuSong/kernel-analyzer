@@ -117,10 +117,14 @@ public:
       Alias, // dst value aliases src value (interior/identity return)
       Store, // *container <- value
       Load,  // dst value <- *container
-      FreshSub // a fresh anonymous sub-object stored into *dst
+      FreshSub, // a fresh anonymous sub-object stored into *dst
+      Invoke // pair-correlated dispatch: fn at arg[dst] will be called
+             // with arg[src] bound to its formal [aux] (C interface
+             // polymorphism: (fn,data) registration pairs)
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)
+    int aux = 0;  // Invoke: callee formal index receiving src
     const llvm::GlobalValue *gsrc = nullptr; // Store: global-value source
                                              // (generated atoms only)
   };

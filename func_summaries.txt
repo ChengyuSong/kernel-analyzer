@@ -38,6 +38,28 @@ realloc FRESH CPY(ret<-arg0)
 strdup FRESH CPY(ret<-arg0)
 strndup FRESH CPY(ret<-arg0)
 
+# ---- kernel: pair-correlated registration (task #28, INVOKE) ----
+# INVOKE(argF:fK<-argD): the fn at argF will be invoked with argD bound
+# to its formal K. Registration callsites bind (fn,data) directly and
+# the invocation edge is RE-ATTRIBUTED to the registration site
+# (Callees), so the pooled dispatcher container drains — this is the
+# modeling choice, precedent tp_func->__traceiter. Non-constant fn at a
+# callsite falls back to pooled wiring (LEDGERed); NULL fn is skipped.
+# ASSUMPTION (kthread FRESH): ret task_struct is a genuine per-call
+# allocation; fields templated inside copy_process are cut — scheduler
+# icalls keep targets via tasks from the pooled runqueue channels.
+kthread_create_on_node INVOKE(arg0:f0<-arg1) FRESH
+init_timer_key INVOKE(arg1:f0<-arg0)
+call_rcu INVOKE(arg1:f0<-arg0)
+call_rcu_hurry INVOKE(arg1:f0<-arg0)
+call_rcu_tasks INVOKE(arg1:f0<-arg0)
+call_rcu_tasks_trace INVOKE(arg1:f0<-arg0)
+call_rcu_tasks_rude INVOKE(arg1:f0<-arg0)
+call_srcu INVOKE(arg2:f0<-arg1)
+# irq_handler_t(int irq, void *dev_id): dev_id -> formal 1, both the
+# hardirq handler and the threaded fn receive the same dev_id
+request_threaded_irq INVOKE(arg1:f1<-arg5) INVOKE(arg2:f1<-arg5)
+
 # ---- kernel: dup family (FRESH + copy semantics) ----
 kmemdup FRESH CPY(ret<-arg0)
 kmemdup_nul FRESH CPY(ret<-arg0)

@@ -1,0 +1,2 @@
+# t_pairs.c micro summaries: pair-correlated registration
+reg INVOKE(arg0:f0<-arg1)

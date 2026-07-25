@@ -2120,3 +2120,32 @@ as validated machinery + measurement instrument); kernel-summ pin
 UNCHANGED; frontier = the formal-identity channel (kthread/work/
 timer void* payloads and equivalent), which is context sensitivity
 on FORMALS, not heap cloning.
+
+### Task #28 design core (2026-07-25): pair roots — C interface polymorphism as correlation
+
+The kernel's interface lowering (user framing: how C realizes
+polymorphism) has three shapes sharing one lost invariant:
+(1) explicit (fn, data) registration pairs — kthread, request_irq
+(handler, dev_id), notifiers, RCU, tasklets; (2) container_of self
+— the callback receives &outer->member and recovers the receiver
+geometrically (work_struct, timer_list); (3) ops + instance state
+(f_op + private_data, netdev_ops + netdev_priv). Java object
+sensitivity gets the correlation free (this IS the pair); C lowers
+the receiver away, and pooling dispatcher formals destroys it —
+producing BOTH measured pathologies at once: fn x data cross
+products (precision) and the pooled channel itself (the 44k-formal
+hub). Closest related work: JS correlation tracking (Sridharan
+ECOOP'12); nothing for kernel C callback pairs.
+
+Mechanism: PAIR ROOTS. Mint one root per recognized registration
+site for the (fn, data) tuple; the pair fact travels containers as
+one bit; at the dispatcher icall, resolution wires PER PAIR (callee
+fn_r's formal bound to data_r, never the pool). Registration-site
+correlation without body cloning, cost ~ registration sites, sound
+degradation to the pooled channel + LEDGER for unrecognized flows.
+Family (2) needs no pairs at all: fn read from origin o + argument
+o+shift = same-origin binding at wiring — latent in the existing
+fact/shift machinery. Family (3) = same-origin at the container.
+Evaluation order: measure recognizable registration sites (census
+of the ~10 dispatcher idioms), then a pair-root prototype on the
+kthread channel (the c513/c5500 core), km ladder, kernel.

@@ -60,6 +60,27 @@ call_srcu INVOKE(arg2:f0<-arg1)
 # hardirq handler and the threaded fn receive the same dev_id
 request_threaded_irq INVOKE(arg1:f1<-arg5) INVOKE(arg2:f1<-arg5)
 
+# ---- kernel: tier-2 auto-confirmed INVOKE (2026-07-26, km A/B) ----
+# Emitted by --cfl-confirm-invoke under the completeness discipline
+# (DIRECT sync invocation / PASSTHRU composition), adopted after km
+# review: -397/+0 vs the INVOKE pin; smpboot_thread_fn left the pooled
+# smear and its own icalls sharpened 436 -> 101 pairs (true
+# smp_hotplug_thread population). See docs/cfl-graph-explosion-and-
+# scaling.md "Tier-2 confirmer".
+kthread_create_on_cpu INVOKE(arg0:f0<-arg1) FRESH
+request_any_context_irq INVOKE(arg1:f1<-arg4)
+__walk_iomem_res_desc INVOKE(arg5:f1<-arg4)
+walk_iomem_res_desc INVOKE(arg5:f1<-arg4)
+walk_system_ram_res INVOKE(arg3:f1<-arg2)
+walk_system_ram_res_rev INVOKE(arg3:f1<-arg2)
+walk_mem_res INVOKE(arg3:f1<-arg2)
+walk_system_ram_range INVOKE(arg3:f2<-arg2)
+hibernate_quiet_exec INVOKE(arg0:f0<-arg1)
+get_device_system_crosststamp INVOKE(arg0:f0<-arg3) INVOKE(arg0:f2<-arg1)
+kallsyms_on_each_symbol INVOKE(arg0:f0<-arg1)
+for_each_kernel_tracepoint INVOKE(arg0:f1<-arg1)
+bpf_dispatcher_nop_func INVOKE(arg2:f0<-arg0) INVOKE(arg2:f1<-arg1)
+
 # ---- kernel: dup family (FRESH + copy semantics) ----
 kmemdup FRESH CPY(ret<-arg0)
 kmemdup_nul FRESH CPY(ret<-arg0)

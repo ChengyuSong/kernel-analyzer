@@ -2369,3 +2369,43 @@ completeness discipline (every pointer formal accounted or reject to
 LEDGER) so buckets 2-4 can be auto-emitted as reviewed summary lines;
 then seed tranche 2 (stop-machine family + kthread_create_on_cpu) and
 re-ladder.
+
+### Tier-2 confirmer: --cfl-confirm-invoke (2026-07-26)
+
+Auto-confirmation where the proof is local (commit 7ba1fd7), #17
+completeness discipline: DIRECT (fn formal invoked synchronously with
+other formals; benign-use walker for everything else; pointer escapes
+/ ptr returns reject) and PASSTHRU (translation through an
+already-summarized INVOKE callee, +FRESH when the wrapper returns the
+callee's fresh result; wrapper-chain fixpoint). FIELD/COSTORE remain
+census-REVIEW: their dispatchers live elsewhere, no local proof.
+
+Micros: t_pairs3.c — run_cb auto-confirms, cb pairs exact, dispatcher
+drained; run_cb_leak (data escapes to a global) rejects esc-store and
+stays pooled (sound). t_pairs2 — spawn_wrap auto-confirms PASSTHRU
++FRESH. (Micro note: -O1 funcspec cloned the HOFs per callsite and
+trivialized the baseline; t_pairs3 is built at O0+mem2reg.)
+
+km A/B (pinned config + --cfl-confirm-invoke, vs km-invoke2 71,372):
+13 auto-confirmed (8 DIRECT + 5 PASSTHRU, 3 rounds): the iomem/RAM
+walker family (walk_system_ram_range/_res/_rev, walk_mem_res,
+__walk_iomem_res_desc + PASSTHRU walk_iomem_res_desc),
+kthread_create_on_cpu (+FRESH — the predicted smpboot closer, derived
+not hand-seeded), request_any_context_irq (via request_threaded_irq),
+get_device_system_crosststamp, kallsyms_on_each_symbol,
+for_each_kernel_tracepoint, hibernate_quiet_exec,
+bpf_dispatcher_nop_func. Rejected to LEDGER: 37 escape, 4 ptr-ret,
+1 no-binding, 4 mixed-shape — the tier-3 proposer's review queue.
+
+Answers: -397 pairs / +0. 395 = smpboot_thread_fn leaving the pooled
+smear entirely; its own 6 icalls SHARPEN from 436 pool-smeared pairs
+(85-target smear incl. cpuhp state callbacks) to 101 pairs carrying
+the true smp_hotplug_thread population (cpuhp_should_run,
+cpu_stopper_thread, cpu_stop_should_run, ...) — per-registration td
+binding replacing the kthread data pool. The remaining 2 = walker-
+family data precision.
+
+Adoption path (per the recorded rollout discipline): the 13 CONFIRMED
+lines are file-format; adopting them into func_summaries.txt (the
+reviewed artifact) + kernel re-pin is the next decision point.
+--cfl-confirm-invoke itself stays OFF in pinned configs.

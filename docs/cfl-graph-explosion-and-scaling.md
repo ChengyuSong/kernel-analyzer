@@ -2261,3 +2261,54 @@ finding — draining ONE channel family shrinks answers, not closure.
 Whole-kernel run with the pinned kernel-summ config + seeds is in
 flight; candidate results go to ka-scratch for review before any
 baseline pin moves.
+
+### Kernel INVOKE run #1: the ladder catches a soundness hole (2026-07-25)
+
+The first whole-kernel INVOKE run (pinned config + seeds) read as a
+triumph at first glance — 5,649,018 -> 5,480,765 pairs (-168,255,
+-3.0%), added set = exactly the 2 vetted wakeme_after_rcu
+re-attribution pairs, removed targets = the threadfn drain at 3,320
+sites each. The tell was one level deeper: resolved icalls 16,532 ->
+16,526, and the 6 fully-drained sites were all inside
+smpboot_thread_fn — whose baseline targets included REAL callbacks
+(cpuhp_should_run, run_ksoftirqd). smpboot_thread_fn itself went from
+3,320 icall-target sites to ZERO. Real loss, not drain.
+
+Root cause, two layers (commit 2a7305e):
+1. The three allocator-branch callers of applySummaryAtoms discarded
+   the needPooled return — a dynamic-fn registration through a
+   FRESH+INVOKE function (kthread_create_on_cpu passes its OWN FORMAL
+   to kthread_create_on_node) wired nothing. Fixed by extracting
+   handleCall's actual->formal wiring into wireCallArgs() and calling
+   it on fallback (args only; the fresh object stays the ret identity).
+2. Even wired, the args fed a SKIPPED body — FRESH routes the callee
+   through the allocator body-skip, severing the create-struct ->
+   kthread() container channel. Fixed by summaryInvokeKeepsBody():
+   INVOKE-bearing FRESH summaries keep their bodies analyzed; constant
+   callsites still don't feed them, so the body carries exactly the
+   dynamic-registration residual.
+
+Micro pin: t_pairs2.c (FRESH+INVOKE table registration + a wrapper
+passing its own formals) — 4/4 exact after the fix, cb3 resolved via
+the pooled residual only.
+
+km re-run (fixed): 80,531 -> 71,372 (-9,159, -11.4%); added = the 2
+wakeme pairs only; smpboot_thread_fn RESTORED at its 395 pooled
+sites, plus the cpuhp-adjacent flows that rode its td channel
+(vmstat_cpu_*, takeover_tasklets, slub_cpu_dead, ...). The drain
+number is 496 pairs smaller than the broken run — that delta was
+exactly the unsoundness.
+
+Method note for the paper: the both-directions diff review plus the
+resolved-icalls count is what caught this — the top-line pair delta
+and even the added-set review looked perfect. A fully-drained icall
+whose baseline held confirmable true targets is the signature that
+separates "channel re-attributed" from "channel severed".
+
+Refinement queued: kthread_create_on_cpu is itself a constant-fn
+registration API (smpboot passes smpboot_thread_fn constantly) —
+seeding it with INVOKE(arg0:f0<-arg1) FRESH would drain the smpboot
+residual too. Same for other kthread_create_on_node wrappers.
+
+Kernel re-run with the fixed binary in flight; candidates to
+ka-scratch, baselines untouched pending review.

@@ -63,3 +63,7 @@ BYTE-IDENTICAL to kernel-lazy-icalls.sort.gz — the GUID-filter binary
 reproduces the pinned canonical dump exactly, closing the loop on the
 constructed-pin methodology. (Wall was shared with concurrent km-scale
 measurement runs; the 2:24 lazy2 figure is the cleaner wall number.)
+
+answer set: kernel-lazy-icalls.sort.gz (NOT in git — kept locally / regenerable
+  deterministically from this pinned commit + the bclist corpus)
+  sha256: 807d480c5e4a51faf6ffa22fe5336ccb1c1efacfeef33235046ffc1872c9bbf5

@@ -9,3 +9,7 @@ StaticCall LEDGER: 2187 key-wired + 1865 tp->iterator sites, 220 update primitiv
 InlineAsm LEDGER: 2217 slot loads + 479 stores (2806 width-witnessed), 5942 reg loads + 1209 stores + 338 copies, 7253 declined (LEDGER)
 known residual: 151k __SCT__tp_func-as-target pairs = tracepoint-struct hub residency (pre-existing; #17/#21)
 subsets: km 1479/81286; harfbuzz 333/2811 zero-diff; smoke 4/4; micro tests exact
+
+answer set: kernel-full7-icalls.sort.gz (NOT in git — kept locally / regenerable
+  deterministically from this pinned commit + the bclist corpus)
+  sha256: b199a2385e9f0c8f0f38e5eb105b8d311e34e7fd9ccfedc8a21a6af9b5817a12

@@ -7,3 +7,7 @@ LinkerArrays: 37 bounds wired (17713 member flows), LEDGER 37 memberless + 32 ex
 vs pre-#22 pin (14824/5135527): +26 icalls, +731034 pairs (superset verified, 0 removed)
 do_one_initcall: 735 targets (649 initstubs)
 subsets: bclist-subset-km 1072/74185; bclist-subset 1919/209914; harfbuzz 333/2811 (zero diff); libpng smoke 4/4
+
+answer set: kernel-full6-icalls.sort.gz (NOT in git — kept locally / regenerable
+  deterministically from this pinned commit + the bclist corpus)
+  sha256: aafa287f7baf15f6bbc5c2fa1ecbdd009229132a84c148e8fa08dda413c24099

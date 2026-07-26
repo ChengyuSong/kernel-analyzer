@@ -6,3 +6,4 @@ tags
 GPATH
 GRTAGS
 GTAGS
+test/baselines/*icalls.sort.gz

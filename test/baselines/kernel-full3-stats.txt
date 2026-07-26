@@ -1,0 +1,22 @@
+CallGraph: FlowsTo: minted 332633 roots (36213 function), 0 wildcard nodes, 1 shift planes
+CallGraph: FlowsTo: a-SCC collapse merged 2182 classes at 262144 pops
+CallGraph: FlowsTo: 404734 classes (279520 after 125214 merges), 332633 roots, 1443236444 native + 0 bridged facts (vs pairwise V), 249644 cell clusters, 0 VX bridges, 14 waves, 394611 worklist pops, 291454 ms
+CallGraph: FlowsTo: resolved 13276 icalls, 4227421 targets (4227421 new pairs wired, 0 via wildcard plane only), iteration 0
+CallGraph: FlowsTo: minted 322182 roots (36241 function), 0 wildcard nodes, 1 shift planes
+CallGraph: FlowsTo: a-SCC collapse merged 3088 classes at 262144 pops
+CallGraph: FlowsTo: 394136 classes (263435 after 130701 merges), 322182 roots, 1458064904 native + 0 bridged facts (vs pairwise V), 246536 cell clusters, 0 VX bridges, 13 waves, 375278 worklist pops, 214167 ms
+CallGraph: FlowsTo: resolved 14759 icalls, 5073576 targets (846155 new pairs wired, 0 via wildcard plane only), iteration 1
+CallGraph: FlowsTo: minted 321507 roots (36242 function), 0 wildcard nodes, 1 shift planes
+CallGraph: FlowsTo: a-SCC collapse merged 3119 classes at 262144 pops
+CallGraph: FlowsTo: 393462 classes (262946 after 130516 merges), 321507 roots, 1455517619 native + 0 bridged facts (vs pairwise V), 246029 cell clusters, 0 VX bridges, 13 waves, 374560 worklist pops, 239681 ms
+CallGraph: FlowsTo: resolved 14790 icalls, 5103153 targets (29577 new pairs wired, 0 via wildcard plane only), iteration 2
+CallGraph: FlowsTo: minted 321486 roots (36242 function), 0 wildcard nodes, 1 shift planes
+CallGraph: FlowsTo: a-SCC collapse merged 3120 classes at 262144 pops
+CallGraph: FlowsTo: 393443 classes (262923 after 130520 merges), 321486 roots, 1456390834 native + 0 bridged facts (vs pairwise V), 246026 cell clusters, 0 VX bridges, 13 waves, 374546 worklist pops, 215926 ms
+CallGraph: FlowsTo: resolved 14799 icalls, 5107435 targets (4282 new pairs wired, 0 via wildcard plane only), iteration 3
+CallGraph: FlowsTo: minted 321484 roots (36242 function), 0 wildcard nodes, 1 shift planes
+CallGraph: FlowsTo: a-SCC collapse merged 3122 classes at 262144 pops
+CallGraph: FlowsTo: 393437 classes (262916 after 130521 merges), 321484 roots, 1455485233 native + 0 bridged facts (vs pairwise V), 246024 cell clusters, 0 VX bridges, 13 waves, 374517 worklist pops, 214536 ms
+CallGraph: FlowsTo: resolved 14799 icalls, 5107435 targets (0 new pairs wired, 0 via wildcard plane only), iteration 4
+CallGraph: Callee by type: total 52845869, match by CFL 4879335
+CallGraph: PrintfSink: 9925 benign vararg callsites (21442 tail args unwired), 10354 non-constant fmt kept, 25 non-benign fmt kept

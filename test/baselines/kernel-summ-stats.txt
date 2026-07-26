@@ -30,3 +30,7 @@ vs kernel-lazy pin (16,720/5,644,480; dump 5,644,875 lines):
 Micro/subsets at this commit: t_kmemdup 2/2 exact (was 0/2);
 t_allocinit 2/2 EXACT (was 4/2 conflated); other micros identical;
 km 80,531 (-763/+1 reviewed); harfbuzz/libpng identical; smoke 4/4.
+
+answer set: kernel-summ-icalls.sort.gz (NOT in git — kept locally / regenerable
+  deterministically from this pinned commit + the bclist corpus)
+  sha256: 528c1fe19af10feafbf34d116d26aaedd9a016489707e8f7a1dbe072f2366342

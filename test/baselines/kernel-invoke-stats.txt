@@ -20,3 +20,7 @@ soundness checks: resolved-icalls count restored to 16,532 (was 16,526
         carry 436 pairs (== baseline count, cpuhp/ksoftirqd targets
         intact)
 timing: CGPass 9,414,643 ms (~2.6 h, dominated by the 5.5M-line dump)
+
+answer set: kernel-invoke-icalls.sort.gz (NOT in git — kept locally / regenerable
+  deterministically from this pinned commit + the bclist corpus)
+  sha256: 2c98de1aab14e883cf5da14e90205ffc78a78c642d7ab542ee380e12e5d6a5c7

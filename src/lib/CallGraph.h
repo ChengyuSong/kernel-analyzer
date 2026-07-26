@@ -134,6 +134,7 @@ private:
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool applySummaryAtoms(const llvm::CallBase *CS,
                          const GlobalContext::FuncSummary &S);
+  void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF);
   void confirmFreshWrappers();
   void handleInlineAsm(llvm::CallBase &CS);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph,

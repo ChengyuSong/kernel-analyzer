@@ -1,0 +1,2 @@
+# t_pairs2.c: FRESH + INVOKE with a dynamic-fn wrapper callsite
+spawn INVOKE(arg0:f0<-arg1) FRESH

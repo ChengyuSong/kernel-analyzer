@@ -1157,6 +1157,32 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       return false;
   }
 
+  wireCallArgs(CS, CF);
+
+  // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
+  if (containsPointerType(CF->getReturnType())) {
+    NodeIndex retNode = NF.getReturnNodeFor(CF);
+    if (retNode == AndersNodeFactory::InvalidIndex ||
+        retNode == NF.getUniversalPtrNode()) {
+      // On-demand return node for declared function.
+      retNode = NF.createReturnNode(CF);
+    }
+    retNode = getCanonicalNode(retNode);
+    // The callsite may not have a value node if it discards the return value
+    // (e.g., void-typed callsite matched via permissive isCompatible)
+    NodeIndex callNode = getRepNodeForValue(CS);
+    if (callNode != AndersNodeFactory::InvalidIndex)
+      addAssignmentEdge(retNode, callNode);
+  }
+
+  return false;
+}
+
+// Actual->formal (and variadic-tail) wiring for a callsite, shared by
+// handleCall and the summary dynamic-fn pooled fallback at allocator
+// branches (which must feed the callee body WITHOUT the shared-return
+// edge: the callsite's fresh object is its return identity).
+void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF) {
   // handle args:
   // - fixed arguments map to formal params
   // - variadic tail (if any) maps to the callee's vararg summary node
@@ -1217,23 +1243,6 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
     }
   }
 
-  // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
-  if (containsPointerType(CF->getReturnType())) {
-    NodeIndex retNode = NF.getReturnNodeFor(CF);
-    if (retNode == AndersNodeFactory::InvalidIndex ||
-        retNode == NF.getUniversalPtrNode()) {
-      // On-demand return node for declared function.
-      retNode = NF.createReturnNode(CF);
-    }
-    retNode = getCanonicalNode(retNode);
-    // The callsite may not have a value node if it discards the return value
-    // (e.g., void-typed callsite matched via permissive isCompatible)
-    NodeIndex callNode = getRepNodeForValue(CS);
-    if (callNode != AndersNodeFactory::InvalidIndex)
-      addAssignmentEdge(retNode, callNode);
-  }
-
-  return false;
 }
 
 bool CallGraphPass::handleContainerCall(const CallBase *CS, const Function *CF) {
@@ -3927,8 +3936,9 @@ bool CallGraphPass::runFlowsToResolution() {
         NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
         EB.addDereferenceEdges(callNode, heapObj);
         auto sit = Ctx->FuncSummaries.find(CF);
-        if (sit != Ctx->FuncSummaries.end())
-          applySummaryAtoms(CS, *sit->second); // CPY etc. for dup family
+        if (sit != Ctx->FuncSummaries.end() &&
+            applySummaryAtoms(CS, *sit->second))
+          wireCallArgs(CS, CF); // dynamic-fn INVOKE: feed the body pool
       } else if (Ctx->ContainerFuncs.count(CF)) {
         handleContainerCall(CS, CF);
       } else {
@@ -5393,7 +5403,8 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
         // cross-caller conflation channel (~470 witnessed joins at km)
         // — suppress it, then apply the remaining atoms (CPY for the
         // dup family restores the copy the skipped body drops).
-        CGP.applySummaryAtoms(&CS, *sit->second);
+        if (CGP.applySummaryAtoms(&CS, *sit->second))
+          CGP.wireCallArgs(&CS, RCF); // dynamic-fn INVOKE: feed the body pool
       } else if (CF->getReturnType()->isPointerTy()) {
         NodeIndex retNode = CGP.NF.getReturnNodeFor(RCF);
         if (retNode == AndersNodeFactory::InvalidIndex)
@@ -7644,6 +7655,23 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
   return needPooled;
 }
 
+// An INVOKE-bearing FRESH summary keeps its body analyzed: the body IS
+// the pooled container channel (create-struct stores -> dispatcher) that
+// dynamic-fn registration callsites still feed. Constant-fn callsites
+// don't wire actuals into it (drained by design), so the body carries
+// exactly the dynamic residual. Without this, FRESH routes the function
+// through the allocator body-skip and dynamic registrations are silently
+// severed (caught by the kernel smpboot_thread_fn zero-target diff;
+// micro: t_pairs2.c).
+static bool summaryInvokeKeepsBody(GlobalContext *Ctx,
+                                   const llvm::Function *F) {
+  auto it = Ctx->FuncSummaries.find(F);
+  if (it == Ctx->FuncSummaries.end()) return false;
+  for (const auto &A : it->second->atoms)
+    if (A.kind == GlobalContext::SummaryAtom::Invoke) return true;
+  return false;
+}
+
 bool CallGraphPass::doInitialization(Module *M) {
   if (iteration == 0 && M == Ctx->Modules.front().first) {
     if (!FuncSummaryFile.empty() && Ctx->SummarySpecs.empty())
@@ -8407,8 +8435,8 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
   // falls back to always-accept for it.
   auto scannedFn = [&](const Function *PF) {
     return PF && !PF->isDeclaration() && !PF->isIntrinsic() && !PF->empty() &&
-           !Ctx->AllocFuncs.count(PF) && !Ctx->ContainerFuncs.count(PF) &&
-           !shouldSkipFunction(PF);
+           (!Ctx->AllocFuncs.count(PF) || summaryInvokeKeepsBody(Ctx, PF)) &&
+           !Ctx->ContainerFuncs.count(PF) && !shouldSkipFunction(PF);
   };
   size_t incompleteMarked = 0;
   for (Function &F : *M) {
@@ -8565,8 +8593,9 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph,
             NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
             EB.addDereferenceEdges(callNode, heapObj);
             auto sit = Ctx->FuncSummaries.find(CF);
-            if (sit != Ctx->FuncSummaries.end())
-              applySummaryAtoms(CS, *sit->second);
+            if (sit != Ctx->FuncSummaries.end() &&
+                applySummaryAtoms(CS, *sit->second))
+              wireCallArgs(CS, CF); // dynamic-fn INVOKE: feed the body pool
             CG_LOG("Handle indirect allocator target: " << CF->getName() << "\n");
           } else if (Ctx->ContainerFuncs.count(CF)) {
             CG_LOG("Handle indirect target: " << CF->getName() << " (container)\n");
@@ -9417,7 +9446,7 @@ bool CallGraphPass::doModulePass(Module *M) {
 
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
-          Ctx->AllocFuncs.count(&F) ||
+          (Ctx->AllocFuncs.count(&F) && !summaryInvokeKeepsBody(Ctx, &F)) ||
           Ctx->ContainerFuncs.count(&F))
         continue;
       if (shouldSkipFunction(&F))

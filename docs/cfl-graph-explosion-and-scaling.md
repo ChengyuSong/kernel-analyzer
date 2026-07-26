@@ -2312,3 +2312,19 @@ residual too. Same for other kthread_create_on_node wrappers.
 
 Kernel re-run with the fixed binary in flight; candidates to
 ka-scratch, baselines untouched pending review.
+
+### Kernel INVOKE re-run (post-fix): clean verdict (2026-07-26)
+
+Fixed binary (2a7305e), pinned config + seeds: 16,532 resolved icalls
+/ 5,484,521 pairs vs the kernel-summ pin's 16,532 / 5,649,018 —
+-164,499 removed, +2 added (-2.91%). Every soundness tell from run #1
+is green: resolved-icalls count restored exactly; smpboot_thread_fn
+remains a target at its full 3,320-site pooled residual AND its own 6
+icalls carry 436 pairs (== baseline, cpuhp/ksoftirqd true targets
+intact); the only additions are the 2 vetted wakeme_after_rcu
+re-attribution pairs. Removed = the kthread threadfn fan-in (3,320
+sites per threadfn) plus the irq/timer/rcu pools. LEDGER: 464 INVOKE
+bindings, 2,258 dynamic-fn pooled fallbacks. Cost unchanged (~2.6h,
+dump-dominated). Candidate pin files:
+ka-scratch/kernel-invoke2-{stats.txt,icalls.sort.gz} — awaiting
+review before replacing the kernel-summ baseline.

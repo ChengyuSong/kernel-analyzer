@@ -35,6 +35,7 @@ extern cl::opt<unsigned> CFLFlowsToMaxIters;
 extern cl::opt<unsigned> CFLFieldBuckets;
 extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLLazyMint;
+extern cl::opt<bool> CFLCensusInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;
 extern cl::opt<std::string> FuncSummaryFile;

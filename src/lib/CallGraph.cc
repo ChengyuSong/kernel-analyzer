@@ -9386,12 +9386,176 @@ void CallGraphPass::solveAndCompressPerTU(Module *M, size_t edgeStart, size_t ed
          << " ms\n");
 }
 
+// --cfl-census-invoke: MEASUREMENT-ONLY. Tier-1 discovery for the
+// INVOKE summary vocabulary (task #28): scan every defined,
+// not-yet-summarized function for the registration shapes, then rank
+// candidates by constant-Function evidence at their direct callsites —
+// the discriminator separating fn-registration APIs from generic
+// container stores (opaque pointers make formal types useless).
+// Shapes:
+//   DIRECT   fptr formal invoked in the body with another formal at
+//            call-arg position K  -> INVOKE(argF:fK<-argD) verbatim
+//   FIELD    formal stored into a field of another formal (timer/rcu
+//            shape: data IS the container; dispatcher supplies K)
+//   COSTORE  two formals stored into one local/heap object (kthread
+//            create-struct shape; dispatcher elsewhere)
+// Adds no edges; emits proposal lines for the proposer/confirmer loop.
+void CallGraphPass::runInvokeCensus() {
+  struct Cand {
+    const Function *F;
+    int argF, argD;
+    int fk;            // DIRECT only; -1 otherwise
+    const char *shape;
+    size_t callsites = 0, constFn = 0, nullFn = 0, dynFn = 0;
+  };
+  std::vector<Cand> cands;
+  // (function, argF, argD, shape) dedup across multiple body sites
+  std::set<std::tuple<const Function *, int, int, std::string>> seen;
+  auto formalIdx = [](const Function &F, const Value *V) -> int {
+    V = V->stripPointerCasts();
+    for (const auto &A : F.args())
+      if (&A == V) return (int)A.getArgNo();
+    return -1;
+  };
+  auto storeBase = [](const Value *P) -> const Value * {
+    P = P->stripPointerCasts();
+    while (auto *G = dyn_cast<GEPOperator>(P))
+      P = G->getPointerOperand()->stripPointerCasts();
+    return P;
+  };
+  size_t nFuncs = 0;
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
+      if (shouldSkipFunction(&F)) continue;
+      if (Ctx->FuncSummaries.count(&F)) continue; // already handled
+      if (F.arg_size() < 2) continue;             // need (fn, data)
+      nFuncs++;
+      // per-object co-store map: base -> formal indices stored into it
+      std::map<const Value *, std::set<int>> coStores;
+      for (const Instruction &I : instructions(F)) {
+        if (const auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB->isInlineAsm()) continue;
+          if (const Function *IC = CB->getCalledFunction()) {
+            // PASSTHRU: formals forwarded into an already-summarized
+            // INVOKE function -> the wrapper inherits the translated
+            // atom (composition lift; closes kthread_create_on_cpu /
+            // smpboot without hand-seeding)
+            auto sit = Ctx->FuncSummaries.find(
+                getFuncDef(const_cast<Function *>(IC)));
+            if (sit == Ctx->FuncSummaries.end())
+              sit = Ctx->FuncSummaries.find(IC);
+            if (sit != Ctx->FuncSummaries.end()) {
+              for (const auto &A : sit->second->atoms) {
+                if (A.kind != GlobalContext::SummaryAtom::Invoke) continue;
+                if ((unsigned)A.dst >= CB->arg_size() ||
+                    (unsigned)A.src >= CB->arg_size())
+                  continue;
+                int fIdx = formalIdx(F, CB->getArgOperand(A.dst));
+                int dIdx = formalIdx(F, CB->getArgOperand(A.src));
+                if (fIdx < 0 || dIdx < 0 || fIdx == dIdx) continue;
+                if (seen.insert({&F, fIdx, dIdx, "PASSTHRU"}).second)
+                  cands.push_back({&F, fIdx, dIdx, A.aux, "PASSTHRU"});
+              }
+            }
+            continue;
+          }
+          int fIdx = formalIdx(F, CB->getCalledOperand());
+          if (fIdx < 0) continue;
+          for (unsigned k = 0; k < CB->arg_size(); k++) {
+            int dIdx = formalIdx(F, CB->getArgOperand(k));
+            if (dIdx < 0 || dIdx == fIdx) continue;
+            if (!containsPointerType(CB->getArgOperand(k)->getType()))
+              continue;
+            if (seen.insert({&F, fIdx, dIdx, "DIRECT"}).second)
+              cands.push_back({&F, fIdx, dIdx, (int)k, "DIRECT"});
+          }
+        } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+          int vIdx = formalIdx(F, SI->getValueOperand());
+          if (vIdx < 0) continue;
+          const Value *base = storeBase(SI->getPointerOperand());
+          int bIdx = formalIdx(F, base);
+          if (bIdx >= 0 && bIdx != vIdx) {
+            if (seen.insert({&F, vIdx, bIdx, "FIELD"}).second)
+              cands.push_back({&F, vIdx, bIdx, -1, "FIELD"});
+          } else if (isa<AllocaInst>(base) || isa<CallBase>(base) ||
+                     isa<GlobalVariable>(base)) {
+            coStores[base].insert(vIdx);
+          }
+        }
+      }
+      for (auto &[base, idxs] : coStores) {
+        if (idxs.size() < 2) continue;
+        // report each ordered pair once (fn identity unknown pre-callsite)
+        for (int a : idxs)
+          for (int b : idxs)
+            if (a != b && seen.insert({&F, a, b, "COSTORE"}).second)
+              cands.push_back({&F, a, b, -1, "COSTORE"});
+      }
+    }
+  }
+  // callsite evidence sweep: constant Function at argF position
+  std::map<const Function *, std::vector<Cand *>> byFunc;
+  for (auto &c : cands) byFunc[getFuncDef(const_cast<Function *>(c.F))]
+                            .push_back(&c);
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) {
+      if (F.isDeclaration()) continue;
+      for (const Instruction &I : instructions(F)) {
+        const auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->isInlineAsm()) continue;
+        const Function *CF = CB->getCalledFunction();
+        if (!CF) continue;
+        auto it = byFunc.find(getFuncDef(const_cast<Function *>(CF)));
+        if (it == byFunc.end()) continue;
+        for (Cand *c : it->second) {
+          if ((unsigned)c->argF >= CB->arg_size()) continue;
+          c->callsites++;
+          const Value *fv = CB->getArgOperand(c->argF)->stripPointerCasts();
+          if (isa<Function>(fv)) c->constFn++;
+          else if (isa<ConstantPointerNull>(fv)) c->nullFn++;
+          else c->dynFn++;
+        }
+      }
+    }
+  }
+  std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) {
+    return a.constFn != b.constFn ? a.constFn > b.constFn
+                                  : a.callsites > b.callsites;
+  });
+  size_t withEvidence = 0, printed = 0;
+  for (const auto &c : cands)
+    if (c.constFn > 0) withEvidence++;
+  errs() << "InvokeCensus: scanned " << nFuncs << " defined functions, "
+         << cands.size() << " shape candidates, " << withEvidence
+         << " with constant-Function callsite evidence\n";
+  for (const auto &c : cands) {
+    if (c.constFn == 0 || printed >= 200) break;
+    printed++;
+    errs() << "InvokeCensus: " << c.shape << " " << c.F->getName()
+           << " fn=arg" << c.argF << " data=arg" << c.argD;
+    if (c.fk >= 0) errs() << " f" << c.fk;
+    errs() << " callsites=" << c.callsites << " constFn=" << c.constFn
+           << " null=" << c.nullFn << " dyn=" << c.dynFn;
+    if (c.fk >= 0)
+      errs() << "  proposal: " << c.F->getName() << " INVOKE(arg" << c.argF
+             << ":f" << c.fk << "<-arg" << c.argD << ")";
+    errs() << "\n";
+  }
+  if (withEvidence > printed)
+    errs() << "InvokeCensus: ... +" << (withEvidence - printed)
+           << " more with evidence (raise the cap to see them)\n";
+}
+
 bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
 
   if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
+
+  if (CFLCensusInvoke && iteration == 0 && M == Ctx->Modules.front().first)
+    runInvokeCensus(); // all modules + summaries loaded; adds no edges
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

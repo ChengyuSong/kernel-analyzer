@@ -285,6 +285,17 @@ cl::opt<bool> CFLProbeRodataJoins(
            "answers WILL drop. Do not combine with --cfl-verify-closure"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusInvoke(
+  "cfl-census-invoke",
+  cl::desc("MEASUREMENT-ONLY census: scan defined functions for the "
+           "(fn,data) registration shapes behind the INVOKE summary atom "
+           "(fptr formal invoked with another formal; formal stored into "
+           "another formal's field; formals co-stored into one object), "
+           "then rank candidates by constant-Function evidence at their "
+           "direct callsites. Emits proposal lines for review; adds no "
+           "edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLConfirmFresh(
   "cfl-confirm-fresh",
   cl::desc("Body-confirm PURE-FRESH allocation wrappers (returns trace "

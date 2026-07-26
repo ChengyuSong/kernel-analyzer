@@ -14,14 +14,17 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <cstdio>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "LLMAnalysis.h"
 #include "Global.h"
 #include "Annotation.h"
 #include "LLMClient.h"
+#include <llvm/Support/CommandLine.h>
 
 #define LLM_LOG(stmt) KA_LOG(2, "LLMAnalysis: " << stmt)
 #define LLM_DEBUG(stmt) KA_LOG(3, "LLMAnalysis: " << stmt)
@@ -601,4 +604,294 @@ int loadContainerFile(GlobalContext *Ctx, StringRef Path) {
   size_t Added = processContainerResponse(Ctx, JsonStr, Batch);
   LLM_LOG("Loaded " << Added << " container function(s) from " << Path << "\n");
   return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Kerneldoc-driven INVOKE mining (task #28 tier 3)
+// ---------------------------------------------------------------------------
+
+namespace {
+struct KdocBlock {
+  std::string File;
+  unsigned Line = 0;
+  std::vector<std::pair<std::string, std::string>> Params; // ordered
+  std::string Text; // full block text
+};
+} // namespace
+
+// Read the kerneldoc block around File:Line (the " * name - " header).
+static bool readKdocBlock(StringRef Path, unsigned Line, KdocBlock &Out) {
+  auto Buf = MemoryBuffer::getFile(Path);
+  if (!Buf)
+    return false;
+  SmallVector<StringRef, 0> Lines;
+  (*Buf)->getBuffer().split(Lines, '\n');
+  if (Line == 0 || Line > Lines.size())
+    return false;
+  size_t I = Line - 1, Start = I, End = I;
+  while (Start > 0 && !Lines[Start].contains("/**"))
+    Start--;
+  while (End < Lines.size() && !Lines[End].contains("*/"))
+    End++;
+  std::pair<std::string, std::string> *Cur = nullptr;
+  for (size_t L = Start; L < End && L < Lines.size(); L++) {
+    StringRef S = Lines[L].trim();
+    Out.Text += S.str();
+    Out.Text += "\n";
+    if (!S.consume_front("*"))
+      continue;
+    S = S.ltrim();
+    if (S.consume_front("@")) {
+      auto [Name, Rest] = S.split(':');
+      std::string N = Name.trim().str();
+      std::string LowerN = StringRef(N).lower();
+      if (LowerN == "return" || LowerN == "returns" || LowerN == "note" ||
+          LowerN == "context") {
+        Cur = nullptr;
+        continue;
+      }
+      Out.Params.emplace_back(N, Rest.trim().str());
+      Cur = &Out.Params.back();
+    } else if (Cur && !S.empty()) {
+      Cur->second += " ";
+      Cur->second += S.str();
+    } else {
+      Cur = nullptr;
+    }
+  }
+  return !Out.Params.empty();
+}
+
+static bool kdocHasCallbackIdiom(const KdocBlock &B) {
+  static const char *Idioms[] = {
+      "callback", "handler",   "called",      "invoked",  "cookie",
+      "argument to", "passed to", "data passed", "private data", "opaque"};
+  std::string Lower = StringRef(B.Text).lower();
+  for (const char *I : Idioms)
+    if (Lower.find(I) != std::string::npos)
+      return true;
+  return false;
+}
+
+void queryInvokeCandidates(GlobalContext *Ctx, LLMClient *LLM,
+                           StringRef KernelSrc, StringRef OutPath,
+                           bool DryRun) {
+  if (!DryRun && !LLM) {
+    WARNING("InvokeMine: no LLM client (use --llm-server-host/port, or "
+            "--invoke-mine-dry)\n");
+    return;
+  }
+  // Names already summarized: mining runs pre-pass, so read the
+  // authoritative file directly (first token per non-comment line).
+  std::unordered_set<std::string> Summarized;
+  {
+    extern cl::opt<std::string> FuncSummaryFile;
+    std::ifstream In(FuncSummaryFile);
+    std::string Line;
+    while (std::getline(In, Line)) {
+      StringRef L = StringRef(Line).trim();
+      if (L.empty() || L.starts_with("#")) continue;
+      StringRef Name = L.split(' ').first.rtrim("*");
+      Summarized.insert(Name.str());
+    }
+  }
+  // Corpus-defined functions eligible for a registration contract.
+  std::unordered_map<std::string, Function *> Defined;
+  for (auto &mp : Ctx->Modules)
+    for (Function &F : *mp.first) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty())
+        continue;
+      if (F.arg_size() < 2)
+        continue;
+      bool HasPtr = false;
+      for (auto &A : F.args())
+        HasPtr |= A.getType()->isPointerTy();
+      if (HasPtr)
+        Defined.emplace(F.getName().str(), &F);
+    }
+  LLM_LOG("InvokeMine: " << Defined.size()
+          << " defined candidate functions in corpus\n");
+
+  // One grep pass over the kernel tree for kerneldoc headers.
+  std::string Cmd =
+      "grep -rnE --include=*.c --include=*.h "
+      "'^[[:space:]]*\\*[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]+-"
+      "[[:space:]]' " +
+      KernelSrc.str() + " 2>/dev/null";
+  FILE *P = popen(Cmd.c_str(), "r");
+  if (!P) {
+    WARNING("InvokeMine: grep over kernel tree failed\n");
+    return;
+  }
+  std::unordered_map<std::string, std::pair<std::string, unsigned>> Hits;
+  {
+    char *LinePtr = nullptr;
+    size_t Cap = 0;
+    ssize_t N;
+    while ((N = getline(&LinePtr, &Cap, P)) > 0) {
+      StringRef L(LinePtr, N);
+      auto [FileName, Rest1] = L.split(':');
+      auto [LineNo, Rest2] = Rest1.split(':');
+      unsigned LN = 0;
+      if (LineNo.getAsInteger(10, LN))
+        continue;
+      StringRef S = Rest2.trim();
+      if (!S.consume_front("*"))
+        continue;
+      S = S.ltrim();
+      auto NameEnd = S.find_first_not_of(
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_");
+      std::string Name = S.substr(0, NameEnd).str();
+      if (Name.empty() || !Defined.count(Name))
+        continue;
+      Hits.emplace(Name, std::make_pair(FileName.str(), LN)); // first wins
+    }
+    free(LinePtr);
+  }
+  pclose(P);
+  LLM_LOG("InvokeMine: kerneldoc headers matched for " << Hits.size()
+          << " corpus functions\n");
+
+  // Extract blocks; keep callback-idiom candidates the file hasn't
+  // already summarized.
+  struct Cand {
+    Function *F;
+    KdocBlock B;
+  };
+  std::vector<Cand> Cands;
+  for (auto &[Name, Loc] : Hits) {
+    Function *F = Defined[Name];
+    if (Summarized.count(Name))
+      continue;
+    KdocBlock B;
+    B.File = Loc.first;
+    B.Line = Loc.second;
+    if (!readKdocBlock(Loc.first, Loc.second, B))
+      continue;
+    if (B.Params.size() < 2 || !kdocHasCallbackIdiom(B))
+      continue;
+    Cands.push_back({F, std::move(B)});
+  }
+  std::sort(Cands.begin(), Cands.end(),
+            [](const Cand &A, const Cand &B) {
+              return A.F->getName() < B.F->getName();
+            });
+  LLM_LOG("InvokeMine: " << Cands.size()
+          << " candidates pass the callback-idiom prefilter\n");
+  if (Cands.empty())
+    return;
+
+  std::error_code EC;
+  raw_fd_ostream Out(OutPath, EC);
+  if (EC) {
+    WARNING("InvokeMine: cannot write " << OutPath << ": " << EC.message()
+            << "\n");
+    return;
+  }
+  Out << "# INVOKE proposals mined from kerneldoc (LLM tier-3; REVIEW "
+         "REQUIRED)\n"
+      << "# Docs describe intent — confirm via --cfl-confirm-invoke / "
+         "census evidence\n"
+      << "# before adopting lines into func_summaries.txt.\n";
+
+  const StringRef SystemPrompt =
+      "You extract callback-registration contracts from Linux kernel "
+      "kerneldoc. Answer with strict JSON only, no prose.";
+  const unsigned BatchSize = 6;
+  size_t Proposed = 0, Queried = 0;
+  for (size_t Begin = 0; Begin < Cands.size(); Begin += BatchSize) {
+    size_t End = std::min(Begin + BatchSize, Cands.size());
+    std::string UserPrompt;
+    raw_string_ostream OS(UserPrompt);
+    OS << "For each function, decide from its kerneldoc whether calling it "
+          "registers or performs a callback: a function-pointer parameter "
+          "invoked later or during the call, with another parameter passed "
+          "to it. Use 0-based parameter indices in kerneldoc order. Report "
+          "fn_arg (the function-pointer parameter), data_arg (the parameter "
+          "passed to the callback), callee_formal (0-based position of the "
+          "callback's own parameter receiving data_arg, or null if the doc "
+          "does not say), and evidence (the exact doc sentence). Skip "
+          "functions without such a contract.\n"
+          "Return strict JSON: {\"proposals\":[{\"name\":\"...\",\"fn_arg\":"
+          "0,\"data_arg\":0,\"callee_formal\":null,\"evidence\":\"...\"}]}\n";
+    for (size_t I = Begin; I < End; I++) {
+      const Cand &C = Cands[I];
+      OS << "\n=== " << C.F->getName() << " (params in kerneldoc order:";
+      for (size_t Pi = 0; Pi < C.B.Params.size(); Pi++)
+        OS << (Pi ? ", " : " ") << C.B.Params[Pi].first;
+      OS << ")\nsignature: " << *C.F->getFunctionType() << "\n"
+         << C.B.Text;
+    }
+    OS.flush();
+    if (DryRun) {
+      Out << "\n# ---- DRY-RUN batch at " << Begin << " ("
+          << UserPrompt.size() << " prompt bytes):";
+      for (size_t I = Begin; I < End; I++)
+        Out << " " << Cands[I].F->getName();
+      Out << "\n";
+      if (Begin == 0)
+        LLM_LOG("InvokeMine: first dry-run prompt:\n" << UserPrompt << "\n");
+      continue;
+    }
+    Queried++;
+    unsigned MaxTok = 220 * (End - Begin) + 120;
+    auto Resp = LLM->requestText(SystemPrompt, UserPrompt, MaxTok,
+                                 std::max(240u, MaxTok / 4));
+    if (!Resp) {
+      WARNING("InvokeMine: batch at " << Begin
+              << " failed: " << toString(Resp.takeError()) << "\n");
+      continue;
+    }
+    Expected<json::Value> Parsed =
+        json::parse(LLMClient::stripMarkdownFence(*Resp));
+    if (!Parsed) {
+      consumeError(Parsed.takeError());
+      std::string Repaired =
+          repairTruncatedJSON(LLMClient::stripMarkdownFence(*Resp));
+      Parsed = json::parse(Repaired);
+      if (!Parsed) {
+        consumeError(Parsed.takeError());
+        WARNING("InvokeMine: unparseable JSON for batch at " << Begin << "\n");
+        continue;
+      }
+    }
+    const json::Object *Obj = Parsed->getAsObject();
+    const json::Array *Props = Obj ? Obj->getArray("proposals") : nullptr;
+    if (!Props)
+      continue;
+    for (const json::Value &V : *Props) {
+      const json::Object *E = V.getAsObject();
+      if (!E)
+        continue;
+      auto Name = E->getString("name");
+      auto FnA = E->getInteger("fn_arg");
+      auto DataA = E->getInteger("data_arg");
+      auto Ev = E->getString("evidence");
+      if (!Name || !FnA || !DataA)
+        continue;
+      // Validate against the batch and the IR arity.
+      const Cand *C = nullptr;
+      for (size_t I = Begin; I < End; I++)
+        if (Cands[I].F->getName() == *Name)
+          C = &Cands[I];
+      if (!C || *FnA == *DataA || *FnA < 0 || *DataA < 0 ||
+          (unsigned)*FnA >= C->F->arg_size() ||
+          (unsigned)*DataA >= C->F->arg_size())
+        continue;
+      auto KF = E->getInteger("callee_formal");
+      Out << "\n# doc[" << C->B.File << ":" << C->B.Line << "] "
+          << (Ev ? *Ev : StringRef("(no evidence quoted)")) << "\n";
+      Out << "# PROPOSAL: " << *Name << " INVOKE(arg" << *FnA << ":f"
+          << (KF ? std::to_string(*KF) : std::string("?")) << "<-arg"
+          << *DataA << ")";
+      if (!KF)
+        Out << "   # fK: review the callback typedef";
+      Out << "\n";
+      Proposed++;
+    }
+  }
+  LLM_LOG("InvokeMine: " << Proposed << " proposals from " << Queried
+          << " LLM batches -> " << OutPath << "\n");
+  Out << "\n# == " << Cands.size() << " candidates, " << Proposed
+      << " proposals\n";
 }

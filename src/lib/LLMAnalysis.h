@@ -12,6 +12,18 @@ class LLMClient;
 void queryAllocatorCandidates(GlobalContext *Ctx, LLMClient *LLM, llvm::Module *M);
 void queryContainerCandidates(GlobalContext *Ctx, LLMClient *LLM, llvm::Module *M);
 
+// Kerneldoc-driven INVOKE mining (task #28 tier 3): one grep pass over
+// KernelSrc finds kerneldoc blocks for corpus-defined functions; blocks
+// with callback idioms are batched to the LLM, which extracts the
+// registration contract (fn param, data param, callee formal) with the
+// doc sentence as evidence. Validated proposals are WRITTEN to OutPath
+// in func_summaries.txt line format with provenance comments — never
+// auto-applied; the confirmer / file review remain the soundness gate.
+// DryRun extracts and prints prompts without contacting the LLM.
+void queryInvokeCandidates(GlobalContext *Ctx, LLMClient *LLM,
+                           llvm::StringRef KernelSrc, llvm::StringRef OutPath,
+                           bool DryRun);
+
 // File save/load
 bool saveAllocatorResults(GlobalContext *Ctx, llvm::StringRef Path);
 bool saveContainerResults(GlobalContext *Ctx, llvm::StringRef Path);

@@ -87,6 +87,26 @@ cl::opt<std::string> LLMServerHost(
 cl::opt<unsigned> LLMServerPort(
   "llm-server-port", cl::desc("Port of local LLM server"), cl::init(0));
 
+cl::opt<std::string> InvokeProposalsFile(
+  "invoke-proposals",
+  cl::desc("Mine kerneldoc for INVOKE registration contracts (task #28 "
+           "tier 3) and write REVIEW proposals to this file, then exit. "
+           "Requires --kernel-src and an LLM server (--llm-server-host/"
+           "-port), or --invoke-mine-dry to validate extraction offline. "
+           "Proposals are never auto-applied"),
+  cl::init(""));
+
+cl::opt<std::string> KernelSrcTree(
+  "kernel-src",
+  cl::desc("Kernel source tree for kerneldoc extraction"),
+  cl::init(""));
+
+cl::opt<bool> InvokeMineDry(
+  "invoke-mine-dry",
+  cl::desc("Extract + prefilter kerneldoc candidates and record batch "
+           "prompts without contacting the LLM"),
+  cl::init(false));
+
 cl::opt<bool> QueryLLM(
   "query-llm", cl::desc("Run LLM queries, save results to files, then exit"), cl::init(false));
 
@@ -737,6 +757,22 @@ int main(int argc, char **argv) {
     if (IRCensusOpt)
       return CR.undispKinds > 0 ? 1 : 0;
     // strict/out without --ir-census: gate passed, continue to analysis
+  }
+
+  // Kerneldoc INVOKE mining: standalone proposer stage, exits after.
+  if (!InvokeProposalsFile.empty()) {
+    if (KernelSrcTree.empty()) {
+      errs() << "Error: --invoke-proposals requires --kernel-src\n";
+      return 1;
+    }
+    if (!InvokeMineDry && !LLM) {
+      errs() << "Error: --invoke-proposals requires --llm-server-host and "
+                "--llm-server-port (or --invoke-mine-dry)\n";
+      return 1;
+    }
+    queryInvokeCandidates(&GlobalCtx, LLM.get(), KernelSrcTree,
+                          InvokeProposalsFile, InvokeMineDry);
+    return 0;
   }
 
   // LLM query / file loading for allocator candidates

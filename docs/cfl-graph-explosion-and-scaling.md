@@ -2328,3 +2328,44 @@ bindings, 2,258 dynamic-fn pooled fallbacks. Cost unchanged (~2.6h,
 dump-dominated). Candidate pin files:
 ka-scratch/kernel-invoke2-{stats.txt,icalls.sort.gz} — awaiting
 review before replacing the kernel-summ baseline.
+
+### INVOKE candidate census, tier 1 (km, 2026-07-26)
+
+Kernel pin promoted first: test/baselines/kernel-invoke-* is now the
+canonical whole-kernel baseline (16,532 / 5,484,521; commit 42d7a9a).
+
+--cfl-census-invoke (057cd9c) makes candidate discovery mechanical:
+four body shapes (DIRECT / FIELD / COSTORE / PASSTHRU) filtered by
+constant-Function evidence at direct callsites. km: 6,788 functions
+scanned, 3,968 raw shape hits, 46 survive the evidence filter — the
+filter is doing the work (99% of shape hits are generic container
+stores with no fn-registration evidence).
+
+The 46 split into four buckets:
+1. Already modeled, rediscovered (validation): __static_call_update
+   (task #14), tracepoint_probe_register[_prio] (tp_func machinery) —
+   do NOT seed blindly; the data-correlation half may still be worth
+   adding on top of the dispatch model, separately evaluated.
+2. Deferred registration, new: stop_one_cpu_nowait (FIELD, 8 const)
+   and the stop-machine/smp family (stop_machine_cpuslocked,
+   smp_call_on_cpu, work_on_cpu_key, smp_call_function_many_cond) —
+   this is the multi_cpu_stop/migration_cpu_stop hub residual the km
+   A/B left standing. kernel_thread/user_mode_thread/
+   __kthread_create_on_node extend the kthread family.
+   call_rcu_tasks_generic is the shared body behind the seeded
+   call_rcu_tasks wrappers.
+3. Synchronous higher-order fns: event_function_call (15),
+   perf_iterate_sb (12), task_call_func, kref_put, write_cache_pages,
+   parse_args, kallsyms iterators, __bfs — these drain shared-formal
+   conflation (the c17037 channel is pointer formals) rather than a
+   container pool.
+4. PASSTHRU composition: kthread_create_on_cpu INVOKE(arg0:f0<-arg1)
+   derived from its single forwarding callsite into summarized
+   kthread_create_on_node — the smpboot-residual closer, found
+   without hand analysis.
+
+Next: tier-2 confirmer (--cfl-confirm-invoke) applying the #17
+completeness discipline (every pointer formal accounted or reject to
+LEDGER) so buckets 2-4 can be auto-emitted as reviewed summary lines;
+then seed tranche 2 (stop-machine family + kthread_create_on_cpu) and
+re-ladder.

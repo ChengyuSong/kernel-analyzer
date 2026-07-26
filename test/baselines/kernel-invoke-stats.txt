@@ -1,0 +1,22 @@
+Whole-kernel flows-to baseline WITH INVOKE PAIR SUMMARIES (canonical pin) (2026-07-26, task #28)
+commits: cedcd1c (INVOKE atom) + 2a7305e (dynamic-fn fallback soundness fix)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
+        --func-summaries=func_summaries.txt --cfl-dump-icalls --bc-list bclist
+baseline: kernel-summ pin (16,532 icalls / 5,649,018 dumped pairs)
+
+resolved: 16,532 icalls / 5,484,521 dumped pairs (converged iteration 4)
+delta vs pin: -164,499 removed / +2 added (-2.91%)
+LEDGER: 2,524 functions summarized; 383 CPY, 464 INVOKE bindings,
+        2,258 dynamic-fn pooled fallbacks, 0 refs skipped
+added (2): __wait_rcu_gp + synchronize_rcu_tasks_generic icalls ->
+        wakeme_after_rcu (INVOKE re-attribution on icalls resolving to
+        the summarized call_rcu family; vetted at km)
+removed: kthread/timer/rcu/irq pooled-dispatch smear — each kthread
+        threadfn (worker_thread, rescuer_thread, kswapd, md_thread,
+        napi_threaded_poll, ...) drained from its 3,320-site fan-in
+soundness checks: resolved-icalls count restored to 16,532 (was 16,526
+        in the pre-fix run); smpboot_thread_fn a target at 3,320 sites
+        (dynamic-registration pooled residual) and its own 6 icalls
+        carry 436 pairs (== baseline count, cpuhp/ksoftirqd targets
+        intact)
+timing: CGPass 9,414,643 ms (~2.6 h, dominated by the 5.5M-line dump)

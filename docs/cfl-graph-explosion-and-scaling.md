@@ -2409,3 +2409,32 @@ Adoption path (per the recorded rollout discipline): the 13 CONFIRMED
 lines are file-format; adopting them into func_summaries.txt (the
 reviewed artifact) + kernel re-pin is the next decision point.
 --cfl-confirm-invoke itself stays OFF in pinned configs.
+
+### Tier-3 input: kerneldoc corroboration (tools/kdoc_invoke.py, 2026-07-26)
+
+The 13 tier-2 lines were adopted into func_summaries.txt (4630c6a; km
+file-only run byte-identical to the confirmer run, 70,975); kernel
+re-pin candidate in flight.
+
+The kernel documents the INVOKE relation in stereotyped kerneldoc:
+"@dev_id: A cookie passed back to the handler function"
+(request_threaded_irq) is INVOKE(arg1:f1<-arg5) in natural language.
+tools/kdoc_invoke.py (5a7542e) cross-checks census candidates against
+these idioms: ordered @param blocks give doc-implied fn/data indices;
+agreement with the census-derived indices emits a proposal line
+carrying the matched doc sentence as provenance; disagreement emits
+PARTIAL. Docs describe intent — proposer tier only, confirmer/file
+review remain the gate.
+
+km residual queue (40 after adoption): 3 AGREE (task_call_func
+"Argument to function." -> INVOKE(arg1:f1<-arg2); write_cache_pages
+"data passed to writepage function" -> INVOKE(arg2:f2<-arg3);
+stop_one_cpu "argument to @fn"), 7 PARTIAL (incl. the
+tracepoint/stop-machine families where the doc names the fn but the
+data phrasing is loose), 22 no-doc. The no-doc population is
+internal/static helpers (__static_call_update, event_function_call,
+__bfs, __kthread_create_on_node): the kernel documents its PUBLIC
+boundary. Evidence sources therefore complement BY LAYER — body proof
+for internals, callsite evidence everywhere, documented intent at the
+API boundary — each gated by the one above it. (Paper: a three-source
+evidence pipeline of decreasing rigor with a single soundness gate.)

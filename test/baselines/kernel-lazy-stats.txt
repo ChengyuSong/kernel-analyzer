@@ -1,5 +1,5 @@
 Whole-kernel flows-to LAZY-MINT pinned baseline (2026-07-23, task #21)
-commits: 7da46aa (lazy mint) + 446f35b (catch-up) + GUID self-filter (this commit)
+commits: 62b2786 (lazy mint) + 1fa5186 (catch-up) + GUID self-filter (this commit)
 config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune --cfl-lazy-mint
         --cfl-dump-icalls --bc-list bclist   (from-scratch driver mode, the default)
 
@@ -52,12 +52,12 @@ subsets (GUID-filter binary, eager==lazy bit-identical, closure verified):
   km 1,482/81,293; harfbuzz 2,824 (catch-up 264); libpng 9 (Callee-by-type 27/9);
   8 micro tests exact; saturation smoke 4/4.
 
-Lean (proof/lean/CompositionalCFL/FlowsTo.lean, commit daf04ba): sderiv_catchup
+Lean (proof/lean/CompositionalCFL/FlowsTo.lean, commit 7b9b028): sderiv_catchup
   (staging confluence = catch-up exactness), catchup_answers_complete,
   answer_not_derivable_restricted (necessity counterexample). Open: F11 —
   a provably sufficient restricted root set (would drop the catch-up cost).
 
-CONFIRMATION RUN (kernel-lazy3, commit 1f5ff6e binary, completed
+CONFIRMATION RUN (kernel-lazy3, commit 809c17d binary, completed
 2026-07-24): rc=0, wall 2:58:09, peak RSS 40.05 GB; ICALL dump
 BYTE-IDENTICAL to kernel-lazy-icalls.sort.gz — the GUID-filter binary
 reproduces the pinned canonical dump exactly, closing the loop on the

@@ -1,5 +1,5 @@
 Whole-kernel flows-to baseline WITH TRANSFER SUMMARIES (2026-07-24, task #26)
-commits: b9468f4 (summary infrastructure) on top of the task #21 line
+commits: 7ac1559 (summary infrastructure) on top of the task #21 line
 config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
         --func-summaries=func_summaries.txt --cfl-dump-icalls --bc-list bclist
         (EAGER minting; lazy==eager equivalence pinned separately in

@@ -1528,7 +1528,7 @@ SCT 142k (real &tramp flows into __static_call_update void* params),
 other 553k (trace/param members through registration stores + hub
 spread) — the quantified motivation for #17/#21.
 
-## 2026-07-23: soundness items closed — asm interface closure + static_call (tasks #23 + #14, 4295575/9fc2994)
+## 2026-07-23: soundness items closed — asm interface closure + static_call (tasks #23 + #14, 287f3c9/4aab066)
 
 Inline asm (census top levers): handleInlineAsm extended with (a)
 ptr-WIDTH indirect slots under the laundering witnesses (asm atomics
@@ -1566,7 +1566,7 @@ outsized precision.
 
 ## 2026-07-23: lazy minting shipped (task #21) — catch-up round required; A-loop sufficiency REFUTED
 
-Implemented `--cfl-lazy-mint` (7da46aa): A := backward reachability
+Implemented `--cfl-lazy-mint` (62b2786): A := backward reachability
 from fptr classes over reversed {a, f} edges PLUS cell->owner hops
 (the owner hop must apply to the WHOLE closure, not only fptr-feeding
 cells, or witnesses of intermediate joins are missed); origins and
@@ -1593,9 +1593,9 @@ shapes resolve through owner-hops (we could not build a <=7-node
 counterexample against the A-loop — constructing one is open), the
 kernel's circular lists do not.
 
-FIX (446f35b): catch-up round at convergence — mint every
+FIX (1fa5186): catch-up round at convergence — mint every
 still-deferred root, keep draining. Exact BY CONSTRUCTION via closure
-confluence, machine-checked (proof/lean daf04ba: `sderiv_catchup`
+confluence, machine-checked (proof/lean 7b9b028: `sderiv_catchup`
 staging theorem, `catchup_answers_complete`, plus the necessity
 counterexample `answer_not_derivable_restricted`; GAPS.md F11 records
 the open sufficiency problem).
@@ -2166,7 +2166,7 @@ alongside the kthread pair-root prototype (step b).
 ### INVOKE: pair correlation as a transfer summary (2026-07-25)
 
 Step (b) shipped not as a bespoke pair-root mechanism but as a new
-atom in the transfer-summary vocabulary (commit cedcd1c):
+atom in the transfer-summary vocabulary (commit cead1e8):
 `INVOKE(argF:fK<-argD)` — "the fn at argF will be invoked with argD
 bound to its formal K". Creatable by hand/census/proposer, imported
 from func_summaries.txt, applied at callsites like every other atom.
@@ -2217,7 +2217,7 @@ gap, not a regression: wireLinkerSectionArrays runs once after the
 last module, so its cross-module edges fall outside every per-TU
 graph and no TU exports the bounds symbols the compose-time
 expected-set demands (the code comment at the call site says
-exactly this). Verified by bisect: cda6fd9 (the km-summ pin commit)
+exactly this). Verified by bisect: 66cf326 (the km-summ pin commit)
 fails identically in compositional mode on the same input. The
 strict sanity check caught the mode mismatch loudly instead of
 composing over missing linker-array flows — working as designed.
@@ -2274,7 +2274,7 @@ smpboot_thread_fn — whose baseline targets included REAL callbacks
 (cpuhp_should_run, run_ksoftirqd). smpboot_thread_fn itself went from
 3,320 icall-target sites to ZERO. Real loss, not drain.
 
-Root cause, two layers (commit 2a7305e):
+Root cause, two layers (commit 16ab7dc):
 1. The three allocator-branch callers of applySummaryAtoms discarded
    the needPooled return — a dynamic-fn registration through a
    FRESH+INVOKE function (kthread_create_on_cpu passes its OWN FORMAL
@@ -2315,7 +2315,7 @@ ka-scratch, baselines untouched pending review.
 
 ### Kernel INVOKE re-run (post-fix): clean verdict (2026-07-26)
 
-Fixed binary (2a7305e), pinned config + seeds: 16,532 resolved icalls
+Fixed binary (16ab7dc), pinned config + seeds: 16,532 resolved icalls
 / 5,484,521 pairs vs the kernel-summ pin's 16,532 / 5,649,018 —
 -164,499 removed, +2 added (-2.91%). Every soundness tell from run #1
 is green: resolved-icalls count restored exactly; smpboot_thread_fn
@@ -2332,9 +2332,9 @@ review before replacing the kernel-summ baseline.
 ### INVOKE candidate census, tier 1 (km, 2026-07-26)
 
 Kernel pin promoted first: test/baselines/kernel-invoke-* is now the
-canonical whole-kernel baseline (16,532 / 5,484,521; commit 42d7a9a).
+canonical whole-kernel baseline (16,532 / 5,484,521; commit 1b2222d).
 
---cfl-census-invoke (057cd9c) makes candidate discovery mechanical:
+--cfl-census-invoke (6e41c7e) makes candidate discovery mechanical:
 four body shapes (DIRECT / FIELD / COSTORE / PASSTHRU) filtered by
 constant-Function evidence at direct callsites. km: 6,788 functions
 scanned, 3,968 raw shape hits, 46 survive the evidence filter — the

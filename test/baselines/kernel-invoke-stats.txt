@@ -1,5 +1,5 @@
 Whole-kernel flows-to baseline WITH INVOKE PAIR SUMMARIES (canonical pin) (2026-07-26, task #28)
-commits: cedcd1c (INVOKE atom) + 2a7305e (dynamic-fn fallback soundness fix)
+commits: cead1e8 (INVOKE atom) + 16ab7dc (dynamic-fn fallback soundness fix)
 config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
         --func-summaries=func_summaries.txt --cfl-dump-icalls --bc-list bclist
 baseline: kernel-summ pin (16,532 icalls / 5,649,018 dumped pairs)

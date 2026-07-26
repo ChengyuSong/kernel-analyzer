@@ -1,4 +1,4 @@
-Whole-kernel flows-to pinned baseline (2026-07-23, commit 9fc2994, tasks #14+#23)
+Whole-kernel flows-to pinned baseline (2026-07-23, commit 4aab066, tasks #14+#23)
 config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune --cfl-dump-icalls --bc-list bclist
 resolved: 16720 icalls / 5644481 pairs, converged iteration 4
 solve: 223667 244773 245272 245108 245544 ms (~20.1 min)  wall 2:40:04 (incl 5.6M-line dump)  RSS 40.1 GB

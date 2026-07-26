@@ -7655,6 +7655,259 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
   return needPooled;
 }
 
+// --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries
+// where the proof is LOCAL, under the #17 completeness discipline — a
+// summary replaces callsite arg/ret wiring, so every pointer formal
+// must be fully accounted by the atoms or provably benign; anything
+// else rejects to the LEDGER.
+//   DIRECT   the fn formal is invoked synchronously in the body with
+//            other formals as arguments -> INVOKE atoms verbatim.
+//   PASSTHRU formals are forwarded into an already-summarized INVOKE
+//            callee -> the wrapper inherits translated atoms (+FRESH
+//            when it returns the callee's fresh result). Fixpoint over
+//            wrapper chains.
+// Deferred shapes (FIELD/COSTORE) are NOT auto-confirmed: their
+// dispatcher lives elsewhere; the census reports them for review.
+static size_t g_invConfirmed = 0, g_invConfirmedPass = 0, g_invRejEscape = 0,
+              g_invRejPtrRet = 0, g_invRejNoBinding = 0, g_invRejShape = 0;
+void CallGraphPass::confirmInvokeSummaries() {
+  // Benign transitive use of a pointer chain rooted at a formal:
+  // address arithmetic and non-pointer reads/writes lose no pointer
+  // flow when callsite wiring is dropped. PHIs/selects reject (v1).
+  std::function<bool(const Value *)> benignChain = [&](const Value *V) {
+    for (const User *U : V->users()) {
+      if (isa<GEPOperator>(U) || isa<CastInst>(U)) {
+        if (!benignChain(U)) return false;
+      } else if (const auto *LI = dyn_cast<LoadInst>(U)) {
+        if (containsPointerType(LI->getType())) return false;
+      } else if (const auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getValueOperand() == V) return false; // chain ptr escapes
+        if (containsPointerType(SI->getValueOperand()->getType()))
+          return false; // pointer written through the chain
+      } else if (const auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
+        if (containsPointerType(RMW->getValOperand()->getType()))
+          return false;
+      } else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(U)) {
+        if (containsPointerType(CX->getNewValOperand()->getType()))
+          return false;
+      } else if (isa<ICmpInst>(U)) {
+        // ok
+      } else {
+        return false;
+      }
+    }
+    return true;
+  };
+  auto isNoopIntrinsic = [](const Function *IF) {
+    if (!IF || !IF->isIntrinsic()) return false;
+    switch (IF->getIntrinsicID()) {
+    case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+    case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+    case Intrinsic::assume: case Intrinsic::expect:
+      return true;
+    default: return false;
+    }
+  };
+  size_t rounds = 0;
+  bool changed = true;
+  SmallPtrSet<const Function *, 16> rejected; // don't re-check/re-count
+  while (changed && rounds++ < 16) {
+    changed = false;
+    for (auto &mp : Ctx->Modules) {
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
+        if (F.isVarArg()) continue;
+        if (shouldSkipFunction(&F)) continue;
+        if (Ctx->FuncSummaries.count(&F)) continue;
+        if (rejected.count(&F)) continue;
+        if (F.arg_size() < 2) continue;
+        auto formalIdx = [&](const Value *V) -> int {
+          V = V->stripPointerCasts();
+          for (const auto &A : F.args())
+            if (&A == V) return (int)A.getArgNo();
+          return -1;
+        };
+        // Locate the dispatch sites: icalls on ONE fn formal (DIRECT)
+        // and/or calls into summarized-INVOKE callees (PASSTHRU).
+        int fnFormal = -1;
+        bool multiFn = false;
+        SmallPtrSet<const CallBase *, 4> fnIcalls, passCalls;
+        for (const Instruction &I : instructions(F)) {
+          const auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || CB->isInlineAsm()) continue;
+          if (const Function *IC = CB->getCalledFunction()) {
+            auto sit = Ctx->FuncSummaries.find(
+                getFuncDef(const_cast<Function *>(IC)));
+            if (sit == Ctx->FuncSummaries.end())
+              sit = Ctx->FuncSummaries.find(IC);
+            if (sit == Ctx->FuncSummaries.end()) continue;
+            bool onlyInvFresh = true;
+            for (const auto &A : sit->second->atoms) {
+              if (A.kind == GlobalContext::SummaryAtom::Invoke) {
+                if ((unsigned)A.dst < CB->arg_size() &&
+                    formalIdx(CB->getArgOperand(A.dst)) >= 0)
+                  passCalls.insert(CB);
+              } else if (A.kind != GlobalContext::SummaryAtom::Fresh) {
+                onlyInvFresh = false; // CPY/ST/... translation: v1 out
+              }
+            }
+            if (!onlyInvFresh) passCalls.erase(CB); // CPY/ST etc.: v1 out
+            continue;
+          }
+          int fi = formalIdx(CB->getCalledOperand());
+          if (fi < 0) continue;
+          if (fnFormal != -1 && fnFormal != fi) multiFn = true;
+          fnFormal = fi;
+          fnIcalls.insert(CB);
+        }
+        if (fnIcalls.empty() && passCalls.empty()) continue;
+        if (multiFn || (!fnIcalls.empty() && !passCalls.empty())) {
+          g_invRejShape++;
+          rejected.insert(&F);
+          continue; // mixed/multi shapes: review territory (v1)
+        }
+        // Completeness sweep over every pointer formal.
+        bool ok = true;
+        const char *why = nullptr;
+        std::set<std::pair<int, int>> bindings; // (callee formal k, data idx)
+        bool wantFresh = false;
+        for (const auto &Arg : F.args()) {
+          if (!containsPointerType(Arg.getType())) continue;
+          int ai = (int)Arg.getArgNo();
+          for (const User *U : Arg.users()) {
+            const auto *CB = dyn_cast<CallBase>(U);
+            if (CB && fnIcalls.count(CB)) {
+              if (CB->getCalledOperand()->stripPointerCasts() == &Arg)
+                continue; // the fn slot itself
+              bool foundArg = false;
+              for (unsigned k = 0; k < CB->arg_size(); k++)
+                if (CB->getArgOperand(k)->stripPointerCasts() == &Arg) {
+                  bindings.insert({(int)k, ai});
+                  foundArg = true;
+                }
+              if (!foundArg) { ok = false; why = "esc-call"; }
+              continue;
+            }
+            if (CB && passCalls.count(CB)) continue; // callee summary is
+                                                     // authoritative
+            if (CB) {
+              const Function *IC = CB->getCalledFunction();
+              if (IC && (isNoopIntrinsic(IC) || isFreeFn(IC->getName())))
+                continue;
+              ok = false; why = "esc-call"; break;
+            }
+            if (isa<ICmpInst>(U)) continue;
+            if (isa<GEPOperator>(U) || isa<CastInst>(U) ||
+                isa<LoadInst>(U) || isa<StoreInst>(U) ||
+                isa<AtomicRMWInst>(U) || isa<AtomicCmpXchgInst>(U)) {
+              // treat as chain rooted here: store OF the formal rejects
+              if (const auto *SI = dyn_cast<StoreInst>(U)) {
+                if (SI->getValueOperand()->stripPointerCasts() == &Arg) {
+                  ok = false; why = "esc-store"; break;
+                }
+                if (containsPointerType(SI->getValueOperand()->getType())) {
+                  ok = false; why = "esc-store"; break;
+                }
+                continue;
+              }
+              if (const auto *LI = dyn_cast<LoadInst>(U)) {
+                if (containsPointerType(LI->getType())) {
+                  ok = false; why = "esc-load"; break;
+                }
+                continue;
+              }
+              if (!benignChain(U)) { ok = false; why = "esc-chain"; break; }
+              continue;
+            }
+            ok = false; why = "esc-other"; break;
+          }
+          if (!ok) break;
+        }
+        // Return accounting.
+        const CallBase *retPass = nullptr;
+        if (ok && containsPointerType(F.getReturnType())) {
+          if (!fnIcalls.empty()) {
+            ok = false; why = "ptr-ret";
+          } else {
+            for (const Instruction &I : instructions(F)) {
+              const auto *RI = dyn_cast<ReturnInst>(&I);
+              if (!RI) continue;
+              const Value *RV = RI->getReturnValue()->stripPointerCasts();
+              if (isa<ConstantPointerNull>(RV)) continue;
+              const auto *RC = dyn_cast<CallBase>(RV);
+              if (RC && passCalls.count(RC)) { retPass = RC; continue; }
+              ok = false; why = "ptr-ret"; break;
+            }
+          }
+        }
+        if (!ok) {
+          if (why && (!strcmp(why, "ptr-ret"))) g_invRejPtrRet++;
+          else g_invRejEscape++;
+          CG_LOG("ConfirmInvoke: REVIEW " << F.getName() << " ("
+                 << (fnIcalls.empty() ? "PASSTHRU" : "DIRECT") << ", "
+                 << (why ? why : "?") << ")\n");
+          rejected.insert(&F);
+          continue;
+        }
+        // Build atoms.
+        GlobalContext::FuncSummary S;
+        if (!fnIcalls.empty()) {
+          for (auto [k, d] : bindings)
+            S.atoms.push_back({GlobalContext::SummaryAtom::Invoke,
+                               fnFormal, d, k, nullptr});
+        } else {
+          for (const CallBase *CB : passCalls) {
+            const Function *IC = getFuncDef(
+                const_cast<Function *>(CB->getCalledFunction()));
+            auto sit = Ctx->FuncSummaries.find(IC);
+            if (sit == Ctx->FuncSummaries.end())
+              sit = Ctx->FuncSummaries.find(CB->getCalledFunction());
+            for (const auto &A : sit->second->atoms) {
+              if (A.kind != GlobalContext::SummaryAtom::Invoke) continue;
+              if ((unsigned)A.dst >= CB->arg_size() ||
+                  (unsigned)A.src >= CB->arg_size())
+                continue;
+              int wf = formalIdx(CB->getArgOperand(A.dst));
+              int wd = formalIdx(CB->getArgOperand(A.src));
+              if (wf < 0 || wd < 0 || wf == wd) continue;
+              S.atoms.push_back({GlobalContext::SummaryAtom::Invoke,
+                                 wf, wd, A.aux, nullptr});
+            }
+            if (retPass == CB && sit->second->fresh) wantFresh = true;
+          }
+        }
+        if (S.atoms.empty()) {
+          if (!fnIcalls.empty()) { g_invRejNoBinding++; rejected.insert(&F); }
+          continue; // PASSTHRU may translate in a later round
+        }
+        S.fresh = wantFresh;
+        Ctx->OwnedSummaries.push_back(std::move(S));
+        Ctx->FuncSummaries[&F] = &Ctx->OwnedSummaries.back();
+        if (wantFresh) Ctx->AllocFuncs.insert(&F);
+        if (!fnIcalls.empty()) g_invConfirmed++; else g_invConfirmedPass++;
+        changed = true;
+        // file-format proposal line for review adoption
+        std::string line = F.getName().str();
+        for (const auto &A : Ctx->OwnedSummaries.back().atoms) {
+          line += " INVOKE(arg" + std::to_string(A.dst) + ":f" +
+                  std::to_string(A.aux) + "<-arg" + std::to_string(A.src) +
+                  ")";
+        }
+        if (wantFresh) line += " FRESH";
+        errs() << "ConfirmInvoke: CONFIRMED "
+               << (fnIcalls.empty() ? "PASSTHRU " : "DIRECT ") << line
+               << "\n";
+      }
+    }
+  }
+  CG_LOG("ConfirmInvoke LEDGER: " << g_invConfirmed << " DIRECT + "
+         << g_invConfirmedPass << " PASSTHRU confirmed ("
+         << rounds << " rounds); rejected " << g_invRejEscape
+         << " escape, " << g_invRejPtrRet << " ptr-ret, "
+         << g_invRejNoBinding << " no-binding, " << g_invRejShape
+         << " mixed-shape\n");
+}
+
 // An INVOKE-bearing FRESH summary keeps its body analyzed: the body IS
 // the pooled container channel (create-struct stores -> dispatcher) that
 // dynamic-fn registration callsites still feed. Constant-fn callsites
@@ -9553,6 +9806,9 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
+
+  if (CFLConfirmInvoke && iteration == 0 && M == Ctx->Modules.front().first)
+    confirmInvokeSummaries(); // before any callsite wiring
 
   if (CFLCensusInvoke && iteration == 0 && M == Ctx->Modules.front().first)
     runInvokeCensus(); // all modules + summaries loaded; adds no edges

@@ -137,6 +137,7 @@ private:
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF);
   void confirmFreshWrappers();
   void runInvokeCensus();
+  void confirmInvokeSummaries();
   void handleInlineAsm(llvm::CallBase &CS);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
                             bool rewriteEdges = true);

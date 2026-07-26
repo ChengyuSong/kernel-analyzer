@@ -296,6 +296,17 @@ cl::opt<bool> CFLCensusInvoke(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLConfirmInvoke(
+  "cfl-confirm-invoke",
+  cl::desc("Auto-confirm INVOKE pair summaries where the proof is local "
+           "(task #28 tier 2): DIRECT synchronous invocation of a fn "
+           "formal, and PASSTHRU forwarding into already-summarized "
+           "INVOKE callees (wrapper-chain fixpoint) — both under the "
+           "completeness discipline (every pointer formal accounted or "
+           "reject to LEDGER). Deferred FIELD/COSTORE shapes stay "
+           "census-reported for human review"),
+  cl::init(false));
+
 cl::opt<bool> CFLConfirmFresh(
   "cfl-confirm-fresh",
   cl::desc("Body-confirm PURE-FRESH allocation wrappers (returns trace "

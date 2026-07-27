@@ -136,8 +136,11 @@ public:
     int aux = 0;  // Invoke: callee formal index receiving src
     int off = -1; // ChainReg: byte offset of the fn inside *arg[src]
     int fk = -1;  // ChainReg/ChainCall: callback formal index
-    const llvm::GlobalValue *gsrc = nullptr; // Store: global-value source
+    const llvm::GlobalValue *gsrc = nullptr; // Store: global-value source;
+                                             // ChainReg: derived key global
                                              // (generated atoms only)
+    std::string gsym; // ChainReg: key global by symbol name (file syntax
+                      // CHAINREG(@sym,...) for external-linkage heads)
   };
   struct FuncSummary {
     std::vector<SummaryAtom> atoms;

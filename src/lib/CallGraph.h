@@ -154,6 +154,7 @@ private:
   std::vector<ChainDispatchRec> chainDispatches;
   bool chainFinalized = false;
   void finalizeChainPairs();
+  const llvm::GlobalValue *canonChainKey(const llvm::GlobalValue *G);
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF);
   void confirmFreshWrappers();
   void runInvokeCensus();

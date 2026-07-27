@@ -7588,7 +7588,16 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         SmallVector<StringRef, 3> ps;
         t.split(ps, ',');
         A.kind = GlobalContext::SummaryAtom::ChainReg;
-        bad = ps.size() != 3 || !parseRef(ps[0], A.dst) || A.dst < 0;
+        bad = ps.size() != 3;
+        if (!bad) {
+          StringRef k = ps[0];
+          if (k.consume_front("@")) {
+            A.gsym = k.str(); // global-keyed variant (wrapper lift)
+            bad = A.gsym.empty();
+          } else {
+            bad = !parseRef(k, A.dst) || A.dst < 0;
+          }
+        }
         if (!bad) {
           StringRef b = ps[1];
           bad = !b.consume_front("*");
@@ -7664,6 +7673,17 @@ static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
 // Returns true when an Invoke atom's fn operand is not a constant
 // function at this callsite — the caller must fall back to the pooled
 // arg/ret wiring for soundness (LEDGERed).
+// Chain keys must be canonical across TUs: external-linkage heads have
+// per-TU declaration copies; map through Gobjs/ExtGobjs by GUID.
+const GlobalValue *CallGraphPass::canonChainKey(const GlobalValue *G) {
+  if (!G || G->hasLocalLinkage()) return G;
+  auto git = Ctx->Gobjs.find(G->getGUID());
+  if (git != Ctx->Gobjs.end() && git->second) return git->second;
+  auto eit = Ctx->ExtGobjs.find(G->getGUID());
+  if (eit != Ctx->ExtGobjs.end() && eit->second) return eit->second;
+  return G;
+}
+
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S) {
   bool needPooled = false;
@@ -7749,11 +7769,21 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::ChainReg: {
-      if ((unsigned)A.dst >= CS->arg_size() ||
-          (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
+      if ((unsigned)A.src >= CS->arg_size() ||
+          (A.dst >= 0 && (unsigned)A.dst >= CS->arg_size())) {
+        g_sumSkipped++;
+        break;
+      }
       if (chainFinalized) { g_chainLate++; needPooled = true; break; }
-      const auto *key = dyn_cast<GlobalValue>(
-          CS->getArgOperand(A.dst)->stripPointerCasts());
+      const GlobalValue *key = nullptr;
+      if (A.gsrc) {
+        key = A.gsrc; // derived (composition lift): already canonical
+      } else if (!A.gsym.empty()) {
+        key = canonChainKey(CS->getModule()->getNamedValue(A.gsym));
+      } else if (A.dst >= 0) {
+        key = canonChainKey(dyn_cast<GlobalValue>(
+            CS->getArgOperand(A.dst)->stripPointerCasts()));
+      }
       const auto *blk = dyn_cast<GlobalVariable>(
           CS->getArgOperand(A.src)->stripPointerCasts());
       Function *fn = nullptr;
@@ -7796,8 +7826,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if ((unsigned)A.dst >= CS->arg_size() ||
           (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
       if (chainFinalized) { g_chainLate++; needPooled = true; break; }
-      const auto *key = dyn_cast<GlobalValue>(
-          CS->getArgOperand(A.dst)->stripPointerCasts());
+      const GlobalValue *key = canonChainKey(dyn_cast<GlobalValue>(
+          CS->getArgOperand(A.dst)->stripPointerCasts()));
       if (!key) { g_chainCallDyn++; needPooled = true; break; }
       if (!chainDispatches.empty() && chainDispatches.back().cs == CS &&
           chainDispatches.back().key == key) {
@@ -7808,6 +7838,11 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         chainDispatches.push_back(std::move(r));
         g_chainCall++;
       }
+      // The dispatch site ALWAYS keeps pooled wiring: pooled-fallback
+      // registrations and manual chain links flow through the body,
+      // and its icall must still resolve them (the paired subset is
+      // additional). Draining here severed t_chain2's fallback reg.
+      needPooled = true;
       break;
     }
     case GlobalContext::SummaryAtom::FreshSub: {
@@ -7981,7 +8016,8 @@ void CallGraphPass::runFieldChannelCensus() {
 // Deferred shapes (FIELD/COSTORE) are NOT auto-confirmed: their
 // dispatcher lives elsewhere; the census reports them for review.
 static size_t g_invConfirmed = 0, g_invConfirmedPass = 0, g_invRejEscape = 0,
-              g_invRejPtrRet = 0, g_invRejNoBinding = 0, g_invRejShape = 0;
+              g_invRejPtrRet = 0, g_invRejNoBinding = 0, g_invRejShape = 0,
+              g_invConfirmedChain = 0;
 void CallGraphPass::confirmInvokeSummaries() {
   // Benign transitive use of a pointer chain rooted at a formal:
   // address arithmetic and non-pointer reads/writes lose no pointer
@@ -8032,7 +8068,7 @@ void CallGraphPass::confirmInvokeSummaries() {
         if (shouldSkipFunction(&F)) continue;
         if (Ctx->FuncSummaries.count(&F)) continue;
         if (rejected.count(&F)) continue;
-        if (F.arg_size() < 2) continue;
+        if (F.arg_size() < 1) continue; // chain wrappers are single-arg
         auto formalIdx = [&](const Value *V) -> int {
           V = V->stripPointerCasts();
           for (const auto &A : F.args())
@@ -8043,7 +8079,8 @@ void CallGraphPass::confirmInvokeSummaries() {
         // and/or calls into summarized-INVOKE callees (PASSTHRU).
         int fnFormal = -1;
         bool multiFn = false;
-        SmallPtrSet<const CallBase *, 4> fnIcalls, passCalls;
+        SmallPtrSet<const CallBase *, 4> fnIcalls, passCalls,
+            chainPassCalls;
         for (const Instruction &I : instructions(F)) {
           const auto *CB = dyn_cast<CallBase>(&I);
           if (!CB || CB->isInlineAsm()) continue;
@@ -8059,11 +8096,24 @@ void CallGraphPass::confirmInvokeSummaries() {
                 if ((unsigned)A.dst < CB->arg_size() &&
                     formalIdx(CB->getArgOperand(A.dst)) >= 0)
                   passCalls.insert(CB);
+              } else if (A.kind == GlobalContext::SummaryAtom::ChainReg) {
+                // wrapper forwards its block formal into a CHAINREG
+                // callee whose key is CONSTANT here -> liftable
+                if ((unsigned)A.src < CB->arg_size() &&
+                    formalIdx(CB->getArgOperand(A.src)) >= 0 &&
+                    (A.gsrc || !A.gsym.empty() ||
+                     (A.dst >= 0 && (unsigned)A.dst < CB->arg_size() &&
+                      isa<GlobalValue>(CB->getArgOperand(A.dst)
+                                           ->stripPointerCasts()))))
+                  chainPassCalls.insert(CB);
               } else if (A.kind != GlobalContext::SummaryAtom::Fresh) {
                 onlyInvFresh = false; // CPY/ST/... translation: v1 out
               }
             }
-            if (!onlyInvFresh) passCalls.erase(CB); // CPY/ST etc.: v1 out
+            if (!onlyInvFresh) {
+              passCalls.erase(CB); // CPY/ST etc.: v1 out
+              chainPassCalls.erase(CB);
+            }
             continue;
           }
           int fi = formalIdx(CB->getCalledOperand());
@@ -8072,8 +8122,11 @@ void CallGraphPass::confirmInvokeSummaries() {
           fnFormal = fi;
           fnIcalls.insert(CB);
         }
-        if (fnIcalls.empty() && passCalls.empty()) continue;
-        if (multiFn || (!fnIcalls.empty() && !passCalls.empty())) {
+        if (fnIcalls.empty() && passCalls.empty() && chainPassCalls.empty())
+          continue;
+        const int shapes = (!fnIcalls.empty()) + (!passCalls.empty()) +
+                           (!chainPassCalls.empty());
+        if (multiFn || shapes > 1) {
           g_invRejShape++;
           rejected.insert(&F);
           continue; // mixed/multi shapes: review territory (v1)
@@ -8100,8 +8153,8 @@ void CallGraphPass::confirmInvokeSummaries() {
               if (!foundArg) { ok = false; why = "esc-call"; }
               continue;
             }
-            if (CB && passCalls.count(CB)) continue; // callee summary is
-                                                     // authoritative
+            if (CB && (passCalls.count(CB) || chainPassCalls.count(CB)))
+              continue; // callee summary is authoritative
             if (CB) {
               const Function *IC = CB->getCalledFunction();
               if (IC && (isNoopIntrinsic(IC) || isFreeFn(IC->getName())))
@@ -8138,8 +8191,8 @@ void CallGraphPass::confirmInvokeSummaries() {
         // Return accounting.
         const CallBase *retPass = nullptr;
         if (ok && containsPointerType(F.getReturnType())) {
-          if (!fnIcalls.empty()) {
-            ok = false; why = "ptr-ret";
+          if (!fnIcalls.empty() || !chainPassCalls.empty()) {
+            ok = false; why = "ptr-ret"; // chain regs return int
           } else {
             for (const Instruction &I : instructions(F)) {
               const auto *RI = dyn_cast<ReturnInst>(&I);
@@ -8163,6 +8216,55 @@ void CallGraphPass::confirmInvokeSummaries() {
         }
         // Build atoms.
         GlobalContext::FuncSummary S;
+        if (!chainPassCalls.empty()) {
+          for (const CallBase *CB : chainPassCalls) {
+            const Function *IC = getFuncDef(
+                const_cast<Function *>(CB->getCalledFunction()));
+            auto sit = Ctx->FuncSummaries.find(IC);
+            if (sit == Ctx->FuncSummaries.end())
+              sit = Ctx->FuncSummaries.find(CB->getCalledFunction());
+            for (const auto &A : sit->second->atoms) {
+              if (A.kind != GlobalContext::SummaryAtom::ChainReg) continue;
+              int wb = (unsigned)A.src < CB->arg_size()
+                           ? formalIdx(CB->getArgOperand(A.src))
+                           : -1;
+              if (wb < 0) continue;
+              const GlobalValue *key = nullptr;
+              if (A.gsrc) key = A.gsrc;
+              else if (!A.gsym.empty())
+                key = canonChainKey(
+                    CB->getModule()->getNamedValue(A.gsym));
+              else if (A.dst >= 0 && (unsigned)A.dst < CB->arg_size())
+                key = canonChainKey(dyn_cast<GlobalValue>(
+                    CB->getArgOperand(A.dst)->stripPointerCasts()));
+              if (!key) continue;
+              GlobalContext::SummaryAtom NA;
+              NA.kind = GlobalContext::SummaryAtom::ChainReg;
+              NA.dst = -1;
+              NA.src = wb;
+              NA.off = A.off;
+              NA.fk = A.fk;
+              NA.gsrc = key;
+              S.atoms.push_back(std::move(NA));
+            }
+          }
+          if (!S.atoms.empty()) {
+            Ctx->OwnedSummaries.push_back(std::move(S));
+            Ctx->FuncSummaries[&F] = &Ctx->OwnedSummaries.back();
+            g_invConfirmedChain++;
+            changed = true;
+            std::string line = F.getName().str();
+            for (const auto &A : Ctx->OwnedSummaries.back().atoms)
+              line += " CHAINREG(@" + A.gsrc->getName().str() + ",*arg" +
+                      std::to_string(A.src) + "+" + std::to_string(A.off) +
+                      ",f" + std::to_string(A.fk) + ")";
+            errs() << "ConfirmInvoke: CONFIRMED CHAINLIFT " << line << "\n";
+          } else {
+            g_invRejNoBinding++;
+            rejected.insert(&F);
+          }
+          continue;
+        }
         if (!fnIcalls.empty()) {
           for (auto [k, d] : bindings)
             S.atoms.push_back({GlobalContext::SummaryAtom::Invoke,
@@ -8213,7 +8315,8 @@ void CallGraphPass::confirmInvokeSummaries() {
     }
   }
   CG_LOG("ConfirmInvoke LEDGER: " << g_invConfirmed << " DIRECT + "
-         << g_invConfirmedPass << " PASSTHRU confirmed ("
+         << g_invConfirmedPass << " PASSTHRU + " << g_invConfirmedChain
+         << " CHAINLIFT confirmed ("
          << rounds << " rounds); rejected " << g_invRejEscape
          << " escape, " << g_invRejPtrRet << " ptr-ret, "
          << g_invRejNoBinding << " no-binding, " << g_invRejShape
@@ -9519,6 +9622,15 @@ void CallGraphPass::globalDedupScanCallEdges(
 
     // Only merge for callees with exactly 1 callsite
     if (!singleCallsiteCallees.count(CF))
+      continue;
+
+    // Summarized callees: the summary REPLACES callsite arg wiring
+    // (drain semantics). A single-callsite actual<->formal pre-merge
+    // makes the actual and formal one union-find node, silently
+    // defeating the drain (found via the t_chain2 wrapper lift: the
+    // lifted registration stayed pooled through the merged node).
+    if (Ctx->FuncSummaries.count(CF) ||
+        Ctx->FuncSummaries.count(getFuncDef(const_cast<Function *>(CF))))
       continue;
 
     // Merge pointer args: fixed actual→formal, variadic tail→vararg node

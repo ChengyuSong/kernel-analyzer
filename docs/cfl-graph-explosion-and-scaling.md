@@ -2558,3 +2558,26 @@ Consequences for the roadmap:
   which drains channels the way family 1 did, no solver change.
 - (b) is the near-term play; (a) is the paper-scale rework whose
   justification this probe now makes falsifiable and quantified.
+
+### Keyed pair-channels: CHAINREG/CHAINCALL (task #29, 2026-07-27)
+
+The sound deref-binding design (9476849): a registration-only INVOKE
+on notifier chains would sever the dispatch-time data argument, so
+the model pairs both sides per chain-head key — CHAINREG reads the
+callback from the block global's const initializer; CHAINCALL records
+dispatch sites; finalize wires the per-key cross product with the
+callback attributed AT THE DISPATCH SITE and both data channels bound
+(self <- block, fN <- dispatch argV). Micro-exact (t_chain.c: per-key
+2 pairs vs pooled 6). All fallbacks pooled + LEDGERed; orphan keys
+keep their pooled channel — severing impossible by construction.
+
+km A/B: NULL RESULT, kept honest — 3 const registrations and 25
+dispatch sites share no keys at km scale; 18/21 registrations are
+wrapper-mediated (register_foo_notifier passes its formal, so the
+block is dynamic at the CHAINREG callsite). The notifier ecosystem's
+correlation lives one wrapper level up, where the KEY is constant
+inside the wrapper body. Next increment: global-keyed CHAINREG
+(key in the atom's gsrc slot) + the tier-2 composition lift deriving
+it mechanically from wrapper bodies — then re-measure at km and
+kernel scale, where the register/dispatch key overlap should be
+dense (reboot/netdev/cpu chains all have both sides in-corpus).

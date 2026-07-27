@@ -7533,7 +7533,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   };
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
-         nNone = 0, nInv = 0;
+         nNone = 0, nInv = 0, nChR = 0, nChC = 0;
   while (std::getline(in, line)) {
     lineNo++;
     StringRef L = StringRef(line).trim();
@@ -7582,6 +7582,39 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
           A.aux = (int)fkv;
         }
         nInv++;
+      } else if (t.consume_front("CHAINREG(") && t.consume_back(")")) {
+        // CHAINREG(argK,*argB+OFF,fS): key at argK; callback at byte
+        // OFF inside the block global at argB; block -> formal fS
+        SmallVector<StringRef, 3> ps;
+        t.split(ps, ',');
+        A.kind = GlobalContext::SummaryAtom::ChainReg;
+        bad = ps.size() != 3 || !parseRef(ps[0], A.dst) || A.dst < 0;
+        if (!bad) {
+          StringRef b = ps[1];
+          bad = !b.consume_front("*");
+          auto [ba, boff] = b.split('+');
+          unsigned offv = 0, fkv = 0;
+          bad = bad || !parseRef(ba, A.src) || A.src < 0 ||
+                boff.getAsInteger(10, offv);
+          StringRef fs = ps[2];
+          bad = bad || !fs.consume_front("f") || fs.getAsInteger(10, fkv);
+          A.off = (int)offv;
+          A.fk = (int)fkv;
+        }
+        nChR++;
+      } else if (t.consume_front("CHAINCALL(") && t.consume_back(")")) {
+        // CHAINCALL(argK:fN<-argV): key at argK; dispatch value argV ->
+        // each registered callback's formal fN
+        auto [kp, rest2] = t.split(':');
+        auto [fkp, vp] = rest2.split("<-");
+        A.kind = GlobalContext::SummaryAtom::ChainCall;
+        unsigned fkv = 0;
+        StringRef fks = fkp;
+        bad = !parseRef(kp, A.dst) || A.dst < 0 || !parseRef(vp, A.src) ||
+              A.src < 0 || !fks.consume_front("f") ||
+              fks.getAsInteger(10, fkv);
+        A.fk = (int)fkv;
+        nChC++;
       } else if (t.consume_front("LD(") && t.consume_back(")")) {
         auto [d, c] = t.split("<-*");
         A.kind = GlobalContext::SummaryAtom::Load;
@@ -7603,7 +7636,8 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   CG_LOG("FuncSummary: loaded " << Ctx->SummarySpecs.size() << " specs from "
          << path << " (" << nFresh << " FRESH, " << nCpy << " CPY, "
          << nAlias << " ALIAS, " << nSt << " ST, " << nLd << " LD, "
-         << nInv << " INVOKE, " << nNone << " NONE)\n");
+         << nInv << " INVOKE, " << nChR << " CHAINREG, " << nChC
+         << " CHAINCALL, " << nNone << " NONE)\n");
 }
 
 // First-match-wins spec lookup ('*' suffix = prefix).
@@ -7625,7 +7659,8 @@ summaryForName(GlobalContext *Ctx, StringRef name) {
 // over-approximate soundly.
 static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
               g_sumSkipped = 0, g_sumFreshSub = 0, g_sumInvoke = 0,
-              g_sumInvokeDyn = 0;
+              g_sumInvokeDyn = 0, g_chainReg = 0, g_chainRegDyn = 0,
+              g_chainCall = 0, g_chainCallDyn = 0, g_chainLate = 0;
 // Returns true when an Invoke atom's fn operand is not a constant
 // function at this callsite — the caller must fall back to the pooled
 // arg/ret wiring for soundness (LEDGERed).
@@ -7711,6 +7746,68 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         }
       }
       Ctx->Callees[CS].insert(DF); // re-attributed callgraph edge
+      break;
+    }
+    case GlobalContext::SummaryAtom::ChainReg: {
+      if ((unsigned)A.dst >= CS->arg_size() ||
+          (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
+      if (chainFinalized) { g_chainLate++; needPooled = true; break; }
+      const auto *key = dyn_cast<GlobalValue>(
+          CS->getArgOperand(A.dst)->stripPointerCasts());
+      const auto *blk = dyn_cast<GlobalVariable>(
+          CS->getArgOperand(A.src)->stripPointerCasts());
+      Function *fn = nullptr;
+      if (blk && blk->hasInitializer()) {
+        // walk the constant initializer to the fn at byte offset A.off
+        const DataLayout &DL = blk->getParent()->getDataLayout();
+        const Constant *C = blk->getInitializer();
+        uint64_t off = (uint64_t)A.off;
+        while (C) {
+          if (const auto *CSt = dyn_cast<ConstantStruct>(C)) {
+            const StructLayout *SL = DL.getStructLayout(CSt->getType());
+            unsigned e = SL->getElementContainingOffset(off);
+            off -= SL->getElementOffset(e);
+            C = CSt->getOperand(e);
+          } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+            uint64_t es = DL.getTypeAllocSize(CA->getType()->getElementType());
+            if (!es) { C = nullptr; break; }
+            C = CA->getOperand(off / es);
+            off %= es;
+          } else {
+            break;
+          }
+        }
+        if (C && off == 0)
+          fn = const_cast<Function *>(
+              dyn_cast<Function>(C->stripPointerCasts()));
+      }
+      if (!key || !blk || !fn) {
+        // dynamic key/block or runtime-installed callback: keep the
+        // container fed (pooled) — sound, LEDGERed
+        g_chainRegDyn++;
+        needPooled = true;
+        break;
+      }
+      chainRegs.push_back({key, blk, getFuncDef(fn), A.fk, CS});
+      g_chainReg++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::ChainCall: {
+      if ((unsigned)A.dst >= CS->arg_size() ||
+          (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
+      if (chainFinalized) { g_chainLate++; needPooled = true; break; }
+      const auto *key = dyn_cast<GlobalValue>(
+          CS->getArgOperand(A.dst)->stripPointerCasts());
+      if (!key) { g_chainCallDyn++; needPooled = true; break; }
+      if (!chainDispatches.empty() && chainDispatches.back().cs == CS &&
+          chainDispatches.back().key == key) {
+        chainDispatches.back().binds.push_back({A.fk, A.src});
+      } else {
+        ChainDispatchRec r{CS, key, {}};
+        r.binds.push_back({A.fk, A.src});
+        chainDispatches.push_back(std::move(r));
+        g_chainCall++;
+      }
       break;
     }
     case GlobalContext::SummaryAtom::FreshSub: {
@@ -8069,7 +8166,7 @@ void CallGraphPass::confirmInvokeSummaries() {
         if (!fnIcalls.empty()) {
           for (auto [k, d] : bindings)
             S.atoms.push_back({GlobalContext::SummaryAtom::Invoke,
-                               fnFormal, d, k, nullptr});
+                               fnFormal, d, k});
         } else {
           for (const CallBase *CB : passCalls) {
             const Function *IC = getFuncDef(
@@ -8086,7 +8183,7 @@ void CallGraphPass::confirmInvokeSummaries() {
               int wd = formalIdx(CB->getArgOperand(A.src));
               if (wf < 0 || wd < 0 || wf == wd) continue;
               S.atoms.push_back({GlobalContext::SummaryAtom::Invoke,
-                                 wf, wd, A.aux, nullptr});
+                                 wf, wd, A.aux});
             }
             if (retPass == CB && sit->second->fresh) wantFresh = true;
           }
@@ -8121,6 +8218,84 @@ void CallGraphPass::confirmInvokeSummaries() {
          << " escape, " << g_invRejPtrRet << " ptr-ret, "
          << g_invRejNoBinding << " no-binding, " << g_invRejShape
          << " mixed-shape\n");
+}
+
+// Wire the keyed pair-channels: for each chain-head key, the cross
+// product of registrations and dispatch sites — the callback becomes a
+// callee OF THE DISPATCH SITE (real invocation attribution), its self
+// formal receives the registration's block global, and each dispatch
+// binding wires that site's value operand to the callback's formal.
+// Registrations whose key has NO dispatch site fall back to pooled
+// wiring (the container channel keeps them; nothing is severed).
+void CallGraphPass::finalizeChainPairs() {
+  chainFinalized = true;
+  if (chainRegs.empty() && chainDispatches.empty()) return;
+  if (CFLCompositional && CompressedGraphInputs.empty()) {
+    errs() << "finalizeChainPairs: keyed pair-channels create cross-module "
+              "edges after the last module; per-TU compositional mode "
+              "cannot compose them. Rerun with --cfl-compositional=false.\n";
+    exit(1);
+  }
+  std::map<const GlobalValue *, std::vector<size_t>> byKeyR, byKeyD;
+  for (size_t i = 0; i < chainRegs.size(); i++)
+    byKeyR[chainRegs[i].key].push_back(i);
+  for (size_t i = 0; i < chainDispatches.size(); i++)
+    byKeyD[chainDispatches[i].key].push_back(i);
+  size_t pairs = 0, orphanRegs = 0, orphanDispatch = 0;
+  auto formalNode = [&](Function *F, int k) -> NodeIndex {
+    if (k < 0 || (unsigned)k >= F->arg_size())
+      return AndersNodeFactory::InvalidIndex;
+    NodeIndex n = getRepNodeForValue(F->getArg(k));
+    if (n == AndersNodeFactory::InvalidIndex)
+      n = NF.createValueNode(F->getArg(k));
+    return getCanonicalNode(n);
+  };
+  for (auto &[key, regs] : byKeyR) {
+    auto dIt = byKeyD.find(key);
+    if (dIt == byKeyD.end()) {
+      // no dispatch in corpus for this key: keep the pooled channel
+      for (size_t ri : regs) {
+        const ChainRegRec &r = chainRegs[ri];
+        Function *CF = r.cs->getCalledFunction()
+                           ? getFuncDef(r.cs->getCalledFunction())
+                           : nullptr;
+        if (CF && !CF->isDeclaration()) wireCallArgs(r.cs, CF);
+        orphanRegs++;
+      }
+      continue;
+    }
+    for (size_t ri : regs) {
+      const ChainRegRec &r = chainRegs[ri];
+      NodeIndex blkNode = getRepNodeForValue(r.blk);
+      if (blkNode == AndersNodeFactory::InvalidIndex)
+        blkNode = NF.createValueNode(r.blk);
+      NodeIndex selfN = formalNode(r.fn, r.selfFk);
+      if (selfN != AndersNodeFactory::InvalidIndex)
+        addAssignmentEdge(getCanonicalNode(blkNode), selfN);
+      for (size_t di : dIt->second) {
+        const ChainDispatchRec &d = chainDispatches[di];
+        Ctx->Callees[d.cs].insert(r.fn);
+        for (auto [fk, ai] : d.binds) {
+          if ((unsigned)ai >= d.cs->arg_size()) continue;
+          NodeIndex vN = getRepNodeForValue(d.cs->getArgOperand(ai));
+          if (vN == AndersNodeFactory::InvalidIndex) continue;
+          NodeIndex fN = formalNode(r.fn, fk);
+          if (fN != AndersNodeFactory::InvalidIndex)
+            addAssignmentEdge(getCanonicalNode(vN), fN);
+        }
+        pairs++;
+      }
+    }
+  }
+  for (auto &[key, ds] : byKeyD)
+    if (!byKeyR.count(key)) orphanDispatch += ds.size();
+  CG_LOG("ChainPairs LEDGER: " << chainRegs.size() << " const registrations"
+         << " x " << chainDispatches.size() << " dispatch sites over "
+         << byKeyR.size() << " keys -> " << pairs << " wired pairs; "
+         << orphanRegs << " regs pooled (no dispatch), " << orphanDispatch
+         << " dispatch sites without const regs; dyn fallbacks "
+         << g_chainRegDyn << " reg / " << g_chainCallDyn << " call, "
+         << g_chainLate << " post-finalize\n");
 }
 
 // An INVOKE-bearing FRESH summary keeps its body analyzed: the body IS
@@ -10111,8 +10286,10 @@ bool CallGraphPass::doModulePass(Module *M) {
     // compositional mode these edges are cross-module by nature and
     // fall outside all module ranges — repair mode won't recompute
     // them; monolithic flows-to/saturation consume them normally.
-    if (M == Ctx->Modules.back().first)
+    if (M == Ctx->Modules.back().first) {
       wireLinkerSectionArrays();
+      finalizeChainPairs();
+    }
   }
 
   bool Changed = false;

@@ -134,6 +134,26 @@ private:
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool applySummaryAtoms(const llvm::CallBase *CS,
                          const GlobalContext::FuncSummary &S);
+  // Keyed pair-channels (CHAINREG/CHAINCALL): registrations and
+  // dispatch sites collected during edge construction, wired per key
+  // (cross product) after the last module. Keys are chain-head
+  // globals; non-constant sides fall back pooled.
+  struct ChainRegRec {
+    const llvm::GlobalValue *key;
+    const llvm::GlobalVariable *blk;
+    llvm::Function *fn;
+    int selfFk;
+    const llvm::CallBase *cs;
+  };
+  struct ChainDispatchRec {
+    const llvm::CallBase *cs;
+    const llvm::GlobalValue *key;
+    llvm::SmallVector<std::pair<int, int>, 2> binds; // (fk, arg idx)
+  };
+  std::vector<ChainRegRec> chainRegs;
+  std::vector<ChainDispatchRec> chainDispatches;
+  bool chainFinalized = false;
+  void finalizeChainPairs();
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF);
   void confirmFreshWrappers();
   void runInvokeCensus();

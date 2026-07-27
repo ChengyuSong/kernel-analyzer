@@ -118,13 +118,24 @@ public:
       Store, // *container <- value
       Load,  // dst value <- *container
       FreshSub, // a fresh anonymous sub-object stored into *dst
-      Invoke // pair-correlated dispatch: fn at arg[dst] will be called
-             // with arg[src] bound to its formal [aux] (C interface
-             // polymorphism: (fn,data) registration pairs)
+      Invoke, // pair-correlated dispatch: fn at arg[dst] will be called
+              // with arg[src] bound to its formal [aux] (C interface
+              // polymorphism: (fn,data) registration pairs)
+      ChainReg, // keyed pair-channel REGISTRATION (notifier shape):
+                // key = chain-head global at arg[dst]; callback read
+                // from the constant initializer of the block global at
+                // arg[src], byte offset [off]; the block binds to the
+                // callback's formal [fk]
+      ChainCall // keyed pair-channel DISPATCH: key at arg[dst]; the
+                // dispatch value at arg[src] binds to each registered
+                // callback's formal [fk]. Registration x dispatch pairs
+                // are wired per key at finalize (static_call precedent)
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)
     int aux = 0;  // Invoke: callee formal index receiving src
+    int off = -1; // ChainReg: byte offset of the fn inside *arg[src]
+    int fk = -1;  // ChainReg/ChainCall: callback formal index
     const llvm::GlobalValue *gsrc = nullptr; // Store: global-value source
                                              // (generated atoms only)
   };

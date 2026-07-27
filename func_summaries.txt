@@ -121,6 +121,32 @@ smp_call_function_single INVOKE(arg1:f0<-arg2)
 smp_call_function_any INVOKE(arg1:f0<-arg2)
 task_call_func INVOKE(arg1:f0<-arg0) INVOKE(arg1:f1<-arg2)
 
+# ---- kernel: keyed pair-channels — notifier chains (task #29) ----
+# CHAINREG(argK,*argB+OFF,fS): registration keyed by the chain-head
+# global at argK; callback read from the CONST INITIALIZER of the
+# block global at argB (byte OFF); block binds to callback formal fS.
+# CHAINCALL(argK:fN<-argV): dispatch keyed by argK; argV binds to each
+# registered callback's formal fN, and the callback becomes a callee
+# OF THE DISPATCH SITE. Pairs wired per key at finalize (static_call
+# precedent). Non-constant key/block/callback -> pooled fallback on
+# that side; keys with no in-corpus dispatch keep pooled registration
+# (nothing severed). Wrapper registrations (register_reboot_notifier
+# passing its formal) hit the block-dyn fallback -> pooled, sound.
+# notifier_fn_t(nb, action(long), data) -> f0=nb, f2=data; notifier_
+# call at offset 0 of notifier_block (verified 6.8.2).
+atomic_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+atomic_notifier_chain_register_unique_prio CHAINREG(arg0,*arg1+0,f0)
+blocking_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+blocking_notifier_chain_register_unique_prio CHAINREG(arg0,*arg1+0,f0)
+raw_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+srcu_notifier_chain_register CHAINREG(arg0,*arg1+0,f0)
+atomic_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+blocking_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+raw_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+srcu_notifier_call_chain CHAINCALL(arg0:f2<-arg2)
+blocking_notifier_call_chain_robust CHAINCALL(arg0:f2<-arg3)
+raw_notifier_call_chain_robust CHAINCALL(arg0:f2<-arg3)
+
 # ---- kernel: dup family (FRESH + copy semantics) ----
 kmemdup FRESH CPY(ret<-arg0)
 kmemdup_nul FRESH CPY(ret<-arg0)

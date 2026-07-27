@@ -326,6 +326,17 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLProbeOriginSplit(
+  "cfl-probe-origin-split",
+  cl::desc("MEASUREMENT-ONLY probe (task #29): at each flows-to "
+           "resolution round, compare the pooled icall answer against "
+           "the counterfactual origin-indexed answer (targets present "
+           "in the merged cluster classes of the container origins the "
+           "fptr was loaded from) and report cluster diversity — sizes "
+           "the same-origin binding lever and how much of it needs "
+           "witness-based unmerging. Adds no edges, changes no answers"),
+  cl::init(false));
+
 cl::opt<bool> CFLConfirmInvoke(
   "cfl-confirm-invoke",
   cl::desc("Auto-confirm INVOKE pair summaries where the proof is local "

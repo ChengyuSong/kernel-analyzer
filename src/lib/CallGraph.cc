@@ -3747,6 +3747,17 @@ bool CallGraphPass::runFlowsToResolution() {
   // exposure and, symmetrically, the filter's precision contribution —
   // the retirement criterion once CFL-side precision drives them to zero.
   size_t filtCandidates = 0, filtTypeRej = 0, filtFieldRej = 0;
+  // --cfl-probe-origin-split (task #29): per-icall, the counterfactual
+  // origin-indexed answer — targets attributable to the merged cluster
+  // classes of the container origins the fptr was LOADED from — vs the
+  // pooled class answer. D = distinct merged cluster classes among
+  // those origins: D>1 means per-origin binding splits the answer from
+  // the FINAL state already; D==1 means the clusters merged (hub) and
+  // splitting needs witness provenance / unmerging. Measurement-only.
+  size_t osIcalls = 0, osPooled = 0, osSplit = 0, osD1 = 0, osD24 = 0,
+         osDbig = 0, osNoLoad = 0, osNoOrigin = 0;
+  std::vector<std::tuple<size_t, const CallBase *, size_t, size_t, size_t>>
+      osTop; // (excess, CS, |A|, |Asplit|, D)
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -3914,6 +3925,62 @@ bool CallGraphPass::runFlowsToResolution() {
       collect(RB[rep][SHIFT_X]);
     }
     topOnlyPairs += targets.size() - exactTargets;
+    if (CFLProbeOriginSplit && !targets.empty()) {
+      const auto *LI = dyn_cast<LoadInst>(fptr);
+      if (!LI) {
+        osNoLoad++;
+      } else {
+        NodeIndex pn = NF.getValueNodeFor(LI->getPointerOperand());
+        auto pIt = pn == AndersNodeFactory::InvalidIndex
+                       ? toDense.end()
+                       : toDense.find(getCanonicalNode(pn));
+        if (pIt == toDense.end()) {
+          osNoOrigin++;
+        } else {
+          const uint32_t prep = find(pIt->second);
+          std::set<uint32_t> clsSet;
+          auto scanO = [&](const FactSet &pl) {
+            pl.forEach([&](uint32_t o) {
+              if (funcRootOf.count(o)) return; // container origins only
+              for (uint32_t sh = 0; sh < NSHIFT; sh++) {
+                uint32_t c = clusterFind((uint64_t)o * NSHIFT + sh);
+                if (c != UINT32_MAX) clsSet.insert(find(c));
+              }
+            });
+          };
+          scanO(R[prep][0]);
+          scanO(RB[prep][0]);
+          if (clsSet.empty()) {
+            osNoOrigin++;
+          } else {
+            FuncSet split;
+            for (uint32_t c : clsSet) {
+              auto scanF = [&](const FactSet &pl) {
+                pl.forEach([&](uint32_t o) {
+                  auto rIt = funcRootOf.find(o);
+                  if (rIt == funcRootOf.end()) return;
+                  Function *F =
+                      getFuncDef(const_cast<Function *>(rIt->second));
+                  if (targets.count(F)) split.insert(F);
+                });
+              };
+              scanF(R[c][0]);
+              scanF(RB[c][0]);
+            }
+            osIcalls++;
+            osPooled += targets.size();
+            osSplit += split.size();
+            const size_t D = clsSet.size();
+            if (D == 1) osD1++;
+            else if (D <= 4) osD24++;
+            else osDbig++;
+            if (targets.size() > split.size())
+              osTop.emplace_back(targets.size() - split.size(), CS,
+                                 targets.size(), split.size(), D);
+          }
+        }
+      }
+    }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
     for (const Function *F : targets) {
       if (!Ctx->Callees[CS].insert(F).second)
@@ -3944,6 +4011,23 @@ bool CallGraphPass::runFlowsToResolution() {
       } else {
         handleCall(CS, CF);
       }
+    }
+  }
+  if (CFLProbeOriginSplit) {
+    std::sort(osTop.begin(), osTop.end(),
+              [](auto &a, auto &b) { return std::get<0>(a) > std::get<0>(b); });
+    errs() << "OriginSplit: " << osIcalls << " load-shaped icalls probed ("
+           << osNoLoad << " non-load fptr, " << osNoOrigin
+           << " no container origin); pooled pairs " << osPooled
+           << " vs origin-indexed " << osSplit << " ("
+           << (osPooled ? 100.0 * (osPooled - osSplit) / osPooled : 0.0)
+           << "% excess); cluster diversity D==1: " << osD1
+           << ", 2-4: " << osD24 << ", >4: " << osDbig << "\n";
+    for (size_t i = 0; i < std::min<size_t>(15, osTop.size()); i++) {
+      auto &[ex, cs2, a, sp, d] = osTop[i];
+      errs() << "OriginSplit: excess=" << ex << " |A|=" << a << " split="
+             << sp << " D=" << d << " at "
+             << cs2->getFunction()->getName() << "\n";
     }
   }
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, "

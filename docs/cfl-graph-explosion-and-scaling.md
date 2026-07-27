@@ -2525,3 +2525,36 @@ per-origin instead of pooled. Cheap-atom complement for the untyped
 registration side: a deref-binding INVOKE variant (fn read from
 *argD+off — the notifier shape) for registration APIs whose fn
 arrives inside the data container.
+
+### Falsification #6: same-origin binding is vacuous on the final quotient (task #29, km, 2026-07-27)
+
+--cfl-probe-origin-split compares, per load-shaped icall, the pooled
+answer against the counterfactual origin-indexed answer (targets
+present in the merged cluster classes of the container origins the
+fptr was loaded from). km verdict, all resolution rounds: 1,047
+load-shaped icalls probed (426 non-load fptrs), pooled 63,304 pairs
+vs origin-indexed 63,304 — 0.000% excess — and cluster diversity
+D==1 for EVERY SINGLE icall. All container origins reaching any given
+fptr load have already collapsed into one merged cluster class by
+fixpoint.
+
+Reading: the (fn,data) correlation the field census showed on the
+STORE side (rmap 11/11 paired, etc.) is destroyed by the time the
+solver converges — the pooling happens IN the cluster merges (exact-
+fact joins are transitive, so cells sharing any flow unify), not at
+the icall wiring. Same-origin binding as a wiring-time refinement of
+the final state is therefore worth exactly zero: there is no origin
+partition left to exploit. Consistent with fs13==FI on harfbuzz
+("classes merged before planes can discriminate") and the
+over-determination finding — this is the same phenomenon measured a
+third way, now at the origin level.
+
+Consequences for the roadmap:
+- The correlation lever for family 2/3 must act BEFORE or AROUND the
+  merges: (a) provenance-preserving machinery (per-field memory
+  cells / witness-indexed facts — the known big-ticket redesign), or
+  (b) bypass the container entirely on the registration side — the
+  deref-binding INVOKE atom (fn read from *argD+off, notifier shape),
+  which drains channels the way family 1 did, no solver change.
+- (b) is the near-term play; (a) is the paper-scale rework whose
+  justification this probe now makes falsifiable and quantified.

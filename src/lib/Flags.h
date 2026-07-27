@@ -37,6 +37,7 @@ extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLLazyMint;
 extern cl::opt<bool> CFLCensusInvoke;
 extern cl::opt<bool> CFLCensusFields;
+extern cl::opt<bool> CFLProbeOriginSplit;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

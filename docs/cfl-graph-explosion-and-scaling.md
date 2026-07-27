@@ -2484,3 +2484,44 @@ suggested). One resolved-icall drop = task_call_func's own dispatcher
 (constant-registered re-attribution, verified). Cumulative #28 arc at
 kernel: 5,649,018 -> 5,452,202 (-196,816, -3.5%); at km: 80,531 ->
 69,080 (-14.2%). Every adoption step -N/+0.
+
+### Family-2/3 field-channel census (task #29, km, 2026-07-27)
+
+--cfl-census-fields measures the store-side registration channels:
+(struct,byte-offset) keys with constant-Function stores on one side
+and field-load-fed icalls on the other, plus paired sibling-store
+evidence. km: 631 field keys, 37 two-sided channels, 100 store-only,
+465 load-only; 340 constant-fn stores, 1,539 field-load icalls.
+
+Two findings that shape the design:
+
+1. TYPE NAMES ARE GONE AT -O2. The dominant "channel" is ?+0 — 44
+   constant-fn stores / 3,095 dynamic ptr stores / 423 dispatch loads
+   whose GEPs are i8-canonicalized (opaque pointers): struct identity
+   is unrecoverable from the IR access path for most of the corpus
+   (notifier_block.notifier_call lands here — sys_off_notify in the
+   sample). Any family-2 model keyed on struct types would cover only
+   the typed minority; the correlation carrier has to be the OBJECT
+   (origin), not the type. That is exactly what the flows-to
+   (origin,shift) planes already track — reinforcing the original
+   design note that family 2/3 is same-origin binding, latent in the
+   existing fact machinery.
+2. THE PAIRING IS REAL. Where types survive, the (fn,data)
+   sibling-store correlation is near-total: rmap_walk_control 11/11
+   paired, remote_function_call+8 11/11, balance_callback+8 8/8,
+   cpu_stop_work+16 (multi_cpu_stop — the stop-machine container
+   itself), hrtimer+40 6 stores (the hrtimer_init family the INVOKE
+   census could not see), task_struct+1336 restart_block 14 stores,
+   callback_head+8 task_work. Stack-allocated ops structs
+   (rmap_walk_control, remote_function_call) are per-callsite objects
+   — same-origin binding would resolve them exactly with NO new
+   summary vocabulary.
+
+Design direction recorded for the solver lever: at icall wiring,
+partition the fptr class's function facts BY THE ORIGIN they traveled
+through (the witness-exact unification machinery already certifies
+which joins carried a fact) and bind the receiver/data operand
+per-origin instead of pooled. Cheap-atom complement for the untyped
+registration side: a deref-binding INVOKE variant (fn read from
+*argD+off — the notifier shape) for registration APIs whose fn
+arrives inside the data container.

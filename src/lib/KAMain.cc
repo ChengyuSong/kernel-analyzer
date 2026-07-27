@@ -316,6 +316,16 @@ cl::opt<bool> CFLCensusInvoke(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusFields(
+  "cfl-census-fields",
+  cl::desc("MEASUREMENT-ONLY census of family-2/3 store-side "
+           "registration channels: (struct,offset) field keys with "
+           "constant-Function stores on the registration side and "
+           "field-load-fed icalls on the dispatch side, with paired "
+           "sibling-store and ops-struct tallies (task #29). Adds no "
+           "edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLConfirmInvoke(
   "cfl-confirm-invoke",
   cl::desc("Auto-confirm INVOKE pair summaries where the proof is local "

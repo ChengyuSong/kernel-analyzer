@@ -7655,6 +7655,137 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
   return needPooled;
 }
 
+// --cfl-census-fields (task #29): MEASUREMENT-ONLY census of the
+// family-2/3 store-side registration channels. A channel is a
+// (struct,byte-offset) field key with constant-Function STORES on the
+// registration side and field-LOAD-fed icalls on the dispatch side
+// (INIT_WORK/timer/hrtimer/notifier shape: the fn is not a call
+// parameter, it is written into a container the dispatcher reads
+// back). Also counts paired sibling stores ((fn,data) written into
+// the same object in the same function — the correlation a
+// same-origin binding could exploit) and ops-struct pointer stores
+// (family 3). Adds no edges.
+void CallGraphPass::runFieldChannelCensus() {
+  struct Chan {
+    size_t fnStores = 0, dynStores = 0, opsStores = 0, icallLoads = 0;
+    size_t paired = 0;
+    std::set<std::string> fnSample;
+    std::string loadSample;
+  };
+  std::map<std::string, Chan> chans;
+  auto fieldKey = [&](const Value *P, const DataLayout &DL,
+                      bool &varIdx) -> std::pair<std::string, const Value *> {
+    APInt Off(64, 0);
+    std::string SName;
+    varIdx = false;
+    P = P->stripPointerCasts();
+    while (const auto *G = dyn_cast<GEPOperator>(P)) {
+      if (!G->accumulateConstantOffset(DL, Off))
+        varIdx = true;
+      if (SName.empty())
+        if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
+          if (ST->hasName())
+            SName = stripStructNameSuffix(ST->getStructName()).str();
+      P = G->getPointerOperand()->stripPointerCasts();
+    }
+    std::string Key = (SName.empty() ? std::string("?") : SName) + "+" +
+                      (varIdx ? std::string("var")
+                              : std::to_string(Off.getSExtValue()));
+    return {Key, P};
+  };
+  auto isOpsGlobal = [](const Value *V) {
+    const auto *GV = dyn_cast<GlobalVariable>(V);
+    if (!GV || !GV->hasInitializer()) return false;
+    const auto *CS = dyn_cast<ConstantStruct>(GV->getInitializer());
+    if (!CS) return false;
+    for (const Use &Op : CS->operands())
+      if (isa<Function>(Op->stripPointerCasts())) return true;
+    return false;
+  };
+  size_t totalFnStores = 0, totalIcallLoads = 0;
+  for (auto &mp : Ctx->Modules) {
+    const DataLayout &DL = mp.first->getDataLayout();
+    for (Function &F : *mp.first) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
+      if (shouldSkipFunction(&F)) continue;
+      // per-base sibling stores within this function: fn-offset keys
+      // and data-ptr stores keyed by base object
+      std::map<const Value *, std::vector<std::string>> baseFnKeys;
+      std::map<const Value *, size_t> baseDataStores;
+      for (const Instruction &I : instructions(F)) {
+        if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+          const Value *V = SI->getValueOperand()->stripPointerCasts();
+          bool varIdx = false;
+          auto [Key, Base] = fieldKey(SI->getPointerOperand(), DL, varIdx);
+          if (const auto *Fn = dyn_cast<Function>(V)) {
+            Chan &C = chans[Key];
+            C.fnStores++;
+            totalFnStores++;
+            if (C.fnSample.size() < 4) C.fnSample.insert(Fn->getName().str());
+            baseFnKeys[Base].push_back(Key);
+          } else if (isOpsGlobal(V)) {
+            chans[Key].opsStores++;
+          } else if (containsPointerType(V->getType())) {
+            baseDataStores[Base]++;
+            // dynamic fn store? count under the key only if the value
+            // could be a function — unknowable under opaque ptrs; the
+            // dyn tally lives on channels that ALSO see constant fns
+            if (chans.count(Key)) chans[Key].dynStores++;
+          }
+        } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+          bool fedIcall = false;
+          for (const User *U : LI->users()) {
+            const auto *CB = dyn_cast<CallBase>(U);
+            if (CB && !CB->isInlineAsm() &&
+                CB->getCalledOperand()->stripPointerCasts() == LI)
+              fedIcall = true;
+          }
+          if (!fedIcall) continue;
+          bool varIdx = false;
+          auto [Key, Base] = fieldKey(LI->getPointerOperand(), DL, varIdx);
+          (void)Base;
+          Chan &C = chans[Key];
+          C.icallLoads++;
+          totalIcallLoads++;
+          if (C.loadSample.empty())
+            C.loadSample = F.getName().str();
+        }
+      }
+      for (auto &[Base, Keys] : baseFnKeys)
+        if (baseDataStores.count(Base))
+          for (const std::string &K : Keys) chans[K].paired++;
+    }
+  }
+  // Rank two-sided channels (registration AND dispatch observed).
+  std::vector<std::pair<const std::string *, const Chan *>> ranked;
+  size_t oneSidedStores = 0, oneSidedLoads = 0;
+  for (auto &[K, C] : chans) {
+    if (C.fnStores && C.icallLoads) ranked.push_back({&K, &C});
+    else if (C.fnStores) oneSidedStores++;
+    else if (C.icallLoads) oneSidedLoads++;
+  }
+  std::sort(ranked.begin(), ranked.end(), [](auto &A, auto &B) {
+    return A.second->fnStores * A.second->icallLoads >
+           B.second->fnStores * B.second->icallLoads;
+  });
+  errs() << "FieldChannels: " << chans.size() << " field keys; "
+         << ranked.size() << " two-sided channels (" << oneSidedStores
+         << " store-only, " << oneSidedLoads << " load-only); "
+         << totalFnStores << " constant-fn stores, " << totalIcallLoads
+         << " field-load icalls total\n";
+  size_t shown = 0;
+  for (auto &[K, C] : ranked) {
+    if (shown++ >= 40) break;
+    errs() << "FieldChannels: " << *K << " fnStores=" << C->fnStores
+           << " paired=" << C->paired << " dynStores=" << C->dynStores
+           << " opsStores=" << C->opsStores
+           << " icallLoads=" << C->icallLoads << " dispatch@"
+           << C->loadSample << " fns:";
+    for (const auto &N : C->fnSample) errs() << " " << N;
+    errs() << "\n";
+  }
+}
+
 // --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries
 // where the proof is LOCAL, under the #17 completeness discipline — a
 // summary replaces callsite arg/ret wiring, so every pointer formal
@@ -9812,6 +9943,9 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLCensusInvoke && iteration == 0 && M == Ctx->Modules.front().first)
     runInvokeCensus(); // all modules + summaries loaded; adds no edges
+
+  if (CFLCensusFields && iteration == 0 && M == Ctx->Modules.front().first)
+    runFieldChannelCensus(); // measurement-only, adds no edges
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

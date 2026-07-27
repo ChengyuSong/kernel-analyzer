@@ -2471,3 +2471,16 @@ Kernel run for the kernel-llm-invoke pin in flight (pre-approved,
 pinned on a clean both-directions diff). Cumulative #28 arc at km:
 80,531 -> 69,080 (-14.2%) across hand seeds + tier-2 auto-confirm +
 tier-3 doc-mined adoption, every step -N/+0 or +2-vetted.
+
+### PIN: kernel-llm-invoke (2026-07-27, e73f030)
+
+test/baselines/kernel-llm-invoke-stats.txt is the canonical
+whole-kernel baseline: 16,529 icalls / 5,452,202 pairs. Tier-3 kernel
+delta vs the tier-2 state: -28,989/+0 — the stop-machine callbacks at
+their full 3,320-site pools and the async_schedule population
+(async_suspend*, attach_async helpers, do_populate_rootfs, ... at
+547-site pools; the async pool is far larger at kernel scale than km
+suggested). One resolved-icall drop = task_call_func's own dispatcher
+(constant-registered re-attribution, verified). Cumulative #28 arc at
+kernel: 5,649,018 -> 5,452,202 (-196,816, -3.5%); at km: 80,531 ->
+69,080 (-14.2%). Every adoption step -N/+0.

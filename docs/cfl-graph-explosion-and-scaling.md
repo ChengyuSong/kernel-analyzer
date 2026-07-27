@@ -2581,3 +2581,28 @@ inside the wrapper body. Next increment: global-keyed CHAINREG
 it mechanically from wrapper bodies — then re-measure at km and
 kernel scale, where the register/dispatch key overlap should be
 dense (reboot/netdev/cpu chains all have both sides in-corpus).
+
+### Chain lift lands + a general drain bug found (task #29, 2026-07-27)
+
+Commit 967618b, three pieces: canonical chain keys (GUID -> def; raw
+GlobalValue* pointers never matched across TUs), the CHAINLIFT
+composition rule (wrapper forwarding its block formal into a
+CHAINREG callee with a body-constant key inherits the global-keyed
+atom; CHAINCALL sites always keep pooled wiring — pairs are additive,
+so fallback registrations and manual chain links can never be
+severed), and a GENERAL bug the lift micro exposed:
+globalDedupScanCallEdges pre-merged single-callsite actual<->formal
+node pairs, making every summary drain silently vacuous for
+single-caller summarized functions. Two ablations (self-bind edge,
+Callees insert) exonerated the finalize wiring before the union-find
+pre-merge emerged as the only remaining channel. Dedup now skips
+summarized callees. All prior INVOKE results were sound but
+conservatively over-approximated at single-caller wrappers — the
+kernel re-run quantifies the recovered drain.
+
+km (confirm-invoke on): 8 CHAINLIFT wrappers derived by name
+(register_reboot/pm/module/oom/vmap_purge/restart_handler/
+pvclock_gtod/mt_adistance), 17 const registrations x 25 dispatch
+sites over 4 keys -> 66 wired pairs; 69,080 -> 68,563 (-517/+0).
+Micros exact (t_chain3 1-pair drain, t_chain2 2/2). Kernel run in
+flight; pin refresh awaits review.

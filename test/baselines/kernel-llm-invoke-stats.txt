@@ -1,0 +1,29 @@
+Whole-kernel flows-to baseline WITH FULL INVOKE PIPELINE (canonical pin)
+(2026-07-27, task #28: hand seeds + tier-2 auto-confirmed + tier-3
+kerneldoc/LLM-mined, all file-adopted after review)
+commits: cead1e8 (INVOKE atom) + 16ab7dc (dyn-fallback soundness) +
+         4630c6a (13 tier-2 lines) + a075227 (15 tier-3 lines)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
+        --func-summaries=func_summaries.txt --cfl-dump-icalls --bc-list bclist
+
+resolved: 16,529 icalls / 5,452,202 dumped pairs (converged iteration 4)
+deltas: kernel-invoke pin 5,484,521 -> tier-2 adopted 5,481,191
+        (-3,330/+0) -> this pin 5,452,202 (-28,989/+0)
+  tier-3 removed = stop-machine callbacks (softlockup_fn,
+  push_cpu_stop, __balance_push_cpu_stop, active_load_balance_cpu_stop
+  at 3,320-site pools each) + the async_schedule population
+  (async_suspend*, __driver/__device_attach_async_helper,
+  do_scan_async, do_populate_rootfs, ... at 547-site pools) + smp/IPI
+  + irq-cookie singles. Zero additions at every step.
+resolved-icall deltas all EXPLAINED (re-attribution, not severing):
+  16,532 -> 16,530 (walk_system_ram_range + get_device_system_
+  crosststamp internal dispatchers) -> 16,529 (task_call_func's own
+  dispatcher; all callsites constant-registered; invocations live at
+  registration-site Callees edges; data flows via INVOKE bindings)
+LEDGER: 2,609 summarized; 572 INVOKE bindings, 2,442 dynamic-fn pooled
+  fallbacks, 0 refs skipped. CGPass 9,667,659 ms.
+
+answer set: kernel-llm-invoke-icalls.sort.gz (NOT in git — local
+  ~/fast/ka-scratch/baselines/ per the history-strip policy;
+  regenerable deterministically from this pinned commit + bclist)
+  sha256: 0050fda51664ca8f1967a4da011e865584b52c5f3f4f154af41de3c64b1a9fa3

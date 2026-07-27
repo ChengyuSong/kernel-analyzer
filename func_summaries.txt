@@ -81,6 +81,46 @@ kallsyms_on_each_symbol INVOKE(arg0:f0<-arg1)
 for_each_kernel_tracepoint INVOKE(arg0:f1<-arg1)
 bpf_dispatcher_nop_func INVOKE(arg2:f0<-arg0) INVOKE(arg2:f1<-arg1)
 
+# ---- kernel: tier-3 kerneldoc-mined INVOKE (2026-07-27, reviewed) ----
+# Source: --invoke-proposals mining (Qwopus3.6-27B over kerneldoc, 38
+# proposals) reviewed against 6.8.2 signatures/typedefs under the
+# completeness rule: adopt ONLY where every pointer the callback
+# receives is a caller formal (irq_handler_t(int,void*)=f1,
+# async_func_t(void*,cookie)=f0, cpu_stop_fn_t(void*)=f0,
+# smp_call_func_t(void*)=f0, task_call_f(p,void*)=f0/f1).
+# REJECTED in review (recorded so they aren't re-proposed):
+#   alarm_init (body installs alarmtimer_fired into the data formal's
+#     hrtimer — summarizing severs that channel), write_cache_pages /
+#     read_cache_folio / allocate_resource / free_ftrace_func_mapper /
+#     mempool_* (callback receives body-derived pointers our atom
+#     can't express), call_usermodehelper_setup / register_*sys_off /
+#     hw_breakpoint (callback receives a container/ret object, not the
+#     data arg), relay_open (ops-struct, family 3), raw_notifier_call_
+#     chain (dispatcher not registration; arg0 is the chain head),
+#     tracepoint_probe_register* (interacts with the static_call/tp
+#     model), dynevent_arg_add (cmd seq-buf ptr stores dropped).
+# smp_call_function_single: LLM proposed arg0<-arg1 (off-by-one vs
+# kerneldoc order); corrected to arg1<-arg2 in review.
+# devm irq pair: dev's devres bookkeeping loss is within the accepted
+# devres model (devres_alloc has been FRESH-summarized since the
+# isAllocFn era). __percpu dev_id binding matches the task #23
+# percpu identity model.
+__request_percpu_irq INVOKE(arg1:f1<-arg4)
+request_nmi INVOKE(arg1:f1<-arg4)
+request_percpu_nmi INVOKE(arg1:f1<-arg3)
+devm_request_threaded_irq INVOKE(arg2:f1<-arg6) INVOKE(arg3:f1<-arg6)
+devm_request_any_context_irq INVOKE(arg2:f1<-arg5)
+async_schedule_node INVOKE(arg0:f0<-arg1)
+async_schedule_node_domain INVOKE(arg0:f0<-arg1)
+async_schedule_dev_nocall INVOKE(arg0:f0<-arg1)
+stop_one_cpu INVOKE(arg1:f0<-arg2)
+stop_one_cpu_nowait INVOKE(arg1:f0<-arg2)
+stop_two_cpus INVOKE(arg2:f0<-arg3)
+stop_machine_from_inactive_cpu INVOKE(arg0:f0<-arg1)
+smp_call_function_single INVOKE(arg1:f0<-arg2)
+smp_call_function_any INVOKE(arg1:f0<-arg2)
+task_call_func INVOKE(arg1:f0<-arg0) INVOKE(arg1:f1<-arg2)
+
 # ---- kernel: dup family (FRESH + copy semantics) ----
 kmemdup FRESH CPY(ret<-arg0)
 kmemdup_nul FRESH CPY(ret<-arg0)

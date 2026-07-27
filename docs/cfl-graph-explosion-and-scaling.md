@@ -2438,3 +2438,36 @@ boundary. Evidence sources therefore complement BY LAYER — body proof
 for internals, callsite evidence everywhere, documented intent at the
 API boundary — each gated by the one above it. (Paper: a three-source
 evidence pipeline of decreasing rigor with a single soundness gate.)
+
+### Tier-3 review + adoption: the LLM tranche (2026-07-27)
+
+All 38 kerneldoc-mined proposals reviewed against 6.8.2 signatures and
+callback typedefs under the completeness rule. ADOPTED 15 (a075227):
+irq cookie family (incl. devm_request_threaded_irq with BOTH handler
+and thread_fn — the LLM only proposed handler; and request_nmi/
+request_percpu_nmi the census never saw), async_schedule family,
+stop-machine family, smp_call_function_single/any (single's LLM
+off-by-one corrected against kerneldoc order), task_call_func (both
+formals). REJECTED 15 with reasons recorded in func_summaries.txt —
+the two recurring rejection classes are exactly the atom's current
+expressiveness limits: (1) callbacks receiving BODY-DERIVED pointers
+(write_cache_pages' folio, allocate_resource's candidate resource,
+mempool elements), (2) callbacks receiving a CONTAINER/ret object
+holding the data (sys_off_data, subprocess_info, hw_breakpoint
+event). Both are future-atom material (deref-binding / ret-binding),
+not adoption failures. Plus one genuine trap the review caught:
+alarm_init also installs alarmtimer_fired into the data formal's
+embedded hrtimer — summarizing would sever a second callback channel.
+
+km A/B: 70,975 -> 69,080 (-1,895/+0). Removed = the stop-machine
+residual the tier-2 verdict left standing (softlockup_fn,
+push_cpu_stop, __balance_push_cpu_stop, active_load_balance_cpu_stop
+each leaving 395-site pools) + the 31-site smp/IPI pool
+(remote_function, rcu_exp_handler, __perf_event_read, ...). With this
+tranche the c17037-class hub's remaining 395-fan members are down to
+the family-2/3 store-side idioms (workqueue/timer/ops containers).
+
+Kernel run for the kernel-llm-invoke pin in flight (pre-approved,
+pinned on a clean both-directions diff). Cumulative #28 arc at km:
+80,531 -> 69,080 (-14.2%) across hand seeds + tier-2 auto-confirm +
+tier-3 doc-mined adoption, every step -N/+0 or +2-vetted.

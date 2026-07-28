@@ -7789,10 +7789,33 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
           key = git->second;
         } else {
           auto eit = Ctx->ExtGobjs.find(g);
-          if (eit != Ctx->ExtGobjs.end() && eit->second)
+          if (eit != Ctx->ExtGobjs.end() && eit->second) {
             key = eit->second;
-          else
-            key = canonChainKey(CS->getModule()->getNamedValue(A.gsym));
+          } else {
+            // STATIC chain heads (pm_chain_head, oom_notify_list, ...)
+            // are in no global map and not visible from callers' TUs.
+            // Resolve by a one-time corpus scan of local-linkage
+            // globals; only a UNIQUE name match binds (ambiguous or
+            // absent -> dyn fallback, LEDGERed by the caller path).
+            static std::unordered_map<std::string, const GlobalValue *>
+                localByName; // nullptr sentinel = ambiguous
+            static bool scanned = false;
+            if (!scanned) {
+              scanned = true;
+              for (auto &mp2 : Ctx->Modules)
+                for (const GlobalVariable &GV2 : mp2.first->globals()) {
+                  if (!GV2.hasLocalLinkage() || !GV2.hasName()) continue;
+                  auto [it2, ins2] =
+                      localByName.emplace(GV2.getName().str(), &GV2);
+                  if (!ins2) it2->second = nullptr; // ambiguous
+                }
+            }
+            auto lit = localByName.find(A.gsym);
+            if (lit != localByName.end() && lit->second)
+              key = lit->second;
+            else
+              key = canonChainKey(CS->getModule()->getNamedValue(A.gsym));
+          }
         }
       } else if (A.dst >= 0) {
         key = canonChainKey(dyn_cast<GlobalValue>(

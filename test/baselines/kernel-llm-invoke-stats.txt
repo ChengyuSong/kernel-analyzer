@@ -27,3 +27,23 @@ answer set: kernel-llm-invoke-icalls.sort.gz (NOT in git — local
   ~/fast/ka-scratch/baselines/ per the history-strip policy;
   regenerable deterministically from this pinned commit + bclist)
   sha256: 0050fda51664ca8f1967a4da011e865584b52c5f3f4f154af41de3c64b1a9fa3
+
+REFRESH 2026-07-28 (task #29: chain pair-channels + dedup drain fix)
+commits: 967618b (CHAINREG/CHAINCALL + CHAINLIFT + dedup drain fix) +
+         edb7fab (49 kernel-scale confirmer lines adopted) +
+         5c6d866/f6918f7 (@sym key resolution: GUID maps for external
+         heads + unique local-linkage scan for static heads — BOTH
+         gaps caught by the adoption identity check)
+config: unchanged (confirm-OFF, file-only func_summaries.txt)
+resolved: 16,516 icalls / 5,444,041 dumped pairs (iteration 4)
+delta vs prior pin (16,529 / 5,452,202): -8,220 / +60 gross; net
+  attribution: notifier chains (ChainPairs 42 regs x 107 dispatch
+  sites over 10 keys -> 125 pairs; ~1,700 notifier-target removals)
+  + dedup-drain recovery at single-caller summarized wrappers (e1000
+  irq/diag, sync_fs/quota shared-formal pools) + vetted bpf_throw ->
+  __bpf_call_base addition (confirmer-binding recovery) + 59-pair
+  __SCT__tp_func_nvme_sq residual (definition-less trampoline
+  declaration-selection nondeterminism across binaries — known class,
+  GUID self-filter covers only self-pairs)
+answer set: kernel-llm-invoke-icalls.sort.gz (local-only per the
+  strip policy) sha256: 78db2eeb5f98762dc1bfc17faea29b9e67de42e0466fac8a872d580b2087d4ee

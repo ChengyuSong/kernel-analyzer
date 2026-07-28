@@ -7779,7 +7779,21 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (A.gsrc) {
         key = A.gsrc; // derived (composition lift): already canonical
       } else if (!A.gsym.empty()) {
-        key = canonChainKey(CS->getModule()->getNamedValue(A.gsym));
+        // resolve by GUID against the global maps: the callsite TU
+        // usually does NOT declare the chain head (the wrapper hides
+        // it) -- getNamedValue there returned null and 1,889 wrapper
+        // registrations fell back pooled (kernel-adopt2 identity check)
+        const uint64_t g = llvm::GlobalValue::getGUID(A.gsym);
+        auto git = Ctx->Gobjs.find(g);
+        if (git != Ctx->Gobjs.end() && git->second) {
+          key = git->second;
+        } else {
+          auto eit = Ctx->ExtGobjs.find(g);
+          if (eit != Ctx->ExtGobjs.end() && eit->second)
+            key = eit->second;
+          else
+            key = canonChainKey(CS->getModule()->getNamedValue(A.gsym));
+        }
       } else if (A.dst >= 0) {
         key = canonChainKey(dyn_cast<GlobalValue>(
             CS->getArgOperand(A.dst)->stripPointerCasts()));

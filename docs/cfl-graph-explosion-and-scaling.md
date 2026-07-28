@@ -2606,3 +2606,19 @@ pvclock_gtod/mt_adistance), 17 const registrations x 25 dispatch
 sites over 4 keys -> 66 wired pairs; 69,080 -> 68,563 (-517/+0).
 Micros exact (t_chain3 1-pair drain, t_chain2 2/2). Kernel run in
 flight; pin refresh awaits review.
+
+### PIN REFRESH: kernel-llm-invoke (2026-07-28, 061a4d4) — task #29 closed
+
+16,516 icalls / 5,444,041 pairs, confirm-OFF file-only config. vs the
+2026-07-27 pin: -8,220/+60 — notifier keyed pair-channels (42 regs x
+107 dispatch sites over 10 keys, 125 pairs) + dedup-drain recovery at
+single-caller summarized wrappers + the vetted bpf_throw addition +
+a 59-pair __SCT__tp_func_nvme_sq residual (definition-less trampoline
+declaration-selection nondeterminism across binaries; known class).
+Option-b file expression needed TWO fixes caught by the adoption
+identity check: GUID-map resolution for external chain heads and a
+unique local-linkage scan for static heads. Remaining #29 frontier ->
+new tasks: family-3 ops structs; provenance-preserving cells
+(big-ticket, motivated by falsification #6). Kernel kdoc corroboration
+of the 251-item confirmer rejection queue was NULL (165 no-doc,
+internal helpers) — the doc tier is exhausted below the API boundary.

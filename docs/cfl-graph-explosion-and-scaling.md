@@ -2622,3 +2622,30 @@ new tasks: family-3 ops structs; provenance-preserving cells
 (big-ticket, motivated by falsification #6). Kernel kdoc corroboration
 of the 251-item confirmer rejection queue was NULL (165 no-doc,
 internal helpers) — the doc tier is exhausted below the API boundary.
+
+### Family-3 two-level ops census (task #30, km, 2026-07-28)
+
+--cfl-census-fields now reports OpsChannels: two-level dispatch
+(obj->ops then ops->fn feeding an icall) with receiver evidence. km:
+416 channels / 853 dispatch sites, 386 (45%) pass the receiver (the
+inner load's base object) as a callback argument; 54 distinct ops
+globals stored. Top channels are the canonical kernel vtables, most
+WITH receiver correlation: sched_class via task_struct+688,
+dentry_operations via dentry+224, vm_operations_struct via vma+120,
+trace_event_class via trace_event_call+16, bpf_map_ops, mm_walk_ops
+(all recv==sites); irq_chip via irq_desc+64 and pmu channels show
+recv=0 only because the receiver is a SIBLING field (&desc->irq_data)
+— the exact-base test undercounts those.
+
+Reading for the model (task #30 step b): the keyed ops-channel shape
+is real — key = the ops GLOBAL (54 of them), registration = ops-ptr
+store into a container origin, dispatch = the 386 receiver-passing
+sites. Callsite-level pairing (the chains precedent) bypasses the
+cluster merges falsification #6 forbids exploiting. The complication
+vs notifier chains: registration stores are NOT behind one API — they
+are raw field stores (family-2 shape) — so the registration side
+needs either a store-pattern recognizer (census already finds them)
+or per-ops-global Callees pairing at the dispatch sites directly
+(ops-global -> its member fns is STATIC from the initializer; the
+pairing question is only WHICH receivers, which is where the
+container origin enters). Design continues next session.

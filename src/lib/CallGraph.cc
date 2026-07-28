@@ -7926,6 +7926,10 @@ void CallGraphPass::runFieldChannelCensus() {
     std::string loadSample;
   };
   std::map<std::string, Chan> chans;
+  // family-3: "<opsFieldKey> ->fn <fnFieldKey>" -> (dispatchSites,
+  // receiver-passing sites)
+  std::map<std::string, std::pair<size_t, size_t>> twoLevel;
+  std::map<const Value *, size_t> opsGlobalFanout; // ops global -> stores
   auto fieldKey = [&](const Value *P, const DataLayout &DL,
                       bool &varIdx) -> std::pair<std::string, const Value *> {
     APInt Off(64, 0);
@@ -7978,6 +7982,7 @@ void CallGraphPass::runFieldChannelCensus() {
             baseFnKeys[Base].push_back(Key);
           } else if (isOpsGlobal(V)) {
             chans[Key].opsStores++;
+            opsGlobalFanout[V]++;
           } else if (containsPointerType(V->getType())) {
             baseDataStores[Base]++;
             // dynamic fn store? count under the key only if the value
@@ -7986,22 +7991,35 @@ void CallGraphPass::runFieldChannelCensus() {
             if (chans.count(Key)) chans[Key].dynStores++;
           }
         } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
-          bool fedIcall = false;
+          const CallBase *fedCB = nullptr;
           for (const User *U : LI->users()) {
             const auto *CB = dyn_cast<CallBase>(U);
             if (CB && !CB->isInlineAsm() &&
                 CB->getCalledOperand()->stripPointerCasts() == LI)
-              fedIcall = true;
+              fedCB = CB;
           }
-          if (!fedIcall) continue;
+          if (!fedCB) continue;
           bool varIdx = false;
           auto [Key, Base] = fieldKey(LI->getPointerOperand(), DL, varIdx);
-          (void)Base;
           Chan &C = chans[Key];
           C.icallLoads++;
           totalIcallLoads++;
           if (C.loadSample.empty())
             C.loadSample = F.getName().str();
+          // family-3 two-level dispatch: the fn load's base is ITSELF
+          // a loaded pointer (obj->ops then ops->fn). Record the outer
+          // (ops-field) key and whether the icall passes the receiver
+          // (the inner load's base object) as an argument.
+          if (const auto *L1 = dyn_cast<LoadInst>(Base)) {
+            bool v2 = false;
+            auto [OKey, OBase] = fieldKey(L1->getPointerOperand(), DL, v2);
+            bool recv = false;
+            for (const Use &A2 : fedCB->args())
+              if (A2->stripPointerCasts() == OBase) recv = true;
+            auto &T = twoLevel[OKey + " ->fn " + Key];
+            T.first++;
+            if (recv) T.second++;
+          }
         }
       }
       for (auto &[Base, Keys] : baseFnKeys)
@@ -8037,6 +8055,30 @@ void CallGraphPass::runFieldChannelCensus() {
     for (const auto &N : C->fnSample) errs() << " " << N;
     errs() << "\n";
   }
+  // family-3 report: two-level dispatch channels + ops-global fan-out
+  std::vector<std::pair<size_t, const std::string *>> tlRank;
+  size_t recvTotal = 0, tlTotal = 0;
+  for (auto &[K, V] : twoLevel) {
+    tlRank.emplace_back(V.first, &K);
+    tlTotal += V.first;
+    recvTotal += V.second;
+  }
+  std::sort(tlRank.begin(), tlRank.end(), std::greater<>());
+  errs() << "OpsChannels: " << twoLevel.size()
+         << " two-level dispatch channels, " << tlTotal << " sites, "
+         << recvTotal << " pass the receiver; " << opsGlobalFanout.size()
+         << " distinct ops globals stored\n";
+  for (size_t i = 0; i < std::min<size_t>(25, tlRank.size()); i++) {
+    auto &V = twoLevel[*tlRank[i].second];
+    errs() << "OpsChannels: " << *tlRank[i].second << " sites=" << V.first
+           << " recv=" << V.second << "\n";
+  }
+  std::vector<std::pair<size_t, const Value *>> ogRank;
+  for (auto &[G, N] : opsGlobalFanout) ogRank.emplace_back(N, G);
+  std::sort(ogRank.begin(), ogRank.end(), std::greater<>());
+  for (size_t i = 0; i < std::min<size_t>(10, ogRank.size()); i++)
+    errs() << "OpsChannels: opsGlobal " << ogRank[i].second->getName()
+           << " stored at " << ogRank[i].first << " sites\n";
 }
 
 // --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries

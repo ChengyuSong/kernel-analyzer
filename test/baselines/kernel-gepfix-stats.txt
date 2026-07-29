@@ -1,0 +1,45 @@
+Whole-kernel flows-to baseline WITH THE CONSTEXPR-GEP SOUNDNESS FIX
+(2026-07-29, task #30 fallout — CANONICAL PIN, supersedes
+kernel-llm-invoke-stats.txt)
+commits: fe993a7 (constexpr-GEP fix) + ed2be74 (--cfl-ops-pairs step 2,
+         OFF in this config)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
+        --func-summaries=func_summaries.txt --cfl-dump-icalls --bc-list bclist
+
+resolved: 18,189 icalls / 8,389,759 pairs (converged iteration 4)
+delta vs kernel-llm-invoke refresh pin (16,516 / 5,444,041):
+  -59 / +2,947,968
+  the 59 removals are ALL -> __SCT__tp_func_nvme_sq: the documented
+  definition-less trampoline declaration-selection nondeterminism
+  (same 59-pair set the prior pin gained), NOT a regression.
+  additions: 1,504,648 (51%) tracepoint probe pools (__traceiter_*
+  loads of probe arrays that registration stores through constexpr
+  GEPs into static __tracepoint_* structs — fully dark before the
+  fix); the rest dominated by kvm_x86_ops / x86_pmu-style global ops
+  structs written and read via constexpr GEP field access (vcpu_run
+  133,907; enter_smm 48,628; __set_sregs_common 31,344; ...).
++1,673 newly resolved icalls (previously zero-target sites reading
+  fields of static globals).
+
+THE BUG (found by test/t_ops.c): in field-insensitive mode a non-zero-
+field ConstantExpr GEP gets its own node (NodeFactory gepMap keyed
+(base, fieldNum)) and nothing emitted the grammar's GetElementPtr
+base->result 'a' edge (ensureConstGEPFieldEdges early-returned unless
+field labels were on). Every store/load through gep(@G, field) in
+instruction position was silently severed from @G's cell. km recovery:
+match-by-CFL 66,318 -> 128,227 (+93%), 0 removed / +62,388 added.
+
+runtime: CGPass 14,828,774 ms (4.12 h; prior pin 2.69 h — +53% from
+the recovered fact mass). peak within the 49 GB limit.
+
+answer set: kernel-gepfix-icalls.sort.gz (NOT in git — local
+  ~/fast/ka-scratch/baselines/ per the history-strip policy;
+  regenerable deterministically from the pinned commits + bclist)
+  sha256: 0ea72426d677a6b41524d3de8f3d3226522601fa4727ceabd8a324b84cc1d0f7
+
+NOTE --cfl-ops-pairs stays OFF in the canonical config. Full ladder
+state at this pin: micros exact (t_ops acceptance: a1->cba/b1->cbb
+per-pair exact under the flag), smoke 4/4, km A/B flag-vs-noflag =
+0 removed / +22 added (see docs/cfl-graph-explosion-and-scaling.md,
+task #30: km payoff gated on certificate coverage — 39 protected
+origins collapse to 8 cell classes via shared writers).

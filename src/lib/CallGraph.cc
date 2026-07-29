@@ -2495,6 +2495,48 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
 
+  // ---- Provenance-protected cells (task #30, --cfl-ops-pairs) ----
+  // Certified container origins get copy-out semantics: WRITER cells
+  // (any in-edge) merge into the per-origin protected cell as today;
+  // READER cells (no in-edge) BRIDGE to it — the solver's existing
+  // non-transitive pairwise fact exchange — instead of unifying. One
+  // polymorphic reader thus no longer collapses two containers' cells
+  // into a single class (the t_ops wall). Readers arriving before any
+  // writer wait and attach when the cell materializes; a bridged
+  // reader that later gains an in-edge is DEMOTED — merged into every
+  // cell it bridge-joined (soundness first, LEDGERed). Scoped to
+  // NB==0 (canonical field-insensitive config).
+  struct ProtState {
+    uint32_t cell = UINT32_MAX;
+    llvm::SmallVector<uint32_t, 2> waiting;
+  };
+  const bool protOn = CFLOpsPairs && NB == 0 && !opsPairs.empty();
+  boost::unordered_flat_set<uint32_t> protRid;
+  boost::unordered_flat_map<uint32_t, ProtState> prot; // rid -> state
+  boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
+      readerBridgedTo; // reader class -> rids it bridge-joined
+  std::vector<uint32_t> protDemoteQ;
+  std::vector<char> protIn; // hasIn, class-folded (private copy)
+  size_t protWriterMerges = 0, protReaderBridges = 0, protDemotions = 0,
+         protWaitAttached = 0;
+  if (protOn) {
+    protIn.assign(hasIn.begin(), hasIn.end());
+    boost::unordered_flat_set<uint32_t> protCls;
+    for (auto &kv : opsPairs)
+      for (const Value *C2 : kv.second.containers)
+        if (isa<GlobalVariable>(C2)) {
+          NodeIndex vn = getRepNodeForValue(C2);
+          if (vn == AndersNodeFactory::InvalidIndex)
+            continue;
+          auto dit = toDense.find(getCanonicalNode(vn));
+          if (dit != toDense.end())
+            protCls.insert(dit->second);
+        }
+    for (auto &sd : seeds)
+      if (protCls.count(sd.first))
+        protRid.insert(sd.second);
+  }
+
   // Root-class tracking so incremental wiring can mint identity roots
   // for classes that BECOME origins mid-fixpoint (new allocation sites)
   // without duplicating existing ones.
@@ -2934,6 +2976,18 @@ bool CallGraphPass::runFlowsToResolution() {
         if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s], ctx0);
       }
     wflag[a] |= wflag[b];
+    if (protOn) {
+      if (protIn[b])
+        protIn[a] = 1;
+      auto rb = readerBridgedTo.find(b);
+      if (rb != readerBridgedTo.end()) {
+        auto &va = readerBridgedTo[a];
+        va.append(rb->second.begin(), rb->second.end());
+        readerBridgedTo.erase(rb);
+      }
+      if (protIn[a] && readerBridgedTo.count(a))
+        protDemoteQ.push_back(a); // reader gained stores: demote later
+    }
     push(a, ctx0);
     return a;
   };
@@ -3002,6 +3056,49 @@ bool CallGraphPass::runFlowsToResolution() {
       g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
       return;
     }
+    if (protOn && s == 0 && protRid.count(o)) {
+      auto &ps = prot[o];
+      if (ps.cell != UINT32_MAX)
+        ps.cell = find(ps.cell);
+      const uint32_t cr = find(cell);
+      if (cr == ps.cell)
+        return;
+      if (protIn[cr]) {
+        // writer (or mixed): merges into the cell, exactly as today
+        if (ps.cell == UINT32_MAX)
+          ps.cell = cr;
+        else
+          ps.cell = merge(ps.cell, cr);
+        protWriterMerges++;
+        if (!ps.waiting.empty()) {
+          auto pending = std::move(ps.waiting);
+          ps.waiting.clear();
+          for (uint32_t w : pending) {
+            w = find(w);
+            if (w == ps.cell)
+              continue;
+            addBridge(find(ps.cell), w);
+            protWaitAttached++;
+          }
+          ps.cell = find(ps.cell);
+        }
+      } else {
+        // reader: copy-out. Facts cross the bridge and re-emit native
+        // along a-edges (value flow launders provenance), but never
+        // re-cross another bridge — cells stay separate classes.
+        auto &v = readerBridgedTo[cr];
+        if (std::find(v.begin(), v.end(), o) != v.end())
+          return; // already attached to this origin's cell
+        v.push_back(o);
+        if (ps.cell == UINT32_MAX) {
+          ps.waiting.push_back(cr); // no writer yet: attach on arrival
+        } else {
+          addBridge(ps.cell, cr);
+          protReaderBridges++;
+        }
+      }
+      return;
+    }
     const uint64_t key = (uint64_t)o * NSHIFT + s;
     auto [it, ins] = clusterRep.emplace(key, find(cell));
     if (!ins) {
@@ -3036,6 +3133,36 @@ bool CallGraphPass::runFlowsToResolution() {
         addBridge(it->second, xr);
     }
   };
+  // Demote bridged readers that gained an in-edge: stores landing in a
+  // reader class cross its bridge once but never re-cross, so other
+  // readers of the same cell would miss them — merge the reader into
+  // EVERY cell it bridge-joined (collapses those cells together if it
+  // joined several: exactly today's semantics, protection forfeited
+  // for them). Sequential contexts only (join sweeps / wiring).
+  auto processProtDemotions = [&]() {
+    while (!protDemoteQ.empty()) {
+      uint32_t c = find(protDemoteQ.back());
+      protDemoteQ.pop_back();
+      auto rb = readerBridgedTo.find(c);
+      if (rb == readerBridgedTo.end())
+        continue; // already handled (or folded away by a merge)
+      auto rids = std::move(rb->second);
+      readerBridgedTo.erase(rb);
+      for (uint32_t o : rids) {
+        auto &ps = prot[o];
+        c = find(c);
+        if (ps.cell == UINT32_MAX) {
+          ps.cell = c; // waiting reader turned writer: it IS the cell
+          continue;
+        }
+        ps.cell = find(ps.cell);
+        if (ps.cell != c)
+          ps.cell = merge(ps.cell, c);
+        protDemotions++;
+      }
+    }
+  };
+
   // Dynamic a-SCC collapse: classes mutually reachable over the current
   // (post-merge) shift-preserving edge graph — a-edges plus residue-0
   // f-edges — receive each other's every fact, so their planes are equal
@@ -3142,6 +3269,7 @@ bool CallGraphPass::runFlowsToResolution() {
     mergeHits.resize(N2, 0);
     isRoot.resize(N2, 0);
     if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
+    if (!protIn.empty()) protIn.resize(N2, 0);
     N = N2;
   };
   auto originBearing = [&](NodeIndex canon) {
@@ -3226,6 +3354,14 @@ bool CallGraphPass::runFlowsToResolution() {
     for (const NewEdge &e : batch) {
       if (e.kind == 0) {
         hasIn[e.b] = true;
+        if (protOn) {
+          const uint32_t pb = find(e.b);
+          if (!protIn[pb]) {
+            protIn[pb] = 1;
+            if (readerBridgedTo.count(pb))
+              protDemoteQ.push_back(pb);
+          }
+        }
         uint32_t x = find(e.a), y = find(e.b);
         if (x == y) continue;
         outA[x].push_back(e.b);
@@ -3253,6 +3389,14 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       } else if (e.kind == 2) {
         hasIn[e.b] = true;
+        if (protOn) {
+          const uint32_t pb = find(e.b);
+          if (!protIn[pb]) {
+            protIn[pb] = 1;
+            if (readerBridgedTo.count(pb))
+              protDemoteQ.push_back(pb);
+          }
+        }
         uint32_t b = find(e.a);
         outF[b].emplace_back(e.b, e.c);
         nF++;
@@ -3404,6 +3548,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // cycles and lost on kernel-shaped merge churn. A merge can absorb n
   // itself: stop; the keeper inherits the backlog and is re-queued.
   auto joinSweep = [&](uint32_t n, SolverCtx &ctx) {
+    if (protOn && !protDemoteQ.empty())
+      processProtDemotions();
     if (find(n) != n) return; // merged away; keeper carries the state
     for (uint32_t s = 0; s < NSHIFT; s++) {
       if (jdirty[n][s].none()) continue;
@@ -4146,6 +4292,23 @@ bool CallGraphPass::runFlowsToResolution() {
     CG_LOG("OpsPairs LEDGER: tightened " << g_opsTightSites
            << " (callee,site) wirings so far, " << g_opsTightRej
            << " two-level rejections (untightenable/no-recv-arg)\n");
+  if (protOn) {
+    size_t cells = 0, waiting = 0;
+    boost::unordered_flat_set<uint32_t> live;
+    for (auto &kv : prot) {
+      if (kv.second.cell != UINT32_MAX) {
+        cells++;
+        live.insert(find(kv.second.cell));
+      }
+      waiting += kv.second.waiting.size();
+    }
+    CG_LOG("ProtCells LEDGER: " << protRid.size() << " protected origins, "
+           << cells << " cells materialized (" << live.size()
+           << " distinct classes), " << protWriterMerges << " writer merges, "
+           << protReaderBridges << " reader bridges (+" << protWaitAttached
+           << " wait-attached), " << waiting << " readers still waiting, "
+           << protDemotions << " demotions\n");
+  }
   if (CFLProbeOpsMono && omSites) {
     errs() << "OpsMono: " << omSites << " two-level dispatch sites: "
            << omMono << " mono (targets inside ONE ops global), " << omNear

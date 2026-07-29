@@ -2731,3 +2731,44 @@ certificates + wiring are the instrument half of the mechanism, and
 the payoff is gated entirely on provenance-preserving cells (protected
 cluster keys, reader-copy via the bridge primitive). t_ops is the
 acceptance test.
+
+### Provenance-protected cells v0 SHIPPED + kernel pin refresh (task #30, 2026-07-29)
+
+The protected-cells prototype landed inside --cfl-ops-pairs: certified
+container origins key protected cluster entries; WRITER cells (any
+in-edge, tracked in a protIn class-folded copy of hasIn) merge into
+the per-origin cell exactly as before; READER cells bridge (the
+solver's non-transitive pairwise exchange — facts cross once, re-emit
+native along a-edges, never re-cross another bridge); readers arriving
+before any writer wait and attach when the cell materializes; a
+bridged reader that later gains an in-edge (merge fold or incremental
+wiring) is DEMOTED — merged into every cell it bridge-joined. All
+LEDGERed (ProtCells line).
+
+t_ops ACCEPTANCE PASSES: a1->cba, a2->cba, b1->cbb, b2->cbb — per-pair
+exact, dispatch unchanged, 2 cells stay distinct classes, 0 demotions.
+The mechanism trilogy (certificates -> receiver tightening -> protected
+cells) delivers the user's pair-precision recovery on the micro. Full
+micro suite without the flag: bit-identical (feature inert). With the
+flag: the ONLY movement across all micros is t_ops's 4 cross-pair
+removals. Smoke 4/4.
+
+km reality check: 39 protected origins (of 102 containers — globals
+whose value class minted a root), 91 writer merges COLLAPSE them to 8
+distinct cell classes, 17 reader bridges, 0 demotions — and answers
+are IDENTICAL to ops-pairs-without-protection (128,249). The km-scale
+payoff is gated on certificate COVERAGE, not mechanism: shared
+registration writers (one helper's deref cell joins many protected
+keys) merge cells pairwise, exactly the predicted multi-key writer
+collapse. Levers, in order: (1) walker v2 — recurse one level into
+call arguments under PASSTHRU discipline (relay_open/cdev_init class,
+the dominant 226-incomplete bucket) to certify more globals AND to
+break shared-writer collapse by certifying the helper's formal
+channel; (2) per-container writer splitting at the helper (same
+formal-channel evidence).
+
+KERNEL PIN REFRESH (canonical, flag OFF): 18,189 icalls / 8,389,759
+pairs, -59 (all the documented __SCT__tp_func_nvme_sq trampoline
+nondeterminism) / +2,947,968 vs the prior pin — 51% tracepoint probe
+pools, the rest kvm_x86_ops/x86_pmu-style constexpr-GEP ops-struct
+traffic. 4.12 h (+53%). test/baselines/kernel-gepfix-stats.txt.

@@ -2649,3 +2649,24 @@ or per-ops-global Callees pairing at the dispatch sites directly
 (ops-global -> its member fns is STATIC from the initializer; the
 pairing question is only WHICH receivers, which is where the
 container origin enters). Design continues next session.
+
+### OpsMono instrument: site-level containment is the wrong certificate (task #30, km, 2026-07-28)
+
+--cfl-probe-ops-mono classifies two-level dispatch sites by target
+containment in one ops-global member set. km: 701 sites — 23 mono
+(3.3%), 37 near, 620 polymorphic (88%), vs 988 ops globals (>=2 fns).
+Poly giants: bpf_iter_create |T|=483, move_to_new_folio |T|=339.
+
+READING: this does NOT refute kernel modularity — it shows SITE-level
+containment is the wrong granularity for the certificate. A vfs/bpf
+dispatch site legitimately serves many ops globals (many drivers/map
+types through one site); modularity lives at the PAIR level (each
+receiver with the members of ITS OWN installed g). The 23 mono sites
+are the only ones where per-g pairing is free; everywhere else the
+model must be per-pair: bind each member fn F of g's RECEIVER FORMAL
+to the origins g was stored into (store-side IR evidence, pre-merge,
+so falsification #6 does not apply) — a callee-side constraint
+tightening, not site partitioning. Soundness needs a per-g
+completeness bit (every store of g base-resolvable; container
+copies/memcpy escape-hatch to pooled). That per-pair model + its
+completeness discipline is the next design block for #30.

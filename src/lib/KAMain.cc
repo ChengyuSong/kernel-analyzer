@@ -326,6 +326,16 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLProbeOpsMono(
+  "cfl-probe-ops-mono",
+  cl::desc("MEASUREMENT-ONLY probe (task #30): classify each two-level "
+           "dispatch site (obj->ops->fn) by whether its resolved targets "
+           "lie inside a single ops-global member set — derives the "
+           "kernel-modularity invariant from the sound analysis (mono "
+           "sites certify per-ops pairing; polymorphic sites form the "
+           "violation/imprecision ledger). Adds no edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeOriginSplit(
   "cfl-probe-origin-split",
   cl::desc("MEASUREMENT-ONLY probe (task #29): at each flows-to "
@@ -657,6 +667,8 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLConflationReport, "--cfl-conflation-report");
     requireFlowsTo(CFLRootRelevance, "--cfl-root-relevance");
     requireFlowsTo(CFLProbeRodataJoins, "--cfl-probe-rodata-joins");
+    requireFlowsTo(CFLProbeOriginSplit, "--cfl-probe-origin-split");
+    requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
     requireFlowsTo(!CFLAblateMints.empty(), "--cfl-ablate-mints");
     requireFlowsTo(CFLFlowsToMaxIters.getNumOccurrences() > 0,
                    "--cfl-flows-to-max-iters");

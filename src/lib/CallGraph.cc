@@ -3758,6 +3758,40 @@ bool CallGraphPass::runFlowsToResolution() {
          osDbig = 0, osNoLoad = 0, osNoOrigin = 0;
   std::vector<std::tuple<size_t, const CallBase *, size_t, size_t, size_t>>
       osTop; // (excess, CS, |A|, |Asplit|, D)
+  // --cfl-probe-ops-mono (task #30): per two-level dispatch site, is
+  // the resolved target set contained in ONE ops-global's member set?
+  // Derives the kernel-modularity invariant from the sound analysis
+  // instead of assuming it: mono sites certify per-ops pairing; poly
+  // sites are the violation/imprecision ledger. Measurement-only.
+  std::unordered_map<const GlobalVariable *, FuncSet> opsMembers;
+  std::unordered_map<const Function *, SmallVector<const GlobalVariable *, 2>>
+      opsMemberOf;
+  size_t omSites = 0, omMono = 0, omNear = 0, omPoly = 0, omNoOps = 0;
+  std::map<const GlobalVariable *, size_t> omMonoByG;
+  std::vector<std::pair<const CallBase *, size_t>> omPolySample;
+  if (CFLProbeOpsMono) {
+    std::function<void(const Constant *, FuncSet &)> collectFns =
+        [&](const Constant *C, FuncSet &out) {
+          if (const auto *F2 = dyn_cast<Function>(C->stripPointerCasts())) {
+            out.insert(getFuncDef(const_cast<Function *>(F2)));
+            return;
+          }
+          if (isa<ConstantAggregate>(C))
+            for (const Use &Op : C->operands())
+              if (const auto *CO = dyn_cast<Constant>(Op.get()))
+                collectFns(CO, out);
+        };
+    for (auto &mp2 : Ctx->Modules)
+      for (const GlobalVariable &GV : mp2.first->globals()) {
+        if (!GV.hasInitializer()) continue;
+        FuncSet ms;
+        collectFns(GV.getInitializer(), ms);
+        if (ms.size() < 2) continue; // singleton "ops" add no partition
+        auto &slot = opsMembers[&GV];
+        slot = std::move(ms);
+        for (const Function *F2 : slot) opsMemberOf[F2].push_back(&GV);
+      }
+  }
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -3981,6 +4015,43 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
     }
+    if (CFLProbeOpsMono && !targets.empty()) {
+      const auto *LI2 = dyn_cast<LoadInst>(fptr);
+      const LoadInst *L1 = nullptr;
+      if (LI2) {
+        const Value *B = LI2->getPointerOperand()->stripPointerCasts();
+        while (const auto *G = dyn_cast<GEPOperator>(B))
+          B = G->getPointerOperand()->stripPointerCasts();
+        L1 = dyn_cast<LoadInst>(B);
+      }
+      if (L1) { // two-level dispatch site
+        omSites++;
+        std::map<const GlobalVariable *, size_t> cover;
+        size_t withOps = 0;
+        for (const Function *F2 : targets) {
+          auto mIt = opsMemberOf.find(F2);
+          if (mIt == opsMemberOf.end()) continue;
+          withOps++;
+          for (const GlobalVariable *G : mIt->second) cover[G]++;
+        }
+        size_t best = 0;
+        const GlobalVariable *bestG = nullptr;
+        for (auto &[G, N] : cover)
+          if (N > best) { best = N; bestG = G; }
+        if (withOps == 0) {
+          omNoOps++;
+        } else if (best == targets.size()) {
+          omMono++;
+          omMonoByG[bestG]++;
+        } else if (best + 2 >= targets.size()) {
+          omNear++;
+        } else {
+          omPoly++;
+          if (omPolySample.size() < 12)
+            omPolySample.emplace_back(CS, targets.size());
+        }
+      }
+    }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
     for (const Function *F : targets) {
       if (!Ctx->Callees[CS].insert(F).second)
@@ -4012,6 +4083,23 @@ bool CallGraphPass::runFlowsToResolution() {
         handleCall(CS, CF);
       }
     }
+  }
+  if (CFLProbeOpsMono && omSites) {
+    errs() << "OpsMono: " << omSites << " two-level dispatch sites: "
+           << omMono << " mono (targets inside ONE ops global), " << omNear
+           << " near (<=2 extras), " << omPoly << " polymorphic, "
+           << omNoOps << " no-ops-member; " << opsMembers.size()
+           << " ops globals (>=2 fns)\n";
+    std::vector<std::pair<size_t, const GlobalVariable *>> gr;
+    for (auto &[G, N] : omMonoByG) gr.emplace_back(N, G);
+    std::sort(gr.begin(), gr.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(15, gr.size()); i++)
+      errs() << "OpsMono: mono-certified " << gr[i].second->getName()
+             << " sites=" << gr[i].first << " members="
+             << opsMembers[gr[i].second].size() << "\n";
+    for (auto &[cs2, n] : omPolySample)
+      errs() << "OpsMono: POLY |T|=" << n << " at "
+             << cs2->getFunction()->getName() << "\n";
   }
   if (CFLProbeOriginSplit) {
     std::sort(osTop.begin(), osTop.end(),

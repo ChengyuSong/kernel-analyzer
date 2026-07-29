@@ -1401,13 +1401,12 @@ NodeIndex CallGraphPass::getRepNodeForValue(const Value *V) {
   NodeIndex n = NF.getValueNodeFor(V);
   if (n == AndersNodeFactory::InvalidIndex)
     return n;
-  // In field mode, canonical ConstantExpr-GEP nodes need their field edges
-  // from the base emitted (once per module) wherever they appear as operands.
-  if (EB.hasFieldLabels()) {
-    if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
-      if (CE->getOpcode() == Instruction::GetElementPtr)
-        ensureConstGEPFieldEdges(CE);
-    }
+  // Canonical ConstantExpr-GEP nodes need their base connection emitted
+  // (once per module) wherever they appear as operands: field-chain
+  // edges in field mode, the plain GetElementPtr 'a' edge otherwise.
+  if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+    if (CE->getOpcode() == Instruction::GetElementPtr)
+      ensureConstGEPFieldEdges(CE);
   }
   return getCanonicalNode(n);
 }
@@ -4941,8 +4940,6 @@ bool CallGraphPass::runFlowsToResolution() {
 }
 
 void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
-  if (!EB.hasFieldLabels() || !curDL)
-    return;
   const auto *GEP = dyn_cast<GEPOperator>(CE);
   if (!GEP)
     return;
@@ -4959,6 +4956,16 @@ void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
     return;
   if (canon == getCanonicalNode(baseNode))
     return; // field-0 GEPs canonicalize to the base node itself
+
+  if (!EB.hasFieldLabels() || !curDL) {
+    // Field-insensitive: a non-zero-field constexpr GEP gets its own
+    // node (NodeFactory gepMap) — without the grammar's plain
+    // GetElementPtr edge (base -> result a) that node floats and every
+    // store/load through gep(@G, field) is silently severed from the
+    // global's cell (found by t_ops.c, task #30).
+    addAssignmentEdge(baseNode, node);
+    return;
+  }
 
   SmallVector<int64_t, 4> levels;
   if (!decomposeGEPLevels(GEP, *curDL, levels)) {

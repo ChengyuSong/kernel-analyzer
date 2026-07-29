@@ -8815,7 +8815,9 @@ void CallGraphPass::finalizeChainPairs() {
 // Certified pairs feed the step-2 receiver-formal tightening; this
 // pass alone is measurement + table building.
 static size_t g_opsCertified = 0, g_opsIncomplete = 0, g_opsContainers = 0,
-              g_opsEmbedded = 0;
+              g_opsEmbedded = 0, g_opsReadOnly = 0, g_opsV2CallCert = 0,
+              g_opsV2RetAlloc = 0, g_opsV2Level2 = 0, g_opsV2BaseUnres = 0,
+              g_opsV2NoBody = 0, g_opsV2Other = 0;
 // F is tightenable iff it belongs to >=1 certified table AND its
 // address appears ONLY inside certified fn-table initializers (walked
 // up constant chains), in direct calls, or in compares — any other
@@ -8896,13 +8898,183 @@ void CallGraphPass::certifyOpsPairs() {
         if (const auto *CO = dyn_cast<Constant>(Op.get()))
           self(CO, out, self);
   };
+  // Interior pointers (gep(&g, k!=0) as a VALUE): only member reads and
+  // compares are benign. Anything else could store a derived pointer a
+  // two-level site later dispatches through, bypassing the container
+  // set -> the certificate must fail.
+  auto interiorOK = [&](const Constant *C0) -> bool {
+    SmallVector<const Constant *, 4> q{C0};
+    SmallPtrSet<const Constant *, 4> qs;
+    while (!q.empty()) {
+      const Constant *C = q.pop_back_val();
+      if (!qs.insert(C).second)
+        continue;
+      for (const User *U2 : C->users()) {
+        if (isa<ICmpInst>(U2))
+          continue;
+        if (const auto *L2 = dyn_cast<LoadInst>(U2)) {
+          if (L2->getPointerOperand()->stripPointerCasts() == C)
+            continue;
+          return false;
+        }
+        if (const auto *C2 = dyn_cast<ConstantExpr>(U2)) {
+          q.push_back(C2);
+          continue;
+        }
+        return false; // embedded in an initializer, call arg, store, ...
+      }
+    }
+    return true;
+  };
+  // Walker v2: one-level recursion into a direct callee's formal. The
+  // recipe classifies every use of formal [idx] (which holds &g at the
+  // callsites we instantiate from):
+  //   member reads / compares         -> benign
+  //   store into a field of formal k  -> container = caller actual k
+  //   store into a field of a global  -> container = that global
+  //   store into a call-result local
+  //     returned on every path        -> container = the callsite value
+  //   anything else (second-level call, phi, unresolved base) -> FAIL
+  struct FormalRecipe {
+    bool ok = false;
+    bool retAlloc = false;
+    SmallVector<unsigned, 2> formalIdx;
+    SmallVector<const GlobalVariable *, 2> globals;
+  };
+  std::map<std::pair<const Function *, unsigned>, FormalRecipe> recipeCache;
+  auto walkFormal = [&](const Function *H0,
+                        unsigned idx) -> const FormalRecipe & {
+    auto key = std::make_pair(H0, idx);
+    auto cit = recipeCache.find(key);
+    if (cit != recipeCache.end())
+      return cit->second;
+    FormalRecipe &R2 = recipeCache[key];
+    const Function *H = getFuncDef(const_cast<Function *>(H0));
+    if (!H || H->empty() || idx >= H->arg_size()) {
+      g_opsV2NoBody++;
+      return R2;
+    }
+    const Argument *A = H->getArg(idx);
+    bool ok = true;
+    for (const User *U : A->users()) {
+      if (isa<ICmpInst>(U))
+        continue;
+      if (const auto *LI = dyn_cast<LoadInst>(U)) {
+        if (LI->getPointerOperand()->stripPointerCasts() == A)
+          continue; // member read through the table pointer
+        ok = false;
+        g_opsV2Other++;
+        break;
+      }
+      if (const auto *GI = dyn_cast<GetElementPtrInst>(U)) {
+        if (GI->getPointerOperand()->stripPointerCasts() != A) {
+          ok = false;
+          g_opsV2Other++;
+          break;
+        }
+        bool gok = true;
+        for (const User *GU : GI->users()) {
+          if (isa<ICmpInst>(GU))
+            continue;
+          const auto *GL = dyn_cast<LoadInst>(GU);
+          if (GL && GL->getPointerOperand()->stripPointerCasts() == GI)
+            continue;
+          gok = false;
+          break;
+        }
+        if (!gok) {
+          ok = false;
+          g_opsV2Other++;
+          break;
+        }
+        continue;
+      }
+      if (const auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getValueOperand()->stripPointerCasts() != A) {
+          ok = false; // formal used as a store TARGET base
+          g_opsV2Other++;
+          break;
+        }
+        const Value *B = SI->getPointerOperand()->stripPointerCasts();
+        while (const auto *G2 = dyn_cast<GEPOperator>(B))
+          B = G2->getPointerOperand()->stripPointerCasts();
+        if (const auto *BA = dyn_cast<Argument>(B)) {
+          if (BA->getParent() == H) {
+            R2.formalIdx.push_back(BA->getArgNo());
+            continue;
+          }
+          ok = false;
+          g_opsV2BaseUnres++;
+          break;
+        }
+        if (const auto *BG = dyn_cast<GlobalVariable>(B)) {
+          R2.globals.push_back(BG);
+          continue;
+        }
+        if (const auto *BC = dyn_cast<CallBase>(B)) {
+          // container allocated inside the helper: nameable at the
+          // caller iff every return path yields it (or null)
+          bool retOK = true, anyRet = false;
+          for (const BasicBlock &BB : *H)
+            if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
+              anyRet = true;
+              const Value *RV = RI->getReturnValue();
+              if (!RV) {
+                retOK = false;
+                break;
+              }
+              RV = RV->stripPointerCasts();
+              if (RV == BC || isa<ConstantPointerNull>(RV))
+                continue;
+              if (const auto *PH = dyn_cast<PHINode>(RV)) {
+                // mem2reg null-check shape: ret phi [B, ...], [null, ...]
+                bool phok = true;
+                for (const Value *IV : PH->incoming_values()) {
+                  const Value *IS = IV->stripPointerCasts();
+                  if (IS == BC || isa<ConstantPointerNull>(IS))
+                    continue;
+                  phok = false;
+                  break;
+                }
+                if (phok)
+                  continue;
+              }
+              retOK = false;
+              break;
+            }
+          if (retOK && anyRet) {
+            R2.retAlloc = true;
+            g_opsV2RetAlloc++;
+            continue;
+          }
+          ok = false;
+          g_opsV2BaseUnres++;
+          break;
+        }
+        ok = false;
+        g_opsV2BaseUnres++;
+        break;
+      }
+      if (isa<CallBase>(U)) {
+        ok = false; // second-level escape: one level only
+        g_opsV2Level2++;
+        break;
+      }
+      ok = false;
+      g_opsV2Other++;
+      break;
+    }
+    R2.ok = ok;
+    return R2;
+  };
   for (auto &mp : Ctx->Modules) {
     for (const GlobalVariable &GV : mp.first->globals()) {
       if (!GV.hasInitializer() || !GV.isConstant()) continue;
       FuncSet ms;
       collectFns(GV.getInitializer(), ms, collectFns);
       if (ms.size() < 2) continue;
-      // walk every use of g (transitively through constant exprs)
+      // walk every use of g; the worklist carries the exact &g alias
+      // value so call-argument positions can be matched
       bool complete = true;
       std::vector<const Value *> containers;
       SmallVector<const User *, 16> wl(GV.user_begin(), GV.user_end());
@@ -8911,7 +9083,11 @@ void CallGraphPass::certifyOpsPairs() {
         const User *U = wl.pop_back_val();
         if (!seen.insert(U).second) continue;
         if (const auto *CE = dyn_cast<ConstantExpr>(U)) {
-          for (const User *U2 : CE->users()) wl.push_back(U2);
+          if (CE->stripPointerCasts() == &GV) {
+            for (const User *U2 : CE->users()) wl.push_back(U2);
+          } else if (!interiorOK(CE)) {
+            complete = false; // interior pointer escapes
+          }
           continue;
         }
         if (const auto *CA = dyn_cast<Constant>(U)) {
@@ -8948,11 +9124,75 @@ void CallGraphPass::certifyOpsPairs() {
           continue;
         }
         if (isa<ICmpInst>(U)) continue;
-        complete = false; // call arg / load-through / phi / anything else
+        if (const auto *LI = dyn_cast<LoadInst>(U)) {
+          if (LI->getPointerOperand()->stripPointerCasts() == &GV)
+            continue; // direct member read (v2: was counted an escape)
+          complete = false;
+          continue;
+        }
+        if (const auto *GI = dyn_cast<GetElementPtrInst>(U)) {
+          bool gok = GI->getPointerOperand()->stripPointerCasts() == &GV;
+          if (gok)
+            for (const User *GU : GI->users()) {
+              if (isa<ICmpInst>(GU)) continue;
+              const auto *GL = dyn_cast<LoadInst>(GU);
+              if (GL && GL->getPointerOperand()->stripPointerCasts() == GI)
+                continue;
+              gok = false;
+              break;
+            }
+          if (!gok) complete = false;
+          continue;
+        }
+        if (const auto *CB = dyn_cast<CallBase>(U)) {
+          // v2: &g escapes into a direct call — recurse one level into
+          // the callee's formal and instantiate the recipe per callsite
+          const auto *H =
+              dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+          if (!H || CB->isInlineAsm()) {
+            complete = false; // indirect/asm callee: cannot follow
+            continue;
+          }
+          bool any = false, allok = true;
+          for (unsigned ai = 0; ai < CB->arg_size() && allok; ai++) {
+            if (CB->getArgOperand(ai)->stripPointerCasts() != &GV)
+              continue;
+            any = true;
+            const FormalRecipe &R2 = walkFormal(H, ai);
+            if (!R2.ok) {
+              allok = false;
+              break;
+            }
+            for (unsigned k : R2.formalIdx) {
+              if (k >= CB->arg_size()) {
+                allok = false;
+                break;
+              }
+              containers.push_back(CB->getArgOperand(k)->stripPointerCasts());
+            }
+            for (const GlobalVariable *BG : R2.globals)
+              containers.push_back(BG);
+            if (R2.retAlloc)
+              containers.push_back(CB);
+          }
+          if (!any || !allok)
+            complete = false;
+          else
+            g_opsV2CallCert++;
+          continue;
+        }
+        complete = false; // phi / select / ptrtoint / anything else
       }
-      if (!complete || containers.empty()) {
+      if (!complete) {
         g_opsIncomplete++;
         continue;
+      }
+      if (containers.empty()) {
+        // read-only table: never stored anywhere, so it can never sit
+        // behind a two-level receiver — certifying it (with an empty
+        // container set) is sound and unblocks opsFnTightenable for
+        // members shared with stored tables.
+        g_opsReadOnly++;
       }
       g_opsCertified++;
       g_opsContainers += containers.size();
@@ -8963,10 +9203,14 @@ void CallGraphPass::certifyOpsPairs() {
   }
   CG_LOG("OpsPairs LEDGER: " << g_opsCertified << " ops globals CERTIFIED ("
          << g_opsContainers << " containers, " << g_opsEmbedded
-         << " via initializer embedding), " << g_opsIncomplete
-         << " incomplete -> pooled\n");
+         << " via initializer embedding, " << g_opsReadOnly
+         << " read-only), " << g_opsIncomplete << " incomplete -> pooled; v2: "
+         << g_opsV2CallCert << " call-escapes certified ("
+         << g_opsV2RetAlloc << " ret-alloc), rejections: " << g_opsV2Level2
+         << " second-level, " << g_opsV2BaseUnres << " base-unresolved, "
+         << g_opsV2NoBody << " no-body/vararg, " << g_opsV2Other
+         << " other\n");
 }
-
 // An INVOKE-bearing FRESH summary keeps its body analyzed: the body IS
 // the pooled container channel (create-struct stores -> dispatcher) that
 // dynamic-fn registration callsites still feed. Constant-fn callsites

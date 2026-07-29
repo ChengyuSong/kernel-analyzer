@@ -2772,3 +2772,47 @@ pairs, -59 (all the documented __SCT__tp_func_nvme_sq trampoline
 nondeterminism) / +2,947,968 vs the prior pin — 51% tracepoint probe
 pools, the rest kvm_x86_ops/x86_pmu-style constexpr-GEP ops-struct
 traffic. 4.12 h (+53%). test/baselines/kernel-gepfix-stats.txt.
+
+### Walker v2: one-level call-arg recursion + benign-read recovery (task #30, 2026-07-29)
+
+certifyOpsPairs v2, three extensions under the same completeness
+discipline: (1) benign interior reads — direct member loads of a table
+(and load-only GEP/constexpr chains) no longer fail the certificate;
+(2) one-level recursion into a direct callee's formal when &g escapes
+as a call argument: the recipe classifies every use of the formal
+(member reads/compares benign; store into formal k's field ->
+container = caller actual k; store into a global -> that global; store
+into a call-result local returned on every path, incl. the mem2reg
+phi-of-{B,null} shape -> container = the callsite value; second-level
+calls/unresolved bases FAIL); (3) read-only tables (never stored)
+certify with an EMPTY container set — sound (they can never sit
+behind a two-level receiver) and it unblocks opsFnTightenable for
+members shared with stored tables.
+
+Micro t_ops2.c (reg_ops = cdev_init shape, mk_widget = relay_open
+ret-alloc shape, direct_probe = benign read): both tables certified, 3
+containers (OA, OB, callsite value), 0 incomplete. t_ops regression:
+still per-pair exact. Micros without the flag bit-identical; smoke 4/4.
+
+km: certified 93 -> 161 (+60 read-only, +8 call-escape recipes, 1
+ret-alloc), incomplete 226 -> 158; remaining rejections: 56
+no-body/vararg (the helper defs live OUTSIDE the kernel/-only km
+subset — full-kernel runs will resolve most), 9 second-level, 8
+base-unresolved, 1 other. Answers IDENTICAL (128,249) and ProtCells
+unchanged (39 origins / 8 classes): the new certificates are read-only
+(no containers) or carry non-global containers (v0 protection is
+globals-only), and the shared-writer collapse still owns the km
+subset. t_ops2 demonstrates the collapse at micro scale: reg_ops's
+single store cell joins both protected keys as a writer and merges
+them — certificates fine, cells collapsed.
+
+NEXT (the payoff unlock): store-side splitting through the EXISTING
+summary machinery. A helper whose recipe proves BOTH formals fully
+replicable (table formal j only stored; container formal k only
+stored-into with replicable values) is exactly an ST atom
+("H ST(argK <- argJ)"): applySummaryAtoms wires it per-callsite and
+skips the pooled formal channel — distinct writer cells per container,
+which protection then keeps separate. Plan: auto-PROPOSE such lines
+from the recipes (tier-2 confirmer pattern), review, adopt into
+func_summaries.txt. Helpers that do more (cdev_init's kobject_init
+call) correctly fail the both-formals test and stay pooled.

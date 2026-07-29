@@ -326,6 +326,17 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLOpsPairs(
+  "cfl-ops-pairs",
+  cl::desc("Certify (ops-global, container) pair invariants from IR use "
+           "evidence (every use of a const fn-table global classified: "
+           "field store -> container captured; initializer embedding -> "
+           "parent global; else INCOMPLETE -> pooled) and, in step 2, "
+           "tighten certified member fns' receiver formals to their "
+           "paired containers (task #30). Certificates are derived, "
+           "never assumed; violations stay pooled + LEDGERed"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeOpsMono(
   "cfl-probe-ops-mono",
   cl::desc("MEASUREMENT-ONLY probe (task #30): classify each two-level "

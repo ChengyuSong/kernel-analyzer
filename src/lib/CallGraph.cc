@@ -8568,6 +8568,104 @@ void CallGraphPass::finalizeChainPairs() {
          << g_chainLate << " post-finalize\n");
 }
 
+// --cfl-ops-pairs (task #30): certify the (ops-global, container)
+// pair invariant per ops global, from IR use evidence (pre-merge, so
+// falsification #6 does not apply). An ops global g is CERTIFIED when
+// every use of g is classified:
+//   - store of &g into a field: the store base (container value) is
+//     captured as g's pair partner;
+//   - embedding in another constant initializer: the embedding global
+//     is the container;
+//   - icmp/ptrtoint-for-compare: benign;
+//   - anything else (escapes into calls, unanalyzable): INCOMPLETE ->
+//     g keeps fully pooled behavior (nothing changes, LEDGERed).
+// Certified pairs feed the step-2 receiver-formal tightening; this
+// pass alone is measurement + table building.
+static size_t g_opsCertified = 0, g_opsIncomplete = 0, g_opsContainers = 0,
+              g_opsEmbedded = 0;
+void CallGraphPass::certifyOpsPairs() {
+  auto collectFns = [&](const Constant *C, FuncSet &out,
+                        auto &&self) -> void {
+    if (const auto *F2 = dyn_cast<Function>(C->stripPointerCasts())) {
+      out.insert(getFuncDef(const_cast<Function *>(F2)));
+      return;
+    }
+    if (isa<ConstantAggregate>(C))
+      for (const Use &Op : C->operands())
+        if (const auto *CO = dyn_cast<Constant>(Op.get()))
+          self(CO, out, self);
+  };
+  for (auto &mp : Ctx->Modules) {
+    for (const GlobalVariable &GV : mp.first->globals()) {
+      if (!GV.hasInitializer() || !GV.isConstant()) continue;
+      FuncSet ms;
+      collectFns(GV.getInitializer(), ms, collectFns);
+      if (ms.size() < 2) continue;
+      // walk every use of g (transitively through constant exprs)
+      bool complete = true;
+      std::vector<const Value *> containers;
+      SmallVector<const User *, 16> wl(GV.user_begin(), GV.user_end());
+      SmallPtrSet<const User *, 16> seen;
+      while (!wl.empty() && complete) {
+        const User *U = wl.pop_back_val();
+        if (!seen.insert(U).second) continue;
+        if (const auto *CE = dyn_cast<ConstantExpr>(U)) {
+          for (const User *U2 : CE->users()) wl.push_back(U2);
+          continue;
+        }
+        if (const auto *CA = dyn_cast<Constant>(U)) {
+          // embedded in another global's initializer: find the global
+          bool foundG = false;
+          SmallVector<const User *, 8> cwl(CA->user_begin(), CA->user_end());
+          SmallPtrSet<const User *, 8> cseen;
+          while (!cwl.empty()) {
+            const User *CU = cwl.pop_back_val();
+            if (!cseen.insert(CU).second) continue;
+            if (const auto *PG = dyn_cast<GlobalVariable>(CU)) {
+              containers.push_back(PG);
+              foundG = true;
+              g_opsEmbedded++;
+            } else if (isa<Constant>(CU)) {
+              for (const User *CU2 : CU->users()) cwl.push_back(CU2);
+            } else {
+              complete = false; // constant used by an instruction we
+                                // did not classify at this level
+            }
+          }
+          if (!foundG && cseen.empty()) complete = false;
+          continue;
+        }
+        if (const auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getValueOperand()->stripPointerCasts() != &GV) {
+            complete = false; // g's address used as a store TARGET base?
+            continue;
+          }
+          const Value *B = SI->getPointerOperand()->stripPointerCasts();
+          while (const auto *G2 = dyn_cast<GEPOperator>(B))
+            B = G2->getPointerOperand()->stripPointerCasts();
+          containers.push_back(B);
+          continue;
+        }
+        if (isa<ICmpInst>(U)) continue;
+        complete = false; // call arg / load-through / phi / anything else
+      }
+      if (!complete || containers.empty()) {
+        g_opsIncomplete++;
+        continue;
+      }
+      g_opsCertified++;
+      g_opsContainers += containers.size();
+      auto &rec = opsPairs[&GV];
+      rec.members = std::move(ms);
+      rec.containers = std::move(containers);
+    }
+  }
+  CG_LOG("OpsPairs LEDGER: " << g_opsCertified << " ops globals CERTIFIED ("
+         << g_opsContainers << " containers, " << g_opsEmbedded
+         << " via initializer embedding), " << g_opsIncomplete
+         << " incomplete -> pooled\n");
+}
+
 // An INVOKE-bearing FRESH summary keeps its body analyzed: the body IS
 // the pooled container channel (create-struct stores -> dispatcher) that
 // dynamic-fn registration callsites still feed. Constant-fn callsites
@@ -10484,6 +10582,9 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLCensusFields && iteration == 0 && M == Ctx->Modules.front().first)
     runFieldChannelCensus(); // measurement-only, adds no edges
+
+  if (CFLOpsPairs && iteration == 0 && M == Ctx->Modules.front().first)
+    certifyOpsPairs(); // pair certificates from IR use evidence
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

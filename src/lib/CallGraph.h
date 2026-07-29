@@ -155,6 +155,14 @@ private:
   bool chainFinalized = false;
   void finalizeChainPairs();
   const llvm::GlobalValue *canonChainKey(const llvm::GlobalValue *G);
+  // Certified (ops-global, container) pairs (task #30): members from
+  // the const initializer; containers from the complete use walk.
+  struct OpsPairRec {
+    FuncSet members;
+    std::vector<const llvm::Value *> containers;
+  };
+  std::map<const llvm::GlobalVariable *, OpsPairRec> opsPairs;
+  void certifyOpsPairs();
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF);
   void confirmFreshWrappers();
   void runInvokeCensus();

@@ -70,7 +70,8 @@ private:
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
   bool handleMemcpy(const llvm::CallBase*);
-  bool handleCall(const llvm::CallBase*, const llvm::Function*);
+  bool handleCall(const llvm::CallBase*, const llvm::Function*,
+                  int opsSkipArg = -1);
   bool removeCallEdges(const llvm::CallBase*, const llvm::Function*);
   bool isCompatibleType(const llvm::Type *T1, const llvm::Type *T2);
   bool isStructLayoutCompatible(const llvm::StructType *ST1, const llvm::StructType *ST2);
@@ -163,7 +164,14 @@ private:
   };
   std::map<const llvm::GlobalVariable *, OpsPairRec> opsPairs;
   void certifyOpsPairs();
-  void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF);
+  void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF,
+                    int skipArg = -1);
+  // ops-pairs step 2 (task #30): true when F may be tightened — every
+  // fn-table membership certified and F's address never escapes
+  // outside certified tables. Memoized.
+  bool opsFnTightenable(const llvm::Function *F);
+  std::map<const llvm::Function *, char> opsTightCache;
+  std::set<std::pair<const llvm::Function *, int>> opsPairWired;
   void confirmFreshWrappers();
   void runInvokeCensus();
   void runFieldChannelCensus();

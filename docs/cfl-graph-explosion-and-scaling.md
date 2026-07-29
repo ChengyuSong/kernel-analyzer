@@ -2670,3 +2670,64 @@ tightening, not site partitioning. Soundness needs a per-g
 completeness bit (every store of g base-resolvable; container
 copies/memcpy escape-hatch to pooled). That per-pair model + its
 completeness discipline is the next design block for #30.
+
+### Step 2 lands + two findings: a constexpr-GEP soundness hole and the cell-merge wall (task #30, 2026-07-28)
+
+Step 2 (receiver-formal tightening) is implemented: at a two-level
+dispatch site (fptr = load(gep(load(gep(recv))))), a resolved callee F
+that passes opsFnTightenable — member of >=1 table, ALL tables holding
+F certified, and F's address never escaping outside certified-table
+initializers (direct calls and compares are the only other allowed
+uses) — has its receiver formal bound to the certified containers of
+every table holding F, and the pooled receiver-arg edge is skipped
+(handleCall/wireCallArgs thread a skipArg). Everything else stays
+pooled; LEDGER: g_opsTightSites/g_opsTightRej.
+
+The micro (test/t_ops.c: OA/OB carry certified ops_a/ops_b, shared
+dispatcher o->ops->op1(o), inner icall o->cb()) surfaced two facts:
+
+1. SOUNDNESS HOLE (pre-existing, fixed): in field-insensitive mode a
+   non-zero-field ConstantExpr GEP gets its own node (NodeFactory
+   gepMap keyed (base, fieldNum)) and NOTHING emitted the grammar's
+   GetElementPtr base->result 'a' edge — ensureConstGEPFieldEdges
+   early-returned unless field labels were on. Every store/load
+   through gep(@G, field) in instruction position was silently severed
+   from @G's cell: t_ops inner icalls resolved to NOTHING (0 targets)
+   while type-based saw 8 pairs. Fix: getRepNodeForValue now calls
+   ensureConstGEPFieldEdges in all modes; without field labels it
+   emits the plain assignment edge. Existing micros + smoke unchanged
+   (none exercised the pattern); km/kernel A/B = soundness additions
+   expected.
+
+2. THE CELL-MERGE WALL (t_ops, post-fix): tightening fires exactly as
+   designed (2 tables certified, 4 (F,recv) wirings, 0 rejections) and
+   the inner icalls STILL smear {cba,cbb}. TRACE-BWD shows why: the
+   genuinely-polymorphic dispatcher's ops-load witnesses BOTH (OA,0)
+   and (OB,0), and witness-exact unification makes that load's class
+   the shared representative of both cluster keys — every subsequent
+   single-witness reader (a1's cb-load joining (OA,0)) merges into the
+   same class and inherits the union. The receiver formal IS correctly
+   restricted to OA; the read-through re-smears at the quotient. This
+   is falsification #6's mechanism operating at the cell layer, and it
+   gates the entire per-pair payoff: wiring-side tightening is
+   necessary but NOT sufficient. The missing mechanism is
+   provenance-preserving cells — protected (origin,shift) cluster keys
+   whose readers copy facts out (the solver's existing non-transitive
+   bridge primitive) instead of unifying, with writers still merging
+   in. Scoped to certified containers this is bounded; it is the
+   concrete next design block, and t_ops is its acceptance test
+   (a1->cba only, b1->cbb only, dispatch unchanged).
+
+### km verdict, step 2 as-wired: the wall is real (task #30, 2026-07-28)
+
+km A/B (--cfl-ops-pairs vs without, both on the GEP fix): 629 (F,recv)
+wirings tightened, 40,734 two-level rejections, and the answer diff is
+0 removed / +22 added (traceiter sites +1 each, second-order flow from
+the container->formal edges). Exactly what t_ops predicted: under
+witness-exact cell unification, receiver-formal tightening removes
+NOTHING (reads re-smear at the quotient) and its added edges can only
+add. --cfl-ops-pairs therefore stays OFF in the pinned config; the
+certificates + wiring are the instrument half of the mechanism, and
+the payoff is gated entirely on provenance-preserving cells (protected
+cluster keys, reader-copy via the bridge primitive). t_ops is the
+acceptance test.

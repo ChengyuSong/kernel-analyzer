@@ -1118,7 +1118,8 @@ void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
   }
 }
 
-bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
+bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
+                               int opsSkipArg) {
   if (CF->isIntrinsic()) {
     // handle intrinsic functions
     return false;
@@ -1157,7 +1158,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
       return false;
   }
 
-  wireCallArgs(CS, CF);
+  wireCallArgs(CS, CF, opsSkipArg);
 
   // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
   if (containsPointerType(CF->getReturnType())) {
@@ -1182,7 +1183,8 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF) {
 // handleCall and the summary dynamic-fn pooled fallback at allocator
 // branches (which must feed the callee body WITHOUT the shared-return
 // edge: the callsite's fresh object is its return identity).
-void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF) {
+void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
+                                 int skipArg) {
   // handle args:
   // - fixed arguments map to formal params
   // - variadic tail (if any) maps to the callee's vararg summary node
@@ -1190,6 +1192,8 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF) {
   unsigned numFormals = CF->arg_size();
   unsigned minArgs = std::min(numArgs, numFormals);
   for (unsigned i = 0; i < minArgs; i++) {
+    if ((int)i == skipArg)
+      continue; // ops-pairs tightening: receiver bound per-pair instead
     Value *arg = CS->getArgOperand(i);
     // First-class aggregates ({ptr,ptr} closures, coerced small structs)
     // carry pointer identity by value — skip only pointer-free types.
@@ -1956,6 +1960,7 @@ public:
 // rectangular (fact sets), never pairwise V.
 
 static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
+static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
   const auto &edges = EB.getEdges();
@@ -4052,6 +4057,23 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
+    // ops-pairs step 2 (task #30): at a two-level dispatch site
+    // (obj->ops then ops->fn), the receiver base object is the value
+    // whose pooled actual->formal edge we can replace per-pair.
+    const Value *opsRecv = nullptr;
+    if (CFLOpsPairs && !opsPairs.empty() && !targets.empty()) {
+      if (const auto *L2 = dyn_cast<LoadInst>(fptr)) {
+        const Value *B = L2->getPointerOperand()->stripPointerCasts();
+        while (const auto *G2 = dyn_cast<GEPOperator>(B))
+          B = G2->getPointerOperand()->stripPointerCasts();
+        if (const auto *L1 = dyn_cast<LoadInst>(B)) {
+          const Value *RB = L1->getPointerOperand()->stripPointerCasts();
+          while (const auto *G3 = dyn_cast<GEPOperator>(RB))
+            RB = G3->getPointerOperand()->stripPointerCasts();
+          opsRecv = RB;
+        }
+      }
+    }
     for (const Function *F : targets) {
       if (!Ctx->Callees[CS].insert(F).second)
         continue; // wired in an earlier iteration
@@ -4079,10 +4101,51 @@ bool CallGraphPass::runFlowsToResolution() {
       } else if (Ctx->ContainerFuncs.count(CF)) {
         handleContainerCall(CS, CF);
       } else {
-        handleCall(CS, CF);
+        int k = -1;
+        if (opsRecv && opsFnTightenable(F)) {
+          // receiver position: the callsite arg that IS the base object
+          for (unsigned ai = 0;
+               ai < CS->arg_size() && ai < CF->arg_size(); ai++)
+            if (CS->getArgOperand(ai)->stripPointerCasts() == opsRecv) {
+              k = (int)ai;
+              break;
+            }
+        }
+        if (k >= 0) {
+          g_opsTightSites++;
+          if (opsPairWired.insert({F, k}).second) {
+            // per-pair binding: F's receiver formal <- every certified
+            // container of every table F belongs to (all certified, by
+            // opsFnTightenable)
+            Value *farg = CF->getArg(k);
+            NodeIndex fk = getRepNodeForValue(farg);
+            if (fk == AndersNodeFactory::InvalidIndex)
+              fk = NF.createValueNode(farg);
+            fk = getCanonicalNode(fk);
+            for (auto &kv : opsPairs) {
+              if (!kv.second.members.count(CF))
+                continue;
+              for (const Value *C2 : kv.second.containers) {
+                NodeIndex cn = getRepNodeForValue(C2);
+                if (cn == AndersNodeFactory::InvalidIndex)
+                  cn = NF.createValueNode(const_cast<Value *>(C2));
+                addAssignmentEdge(getCanonicalNode(cn), fk);
+              }
+            }
+          }
+          handleCall(CS, CF, k);
+        } else {
+          if (opsRecv)
+            g_opsTightRej++;
+          handleCall(CS, CF);
+        }
       }
     }
   }
+  if (CFLOpsPairs && (g_opsTightSites || g_opsTightRej))
+    CG_LOG("OpsPairs LEDGER: tightened " << g_opsTightSites
+           << " (callee,site) wirings so far, " << g_opsTightRej
+           << " two-level rejections (untightenable/no-recv-arg)\n");
   if (CFLProbeOpsMono && omSites) {
     errs() << "OpsMono: " << omSites << " two-level dispatch sites: "
            << omMono << " mono (targets inside ONE ops global), " << omNear
@@ -8590,6 +8653,74 @@ void CallGraphPass::finalizeChainPairs() {
 // pass alone is measurement + table building.
 static size_t g_opsCertified = 0, g_opsIncomplete = 0, g_opsContainers = 0,
               g_opsEmbedded = 0;
+// F is tightenable iff it belongs to >=1 certified table AND its
+// address appears ONLY inside certified fn-table initializers (walked
+// up constant chains), in direct calls, or in compares — any other
+// escape (raw store of &F, &F as a call argument) means uncertified
+// receivers could reach F, so it stays pooled.
+bool CallGraphPass::opsFnTightenable(const Function *F) {
+  auto it = opsTightCache.find(F);
+  if (it != opsTightCache.end())
+    return it->second;
+  bool inTable = false;
+  for (auto &kv : opsPairs)
+    if (kv.second.members.count(const_cast<Function *>(F))) {
+      inTable = true;
+      break;
+    }
+  bool ok = inTable;
+  if (ok) {
+    for (const User *U : F->users()) {
+      if (const auto *CB = dyn_cast<CallBase>(U)) {
+        if (CB->getCalledOperand()->stripPointerCasts() == F)
+          continue; // direct call
+        ok = false; // &F passed as an argument
+        break;
+      }
+      if (isa<ICmpInst>(U))
+        continue;
+      if (const auto *C = dyn_cast<Constant>(U)) {
+        // climb constant chains to owning globals; each must be a
+        // certified table
+        bool cok = true;
+        SmallVector<const Constant *, 8> cwl{C};
+        SmallPtrSet<const Constant *, 8> cseen;
+        while (!cwl.empty() && cok) {
+          const Constant *CC = cwl.pop_back_val();
+          if (!cseen.insert(CC).second)
+            continue;
+          if (const auto *PG = dyn_cast<GlobalVariable>(CC)) {
+            if (!opsPairs.count(PG))
+              cok = false;
+            continue;
+          }
+          bool owned = false;
+          for (const User *U2 : CC->users()) {
+            if (const auto *PC = dyn_cast<Constant>(U2)) {
+              owned = true;
+              cwl.push_back(PC);
+            } else {
+              cok = false; // constant used by an instruction directly
+              break;
+            }
+          }
+          if (!owned)
+            cok = false; // dangling constant use
+        }
+        if (!cok) {
+          ok = false;
+          break;
+        }
+        continue;
+      }
+      ok = false;
+      break;
+    }
+  }
+  opsTightCache[F] = ok;
+  return ok;
+}
+
 void CallGraphPass::certifyOpsPairs() {
   auto collectFns = [&](const Constant *C, FuncSet &out,
                         auto &&self) -> void {

@@ -2527,6 +2527,39 @@ bool CallGraphPass::runFlowsToResolution() {
   boost::unordered_flat_set<uint32_t> protCollapsed;
   std::vector<uint32_t> protCollapseQ;
   static constexpr uint32_t PROT_ANCHOR_K = 4;
+  // Coalescence census: when a writer class that already anchors one
+  // protected key joins ANOTHER key, the two families fuse — blame the
+  // writer (exemplar member instruction) so the hub's composition is
+  // measurable: few nameable helpers -> summary severing wins; diffuse
+  // -> field-keyed cells / provenance rework territory.
+  std::map<std::string, size_t> protCoalesceBlame;
+  auto protBlameName = [&](uint32_t cls) -> std::string {
+    if (cls >= toOrig.size())
+      return "<synthetic>";
+    NodeIndex canon = toOrig[cls];
+    const Value *V2 = NF.getValueForNode(canon);
+    auto nameOf = [](const Value *V3) -> std::string {
+      if (!V3)
+        return std::string();
+      if (const auto *I2 = dyn_cast<Instruction>(V3))
+        return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
+            .str();
+      if (V3->hasName())
+        return V3->getName().str();
+      return std::string();
+    };
+    std::string n = nameOf(V2);
+    if (!n.empty())
+      return n;
+    auto mit = canonicalClassMembers.find(canon);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m2 : mit->second) {
+        n = nameOf(NF.getValueForNode(m2));
+        if (!n.empty())
+          return n;
+      }
+    return "<unnamed>";
+  };
   std::vector<char> protIn; // hasIn, class-folded (private copy)
   size_t protWriterMerges = 0, protReaderBridges = 0, protDemotions = 0,
          protWaitAttached = 0, protCollapses = 0, protPooledReaders = 0;
@@ -3113,6 +3146,10 @@ bool CallGraphPass::runFlowsToResolution() {
         return;
       if (protIn[cr]) {
         // writer (or mixed): merges into the cell, exactly as today
+        auto ait = protAnchor.find(cr);
+        if (ait != protAnchor.end() && ait->second > 0 &&
+            (ps.cell == UINT32_MAX || find(ps.cell) != cr))
+          protCoalesceBlame[protBlameName(cr)]++; // key-family fusion
         if (ps.cell == UINT32_MAX) {
           ps.cell = cr;
           uint32_t n2 = ++protAnchor[find(cr)];
@@ -3206,6 +3243,8 @@ bool CallGraphPass::runFlowsToResolution() {
         continue; // already handled (or folded away by a merge)
       auto rids = std::move(rb->second);
       readerBridgedTo.erase(rb);
+      if (rids.size() > 1)
+        protCoalesceBlame["DEMOTE:" + protBlameName(c)] += rids.size() - 1;
       for (uint32_t o : rids) {
         auto &ps = prot[o];
         c = find(c);
@@ -4411,6 +4450,20 @@ bool CallGraphPass::runFlowsToResolution() {
            << protDemotions << " demotions, " << protCollapses
            << " over-anchored cells collapsed (" << protPooledReaders
            << " readers pooled)\n");
+  if (protOn && !protCoalesceBlame.empty()) {
+    std::vector<std::pair<size_t, const std::string *>> br2;
+    size_t total2 = 0;
+    for (auto &kv : protCoalesceBlame) {
+      br2.emplace_back(kv.second, &kv.first);
+      total2 += kv.second;
+    }
+    std::sort(br2.begin(), br2.end(), std::greater<>());
+    errs() << "ProtCoalesce: " << total2 << " key-family fusions via "
+           << protCoalesceBlame.size() << " distinct writer classes\n";
+    for (size_t i = 0; i < std::min<size_t>(30, br2.size()); i++)
+      errs() << "ProtCoalesce: " << br2[i].first << "x " << *br2[i].second
+             << "\n";
+  }
   }
   if (CFLProbeOpsMono && omSites) {
     errs() << "OpsMono: " << omSites << " two-level dispatch sites: "

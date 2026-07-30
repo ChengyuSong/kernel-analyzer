@@ -2859,3 +2859,25 @@ and friends are defined OUTSIDE the kernel/-only km subset, so the
 proposal sweep must run at FULL kernel scale next; adoption there
 feeds both the summary drain (INVOKE-style) and the protected-cell
 separation under --cfl-ops-pairs.
+
+### Kernel OOM -> self-limiting protection (task #30, 2026-07-29)
+
+First full-kernel --cfl-ops-pairs run died OOM entering iteration 1 —
+but iteration 0 is a trove: 1,103 tables certified (589 embedded, 260
+read-only, 128 call-escape recipes), 178,416 tightened wirings, and
+kernel-scale certification surfaced the failure mode: 9,387 protected
+origins collapse (11,348 writer merges, 4,625 demotions) into 18
+mega-cells, and ~12.6k reader BRIDGES each materialize a private copy
+of a mega-cell plane. Copy-not-unify's cost lands precisely where the
+mechanism has already lost discrimination.
+
+Fix: self-limiting protection. A cell class anchoring > K=4 protected
+keys is marked COLLAPSED: its bridge partners are merged back in and
+future readers merge (plain pooled semantics for that family) — no
+per-reader plane copies where there is nothing left to separate.
+Anchor counts are per-class, folded through merge (queued collapse
+processing, no reentrant merges). km: 1 collapse / 718 readers
+pooled, demotions 184 -> 54, runtime 269 s -> 175 s (cheaper than the
+UNlimited run), answers stable. Micros exact, 0 collapses.
+
+Kernel sweep relaunched with the limiter (kernel-stprop2.log).

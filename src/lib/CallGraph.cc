@@ -2517,9 +2517,19 @@ bool CallGraphPass::runFlowsToResolution() {
   boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
       readerBridgedTo; // reader class -> rids it bridge-joined
   std::vector<uint32_t> protDemoteQ;
+  // Self-limiting protection: a cell class anchoring > K protected keys
+  // has already lost its discrimination (writer collapse) — bridging
+  // readers to it only COPIES its mega-plane per reader (the kernel
+  // iteration-1 OOM). Such classes are marked collapsed: existing
+  // bridge partners are merged back in and future readers merge (plain
+  // pooled semantics for that family).
+  boost::unordered_flat_map<uint32_t, uint32_t> protAnchor; // cell -> #keys
+  boost::unordered_flat_set<uint32_t> protCollapsed;
+  std::vector<uint32_t> protCollapseQ;
+  static constexpr uint32_t PROT_ANCHOR_K = 4;
   std::vector<char> protIn; // hasIn, class-folded (private copy)
   size_t protWriterMerges = 0, protReaderBridges = 0, protDemotions = 0,
-         protWaitAttached = 0;
+         protWaitAttached = 0, protCollapses = 0, protPooledReaders = 0;
   if (protOn) {
     protIn.assign(hasIn.begin(), hasIn.end());
     // EVERY certified container value class is protection-eligible:
@@ -3014,6 +3024,17 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       if (protIn[a] && readerBridgedTo.count(a))
         protDemoteQ.push_back(a); // reader gained stores: demote later
+      auto pa = protAnchor.find(b);
+      if (pa != protAnchor.end()) {
+        uint32_t n2 = (protAnchor[a] += pa->second);
+        protAnchor.erase(b);
+        if (n2 > PROT_ANCHOR_K && !protCollapsed.count(a))
+          protCollapseQ.push_back(a); // no merge here: queue (reentrancy)
+      }
+      if (protCollapsed.count(b)) {
+        protCollapsed.erase(b);
+        protCollapsed.insert(a);
+      }
     }
     push(a, ctx0);
     return a;
@@ -3092,10 +3113,14 @@ bool CallGraphPass::runFlowsToResolution() {
         return;
       if (protIn[cr]) {
         // writer (or mixed): merges into the cell, exactly as today
-        if (ps.cell == UINT32_MAX)
+        if (ps.cell == UINT32_MAX) {
           ps.cell = cr;
-        else
+          uint32_t n2 = ++protAnchor[find(cr)];
+          if (n2 > PROT_ANCHOR_K && !protCollapsed.count(find(cr)))
+            protCollapseQ.push_back(find(cr));
+        } else {
           ps.cell = merge(ps.cell, cr);
+        }
         protWriterMerges++;
         if (!ps.waiting.empty()) {
           auto pending = std::move(ps.waiting);
@@ -3109,6 +3134,12 @@ bool CallGraphPass::runFlowsToResolution() {
           }
           ps.cell = find(ps.cell);
         }
+      } else if (ps.cell != UINT32_MAX &&
+                 protCollapsed.count(find(ps.cell))) {
+        // collapsed family: no discrimination left — pooled semantics,
+        // and no per-reader plane copies
+        ps.cell = merge(find(ps.cell), cr);
+        protPooledReaders++;
       } else {
         // reader: copy-out. Facts cross the bridge and re-emit native
         // along a-edges (value flow launders provenance), but never
@@ -3180,12 +3211,47 @@ bool CallGraphPass::runFlowsToResolution() {
         c = find(c);
         if (ps.cell == UINT32_MAX) {
           ps.cell = c; // waiting reader turned writer: it IS the cell
+          uint32_t n2 = ++protAnchor[find(c)];
+          if (n2 > PROT_ANCHOR_K && !protCollapsed.count(find(c)))
+            protCollapseQ.push_back(find(c));
           continue;
         }
         ps.cell = find(ps.cell);
         if (ps.cell != c)
           ps.cell = merge(ps.cell, c);
         protDemotions++;
+      }
+    }
+  };
+
+  // Collapse over-anchored cells: merge every bridge partner back in
+  // and mark the class so future readers merge too. Restores plain
+  // pooled semantics for families whose writers already coalesced —
+  // protection stops paying copy costs where it cannot discriminate.
+  auto processProtCollapses = [&]() {
+    while (!protCollapseQ.empty()) {
+      uint32_t c = find(protCollapseQ.back());
+      protCollapseQ.pop_back();
+      if (protCollapsed.count(c))
+        continue;
+      protCollapsed.insert(c);
+      protCollapses++;
+      bool again = true;
+      while (again) {
+        again = false;
+        for (uint32_t br : bridgesOf[c]) {
+          uint32_t bb = find(br);
+          if (bb != c) {
+            uint32_t keeper = merge(c, bb);
+            if (!protCollapsed.count(keeper)) {
+              protCollapsed.erase(c);
+              protCollapsed.insert(keeper);
+            }
+            c = find(keeper);
+            again = true;
+            break; // bridgesOf[c] mutated by the merge: restart scan
+          }
+        }
       }
     }
   };
@@ -3583,6 +3649,8 @@ bool CallGraphPass::runFlowsToResolution() {
   auto joinSweep = [&](uint32_t n, SolverCtx &ctx) {
     if (protOn && !protDemoteQ.empty())
       processProtDemotions();
+    if (protOn && !protCollapseQ.empty())
+      processProtCollapses();
     if (find(n) != n) return; // merged away; keeper carries the state
     for (uint32_t s = 0; s < NSHIFT; s++) {
       if (jdirty[n][s].none()) continue;
@@ -4340,7 +4408,9 @@ bool CallGraphPass::runFlowsToResolution() {
            << " distinct classes), " << protWriterMerges << " writer merges, "
            << protReaderBridges << " reader bridges (+" << protWaitAttached
            << " wait-attached), " << waiting << " readers still waiting, "
-           << protDemotions << " demotions\n");
+           << protDemotions << " demotions, " << protCollapses
+           << " over-anchored cells collapsed (" << protPooledReaders
+           << " readers pooled)\n");
   }
   if (CFLProbeOpsMono && omSites) {
     errs() << "OpsMono: " << omSites << " two-level dispatch sites: "

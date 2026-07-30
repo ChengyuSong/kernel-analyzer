@@ -2512,6 +2512,7 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   const bool protOn = CFLOpsPairs && NB == 0 && !opsPairs.empty();
   boost::unordered_flat_set<uint32_t> protRid;
+  boost::unordered_flat_set<uint32_t> protCls; // container value classes
   boost::unordered_flat_map<uint32_t, ProtState> prot; // rid -> state
   boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
       readerBridgedTo; // reader class -> rids it bridge-joined
@@ -2521,17 +2522,43 @@ bool CallGraphPass::runFlowsToResolution() {
          protWaitAttached = 0;
   if (protOn) {
     protIn.assign(hasIn.begin(), hasIn.end());
-    boost::unordered_flat_set<uint32_t> protCls;
-    for (auto &kv : opsPairs)
-      for (const Value *C2 : kv.second.containers)
-        if (isa<GlobalVariable>(C2)) {
+    // EVERY certified container value class is protection-eligible:
+    // globals, helper-returned alloc callsites, locals. Readers that
+    // co-witness an UNPROTECTED origin merge through that key and
+    // drag the protected cells down with them (t_ops2: the mk_widget
+    // heap origin re-unified a1/b1's readers, then demotions collapsed
+    // both cells) — so the container set must be protected wholesale,
+    // INCLUDING the origins that feed a container value: the actual
+    // origin root of a RETALLOC container is minted on the alloc
+    // callsite class inside the helper, connected to the container by
+    // the static ret-chain a-edges. Close backward over a-edges
+    // (depth- and size-capped; partial closure is merely weaker
+    // protection, never unsound).
+    {
+      SmallVector<uint32_t, 32> frontier;
+      for (auto &kv : opsPairs)
+        for (const Value *C2 : kv.second.containers) {
           NodeIndex vn = getRepNodeForValue(C2);
           if (vn == AndersNodeFactory::InvalidIndex)
             continue;
           auto dit = toDense.find(getCanonicalNode(vn));
-          if (dit != toDense.end())
-            protCls.insert(dit->second);
+          if (dit != toDense.end() && protCls.insert(dit->second).second)
+            frontier.push_back(dit->second);
         }
+      for (int depth = 0; depth < 8 && !frontier.empty(); depth++) {
+        boost::unordered_flat_set<uint32_t> tgt(frontier.begin(),
+                                                frontier.end());
+        frontier.clear();
+        for (auto [ea, eb] : aEdges)
+          if (tgt.count(eb) && protCls.insert(ea).second)
+            frontier.push_back(ea);
+        if (protCls.size() > 8192) {
+          CG_LOG("ProtCells: backward closure capped at " << protCls.size()
+                 << " classes (depth " << depth << ")\n");
+          break;
+        }
+      }
+    }
     for (auto &sd : seeds)
       if (protCls.count(sd.first))
         protRid.insert(sd.second);
@@ -3285,6 +3312,12 @@ bool CallGraphPass::runFlowsToResolution() {
     if (isRoot[rep]) return;
     isRoot[rep] = 1;
     uint32_t rid = nextRoot++;
+    if (protOn)
+      for (uint32_t pc : protCls)
+        if (find(pc) == rep) {
+          protRid.insert(rid); // container origin minted mid-fixpoint
+          break;
+        }
     FactSet::Universe = nextRoot; // widen BEFORE the first set of this bit
     rootClassOf.push_back(rep);
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
@@ -8942,6 +8975,7 @@ void CallGraphPass::certifyOpsPairs() {
     SmallVector<const GlobalVariable *, 2> globals;
   };
   std::map<std::pair<const Function *, unsigned>, FormalRecipe> recipeCache;
+  std::set<const Function *> stCandidates; // --cfl-propose-ops-st
   auto walkFormal = [&](const Function *H0,
                         unsigned idx) -> const FormalRecipe & {
     auto key = std::make_pair(H0, idx);
@@ -9177,8 +9211,16 @@ void CallGraphPass::certifyOpsPairs() {
           }
           if (!any || !allok)
             complete = false;
-          else
+          else {
             g_opsV2CallCert++;
+            if (CFLProposeOpsSt)
+              for (unsigned ai = 0; ai < CB->arg_size(); ai++)
+                if (CB->getArgOperand(ai)->stripPointerCasts() == &GV) {
+                  const auto &R2 = walkFormal(H, ai);
+                  if (R2.ok && !R2.formalIdx.empty())
+                    stCandidates.insert(getFuncDef(const_cast<Function *>(H)));
+                }
+          }
           continue;
         }
         complete = false; // phi / select / ptrtoint / anything else
@@ -9201,6 +9243,164 @@ void CallGraphPass::certifyOpsPairs() {
       rec.containers = std::move(containers);
     }
   }
+  // --cfl-propose-ops-st: whole-body qualifier for registration-setter
+  // helpers. A helper is proposable iff EVERY instruction is
+  // replicable per callsite: stores with a formal (GEP-walked) base
+  // and formal/null/small-constant values; non-pointer reads;
+  // pointer loads only feeding null-checks; no call touching a
+  // formal-derived pointer; no pointer phi/select/alloca/atomics; ret
+  // void, non-pointer, constant, or a plain formal (-> ALIAS atom).
+  // Output lines are directly adoptable func_summaries.txt syntax, and
+  // PROPOSALS ONLY — reviewed before adoption, never auto-applied.
+  if (CFLProposeOpsSt) {
+    auto baseOfV = [](const Value *V) -> const Value * {
+      V = V->stripPointerCasts();
+      while (const auto *G2 = dyn_cast<GEPOperator>(V))
+        V = G2->getPointerOperand()->stripPointerCasts();
+      return V;
+    };
+    std::vector<std::string> lines;
+    for (const Function *H : stCandidates) {
+      if (!H || H->empty() || H->isVarArg())
+        continue;
+      std::set<std::string> atoms; // dedup repeated identical stores
+      std::string retAtom;
+      bool ok = true;
+      for (const BasicBlock &BB : *H) {
+        for (const Instruction &I : BB) {
+          if (!ok)
+            break;
+          if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+            const Value *B = baseOfV(SI->getPointerOperand());
+            const auto *BA = dyn_cast<Argument>(B);
+            if (!BA || BA->getParent() != H) {
+              ok = false;
+              break;
+            }
+            const Value *V = SI->getValueOperand()->stripPointerCasts();
+            if (const auto *VA = dyn_cast<Argument>(V)) {
+              if (VA->getParent() != H) {
+                ok = false;
+                break;
+              }
+              // scalar formals (enum/flags) need no atom — only pointer
+              // identity must be replicated per callsite
+              if (containsPointerType(VA->getType()))
+                atoms.insert("ST(*arg" + std::to_string(BA->getArgNo()) +
+                             "<-arg" + std::to_string(VA->getArgNo()) + ")");
+              continue;
+            }
+            if (isa<ConstantPointerNull>(V))
+              continue; // null init: no pointer flow
+            if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+              (void)CI;
+              continue; // constant scalar init
+            }
+            if (V->getType()->isPointerTy()) {
+              ok = false; // fn ptr / global / computed pointer value
+              break;
+            }
+            // non-constant scalar: reject ptr-width ints (possible
+            // laundered provenance), allow narrow scalars
+            if (curDL && V->getType()->isIntegerTy() &&
+                V->getType()->getIntegerBitWidth() >= 64) {
+              ok = false;
+              break;
+            }
+            continue;
+          }
+          if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+            if (!containsPointerType(LI->getType()))
+              continue; // scalar read
+            bool nullChk = true;
+            for (const User *LU : LI->users())
+              if (!isa<ICmpInst>(LU)) {
+                nullChk = false;
+                break;
+              }
+            if (!nullChk) {
+              ok = false;
+              break;
+            }
+            continue;
+          }
+          if (const auto *CB2 = dyn_cast<CallBase>(&I)) {
+            if (const auto *II = dyn_cast<IntrinsicInst>(CB2))
+              if (II->isAssumeLikeIntrinsic() ||
+                  isa<DbgInfoIntrinsic>(II))
+                continue;
+            for (const Use &Op : CB2->args()) {
+              const Value *B = baseOfV(Op.get());
+              if (isa<Argument>(B) || isa<PHINode>(B) || isa<SelectInst>(B) ||
+                  isa<LoadInst>(B)) {
+                ok = false; // formal-derived (or unresolvable) escape
+                break;
+              }
+            }
+            if (!ok)
+              break;
+            continue;
+          }
+          if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
+            const Value *RV = RI->getReturnValue();
+            if (!RV || !RV->getType()->isPointerTy())
+              continue;
+            RV = RV->stripPointerCasts();
+            if (const auto *RA = dyn_cast<Argument>(RV)) {
+              std::string a =
+                  "ALIAS(ret=arg" + std::to_string(RA->getArgNo()) + ")";
+              if (retAtom.empty() || retAtom == a) {
+                retAtom = a;
+                continue;
+              }
+            }
+            if (isa<ConstantPointerNull>(RV) || isa<UndefValue>(RV))
+              continue;
+            ok = false;
+            break;
+          }
+          if (isa<GetElementPtrInst>(I) || isa<ICmpInst>(I) ||
+              isa<BranchInst>(I) || isa<SwitchInst>(I) ||
+              isa<UnreachableInst>(I) || isa<FenceInst>(I))
+            continue;
+          if (const auto *CI2 = dyn_cast<CastInst>(&I)) {
+            if (isa<IntToPtrInst>(CI2) || isa<PtrToIntInst>(CI2)) {
+              ok = false;
+              break;
+            }
+            continue;
+          }
+          if (isa<BinaryOperator>(I))
+            continue;
+          if (isa<PHINode>(I) || isa<SelectInst>(I)) {
+            if (I.getType()->isPointerTy()) {
+              ok = false;
+              break;
+            }
+            continue;
+          }
+          ok = false; // alloca / atomics / aggregates / anything else
+          break;
+        }
+        if (!ok)
+          break;
+      }
+      if (!ok || atoms.empty() || atoms.size() > 6)
+        continue;
+      std::string line = H->getName().str();
+      for (const std::string &a : atoms)
+        line += " " + a;
+      if (!retAtom.empty())
+        line += " " + retAtom;
+      lines.push_back(line);
+    }
+    std::sort(lines.begin(), lines.end());
+    for (const std::string &L : lines)
+      errs() << "OpsST PROPOSAL: " << L << "\n";
+    errs() << "OpsST PROPOSAL: " << lines.size() << " of "
+           << stCandidates.size() << " escape helpers qualified\n";
+  }
+
   CG_LOG("OpsPairs LEDGER: " << g_opsCertified << " ops globals CERTIFIED ("
          << g_opsContainers << " containers, " << g_opsEmbedded
          << " via initializer embedding, " << g_opsReadOnly

@@ -1,0 +1,2 @@
+malloc FRESH
+reg_ops ST(*arg0<-arg1)

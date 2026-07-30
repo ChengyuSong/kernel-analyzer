@@ -326,6 +326,17 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLProposeOpsSt(
+  "cfl-propose-ops-st",
+  cl::desc("PROPOSE (never auto-apply) ST/ALIAS transfer summaries for "
+           "registration-setter helpers discovered by the ops-pairs "
+           "call-escape walk: a helper qualifies only if EVERY "
+           "instruction is replicable per callsite (formal-base stores "
+           "of formal/null/scalar values, non-pointer reads, no "
+           "formal-derived call operands). Output is reviewable "
+           "func_summaries.txt syntax (task #30 store-side splitting)"),
+  cl::init(false));
+
 cl::opt<bool> CFLOpsPairs(
   "cfl-ops-pairs",
   cl::desc("Certify (ops-global, container) pair invariants from IR use "
@@ -680,6 +691,11 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeRodataJoins, "--cfl-probe-rodata-joins");
     requireFlowsTo(CFLProbeOriginSplit, "--cfl-probe-origin-split");
     requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
+    if (CFLProposeOpsSt && !CFLOpsPairs) {
+      errs() << "ERROR: --cfl-propose-ops-st requires --cfl-ops-pairs "
+                "(proposals derive from the certification walk)\n";
+      exit(1);
+    }
     requireFlowsTo(!CFLAblateMints.empty(), "--cfl-ablate-mints");
     requireFlowsTo(CFLFlowsToMaxIters.getNumOccurrences() > 0,
                    "--cfl-flows-to-max-iters");

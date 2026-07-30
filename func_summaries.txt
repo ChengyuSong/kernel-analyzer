@@ -304,3 +304,11 @@ skx_pmu_get_topology INVOKE(arg1:f0<-arg0)
 vc_t416_color INVOKE(arg2:f0<-arg0)
 walk_dynamic_memory_groups INVOKE(arg1:f1<-arg3)
 walk_memory_blocks INVOKE(arg3:f1<-arg2)
+
+# ---- task #30: ops-pairs ST proposals (auto-proposed by --cfl-propose-ops-st,
+# ---- reviewed 2026-07-29 against kernel/bpf/syscall.c) ----
+# bpf_link_init(link, type, ops, prog): pure setter — refcnt/type/id are
+# scalars; the two pointer stores are the (ops, prog) registration pair.
+# Per-callsite ST severs the pooled link formal so each caller's link
+# object keeps its own (ops, prog) identity.
+bpf_link_init ST(*arg0<-arg2) ST(*arg0<-arg3)

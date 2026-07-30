@@ -2816,3 +2816,46 @@ which protection then keeps separate. Plan: auto-PROPOSE such lines
 from the recipes (tier-2 confirmer pattern), review, adopt into
 func_summaries.txt. Helpers that do more (cdev_init's kobject_init
 call) correctly fail the both-formals test and stay pooled.
+
+### ST-proposal pipeline + backward-closure protection: the arc closes on micro (task #30, 2026-07-29)
+
+Three pieces landed:
+
+1. --cfl-propose-ops-st: whole-body qualifier over the call-escape
+   helpers from the certification walk. A helper qualifies iff EVERY
+   instruction is per-callsite replicable (formal-base stores of
+   pointer-formal/null/scalar values — scalar formals need no atom;
+   non-pointer reads; pointer loads only null-checked; no
+   formal-derived call operands; ret void/scalar/formal->ALIAS).
+   Output is adoptable func_summaries.txt syntax, proposals only.
+
+2. Backward a-closure protection seeding: protecting only container
+   VALUE classes was insufficient — t_ops2's readers co-witness the
+   helper's heap origin (minted on the alloc callsite class INSIDE
+   mk_widget), merge through that unprotected key, gain in-edges from
+   the helper's stores, and the demotion cascade collapsed both
+   protected cells. protCls now closes backward over static a-edges
+   (depth 8 / 8192-class cap, partial closure = weaker protection
+   never unsoundness) and mintRoot protects roots minted mid-fixpoint
+   on closure classes (FRESH heap origins).
+
+3. t_ops2 END-TO-END EXACT with reg_ops's proposed summary adopted:
+   3 protected origins / 3 distinct cells / 0 demotions, a1/a2->cba
+   only, b1/b2->cbb only. The full mechanism chain — certificates ->
+   receiver tightening -> ST severing -> protected cells — delivers
+   the pair-precision recovery. Ladder: micros no-flag bit-identical,
+   t_ops 0 cross-pairs, smoke 4/4.
+
+km reality: 973 protected origins now (39 before closure), but STILL
+14 distinct cells / 184 demotions / answers identical (128,249; +12%
+runtime) — km's registration writers are pooled formal channels of
+UNSUMMARIZED helpers, and the subset only surfaces ONE qualifying
+proposal: bpf_link_init ST(*arg0<-arg2) ST(*arg0<-arg3) (reviewed
+against kernel/bpf/syscall.c: pure setter, scalars atom-free; ADOPTED
+into func_summaries.txt; km adoption A/B 0/0 — answer-neutral in the
+canonical config, kernel identity check rides the next full run). The
+volume target is the 56 no-body rejections — cdev_init, relay_open
+and friends are defined OUTSIDE the kernel/-only km subset, so the
+proposal sweep must run at FULL kernel scale next; adoption there
+feeds both the summary drain (INVOKE-style) and the protected-cell
+separation under --cfl-ops-pairs.

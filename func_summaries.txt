@@ -316,3 +316,15 @@ bpf_link_init ST(*arg0<-arg2) ST(*arg0<-arg3)
 # (fs/dcache.c). One pointer store dentry->d_op = op; the rest is
 # d_flags scalar bit-ORs and null-check probes of op's members.
 d_set_d_op ST(*arg0<-arg1)
+
+# ---- task #31: ret-pooling HOF family (fwnode devcon) ----
+# Verified against drivers/base/property.c (6.8): every non-NULL
+# return of fwnode_connection_find_match IS a match-callback return
+# (the static helpers store match(node,...) into the out slot; count
+# guards NULL). PURE-RET form on purpose: the callback's formal 0
+# receives graph-walk nodes the caller never passes, so args stay
+# pooled (no completeness claim); constant-fn callsites bind ret
+# per-callsite. Severs the ProtWriters hub neck channel (9,767x).
+# fwnode_connection_find_matches (plural) fills a caller ARRAY and
+# returns a count — deref-binding shape, NOT covered; stays pooled.
+fwnode_connection_find_match INVOKE(arg3:ret)

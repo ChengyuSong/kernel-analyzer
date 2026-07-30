@@ -1130,13 +1130,17 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
   // formal/ret mixing). FRESH-bearing summaries normally short-circuit
   // earlier via the AllocSites branch; this path serves non-fresh
   // summaries and fresh ones reached through indirect resolution.
+  bool retBound = false;
   {
     auto sit = Ctx->FuncSummaries.find(CF);
     if (sit != Ctx->FuncSummaries.end()) {
-      if (!applySummaryAtoms(CS, *sit->second))
+      if (!applySummaryAtoms(CS, *sit->second, &retBound))
         return false;
       // Invoke atom with dynamic fn at this callsite: fall through to
-      // the pooled arg/ret wiring (sound, LEDGERed).
+      // the pooled arg/ret wiring (sound, LEDGERed). retBound=true
+      // means an INVOKE :ret atom already wired this callsite's
+      // return per-fn — the shared HOF return edge is the severed
+      // ret-pooling channel, so it must NOT also be added below.
     }
   }
 
@@ -1161,7 +1165,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
   wireCallArgs(CS, CF, opsSkipArg);
 
   // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
-  if (containsPointerType(CF->getReturnType())) {
+  if (!retBound && containsPointerType(CF->getReturnType())) {
     NodeIndex retNode = NF.getReturnNodeFor(CF);
     if (retNode == AndersNodeFactory::InvalidIndex ||
         retNode == NF.getUniversalPtrNode()) {
@@ -2534,6 +2538,11 @@ bool CallGraphPass::runFlowsToResolution() {
   // measurable: few nameable helpers -> summary severing wins; diffuse
   // -> field-keyed cells / provenance rework territory.
   std::map<std::string, std::pair<size_t, uint32_t>> protCoalesceBlame;
+  // Writer-merge composition: name EVERY writer class at the moment it
+  // merges into a protected cell — before the blob swallows it and the
+  // exemplar drifts. This is the true composition census of the
+  // "connected registration-writer universe".
+  std::map<std::string, size_t> protWriterBlame;
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size())
       return "<synthetic>";
@@ -3206,6 +3215,7 @@ bool CallGraphPass::runFlowsToResolution() {
         return;
       if (protIn[cr]) {
         // writer (or mixed): merges into the cell, exactly as today
+        protWriterBlame[protBlameName(cr)]++;
         auto ait = protAnchor.find(cr);
         if (ait != protAnchor.end() && ait->second > 0 &&
             (ps.cell == UINT32_MAX || find(ps.cell) != cr))
@@ -4517,6 +4527,20 @@ bool CallGraphPass::runFlowsToResolution() {
   if (g_sinkAblatedJoins)
     errs() << "SinkAblate: " << g_sinkAblatedJoins
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
+  if (protOn && !protWriterBlame.empty()) {
+    std::vector<std::pair<size_t, const std::string *>> wr2;
+    size_t wtot = 0;
+    for (auto &kv : protWriterBlame) {
+      wr2.emplace_back(kv.second, &kv.first);
+      wtot += kv.second;
+    }
+    std::sort(wr2.begin(), wr2.end(), std::greater<>());
+    errs() << "ProtWriters: " << wtot << " writer merges via "
+           << protWriterBlame.size() << " distinct pre-merge identities\n";
+    for (size_t i = 0; i < std::min<size_t>(40, wr2.size()); i++)
+      errs() << "ProtWriters: " << wr2[i].first << "x " << *wr2[i].second
+             << "\n";
+  }
   if (protOn && !protCoalesceBlame.empty()) {
     std::vector<std::pair<size_t, const std::string *>> br2;
     size_t total2 = 0;
@@ -8134,15 +8158,27 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         nSt++;
       } else if (t.consume_front("INVOKE(") && t.consume_back(")")) {
         auto [fnp, rest2] = t.split(":");
-        auto [fk, dp] = rest2.split("<-");
         A.kind = GlobalContext::SummaryAtom::Invoke;
-        bad = !parseRef(fnp, A.dst) || A.dst < 0 || !parseRef(dp, A.src) ||
-              A.src < 0;
-        unsigned fkv = 0;
-        if (!bad) {
-          StringRef fks = fk;
-          bad = !fks.consume_front("f") || fks.getAsInteger(10, fkv);
-          A.aux = (int)fkv;
+        bad = !parseRef(fnp, A.dst) || A.dst < 0;
+        if (!bad && rest2 == "ret") {
+          // ret-transparency only: INVOKE(argF:ret). Args stay pooled
+          // (no completeness claim); constant-fn callsites bind the
+          // invoked fn's return to THIS callsite value instead of the
+          // pooled HOF return (the ret-pooling hub channel).
+          A.src = -1;
+          A.aux = -1;
+          A.off = 1;
+        } else if (!bad) {
+          auto [fk, dp] = rest2.split("<-");
+          if (dp.consume_back(":ret"))
+            A.off = 1; // data binding + ret-transparency
+          bad = !parseRef(dp, A.src) || A.src < 0;
+          unsigned fkv = 0;
+          if (!bad) {
+            StringRef fks = fk;
+            bad = !fks.consume_front("f") || fks.getAsInteger(10, fkv);
+            A.aux = (int)fkv;
+          }
         }
         nInv++;
       } else if (t.consume_front("CHAINREG(") && t.consume_back(")")) {
@@ -8229,6 +8265,7 @@ summaryForName(GlobalContext *Ctx, StringRef name) {
 // construction (a-edge between deref nodes), which is exactly right for
 // aligned whole-buffer dups (kmemdup family); prefix copies
 // over-approximate soundly.
+static size_t g_sumInvokeRet = 0; // INVOKE :ret bindings applied
 static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
               g_sumSkipped = 0, g_sumFreshSub = 0, g_sumInvoke = 0,
               g_sumInvokeDyn = 0, g_chainReg = 0, g_chainRegDyn = 0,
@@ -8248,7 +8285,8 @@ const GlobalValue *CallGraphPass::canonChainKey(const GlobalValue *G) {
 }
 
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
-                                      const GlobalContext::FuncSummary &S) {
+                                      const GlobalContext::FuncSummary &S,
+                                      bool *retBound) {
   bool needPooled = false;
   auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
     const Value *v =
@@ -8304,21 +8342,27 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       // formal directly and re-attribute the invocation to this
       // registration site (Callees export edge). The pooled container
       // path drains because the summarized registration no longer
-      // feeds it.
+      // feeds it. A.off==1 adds RET-TRANSPARENCY: the callsite value
+      // receives (only) the invoked fn's return — severs the
+      // ret-pooling hub channel (fwnode devcon family, task #31).
       if ((unsigned)A.dst >= CS->arg_size() ||
-          (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
+          (A.src >= 0 && (unsigned)A.src >= CS->arg_size())) {
+        g_sumSkipped++;
+        break;
+      }
       const Value *fv = CS->getArgOperand(A.dst)->stripPointerCasts();
       if (isa<ConstantPointerNull>(fv))
         break; // null fn: never invoked, nothing to bind
       const auto *RF = dyn_cast<Function>(fv);
       if (!RF) {
         // dynamic fn: cannot bind statically — signal pooled fallback
+        // (ret included: the pooled return edge stays)
         g_sumInvokeDyn++;
         needPooled = true;
         break;
       }
       Function *DF = getFuncDef(const_cast<Function *>(RF));
-      if ((unsigned)A.aux < DF->arg_size()) {
+      if (A.src >= 0 && (unsigned)A.aux < DF->arg_size()) {
         NodeIndex dn = nodeForRef(A.src, false);
         NodeIndex fn2 = getRepNodeForValue(DF->getArg(A.aux));
         if (fn2 == AndersNodeFactory::InvalidIndex)
@@ -8327,6 +8371,22 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
           addAssignmentEdge(getCanonicalNode(dn), getCanonicalNode(fn2));
           g_sumInvoke++;
         }
+      }
+      if (A.off == 1) {
+        if (containsPointerType(DF->getReturnType())) {
+          NodeIndex rn = NF.getReturnNodeFor(DF);
+          if (rn == AndersNodeFactory::InvalidIndex ||
+              rn == NF.getUniversalPtrNode())
+            rn = NF.createReturnNode(DF);
+          NodeIndex cn = nodeForRef(-1, true);
+          if (cn != AndersNodeFactory::InvalidIndex)
+            addAssignmentEdge(getCanonicalNode(rn), getCanonicalNode(cn));
+        }
+        if (retBound)
+          *retBound = true; // suppress the pooled HOF return edge
+        if (A.src < 0)
+          needPooled = true; // pure-ret: no claim about the args
+        g_sumInvokeRet++;
       }
       Ctx->Callees[CS].insert(DF); // re-attributed callgraph edge
       break;

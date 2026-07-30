@@ -134,7 +134,8 @@ private:
                           unsigned callSiteFieldIdx) const;
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   bool applySummaryAtoms(const llvm::CallBase *CS,
-                         const GlobalContext::FuncSummary &S);
+                         const GlobalContext::FuncSummary &S,
+                         bool *retBound = nullptr);
   // Keyed pair-channels (CHAINREG/CHAINCALL): registrations and
   // dispatch sites collected during edge construction, wired per key
   // (cross product) after the last module. Keys are chain-head

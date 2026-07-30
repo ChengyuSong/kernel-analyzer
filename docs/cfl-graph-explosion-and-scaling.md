@@ -2881,3 +2881,50 @@ pooled, demotions 184 -> 54, runtime 269 s -> 175 s (cheaper than the
 UNlimited run), answers stable. Micros exact, 0 collapses.
 
 Kernel sweep relaunched with the limiter (kernel-stprop2.log).
+
+### Kernel-scale verdict: task #30 closes — certificates prove modularity, ONE store-hub absorbs it (2026-07-30)
+
+The relaunched kernel sweep completed (4.43 h, +7.5% over baseline, no
+OOM — the K=4 limiter held: 1 collapse, 80,782 readers pooled).
+
+The numbers:
+- Certification at kernel scale is RICH: 1,103 tables certified (589
+  initializer-embedded, 260 read-only, 128 call-escape recipes / 6
+  ret-alloc), 1,110 containers, 835 incomplete. 178,416 (callee,site)
+  wirings tightened. The user's modularity hypothesis is provable
+  from IR evidence at scale.
+- The payoff is ZERO on the final quotient: answers vs the canonical
+  pin = 0 removed / +59 added, ALL the documented
+  __SCT__tp_func_nvme_sq flap. ProtCells: 9,802 protected origins
+  collapse into 11 distinct classes — ONE connected shared-writer
+  component (the kobject/device-init registration universe) absorbs
+  essentially every certified container; 42 bridges survive, moving
+  nothing.
+- Helper-level severing is NARROW under the strict whole-body
+  qualifier: 2 of 21 escape helpers qualify kernel-wide
+  (bpf_link_init, d_set_d_op — both reviewed against source and
+  ADOPTED; both answer-neutral at km, 0/0). The v2 rejection ledger
+  says where the volume hides: 180 second-level escapes (wrapper
+  chains), 140 base-unresolved, 33 no-body, 33 other.
+
+READING (taxonomy entry): callee-side per-pair binding — even with
+sound certificates, receiver tightening, and copy-out cells — cannot
+separate what a connected STORE universe has already joined. The
+discrimination the certificates prove is destroyed upstream of every
+dispatch site by shared registration writers, and severing those is a
+summary-COVERAGE problem (each helper needs its store channel
+replicated per callsite), not a solver problem. The two adopted
+helpers are the existence proof; the 180 second-level rejections are
+the next coverage tranche (qualifier recursion depth 2 = wrapper
+chains like device_add_disk -> ...), and the INVOKE/CHAINREG family
+remains the model for hub channels too entangled to qualify.
+
+DISPOSITION: --cfl-ops-pairs stays OFF in the canonical config
+(instrument + acceptance tests + certificates retained; zero-cost when
+off). Canonical pin kernel-gepfix UNCHANGED (flag-on run reproduces it
+modulo the known flap — that is also the pending kernel identity check
+for the two adoptions, now discharged). Task #30 CLOSED; frontier
+recorded: (a) qualifier depth-2 wrapper recursion, (b) provenance
+cells as first-class solver design (this prototype = the scoped
+evidence), (c) tracepoint/kvm_x86_ops keyed channels from the GEP-fix
+smear families.

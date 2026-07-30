@@ -312,3 +312,7 @@ walk_memory_blocks INVOKE(arg3:f1<-arg2)
 # Per-callsite ST severs the pooled link formal so each caller's link
 # object keeps its own (ops, prog) identity.
 bpf_link_init ST(*arg0<-arg2) ST(*arg0<-arg3)
+# d_set_d_op(dentry, op): the dentry_operations registration channel
+# (fs/dcache.c). One pointer store dentry->d_op = op; the rest is
+# d_flags scalar bit-ORs and null-check probes of op's members.
+d_set_d_op ST(*arg0<-arg1)

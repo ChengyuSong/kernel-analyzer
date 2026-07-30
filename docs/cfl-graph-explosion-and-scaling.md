@@ -3000,3 +3000,47 @@ traffic removed. Kernel-scale blame census running (kernel-blame.log)
 to size the same channels + surface driver-core additions before the
 confirmer is built. Wholesale perf/event sealing is RECORDED AS
 REJECTED (removes legitimate probe dispatch).
+
+### Kernel ProtWriters composition: the writer universe is healthy — the hub is the problem (task #31, 2026-07-30)
+
+Full-kernel pre-merge writer histogram (17,538 writer merges into
+protected cells, 2,122 distinct identities; run 2.56 h, answers ==
+canonical baseline):
+
+1. THE HUB: 9,767 merges (56%) from ONE class, stable exemplar
+   fwnode_graph_devcon_matches::call, plus 5,229 <unnamed> (mostly its
+   synthetic satellites) — together ~85%. This is the long-known giant
+   a-connected component, ALREADY fused before it touches any
+   protected key; it then serially absorbs 9,7xx container families.
+   The exemplar is diagnostic: fwnode_graph_devcon_matches /
+   fwnode_connection_find_match is an INVOKE-SHAPED HOF — it walks the
+   device graph invoking match callbacks (devcon_match_fn_t) and
+   POOLS THEIR void* RETURNS; every subsystem's matcher return flows
+   into one class, connecting the device universe. That is exactly
+   the ret-binding gap recorded at task #28 close ("richer atoms:
+   deref/ret-binding for the 15 recorded rejections"): an INVOKE atom
+   with RET-BINDING (per-callsite match-fn constant -> direct call
+   edge, ret bound to that callsite only) would sever the top hub
+   channel at its neck. NEXT DESIGN BLOCK.
+2. THE HEALTHY TAIL: 2,120 identities at 1-23 merges each —
+   drmm_mode_config_init, init_hw_perf_events, __regmap_init,
+   crypto_register_*, neigh_table_init, snd_hda_*, ttm_pool_*,
+   bpf_struct_ops, squashfs_fill_super, ... Genuine subsystem
+   registration writers pairing a handful of containers each: this is
+   the population the pair certificates MODEL, and it needs no fixing.
+3. TRACE CAPTURE: perf_trace_*/trace_event_* identities at 5x each
+   (78x at iteration 0 incl. perf_trace_initcall_level::inttoptr) —
+   small in FUSION volume at kernel scale, but its cost is join
+   traffic and smear (km: 27% of all cluster joins, -3,6xx pure-smear
+   pairs), so the payload sink model stands unchanged.
+
+CONCLUSION (task #31 measurement phase closed): "disable tracepoints/
+lockdep" addresses overhead and smear, not the collapse; the
+registration-writer universe is healthy long-tail; the single object
+that destroys certified discrimination is the pre-fused hub, and its
+top identified channel is a ret-pooling HOF. Priority order for the
+modeling phase: (1) INVOKE ret-binding atom + fwnode devcon/
+connection-find family summaries (severs the hub's neck channel),
+(2) trace-payload + lockdep sink models gated on the read-back
+confirmer (bounded, already sized), (3) blob-composition diagnostic
+for whatever remains of the hub after (1).

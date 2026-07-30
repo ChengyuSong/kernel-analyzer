@@ -2928,3 +2928,75 @@ recorded: (a) qualifier depth-2 wrapper recursion, (b) provenance
 cells as first-class solver design (this prototype = the scoped
 evidence), (c) tracepoint/kvm_x86_ops keyed channels from the GEP-fix
 smear families.
+
+## Instrumentation-sink channels: measurement study (task #31, km, 2026-07-30)
+
+Question (user): the 9,802-origins-into-11-cells collapse is driven by
+a connected writer universe — can we model/summarize it? Instruments:
+ProtCoalesce blame census now reports per-class characteristics
+(members / fact planes / edges / keysAnchored / collapsed), and
+--cfl-probe-sink-ablate=<substrs> (MEASUREMENT-ONLY UNSOUND) skips all
+cluster joins by cells belonging to matching functions/globals.
+
+### The fusion structure is hub-plus-tail
+
+km, flag-on: 1,001 key-family fusions via just 8 writer classes, and
+every blame entry resolves to ONE terminal blob (c16931: 73 members,
+35,061 native facts, 967 of 980 protected keys anchored, COLLAPSED).
+Pre-merge exemplars split the bulk between the perf/ftrace capture
+universe (~649) and lockdep's lock_classes walker (~277). BUT ablating
+both hubs (M3) still yields a 959-key blob (c697: 184 members, 25,956
+facts, -26% fact mass) built by a 1x-each tail of ordinary shared code
+(wait_consider_task, do_kexec_load, sysfs_* ...): killing the hubs
+shrinks the blob and recovers separation only modestly (distinct
+cells 14 -> 18, reader bridges 26 -> 209). The hubs' real costs are
+join traffic, answer smear, and solve churn — quantified below.
+
+### km ablation matrix (all diffs are removals-only, +0)
+
+config                                   joins-skipped  match-CFL  Dpairs   note
+M1 baseline (--cfl-ops-pairs)                        0    128,249       0   14 cells, 26 bridges, 54 demotions
+M2 + perf_trace_/trace_event_/__bpf_trace_/
+     trace_buf/ring_buffer_                131,280,998    112,282 -16,042   registration ablated too — NOT a model target
+M3 M2 + lockdep/lock_class/__lock_acquire  135,504,757    112,172 -16,152   lockdep alone: +4.2M joins, -110 answers
+M4 payload only (ring_buffer_,trace_buf)    35,639,393    124,657  -3,639   registration INTACT (__traceiter_ pools survive)
+M5 payload only, canonical no-flag config   35,639,393*   124,657  -3,617   same tally as M4 — protection-independent
+
+(*same patterns; runtimes 294-430 s under concurrent kernel-run
+contention — not comparable beyond "ablation lookup cost is visible".)
+
+### Channel characteristics -> what each construct does to the graph
+
+1. TRACE PAYLOAD CAPTURE (ring-buffer event payloads, trace_buf):
+   pointer values stored AS DATA — often ptr->u64 laundering that the
+   int-provenance model correctly witnesses (km: 5,368 modeled int
+   stores / 8,503 loads; 1,735/5,523 unmodeled-interprocedural in the
+   LEDGER). Effect: ~27% of ALL cluster-join traffic (35.6M joins),
+   3,6xx pure-smear answer pairs (a 232-target fn pool laundered into
+   unrelated sites like vmemmap_pte_entry), and the dominant share of
+   protected-key fusions. Payload cells are read by formatters/
+   userspace export, not dispatch — the sink-model candidate.
+2. PERF/EVENT GLUE WHOLESALE: dominates join traffic (131M) and holds
+   16k answer pairs, but perf probe REGISTRATION lives in the same
+   functions (perf_trace_* fns ARE tracepoint probes) — wholesale
+   sealing removes legitimate probe dispatch (bpf_link_release -563,
+   __traceiter_* -232 pools in M2 vs INTACT in M4). Only the payload
+   sub-channel is separable.
+3. LOCKDEP (lock_classes + walkers): 4.2M joins, ~277 fusions, -110
+   answer pairs — nearly pure graph/solve overhead from debug-only
+   machinery. Trivial sink model, or gone entirely in a production
+   (!CONFIG_LOCKDEP) build.
+
+### Design conclusion (recorded)
+
+The shipped model should be a reviewed SINK family, not ablation:
+seal ring-buffer/trace payload CELLS (stores keep their own cell,
+joins to stored objects' keys suppressed) gated on a read-back
+contract confirmer — enumerate ring_buffer_event_data /
+trace_event_buffer consumers and machine-check none feeds a dispatch;
+lockdep registration gets the same treatment (compare-only contract).
+Expected canonical-config effect at km: -3.6k smear pairs, ~27% join
+traffic removed. Kernel-scale blame census running (kernel-blame.log)
+to size the same channels + surface driver-core additions before the
+confirmer is built. Wholesale perf/event sealing is RECORDED AS
+REJECTED (removes legitimate probe dispatch).

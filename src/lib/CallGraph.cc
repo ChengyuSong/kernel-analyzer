@@ -1960,6 +1960,7 @@ public:
 // rectangular (fact sets), never pairwise V.
 
 static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
+static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
 static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
@@ -2532,7 +2533,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // writer (exemplar member instruction) so the hub's composition is
   // measurable: few nameable helpers -> summary severing wins; diffuse
   // -> field-keyed cells / provenance rework territory.
-  std::map<std::string, size_t> protCoalesceBlame;
+  std::map<std::string, std::pair<size_t, uint32_t>> protCoalesceBlame;
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size())
       return "<synthetic>";
@@ -3132,9 +3133,68 @@ bool CallGraphPass::runFlowsToResolution() {
       if (R[y][s].any()) addBitsBridged(x, s, R[y][s], ctx0);
     }
   };
+  // --cfl-probe-sink-ablate (MEASUREMENT-ONLY, UNSOUND): pretend cells
+  // whose class contains an instruction from a matching function (or a
+  // matching global) are write-only sinks — skip ALL their cluster
+  // joins. Quantifies a channel's contribution to fusion/fact-mass/
+  // answers and previews a reviewed sink model. Memoized per rep at
+  // query time; merges can stale the memo — acceptable for a probe.
+  SmallVector<StringRef, 8> sinkAblatePats;
+  {
+    StringRef spec(CFLProbeSinkAblate);
+    while (!spec.empty()) {
+      auto [head, rest] = spec.split(',');
+      if (!head.empty())
+        sinkAblatePats.push_back(head);
+      spec = rest;
+    }
+    if (!sinkAblatePats.empty())
+      WARNING("[MEASUREMENT-ONLY UNSOUND] sink-ablate active: "
+              << CFLProbeSinkAblate << "\n");
+  }
+  boost::unordered_flat_map<uint32_t, char> sinkAblateMemo;
+  auto sinkAblateClass = [&](uint32_t cls) -> bool {
+    auto it2 = sinkAblateMemo.find(cls);
+    if (it2 != sinkAblateMemo.end())
+      return it2->second;
+    bool hit = false;
+    auto nameHit = [&](const Value *V3) {
+      if (!V3)
+        return;
+      StringRef nm;
+      if (const auto *I3 = dyn_cast<Instruction>(V3))
+        nm = I3->getFunction()->getName();
+      else if (V3->hasName())
+        nm = V3->getName();
+      for (StringRef p : sinkAblatePats)
+        if (!nm.empty() && nm.contains(p)) {
+          hit = true;
+          return;
+        }
+    };
+    if (cls < toOrig.size()) {
+      nameHit(NF.getValueForNode(toOrig[cls]));
+      if (!hit) {
+        auto mit2 = canonicalClassMembers.find(toOrig[cls]);
+        if (mit2 != canonicalClassMembers.end())
+          for (NodeIndex m3 : mit2->second) {
+            nameHit(NF.getValueForNode(m3));
+            if (hit)
+              break;
+          }
+      }
+    }
+    sinkAblateMemo[cls] = hit;
+    return hit;
+  };
+
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
       g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
+      return;
+    }
+    if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
+      g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
       return;
     }
     if (protOn && s == 0 && protRid.count(o)) {
@@ -3149,7 +3209,8 @@ bool CallGraphPass::runFlowsToResolution() {
         auto ait = protAnchor.find(cr);
         if (ait != protAnchor.end() && ait->second > 0 &&
             (ps.cell == UINT32_MAX || find(ps.cell) != cr))
-          protCoalesceBlame[protBlameName(cr)]++; // key-family fusion
+          { auto &bl = protCoalesceBlame[protBlameName(cr)];
+            bl.first++; bl.second = cr; } // key-family fusion
         if (ps.cell == UINT32_MAX) {
           ps.cell = cr;
           uint32_t n2 = ++protAnchor[find(cr)];
@@ -3243,8 +3304,11 @@ bool CallGraphPass::runFlowsToResolution() {
         continue; // already handled (or folded away by a merge)
       auto rids = std::move(rb->second);
       readerBridgedTo.erase(rb);
-      if (rids.size() > 1)
-        protCoalesceBlame["DEMOTE:" + protBlameName(c)] += rids.size() - 1;
+      if (rids.size() > 1) {
+        auto &bl = protCoalesceBlame["DEMOTE:" + protBlameName(c)];
+        bl.first += rids.size() - 1;
+        bl.second = c;
+      }
       for (uint32_t o : rids) {
         auto &ps = prot[o];
         c = find(c);
@@ -4450,19 +4514,41 @@ bool CallGraphPass::runFlowsToResolution() {
            << protDemotions << " demotions, " << protCollapses
            << " over-anchored cells collapsed (" << protPooledReaders
            << " readers pooled)\n");
+  if (g_sinkAblatedJoins)
+    errs() << "SinkAblate: " << g_sinkAblatedJoins
+           << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
   if (protOn && !protCoalesceBlame.empty()) {
     std::vector<std::pair<size_t, const std::string *>> br2;
     size_t total2 = 0;
     for (auto &kv : protCoalesceBlame) {
-      br2.emplace_back(kv.second, &kv.first);
-      total2 += kv.second;
+      br2.emplace_back(kv.second.first, &kv.first);
+      total2 += kv.second.first;
     }
     std::sort(br2.begin(), br2.end(), std::greater<>());
     errs() << "ProtCoalesce: " << total2 << " key-family fusions via "
            << protCoalesceBlame.size() << " distinct writer classes\n";
-    for (size_t i = 0; i < std::min<size_t>(30, br2.size()); i++)
+    for (size_t i = 0; i < std::min<size_t>(30, br2.size()); i++) {
+      uint32_t bc = find(protCoalesceBlame[*br2[i].second].second);
+      size_t facts = 0, bfacts = 0;
+      for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+        facts += R[bc][s2].count();
+        bfacts += RB[bc][s2].count();
+      }
+      size_t mem2 = 0;
+      if (bc < toOrig.size()) {
+        auto mit2 = canonicalClassMembers.find(toOrig[bc]);
+        if (mit2 != canonicalClassMembers.end())
+          mem2 = mit2->second.size();
+      }
+      auto aIt2 = protAnchor.find(bc);
       errs() << "ProtCoalesce: " << br2[i].first << "x " << *br2[i].second
-             << "\n";
+             << "  [class c" << bc << ": members=" << mem2
+             << " facts=" << facts << "+" << bfacts << "br outA="
+             << outA[bc].size() << " cells=" << cellsOf[bc].size()
+             << " keysAnchored="
+             << (aIt2 == protAnchor.end() ? 0 : aIt2->second)
+             << (protCollapsed.count(bc) ? " COLLAPSED" : "") << "]\n";
+    }
   }
   }
   if (CFLProbeOpsMono && omSites) {

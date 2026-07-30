@@ -326,6 +326,16 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<std::string> CFLProbeSinkAblate(
+  "cfl-probe-sink-ablate",
+  cl::desc("MEASUREMENT-ONLY UNSOUND probe: comma-separated name "
+           "substrings; cells whose class belongs to a matching "
+           "function/global are treated as write-only sinks (all "
+           "cluster joins skipped). Quantifies an instrumentation "
+           "channel's contribution to cell fusion, fact mass and "
+           "answers (task #30 follow-on). NEVER a shipped config"),
+  cl::init(""));
+
 cl::opt<bool> CFLProposeOpsSt(
   "cfl-propose-ops-st",
   cl::desc("PROPOSE (never auto-apply) ST/ALIAS transfer summaries for "
@@ -691,6 +701,10 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeRodataJoins, "--cfl-probe-rodata-joins");
     requireFlowsTo(CFLProbeOriginSplit, "--cfl-probe-origin-split");
     requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
+    if (!CFLProbeSinkAblate.empty() && !CFLFlowsTo) {
+      errs() << "ERROR: --cfl-probe-sink-ablate requires --cfl-flows-to\n";
+      exit(1);
+    }
     if (CFLProposeOpsSt && !CFLOpsPairs) {
       errs() << "ERROR: --cfl-propose-ops-st requires --cfl-ops-pairs "
                 "(proposals derive from the certification walk)\n";

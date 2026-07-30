@@ -41,6 +41,7 @@ extern cl::opt<bool> CFLProbeOriginSplit;
 extern cl::opt<bool> CFLProbeOpsMono;
 extern cl::opt<bool> CFLOpsPairs;
 extern cl::opt<bool> CFLProposeOpsSt;
+extern cl::opt<std::string> CFLProbeSinkAblate;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

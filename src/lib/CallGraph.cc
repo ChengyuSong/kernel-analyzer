@@ -9951,7 +9951,8 @@ bool CallGraphPass::doFinalization(Module *M) {
              << g_sumAlias << " ALIAS, " << g_sumSt << " ST, " << g_sumLd
              << " LD, " << g_sumFreshSub << " FRESHSUB, " << g_sumInvoke
              << " INVOKE (" << g_sumInvokeDyn
-             << " dynamic-fn pooled fallbacks); " << g_sumSkipped
+             << " dynamic-fn pooled fallbacks, " << g_sumInvokeRet
+             << " :ret bindings); " << g_sumSkipped
              << " atom refs skipped (missing arg/node)\n");
     {
       uint64_t uniExtGobj = 0, uniOther = 0;

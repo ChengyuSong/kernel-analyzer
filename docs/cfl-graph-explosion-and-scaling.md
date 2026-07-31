@@ -3044,3 +3044,34 @@ connection-find family summaries (severs the hub's neck channel),
 (2) trace-payload + lockdep sink models gated on the read-back
 confirmer (bounded, already sized), (3) blob-composition diagnostic
 for whatever remains of the hub after (1).
+
+### INVOKE :ret kernel A/B — null result, and an attribution lesson (task #31, 2026-07-31)
+
+Kernel run (flag-on, 4.6 h): answers vs canonical pin = 0 removed /
++59 (the known __SCT__ flap); ProtWriters histogram and fusion count
+BYTE-IDENTICAL; FuncSummary LEDGER INVOKE counts unchanged. Root
+cause, established from the corpus: there are ZERO callers of
+fwnode_connection_find_match in this bclist (usb/typec and usb/roles
+are not built) — the adopted atom never fired. The g_sumInvokeRet
+counter was also missing from the LEDGER print (fixed; :ret bindings
+now reported).
+
+THE LESSON (recorded for the taxonomy): protBlameName names a class by
+its FIRST NAMEABLE MEMBER. For the small tail classes (1-23 merges)
+that is a faithful channel identity; for the 9,767x mega-class it
+merely says "an fwnode instruction is among ~100k members" — a member
+name, NOT a causal channel. The "hub neck = devcon ret pooling"
+hypothesis was built on that misattribution and is REFUTED-AS-TESTED
+(untestable on this corpus; structurally wrong regardless — the blob
+forms before and independently of that public API's returns).
+
+Standing state: the :ret atom itself is validated (t_retinvoke exact)
+and the fwnode adoption is reviewed-sound — kept (live on fuller
+corpora, harmless here: 0/+flap). The causal question — WHAT builds
+the giant class — needs a formation-time instrument, not member
+names: log the early merge events of classes that grow past a size
+threshold (which two classes, via which join key / edge kind, at
+which solve phase). That blob-formation diagnostic is the next block;
+it subsumes the residual-blob item and directly serves the
+provenance-cells design (it names the channels a first-class cell
+design must refuse to unify).

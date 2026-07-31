@@ -3219,3 +3219,28 @@ an assumption but a measured property, with the vmemmap metadata
 plane correctly retained inside the kernel-object stratum. Kernel-
 scale directmap-only run queued after the in-flight combined run
 (whose removals must be read as metadata+content conflated).
+
+### Kernel-scale stratum probe (conflated all-bucket): removals = ONLY the metadata family (task #32, 2026-08-01)
+
+Full-kernel combined ablation (2,045 bridges severed, 4.6 h): census
+scales cleanly (14,798 inttoptr: directmap 839 / vmemmap 505 / mm-fn
+723 / trace 741 / OTHER 11,987; 853 user-copy sites, 727
+_copy_from_user). Blob response: FINAL giant 1,113,666 vs 1,116,454
+(-0.25%) — kernel scale confirms the quotient verdict.
+
+Answer diff vs canonical pin: -620 / +0, and the ENTIRE inventory is
+isolate_movable_page (594) + balloon_page_migrate (26) — the
+movable_operations family dispatching through struct page METADATA
+(the vmemmap bucket the corrected taxonomy keeps inside the
+kernel-object stratum). At full driver scale, NO other family
+appeared: no DMA, scatterlist, or io_uring content crossing
+surfaced even under the conflated cut. (The km-only vmemmap tail —
+futex keys, tracepoint pools — re-derives through redundant paths at
+kernel scale and does not show in answers.)
+
+Implication: the kernel-scale directmap-only run (in flight) is
+expected -0/+0 — the content-separation theorem holding at full
+corpus scale. If confirmed, the paper statement upgrades from km to
+the whole kernel: severing every direct-map page-content bridge
+changes zero call-graph answers; the only phys-adjacent dispatch is
+typed metadata (movable_ops), correctly inside the kernel stratum.

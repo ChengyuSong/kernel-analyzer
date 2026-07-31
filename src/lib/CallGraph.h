@@ -165,6 +165,7 @@ private:
   };
   std::map<const llvm::GlobalVariable *, OpsPairRec> opsPairs;
   void certifyOpsPairs();
+  void runStrataCensus(); // task #32 stratum-bridge census
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF,
                     int skipArg = -1);
   // ops-pairs step 2 (task #30): true when F may be tightened — every

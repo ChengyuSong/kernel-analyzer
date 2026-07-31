@@ -1965,6 +1965,71 @@ public:
 
 static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
 static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
+
+// task #32: stratum classification of an inttoptr's int computation —
+// shared by the census and the --cfl-probe-stratum-ablate probe.
+enum StrataBucket {
+  STRATA_DIRECTMAP,
+  STRATA_VMEMMAP,
+  STRATA_KERNELMAP,
+  STRATA_MMFN,
+  STRATA_TRACE,
+  STRATA_OTHER,
+  STRATA_NBUCK
+};
+static StrataBucket strataClassify(const Value *V0, const Function *F) {
+  SmallVector<const Value *, 16> wl{V0};
+  SmallPtrSet<const Value *, 16> seen;
+  unsigned steps = 0;
+  while (!wl.empty() && steps++ < 64) {
+    const Value *V = wl.pop_back_val();
+    if (!seen.insert(V).second)
+      continue;
+    if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+      uint64_t c = CI->getZExtValue();
+      if (c == 0xffff888000000000ull)
+        return STRATA_DIRECTMAP;
+      if (c == 0xffffea0000000000ull)
+        return STRATA_VMEMMAP;
+      if (c == 0xffffffff80000000ull)
+        return STRATA_KERNELMAP;
+      continue;
+    }
+    if (const auto *LI = dyn_cast<LoadInst>(V)) {
+      const Value *P = LI->getPointerOperand()->stripPointerCasts();
+      if (const auto *GV = dyn_cast<GlobalVariable>(P)) {
+        StringRef n = GV->getName();
+        if (n == "page_offset_base")
+          return STRATA_DIRECTMAP;
+        if (n == "vmemmap_base")
+          return STRATA_VMEMMAP;
+        if (n == "phys_base")
+          return STRATA_KERNELMAP;
+      }
+      continue; // don't walk through memory
+    }
+    if (const auto *I2 = dyn_cast<Instruction>(V)) {
+      if (isa<BinaryOperator>(I2) || isa<CastInst>(I2) ||
+          isa<SelectInst>(I2) || isa<PHINode>(I2))
+        for (const Use &Op : I2->operands())
+          wl.push_back(Op.get());
+    }
+  }
+  StringRef fn = F->getName();
+  if (fn.starts_with("perf_trace_") || fn.contains("trace_event") ||
+      fn.starts_with("__bpf_trace_"))
+    return STRATA_TRACE;
+  if (fn.contains("pte") || fn.contains("pmd") || fn.contains("pud") ||
+      fn.contains("pgd") || fn.contains("pfn") || fn.contains("_page"))
+    return STRATA_MMFN;
+  return STRATA_OTHER;
+}
+static bool strataIsPhys(StrataBucket b) {
+  return b == STRATA_DIRECTMAP || b == STRATA_VMEMMAP ||
+         b == STRATA_KERNELMAP || b == STRATA_MMFN;
+}
+static size_t g_strataAblated = 0; // probe: severed inttoptr bridges
+
 static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
@@ -4601,6 +4666,10 @@ bool CallGraphPass::runFlowsToResolution() {
            << protDemotions << " demotions, " << protCollapses
            << " over-anchored cells collapsed (" << protPooledReaders
            << " readers pooled)\n");
+  if (g_strataAblated)
+    errs() << "StrataAblate: " << g_strataAblated
+           << " phys-stratum inttoptr bridges severed "
+              "[MEASUREMENT-ONLY UNSOUND]\n";
   if (g_sinkAblatedJoins)
     errs() << "SinkAblate: " << g_sinkAblatedJoins
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
@@ -6969,6 +7038,14 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
 }
 
 void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
+  if (!CFLProbeStratumAblate.empty() &&
+      strataIsPhys(strataClassify(I.getOperand(0), I.getFunction()))) {
+    // MEASUREMENT-ONLY UNSOUND: sever the phys-stratum bridge — the
+    // result becomes an opaque identity (no in-edge -> its own root),
+    // as if phys<->virt conversions returned a fresh stratum handle.
+    g_strataAblated++;
+    return;
+  }
   NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
     WARNING("IntToPtr: src node not found: " << I << "\n");
@@ -9806,6 +9883,80 @@ void CallGraphPass::certifyOpsPairs() {
          << g_opsV2NoBody << " no-body/vararg, " << g_opsV2Other
          << " other\n");
 }
+// --cfl-census-strata (task #32): stratum-bridge census. The phys/page
+// stratum re-enters the typed-object universe through inlined
+// phys<->virt conversions — under KASLR these load the NAMED base
+// globals (page_offset_base, vmemmap_base, phys_base), so the bridge
+// sites are robustly detectable. Classify every inttoptr/ptrtoint by
+// a depth-limited backward walk of its int computation, plus census
+// the user-boundary copy interfaces. Measurement only.
+
+void CallGraphPass::runStrataCensus() {
+  static const char *bname[STRATA_NBUCK] = {
+      "directmap", "vmemmap", "kernelmap", "mm-fn", "trace", "OTHER"};
+  size_t i2p[STRATA_NBUCK] = {0}, p2i[STRATA_NBUCK] = {0};
+  std::map<std::string, size_t> bridgeFns[2]; // [0]=phys buckets, [1]=OTHER
+  std::map<std::string, size_t> userCopy;
+  size_t userCopySites = 0;
+  auto classify = [&](const Value *V0, const Function *F) -> StrataBucket {
+    return strataClassify(V0, F);
+  };
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) {
+      if (F.empty())
+        continue;
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (const auto *IP = dyn_cast<IntToPtrInst>(&I)) {
+            StrataBucket b = classify(IP->getOperand(0), &F);
+            i2p[b]++;
+            bridgeFns[b == STRATA_OTHER][F.getName().str()]++;
+          } else if (const auto *PI = dyn_cast<PtrToIntInst>(&I)) {
+            p2i[classify(PI, &F)]++;
+          } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+            const auto *H = dyn_cast<Function>(
+                CB->getCalledOperand()->stripPointerCasts());
+            if (!H)
+              continue;
+            StringRef n = H->getName();
+            if (n == "copy_from_user" || n == "_copy_from_user" ||
+                n == "__copy_from_user" || n == "strncpy_from_user" ||
+                n == "strndup_user" || n == "memdup_user" ||
+                n == "vmemdup_user" || n == "copy_from_user_nofault" ||
+                n == "__copy_from_user_inatomic" || n == "memdup_user_nul") {
+              userCopy[n.str()]++;
+              userCopySites++;
+            }
+          }
+        }
+      }
+    }
+  }
+  size_t ti = 0, tp = 0;
+  for (int b = 0; b < STRATA_NBUCK; b++) {
+    ti += i2p[b];
+    tp += p2i[b];
+  }
+  errs() << "Strata: " << ti << " inttoptr / " << tp
+         << " ptrtoint sites classified\n";
+  for (int b = 0; b < STRATA_NBUCK; b++)
+    errs() << "Strata: bucket " << bname[b] << " inttoptr=" << i2p[b]
+           << " ptrtoint=" << p2i[b] << "\n";
+  for (int h = 0; h < 2; h++) {
+    std::vector<std::pair<size_t, const std::string *>> r;
+    for (auto &kv : bridgeFns[h])
+      r.emplace_back(kv.second, &kv.first);
+    std::sort(r.begin(), r.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(15, r.size()); i++)
+      errs() << "Strata: " << (h ? "OTHER-fn " : "phys-bridge-fn ")
+             << r[i].first << "x " << *r[i].second << "\n";
+  }
+  errs() << "Strata: " << userCopySites << " user-copy sites:";
+  for (auto &kv : userCopy)
+    errs() << " " << kv.first << "=" << kv.second;
+  errs() << "\n";
+}
+
 // An INVOKE-bearing FRESH summary keeps its body analyzed: the body IS
 // the pooled container channel (create-struct stores -> dispatcher) that
 // dynamic-fn registration callsites still feed. Constant-fn callsites
@@ -11726,6 +11877,9 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLOpsPairs && iteration == 0 && M == Ctx->Modules.front().first)
     certifyOpsPairs(); // pair certificates from IR use evidence
+
+  if (CFLCensusStrata && iteration == 0 && M == Ctx->Modules.front().first)
+    runStrataCensus(); // measurement-only, adds no edges
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

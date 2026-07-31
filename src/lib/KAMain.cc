@@ -326,6 +326,25 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<std::string> CFLProbeStratumAblate(
+  "cfl-probe-stratum-ablate",
+  cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "
+           "severs inttoptr bridges classified as phys-stratum "
+           "(directmap/vmemmap/kernelmap/mm-fn) — the result becomes an "
+           "opaque identity root. Measures blob fragmentation and the "
+           "answer delta of stratum separation. NEVER a shipped config"),
+  cl::init(""));
+
+cl::opt<bool> CFLCensusStrata(
+  "cfl-census-strata",
+  cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
+           "inttoptr/ptrtoint by its int computation (page_offset_base/"
+           "vmemmap_base/phys_base loads, direct-map constants, mm/trace "
+           "function context) + census user-copy boundary interfaces — "
+           "the stratum-crossing site inventory for the separation "
+           "theorem. Adds no edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeBlobFormation(
   "cfl-probe-blob-formation",
   cl::desc("MEASUREMENT-ONLY probe (task #31): log merge events while "
@@ -712,6 +731,11 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeOriginSplit, "--cfl-probe-origin-split");
     requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
     requireFlowsTo(CFLProbeBlobFormation, "--cfl-probe-blob-formation");
+    requireFlowsTo(CFLCensusStrata, "--cfl-census-strata");
+    if (!CFLProbeStratumAblate.empty() && !CFLFlowsTo) {
+      errs() << "ERROR: --cfl-probe-stratum-ablate requires --cfl-flows-to\n";
+      exit(1);
+    }
     if (!CFLProbeSinkAblate.empty() && !CFLFlowsTo) {
       errs() << "ERROR: --cfl-probe-sink-ablate requires --cfl-flows-to\n";
       exit(1);

@@ -3154,3 +3154,38 @@ lockdep) remain bounded secondary wins, now folded into #32's stratum
 program (trace payload IS a stratum channel). Attribution discipline
 recorded: name channels at merge time or at pre-solve census — never
 by a finished blob's member.
+
+## Task #32: stratum census + ablate probe, km round (2026-07-31)
+
+--cfl-census-strata (km): 5,556 inttoptr / 3,981 ptrtoint. Phys
+buckets: directmap 260+13, vmemmap 224, mm-fn 419+487 — the bridge-fn
+list IS the blob's mm walkers (unmap_page_range, copy_page_range,
+do_wp_page, gup, migration): the two censuses cross-confirm. Trace
+237+641. OTHER 4,416 decomposes into nameable families: scheduler
+percpu arithmetic (build_sched_domains/select_task_rq_fair),
+___slab_alloc freelist encoding (allocator-INTERNAL — below the FRESH
+boundary), the BPF interpreter, kprobe/uprobe fetch, module loading.
+164 user-copy sites (126 _copy_from_user).
+
+--cfl-probe-stratum-ablate (km, MEASUREMENT-ONLY): severing all 886
+phys-classified inttoptr bridges:
+1. The blob BARELY moves: pre-solve giant 73,614 -> 71,221 (-3%),
+   final 177,574 -> 176,405 (-0.7%). The quotient's skeleton is plain
+   typed-pointer/GEP entanglement, NOT the phys channels — field
+   sensitivity remains the trunk lever, unchallenged.
+2. THE REMOVALS ENUMERATE REAL CROSSINGS: -216/+0 answer pairs, two
+   icalls fully drained, concentrated in isolate_movable_page (50)
+   and balloon_page_migrate (8) — the movable_operations family
+   dispatches THROUGH struct page (page->mapping->mops), a genuine,
+   by-design phys-stratum crossing. The separation theorem is
+   therefore NOT absolute: its exception list is non-empty, small,
+   and mechanically discoverable — exactly the shape a certificate
+   family wants (movable_operations registration is typed and
+   enumerable; a reviewed crossing certificate covers it).
+
+Reading for the paper: the probe operationalizes the separation
+question — removals = crossing inventory; blob response = how much of
+the entanglement is stratum-bridging vs abstraction quotient. km
+answer: crossings are rare and nameable (theorem plausible modulo a
+short exception list), and the blob is quotient-dominated (the
+refinement lever is orthogonal). Kernel-scale probe run queued.

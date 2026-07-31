@@ -3116,3 +3116,41 @@ trunk is the abstraction quotient. The scaling agenda's priority
 follows: field-sensitive encoding for the a/GEP layer is THE lever on
 the giant class — everything else trims its edges. Kernel-scale
 confirmation run in flight (kernel-blobform.log).
+
+### Kernel-scale blob formation: verdict confirmed and sharpened (task #31 CLOSES, 2026-07-31)
+
+Full-kernel probe run (2.45 h): FINAL giant class = 1,116,454 members;
+pre-solve core = 494,457 (44%) — at kernel scale the born-giant
+quotient spans EVERY subsystem's pointer/buffer-arithmetic code: BPF
+JIT (582 member nodes) + interpreter, i915 display/atomic (501/436),
+elf_core_dump (455), ext4_fill_super (371), nvme_tcp_recv_skb (328),
+e1000_xmit_frame (324), plus .str.* rodata literals (the #25 witness
+family, present exactly as the taxonomy predicted).
+
+THE CONTROL CASE: the ZSTD decompressor forms its OWN 5,966-member
+pre-solve class — pure data-plane code CAN stay separated — and then
+fuses in-solve through alloca-keyed joins (751 mass): its I/O buffer
+interface is the bridge. That is the stratum-separation thesis in
+miniature: separation is the natural state; enumerable buffer
+crossings destroy it.
+
+In-solve accretion channels (286 logged events): the long tail of
+payload/buffer keys across subsystems (fwnode endpoint walks 2,965
+mass, ZSTD buffers, ext4_fc_replay, maple-tree mas_wr_modify, kvm hv
+msr, e1000, acpi resource parsing), instrumentation keys (tracepoint
+globals 15k+4.5k via the protection paths, lock_classes 407), and
+rodata strings (.str.8 439, .str.3 295). Feeders are uniformly
+parser/buffer code (n_tty_receive_buf, btf_check_all_metas,
+cgroup1_parse_param, find_module_sections, printk rb).
+
+TASK #31 FINAL VERDICT: (1) the hub trunk is the field-insensitivity
+quotient, born pre-solve (44% of the giant), uniform across
+subsystems — only abstraction refinement (field-keyed GEP edges) or
+stratum modeling can split it; (2) in-solve growth runs through
+enumerable BUFFER/PAYLOAD crossings + instrumentation keys — exactly
+the crossing set task #32's separation theorem must certify; (3) the
+instrumentation sink models (trace payload 27% of km join traffic,
+lockdep) remain bounded secondary wins, now folded into #32's stratum
+program (trace payload IS a stratum channel). Attribution discipline
+recorded: name channels at merge time or at pre-solve census — never
+by a finished blob's member.

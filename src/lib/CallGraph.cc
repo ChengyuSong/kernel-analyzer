@@ -2515,6 +2515,62 @@ bool CallGraphPass::runFlowsToResolution() {
     uint32_t cell = UINT32_MAX;
     llvm::SmallVector<uint32_t, 2> waiting;
   };
+  // --cfl-probe-blob-formation (task #31): formation-time causality
+  // for giant classes. Names captured AT MERGE TIME while both sides
+  // are still small are faithful; the finished blob's member name is
+  // not (the fwnode misattribution). clsSize is always maintained
+  // (one add per merge); events only under the flag.
+  std::vector<uint32_t> clsSize;
+  struct BlobEv {
+    uint32_t keeper, szA, szB;
+    std::string nA, nB;
+    const char *ctx;
+    std::string origin; // join events: whose key coalesced them
+  };
+  std::vector<BlobEv> blobEvents;
+  const char *blobCtx = "?";
+  uint32_t blobCtxOrigin = UINT32_MAX;
+  clsSize.assign(N, 1);
+  for (uint32_t n2 = 0; n2 < N; n2++) {
+    auto cit2 = canonicalClassMembers.find(toOrig[n2]);
+    if (cit2 != canonicalClassMembers.end() && cit2->second.size() > 1)
+      clsSize[n2] = (uint32_t)cit2->second.size();
+  }
+  if (CFLProbeBlobFormation) {
+    std::vector<std::pair<uint32_t, uint32_t>> top0;
+    for (uint32_t n2 = 0; n2 < N; n2++) top0.emplace_back(clsSize[n2], n2);
+    std::partial_sort(top0.begin(), top0.begin() + std::min<size_t>(10, top0.size()),
+                      top0.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(10, top0.size()); i++) {
+      errs() << "BlobForm: INITIAL class size=" << top0[i].first << " c"
+             << top0[i].second << "\n";
+      if (i < 5) {
+        // sample members: WHAT does the pre-solve blob contain?
+        auto mit3 = canonicalClassMembers.find(toOrig[top0[i].second]);
+        if (mit3 != canonicalClassMembers.end()) {
+          size_t shown3 = 0;
+          std::map<std::string, size_t> fnHist;
+          for (NodeIndex m3 : mit3->second) {
+            const Value *V3 = NF.getValueForNode(m3);
+            if (!V3)
+              continue;
+            if (const auto *I3 = dyn_cast<Instruction>(V3))
+              fnHist[I3->getFunction()->getName().str()]++;
+            else if (V3->hasName() && shown3++ < 8)
+              errs() << "BlobForm:   member(global) " << V3->getName()
+                     << "\n";
+          }
+          std::vector<std::pair<size_t, const std::string *>> fh;
+          for (auto &kv : fnHist)
+            fh.emplace_back(kv.second, &kv.first);
+          std::sort(fh.begin(), fh.end(), std::greater<>());
+          for (size_t j = 0; j < std::min<size_t>(10, fh.size()); j++)
+            errs() << "BlobForm:   member-fns " << fh[j].first << "x "
+                   << *fh[j].second << "\n";
+        }
+      }
+    }
+  }
   const bool protOn = CFLOpsPairs && NB == 0 && !opsPairs.empty();
   boost::unordered_flat_set<uint32_t> protRid;
   boost::unordered_flat_set<uint32_t> protCls; // container value classes
@@ -2543,6 +2599,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // exemplar drifts. This is the true composition census of the
   // "connected registration-writer universe".
   std::map<std::string, size_t> protWriterBlame;
+
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size())
       return "<synthetic>";
@@ -3056,6 +3113,18 @@ bool CallGraphPass::runFlowsToResolution() {
         if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s], ctx0);
       }
     wflag[a] |= wflag[b];
+    if (CFLProbeBlobFormation && blobEvents.size() < 60000) {
+      const uint32_t sa = clsSize[a], sb = clsSize[b];
+      // log when both sides are substantial, or a milestone is crossed
+      if (std::min(sa, sb) >= 64 ||
+          (sa + sb >= 4096 && sa < 4096) || (sa + sb >= 65536 && sa < 65536))
+        blobEvents.push_back(
+            {a, sa, sb, protBlameName(a), protBlameName(b), blobCtx,
+             blobCtxOrigin == UINT32_MAX
+                 ? std::string()
+                 : protBlameName(find(rootClassOf[blobCtxOrigin]))});
+    }
+    clsSize[a] += clsSize[b];
     if (protOn) {
       if (protIn[b])
         protIn[a] = 1;
@@ -3227,6 +3296,7 @@ bool CallGraphPass::runFlowsToResolution() {
           if (n2 > PROT_ANCHOR_K && !protCollapsed.count(find(cr)))
             protCollapseQ.push_back(find(cr));
         } else {
+          blobCtx = "prot-writer"; blobCtxOrigin = o;
           ps.cell = merge(ps.cell, cr);
         }
         protWriterMerges++;
@@ -3246,6 +3316,7 @@ bool CallGraphPass::runFlowsToResolution() {
                  protCollapsed.count(find(ps.cell))) {
         // collapsed family: no discrimination left — pooled semantics,
         // and no per-reader plane copies
+        blobCtx = "prot-pooled-reader"; blobCtxOrigin = o;
         ps.cell = merge(find(ps.cell), cr);
         protPooledReaders++;
       } else {
@@ -3275,6 +3346,7 @@ bool CallGraphPass::runFlowsToResolution() {
         transKeyMerges++; // cell anchors other keys: key-clusters coalesce
       }
       const size_t mc0 = mergeCount;
+      blobCtx = "join"; blobCtxOrigin = o;
       it->second = merge(it->second, cell);
       if (mergeCount > mc0) {
         mergesFromJoin++;
@@ -3330,8 +3402,10 @@ bool CallGraphPass::runFlowsToResolution() {
           continue;
         }
         ps.cell = find(ps.cell);
-        if (ps.cell != c)
+        if (ps.cell != c) {
+          blobCtx = "prot-demote"; blobCtxOrigin = o;
           ps.cell = merge(ps.cell, c);
+        }
         protDemotions++;
       }
     }
@@ -3355,6 +3429,7 @@ bool CallGraphPass::runFlowsToResolution() {
         for (uint32_t br : bridgesOf[c]) {
           uint32_t bb = find(br);
           if (bb != c) {
+            blobCtx = "prot-collapse"; blobCtxOrigin = UINT32_MAX;
             uint32_t keeper = merge(c, bb);
             if (!protCollapsed.count(keeper)) {
               protCollapsed.erase(c);
@@ -3431,6 +3506,7 @@ bool CallGraphPass::runFlowsToResolution() {
     size_t collapsed = 0;
     for (auto &scc : sccs) {
       uint32_t rep = find(scc[0]);
+      blobCtx = "a-scc"; blobCtxOrigin = UINT32_MAX;
       for (size_t i = 1; i < scc.size(); i++) {
         rep = merge(rep, scc[i]);
         collapsed++;
@@ -3476,6 +3552,7 @@ bool CallGraphPass::runFlowsToResolution() {
     isRoot.resize(N2, 0);
     if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
     if (!protIn.empty()) protIn.resize(N2, 0);
+    clsSize.resize(N2, 1);
     N = N2;
   };
   auto originBearing = [&](NodeIndex canon) {
@@ -4527,6 +4604,55 @@ bool CallGraphPass::runFlowsToResolution() {
   if (g_sinkAblatedJoins)
     errs() << "SinkAblate: " << g_sinkAblatedJoins
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
+  if (CFLProbeBlobFormation) {
+    uint32_t giant = 0;
+    for (uint32_t n2 = 0; n2 < N; n2++)
+      if (find(n2) == n2 && clsSize[n2] > clsSize[giant])
+        giant = n2;
+    errs() << "BlobForm: FINAL giant class c" << giant
+           << " size=" << clsSize[giant] << " (" << blobEvents.size()
+           << " events logged)\n";
+    std::map<std::string, std::pair<size_t, uint64_t>> byCtx; // n, mass
+    std::map<std::string, uint64_t> byFeeder;                 // absorbed
+    size_t shown = 0, giantEvents = 0;
+    for (const BlobEv &ev : blobEvents) {
+      if (find(ev.keeper) != giant)
+        continue;
+      giantEvents++;
+      std::string ck = ev.ctx;
+      if (!ev.origin.empty())
+        ck += ":" + ev.origin;
+      auto &ce = byCtx[ck];
+      ce.first++;
+      ce.second += std::min(ev.szA, ev.szB);
+      byFeeder[ev.szA < ev.szB ? ev.nA : ev.nB] +=
+          std::min(ev.szA, ev.szB);
+      if (shown < 60) {
+        shown++;
+        errs() << "BlobForm: EV " << ev.ctx
+               << (ev.origin.empty() ? "" : (" origin=" + ev.origin))
+               << " " << ev.szA << "<" << ev.nA.substr(0, 50) << "> + "
+               << ev.szB << "<" << ev.nB.substr(0, 50) << ">\n";
+      }
+    }
+    errs() << "BlobForm: " << giantEvents
+           << " logged events fed the giant; by channel:\n";
+    std::vector<std::pair<uint64_t, const std::string *>> cr2;
+    for (auto &kv : byCtx)
+      cr2.emplace_back(kv.second.second, &kv.first);
+    std::sort(cr2.begin(), cr2.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(25, cr2.size()); i++)
+      errs() << "BlobForm: channel " << *cr2[i].second << " events="
+             << byCtx[*cr2[i].second].first << " absorbed-mass=" << cr2[i].first
+             << "\n";
+    std::vector<std::pair<uint64_t, const std::string *>> fr2;
+    for (auto &kv : byFeeder)
+      fr2.emplace_back(kv.second, &kv.first);
+    std::sort(fr2.begin(), fr2.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(25, fr2.size()); i++)
+      errs() << "BlobForm: feeder " << *fr2[i].second << " absorbed="
+             << fr2[i].first << "\n";
+  }
   if (protOn && !protWriterBlame.empty()) {
     std::vector<std::pair<size_t, const std::string *>> wr2;
     size_t wtot = 0;

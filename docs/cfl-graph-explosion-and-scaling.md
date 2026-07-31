@@ -3075,3 +3075,44 @@ which solve phase). That blob-formation diagnostic is the next block;
 it subsumes the residual-blob item and directly serves the
 provenance-cells design (it names the channels a first-class cell
 design must refuse to unify).
+
+### Blob-formation diagnostic: the giant is BORN giant — and it is the field-insensitivity quotient itself (task #31, km, 2026-07-31)
+
+--cfl-probe-blob-formation: clsSize maintained across all merges;
+merge events logged while both sides are >=64 members (names faithful
+pre-blob); INITIAL (pre-solve) top-10 class sizes with member-function
+histograms; final report reconstructs the giant's growth by channel.
+
+km findings:
+1. THE GIANT IS BORN GIANT: largest PRE-SOLVE class = 73,614 members
+   (final giant 177,574 — 41% exists before any solving; the rest
+   accretes mostly via sub-threshold small joins). The in-solve big
+   events are the already-sized instrumentation channels (63 events /
+   10,572 mass keyed by the perf_trace inttoptr origin; lock_classes,
+   printk_rb_static, ftrace_regex_open, tracing_mark_write).
+2. WHAT THE PRE-SOLVE BLOB IS: member-fn histogram of the 73,614
+   class = handle_mm_fault, copy_page_range, unmap_page_range,
+   compact_zone, vm_map_ram, pcpu_get_vm_areas (mm page-table and
+   vmalloc walkers), ___bpf_prog_run (309 nodes — the BPF interpreter
+   register web), load_module, uprobe_write_opcode, process_fetch_insn
+   + globals (console_sem, alarm_bases...). Generic pointer-
+   manipulation code whose SSA webs are mutually entangled through
+   assignment/GEP cycles.
+3. THE READING: pre-solve canonicalization collapses only EXACT
+   equivalences (a-SCCs, single-callsite actual<->formal dedup) — and
+   under a FIELD-INSENSITIVE abstraction the GEP edge is a plain
+   assignment, so pointer-arithmetic loops (page-table walks, BPF reg
+   file, allocator internals) are genuine V-equal cycles. The blob is
+   not an artifact, a bug, or an instrumentation channel: it is the
+   exact quotient of field-insensitivity over pointer-arithmetic-heavy
+   code. NO summary, sink model, or protection scheme can split an
+   exact quotient — only refining the abstraction can (field-keyed
+   GEP edges break the cycles; that is precisely the per-field memory
+   nodes / shift-grammar plan, and the provenance-cells design).
+
+This closes the causal chain of task #31: instrumentation channels
+(trace payload, lockdep) are real but secondary accelerants; the hub
+trunk is the abstraction quotient. The scaling agenda's priority
+follows: field-sensitive encoding for the a/GEP layer is THE lever on
+the giant class — everything else trims its edges. Kernel-scale
+confirmation run in flight (kernel-blobform.log).

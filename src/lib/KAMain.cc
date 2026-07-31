@@ -326,6 +326,16 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLProbeBlobFormation(
+  "cfl-probe-blob-formation",
+  cl::desc("MEASUREMENT-ONLY probe (task #31): log merge events while "
+           "both classes are still small/nameable (min side >= 64 or "
+           "size milestones), tagged by channel (join key origin, "
+           "a-scc, protection paths). Report reconstructs the final "
+           "giant class's growth history — causal channels instead of "
+           "member names. Adds no edges"),
+  cl::init(false));
+
 cl::opt<std::string> CFLProbeSinkAblate(
   "cfl-probe-sink-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe: comma-separated name "
@@ -701,6 +711,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeRodataJoins, "--cfl-probe-rodata-joins");
     requireFlowsTo(CFLProbeOriginSplit, "--cfl-probe-origin-split");
     requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
+    requireFlowsTo(CFLProbeBlobFormation, "--cfl-probe-blob-formation");
     if (!CFLProbeSinkAblate.empty() && !CFLFlowsTo) {
       errs() << "ERROR: --cfl-probe-sink-ablate requires --cfl-flows-to\n";
       exit(1);

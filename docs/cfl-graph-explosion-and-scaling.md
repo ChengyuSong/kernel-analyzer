@@ -3189,3 +3189,33 @@ the entanglement is stratum-bridging vs abstraction quotient. km
 answer: crossings are rare and nameable (theorem plausible modulo a
 short exception list), and the blob is quotient-dominated (the
 refinement lever is orthogonal). Kernel-scale probe run queued.
+
+### Stratum taxonomy corrected (user review) + bucket decomposition: CONTENT separation holds at km (task #32, 2026-07-31)
+
+USER CORRECTION, now load-bearing: struct page is the kernel's typed
+METADATA for a physical page (it lives in the vmemmap array — a
+kernel-object stratum citizen); the worry stratum is the physical
+page CONTENTS, exposed only through the direct map (__va /
+page_address). The first probe conflated the two.
+
+Bucket-selective ablation at km decomposes the earlier -216:
+- directmap ONLY (255 bridges severed): -0/+0. ZERO answers flow from
+  page contents into indirect-call resolution — the kernel (at km
+  scale) never dispatches through pointers reconstructed from
+  direct-mapped contents; every dispatch flow arrives via typed
+  handles inside the FRESH/global boundaries. THE CONTENT-STRATUM
+  SEPARATION HOLDS EXACTLY at km.
+- vmemmap ONLY (218 severed): -158/+0 — futex key walks, migration/
+  movable_operations, tracepoint pools: TYPED KERNEL-OBJECT flows
+  through page metadata, unsoundly cut by the probe. vmemmap belongs
+  to the kernel-object stratum; the earlier "crossing inventory" was
+  this misclassification (movable_ops via page->mapping is kernel
+  metadata dispatch, not a content crossing).
+
+Paper statement this licenses (km-scale, kernel-scale test pending):
+"severing every direct-map content bridge changes zero call-graph
+answers" — separation of the control plane from page contents is not
+an assumption but a measured property, with the vmemmap metadata
+plane correctly retained inside the kernel-object stratum. Kernel-
+scale directmap-only run queued after the in-flight combined run
+(whose removals must be read as metadata+content conflated).

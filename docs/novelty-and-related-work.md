@@ -185,3 +185,44 @@ that report precision tables without it cannot say WHY numbers
 move. Our probes (witness provenance, no-mint ablation, rule-class
 upper bounds, funnel telemetry) are the instruments that make the
 middle layer measurable.
+
+## Research question (added 2026-07-31, from the task #31 blob verdict):
+## provable control-plane stratum separation for a monolithic kernel
+
+The blob-formation diagnostic showed the giant class is the exact
+field-insensitivity quotient centered on the mm/phys stratum — code
+one level BELOW the heap abstraction that user-space analyses hide
+behind malloc summaries and syscalls. For the kernel that stratum is
+analyzed code, and it re-enters the typed-object universe through
+phys<->virt conversion channels (inlined __va/page_address = inttoptr
++ direct-map arithmetic, i.e. the int-provenance layer).
+
+QUESTION: can we PROVE, for Linux, separation of the control plane —
+that no flow from (a) user-space-controlled memory or (b) raw data
+payloads (pages, packet buffers, trace payloads) reaches indirect-call
+resolution, except through an enumerated, reviewed crossing set
+(allocator interfaces)?
+
+Method (the project's standing discipline, lifted to a theorem):
+partition origins into strata (typed kernel heap = FRESH origins;
+kernel globals; phys/page stratum via int-provenance witnesses
+(PAGE_OFFSET / vmemmap arithmetic, pte channels); user-boundary
+interfaces (copy_from_user targets, user-mapped rings); payload
+buffers) and CHECK on the sound closure that stratum crossings into
+fptr cones are empty modulo the reviewed set. Every violation is a
+finding: imprecision (hub smear -> refinement ladder), a benign
+design fact needing a certificate (io_uring: shared pages but
+opcode-INDEXED dispatch, never user-supplied fptrs), or a real
+user-data-to-control channel (a security result per se).
+
+Positioning: noninterference proofs exist for microkernels (seL4) by
+construction; kernel CFI deployments ASSUME this separation without
+evidence; type-based kernel callgraphs (MLTA/TypeDive) cannot even
+express it. Derived separation certificates with an auditable
+exception list for a monolithic kernel would be a standalone
+contribution, and the precision arc (tasks #28-#31: pair channels,
+soundness fixes, sink channels, stratum boundary) is exactly the
+machinery that makes the theorem checkable: provability and precision
+are the same ladder. First empirical test = the stratum-ablate probe:
+if separation holds on the corpus, segregating phys/user strata
+removes ~0 true pairs while fragmenting the 73k-member quotient class.

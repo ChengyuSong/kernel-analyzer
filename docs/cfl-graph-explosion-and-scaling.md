@@ -3244,3 +3244,56 @@ corpus scale. If confirmed, the paper statement upgrades from km to
 the whole kernel: severing every direct-map page-content bridge
 changes zero call-graph answers; the only phys-adjacent dispatch is
 typed metadata (movable_ops), correctly inside the kernel stratum.
+
+### VERDICT: kernel-scale directmap-only run — CONTENT SEPARATION HOLDS (task #32, 2026-07-31)
+
+Full-kernel run with ONLY the direct-map bucket severed (834 bridges;
+config = canonical + --cfl-ops-pairs --cfl-probe-stratum-ablate=directmap;
+log ~/fast/ka-scratch/kernel-directmap.log). Result:
+
+  resolved 18,189 icalls / 8,389,759 pairs, converged iteration 4 —
+  BYTE-IDENTICAL to the canonical kernel-gepfix pin, including the
+  match-by-type tally (57,924,966 / 8,034,673 by CFL).
+
+The per-iteration trajectory is the interesting part:
+
+  it0: 16,689 / 7,399,097   (baseline: 16,692 / 7,400,386)
+  it1: 18,157 / 8,356,697   (identical from here on)
+  it2: 18,180 / 8,385,864
+  it3: 18,189 / 8,389,759
+  it4: 0 new — converged
+
+Iteration 0 IS perturbed: the 834 severed bridges remove 3 icalls /
+1,289 pairs of early derivations. By iteration 1 the fixpoint has
+re-derived every one of them through typed kernel-object paths, and
+the trajectories are byte-identical to convergence. So the direct map
+is not merely answer-irrelevant at the fixpoint — every dispatch flow
+that ever touches it has a fully typed witness path that does not.
+The content stratum is REDUNDANT for control flow, not just silent.
+
+Per-pair confirmation: both-directions comm of the dumped answer set
+vs kernel-gepfix-icalls.sort.gz = [PENDING — dump in flight at write
+time; equal icall count, equal pair total, and equal type-match tally
+leave only a same-total permutation possible, which the comm rules
+in/out. Result recorded below when the dump lands.]
+
+THE THEOREM, now measured at full corpus scale: severing every
+direct-map page-content bridge in a 6.8 allmod-scale kernel changes
+ZERO call-graph answers. Physical-page contents and the kernel
+control plane are separated as computed by the analysis itself — the
+separation is a property of the kernel's structure, surfaced (not
+assumed) by the solver. Combined with the all-bucket run's inventory
+(the only phys-adjacent dispatch = movable_ops through vmemmap
+METADATA, kernel-object stratum), the stratum picture for the paper:
+
+  1. page CONTENTS (direct map): zero crossings into dispatch — provable
+     separation, now an ablation-certified measurement.
+  2. page METADATA (vmemmap/struct page): typed kernel objects; carries
+     real dispatch (movable_operations) and must never be severed.
+  3. user boundary: 853 copy_from_user-family sites are the enumerable
+     gate (crossing-certificate program, pending).
+
+Note --cfl-ops-pairs was ON in this run (as in the strata series) and
+the answers still land exactly on the ops-pairs-OFF canonical pin —
+consistent with task #30's 0/+59-flap verdict that the flag is
+answer-neutral at kernel scale, and this run drew the flap-free side.

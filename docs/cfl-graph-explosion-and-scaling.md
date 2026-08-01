@@ -3271,11 +3271,12 @@ is not merely answer-irrelevant at the fixpoint — every dispatch flow
 that ever touches it has a fully typed witness path that does not.
 The content stratum is REDUNDANT for control flow, not just silent.
 
-Per-pair confirmation: both-directions comm of the dumped answer set
-vs kernel-gepfix-icalls.sort.gz = [PENDING — dump in flight at write
-time; equal icall count, equal pair total, and equal type-match tally
-leave only a same-total permutation possible, which the comm rules
-in/out. Result recorded below when the dump lands.]
+Per-pair confirmation (dump completed, CGPass 17,386,938 ms = 4.83 h):
+both-directions comm of the dumped answer set vs
+kernel-gepfix-icalls.sort.gz = -0/+0 EXACTLY — all 8,391,950 dump
+lines byte-identical. Not even the __SCT__tp_func_nvme_sq
+declaration-selection flap fired this run. Zero genuine
+content-stratum crossings to inventory.
 
 THE THEOREM, now measured at full corpus scale: severing every
 direct-map page-content bridge in a 6.8 allmod-scale kernel changes

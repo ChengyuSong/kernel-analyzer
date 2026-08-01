@@ -1965,6 +1965,12 @@ public:
 
 static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
 static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
+// --cfl-sink-instr / --cfl-confirm-sinks (task #31/#32 design)
+static size_t g_sinkSealedJoins = 0; // reviewed trace-payload seal
+static size_t g_sinkSitesConfirmed = 0, g_sinkSitesEscaped = 0,
+              g_sinkSitesViolated = 0;
+static bool g_sinkContractChecked = false;
+static std::map<std::string, size_t> g_sinkEscapeSinks; // sink -> sites
 
 // task #32: stratum classification of an inttoptr's int computation —
 // shared by the census and the --cfl-probe-stratum-ablate probe.
@@ -3339,10 +3345,11 @@ bool CallGraphPass::runFlowsToResolution() {
       WARNING("[MEASUREMENT-ONLY UNSOUND] sink-ablate active: "
               << CFLProbeSinkAblate << "\n");
   }
-  boost::unordered_flat_map<uint32_t, char> sinkAblateMemo;
-  auto sinkAblateClass = [&](uint32_t cls) -> bool {
-    auto it2 = sinkAblateMemo.find(cls);
-    if (it2 != sinkAblateMemo.end())
+  auto classMatchesPats = [&](uint32_t cls, ArrayRef<StringRef> pats,
+                              boost::unordered_flat_map<uint32_t, char>
+                                  &memo) -> bool {
+    auto it2 = memo.find(cls);
+    if (it2 != memo.end())
       return it2->second;
     bool hit = false;
     auto nameHit = [&](const Value *V3) {
@@ -3353,7 +3360,7 @@ bool CallGraphPass::runFlowsToResolution() {
         nm = I3->getFunction()->getName();
       else if (V3->hasName())
         nm = V3->getName();
-      for (StringRef p : sinkAblatePats)
+      for (StringRef p : pats)
         if (!nm.empty() && nm.contains(p)) {
           hit = true;
           return;
@@ -3371,8 +3378,22 @@ bool CallGraphPass::runFlowsToResolution() {
           }
       }
     }
-    sinkAblateMemo[cls] = hit;
+    memo[cls] = hit;
     return hit;
+  };
+  boost::unordered_flat_map<uint32_t, char> sinkAblateMemo;
+  auto sinkAblateClass = [&](uint32_t cls) {
+    return classMatchesPats(cls, sinkAblatePats, sinkAblateMemo);
+  };
+  // --cfl-sink-instr (reviewed model, task #31/#32 design): the fixed
+  // trace-payload family — the M4 ablation-matrix cell set, kept
+  // identical for comparability. Sealing is gated on the read-back
+  // contract confirmer (runSinkConfirmer refuses on VIOLATION before
+  // resolution ever runs).
+  static const StringRef sinkSealPatsArr[] = {"ring_buffer_", "trace_buf"};
+  boost::unordered_flat_map<uint32_t, char> sinkSealMemo;
+  auto sinkSealClass = [&](uint32_t cls) {
+    return classMatchesPats(cls, sinkSealPatsArr, sinkSealMemo);
   };
 
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
@@ -3382,6 +3403,10 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
       g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
+      return;
+    }
+    if (CFLSinkInstr && sinkSealClass(find(cell))) {
+      g_sinkSealedJoins++; // reviewed trace-payload seal (contract-gated)
       return;
     }
     if (protOn && s == 0 && protRid.count(o)) {
@@ -4714,9 +4739,6 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "StrataAblate: " << g_strataAblated
            << " phys-stratum inttoptr bridges severed "
               "[MEASUREMENT-ONLY UNSOUND]\n";
-  if (g_sinkAblatedJoins)
-    errs() << "SinkAblate: " << g_sinkAblatedJoins
-           << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLProbeBlobFormation) {
     uint32_t giant = 0;
     for (uint32_t n2 = 0; n2 < N; n2++)
@@ -4820,6 +4842,20 @@ bool CallGraphPass::runFlowsToResolution() {
            << " get_user asm memory closures severed ("
            << g_userCopyDerefsSevered
            << " raw-ptr derefs) [MEASUREMENT-ONLY UNSOUND]\n";
+  // NOTE probe/model LEDGER prints must live HERE, after the protOn
+  // block closes — anything inside it only prints when protection is
+  // active (the ops-pairs config), which the canonical config is not.
+  if (g_sinkAblatedJoins)
+    errs() << "SinkAblate: " << g_sinkAblatedJoins
+           << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
+  if (CFLSinkInstr) {
+    assert(g_sinkContractChecked &&
+           "sink seal ran without the read-back contract check");
+    errs() << "SinkInstr: " << g_sinkSealedJoins
+           << " joins sealed at trace-payload cells (contract: "
+           << g_sinkSitesConfirmed << " confirmed / " << g_sinkSitesEscaped
+           << " escape / " << g_sinkSitesViolated << " violation)\n";
+  }
   if (CFLCertUserCopy) {
     // Match cert rids by their MINTED class (pre-merge): post-merge
     // matching would blame every foreign root whose class later merged
@@ -9104,6 +9140,183 @@ void CallGraphPass::runFieldChannelCensus() {
 static size_t g_invConfirmed = 0, g_invConfirmedPass = 0, g_invRejEscape = 0,
               g_invRejPtrRet = 0, g_invRejNoBinding = 0, g_invRejShape = 0,
               g_invConfirmedChain = 0;
+// Trace-payload read-back contract confirmer (task #32, design recorded
+// at task #31 close). The sink model (--cfl-sink-instr) seals cluster
+// joins at trace-payload cells — sound ONLY if nothing loaded back out
+// of a payload cell ever feeds an indirect call. This pass machine-
+// checks that contract at every payload accessor callsite:
+//   ring_buffer_event_data — THE payload pointer accessor, both the
+//     write path (trace_event_buffer_reserve fills fbuffer->entry) and
+//     the read path (trace output iterators);
+//   perf_trace_buf_alloc — the perf-side raw_data payload buffer.
+// The returned pointer is walked as PTR (payload address: GEP/cast
+// chains, phi/select); loads through PTR yield VAL (payload content),
+// walked through casts/phis/arithmetic — with inttoptr(VAL) laundering
+// re-entering as PTR. Verdicts per site:
+//   VIOLATION — a tracked value IS an indirect call's called operand.
+//     Sealing REFUSES to run (hard error), never silently degrades.
+//   ESCAPE — the value leaves the local walk (pointer stored, e.g.
+//     fbuffer->entry / iter->ent; passed to a non-intrinsic callee;
+//     returned; walk cap). Inventoried by sink name for the documented
+//     review — the contract holds for these by review, not by machine.
+//   CONFIRMED — every use is a write into the payload, comparison,
+//     GEP index / branch condition (the certified benign control
+//     channel: data-indexed selection, soundly over-approximated by
+//     including all table entries), or other local non-dispatch use.
+void CallGraphPass::runSinkConfirmer() {
+  auto isPayloadAccessor = [](StringRef n) {
+    return n == "ring_buffer_event_data" || n == "perf_trace_buf_alloc";
+  };
+  enum Kind : char { PTR, VAL };
+  size_t sites = 0;
+  std::vector<std::string> violations;
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) {
+      if (F.empty())
+        continue;
+      for (Instruction &I : instructions(F)) {
+        const auto *Root = dyn_cast<CallBase>(&I);
+        if (!Root || Root->isInlineAsm())
+          continue;
+        const auto *AF = dyn_cast<Function>(
+            Root->getCalledOperand()->stripPointerCasts());
+        if (!AF || !isPayloadAccessor(AF->getName()))
+          continue;
+        sites++;
+        // Bounded forward walk from the payload pointer.
+        SmallVector<std::pair<const Value *, Kind>, 32> wl;
+        SmallPtrSet<const Value *, 32> seenP, seenV;
+        std::set<std::string> escapes;
+        bool violated = false;
+        wl.push_back({Root, PTR});
+        seenP.insert(Root);
+        size_t steps = 0;
+        while (!wl.empty()) {
+          if (++steps > 768) { // explicit cap, never silent
+            escapes.insert("walk-cap");
+            break;
+          }
+          auto [V, k] = wl.pop_back_val();
+          auto push = [&](const Value *N2, Kind nk) {
+            auto &seen = nk == PTR ? seenP : seenV;
+            if (seen.insert(N2).second)
+              wl.push_back({N2, nk});
+          };
+          for (const User *U : V->users()) {
+            if (const auto *CB = dyn_cast<CallBase>(U)) {
+              if (CB->getCalledOperand()->stripPointerCasts() == V) {
+                violated = true; // payload-derived value dispatched
+                violations.push_back(
+                    (F.getName() + " (" + AF->getName() + " site)").str());
+                continue;
+              }
+              const auto *CF2 = dyn_cast<Function>(
+                  CB->getCalledOperand()->stripPointerCasts());
+              if (CF2 && CF2->isIntrinsic()) {
+                // mem-write INTO the payload is the sink's purpose;
+                // memcpy OUT of it exports the bytes — review item.
+                if (const auto *MT = dyn_cast<MemTransferInst>(CB)) {
+                  if (MT->getRawSource()->stripPointerCasts() == V)
+                    escapes.insert("memcpy-out");
+                  continue;
+                }
+                continue; // memset/dbg/lifetime/assume: benign
+              }
+              escapes.insert(CF2 ? CF2->getName().str()
+                                 : std::string("<indirect-arg>"));
+              continue;
+            }
+            if (const auto *LI = dyn_cast<LoadInst>(U)) {
+              if (k == PTR || LI->getPointerOperand() == V)
+                push(LI, VAL); // content read-back (or read through a
+                               // content-derived pointer: conservative)
+              continue;
+            }
+            if (const auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getValueOperand() == V)
+                escapes.insert(k == PTR ? "ptr-stored" : "val-stored");
+              continue; // store INTO tracked memory: benign write
+            }
+            if (isa<IntToPtrInst>(U)) {
+              push(U, PTR); // laundering: content becomes a pointer
+              continue;
+            }
+            if (const auto *G2 = dyn_cast<GEPOperator>(U)) {
+              if (G2->getPointerOperand() == V)
+                push(U, k); // address arithmetic keeps the kind
+              // V as INDEX: data-selected offset — certified benign
+              // control channel (all table entries stay included)
+              continue;
+            }
+            if (isa<CastInst>(U)) {
+              push(U, k);
+              continue;
+            }
+            if (isa<PHINode>(U) || isa<SelectInst>(U)) {
+              push(U, k);
+              continue;
+            }
+            if (isa<BinaryOperator>(U)) {
+              push(U, VAL); // arithmetic on content/address stays data
+              continue;
+            }
+            if (isa<ICmpInst>(U) || isa<BranchInst>(U) ||
+                isa<SwitchInst>(U))
+              continue; // compare/branch: certified benign channel
+            if (isa<ReturnInst>(U)) {
+              escapes.insert(k == PTR ? "ret-ptr" : "ret-val");
+              continue;
+            }
+            if (const auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
+              if (RMW->getPointerOperand() == V)
+                push(U, VAL); // old value read back
+              else
+                escapes.insert("atomic-val");
+              continue;
+            }
+            escapes.insert(std::string("use:") +
+                           (isa<Instruction>(U)
+                                ? cast<Instruction>(U)->getOpcodeName()
+                                : "constexpr"));
+          }
+        }
+        if (violated)
+          g_sinkSitesViolated++;
+        else if (!escapes.empty()) {
+          g_sinkSitesEscaped++;
+          for (const std::string &e : escapes)
+            g_sinkEscapeSinks[e]++;
+        } else {
+          g_sinkSitesConfirmed++;
+        }
+      }
+    }
+  }
+  g_sinkContractChecked = true;
+  errs() << "SinkConfirm: " << sites << " payload accessor sites: "
+         << g_sinkSitesConfirmed << " CONFIRMED, " << g_sinkSitesEscaped
+         << " ESCAPE, " << g_sinkSitesViolated << " VIOLATION\n";
+  size_t eShown = 0;
+  for (auto &kv : g_sinkEscapeSinks) {
+    if (eShown++ >= 40) {
+      errs() << "SinkConfirm: ... " << (g_sinkEscapeSinks.size() - 40)
+             << " more escape sinks\n";
+      break;
+    }
+    errs() << "SinkConfirm: escape " << kv.first << " at " << kv.second
+           << " sites\n";
+  }
+  for (size_t i = 0; i < std::min<size_t>(20, violations.size()); i++)
+    errs() << "SinkConfirm: VIOLATION in " << violations[i] << "\n";
+  if (CFLSinkInstr && g_sinkSitesViolated) {
+    errs() << "ERROR: --cfl-sink-instr read-back contract VIOLATED at "
+           << g_sinkSitesViolated
+           << " sites — a payload-derived value feeds an indirect call; "
+              "refusing to seal (see SinkConfirm: VIOLATION lines)\n";
+    exit(1);
+  }
+}
+
 void CallGraphPass::confirmInvokeSummaries() {
   // Benign transitive use of a pointer chain rooted at a formal:
   // address arithmetic and non-pointer reads/writes lose no pointer
@@ -12061,6 +12274,10 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLCensusStrata && iteration == 0 && M == Ctx->Modules.front().first)
     runStrataCensus(); // measurement-only, adds no edges
+
+  if ((CFLConfirmSinks || CFLSinkInstr) && iteration == 0 &&
+      M == Ctx->Modules.front().first)
+    runSinkConfirmer(); // contract gate BEFORE any sealing can happen
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

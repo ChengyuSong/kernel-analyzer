@@ -357,6 +357,26 @@ cl::opt<bool> CFLCertUserCopy(
            "its answer set against pins"),
   cl::init(false));
 
+cl::opt<bool> CFLConfirmSinks(
+  "cfl-confirm-sinks",
+  cl::desc("MEASUREMENT-ONLY confirmer (task #32): machine-check the "
+           "trace-payload read-back contract — walk every payload "
+           "accessor callsite (ring_buffer_event_data, "
+           "perf_trace_buf_alloc) and verify no value loaded back out "
+           "of a payload cell feeds an indirect call. Reports "
+           "CONFIRMED/ESCAPE/VIOLATION per site; adds no edges"),
+  cl::init(false));
+
+cl::opt<bool> CFLSinkInstr(
+  "cfl-sink-instr",
+  cl::desc("Reviewed sink model (task #31/#32 design): seal cluster "
+           "joins at trace-payload cells (ring_buffer_/trace_buf "
+           "family) — stores keep their own cell, joins to stored "
+           "objects' keys are suppressed. Auto-runs the read-back "
+           "contract confirmer and REFUSES to run on any VIOLATION; "
+           "ESCAPE sites are inventoried for the documented review"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -756,6 +776,8 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLCensusStrata, "--cfl-census-strata");
     requireFlowsTo(CFLProbeUserCopyAblate, "--cfl-probe-usercopy-ablate");
     requireFlowsTo(CFLCertUserCopy, "--cfl-cert-usercopy");
+    requireFlowsTo(CFLConfirmSinks, "--cfl-confirm-sinks");
+    requireFlowsTo(CFLSinkInstr, "--cfl-sink-instr");
     if (CFLCertUserCopy && CFLProbeUserCopyAblate) {
       errs() << "ERROR: --cfl-cert-usercopy tags the very edges "
                 "--cfl-probe-usercopy-ablate severs; the flags are "

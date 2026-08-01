@@ -3402,3 +3402,56 @@ and their apparent reach in the closure is an artifact of the
 field-insensitivity quotient (certificate, 62/62 absorbed) — the
 separation theorem holds at the answer level, and naming the residual
 crossing set is exactly the field-sensitivity frontier.
+
+### Trace-payload sink model SHIPPED: --cfl-sink-instr + read-back contract confirmer (task #32, 2026-08-01)
+
+The reviewed SINK family from the task #31 design conclusion is now an
+implemented, contract-gated model — the first of the #31/#32 channel
+models to graduate from ablation preview to shipped flag.
+
+--cfl-confirm-sinks (measurement, standalone): machine-checks the
+read-back contract at every payload accessor callsite
+(ring_buffer_event_data, perf_trace_buf_alloc). The returned pointer
+is walked as PTR (GEP/cast/phi chains); loads yield VAL (payload
+content) walked through casts/arithmetic, with inttoptr(VAL)
+laundering re-entering as PTR. Called-operand use = VIOLATION;
+leaving the local walk = named ESCAPE; GEP-index/branch-condition use
+is benign BY THE THEOREM (data-indexed selection: the certified
+control channel, soundly over-approximated). Explicit walk cap
+escapes, never silent.
+
+--cfl-sink-instr (the model): seals cluster joins at the M4
+trace-payload cell family {ring_buffer_, trace_buf} — stores keep
+their own cell, joins to stored objects' keys are suppressed.
+Auto-runs the confirmer and REFUSES (hard error) on any VIOLATION.
+Lockdep sealing deliberately deferred: production kernels drop
+CONFIG_LOCKDEP entirely, and its -110-answer M3 signature deserves
+its own compare-only contract before sealing.
+
+km verdict (kernel/-only subset, both runs current binary):
+
+  contract: 171 accessor sites = 21 CONFIRMED / 150 ESCAPE /
+    0 VIOLATION. The escape histogram is the review inventory, and it
+    tells one story: 127/150 are perf_trace_run_bpf_submit — the
+    payload handed to BPF programs as the ctx ARGUMENT (the
+    already-certified BPF crossing family: kernel FRESH code pointer,
+    payload-determined contents), never as a called operand. The rest:
+    strcpy/strscpy (27, payload as dest = write-into-sink, not
+    intrinsic so not auto-benign), filter/discard predicates (10,
+    compare-only by design), fetch/print helpers, 2 ptr-stores
+    (fbuffer->entry / iter->ent), 3 indirect-arg, 2 memcpy-out.
+  answers: 92,874 vs 95,318 baseline pairs = -2,444 / +0 — pure
+    removals, the M4/M5 smear family (relay_buf_fault,
+    perf_mmap_fault, generic_delete_inode, ... the laundered fn-pool
+    targets). 22.4M joins sealed (final iteration; M4 measured 35.6M
+    under the ops-pairs config).
+
+LEDGER-placement lesson RE-learned and now commented in the code:
+probe/model reports in runFlowsToResolution must sit AFTER the
+if (protOn) block — SinkAblate had been inside it since task #31 and
+only ever printed because those runs carried --cfl-ops-pairs; both
+sink prints now live at the unconditional site.
+
+Kernel-scale identity run (canonical + --cfl-sink-instr, full bclist)
+is the remaining acceptance gate before any canonical-config adoption
+discussion.

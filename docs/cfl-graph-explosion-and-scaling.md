@@ -3355,3 +3355,50 @@ user boundary DONE -0/+0 (mod flap); page METADATA (vmemmap) carries
 real dispatch and must never be severed. Remaining task #32 frontier:
 crossing certificates for the 853-site copy_from_user gate inventory
 (the census side), field-keyed GEP encoding.
+
+### Usercopy crossing certificate: quotient-drowned at kernel scale — certifiability is gated on field sensitivity (task #32, 2026-08-01)
+
+The positive-direction instrument (--cfl-cert-usercopy, commit
+4b33247): tag the same two ingress shapes the ablation severs with
+synthetic origin objects U (assigned into the asm's raw-ptr cells),
+force-mint them past the bidi/lazy oracles (letting the cone oracle
+skip U would pre-decide the question), and inventory which icall fptr
+classes carry a U root after solve. Cert rids are matched by MINTED
+class — post-merge matching blamed every foreign root whose class
+later merged with U (340 false roots from 8 sites on the 2-file
+corpus). U never adds a callee (not a function) but its roots add
+cluster joins: cert answer sets are never pin-comparable, flag is
+mutually exclusive with the ablate probe.
+
+Kernel run (kernel-usercert.log, 2.17 h, no icall dump): 3 copy-body
++ 329 get_user sites -> 62 live cert roots, and the verdict is
+unambiguous in its SHAPE:
+
+  16,195 / 18,638 icall fptr operands (87%) test positive — but all
+  62 U classes merged into bigger classes, and every per-site count
+  is an exact multiple of 16,195 (k x 16,195 for labels covering k
+  asm sites). One membership set, shared by every root: ALL 62 U
+  classes were absorbed into the same giant class — the 1.1M-member
+  field-insensitivity blob (task #31) — and "user bytes reach X" is
+  quotient membership, not flow (sample: hsw_fdi_disable
+  <- kvm_arch_vcpu_ioctl::get_user, i915 display code "reached" by
+  KVM ioctl bytes).
+
+Two real results despite the drowning:
+
+  1. 2,443 icall sites (13%) are certified clean EVEN AT the coarsest
+     quotient: their operand classes never meet user bytes no matter
+     how much the blob smears. A nontrivial unconditional floor.
+  2. The certificate program is now provably GATED on field
+     sensitivity: the ablation (edge-level, exact) proves the theorem
+     -0/+0, but a nameable crossing INVENTORY at class granularity is
+     information-free while the quotient conflates U with the blob.
+     Field-keyed GEP encoding is prerequisite for certifiABILITY, not
+     just precision — a sharper form of the #31 verdict.
+
+Ablation + certificate together, the paper statement: user-copied
+bytes are REMOVABLE from the call-graph derivation (ablation, exact)
+and their apparent reach in the closure is an artifact of the
+field-insensitivity quotient (certificate, 62/62 absorbed) — the
+separation theorem holds at the answer level, and naming the residual
+crossing set is exactly the field-sensitivity frontier.

@@ -3298,3 +3298,60 @@ Note --cfl-ops-pairs was ON in this run (as in the strata series) and
 the answers still land exactly on the ops-pairs-OFF canonical pin —
 consistent with task #30's 0/+59-flap verdict that the flag is
 answer-neutral at kernel scale, and this run drew the flap-free side.
+
+### VERDICT: kernel-scale user-copy ablation — USER-BOUNDARY SEPARATION HOLDS (task #32, 2026-08-01)
+
+The user-boundary half of the separation theorem, by the same ablation
+methodology as the directmap run: sever the memory edges through which
+user-space BYTES enter kernel memory, re-solve, diff. New probe flag
+--cfl-probe-usercopy-ablate (MEASUREMENT-ONLY UNSOUND) cuts the task
+#23 inline-asm raw-ptr memory closure (handleInlineAsm section 2b) at
+exactly two shapes:
+
+  1. copy-body: the `rep movs ~{memory}`-clobber asm inside the IR
+     bodies of the from-user copy primitives (_copy_from_user family,
+     gated by enclosing-function name) — the SOLE source of the
+     *dest <- *src pointer-memory edges under the #23 model.
+  2. caller-side get_user: `call __get_user_${N:P}` asm (asm-text
+     gated, matches __get_user only — egress __put_user untouched) —
+     the register-output load through the user pointer.
+
+What is NOT cut: actual->formal argument edges (pointer-identity
+dataflow, not memory content), __put_user/copy_to_user egress, and
+every shared helper's asm. The cut is the CONTENT channel only:
+after it, a user pointer still flows anywhere it flowed before, but
+the bytes it points AT no longer land in any kernel cell.
+
+Kernel-scale sever inventory: 3 copy-body + 329 get_user asm memory
+closures (334 raw-ptr derefs). Config = canonical pin config exactly
+(--cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
+--func-summaries --cfl-dump-icalls, ops-pairs OFF — unlike the
+directmap run, NO extra flag differs from the pin, so the severed
+edges are the sole variable). Log ~/fast/ka-scratch/kernel-usercopy.log,
+CGPass 15,353,234 ms (4.27 h).
+
+RESULT: both-directions comm vs kernel-gepfix-icalls.sort.gz =
+  -0 / +59, and all 59 additions are -> __SCT__tp_func_nvme_sq — the
+  documented definition-less trampoline declaration-selection flap
+  (this run drew the flap side; the directmap run drew the flap-free
+  side of the same coin). Distinct dump sites 18,191 = IDENTICAL set
+  both runs (comm empty both directions on the site projection).
+  Zero removals: severing the user-byte channel takes NOTHING away
+  from the call graph — no dispatch pair anywhere in the 8.39M-pair
+  answer set depends on memory written by copy_from_user/get_user.
+
+THE THEOREM, user half: bytes copied from user space never become
+control flow. Every function pointer the kernel ever dispatches
+through has a witness path entirely inside the kernel-object stratum;
+the user boundary contributes pointer IDENTITIES (the buffers being
+filled) but never pointer CONTENTS that reach an indirect call. Like
+the directmap half this is surfaced by the solver, not assumed — and
+it is exactly the property CFI/signal-handling folklore asserts
+(usermode values must never be branch targets), here derived as a
+whole-kernel static measurement.
+
+Stratum picture status: content stratum (direct map) DONE -0/+0;
+user boundary DONE -0/+0 (mod flap); page METADATA (vmemmap) carries
+real dispatch and must never be severed. Remaining task #32 frontier:
+crossing certificates for the 853-site copy_from_user gate inventory
+(the census side), field-keyed GEP encoding.

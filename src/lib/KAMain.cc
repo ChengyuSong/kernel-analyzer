@@ -335,6 +335,16 @@ cl::opt<std::string> CFLProbeStratumAblate(
            "answer delta of stratum separation. NEVER a shipped config"),
   cl::init(""));
 
+cl::opt<bool> CFLProbeUserCopyAblate(
+  "cfl-probe-usercopy-ablate",
+  cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): sever the memory "
+           "edges introduced by the from-user copy primitives "
+           "(_copy_from_user et al.) — the uaccess `~{memory}`-clobber "
+           "asm raw-ptr closure that carries user bytes into the "
+           "destination buffer. Tests whether user-copied memory affects "
+           "the indirect-call graph (expect -0/+0). NEVER a shipped config"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -732,6 +742,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
     requireFlowsTo(CFLProbeBlobFormation, "--cfl-probe-blob-formation");
     requireFlowsTo(CFLCensusStrata, "--cfl-census-strata");
+    requireFlowsTo(CFLProbeUserCopyAblate, "--cfl-probe-usercopy-ablate");
     if (!CFLProbeStratumAblate.empty() && !CFLFlowsTo) {
       errs() << "ERROR: --cfl-probe-stratum-ablate requires --cfl-flows-to\n";
       exit(1);

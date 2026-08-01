@@ -2030,6 +2030,28 @@ static bool strataIsPhys(StrataBucket b) {
 }
 static size_t g_strataAblated = 0; // probe: severed inttoptr bridges
 
+// --cfl-probe-usercopy-ablate (task #32): user ingress reaches kernel
+// memory through two uaccess shapes, both severed here.
+//   (1) bulk copies (_copy_from_user et al.): the body's rep-movsb
+//       `~{memory}`-clobber asm is the SOLE source of pointer-memory
+//       edges (task #23 raw-ptr closure aliases *dest<->*src and stores
+//       the pointer inputs into those cells). Gated by the enclosing
+//       primitive name so egress (copy_to_user) and the direction-
+//       agnostic shared movsb helpers are left intact.
+//   (2) scalar reads (get_user): the value materializes at the CALLER's
+//       `call __get_user_N` asm as a register output loaded through the
+//       user pointer (the result aggregate can be ptr-typed). The
+//       enclosing fn is arbitrary, so this shape is gated by the asm
+//       text mentioning __get_user ("__put_user"/egress won't match).
+static bool isUserCopyFromFn(llvm::StringRef n) {
+  return n == "copy_from_user" || n == "_copy_from_user" ||
+         n == "__copy_from_user" || n == "__copy_from_user_inatomic" ||
+         n == "copy_from_user_nofault" || n == "strncpy_from_user";
+}
+static size_t g_userCopyAsmSevered = 0;   // from-user copy-body asm sites cut
+static size_t g_userGetAsmSevered = 0;    // caller-side get_user asm sites cut
+static size_t g_userCopyDerefsSevered = 0; // raw-ptr memory derefs suppressed
+
 static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
@@ -4770,6 +4792,12 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
   }
+  if (CFLProbeUserCopyAblate)
+    errs() << "UserCopyAblate: " << g_userCopyAsmSevered
+           << " copy-body + " << g_userGetAsmSevered
+           << " get_user asm memory closures severed ("
+           << g_userCopyDerefsSevered
+           << " raw-ptr derefs) [MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLProbeOpsMono && omSites) {
     errs() << "OpsMono: " << omSites << " two-level dispatch sites: "
            << omMono << " mono (targets inside ONE ops global), " << omNear
@@ -5886,6 +5914,25 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
       if (pNode == AndersNodeFactory::InvalidIndex)
         continue;
       rawPtrDerefs.push_back(getRepDerefNode(pNode));
+    }
+    // MEASUREMENT-ONLY UNSOUND (task #32 usercopy ablation): if this asm
+    // is a from-user uaccess memory access — a bulk-copy body (rep movsb)
+    // or a caller-side `call __get_user_N` scalar read — drop its entire
+    // raw-ptr memory closure: the load/store/alias edges that carry user
+    // bytes into (and around) the destination. The separation test then
+    // checks the indirect-call graph is unchanged.
+    if (CFLProbeUserCopyAblate && !rawPtrDerefs.empty()) {
+      const bool copyBody =
+          CS.getFunction() && isUserCopyFromFn(CS.getFunction()->getName());
+      const bool getUser = StringRef(IA->getAsmString()).contains("__get_user");
+      if (copyBody || getUser) {
+        if (copyBody)
+          g_userCopyAsmSevered++;
+        else
+          g_userGetAsmSevered++;
+        g_userCopyDerefsSevered += rawPtrDerefs.size();
+        rawPtrDerefs.clear();
+      }
     }
     for (NodeIndex derefP : rawPtrDerefs) {
       if (resPtrCapable) {

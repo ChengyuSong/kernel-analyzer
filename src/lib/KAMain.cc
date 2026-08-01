@@ -345,6 +345,18 @@ cl::opt<bool> CFLProbeUserCopyAblate(
            "the indirect-call graph (expect -0/+0). NEVER a shipped config"),
   cl::init(false));
 
+cl::opt<bool> CFLCertUserCopy(
+  "cfl-cert-usercopy",
+  cl::desc("MEASUREMENT-ONLY certificate (task #32): tag the from-user "
+           "memory ingress sites (the same copy-body + __get_user asm "
+           "closures the ablation probe severs) with synthetic origin "
+           "roots and report which indirect-call operands their bytes "
+           "reach in the flows-to closure — the positive-direction "
+           "crossing inventory (expect empty modulo certified crossings). "
+           "Adds measurement roots; answers may smear — never compare "
+           "its answer set against pins"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -743,6 +755,13 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeBlobFormation, "--cfl-probe-blob-formation");
     requireFlowsTo(CFLCensusStrata, "--cfl-census-strata");
     requireFlowsTo(CFLProbeUserCopyAblate, "--cfl-probe-usercopy-ablate");
+    requireFlowsTo(CFLCertUserCopy, "--cfl-cert-usercopy");
+    if (CFLCertUserCopy && CFLProbeUserCopyAblate) {
+      errs() << "ERROR: --cfl-cert-usercopy tags the very edges "
+                "--cfl-probe-usercopy-ablate severs; the flags are "
+                "mutually exclusive\n";
+      exit(1);
+    }
     if (!CFLProbeStratumAblate.empty() && !CFLFlowsTo) {
       errs() << "ERROR: --cfl-probe-stratum-ablate requires --cfl-flows-to\n";
       exit(1);

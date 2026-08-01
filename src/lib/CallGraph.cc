@@ -2052,6 +2052,18 @@ static size_t g_userCopyAsmSevered = 0;   // from-user copy-body asm sites cut
 static size_t g_userGetAsmSevered = 0;    // caller-side get_user asm sites cut
 static size_t g_userCopyDerefsSevered = 0; // raw-ptr memory derefs suppressed
 
+// --cfl-cert-usercopy (task #32): the positive-direction check. At the
+// SAME two ingress shapes the ablation severs, mint a synthetic origin
+// object U and assign it into the asm's raw-ptr memory cells — "user
+// bytes" become a trackable root. After solve, any icall fptr class
+// whose fact planes carry a U root is a stratum crossing to inventory
+// (U is not a function, so it never adds a callee — but the extra
+// roots can add cluster joins, so this config's ANSWERS are not
+// pin-comparable).
+static std::vector<std::pair<NodeIndex, std::string>>
+    g_userCertObjs; // (U object node, site label)
+static size_t g_userCertCopySites = 0, g_userCertGetSites = 0;
+
 static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
@@ -2519,12 +2531,22 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   size_t bidiPrunable = 0;
+  // usercopy-certificate classes must be minted unconditionally: letting
+  // the bidi/lazy oracles skip them would pre-decide the very question
+  // the certificate asks (does this origin reach an fptr operand?).
+  boost::unordered_flat_set<uint32_t> certCls;
+  if (CFLCertUserCopy)
+    for (auto &p : g_userCertObjs) {
+      auto dIt = toDense.find(getCanonicalNode(p.first));
+      if (dIt != toDense.end()) certCls.insert(dIt->second);
+    }
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
     auto fit = funcOfCanon.find(toOrig[n]);
     const bool isFunc = fit != funcOfCanon.end();
-    if (!hasIn[n] || isFunc || hasOrigin[n]) {
-      if (!bidiMarked.empty() && !isFunc && !bidiMarked[n]) {
+    const bool isCert = !certCls.empty() && certCls.count(n);
+    if (!hasIn[n] || isFunc || hasOrigin[n] || isCert) {
+      if (!bidiMarked.empty() && !isFunc && !isCert && !bidiMarked[n]) {
         // Outside the fptr cone: this origin's facts can key joins only
         // at cells inside its partition's d/f closure, which never
         // meets an fptr partition — it cannot influence any answer.
@@ -2533,7 +2555,7 @@ bool CallGraphPass::runFlowsToResolution() {
         bidiPrunable++;
         continue;
       }
-      if (!lazyA.empty() && !isFunc && !lazyA[n]) {
+      if (!lazyA.empty() && !isFunc && !isCert && !lazyA[n]) {
         // Not backward-reachable from any answer on the initial
         // quotient: defer — the post-drain expansion re-checks on the
         // live quotient and mints the moment the class enters A.
@@ -4798,6 +4820,77 @@ bool CallGraphPass::runFlowsToResolution() {
            << " get_user asm memory closures severed ("
            << g_userCopyDerefsSevered
            << " raw-ptr derefs) [MEASUREMENT-ONLY UNSOUND]\n";
+  if (CFLCertUserCopy) {
+    // Match cert rids by their MINTED class (pre-merge): post-merge
+    // matching would blame every foreign root whose class later merged
+    // with a U class. rootClassOf holds the class at mint time, and
+    // the U objects are minted before any solve-time union.
+    boost::unordered_flat_map<uint32_t, std::vector<const std::string *>>
+        certMintSites; // minted dense class -> site labels
+    for (auto &p : g_userCertObjs) {
+      auto dIt = toDense.find(getCanonicalNode(p.first));
+      if (dIt == toDense.end()) continue;
+      certMintSites[dIt->second].push_back(&p.second);
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> certRids; // (rid, mint cls)
+    size_t certMergedAway = 0;
+    for (uint32_t rid = 0; rid < nextRoot; rid++) {
+      auto cIt = certMintSites.find(rootClassOf[rid]);
+      if (cIt == certMintSites.end()) continue;
+      certRids.emplace_back(rid, rootClassOf[rid]);
+      // A U class merged into a bigger class means its rid now rides
+      // that class's whole downstream — inventory becomes coarse.
+      if (find(rootClassOf[rid]) != rootClassOf[rid] ||
+          clsSize[find(rootClassOf[rid])] > 1)
+        certMergedAway++;
+    }
+    size_t crossIcalls = 0, checkedIcalls = 0, shown = 0;
+    std::map<std::string, size_t> crossBySite; // site label -> icall count
+    for (auto *CS2 : Ctx->IndirectCallInsts) {
+      Value *fp2 = CS2->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn2 = NF.getValueNodeFor(fp2);
+      if (fn2 == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt2 = toDense.find(getCanonicalNode(fn2));
+      if (dIt2 == toDense.end()) continue;
+      const uint32_t rep2 = find(dIt2->second);
+      checkedIcalls++;
+      bool hit = false;
+      for (auto [rid, mc] : certRids) {
+        bool has = false;
+        for (uint32_t s2 = 0; s2 < NSHIFT && !has; s2++)
+          has = R[rep2][s2].test(rid) || RB[rep2][s2].test(rid);
+        if (!has) continue;
+        hit = true;
+        for (const std::string *sd : certMintSites[mc]) {
+          crossBySite[*sd]++;
+          if (shown < 40) {
+            shown++;
+            errs() << "UserCert: CROSSING icall in "
+                   << CS2->getFunction()->getName() << " <- " << *sd << "\n";
+          }
+        }
+      }
+      if (hit) crossIcalls++;
+    }
+    errs() << "UserCert: " << g_userCertCopySites << " copy-body + "
+           << g_userCertGetSites << " get_user sites tagged, "
+           << certRids.size() << " cert roots live";
+    if (certMergedAway)
+      errs() << " (" << certMergedAway
+             << " U classes merged into bigger classes — coarse blame)";
+    errs() << "; " << crossIcalls << "/" << checkedIcalls
+           << " icall fptr operands carry user bytes\n";
+    size_t siteShown = 0;
+    for (auto &kv : crossBySite) {
+      if (siteShown++ >= 30) {
+        errs() << "UserCert: ... " << (crossBySite.size() - 30)
+               << " more sites\n";
+        break;
+      }
+      errs() << "UserCert: site " << kv.first << " reaches " << kv.second
+             << " icalls\n";
+    }
+  }
   if (CFLProbeOpsMono && omSites) {
     errs() << "OpsMono: " << omSites << " two-level dispatch sites: "
            << omMono << " mono (targets inside ONE ops global), " << omNear
@@ -5932,6 +6025,29 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
           g_userGetAsmSevered++;
         g_userCopyDerefsSevered += rawPtrDerefs.size();
         rawPtrDerefs.clear();
+      }
+    }
+    // MEASUREMENT-ONLY (task #32 usercopy certificate): tag the same
+    // two ingress shapes with a synthetic origin object flowing into
+    // the asm's memory cells — the solver then tracks "user bytes" as
+    // a root and the resolution pass inventories which icall operands
+    // they reach.
+    if (CFLCertUserCopy && !rawPtrDerefs.empty()) {
+      const bool copyBody =
+          CS.getFunction() && isUserCopyFromFn(CS.getFunction()->getName());
+      const bool getUser = StringRef(IA->getAsmString()).contains("__get_user");
+      if (copyBody || getUser) {
+        NodeIndex U = NF.createOpaqueObjectNode(&CS, true);
+        for (NodeIndex derefP : rawPtrDerefs)
+          addAssignmentEdge(U, derefP);
+        if (copyBody)
+          g_userCertCopySites++;
+        else
+          g_userCertGetSites++;
+        g_userCertObjs.emplace_back(
+            U, (CS.getFunction()->getName() +
+                (copyBody ? "::copy-body" : "::get_user"))
+                   .str());
       }
     }
     for (NodeIndex derefP : rawPtrDerefs) {

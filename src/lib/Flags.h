@@ -46,6 +46,7 @@ extern cl::opt<bool> CFLProbeBlobFormation;
 extern cl::opt<bool> CFLCensusStrata;
 extern cl::opt<std::string> CFLProbeStratumAblate;
 extern cl::opt<bool> CFLProbeUserCopyAblate;
+extern cl::opt<bool> CFLCertUserCopy;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

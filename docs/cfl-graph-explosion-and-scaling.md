@@ -3492,3 +3492,85 @@ model (probe-era "acceptable" note does not transfer). Both argue
 for a write-provenance-keyed seal (only joins whose ORIGIN root is a
 payload write) as the refinement if adoption stalls. Flag stays
 opt-in; canonical pin unchanged.
+
+### Task #32 CLOSED: stratum separation — census + probe + theorem, delivered (2026-08-02)
+
+Scope shipped in full:
+  CENSUS — strata bridge inventory (--cfl-census-strata: phys-bucket
+    inttoptr/ptrtoint classification, 853 user-copy sites), writer-
+    composition census, blob-formation diagnostic.
+  PROBES — --cfl-probe-stratum-ablate (directmap/vmemmap/kernelmap),
+    --cfl-probe-usercopy-ablate, --cfl-cert-usercopy,
+    --cfl-confirm-sinks / --cfl-sink-instr.
+  THEOREM, at full corpus scale, both content channels:
+    (1) direct-map contents: -0/+0 byte-identical (severing all 834
+        bridges changes nothing — redundant witness paths, not just
+        silence);
+    (2) user-copied bytes: -0/+59-flap (3 copy-body + 329 get_user
+        closures severed; zero removals);
+    (3) certified crossings NAMED: movable_ops through vmemmap
+        METADATA (typed kernel objects — never sever), BPF programs
+        receiving payload as ctx ARGUMENT (kernel FRESH code pointer,
+        data-determined contents), GEP-index/branch = the benign
+        data-indexed control channel, soundly over-approximated.
+  Plus the shipped sink model (-190,493/+0 at kernel, opt-in).
+
+Dispositions of the non-closed edges:
+  - Nameable crossing INVENTORY (the certificate) is quotient-drowned
+    at class granularity -> acceptance criterion of task #33 (field
+    sensitivity), not an open item here.
+  - --cfl-sink-instr canonical adoption: user decision "not yet";
+    follow-on task = IR-anchored seal re-key + 63-site sweep.
+  - Lockdep compare-only contract: deferred (CONFIG_LOCKDEP is off in
+    production configs).
+
+### Task #33 OPENED: field-keyed GEP — kernel campaign, not a fresh design (2026-08-02)
+
+Corrected framing after re-reading §3.1: the encoding EXISTS and is
+validated. The shift-indexed valley grammar (offsets mod prime P,
+Dn/Up residue composition, VX wildcard absorption) is implemented in
+flows-to as the per-shift fact planes (R/RB[class][shift], NSHIFT,
+bridges = phase-2 pairwise VX with 1-bit provenance) — the same
+machinery every #30-#32 instrument has been reading. Status verified
+on current HEAD (2026-08-02): t_container 2/2 under fs13, libpng
+fs13 per-icall identical to FI (27/9), harfbuzz fs13 = first sound
+field-sensitive result (32m54s / 1.27 GB, 2,766 targets, strict
+subset of FI's 2,795, 25/29 prunes source-verified correct).
+
+What task #33 actually is — three fronts, in order:
+
+1. THE SOUNDNESS BUG (blocker): harfbuzz would_match_input — fs13
+   keeps only match_coverage of the ~7 match functions stored into
+   the same ContextApplyFuncs match slot (gsubgpos.hh:2558/2751/
+   2797/4041); FI resolves all; simple repros pass (t_ctxfuncs 4/4),
+   145-function llvm-extract does NOT reproduce — a full-module
+   interaction, unlocalized since 2026-07-08. Tools: --cfl-trace-func
+   / --cfl-trace-fptr / --cfl-trace-value. Nothing kernel-scale can
+   be trusted under fs until this is found.
+2. KERNEL fs CAMPAIGN (the payoff): the canonical pin is FI; fs13
+   has never run at km or kernel scale. Kernel C is the favorable
+   case (wildcard density low — phase-2 bridges ~free; the C++
+   container churn that made residue-copies net-negative is absent;
+   --cfl-residue-copies re-evaluation rides along). Acceptance
+   criteria fixed IN ADVANCE by #31/#32 findings:
+     (a) the 1.1M-member pre-solve blob fragments (it is the
+         field-insensitivity quotient — fs is the only lever that
+         can split an exact equivalence);
+     (b) the usercopy certificate becomes nameable (U classes stop
+         merging into the giant; the 87% positive rate collapses
+         toward a reviewable crossing list);
+     (c) smear families sized by #30/#31 (kvm_x86_ops constexpr-GEP
+         fields, tracepoint probe pools, ops-struct channels) shrink,
+         measured as -N/+0-style per-icall diffs against the FI pin
+         PLUS micro-suite exactness (t_ops, t_ops2, t_container,
+         t_ctxfuncs) — answers WILL legitimately move, so acceptance
+         is subset-plus-audit, not byte-identity.
+3. COST CONTROL: DS0 adjacent-M coarsening (noted, empirically free
+   so far), P selection (13 vs coarser), fx-fallback census at
+   kernel scale (memcpy/ptrtoint/variable-GEP mix differs from C++),
+   interaction with lazy mint / incremental / protection machinery
+   that landed after the fs work (all built and tested FI-first).
+
+Sequence: localize the bug (km-scale bisection of the harfbuzz
+module set is the recorded next tool), then km fs13 A/B with the
+acceptance trio, then full kernel.

@@ -3707,3 +3707,48 @@ TASK #33 DISPOSITION:
   - The usercopy-certificate certifiability goal inherits this:
     class-granular naming cannot come from offset refinement; the
     13% certified-clean floor stands as the honest number.
+
+### Tagged-pointer rule + int-select/phi provenance fix + the teaching micro (task #33, 2026-08-02)
+
+User direction: kernel code tags ALIGNED pointers in their low bits
+(p|1 mark, p&~1 clear, v&7 extract) — (p|1)&~1 must equal p. Three
+deliverables landed together:
+
+1. TAG-ROUND-TRIP RULE (fs): a ptrtoint whose complete local
+   use-closure is sub-alignment constant bit-ops + compares + tag
+   extraction + inttoptr round trips no longer pays the fx escape
+   wildcard — the plain a-edges (shift 0) are already the exact
+   model. Any other use (store/call/ret, offset-destroying mask,
+   variable or non-tag arithmetic, walk cap) keeps the wildcard: the
+   source wildcard is the only sound cover for downstream rebasing
+   through memory. Census reclassified accordingly: TAG 75 (3%) —
+   rb_check_pages / rb_get_reader_page (the ring buffer's tagged
+   reader page), rt_mutex_adjust_prio_chain, toggle_bp_slot; MASK
+   260 -> 123; suppressible population 97 -> 203/2,497 (8%).
+
+2. INT-SELECT/PHI PROVENANCE SOUNDNESS FIX, found by the micro:
+   clang folds `flag ? (ulong)&a : (ulong)&b` into a select whose
+   operands are ptrtoint CONSTANT EXPRESSIONS. visitSelectInst /
+   visitPHINode early-returned on non-pointer types, AND
+   getRepNodeForValue maps a ptrtoint CE to a special constant-pool
+   node that silently absorbs flow — the whole chain dropped and the
+   downstream icall resolved to NOTHING. Both visitors now use the
+   atomic-handlers' laundering guards (ptr-width int +
+   mayCarryPtrProvenance/mayBecomePointer), unwrap CE ptrtoints to
+   their pointer operand, and apply the ptrtoint-escape wildcard
+   discipline under fs (a CE never passes through visitPtrToIntInst,
+   so this is its only wildcard site — tag-round-trip CEs are
+   exempt). km A/B (canonical+seal): -0/+324 pure recall, dominated
+   by tracing_stat_open (267). The KERNEL PIN WILL MOVE (+recall) on
+   the next full run.
+
+3. test/t_maskwalk.c — the explainable artifact. Three routes, one
+   object pair each (sharing a pair cross-poisons routes through the
+   (o,X)<->(o,s) bridges — the #27 ensemble effect in miniature):
+     FI:    use_gep {fa1,fb1}  use_mask {fa2,fb2}  use_tag {fa3,fb3}
+     fs13:  use_gep {fa1}      use_mask {fa2,fb2}  use_tag {fa3}
+   gep: struct offsets survive value merging (fields pay). mask: the
+   __va / page-align shape erases offsets BY DESIGN — irreducible
+   under any offset-keyed refinement, both modes equal. tag: (p|1)&~1
+   == p, exact under the new rule. Validation: smoke 4/4, libpng
+   FI==fs13==27/9 unchanged.

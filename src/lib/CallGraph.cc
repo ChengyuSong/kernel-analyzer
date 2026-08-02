@@ -2071,6 +2071,8 @@ static std::vector<std::pair<NodeIndex, std::string>>
 static size_t g_userCertCopySites = 0, g_userCertGetSites = 0;
 
 static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
+static size_t g_tagRoundTrips = 0; // fs: ptrtoint wildcards suppressed
+                                   // (tag-bit-only local closures)
 bool CallGraphPass::runFlowsToResolution() {
   auto tStart = std::chrono::steady_clock::now();
   const auto &edges = EB.getEdges();
@@ -4796,6 +4798,9 @@ bool CallGraphPass::runFlowsToResolution() {
   // NOTE probe/model LEDGER prints must live HERE, after the protOn
   // block closes — anything inside it only prints when protection is
   // active (the ops-pairs config), which the canonical config is not.
+  if (NB > 0 && g_tagRoundTrips)
+    CG_LOG("TagRoundTrip: " << g_tagRoundTrips
+           << " ptrtoint wildcards suppressed (tag-bit-only closures)\n");
   if (g_sinkAblatedJoins)
     errs() << "SinkAblate: " << g_sinkAblatedJoins
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
@@ -7121,56 +7126,119 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   CGP.addAssignmentEdge(derefNode, resNode);
 }
 
+static bool ptrToIntTagRoundTripOnly(const Value *PTI); // defined below
+
+// phi/select of PTR-WIDTH INTS can carry pointer provenance — clang
+// folds `flag ? (ulong)&a : (ulong)&b` into a select whose operands
+// are ptrtoint CONSTANT EXPRESSIONS (found by test/t_maskwalk.c:
+// the whole chain silently dropped and the downstream icall resolved
+// to NOTHING). Same laundering guards as the atomic handlers above;
+// a CE ptrtoint contributes its pointer operand, plus — under field
+// mode — the same escape-wildcard discipline visitPtrToIntInst
+// applies to the instruction form (a CE never passes through that
+// visitor, so this is its only wildcard site).
 void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
   if (!containsPointerType(PHI.getType())) {
-    // XXX only consider pointer type
-    return;
+    if (!(CGP.curDL && isPtrWidthInt(PHI.getType(), *CGP.curDL)))
+      return;
+    bool d = false, prov = mayBecomePointer(&PHI, 8, d);
+    for (unsigned i = 0, e = PHI.getNumIncomingValues(); !prov && i != e;
+         ++i) {
+      bool d2 = false;
+      prov = mayCarryPtrProvenance(PHI.getIncomingValue(i), 8, d2);
+      d |= d2;
+    }
+    if (!prov) {
+      if (d) g_intStoreUnmodeled++;
+      return;
+    }
   }
   NodeIndex dstNode = CGP.getRepNodeForValue(&PHI);
-  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find phi dst node");
+  if (dstNode == AndersNodeFactory::InvalidIndex)
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&PHI));
+  auto wireIncoming = [&](Value *src) {
+    // A ptrtoint CONSTANT EXPRESSION maps to a special node (constant
+    // pool), which would silently absorb the flow — unwrap to the
+    // pointer operand instead.
+    const auto *CE = dyn_cast<ConstantExpr>(src);
+    const bool ceP2I = CE && CE->getOpcode() == Instruction::PtrToInt;
+    NodeIndex srcNode = CGP.getRepNodeForValue(src);
+    if (srcNode != AndersNodeFactory::InvalidIndex &&
+        !(ceP2I && CGP.NF.isSpecialNode(srcNode))) {
+      CGP.addAssignmentEdge(srcNode, dstNode);
+      return;
+    }
+    if (!ceP2I)
+      return; // plain int constant: no provenance
+    NodeIndex ptrN = CGP.getRepNodeForValue(CE->getOperand(0));
+    if (ptrN == AndersNodeFactory::InvalidIndex || CGP.NF.isSpecialNode(ptrN))
+      return;
+    if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CE))
+      CGP.addFieldWildcardLoop(ptrN, "ptrtoint-escape-ce");
+    else if (CGP.EB.hasFieldLabels())
+      g_tagRoundTrips++;
+    CGP.addAssignmentEdge(ptrN, dstNode);
+  };
   for (unsigned i = 0, e = PHI.getNumIncomingValues(); i != e; ++i) {
     Value *src = PHI.getIncomingValue(i);
-
     // Skip nullptr and compiler-introduced values
     if (shouldSkipValue(src)) {
       CG_DEBUG("Skipping value in PHI: " << *src << "\n");
       continue;
     }
-
-    NodeIndex srcNode = CGP.getRepNodeForValue(src);
-    assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find phi src node");
-    // if (srcNode == AndersNodeFactory::InvalidIndex) {
-    //   srcNode = CGP.NF.createValueNode(src);
-    //   CG_DEBUG("Create value node " << srcNode << " for PHI src " << *src << "\n");
-    // }
-    CGP.addAssignmentEdge(srcNode, dstNode);
+    wireIncoming(src);
   }
 }
 
 void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
   if (!containsPointerType(I.getType())) {
-    // XXX only consider pointer type
-    return;
+    if (!(CGP.curDL && isPtrWidthInt(I.getType(), *CGP.curDL)))
+      return;
+    bool d = false, prov = mayBecomePointer(&I, 8, d);
+    for (unsigned i = 1; !prov && i < I.getNumOperands(); i++) {
+      bool d2 = false;
+      prov = mayCarryPtrProvenance(I.getOperand(i), 8, d2);
+      d |= d2;
+    }
+    if (!prov) {
+      if (d) g_intStoreUnmodeled++;
+      return;
+    }
   }
   NodeIndex dstNode = CGP.getRepNodeForValue(&I);
-  assert(dstNode != AndersNodeFactory::InvalidIndex && "Failed to find select dst node");
-  // NodeIndex dstNode = CGP.NF.createValueNode(&I);
+  if (dstNode == AndersNodeFactory::InvalidIndex)
+    dstNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  auto wireIncoming = [&](Value *src) {
+    // A ptrtoint CONSTANT EXPRESSION maps to a special node (constant
+    // pool), which would silently absorb the flow — unwrap to the
+    // pointer operand instead.
+    const auto *CE = dyn_cast<ConstantExpr>(src);
+    const bool ceP2I = CE && CE->getOpcode() == Instruction::PtrToInt;
+    NodeIndex srcNode = CGP.getRepNodeForValue(src);
+    if (srcNode != AndersNodeFactory::InvalidIndex &&
+        !(ceP2I && CGP.NF.isSpecialNode(srcNode))) {
+      CGP.addAssignmentEdge(srcNode, dstNode);
+      return;
+    }
+    if (!ceP2I)
+      return; // plain int constant: no provenance
+    NodeIndex ptrN = CGP.getRepNodeForValue(CE->getOperand(0));
+    if (ptrN == AndersNodeFactory::InvalidIndex || CGP.NF.isSpecialNode(ptrN))
+      return;
+    if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CE))
+      CGP.addFieldWildcardLoop(ptrN, "ptrtoint-escape-ce");
+    else if (CGP.EB.hasFieldLabels())
+      g_tagRoundTrips++;
+    CGP.addAssignmentEdge(ptrN, dstNode);
+  };
   for (unsigned i = 1; i < I.getNumOperands(); i++) {
     Value *src = I.getOperand(i);
-
     // Skip nullptr and compiler-introduced values
     if (shouldSkipValue(src)) {
       CG_DEBUG("Skipping value in Select: " << *src << "\n");
       continue;
     }
-
-    NodeIndex srcNode = CGP.getRepNodeForValue(src);
-    assert(srcNode != AndersNodeFactory::InvalidIndex && "Failed to find select src node");
-    // if (srcNode == AndersNodeFactory::InvalidIndex) {
-    //   srcNode = CGP.NF.createValueNode(src);
-    //   CG_DEBUG("Create value node " << srcNode << " for select src " << *src << "\n");
-    // }
-    CGP.addAssignmentEdge(srcNode, dstNode);
+    wireIncoming(src);
   }
 }
 
@@ -7345,6 +7413,64 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
   }
 }
 
+// Kernel code tags ALIGNED pointers in their low bits (p|1 to mark,
+// p&~1 to clear, v&7 to extract the tag). Sub-alignment constant
+// bit-twiddling never changes the field offset, so a ptrtoint whose
+// COMPLETE local use-closure is tag ops + compares + tag extraction +
+// inttoptr round trips is not a field escape: the plain a-edges
+// already model it exactly (shift 0) and the fx wildcard would only
+// smear. Any other use — store/call/ret (downstream rebasing through
+// memory is covered ONLY by the source wildcard), offset-destroying
+// masks (& ~0xfff), variable or non-tag arithmetic — keeps the
+// wildcard. Bounded walk; on cap, keep the wildcard (sound default).
+static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
+  SmallVector<const Value *, 16> wl{PTI};
+  SmallPtrSet<const Value *, 32> seen{PTI};
+  unsigned steps = 0;
+  while (!wl.empty()) {
+    if (++steps > 128)
+      return false;
+    const Value *V = wl.pop_back_val();
+    for (const User *U : V->users()) {
+      if (isa<IntToPtrInst>(U) || isa<ICmpInst>(U) || isa<SwitchInst>(U))
+        continue; // round trip at offset 0 / compare: exact
+      if (const auto *BO = dyn_cast<BinaryOperator>(U)) {
+        const auto *CI = dyn_cast<ConstantInt>(
+            BO->getOperand(BO->getOperand(0) == V ? 1 : 0));
+        if (!CI)
+          return false;
+        const uint64_t c = CI->getZExtValue();
+        switch (BO->getOpcode()) {
+        case Instruction::Or:
+        case Instruction::Xor:
+          if (c >= 8)
+            return false; // beyond sub-alignment bits
+          break;
+        case Instruction::And:
+          if (c < 8)
+            continue; // tag EXTRACTION: result carries no pointer
+          if (~c >= 8)
+            return false; // offset-destroying mask (& ~0xfff et al.)
+          break; // tag clear (& ~7 and finer)
+        default:
+          return false;
+        }
+        if (seen.insert(U).second)
+          wl.push_back(U);
+        continue;
+      }
+      if (isa<ZExtInst>(U) || isa<BitCastInst>(U) || isa<FreezeInst>(U) ||
+          isa<PHINode>(U) || isa<SelectInst>(U)) {
+        if (seen.insert(U).second)
+          wl.push_back(U);
+        continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
@@ -7358,9 +7484,14 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   }
   CG_DEBUG("PtrToInt: " << srcNode << " -> " << dstNode << " for " << I << "\n");
   // Field mode: integer arithmetic on the escaped pointer can rebase it to
-  // any field (disguised GEP); absorb with the wildcard loop at the source.
-  if (CGP.EB.hasFieldLabels())
-    CGP.addFieldWildcardLoop(srcNode, "ptrtoint-escape");
+  // any field (disguised GEP); absorb with the wildcard loop at the source
+  // — EXCEPT proven tag-bit round trips, which are exact at shift 0.
+  if (CGP.EB.hasFieldLabels()) {
+    if (ptrToIntTagRoundTripOnly(&I))
+      g_tagRoundTrips++;
+    else
+      CGP.addFieldWildcardLoop(srcNode, "ptrtoint-escape");
+  }
   CGP.addAssignmentEdge(srcNode, dstNode);
 }
 
@@ -9157,10 +9288,12 @@ static size_t g_invConfirmed = 0, g_invConfirmedPass = 0, g_invRejEscape = 0,
 //   DEAD     — no users
 // CONST + CONST0 + CMP = the wildcard-suppressible population.
 void CallGraphPass::runPtrToIntCensus() {
-  enum Sev { DEAD, CMP, CONST0, CONST, MASK, VARIABLE, OTHER, ESCAPE, NSEV };
+  enum Sev {
+    DEAD, CMP, CONST0, TAG, CONST, MASK, VARIABLE, OTHER, ESCAPE, NSEV
+  };
   static const char *sname[NSEV] = {"DEAD",  "CMP",      "CONST0",
-                                    "CONST", "MASK",     "VARIABLE",
-                                    "OTHER", "ESCAPE"};
+                                    "TAG",   "CONST",    "MASK",
+                                    "VARIABLE", "OTHER", "ESCAPE"};
   size_t tally[NSEV] = {0};
   size_t total = 0, inexactI2P = 0;
   std::map<int64_t, size_t> constOffsets;
@@ -9184,7 +9317,7 @@ void CallGraphPass::runPtrToIntCensus() {
         SmallVector<WI, 16> wl{{PTI, 0, true}};
         SmallPtrSet<const Value *, 32> seen{PTI};
         bool fEsc = false, fOther = false, fVar = false, fMask = false,
-             fConst = false, fZero = false, fCmp = false;
+             fConst = false, fZero = false, fCmp = false, fTag = false;
         unsigned steps = 0;
         while (!wl.empty() && steps++ < 256) {
           WI w = wl.pop_back_val();
@@ -9233,11 +9366,21 @@ void CallGraphPass::runPtrToIntCensus() {
               case Instruction::And:
               case Instruction::Or:
               case Instruction::Xor:
-                if (CI2) {
-                  fMask = true;
-                  push(0, false);
-                } else {
+                if (!CI2) {
                   fVar = true;
+                  push(0, false);
+                } else if (BO->getOpcode() == Instruction::And &&
+                           CI2->getZExtValue() < 8) {
+                  // tag EXTRACTION (v & 7): result is the flag bits,
+                  // not a pointer — benign terminal
+                } else if (BO->getOpcode() != Instruction::And
+                               ? CI2->getZExtValue() < 8
+                               : ~CI2->getZExtValue() < 8) {
+                  // sub-alignment tag set/flip/clear: offset unchanged
+                  fTag = true;
+                  push(w.off, w.exact);
+                } else {
+                  fMask = true;
                   push(0, false);
                 }
                 break;
@@ -9290,6 +9433,7 @@ void CallGraphPass::runPtrToIntCensus() {
                 : fVar     ? VARIABLE
                 : fMask    ? MASK
                 : fConst   ? CONST
+                : fTag     ? TAG
                 : fZero    ? CONST0
                 : fCmp     ? CMP
                            : DEAD;
@@ -9299,15 +9443,18 @@ void CallGraphPass::runPtrToIntCensus() {
     }
   }
   errs() << "PtrToIntCensus: " << total << " ptrtoint instructions\n";
-  size_t suppressible = tally[CONST] + tally[CONST0] + tally[CMP] +
+  // TAG+CONST0+CMP+DEAD = what the shipped tag-round-trip rule
+  // suppresses; CONST would additionally need f-edge emission.
+  size_t suppressible = tally[TAG] + tally[CONST0] + tally[CMP] +
                         tally[DEAD];
   for (int s = 0; s < NSEV; s++)
     errs() << "PtrToIntCensus: " << sname[s] << " " << tally[s] << " ("
            << (total ? tally[s] * 100 / total : 0) << "%)\n";
-  errs() << "PtrToIntCensus: wildcard-suppressible (CONST+CONST0+CMP+DEAD) "
+  errs() << "PtrToIntCensus: tag-rule suppressible (TAG+CONST0+CMP+DEAD) "
          << suppressible << "/" << total << " ("
-         << (total ? suppressible * 100 / total : 0) << "%), "
-         << inexactI2P << " inexact inttoptr terminals\n";
+         << (total ? suppressible * 100 / total : 0) << "%), +CONST "
+         << tally[CONST] << " residue-encodable, " << inexactI2P
+         << " inexact inttoptr terminals\n";
   {
     std::vector<std::pair<size_t, int64_t>> or2;
     for (auto &kv : constOffsets)
@@ -9317,7 +9464,8 @@ void CallGraphPass::runPtrToIntCensus() {
       errs() << "PtrToIntCensus: CONST offset " << or2[i].second << " x"
              << or2[i].first << "\n";
   }
-  for (int s : {(int)CONST, (int)ESCAPE, (int)VARIABLE, (int)MASK}) {
+  for (int s : {(int)TAG, (int)CONST, (int)ESCAPE, (int)VARIABLE,
+                (int)MASK}) {
     std::vector<std::pair<size_t, const std::string *>> fr2;
     for (auto &kv : fnBySev[s])
       fr2.emplace_back(kv.second, &kv.first);

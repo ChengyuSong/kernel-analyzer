@@ -180,6 +180,13 @@ private:
   void confirmInvokeSummaries();
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
   void runPtrToIntCensus(); // task #33: int-provenance residue sizing
+  void runTracepointCensus(); // task #35: keyed-channel design sizing
+  // task #35 keyed-channel model (--cfl-tracepoint-keys)
+  NodeIndex tracepointFnCell(const llvm::GlobalVariable *KeyGV);
+  void bindTracepointProbe(const llvm::GlobalVariable *KeyGV,
+                           const llvm::Value *ProbeV,
+                           const llvm::Value *DataV, bool fromWalker);
+  void bindTracepointMediatorPairs();
   void handleInlineAsm(llvm::CallBase &CS);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
                             bool rewriteEdges = true);

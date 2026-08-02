@@ -1963,6 +1963,54 @@ public:
 // down 8 then down 8 carries the same shift as flat down 16. Storage is
 // rectangular (fact sets), never pairwise V.
 
+// Tracepoint keyed channels (task #35). One registration family, four
+// entry points; the census (km + kernel, 2026-08-02) classifies 100%
+// of their callsites as CONST-key or one of the two struct-mediated
+// registrars, and 100% of __traceiter_* bodies name their key.
+static bool isTracepointRegFn(StringRef n) {
+  return n == "tracepoint_probe_register" ||
+         n == "tracepoint_probe_register_prio" ||
+         n == "tracepoint_probe_register_prio_may_exist" ||
+         n == "tracepoint_probe_unregister";
+}
+static size_t g_tpKeyConstBinds = 0, g_tpKeyMediatorBinds = 0,
+              g_tpKeyDispatchWires = 0, g_tpKeyUnclassified = 0,
+              g_tpKeyKeylessIter = 0, g_tpKeyUnmapped = 0,
+              g_tpKeyClassFnSkipped = 0, g_tpKeyMediatorDataPools = 0,
+              g_tpKeyIterLoadsSevered = 0;
+// Keys bound by the initializer walker — mediator callsites pool their
+// dynamic data argument (trace_event_file, bpf_prog) into every
+// walker-bound key's data cell (data was globally pooled before this
+// model too; only the fn plane is keyed).
+static std::vector<const GlobalVariable *> g_tpWalkerKeys;
+
+// The dispatch key of a __traceiter_* body: the base of the constexpr
+// GEP its funcs-head load reads from. Memoized; single-threaded visit.
+static const GlobalVariable *traceiterKeyOf(const Function *F) {
+  static boost::unordered_flat_map<const Function *, const GlobalVariable *>
+      memo;
+  auto it = memo.find(F);
+  if (it != memo.end())
+    return it->second;
+  const GlobalVariable *key = nullptr;
+  for (const Instruction &I : instructions(*F)) {
+    const auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI)
+      continue;
+    const Value *P = LI->getPointerOperand();
+    if (const auto *CE = dyn_cast<ConstantExpr>(P))
+      if (CE->getOpcode() == Instruction::GetElementPtr)
+        P = CE->getOperand(0);
+    if (const auto *GV = dyn_cast<GlobalVariable>(P->stripPointerCasts()))
+      if (GV->getName().starts_with("__tracepoint_")) {
+        key = GV;
+        break;
+      }
+  }
+  memo[F] = key;
+  return key;
+}
+
 static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
 static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
 // --cfl-sink-instr / --cfl-confirm-sinks (task #31/#32 design)
@@ -4822,6 +4870,18 @@ bool CallGraphPass::runFlowsToResolution() {
            << g_sinkSitesConfirmed << " confirmed / " << g_sinkSitesEscaped
            << " escape / " << g_sinkSitesViolated << " violation)\n";
   }
+  if (CFLTracepointKeys) {
+    errs() << "TracepointKeys: " << g_tpKeyConstBinds << " const binds + "
+           << g_tpKeyMediatorBinds << " walker pairs ("
+           << g_tpWalkerKeys.size() << " keys, "
+           << g_tpKeyMediatorDataPools << " mediator data pools), "
+           << g_tpKeyDispatchWires << " __traceiter dispatches wired, "
+           << g_tpKeyIterLoadsSevered << " iterator funcs-loads severed; "
+           << "UNCLASSIFIED reg sites " << g_tpKeyUnclassified
+           << ", keyless iters " << g_tpKeyKeylessIter << ", unmapped keys "
+           << g_tpKeyUnmapped << " (all three must be 0 for the severed "
+           << "model to be complete)\n";
+  }
   if (CFLProbeBlobFormation) {
     uint32_t giant = 0;
     for (uint32_t n2 = 0; n2 < N; n2++)
@@ -5850,6 +5910,7 @@ static bool isPtrWidthInt(const llvm::Type *T, const llvm::DataLayout &DL);
 static size_t g_staticCallWired = 0, g_staticCallNoKey = 0,
               g_staticCallUpdates = 0, g_staticCallDynUpdate = 0,
               g_tracepointProbes = 0, g_staticCallTpIter = 0;
+
 static size_t g_asmSlotLoads = 0, g_asmSlotStores = 0,
               g_asmWidthWitnessed = 0, g_asmLaunderDeclined = 0,
               g_asmRegLoads = 0, g_asmRegStores = 0, g_asmRegCopies = 0;
@@ -6614,6 +6675,60 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     }
   }
 
+  // Tracepoint keyed channels (task #35): the register family's shared
+  // tp formal is THE channel that pools every tracepoint's probes into
+  // every __traceiter_* dispatch (pin: 964 sites x ~1,561 targets =
+  // 17.9% of the kernel answer set). Sever every classifiable family
+  // callsite from the generic body and bind per key instead: CONST
+  // keys here; the two struct-mediated registrars are covered by the
+  // initializer walker, and their dynamic data argument is pooled into
+  // the walker keys' data cells (data was globally pooled before this
+  // model too — only the fn plane gains keying). Unclassifiable sites
+  // keep generic wiring, counted LOUDLY (census: zero at kernel scale).
+  if (CFLTracepointKeys) {
+    const Function *RF = dyn_cast<Function>(
+        CS.getCalledOperand()->stripPointerCasts());
+    if (RF && isTracepointRegFn(RF->getName()) && CS.arg_size() >= 3) {
+      const Value *tpArg = CS.getArgOperand(0)->stripPointerCasts();
+      const auto *TPG = dyn_cast<GlobalVariable>(tpArg);
+      const bool constKey =
+          TPG && TPG->getName().starts_with("__tracepoint_");
+      const bool knownMediator = F->getName() == "trace_event_reg" ||
+                                 F->getName() == "bpf_probe_register" ||
+                                 F->getName() == "bpf_probe_unregister";
+      if (constKey || knownMediator) {
+        const bool unreg =
+            RF->getName() == "tracepoint_probe_unregister";
+        if (constKey && !unreg)
+          CGP.bindTracepointProbe(TPG,
+                                  CS.getArgOperand(1)->stripPointerCasts(),
+                                  CS.getArgOperand(2),
+                                  /*fromWalker=*/false);
+        if (!constKey && !unreg) {
+          // mediator data pool: this callsite's dynamic data actual
+          // feeds every walker-bound key's data cell
+          NodeIndex dataN =
+              CGP.getRepNodeForValue(CS.getArgOperand(2));
+          if (dataN != AndersNodeFactory::InvalidIndex &&
+              !CGP.NF.isSpecialNode(dataN)) {
+            for (const GlobalVariable *K : g_tpWalkerKeys) {
+              NodeIndex fnCell = CGP.tracepointFnCell(K);
+              if (fnCell != AndersNodeFactory::InvalidIndex)
+                CGP.addAssignmentEdge(
+                    dataN, CGP.getRepDerefNode(
+                               CGP.getCanonicalNode(fnCell)));
+            }
+            g_tpKeyMediatorDataPools++;
+          }
+        }
+        CGP.Ctx->Callees[&CS].insert(
+            CGP.getFuncDef(const_cast<Function *>(RF)));
+        return; // severed: the shared tp formal never sees this key
+      }
+      g_tpKeyUnclassified++; // LOUD: generic wiring kept, pool re-forms
+    }
+  }
+
   // static_call (task #14): a direct call to the undefined __SCT__X
   // trampoline dispatches through __SCK__X's func slot — the key is a
   // real IR global whose initializer (DEFINE_STATIC_CALL) and updates
@@ -6738,6 +6853,33 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
         CG_DEBUG("IFunc call: " << IF->getName() << " has no resolved targets\n");
       }
     } else {
+      // Tracepoint keyed dispatch (task #35): a __traceiter_X icall
+      // reads its own key's channel cells. The generic funcs-load
+      // chain stays wired but carries nothing once every registration
+      // callsite is severed above — this edge pair IS the resolution.
+      if (CFLTracepointKeys &&
+          F->getName().starts_with("__traceiter_")) {
+        if (const GlobalVariable *KeyGV = traceiterKeyOf(F)) {
+          NodeIndex fnCell = CGP.tracepointFnCell(KeyGV);
+          NodeIndex coN =
+              CGP.getRepNodeForValue(CS.getCalledOperand());
+          if (fnCell != AndersNodeFactory::InvalidIndex &&
+              coN != AndersNodeFactory::InvalidIndex) {
+            CGP.addAssignmentEdge(fnCell, coN);
+            if (CS.arg_size() >= 1) {
+              NodeIndex dArg =
+                  CGP.getRepNodeForValue(CS.getArgOperand(0));
+              if (dArg != AndersNodeFactory::InvalidIndex)
+                CGP.addAssignmentEdge(
+                    CGP.getRepDerefNode(CGP.getCanonicalNode(fnCell)),
+                    dArg);
+            }
+            g_tpKeyDispatchWires++;
+          }
+        } else {
+          g_tpKeyKeylessIter++; // LOUD: census says this is empty
+        }
+      }
       CGP.Ctx->IndirectCallInsts.insert(&CS);
       CGP.moduleIndirectCallInsts[F->getParent()].insert(&CS);
       // Attach deterministic icall ID as LLVM metadata.
@@ -6847,6 +6989,26 @@ static bool isPtrWidthInt(const Type *T, const DataLayout &DL) {
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
+  // Tracepoint keyed dispatch (task #35): inside __traceiter_X, the
+  // funcs-head load reads cells that the kernel-scale giant absorbs —
+  // the keyed channel replaces this read entirely (sound: the census
+  // completeness counters prove every registration is channel-bound),
+  // so the generic wiring is severed here to keep the pool from
+  // riding back in beside the exact channel.
+  if (CFLTracepointKeys) {
+    const Function *LF = I.getFunction();
+    if (LF && LF->getName().starts_with("__traceiter_")) {
+      const Value *P = I.getPointerOperand();
+      if (const auto *CE = dyn_cast<ConstantExpr>(P))
+        if (CE->getOpcode() == Instruction::GetElementPtr)
+          P = CE->getOperand(0);
+      if (const auto *GV = dyn_cast<GlobalVariable>(P->stripPointerCasts()))
+        if (GV->getName().starts_with("__tracepoint_")) {
+          g_tpKeyIterLoadsSevered++;
+          return;
+        }
+    }
+  }
   if (!containsPointerType(I.getType())) {
     // Integer-laundered provenance: a pointer-width int load whose value
     // can become a pointer again (inttoptr downstream, or stored onward)
@@ -9514,6 +9676,262 @@ void CallGraphPass::runPtrToIntCensus() {
       errs() << "PtrToIntCensus: " << sname[s] << "-fn " << fr2[i].first
              << "x " << *fr2[i].second << "\n";
   }
+}
+
+// --cfl-census-tracepoint (task #35): size the tracepoint keyed-channel
+// design. The prize (pin-measured): 964 __traceiter_* callers carry
+// 1,504,648 pairs = 17.9% of the 8.39M kernel answer set, because
+// tracepoint_add_func's generic tp->funcs store pools every
+// tracepoint's (probe, data) registrations into one channel. The model
+// keys the channel by the @__tracepoint_* global — this census splits
+// the registration sites by how the key is named there:
+//   CONST  — tp argument IS a @__tracepoint_* global (the inlined
+//            register_trace_<name> wrappers): directly keyable, the
+//            static_call (#14) primitive shape.
+//   LOAD   — tp loaded from memory (trace_event_reg's call->tp path):
+//            needs the trace_event_call static-initializer pair
+//            correlation (.tp co-resident with .probe/.perf_probe —
+//            the #28 pair-atom shape).
+//   FORMAL — tp is the enclosing function's parameter: in-family
+//            plumbing (tracepoint_add_func etc.), not a channel entry.
+// Dispatch side: every __traceiter_* body must name its key global at
+// the funcs-head load (constexpr GEP on @__tracepoint_*) — keyless
+// icalls would break the model, so they are counted loudly.
+void CallGraphPass::runTracepointCensus() {
+  auto isRegFn = isTracepointRegFn;
+  size_t nConst = 0, nConstPair = 0, nLoad = 0, nFormal = 0, nOther = 0;
+  std::map<std::string, size_t> loadEnclosing, formalEnclosing,
+      otherEnclosing;
+  boost::unordered_flat_set<const GlobalVariable *> constKeys;
+  boost::unordered_flat_set<const Function *> constProbes;
+  size_t nTraceiter = 0, nTraceiterKeyless = 0, nIcallKeyed = 0,
+         nIcallKeyless = 0;
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) {
+      if (F.empty())
+        continue;
+      const bool isTraceiter = F.getName().starts_with("__traceiter_");
+      const GlobalVariable *fnKey = nullptr;
+      if (isTraceiter) {
+        nTraceiter++;
+        for (Instruction &I : instructions(F)) {
+          const auto *LI = dyn_cast<LoadInst>(&I);
+          if (!LI)
+            continue;
+          const Value *P = LI->getPointerOperand();
+          if (const auto *CE = dyn_cast<ConstantExpr>(P))
+            if (CE->getOpcode() == Instruction::GetElementPtr)
+              P = CE->getOperand(0);
+          if (const auto *GV =
+                  dyn_cast<GlobalVariable>(P->stripPointerCasts()))
+            if (GV->getName().starts_with("__tracepoint_")) {
+              fnKey = GV;
+              break;
+            }
+        }
+        if (!fnKey)
+          nTraceiterKeyless++;
+      }
+      for (Instruction &I : instructions(F)) {
+        const auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->isInlineAsm())
+          continue;
+        const auto *CF = dyn_cast<Function>(
+            CB->getCalledOperand()->stripPointerCasts());
+        if (!CF) {
+          if (isTraceiter) {
+            if (fnKey)
+              nIcallKeyed++;
+            else
+              nIcallKeyless++;
+          }
+          continue;
+        }
+        if (!isRegFn(CF->getName()) || CB->arg_size() < 2)
+          continue;
+        const Value *tp = CB->getArgOperand(0)->stripPointerCasts();
+        if (const auto *GV = dyn_cast<GlobalVariable>(tp)) {
+          if (GV->getName().starts_with("__tracepoint_")) {
+            nConst++;
+            constKeys.insert(GV);
+            if (const auto *PF = dyn_cast<Function>(
+                    CB->getArgOperand(1)->stripPointerCasts())) {
+              nConstPair++;
+              constProbes.insert(PF);
+            }
+          } else {
+            nOther++;
+            otherEnclosing[(F.getName() + " (gv " + GV->getName() + ")")
+                               .str()]++;
+          }
+        } else if (isa<LoadInst>(tp)) {
+          nLoad++;
+          loadEnclosing[F.getName().str()]++;
+        } else if (isa<Argument>(tp)) {
+          nFormal++;
+          formalEnclosing[F.getName().str()]++;
+        } else {
+          nOther++;
+          otherEnclosing[
+              (F.getName() + " (" +
+               (isa<Instruction>(tp) ? cast<Instruction>(tp)->getOpcodeName()
+                                     : "non-inst") +
+               ")").str()]++;
+        }
+      }
+    }
+  }
+  errs() << "TracepointCensus: register-family sites "
+         << (nConst + nLoad + nFormal + nOther) << " = CONST " << nConst
+         << " (" << nConstPair << " fully-static pairs, "
+         << constKeys.size() << " distinct keys, " << constProbes.size()
+         << " distinct probes) / LOAD " << nLoad << " / FORMAL " << nFormal
+         << " / OTHER " << nOther << "\n";
+  errs() << "TracepointCensus: dispatch __traceiter fns " << nTraceiter
+         << " (" << nTraceiterKeyless << " KEYLESS), icalls keyed "
+         << nIcallKeyed << " / keyless " << nIcallKeyless << "\n";
+  auto dumpTop = [](const char *tag,
+                    const std::map<std::string, size_t> &m) {
+    std::vector<std::pair<size_t, const std::string *>> v;
+    for (auto &kv : m)
+      v.emplace_back(kv.second, &kv.first);
+    std::sort(v.begin(), v.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(10, v.size()); i++)
+      errs() << "TracepointCensus: " << tag << " x" << v[i].first << " "
+             << *v[i].second << "\n";
+  };
+  dumpTop("load-site", loadEnclosing);
+  dumpTop("formal-site", formalEnclosing);
+  dumpTop("other-site", otherEnclosing);
+}
+
+// ---- Tracepoint keyed channels (task #35, --cfl-tracepoint-keys) ----
+// Channel cells per key X: fnCell = deref(@__tracepoint_X) holds the
+// registered probe fns, dataCell = deref(fnCell) holds their data
+// arguments. Cluster joins key on POINTER origins, and each key
+// global is its own origin, so fn channels never merge across keys —
+// even when two events of one DECLARE_EVENT_CLASS template share a
+// probe fn (shared CONTENT does not join cells).
+
+NodeIndex CallGraphPass::tracepointFnCell(const GlobalVariable *KeyGV) {
+  NodeIndex keyN = getRepNodeForValue(KeyGV);
+  if (keyN == AndersNodeFactory::InvalidIndex) {
+    g_tpKeyUnmapped++; // LOUD in the LEDGER — census says this is empty
+    return AndersNodeFactory::InvalidIndex;
+  }
+  return getRepDerefNode(getCanonicalNode(keyN));
+}
+
+void CallGraphPass::bindTracepointProbe(const GlobalVariable *KeyGV,
+                                        const Value *ProbeV,
+                                        const Value *DataV,
+                                        bool fromWalker) {
+  NodeIndex fnCell = tracepointFnCell(KeyGV);
+  if (fnCell == AndersNodeFactory::InvalidIndex)
+    return;
+  NodeIndex probeN = getRepNodeForValue(ProbeV);
+  if (probeN != AndersNodeFactory::InvalidIndex &&
+      !NF.isSpecialNode(probeN)) {
+    addAssignmentEdge(probeN, fnCell);
+    (fromWalker ? g_tpKeyMediatorBinds : g_tpKeyConstBinds)++;
+  }
+  if (DataV && !shouldSkipValue(DataV)) {
+    NodeIndex dataN = getRepNodeForValue(DataV);
+    if (dataN != AndersNodeFactory::InvalidIndex &&
+        !NF.isSpecialNode(dataN))
+      addAssignmentEdge(dataN,
+                        getRepDerefNode(getCanonicalNode(fnCell)));
+  }
+}
+
+// Struct-mediated registrations: trace_event_reg registers
+// call->class->probe / ->perf_probe on call->tp; bpf_probe_register
+// registers btp->bpf_func on btp->tp. Both (key, probe) pairs exist
+// as static-initializer co-residents — trace_event_call references
+// its class (probe fns live in the class initializer) and its
+// tracepoint; bpf_raw_event_map holds {tp, bpf_func} directly. The
+// registrar callsites themselves are severed like every family site;
+// the pairs bound here replace them. Probe-fn filters are the
+// macro-generated prefixes; anything else in a class initializer is
+// counted, not bound.
+void CallGraphPass::bindTracepointMediatorPairs() {
+  auto collectRefs = [](const Constant *Init,
+                        SmallVectorImpl<const GlobalValue *> &out) {
+    SmallVector<const Constant *, 16> wl{Init};
+    SmallPtrSet<const Constant *, 32> seen;
+    while (!wl.empty()) {
+      const Constant *C = wl.pop_back_val();
+      if (!seen.insert(C).second)
+        continue;
+      if (const auto *GVal = dyn_cast<GlobalValue>(C)) {
+        out.push_back(GVal);
+        continue;
+      }
+      for (const Use &U : C->operands())
+        if (const auto *OC = dyn_cast<Constant>(U))
+          wl.push_back(OC);
+    }
+  };
+  boost::unordered_flat_set<const GlobalVariable *> keySet;
+  for (auto &mp : Ctx->Modules) {
+    for (const GlobalVariable &GV : mp.first->globals()) {
+      if (!GV.hasInitializer())
+        continue;
+      SmallVector<const GlobalValue *, 16> refs;
+      collectRefs(GV.getInitializer(), refs);
+      const GlobalVariable *tpKey = nullptr;
+      for (const GlobalValue *R : refs)
+        if (R->getName().starts_with("__tracepoint_")) {
+          tpKey = dyn_cast<GlobalVariable>(R);
+          break;
+        }
+      if (!tpKey)
+        continue;
+      bool bound = false;
+      // bpf_raw_event_map shape: {tp, __bpf_trace_X} in one initializer
+      for (const GlobalValue *R : refs)
+        if (const auto *PF = dyn_cast<Function>(R)) {
+          if (PF->getName().starts_with("__bpf_trace_")) {
+            bindTracepointProbe(tpKey, PF, nullptr, /*fromWalker=*/true);
+            bound = true;
+          } else {
+            g_tpKeyClassFnSkipped++;
+          }
+        }
+      // trace_event_call shape: class global carries the probe fns
+      for (const GlobalValue *R : refs) {
+        const auto *ClsGV = dyn_cast<GlobalVariable>(R);
+        if (!ClsGV || ClsGV == &GV || ClsGV == tpKey ||
+            !ClsGV->hasInitializer())
+          continue;
+        const auto *ST = dyn_cast<StructType>(ClsGV->getValueType());
+        if (!ST || !ST->hasName() ||
+            !ST->getName().contains("trace_event_class"))
+          continue;
+        SmallVector<const GlobalValue *, 16> crefs;
+        collectRefs(ClsGV->getInitializer(), crefs);
+        for (const GlobalValue *CR : crefs)
+          if (const auto *PF = dyn_cast<Function>(CR)) {
+            StringRef pn = PF->getName();
+            if (pn.starts_with("trace_event_raw_event_") ||
+                pn.starts_with("perf_trace_")) {
+              bindTracepointProbe(tpKey, PF, nullptr, /*fromWalker=*/true);
+              bound = true;
+            } else if (pn != "trace_event_reg" &&
+                       pn != "trace_event_raw_init") {
+              g_tpKeyClassFnSkipped++;
+            }
+          }
+      }
+      if (bound && keySet.insert(tpKey).second)
+        g_tpWalkerKeys.push_back(tpKey);
+    }
+  }
+  CG_LOG("TracepointKeys: walker bound " << g_tpKeyMediatorBinds
+         << " mediator (key,probe) pairs over " << g_tpWalkerKeys.size()
+         << " keys (" << g_tpKeyClassFnSkipped
+         << " non-probe initializer fns skipped, " << g_tpKeyUnmapped
+         << " unmapped keys)\n");
 }
 
 // Trace-payload read-back contract confirmer (task #32, design recorded
@@ -12657,6 +13075,14 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLCensusPtrToInt && iteration == 0 && M == Ctx->Modules.front().first)
     runPtrToIntCensus(); // measurement-only, adds no edges
+
+  if (CFLCensusTracepoint && iteration == 0 &&
+      M == Ctx->Modules.front().first)
+    runTracepointCensus(); // measurement-only, adds no edges
+
+  if (CFLTracepointKeys && iteration == 0 &&
+      M == Ctx->Modules.front().first)
+    bindTracepointMediatorPairs(); // before any callsite is visited
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

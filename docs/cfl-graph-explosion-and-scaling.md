@@ -3839,3 +3839,47 @@ mass: 19,750 int stores + 27,926 loads witnessed, 4-5x the km counts).
   62 GB box. Module loading alone reaches ~44 GB RSS in the first few
   minutes; the envelope statement becomes "4.4 h, <45 GB RSS /
   ~55 GB AS".
+
+### Tracepoint keyed channels: census + model + km validation (task #35, 2026-08-02)
+
+The identity-shaped frontier, sized from the pin: 964 __traceiter_*
+callers carry 1,504,648 pairs = 17.9% of the 8.39M kernel answer set
+(~1,561 targets/site). Rodata (task #25) was re-measured on the way —
+--cfl-probe-rodata-joins over-removal bound = -29,128/+0 at km (30%),
+NOT closable, upgraded and queued behind this.
+
+CENSUS (--cfl-census-tracepoint, km + kernel): the registration family
+(tracepoint_probe_register/_prio/_prio_may_exist/_unregister) has 87
+callsites kernel-wide: 81 CONST (@__tracepoint_* argument, all with
+static probe too) + 6 LOAD, and the LOAD sites are exactly two
+struct-mediated registrars — trace_event_reg (x4: ftrace/perf paths;
+pairs live in trace_event_call -> trace_event_class static
+initializers) and bpf_probe_register/unregister (pairs live in
+bpf_raw_event_map {tp, __bpf_trace_*}). Zero FORMAL/OTHER. All 964
+__traceiter bodies name their key global at the funcs-head load
+(constexpr GEP), zero keyless. 100% classification — the model needs
+no unsound fallback.
+
+MODEL (--cfl-tracepoint-keys): per-key channel cells fnCell =
+deref(@__tracepoint_X), dataCell = deref(fnCell). Every register-
+family callsite is severed from the generic body — the body's shared
+tp formal IS the pooling channel — with CONST sites binding
+probe/data directly, walker pairs covering the two mediators, and
+mediator data pooled into walker keys' data cells (data was globally
+pooled before; only the fn plane gains keying). Each __traceiter icall
+reads its own key's cells, and the iterator's funcs-head load is
+severed (the channel replaces it; sound because the completeness
+counters — unclassified sites, keyless iterators, unmapped keys — are
+all zero and LOUD). Cluster joins key on POINTER origins, so per-key
+fn channels cannot merge even when DECLARE_EVENT_CLASS templates share
+probe fns across events.
+
+km VALIDATION: 37 const binds + 812 walker pairs over 194 keys, all
+completeness counters 0, and the A/B vs base is -0/+0 EXACT — with
+every registration severed and the funcs path cut, the channel ALONE
+reproduces the baseline resolution byte-for-byte. Crucially the km
+baseline was ALREADY per-key exact (__traceiter_sched_switch: 11
+targets, all sched_switch probes) — the 1,561/site pooling is a
+KERNEL-SCALE phenomenon (the 1.1M-member giant absorbs the funcs
+cells; the 177k km giant does not). So km proves soundness/
+completeness; the kernel A/B (in flight) measures the prize.

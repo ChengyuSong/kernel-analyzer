@@ -387,6 +387,34 @@ cl::opt<bool> CFLCensusPtrToInt(
            "cmp-only sites need no wildcard at all. Adds no edges"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusTracepoint(
+  "cfl-census-tracepoint",
+  cl::desc("MEASUREMENT-ONLY census (task #35): size the tracepoint "
+           "keyed-channel design. Classifies every "
+           "tracepoint_probe_register-family callsite by how the tp "
+           "argument is named (CONST @__tracepoint_* global = directly "
+           "keyable / LOAD = struct-mediated, needs initializer pair "
+           "correlation / FORMAL = in-family wrapper / OTHER), and "
+           "checks every __traceiter_* body names its key global at "
+           "the funcs-head load. Adds no edges"),
+  cl::init(false));
+
+cl::opt<bool> CFLTracepointKeys(
+  "cfl-tracepoint-keys",
+  cl::desc("REVIEWED MODEL (task #35): per-tracepoint keyed probe "
+           "channels. Every tracepoint_probe_register-family callsite "
+           "is severed from the generic body (whose shared tp formal "
+           "is the channel that pools ALL tracepoints' probes into "
+           "every __traceiter_* dispatch); CONST-key sites bind "
+           "probe/data to the key global's channel cells directly, and "
+           "the two struct-mediated registrars (trace_event_reg, "
+           "bpf_probe_register) are covered by walking the "
+           "trace_event_call / bpf_raw_event_map static initializers "
+           "for (tp, probe) pairs. __traceiter_* icalls read their own "
+           "key's channel. Unclassifiable sites keep generic wiring "
+           "and are counted LOUDLY (census: zero at kernel scale)"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -789,6 +817,8 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLConfirmSinks, "--cfl-confirm-sinks");
     requireFlowsTo(CFLSinkInstr, "--cfl-sink-instr");
     requireFlowsTo(CFLCensusPtrToInt, "--cfl-census-ptrtoint");
+    requireFlowsTo(CFLCensusTracepoint, "--cfl-census-tracepoint");
+    requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
     if (CFLCertUserCopy && CFLProbeUserCopyAblate) {
       errs() << "ERROR: --cfl-cert-usercopy tags the very edges "
                 "--cfl-probe-usercopy-ablate severs; the flags are "

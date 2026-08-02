@@ -1966,11 +1966,32 @@ public:
 static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
 static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
 // --cfl-sink-instr / --cfl-confirm-sinks (task #31/#32 design)
-static size_t g_sinkSealedJoins = 0; // reviewed trace-payload seal
 static size_t g_sinkSitesConfirmed = 0, g_sinkSitesEscaped = 0,
               g_sinkSitesViolated = 0;
 static bool g_sinkContractChecked = false;
 static std::map<std::string, size_t> g_sinkEscapeSinks; // sink -> sites
+// task #34 re-key v3: OPAQUE-ARENA model. Two join-time seal re-keys
+// were falsified at km before this: (v1) sealing cellsOf[class] of the
+// confirmer's anchor values over-reached 24x (-59,737 vs name-keyed
+// -2,442; presolve copy chains merge payload pointers into
+// generic-pointer classes, sweeping foreign deref sites at
+// irq/bpf/clocksource); (v2) sealing only each anchor's own deref node
+// under-reached to -0/+0 (673 anchors collapse to 3 presolve cell
+// classes; the giant-join glue forms at the rb-page OBJECT cells
+// reached through OTHER pointers, so facts flow around the boundary
+// cells). The object-keyed scope the name patterns approximated is
+// instead obtained STRUCTURALLY: each payload accessor's callsites
+// return a pointer to one shared opaque arena object (per accessor),
+// replacing the ret binding into ring-buffer internals. Payload
+// write->read flow is PRESERVED (sounder than the seal, which cut it);
+// only the false unification of payload cells with kernel-object cells
+// never forms. No join-time check, no name patterns on minted objects.
+static bool isSinkPayloadAccessor(StringRef n) {
+  return n == "ring_buffer_event_data" || n == "perf_trace_buf_alloc";
+}
+static size_t g_sinkArenaSites = 0;
+static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
+                                      AndersNodeFactory::InvalidIndex};
 
 // task #32: stratum classification of an inttoptr's int computation —
 // shared by the census and the --cfl-probe-stratum-ablate probe.
@@ -2322,7 +2343,6 @@ bool CallGraphPass::runFlowsToResolution() {
     auto &cs = cellsOf[p];
     if (std::find(cs.begin(), cs.end(), c) == cs.end()) cs.push_back(c);
   }
-
   // Facts are (origin root, shift) pairs, stored as NSHIFT bit planes per
   // class: plane s is a bitset over origins present at shift s. Shift
   // values: 0..NB-1 exact residues, NB = unknown (X). Field-insensitive
@@ -3387,16 +3407,10 @@ bool CallGraphPass::runFlowsToResolution() {
   auto sinkAblateClass = [&](uint32_t cls) {
     return classMatchesPats(cls, sinkAblatePats, sinkAblateMemo);
   };
-  // --cfl-sink-instr (reviewed model, task #31/#32 design): the fixed
-  // trace-payload family — the M4 ablation-matrix cell set, kept
-  // identical for comparability. Sealing is gated on the read-back
-  // contract confirmer (runSinkConfirmer refuses on VIOLATION before
-  // resolution ever runs).
-  static const StringRef sinkSealPatsArr[] = {"ring_buffer_", "trace_buf"};
-  boost::unordered_flat_map<uint32_t, char> sinkSealMemo;
-  auto sinkSealClass = [&](uint32_t cls) {
-    return classMatchesPats(cls, sinkSealPatsArr, sinkSealMemo);
-  };
+  // --cfl-sink-instr needs no code here: the opaque-arena model (task
+  // #34 v3) is applied structurally at graph-build time (visitCallBase
+  // binds payload-accessor returns to shared arena objects), so the
+  // solve runs unmodified. Contract gating is enforced at planting.
 
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
@@ -3405,10 +3419,6 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
       g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
-      return;
-    }
-    if (CFLSinkInstr && sinkSealClass(find(cell))) {
-      g_sinkSealedJoins++; // reviewed trace-payload seal (contract-gated)
       return;
     }
     if (protOn && s == 0 && protRid.count(o)) {
@@ -4806,9 +4816,9 @@ bool CallGraphPass::runFlowsToResolution() {
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLSinkInstr) {
     assert(g_sinkContractChecked &&
-           "sink seal ran without the read-back contract check");
-    errs() << "SinkInstr: " << g_sinkSealedJoins
-           << " joins sealed at trace-payload cells (contract: "
+           "sink arena ran without the read-back contract check");
+    errs() << "SinkInstr: " << g_sinkArenaSites
+           << " accessor callsites bound to opaque payload arenas (contract: "
            << g_sinkSitesConfirmed << " confirmed / " << g_sinkSitesEscaped
            << " escape / " << g_sinkSitesViolated << " violation)\n";
   }
@@ -6485,6 +6495,36 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
     }
     CG_DEBUG("Create heap obj node " << heapObj << " for " << CS << "\n");
     return; // skip allocation sites
+  }
+
+  // --cfl-sink-instr (task #34 v3): OPAQUE-ARENA model at the payload
+  // accessor boundary. The accessor's return is bound to ONE shared
+  // opaque object per accessor (NOT per callsite — write-side and
+  // read-side callsites must share the origin so payload write->read
+  // flow through the arena cells is preserved), replacing the ret
+  // binding into ring-buffer internals. Args still feed the real body
+  // (out-params, side effects). Gated on the read-back contract
+  // confirmer, which runs before any instruction visiting.
+  if (CFLSinkInstr) {
+    const Function *AF = dyn_cast<Function>(
+        CS.getCalledOperand()->stripPointerCasts());
+    if (AF && isSinkPayloadAccessor(AF->getName())) {
+      assert(g_sinkContractChecked &&
+             "arena planting reached before the contract check");
+      NodeIndex valNode = CGP.getRepNodeForValue(&CS);
+      if (valNode == AndersNodeFactory::InvalidIndex)
+        valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&CS));
+      NodeIndex &arena =
+          g_sinkArenaObj[AF->getName() == "perf_trace_buf_alloc"];
+      if (arena == AndersNodeFactory::InvalidIndex)
+        arena = CGP.NF.createOpaqueObjectNode(&CS, true);
+      CGP.EB.addDereferenceEdges(valNode, arena);
+      Function *RCF = CGP.getFuncDef(const_cast<Function *>(AF));
+      CGP.Ctx->Callees[&CS].insert(RCF);
+      CGP.wireCallArgs(&CS, RCF);
+      g_sinkArenaSites++;
+      return; // the arena IS the return identity; skip normal ret binding
+    }
   }
 
   // Check for function pointer cycles
@@ -9500,9 +9540,9 @@ void CallGraphPass::runPtrToIntCensus() {
 //     channel: data-indexed selection, soundly over-approximated by
 //     including all table entries), or other local non-dispatch use.
 void CallGraphPass::runSinkConfirmer() {
-  auto isPayloadAccessor = [](StringRef n) {
-    return n == "ring_buffer_event_data" || n == "perf_trace_buf_alloc";
-  };
+  // Accessor list shared with the arena planting in visitCallBase — the
+  // contract this confirms and the model it gates must key identically.
+  auto isPayloadAccessor = isSinkPayloadAccessor;
   enum Kind : char { PTR, VAL };
   size_t sites = 0;
   std::vector<std::string> violations;

@@ -3752,3 +3752,64 @@ deliverables landed together:
    under any offset-keyed refinement, both modes equal. tag: (p|1)&~1
    == p, exact under the new rule. Validation: smoke 4/4, libpng
    FI==fs13==27/9 unchanged.
+
+### Sink-instr re-key FALSIFIES the seal: the -190k was join-denial, not payload semantics (task #34, 2026-08-02)
+
+The adoption question ("re-key the name-matched seal to IR anchors,
+then decide default") answered itself by falsifying the seal. Three
+implementations, one km A/B each (base = canonical, 95,640 pairs,
+carries the select/phi fix; name-keyed reference = -2,442/+0):
+
+- v1, anchor the confirmer's payload-pointer chain values and seal
+  cellsOf[find(class)]: -59,737/+0, 195M joins sealed (9x the
+  name-keyed 22M). Removals at clocksource_watchdog, handle_edge_irq,
+  bpf_link_*, smp_call_function_many_cond — presolve copy chains merge
+  the accessor's void* results into generic-pointer classes, so the
+  class's cell list is mostly FOREIGN deref sites. Name-keyed removals
+  were a strict subset; scope semantically wrong.
+- v2, seal only each anchor's own deref node: 673 anchors collapse to
+  3 presolve cell classes, 666k joins sealed, -0/+0. The name-keyed
+  -2,442 is entirely missed: the glue forms at the rb-page OBJECT
+  cells reached through ring-buffer-internal pointers, and facts flow
+  around the sealed accessor-boundary cells. The name patterns had
+  been OBJECT-keyed all along — that emergent scope, not the payload
+  boundary, is what the seal's effect lived in.
+- v3, the semantically honest model, SHIPPED in-tree: OPAQUE ARENA at
+  the accessor boundary. visitCallBase binds the return of each
+  payload accessor (ring_buffer_event_data, perf_trace_buf_alloc —
+  the same two names the contract confirmer keys on) to ONE shared
+  opaque object per accessor; args still feed the real body; ret
+  binding into ring-buffer internals is replaced. Payload write->read
+  flow is PRESERVED (the seal cut it — the arena is strictly sounder),
+  only the unification of payload cells with kernel-object cells never
+  forms. No join-time check, no name patterns, no sealCell machinery
+  (all deleted). Result: 171 accessor callsites bound, contract
+  21/150/0 — and -0/+0 EXACT.
+
+VERDICT — reinterpretation of the #32 kernel acceptance number:
+- The true trace-payload channel contributes ZERO false icall pairs
+  at km. All 171 accessor sites live under kernel/, so the payload
+  semantics are FULLY CONTAINED in the km subset: the kernel-scale
+  -190,493 cannot have been payload precision either.
+- What the name-keyed seal actually did: deny 22M+ joins at cells
+  whose merged classes happened to contain a payload-named value —
+  emergent-scope glue denial, a cousin of the ablation probes. Its
+  removed pairs (703 targets scattered over 211 sites: trace_clock*,
+  buffer_pipe_buf_*, perf_mmap_* mixed with generic_delete_inode,
+  alarmtimer_rtc_add_device) are giant-membership subtractions. The
+  63 zeroed-site inventory ("masked under-resolution") was the same
+  symptom seen from the other side.
+- ADOPTION: the name-keyed seal is RETIRED — its win is unprincipled
+  and its removals were never validated as false pairs (the contract
+  only certifies accessor-derived dispatch, not the emergent scope).
+  --cfl-sink-instr now IS the arena model: sound, contract-gated,
+  ~free, and worth +/-0 at km — kept as the honest instrument, no
+  case for default. The user's "not yet" call was right.
+- The 63-site sweep is MOOT in its original form (it audited seal
+  zeroings; the arena zeroes nothing). Falsification count for the
+  paper spine: this is #6, and the second time a headline win
+  dissolved under an intrinsic re-key (cf. #17 identity splitting).
+
+Validation: smoke 4/4, t_maskwalk FI 6/6 unchanged. Next: kernel
+canonical re-pin run carrying the select/phi provenance fix (+324
+recall at km) and the tag rule — no sink flag in the canonical config.

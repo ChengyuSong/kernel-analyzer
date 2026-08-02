@@ -377,6 +377,16 @@ cl::opt<bool> CFLSinkInstr(
            "ESCAPE sites are inventoried for the documented review"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusPtrToInt(
+  "cfl-census-ptrtoint",
+  cl::desc("MEASUREMENT-ONLY census (task #33): classify every ptrtoint "
+           "by its forward use-chains (escape > other > variable-arith > "
+           "mask > const-add-chain-to-inttoptr > compare-only) — sizes "
+           "the int-provenance residue design: const chains are GEPs in "
+           "disguise (residue-encodable, wildcard-suppressible), "
+           "cmp-only sites need no wildcard at all. Adds no edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -778,6 +788,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLCertUserCopy, "--cfl-cert-usercopy");
     requireFlowsTo(CFLConfirmSinks, "--cfl-confirm-sinks");
     requireFlowsTo(CFLSinkInstr, "--cfl-sink-instr");
+    requireFlowsTo(CFLCensusPtrToInt, "--cfl-census-ptrtoint");
     if (CFLCertUserCopy && CFLProbeUserCopyAblate) {
       errs() << "ERROR: --cfl-cert-usercopy tags the very edges "
                 "--cfl-probe-usercopy-ablate severs; the flags are "

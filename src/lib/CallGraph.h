@@ -179,6 +179,7 @@ private:
   void runFieldChannelCensus();
   void confirmInvokeSummaries();
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
+  void runPtrToIntCensus(); // task #33: int-provenance residue sizing
   void handleInlineAsm(llvm::CallBase &CS);
   bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
                             bool rewriteEdges = true);

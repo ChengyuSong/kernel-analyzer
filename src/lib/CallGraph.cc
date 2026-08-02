@@ -9140,6 +9140,194 @@ void CallGraphPass::runFieldChannelCensus() {
 static size_t g_invConfirmed = 0, g_invConfirmedPass = 0, g_invRejEscape = 0,
               g_invRejPtrRet = 0, g_invRejNoBinding = 0, g_invRejShape = 0,
               g_invConfirmedChain = 0;
+// --cfl-census-ptrtoint (task #33): sizes the int-provenance residue
+// design. Every ptrtoint under field mode currently pays an fx
+// wildcard on its source ("ptrtoint-escape", the top wildcard family
+// at km) — but a chain that is only constant add/sub back into
+// inttoptr is a GEP in disguise (residue-encodable: f<C mod P>), and
+// a compare-only use needs no wildcard at all. Classify every
+// ptrtoint instruction by the worst thing its forward use-chains do:
+//   ESCAPE   — stored / call arg / returned (leaves local analysis)
+//   OTHER    — mul/shift/trunc/gep-index/unknown use
+//   VARIABLE — add/sub/or with a non-constant operand (percpu, stride)
+//   MASK     — and/or with a constant (alignment, low-bit tags)
+//   CONST    — every terminal is inttoptr at an exact nonzero offset
+//   CONST0   — exact offset-0 round trips only (plain 'a' already right)
+//   CMP      — compares/switches only
+//   DEAD     — no users
+// CONST + CONST0 + CMP = the wildcard-suppressible population.
+void CallGraphPass::runPtrToIntCensus() {
+  enum Sev { DEAD, CMP, CONST0, CONST, MASK, VARIABLE, OTHER, ESCAPE, NSEV };
+  static const char *sname[NSEV] = {"DEAD",  "CMP",      "CONST0",
+                                    "CONST", "MASK",     "VARIABLE",
+                                    "OTHER", "ESCAPE"};
+  size_t tally[NSEV] = {0};
+  size_t total = 0, inexactI2P = 0;
+  std::map<int64_t, size_t> constOffsets;
+  std::map<std::string, size_t> fnBySev[NSEV];
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) {
+      if (F.empty())
+        continue;
+      for (Instruction &I : instructions(F)) {
+        auto *PTI = dyn_cast<PtrToIntInst>(&I);
+        if (!PTI)
+          continue;
+        total++;
+        // Forward BFS over the int computation. State = accumulated
+        // constant offset while it stays exact.
+        struct WI {
+          const Value *v;
+          int64_t off;
+          bool exact;
+        };
+        SmallVector<WI, 16> wl{{PTI, 0, true}};
+        SmallPtrSet<const Value *, 32> seen{PTI};
+        bool fEsc = false, fOther = false, fVar = false, fMask = false,
+             fConst = false, fZero = false, fCmp = false;
+        unsigned steps = 0;
+        while (!wl.empty() && steps++ < 256) {
+          WI w = wl.pop_back_val();
+          for (const User *U : w.v->users()) {
+            auto push = [&](int64_t off, bool exact) {
+              if (seen.insert(U).second)
+                wl.push_back({cast<Value>(U), off, exact});
+            };
+            if (isa<IntToPtrInst>(U)) {
+              if (w.exact) {
+                if (w.off == 0)
+                  fZero = true;
+                else {
+                  fConst = true;
+                  constOffsets[w.off]++;
+                }
+              } else {
+                inexactI2P++; // why-inexact already flagged en route
+              }
+              continue;
+            }
+            if (const auto *BO = dyn_cast<BinaryOperator>(U)) {
+              const Value *other = BO->getOperand(BO->getOperand(0) == w.v
+                                                      ? 1
+                                                      : 0);
+              const auto *CI2 = dyn_cast<ConstantInt>(other);
+              switch (BO->getOpcode()) {
+              case Instruction::Add:
+                if (CI2)
+                  push(w.off + CI2->getSExtValue(), w.exact);
+                else {
+                  fVar = true;
+                  push(0, false);
+                }
+                break;
+              case Instruction::Sub:
+                if (CI2 && BO->getOperand(0) == w.v)
+                  push(w.off - CI2->getSExtValue(), w.exact);
+                else if (BO->getOperand(1) == w.v)
+                  fOther = true; // negated provenance / ptr difference
+                else {
+                  fVar = true;
+                  push(0, false);
+                }
+                break;
+              case Instruction::And:
+              case Instruction::Or:
+              case Instruction::Xor:
+                if (CI2) {
+                  fMask = true;
+                  push(0, false);
+                } else {
+                  fVar = true;
+                  push(0, false);
+                }
+                break;
+              default:
+                fOther = true; // mul/shift/div: scaling, not an offset
+                push(0, false);
+                break;
+              }
+              continue;
+            }
+            if (isa<ZExtInst>(U) || isa<SExtInst>(U) ||
+                isa<BitCastInst>(U) || isa<FreezeInst>(U)) {
+              push(w.off, w.exact);
+              continue;
+            }
+            if (isa<TruncInst>(U)) {
+              fOther = true;
+              push(0, false);
+              continue;
+            }
+            if (isa<PHINode>(U) || isa<SelectInst>(U)) {
+              push(0, false); // per-path offsets may differ
+              continue;
+            }
+            if (isa<ICmpInst>(U) || isa<SwitchInst>(U)) {
+              fCmp = true;
+              continue;
+            }
+            if (const auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getValueOperand() == w.v)
+                fEsc = true;
+              continue;
+            }
+            if (isa<CallBase>(U) || isa<ReturnInst>(U) ||
+                isa<AtomicRMWInst>(U) || isa<AtomicCmpXchgInst>(U)) {
+              fEsc = true;
+              continue;
+            }
+            if (isa<GetElementPtrInst>(U)) {
+              fOther = true; // laundered into another pointer's offset
+              continue;
+            }
+            fOther = true;
+          }
+        }
+        if (steps >= 256)
+          fOther = true; // walk cap: never classify as suppressible
+        Sev s = fEsc       ? ESCAPE
+                : fOther   ? OTHER
+                : fVar     ? VARIABLE
+                : fMask    ? MASK
+                : fConst   ? CONST
+                : fZero    ? CONST0
+                : fCmp     ? CMP
+                           : DEAD;
+        tally[s]++;
+        fnBySev[s][F.getName().str()]++;
+      }
+    }
+  }
+  errs() << "PtrToIntCensus: " << total << " ptrtoint instructions\n";
+  size_t suppressible = tally[CONST] + tally[CONST0] + tally[CMP] +
+                        tally[DEAD];
+  for (int s = 0; s < NSEV; s++)
+    errs() << "PtrToIntCensus: " << sname[s] << " " << tally[s] << " ("
+           << (total ? tally[s] * 100 / total : 0) << "%)\n";
+  errs() << "PtrToIntCensus: wildcard-suppressible (CONST+CONST0+CMP+DEAD) "
+         << suppressible << "/" << total << " ("
+         << (total ? suppressible * 100 / total : 0) << "%), "
+         << inexactI2P << " inexact inttoptr terminals\n";
+  {
+    std::vector<std::pair<size_t, int64_t>> or2;
+    for (auto &kv : constOffsets)
+      or2.emplace_back(kv.second, kv.first);
+    std::sort(or2.begin(), or2.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(12, or2.size()); i++)
+      errs() << "PtrToIntCensus: CONST offset " << or2[i].second << " x"
+             << or2[i].first << "\n";
+  }
+  for (int s : {(int)CONST, (int)ESCAPE, (int)VARIABLE, (int)MASK}) {
+    std::vector<std::pair<size_t, const std::string *>> fr2;
+    for (auto &kv : fnBySev[s])
+      fr2.emplace_back(kv.second, &kv.first);
+    std::sort(fr2.begin(), fr2.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(8, fr2.size()); i++)
+      errs() << "PtrToIntCensus: " << sname[s] << "-fn " << fr2[i].first
+             << "x " << *fr2[i].second << "\n";
+  }
+}
+
 // Trace-payload read-back contract confirmer (task #32, design recorded
 // at task #31 close). The sink model (--cfl-sink-instr) seals cluster
 // joins at trace-payload cells — sound ONLY if nothing loaded back out
@@ -12278,6 +12466,9 @@ bool CallGraphPass::doModulePass(Module *M) {
   if ((CFLConfirmSinks || CFLSinkInstr) && iteration == 0 &&
       M == Ctx->Modules.front().first)
     runSinkConfirmer(); // contract gate BEFORE any sealing can happen
+
+  if (CFLCensusPtrToInt && iteration == 0 && M == Ctx->Modules.front().first)
+    runPtrToIntCensus(); // measurement-only, adds no edges
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

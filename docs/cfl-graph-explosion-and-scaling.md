@@ -3664,3 +3664,46 @@ through the channel that actually glues the giant. That is new
 encoding design (task #33 next front, needs design review), with the
 +303 recall additions and the -1,670 prunes as the standing evidence
 that the residue machinery itself works when offsets survive to it.
+
+### Int-provenance residues FALSIFIED by census — the blob is irreducible at the offset abstraction (task #33, 2026-08-02)
+
+--cfl-census-ptrtoint (km): classify every ptrtoint by the worst
+thing its forward use-chains do. Verdict on 2,497 sites:
+
+  ESCAPE 1,470 (58%)  stored/call-arg/returned — address-as-data
+                      (snapshot_write_next, kprobe/traceprobe
+                      registration, BPF trampolines, siginfo export)
+  VARIABLE  341 (13%) non-constant strides (build_sched_domains,
+                      rstat cursors, static_call table walks)
+  OTHER     329 (13%) mul/shift/trunc/gep-index
+  MASK      260 (10%) alignment/tag arithmetic
+  CONST      32 (1%)  — 24 of them ONE __seccomp_filter +16384 idiom
+  CMP        61 (2%), CONST0 0, DEAD 4
+
+Wildcard-suppressible (CONST+CONST0+CMP+DEAD): 97/2,497 = 3%.
+
+The "GEP in disguise" population does not exist at km scale. With
+this, both offset-abstraction levers on the born giant are measured
+dead: constant-GEP residues moved it -9.7%, and constant int-chain
+residues have a 3% ceiling before touching a single hard case. The
+giant's glue is loop-carried variable arithmetic and escaped
+addresses — genuinely field-insensitive code whose conflation is
+real at the offset abstraction, not an encoding artifact. No mod-P
+(or any offset-keyed) refinement can split it.
+
+TASK #33 DISPOSITION:
+  - fs13 = a validated opt-in precision/recall instrument: -2,161
+    smear / +303 genuine recall (Up/Dn container flows) at 31x cost,
+    kernel-affordable-if-needed, converges. Not a default; not the
+    blob lever.
+  - The born giant is irreducible by offsets. Remaining candidate
+    levers are IDENTITY-shaped, not offset-shaped — noting one
+    specific stale verdict worth one cheap re-test: #17's
+    "identity splitting REGRESSES" was measured PRE-SEAL, when the
+    giant was 177k and join-glued; under the seal it is 71k and
+    born, a different object. One km A/B re-run of the #17
+    machinery under the seal would confirm or retire that verdict
+    in its new context.
+  - The usercopy-certificate certifiability goal inherits this:
+    class-granular naming cannot come from offset refinement; the
+    13% certified-clean floor stands as the honest number.

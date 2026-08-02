@@ -49,6 +49,7 @@ extern cl::opt<bool> CFLProbeUserCopyAblate;
 extern cl::opt<bool> CFLCertUserCopy;
 extern cl::opt<bool> CFLConfirmSinks;
 extern cl::opt<bool> CFLSinkInstr;
+extern cl::opt<bool> CFLCensusPtrToInt;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

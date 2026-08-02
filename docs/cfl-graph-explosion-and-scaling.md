@@ -3574,3 +3574,41 @@ What task #33 actually is — three fronts, in order:
 Sequence: localize the bug (km-scale bisection of the harfbuzz
 module set is the recorded next tool), then km fs13 A/B with the
 acceptance trio, then full kernel.
+
+### Task #33 framing CORRECTED against the task #27 record (2026-08-02)
+
+The section above shipped with two stale claims; the Jul-24 record
+(task #27) supersedes both, re-verified on HEAD today:
+
+1. There is NO open fs soundness bug. would_match_input resolves all
+   7 match functions under fs13; today's hb fs13 dump is
+   byte-identical to FI (2,824 pairs both). Gone since the Jul 8-17
+   incremental/bridge rework, diagnosed Jul 24.
+2. "km fs13 A/B" has a recorded cost wall: 37.7 min for ONE drain
+   (~200x FI, killed), wildcards dominated by ptrtoint-escape (3,467)
+   + union-initializer (1,777); and hb discrimination is zero because
+   fptr CLASSES merge before shift planes can discriminate (ensemble
+   gluing: strings + variable-index arrays + memcpy'd tables).
+
+What is genuinely NEW since that verdict, and what #33 actually
+tests: the #31 blob verdict (post-dating #27) established that the
+kernel giant is BORN PRE-SOLVE as the exact field-insensitivity
+quotient — an ENCODING-level conflation, structurally different from
+hb's in-solve cluster gluing, and touchable only by field-keyed
+edges (f-edges are not a-edges: GEP cycles stop being V-equal
+cycles by construction). Also new: the sink seal removes 27% of km
+join traffic (joins were both the fs cost driver and a gluing
+channel), and the #22/#23 int-provenance/asm modeling landed after
+ptrtoint-escape was named the top wildcard source.
+
+Decisive cheap experiment (in flight, km-fs13-blob.log): km fs13 +
+--cfl-probe-blob-formation + --cfl-sink-instr. Reads out (a) whether
+the born giant fragments under fs residues (pre-solve class sizes),
+(b) whether the seal + current stack moves the 200x drain cost,
+(c) answers if it converges. If (a) is yes and (b) is materially
+better, the kernel fs campaign is on; if the giant fragments but
+cost stays prohibitive, the next lever is fs-cost engineering
+(wildcard-source reduction, P tuning) with the quotient argument as
+justification; if the giant does NOT fragment, the blob is glued by
+non-GEP channels even at the encoding level and per-field cells
+demote to a precision-only tool behind identity work.

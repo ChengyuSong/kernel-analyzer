@@ -3612,3 +3612,55 @@ cost stays prohibitive, the next lever is fs-cost engineering
 justification; if the giant does NOT fragment, the blob is glued by
 non-GEP channels even at the encoding level and per-field cells
 demote to a precision-only tool behind identity work.
+
+### VERDICT: km fs13 A/B under the seal — the born giant is NOT a constant-GEP quotient (task #33, 2026-08-02)
+
+The pre-registered experiment (both legs: canonical + sink seal +
+blob probe, kernel/-only subset, current HEAD):
+
+                      FI+seal      fs13+seal
+  giant (final)        71,140       64,211    (-9.7%)
+  join events fed        106           29     (giant is ~all BORN)
+  match-by-CFL         90,734       89,064    (-1,670)
+  pairs                92,874       91,016    (-2,161/+303)
+  CGPass                2.6 min     79.7 min  (31x)
+
+READOUTS against the pre-committed branch logic:
+  (a) FRAGMENTATION: NO. The quotient-fragmentation hypothesis is
+      FALSIFIED at km — field residues on constant-offset GEPs shrink
+      the born giant by only 9.7%. Corollary discovered en route: the
+      sink seal alone already collapsed the FINAL giant from #31's
+      177,574 to 71,140 with only ~100 join events feeding it — the
+      in-solve gluing was largely the trace-payload channel, and what
+      remains is the born quotient. That quotient's glue is the
+      wildcard/laundering population, not constant GEPs: ptrtoint-
+      escape (3,467 wildcard nodes), union initializers (1,777),
+      variable-index GEPs — consistent with the #31 member census
+      (mm walkers, BPF interpreter, load_module: int-arithmetic-heavy
+      code). THE BLOB IS AN INT-ARITHMETIC QUOTIENT, NOT A GEP
+      QUOTIENT.
+  (b) COST: the wall moved 200x -> 31x (seal + a month of solver
+      work), and fs13 now CONVERGES at km (79.7 min). Real but not
+      decisive: 31x buys -1,670 match-CFL.
+  (c) ANSWERS: -2,161/+303. Removals = RCU/perf pool smear
+      (call_rcu_tasks* 123 each, perf IPI family) — plausibly correct
+      prunes. The +303 ADDITIONS are the surprise: legitimate recall
+      via the shift grammar's Up/Dn composition (member->container
+      flows that FI's one-directional GEP 'a' edge cannot derive;
+      exemplar __hrtimer_get_remaining -> ktime_get_*_fast_ns /
+      trace_clock*, the hrtimer clock_base get_time slots). fs is not
+      strictly tighter than FI — it is also SOUNDER on container
+      walks, which matters for the soundness story independent of
+      cost.
+
+DISPOSITION per the branch: per-field cells demote to a
+precision-plus-recall tool, not the blob lever. The sharpened
+frontier is INT-PROVENANCE RESIDUES: the laundering channel
+(ptrtoint -> add/sub const -> inttoptr) currently degrades to plain
+'a' edges (or fx wildcards on escape), erasing offsets exactly where
+the kernel does its pointer arithmetic; extending residue transforms
+through constant int arithmetic would key the SAME mod-P planes
+through the channel that actually glues the giant. That is new
+encoding design (task #33 next front, needs design review), with the
++303 recall additions and the -1,670 prunes as the standing evidence
+that the residue machinery itself works when offsets survive to it.

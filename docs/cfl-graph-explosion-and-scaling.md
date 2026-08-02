@@ -3813,3 +3813,29 @@ VERDICT — reinterpretation of the #32 kernel acceptance number:
 Validation: smoke 4/4, t_maskwalk FI 6/6 unchanged. Next: kernel
 canonical re-pin run carrying the select/phi provenance fix (+324
 recall at km) and the tag rule — no sink flag in the canonical config.
+
+### Kernel identity run: pin does NOT move — select/phi fix is kernel-redundant (2026-08-02)
+
+Canonical config, full bclist, carrying the select/phi provenance fix,
+the tag rule (inert at NB=0) and the arena code (inert without the
+flag). Result: BYTE-IDENTICAL to the kernel-gepfix pin — -0/+0 over
+all 8,391,950 dump lines (LC_ALL=C both-directions comm; note the pin
+.gz needed a C-locale re-sort — the locale trap again). No nvme_sq
+flap. 4.43 h vs the pin's 4.12 h (+7.5% from the modeled int-prov
+mass: 19,750 int stores + 27,926 loads witnessed, 4-5x the km counts).
+
+- The predicted pin move (+324-recall class from km) is FALSIFIED at
+  full scale: tracing_stat_open sits at 2,355 pairs in BOTH runs — the
+  chain the fix recovers at km already has redundant witnesses in the
+  full-kernel graph (other TUs' paths into the same stat machinery)
+  and is quotient-drowned besides. Same redundancy pattern as the
+  directmap ablation: per-TU-visible soundness gaps often carry
+  redundant witnesses at full scale. The fix STAYS (km proves real
+  dropped chains; kernel redundancy is corpus luck, not a guarantee).
+- OPERATIONAL: the first attempt OOM'd at the default --mem-limit=80
+  (49 GB) — died at presolve-saturation iteration 62/62. The limit is
+  RLIMIT_AS (address space), not RSS: peak RSS was only ~44 GB but VSZ
+  crossed 49 GB. Canonical kernel runs now need --mem-limit=92 on the
+  62 GB box. Module loading alone reaches ~44 GB RSS in the first few
+  minutes; the envelope statement becomes "4.4 h, <45 GB RSS /
+  ~55 GB AS".

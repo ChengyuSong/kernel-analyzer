@@ -4739,55 +4739,6 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "StrataAblate: " << g_strataAblated
            << " phys-stratum inttoptr bridges severed "
               "[MEASUREMENT-ONLY UNSOUND]\n";
-  if (CFLProbeBlobFormation) {
-    uint32_t giant = 0;
-    for (uint32_t n2 = 0; n2 < N; n2++)
-      if (find(n2) == n2 && clsSize[n2] > clsSize[giant])
-        giant = n2;
-    errs() << "BlobForm: FINAL giant class c" << giant
-           << " size=" << clsSize[giant] << " (" << blobEvents.size()
-           << " events logged)\n";
-    std::map<std::string, std::pair<size_t, uint64_t>> byCtx; // n, mass
-    std::map<std::string, uint64_t> byFeeder;                 // absorbed
-    size_t shown = 0, giantEvents = 0;
-    for (const BlobEv &ev : blobEvents) {
-      if (find(ev.keeper) != giant)
-        continue;
-      giantEvents++;
-      std::string ck = ev.ctx;
-      if (!ev.origin.empty())
-        ck += ":" + ev.origin;
-      auto &ce = byCtx[ck];
-      ce.first++;
-      ce.second += std::min(ev.szA, ev.szB);
-      byFeeder[ev.szA < ev.szB ? ev.nA : ev.nB] +=
-          std::min(ev.szA, ev.szB);
-      if (shown < 60) {
-        shown++;
-        errs() << "BlobForm: EV " << ev.ctx
-               << (ev.origin.empty() ? "" : (" origin=" + ev.origin))
-               << " " << ev.szA << "<" << ev.nA.substr(0, 50) << "> + "
-               << ev.szB << "<" << ev.nB.substr(0, 50) << ">\n";
-      }
-    }
-    errs() << "BlobForm: " << giantEvents
-           << " logged events fed the giant; by channel:\n";
-    std::vector<std::pair<uint64_t, const std::string *>> cr2;
-    for (auto &kv : byCtx)
-      cr2.emplace_back(kv.second.second, &kv.first);
-    std::sort(cr2.begin(), cr2.end(), std::greater<>());
-    for (size_t i = 0; i < std::min<size_t>(25, cr2.size()); i++)
-      errs() << "BlobForm: channel " << *cr2[i].second << " events="
-             << byCtx[*cr2[i].second].first << " absorbed-mass=" << cr2[i].first
-             << "\n";
-    std::vector<std::pair<uint64_t, const std::string *>> fr2;
-    for (auto &kv : byFeeder)
-      fr2.emplace_back(kv.second, &kv.first);
-    std::sort(fr2.begin(), fr2.end(), std::greater<>());
-    for (size_t i = 0; i < std::min<size_t>(25, fr2.size()); i++)
-      errs() << "BlobForm: feeder " << *fr2[i].second << " absorbed="
-             << fr2[i].first << "\n";
-  }
   if (protOn && !protWriterBlame.empty()) {
     std::vector<std::pair<size_t, const std::string *>> wr2;
     size_t wtot = 0;
@@ -4855,6 +4806,55 @@ bool CallGraphPass::runFlowsToResolution() {
            << " joins sealed at trace-payload cells (contract: "
            << g_sinkSitesConfirmed << " confirmed / " << g_sinkSitesEscaped
            << " escape / " << g_sinkSitesViolated << " violation)\n";
+  }
+  if (CFLProbeBlobFormation) {
+    uint32_t giant = 0;
+    for (uint32_t n2 = 0; n2 < N; n2++)
+      if (find(n2) == n2 && clsSize[n2] > clsSize[giant])
+        giant = n2;
+    errs() << "BlobForm: FINAL giant class c" << giant
+           << " size=" << clsSize[giant] << " (" << blobEvents.size()
+           << " events logged)\n";
+    std::map<std::string, std::pair<size_t, uint64_t>> byCtx; // n, mass
+    std::map<std::string, uint64_t> byFeeder;                 // absorbed
+    size_t shown = 0, giantEvents = 0;
+    for (const BlobEv &ev : blobEvents) {
+      if (find(ev.keeper) != giant)
+        continue;
+      giantEvents++;
+      std::string ck = ev.ctx;
+      if (!ev.origin.empty())
+        ck += ":" + ev.origin;
+      auto &ce = byCtx[ck];
+      ce.first++;
+      ce.second += std::min(ev.szA, ev.szB);
+      byFeeder[ev.szA < ev.szB ? ev.nA : ev.nB] +=
+          std::min(ev.szA, ev.szB);
+      if (shown < 60) {
+        shown++;
+        errs() << "BlobForm: EV " << ev.ctx
+               << (ev.origin.empty() ? "" : (" origin=" + ev.origin))
+               << " " << ev.szA << "<" << ev.nA.substr(0, 50) << "> + "
+               << ev.szB << "<" << ev.nB.substr(0, 50) << ">\n";
+      }
+    }
+    errs() << "BlobForm: " << giantEvents
+           << " logged events fed the giant; by channel:\n";
+    std::vector<std::pair<uint64_t, const std::string *>> cr2;
+    for (auto &kv : byCtx)
+      cr2.emplace_back(kv.second.second, &kv.first);
+    std::sort(cr2.begin(), cr2.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(25, cr2.size()); i++)
+      errs() << "BlobForm: channel " << *cr2[i].second << " events="
+             << byCtx[*cr2[i].second].first << " absorbed-mass=" << cr2[i].first
+             << "\n";
+    std::vector<std::pair<uint64_t, const std::string *>> fr2;
+    for (auto &kv : byFeeder)
+      fr2.emplace_back(kv.second, &kv.first);
+    std::sort(fr2.begin(), fr2.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(25, fr2.size()); i++)
+      errs() << "BlobForm: feeder " << *fr2[i].second << " absorbed="
+             << fr2[i].first << "\n";
   }
   if (CFLCertUserCopy) {
     // Match cert rids by their MINTED class (pre-merge): post-merge

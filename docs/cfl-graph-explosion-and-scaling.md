@@ -3455,3 +3455,40 @@ sink prints now live at the unconditional site.
 Kernel-scale identity run (canonical + --cfl-sink-instr, full bclist)
 is the remaining acceptance gate before any canonical-config adoption
 discussion.
+
+### Kernel acceptance run: --cfl-sink-instr = -190,493/+0 (task #32, 2026-08-02)
+
+Canonical config + --cfl-sink-instr, full bclist (4.25 h,
+kernel-sinkinstr.log):
+
+  contract: 726 payload accessor sites = 21 CONFIRMED / 705 ESCAPE /
+    0 VIOLATION (escapes again dominated by perf_trace_run_bpf_submit
+    — payload as BPF ctx argument, the certified crossing family).
+  seal: 479,966,232 joins sealed at trace-payload cells.
+  answers: 8,201,457 pairs vs the 8,391,950 pin = -190,493 / +0
+    EXACTLY (both-directions comm; not even the nvme_sq flap fired).
+    2.3% of the whole answer set was trace-payload smear: the
+    laundered fn-pool families (alloc_pgt_page 4,744; acpi/rtc
+    handlers 3,542 each; dmar_parse_* 1,655 each), concentrated in
+    HOF/poll callers (__switchdev_handle_* 7,489 each,
+    io_wq_worker_cancel, ring_buffer_poll_wait, n_tty_poll).
+
+ZEROED-SITE INVENTORY (the adoption review): 63 of 7,842
+pair-losing sites dropped to zero targets. Their lost targets are
+diagnostic — filter_match_preds' pred->fn lost udp_sendmsg /
+user_read / __traceiter_* (cross-subsystem junk, NOT the real
+filter_pred_* family); __switchdev_handle_* lost vp_get_status /
+dst_discard-class pool members. At all sampled zeroed sites the
+pin's ENTIRE answer was the smear pool — no genuine callee was among
+the removals, i.e. these sites never had a true witness and the pool
+was masking under-resolution (pred->fn's registration path is a
+separate, pre-existing modeling gap).
+
+Caveats recorded for the adoption discussion: (1) classMatchesPats
+is any-member on post-merge classes — a merged class containing one
+ring_buffer_ value seals the whole class (merge contamination);
+(2) sinkSealMemo staleness across merges cuts both ways in a shipped
+model (probe-era "acceptable" note does not transfer). Both argue
+for a write-provenance-keyed seal (only joins whose ORIGIN root is a
+payload write) as the refinement if adoption stalls. Flag stays
+opt-in; canonical pin unchanged.

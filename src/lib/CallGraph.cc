@@ -6711,13 +6711,9 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
               CGP.getRepNodeForValue(CS.getArgOperand(2));
           if (dataN != AndersNodeFactory::InvalidIndex &&
               !CGP.NF.isSpecialNode(dataN)) {
-            for (const GlobalVariable *K : g_tpWalkerKeys) {
-              NodeIndex fnCell = CGP.tracepointFnCell(K);
-              if (fnCell != AndersNodeFactory::InvalidIndex)
-                CGP.addAssignmentEdge(
-                    dataN, CGP.getRepDerefNode(
-                               CGP.getCanonicalNode(fnCell)));
-            }
+            for (const GlobalVariable *K : g_tpWalkerKeys)
+              CGP.addAssignmentEdge(dataN,
+                                    CGP.tracepointJunctions(K).second);
             g_tpKeyMediatorDataPools++;
           }
         }
@@ -6860,19 +6856,16 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       if (CFLTracepointKeys &&
           F->getName().starts_with("__traceiter_")) {
         if (const GlobalVariable *KeyGV = traceiterKeyOf(F)) {
-          NodeIndex fnCell = CGP.tracepointFnCell(KeyGV);
+          auto [fnJ, dataJ] = CGP.tracepointJunctions(KeyGV);
           NodeIndex coN =
               CGP.getRepNodeForValue(CS.getCalledOperand());
-          if (fnCell != AndersNodeFactory::InvalidIndex &&
-              coN != AndersNodeFactory::InvalidIndex) {
-            CGP.addAssignmentEdge(fnCell, coN);
+          if (coN != AndersNodeFactory::InvalidIndex) {
+            CGP.addAssignmentEdge(fnJ, coN);
             if (CS.arg_size() >= 1) {
               NodeIndex dArg =
                   CGP.getRepNodeForValue(CS.getArgOperand(0));
               if (dArg != AndersNodeFactory::InvalidIndex)
-                CGP.addAssignmentEdge(
-                    CGP.getRepDerefNode(CGP.getCanonicalNode(fnCell)),
-                    dArg);
+                CGP.addAssignmentEdge(dataJ, dArg);
             }
             g_tpKeyDispatchWires++;
           }
@@ -9806,41 +9799,49 @@ void CallGraphPass::runTracepointCensus() {
 }
 
 // ---- Tracepoint keyed channels (task #35, --cfl-tracepoint-keys) ----
-// Channel cells per key X: fnCell = deref(@__tracepoint_X) holds the
-// registered probe fns, dataCell = deref(fnCell) holds their data
-// arguments. Cluster joins key on POINTER origins, and each key
-// global is its own origin, so fn channels never merge across keys —
-// even when two events of one DECLARE_EVENT_CLASS template share a
-// probe fn (shared CONTENT does not join cells).
+// Per-key channel = two synthetic JUNCTION value nodes (fn, data), NOT
+// memory cells. v1 used fnCell = deref(@__tracepoint_X) and was
+// byte-identical to the pin at kernel scale (-0/+59-flap): the tp
+// structs' deref cells are inside the giant cluster there (tp pointers
+// travel through the __tracepoint_ptrs section arrays and iterator
+// formals, merging every tp's cells), so reading the channel imported
+// the whole quotient even though the channel CONTENT was exact.
+// Junction nodes are referenced by nothing but the model's own edges —
+// no pointer ever names them, no cell join can absorb them. With the
+// registration bodies and the iterator funcs-loads severed, plain
+// a-edges probe -> J_X -> called-operand ARE the exact dispatch.
+static boost::unordered_flat_map<const GlobalVariable *,
+                                 std::pair<NodeIndex, NodeIndex>>
+    g_tpKeyJunctionMap;
 
-NodeIndex CallGraphPass::tracepointFnCell(const GlobalVariable *KeyGV) {
-  NodeIndex keyN = getRepNodeForValue(KeyGV);
-  if (keyN == AndersNodeFactory::InvalidIndex) {
-    g_tpKeyUnmapped++; // LOUD in the LEDGER — census says this is empty
-    return AndersNodeFactory::InvalidIndex;
-  }
-  return getRepDerefNode(getCanonicalNode(keyN));
+std::pair<NodeIndex, NodeIndex>
+CallGraphPass::tracepointJunctions(const GlobalVariable *KeyGV) {
+  auto it = g_tpKeyJunctionMap.find(KeyGV);
+  if (it != g_tpKeyJunctionMap.end())
+    return it->second;
+  NodeIndex fnJ = getCanonicalNode(NF.createValueNode(nullptr));
+  NodeIndex dataJ = getCanonicalNode(NF.createValueNode(nullptr));
+  auto p = std::make_pair(fnJ, dataJ);
+  g_tpKeyJunctionMap.emplace(KeyGV, p);
+  return p;
 }
 
 void CallGraphPass::bindTracepointProbe(const GlobalVariable *KeyGV,
                                         const Value *ProbeV,
                                         const Value *DataV,
                                         bool fromWalker) {
-  NodeIndex fnCell = tracepointFnCell(KeyGV);
-  if (fnCell == AndersNodeFactory::InvalidIndex)
-    return;
+  auto [fnJ, dataJ] = tracepointJunctions(KeyGV);
   NodeIndex probeN = getRepNodeForValue(ProbeV);
   if (probeN != AndersNodeFactory::InvalidIndex &&
       !NF.isSpecialNode(probeN)) {
-    addAssignmentEdge(probeN, fnCell);
+    addAssignmentEdge(probeN, fnJ);
     (fromWalker ? g_tpKeyMediatorBinds : g_tpKeyConstBinds)++;
   }
   if (DataV && !shouldSkipValue(DataV)) {
     NodeIndex dataN = getRepNodeForValue(DataV);
     if (dataN != AndersNodeFactory::InvalidIndex &&
         !NF.isSpecialNode(dataN))
-      addAssignmentEdge(dataN,
-                        getRepDerefNode(getCanonicalNode(fnCell)));
+      addAssignmentEdge(dataN, dataJ);
   }
 }
 

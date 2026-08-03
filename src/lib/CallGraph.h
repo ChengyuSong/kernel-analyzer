@@ -182,7 +182,8 @@ private:
   void runPtrToIntCensus(); // task #33: int-provenance residue sizing
   void runTracepointCensus(); // task #35: keyed-channel design sizing
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
-  NodeIndex tracepointFnCell(const llvm::GlobalVariable *KeyGV);
+  std::pair<NodeIndex, NodeIndex>
+  tracepointJunctions(const llvm::GlobalVariable *KeyGV);
   void bindTracepointProbe(const llvm::GlobalVariable *KeyGV,
                            const llvm::Value *ProbeV,
                            const llvm::Value *DataV, bool fromWalker);

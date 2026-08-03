@@ -3874,12 +3874,32 @@ all zero and LOUD). Cluster joins key on POINTER origins, so per-key
 fn channels cannot merge even when DECLARE_EVENT_CLASS templates share
 probe fns across events.
 
-km VALIDATION: 37 const binds + 812 walker pairs over 194 keys, all
-completeness counters 0, and the A/B vs base is -0/+0 EXACT — with
-every registration severed and the funcs path cut, the channel ALONE
-reproduces the baseline resolution byte-for-byte. Crucially the km
-baseline was ALREADY per-key exact (__traceiter_sched_switch: 11
-targets, all sched_switch probes) — the 1,561/site pooling is a
-KERNEL-SCALE phenomenon (the 1.1M-member giant absorbs the funcs
-cells; the 177k km giant does not). So km proves soundness/
-completeness; the kernel A/B (in flight) measures the prize.
+km VALIDATION (v1, cell channel): 37 const binds + 812 walker pairs
+over 194 keys, all completeness counters 0, and the A/B vs base is
+-0/+0 EXACT — with every registration severed and the funcs path cut,
+the channel ALONE reproduces the baseline resolution byte-for-byte.
+Crucially the km baseline was ALREADY per-key exact
+(__traceiter_sched_switch: 11 targets, all sched_switch probes) — the
+1,561/site pooling is a KERNEL-SCALE phenomenon (the 1.1M-member
+giant absorbs the funcs cells; the 177k km giant does not).
+
+KERNEL A/B of v1: -0/+59-flap — BYTE-IDENTICAL pooling (median 686
+targets/site, max 4,616 at the x86_fpu family, all unchanged). The
+channel CONTENT was exact but the channel CELL was quotient-
+contaminated: deref(@__tracepoint_X) sits inside the kernel giant (tp
+pointers travel the __tracepoint_ptrs section arrays and iterator
+formals, merging every tp's cells), so the dispatch edge read the
+whole quotient back in. The #30 store-hub wall, rediscovered: keyed
+discrimination is absorbed the moment the key's CELL is merged.
+
+v2 (SHIPPED): junctions, not cells. Per-key synthetic value nodes
+J_X/D_X (createValueNode(nullptr)) carry probe -> J_X ->
+called-operand and data -> D_X -> arg0 as plain a-edges. Junctions
+are referenced by nothing but the model's own edges — no pointer
+names them, no cell join can absorb them. km A/B: -1,434/+0, and the
+removals are all NON-traceiter smear (bpf_seq_read 60, __schedule 21,
+rt_mutex_setprio 34...) — the tracepoint machinery's heap arrays had
+been leaking into other icall resolutions, and v1's cell writes had
+masked this by re-feeding the tp cells. __traceiter answers stay
+EXACT (sched_switch 11/11 identical). Kernel A/B v2 in flight — the
+theory predicts ~1.4M removals at the 964 __traceiter callers.

@@ -3943,3 +3943,35 @@ operand classes at the sink). Channels must live at the ANSWER level
 (modeled primitives over census-complete inventories, #14/#35) until
 the solver grows provenance cells (#30 frontier) that exempt fn
 identity from V-merging.
+
+### KERNEL VERDICT: -1,503,226/+0 — 17.9% of the answer set, and 19% faster (task #35, 2026-08-03)
+
+Canonical config + --cfl-tracepoint-keys, full bclist, 3.33 h
+(vs the pin's 4.12 h — severing the tracepoint registration machinery
+from the solve cut runtime ~19%; kernel-tpkeys3.log). Both-directions
+LC_ALL=C comm vs the kernel-gepfix pin:
+
+- REMOVED 1,503,226 / ADDED 0 (no nvme flap). 8,391,950 -> 6,888,724.
+- __traceiter pairs: 1,504,648 -> 3,871 (964 sites x ~4). Exemplar
+  __traceiter_x86_fpu_init_state: 4,616 type-fallback pairs -> exactly
+  {trace_event_raw_event_x86_fpu, perf_trace_x86_fpu,
+  __bpf_trace_x86_fpu, __probestub_x86_fpu_init_state}.
+- Non-traceiter removals: 2,449, ALL at __gen8_ppgtt_foreach (i915,
+  a giant member shedding tracepoint-glued smear).
+- Completeness certificate at kernel scale: 964/964 keys bound (39
+  const + 2,868 walker pairs), 0 type rejections, 0 unclassified reg
+  sites, 0 keyless iterators, 0 unmapped keys, 0 dyn-probe fallbacks.
+
+This is the largest single precision movement in the project (prior
+best: INVOKE pipeline -3.5%). Character differs from the retired seal:
+the inventory is census-complete and structural (registration API +
+static initializers), the km channel reproduced ground-truth
+resolution exactly before the primitive was added, every deviation
+path is counted loudly, and the direction is removals-only with the
+removed entries being TYPE-FALLBACK pairs (sites CFL never resolved),
+not CFL answers. Adoption (default-on vs opt-in) = user's call; the
+flag is opt-in until then and the canonical pin is unchanged.
+
+Follow-on candidates with the same answer-level shape: the singleton
+ops-struct families (kvm_x86_ops / x86_pmu: vcpu_run 134k + enter_smm
+49k pairs), and #25 rodata copy-not-unify (-29,128/+0 km bound).

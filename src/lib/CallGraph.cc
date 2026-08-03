@@ -1998,6 +1998,38 @@ static boost::unordered_flat_set<NodeIndex> g_tpKeyHasDynProbe;
 static size_t g_tpKeyModelAnswered = 0, g_tpKeyDynProbe = 0,
               g_tpKeyFallbackSites = 0, g_tpKeyTypeRej = 0;
 
+// --cfl-static-ops-tables (task #36): answer-level channel for
+// static_call keys updated from ops-struct tables — the kvm_x86 /
+// x86_pmu / apic_call families (1,225,715 pin pairs, ~all type-
+// fallback: the update's fn argument is a dynamic load the graph
+// never resolves). The update site's IR names the correlation
+// structurally — load gep(%struct.kvm_x86_ops, base, 0, N) — and the
+// binding inventory is the set of same-typed global initializers
+// (vmx_x86_ops/svm_x86_ops, intel/amd pmu, the apic drivers). Keys
+// with any non-conforming update argument (e.g. bpf_dispatcher's JIT
+// image) are UNTABLED and their sites keep graph behavior, LOUDLY.
+struct SctPending {
+  std::string keyName;    // __SCK__<suffix>
+  std::string structName; // canonical (suffix-stripped) struct name
+  unsigned fieldIdx;
+};
+static std::vector<SctPending> g_sctPendings;
+static boost::unordered_flat_map<std::string, FuncSet> g_sctKeyTable;
+static boost::unordered_flat_set<std::string> g_sctKeyUntabled;
+static bool g_sctTableBuilt = false;
+static size_t g_sctUpdConst = 0, g_sctUpdLoad = 0, g_sctUpdNonconform = 0,
+              g_sctTablesScanned = 0, g_sctPendingNoTable = 0,
+              g_sctSitesModelAnswered = 0, g_sctSitesUntabled = 0,
+              g_sctTypeRej = 0;
+static StringRef sctCanonStructName(StringRef n) {
+  // "struct.kvm_x86_ops.123" -> "struct.kvm_x86_ops" (per-TU suffixes)
+  size_t dot = n.rfind('.');
+  if (dot != StringRef::npos && dot + 1 < n.size() &&
+      isdigit(static_cast<unsigned char>(n[dot + 1])))
+    return n.substr(0, dot);
+  return n;
+}
+
 // The dispatch key of a __traceiter_* body: the base of the constexpr
 // GEP its funcs-head load reads from. Memoized; single-threaded visit.
 static const GlobalVariable *traceiterKeyOf(const Function *F) {
@@ -4441,6 +4473,52 @@ bool CallGraphPass::runFlowsToResolution() {
         for (const Function *F2 : slot) opsMemberOf[F2].push_back(&GV);
       }
   }
+  // Ops-table channel (task #36): resolve the pendings recorded at
+  // __static_call_update sites against every same-typed global
+  // initializer, once. zeroinitializer tables contribute nothing
+  // (their field elements are null, not functions).
+  if (CFLStaticOpsTables && !g_sctTableBuilt) {
+    g_sctTableBuilt = true;
+    boost::unordered_flat_map<std::string,
+                              std::vector<const GlobalVariable *>>
+        byType;
+    for (auto &mp : Ctx->Modules)
+      for (const GlobalVariable &GVt : mp.first->globals()) {
+        if (!GVt.hasInitializer())
+          continue;
+        const auto *STt = dyn_cast<StructType>(GVt.getValueType());
+        if (STt && STt->hasName())
+          byType[sctCanonStructName(STt->getName()).str()].push_back(&GVt);
+      }
+    for (const auto &P : g_sctPendings) {
+      auto tIt = byType.find(P.structName);
+      bool any = false;
+      if (tIt != byType.end())
+        for (const GlobalVariable *T : tIt->second) {
+          g_sctTablesScanned++;
+          const Constant *E =
+              T->getInitializer()->getAggregateElement(P.fieldIdx);
+          if (!E)
+            continue;
+          if (const auto *TF =
+                  dyn_cast<Function>(E->stripPointerCasts())) {
+            g_sctKeyTable[P.keyName].insert(
+                getFuncDef(const_cast<Function *>(TF)));
+            any = true;
+          }
+        }
+      if (!any)
+        g_sctPendingNoTable++;
+    }
+    CG_LOG("StaticOpsTables: " << g_sctPendings.size()
+           << " load-shaped updates resolved against " << g_sctTablesScanned
+           << " table scans; " << g_sctKeyTable.size() << " keys tabled ("
+           << g_sctUpdConst << " const + " << g_sctUpdLoad
+           << " load updates, " << g_sctUpdNonconform << " non-conforming"
+           << " -> " << g_sctKeyUntabled.size() << " untabled keys, "
+           << g_sctPendingNoTable << " pendings with no fn source)\n");
+  }
+
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -4631,12 +4709,49 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
     }
-    if (!tpModelOwned) {
+    // Ops-table channel (task #36): a __SCT__ site whose key is tabled
+    // takes its targets from the table — the graph answer at these
+    // sites is the type fallback (the update's fn argument is a
+    // dynamic ops-struct load the graph never resolves). Untabled or
+    // non-conforming keys keep graph behavior, counted.
+    bool sctModelOwned = false;
+    if (CFLStaticOpsTables && !tpModelOwned) {
+      Function *SCTF = CS->getCalledFunction();
+      if (SCTF && SCTF->getName().starts_with("__SCT__")) {
+        std::string keyName =
+            ("__SCK__" + SCTF->getName().drop_front(7)).str();
+        auto kIt = g_sctKeyTable.find(keyName);
+        if (kIt != g_sctKeyTable.end() &&
+            !g_sctKeyUntabled.count(keyName)) {
+          sctModelOwned = true;
+          g_sctSitesModelAnswered++;
+          for (const Function *TF : kIt->second) {
+            // The table is AUTHORITATIVE: it lists exactly what update
+            // sites patch into this key, so a type mismatch (e.g.
+            // __static_call_return0's long(void) at a typed site) is a
+            // REAL runtime target the type filter would wrongly drop.
+            // Counted + warned for review, never filtered.
+            if (!isCompatible(CS, TF)) {
+              g_sctTypeRej++;
+              if (g_sctTypeRej <= 20)
+                WARNING("StaticOpsTables: type-mismatched table entry "
+                        << TF->getName() << " at "
+                        << CS->getFunction()->getName()
+                        << " (kept)\n");
+            }
+            targets.insert(TF);
+          }
+        } else {
+          g_sctSitesUntabled++;
+        }
+      }
+    }
+    if (!tpModelOwned && !sctModelOwned) {
       collect(R[rep][0]);
       collect(RB[rep][0]);
     }
     const size_t exactTargets = targets.size();
-    if (!tpModelOwned && NB > 0) {
+    if (!tpModelOwned && !sctModelOwned && NB > 0) {
       collect(R[rep][SHIFT_X]);
       collect(RB[rep][SHIFT_X]);
     }
@@ -4932,6 +5047,17 @@ bool CallGraphPass::runFlowsToResolution() {
            << " -> " << g_tpKeyFallbackSites
            << " fallback sites (all must be 0 for the severed model to "
            << "be complete)\n";
+  }
+  if (CFLStaticOpsTables) {
+    errs() << "StaticOpsTables: " << g_sctKeyTable.size() << " keys tabled ("
+           << g_sctUpdConst << " const + " << g_sctUpdLoad
+           << " load-shaped updates), " << g_sctSitesModelAnswered
+           << " __SCT__ sites model-answered (" << g_sctTypeRej
+           << " type-mismatched entries KEPT); " << g_sctUpdNonconform
+           << " non-conforming updates -> " << g_sctKeyUntabled.size()
+           << " untabled keys, " << g_sctSitesUntabled
+           << " sites kept graph behavior, " << g_sctPendingNoTable
+           << " pendings without a fn source\n";
   }
   if (CFLProbeBlobFormation) {
     uint32_t giant = 0;
@@ -6661,6 +6787,107 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
         CS.arg_size() >= 3) {
       Value *KeyV = CS.getArgOperand(0)->stripPointerCasts();
       if (auto *KeyG = dyn_cast<GlobalVariable>(KeyV)) {
+        // Ops-table channel (task #36): record what this update binds.
+        // Const fn -> direct table entry; load gep(%struct.X, base,
+        // 0, N) -> pending (resolved against all %struct.X global
+        // initializers at resolution); anything else UNTABLES the key.
+        if (CFLStaticOpsTables) {
+          std::string keyName = KeyG->getName().str();
+          // Recursive fn-source classifier: const fn / null / ops-table
+          // load, composed through select/phi (the OPTIONAL_RET0 macro
+          // emits `load ?: __static_call_return0` as a select). EVERY
+          // leaf must conform or the key is untabled.
+          std::function<bool(const Value *, unsigned)> classify =
+              [&](const Value *FV, unsigned depth) -> bool {
+            if (depth > 4)
+              return false;
+            FV = FV->stripPointerCasts();
+            if (const auto *TF = dyn_cast<Function>(FV)) {
+              g_sctKeyTable[keyName].insert(
+                  CGP.getFuncDef(const_cast<Function *>(TF)));
+              g_sctUpdConst++;
+              return true;
+            }
+            if (isa<ConstantPointerNull>(FV)) {
+              g_sctKeyTable.try_emplace(keyName); // known key, no target
+              return true;
+            }
+            if (const auto *LI2 = dyn_cast<LoadInst>(FV)) {
+              const Value *PB =
+                  LI2->getPointerOperand()->stripPointerCasts();
+              // (a) base strips to a struct-typed GLOBAL (the singleton
+              // pattern: @kvm_pmu_ops field 0 has NO gep, later fields
+              // are canonical i8 byte-geps): map the constant byte
+              // offset to a field via DataLayout.
+              const Value *Base = PB;
+              APInt Off(64, 0);
+              bool constOff = true;
+              if (const auto *GO0 = dyn_cast<GEPOperator>(PB)) {
+                constOff =
+                    CGP.curDL && GO0->accumulateConstantOffset(*CGP.curDL,
+                                                               Off);
+                Base = GO0->getPointerOperand()->stripPointerCasts();
+              }
+              if (const auto *BG = dyn_cast<GlobalVariable>(Base)) {
+                const auto *BST =
+                    dyn_cast<StructType>(BG->getValueType());
+                if (constOff && BST && BST->hasName() && CGP.curDL) {
+                  const StructLayout *SL = CGP.curDL->getStructLayout(
+                      const_cast<StructType *>(BST));
+                  uint64_t o = Off.getZExtValue();
+                  if (o < SL->getSizeInBytes()) {
+                    g_sctKeyTable.try_emplace(keyName);
+                    g_sctPendings.push_back(
+                        {keyName,
+                         sctCanonStructName(BST->getName()).str(),
+                         SL->getElementContainingOffset(o)});
+                    g_sctUpdLoad++;
+                    return true;
+                  }
+                }
+                return false;
+              }
+              // (b) dynamic base: struct-typed gep with constant field
+              // index (trace_event_reg / apic->f shape)
+              const auto *GO = dyn_cast<GEPOperator>(PB);
+              const StructType *ST2 =
+                  GO ? dyn_cast<StructType>(GO->getSourceElementType())
+                     : nullptr;
+              const auto *Zero =
+                  GO && GO->getNumIndices() == 2
+                      ? dyn_cast<ConstantInt>(GO->getOperand(1))
+                      : nullptr;
+              const auto *FieldC =
+                  Zero && Zero->isZero()
+                      ? dyn_cast<ConstantInt>(GO->getOperand(2))
+                      : nullptr;
+              if (!ST2 || !ST2->hasName() || !FieldC)
+                return false;
+              g_sctKeyTable.try_emplace(keyName);
+              g_sctPendings.push_back(
+                  {keyName, sctCanonStructName(ST2->getName()).str(),
+                   (unsigned)FieldC->getZExtValue()});
+              g_sctUpdLoad++;
+              return true;
+            }
+            if (const auto *SEL = dyn_cast<SelectInst>(FV)) {
+              bool a = classify(SEL->getTrueValue(), depth + 1);
+              bool b = classify(SEL->getFalseValue(), depth + 1);
+              return a && b;
+            }
+            if (const auto *PHI2 = dyn_cast<PHINode>(FV)) {
+              bool ok = true;
+              for (const Value *IV : PHI2->incoming_values())
+                ok &= classify(IV, depth + 1);
+              return ok;
+            }
+            return false;
+          };
+          if (!classify(CS.getArgOperand(2), 0)) {
+            g_sctKeyUntabled.insert(keyName);
+            g_sctUpdNonconform++;
+          }
+        }
         NodeIndex keyNode = CGP.getRepNodeForValue(KeyG);
         NodeIndex funcNode =
             CGP.getRepNodeForValue(CS.getArgOperand(2)->stripPointerCasts());

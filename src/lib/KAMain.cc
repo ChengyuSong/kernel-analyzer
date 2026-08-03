@@ -415,6 +415,20 @@ cl::opt<bool> CFLTracepointKeys(
            "and are counted LOUDLY (census: zero at kernel scale)"),
   cl::init(false));
 
+cl::opt<bool> CFLStaticOpsTables(
+  "cfl-static-ops-tables",
+  cl::desc("REVIEWED MODEL (task #36): answer-level channel for "
+           "static_call keys updated from ops-struct tables. At "
+           "__static_call_update(key, ops->field) sites the IR names "
+           "the struct type and field index; the binding inventory is "
+           "the set of same-typed global initializers (vmx/svm "
+           "kvm_x86_ops, intel/amd x86_pmu, apic drivers). __SCT__ "
+           "dispatch sites whose key is tabled take their targets from "
+           "the table instead of the (type-fallback) graph answer; "
+           "non-conforming update args untable the key LOUDLY and its "
+           "sites keep graph behavior. Requires --cfl-static-call"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -819,6 +833,11 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLCensusPtrToInt, "--cfl-census-ptrtoint");
     requireFlowsTo(CFLCensusTracepoint, "--cfl-census-tracepoint");
     requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
+    requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");
+    if (CFLStaticOpsTables && !CFLStaticCall) {
+      errs() << "ERROR: --cfl-static-ops-tables requires --cfl-static-call\n";
+      exit(1);
+    }
     if (CFLCertUserCopy && CFLProbeUserCopyAblate) {
       errs() << "ERROR: --cfl-cert-usercopy tags the very edges "
                 "--cfl-probe-usercopy-ablate severs; the flags are "

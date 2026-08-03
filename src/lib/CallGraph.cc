@@ -2802,7 +2802,11 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
-  const bool protOn = CFLOpsPairs && NB == 0 && !opsPairs.empty();
+  // Protection activates for certified ops containers (task #30) and/or
+  // rodata origins (task #25 copy-not-unify — same machinery: writer
+  // joins merge, reader joins bridge non-transitively, mixed demotes).
+  const bool protOn = NB == 0 && ((CFLOpsPairs && !opsPairs.empty()) ||
+                                  CFLRodataCopy);
   boost::unordered_flat_set<uint32_t> protRid;
   boost::unordered_flat_set<uint32_t> protCls; // container value classes
   boost::unordered_flat_map<uint32_t, ProtState> prot; // rid -> state
@@ -2903,6 +2907,18 @@ bool CallGraphPass::runFlowsToResolution() {
     for (auto &sd : seeds)
       if (protCls.count(sd.first))
         protRid.insert(sd.second);
+  }
+  if (CFLRodataCopy && NB == 0) {
+    // task #25: every rodata origin is protection-eligible — const
+    // memory has exactly one writer (its initializer), so writer joins
+    // establish the cell and every reader bridges copy-out. rootRodata
+    // excludes function origins by construction.
+    size_t nRP = 0;
+    for (uint32_t rid = 0; rid < nextRoot; rid++)
+      if (rootRodata[rid] && protRid.insert(rid).second)
+        nRP++;
+    CG_LOG("RodataCopy: " << nRP
+           << " rodata origins protected (copy-not-unify)\n");
   }
 
   // Root-class tracking so incremental wiring can mint identity roots
@@ -3818,6 +3834,8 @@ bool CallGraphPass::runFlowsToResolution() {
     rootClassOf.push_back(rep);
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
     rootRodata.push_back(classIsRodata(toOrig[rep]));
+    if (CFLRodataCopy && rootRodata.back())
+      protRid.insert(rid); // rodata origin minted mid-fixpoint (task #25)
     tHow = "inc-mint"; tFrom = rep;
     addFact(rep, 0, rid, ctx0);
   };

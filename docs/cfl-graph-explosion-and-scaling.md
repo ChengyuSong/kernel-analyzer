@@ -4017,3 +4017,31 @@ COMBINED PICTURE: #35 (-1,503,226) + #36 (-1,197,091) ≈ -2.70M pairs
 primitives, both with faster runs than baseline. Both flags opt-in;
 adoption/default = user's call (a combined-flag kernel run would be
 the natural new-pin candidate if adopted).
+
+### Rodata copy-not-unify: the honest model is answer-neutral — probe bound falsified (task #25 CLOSED, 2026-08-03)
+
+The sound implementation cost ~40 lines: the #30 provenance-protection
+machinery IS copy-not-unify (writer joins merge, reader joins attach
+via non-transitive bridges, mixed cells demote), so --cfl-rodata-copy
+just protects every rodata origin (rootRodata was already minted, both
+initially and mid-fixpoint) and extends protOn. Validation: t_ops /
+t_ops2 / t_container / t_allocinit exact with the flag on (const ops
+tables still resolve — initializer flow preserved), smoke 4/4.
+
+km VERDICT: -0/+0 EXACT, runtime unchanged. The machinery engaged
+fully — 3,570 rodata origins protected, 3,403 writer merges, 2,720
+reader bridges, 82 demotions — and no answer moved. The probe's
+-29,128/+0 (30% of km) is therefore a JOIN-DENIAL ARTIFACT, the third
+instance of the emergent-scope pattern (trace-payload seal, tracepoint
+cell channel): the probe removed pairs by denying WRITER-shaped joins
+at rodata-witnessed cells — stores through mixed-pointee pointers and
+memcpy chains, flows that are semantically real — while the honest
+model cuts only reader-reader unification, which is answer-neutral.
+"String-literal witnesses seed the hub" (the #26-era diagnosis) is
+DEAD as a precision lever: the glue rides written-through cells, not
+pure-const readership.
+
+DISPOSITION: #25 CLOSED. --cfl-rodata-copy stays in-tree as a sound,
+neutral, off-by-default instrument. The pin-candidate combination
+(user directive) proceeds with the TWO positive levers:
+--cfl-tracepoint-keys + --cfl-static-ops-tables.

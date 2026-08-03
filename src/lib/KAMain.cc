@@ -429,6 +429,20 @@ cl::opt<bool> CFLStaticOpsTables(
            "sites keep graph behavior. Requires --cfl-static-call"),
   cl::init(false));
 
+cl::opt<bool> CFLRodataCopy(
+  "cfl-rodata-copy",
+  cl::desc("REVIEWED MODEL (task #25): copy-not-unify for rodata "
+           "origins. Const globals are immutable, so their cells "
+           "transmit contents to readers (initializer-planted facts "
+           "still flow: const ops tables resolve) but never unify "
+           "reader classes with each other — the string-literal / "
+           "const-struct witness glue never forms. Reuses the #30 "
+           "provenance-protection machinery: writer joins (initializer "
+           "cells) merge, reader joins attach via non-transitive "
+           "bridges, mixed cells demote soundly. km over-removal upper "
+           "bound was -29,128/+0 (30%)"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -834,6 +848,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLCensusTracepoint, "--cfl-census-tracepoint");
     requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
     requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");
+    requireFlowsTo(CFLRodataCopy, "--cfl-rodata-copy");
     if (CFLStaticOpsTables && !CFLStaticCall) {
       errs() << "ERROR: --cfl-static-ops-tables requires --cfl-static-call\n";
       exit(1);

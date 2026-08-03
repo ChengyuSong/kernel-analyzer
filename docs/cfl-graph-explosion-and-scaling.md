@@ -3975,3 +3975,45 @@ flag is opt-in until then and the canonical pin is unchanged.
 Follow-on candidates with the same answer-level shape: the singleton
 ops-struct families (kvm_x86_ops / x86_pmu: vcpu_run 134k + enter_smm
 49k pairs), and #25 rodata copy-not-unify (-29,128/+0 km bound).
+
+### static_call ops-table channel: -1,197,091/+29 at kernel scale (task #36, 2026-08-03)
+
+The follow-on landed the same day (df07d7f). Re-sized prize: the
+__SCT__ static_call families carry 1,225,715 pin pairs (kvm_x86
+1,034,082 + x86_pmu 132,400 + apic_call 51,918 + tails), and they are
+TYPE-FALLBACK: static_call_update's fn argument is a dynamic
+ops-struct load the graph never resolves, so every vcpu_run __SCT__
+site carried the 4,928-fn type-compatible set.
+
+MODEL (--cfl-static-ops-tables, requires --cfl-static-call): at each
+const-key __static_call_update site, classify the fn source —
+  - constant fn: direct table entry (cond_resched family lands here);
+  - load gep(%struct.X, base, 0, N), or the SINGLETON shapes (no-gep
+    field-0 load of @kvm_pmu_ops; canonical i8 byte-geps mapped
+    offset->field via DataLayout StructLayout): a pending, resolved
+    against EVERY same-typed global initializer (vmx/svm kvm_x86_ops,
+    intel/amd pmu, the apic drivers; suffix-canonicalized type names);
+  - select/phi composed for OPTIONAL_RET0's `load ?: return0`;
+  - anything else UNTABLES the key loudly (kernel: 3 keys, led by
+    bpf_dispatcher's JIT image — graph behavior is correct there).
+Tabled __SCT__ sites take targets from the table in the resolution
+loop (#35 ownership pattern). The table is AUTHORITATIVE over
+isCompatible: __static_call_return0 (long(void)) is a real runtime
+target at typed RET0 sites — mismatches are warned and KEPT, never
+filtered (90 at kernel scale, all return0).
+
+KERNEL VERDICT: -1,197,091 / +88 vs the pin (14.3% of the answer
+set), 3.89 h. The 88 additions: 59 = the known nvme_sq flap, 18 =
+__static_call_return0 recall, 11 = default_send_IPI_*_phys apic-table
+recall — every non-flap addition is a REAL target the type fallback
+missed. 188 keys tabled (59 const + 171 load-shaped), 10,785 sites
+model-answered, 150 sites kept graph behavior under the 3 untabled
+keys. Repro-subset validation (km + arch/x86/kvm + arch/x86/events):
+-204,758/+18; get_rflags -> {vmx,svm}, pmu_hw_event_available ->
+{intel,amd}, cache_reg 131 sites x 3 exact; no fat SCT set remains.
+
+COMBINED PICTURE: #35 (-1,503,226) + #36 (-1,197,091) ≈ -2.70M pairs
+= 32% of the 8.39M pin, from two census-complete answer-level
+primitives, both with faster runs than baseline. Both flags opt-in;
+adoption/default = user's call (a combined-flag kernel run would be
+the natural new-pin candidate if adopted).

@@ -3892,14 +3892,54 @@ formals, merging every tp's cells), so the dispatch edge read the
 whole quotient back in. The #30 store-hub wall, rediscovered: keyed
 discrimination is absorbed the moment the key's CELL is merged.
 
-v2 (SHIPPED): junctions, not cells. Per-key synthetic value nodes
-J_X/D_X (createValueNode(nullptr)) carry probe -> J_X ->
-called-operand and data -> D_X -> arg0 as plain a-edges. Junctions
-are referenced by nothing but the model's own edges — no pointer
-names them, no cell join can absorb them. km A/B: -1,434/+0, and the
-removals are all NON-traceiter smear (bpf_seq_read 60, __schedule 21,
-rt_mutex_setprio 34...) — the tracepoint machinery's heap arrays had
-been leaking into other icall resolutions, and v1's cell writes had
-masked this by re-feeding the tp cells. __traceiter answers stay
-EXACT (sched_switch 11/11 identical). Kernel A/B v2 in flight — the
-theory predicts ~1.4M removals at the 964 __traceiter callers.
+v2: junctions, not cells. Per-key synthetic value nodes J_X/D_X
+(createValueNode(nullptr)) carry probe -> J_X -> called-operand and
+data -> D_X -> arg0 as plain a-edges. Junctions are referenced by
+nothing but the model's own edges — no cell join can absorb them.
+km A/B: -1,434/+0, all NON-traceiter smear (the tracepoint machinery's
+heap arrays had been leaking into other icall resolutions; v1's cell
+writes masked this). But kernel A/B v2 = BYTE-IDENTICAL AGAIN, and
+--cfl-trace-fptr told the whole story: the fpu operand's class is a
+solve-time merged mega-class (handle_edge_irq irq_chip loads, other
+__traceiter fptr loads, balance_callback int-provenance chains), and
+its in-edges come from the class displaying as perf_trace_task_newtask
+— i.e. THE PROBE FUNCTIONS' OWN VALUE CLASSES ARE INSIDE THE GIANT.
+Fn identity is a casualty of the V-merge quotient: any graph channel
+sourced from fn value nodes imports the pool at the SOURCE, and any
+edge into the operand lands in a giant-merged class at the SINK. A
+further correction: the "pooled" sites were never CFL-resolved at all
+— their dump entries are the TYPE-BASED FALLBACK (alphabetical
+type-compatible sets; km baseline was pooled too at ~523/site, and
+sched_switch's exact 11 was the exception, not the rule).
+
+v3 (SHIPPED): ANSWER-LEVEL PRIMITIVE — the #14 static_call precedent.
+The resolution loop takes targets for __traceiter sites directly from
+the census-complete binding table (key -> registered probes +
+defensive __probestub_X), skipping the R[operand-class] scan; Callees
+insertion and callee-flow wiring proceed unchanged, so probe formals
+still receive their actuals. Graph edges kept: data junction + the
+severs; fn junction dropped (it could only import the giant). Keys
+with any non-static probe registration fall back to the graph path,
+counted LOUDLY (zero today). Two walker bugs found by the
+type-rejection counter: @llvm.used matched the "initializer references
+a tracepoint" scan and bound ALL of a TU's probes to one key (fixed:
+only trace_event_call-typed globals and __bpf_raw_tp_map-section
+globals may bind), and bpf maps are union-wrapped so the type name is
+invisible (fixed: section anchor).
+
+km VERDICT (final): -40,965/+0 EXACT — 42.8% of the km answer set,
+removals only. 194/194 keys bound (37 const + 558 walker pairs), 0
+type rejections, all completeness counters 0. Traceiter sites: ~523
+pooled -> ~4-9 exact registered probes (sched_switch: 8 probes +
+stub; the baseline's __SCT__/iterator-self entries are gone — the
+funcs-array dispatch never calls them). Non-traceiter removals = the
+known smear channel (bpf_seq_read 679, cgroup_file_write 76...).
+Smoke 4/4 flag-off. Kernel A/B next.
+
+DESIGN PRINCIPLE (paper): identity-keyed dispatch channels cannot be
+carried by the graph once the quotient has merged either endpoint —
+and at kernel scale it merges BOTH (fn identities at the source,
+operand classes at the sink). Channels must live at the ANSWER level
+(modeled primitives over census-complete inventories, #14/#35) until
+the solver grows provenance cells (#30 frontier) that exempt fn
+identity from V-merging.

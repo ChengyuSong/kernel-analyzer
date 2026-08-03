@@ -1983,6 +1983,20 @@ static size_t g_tpKeyConstBinds = 0, g_tpKeyMediatorBinds = 0,
 // walker-bound key's data cell (data was globally pooled before this
 // model too; only the fn plane is keyed).
 static std::vector<const GlobalVariable *> g_tpWalkerKeys;
+// v3 (task #35): ANSWER-LEVEL primitive. The graph cannot carry per-key
+// fn channels at kernel scale: probe VALUE classes are V-merged into
+// the giant (fn identity is a casualty of the quotient — TRACE-BWD
+// showed __traceiter operands AND probe classes both inside one merged
+// mega-class), so any graph channel imports the pool at the source.
+// The census-complete registration table IS the answer for __traceiter
+// sites; the resolution loop takes targets from here (the #14
+// static_call precedent) and its normal arg wiring feeds the probes.
+static boost::unordered_flat_map<NodeIndex, FuncSet> g_tpKeyProbes;
+static boost::unordered_flat_map<const llvm::CallBase *, NodeIndex>
+    g_tpIterIcallKey;
+static boost::unordered_flat_set<NodeIndex> g_tpKeyHasDynProbe;
+static size_t g_tpKeyModelAnswered = 0, g_tpKeyDynProbe = 0,
+              g_tpKeyFallbackSites = 0, g_tpKeyTypeRej = 0;
 
 // The dispatch key of a __traceiter_* body: the base of the constexpr
 // GEP its funcs-head load reads from. Memoized; single-threaded visit.
@@ -4586,10 +4600,43 @@ bool CallGraphPass::runFlowsToResolution() {
         targets.insert(F);
       });
     };
-    collect(R[rep][0]);
-    collect(RB[rep][0]);
+    // Tracepoint keyed dispatch (task #35 v3): answer-level primitive.
+    // The graph cannot carry per-key fn channels — probe VALUE classes
+    // are V-merged into the giant, so scanning R[operand-class] returns
+    // the pool no matter how the channel is wired. For __traceiter
+    // sites the census-complete registration table IS the answer; the
+    // wiring below (Callees insert + callee-flow wiring) is unchanged.
+    bool tpModelOwned = false;
+    if (CFLTracepointKeys) {
+      auto tpIt = g_tpIterIcallKey.find(CS);
+      if (tpIt != g_tpIterIcallKey.end()) {
+        if (!g_tpKeyHasDynProbe.count(tpIt->second)) {
+          tpModelOwned = true;
+          g_tpKeyModelAnswered++;
+          auto pIt = g_tpKeyProbes.find(tpIt->second);
+          if (pIt != g_tpKeyProbes.end())
+            for (const Function *PF : pIt->second) {
+              if (!isCompatible(CS, PF)) {
+                g_tpKeyTypeRej++;
+                if (g_tpKeyTypeRej <= 40)
+                  WARNING("TracepointKeys: type-rejected probe "
+                          << PF->getName() << " at "
+                          << CS->getFunction()->getName() << "\n");
+                continue;
+              }
+              targets.insert(PF);
+            }
+        } else {
+          g_tpKeyFallbackSites++; // LOUD: table incomplete for this key
+        }
+      }
+    }
+    if (!tpModelOwned) {
+      collect(R[rep][0]);
+      collect(RB[rep][0]);
+    }
     const size_t exactTargets = targets.size();
-    if (NB > 0) {
+    if (!tpModelOwned && NB > 0) {
       collect(R[rep][SHIFT_X]);
       collect(RB[rep][SHIFT_X]);
     }
@@ -4876,11 +4923,15 @@ bool CallGraphPass::runFlowsToResolution() {
            << g_tpWalkerKeys.size() << " keys, "
            << g_tpKeyMediatorDataPools << " mediator data pools), "
            << g_tpKeyDispatchWires << " __traceiter dispatches wired, "
-           << g_tpKeyIterLoadsSevered << " iterator funcs-loads severed; "
+           << g_tpKeyIterLoadsSevered << " iterator funcs-loads severed, "
+           << g_tpKeyModelAnswered << " sites model-answered ("
+           << g_tpKeyTypeRej << " type-rejected probes); "
            << "UNCLASSIFIED reg sites " << g_tpKeyUnclassified
            << ", keyless iters " << g_tpKeyKeylessIter << ", unmapped keys "
-           << g_tpKeyUnmapped << " (all three must be 0 for the severed "
-           << "model to be complete)\n";
+           << g_tpKeyUnmapped << ", dyn-probe keys " << g_tpKeyDynProbe
+           << " -> " << g_tpKeyFallbackSites
+           << " fallback sites (all must be 0 for the severed model to "
+           << "be complete)\n";
   }
   if (CFLProbeBlobFormation) {
     uint32_t giant = 0;
@@ -6857,10 +6908,24 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
           F->getName().starts_with("__traceiter_")) {
         if (const GlobalVariable *KeyGV = traceiterKeyOf(F)) {
           auto [fnJ, dataJ] = CGP.tracepointJunctions(KeyGV);
-          NodeIndex coN =
-              CGP.getRepNodeForValue(CS.getCalledOperand());
-          if (coN != AndersNodeFactory::InvalidIndex) {
-            CGP.addAssignmentEdge(fnJ, coN);
+          (void)fnJ; // v3: answers come from the binding table
+          NodeIndex keyN = CGP.getRepNodeForValue(KeyGV);
+          if (keyN != AndersNodeFactory::InvalidIndex) {
+            keyN = CGP.getCanonicalNode(keyN);
+            g_tpIterIcallKey[&CS] = keyN;
+            // The no-probe default stub is dispatched on the
+            // static-call fast path; include it defensively.
+            std::string stubName =
+                ("__probestub_" + KeyGV->getName().drop_front(13)).str();
+            Function *Stub = F->getParent()->getFunction(stubName);
+            if (!Stub || Stub->isDeclaration()) {
+              auto fit2 =
+                  CGP.Ctx->Funcs.find(GlobalValue::getGUID(stubName));
+              if (fit2 != CGP.Ctx->Funcs.end())
+                Stub = fit2->second;
+            }
+            if (Stub)
+              g_tpKeyProbes[keyN].insert(CGP.getFuncDef(Stub));
             if (CS.arg_size() >= 1) {
               NodeIndex dArg =
                   CGP.getRepNodeForValue(CS.getArgOperand(0));
@@ -9810,19 +9875,29 @@ void CallGraphPass::runTracepointCensus() {
 // no pointer ever names them, no cell join can absorb them. With the
 // registration bodies and the iterator funcs-loads severed, plain
 // a-edges probe -> J_X -> called-operand ARE the exact dispatch.
-static boost::unordered_flat_map<const GlobalVariable *,
-                                 std::pair<NodeIndex, NodeIndex>>
+// Keyed by the key's CANONICAL NODE, not the GlobalVariable*: each TU
+// has its own declaration object for an extern tracepoint, and all of
+// them must land on one junction (getRepNodeForValue resolves decl ->
+// def through the GUID linking).
+static boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, NodeIndex>>
     g_tpKeyJunctionMap;
 
 std::pair<NodeIndex, NodeIndex>
 CallGraphPass::tracepointJunctions(const GlobalVariable *KeyGV) {
-  auto it = g_tpKeyJunctionMap.find(KeyGV);
+  NodeIndex keyN = getRepNodeForValue(KeyGV);
+  if (keyN == AndersNodeFactory::InvalidIndex) {
+    g_tpKeyUnmapped++; // LOUD in the LEDGER — census says this is empty
+    keyN = getCanonicalNode(NF.createValueNode(KeyGV));
+  } else {
+    keyN = getCanonicalNode(keyN);
+  }
+  auto it = g_tpKeyJunctionMap.find(keyN);
   if (it != g_tpKeyJunctionMap.end())
     return it->second;
   NodeIndex fnJ = getCanonicalNode(NF.createValueNode(nullptr));
   NodeIndex dataJ = getCanonicalNode(NF.createValueNode(nullptr));
   auto p = std::make_pair(fnJ, dataJ);
-  g_tpKeyJunctionMap.emplace(KeyGV, p);
+  g_tpKeyJunctionMap.emplace(keyN, p);
   return p;
 }
 
@@ -9831,11 +9906,22 @@ void CallGraphPass::bindTracepointProbe(const GlobalVariable *KeyGV,
                                         const Value *DataV,
                                         bool fromWalker) {
   auto [fnJ, dataJ] = tracepointJunctions(KeyGV);
-  NodeIndex probeN = getRepNodeForValue(ProbeV);
-  if (probeN != AndersNodeFactory::InvalidIndex &&
-      !NF.isSpecialNode(probeN)) {
-    addAssignmentEdge(probeN, fnJ);
-    (fromWalker ? g_tpKeyMediatorBinds : g_tpKeyConstBinds)++;
+  (void)fnJ; // v3: fn plane is answer-level, no graph edge (see above)
+  NodeIndex keyN = getRepNodeForValue(KeyGV);
+  keyN = keyN == AndersNodeFactory::InvalidIndex
+             ? AndersNodeFactory::InvalidIndex
+             : getCanonicalNode(keyN);
+  if (const auto *PF = dyn_cast<Function>(ProbeV)) {
+    if (keyN != AndersNodeFactory::InvalidIndex) {
+      g_tpKeyProbes[keyN].insert(getFuncDef(const_cast<Function *>(PF)));
+      (fromWalker ? g_tpKeyMediatorBinds : g_tpKeyConstBinds)++;
+    }
+  } else if (keyN != AndersNodeFactory::InvalidIndex) {
+    // dynamic probe value: the table is incomplete for this key — its
+    // dispatch sites fall back to the graph path, counted LOUDLY
+    // (census: zero such registrations at kernel scale)
+    g_tpKeyHasDynProbe.insert(keyN);
+    g_tpKeyDynProbe++;
   }
   if (DataV && !shouldSkipValue(DataV)) {
     NodeIndex dataN = getRepNodeForValue(DataV);
@@ -9878,6 +9964,24 @@ void CallGraphPass::bindTracepointMediatorPairs() {
     for (const GlobalVariable &GV : mp.first->globals()) {
       if (!GV.hasInitializer())
         continue;
+      // Only the two registrar-container shapes may bind pairs. Without
+      // this, @llvm.used (which references every tracepoint, class and
+      // probe in the TU) bound ALL of a TU's probes to whichever
+      // tracepoint ref came first — wrong-proto cross-binds surfaced as
+      // isCompatible rejections, same-template ones silently inflated
+      // one key per TU.
+      const auto *GVT = dyn_cast<StructType>(GV.getValueType());
+      const bool isEventCall = GVT && GVT->hasName() &&
+                               GVT->getName().contains("trace_event_call");
+      // bpf maps are union-wrapped (%union.anon.N { %struct.bpf_raw_
+      // event_map }) so the type name is invisible at the top level —
+      // the placement section is the semantic anchor.
+      const bool isBpfMap =
+          GV.getSection() == "__bpf_raw_tp_map" ||
+          (GVT && GVT->hasName() &&
+           GVT->getName().contains("bpf_raw_event_map"));
+      if (!isEventCall && !isBpfMap)
+        continue;
       SmallVector<const GlobalValue *, 16> refs;
       collectRefs(GV.getInitializer(), refs);
       const GlobalVariable *tpKey = nullptr;
@@ -9890,15 +9994,16 @@ void CallGraphPass::bindTracepointMediatorPairs() {
         continue;
       bool bound = false;
       // bpf_raw_event_map shape: {tp, __bpf_trace_X} in one initializer
-      for (const GlobalValue *R : refs)
-        if (const auto *PF = dyn_cast<Function>(R)) {
-          if (PF->getName().starts_with("__bpf_trace_")) {
-            bindTracepointProbe(tpKey, PF, nullptr, /*fromWalker=*/true);
-            bound = true;
-          } else {
-            g_tpKeyClassFnSkipped++;
+      if (isBpfMap)
+        for (const GlobalValue *R : refs)
+          if (const auto *PF = dyn_cast<Function>(R)) {
+            if (PF->getName().starts_with("__bpf_trace_")) {
+              bindTracepointProbe(tpKey, PF, nullptr, /*fromWalker=*/true);
+              bound = true;
+            } else {
+              g_tpKeyClassFnSkipped++;
+            }
           }
-        }
       // trace_event_call shape: class global carries the probe fns
       for (const GlobalValue *R : refs) {
         const auto *ClsGV = dyn_cast<GlobalVariable>(R);

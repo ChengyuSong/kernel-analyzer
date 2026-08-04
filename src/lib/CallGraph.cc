@@ -1602,6 +1602,7 @@ static std::vector<NodeIndex> g_presolveConeCanon;
 // it, readers of either cell see both subsystems' objects. Fn origins
 // are excluded (the identity channels already bind ops per object).
 static boost::unordered_flat_map<std::string, uint8_t> g_subsysIds;
+static boost::unordered_flat_map<std::string, uint32_t> g_weldRepOf;
 static std::vector<std::string> g_subsysNames;
 static uint8_t subsysBitOf(const llvm::Module *M2) {
   if (!M2) return 63;
@@ -3767,6 +3768,7 @@ bool CallGraphPass::runFlowsToResolution() {
         auto &bl2 = weldBlame[who];
         bl2.first++;
         bl2.second |= ownedMask[a] | ownedMask[b];
+        g_weldRepOf[who] = a; // post-merge rep (re-find at report)
       }
       ownedMask[a] |= ownedMask[b];
     }
@@ -5568,6 +5570,44 @@ bool CallGraphPass::runFlowsToResolution() {
       errs() << "Couplers: x" << e2.first << " ("
              << __builtin_popcountll(e2.second) << " subsys) "
              << *wb[i2].second << "\n";
+      if (i2 < 6) {
+        errs() << "Couplers:   subsystems:";
+        for (unsigned b3 = 0; b3 < 63 && b3 < g_subsysNames.size(); b3++)
+          if (e2.second & (1ull << b3))
+            errs() << " " << g_subsysNames[b3];
+        errs() << "\n";
+        // sample the welded class's owned origins, one per subsystem
+        auto rIt2 = g_weldRepOf.find(*wb[i2].second);
+        if (rIt2 != g_weldRepOf.end()) {
+          const uint32_t wrep = find(rIt2->second);
+          uint64_t seen3 = 0;
+          size_t shown3 = 0;
+          for (uint32_t rid3 = 0; rid3 < nextRoot && shown3 < 14; rid3++) {
+            if (funcRootOf.count(rid3)) continue;
+            if (find(rootClassOf[rid3]) != wrep) continue;
+            const Value *ov3 =
+                NF.getValueForNode(toOrig[rootClassOf[rid3]]);
+            const llvm::Module *om3 = nullptr;
+            std::string on3 = "<synthetic>";
+            if (ov3) {
+              if (const auto *oi3 = dyn_cast<Instruction>(ov3)) {
+                om3 = oi3->getModule();
+                on3 = (oi3->getFunction()->getName() + "::" +
+                       oi3->getOpcodeName()).str();
+              } else if (const auto *og3 = dyn_cast<GlobalValue>(ov3)) {
+                om3 = og3->getParent();
+                on3 = og3->getName().str();
+              }
+            }
+            uint8_t sb3 = subsysBitOf(om3);
+            if (seen3 & (1ull << sb3)) continue;
+            seen3 |= 1ull << sb3;
+            shown3++;
+            errs() << "Couplers:   origin[" << (om3 ? g_subsysNames[sb3]
+                    : std::string("?")) << "] " << on3 << "\n";
+          }
+        }
+      }
     }
     // Answer-side diversity: how many subsystems' DATA objects does
     // each icall operand class see at fixpoint?
@@ -10660,6 +10700,72 @@ void CallGraphPass::runPtrToIntCensus() {
 // Dispatch side: every __traceiter_* body must name its key global at
 // the funcs-head load (constexpr GEP on @__tracepoint_*) — keyless
 // icalls would break the model, so they are counted loudly.
+// --cfl-census-nexus (task #38): DISCOVER nexus structs instead of
+// guessing them. A nexus struct is one whose objects many subsystems
+// write pointers into — under FI its single cell transitively couples
+// them all (task_struct = the exemplar found via the coupler census).
+// Static signal: for every store whose address is a GEP into a named
+// struct type, record (type <- writing subsystem); rank by subsystem
+// diversity, splitting pointer-valued stores (the coupling carriers)
+// from all stores.
+void CallGraphPass::runNexusCensus() {
+  struct TypeStat {
+    uint64_t ptrWriters = 0, allWriters = 0, readers = 0;
+    size_t ptrStores = 0;
+  };
+  std::map<std::string, TypeStat> byType;
+  for (auto &mp : Ctx->Modules) {
+    const uint8_t sb = subsysBitOf(mp.first);
+    for (Function &F : *mp.first) {
+      if (F.empty())
+        continue;
+      for (Instruction &I : instructions(F)) {
+        const Value *addr = nullptr;
+        bool isStore = false, ptrVal = false;
+        if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+          addr = SI->getPointerOperand();
+          isStore = true;
+          ptrVal = SI->getValueOperand()->getType()->isPointerTy();
+        } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+          addr = LI->getPointerOperand();
+          ptrVal = LI->getType()->isPointerTy();
+        } else {
+          continue;
+        }
+        const auto *GO =
+            dyn_cast<GEPOperator>(addr->stripPointerCasts());
+        const StructType *ST =
+            GO ? dyn_cast<StructType>(GO->getSourceElementType()) : nullptr;
+        if (!ST || !ST->hasName())
+          continue;
+        auto &t = byType[sctCanonStructName(ST->getName()).str()];
+        if (isStore) {
+          t.allWriters |= 1ull << sb;
+          if (ptrVal) {
+            t.ptrWriters |= 1ull << sb;
+            t.ptrStores++;
+          }
+        } else if (ptrVal) {
+          t.readers |= 1ull << sb;
+        }
+      }
+    }
+  }
+  std::vector<std::pair<int, const std::string *>> rk;
+  for (auto &kv : byType)
+    rk.emplace_back(__builtin_popcountll(kv.second.ptrWriters), &kv.first);
+  std::sort(rk.begin(), rk.end(), std::greater<>());
+  errs() << "NexusCensus: " << byType.size() << " struct types with "
+         << "field traffic\n";
+  for (size_t i = 0; i < std::min<size_t>(30, rk.size()); i++) {
+    auto &t = byType[*rk[i].second];
+    errs() << "NexusCensus: ptr-writers " << rk[i].first << " subsys, "
+           << "readers " << __builtin_popcountll(t.readers)
+           << " subsys, " << t.ptrStores << " ptr-stores  "
+           << *rk[i].second << "\n";
+  }
+}
+
 void CallGraphPass::runTracepointCensus() {
   auto isRegFn = isTracepointRegFn;
   size_t nConst = 0, nConstPair = 0, nLoad = 0, nFormal = 0, nOther = 0;
@@ -14094,6 +14200,9 @@ bool CallGraphPass::doModulePass(Module *M) {
   if (CFLTracepointKeys && iteration == 0 &&
       M == Ctx->Modules.front().first)
     bindTracepointMediatorPairs(); // before any callsite is visited
+
+  if (CFLCensusNexus && iteration == 0 && M == Ctx->Modules.front().first)
+    runNexusCensus(); // measurement-only, adds no edges
 
   // process global initializers and functions, only the first iteration
   if (iteration == 0) {

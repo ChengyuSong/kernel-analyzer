@@ -181,6 +181,7 @@ private:
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
   void runPtrToIntCensus(); // task #33: int-provenance residue sizing
   void runTracepointCensus(); // task #35: keyed-channel design sizing
+  void runNexusCensus();      // task #38: nexus-struct discovery
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>
   tracepointJunctions(const llvm::GlobalVariable *KeyGV);

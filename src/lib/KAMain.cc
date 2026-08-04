@@ -503,6 +503,14 @@ cl::opt<bool> CFLCensusCouplers(
            "naturally compartmentalized"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusNexus(
+  "cfl-census-nexus",
+  cl::desc("MEASUREMENT-ONLY census (task #38): discover nexus structs "
+           "— rank named struct types by how many subsystems store "
+           "POINTERS through GEPs into them (the FI-cell coupling "
+           "carriers), with reader diversity alongside"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -929,6 +937,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLPreSolveCone, "--cfl-presolve-cone");
     requireFlowsTo(CFLJoinCone, "--cfl-join-cone");
     requireFlowsTo(CFLCensusCouplers, "--cfl-census-couplers");
+    requireFlowsTo(CFLCensusNexus, "--cfl-census-nexus");
     if (CFLJoinCone && !CFLPreSolveCone) {
       errs() << "ERROR: --cfl-join-cone needs the presolve cone "
                 "(--cfl-presolve-cone)\n";

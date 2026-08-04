@@ -1646,6 +1646,101 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   CG_LOG("Pre-solve merge: sublanguage graph " << toCanon.size()
          << " nodes, " << subEdges.size() << " edges\n");
   auto tSolve = std::chrono::steady_clock::now();
+
+  // --cfl-presolve-exact (task #38): merge ONLY raw mutual-flow SCCs
+  // (x ->a* y AND y ->a* x = provable value equality — exact). The
+  // V-component path below quotients by CONNECTIVITY of the symmetric
+  // alias relation V := -a* a* (with M splices) — alias is not
+  // transitive, so component-merging is Steensgaard-style
+  // over-unification: at km it manufactures a 41,350-member born class
+  // whose true mutual-flow core is 41 nodes. Exact mode trades that
+  // compression back for precision; cost measured, not assumed.
+  if (CFLPreSolveExact) {
+    const uint32_t M2 = (uint32_t)toCanon.size();
+    const uint32_t laX = EB.getLabelAssign();
+    auto isFwdX = [&](uint32_t l) {
+      if (l == laX)
+        return true;
+      if (!EB.hasFieldLabels())
+        return false;
+      if (l == EB.getLabelFieldAny())
+        return true;
+      for (unsigned b2 = 0; b2 < EB.getNumFieldBuckets(); b2++)
+        if (l == EB.getLabelField(b2))
+          return true;
+      return false;
+    };
+    std::vector<std::vector<uint32_t>> adjX(M2);
+    for (auto &E : subEdges)
+      if (isFwdX(E.label))
+        adjX[E.from].push_back(E.to);
+    // iterative Tarjan
+    std::vector<uint32_t> idx(M2, UINT32_MAX), low(M2, 0), comp(M2,
+                                                                UINT32_MAX);
+    std::vector<char> onStk(M2, 0);
+    std::vector<uint32_t> stk;
+    uint32_t counter = 0, nComp = 0;
+    std::vector<std::pair<uint32_t, size_t>> call;
+    for (uint32_t s2 = 0; s2 < M2; s2++) {
+      if (idx[s2] != UINT32_MAX)
+        continue;
+      call.emplace_back(s2, 0);
+      while (!call.empty()) {
+        auto &[u, ci] = call.back();
+        if (ci == 0) {
+          idx[u] = low[u] = counter++;
+          stk.push_back(u);
+          onStk[u] = 1;
+        }
+        if (ci < adjX[u].size()) {
+          uint32_t w = adjX[u][ci++];
+          if (idx[w] == UINT32_MAX) {
+            call.emplace_back(w, 0);
+          } else if (onStk[w]) {
+            low[u] = std::min(low[u], idx[w]);
+          }
+        } else {
+          if (low[u] == idx[u]) {
+            while (true) {
+              uint32_t w = stk.back();
+              stk.pop_back();
+              onStk[w] = 0;
+              comp[w] = nComp;
+              if (w == u)
+                break;
+            }
+            nComp++;
+          }
+          uint32_t uu = u;
+          call.pop_back();
+          if (!call.empty())
+            low[call.back().first] =
+                std::min(low[call.back().first], low[uu]);
+        }
+      }
+    }
+    std::vector<NodeIndex> repX(nComp, AndersNodeFactory::InvalidIndex);
+    size_t mergedX = 0;
+    uint32_t biggest = 0;
+    std::vector<uint32_t> csz(nComp, 0);
+    for (uint32_t ln = 0; ln < M2; ln++) {
+      csz[comp[ln]]++;
+      if (repX[comp[ln]] == AndersNodeFactory::InvalidIndex)
+        repX[comp[ln]] = toCanon[ln];
+      else {
+        mergeCanonicalClasses(repX[comp[ln]], toCanon[ln]);
+        mergedX++;
+      }
+    }
+    for (uint32_t c2 = 0; c2 < nComp; c2++) biggest = std::max(biggest, csz[c2]);
+    CG_LOG("Pre-solve merge (EXACT): " << M2 << " nodes -> " << nComp
+           << " mutual-flow SCCs, " << mergedX << " merges (largest "
+           << biggest << "), "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tSolve).count()
+           << " ms; V-component merge SKIPPED\n");
+    return;
+  }
   gracfl::SolverFWGramParallel sub(subEdges, *EB.getGrammar(), cflThreads);
   sub.runCFL();
   const auto &graph = sub.getReachability();
@@ -1654,12 +1749,211 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   uint32_t numSCCs = 0;
   computeVSCC(graph, EB.getLabelV(), nodeToSCC, numSCCs);
 
+  // --cfl-probe-born-hub (task #38): is the BORN giant held together by
+  // a few articulation hubs, or is it a dense expander? Induce the
+  // forward-flow subgraph on the largest V' SCC's members, then
+  // repeatedly remove the highest-degree live node and recompute the
+  // largest strongly connected component — the shatter curve decides
+  // whether phase-1 cutting is viable. Measurement only.
+  if (CFLProbeBornHub) {
+    std::unordered_map<uint32_t, uint32_t> sccSz;
+    for (uint32_t scc : nodeToSCC)
+      if (scc != UINT32_MAX)
+        sccSz[scc]++;
+    uint32_t big = UINT32_MAX, bigSz = 0;
+    for (auto &kv : sccSz)
+      if (kv.second > bigSz) {
+        bigSz = kv.second;
+        big = kv.first;
+      }
+    if (big != UINT32_MAX && bigSz > 100) {
+      std::vector<uint32_t> lid2m(toCanon.size(), UINT32_MAX);
+      std::vector<uint32_t> mem;
+      for (uint32_t ln = 0; ln < toCanon.size() && ln < nodeToSCC.size();
+           ln++)
+        if (nodeToSCC[ln] == big) {
+          lid2m[ln] = (uint32_t)mem.size();
+          mem.push_back(ln);
+        }
+      const uint32_t M = (uint32_t)mem.size();
+      const uint32_t laF = EB.getLabelAssign();
+      auto isFwd = [&](uint32_t l) {
+        if (l == laF)
+          return true;
+        if (!EB.hasFieldLabels())
+          return false;
+        if (l == EB.getLabelFieldAny())
+          return true;
+        for (unsigned b2 = 0; b2 < EB.getNumFieldBuckets(); b2++)
+          if (l == EB.getLabelField(b2))
+            return true;
+        return false;
+      };
+      std::vector<std::vector<uint32_t>> adj(M), radj(M);
+      std::vector<uint32_t> deg(M, 0);
+      for (auto &E : subEdges) {
+        if (!isFwd(E.label))
+          continue;
+        uint32_t f = lid2m[E.from], t = lid2m[E.to];
+        if (f == UINT32_MAX || t == UINT32_MAX || f == t)
+          continue;
+        adj[f].push_back(t);
+        radj[t].push_back(f);
+        deg[f]++;
+        deg[t]++;
+      }
+      std::vector<char> rm(M, 0);
+      // iterative Kosaraju restricted to live nodes
+      auto largestSCC = [&]() -> uint32_t {
+        std::vector<uint32_t> order;
+        order.reserve(M);
+        std::vector<char> vis(M, 0);
+        std::vector<std::pair<uint32_t, size_t>> st;
+        for (uint32_t s2 = 0; s2 < M; s2++) {
+          if (vis[s2] || rm[s2])
+            continue;
+          st.emplace_back(s2, 0);
+          vis[s2] = 1;
+          while (!st.empty()) {
+            auto &[u, i2] = st.back();
+            if (i2 < adj[u].size()) {
+              uint32_t w = adj[u][i2++];
+              if (!vis[w] && !rm[w]) {
+                vis[w] = 1;
+                st.emplace_back(w, 0);
+              }
+            } else {
+              order.push_back(u);
+              st.pop_back();
+            }
+          }
+        }
+        std::fill(vis.begin(), vis.end(), 0);
+        uint32_t bestC = 0;
+        std::vector<uint32_t> stack2;
+        for (auto it2 = order.rbegin(); it2 != order.rend(); ++it2) {
+          uint32_t s2 = *it2;
+          if (vis[s2] || rm[s2])
+            continue;
+          uint32_t cnt = 0;
+          stack2.push_back(s2);
+          vis[s2] = 1;
+          while (!stack2.empty()) {
+            uint32_t u = stack2.back();
+            stack2.pop_back();
+            cnt++;
+            for (uint32_t w : radj[u])
+              if (!vis[w] && !rm[w]) {
+                vis[w] = 1;
+                stack2.push_back(w);
+              }
+          }
+          bestC = std::max(bestC, cnt);
+        }
+        return bestC;
+      };
+      auto nodeName = [&](uint32_t m2) -> std::string {
+        const Value *v2 = NF.getValueForNode(toCanon[mem[m2]]);
+        if (!v2)
+          return "<synthetic>";
+        if (v2->hasName())
+          return v2->getName().str();
+        if (const auto *I2 = dyn_cast<Instruction>(v2))
+          return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
+              .str();
+        return "<unnamed>";
+      };
+      errs() << "BornHub: V' giant " << bigSz << " members, induced fwd "
+             << "largest SCC " << largestSCC() << "\n";
+      for (int round = 0; round < 24; round++) {
+        uint32_t top = UINT32_MAX, topDeg = 0;
+        for (uint32_t m2 = 0; m2 < M; m2++) {
+          if (rm[m2])
+            continue;
+          uint32_t d2 = 0;
+          for (uint32_t w : adj[m2])
+            if (!rm[w])
+              d2++;
+          for (uint32_t w : radj[m2])
+            if (!rm[w])
+              d2++;
+          if (d2 > topDeg) {
+            topDeg = d2;
+            top = m2;
+          }
+        }
+        if (top == UINT32_MAX)
+          break;
+        rm[top] = 1;
+        errs() << "BornHub: -" << (round + 1) << " deg " << topDeg << " "
+               << nodeName(top) << " -> largest SCC " << largestSCC()
+               << "\n";
+      }
+    }
+  }
+
+  // --cfl-presolve-cone (task #38 hybrid): exact treatment only where
+  // answers live. Nodes in the backward value-flow cone of icall
+  // called operands are NEVER component-merged (their facts must not
+  // smear); everything else keeps the cheap V-component quotient. The
+  // cone nodes still get their own exact mutual-flow SCC merges via the
+  // in-solve a-scc collapse, so no compression is lost among true
+  // value-equals. Full-exact mode measured 9.2x at km for -2,710/+0;
+  // this buys the precision where it counts at a bounded class-count
+  // increase (|cone|).
+  std::vector<char> inCone;
+  if (CFLPreSolveCone) {
+    const uint32_t Mc = (uint32_t)toCanon.size();
+    inCone.assign(Mc, 0);
+    const uint32_t laC = EB.getLabelAssign();
+    auto isFwdC = [&](uint32_t l) {
+      if (l == laC)
+        return true;
+      if (!EB.hasFieldLabels())
+        return false;
+      if (l == EB.getLabelFieldAny())
+        return true;
+      for (unsigned b2 = 0; b2 < EB.getNumFieldBuckets(); b2++)
+        if (l == EB.getLabelField(b2))
+          return true;
+      return false;
+    };
+    std::vector<std::vector<uint32_t>> radjC(Mc);
+    for (auto &E : subEdges)
+      if (isFwdC(E.label))
+        radjC[E.to].push_back(E.from);
+    std::vector<uint32_t> bfs;
+    for (const CallBase *CS2 : Ctx->IndirectCallInsts) {
+      NodeIndex n2 = NF.getValueNodeFor(
+          CS2->getCalledOperand()->stripPointerCastsAndAliases());
+      if (n2 == AndersNodeFactory::InvalidIndex)
+        continue;
+      auto lit = toLocal.find(getCanonicalNode(n2));
+      if (lit == toLocal.end() || inCone[lit->second])
+        continue;
+      inCone[lit->second] = 1;
+      bfs.push_back(lit->second);
+    }
+    for (size_t qi = 0; qi < bfs.size(); qi++)
+      for (uint32_t w : radjC[bfs[qi]])
+        if (!inCone[w]) {
+          inCone[w] = 1;
+          bfs.push_back(w);
+        }
+    CG_LOG("Pre-solve merge (CONE): " << bfs.size() << "/" << Mc
+           << " nodes in the fptr backward cone kept exact\n");
+  }
+
   std::vector<NodeIndex> sccRep(numSCCs, AndersNodeFactory::InvalidIndex);
-  size_t merged = 0;
+  size_t merged = 0, coneSkipped = 0;
   for (uint32_t ln = 0; ln < toCanon.size() && ln < nodeToSCC.size(); ln++) {
     uint32_t scc = nodeToSCC[ln];
     if (scc == UINT32_MAX)
       continue;
+    if (!inCone.empty() && inCone[ln]) {
+      coneSkipped++;
+      continue; // answer-relevant: no component quotient for this node
+    }
     if (sccRep[scc] == AndersNodeFactory::InvalidIndex) {
       sccRep[scc] = toCanon[ln];
     } else {
@@ -1667,6 +1961,9 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
       merged++;
     }
   }
+  if (coneSkipped)
+    CG_LOG("Pre-solve merge (CONE): " << coneSkipped
+           << " cone nodes excluded from component merging\n");
   CG_LOG("Pre-solve merge: " << toCanon.size() << " nodes -> " << numSCCs
          << " V' classes, " << merged << " merges, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -455,6 +455,32 @@ cl::opt<bool> CFLCensusIcallShape(
            "answer-level campaigns"),
   cl::init(false));
 
+cl::opt<bool> CFLProbeBornHub(
+  "cfl-probe-born-hub",
+  cl::desc("MEASUREMENT-ONLY probe (task #38): after the pre-solve "
+           "mutual-V' merge, induce the forward-flow subgraph on the "
+           "largest (born-giant) SCC and iteratively remove the "
+           "highest-degree node, reporting the largest-SCC shatter "
+           "curve — decides whether phase-1 hub cutting is viable"),
+  cl::init(false));
+
+cl::opt<bool> CFLPreSolveExact(
+  "cfl-presolve-exact",
+  cl::desc("EXPERIMENT (task #38): pre-solve merge quotients only raw "
+           "mutual-flow SCCs (provable value equality) instead of "
+           "V-alias-connectivity components (Steensgaard-style "
+           "over-unification that manufactures the born giant). "
+           "Precision can only improve; cost is the question"),
+  cl::init(false));
+
+cl::opt<bool> CFLPreSolveCone(
+  "cfl-presolve-cone",
+  cl::desc("EXPERIMENT (task #38 hybrid): keep the pre-solve V-component "
+           "quotient for the data plane but exclude nodes in the "
+           "backward value-flow cone of icall operands — exactness "
+           "only where answers live, bounded class-count increase"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -874,6 +900,14 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");
     requireFlowsTo(CFLRodataCopy, "--cfl-rodata-copy");
     requireFlowsTo(CFLCensusIcallShape, "--cfl-census-icall-shape");
+    requireFlowsTo(CFLProbeBornHub, "--cfl-probe-born-hub");
+    requireFlowsTo(CFLPreSolveExact, "--cfl-presolve-exact");
+    requireFlowsTo(CFLPreSolveCone, "--cfl-presolve-cone");
+    if (CFLPreSolveExact && CFLPreSolveCone) {
+      errs() << "ERROR: --cfl-presolve-exact and --cfl-presolve-cone are "
+                "mutually exclusive\n";
+      exit(1);
+    }
     if (CFLStaticOpsTables && !CFLStaticCall) {
       if (CFLStaticOpsTables.getNumOccurrences() == 0) {
         CFLStaticOpsTables = false; // no static-call model, no keys

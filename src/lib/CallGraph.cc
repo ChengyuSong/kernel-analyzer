@@ -4537,6 +4537,24 @@ bool CallGraphPass::runFlowsToResolution() {
            << g_sctPendingNoTable << " pendings with no fn source)\n");
   }
 
+  // --cfl-census-icall-shape (task #37): classify every FAT answer site
+  // (>=100 targets) by the IR shape of its fptr chain and by whether its
+  // operand class is THE giant — separates "resolved to the quotient"
+  // from "genuinely unresolved" and names the families for the next
+  // answer-level campaigns. Measurement only.
+  struct IcallShapeFam { size_t sites = 0, pairs = 0, giantSites = 0;
+                         std::string exemplar; };
+  std::map<std::string, IcallShapeFam> shapeFams;
+  uint32_t censusGiantRep = UINT32_MAX;
+  if (CFLCensusIcallShape) {
+    uint32_t best = 0;
+    for (uint32_t n2 = 0; n2 < N; n2++)
+      if (find(n2) == n2 && clsSize[n2] > best) {
+        best = clsSize[n2];
+        censusGiantRep = n2;
+      }
+  }
+
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -4774,6 +4792,58 @@ bool CallGraphPass::runFlowsToResolution() {
       collect(RB[rep][SHIFT_X]);
     }
     topOnlyPairs += targets.size() - exactTargets;
+    if (CFLCensusIcallShape && targets.size() >= 100) {
+      auto shapeOf = [&]() -> std::string {
+        const Value *co = CS->getCalledOperand()->stripPointerCasts();
+        if (const auto *A = dyn_cast<Argument>(co))
+          return ("formal " + A->getParent()->getName() + "#" +
+                  std::to_string(A->getArgNo()))
+              .str();
+        const auto *LI = dyn_cast<LoadInst>(co);
+        if (!LI) {
+          if (isa<PHINode>(co)) return "phi";
+          if (isa<SelectInst>(co)) return "select";
+          const auto *IC = dyn_cast<Instruction>(co);
+          return std::string("other:") +
+                 (IC ? IC->getOpcodeName() : "non-inst");
+        }
+        const Value *P = LI->getPointerOperand()->stripPointerCasts();
+        if (const auto *GO = dyn_cast<GEPOperator>(P)) {
+          const auto *ST3 =
+              dyn_cast<StructType>(GO->getSourceElementType());
+          std::string fld = "?";
+          if (GO->getNumIndices() == 2)
+            if (const auto *ci = dyn_cast<ConstantInt>(GO->getOperand(2)))
+              fld = std::to_string(ci->getZExtValue());
+          const Value *B = GO->getPointerOperand()->stripPointerCasts();
+          std::string base = isa<LoadInst>(B)      ? " [2level]"
+                             : isa<Argument>(B)    ? " [parambase]"
+                             : isa<GlobalVariable>(B) ? " [globalbase]"
+                                                      : "";
+          if (ST3 && ST3->hasName())
+            return ("load " + sctCanonStructName(ST3->getName()) + "." +
+                    fld + base)
+                .str();
+          return "load gep-untyped" + base;
+        }
+        if (isa<GlobalVariable>(P))
+          return ("load @" + P->getName()).str();
+        if (isa<Argument>(P)) return "load *param";
+        if (isa<PHINode>(P)) return "load phi-ptr";
+        if (isa<LoadInst>(P)) return "load **indirect";
+        return "load other";
+      };
+      auto &fam = shapeFams[shapeOf()];
+      fam.sites++;
+      fam.pairs += targets.size();
+      if (rep == censusGiantRep) fam.giantSites++;
+      if (fam.exemplar.empty())
+        fam.exemplar = (CS->getFunction()->getName() + " (" +
+                        std::to_string(targets.size()) + " tgts, cls " +
+                        std::to_string(clsSize[rep]) + ", R " +
+                        std::to_string(R[rep][0].count()) + ")")
+                           .str();
+    }
     if (CFLProbeOriginSplit && !targets.empty()) {
       const auto *LI = dyn_cast<LoadInst>(fptr);
       if (!LI) {
@@ -5229,6 +5299,24 @@ bool CallGraphPass::runFlowsToResolution() {
       errs() << "OriginSplit: excess=" << ex << " |A|=" << a << " split="
              << sp << " D=" << d << " at "
              << cs2->getFunction()->getName() << "\n";
+    }
+  }
+  if (CFLCensusIcallShape && !shapeFams.empty()) {
+    std::vector<std::pair<size_t, const std::string *>> fr;
+    size_t totP = 0, totS = 0;
+    for (auto &kv : shapeFams) {
+      fr.emplace_back(kv.second.pairs, &kv.first);
+      totP += kv.second.pairs;
+      totS += kv.second.sites;
+    }
+    std::sort(fr.begin(), fr.end(), std::greater<>());
+    errs() << "IcallShape: " << totS << " fat sites (>=100 tgts) / "
+           << totP << " pairs in " << shapeFams.size() << " families\n";
+    for (size_t i2 = 0; i2 < std::min<size_t>(40, fr.size()); i2++) {
+      auto &fam = shapeFams[*fr[i2].second];
+      errs() << "IcallShape: " << fam.pairs << " pairs / " << fam.sites
+             << " sites (" << fam.giantSites << " giant-cls) "
+             << *fr[i2].second << "  e.g. " << fam.exemplar << "\n";
     }
   }
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, "

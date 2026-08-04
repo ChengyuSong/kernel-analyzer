@@ -445,6 +445,16 @@ cl::opt<bool> CFLRodataCopy(
            "bound was -29,128/+0 (30%)"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusIcallShape(
+  "cfl-census-icall-shape",
+  cl::desc("MEASUREMENT-ONLY census (task #37): classify every fat "
+           "answer site (>=100 targets) by the IR shape of its fptr "
+           "chain (formal param / struct-field load / global load / "
+           "phi-select) and by whether its operand class is the giant "
+           "quotient class — names the families for the next "
+           "answer-level campaigns"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -863,6 +873,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
     requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");
     requireFlowsTo(CFLRodataCopy, "--cfl-rodata-copy");
+    requireFlowsTo(CFLCensusIcallShape, "--cfl-census-icall-shape");
     if (CFLStaticOpsTables && !CFLStaticCall) {
       if (CFLStaticOpsTables.getNumOccurrences() == 0) {
         CFLStaticOpsTables = false; // no static-call model, no keys

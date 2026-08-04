@@ -4160,3 +4160,45 @@ cells this evidence supports):
 
 This is a solver-core rework (days, not an A/B afternoon) — design
 sign-off is the next gate.
+
+### Phase-1 over-unification: exposed, measured, and a free lever shipped (task #38, 2026-08-04)
+
+The user's "is there a hub in phase 1?" question broke the born-giant
+story open. --cfl-probe-born-hub found NO hub — because the 41,350-
+member born component's true mutual-flow core is 41 NODES. The
+grammar explains it: V := (M? -a)* M? (a M?)* is the SYMMETRIC
+may-alias relation; computeVSCC over a symmetric relation returns
+alias-CONNECTED COMPONENTS, and the presolve merges them — treating
+non-transitive alias as transitive. The born giant is Steensgaard-
+style over-unification, a scale policy, NOT the exact FI quotient
+(#31's "born = exact, unsplittable" is refuted; the exact quotient is
+41 nodes).
+
+Two sound-by-construction experiments (unmerging cannot lose flows):
+- --cfl-presolve-exact (merge only provable value-equalities: 4,915
+  merges, largest SCC 96, 61 ms, GraCFL presolve skipped entirely):
+  km -2,710/+0 REMOVALS-ONLY — the (fn,data) formal fat sites deflate
+  (smp_call_function_many_cond, execute_in_process_context,
+  stop_machine_cpuslocked, opt_pre_handler) — at 9.2x runtime.
+- --cfl-presolve-cone (hybrid: keep the component quotient for the
+  data plane; exclude only the backward value-flow cone of icall
+  called operands): km 2,442/145,068 nodes = 1.7% cone, -1,184/+0 at
+  BASELINE cost (112 s vs 111 s). KERNEL: 22,973/1,031,125 = 2.2%
+  cone, -201,724/+0 vs the kernel-idchan pin (3.5% of the answer
+  set), 3.07 h vs 2.98 h (+3%). Removals spread wide-and-shallow over
+  4,265 callers: switchdev handler walkers (7,489 x3), percpu_ref,
+  smp_call, i915 fences, drm actions, decompressors.
+
+Known residue and the ladder above the cone: the cone walks static
+a-edges only, so smears that cross CELL-ALIAS joins stay (km gap to
+full exact: 1,526 pairs; the kernel giant is mostly in-solve-grown,
+so the larger share of the 5.3M residue is phase-2 joins, not
+phase-1 welds). Next rungs, in order of ambition: bidi-partition cone
+extension (cross may-alias cell partitions during the cone walk);
+in-solve join-side cone exemption (the same answer-relevance
+discipline applied to cluster joins); fn-provenance planes (the full
+witness-scoped visibility redesign, brief pinned earlier).
+
+ADOPTION QUESTION: --cfl-presolve-cone is free (+3%), sound-direction
+only, and orthogonal to the adopted identity channels. Default-on
+candidate = user's call.

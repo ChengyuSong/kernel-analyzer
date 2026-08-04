@@ -5318,6 +5318,90 @@ bool CallGraphPass::runFlowsToResolution() {
              << " sites (" << fam.giantSites << " giant-cls) "
              << *fr[i2].second << "  e.g. " << fam.exemplar << "\n";
     }
+    // Giant anatomy (task #38): fn identity is destroyed by TWO distinct
+    // mechanisms — fn value CLASSES union-find-merged into the giant
+    // (class-identity destruction) vs fn ROOTS accumulated into
+    // R[giant] by fact propagation (every real flow into any cell the
+    // giant absorbed). The forensics and the injection points differ,
+    // so count them separately.
+    if (censusGiantRep != UINT32_MAX) {
+      const uint32_t gr = find(censusGiantRep);
+      size_t fnClasses = 0, fnClassesInGiant = 0;
+      std::vector<StringRef> ex;
+      for (auto &kv : funcOfCanon) {
+        auto dIt2 = toDense.find(kv.first);
+        if (dIt2 == toDense.end())
+          continue;
+        fnClasses++;
+        if (find(dIt2->second) == gr) {
+          fnClassesInGiant++;
+          if (ex.size() < 12)
+            ex.push_back(kv.second->getName());
+        }
+      }
+      size_t rootsInGiant = 0, fnRootsInGiant = 0;
+      R[gr][0].forEach([&](uint32_t o) {
+        rootsInGiant++;
+        if (funcRootOf.count(o))
+          fnRootsInGiant++;
+      });
+      errs() << "GiantAnatomy: rep c" << gr << " members " << clsSize[gr]
+             << "; fn CLASSES merged in " << fnClassesInGiant << "/"
+             << fnClasses << " address-taken; R[giant] roots "
+             << rootsInGiant << " of which " << fnRootsInGiant
+             << " are fn roots\n";
+      for (StringRef n2 : ex)
+        errs() << "GiantAnatomy: merged-fn-class " << n2 << "\n";
+      // Entry-cell histogram: fn identities reach the giant through
+      // their FIRST-HOP a-edge targets (exemplar acct_pin_kill: one
+      // store into the fs_pin cell chain, already giant-merged). Count
+      // the DISTINCT giant-member entry classes over all fn roots —
+      // few nameable channels => targeted guards; thousands => the
+      // full provenance-cells redesign.
+      {
+        boost::unordered_flat_set<uint32_t> fnDense;
+        for (auto &kv : funcOfCanon) {
+          auto dIt3 = toDense.find(kv.first);
+          if (dIt3 != toDense.end())
+            fnDense.insert(dIt3->second);
+        }
+        boost::unordered_flat_map<uint32_t, uint32_t> entryFnCount;
+        size_t fnEdges = 0, fnEdgesToGiant = 0;
+        for (auto [s2, t2] : aEdges) {
+          if (!fnDense.count(s2))
+            continue;
+          fnEdges++;
+          if (find(t2) != gr)
+            continue;
+          fnEdgesToGiant++;
+          entryFnCount[t2]++;
+        }
+        auto entryName = [&](uint32_t cls) -> std::string {
+          const Value *V2 =
+              cls < toOrig.size() ? NF.getValueForNode(toOrig[cls]) : nullptr;
+          if (!V2)
+            return "<synthetic>";
+          if (V2->hasName())
+            return V2->getName().str();
+          if (const auto *I3 = dyn_cast<Instruction>(V2))
+            return (I3->getFunction()->getName() + "::" +
+                    I3->getOpcodeName())
+                .str();
+          return "<unnamed>";
+        };
+        std::vector<std::pair<uint32_t, uint32_t>> top;
+        for (auto &kv : entryFnCount)
+          top.emplace_back(kv.second, kv.first);
+        std::sort(top.begin(), top.end(), std::greater<>());
+        errs() << "GiantAnatomy: fn out-a edges " << fnEdges << ", into "
+               << "giant " << fnEdgesToGiant << " via "
+               << entryFnCount.size() << " distinct entry classes\n";
+        for (size_t i3 = 0; i3 < std::min<size_t>(30, top.size()); i3++)
+          errs() << "GiantAnatomy: entry x" << top[i3].first << " c"
+                 << top[i3].second << " " << entryName(top[i3].second)
+                 << "\n";
+      }
+    }
   }
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, "
          << totalTargets << " targets (" << newPairs << " new pairs wired, "

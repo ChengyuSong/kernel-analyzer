@@ -4114,3 +4114,49 @@ census-complete inventory by construction. The remaining lever set:
 (C) stop: declare the quotient boundary — 18,189 icalls at a median
     well under 100 targets, with the fat tail documented as the
     field-insensitive quotient's residue.
+
+### Giant anatomy forensics: fact smearing, not class merging — and the fn-provenance-plane design (task #38, 2026-08-03)
+
+Three measurements (km, kernel-idchan defaults) close the "what leads
+to the giant quotient" question:
+
+1. CLASS MERGING IS INNOCENT: 0 of 4,733 address-taken fn classes are
+   union-find-merged into the giant. The sound merge-exemption lever
+   has nothing to exempt.
+2. THE MECHANISM IS FACT ACCUMULATION: R[giant] holds 25,884 roots of
+   which 2,404 are fn roots, visible to every reader of any of the
+   cluster's 141,040 member cells. Exemplar trace (acct_pin_kill,
+   absurd target at clocksource_resume): the fn has ONE a-edge — its
+   legitimate store into the fs_pin cell — and that entry cell's class
+   is already giant-merged; one hop in, 5,900 propagation events out.
+3. ENTRY IS DIFFUSE: 3,456 of 6,308 fn out-a edges land in the giant
+   through 1,389 DISTINCT entry classes (top entry: 83 fns; top-30
+   cover <20%). Every callback-registration cell is its own door.
+   Targeted channel guards cannot cover this; the injection must be
+   structural.
+
+DESIGN BRIEF — FN-PROVENANCE PLANES (the scoped form of provenance
+cells this evidence supports):
+- Observation: ANSWERS depend only on fn-root facts — 2,404 of 25,884
+  roots (9%) at km. The expensive treatment can be restricted to the
+  fn plane; every other origin keeps the cheap transitive quotient.
+- Property to enforce: cluster-join fact visibility for FN facts must
+  be WITNESS-SCOPED, not cluster-wide. A reader cell sees a fn fact
+  only if a join-witness chain (shared (origin, shift) evidence)
+  connects it to the fact's ENTRY cell — the #30 reader-bridge
+  (copy-out, non-transitive) semantics, generalized from protected
+  origins to the fn plane of every join, with the K-collapse
+  self-limiting rule inherited to bound plane copies (the #30 kernel
+  OOM lesson).
+- Sketch: fn bits leave the merged R planes; they live in per-entry-
+  cell side tables plus a recorded join-witness graph; icall
+  resolution does a demand-driven witness-closure readback from the
+  fptr class (18k icalls — readback is cheap; the witness graph is
+  the new memory cost).
+- Prize: the 5.3M-pair / 93% giant residue, all 6,138 fat sites at
+  once. Risks: witness-closure semantics must reproduce the V/VX
+  shift-matching rules exactly (Lean-checkable like sderiv_catchup);
+  join-witness recording is on the hot path; cost model unproven.
+
+This is a solver-core rework (days, not an A/B afternoon) — design
+sign-off is the next gate.

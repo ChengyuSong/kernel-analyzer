@@ -4075,3 +4075,42 @@ was chosen. CANONICAL PIN is now kernel-idchan
 (test/baselines/kernel-idchan-stats.txt): 18,189 icalls / 5,691,662
 dump lines, 2.98 h, superseding kernel-gepfix. The rodata copy-not-
 unify flag stays default OFF (answer-neutral instrument).
+
+### Fat-site census verdict: the remaining mass is ONE fish (task #37, 2026-08-03)
+
+--cfl-census-icall-shape at kernel scale (defaults on, kernel-idchan
+config): 6,138 fat sites (>=100 targets) carry 5,306,253 pairs = 93%
+of the remaining 5.69M answer set, spread over 2,231 IR-shape
+families — and effectively EVERY fat site sits on the SAME operand
+class: the giant (1,139,703 members, 204,293 fact roots). The fat
+answers are all R[giant] ∩ type-compatible, seen from different IR
+angles.
+
+Family structure (top-40 = 3.47M pairs):
+- shapeless ~2.73M: double-indirect loads (1.03M/406 sites), untyped
+  byte-gep loads (1.10M across 2level/parambase/plain), *param loads
+  (256k), phi/select (169k) — no per-family inventory exists; these
+  are the quotient itself.
+- named struct.field ~522k in the top-40 (+ most of the 1.83M
+  long-tail): intel_context_ops.14, hrtimer_clock_base.6,
+  percpu_ref_data.1, bpf_prog.9, virtio_config_ops.7, sk_buff
+  destructor fields, regmap.1/2... each 10-25k, hundreds of them.
+- formal (fn,data) channels ~217k: decompressor flush/error params
+  (unlzo#6 ...), call_timer_fn#1, smp_call_function_many_cond#1.
+
+CONSEQUENCE: there is no third #35/#36-style campaign — no single
+family is worth >110k pairs, and the shapeless majority has no
+census-complete inventory by construction. The remaining lever set:
+(A) provenance-cells solver redesign (fn identity exempt from
+    V-merging, the #30 frontier): deflates ALL 6,138 sites at once —
+    the one true big fish, research-grade effort, now cleanly sized
+    at ~5.3M pairs / 93% of the answer set;
+(B) generic field-keyed tables (the #36 mechanism generalized to
+    non-singleton ops structs + store-side inventories per #29):
+    covers the named-field + formal slices (~0.7-2.3M depending on
+    tail composition), engineering-grade, but leans toward
+    type+field-flavored resolution and needs store-escape
+    completeness arguments per family class;
+(C) stop: declare the quotient boundary — 18,189 icalls at a median
+    well under 100 targets, with the fat tail documented as the
+    field-insensitive quotient's residue.

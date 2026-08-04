@@ -482,6 +482,16 @@ cl::opt<bool> CFLPreSolveCone(
            "only where answers live, bounded class-count increase"),
   cl::init(true));
 
+cl::opt<bool> CFLJoinCone(
+  "cfl-join-cone",
+  cl::desc("EXPERIMENT (task #38 rung 2): apply the answer-relevance "
+           "discipline to IN-SOLVE cluster joins — every origin is "
+           "protection-eligible, and pure-reader cells in the fptr "
+           "backward cone attach via non-transitive copy-out bridges "
+           "instead of merging (writers and non-cone readers merge as "
+           "today). Requires --cfl-presolve-cone for the cone"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -906,6 +916,12 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLProbeBornHub, "--cfl-probe-born-hub");
     requireFlowsTo(CFLPreSolveExact, "--cfl-presolve-exact");
     requireFlowsTo(CFLPreSolveCone, "--cfl-presolve-cone");
+    requireFlowsTo(CFLJoinCone, "--cfl-join-cone");
+    if (CFLJoinCone && !CFLPreSolveCone) {
+      errs() << "ERROR: --cfl-join-cone needs the presolve cone "
+                "(--cfl-presolve-cone)\n";
+      exit(1);
+    }
     if (CFLPreSolveExact && CFLPreSolveCone) {
       errs() << "ERROR: --cfl-presolve-exact and --cfl-presolve-cone are "
                 "mutually exclusive\n";

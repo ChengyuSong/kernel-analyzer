@@ -58,6 +58,7 @@ extern cl::opt<bool> CFLCensusIcallShape;
 extern cl::opt<bool> CFLProbeBornHub;
 extern cl::opt<bool> CFLPreSolveExact;
 extern cl::opt<bool> CFLPreSolveCone;
+extern cl::opt<bool> CFLJoinCone;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

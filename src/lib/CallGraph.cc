@@ -1591,6 +1591,10 @@ void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
   membersA.insert(b);
 }
 
+// task #38 rung 2: canonical nodes of the presolve fptr backward cone,
+// persisted for the in-solve join-cone experiment (--cfl-join-cone).
+static std::vector<NodeIndex> g_presolveConeCanon;
+
 void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edges,
                                            const std::vector<size_t> *idx) {
   // Labels participating in the memory-free sublanguage.
@@ -1940,6 +1944,10 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
           inCone[w] = 1;
           bfs.push_back(w);
         }
+    g_presolveConeCanon.clear();
+    for (uint32_t ln = 0; ln < Mc; ln++)
+      if (inCone[ln])
+        g_presolveConeCanon.push_back(toCanon[ln]);
     CG_LOG("Pre-solve merge (CONE): " << bfs.size() << "/" << Mc
            << " nodes in the fptr backward cone kept exact\n");
   }
@@ -3103,7 +3111,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // rodata origins (task #25 copy-not-unify — same machinery: writer
   // joins merge, reader joins bridge non-transitively, mixed demotes).
   const bool protOn = NB == 0 && ((CFLOpsPairs && !opsPairs.empty()) ||
-                                  CFLRodataCopy);
+                                  CFLRodataCopy || CFLJoinCone);
   boost::unordered_flat_set<uint32_t> protRid;
   boost::unordered_flat_set<uint32_t> protCls; // container value classes
   boost::unordered_flat_map<uint32_t, ProtState> prot; // rid -> state
@@ -3162,8 +3170,26 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<char> protIn; // hasIn, class-folded (private copy)
   size_t protWriterMerges = 0, protReaderBridges = 0, protDemotions = 0,
          protWaitAttached = 0, protCollapses = 0, protPooledReaders = 0;
+  std::vector<char> coneIn; // task #38 rung 2: answer-cone cell classes
   if (protOn) {
     protIn.assign(hasIn.begin(), hasIn.end());
+    if (CFLJoinCone) {
+      coneIn.assign(N, 0);
+      size_t marked = 0, unmapped = 0;
+      for (NodeIndex cn : g_presolveConeCanon) {
+        auto dIt = toDense.find(getCanonicalNode(cn));
+        if (dIt == toDense.end()) {
+          unmapped++;
+          continue;
+        }
+        if (!coneIn[dIt->second]) {
+          coneIn[dIt->second] = 1; // pre-merge: dense ids are canonical
+          marked++;
+        }
+      }
+      CG_LOG("JoinCone: " << marked << " cone cell classes marked ("
+             << unmapped << " unmapped)\n");
+    }
     // EVERY certified container value class is protection-eligible:
     // globals, helper-returned alloc callsites, locals. Readers that
     // co-witness an UNPROTECTED origin merge through that key and
@@ -3204,6 +3230,14 @@ bool CallGraphPass::runFlowsToResolution() {
     for (auto &sd : seeds)
       if (protCls.count(sd.first))
         protRid.insert(sd.second);
+  }
+  if (CFLJoinCone && NB == 0) {
+    // rung 2 (task #38): every origin is protection-eligible; the
+    // reader path below then bridges ONLY answer-cone cells — the
+    // non-transitive copy-out is bought exactly where answers live.
+    for (uint32_t rid = 0; rid < nextRoot; rid++)
+      protRid.insert(rid);
+    CG_LOG("JoinCone: all " << nextRoot << " origins protection-eligible\n");
   }
   if (CFLRodataCopy && NB == 0) {
     // task #25: every rodata origin is protection-eligible — const
@@ -3657,6 +3691,8 @@ bool CallGraphPass::runFlowsToResolution() {
         if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s], ctx0);
       }
     wflag[a] |= wflag[b];
+    if (!coneIn.empty())
+      coneIn[a] |= coneIn[b]; // cone membership survives unions
     if (CFLProbeBlobFormation && blobEvents.size() < 60000) {
       const uint32_t sa = clsSize[a], sb = clsSize[b];
       // log when both sides are substantial, or a milestone is crossed
@@ -3846,8 +3882,11 @@ bool CallGraphPass::runFlowsToResolution() {
         if (ps.cell == UINT32_MAX) {
           ps.cell = cr;
           uint32_t n2 = ++protAnchor[find(cr)];
-          if (n2 > PROT_ANCHOR_K && !protCollapsed.count(find(cr)))
-            protCollapseQ.push_back(find(cr));
+          if (n2 > PROT_ANCHOR_K && !CFLJoinCone &&
+              !protCollapsed.count(find(cr)))
+            protCollapseQ.push_back(find(cr)); // join-cone: readers are
+                                               // few (2% cone), allow
+                                               // wide anchors
         } else {
           blobCtx = "prot-writer"; blobCtxOrigin = o;
           ps.cell = merge(ps.cell, cr);
@@ -3871,6 +3910,13 @@ bool CallGraphPass::runFlowsToResolution() {
         // and no per-reader plane copies
         blobCtx = "prot-pooled-reader"; blobCtxOrigin = o;
         ps.cell = merge(find(ps.cell), cr);
+        protPooledReaders++;
+      } else if (CFLJoinCone && (coneIn.empty() || !coneIn[cr])) {
+        // join-cone mode, NON-cone reader: pooled semantics exactly as
+        // without protection — the copy-out is reserved for cells in
+        // the answer cone.
+        blobCtx = "cone-pooled-reader"; blobCtxOrigin = o;
+        ps.cell = ps.cell == UINT32_MAX ? cr : merge(find(ps.cell), cr);
         protPooledReaders++;
       } else {
         // reader: copy-out. Facts cross the bridge and re-emit native
@@ -4105,6 +4151,7 @@ bool CallGraphPass::runFlowsToResolution() {
     isRoot.resize(N2, 0);
     if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
     if (!protIn.empty()) protIn.resize(N2, 0);
+    if (!coneIn.empty()) coneIn.resize(N2, 0);
     clsSize.resize(N2, 1);
     N = N2;
   };
@@ -4133,6 +4180,8 @@ bool CallGraphPass::runFlowsToResolution() {
     rootRodata.push_back(classIsRodata(toOrig[rep]));
     if (CFLRodataCopy && rootRodata.back())
       protRid.insert(rid); // rodata origin minted mid-fixpoint (task #25)
+    if (CFLJoinCone)
+      protRid.insert(rid); // join-cone: all origins eligible (task #38)
     tHow = "inc-mint"; tFrom = rep;
     addFact(rep, 0, rid, ctx0);
   };

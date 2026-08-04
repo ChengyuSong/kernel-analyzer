@@ -4202,3 +4202,28 @@ witness-scoped visibility redesign, brief pinned earlier).
 ADOPTION QUESTION: --cfl-presolve-cone is free (+3%), sound-direction
 only, and orthogonal to the adopted identity channels. Default-on
 candidate = user's call.
+
+### Rung 2 null result: reader-side discipline cannot reach writer-side coupling (task #38, 2026-08-04)
+
+--cfl-join-cone (every origin protection-eligible; answer-cone cells
+bridge as prot readers, everything else merges as today): km -0/+0
+EXACT vs the cone baseline, runtime unchanged. The ledger says why —
+only 418 reader bridges fired across the whole solve: answer-cone
+cells virtually never reach a join as PURE readers, because their
+classes are in-edged (fptr-chain deref cells receive real stores, and
+class-folded hasIn marks the rest). Writers must merge — store
+visibility is semantic — so the reader/writer discipline never
+engages where the coupling actually happens.
+
+DIAGNOSIS, and the narrowed design space: phase-2 giant coupling is
+WRITER-SIDE. A written cell keyed (o1) that joins a cluster via o1
+carries its o2/o3/... planes along, because the merge unions ALL
+planes; the semantic requirement was only the SHARED origin's plane,
+both ways. Preventing writer-side smear requires per-origin plane
+exchange at joins — facts crossing per shared origin with classes
+kept separate — which is exactly the pairwise storage the #18 merge
+layer replaced for scale, and exactly the fn-provenance-plane brief
+(witness-scoped visibility). Rung 2 has no cheap form; the ladder
+collapses to rung 3 with a bounded variant now well-motivated:
+per-plane exchange ONLY at answer-cone cells (2% of nodes), reader
+AND writer, fn plane only — pairwise cost bounded by cone size.

@@ -2976,6 +2976,105 @@ bool CallGraphPass::runFlowsToResolution() {
                   std::chrono::steady_clock::now() - tLazy).count()
            << " ms\n");
   }
+  // --cfl-nexus-fields (task #39, class B): surgical field sensitivity.
+  // Only origins of nexus-typed objects mint at exact shift 0; every
+  // other root mints directly on the wildcard plane — bit-identical to
+  // FI for that origin (one (o,X) join cluster, no exact keys, no VX
+  // bridges), so the residue-plane cost is confined to the nexus
+  // population. Typing: globals/allocas by value type; heap sites by
+  // USE — any GEP whose source element type is a nexus struct marks
+  // its stripped base class, then a backward closure over a-edges
+  // carries the mark to the allocation-site classes (crossing cells on
+  // purpose: `tsk = load ...; gep tsk` chains reach the fork-side
+  // stores and their alloc callsites). Over-marking costs planes,
+  // never soundness; under-marking degrades to today's FI.
+  std::vector<char> nexusCls;
+  std::vector<char> rootNexus; // rid-indexed: 1 = exact mint
+  const bool nexusGate = NB > 0 && !CFLNexusFields.empty();
+  if (nexusGate) {
+    boost::unordered_flat_set<std::string> nexusNames;
+    {
+      StringRef spec(CFLNexusFields);
+      if (spec == "default")
+        spec = "task_struct,file,cred,signal_struct,device,module";
+      while (!spec.empty()) {
+        auto [head, rest] = spec.split(',');
+        if (!head.empty())
+          nexusNames.insert(("struct." + head).str());
+        spec = rest;
+      }
+    }
+    auto nexusValueType = [&](llvm::Type *T) {
+      while (auto *AT = dyn_cast<ArrayType>(T))
+        T = AT->getElementType();
+      auto *ST = dyn_cast<StructType>(T);
+      return ST && ST->hasName() &&
+             nexusNames.count(sctCanonStructName(ST->getName()).str()) > 0;
+    };
+    nexusCls.assign(N, 0);
+    size_t mGep = 0, mVal = 0, mClo = 0;
+    for (auto &mp : Ctx->Modules)
+      for (Function &F : *mp.first)
+        for (Instruction &I : instructions(F)) {
+          auto *GEP = dyn_cast<GetElementPtrInst>(&I);
+          if (!GEP || !nexusValueType(GEP->getSourceElementType()))
+            continue;
+          const Value *base =
+              GEP->getPointerOperand()->stripPointerCastsAndAliases();
+          NodeIndex vn = getRepNodeForValue(base);
+          if (vn == AndersNodeFactory::InvalidIndex)
+            continue;
+          auto dIt = toDense.find(getCanonicalNode(vn));
+          if (dIt != toDense.end() && !nexusCls[dIt->second]) {
+            nexusCls[dIt->second] = 1;
+            mGep++;
+          }
+        }
+    auto valTyped = [&](NodeIndex m) {
+      const Value *v = NF.getValueForNode(m);
+      if (const auto *GV = dyn_cast_or_null<GlobalVariable>(v))
+        return nexusValueType(GV->getValueType());
+      if (const auto *AI = dyn_cast_or_null<AllocaInst>(v))
+        return nexusValueType(AI->getAllocatedType());
+      return false;
+    };
+    for (uint32_t n2 = 0; n2 < N; n2++) {
+      if (nexusCls[n2])
+        continue;
+      bool hit = valTyped(toOrig[n2]);
+      if (!hit) {
+        auto mit = canonicalClassMembers.find(toOrig[n2]);
+        if (mit != canonicalClassMembers.end())
+          for (NodeIndex m : mit->second)
+            if ((hit = valTyped(m)))
+              break;
+      }
+      if (hit) {
+        nexusCls[n2] = 1;
+        mVal++;
+      }
+    }
+    // Backward waves over a-edges: each pass extends the mark one edge
+    // upstream (more within a pass in favorable edge order — the cap
+    // is a cost heuristic, extra marks are planes, not unsoundness).
+    for (int depth = 0; depth < 8; depth++) {
+      const size_t before = mClo;
+      for (auto [ea, eb] : aEdges)
+        if (nexusCls[eb] && !nexusCls[ea]) {
+          nexusCls[ea] = 1;
+          mClo++;
+        }
+      if (mClo == before)
+        break;
+    }
+    size_t mTot = 0;
+    for (uint32_t n2 = 0; n2 < N; n2++)
+      mTot += nexusCls[n2];
+    CG_LOG("NexusFields: " << nexusNames.size() << " nexus types; "
+           << mGep << " gep-base + " << mVal << " value-typed + " << mClo
+           << " backward-closure = " << mTot << "/" << N
+           << " classes marked (NB=" << NB << ")\n");
+  }
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
   std::vector<char> rootParkable;    // rid -> pure no-in identity
@@ -3058,6 +3157,13 @@ bool CallGraphPass::runFlowsToResolution() {
       // formal identities don't double the fact volume.
       rootParkable.push_back(!isFunc && !hasOrigin[n]);
       rootRodata.push_back(!isFunc && classIsRodata(toOrig[n]));
+      // Exact residues only for function identities (answer alphabet,
+      // negligible plane mass: their facts rarely meet f-edges) and
+      // nexus-typed OBJECT origins; identity-only roots (formals,
+      // no-in classes) stay wildcard even when a-reachable from nexus
+      // GEPs — the object's origin fact carries the field split.
+      if (nexusGate)
+        rootNexus.push_back(isFunc || (nexusCls[n] && hasOrigin[n]));
     }
   }
 
@@ -3740,6 +3846,8 @@ bool CallGraphPass::runFlowsToResolution() {
         if (RB[a][s].any()) addBitsBridged(a, SHIFT_X, RB[a][s], ctx0);
       }
     wflag[a] |= wflag[b];
+    if (!nexusCls.empty())
+      nexusCls[a] |= nexusCls[b]; // nexus typing survives unions
     if (!coneIn.empty())
       coneIn[a] |= coneIn[b]; // cone membership survives unions
     if (!ownedMask.empty()) {
@@ -4194,7 +4302,17 @@ bool CallGraphPass::runFlowsToResolution() {
     return collapsed;
   };
   tHow = "seed"; tFrom = UINT32_MAX;
-  for (auto [n, rid] : seeds) addFact(find(n), 0, rid, ctx0);
+  {
+    size_t exactMint = 0, wildMint = 0;
+    for (auto [n, rid] : seeds) {
+      const bool exact = !nexusGate || rootNexus[rid];
+      addFact(find(n), exact ? 0 : SHIFT_X, rid, ctx0);
+      (exact ? exactMint : wildMint)++;
+    }
+    if (nexusGate)
+      CG_LOG("NexusFields: " << exactMint << " exact-minted roots (fn + "
+             "nexus origins), " << wildMint << " wildcard-minted (FI)\n");
+  }
   flushCtx(ctx0);
 
   // ---- Incremental cross-iteration wiring ----
@@ -4230,6 +4348,9 @@ bool CallGraphPass::runFlowsToResolution() {
     isRoot.resize(N2, 0);
     if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
     if (!protIn.empty()) protIn.resize(N2, 0);
+    // New wiring-era classes default non-nexus: a late-minted nexus
+    // alloc degrades to FI for itself (sound, logged via mint tally).
+    if (!nexusCls.empty()) nexusCls.resize(N2, 0);
     if (!coneIn.empty()) coneIn.resize(N2, 0);
     if (!ownedMask.empty()) ownedMask.resize(N2, 0);
     clsSize.resize(N2, 1);
@@ -4273,8 +4394,11 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       ownedMask[rep] |= 1ull << subsysBitOf(om2);
     }
+    if (nexusGate)
+      rootNexus.push_back(funcOfCanon.count(toOrig[rep]) != 0 ||
+                          (nexusCls[rep] && originBearing(toOrig[rep])));
     tHow = "inc-mint"; tFrom = rep;
-    addFact(rep, 0, rid, ctx0);
+    addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, rid, ctx0);
   };
   auto wireIncremental = [&](size_t lo) {
     const uint32_t oldN = N;

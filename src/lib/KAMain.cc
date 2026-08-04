@@ -511,6 +511,18 @@ cl::opt<bool> CFLCensusNexus(
            "carriers), with reader diversity alongside"),
   cl::init(false));
 
+cl::opt<std::string> CFLNexusFields(
+  "cfl-nexus-fields",
+  cl::desc("Surgical field sensitivity (task #39): comma-separated named "
+           "struct list (e.g. task_struct,file,cred) or 'default' (the "
+           "fat-object census list). ONLY origins of these nexus types "
+           "carry exact field residues; every other origin mints on the "
+           "wildcard plane, which is bit-identical to FI for it (one "
+           "(o,X) join cluster, no exact keys, no VX bridges) — the "
+           "residue-plane cost is confined to the nexus population. "
+           "Requires --cfl-field-buckets>0 (auto-set to 13 if unset)"),
+  cl::init(""));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -938,6 +950,18 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLJoinCone, "--cfl-join-cone");
     requireFlowsTo(CFLCensusCouplers, "--cfl-census-couplers");
     requireFlowsTo(CFLCensusNexus, "--cfl-census-nexus");
+    requireFlowsTo(!CFLNexusFields.empty(), "--cfl-nexus-fields");
+    if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {
+      if (CFLFieldBuckets.getNumOccurrences() == 0) {
+        CFLFieldBuckets = 13;
+        errs() << "NexusFields: --cfl-field-buckets unset, using 13\n";
+      } else {
+        errs() << "ERROR: --cfl-nexus-fields requires "
+                  "--cfl-field-buckets>0 (residue planes carry the "
+                  "nexus precision)\n";
+        exit(1);
+      }
+    }
     if (CFLJoinCone && !CFLPreSolveCone) {
       errs() << "ERROR: --cfl-join-cone needs the presolve cone "
                 "(--cfl-presolve-cone)\n";

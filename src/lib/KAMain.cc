@@ -492,6 +492,17 @@ cl::opt<bool> CFLJoinCone(
            "today). Requires --cfl-presolve-cone for the cone"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusCouplers(
+  "cfl-census-couplers",
+  cl::desc("MEASUREMENT-ONLY census (task #38, modularity thesis): "
+           "track per-class subsystem masks over owned DATA origins "
+           "(fn identities excluded) and record every cross-subsystem "
+           "WELD at merge time, blamed by the shared join origin; "
+           "report top welders + icall-operand data-subsystem "
+           "diversity. Tests whether the kernel's object plane is "
+           "naturally compartmentalized"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -917,6 +928,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLPreSolveExact, "--cfl-presolve-exact");
     requireFlowsTo(CFLPreSolveCone, "--cfl-presolve-cone");
     requireFlowsTo(CFLJoinCone, "--cfl-join-cone");
+    requireFlowsTo(CFLCensusCouplers, "--cfl-census-couplers");
     if (CFLJoinCone && !CFLPreSolveCone) {
       errs() << "ERROR: --cfl-join-cone needs the presolve cone "
                 "(--cfl-presolve-cone)\n";

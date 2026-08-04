@@ -1595,6 +1595,30 @@ void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
 // persisted for the in-solve join-cone experiment (--cfl-join-cone).
 static std::vector<NodeIndex> g_presolveConeCanon;
 
+// --cfl-census-couplers (task #38, user thesis: kernel modularity at the
+// DATA-OBJECT level). Subsystem = first two path components of the
+// origin's defining module. A cross-subsystem WELD = a merge whose two
+// sides each own data origins from subsystems the other lacks — after
+// it, readers of either cell see both subsystems' objects. Fn origins
+// are excluded (the identity channels already bind ops per object).
+static boost::unordered_flat_map<std::string, uint8_t> g_subsysIds;
+static std::vector<std::string> g_subsysNames;
+static uint8_t subsysBitOf(const llvm::Module *M2) {
+  if (!M2) return 63;
+  llvm::StringRef p2 = M2->getModuleIdentifier();
+  p2.consume_front("./");
+  size_t s1 = p2.find('/');
+  size_t s2 = s1 == llvm::StringRef::npos ? s1 : p2.find('/', s1 + 1);
+  std::string key =
+      (s2 == llvm::StringRef::npos ? p2 : p2.substr(0, s2)).str();
+  auto [it, ins] = g_subsysIds.emplace(key, (uint8_t)g_subsysNames.size());
+  if (ins) {
+    if (g_subsysNames.size() >= 63) { it->second = 62; return 62; }
+    g_subsysNames.push_back(key);
+  }
+  return it->second;
+}
+
 void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edges,
                                            const std::vector<size_t> *idx) {
   // Labels participating in the memory-free sublanguage.
@@ -3231,6 +3255,30 @@ bool CallGraphPass::runFlowsToResolution() {
       if (protCls.count(sd.first))
         protRid.insert(sd.second);
   }
+  // Coupler census state: per-class subsystem masks over OWNED data
+  // origins; weld events recorded in merge().
+  std::vector<uint64_t> ownedMask;
+  boost::unordered_flat_map<std::string, std::pair<uint64_t, uint64_t>>
+      weldBlame; // name -> (count, united-bits)
+  size_t weldEvents = 0, mergeEvents = 0;
+  if (CFLCensusCouplers) {
+    ownedMask.assign(N, 0);
+    for (uint32_t rid = 0; rid < nextRoot; rid++) {
+      if (funcRootOf.count(rid))
+        continue; // fn identities excluded: data-object plane only
+      const Value *ov = NF.getValueForNode(toOrig[rootClassOf[rid]]);
+      const llvm::Module *om = nullptr;
+      if (ov) {
+        if (const auto *oi = dyn_cast<Instruction>(ov))
+          om = oi->getModule();
+        else if (const auto *og = dyn_cast<GlobalValue>(ov))
+          om = og->getParent();
+      }
+      ownedMask[rootClassOf[rid]] |= 1ull << subsysBitOf(om); // pre-merge: canonical
+    }
+    CG_LOG("Couplers: " << g_subsysNames.size()
+           << " subsystems over data origins\n");
+  }
   if (CFLJoinCone && NB == 0) {
     // rung 2 (task #38): every origin is protection-eligible; the
     // reader path below then bridges ONLY answer-cone cells — the
@@ -3693,6 +3741,35 @@ bool CallGraphPass::runFlowsToResolution() {
     wflag[a] |= wflag[b];
     if (!coneIn.empty())
       coneIn[a] |= coneIn[b]; // cone membership survives unions
+    if (!ownedMask.empty()) {
+      mergeEvents++;
+      const uint64_t na2 = ownedMask[a] & ~ownedMask[b];
+      const uint64_t nb2 = ownedMask[b] & ~ownedMask[a];
+      if (na2 && nb2) {
+        // true cross-subsystem weld: blame the shared join origin (the
+        // object whose cell keyed this union) when available
+        weldEvents++;
+        std::string who = "ctx:" + std::string(blobCtx);
+        if (blobCtxOrigin != UINT32_MAX &&
+            blobCtxOrigin < rootClassOf.size()) {
+          const Value *wv =
+              NF.getValueForNode(toOrig[rootClassOf[blobCtxOrigin]]);
+          if (wv && wv->hasName())
+            who = wv->getName().str();
+          else if (wv) {
+            if (const auto *wi = dyn_cast<Instruction>(wv))
+              who = (wi->getFunction()->getName() + "::" +
+                     wi->getOpcodeName()).str();
+          } else {
+            who = "<synthetic>/" + std::string(blobCtx);
+          }
+        }
+        auto &bl2 = weldBlame[who];
+        bl2.first++;
+        bl2.second |= ownedMask[a] | ownedMask[b];
+      }
+      ownedMask[a] |= ownedMask[b];
+    }
     if (CFLProbeBlobFormation && blobEvents.size() < 60000) {
       const uint32_t sa = clsSize[a], sb = clsSize[b];
       // log when both sides are substantial, or a milestone is crossed
@@ -4152,6 +4229,7 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
     if (!protIn.empty()) protIn.resize(N2, 0);
     if (!coneIn.empty()) coneIn.resize(N2, 0);
+    if (!ownedMask.empty()) ownedMask.resize(N2, 0);
     clsSize.resize(N2, 1);
     N = N2;
   };
@@ -4182,6 +4260,17 @@ bool CallGraphPass::runFlowsToResolution() {
       protRid.insert(rid); // rodata origin minted mid-fixpoint (task #25)
     if (CFLJoinCone)
       protRid.insert(rid); // join-cone: all origins eligible (task #38)
+    if (!ownedMask.empty() && !funcOfCanon.count(toOrig[rep])) {
+      const Value *ov2 = NF.getValueForNode(toOrig[rep]);
+      const llvm::Module *om2 = nullptr;
+      if (ov2) {
+        if (const auto *oi2 = dyn_cast<Instruction>(ov2))
+          om2 = oi2->getModule();
+        else if (const auto *og2 = dyn_cast<GlobalValue>(ov2))
+          om2 = og2->getParent();
+      }
+      ownedMask[rep] |= 1ull << subsysBitOf(om2);
+    }
     tHow = "inc-mint"; tFrom = rep;
     addFact(rep, 0, rid, ctx0);
   };
@@ -5465,6 +5554,59 @@ bool CallGraphPass::runFlowsToResolution() {
            << " accessor callsites bound to opaque payload arenas (contract: "
            << g_sinkSitesConfirmed << " confirmed / " << g_sinkSitesEscaped
            << " escape / " << g_sinkSitesViolated << " violation)\n";
+  }
+  if (CFLCensusCouplers && !ownedMask.empty()) {
+    errs() << "Couplers: " << weldEvents << " cross-subsystem welds / "
+           << mergeEvents << " merges; subsystems: " << g_subsysNames.size()
+           << "\n";
+    std::vector<std::pair<uint64_t, const std::string *>> wb;
+    for (auto &kv : weldBlame)
+      wb.emplace_back(kv.second.first, &kv.first);
+    std::sort(wb.begin(), wb.end(), std::greater<>());
+    for (size_t i2 = 0; i2 < std::min<size_t>(30, wb.size()); i2++) {
+      auto &e2 = weldBlame[*wb[i2].second];
+      errs() << "Couplers: x" << e2.first << " ("
+             << __builtin_popcountll(e2.second) << " subsys) "
+             << *wb[i2].second << "\n";
+    }
+    // Answer-side diversity: how many subsystems' DATA objects does
+    // each icall operand class see at fixpoint?
+    size_t h[9] = {0};
+    for (auto *CS3 : Ctx->IndirectCallInsts) {
+      NodeIndex fn3 = NF.getValueNodeFor(
+          CS3->getCalledOperand()->stripPointerCastsAndAliases());
+      if (fn3 == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt3 = toDense.find(getCanonicalNode(fn3));
+      if (dIt3 == toDense.end()) continue;
+      const uint32_t rep3 = find(dIt3->second);
+      uint64_t m3 = 0;
+      auto accum = [&](const FactSet &pl) {
+        pl.forEach([&](uint32_t o3) {
+          if (funcRootOf.count(o3)) return;
+          const Value *ov3 = o3 < rootClassOf.size()
+              ? NF.getValueForNode(toOrig[rootClassOf[o3]]) : nullptr;
+          const llvm::Module *om3 = nullptr;
+          if (ov3) {
+            if (const auto *oi3 = dyn_cast<Instruction>(ov3))
+              om3 = oi3->getModule();
+            else if (const auto *og3 = dyn_cast<GlobalValue>(ov3))
+              om3 = og3->getParent();
+          }
+          m3 |= 1ull << subsysBitOf(om3);
+        });
+      };
+      accum(R[rep3][0]);
+      accum(RB[rep3][0]);
+      int pc3 = __builtin_popcountll(m3);
+      h[pc3 >= 8 ? 8 : pc3]++;
+    }
+    errs() << "Couplers: icall-operand data-subsystem diversity:";
+    for (int i3 = 0; i3 < 9; i3++)
+      errs() << " [" << i3 << (i3 == 8 ? "+" : "") << "]=" << h[i3];
+    errs() << "\n";
+    for (size_t i3 = 0; i3 < g_subsysNames.size() && i3 < 40; i3++)
+      errs() << "Couplers: subsys " << i3 << " = " << g_subsysNames[i3]
+             << "\n";
   }
   if (CFLTracepointKeys) {
     errs() << "TracepointKeys: " << g_tpKeyConstBinds << " const binds + "

@@ -4266,3 +4266,55 @@ iterators) — and the object plane fragments into subsystem cones
 without solver surgery. Class-2 stays (correct), class-3 is heap
 identity (revisit #17 under the post-idchan graph). Rung-3 plane
 exchange is reserved for the residue after the courier campaigns.
+
+## Task #39: surgical nexus field sensitivity — --cfl-nexus-fields (2026-08-04)
+
+Class-B remedy from the #38 nexus discovery, built class-B-first per the
+dependency the user identified: container heads (`task->children`,
+`tsk->ptraced`) live at fixed offsets INSIDE the fat objects, so class-A
+container summaries have nothing to key on until the fat-object cell is
+split — class B gives class A its keys.
+
+**Design.** The fs13 shift machinery unchanged, but exact residue minting
+is gated: only origins of listed nexus struct types mint at shift 0;
+every other root — including FUNCTION roots — mints directly on the
+wildcard plane. Wildcard minting is bit-identical to FI for that origin
+(one `(o,X)` join cluster, no exact keys, no VX bridges), so the residue
+cost is confined to the nexus population. Typing: globals/allocas by
+value type; heap sites by use (classes of stripped bases of GEPs whose
+source element type is nexus, plus a backward a-edge closure that
+crosses cells on purpose to reach fork-side alloc callsites).
+Over-marking costs planes, never soundness.
+
+**km results (default list task_struct,file,cred,signal_struct,device,module):**
+- **-1,846/+0**, a STRICT SUBSET of full fs13's -4,499/+0 — 41% of the
+  precision for 22% of the cost. Removal profile: callback-carrier
+  dispatch (execute_in_process_context 454, smp_call_function_many_cond
+  442, stop_machine 132, async_schedule 134) separated by
+  task_struct/signal_struct cell splits.
+- **Fn-roots-at-X is free**: byte-identical answers, 25.5min → 17.5min.
+  A fn identity's shift never keys anything answer-relevant (answers
+  union the X plane; rotation is absorbing at X; `(fn,X)` join keys are
+  FI-identical), while exact fn facts blanket the graph and spread
+  across every plane at each f-edge rotation.
+- **212 exact-minted roots carry the entire effect** (of 46,869 rids).
+- **Widened-list null**: +14 types (bpf_link, trace_array, irq_desc,
+  work_struct, timer_list, ...) bought only +29 more removals. The
+  fs13-only gap (bpf_link_release 508, tracing_stat_open 267, ...) is
+  EMBEDDED-TYPE origins: `bpf_link` lives inside `bpf_tracing_link`,
+  and name-matched GEP typing misses the containing type. Containment
+  closure would recover them, but for promiscuous carriers
+  (`work_struct` embeds in hundreds of types) it approaches full fs13.
+
+**Cost structure nailed.** 9.4× residual cost for 212 exact origins:
+exact planes are FULL-UNIVERSE FactSet bitsets (46,869 bits) though
+they can only ever contain the ≤212 nexus rids — ~220× width waste per
+occupied plane, and occupied-plane count × universe width is exactly
+the fs13 wall's composition. Narrow-universe exact planes (separate
+dense id space for exact-minted rids) is the engineering lever; until
+then a kernel-scale run extrapolates to ~30 h.
+
+**Soundness.** t_container 2/2 under the gate (container_of exact — the
+old flows-to shift blowup does not manifest at this marking density);
+t_maskwalk all three routes; t_ops/t_pairs/t_allocinit exact; smoke 4/4
+with the gate off (defaults untouched).

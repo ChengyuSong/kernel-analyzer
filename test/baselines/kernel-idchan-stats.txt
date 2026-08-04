@@ -1,6 +1,9 @@
-Whole-kernel flows-to PIN CANDIDATE: answer-level identity channels
-(2026-08-03, tasks #35 + #36 — CANDIDATE pending user adoption;
-current canonical pin remains kernel-gepfix)
+Whole-kernel flows-to baseline: ANSWER-LEVEL IDENTITY CHANNELS
+(2026-08-03, tasks #35 + #36 — CANONICAL PIN, adopted by user
+2026-08-03, supersedes kernel-gepfix-stats.txt. Both model flags are
+DEFAULT ON since this commit; the config below predates the flip and
+lists them explicitly — a bare canonical invocation now matches it.
+Opt out with --cfl-tracepoint-keys=false / --cfl-static-ops-tables=false.)
 commits: 50bb688 (tracepoint keyed channels v3, answer-level)
          df07d7f (static_call ops-table channel)
 config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
@@ -30,5 +33,5 @@ completeness certificates (both models, kernel scale):
   3 untabled keys (bpf_dispatcher JIT-led; 150 sites keep graph
   behavior, correct); 90 type-mismatched entries KEPT (all
   __static_call_return0 — real runtime targets).
-answer set: ~/fast/ka-scratch/baselines/kernel-pincand-icalls.sort.gz
+answer set: ~/fast/ka-scratch/baselines/kernel-idchan-icalls.sort.gz
 sha256: 086179680e8eed93b1a1a3209470f718de1c3f0c052d889ad0b2abd04ff1e3b5

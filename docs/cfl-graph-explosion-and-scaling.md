@@ -4063,3 +4063,15 @@ solo-#35 ∪ solo-#36 + 45,453 synergy pairs at kvm dispatch bodies,
 with union-only = 0 (combination loses nothing either solo run
 removed). ADOPTION = user sign-off; until then kernel-gepfix remains
 canonical.
+
+### ADOPTED: identity channels are the canonical config; pin = kernel-idchan (2026-08-03)
+
+User adoption: --cfl-tracepoint-keys and --cfl-static-ops-tables are
+DEFAULT ON (opt out with =false). Outside the monolithic flows-to
+mode they auto-disable unless explicitly requested (their graph-build
+severs are only sound paired with the answer-level resolution loop);
+--cfl-static-ops-tables also auto-disables if --cfl-static-call=false
+was chosen. CANONICAL PIN is now kernel-idchan
+(test/baselines/kernel-idchan-stats.txt): 18,189 icalls / 5,691,662
+dump lines, 2.98 h, superseding kernel-gepfix. The rodata copy-not-
+unify flag stays default OFF (answer-neutral instrument).

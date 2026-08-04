@@ -401,7 +401,8 @@ cl::opt<bool> CFLCensusTracepoint(
 
 cl::opt<bool> CFLTracepointKeys(
   "cfl-tracepoint-keys",
-  cl::desc("REVIEWED MODEL (task #35): per-tracepoint keyed probe "
+  cl::desc("ADOPTED MODEL (task #35, default ON; =false to opt out): "
+           "per-tracepoint keyed probe "
            "channels. Every tracepoint_probe_register-family callsite "
            "is severed from the generic body (whose shared tp formal "
            "is the channel that pools ALL tracepoints' probes into "
@@ -413,11 +414,12 @@ cl::opt<bool> CFLTracepointKeys(
            "for (tp, probe) pairs. __traceiter_* icalls read their own "
            "key's channel. Unclassifiable sites keep generic wiring "
            "and are counted LOUDLY (census: zero at kernel scale)"),
-  cl::init(false));
+  cl::init(true));
 
 cl::opt<bool> CFLStaticOpsTables(
   "cfl-static-ops-tables",
-  cl::desc("REVIEWED MODEL (task #36): answer-level channel for "
+  cl::desc("ADOPTED MODEL (task #36, default ON; =false to opt out): "
+           "answer-level channel for "
            "static_call keys updated from ops-struct tables. At "
            "__static_call_update(key, ops->field) sites the IR names "
            "the struct type and field index; the binding inventory is "
@@ -427,7 +429,7 @@ cl::opt<bool> CFLStaticOpsTables(
            "the table instead of the (type-fallback) graph answer; "
            "non-conforming update args untable the key LOUDLY and its "
            "sites keep graph behavior. Requires --cfl-static-call"),
-  cl::init(false));
+  cl::init(true));
 
 cl::opt<bool> CFLRodataCopy(
   "cfl-rodata-copy",
@@ -846,12 +848,29 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLSinkInstr, "--cfl-sink-instr");
     requireFlowsTo(CFLCensusPtrToInt, "--cfl-census-ptrtoint");
     requireFlowsTo(CFLCensusTracepoint, "--cfl-census-tracepoint");
+    // Adopted identity-channel models (tasks #35/#36, ADOPTED
+    // 2026-08-03): default ON in the canonical flows-to mode, opt out
+    // with --cfl-tracepoint-keys=false / --cfl-static-ops-tables=false.
+    // Outside flows-to they AUTO-DISABLE unless explicitly requested —
+    // their graph-build severs are only sound paired with the
+    // answer-level resolution loop.
+    if (!flowsToActive) {
+      if (CFLTracepointKeys.getNumOccurrences() == 0)
+        CFLTracepointKeys = false;
+      if (CFLStaticOpsTables.getNumOccurrences() == 0)
+        CFLStaticOpsTables = false;
+    }
     requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
     requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");
     requireFlowsTo(CFLRodataCopy, "--cfl-rodata-copy");
     if (CFLStaticOpsTables && !CFLStaticCall) {
-      errs() << "ERROR: --cfl-static-ops-tables requires --cfl-static-call\n";
-      exit(1);
+      if (CFLStaticOpsTables.getNumOccurrences() == 0) {
+        CFLStaticOpsTables = false; // no static-call model, no keys
+      } else {
+        errs() << "ERROR: --cfl-static-ops-tables requires "
+                  "--cfl-static-call\n";
+        exit(1);
+      }
     }
     if (CFLCertUserCopy && CFLProbeUserCopyAblate) {
       errs() << "ERROR: --cfl-cert-usercopy tags the very edges "

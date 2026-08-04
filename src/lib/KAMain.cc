@@ -475,11 +475,12 @@ cl::opt<bool> CFLPreSolveExact(
 
 cl::opt<bool> CFLPreSolveCone(
   "cfl-presolve-cone",
-  cl::desc("EXPERIMENT (task #38 hybrid): keep the pre-solve V-component "
+  cl::desc("ADOPTED (task #38, default ON; =false to opt out): keep the "
+           "pre-solve V-component "
            "quotient for the data plane but exclude nodes in the "
            "backward value-flow cone of icall operands — exactness "
            "only where answers live, bounded class-count increase"),
-  cl::init(false));
+  cl::init(true));
 
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
@@ -895,6 +896,8 @@ int main(int argc, char **argv) {
         CFLTracepointKeys = false;
       if (CFLStaticOpsTables.getNumOccurrences() == 0)
         CFLStaticOpsTables = false;
+      if (CFLPreSolveCone.getNumOccurrences() == 0)
+        CFLPreSolveCone = false;
     }
     requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
     requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");

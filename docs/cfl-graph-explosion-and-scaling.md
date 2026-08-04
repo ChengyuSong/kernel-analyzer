@@ -4227,3 +4227,42 @@ layer replaced for scale, and exactly the fn-provenance-plane brief
 collapses to rung 3 with a bounded variant now well-motivated:
 per-plane exchange ONLY at answer-cone cells (2% of nodes), reader
 AND writer, fn plane only — pairwise cost bounded by cone size.
+
+### Modularity thesis confirmed at kernel scale: the object plane is bimodal (task #38, 2026-08-04)
+
+--cfl-census-couplers, full bclist. The user's thesis — the kernel is
+naturally compartmentalized at the data-object level, and the giant
+is shared-plumbing artifact — holds in the strongest form the data
+could take:
+
+- BIMODAL, EMPTY MIDDLE, at both scales. Kernel icall-operand data-
+  subsystem diversity: [0]=1,638 [1]=602 [2]=266 [3]=2 [4..7]=0
+  [8+]=16,141. (km: 455 vs 0 vs 1,081.) A dispatch site either sees
+  <=2 subsystems' objects or ~all of them; compartmentalization is
+  the natural state and the giant is a phase transition.
+- WELDS ARE RARE: kernel 1,695 / 173,527 merges (0.98%; km 2.6%).
+- WELDER TAXONOMY (three classes, from the blame table):
+  1. UNIVERSAL COURIERS, catastrophic and few: mptcp_stream_accept
+     (54 subsystems in one weld — the socket layer is the kernel's
+     universal object courier), __warn (55 — diagnostics touch
+     everything), bpf tp maps / iterators, kthread/stopper engines,
+     procfs show iterators (km: perf_ctx_sched_task_cb at 55).
+  2. HONEST NEIGHBORS, small and semantically correct: ext4<->jbd2
+     journal buffers (x6+x4+x4+x4 at 2 subsystems), quota transfer,
+     snd_hda — real shared objects between adjacent subsystems, as
+     they should be.
+  3. THE ALLOCATOR: kmalloc_caches (6 subsystems) — the known heap-
+     identity story (#17), now placed in context.
+- Census caveat: the 64-bit subsystem mask saturates (63 named + 1
+  overflow slot) at kernel scale; drivers'/fs' long tail pools into
+  the overflow bit, so courier diversities are lower bounds and a
+  wider-mask rerun would sharpen fs/X-vs-fs/Y specifics.
+
+ROADMAP IMPLICATION (inverts the rung-3-first plan): summarize/model
+the class-1 courier list — each is a #35/#36-shaped campaign with a
+nameable inventory (socket accept/skb paths, warn/diagnostics, bpf
+iterator engines, kthread/stopper (fn,data) channels, procfs
+iterators) — and the object plane fragments into subsystem cones
+without solver surgery. Class-2 stays (correct), class-3 is heap
+identity (revisit #17 under the post-idchan graph). Rung-3 plane
+exchange is reserved for the residue after the courier campaigns.

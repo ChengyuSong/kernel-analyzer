@@ -1,0 +1,34 @@
+Whole-kernel flows-to PIN CANDIDATE: answer-level identity channels
+(2026-08-03, tasks #35 + #36 — CANDIDATE pending user adoption;
+current canonical pin remains kernel-gepfix)
+commits: 50bb688 (tracepoint keyed channels v3, answer-level)
+         df07d7f (static_call ops-table channel)
+config: --cfl-flows-to --cfl-compositional=false --cfl-bidi-prune
+        --func-summaries=func_summaries.txt --cfl-tracepoint-keys
+        --cfl-static-ops-tables --cfl-dump-icalls --mem-limit=92
+        --bc-list bclist
+
+resolved: 18,189 icalls / 5,691,662 dump lines, 2.98 h (-28% vs pin's
+4.12 h; --mem-limit=92 required since 2cc1a2e, RLIMIT_AS not RSS)
+delta vs kernel-gepfix pin (18,189 / 8,391,950 dump lines):
+  -2,700,317 / +29
+  additions = REAL RECALL the type fallback missed: 18x
+  __static_call_return0 (RET0-patched keys at typed sites) + 11x
+  default_send_IPI_*_phys (apic table entries). NO nvme flap this run.
+  removals decompose EXACTLY: solo-#35 (-1,503,226 traceiter
+  type-fallback pools -> 3,871 registered-probe pairs) UNION solo-#36
+  (-1,197,091 __SCT__ type-fallback pools -> table answers) plus
+  45,453 SYNERGY pairs (kvm dispatch bodies: vcpu_run 1,476, enter_smm
+  566, handle_cr 539 — plain-icall answers shrink when both families'
+  giant mass is severed together). union-only = 0: no solo removal
+  is lost in combination.
+completeness certificates (both models, kernel scale):
+  TracepointKeys: 964/964 keys (39 const + 2,868 walker pairs);
+  0 unclassified reg sites / 0 keyless iterators / 0 unmapped keys /
+  0 dyn-probe fallbacks; 0 type-rejected probes.
+  StaticOpsTables: 188 keys tabled (59 const + 171 load-shaped);
+  3 untabled keys (bpf_dispatcher JIT-led; 150 sites keep graph
+  behavior, correct); 90 type-mismatched entries KEPT (all
+  __static_call_return0 — real runtime targets).
+answer set: ~/fast/ka-scratch/baselines/kernel-pincand-icalls.sort.gz
+sha256: 086179680e8eed93b1a1a3209470f718de1c3f0c052d889ad0b2abd04ff1e3b5

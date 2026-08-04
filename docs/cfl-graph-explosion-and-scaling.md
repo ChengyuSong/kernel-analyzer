@@ -4045,3 +4045,21 @@ DISPOSITION: #25 CLOSED. --cfl-rodata-copy stays in-tree as a sound,
 neutral, off-by-default instrument. The pin-candidate combination
 (user directive) proceeds with the TWO positive levers:
 --cfl-tracepoint-keys + --cfl-static-ops-tables.
+
+### PIN CANDIDATE: canonical + tpkeys + static-ops-tables = -2,700,317/+29, 2.98 h (2026-08-03)
+
+Per user directive (rodata was the third lever; its honest model came
+back answer-neutral, so the candidate combines the two positive ones).
+Full stats + completeness certificates:
+test/baselines/kernel-pincand-stats.txt; answer set (sha256-pinned)
+in ~/fast/ka-scratch/baselines/kernel-pincand-icalls.sort.gz.
+
+Headline: 18,189 icalls / 5,691,662 dump lines — 32.2% below the
+kernel-gepfix pin — in 2.98 h (-28% runtime; the two severed
+machineries also cut solve cost). Additions are 29 REAL-RECALL pairs
+(return0 + apic IPI table entries the type fallback missed); no nvme
+flap this run. The removal set decomposes exactly as
+solo-#35 ∪ solo-#36 + 45,453 synergy pairs at kvm dispatch bodies,
+with union-only = 0 (combination loses nothing either solo run
+removed). ADOPTION = user sign-off; until then kernel-gepfix remains
+canonical.

@@ -3157,13 +3157,16 @@ bool CallGraphPass::runFlowsToResolution() {
       // formal identities don't double the fact volume.
       rootParkable.push_back(!isFunc && !hasOrigin[n]);
       rootRodata.push_back(!isFunc && classIsRodata(toOrig[n]));
-      // Exact residues only for function identities (answer alphabet,
-      // negligible plane mass: their facts rarely meet f-edges) and
-      // nexus-typed OBJECT origins; identity-only roots (formals,
-      // no-in classes) stay wildcard even when a-reachable from nexus
-      // GEPs — the object's origin fact carries the field split.
+      // Exact residues ONLY for nexus-typed OBJECT origins. Function
+      // roots mint on the wildcard plane too: answers union the X
+      // plane, rotation is absorbing at X, and the (fn,X) join key is
+      // FI-identical — while exact fn facts would blanket the graph
+      // and spread across every plane at each f-edge rotation (fn
+      // facts are the dominant mass). Identity-only roots (formals,
+      // no-in classes) likewise stay wildcard: the object's origin
+      // fact carries the field split.
       if (nexusGate)
-        rootNexus.push_back(isFunc || (nexusCls[n] && hasOrigin[n]));
+        rootNexus.push_back(nexusCls[n] && hasOrigin[n]);
     }
   }
 
@@ -4395,8 +4398,7 @@ bool CallGraphPass::runFlowsToResolution() {
       ownedMask[rep] |= 1ull << subsysBitOf(om2);
     }
     if (nexusGate)
-      rootNexus.push_back(funcOfCanon.count(toOrig[rep]) != 0 ||
-                          (nexusCls[rep] && originBearing(toOrig[rep])));
+      rootNexus.push_back(nexusCls[rep] && originBearing(toOrig[rep]));
     tHow = "inc-mint"; tFrom = rep;
     addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, rid, ctx0);
   };

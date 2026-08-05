@@ -49,6 +49,7 @@
 #include <unordered_set>
 
 #include <cstdio>
+#include <deque>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -3667,7 +3668,9 @@ bool CallGraphPass::runFlowsToResolution() {
     uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
     uint64_t sweepOffered = 0, sweepKept = 0;
   };
-  std::vector<SolverCtx> ctxs(solverThreads);
+  // deque, not vector: forked batch workers grow it for their own
+  // thread pool, and ctx0 below must stay a valid reference.
+  std::deque<SolverCtx> ctxs(solverThreads);
   SolverCtx &ctx0 = ctxs[0];
   auto push = [&](uint32_t n, SolverCtx &ctx) {
     if (!inWL[n].exchange(1, std::memory_order_relaxed))
@@ -4773,7 +4776,10 @@ bool CallGraphPass::runFlowsToResolution() {
       if (find(n) != n) return;
     }
   };
-  WavePool pool(solverThreads);
+  // unique_ptr: in batch-worker mode the parent's pool has T=1 (no
+  // live threads — fork-safe); each forked worker rebuilds its own
+  // pool with its share of the cores.
+  auto poolPtr = std::make_unique<WavePool>(solverThreads);
   uint64_t seqJoinCy = 0; // T>1: cycles in the sequential join sub-phase
   // Phase B — bridge crossings, wildcard projection and a/f delta
   // propagation. Parallel-safe under the lock discipline: the owner
@@ -4906,7 +4912,7 @@ bool CallGraphPass::runFlowsToResolution() {
       auto runPhase = [&](auto &&body) {
         cursor.store(lo, std::memory_order_relaxed);
         parallelPhase = solverThreads > 1;
-        pool.run([&](unsigned tid) {
+        poolPtr->run([&](unsigned tid) {
           SolverCtx &ctx = ctxs[tid];
           while (true) {
             uint32_t i = cursor.fetch_add(kGrain, std::memory_order_relaxed);
@@ -5043,6 +5049,17 @@ bool CallGraphPass::runFlowsToResolution() {
           if (pid < 0)
             report_fatal_error("BatchWorkers: fork failed");
           if (pid == 0) {
+            // Claim this worker's share of the cores: fork carried no
+            // pool threads, so build a fresh pool and enough ctxs (the
+            // deque grows without invalidating ctx0).
+            const unsigned wT = std::max(
+                1u, std::thread::hardware_concurrency() / W);
+            if (wT > 1) {
+              solverThreads = wT;
+              while (ctxs.size() < wT)
+                ctxs.emplace_back();
+              poolPtr = std::make_unique<WavePool>(wT);
+            }
             g_batchRecord = true;
             g_batchEvts.clear();
             boost::unordered_flat_map<uint32_t, FactSet> hv;

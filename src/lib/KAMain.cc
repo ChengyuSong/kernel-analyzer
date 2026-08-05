@@ -523,6 +523,18 @@ cl::opt<std::string> CFLNexusFields(
            "Requires --cfl-field-buckets>0 (auto-set to 13 if unset)"),
   cl::init(""));
 
+cl::opt<unsigned> CFLBatchRoots(
+  "cfl-batch-roots",
+  cl::desc("Origin-batched flows-to solving (task #40): mint and drain "
+           "roots K at a time, releasing all fact planes between "
+           "batches; only the union-find quotient, join keys, bridges "
+           "and harvested answer bits persist. Outer rounds repeat "
+           "until a full pass adds no merges (same closure, monotone-"
+           "merge argument). Memory = graph + one batch's planes. "
+           "0 = off (monolithic). Diagnostics that read live planes "
+           "post-solve see only the last batch"),
+  cl::init(0));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -951,6 +963,19 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLCensusCouplers, "--cfl-census-couplers");
     requireFlowsTo(CFLCensusNexus, "--cfl-census-nexus");
     requireFlowsTo(!CFLNexusFields.empty(), "--cfl-nexus-fields");
+    requireFlowsTo(CFLBatchRoots > 0, "--cfl-batch-roots");
+    if (CFLBatchRoots > 0 && CFLLazyMint) {
+      errs() << "ERROR: --cfl-batch-roots is incompatible with "
+                "--cfl-lazy-mint (deferred-root admission assumes live "
+                "planes across the whole drain)\n";
+      exit(1);
+    }
+    if (CFLBatchRoots > 0 && CFLVerifyClosure) {
+      errs() << "ERROR: --cfl-batch-roots releases planes between "
+                "batches; --cfl-verify-closure would check only the "
+                "last batch and report false violations\n";
+      exit(1);
+    }
     if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {
       if (CFLFieldBuckets.getNumOccurrences() == 0) {
         CFLFieldBuckets = 13;

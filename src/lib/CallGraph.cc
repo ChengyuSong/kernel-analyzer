@@ -4342,7 +4342,7 @@ bool CallGraphPass::runFlowsToResolution() {
     return collapsed;
   };
   tHow = "seed"; tFrom = UINT32_MAX;
-  {
+  if (CFLBatchRoots == 0) {
     size_t exactMint = 0, wildMint = 0;
     for (auto [n, rid] : seeds) {
       const bool exact = !nexusGate || rootNexus[rid];
@@ -4352,7 +4352,7 @@ bool CallGraphPass::runFlowsToResolution() {
     if (nexusGate)
       CG_LOG("NexusFields: " << exactMint << " exact-minted roots (fn + "
              "nexus origins), " << wildMint << " wildcard-minted (FI)\n");
-  }
+  } // batched mode seeds per batch inside the round driver (task #40)
   flushCtx(ctx0);
 
   // ---- Incremental cross-iteration wiring ----
@@ -4853,8 +4853,10 @@ bool CallGraphPass::runFlowsToResolution() {
   // Outer resolution fixpoint: drain -> resolve -> wire the new callee
   // edges incrementally -> drain again from the reached fixpoint. The
   // heavy diagnostics run once, after convergence.
-  for (;;) {
-  do { // lazy-mint: drain, expand deferred roots, drain again to stability
+  // Drain to fixpoint: rank-sorted waves until the worklist is empty.
+  // Factored out so the origin-batched driver (task #40) can run it
+  // once per batch.
+  auto drainWaves = [&]() {
   while (true) {
     for (auto &c : ctxs) flushCtx(c);
     if (worklist.empty()) break;
@@ -4918,10 +4920,99 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
+  };
+  // ---- Origin-batched solving (task #40, --cfl-batch-roots=K) ----
+  // Fact planes are pure DERIVED state; the only cross-origin coupling
+  // is the union-find quotient + clusterRep join keys + bridges, all
+  // retained across batches. Per batch: release every plane, seed K
+  // roots, drain to fixpoint, harvest the answer-plane bits at fptr
+  // classes. Outer rounds repeat until a full pass adds no merges —
+  // merges are monotone and bounded, so this terminates at the same
+  // closure (lazy-mint catch-up argument family); the stable round's
+  // harvest is complete under the final quotient. Memory = graph + one
+  // batch's planes; round count measures the modularity thesis.
+  auto clearPlanes = [&]() {
+    for (uint32_t n = 0; n < N; n++) {
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        R[n][s].release();
+        RB[n][s].release();
+        dirty[n][s].release();
+        jdirty[n][s].release();
+        dirtyBr[n][s].release();
+        joined[n][s].release();
+      }
+      popCount[n] = 0;
+    }
+  };
+  // Accumulated answer-plane bits per fptr-class rep (batched mode):
+  // resolution reads these instead of the (released) live planes.
+  std::vector<uint32_t> fptrClsList;
+  boost::unordered_flat_map<uint32_t, FactSet> fptrAcc;
+  if (CFLBatchRoots) {
+    boost::unordered_flat_set<uint32_t> seenF;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex)
+        continue;
+      auto dIt = toDense.find(getCanonicalNode(fn));
+      if (dIt != toDense.end() && seenF.insert(dIt->second).second)
+        fptrClsList.push_back(dIt->second);
+    }
+    CG_LOG("BatchRoots: K=" << CFLBatchRoots << ", " << fptrClsList.size()
+           << " fptr classes tracked\n");
+  }
+  for (;;) {
+  if (CFLBatchRoots == 0) {
+  do { // lazy-mint: drain, expand deferred roots, drain again to stability
+    drainWaves();
   // At every drain fixpoint, re-admit deferred roots whose classes
   // entered A on the merge-coarsened quotient, then drain the new
   // identity bits; stable A + empty backlog = restricted fixpoint.
   } while (lazyExpand() > 0);
+  } else {
+    const uint32_t K = CFLBatchRoots;
+    size_t round = 0;
+    for (;;) {
+      const size_t mc0 = mergeCount;
+      const uint32_t nR = nextRoot;
+      for (auto &kv : fptrAcc) kv.second.release();
+      fptrAcc.clear();
+      for (uint32_t blo = 0; blo < nR; blo += K) {
+        clearPlanes();
+        tHow = "batch-seed"; tFrom = UINT32_MAX;
+        const uint32_t bhi = std::min(nR, blo + K);
+        for (uint32_t rid = blo; rid < bhi; rid++) {
+          if (parkedRoots.test(rid))
+            continue;
+          const bool exact =
+              !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
+          addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid, ctx0);
+        }
+        flushCtx(ctx0);
+        drainWaves();
+        // Harvest under the current quotient; only the stable round's
+        // accumulation (no rep movement) is consumed by resolution.
+        for (uint32_t fc : fptrClsList) {
+          const uint32_t rep = find(fc);
+          FactSet &acc = fptrAcc[rep];
+          acc.unionWith(R[rep][0]);
+          acc.unionWith(RB[rep][0]);
+          if (NB > 0) {
+            acc.unionWith(R[rep][SHIFT_X]);
+            acc.unionWith(RB[rep][SHIFT_X]);
+          }
+        }
+      }
+      round++;
+      const size_t dm = mergeCount - mc0;
+      CG_LOG("BatchRoots: round " << round << ": " << dm << " new merges, "
+             << (nextRoot - nR) << " late mints, "
+             << ((nR + K - 1) / K) << " batches\n");
+      if (dm == 0 && nextRoot == nR)
+        break; // quotient stable: this round's harvest is valid
+    }
+  }
   // --cfl-verify-closure: certify the fixpoint. One full non-delta scan of
   // every rule; any rule that would still fire is a violation. This checks
   // the closure property the delta/backlog machinery must maintain — the
@@ -5383,12 +5474,19 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
     }
-    if (!tpModelOwned && !sctModelOwned) {
+    if (!tpModelOwned && !sctModelOwned && CFLBatchRoots) {
+      // Batched mode: live planes hold only the last batch — read the
+      // stable round's accumulated answer bits instead.
+      auto aIt = fptrAcc.find(rep);
+      if (aIt != fptrAcc.end())
+        collect(aIt->second);
+    }
+    if (!tpModelOwned && !sctModelOwned && !CFLBatchRoots) {
       collect(R[rep][0]);
       collect(RB[rep][0]);
     }
     const size_t exactTargets = targets.size();
-    if (!tpModelOwned && !sctModelOwned && NB > 0) {
+    if (!tpModelOwned && !sctModelOwned && !CFLBatchRoots && NB > 0) {
       collect(R[rep][SHIFT_X]);
       collect(RB[rep][SHIFT_X]);
     }

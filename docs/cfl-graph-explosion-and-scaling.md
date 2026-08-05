@@ -4391,3 +4391,36 @@ Also caught: kmdef.s was a STALE baseline (predates cone default-on);
 fresh kmdef2.s differs by exactly the cone -1,184/+0. All relative
 session conclusions stand; true fs-only shares: default -662, all
 -1,908, all+ids -3,259 of fs13's -3,315 (98.3%).
+
+## Task #41: process-parallel batches — fork/CoW workers (km, 2026-08-05)
+
+Motivated by the big-machine kernel all+ids OOM (289 GB peak on the
+700 GB box at 8h35m, near-allyes-class corpus) and the user's
+directive: more cores than memory — parallelize what fits.
+
+`--cfl-batch-workers=P` (00cf6b0): fork P workers after graph build.
+The graph and quotient arrive COPY-ON-WRITE — no reload, no
+duplication; memory = graph(shared) + P live batch plane-sets, sized
+directly by P and K. Workers drain single-threaded (fork does not
+carry the wave pool's threads; all parallelism is processes), record
+their EFFECTUAL events — first-time cluster-key inserts + every merge
+— plus harvested fptr bits to /tmp scratch files, and _exit. The
+parent replays streams in worker order: replayed inserts recreate
+keys/VX bridges, cross-worker key collisions become the cross-batch
+merges. This is the Jacobi form of the sequential rounds (one extra
+round: km all+ids converges 43k/…/86/0 in 4 rounds vs 3 sequential),
+terminating at the same closure by merge monotonicity.
+
+km validation (all byte-identical to monolithic):
+- FI K=4000 P=4: 2:21 wall (sequential batches 3:30, monolithic
+  1:44), RSS flat 3.13 GB, 82,998 events replayed (≈3 MB streams).
+- all+ids K=4000 P=6: 49:47 wall — 3.8× over sequential batching,
+  1.6× over monolithic — peak 7.84 GB.
+
+Big-machine recipe: --cfl-nexus-fields=all+ids --cfl-batch-roots=K
+--cfl-batch-workers=P with #batches ≈ 4P for balance; peak ≈
+graph+presolve + P×(plane total/#batches); start P=8 and raise while
+RSS fits. RLIMIT_AS (--mem-limit) is per process and each child's AS
+includes the shared mappings — set it generously. Workers dirty the
+union-find via path compression (CoW duplicates those pages) — small
+(8B/class).

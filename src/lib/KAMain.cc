@@ -548,6 +548,18 @@ cl::opt<unsigned> CFLBatchWorkers(
            "0/1 = sequential batches"),
   cl::init(0));
 
+cl::opt<std::string> CFLBatchSpill(
+  "cfl-batch-spill",
+  cl::desc("Plane spill/restore for batched solving (task #42, requires "
+           "--cfl-batch-roots): serialize each batch's fact planes to "
+           "this directory after its drain; later rounds RESTORE and "
+           "drain only the cross-batch delta (classes touched by merges/"
+           "bridges since the save) instead of re-deriving from seeds — "
+           "offload over recompute. Point it at a filesystem with space "
+           "(NOT tmpfs; spill ~ total fact mass as u32 lists, and a "
+           "docker volume works). Empty = recompute mode"),
+  cl::init(""));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -987,6 +999,11 @@ int main(int argc, char **argv) {
       errs() << "ERROR: --cfl-batch-roots releases planes between "
                 "batches; --cfl-verify-closure would check only the "
                 "last batch and report false violations\n";
+      exit(1);
+    }
+    if (!CFLBatchSpill.empty() && CFLBatchRoots == 0) {
+      errs() << "ERROR: --cfl-batch-spill requires --cfl-batch-roots "
+                "(spill files are per-batch plane snapshots)\n";
       exit(1);
     }
     if (CFLBatchWorkers > 1 && CFLBatchRoots == 0) {

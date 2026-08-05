@@ -2122,6 +2122,18 @@ static std::vector<BatchEvt> g_batchEvts;
 // and the OOM cliff. Bits translate back to global rids at the join
 // sweep (the only drain-time consumer of rid identity) and at harvest.
 static uint32_t g_ridBase = 0;
+// ---- Task #42: plane spill/restore (offload over recompute) ----
+// With --cfl-batch-spill=<dir>, each batch's planes are serialized
+// after its drain; later rounds RESTORE and drain only the delta
+// instead of re-deriving from seeds. Restored class ids fold through
+// find(); only classes touched by merges or new bridges since the
+// save (the touch-log window) are re-dirtied — the delta is the
+// cross-batch coupling, not the batch. The touch log records both
+// endpoints of every merge and bridge, in order; per-round cursors
+// bound the window.
+static std::vector<uint32_t> g_touchLog;
+static bool g_touchTrack = false;
+static boost::unordered_flat_set<uint32_t> g_dirtyRestore;
 
 class FactSet {
   llvm::SmallVector<uint32_t, 2> S; // sorted, unique (sparse mode)
@@ -3813,6 +3825,10 @@ bool CallGraphPass::runFlowsToResolution() {
     ufp[b] = a;
     if (g_batchRecord)
       g_batchEvts.push_back({1, a, b, 0});
+    if (g_touchTrack) {
+      g_touchLog.push_back(a);
+      g_touchLog.push_back(b);
+    }
     mergeCount++;
     mergeHits[a] += 1 + mergeHits[b];
     keyCount[a].fetch_add(keyCount[b].load(std::memory_order_relaxed),
@@ -4046,6 +4062,10 @@ bool CallGraphPass::runFlowsToResolution() {
   auto addBridge = [&](uint32_t x, uint32_t y) {
     x = find(x); y = find(y);
     if (x == y) return; // already one class; exchange is implicit
+    if (g_touchTrack) {
+      g_touchLog.push_back(x); // restored facts must re-cross new bridges
+      g_touchLog.push_back(y);
+    }
     bridgesOf[x].push_back(y);
     bridgesOf[y].push_back(x);
     bridgeCount++;
@@ -5016,23 +5036,163 @@ bool CallGraphPass::runFlowsToResolution() {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
     size_t round = 0;
-    // One batch: release planes, seed rids [blo, bhi) as LOCAL bits
-    // under a batch-width universe, drain, restore the global universe.
-    auto runBatch = [&](uint32_t blo, uint32_t bhi) {
+    const bool spillOn = !CFLBatchSpill.empty();
+    if (spillOn) {
+      if (auto ec = llvm::sys::fs::create_directories(CFLBatchSpill))
+        report_fatal_error("BatchSpill: cannot create spill dir: " +
+                           llvm::Twine(ec.message()));
+      g_touchTrack = true;
+      g_touchLog.clear();
+    }
+    auto spillPath = [&](uint32_t bi) {
+      return CFLBatchSpill + "/b" + std::to_string(bi) + ".pl";
+    };
+    // Save every rep with any plane content: [blo bhi][nRec] then per
+    // record [class][per shift: R-count R-bits RB-count RB-bits],
+    // batch-local bits throughout.
+    auto savePlanes = [&](uint32_t bi, uint32_t blo, uint32_t bhi) {
+      FILE *f = fopen(spillPath(bi).c_str(), "wb");
+      if (!f)
+        report_fatal_error("BatchSpill: cannot open spill file for write");
+      auto wr = [&](const void *p, size_t sz, size_t cnt) {
+        if (cnt && fwrite(p, sz, cnt, f) != cnt)
+          report_fatal_error("BatchSpill: short write");
+      };
+      const uint32_t hdr[2] = {blo, bhi};
+      uint64_t nRec = 0;
+      wr(hdr, 4, 2);
+      const long nPos = ftell(f);
+      wr(&nRec, 8, 1);
+      std::vector<uint32_t> buf;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n)
+          continue;
+        bool anyP = false;
+        for (uint32_t s = 0; s < NSHIFT && !anyP; s++)
+          anyP = R[n][s].any() || RB[n][s].any();
+        if (!anyP)
+          continue;
+        nRec++;
+        wr(&n, 4, 1);
+        for (uint32_t s = 0; s < NSHIFT; s++)
+          for (int k = 0; k < 2; k++) {
+            const FactSet &S2 = k ? RB[n][s] : R[n][s];
+            buf.clear();
+            S2.forEach([&](uint32_t b) { buf.push_back(b); });
+            const uint32_t c = (uint32_t)buf.size();
+            wr(&c, 4, 1);
+            wr(buf.data(), 4, c);
+          }
+      }
+      if (fseek(f, nPos, SEEK_SET) != 0)
+        report_fatal_error("BatchSpill: seek failed");
+      wr(&nRec, 8, 1);
+      if (fclose(f) != 0)
+        report_fatal_error("BatchSpill: close failed");
+    };
+    // Restore with fold-through-find(): R first (all records), then RB
+    // guarded by final R, then quiescence — joined := R∪RB for
+    // untouched reps; touched reps get the full re-offer (dirty/jdirty
+    // = R∪RB, dirtyBr = R, joined empty) and a worklist push.
+    auto restorePlanes = [&](uint32_t bi, uint32_t blo, uint32_t bhi) {
+      FILE *f = fopen(spillPath(bi).c_str(), "rb");
+      if (!f)
+        report_fatal_error("BatchSpill: missing spill file on restore");
+      auto rd = [&](void *p, size_t sz, size_t cnt) {
+        if (cnt && fread(p, sz, cnt, f) != cnt)
+          report_fatal_error("BatchSpill: short read");
+      };
+      uint32_t hdr[2];
+      uint64_t nRec = 0;
+      rd(hdr, 4, 2);
+      if (hdr[0] != blo || hdr[1] != bhi)
+        report_fatal_error("BatchSpill: stale spill file (batch bounds "
+                           "mismatch — different K or leftover dir?)");
+      rd(&nRec, 8, 1);
+      struct Rec {
+        uint32_t n;
+        std::vector<std::vector<uint32_t>> rs, rbs; // per shift
+      };
+      std::vector<Rec> recs(nRec);
+      for (auto &rec : recs) {
+        rd(&rec.n, 4, 1);
+        rec.rs.resize(NSHIFT);
+        rec.rbs.resize(NSHIFT);
+        for (uint32_t s = 0; s < NSHIFT; s++)
+          for (int k = 0; k < 2; k++) {
+            auto &v = k ? rec.rbs[s] : rec.rs[s];
+            uint32_t c = 0;
+            rd(&c, 4, 1);
+            v.resize(c);
+            rd(v.data(), 4, c);
+          }
+      }
+      fclose(f);
+      boost::unordered_flat_set<uint32_t> touched;
+      for (auto &rec : recs) {
+        const uint32_t rep = find(rec.n);
+        if (g_dirtyRestore.count(rec.n) || g_dirtyRestore.count(rep))
+          touched.insert(rep);
+        for (uint32_t s = 0; s < NSHIFT; s++)
+          for (uint32_t b : rec.rs[s])
+            R[rep][s].set(b);
+      }
+      for (auto &rec : recs) {
+        const uint32_t rep = find(rec.n);
+        for (uint32_t s = 0; s < NSHIFT; s++)
+          for (uint32_t b : rec.rbs[s])
+            if (!R[rep][s].test(b))
+              RB[rep][s].set(b);
+      }
+      boost::unordered_flat_set<uint32_t> seenRep;
+      for (auto &rec : recs) {
+        const uint32_t rep = find(rec.n);
+        if (!seenRep.insert(rep).second)
+          continue;
+        const bool hot = touched.count(rep) > 0;
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          if (R[rep][s].none() && RB[rep][s].none())
+            continue;
+          if (!hot) {
+            joined[rep][s].copyFrom(R[rep][s]);
+            joined[rep][s].unionWith(RB[rep][s]);
+          } else {
+            dirty[rep][s].copyFrom(R[rep][s]);
+            dirty[rep][s].unionWith(RB[rep][s]);
+            jdirty[rep][s].copyFrom(dirty[rep][s]);
+            dirtyBr[rep][s].copyFrom(R[rep][s]);
+          }
+        }
+        if (hot)
+          push(rep, ctx0);
+      }
+    };
+    // One batch: release planes, then either seed rids [blo, bhi) as
+    // LOCAL bits under a batch-width universe (fresh) or restore the
+    // spilled fixpoint and drain only the touch delta.
+    auto runBatch = [&](uint32_t bi, uint32_t blo, uint32_t bhi,
+                        bool fresh) {
       clearPlanes();
       g_ridBase = blo;
       FactSet::Universe = bhi - blo;
-      tHow = "batch-seed"; tFrom = UINT32_MAX;
-      for (uint32_t rid = blo; rid < bhi; rid++) {
-        if (parkedRoots.test(rid))
-          continue;
-        const bool exact =
-            !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
-        addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid - blo,
-                ctx0);
+      if (fresh) {
+        tHow = "batch-seed"; tFrom = UINT32_MAX;
+        for (uint32_t rid = blo; rid < bhi; rid++) {
+          if (parkedRoots.test(rid))
+            continue;
+          const bool exact =
+              !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
+          addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid - blo,
+                  ctx0);
+        }
+      } else {
+        tHow = "batch-restore"; tFrom = UINT32_MAX;
+        restorePlanes(bi, blo, bhi);
       }
       flushCtx(ctx0);
       drainWaves();
+      if (spillOn)
+        savePlanes(bi, blo, bhi);
       g_ridBase = 0;
       FactSet::Universe = nextRoot;
     };
@@ -5041,11 +5201,21 @@ bool CallGraphPass::runFlowsToResolution() {
     auto pullPlane = [&](const FactSet &src, FactSet &dst, uint32_t base) {
       src.forEach([&](uint32_t b) { dst.set(b + base); });
     };
+    size_t touchRoundStart = 0;
     for (;;) {
       const size_t mc0 = mergeCount;
       const uint32_t nR = nextRoot;
       for (auto &kv : fptrAcc) kv.second.release();
       fptrAcc.clear();
+      // Restore window: a batch saved during the previous round missed
+      // every touch since that round began — [prev round start, now).
+      if (spillOn) {
+        g_dirtyRestore.clear();
+        for (size_t ti = touchRoundStart; ti < g_touchLog.size(); ti++)
+          g_dirtyRestore.insert(g_touchLog[ti]);
+        touchRoundStart = g_touchLog.size();
+      }
+      const bool fresh = !spillOn || round == 0;
       if (P > 1) {
         // Process-parallel round (task #41): fork W workers — the graph
         // and quotient arrive copy-on-write, so memory is graph(shared)
@@ -5083,7 +5253,7 @@ bool CallGraphPass::runFlowsToResolution() {
             boost::unordered_flat_map<uint32_t, FactSet> hv;
             for (uint32_t bi = w; bi < nB; bi += W) {
               const uint32_t blo = bi * K;
-              runBatch(blo, std::min(nR, (bi + 1) * K));
+              runBatch(bi, blo, std::min(nR, (bi + 1) * K), fresh);
               for (uint32_t fc : fptrClsList) {
                 const uint32_t rep = find(fc);
                 FactSet &acc = hv[fc];
@@ -5189,7 +5359,7 @@ bool CallGraphPass::runFlowsToResolution() {
                << " events replayed\n");
       } else {
       for (uint32_t blo = 0; blo < nR; blo += K) {
-        runBatch(blo, std::min(nR, blo + K));
+        runBatch(blo / K, blo, std::min(nR, blo + K), fresh);
         // Harvest under the current quotient; only the stable round's
         // accumulation (no rep movement) is consumed by resolution.
         // Keyed by the STATIC fptr class id so worker-local reps never

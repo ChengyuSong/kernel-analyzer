@@ -4497,7 +4497,12 @@ bool CallGraphPass::runFlowsToResolution() {
       rootNexus.push_back(nexusCls[rep] &&
                           (nexusIds || originBearing(toOrig[rep])));
     tHow = "inc-mint"; tFrom = rep;
-    addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, rid, ctx0);
+    // Batch mode: the live planes belong to whichever batch last ran
+    // (local bit space) — the new rid seeds inside its own appended
+    // batch on the next round instead.
+    if (CFLBatchRoots == 0)
+      addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, rid,
+              ctx0);
   };
   auto wireIncremental = [&](size_t lo) {
     const uint32_t oldN = N;
@@ -4557,6 +4562,12 @@ bool CallGraphPass::runFlowsToResolution() {
     // with find() at use, exactly like the initial build. Each new edge
     // is seeded with the source class's full current planes — the same
     // one-time push merge() does for moved edges.
+    // Spill composition: restored batches must re-offer facts at the
+    // sources of newly wired edges (their live-plane seeding below only
+    // covers whatever batch happens to be resident).
+    if (g_touchTrack)
+      for (const NewEdge &e : batch)
+        g_touchLog.push_back(find(e.a));
     size_t nA = 0, nD = 0, nF = 0, nW = 0;
     for (const NewEdge &e : batch) {
       if (e.kind == 0) {
@@ -5024,6 +5035,23 @@ bool CallGraphPass::runFlowsToResolution() {
     CG_LOG("BatchRoots: K=" << CFLBatchRoots << ", " << fptrClsList.size()
            << " fptr classes tracked\n");
   }
+  // Batch bounds FREEZE at creation (spill headers reference them);
+  // root growth appends new batches. hasFile/cursor/touch state
+  // persists across resolution passes so spilled fixpoints carry over
+  // wiring boundaries — the #15 incremental composition: with
+  // --cfl-flows-to-incremental the outer driver never rebuilds, and
+  // passes after the first restore + drain only the wiring delta.
+  std::vector<std::pair<uint32_t, uint32_t>> batchBounds;
+  std::vector<char> batchHasFile;
+  std::vector<size_t> batchCursor; // touch-log length at last save
+  size_t touchRoundStart = 0;
+  if (CFLBatchRoots && !CFLBatchSpill.empty()) {
+    if (auto ec = llvm::sys::fs::create_directories(CFLBatchSpill))
+      report_fatal_error("BatchSpill: cannot create spill dir: " +
+                         llvm::Twine(ec.message()));
+    g_touchTrack = true;
+    g_touchLog.clear();
+  }
   for (;;) {
   if (CFLBatchRoots == 0) {
   do { // lazy-mint: drain, expand deferred roots, drain again to stability
@@ -5037,13 +5065,6 @@ bool CallGraphPass::runFlowsToResolution() {
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
     size_t round = 0;
     const bool spillOn = !CFLBatchSpill.empty();
-    if (spillOn) {
-      if (auto ec = llvm::sys::fs::create_directories(CFLBatchSpill))
-        report_fatal_error("BatchSpill: cannot create spill dir: " +
-                           llvm::Twine(ec.message()));
-      g_touchTrack = true;
-      g_touchLog.clear();
-    }
     auto spillPath = [&](uint32_t bi) {
       return CFLBatchSpill + "/b" + std::to_string(bi) + ".pl";
     };
@@ -5128,10 +5149,23 @@ bool CallGraphPass::runFlowsToResolution() {
           }
       }
       fclose(f);
+      // Sequential mode gets the EXACT per-batch window [cursor, now):
+      // the batch's own pre-save touches are already folded into its
+      // file, and they are the majority of a round's log — this is
+      // what deflates the round-2 re-offer hump. Worker mode keeps the
+      // conservative round window (siblings' touches are not in any
+      // one worker's history).
+      const boost::unordered_flat_set<uint32_t> *dw = &g_dirtyRestore;
+      boost::unordered_flat_set<uint32_t> exactWin;
+      if (P <= 1) {
+        for (size_t ti = batchCursor[bi]; ti < g_touchLog.size(); ti++)
+          exactWin.insert(g_touchLog[ti]);
+        dw = &exactWin;
+      }
       boost::unordered_flat_set<uint32_t> touched;
       for (auto &rec : recs) {
         const uint32_t rep = find(rec.n);
-        if (g_dirtyRestore.count(rec.n) || g_dirtyRestore.count(rep))
+        if (dw->count(rec.n) || dw->count(rep))
           touched.insert(rep);
         for (uint32_t s = 0; s < NSHIFT; s++)
           for (uint32_t b : rec.rs[s])
@@ -5190,9 +5224,18 @@ bool CallGraphPass::runFlowsToResolution() {
         restorePlanes(bi, blo, bhi);
       }
       flushCtx(ctx0);
+      const uint64_t f0 = factCount;
+      const size_t m0 = mergeCount;
       drainWaves();
-      if (spillOn)
+      // Skip-save: an unchanged restore leaves the on-disk fixpoint
+      // valid (re-offers that derive nothing move no facts).
+      const bool changed =
+          fresh || factCount != f0 || mergeCount != m0;
+      if (spillOn && changed) {
         savePlanes(bi, blo, bhi);
+        batchHasFile[bi] = 1;
+        batchCursor[bi] = g_touchLog.size();
+      }
       g_ridBase = 0;
       FactSet::Universe = nextRoot;
     };
@@ -5201,21 +5244,29 @@ bool CallGraphPass::runFlowsToResolution() {
     auto pullPlane = [&](const FactSet &src, FactSet &dst, uint32_t base) {
       src.forEach([&](uint32_t b) { dst.set(b + base); });
     };
-    size_t touchRoundStart = 0;
     for (;;) {
       const size_t mc0 = mergeCount;
       const uint32_t nR = nextRoot;
+      // Frozen batch bounds; growth appends new (fresh) batches.
+      while ((batchBounds.empty() ? 0u : batchBounds.back().second) < nR) {
+        const uint32_t lo =
+            batchBounds.empty() ? 0u : batchBounds.back().second;
+        batchBounds.push_back({lo, std::min(lo + K, nR)});
+        batchHasFile.push_back(0);
+        batchCursor.push_back(0);
+      }
+      const uint32_t nB = (uint32_t)batchBounds.size();
       for (auto &kv : fptrAcc) kv.second.release();
       fptrAcc.clear();
-      // Restore window: a batch saved during the previous round missed
-      // every touch since that round began — [prev round start, now).
+      // Restore window (worker mode): a batch saved during the previous
+      // round missed every touch since that round began. Sequential
+      // mode uses exact per-batch cursors inside restorePlanes instead.
       if (spillOn) {
         g_dirtyRestore.clear();
         for (size_t ti = touchRoundStart; ti < g_touchLog.size(); ti++)
           g_dirtyRestore.insert(g_touchLog[ti]);
         touchRoundStart = g_touchLog.size();
       }
-      const bool fresh = !spillOn || round == 0;
       if (P > 1) {
         // Process-parallel round (task #41): fork W workers — the graph
         // and quotient arrive copy-on-write, so memory is graph(shared)
@@ -5225,7 +5276,6 @@ bool CallGraphPass::runFlowsToResolution() {
         // in worker order: replayed first-inserts recreate keys and VX
         // bridges, cross-worker key collisions become the cross-batch
         // merges, and recorded merges cover SCC collapses.
-        const uint32_t nB = (nR + K - 1) / K;
         const unsigned W = std::min((unsigned)nB, P);
         char scratch[] = "/tmp/ka-batch-XXXXXX";
         if (!mkdtemp(scratch))
@@ -5252,8 +5302,9 @@ bool CallGraphPass::runFlowsToResolution() {
             g_batchEvts.clear();
             boost::unordered_flat_map<uint32_t, FactSet> hv;
             for (uint32_t bi = w; bi < nB; bi += W) {
-              const uint32_t blo = bi * K;
-              runBatch(bi, blo, std::min(nR, (bi + 1) * K), fresh);
+              const uint32_t blo = batchBounds[bi].first;
+              const bool freshB = !spillOn || !batchHasFile[bi];
+              runBatch(bi, blo, batchBounds[bi].second, freshB);
               for (uint32_t fc : fptrClsList) {
                 const uint32_t rep = find(fc);
                 FactSet &acc = hv[fc];
@@ -5355,11 +5406,16 @@ bool CallGraphPass::runFlowsToResolution() {
         }
         flushCtx(ctx0);
         rmdir(scratch);
+        if (spillOn)
+          for (uint32_t bi = 0; bi < nB; bi++)
+            batchHasFile[bi] = 1; // workers saved (child-side flags died)
         CG_LOG("BatchWorkers: " << W << " workers, " << evReplayed
                << " events replayed\n");
       } else {
-      for (uint32_t blo = 0; blo < nR; blo += K) {
-        runBatch(blo / K, blo, std::min(nR, blo + K), fresh);
+      for (uint32_t bi = 0; bi < nB; bi++) {
+        const uint32_t blo = batchBounds[bi].first;
+        const bool freshB = !spillOn || !batchHasFile[bi];
+        runBatch(bi, blo, batchBounds[bi].second, freshB);
         // Harvest under the current quotient; only the stable round's
         // accumulation (no rep movement) is consumed by resolution.
         // Keyed by the STATIC fptr class id so worker-local reps never

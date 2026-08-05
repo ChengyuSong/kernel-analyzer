@@ -4358,3 +4358,36 @@ Reading:
 Every mode is removals-only vs FI and (except 56 pairs) a subset chain:
 default ⊂ all ⊂ all+ids ⊂≈ fs13. The practical instrument today is
 `all+ids`: 98.8% of full field sensitivity at 2.6× less cost.
+
+## Task #40: origin-batched solving — prototype verdict (km, 2026-08-05)
+
+`--cfl-batch-roots=K` (f2a9b16), built off the user's decomposition
+question: if the kernel is modular, sub-problems should solve in
+bounded memory. The right axis is ORIGINS, not subsystems: fact planes
+are pure derived state, so per batch the solver releases every plane,
+seeds K roots, drains, and harvests answer bits; only the union-find
+quotient, join keys, and bridges persist (megabytes — no disk, unlike
+Graspan-style offload: recomputation from the retained quotient is
+cheaper than I/O). Rounds repeat until a pass adds no merges; monotone
+merges terminate this at the same closure.
+
+Verdict (km, K=4000):
+- FI: BYTE-IDENTICAL to monolithic, 2x time. Rounds: 22,288 / 50 / 0
+  merges — 99.8% of the quotient forms in the first pass. THE
+  MODULARITY THESIS, OPERATIONALIZED AS ROUND COUNT.
+- all+ids (full surgical fs): BYTE-IDENTICAL (50,199), 3h07 vs 31min
+  (6x), peak 7.77 vs 8.57 GB. Rounds per CG iteration: ~43.7k / ~450 /
+  0 — stable 3-round convergence.
+- Memory win is modest at km because the km floor is graph+presolve;
+  the plane share batching cuts is the ~200 GB term at kernel scale
+  (the 700 GB-machine run observed 253 GB RSS).
+- Time overhead = per-batch fixed sweeps of hot shared classes ×
+  batches × rounds × CG iterations. Tuning levers: larger K, skip the
+  redundant harvest work in non-final rounds, and parallel batches
+  (the BSP pool already exists). Guards: incompatible with
+  --cfl-lazy-mint / --cfl-verify-closure.
+
+Also caught: kmdef.s was a STALE baseline (predates cone default-on);
+fresh kmdef2.s differs by exactly the cone -1,184/+0. All relative
+session conclusions stand; true fs-only shares: default -662, all
+-1,908, all+ids -3,259 of fs13's -3,315 (98.3%).

@@ -2115,6 +2115,13 @@ struct BatchEvt {
 };
 static bool g_batchRecord = false;
 static std::vector<BatchEvt> g_batchEvts;
+// Batch-local fact universe: during a batch's drain every live rid is
+// in [batchLo, batchHi), so plane bits store rid - batchLo and DENSE
+// planes are batch-width, not nextRoot-width — at kernel scale that is
+// 42.5KB -> 2.5KB per promoted plane, the difference between fitting
+// and the OOM cliff. Bits translate back to global rids at the join
+// sweep (the only drain-time consumer of rid identity) and at harvest.
+static uint32_t g_ridBase = 0;
 
 class FactSet {
   llvm::SmallVector<uint32_t, 2> S; // sorted, unique (sparse mode)
@@ -4763,7 +4770,7 @@ bool CallGraphPass::runFlowsToResolution() {
         bool aborted = false;
         for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
           ctx.nJoinLk++;
-          joinCluster(cellsOf[n][ci], o, s);
+          joinCluster(cellsOf[n][ci], g_ridBase + o, s);
           if (find(n) != n) { aborted = true; break; }
         }
         if (aborted) break;
@@ -5009,19 +5016,30 @@ bool CallGraphPass::runFlowsToResolution() {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
     size_t round = 0;
-    // One batch: release planes, seed rids [blo, bhi), drain.
+    // One batch: release planes, seed rids [blo, bhi) as LOCAL bits
+    // under a batch-width universe, drain, restore the global universe.
     auto runBatch = [&](uint32_t blo, uint32_t bhi) {
       clearPlanes();
+      g_ridBase = blo;
+      FactSet::Universe = bhi - blo;
       tHow = "batch-seed"; tFrom = UINT32_MAX;
       for (uint32_t rid = blo; rid < bhi; rid++) {
         if (parkedRoots.test(rid))
           continue;
         const bool exact =
             !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
-        addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid, ctx0);
+        addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid - blo,
+                ctx0);
       }
       flushCtx(ctx0);
       drainWaves();
+      g_ridBase = 0;
+      FactSet::Universe = nextRoot;
+    };
+    // Harvest translation: plane bits are batch-local, answer bits are
+    // global rids.
+    auto pullPlane = [&](const FactSet &src, FactSet &dst, uint32_t base) {
+      src.forEach([&](uint32_t b) { dst.set(b + base); });
     };
     for (;;) {
       const size_t mc0 = mergeCount;
@@ -5064,15 +5082,16 @@ bool CallGraphPass::runFlowsToResolution() {
             g_batchEvts.clear();
             boost::unordered_flat_map<uint32_t, FactSet> hv;
             for (uint32_t bi = w; bi < nB; bi += W) {
-              runBatch(bi * K, std::min(nR, (bi + 1) * K));
+              const uint32_t blo = bi * K;
+              runBatch(blo, std::min(nR, (bi + 1) * K));
               for (uint32_t fc : fptrClsList) {
                 const uint32_t rep = find(fc);
                 FactSet &acc = hv[fc];
-                acc.unionWith(R[rep][0]);
-                acc.unionWith(RB[rep][0]);
+                pullPlane(R[rep][0], acc, blo);
+                pullPlane(RB[rep][0], acc, blo);
                 if (NB > 0) {
-                  acc.unionWith(R[rep][SHIFT_X]);
-                  acc.unionWith(RB[rep][SHIFT_X]);
+                  pullPlane(R[rep][SHIFT_X], acc, blo);
+                  pullPlane(RB[rep][SHIFT_X], acc, blo);
                 }
               }
             }
@@ -5174,15 +5193,15 @@ bool CallGraphPass::runFlowsToResolution() {
         // Harvest under the current quotient; only the stable round's
         // accumulation (no rep movement) is consumed by resolution.
         // Keyed by the STATIC fptr class id so worker-local reps never
-        // leak across process boundaries.
+        // leak across process boundaries; bits translate local->global.
         for (uint32_t fc : fptrClsList) {
           const uint32_t rep = find(fc);
           FactSet &acc = fptrAcc[fc];
-          acc.unionWith(R[rep][0]);
-          acc.unionWith(RB[rep][0]);
+          pullPlane(R[rep][0], acc, blo);
+          pullPlane(RB[rep][0], acc, blo);
           if (NB > 0) {
-            acc.unionWith(R[rep][SHIFT_X]);
-            acc.unionWith(RB[rep][SHIFT_X]);
+            pullPlane(R[rep][SHIFT_X], acc, blo);
+            pullPlane(RB[rep][SHIFT_X], acc, blo);
           }
         }
       }

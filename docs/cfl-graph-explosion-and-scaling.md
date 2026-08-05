@@ -4318,3 +4318,43 @@ then a kernel-scale run extrapolates to ~30 h.
 old flows-to shift blowup does not manifest at this marking density);
 t_maskwalk all three routes; t_ops/t_pairs/t_allocinit exact; smoke 4/4
 with the gate off (defaults untouched).
+
+## Task #39 round 2: containment closure null + the fs13 decomposition (km, 2026-08-04)
+
+The user pointed at the StructAnalyzer: `StructInfo::containers` already
+records every embedding struct, so the nexus name set now closes
+transitively over containment (bpf_link -> bpf_tracing_link; 20 listed
+-> 174 types at km). **Verdict: NULL** — byte-identical to the
+no-closure run (-1,875/+0). The embedded-type hypothesis for the fs13
+gap is falsified as-tested.
+
+Bound modes settle where fs13's discrimination actually lives:
+
+| mode | exact roots | km removals | share of fs13 | time |
+|---|---|---|---|---|
+| default 6-type list | 212 | -1,846/+0 | 41% | 17.5 min |
+| widened 20 (+closure) | 281 | -1,875/+0 | 42% | 18.4 min |
+| `all` (every struct object origin) | 3,297 | -3,092/+0 | 69% | 22 min |
+| `all+ids` (+ nexus-marked identity roots) | 8,227 | -4,443/+0 | **98.8%** | 31 min |
+| full fs13 (everything exact incl. fn) | 46,869 | -4,499/+0 | 100% | 80 min |
+
+Reading:
+- **Identity-root residues carry ~30% of fs13's discrimination** (the
+  bpf_link_release / tracing_stat_open block): the shared-helper
+  formal (`bpf_link_init`-shaped) is the join witness, and its exact
+  residues separate the ops-field cell from the rest — object origins
+  alone cannot reproduce this because the helper pools every caller's
+  objects through one formal.
+- **Fn-exactness is worth 56 pairs for +49 min** — fn@X is essentially
+  free precision-wise and over half of fs13's cost.
+- **Cost model corrected**: RSS is constant (8.6 GB) from 212 to 8,227
+  exact roots, and time fits ~15 min FLOOR + ~1.7 min per 1,000 exact
+  roots (extrapolating to fs13's 80 min at 46,869). The floor is NB>0
+  structural overhead (presolve under field labels, per-class plane
+  sweeps), NOT plane width — so the earlier narrow-universe idea
+  attacks the linear term, and the floor needs its own profile before
+  a kernel-scale run is priced.
+
+Every mode is removals-only vs FI and (except 56 pairs) a subset chain:
+default ⊂ all ⊂ all+ids ⊂≈ fs13. The practical instrument today is
+`all+ids`: 98.8% of full field sensitivity at 2.6× less cost.

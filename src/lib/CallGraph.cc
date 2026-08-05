@@ -5072,17 +5072,30 @@ bool CallGraphPass::runFlowsToResolution() {
     // record [class][per shift: R-count R-bits RB-count RB-bits],
     // batch-local bits throughout.
     auto savePlanes = [&](uint32_t bi, uint32_t blo, uint32_t bhi) {
-      FILE *f = fopen(spillPath(bi).c_str(), "wb");
+      // zstd stream: raw kernel-scale spill is ~8.7GB/batch (fact-mass
+      // bound); sorted bit lists compress several-fold and -1 streams
+      // faster than the drain produces them. Pipes cannot seek, so the
+      // record count is pre-counted.
+      FILE *f = popen(("zstd -q -f -1 -o '" + spillPath(bi) + "'").c_str(),
+                      "w");
       if (!f)
-        report_fatal_error("BatchSpill: cannot open spill file for write");
+        report_fatal_error("BatchSpill: cannot start zstd writer");
       auto wr = [&](const void *p, size_t sz, size_t cnt) {
         if (cnt && fwrite(p, sz, cnt, f) != cnt)
           report_fatal_error("BatchSpill: short write");
       };
-      const uint32_t hdr[2] = {blo, bhi};
       uint64_t nRec = 0;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n)
+          continue;
+        for (uint32_t s = 0; s < NSHIFT; s++)
+          if (R[n][s].any() || RB[n][s].any()) {
+            nRec++;
+            break;
+          }
+      }
+      const uint32_t hdr[2] = {blo, bhi};
       wr(hdr, 4, 2);
-      const long nPos = ftell(f);
       wr(&nRec, 8, 1);
       std::vector<uint32_t> buf;
       for (uint32_t n = 0; n < N; n++) {
@@ -5093,7 +5106,6 @@ bool CallGraphPass::runFlowsToResolution() {
           anyP = R[n][s].any() || RB[n][s].any();
         if (!anyP)
           continue;
-        nRec++;
         wr(&n, 4, 1);
         for (uint32_t s = 0; s < NSHIFT; s++)
           for (int k = 0; k < 2; k++) {
@@ -5105,23 +5117,22 @@ bool CallGraphPass::runFlowsToResolution() {
             wr(buf.data(), 4, c);
           }
       }
-      if (fseek(f, nPos, SEEK_SET) != 0)
-        report_fatal_error("BatchSpill: seek failed");
-      wr(&nRec, 8, 1);
-      if (fclose(f) != 0)
-        report_fatal_error("BatchSpill: close failed");
+      const int rc = pclose(f);
+      if (rc != 0)
+        report_fatal_error("BatchSpill: zstd writer failed");
     };
     // Restore with fold-through-find(): R first (all records), then RB
     // guarded by final R, then quiescence — joined := R∪RB for
     // untouched reps; touched reps get the full re-offer (dirty/jdirty
     // = R∪RB, dirtyBr = R, joined empty) and a worklist push.
     auto restorePlanes = [&](uint32_t bi, uint32_t blo, uint32_t bhi) {
-      FILE *f = fopen(spillPath(bi).c_str(), "rb");
+      FILE *f = popen(("zstd -dqc '" + spillPath(bi) + "'").c_str(), "r");
       if (!f)
-        report_fatal_error("BatchSpill: missing spill file on restore");
+        report_fatal_error("BatchSpill: cannot start zstd reader");
       auto rd = [&](void *p, size_t sz, size_t cnt) {
         if (cnt && fread(p, sz, cnt, f) != cnt)
-          report_fatal_error("BatchSpill: short read");
+          report_fatal_error("BatchSpill: short read (missing or "
+                             "truncated spill file?)");
       };
       uint32_t hdr[2];
       uint64_t nRec = 0;

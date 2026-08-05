@@ -63,6 +63,7 @@ extern cl::opt<bool> CFLCensusCouplers;
 extern cl::opt<bool> CFLCensusNexus;
 extern cl::opt<std::string> CFLNexusFields;
 extern cl::opt<unsigned> CFLBatchRoots;
+extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

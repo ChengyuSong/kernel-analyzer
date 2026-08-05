@@ -535,6 +535,19 @@ cl::opt<unsigned> CFLBatchRoots(
            "post-solve see only the last batch"),
   cl::init(0));
 
+cl::opt<unsigned> CFLBatchWorkers(
+  "cfl-batch-workers",
+  cl::desc("Process-parallel batches (task #41, requires "
+           "--cfl-batch-roots): fork P workers after graph build — the "
+           "graph and quotient are shared copy-on-write, so memory = "
+           "graph + P live batch plane-sets. Workers drain single-"
+           "threaded and stream effectual events (key inserts, merges) "
+           "+ harvested answer bits through /tmp scratch files; the "
+           "parent replays them (Jacobi rounds, same closure). Size P "
+           "by what fits: peak ~ graph + P * (plane total / #batches). "
+           "0/1 = sequential batches"),
+  cl::init(0));
+
 cl::opt<bool> CFLCensusStrata(
   "cfl-census-strata",
   cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
@@ -974,6 +987,19 @@ int main(int argc, char **argv) {
       errs() << "ERROR: --cfl-batch-roots releases planes between "
                 "batches; --cfl-verify-closure would check only the "
                 "last batch and report false violations\n";
+      exit(1);
+    }
+    if (CFLBatchWorkers > 1 && CFLBatchRoots == 0) {
+      errs() << "ERROR: --cfl-batch-workers requires --cfl-batch-roots "
+                "(the batch size defines what each worker solves)\n";
+      exit(1);
+    }
+    if (CFLBatchRoots > 0 &&
+        (CFLOpsPairs || CFLRodataCopy || CFLJoinCone)) {
+      errs() << "ERROR: --cfl-batch-roots is untested with the "
+                "protected-cell machinery (--cfl-ops-pairs/"
+                "--cfl-rodata-copy/--cfl-join-cone) — prot state is not "
+                "in the batch event protocol\n";
       exit(1);
     }
     if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {

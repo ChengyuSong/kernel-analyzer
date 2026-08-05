@@ -48,6 +48,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <cstdio>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "CallGraph.h"
 #include "IRCensus.h"
 #include "Annotation.h"
@@ -2097,6 +2101,20 @@ namespace {
 // and even seeding OOMs, while most kernel classes hold a handful of
 // facts. clear() empties but keeps a dense buffer (hot delta planes);
 // release() frees it (merged-away losers).
+// ---- Task #41: process-parallel batches (fork/CoW workers) ----
+// A forked worker records the EFFECTUAL solver events of its batches —
+// first-time cluster-key inserts and union-find merges — plus its
+// harvested answer bits. The parent replays the event streams in
+// worker order against the master quotient: replayed joins recreate
+// keys/VX bridges and turn cross-worker key collisions into the
+// cross-batch merges (the Jacobi form of the sequential rounds).
+struct BatchEvt {
+  uint8_t kind; // 0 = join (a=cell, b=origin rid, c=shift), 1 = merge(a,b)
+  uint32_t a, b, c;
+};
+static bool g_batchRecord = false;
+static std::vector<BatchEvt> g_batchEvts;
+
 class FactSet {
   llvm::SmallVector<uint32_t, 2> S; // sorted, unique (sparse mode)
   std::unique_ptr<llvm::BitVector> D; // non-null => dense mode
@@ -3513,6 +3531,13 @@ bool CallGraphPass::runFlowsToResolution() {
            "--cfl-solver-threads=1\n");
     solverThreads = 1;
   }
+  if (CFLBatchWorkers > 1 && solverThreads > 1) {
+    // fork() does not carry the wave pool's threads into workers, and
+    // the parent only replays events — all parallelism is processes.
+    CG_LOG("FlowsTo: --cfl-batch-workers active; drains run "
+           "single-threaded per worker\n");
+    solverThreads = 1;
+  }
   bool parallelPhase = false; // true only inside a parallel wave phase
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
       new std::atomic<uint8_t>[solverCapN]);
@@ -3776,6 +3801,8 @@ bool CallGraphPass::runFlowsToResolution() {
     if (ufrank[a] < ufrank[b]) std::swap(a, b);
     if (ufrank[a] == ufrank[b]) ufrank[a]++;
     ufp[b] = a;
+    if (g_batchRecord)
+      g_batchEvts.push_back({1, a, b, 0});
     mergeCount++;
     mergeHits[a] += 1 + mergeHits[b];
     keyCount[a].fetch_add(keyCount[b].load(std::memory_order_relaxed),
@@ -4182,6 +4209,8 @@ bool CallGraphPass::runFlowsToResolution() {
       return;
     }
     keyCount[find(cell)].fetch_add(1, std::memory_order_relaxed);
+    if (g_batchRecord)
+      g_batchEvts.push_back({0, cell, o, s}); // first insert of this key
     if (NB == 0) return;
     // VX linking: bridge the (o, X) cluster with each exact cluster of o.
     if (s == SHIFT_X) {
@@ -4972,30 +5001,166 @@ bool CallGraphPass::runFlowsToResolution() {
   } while (lazyExpand() > 0);
   } else {
     const uint32_t K = CFLBatchRoots;
+    const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
     size_t round = 0;
+    // One batch: release planes, seed rids [blo, bhi), drain.
+    auto runBatch = [&](uint32_t blo, uint32_t bhi) {
+      clearPlanes();
+      tHow = "batch-seed"; tFrom = UINT32_MAX;
+      for (uint32_t rid = blo; rid < bhi; rid++) {
+        if (parkedRoots.test(rid))
+          continue;
+        const bool exact =
+            !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
+        addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid, ctx0);
+      }
+      flushCtx(ctx0);
+      drainWaves();
+    };
     for (;;) {
       const size_t mc0 = mergeCount;
       const uint32_t nR = nextRoot;
       for (auto &kv : fptrAcc) kv.second.release();
       fptrAcc.clear();
-      for (uint32_t blo = 0; blo < nR; blo += K) {
-        clearPlanes();
-        tHow = "batch-seed"; tFrom = UINT32_MAX;
-        const uint32_t bhi = std::min(nR, blo + K);
-        for (uint32_t rid = blo; rid < bhi; rid++) {
-          if (parkedRoots.test(rid))
-            continue;
-          const bool exact =
-              !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
-          addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid, ctx0);
+      if (P > 1) {
+        // Process-parallel round (task #41): fork W workers — the graph
+        // and quotient arrive copy-on-write, so memory is graph(shared)
+        // + W live batch plane-sets. Workers drain single-threaded,
+        // record effectual events + harvest bits to scratch files, and
+        // _exit without LLVM teardown. The parent replays the streams
+        // in worker order: replayed first-inserts recreate keys and VX
+        // bridges, cross-worker key collisions become the cross-batch
+        // merges, and recorded merges cover SCC collapses.
+        const uint32_t nB = (nR + K - 1) / K;
+        const unsigned W = std::min((unsigned)nB, P);
+        char scratch[] = "/tmp/ka-batch-XXXXXX";
+        if (!mkdtemp(scratch))
+          report_fatal_error("BatchWorkers: mkdtemp failed");
+        std::vector<pid_t> kids(W, -1);
+        fflush(nullptr);
+        for (unsigned w = 0; w < W; w++) {
+          const pid_t pid = fork();
+          if (pid < 0)
+            report_fatal_error("BatchWorkers: fork failed");
+          if (pid == 0) {
+            g_batchRecord = true;
+            g_batchEvts.clear();
+            boost::unordered_flat_map<uint32_t, FactSet> hv;
+            for (uint32_t bi = w; bi < nB; bi += W) {
+              runBatch(bi * K, std::min(nR, (bi + 1) * K));
+              for (uint32_t fc : fptrClsList) {
+                const uint32_t rep = find(fc);
+                FactSet &acc = hv[fc];
+                acc.unionWith(R[rep][0]);
+                acc.unionWith(RB[rep][0]);
+                if (NB > 0) {
+                  acc.unionWith(R[rep][SHIFT_X]);
+                  acc.unionWith(RB[rep][SHIFT_X]);
+                }
+              }
+            }
+            const std::string base =
+                std::string(scratch) + "/" + std::to_string(w);
+            FILE *fe = fopen((base + ".evt").c_str(), "wb");
+            if (!fe)
+              _exit(3);
+            const uint64_t ne = g_batchEvts.size();
+            if (fwrite(&ne, 8, 1, fe) != 1 ||
+                (ne && fwrite(g_batchEvts.data(), sizeof(BatchEvt), ne,
+                              fe) != ne))
+              _exit(3);
+            fclose(fe);
+            FILE *fh = fopen((base + ".hv").c_str(), "wb");
+            if (!fh)
+              _exit(3);
+            const uint64_t nh = hv.size();
+            if (fwrite(&nh, 8, 1, fh) != 1)
+              _exit(3);
+            std::vector<uint32_t> bits;
+            for (auto &kv : hv) {
+              bits.clear();
+              kv.second.forEach([&](uint32_t o) { bits.push_back(o); });
+              const uint32_t id = kv.first;
+              const uint64_t nb2 = bits.size();
+              if (fwrite(&id, 4, 1, fh) != 1 ||
+                  fwrite(&nb2, 8, 1, fh) != 1 ||
+                  (nb2 && fwrite(bits.data(), 4, nb2, fh) != nb2))
+                _exit(3);
+            }
+            fclose(fh);
+            _exit(0);
+          }
+          kids[w] = pid;
+        }
+        for (unsigned w = 0; w < W; w++) {
+          int st = 0;
+          if (waitpid(kids[w], &st, 0) != kids[w] || !WIFEXITED(st) ||
+              WEXITSTATUS(st) != 0)
+            report_fatal_error("BatchWorkers: worker failed");
+        }
+        // Replay in worker order — deterministic, and equivalent to a
+        // sequential schedule of the same derivations.
+        size_t evReplayed = 0;
+        for (unsigned w = 0; w < W; w++) {
+          const std::string base =
+              std::string(scratch) + "/" + std::to_string(w);
+          FILE *fe = fopen((base + ".evt").c_str(), "rb");
+          if (!fe)
+            report_fatal_error("BatchWorkers: missing event file");
+          uint64_t ne = 0;
+          if (fread(&ne, 8, 1, fe) != 1)
+            report_fatal_error("BatchWorkers: bad event file");
+          std::vector<BatchEvt> evs(ne);
+          if (ne && fread(evs.data(), sizeof(BatchEvt), ne, fe) != ne)
+            report_fatal_error("BatchWorkers: truncated event file");
+          fclose(fe);
+          unlink((base + ".evt").c_str());
+          blobCtx = "batch-replay"; blobCtxOrigin = UINT32_MAX;
+          for (const BatchEvt &e : evs) {
+            if (e.kind == 0) {
+              joinCluster(e.a, e.b, e.c);
+            } else {
+              const uint32_t x = find(e.a), y = find(e.b);
+              if (x != y)
+                merge(x, y);
+            }
+          }
+          evReplayed += ne;
+          FILE *fh = fopen((base + ".hv").c_str(), "rb");
+          if (!fh)
+            report_fatal_error("BatchWorkers: missing harvest file");
+          uint64_t nh = 0;
+          if (fread(&nh, 8, 1, fh) != 1)
+            report_fatal_error("BatchWorkers: bad harvest file");
+          for (uint64_t i = 0; i < nh; i++) {
+            uint32_t id = 0;
+            uint64_t nb2 = 0;
+            if (fread(&id, 4, 1, fh) != 1 || fread(&nb2, 8, 1, fh) != 1)
+              report_fatal_error("BatchWorkers: truncated harvest file");
+            std::vector<uint32_t> bits(nb2);
+            if (nb2 && fread(bits.data(), 4, nb2, fh) != nb2)
+              report_fatal_error("BatchWorkers: truncated harvest bits");
+            FactSet &acc = fptrAcc[id];
+            for (uint32_t o : bits)
+              acc.set(o);
+          }
+          fclose(fh);
+          unlink((base + ".hv").c_str());
         }
         flushCtx(ctx0);
-        drainWaves();
+        rmdir(scratch);
+        CG_LOG("BatchWorkers: " << W << " workers, " << evReplayed
+               << " events replayed\n");
+      } else {
+      for (uint32_t blo = 0; blo < nR; blo += K) {
+        runBatch(blo, std::min(nR, blo + K));
         // Harvest under the current quotient; only the stable round's
         // accumulation (no rep movement) is consumed by resolution.
+        // Keyed by the STATIC fptr class id so worker-local reps never
+        // leak across process boundaries.
         for (uint32_t fc : fptrClsList) {
           const uint32_t rep = find(fc);
-          FactSet &acc = fptrAcc[rep];
+          FactSet &acc = fptrAcc[fc];
           acc.unionWith(R[rep][0]);
           acc.unionWith(RB[rep][0]);
           if (NB > 0) {
@@ -5004,6 +5169,7 @@ bool CallGraphPass::runFlowsToResolution() {
           }
         }
       }
+      } // sequential-batch path
       round++;
       const size_t dm = mergeCount - mc0;
       CG_LOG("BatchRoots: round " << round << ": " << dm << " new merges, "
@@ -5476,8 +5642,8 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     if (!tpModelOwned && !sctModelOwned && CFLBatchRoots) {
       // Batched mode: live planes hold only the last batch — read the
-      // stable round's accumulated answer bits instead.
-      auto aIt = fptrAcc.find(rep);
+      // stable round's accumulated answer bits (static-id keyed).
+      auto aIt = fptrAcc.find(dIt->second);
       if (aIt != fptrAcc.end())
         collect(aIt->second);
     }

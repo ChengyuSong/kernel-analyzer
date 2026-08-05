@@ -2990,11 +2990,20 @@ bool CallGraphPass::runFlowsToResolution() {
   // never soundness; under-marking degrades to today's FI.
   std::vector<char> nexusCls;
   std::vector<char> rootNexus; // rid-indexed: 1 = exact mint
+  // 'all' = every named struct type is nexus (origin-complete bound:
+  // measures whether OBJECT origins alone reproduce full fs13 — fn
+  // and identity roots still wildcard-mint).
+  // '+ids' suffix: also exact-mint IDENTITY roots (formals, no-in
+  // classes) whose class is nexus-marked — diagnostic for how much
+  // fs13 discrimination lives on identity residues vs object origins.
+  StringRef nexusSpec0(CFLNexusFields);
+  const bool nexusIds = nexusSpec0.consume_back("+ids");
+  const bool nexusAll = nexusSpec0 == "all";
   const bool nexusGate = NB > 0 && !CFLNexusFields.empty();
   if (nexusGate) {
     boost::unordered_flat_set<std::string> nexusNames;
     {
-      StringRef spec(CFLNexusFields);
+      StringRef spec = nexusSpec0;
       if (spec == "default")
         spec = "task_struct,file,cred,signal_struct,device,module";
       while (!spec.empty()) {
@@ -3004,11 +3013,39 @@ bool CallGraphPass::runFlowsToResolution() {
         spec = rest;
       }
     }
+    // Containment closure via the StructAnalyzer: a struct that EMBEDS
+    // a nexus type is itself nexus — its allocation sites GEP with the
+    // CONTAINING type's name (bpf_link inside bpf_tracing_link), so
+    // name matching without the closure misses embedded-type origins
+    // entirely (the km widened-list null). StructInfo::containers
+    // already records every embedder; worklist = transitive closure.
+    if (!nexusAll) {
+      const size_t listed = nexusNames.size();
+      const llvm::Module *M0 = Ctx->Modules.begin()->first;
+      std::vector<std::string> work(nexusNames.begin(), nexusNames.end());
+      while (!work.empty()) {
+        const std::string cur = std::move(work.back());
+        work.pop_back();
+        std::set<std::string> outc;
+        Ctx->structAnalyzer.getContainer(cur, M0, outc);
+        for (const std::string &c : outc) {
+          std::string canon = sctCanonStructName(c).str();
+          if (nexusNames.insert(canon).second)
+            work.push_back(std::move(canon));
+        }
+      }
+      CG_LOG("NexusFields: containment closure " << listed << " listed -> "
+             << nexusNames.size() << " types\n");
+    }
     auto nexusValueType = [&](llvm::Type *T) {
       while (auto *AT = dyn_cast<ArrayType>(T))
         T = AT->getElementType();
       auto *ST = dyn_cast<StructType>(T);
-      return ST && ST->hasName() &&
+      if (!ST)
+        return false;
+      if (nexusAll)
+        return true; // literal structs included: origin-complete bound
+      return ST->hasName() &&
              nexusNames.count(sctCanonStructName(ST->getName()).str()) > 0;
     };
     nexusCls.assign(N, 0);
@@ -3166,7 +3203,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // no-in classes) likewise stay wildcard: the object's origin
       // fact carries the field split.
       if (nexusGate)
-        rootNexus.push_back(nexusCls[n] && hasOrigin[n]);
+        rootNexus.push_back(nexusCls[n] && (nexusIds || hasOrigin[n]));
     }
   }
 
@@ -4398,7 +4435,8 @@ bool CallGraphPass::runFlowsToResolution() {
       ownedMask[rep] |= 1ull << subsysBitOf(om2);
     }
     if (nexusGate)
-      rootNexus.push_back(nexusCls[rep] && originBearing(toOrig[rep]));
+      rootNexus.push_back(nexusCls[rep] &&
+                          (nexusIds || originBearing(toOrig[rep])));
     tHow = "inc-mint"; tFrom = rep;
     addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, rid, ctx0);
   };

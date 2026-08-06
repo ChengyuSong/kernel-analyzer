@@ -5582,6 +5582,50 @@ bool CallGraphPass::runFlowsToResolution() {
   // exposure and, symmetrically, the filter's precision contribution —
   // the retirement criterion once CFL-side precision drives them to zero.
   size_t filtCandidates = 0, filtTypeRej = 0, filtFieldRej = 0;
+  // --cfl-census-type-rej: reverse census of the type filter. For every
+  // CFL-derived candidate that isCompatible drops, bucket the FIRST
+  // failing check and track per-function accept/reject fates across all
+  // deriving sites. A function derived somewhere but rejected at EVERY
+  // deriving site lands in no target set at all — that set, crossed with
+  // AddressTakenFuncs, is the "data-flow-feasible, type-invisible"
+  // inventory (the ordinary-site analogue of the certified static_call
+  // +29 pairs). Measurement only: answers are unchanged.
+  size_t ctrSitesWithRej = 0, ctrPairsRej = 0, ctrExemplars = 0;
+  std::map<std::string, size_t> ctrBuckets;
+  boost::unordered_flat_map<const Function *, size_t> ctrRejFn;
+  boost::unordered_flat_set<const Function *> ctrAccFn;
+  // (rejected-here, CS, derived-here, kept-here) per site with rejections
+  std::vector<std::tuple<size_t, const CallBase *, size_t, size_t>> ctrTop;
+  auto ctrClassify = [&](const CallBase *CS2,
+                         const Function *F2) -> std::string {
+    if (F2->isIntrinsic()) return "intrinsic";
+    const FunctionType *FTy = F2->getFunctionType();
+    unsigned NP = FTy->getNumParams(), NA = CS2->arg_size();
+    if (FTy->isVarArg()) {
+      if (NA < NP) return "argc-vararg-short";
+    } else if (NA != NP) {
+      return NA < NP ? "argc-site-fewer" : "argc-site-more";
+    }
+    if (!CS2->use_empty() && !CS2->getType()->isVoidTy() &&
+        !isCompatibleType(F2->getReturnType(), CS2->getType()))
+      return "ret-only";
+    auto AI = CS2->arg_begin();
+    for (unsigned i = 0; i < NP; ++i, ++AI) {
+      Type *FT = FTy->getParamType(i), *AT = (*AI)->getType();
+      if (isCompatibleType(FT, AT)) continue;
+      // ints are all mutually compatible, so are pointers (opaque) —
+      // the reachable param mismatches are cross-kind or aggregate.
+      if (FT->isPointerTy() && AT->isIntegerTy()) return "param:site-int-fn-ptr";
+      if (FT->isIntegerTy() && AT->isPointerTy()) return "param:site-ptr-fn-int";
+      if (FT->isStructTy() && AT->isStructTy()) return "param:struct-name";
+      if (FT->isFloatingPointTy() || AT->isFloatingPointTy())
+        return "param:fp";
+      return "param:other";
+    }
+    // isCompatible said no but every check above passed: the only
+    // remaining path is a check-order divergence — surface it loudly.
+    return "UNCLASSIFIED";
+  };
   // --cfl-probe-origin-split (task #29): per-icall, the counterfactual
   // origin-indexed answer — targets attributable to the merged cluster
   // classes of the container origins the fptr was LOADED from — vs the
@@ -5702,6 +5746,7 @@ bool CallGraphPass::runFlowsToResolution() {
     std::string csStruct; unsigned csField = 0;
     bool hasKey = getCallSiteFieldKey(fptr, csStruct, csField);
     FuncSet targets;
+    const size_t ctrSiteC0 = filtCandidates, ctrSiteR0 = filtTypeRej;
     const uint32_t rep = find(dIt->second);
     if (!CFLTraceFptr.empty() &&
         CS->getFunction()->getName().contains(CFLTraceFptr)) {
@@ -5842,7 +5887,23 @@ bool CallGraphPass::runFlowsToResolution() {
           if (F == called || F->getGUID() == called->getGUID())
             return;
         filtCandidates++;
-        if (!isCompatible(CS, F)) { filtTypeRej++; return; }
+        if (!isCompatible(CS, F)) {
+          filtTypeRej++;
+          if (CFLCensusTypeRej) {
+            ctrPairsRej++;
+            ctrRejFn[F]++;
+            std::string bk = ctrClassify(CS, F);
+            ctrBuckets[bk]++;
+            if (ctrExemplars < 40) {
+              ctrExemplars++;
+              errs() << "CENSUS-TYPEREJ [" << bk << "] "
+                     << CS->getFunction()->getName() << " :: " << *CS
+                     << " -/-> " << F->getName() << "\n";
+            }
+          }
+          return;
+        }
+        if (CFLCensusTypeRej) ctrAccFn.insert(F);
         if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
           filtFieldRej++;
           return;
@@ -5935,6 +5996,11 @@ bool CallGraphPass::runFlowsToResolution() {
       collect(RB[rep][SHIFT_X]);
     }
     topOnlyPairs += targets.size() - exactTargets;
+    if (CFLCensusTypeRej && filtTypeRej > ctrSiteR0) {
+      ctrSitesWithRej++;
+      ctrTop.push_back({filtTypeRej - ctrSiteR0, CS,
+                        filtCandidates - ctrSiteC0, targets.size()});
+    }
     if (CFLCensusIcallShape && targets.size() >= 100) {
       auto shapeOf = [&]() -> std::string {
         const Value *co = CS->getCalledOperand()->stripPointerCasts();
@@ -6649,6 +6715,52 @@ bool CallGraphPass::runFlowsToResolution() {
          << filtTypeRej << " type-rejected, " << filtFieldRej
          << " field-rejected (each rejection = unsoundness exposure; "
          << "zero = filter retirable)\n");
+  if (CFLCensusTypeRej) {
+    errs() << "=== CENSUS-TYPEREJ: reverse type-filter census ===\n";
+    errs() << "CENSUS-TYPEREJ sites-with-rejections " << ctrSitesWithRej
+           << " / " << Ctx->IndirectCallInsts.size() << " icalls, "
+           << ctrPairsRej << " pairs rejected, " << ctrRejFn.size()
+           << " distinct functions rejected somewhere, " << ctrAccFn.size()
+           << " distinct functions type-accepted somewhere\n";
+    for (auto &b : ctrBuckets)
+      errs() << "CENSUS-TYPEREJ bucket " << b.first << " " << b.second
+             << "\n";
+    // Fate cross: derived by CFL somewhere yet type-rejected at EVERY
+    // deriving site => in no target set via the graph. Split by whether
+    // the function is address-taken (it should be, to have a root at
+    // all) and report the inventory for manual review.
+    std::vector<std::pair<size_t, const Function *>> ctrNever;
+    for (auto &p : ctrRejFn)
+      if (!ctrAccFn.count(p.first))
+        ctrNever.push_back({p.second, p.first});
+    std::sort(ctrNever.begin(), ctrNever.end(),
+              [](auto &a, auto &b) { return a.first > b.first; });
+    errs() << "CENSUS-TYPEREJ always-rejected fns " << ctrNever.size()
+           << " (CFL-derived somewhere, type-rejected at every deriving "
+           << "site — candidate missing targets)\n";
+    size_t shown = 0;
+    for (auto &p : ctrNever) {
+      if (shown++ >= 60) { errs() << "CENSUS-TYPEREJ   ...\n"; break; }
+      errs() << "CENSUS-TYPEREJ   always-rej " << p.second->getName()
+             << " x" << p.first << " ["
+             << (Ctx->AddressTakenFuncs.count(
+                    getFuncDef(const_cast<Function *>(p.second)))
+                     ? "addr-taken"
+                     : "NOT-addr-taken")
+             << "]\n";
+    }
+    std::sort(ctrTop.begin(), ctrTop.end(),
+              [](auto &a, auto &b) { return std::get<0>(a) > std::get<0>(b); });
+    shown = 0;
+    for (auto &t : ctrTop) {
+      if (shown++ >= 20) break;
+      const CallBase *CS2 = std::get<1>(t);
+      errs() << "CENSUS-TYPEREJ   top-site " << std::get<0>(t) << " rej / "
+             << std::get<2>(t) << " derived / " << std::get<3>(t)
+             << " kept at " << CS2->getFunction()->getName() << " :: "
+             << *CS2 << "\n";
+    }
+  }
   if (newPairs == 0) {
     // Lazy-mint catch-up: the A-loop cannot admit CYCLIC witness
     // dependences — e.g. circular list_head chains, where each node's

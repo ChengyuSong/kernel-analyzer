@@ -387,6 +387,17 @@ cl::opt<bool> CFLCensusPtrToInt(
            "cmp-only sites need no wildcard at all. Adds no edges"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusTypeRej(
+  "cfl-census-type-rej",
+  cl::desc("MEASUREMENT-ONLY reverse census of the type filter: per "
+           "icall, CFL-derived fn candidates vs after isCompatible, "
+           "rejected pairs bucketed by the first failing check (argc / "
+           "ret / param kind); crossed with acceptance elsewhere — a "
+           "function derived somewhere but type-rejected at every "
+           "deriving site is the candidate missing-target inventory "
+           "(cf. the certified static_call +29). Changes no answers"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusTracepoint(
   "cfl-census-tracepoint",
   cl::desc("MEASUREMENT-ONLY census (task #35): size the tracepoint "
@@ -1004,6 +1015,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLSinkInstr, "--cfl-sink-instr");
     requireFlowsTo(CFLCensusPtrToInt, "--cfl-census-ptrtoint");
     requireFlowsTo(CFLCensusTracepoint, "--cfl-census-tracepoint");
+    requireFlowsTo(CFLCensusTypeRej, "--cfl-census-type-rej");
     // Adopted identity-channel models (tasks #35/#36, ADOPTED
     // 2026-08-03): default ON in the canonical flows-to mode, opt out
     // with --cfl-tracepoint-keys=false / --cfl-static-ops-tables=false.

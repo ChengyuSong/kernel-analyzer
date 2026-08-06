@@ -196,3 +196,25 @@ only grammar-underivable pairs" would discharge the gap.
 F9. Edge-encoding completeness (IR construct coverage) is out of scope of
 the model entirely: the July 2026 aggregate call-boundary bug lived here.
 The systematic IR-construct census (task #13) is the practical mitigation.
+
+## Batched solving (tasks #40-#42, added 2026-08-06)
+
+Covered by the model (`WDeriv` section in `FlowsTo.lean`):
+- `batched_exact`: sound + closed witness table ⇒ union of per-batch
+  closures = eager closure (the #40/#41 exactness argument).
+- `wderiv_restore`: spill restore-and-continue under a grown table equals
+  the fresh drain (the #42 exactness argument).
+- `wderiv_sound` is the per-round invariant that keeps the accumulated
+  table sound from the empty start.
+
+NOT covered (implementation-level, below the model's abstraction):
+- The union-find/clusterRep/bridge machinery is modeled as the witness
+  TABLE; that the recorded events regenerate exactly the join topology
+  (worker replay, VX bridging) is unverified.
+- The touch-window re-offer discipline (per-batch cursors, hot-class
+  full re-offer, quiescent joined:=R∪RB) computes the `wderiv_restore`
+  closure — the delta-completeness of that discipline is unverified.
+- Batch-local universes (rid-blo bit translation) are a data-layout
+  bijection, unverified.
+- Round termination (monotone merges) is argued informally; the model
+  takes the stable table as a hypothesis rather than constructing it.

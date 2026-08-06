@@ -5302,6 +5302,7 @@ bool CallGraphPass::runFlowsToResolution() {
           if (pid < 0)
             report_fatal_error("BatchWorkers: fork failed");
           if (pid == 0) {
+            kaStartRssWatchdog(); // parent's watchdog thread died in fork
             // Claim this worker's share of the cores: fork carried no
             // pool threads, so build a fresh pool and enough ctxs (the
             // deque grows without invalidating ctx0).

@@ -756,6 +756,47 @@ cl::opt<std::string> IRSidecarDir(
 cl::opt<int> MemLimitPct(
   "mem-limit", cl::desc("Memory limit as percentage of physical RAM (0 = unlimited, default 80)"), cl::init(80));
 
+cl::opt<std::string> MemLimitMode(
+  "mem-limit-mode",
+  cl::desc("How --mem-limit is enforced: 'rss' (default) = watchdog "
+           "thread on /proc/self/status VmRSS — measures RESIDENT "
+           "memory, immune to allocator reservations / transient "
+           "doublings / mapped files that inflate virtual size; 'as' = "
+           "legacy RLIMIT_AS on virtual address space (overcounts by "
+           "1.2-2x under many threads); 'off' = no in-process limit — "
+           "use when a cgroup enforces it (docker --memory)"),
+  cl::init("rss"));
+
+// RSS watchdog (mem-limit-mode=rss): polls resident size and fails
+// loud before the kernel OOM-killer picks a victim. Forked batch
+// workers lose the parent's thread — they re-arm via this hook.
+uint64_t KAMemLimitRssBytes = 0;
+void kaStartRssWatchdog() {
+  if (KAMemLimitRssBytes == 0)
+    return;
+  std::thread([] {
+    for (;;) {
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      std::ifstream st("/proc/self/status");
+      std::string line;
+      while (std::getline(st, line)) {
+        if (line.rfind("VmRSS:", 0) != 0)
+          continue;
+        const uint64_t kb = std::stoull(line.substr(6));
+        if (kb * 1024ull > KAMemLimitRssBytes) {
+          errs() << "ERROR: Out of memory: VmRSS " << (kb >> 20)
+                 << " GB exceeded the " << (KAMemLimitRssBytes >> 30)
+                 << " GB limit. Increase --mem-limit, use "
+                    "--mem-limit-mode=off under a cgroup, or reduce "
+                    "input/batch size.\n";
+          _exit(1);
+        }
+        break;
+      }
+    }
+  }).detach();
+}
+
 GlobalContext GlobalCtx;
 
 #define Diag llvm::errs()
@@ -1082,23 +1123,43 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (MemLimitPct > 0) {
+  if (MemLimitMode != "rss" && MemLimitMode != "as" && MemLimitMode != "off") {
+    errs() << "ERROR: --mem-limit-mode must be rss, as, or off\n";
+    return 1;
+  }
+  if (MemLimitPct > 0 && MemLimitMode != "off") {
     long pages = sysconf(_SC_PHYS_PAGES);
     long pageSize = sysconf(_SC_PAGE_SIZE);
     if (pages > 0 && pageSize > 0) {
       rlim_t totalBytes = (rlim_t)pages * pageSize;
       rlim_t limitBytes = totalBytes * std::min(MemLimitPct.getValue(), 100) / 100;
-      struct rlimit rl;
-      rl.rlim_cur = rl.rlim_max = limitBytes;
-      if (setrlimit(RLIMIT_AS, &rl) == 0) {
-        Diag << "Memory limit set to " << (limitBytes >> 30) << " GB ("
-             << MemLimitPct << "% of " << (totalBytes >> 30) << " GB RAM)\n";
+      if (MemLimitMode == "as") {
+        struct rlimit rl;
+        rl.rlim_cur = rl.rlim_max = limitBytes;
+        if (setrlimit(RLIMIT_AS, &rl) == 0) {
+          Diag << "Memory limit set to " << (limitBytes >> 30) << " GB ("
+               << MemLimitPct << "% of " << (totalBytes >> 30)
+               << " GB RAM, RLIMIT_AS)\n";
+        } else {
+          errs() << "Warning: failed to set memory limit\n";
+        }
       } else {
-        errs() << "Warning: failed to set memory limit\n";
+        // RSS watchdog: poll resident size and fail LOUD before the
+        // kernel OOM-killer picks a victim. Unlike RLIMIT_AS this
+        // measures memory actually used — allocator arena
+        // reservations, transient vector doublings, fragmentation and
+        // mapped bitcode files do not count (the big-machine run died
+        // at 289GB RSS under a 560GB AS cap on a 700GB box).
+        Diag << "Memory limit set to " << (limitBytes >> 30) << " GB ("
+             << MemLimitPct << "% of " << (totalBytes >> 30)
+             << " GB RAM, RSS watchdog)\n";
+        KAMemLimitRssBytes = (uint64_t)limitBytes;
+        kaStartRssWatchdog();
       }
       // Disable core dumps — a core from a memory-exhausted process is huge
-      rl.rlim_cur = rl.rlim_max = 0;
-      setrlimit(RLIMIT_CORE, &rl);
+      struct rlimit rc;
+      rc.rlim_cur = rc.rlim_max = 0;
+      setrlimit(RLIMIT_CORE, &rc);
       // Handle allocation failure in any thread (including solver workers)
       std::set_new_handler([] {
         errs() << "ERROR: Out of memory. Increase --mem-limit or reduce input size.\n";

@@ -65,6 +65,9 @@ extern cl::opt<std::string> CFLNexusFields;
 extern cl::opt<unsigned> CFLBatchRoots;
 extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<std::string> CFLBatchSpill;
+// RSS watchdog (KAMain.cc): forked batch workers re-arm it post-fork.
+extern uint64_t KAMemLimitRssBytes;
+void kaStartRssWatchdog();
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConflationReport;
 extern cl::opt<std::string> CFLAblateFuncs;

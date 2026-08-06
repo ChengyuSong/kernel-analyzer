@@ -15,6 +15,42 @@ the task log; items marked [PENDING] depend on runs still in flight.
 3. *ORCFL: Answer-Anchored, Resource-Bounded Pointer Analysis for
    Multi-Million-Line Monolithic Systems*
 
+## Positioning (the spectrum, and who we must convince)
+
+- ONE END: type-based resolution. Scales trivially; the community knows
+  its limits and has spent a decade compensating ad hoc (MLTA-style
+  multi-layer refinements, per-pattern filters). Under opaque pointers
+  the type signal itself is eroding. We are NOT another patch on this
+  end.
+- OTHER END: CFL-reachability. Sound by formulation, with a rich engine-
+  scalability literature (Graspan, POCR, Pearl, GraCFL) whose authors —
+  including our colleague, GraCFL's author — reasonably believe the
+  scalability problem is SOLVED. Our claim, stated precisely: it is
+  solved at the ENGINE level and open at the FORMULATION level. An
+  engine's work is lower-bounded by the closure it must materialize;
+  over LLVM IR (assistant cells per load/store, copy chains, whole-
+  program linkage) the closure itself is Θ(Σ|a-component|²). We ran the
+  best engine (GraCFL, which outperforms POCR on our graphs) on the
+  standard encoding: it OOMs on harfbuzz — a LIBRARY. Optimal engines
+  hit the formulation's floor faster; that is demystification, not
+  contradiction — the engine line's success is what ISOLATES the
+  residual wall.
+- THE ESCAPE HATCH THAT ISN'T: demand-driven CFL (Heintze-Tardieu,
+  Sridharan-Bodik, Boomerang-style) answers single queries. A call
+  graph is uniquely WHOLE-PROGRAM: every icall site is a query (18,189
+  of them), the queries share nearly all their work through the giant
+  component, and resolution FEEDS BACK (resolved targets wire new
+  callee edges that change every other query) — so on-demand
+  degenerates to all-demands iterated to a fixpoint, re-paying the
+  closure per round. What a call graph needs is a formulation that is
+  whole-program in COVERAGE but demand-shaped in FACT MASS.
+- OUR POINT ON THE SPECTRUM: answer-anchored flows-to = all demands at
+  once. Anchor the fact space at origins (the alphabet answers are made
+  of), prune to the answer cone (bidi oracle: ~14% of roots are answer-
+  relevant), integrate the wiring fixpoint into one monotone solve.
+  Sound like the CFL end, scalable like neither end could deliver:
+  better than iterative on-demand by construction, not by tuning.
+
 ## The narrative spine (the staircase of walls)
 
 W0. SATURATION WALL: pairwise V saturation is quadratic — V fact mass ≈
@@ -39,16 +75,25 @@ W0. SATURATION WALL: pairwise V saturation is quadratic — V fact mass ≈
 
 ## One-paragraph abstract (draft, rev 2)
 
-CFL-reachability is the standard formulation for precise pointer analysis,
-yet every implementation hits a wall well below the scale of the Linux
-kernel. We first diagnose the wall: it is not graph size but closure size
-— pairwise alias saturation materializes a fact set quadratic in the
-a-connected component mass (V ≈ Σ|C|²), which graph compaction cannot
-touch. This diagnosis forces a reformulation: ORCFL anchors facts at
-origins — (origin, field-shift) pairs joined through witness-exact cluster
-unification — making fact mass linear in component size times live
-origins, and yielding the first sound whole-kernel flows-to call graph,
-10.8x tighter than type-based resolution. Scaling then fails three more
+Indirect-call resolution spans a spectrum: type-based matching scales but
+over-approximates by an order of magnitude despite a decade of ad-hoc
+refinement, while CFL-reachability is sound and — after a rich line of
+engine research — widely believed to scale. We demystify the latter
+belief for the setting that matters: over LLVM-IR graphs, the
+best-in-class engine exhausts memory on a single LIBRARY, because the
+wall is not engine throughput but closure size — pairwise alias
+saturation materializes a fact set quadratic in the a-connected component
+mass (V ≈ Σ|C|²), a floor no engine can beat and graph compaction cannot
+touch. Nor can demand-driven analysis rescue call graphs specifically:
+every call site is a query, queries share their work through one giant
+alias class, and resolution feeds back into every other query — a call
+graph is irreducibly whole-program. This diagnosis forces a formulation
+that is whole-program in coverage but demand-shaped in fact mass: ORCFL
+anchors facts at origins — (origin, field-shift) pairs joined through
+witness-exact cluster unification — making fact mass linear in component
+size times answer-relevant origins, and yielding the first sound
+whole-kernel flows-to call graph, 10.8x tighter than type-based
+resolution. Scaling then fails three more
 times, and each failure is the same phenomenon in a new costume. The
 precision wall: 93% of resolved pairs ride a single may-alias quotient
 class, which we show is born from connected-component over-unification
@@ -157,21 +202,31 @@ C6 (maybe folded into C3). **Methodology: falsifications as results.**
   diagnosis forces.
 - Contributions bullet list (C0-C5/6).
 
-### 2. Why CFL-reachability doesn't scale (1.5 pp) — C0, W0
+### 2. Demystifying the wall: LLVM-IR CFL-reachability doesn't scale (2 pp) — C0, W0
+- The setting that makes the claim precise: LLVM-IR-level graphs
+  (assistant cell nodes per load/store, copy chains from SSA, whole-
+  program linkage — millions of nodes BEFORE closure), not the smaller
+  pre-abstracted graphs much of the engine literature evaluates on.
 - The saturation baseline (per-TU compositional CFL over the P2 grammar,
-  GraCFL engine): correct at libpng scale, OOM at harfbuzz — a LIBRARY,
-  two orders below the kernel.
+  GraCFL engine — best-in-class, outperforms POCR on these graphs):
+  correct at libpng scale, OOM at harfbuzz — a LIBRARY, two orders
+  below the kernel. The engine is at its floor; the floor is the
+  problem.
 - The autopsy: closure size, not graph size. V is an equivalence-like
   pairwise relation materialized fact-by-fact: |V| ≈ Σ over a-connected
   components |C|² (measured curve). The two remedies everyone reaches
   for — global dedup, RSM graph folding — implemented and NULL: they
   shrink the graph, the closure doesn't care. (Negative results stated
-  as results.)
-- Engine choice is not the issue either: GraCFL outperforms POCR-class
-  solvers and still hits the same wall — the formulation is the wall.
+  as results.) Engine work is lower-bounded by output; no engine
+  research can remove an output-size wall.
+- Why on-demand is not the rescue for THIS problem: call graphs are
+  whole-program (all sites are queries; queries share the giant's work;
+  resolution feeds back into every query). Iterated on-demand = the
+  closure re-paid per fixpoint round.
 - What the diagnosis forces: never materialize pairwise V; index facts
-  by origin. Preview of the mass identity: Σ|C|² -> Σ|C|·(live origins),
-  and live origins are further prunable (bidi cone, ~14% answer-relevant).
+  by origin — whole-program coverage, demand-shaped mass. Preview:
+  Σ|C|² -> Σ|C|·(live origins), origins prunable to the answer cone
+  (bidi oracle, ~14% answer-relevant), wiring fixpoint integrated.
 
 ### 3. Answer-anchored flows-to (1.5 pp) — C1
 - The reformulation: mint origins, propagate (origin, shift) planes,
@@ -257,6 +312,17 @@ C6 (maybe folded into C3). **Methodology: falsifications as results.**
   against our own sound baseline, not runtime traces).
 
 ### 9. Related work (1 p)
+Organize as the three lines of the spectrum:
+- Type-based + compensations: MLTA/TypeDive-class multi-layer matching,
+  per-pattern kernel filters — the community's decade of patching the
+  imprecise end; opaque pointers eroding the signal.
+- CFL engine scalability: Graspan, POCR, Pearl, GraCFL — genuine
+  successes AT THE ENGINE LEVEL; our measurements show the residual
+  wall is the formulation's output size on LLVM-IR graphs (respectful
+  framing: their success is what isolates it; we build ON GraCFL).
+- Demand-driven CFL: Heintze-Tardieu, Sridharan-Bodik, Boomerang —
+  single-query framings that call graphs structurally defeat
+  (whole-program, shared work, resolution feedback).
 - From docs/novelty-and-related-work.md: BidirectedReach/POPL'18 (join
   layer rediscovered; witness-exact unification, shift residues,
   certificates new), Graspan (offload: their closure IS the output; our

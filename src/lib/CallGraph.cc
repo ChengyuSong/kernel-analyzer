@@ -6738,17 +6738,32 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "CENSUS-TYPEREJ always-rejected fns " << ctrNever.size()
            << " (CFL-derived somewhere, type-rejected at every deriving "
            << "site — candidate missing targets)\n";
-    size_t shown = 0;
+    // Acceptance via a model-owned channel (tpkeys/sct) bypasses
+    // collect(), so cross against the ACTUAL answer map: a fn already
+    // reached through an identity channel is modeled, not missing.
+    boost::unordered_flat_set<const Function *> ctrAnswered;
+    for (auto &ce : Ctx->Callees)
+      ctrAnswered.insert(ce.second.begin(), ce.second.end());
+    size_t ctrNeverModeled = 0, ctrNeverAbsent = 0, shown = 0;
     for (auto &p : ctrNever) {
-      if (shown++ >= 60) { errs() << "CENSUS-TYPEREJ   ...\n"; break; }
+      bool inAns = ctrAnswered.count(
+          getFuncDef(const_cast<Function *>(p.second)));
+      (inAns ? ctrNeverModeled : ctrNeverAbsent)++;
+      if (shown >= 400) continue;
+      shown++;
       errs() << "CENSUS-TYPEREJ   always-rej " << p.second->getName()
              << " x" << p.first << " ["
              << (Ctx->AddressTakenFuncs.count(
                     getFuncDef(const_cast<Function *>(p.second)))
                      ? "addr-taken"
                      : "NOT-addr-taken")
+             << (inAns ? "|in-answer(modeled)" : "|ABSENT-from-answer")
              << "]\n";
     }
+    if (shown < ctrNever.size()) errs() << "CENSUS-TYPEREJ   ...\n";
+    errs() << "CENSUS-TYPEREJ always-rejected fate: " << ctrNeverModeled
+           << " reached via model channels, " << ctrNeverAbsent
+           << " ABSENT from the whole answer set\n";
     std::sort(ctrTop.begin(), ctrTop.end(),
               [](auto &a, auto &b) { return std::get<0>(a) > std::get<0>(b); });
     shown = 0;

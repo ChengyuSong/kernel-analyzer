@@ -5126,40 +5126,18 @@ bool CallGraphPass::runFlowsToResolution() {
     // untouched reps; touched reps get the full re-offer (dirty/jdirty
     // = R∪RB, dirtyBr = R, joined empty) and a worklist push.
     auto restorePlanes = [&](uint32_t bi, uint32_t blo, uint32_t bhi) {
-      FILE *f = popen(("zstd -dqc '" + spillPath(bi) + "'").c_str(), "r");
-      if (!f)
-        report_fatal_error("BatchSpill: cannot start zstd reader");
-      auto rd = [&](void *p, size_t sz, size_t cnt) {
-        if (cnt && fread(p, sz, cnt, f) != cnt)
-          report_fatal_error("BatchSpill: short read (missing or "
-                             "truncated spill file?)");
+      // STREAMED two-pass restore: buffering a whole batch doubled the
+      // fattest kernel batch (~9GB raw) on top of the 43GB floor and
+      // blew the address-space cap mid-round-2. Re-decompressing costs
+      // seconds; pass A applies R bits (RB blocks skipped), pass B
+      // re-reads and applies RB guarded by the final R.
+      auto openZ = [&]() {
+        FILE *f =
+            popen(("zstd -dqc '" + spillPath(bi) + "'").c_str(), "r");
+        if (!f)
+          report_fatal_error("BatchSpill: cannot start zstd reader");
+        return f;
       };
-      uint32_t hdr[2];
-      uint64_t nRec = 0;
-      rd(hdr, 4, 2);
-      if (hdr[0] != blo || hdr[1] != bhi)
-        report_fatal_error("BatchSpill: stale spill file (batch bounds "
-                           "mismatch — different K or leftover dir?)");
-      rd(&nRec, 8, 1);
-      struct Rec {
-        uint32_t n;
-        std::vector<std::vector<uint32_t>> rs, rbs; // per shift
-      };
-      std::vector<Rec> recs(nRec);
-      for (auto &rec : recs) {
-        rd(&rec.n, 4, 1);
-        rec.rs.resize(NSHIFT);
-        rec.rbs.resize(NSHIFT);
-        for (uint32_t s = 0; s < NSHIFT; s++)
-          for (int k = 0; k < 2; k++) {
-            auto &v = k ? rec.rbs[s] : rec.rs[s];
-            uint32_t c = 0;
-            rd(&c, 4, 1);
-            v.resize(c);
-            rd(v.data(), 4, c);
-          }
-      }
-      fclose(f);
       // Sequential mode gets the EXACT per-batch window [cursor, now):
       // the batch's own pre-save touches are already folded into its
       // file, and they are the majority of a round's log — this is
@@ -5174,26 +5152,52 @@ bool CallGraphPass::runFlowsToResolution() {
         dw = &exactWin;
       }
       boost::unordered_flat_set<uint32_t> touched;
-      for (auto &rec : recs) {
-        const uint32_t rep = find(rec.n);
-        if (dw->count(rec.n) || dw->count(rep))
-          touched.insert(rep);
-        for (uint32_t s = 0; s < NSHIFT; s++)
-          for (uint32_t b : rec.rs[s])
-            R[rep][s].set(b);
+      std::vector<uint32_t> repList; // insertion-ordered unique reps
+      boost::unordered_flat_set<uint32_t> repSeen;
+      std::vector<uint32_t> v;
+      for (int pass = 0; pass < 2; pass++) {
+        FILE *f = openZ();
+        auto rd = [&](void *p, size_t sz, size_t cnt) {
+          if (cnt && fread(p, sz, cnt, f) != cnt)
+            report_fatal_error("BatchSpill: short read (missing or "
+                               "truncated spill file?)");
+        };
+        uint32_t hdr[2];
+        uint64_t nRec = 0;
+        rd(hdr, 4, 2);
+        if (hdr[0] != blo || hdr[1] != bhi)
+          report_fatal_error("BatchSpill: stale spill file (batch "
+                             "bounds mismatch — different K or "
+                             "leftover dir?)");
+        rd(&nRec, 8, 1);
+        for (uint64_t i = 0; i < nRec; i++) {
+          uint32_t n = 0;
+          rd(&n, 4, 1);
+          const uint32_t rep = find(n);
+          if (pass == 0) {
+            if (repSeen.insert(rep).second)
+              repList.push_back(rep);
+            if (dw->count(n) || dw->count(rep))
+              touched.insert(rep);
+          }
+          for (uint32_t s = 0; s < NSHIFT; s++)
+            for (int k = 0; k < 2; k++) {
+              uint32_t c = 0;
+              rd(&c, 4, 1);
+              v.resize(c);
+              rd(v.data(), 4, c);
+              if (pass == 0 && k == 0)
+                for (uint32_t b : v)
+                  R[rep][s].set(b);
+              else if (pass == 1 && k == 1)
+                for (uint32_t b : v)
+                  if (!R[rep][s].test(b))
+                    RB[rep][s].set(b);
+            }
+        }
+        pclose(f);
       }
-      for (auto &rec : recs) {
-        const uint32_t rep = find(rec.n);
-        for (uint32_t s = 0; s < NSHIFT; s++)
-          for (uint32_t b : rec.rbs[s])
-            if (!R[rep][s].test(b))
-              RB[rep][s].set(b);
-      }
-      boost::unordered_flat_set<uint32_t> seenRep;
-      for (auto &rec : recs) {
-        const uint32_t rep = find(rec.n);
-        if (!seenRep.insert(rep).second)
-          continue;
+      for (uint32_t rep : repList) {
         const bool hot = touched.count(rep) > 0;
         for (uint32_t s = 0; s < NSHIFT; s++) {
           if (R[rep][s].none() && RB[rep][s].none())

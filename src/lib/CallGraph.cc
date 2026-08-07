@@ -13405,11 +13405,27 @@ bool CallGraphPass::doFinalization(Module *M) {
     for (auto &it : Ctx->Callees)
       allCallees.insert(it.second.begin(), it.second.end());
     size_t used = 0;
+    // --cfl-census-type-rej: split the unused set by whether ANY input
+    // icall site would type-accept the function. compat==0 = the
+    // dispatch half is outside the input (slice artifact) or the
+    // address is never call-dispatched (comparison/table-only) — not
+    // our miss. compat>0 = a plausible dispatch site exists yet no
+    // data flow reached it: the candidate FALSE-NEGATIVE inventory.
+    size_t atUnusedCompat = 0, atUnusedNoSite = 0;
     for (const Function *F : Ctx->AddressTakenFuncs) {
       if (allCallees.find(F) != allCallees.end()) {
         used++;
       } else {
         WARNING("Address-taken function not used in indirect calls: " << F->getName() << "\n");
+        if (CFLCensusTypeRej) {
+          size_t compat = 0;
+          for (auto *CS2 : Ctx->IndirectCallInsts)
+            if (isCompatible(CS2, F))
+              compat++;
+          (compat ? atUnusedCompat : atUnusedNoSite)++;
+          errs() << "AT-UNUSED " << F->getName() << " compat-sites "
+                 << compat << "\n";
+        }
         // full-constant user dump serializes entire global initializers —
         // multi-GB on kernel inputs, so keep it at debug verbosity
         if (VerboseLevel >= 3) {
@@ -13421,6 +13437,12 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Address-taken functions: total " << Ctx->AddressTakenFuncs.size() << ", used " << used << "\n");
+    if (CFLCensusTypeRej)
+      errs() << "AT-UNUSED summary: " << atUnusedNoSite
+             << " with NO type-compatible input site (slice artifact / "
+             << "non-dispatch address use), " << atUnusedCompat
+             << " WITH a compatible site but no flow (candidate FN "
+             << "inventory)\n";
   }
 
   return false;

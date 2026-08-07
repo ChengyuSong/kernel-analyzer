@@ -447,3 +447,12 @@ strcmp NOOP
 strncmp NOOP
 strcpy NOOP
 strncpy NOOP
+
+# ---- userland extern boundary (task #45 census, libpng exemplar) ----
+# __cxa_throw(obj, tinfo, dtor): the Itanium ABI invokes dtor(obj)
+# during unwind — the only fn-ptr-carrying extern at the libpng
+# boundary (--cfl-census-extern-bound). Kernel census verdict: the
+# kernel corpus boundary is CLOSED for pointer flows (6 residual
+# externs = kernel/bpf/verifier.o missing from bclist, 0 fn-ptr args;
+# memcpy family enters IR as llvm.memcpy intrinsics, modeled).
+__cxa_throw INVOKE(arg2:f0<-arg0)

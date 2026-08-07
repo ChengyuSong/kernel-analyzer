@@ -398,6 +398,15 @@ cl::opt<bool> CFLCensusTypeRej(
            "(cf. the certified static_call +29). Changes no answers"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusExternBound(
+  "cfl-census-extern-bound",
+  cl::desc("MEASUREMENT-ONLY census (task #45): rank called-but-never-"
+           "defined functions (asm-defined symbols, firmware stubs) by "
+           "pointer args / fn-ptr args / pointer returns — the summary-"
+           "writing worklist for the extern boundary; sum=1 marks names "
+           "the --func-summaries file already covers. Adds no edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusTracepoint(
   "cfl-census-tracepoint",
   cl::desc("MEASUREMENT-ONLY census (task #35): size the tracepoint "
@@ -1016,6 +1025,7 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLCensusPtrToInt, "--cfl-census-ptrtoint");
     requireFlowsTo(CFLCensusTracepoint, "--cfl-census-tracepoint");
     requireFlowsTo(CFLCensusTypeRej, "--cfl-census-type-rej");
+    requireFlowsTo(CFLCensusExternBound, "--cfl-census-extern-bound");
     // Adopted identity-channel models (tasks #35/#36, ADOPTED
     // 2026-08-03): default ON in the canonical flows-to mode, opt out
     // with --cfl-tracepoint-keys=false / --cfl-static-ops-tables=false.

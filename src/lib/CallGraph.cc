@@ -13509,6 +13509,66 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Address-taken functions: total " << Ctx->AddressTakenFuncs.size() << ", used " << used << "\n");
+    // --cfl-census-extern-bound (task #45): rank the extern boundary —
+    // called functions with NO definition in the corpus (asm-defined
+    // symbols, firmware stubs, out-of-corpus libraries). Pointer args /
+    // pointer returns / constant-fn args size the summary-writing
+    // worklist: a pointer-propagating asm function with no summary is a
+    // silent flow sink. sum=1 marks names the summary file already
+    // covers. Measurement only.
+    if (CFLCensusExternBound) {
+      struct ExtStat {
+        size_t calls = 0, ptrArgs = 0, fnArgs = 0;
+        bool ptrRet = false, summarized = false;
+      };
+      std::map<std::string, ExtStat> ext;
+      for (auto &mp : Ctx->Modules)
+        for (Function &EF : *mp.first) {
+          if (EF.isIntrinsic()) continue;
+          for (const User *U : EF.users()) {
+            const auto *CB = dyn_cast<CallBase>(U);
+            if (!CB || CB->getCalledOperand()->stripPointerCasts() != &EF)
+              continue;
+            Function *D = getFuncDef(&EF);
+            if (!D->isDeclaration()) continue; // defined somewhere in corpus
+            auto &st = ext[D->getName().str()];
+            st.calls++;
+            st.ptrRet |= containsPointerType(D->getReturnType());
+            st.summarized = Ctx->FuncSummaries.count(D) ||
+                            Ctx->FuncSummaries.count(&EF);
+            for (const Value *A : CB->args()) {
+              if (A->getType()->isPointerTy()) {
+                st.ptrArgs++;
+                if (isa<Function>(A->stripPointerCasts())) st.fnArgs++;
+              }
+            }
+          }
+        }
+      std::vector<std::pair<std::string, ExtStat>> rank(ext.begin(),
+                                                        ext.end());
+      std::sort(rank.begin(), rank.end(), [](auto &a, auto &b) {
+        if (a.second.fnArgs != b.second.fnArgs)
+          return a.second.fnArgs > b.second.fnArgs;
+        if (a.second.ptrArgs != b.second.ptrArgs)
+          return a.second.ptrArgs > b.second.ptrArgs;
+        return a.second.calls > b.second.calls;
+      });
+      size_t unsummarizedPtr = 0;
+      for (auto &p : rank)
+        if (!p.second.summarized && (p.second.ptrArgs || p.second.ptrRet))
+          unsummarizedPtr++;
+      errs() << "EXTERN-BOUND census: " << rank.size()
+             << " extern called fns, " << unsummarizedPtr
+             << " pointer-bearing WITHOUT a summary\n";
+      size_t shownEB = 0;
+      for (auto &p : rank) {
+        if (shownEB++ >= 2000) { errs() << "EXTERN-BOUND   ...\n"; break; }
+        errs() << "EXTERN-BOUND   " << p.first << " calls " << p.second.calls
+               << " ptrargs " << p.second.ptrArgs << " fnargs "
+               << p.second.fnArgs << " ptret " << (int)p.second.ptrRet
+               << " sum " << (int)p.second.summarized << "\n";
+      }
+    }
     if (CFLCensusTypeRej)
       errs() << "AT-UNUSED summary: " << atUnusedNoSite
              << " with NO type-compatible input site (slice artifact / "

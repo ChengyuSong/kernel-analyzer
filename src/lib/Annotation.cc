@@ -527,10 +527,21 @@ bool isKernelUtilityFn(StringRef name) {
       name.equals("spin_unlock"))
     return true;
 
-  // RCU and lockdep (debug/validation, no data flow)
-  if (LLVM_STRING_STARTS_WITH(name, "lockdep_") ||
-      LLVM_STRING_STARTS_WITH(name, "lock_") ||
-      LLVM_STRING_STARTS_WITH(name, "rcu_"))
+  // RCU/lockdep synchronization entry points (no pointer data flow
+  // through them). EXACT names only: the former lockdep_/lock_/rcu_
+  // PREFIX skip silently dropped whole function BODIES across those
+  // subsystems — lockdep_proc_init's proc_create_seq registrations
+  // died there (task #44: /proc/lockdep seq handlers absent from every
+  // kernel answer set). Prefix classes over-match; a skip here must
+  // name the exact hot symbol it means.
+  if (name.equals("lock_acquire") || name.equals("lock_release") ||
+      name.equals("lock_is_held_type") ||
+      name.equals("rcu_read_lock") || name.equals("rcu_read_unlock") ||
+      name.equals("rcu_read_lock_held") ||
+      name.equals("rcu_is_watching") ||
+      name.equals("lockdep_hardirqs_on") ||
+      name.equals("lockdep_hardirqs_off") ||
+      name.equals("lockdep_init_map_type"))
     return true;
 
   // String operations (utility, high fan-out)

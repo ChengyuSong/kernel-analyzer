@@ -10097,7 +10097,8 @@ void CallGraphPass::wireLinkerSectionArrays() {
           // cross-module asm reference whose defining module was
           // initialized before the reference was seen — mint now
           sNode = NF.createValueNode(F);
-          Ctx->AddressTakenFuncs.insert(F);
+          Ctx->AddressTakenFuncs.insert(
+              getFuncDef(const_cast<Function *>(F)));
         } else {
           nodeless++; // skipped compiler global — ledgered
         }
@@ -13258,7 +13259,13 @@ bool CallGraphPass::doInitialization(Module *M) {
     // collect address-taken functions (module-asm references count:
     // the linker materializes their address into a section array)
     if (F.hasAddressTaken() || asmTaken.count(&F)) {
-      Ctx->AddressTakenFuncs.insert(&F);
+      // Insert the CANONICAL definition (task #45): the raw per-TU
+      // object made the set hold one decl copy per referencing TU —
+      // pointer-identity consumers (the used-tally, funcOfCanon's
+      // pointer-ordered overwrites) saw phantom "unused" functions
+      // (kernel census: 8,306 raw vs 4,046 real; __x64_sys_getpid
+      // counted both used AND unused). Reachable.cc already did this.
+      Ctx->AddressTakenFuncs.insert(getFuncDef(&F));
 
       // only add fval -> fobj edge in call graph analysis?
       // create a value node for function pointer

@@ -146,6 +146,10 @@ public:
     std::vector<SummaryAtom> atoms;
     bool fresh = false; // has a Fresh atom
     bool none = false;  // explicit NONE: no summary, stop matching
+    bool noop = false;  // NOOP: call transfers nothing, body skipped
+                        // (free/printk/lock entry points — replaces the
+                        // hardcoded isFreeFn/isKernelUtilityFn lists
+                        // when the file is loaded; task #44 follow-up)
   };
   // Ordered specs (first match wins; trailing '*' = prefix match) and
   // the per-Function resolution filled during doInitialization.

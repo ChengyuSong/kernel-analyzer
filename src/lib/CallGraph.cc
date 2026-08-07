@@ -605,13 +605,25 @@ static bool derivesFromLoweredVAList(const Value *V) {
 }
 
 // Helper to check if we should skip creating edges for a function call
+// NOOP-summarized functions (call transfers nothing, body skipped).
+// Populated at summary resolution; when --func-summaries is loaded the
+// FILE is authoritative and the hardcoded name lists below are NOT
+// consulted (isAllocFn precedent, task #26; migration task #44).
+static boost::unordered_flat_set<const Function *> g_noopBodies;
+static bool g_sumAuthoritative = false;
+
 static bool shouldSkipFunction(const Function *F) {
-  if (!F || !F->hasName())
+  if (!F)
+    return false;
+  if (g_sumAuthoritative)
+    return g_noopBodies.count(F) != 0;
+  if (!F->hasName())
     return false;
 
   StringRef name = F->getName();
 
-  // Skip kernel utility functions
+  // Legacy hardcoded skip lists — active ONLY without --func-summaries
+  // (micros / bare runs keep their historical behavior).
   if (isFreeFn(name) || isKernelUtilityFn(name))
     return true;
 
@@ -10752,7 +10764,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   };
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
-         nNone = 0, nInv = 0, nChR = 0, nChC = 0;
+         nNone = 0, nInv = 0, nChR = 0, nChC = 0, nNoop = 0;
   while (std::getline(in, line)) {
     lineNo++;
     StringRef L = StringRef(line).trim();
@@ -10772,6 +10784,10 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       } else if (t == "NONE") {
         S.none = true;
         nNone++;
+        continue;
+      } else if (t == "NOOP") {
+        S.noop = true;
+        nNoop++;
         continue;
       } else if (t.consume_front("CPY(") && t.consume_back(")")) {
         auto [d, s] = t.split("<-");
@@ -10865,6 +10881,8 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       }
       if (!bad && !S.none) S.atoms.push_back(A);
     }
+    if (S.noop && (!S.atoms.empty() || S.none || S.fresh))
+      bad = true; // NOOP is standalone: it owns the whole callsite
     if (bad) {
       errs() << "FuncSummary: parse error at " << path << ":" << lineNo
              << ": '" << line << "'\n";
@@ -10877,7 +10895,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
          << path << " (" << nFresh << " FRESH, " << nCpy << " CPY, "
          << nAlias << " ALIAS, " << nSt << " ST, " << nLd << " LD, "
          << nInv << " INVOKE, " << nChR << " CHAINREG, " << nChC
-         << " CHAINCALL, " << nNone << " NONE)\n");
+         << " CHAINCALL, " << nNone << " NONE, " << nNoop << " NOOP)\n");
 }
 
 // First-match-wins spec lookup ('*' suffix = prefix).
@@ -10919,6 +10937,8 @@ const GlobalValue *CallGraphPass::canonChainKey(const GlobalValue *G) {
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S,
                                       bool *retBound) {
+  if (S.noop)
+    return false; // NOOP owns the callsite: nothing transfers
   bool needPooled = false;
   auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
     const Value *v =
@@ -13251,9 +13271,11 @@ bool CallGraphPass::doInitialization(Module *M) {
     // the legacy hardcoded isAllocFn table is not consulted). Without
     // it, legacy behavior is unchanged.
     if (!Ctx->SummarySpecs.empty()) {
+      g_sumAuthoritative = true; // file owns skip lists too (NOOP)
       if (const auto *S = summaryForName(Ctx, F.getName())) {
         Ctx->FuncSummaries[&F] = S;
         if (S->fresh) Ctx->AllocFuncs.insert(&F);
+        if (S->noop) g_noopBodies.insert(&F);
       }
     } else {
       int size = 0, flag = 0;

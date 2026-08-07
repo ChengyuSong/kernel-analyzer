@@ -8,6 +8,8 @@
 #   ST(*argC<-argV)  store value argV into *argC
 #   LD(ret<-*argC)   result loaded from *argC
 #   NONE             explicitly no summary (body analyzed)
+#   NOOP             no transfer at the callsite AND body skipped
+#                    (standalone; replaces hardcoded free/utility lists)
 #
 # Provenance: migrated 2026-07-24 from the hardcoded isAllocFn table
 # (src/lib/Annotation.cc) — task #26 — plus the dup family with copy
@@ -332,3 +334,116 @@ d_set_d_op ST(*arg0<-arg1)
 # fwnode_connection_find_matches (plural) fills a caller ARRAY and
 # returns a count — deref-binding shape, NOT covered; stays pooled.
 fwnode_connection_find_match INVOKE(arg3:ret)
+
+# ---- NOOP: no transfer at the callsite, body skipped ----
+# Migrated 2026-08-07 (task #44 follow-up) from the hardcoded
+# isFreeFn/isKernelUtilityFn lists in Annotation.cc. When this file is
+# loaded it is AUTHORITATIVE: the hardcoded lists are not consulted.
+# NOOP is standalone (no other atoms on the line). EXACT names only —
+# the lockdep_/lock_/rcu_ prefix skip silently dropped whole function
+# bodies (l_show/lc_show FN, task #44); a prefix here must carry the
+# same audit burden as everywhere else.
+# free family (end-of-life: argument flows nowhere we model)
+free NOOP
+cfree NOOP
+_ZdlPv* NOOP
+_ZdaPv* NOOP
+kfree NOOP
+kfree_sensitive NOOP
+kzfree NOOP
+kvfree NOOP
+vfree NOOP
+vfree_atomic NOOP
+kmem_cache_free NOOP
+devm_kfree NOOP
+drmm_kfree NOOP
+__free_pages NOOP
+free_pages NOOP
+free_page NOOP
+put_page NOOP
+__free_page NOOP
+dma_free_coherent NOOP
+dma_free_attrs NOOP
+dma_free_noncoherent NOOP
+dma_free_wc NOOP
+mempool_free NOOP
+bio_put NOOP
+bio_free NOOP
+sock_kfree_s NOOP
+kfree_skb NOOP
+__kfree_skb NOOP
+consume_skb NOOP
+kfree_skb_reason NOOP
+__kfree_skb_defer NOOP
+dev_kfree_skb NOOP
+dev_kfree_skb_any NOOP
+dev_kfree_skb_irq NOOP
+free_percpu NOOP
+kunit_kfree NOOP
+f2fs_kfree* NOOP
+f2fs_kvfree* NOOP
+bpf_map_kfree NOOP
+bpf_map_kvfree NOOP
+jent_zfree NOOP
+jent_kvzfree NOOP
+kfree_const NOOP
+kfree_rcu NOOP
+kvfree_rcu NOOP
+# print/debug sinks (vararg byte formatting, no pointer transfer)
+_printk NOOP
+printk NOOP
+__warn_printk NOOP
+seq_printf NOOP
+# out-of-line lock entry points (closed set, kernel/locking)
+mutex_lock NOOP
+mutex_unlock NOOP
+mutex_lock_nested NOOP
+spin_lock NOOP
+spin_unlock NOOP
+_raw_spin_lock NOOP
+_raw_spin_unlock NOOP
+_raw_spin_lock_irq NOOP
+_raw_spin_unlock_irq NOOP
+_raw_spin_lock_irqsave NOOP
+_raw_spin_lock_irqsave_nested NOOP
+_raw_spin_unlock_irqrestore NOOP
+_raw_spin_lock_bh NOOP
+_raw_spin_unlock_bh NOOP
+_raw_spin_trylock NOOP
+_raw_spin_trylock_bh NOOP
+_raw_read_lock NOOP
+_raw_read_unlock NOOP
+_raw_read_lock_irq NOOP
+_raw_read_unlock_irq NOOP
+_raw_read_lock_irqsave NOOP
+_raw_read_unlock_irqrestore NOOP
+_raw_read_lock_bh NOOP
+_raw_read_unlock_bh NOOP
+_raw_read_trylock NOOP
+_raw_write_lock NOOP
+_raw_write_unlock NOOP
+_raw_write_lock_irq NOOP
+_raw_write_unlock_irq NOOP
+_raw_write_lock_irqsave NOOP
+_raw_write_unlock_irqrestore NOOP
+_raw_write_lock_bh NOOP
+_raw_write_unlock_bh NOOP
+_raw_write_trylock NOOP
+_raw_write_lock_nested NOOP
+# lockdep/rcu validation entry points (exact, audited)
+lock_acquire NOOP
+lock_release NOOP
+lock_is_held_type NOOP
+rcu_read_lock NOOP
+rcu_read_unlock NOOP
+rcu_read_lock_held NOOP
+rcu_is_watching NOOP
+lockdep_hardirqs_on NOOP
+lockdep_hardirqs_off NOOP
+lockdep_init_map_type NOOP
+# string utilities (byte data, high fan-out)
+strlen NOOP
+strcmp NOOP
+strncmp NOOP
+strcpy NOOP
+strncpy NOOP

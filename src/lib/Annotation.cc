@@ -516,13 +516,40 @@ bool isKernelUtilityFn(StringRef name) {
       name.equals("seq_printf"))
     return true;
 
-  // Lock/unlock operations (just synchronization, no data flow)
+  // Lock/unlock operations (just synchronization, no data flow).
+  // The kernel/locking/spinlock.c out-of-line entry points are a
+  // CLOSED set — enumerate them exactly; a prefix here would also be
+  // safe today, but exact names keep the rule audit-able (task #44).
   if (name.equals("mutex_lock") ||
       name.equals("mutex_unlock") ||
       name.equals("mutex_lock_nested") ||
-      LLVM_STRING_STARTS_WITH(name, "_raw_spin_") ||
-      LLVM_STRING_STARTS_WITH(name, "_raw_read_") ||
-      LLVM_STRING_STARTS_WITH(name, "_raw_write_") ||
+      name.equals("_raw_spin_lock") || name.equals("_raw_spin_unlock") ||
+      name.equals("_raw_spin_lock_irq") ||
+      name.equals("_raw_spin_unlock_irq") ||
+      name.equals("_raw_spin_lock_irqsave") ||
+      name.equals("_raw_spin_lock_irqsave_nested") ||
+      name.equals("_raw_spin_unlock_irqrestore") ||
+      name.equals("_raw_spin_lock_bh") ||
+      name.equals("_raw_spin_unlock_bh") ||
+      name.equals("_raw_spin_trylock") ||
+      name.equals("_raw_spin_trylock_bh") ||
+      name.equals("_raw_read_lock") || name.equals("_raw_read_unlock") ||
+      name.equals("_raw_read_lock_irq") ||
+      name.equals("_raw_read_unlock_irq") ||
+      name.equals("_raw_read_lock_irqsave") ||
+      name.equals("_raw_read_unlock_irqrestore") ||
+      name.equals("_raw_read_lock_bh") ||
+      name.equals("_raw_read_unlock_bh") ||
+      name.equals("_raw_read_trylock") ||
+      name.equals("_raw_write_lock") || name.equals("_raw_write_unlock") ||
+      name.equals("_raw_write_lock_irq") ||
+      name.equals("_raw_write_unlock_irq") ||
+      name.equals("_raw_write_lock_irqsave") ||
+      name.equals("_raw_write_unlock_irqrestore") ||
+      name.equals("_raw_write_lock_bh") ||
+      name.equals("_raw_write_unlock_bh") ||
+      name.equals("_raw_write_trylock") ||
+      name.equals("_raw_write_lock_nested") ||
       name.equals("spin_lock") ||
       name.equals("spin_unlock"))
     return true;
@@ -552,11 +579,14 @@ bool isKernelUtilityFn(StringRef name) {
       name.equals("strncpy"))
     return true;
 
-  // Reference counting (just increment/decrement)
-  if (LLVM_STRING_STARTS_WITH(name, "refcount_") ||
-      LLVM_STRING_STARTS_WITH(name, "atomic_") ||
-      LLVM_STRING_STARTS_WITH(name, "atomic64_"))
-    return true;
+  // The former refcount_/atomic_/atomic64_ PREFIX classes are GONE
+  // (task #44 follow-up): on x86-64 the arithmetic atomics are inline
+  // (no out-of-line bodies to skip), so the prefixes matched exactly
+  // the functions they must NOT match — atomic_notifier_chain_register
+  // / atomic_notifier_call_chain carry the notifier-block registration
+  // and dispatch flows, and refcount_warn_saturate-style bodies are
+  // counter-only (analyzing them is sound and cheap). A name skipped
+  // here must be an exact, audited symbol.
 
   return false;
 }

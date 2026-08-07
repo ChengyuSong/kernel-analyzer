@@ -2869,9 +2869,14 @@ bool CallGraphPass::runFlowsToResolution() {
   // Measurement mode: report the statically prunable origin fraction.
   std::vector<char> bidiMarked; // partition-class relevance (by class id)
   std::vector<uint32_t> bidiUF;
-  if (CFLBidiPrune) {
+  std::vector<uint32_t> bidiPrunedCls; // origins the cone gate skipped
+  // Re-callable (#43): incremental wiring appends its edge deltas to
+  // aEdges/dEdges/fEdges/wildcardNodes and recomputes — the prune's
+  // soundness argument ("the oracle recomputes per outer iteration")
+  // otherwise breaks when --cfl-flows-to-incremental never rebuilds.
+  auto computeBidiCone = [&]() {
     auto tBidi = std::chrono::steady_clock::now();
-    bidiUF.resize(N);
+    bidiUF.assign(N, 0);
     for (uint32_t i = 0; i < N; i++) bidiUF[i] = i;
     std::function<uint32_t(uint32_t)> bfind = [&](uint32_t x) {
       while (bidiUF[x] != x) { bidiUF[x] = bidiUF[bidiUF[x]]; x = bidiUF[x]; }
@@ -2957,7 +2962,8 @@ bool CallGraphPass::runFlowsToResolution() {
            << " ms\n");
     // expose relevance per CLASS for the mint loop's tally
     for (uint32_t n = 0; n < N; n++) bidiMarked[n] = bidiMarked[bfind(n)];
-  }
+  };
+  if (CFLBidiPrune) computeBidiCone();
   // --cfl-lazy-mint (task #21): demand-driven roots to the exact bound.
   // A = classes backward-reachable from any fptr class over a/f flow
   // edges PLUS cell->owner hops: a cell in A makes every origin
@@ -3179,6 +3185,7 @@ bool CallGraphPass::runFlowsToResolution() {
         // The oracle recomputes per outer iteration, so cone growth
         // from newly wired callee edges re-admits origins as needed.
         bidiPrunable++;
+        bidiPrunedCls.push_back(n);
         continue;
       }
       if (!lazyA.empty() && !isFunc && !isCert && !lazyA[n]) {
@@ -4527,6 +4534,16 @@ bool CallGraphPass::runFlowsToResolution() {
           batch.push_back({2, dense(cf), dense(ct), bIt->second});
       }
     }
+    // Keep the bidi oracle's raw edge lists current: the cone is
+    // recomputed after this batch (phase 3.5) and must see the wired
+    // call edges, or origins they pull into the cone stay pruned.
+    if (!bidiMarked.empty())
+      for (const NewEdge &e : batch) {
+        if (e.kind == 0) aEdges.emplace_back(e.a, e.b);
+        else if (e.kind == 1) dEdges.emplace_back(e.a, e.b);
+        else if (e.kind == 2) fEdges.emplace_back(e.a, e.b, e.c);
+        else wildcardNodes.insert(e.a);
+      }
     growTo((uint32_t)toOrig.size());
     // Park obsolete identity roots: any parkable root whose class is the
     // target of a new a/f edge is exactly a root the from-scratch
@@ -4659,6 +4676,32 @@ bool CallGraphPass::runFlowsToResolution() {
       else mintRoot(dIt->second);
     }
     newAllocNodes.clear();
+    // Phase 3.5 (#43, the #15 root cause): re-run the bidi relevance
+    // oracle over the updated edge lists. The from-scratch outer driver
+    // re-admitted pruned origins implicitly by rebuilding; incremental
+    // wiring must do it explicitly — the cone only grows (edges are
+    // append-only), so this is a monotone re-admission, never a
+    // re-prune. Skipped when nothing was ever pruned.
+    if (!bidiMarked.empty() && !bidiPrunedCls.empty()) {
+      computeBidiCone();
+      size_t readmit = 0;
+      std::vector<uint32_t> still;
+      still.reserve(bidiPrunedCls.size());
+      for (uint32_t pc : bidiPrunedCls) {
+        if (bidiMarked[pc]) {
+          if (CFLLazyMint) lazyDeferred.push_back(pc);
+          else mintRoot(pc);
+          readmit++;
+        } else {
+          still.push_back(pc);
+        }
+      }
+      bidiPrunedCls.swap(still);
+      if (readmit)
+        CG_LOG("FlowsTo incremental: bidi cone re-admitted " << readmit
+               << " pruned origins (" << bidiPrunedCls.size()
+               << " remain outside)\n");
+    }
     flushCtx(ctx0);
     CG_LOG("FlowsTo incremental: +" << (N - oldN) << " classes, +" << nA
            << " a / +" << nD << " d / +" << nF << " f / +" << nW

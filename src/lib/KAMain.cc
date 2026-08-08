@@ -543,6 +543,29 @@ cl::opt<std::string> CFLNexusFields(
            "Requires --cfl-field-buckets>0 (auto-set to 13 if unset)"),
   cl::init(""));
 
+cl::opt<bool> CFLInternPlanes(
+  "cfl-intern-planes",
+  cl::desc("Share dense fact planes copy-on-write (task #46): a full-"
+           "plane delta arriving at an empty plane is ADOPTED (O(1)) "
+           "instead of copied, the share walks copy chains via full-"
+           "plane pushes, and pointer-equality fast paths skip the "
+           "copy+diff on re-offers. Byte-identical answers by "
+           "construction (COW detach on first divergent write). Only "
+           "effective in the sequential solver (T=1): at T>1 concurrent "
+           "in-place OR-ins would race with COW pointer swaps"),
+  cl::init(true));
+
+cl::opt<bool> CFLInternSweep(
+  "cfl-intern-sweep",
+  cl::desc("Additionally run a periodic content-hash sweep unifying "
+           "already-materialized duplicate R/joined planes (requires "
+           "--cfl-intern-planes). Measured 2026-08-07: finds ~9% of "
+           "planes mid-drain but yields no fast-path hits and no RSS "
+           "high-water change (temporal divergence — duplication is an "
+           "end-state property), costs ~11% at library scale. Kept as "
+           "an instrument"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLBatchRoots(
   "cfl-batch-roots",
   cl::desc("Origin-batched flows-to solving (task #40): mint and drain "

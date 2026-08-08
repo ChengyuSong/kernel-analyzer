@@ -15,6 +15,51 @@ the task log; items marked [PENDING] depend on runs still in flight.
 3. *ORCFL: Answer-Anchored, Resource-Bounded Pointer Analysis for
    Multi-Million-Line Monolithic Systems*
 
+## The origin story = the framing device (added 2026-08-07)
+
+The project began as an adjudication between two expert claims that
+cannot both be true as stated:
+
+- The SECURITY practitioner's claim (Zhiyun, KallGraph): pointer-
+  analysis scalability for kernel call graphs is UNSOLVED — that is
+  why KallGraph needs resource heuristics (verified in their released
+  code: 35-edge path cap, dynamic top-50 hub blacklisting, blocking
+  formals of >250-caller utilities; see
+  docs/novelty-and-related-work.md KallGraph dossier).
+- The GRAPH-ENGINE researcher's claim (Zhijia, GraCFL): CFL-
+  reachability scalability is SOLVED — best-in-class engines chew
+  through billions of edges with minimal redundancy.
+
+RESOLUTION (the paper's thesis, provable with our measurements): both
+are right at their own layer and the wall lives BETWEEN them.
+- The engine layer is solved (Zhijia right): GraCFL outperforms POCR
+  on our graphs; no engine defect is in play. But an engine's work is
+  lower-bounded by its OUTPUT, and over LLVM-IR graphs the closure
+  itself is Θ(Σ|a-component|²) — the best engine hits the
+  formulation's floor faster (OOMs on harfbuzz, a library).
+- The practitioner's pain is real (Zhiyun right): whole-kernel icall
+  analysis does not fit — but the caps are the demand-side SYMPTOM of
+  the same wall, not a solution: every deep query re-explores the
+  giant may-alias component, so the DFS must either drown there or
+  silently truncate it. The caps fire exactly where the answers are
+  hardest (and truncation masquerades as precision).
+- What the reconciliation forces: neither more engine nor capped DFS,
+  but a REFORMULATION whose output is small enough to solve —
+  answer-anchored flows-to (Σ|C|·answer-relevant origins) — then
+  real graph-processing discipline applied to THAT problem
+  (delta/wave propagation, union-find joins, origin batching):
+  whole-program solving amortizes exactly the cross-query redundancy
+  that per-query DFS re-pays 159k times per fixpoint round.
+
+Intro hook sentence candidates: "Depending on whom you ask,
+CFL-reachability pointer analysis either scales, or it does not —
+and both answers come from experts holding state-of-the-art
+results." Then: both are right; the wall is the formulation's output
+size, invisible from either side because each side's own layer is
+healthy. (In the paper, cite the two lines' results rather than the
+personal communications; the code-verified caps make the security
+side's position citable.)
+
 ## Positioning (the spectrum, and who we must convince)
 
 - ONE END: type-based resolution. Scales trivially; the community knows
@@ -189,9 +234,11 @@ C6 (maybe folded into C3). **Methodology: falsifications as results.**
 ## Section-by-section
 
 ### 1. Introduction (1.5 pp)
-- Open with the question the project opened with: CFL-reachability is
-  the textbook formulation for precise pointer analysis — why does every
-  engine drown long before Linux-kernel scale?
+- Open with the two-claims hook (see "The origin story" above): the
+  security line says scalability is unsolved and caps its traversals;
+  the engine line says it is solved and has the benchmarks to prove
+  it. Both are state of the art. Who is right? (Answer: both, and the
+  wall is between their layers — the formulation's output size.)
 - Why the answer matters downstream: sound indirect-call resolution for
   CFI policy size, fuzzing reachability, patch impact; type-based is
   both too loose (10.8x) and structurally untrustworthy under opaque

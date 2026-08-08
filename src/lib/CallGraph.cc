@@ -2149,29 +2149,57 @@ static boost::unordered_flat_set<uint32_t> g_dirtyRestore;
 
 class FactSet {
   llvm::SmallVector<uint32_t, 2> S; // sorted, unique (sparse mode)
-  std::unique_ptr<llvm::BitVector> D; // non-null => dense mode
+  // Dense buffers are COW-shared (task #46 interning): the intern sweep
+  // and the adopt-on-copy fast paths point multiple planes at one
+  // buffer, so EVERY mutation of *D must go through mutD(), which
+  // detaches a shared buffer first. Sharing is only CREATED when
+  // EnableShare is on (sequential solver: concurrent in-place OR-ins
+  // at T>1 would race with COW pointer swaps); detach stays
+  // unconditional so correctness never depends on the gate.
+  std::shared_ptr<llvm::BitVector> D; // non-null => dense mode
   static constexpr size_t kPromote = 128;
+  llvm::BitVector &mutD() {
+    if (D.use_count() > 1) D = std::make_shared<llvm::BitVector>(*D);
+    return *D;
+  }
   void promote() {
-    D = std::make_unique<llvm::BitVector>(Universe);
+    D = std::make_shared<llvm::BitVector>(Universe);
     for (uint32_t o : S) D->set(o);
     S.clear();
   }
 
 public:
   static uint32_t Universe;
+  static bool EnableShare;
   bool none() const { return D ? D->none() : S.empty(); }
   bool any() const { return !none(); }
   size_t count() const { return D ? D->count() : S.size(); }
+  bool isDense() const { return (bool)D; }
+  // Pointer-equality witnesses for the interned fast paths: two planes
+  // sharing one buffer are content-identical by construction.
+  bool sharesDense(const FactSet &o) const { return D && D == o.D; }
+  bool denseUnique() const { return D && D.use_count() == 1; }
+  const llvm::BitVector *denseData() const { return D.get(); }
+  size_t denseCapBytes() const {
+    return D ? D->getData().size() * sizeof(uintptr_t) : 0;
+  }
+  void adoptDense(const FactSet &o) { // intern: content-equality proven
+    assert(o.D && "adoptDense needs a dense source");
+    D = o.D;
+    S.clear();
+  }
   bool test(uint32_t o) const {
     if (D) return o < D->size() && D->test(o);
     return std::binary_search(S.begin(), S.end(), o);
   }
   void set(uint32_t o) {
     if (D) {
+      if (o < D->size() && D->test(o)) return; // no detach for a no-op
+      auto &B = mutD();
       // Universe can grow between drains (incrementally minted roots);
       // dense buffers widen lazily on first touch past their old width.
-      if (o >= D->size()) D->resize(std::max<uint32_t>(Universe, o + 1));
-      D->set(o);
+      if (o >= B.size()) B.resize(std::max<uint32_t>(Universe, o + 1));
+      B.set(o);
       return;
     }
     auto it = std::lower_bound(S.begin(), S.end(), o);
@@ -2180,12 +2208,20 @@ public:
     if (S.size() > kPromote) promote();
   }
   void reset(uint32_t o) {
-    if (D) { if (o < D->size()) D->reset(o); return; }
+    if (D) {
+      if (o < D->size() && D->test(o)) mutD().reset(o);
+      return;
+    }
     auto it = std::lower_bound(S.begin(), S.end(), o);
     if (it != S.end() && *it == o) S.erase(it);
   }
   void clear() {
-    if (D) D->reset();
+    if (D) {
+      // Shared buffer: drop the handle (zeroing would clear the other
+      // owners' bits). Unique buffer: keep it warm (hot delta planes).
+      if (D.use_count() > 1) D.reset();
+      else D->reset();
+    }
     S.clear();
   }
   void release() {
@@ -2193,10 +2229,28 @@ public:
     llvm::SmallVector<uint32_t, 2>().swap(S); // drop heap capacity too
   }
   void copyFrom(const FactSet &o) {
+    if (this == &o) return;
     if (o.D) {
-      if (D) *D = *o.D; else D = std::make_unique<llvm::BitVector>(*o.D);
+      if (D == o.D) return; // already identical (shared)
+      // Adopt only buffers that are ALREADY shared (interned): adopting
+      // a unique buffer (e.g. scratch) would force ITS owner to detach
+      // on next reuse — the hot-path churn the in-flight-dedup negative
+      // taught us to avoid. The intern sweep is the sole origin of
+      // sharing; adoption just propagates it.
+      if (!D && EnableShare && o.D.use_count() > 1) {
+        D = o.D; // adopt share: O(1); first mutation detaches
+      } else if (D && D.use_count() == 1) {
+        *D = *o.D; // reuse our unique buffer (hot scratch path)
+      } else {
+        D = std::make_shared<llvm::BitVector>(*o.D);
+      }
       S.clear();
     } else if (D) {
+      if (D.use_count() > 1) {
+        D.reset(); // sparse content fits sparse mode; drop the share
+        S = o.S;
+        return;
+      }
       D->reset();
       for (uint32_t x : o.S) {
         if (x >= D->size()) D->resize(std::max<uint32_t>(Universe, x + 1));
@@ -2209,12 +2263,18 @@ public:
   void unionWith(const FactSet &o) {
     if (o.none()) return;
     if (o.D) {
+      if (D == o.D) return; // interned fast path
+      if (!D && S.empty() && EnableShare && o.D.use_count() > 1) {
+        D = o.D; // empty target adopts an interned share: O(1)
+        return;
+      }
       if (!D) promote();
-      *D |= *o.D;
+      mutD() |= *o.D;
     } else if (D) {
+      auto &B = mutD();
       for (uint32_t x : o.S) {
-        if (x >= D->size()) D->resize(std::max<uint32_t>(Universe, x + 1));
-        D->set(x);
+        if (x >= B.size()) B.resize(std::max<uint32_t>(Universe, x + 1));
+        B.set(x);
       }
     } else {
       llvm::SmallVector<uint32_t, 8> merged;
@@ -2227,9 +2287,14 @@ public:
   }
   void subtract(const FactSet &o) { // this \= o
     if (none() || o.none()) return;
+    if (D && D == o.D) { // interned fast path: X \ X = empty
+      clear();
+      return;
+    }
     if (D) {
-      if (o.D) D->reset(*o.D);
-      else for (uint32_t x : o.S) if (x < D->size()) D->reset(x);
+      auto &B = mutD();
+      if (o.D) B.reset(*o.D);
+      else for (uint32_t x : o.S) if (x < B.size()) B.reset(x);
     } else if (o.D) {
       S.erase(std::remove_if(S.begin(), S.end(),
                              [&](uint32_t x) { return o.test(x); }),
@@ -2244,14 +2309,16 @@ public:
   void intersectWith(const FactSet &o) {
     if (none()) return;
     if (o.none()) { clear(); return; }
+    if (D && D == o.D) return; // interned fast path: X ∩ X = X
     if (D && o.D) {
-      *D &= *o.D;
+      mutD() &= *o.D;
     } else if (D) { // dense this, sparse other
       llvm::SmallVector<uint32_t, kPromote> surv;
       for (uint32_t x : o.S)
         if (test(x)) surv.push_back(x);
-      D->reset();
-      for (uint32_t x : surv) D->set(x);
+      auto &B = mutD();
+      B.reset();
+      for (uint32_t x : surv) B.set(x);
     } else if (o.D) {
       S.erase(std::remove_if(S.begin(), S.end(),
                              [&](uint32_t x) { return !o.test(x); }),
@@ -2273,6 +2340,7 @@ public:
   }
 };
 uint32_t FactSet::Universe = 0;
+bool FactSet::EnableShare = false;
 
 // Bulk-synchronous worker pool for the flows-to wave phases: run(f)
 // executes f(tid) on all T threads (the caller participates as tid 0)
@@ -3577,6 +3645,18 @@ bool CallGraphPass::runFlowsToResolution() {
            "single-threaded per worker\n");
     solverThreads = 1;
   }
+  // Task #46: dense-plane interning (hash-consed COW buffers). Sharing
+  // is created only for strictly sequential drains: at T>1 the in-place
+  // OR-ins race with COW pointer swaps, and forked batch workers may
+  // re-raise their own thread count after the fork — so workers-mode
+  // disables it wholesale. (T>1-safe sharing = a future lever, paired
+  // with target-partitioned exchange.)
+  const bool internOK =
+      CFLInternPlanes && solverThreads == 1 && CFLBatchWorkers <= 1;
+  FactSet::EnableShare = internOK;
+  if (CFLInternPlanes && !internOK)
+    CG_LOG("FlowsTo: plane interning inactive (requires a sequential "
+           "solve: T=1, no batch workers)\n");
   bool parallelPhase = false; // true only inside a parallel wave phase
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
       new std::atomic<uint8_t>[solverCapN]);
@@ -3626,6 +3706,63 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::vector<uint32_t>> bridgesOf(N); // VX partners (class ids)
   std::vector<char> wflag(N, 0);
   for (uint32_t w : wildcardNodes) wflag[w] = 1;
+  // ---- Task #46: dense-plane intern sweep (hash-consing) ----
+  // Periodically unify content-equal dense R/joined planes onto one
+  // shared COW buffer. Buffer widths may differ (lazy widening), so
+  // content identity is over the word prefix up to the last nonzero
+  // word. The bucket map is sweep-local: buffers registered here hold
+  // no extra refcount afterwards, so a canonical buffer that later
+  // diverges COW-detaches like any other — no stale-hash hazard.
+  uint64_t internUnified = 0, internSweeps = 0, internBytesFreed = 0;
+  // virgin[n*NSHIFT+s]: dirty[n][s] content == R[n][s] content (the
+  // whole plane is one un-consumed delta). Maintained exactly and O(1):
+  // set when an arrival fills a previously empty (R,RB) pair — every
+  // arrival appends to dirty and R equally, so equality persists until
+  // a pop consumes dirty (or RB/merge traffic mixes kinds). Replaces
+  // the popcount-equality probe, whose per-pop full-plane scans were
+  // the fs-scale regression.
+  std::vector<uint8_t> virginPl((size_t)N * NSHIFT, 0);
+  auto internPlanes = [&]() {
+    internSweeps++;
+    auto prefixLen = [](llvm::ArrayRef<uintptr_t> W) {
+      size_t l = W.size();
+      while (l && W[l - 1] == 0) l--;
+      return l;
+    };
+    boost::unordered_flat_map<uint64_t, llvm::SmallVector<FactSet *, 2>>
+        buckets;
+    auto sweepPlane = [&](FactSet &P) {
+      if (!P.isDense()) return;
+      const auto W = P.denseData()->getData();
+      const size_t len = prefixLen(W);
+      if (!len) return; // empty planes: not worth an entry
+      uint64_t h = 1469598103934665603ull ^ (uint64_t)len;
+      for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)W[i];
+        h *= 1099511628211ull;
+      }
+      auto &vec = buckets[h];
+      for (FactSet *C : vec) {
+        if (C->sharesDense(P)) return; // already unified earlier
+        const auto WC = C->denseData()->getData();
+        if (prefixLen(WC) != len ||
+            !std::equal(W.begin(), W.begin() + len, WC.begin()))
+          continue; // hash collision, different content
+        internBytesFreed += P.denseCapBytes();
+        P.adoptDense(*C);
+        internUnified++;
+        return;
+      }
+      vec.push_back(&P);
+    };
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue; // losers' planes are released
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        sweepPlane(R[n][s]);
+        sweepPlane(joined[n][s]);
+      }
+    }
+  };
   // Wave scheduling: pop classes in topological order of the initial
   // propagation graph's condensation, so deltas flow downhill and each
   // plane is touched once per wave with its full accumulated delta,
@@ -3705,6 +3842,8 @@ bool CallGraphPass::runFlowsToResolution() {
              cyF = 0;
     uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
     uint64_t sweepOffered = 0, sweepKept = 0;
+    uint64_t internHits = 0; // sharesDense early-outs (skipped copy+diff)
+    uint64_t internShares = 0; // share-on-full-arrival adoptions
   };
   // deque, not vector: forked batch workers grow it for their own
   // thread pool, and ctx0 below must stay a valid reference.
@@ -3728,13 +3867,48 @@ bool CallGraphPass::runFlowsToResolution() {
   // and a/f propagation already ran — only bridge-crossing is new).
   // In parallel phases the whole plane update runs under n's spinlock.
   auto addBits = [&](uint32_t n, uint32_t s, const FactSet &src,
-                     SolverCtx &ctx) {
+                     SolverCtx &ctx, bool srcStable = false) {
     if (src.none()) return;
     FactSet &nb = ctx.nbA;
     lockC(n);
+    // Interned fast path: src and R[n][s] sharing one COW buffer proves
+    // src \ R[n][s] = ∅ without touching a word (chains of duplicated
+    // planes are the measured 60% row-duplication case).
+    if (src.sharesDense(R[n][s])) {
+      ctx.internHits++;
+      unlockC(n);
+      return;
+    }
+    // Share-on-full-arrival (task #46): an empty plane receiving a whole
+    // STABLE dense plane (srcStable = the payload is a class R plane,
+    // never scratch) adopts the buffer instead of copying it. The delta
+    // planes share too, so the pop-time snapshot sees dirty==R
+    // (pointer-equal), pushes R itself downstream, and the share walks
+    // the whole copy chain — relay classes cost O(1) and re-offers hit
+    // the pointer-equality skip above. COW detach on the first
+    // divergent write keeps every plane exact.
+    if (srcStable && FactSet::EnableShare && src.isDense() &&
+        R[n][s].none() && RB[n][s].none()) {
+      R[n][s].adoptDense(src);
+      dirty[n][s].adoptDense(src);
+      jdirty[n][s].adoptDense(src);
+      dirtyBr[n][s].adoptDense(src);
+      virginPl[(size_t)n * NSHIFT + s] = 1;
+      ctx.localFacts += src.count();
+      ctx.internShares++;
+      if (traceRoot >= 0 && src.test((uint32_t)traceRoot))
+        traceHit(n, s, false);
+      unlockC(n);
+      push(n, ctx);
+      return;
+    }
     nb.copyFrom(src);
     nb.subtract(R[n][s]);
     if (nb.none()) { unlockC(n); return; }
+    // Arrivals append to dirty and R equally, so a fill-from-empty
+    // starts (and appends preserve) dirty==R — the virgin invariant.
+    if (R[n][s].none() && RB[n][s].none())
+      virginPl[(size_t)n * NSHIFT + s] = 1;
     FactSet &promoted = ctx.promA;
     promoted.clear();
     if (!RB[n][s].none()) {
@@ -3770,6 +3944,8 @@ bool CallGraphPass::runFlowsToResolution() {
       push(n, ctx);
       return;
     }
+    if (R[n][s].none() && RB[n][s].none())
+      virginPl[(size_t)n * NSHIFT + s] = 1;
     R[n][s].set(o);
     dirty[n][s].set(o);
     jdirty[n][s].set(o);
@@ -3786,6 +3962,11 @@ bool CallGraphPass::runFlowsToResolution() {
     if (src.none()) return;
     FactSet &nb = ctx.nbB;
     lockC(n);
+    if (src.sharesDense(R[n][s]) || src.sharesDense(RB[n][s])) {
+      ctx.internHits++;
+      unlockC(n);
+      return;
+    }
     nb.copyFrom(src);
     nb.subtract(RB[n][s]);
     nb.subtract(R[n][s]);
@@ -3793,6 +3974,7 @@ bool CallGraphPass::runFlowsToResolution() {
     RB[n][s].unionWith(nb);
     dirty[n][s].unionWith(nb);
     jdirty[n][s].unionWith(nb);
+    virginPl[(size_t)n * NSHIFT + s] = 0; // dirty gains RB bits: != R now
     ctx.localFacts += nb.count();
     if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
       traceHit(n, s, true);
@@ -3891,6 +4073,9 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       if (dirty[b][s].any()) dirty[a][s].unionWith(dirty[b][s]);
       if (dirtyBr[b][s].any()) dirtyBr[a][s].unionWith(dirtyBr[b][s]);
+      // Merged planes mix kept and consumed content: virgin no more.
+      virginPl[(size_t)a * NSHIFT + s] = 0;
+      virginPl[(size_t)b * NSHIFT + s] = 0;
       R[b][s].release();
       RB[b][s].release();
       dirty[b][s].release();
@@ -4909,18 +5094,32 @@ bool CallGraphPass::runFlowsToResolution() {
       if (doBr) db.copyFrom(dirtyBr[n][s]);
       dirtyBr[n][s].clear();
       const bool hasD = dirty[n][s].any();
+      // Full-plane delta: the delta IS the plane, so push R itself
+      // (stable payload -> downstream adoption) and skip the snapshot
+      // copy. The virgin flag witnesses dirty==R exactly and O(1)
+      // (arrivals append to both equally; consumption/RB/merge traffic
+      // clears it) — an earlier popcount-equality probe here scanned
+      // R on every pop and regressed fs-scale runs.
+      const bool dFull = hasD && FactSet::EnableShare &&
+                         (virginPl[(size_t)n * NSHIFT + s] != 0 ||
+                          dirty[n][s].sharesDense(R[n][s]));
       if (hasD) {
-        d.copyFrom(dirty[n][s]);
-        dirty[n][s].clear();
-        if (wproj) {
-          // Wildcard (fx self-loop): new facts also hold at unknown
-          // shift, kind preserved (retroactive projection on wflag gain
-          // is in merge). Split by kind under the same lock as the
-          // snapshot so the R/RB reads are coherent.
-          ctx.dNatS.copyFrom(d);
-          ctx.dNatS.intersectWith(R[n][s]);
-          ctx.dBrS.copyFrom(d);
-          ctx.dBrS.intersectWith(RB[n][s]);
+        virginPl[(size_t)n * NSHIFT + s] = 0; // consuming dirty below
+        if (dFull) {
+          dirty[n][s].clear(); // drops the shared handle
+        } else {
+          d.copyFrom(dirty[n][s]);
+          dirty[n][s].clear();
+          if (wproj) {
+            // Wildcard (fx self-loop): new facts also hold at unknown
+            // shift, kind preserved (retroactive projection on wflag gain
+            // is in merge). Split by kind under the same lock as the
+            // snapshot so the R/RB reads are coherent.
+            ctx.dNatS.copyFrom(d);
+            ctx.dNatS.intersectWith(R[n][s]);
+            ctx.dBrS.copyFrom(d);
+            ctx.dBrS.intersectWith(RB[n][s]);
+          }
         }
       }
       unlockC(n);
@@ -4936,10 +5135,18 @@ bool CallGraphPass::runFlowsToResolution() {
       ctx.cyBridge += tp2 - tp1;
       if (!hasD) { ctx.cyScan += rd() - tp2; continue; }
       uint64_t tp3 = rd();
+      // Payload: the full R plane (stable, adoptable downstream) when
+      // the delta is the whole plane, the scratch snapshot otherwise.
+      const FactSet &pay = dFull ? R[n][s] : d;
       if (wproj) {
         if (traceRoot >= 0) { tHow = "wflag"; tFrom = n; }
-        if (ctx.dNatS.any()) addBits(n, SHIFT_X, ctx.dNatS, ctx);
-        if (ctx.dBrS.any()) addBitsBridged(n, SHIFT_X, ctx.dBrS, ctx);
+        if (dFull) {
+          // Delta == R and RB empty: the native split is R itself.
+          addBits(n, SHIFT_X, pay, ctx, true);
+        } else {
+          if (ctx.dNatS.any()) addBits(n, SHIFT_X, ctx.dNatS, ctx);
+          if (ctx.dBrS.any()) addBitsBridged(n, SHIFT_X, ctx.dBrS, ctx);
+        }
       }
       uint64_t tp4 = rd();
       ctx.cyW += tp4 - tp3;
@@ -4950,16 +5157,16 @@ bool CallGraphPass::runFlowsToResolution() {
       if (traceRoot >= 0) { tHow = "a-prop"; tFrom = n; }
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
-        if (tt != n) { ctx.nAOr++; addBits(tt, s, d, ctx); }
+        if (tt != n) { ctx.nAOr++; addBits(tt, s, pay, ctx, dFull); }
       }
       uint64_t tp5 = rd();
       ctx.cyA += tp5 - tp4;
-      if (prof) ctx.orWords += (uint64_t)d.count() * outA[n].size();
+      if (prof) ctx.orWords += (uint64_t)pay.count() * outA[n].size();
       if (traceRoot >= 0) { tHow = "f-prop"; tFrom = n; }
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
-        if (tt != n || s2 != s) { ctx.nFOr++; addBits(tt, s2, d, ctx); }
+        if (tt != n || s2 != s) { ctx.nFOr++; addBits(tt, s2, pay, ctx, dFull); }
       }
       ctx.cyF += rd() - tp5;
     }
@@ -4975,7 +5182,7 @@ bool CallGraphPass::runFlowsToResolution() {
   constexpr uint32_t kGrain = 16;
   std::vector<uint32_t> waveBuf;
   size_t waveCount = 0;
-  uint64_t nextSCC = 1u << 18, nextProg = 1u << 20;
+  uint64_t nextSCC = 1u << 18, nextProg = 1u << 20, nextIntern = 1u << 16;
   size_t edgesConsumed = edges.size();
   int fpIter = 0;
   // Outer resolution fixpoint: drain -> resolve -> wire the new callee
@@ -5037,6 +5244,15 @@ bool CallGraphPass::runFlowsToResolution() {
                  << " classes at " << iterations << " pops\n");
         flushCtx(ctx0);
       }
+      if (internOK && CFLInternSweep && iterations >= nextIntern) {
+        nextIntern += 1u << 16;
+        const uint64_t u0 = internUnified;
+        internPlanes();
+        if (internUnified != u0)
+          CG_LOG("FlowsTo: intern sweep unified " << (internUnified - u0)
+                 << " planes at " << iterations << " pops ("
+                 << (internBytesFreed >> 20) << " MB cumulative)\n");
+      }
       if (iterations >= nextProg) {
         nextProg += 1u << 20;
         CG_LOG("FlowsTo progress: " << iterations << " pops, " << factCount
@@ -5071,6 +5287,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       popCount[n] = 0;
     }
+    std::fill(virginPl.begin(), virginPl.end(), 0);
   };
   // Accumulated answer-plane bits per fptr-class rep (batched mode):
   // resolution reads these instead of the (released) live planes.
@@ -5625,6 +5842,18 @@ bool CallGraphPass::runFlowsToResolution() {
          << iterations << " worklist pops, "
          << std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - tStart).count() << " ms\n");
+  if (internOK) {
+    uint64_t internHitsTotal = 0, internSharesTotal = 0;
+    for (auto &c : ctxs) {
+      internHitsTotal += c.internHits;
+      internSharesTotal += c.internShares;
+    }
+    CG_LOG("FlowsTo: intern " << internSweeps << " sweeps, "
+           << internUnified << " planes unified, "
+           << (internBytesFreed >> 20) << " MB freed, "
+           << internSharesTotal << " arrival shares, "
+           << internHitsTotal << " fast-path skips\n");
+  }
 
   // Resolution: origins at the fptr class whose shift is zero or unknown
   // (an exact nonzero shift is a provably misaligned pointer, not a call

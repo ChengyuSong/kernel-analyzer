@@ -64,6 +64,8 @@ extern cl::opt<bool> CFLJoinCone;
 extern cl::opt<bool> CFLCensusCouplers;
 extern cl::opt<bool> CFLCensusNexus;
 extern cl::opt<std::string> CFLNexusFields;
+extern cl::opt<bool> CFLInternPlanes;
+extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<unsigned> CFLBatchRoots;
 extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<std::string> CFLBatchSpill;

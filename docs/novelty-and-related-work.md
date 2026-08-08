@@ -186,6 +186,155 @@ move. Our probes (witness provenance, no-mint ablation, rule-class
 upper bounds, funnel telemetry) are the instruments that make the
 middle layer measurable.
 
+## KallGraph dossier (added 2026-08-07, ~/kallgraph.pdf + source audit)
+
+Li, Sridharan & Qian, *Redefining Indirect Call Analysis with
+KallGraph*, IEEE S&P 2025. UCR colleagues; open source at
+github.com/seclab-ucr/KallGraph (audited checkout: /data/csong/
+opensource/kallgraph, commit 058f9b5, 2026-02-04). This is the
+current SOTA kernel indirect-call system and the paper our related
+work must anchor against.
+
+### What the paper is
+
+1. **A demolition of the type-based line** (FSA -> MLTA -> TyPM /
+   KELP / TFA / SMLTA): design-level unsoundness (type-confinement
+   asymmetry; inclusion-only cast propagation) plus imprecision
+   (FSA fallback on type escape / missing struct layers), inherited
+   by every successor. Validated with fuzzing + ~150 person-hours of
+   manual verification: MLTA has 100+ FN icalls / 1,703+ FN targets
+   on defconfig Linux-6.5, 10x more on allyesconfig. **Cite this
+   study as settling our motivation** — we no longer need to
+   re-litigate why type-based resolution can't be trusted (the
+   opaque-pointer erosion argument stays ours).
+2. **A hybrid demand-driven design**: per-address-taken-function
+   on-demand Andersen-style DFS over the SVF PAG (Unias lineage),
+   with (a) byte-offset stack (MHS) instead of paired Gep matching —
+   handles container_of-style interior pointers and (X+Y,-Z)
+   arithmetic; (b) object-level CastMap (per cast instruction, not
+   per type); (c) type-based shortcut edges (Unias) to skip long
+   propagation chains; (d) bootstrapped on-the-fly fixpoint (no MLTA
+   seed; ~4 rounds with dependency tracking DepiCalls/DepFuncs);
+   (e) embarrassing parallelism (80 threads, read-only PAG).
+3. **Headline numbers**: Linux-6.5 defconfig 10,539 icalls, avg 5.8
+   targets/icall, 8h07m CPU (8m52s wall/80T); allyesconfig 80,484
+   icalls, avg 17.5, 270 CPU-hours (3h49m wall), 246 GB RAM. 75-90%
+   target reduction vs MLTA. FN validation: 7-day Syzkaller trace
+   (937 icalls covered = **8.9% of icalls**) found 0 KallGraph FNs;
+   manual sampling found 2 icalls / 9 FN targets, attributed to SVF
+   PAG not modeling ptrtoint/inttoptr (integer-carried pointers).
+
+### The undisclosed resource heuristics (verified in code)
+
+The paper presents Algorithm 1 as a sound on-demand traversal and
+claims soundness modulo the integer-channel caveat. The released
+implementation adds THREE hard resource caps, none mentioned in the
+paper (user's report from colleagues confirmed in source):
+
+1. **DFS path-length cap = 35 edges**: `Prop()` silently returns
+   when the current path exceeds 35 PAG edges
+   (src/lib/KallGraphAlgo.cpp:35). Any alias path longer than 35
+   edges (deep copy chains, multi-hop registration relays) is
+   dropped — no counter, no log.
+2. **Dynamic hub blacklisting**: past depth 15, node visit
+   frequencies are tallied; every 20,000 deep visits the 50
+   most-visited nodes are PERMANENTLY added to `BlockedNodes`, and
+   `Prop()` refuses to traverse them thereafter
+   (KallGraphAlgo.cpp:59-81, 32-34). The blacklist persists across
+   queries — later queries inherit truncations triggered by earlier
+   ones (result even depends on query order).
+3. **Static popular-callee blocking**: formals of any function with
+   more than baseNum*5 = 250 call edges per argument are blocked
+   up front (src/lib/Util.cpp:107-115; baseNum=50 for both defconfig
+   and allyesconfig, src/include/Util.hpp:4-6, KallGraph.cpp:461).
+   This excises exactly the tiny-utility shared-param channel
+   (sort comparators, __static_call_update-class helpers) that our
+   measurements showed carries BOTH the kernel's worst conflation
+   AND real fptr flow.
+4. Lesser: type shortcuts gated at fan-out < baseNum^2 = 2,500;
+   allocator call/ret edges skipped by substring match on
+   kmalloc/kzalloc/kcalloc (KallGraphAlgo.cpp:53-57, 263, 289).
+
+### Why this matters for positioning (the thesis writes itself)
+
+Caps 1-3 are not arbitrary engineering warts — they are the
+demand-driven signature of OUR wall. The traversal drowns exactly
+where the may-alias quotient concentrates (the type-erased hub that
+carries 93% of our resolved pairs; the >250-caller utilities; paths
+through the giant component longer than any fixed budget). Their
+fix is to cap the traversal at those points; the caps fire
+precisely where the flows that are hardest to resolve live, so they
+buy tractability by silently truncating the hub — which also
+flatters precision (blocked hubs cannot contribute large target
+sets). Their empirical FN validation cannot bound what the caps
+cut: fuzz coverage was 8.9% of icalls, biased toward shallow
+easily-reached dispatch, and manual verification sampled icalls
+where KallGraph already reported targets. "Small target set" is not
+"precise" without a soundness certificate.
+
+Our contrapositive, point by point:
+- They block the hub; we keep it, explain its formation (anatomy,
+  C3), and drain it by certified constructions — identity channels
+  at answer level with -N/+0 certification and completeness
+  counters that must read zero (C2), surgical residues (C4).
+- Their exactness debt is paid in per-query resource caps
+  (unquantified FNs); ours is paid up front in the formulation
+  (answer-anchored fact space) with the exactness of every
+  subsequent transformation machine-checked (Lean) or
+  run-certified (closure certificates C0-C5). No silent fallback
+  is a project invariant enforced by assertion.
+- Whole-program economics: their cost = (address-taken functions x
+  per-query traversal x fixpoint rounds), absorbed by 80 threads
+  and 246 GB; ours = one monotone solve whose fact mass is bounded
+  by answer-relevant origins, on a desktop. Same wall, opposite
+  ledgers.
+- Their 2 admitted FNs are the integer channel (SVF PAG has no
+  int-carried-pointer edges); we model 47,676 kernel int-provenance
+  sites with witnesses and LEDGER the declines. They do not model
+  inline asm (129,812 kernel sites, 13.7% ptr-capable), PREL32
+  linker section arrays (initcalls are module-level asm, invisible
+  in the PAG), or static_call/tracepoint patching families — each a
+  modeled-or-ledgered boundary for us.
+
+### Technical kinship to acknowledge honestly
+
+- **Their MHS byte-offset stack and our Z_P shift residues are dual
+  solutions to the same discovery**: Java-style exact Dyck field
+  parens cannot express C interior pointers (their §5.3
+  counterexamples = our t_container bug of 2026-07-07). Theirs is
+  per-path state, affordable only inside a DFS; ours is the
+  whole-program summarizable form (weight-domain quotient). Cite
+  them as independent evidence that C field sensitivity does not
+  belong in the parenthesis alphabet.
+- Their on-the-fly bootstrapped fixpoint (no unsound MLTA seed) =
+  the same wiring-feedback fixpoint we integrate; their dependency
+  re-analysis (DepiCalls/DepFuncs) is the demand-side analog of our
+  incremental re-solve.
+- Their CastMap look-ahead (store only casts whose surroundings
+  have real dataflow) rhymes with our census->confirm->adopt
+  discipline, minus the completeness accounting.
+- Their observation that MLTA was "an ad-hoc hybrid pointer
+  analysis all along" (§5.2) is a genuinely good framing; our
+  spectrum picture (type-based end / CFL end / demand-driven
+  escape hatch) subsumes it.
+
+### Claims discipline for the paper
+
+- Attribute caps to "the released implementation (commit 058f9b5)",
+  with file:line, not to the paper's algorithm — the paper is
+  silent, which is itself the point (contrast with our
+  certificate/ledger methodology, not a gotcha).
+- Do NOT compare avg-targets-per-icall head-to-head as a precision
+  claim in our favor or theirs (different kernel versions/configs/
+  optimization levels, and their number embeds cap truncation);
+  compare soundness POSTURE and cost model instead. If we run a
+  head-to-head, run their released binary on our corpus and diff
+  answer sets both directions with the caps instrumented.
+- Their study's FN tables (Table 6) are a useful external ground
+  set: candidate differential targets for our kernel runs
+  (sys_call_table, rtnl doit, kprobes opt_pre_handler already in
+  our task log).
+
 ## Research question (added 2026-07-31, from the task #31 blob verdict):
 ## provable control-plane stratum separation for a monolithic kernel
 

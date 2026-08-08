@@ -362,7 +362,11 @@ moved here from the old design §3.2; §4 anatomy stays mid-paper
   table analog. NOTE: fresh-IR corpora, NOT the Graspan-suite fixed
   graphs — never imply comparability with engine-paper tables; the
   suite-graph Σ|C|² experiment (§2.1 external validation) is separate
-  and still TODO.
+  and still TODO. SATURATION BARS DONE (2026-08-08, same IR graphs,
+  GraCFL engine, 49GB cap): httpd OOM at 11:41, postgres OOM at 2:59
+  — vs flows-to 42s/0.75GB and 5:16/5.9GB complete on the identical
+  graphs. ≥65x memory (cap-censored) at httpd; the F0 exhibit no
+  longer depends on harfbuzz alone. Logs: ka-bench/{httpd,pg}-sat.log.gz.
 - E1 End-to-end: kernel 6.8 (2,618 objects), pin trajectory table:
   type-based -> flows-to v0 (14,799/5.1M) -> +summaries/invoke ->
   kernel-idchan (18,189/5.69M, 2.98 h, <45 GB). Sound micro suite +

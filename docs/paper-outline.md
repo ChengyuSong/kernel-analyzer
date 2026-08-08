@@ -350,6 +350,19 @@ moved here from the old design §3.2; §4 anatomy stays mid-paper
   remains unverified (GAPS.md) — honest scoping.
 
 ### 8. Evaluation (2.5 pp)
+- E0 Generality corpora (added 2026-08-08; first sound runs DONE,
+  pins in ~/fast/ka-bench/): httpd 2.4.68+apr (339 TUs LTO bitcode:
+  42s/0.75GB, 175M facts; type 400,968 -> CFL 108,282 = 3.7x; 1,191
+  sites avg 91 max 344 = ap_hook pools) and postgres 18.4 backend
+  (860 TUs: 5:16/5.9GB, 1.26B facts; type 2,382,359 -> CFL 398,698 =
+  6.0x; 2,452 sites avg 163 max 3,271 = fmgr-shaped pool). Both give
+  F0 curve points; both boundary ledgers populated (the census
+  discipline transfers to userspace). Known channel candidates:
+  ap_hook = CHAINREG-keyed (hook name = key); pg fmgr = static ops
+  table analog. NOTE: fresh-IR corpora, NOT the Graspan-suite fixed
+  graphs — never imply comparability with engine-paper tables; the
+  suite-graph Σ|C|² experiment (§2.1 external validation) is separate
+  and still TODO.
 - E1 End-to-end: kernel 6.8 (2,618 objects), pin trajectory table:
   type-based -> flows-to v0 (14,799/5.1M) -> +summaries/invoke ->
   kernel-idchan (18,189/5.69M, 2.98 h, <45 GB). Sound micro suite +

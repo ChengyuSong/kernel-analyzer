@@ -5056,7 +5056,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // Fast path eligibility: the measurement flags reroute joins and
       // the prot path bypasses the registry — both must stay slow-path.
       const bool fastJoinBase =
-          sinkAblatePats.empty() && !CFLProbeRodataJoins;
+          CFLJoinFastpath && sinkAblatePats.empty() && !CFLProbeRodataJoins;
       for (uint32_t o : ctx.sweepElems) {
         const uint32_t grid = g_ridBase + o;
         const bool fastJoin =

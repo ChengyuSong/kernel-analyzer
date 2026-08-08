@@ -555,6 +555,17 @@ cl::opt<bool> CFLInternPlanes(
            "in-place OR-ins would race with COW pointer swaps"),
   cl::init(true));
 
+cl::opt<bool> CFLJoinFastpath(
+  "cfl-join-fastpath",
+  cl::desc("Cluster-mark join fast path (task #48): skip the cluster-rep "
+           "registry probe when the (cluster, origin, shift) join has "
+           "already been performed — the cellJoined planes are a "
+           "monotone mirror of join effects, so a hit is always safe to "
+           "skip and a miss only falls through to the full probe. "
+           "Byte-identical answers by construction; =false to ablate "
+           "(perf measurement only)"),
+  cl::init(true));
+
 cl::opt<bool> CFLBundleProbe(
   "cfl-bundle-probe",
   cl::desc("Post-solve probe for stage-2 root bundling (task #47): "

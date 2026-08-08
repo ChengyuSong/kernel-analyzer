@@ -9,4 +9,5 @@ bash "$d/00-build-kanalyzer.sh"
 bash "$d/10-fetch-corpora.sh"
 bash "$d/20-build-corpora.sh"
 bash "$d/30-run.sh" "$@"
+if [ "${KA_ABLATE:-0}" = 1 ]; then bash "$d/35-ablate.sh" "$@"; fi
 bash "$d/40-extract.sh"

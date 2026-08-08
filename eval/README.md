@@ -48,6 +48,28 @@ backend objects only; optionally your bclist):
   ~50 GB caps: OOM (that is the measured result, not a harness
   failure).
 
+## Ablations (optional: `KA_ABLATE=1` or run `35-ablate.sh` directly)
+
+Two families with different success criteria, both diffed against
+the default ft pin (so `30-run.sh` must run first):
+
+- **exact** — perf machinery that must not change answers:
+  `noshare` (#46 COW plane sharing), `nofastjoin` (#48 cluster-mark
+  join skips), `scratch` (disable incremental), `lazymint`
+  (demand-driven minting). The script asserts byte-identical pins;
+  `MISMATCH` = soundness bug, reported loudly.
+- **precision** — identity channels / relevance discipline:
+  `notpkeys`, `noopstables`, `nocone`, `nosummaries` (kernel-only,
+  auto-skipped without `--func-summaries` in `KA_EXTRA_FLAGS`).
+  Channels only remove pairs, so the default pin must be a subset of
+  the ablated run (the `-N/+0` certification); the delta is the
+  channel's measured contribution.
+
+`KA_ABLATE_LIST="nocone notpkeys"` selects a subset. Output:
+`ablations.csv` / `ablations.md` + per-run logs and pins.
+Note ablation runs cost roughly one ft run each — at kernel scale
+pick your subset deliberately.
+
 ## Outputs (`$KA_RESULTS`)
 
 - `<corpus>-<mode>.log` — full log incl. `/usr/bin/time -v` and

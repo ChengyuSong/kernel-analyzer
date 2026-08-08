@@ -753,10 +753,12 @@ cl::opt<bool> CFLRootRelevance(
 cl::opt<bool> CFLFlowsToIncremental(
   "cfl-flows-to-incremental",
   cl::desc("Continue the flows-to solve across resolution iterations "
-           "instead of re-solving from scratch (wins at library scale; "
-           "NEGATIVE at whole-kernel scale — plane duplication at wired "
-           "call boundaries — and has an open answer-set discrepancy "
-           "there; see docs/cfl-graph-explosion-and-scaling.md)"),
+           "instead of re-solving from scratch. Task #43 (b82985d) "
+           "fixed the stale-bidi-cone divergence; km-validated EXACT "
+           "for FI configs (byte-identical, faster) and AUTO-ENABLED "
+           "there. Refused under field sensitivity (known pool-smear "
+           "divergence) and unvalidated with batching/lazy-mint (not "
+           "auto-enabled)"),
   cl::init(false));
 
 cl::opt<unsigned> CFLSolverThreads(
@@ -1107,6 +1109,30 @@ int main(int argc, char **argv) {
       errs() << "ERROR: --cfl-batch-workers requires --cfl-batch-roots "
                 "(the batch size defines what each worker solves)\n";
       exit(1);
+    }
+    // Incremental cross-iteration solving (task #43, km-validated
+    // 2026-08-07): EXACT for FI configs (byte-identical, faster, bidi
+    // cone re-admit fixed) but DIVERGENT under field sensitivity
+    // (pool-smear, -504/+0 at km all+ids, bidi-independent). Enable by
+    // default inside the validated envelope; refuse explicit requests
+    // outside it.
+    {
+      const bool fsConfig =
+          CFLFieldBuckets > 0 || !CFLNexusFields.empty();
+      if (CFLFlowsToIncremental && fsConfig) {
+        errs() << "ERROR: --cfl-flows-to-incremental is not exact under "
+                  "field sensitivity (known pool-smear divergence, task "
+                  "#43); drop it or the fs flags\n";
+        exit(1);
+      }
+      if (flowsToActive && !fsConfig &&
+          CFLFlowsToIncremental.getNumOccurrences() == 0 &&
+          CFLBatchRoots == 0 && !CFLLazyMint) {
+        CFLFlowsToIncremental = true;
+        errs() << "FlowsTo: incremental cross-iteration solving "
+                  "auto-enabled (FI config, #43-validated envelope); "
+                  "--cfl-flows-to-incremental=false to opt out\n";
+      }
     }
     if (CFLBatchRoots > 0 &&
         (CFLOpsPairs || CFLRodataCopy || CFLJoinCone)) {

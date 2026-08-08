@@ -3694,7 +3694,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // backlog (both kinds, refiltered by `joined`), dirtyBr = bridge-
   // crossing backlog (native only).
   std::vector<std::vector<FactSet>> R(N), RB(N), dirty(N),
-      jdirty(N), dirtyBr(N), joined(N);
+      jdirty(N), dirtyBr(N), joined(N), cellJoined(N);
   for (uint32_t i = 0; i < N; i++) {
     R[i].resize(NSHIFT);
     RB[i].resize(NSHIFT);
@@ -3702,6 +3702,16 @@ bool CallGraphPass::runFlowsToResolution() {
     jdirty[i].resize(NSHIFT);
     dirtyBr[i].resize(NSHIFT);
     joined[i].resize(NSHIFT); // facts already pushed to ALL cells of class
+    // cellJoined[c][s]: GLOBAL rids whose (o,s) cluster already
+    // contains cell c — a monotone mirror of the clusterRep registry
+    // outcome, indexed by the cell's class. Tested before the registry
+    // probe: 99.8% of join lookups at km were redundant re-probes of
+    // cold hash lines (36B cycles = 66% of the solve); a hit here is a
+    // guaranteed registry no-op. Marks can only be MISSED (merges
+    // release the loser's plane; the slow path re-derives) — never
+    // wrongly present, because clusters and the registry are both
+    // monotone. Persists across batches (the registry does too).
+    cellJoined[i].resize(NSHIFT);
   }
   std::vector<std::vector<uint32_t>> bridgesOf(N); // VX partners (class ids)
   std::vector<char> wflag(N, 0);
@@ -3844,6 +3854,7 @@ bool CallGraphPass::runFlowsToResolution() {
     uint64_t sweepOffered = 0, sweepKept = 0;
     uint64_t internHits = 0; // sharesDense early-outs (skipped copy+diff)
     uint64_t internShares = 0; // share-on-full-arrival adoptions
+    uint64_t cellSkips = 0; // cluster-mark join fast-path hits
   };
   // deque, not vector: forked batch workers grow it for their own
   // thread pool, and ctx0 below must stay a valid reference.
@@ -4080,6 +4091,10 @@ bool CallGraphPass::runFlowsToResolution() {
       RB[b][s].release();
       dirty[b][s].release();
       dirtyBr[b][s].release();
+      // Loser's cluster-joined marks become unreachable via find():
+      // drop them (missed marks are conservative — slow path re-probes;
+      // keeper's marks stay valid because clusters only grow).
+      cellJoined[b][s].release();
       // Join backlog: the merged cell list must be swept with every
       // fact not yet known-joined to all of it. Combine the joined
       // marks per the cell geometry above, then re-offer only the
@@ -4632,12 +4647,13 @@ bool CallGraphPass::runFlowsToResolution() {
            "flows-to incremental wiring exceeded class headroom");
     if (N2 <= N) return;
     R.resize(N2); RB.resize(N2); dirty.resize(N2); jdirty.resize(N2);
-    dirtyBr.resize(N2); joined.resize(N2);
+    dirtyBr.resize(N2); joined.resize(N2); cellJoined.resize(N2);
     for (uint32_t i = N; i < N2; i++) {
       R[i].resize(NSHIFT); RB[i].resize(NSHIFT); dirty[i].resize(NSHIFT);
       jdirty[i].resize(NSHIFT); dirtyBr[i].resize(NSHIFT);
-      joined[i].resize(NSHIFT);
+      joined[i].resize(NSHIFT); cellJoined[i].resize(NSHIFT);
     }
+    virginPl.resize((size_t)N2 * NSHIFT, 0); // flat n*NSHIFT+s: rows append
     outA.resize(N2); outF.resize(N2); cellsOf.resize(N2);
     bridgesOf.resize(N2);
     wflag.resize(N2, 0);
@@ -5037,11 +5053,26 @@ bool CallGraphPass::runFlowsToResolution() {
       ctx.sweepElems.clear();
       todo.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
       bool firstFact = true;
+      // Fast path eligibility: the measurement flags reroute joins and
+      // the prot path bypasses the registry — both must stay slow-path.
+      const bool fastJoinBase =
+          sinkAblatePats.empty() && !CFLProbeRodataJoins;
       for (uint32_t o : ctx.sweepElems) {
+        const uint32_t grid = g_ridBase + o;
+        const bool fastJoin =
+            fastJoinBase && !(protOn && s == 0 && protRid.count(grid));
         bool aborted = false;
         for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
+          // Value copy: joinCluster's merges can splice/clear this
+          // very list — never index cellsOf[n] after the call.
+          const uint32_t cell = cellsOf[n][ci];
+          if (fastJoin && cellJoined[find(cell)][s].test(grid)) {
+            ctx.cellSkips++; // registry no-op, proven by the mark
+            continue;
+          }
           ctx.nJoinLk++;
-          joinCluster(cellsOf[n][ci], g_ridBase + o, s);
+          joinCluster(cell, grid, s);
+          if (fastJoin) cellJoined[find(cell)][s].set(grid);
           if (find(n) != n) { aborted = true; break; }
         }
         if (aborted) break;
@@ -7104,7 +7135,7 @@ bool CallGraphPass::runFlowsToResolution() {
 
   // Reduce per-thread counters into the reporting totals.
   uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
-  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0;
+  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0, cellSkips = 0;
   for (auto &c : ctxs) {
     cyJoin += c.cyJoin; cyBridge += c.cyBridge; cyScan += c.cyScan;
     cyW += c.cyW; cyA += c.cyA; cyF += c.cyF;
@@ -7112,13 +7143,15 @@ bool CallGraphPass::runFlowsToResolution() {
     orWords += c.orWords;
     sweepOffered += c.sweepOffered;
     sweepKept += c.sweepKept;
+    cellSkips += c.cellSkips;
   }
   if (prof) {
     const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
     auto pct = [&](uint64_t c) { return cyTot ? (double)c * 100.0 / cyTot : 0.0; };
     errs() << "SolverProf: total " << cyTot << " cycles in pop loop\n";
     errs() << "SolverProf: join   " << cyJoin << " (" << pct(cyJoin)
-           << "%), lookups " << nJoinLk << " (seq sub-phase " << seqJoinCy
+           << "%), lookups " << nJoinLk << ", cluster-mark skips "
+           << cellSkips << " (seq sub-phase " << seqJoinCy
            << ", merge " << cyMerge << " cycles)\n";
     errs() << "SolverProf: bridge " << cyBridge << " (" << pct(cyBridge) << "%)\n";
     errs() << "SolverProf: scan   " << cyScan << " (" << pct(cyScan) << "%)\n";

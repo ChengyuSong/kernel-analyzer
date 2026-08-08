@@ -1,27 +1,28 @@
-# Design section (paper-ready draft, 2026-08-08)
+# Design section (paper-ready draft, 2026-08-08; rev 2 same day)
 
 Drafted after the #46–#48 perf arc closed the measured-lever board.
-This consolidates the outline's §3–§7 into one design exposition
-organized by the three technical challenges. If the paper keeps the
-staircase organization (paper-outline.md), split at the marked seams;
-the principles and interplay subsections survive either way.
-Citation keys and cross-references are placeholders; every number
-cites a pinned baseline or a committed measurement.
+Rev 2: the pre-design measurements (closure-wall autopsy, boundary
+census) moved OUT to §2 (docs/measurement-section.md); this section
+now opens from that section's requirements R1–R4. Consolidates the
+outline's §3–§7; split at the marked seams if the staircase
+organization wins. Citation keys and cross-references are
+placeholders; every number cites a pinned baseline or a committed
+measurement.
 
 ---
 
 # 3. Design
 
-Constructing a sound, precise call graph for a monolithic kernel is
-three problems wearing one coat. **Scalability**: the sound
-formulation's closure is quadratic in alias-component mass, and no
-engine can outrun its own output. **Soundness**: the kernel's dispatch
-fabric routinely bypasses the IR channels analyses model, and solver
-approximations lose flows silently unless something forces them not
-to. **Precision**: sound propagation pools most of the kernel into one
-may-alias class, and naive refinements of that class either explode
-cost or break soundness. This section presents the design as three
-answers that share one discipline. Three principles run through it:
+Section 2 left a specification: change what is computed rather than
+how fast it is computed (R1), tolerate no silent resource caps (R2),
+model or ledger every boundary channel (R3), and make exactness
+checkable at a scale where no one reviews the answers (R4). This
+section presents a design built to that specification. Its three
+axes — **scalability**, **soundness**, **precision** — are three
+problems wearing one coat: the closure that explodes and the
+may-alias pooling that destroys precision are the same quantity, and
+the soundness machinery is what lets the other two axes move
+aggressively. Three principles run through everything:
 
 - **P1 — Anchor, don't materialize.** Never compute a relation larger
   than the answers require. The fact space is anchored at origins;
@@ -38,28 +39,12 @@ answers that share one discipline. Three principles run through it:
 
 ## 3.1 Scalability: from a quadratic closure to answer-anchored facts
 
-**The wall.** CFL-reachability over LLVM IR builds graphs with
-assistant memory cells per load/store, SSA copy chains, and
-whole-program linkage — millions of nodes before any closure. The
-standard formulation saturates a pairwise alias relation V, and its
-size obeys a simple law we measure directly: |V| ≈ Σ|C|² over
-a-connected components C. This is an *output* bound: an engine's work
-is lower-bounded by the closure it must materialize, so better
-engines reach the floor faster rather than lowering it. Our baseline
-uses the best engine available on these graphs (GraCFL, which
-outperforms POCR here); it exhausts 49 GB on a single *library*
-(harfbuzz), two orders of magnitude below the kernel. The two
-remedies the literature reaches for — graph deduplication and
-RSM-based folding — were implemented and are null: they shrink the
-graph, and the closure does not care. Nor is demand-driven analysis
-an escape for this problem specifically: a call graph is irreducibly
-whole-program, because every indirect-call site is a query, the
-queries share nearly all their work through the giant alias
-structure, and resolution feeds back — each resolved target wires new
-interprocedural edges that change every other query. Iterated
-on-demand is the closure re-paid per fixpoint round; the released
-state-of-the-art demand-driven system resorts to undisclosed
-traversal caps precisely where this structure concentrates (§9).
+R1 rules out both roads already traveled: saturation materializes the
+Θ(Σ|C|²) closure that drowned the baseline (§2.1), and per-query
+traversal re-pays the shared exploration once per wiring round. What
+a call graph needs is a formulation that is whole-program in
+*coverage* but demand-shaped in *fact mass* — all demands answered at
+once, anchored at the only identities the answers are made of.
 
 **Answer-anchored flows-to (P1).** The reformulation stores no
 pairwise facts. Each *origin* — a function, global, or allocation
@@ -140,38 +125,30 @@ a 62 GB desktop.
 
 ## 3.2 Soundness: no silent fallback, certified at every layer
 
-**The challenge has two faces.** Outward: the kernel dispatches
-through channels that vanilla IR modeling never sees — inline
-assembly (129,812 sites in our corpus; 13.7% pointer-capable),
-integer-laundered pointers (`ptrtoint`/`inttoptr`, including atomics
-lowered to integer operations), linker section arrays whose initcall
-tables are module-level assembly invisible to any instruction walk,
-and patching families (static_call, tracepoints) whose call targets
-exist only as relocation state. Inward: a solver under scaling
-pressure accumulates approximations, and each one is a place where
-flows can vanish without a trace. The design treats both faces with
-the same instrument set.
+**The challenge has two faces.** Outward, the dispatch-fabric census
+of §2.2: assembly, integer-laundered pointers, section arrays,
+patching families — R3's obligation list. Inward: a solver under
+scaling pressure accumulates approximations, and each one is a place
+where flows can vanish without a trace. The design treats both faces
+with the same instrument set.
 
-**Boundary: census, then model-or-ledger.** The encoder is
-*language-total by construction*: a disposition table over every
-LLVM instruction kind is checked against the compiler's own
-definition list on every run, and an undispositioned kind aborts the
-analysis rather than defaulting. On top of that closed world, each
-boundary channel is either modeled with an explicit witness or
-declined into a named ledger counter: inline assembly is classified
-by constraint signature (pointer-capable templates modeled;
-immediate-only categories excluded honestly); integer-carried
-pointers get witness-gated pointer-width load/store edges (47,676
-kernel sites modeled; every declined case counted); section arrays
-receive their own node identities with closed-world bounds rather
-than resolving to an unsound empty or a universal blob; and the
-extern boundary is a standing proof obligation — a census that
-cross-checks every unresolved symbol against the link map (for our
-kernel corpus it is *closed*: six truly undefined symbols, all from
-one object file absent from the build list, none carrying function
-pointers). The ledger is not an apology; it is the audit surface: a
-reader can enumerate exactly what the analysis declined to model and
-what evidence gates each modeled channel.
+**Boundary: the census as a gate, then model-or-ledger.** The §2.2
+census is not documentation — it is *enforced*. The
+instruction-disposition check runs on every analysis invocation and
+aborts on an undispositioned kind; nothing defaults. Each channel
+the census names is then either modeled with an explicit witness or
+declined into a named ledger counter: pointer-capable assembly
+templates get edges derived from their constraint signatures
+(immediate-only categories excluded, and said so); integer-carried
+pointers get witness-gated pointer-width load/store edges, with
+every declined case counted; section arrays receive their own node
+identities with closed-world bounds rather than resolving to an
+unsound empty or a universal blob; patching families are handled as
+identity channels (§3.3), whose completeness counters must read
+zero. The extern-boundary census re-runs per corpus as a standing
+proof obligation. The ledger is not an apology; it is the audit
+surface: a reader can enumerate exactly what the analysis declined
+to model and what evidence gates each modeled channel.
 
 **Approximation: proof where theory reaches, certificates where it
 does not.** The solver's central invariants are mechanized in Lean
@@ -197,17 +174,13 @@ envelope are *refused at startup* rather than degraded: incremental
 solving under field sensitivity, for example, exits with the named
 divergence rather than running approximately.
 
-**The contrast that motivates the discipline.** The state-of-the-art
-alternative validates soundness empirically — fuzzing coverage over
-8.9% of call sites and manual sampling — while its released
-implementation caps traversal depth and blacklists its hottest nodes,
-precisely where dispatch flow concentrates and where fuzzing sees
-least. We take the opposite bet: soundness claims are only as good as
-their least-audited approximation, so the design makes silent
-approximation structurally unavailable. [Seam: soundness machinery
-recurs in §3.1's staging proofs and §3.3's channel completeness
-counters; in a split organization this subsection owns the census +
-Lean + certificate exposition.]
+This is R2 made structural: where the state of the art moves its
+unsoundness into resource caps at the least-auditable point (§2.1),
+this design makes silent approximation unavailable by construction.
+[Seam: soundness machinery recurs in §3.1's staging proofs and
+§3.3's channel completeness counters; in a split organization this
+subsection owns the Lean + certificate exposition, §2.2 owns the
+census numbers.]
 
 ## 3.3 Precision: understand the quotient, then drain it at the answer layer
 
@@ -305,24 +278,22 @@ and provability climbing the same stairs.
 
 ## Notes for the writer (not part of the section)
 
-- Numbers used and their pins: Σ|C|² law + harfbuzz 49GB OOM
-  (docs/cfl-graph-explosion-and-scaling.md §R1); first whole-kernel
+- Rev 2 split: wall autopsy + boundary census numbers now live in
+  §2 (docs/measurement-section.md); this section references R1–R4
+  and keeps only design-side numbers.
+- Numbers used and their pins: first whole-kernel
   14,799/5.1M/~20min (kernel-full3); canonical pin 18,189/5.69M/2.98h
   (kernel-idchan); wave 11–39x; #48 lookups 39.94M→96k / cycles
   −21.5%; fs surgical 98.3%@1/3 cost + identity-residue 30% (task
   #39); batch width 42.5→2.5KB, spill ~600x, 62GB desktop [PENDING
   kernel fs completion]; identity channels −1.50M/−1.20M = 32%;
   anatomy 41/41,350, 0.98% welds, 93% giant; #44 recall +1,038 (km);
-  IntProvenance 47,676; asm census 129,812/13.7%; extern census 6/1
-  missing TU; falsifications: dedup×2, folding, delta re-offer,
-  heap-split +11k, origin-split 0.000%, tracepoint cells v1/v2,
-  lazy-mint A-loop refutation, #7 in-flight duplication, #8 fs
-  bundling. Cross-check all against the stats files before
-  submission; km numbers are subset-scale evidence, kernel numbers
-  are the headline scale — keep the distinction explicit in prose.
-- The KallGraph contrast paragraph (§3.2) duplicates related-work
-  material by design — keep whichever placement survives editing,
-  not both at full length.
+  falsifications: dedup×2, folding, delta re-offer, heap-split +11k,
+  origin-split 0.000%, tracepoint cells v1/v2, lazy-mint A-loop
+  refutation, #7 in-flight duplication, #8 fs bundling. Cross-check
+  all against the stats files before submission; km numbers are
+  subset-scale evidence, kernel numbers are the headline scale —
+  keep the distinction explicit in prose.
 - If the staircase organization wins, the seams marked [Seam] split
   this into outline §2/§3 (scalability), a soundness-methodology
   section, and §4–§5 (anatomy + channels); 3.4 becomes the closing

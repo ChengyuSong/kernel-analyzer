@@ -249,7 +249,16 @@ C6 (maybe folded into C3). **Methodology: falsifications as results.**
   diagnosis forces.
 - Contributions bullet list (C0-C5/6).
 
-### 2. Demystifying the wall: LLVM-IR CFL-reachability doesn't scale (2 pp) — C0, W0
+### 2. Measurement study: what a kernel call graph actually requires (2–2.5 pp) — C0, W0
+DEDICATED PRE-DESIGN MEASUREMENT SECTION (decided 2026-08-08; draft in
+docs/measurement-section.md). Carries ONLY tool-independent
+measurements; adjudicates the two-colleague dispute with data; ends
+with requirements R1–R4 that §3 (design, docs/design-section.md rev 2)
+opens from. Two subsections: 2.1 the closure wall (below), 2.2 the
+dispatch-fabric census (asm 129,812/13.7%, int-provenance 47,676,
+PREL32 section arrays, patching families, extern boundary closed) —
+moved here from the old design §3.2; §4 anatomy stays mid-paper
+(tool-produced measurements); §8 eval keeps outcomes only.
 - The setting that makes the claim precise: LLVM-IR-level graphs
   (assistant cell nodes per load/store, copy chains from SSA, whole-
   program linkage — millions of nodes BEFORE closure), not the smaller

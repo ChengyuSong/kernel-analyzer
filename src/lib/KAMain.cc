@@ -555,6 +555,17 @@ cl::opt<bool> CFLInternPlanes(
            "in-place OR-ins would race with COW pointer swaps"),
   cl::init(true));
 
+cl::opt<bool> CFLBundleProbe(
+  "cfl-bundle-probe",
+  cl::desc("Post-solve probe for stage-2 root bundling (task #47): "
+           "group roots that co-travel BY CONSTRUCTION (co-resident "
+           "minted classes; identical successor signatures), then "
+           "classify every (plane,group) as FULL (bundleable; savings "
+           "= members-1) or PARTIAL (design-1 split events / design-2 "
+           "exactness violations). Decision data only; no behavior "
+           "change"),
+  cl::init(false));
+
 cl::opt<bool> CFLInternSweep(
   "cfl-intern-sweep",
   cl::desc("Additionally run a periodic content-hash sweep unifying "

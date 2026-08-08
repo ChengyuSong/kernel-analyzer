@@ -7735,6 +7735,172 @@ bool CallGraphPass::runFlowsToResolution() {
            << " ms\n";
   }
 
+  // --cfl-bundle-probe (task #47): go/no-go data for stage-2 root
+  // bundling. Structural groups = roots co-traveling BY CONSTRUCTION:
+  // (a) roots whose minted classes sit in one quotient class (merged),
+  // (b) singleton-class roots whose classes share an identical
+  // post-merge a/f-successor signature (the ops-table confluence
+  // pattern). Then one pass over the final planes classifies each
+  // (plane, group) as FULL (all members present — bundleable; savings
+  // = members-1) or PARTIAL (proper subset — design 1's split events
+  // and design 2's exactness violations; end state suffices because
+  // join outcomes are order-independent by closure confluence).
+  // Own-seed singletons are the expected private prefix, reported
+  // separately.
+  if (CFLBundleProbe) {
+    auto mixb = [](uint64_t x) {
+      x += 0x9E3779B97F4A7C15ULL;
+      x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+      x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+      return x ^ (x >> 31);
+    };
+    // Pass 1: per-root presence + column hash (for the clean-group
+    // cross-check against end-state column equality).
+    std::vector<uint64_t> colHashB(nextRoot, 0);
+    std::vector<uint32_t> colCntB(nextRoot, 0);
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        const uint64_t cellKey = (uint64_t)n * NSHIFT + s;
+        R[n][s].forEach([&](uint32_t r) {
+          colHashB[r] ^= mixb(cellKey);
+          colCntB[r]++;
+        });
+      }
+    }
+    // Grouping: bucket active roots by quotient rep of the minted
+    // class; leftover singletons bucket by successor signature.
+    std::vector<uint32_t> groupOf(nextRoot, UINT32_MAX);
+    std::vector<uint32_t> groupSize, groupFn;
+    {
+      std::unordered_map<uint32_t, std::vector<uint32_t>> byRep;
+      uint64_t exactExcluded = 0;
+      for (uint32_t rid = 0; rid < nextRoot; rid++) {
+        if (!colCntB[rid]) continue;
+        // Under the nexus gate, exact-minted roots exist to DIVERGE
+        // (residue discrimination) — grouping them poisons co-travel;
+        // bundle candidates are the wildcard-minted (FI-behaving) bulk.
+        if (nexusGate && rid < rootNexus.size() && rootNexus[rid]) {
+          exactExcluded++;
+          continue;
+        }
+        byRep[find(rootClassOf[rid])].push_back(rid);
+      }
+      if (exactExcluded)
+        errs() << "BundleProbe: excluded " << exactExcluded
+               << " exact-minted roots from grouping\n";
+      std::unordered_map<uint64_t, std::vector<uint32_t>> bySig;
+      auto newGroup = [&](const std::vector<uint32_t> &v) {
+        const uint32_t gid = (uint32_t)groupSize.size();
+        uint32_t fn = 0;
+        for (uint32_t rid : v) {
+          groupOf[rid] = gid;
+          fn += funcRootOf.count(rid) ? 1 : 0;
+        }
+        groupSize.push_back((uint32_t)v.size());
+        groupFn.push_back(fn);
+      };
+      for (auto &[rep, v] : byRep) {
+        if (v.size() >= 2) {
+          newGroup(v);
+          continue;
+        }
+        llvm::SmallVector<uint32_t, 8> succ;
+        for (uint32_t t : outA[rep]) succ.push_back(find(t));
+        for (auto [t, rr] : outF[rep]) succ.push_back(find(t));
+        if (succ.empty()) continue;
+        std::sort(succ.begin(), succ.end());
+        succ.erase(std::unique(succ.begin(), succ.end()), succ.end());
+        uint64_t h = mixb(succ.size());
+        for (uint32_t t : succ) h = h * 1099511628211ull ^ mixb(t);
+        bySig[h].push_back(v[0]);
+      }
+      for (auto &[h, v] : bySig)
+        if (v.size() >= 2) newGroup(v);
+    }
+    const uint32_t nGroups = (uint32_t)groupSize.size();
+    // Pass 2: classify plane×group occupancy.
+    uint64_t totalFactsB = 0, ungrouped = 0, fullMass = 0, savings = 0,
+             fullPlanes = 0, partialMass = 0, partialPlanes = 0,
+             ownSeedMass = 0, fnSavings = 0;
+    std::unordered_map<uint32_t, uint32_t> tally, soleRid;
+    for (uint32_t n = 0; n < N; n++) {
+      if (find(n) != n) continue;
+      for (uint32_t s = 0; s < NSHIFT; s++) {
+        if (R[n][s].none()) continue;
+        tally.clear();
+        soleRid.clear();
+        R[n][s].forEach([&](uint32_t r) {
+          totalFactsB++;
+          const uint32_t g = groupOf[r];
+          if (g == UINT32_MAX) {
+            ungrouped++;
+            return;
+          }
+          soleRid[g] = r;
+          tally[g]++;
+        });
+        for (auto &[g, c] : tally) {
+          if (c == groupSize[g]) {
+            fullMass += c;
+            fullPlanes++;
+            savings += c - 1;
+            if (groupFn[g] == groupSize[g]) fnSavings += c - 1;
+          } else {
+            partialMass += c;
+            partialPlanes++;
+            if (c == 1 && find(rootClassOf[soleRid[g]]) == n)
+              ownSeedMass += 1;
+          }
+        }
+      }
+    }
+    // Clean groups: all members share one end-state column (identical
+    // (hash,count)) — these bundle with zero exactness machinery.
+    uint64_t cleanGroups = 0, cleanRoots = 0;
+    {
+      std::vector<uint64_t> gh(nGroups, 0);
+      std::vector<uint8_t> gClean(nGroups, 1), gSeen(nGroups, 0);
+      std::vector<uint32_t> gCnt(nGroups, 0);
+      for (uint32_t rid = 0; rid < nextRoot; rid++) {
+        const uint32_t g = groupOf[rid];
+        if (g == UINT32_MAX) continue;
+        const uint64_t key = mixb(colHashB[rid]) ^ mixb(colCntB[rid]);
+        if (!gSeen[g]) {
+          gSeen[g] = 1;
+          gh[g] = key;
+          gCnt[g] = colCntB[rid];
+        } else if (gh[g] != key || gCnt[g] != colCntB[rid]) {
+          gClean[g] = 0;
+        }
+      }
+      for (uint32_t g = 0; g < nGroups; g++)
+        if (gSeen[g] && gClean[g]) {
+          cleanGroups++;
+          cleanRoots += groupSize[g];
+        }
+    }
+    std::vector<uint32_t> topSz(groupSize);
+    std::sort(topSz.rbegin(), topSz.rend());
+    errs() << "BundleProbe: " << nGroups << " structural groups over "
+           << std::accumulate(groupSize.begin(), groupSize.end(), 0ull)
+           << " roots; top sizes";
+    for (size_t i = 0; i < topSz.size() && i < 5; i++)
+      errs() << " " << topSz[i];
+    errs() << "\n";
+    errs() << "BundleProbe: facts " << totalFactsB << ", ungrouped "
+           << ungrouped << "; FULL planes " << fullPlanes << " mass "
+           << fullMass << " -> savings " << savings << " ("
+           << (totalFactsB ? 100.0 * savings / totalFactsB : 0.0)
+           << "% of facts; fn-only-group share " << fnSavings << ")\n";
+    errs() << "BundleProbe: PARTIAL planes " << partialPlanes
+           << " mass " << partialMass << " ("
+           << (totalFactsB ? 100.0 * partialMass / totalFactsB : 0.0)
+           << "%), own-seed prefix singletons " << ownSeedMass << "\n";
+    errs() << "BundleProbe: clean groups (end-state-identical columns) "
+           << cleanGroups << "/" << nGroups << " covering " << cleanRoots
+           << " roots\n";
+  }
   if (CFLCoTravelStats) {
     auto mix64 = [](uint64_t x) {
       x += 0x9E3779B97F4A7C15ULL;

@@ -53,7 +53,8 @@ for c in "${corpora[@]}"; do
     *) echo "unknown corpus $c" >&2; exit 1 ;;
   esac
   [ -s "$bl" ] || { echo "missing bclist $bl (run 20-build-corpora.sh)" >&2; exit 1; }
-  run_one "$c" "$bl" ft
-  run_one "$c" "$bl" sat
+  for m in $KA_MODES; do
+    run_one "$c" "$bl" "$m"
+  done
 done
 echo "OK: logs + pins in $KA_RESULTS"

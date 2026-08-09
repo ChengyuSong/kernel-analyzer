@@ -49,6 +49,10 @@ export LC_ALL=C
 # KA_MEM_LIMIT_MODE: empty = analyzer default (RLIMIT_AS); "rss" for
 # RSS-watchdog mode (big-machine kernel runs used rss).
 export KA_MEM_LIMIT_MODE="${KA_MEM_LIMIT_MODE:-}"
+# KA_MODES: which of ft/sat 30-run.sh executes per corpus. A/B config
+# runs (e.g. kernel FI vs selective-fs) want "ft" for the second
+# invocation so the saturation bar isn't paid twice.
+export KA_MODES="${KA_MODES:-ft sat}"
 
 ka_memflag() {
   if [ "$KA_MEM_LIMIT_GB" != "0" ]; then echo "--mem-limit=$KA_MEM_LIMIT_GB"; fi

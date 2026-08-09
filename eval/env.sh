@@ -46,8 +46,13 @@ export KA_USER_NAME="${KA_USER_NAME:-user-corpus}"
 export MALLOC_ARENA_MAX=2
 export LC_ALL=C
 
+# KA_MEM_LIMIT_MODE: empty = analyzer default (RLIMIT_AS); "rss" for
+# RSS-watchdog mode (big-machine kernel runs used rss).
+export KA_MEM_LIMIT_MODE="${KA_MEM_LIMIT_MODE:-}"
+
 ka_memflag() {
   if [ "$KA_MEM_LIMIT_GB" != "0" ]; then echo "--mem-limit=$KA_MEM_LIMIT_GB"; fi
+  if [ -n "$KA_MEM_LIMIT_MODE" ]; then echo "--mem-limit-mode=$KA_MEM_LIMIT_MODE"; fi
 }
 
 ka_require() {

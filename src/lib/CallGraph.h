@@ -177,6 +177,7 @@ private:
   void confirmFreshWrappers();
   void runInvokeCensus();
   void runFieldChannelCensus();
+  void runRegFieldGapReport(); // targeted-fs detector (post-solve)
   void confirmInvokeSummaries();
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
   void runPtrToIntCensus(); // task #33: int-provenance residue sizing

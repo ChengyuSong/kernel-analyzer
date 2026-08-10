@@ -326,6 +326,18 @@ cl::opt<bool> CFLCensusFields(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLRegFieldReport(
+  "cfl-regfield-report",
+  cl::desc("Post-solve targeted-fs detector: rank (struct+offset) "
+           "registration fields by the gap between resolved icall "
+           "fanout at their readers and the witnessed registration "
+           "population stored through them (constant stores, one "
+           "install-API argument hop, initializer slots, copy-edge "
+           "closure). Narrow population under wide fanout = the "
+           "deep-collapse signature; emits a suggested "
+           "--cfl-nexus-fields list. Report only, adds no edges"),
+  cl::init(false));
+
 cl::opt<std::string> CFLProbeStratumAblate(
   "cfl-probe-stratum-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "

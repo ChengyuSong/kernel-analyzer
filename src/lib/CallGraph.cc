@@ -11785,6 +11785,240 @@ void CallGraphPass::runFieldChannelCensus() {
            << " stored at " << ogRank[i].first << " sites\n";
 }
 
+// --cfl-regfield-report (targeted-fs detector): rank (struct+offset)
+// registration fields by the gap between the resolved fanout at their
+// reader icalls and the registration population actually stored
+// through them. A narrow witnessed population under a huge fanout is
+// the deep-collapse signature: the reader inherited a pooled cone
+// that field residues would sever, so the parent struct is a
+// candidate for --cfl-nexus-fields. Targeted fs is exact by
+// construction — the suggestion only chooses where residues are
+// SPENT, so an open (unwitnessed) population is never a soundness
+// problem, it just stays out of the auto-suggestion. Population
+// sources: constant-Function stores; one argument hop for
+// install-API shapes (the constant lives at the API's callers);
+// global-initializer slots; copy-edge closure between field keys
+// (control-struct relays). Keys with dispatch but no witnessed
+// population are reported unsuggested — same-slot instance pools
+// (work/timer rendezvous) look exactly like that, and residues
+// cannot split them.
+void CallGraphPass::runRegFieldGapReport() {
+  // Deepest named struct traversed by the GEP chain + byte offset
+  // within it ("var" once a non-constant index follows the struct).
+  auto deepKey = [](const Value *P, const DataLayout &DL) -> std::string {
+    P = P->stripPointerCasts();
+    SmallVector<const GEPOperator *, 4> chain;
+    while (const auto *G = dyn_cast<GEPOperator>(P)) {
+      chain.push_back(G);
+      P = G->getPointerOperand()->stripPointerCasts();
+    }
+    std::string SName;
+    uint64_t SOff = 0;
+    bool haveS = false, varTail = false;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      for (auto GTI = gep_type_begin(*it), E = gep_type_end(*it); GTI != E;
+           ++GTI) {
+        if (StructType *ST = GTI.getStructTypeOrNull()) {
+          uint64_t fi = cast<ConstantInt>(GTI.getOperand())->getZExtValue();
+          uint64_t eo = DL.getStructLayout(ST)->getElementOffset(fi);
+          if (ST->hasName()) {
+            SName = stripStructNameSuffix(ST->getStructName()).str();
+            SOff = eo;
+            haveS = true;
+            varTail = false;
+          } else if (haveS && !varTail) {
+            SOff += eo;
+          }
+        } else if (haveS && !varTail) {
+          if (const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand()))
+            SOff += (uint64_t)CI->getSExtValue() *
+                    DL.getTypeAllocSize(GTI.getIndexedType());
+          else
+            varTail = true;
+        }
+      }
+    }
+    if (!haveS) return std::string();
+    return SName + "+" +
+           (varTail ? std::string("var") : std::to_string(SOff));
+  };
+
+  std::map<std::string, std::set<std::string>> regs; // key -> fn names
+  std::set<std::string> open;                        // unwitnessed stores
+  std::map<std::string, std::set<std::string>> copyIn; // dst <- src keys
+
+  for (auto &mp : Ctx->Modules) {
+    const DataLayout &DL = mp.first->getDataLayout();
+    // registration side: dynamic stores
+    for (Function &F : *mp.first) {
+      if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
+      if (shouldSkipFunction(&F)) continue;
+      for (const Instruction &I : instructions(F)) {
+        const auto *SI = dyn_cast<StoreInst>(&I);
+        if (!SI) continue;
+        std::string Key = deepKey(SI->getPointerOperand(), DL);
+        if (Key.empty()) continue;
+        const Value *V = SI->getValueOperand()->stripPointerCasts();
+        if (const auto *Fn = dyn_cast<Function>(V)) {
+          regs[Key].insert(Fn->getName().str());
+        } else if (const auto *A = dyn_cast<Argument>(V)) {
+          bool any = false;
+          auto ci = Ctx->Callers.find(A->getParent());
+          if (ci != Ctx->Callers.end())
+            for (auto *CB : ci->second)
+              if (A->getArgNo() < CB->arg_size())
+                if (const auto *CF = dyn_cast<Function>(
+                        CB->getArgOperand(A->getArgNo())
+                            ->stripPointerCasts())) {
+                  regs[Key].insert(CF->getName().str());
+                  any = true;
+                }
+          if (!any) open.insert(Key);
+        } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
+          std::string SK = deepKey(LI->getPointerOperand(), DL);
+          if (!SK.empty() && SK != Key)
+            copyIn[Key].insert(SK);
+          else
+            open.insert(Key);
+        } else if (containsPointerType(V->getType())) {
+          open.insert(Key);
+        }
+      }
+    }
+    // registration side: global-initializer slots (immediate parent)
+    for (GlobalVariable &GV : mp.first->globals()) {
+      if (!GV.hasInitializer()) continue;
+      std::function<void(const Constant *)> walk = [&](const Constant *C) {
+        if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
+          StructType *ST = CS->getType();
+          const StructLayout *SL = DL.getStructLayout(ST);
+          for (unsigned i = 0; i < CS->getNumOperands(); i++) {
+            const Constant *E = CS->getOperand(i);
+            const auto *Fn = dyn_cast<Function>(E->stripPointerCasts());
+            if (Fn && ST->hasName())
+              regs[stripStructNameSuffix(ST->getStructName()).str() + "+" +
+                   std::to_string(SL->getElementOffset(i))]
+                  .insert(Fn->getName().str());
+            else if (!Fn)
+              walk(E);
+          }
+        } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+          for (const Use &Op : CA->operands())
+            walk(cast<Constant>(Op.get()));
+        }
+      };
+      walk(GV.getInitializer());
+    }
+  }
+
+  // Copy-edge closure (control-struct relays): populations and
+  // openness both flow along key-to-key copies.
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto &[dst, srcs] : copyIn) {
+      auto &D = regs[dst];
+      size_t before = D.size();
+      bool wasOpen = open.count(dst);
+      for (const auto &s : srcs) {
+        auto ri = regs.find(s);
+        if (ri != regs.end())
+          D.insert(ri->second.begin(), ri->second.end());
+        if (open.count(s)) open.insert(dst);
+      }
+      if (D.size() != before || (!wasOpen && open.count(dst)))
+        changed = true;
+    }
+  }
+
+  // Dispatch side: field-load-fed icalls with their resolved fanout.
+  struct Disp {
+    size_t sites = 0, maxFan = 0;
+    uint64_t sumFan = 0;
+    std::string sample;
+  };
+  std::map<std::string, Disp> disp;
+  for (auto *CB : Ctx->IndirectCallInsts) {
+    auto ci = Ctx->Callees.find(CB);
+    if (ci == Ctx->Callees.end() || ci->second.empty()) continue;
+    const auto *LI =
+        dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
+    if (!LI) continue;
+    std::string Key =
+        deepKey(LI->getPointerOperand(), LI->getModule()->getDataLayout());
+    if (Key.empty()) continue;
+    Disp &D = disp[Key];
+    D.sites++;
+    D.sumFan += ci->second.size();
+    D.maxFan = std::max(D.maxFan, (size_t)ci->second.size());
+    if (D.sample.empty())
+      D.sample = CB->getFunction()->getName().str();
+  }
+
+  // Rank by fanout; auto-suggest narrow closed-enough populations
+  // under wide fanout. Thresholds are report-tuning, not soundness.
+  struct Row {
+    const std::string *key;
+    size_t pop;
+    bool op, flag;
+    const Disp *d;
+  };
+  std::vector<Row> rows;
+  std::set<std::string> suggest;
+  size_t witnessed = 0, flagged = 0;
+  for (auto &[K, D] : disp) {
+    size_t pop = 0;
+    auto ri = regs.find(K);
+    if (ri != regs.end()) pop = ri->second.size();
+    if (pop) witnessed++;
+    bool flag = pop > 0 && pop <= 32 && D.maxFan >= 24 &&
+                D.maxFan >= 4 * pop;
+    if (flag) {
+      flagged++;
+      // --cfl-nexus-fields takes bare names and prepends "struct.";
+      // non-struct-prefixed keys (unions) are not expressible there.
+      StringRef sn = StringRef(K).take_front(K.find('+'));
+      if (sn.consume_front("struct."))
+        suggest.insert(sn.str());
+    }
+    rows.push_back({&K, pop, open.count(K) != 0, flag, &D});
+  }
+  std::sort(rows.begin(), rows.end(), [](const Row &A, const Row &B) {
+    if (A.flag != B.flag) return A.flag;
+    return A.d->maxFan > B.d->maxFan;
+  });
+  errs() << "RegFieldGap: " << disp.size() << " dispatch field keys ("
+         << witnessed << " with witnessed population), " << flagged
+         << " flagged across " << suggest.size() << " structs\n";
+  size_t shown = 0;
+  for (const Row &R : rows) {
+    if (shown++ >= 60) break;
+    errs() << "RegFieldGap: " << (R.flag ? "FLAG " : "     ") << *R.key
+           << " stored=" << R.pop << (R.op ? "+" : "")
+           << " sites=" << R.d->sites << " fanout max=" << R.d->maxFan
+           << " avg=" << (R.d->sumFan / R.d->sites) << " dispatch@"
+           << R.d->sample;
+    auto ri = regs.find(*R.key);
+    if (ri != regs.end()) {
+      errs() << " fns:";
+      size_t n = 0;
+      for (const auto &N : ri->second) {
+        if (n++ >= 3) break;
+        errs() << " " << N;
+      }
+    }
+    errs() << "\n";
+  }
+  if (!suggest.empty()) {
+    errs() << "RegFieldGap SUGGEST --cfl-nexus-fields=";
+    bool first = true;
+    for (const auto &S : suggest) {
+      errs() << (first ? "" : ",") << S;
+      first = false;
+    }
+    errs() << "\n";
+  }
+}
+
 // --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries
 // where the proof is LOCAL, under the #17 completeness discipline — a
 // summary replaces callsite arg/ret wiring, so every pointer formal
@@ -13900,6 +14134,8 @@ bool CallGraphPass::doFinalization(Module *M) {
                  << " -> " << F->getName() << "\n";
       }
     }
+    if (CFLRegFieldReport)
+      runRegFieldGapReport(); // targeted-fs detector; adds nothing
     // check if all address-taken functions are used in indirect calls
     FuncSet allCallees;
     for (auto &it : Ctx->Callees)

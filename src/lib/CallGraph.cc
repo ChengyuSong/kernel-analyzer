@@ -11935,6 +11935,12 @@ void CallGraphPass::runRegFieldGapReport() {
     size_t sites = 0, maxFan = 0;
     uint64_t sumFan = 0;
     std::string sample;
+    std::set<std::string> outers; // two-level dispatch: the struct
+                                  // holding the ops POINTER — its cells
+                                  // carry the pooled conflation, so a
+                                  // flagged inner key must bring the
+                                  // outer type into the nexus list too
+                                  // (bpf_link for bpf_link_ops)
   };
   std::map<std::string, Disp> disp;
   for (auto *CB : Ctx->IndirectCallInsts) {
@@ -11943,8 +11949,8 @@ void CallGraphPass::runRegFieldGapReport() {
     const auto *LI =
         dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
     if (!LI) continue;
-    std::string Key =
-        deepKey(LI->getPointerOperand(), LI->getModule()->getDataLayout());
+    const DataLayout &DL = LI->getModule()->getDataLayout();
+    std::string Key = deepKey(LI->getPointerOperand(), DL);
     if (Key.empty()) continue;
     Disp &D = disp[Key];
     D.sites++;
@@ -11952,6 +11958,15 @@ void CallGraphPass::runRegFieldGapReport() {
     D.maxFan = std::max(D.maxFan, (size_t)ci->second.size());
     if (D.sample.empty())
       D.sample = CB->getFunction()->getName().str();
+    const Value *B = LI->getPointerOperand()->stripPointerCasts();
+    while (const auto *G = dyn_cast<GEPOperator>(B))
+      B = G->getPointerOperand()->stripPointerCasts();
+    if (const auto *L1 = dyn_cast<LoadInst>(B)) {
+      std::string OK = deepKey(L1->getPointerOperand(), DL);
+      size_t p = OK.find('+');
+      if (p != std::string::npos && D.outers.size() < 4)
+        D.outers.insert(OK.substr(0, p));
+    }
   }
 
   // Rank by fanout; auto-suggest narrow closed-enough populations
@@ -11979,6 +11994,11 @@ void CallGraphPass::runRegFieldGapReport() {
       StringRef sn = StringRef(K).take_front(K.find('+'));
       if (sn.consume_front("struct."))
         suggest.insert(sn.str());
+      for (const std::string &O : D.outers) {
+        StringRef on(O);
+        if (on.consume_front("struct."))
+          suggest.insert(on.str());
+      }
     }
     rows.push_back({&K, pop, open.count(K) != 0, flag, &D});
   }

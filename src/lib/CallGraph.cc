@@ -11846,6 +11846,13 @@ void CallGraphPass::runRegFieldGapReport() {
   std::map<std::string, std::set<std::string>> regs; // key -> fn names
   std::set<std::string> open;                        // unwitnessed stores
   std::map<std::string, std::set<std::string>> copyIn; // dst <- src keys
+  // Channel-closedness hazards (a key may only auto-close with ALL of
+  // these at zero — a channel table that misses a registrant drops
+  // true pairs, so every unclassifiable mutation path must refuse):
+  std::map<std::string, size_t> hazAtomic;  // cmpxchg/xchg on the slot
+  std::map<std::string, size_t> hazEscape;  // slot address escapes
+  std::set<std::string> hazBulk;            // struct hit by non-const
+                                            // memcpy/memmove (all keys)
 
   for (auto &mp : Ctx->Modules) {
     const DataLayout &DL = mp.first->getDataLayout();
@@ -11854,6 +11861,46 @@ void CallGraphPass::runRegFieldGapReport() {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
       if (shouldSkipFunction(&F)) continue;
       for (const Instruction &I : instructions(F)) {
+        // hazard sweep: atomics on field slots; bulk copies into a
+        // struct from a non-constant source; field addresses used as
+        // anything other than a direct load/store pointer
+        if (const auto *AX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+          std::string Key = deepKey(AX->getPointerOperand(), DL);
+          if (!Key.empty()) {
+            if (const auto *Fn = dyn_cast<Function>(
+                    AX->getNewValOperand()->stripPointerCasts()))
+              regs[Key].insert(Fn->getName().str());
+            else
+              hazAtomic[Key]++;
+          }
+        } else if (const auto *AR = dyn_cast<AtomicRMWInst>(&I)) {
+          std::string Key = deepKey(AR->getPointerOperand(), DL);
+          if (!Key.empty()) hazAtomic[Key]++;
+        } else if (const auto *MI = dyn_cast<AnyMemTransferInst>(&I)) {
+          std::string Key = deepKey(MI->getRawDest(), DL);
+          if (!Key.empty()) {
+            const auto *SG = dyn_cast<GlobalVariable>(
+                MI->getRawSource()->stripPointerCasts());
+            // const-global source is covered by the initializer pass
+            // (same struct keys); anything else is an opaque write
+            if (!(SG && SG->isConstant() && SG->hasInitializer()))
+              hazBulk.insert(Key.substr(0, Key.find('+')));
+          }
+        }
+        for (const Use &Op : I.operands()) {
+          const auto *G = dyn_cast<GEPOperator>(Op.get());
+          if (!G) continue;
+          const bool ptrPos =
+              (isa<LoadInst>(&I) && Op.getOperandNo() == 0) ||
+              (isa<StoreInst>(&I) &&
+               Op.getOperandNo() == StoreInst::getPointerOperandIndex()) ||
+              (isa<AtomicCmpXchgInst>(&I) && Op.getOperandNo() == 0) ||
+              (isa<AtomicRMWInst>(&I) && Op.getOperandNo() == 0) ||
+              isa<GetElementPtrInst>(&I);
+          if (ptrPos) continue;
+          std::string Key = deepKey(G, DL);
+          if (!Key.empty()) hazEscape[Key]++;
+        }
         const auto *SI = dyn_cast<StoreInst>(&I);
         if (!SI) continue;
         std::string Key = deepKey(SI->getPointerOperand(), DL);
@@ -11862,18 +11909,43 @@ void CallGraphPass::runRegFieldGapReport() {
         if (const auto *Fn = dyn_cast<Function>(V)) {
           regs[Key].insert(Fn->getName().str());
         } else if (const auto *A = dyn_cast<Argument>(V)) {
-          bool any = false;
+          // Install-API hop: the population is the constants at the
+          // API's callers — but ONLY if EVERY caller witnesses one.
+          // A single variable-passing caller means an unwitnessed
+          // registrant, so the key must stay open (a channel built
+          // from the partial table would drop true pairs).
+          // DIRECT callers only: Ctx->Callers also holds resolved
+          // indirect callsites, whose caller set is itself the smear
+          // under repair — trusting them lets junk arguments from
+          // spuriously-resolved icalls pollute the table (observed:
+          // clear_page_erms entering irqaction+0). An indirect
+          // caller therefore opens the key.
+          bool all = true, anyC = false;
           auto ci = Ctx->Callers.find(A->getParent());
           if (ci != Ctx->Callers.end())
-            for (auto *CB : ci->second)
-              if (A->getArgNo() < CB->arg_size())
-                if (const auto *CF = dyn_cast<Function>(
-                        CB->getArgOperand(A->getArgNo())
-                            ->stripPointerCasts())) {
-                  regs[Key].insert(CF->getName().str());
-                  any = true;
-                }
-          if (!any) open.insert(Key);
+            for (auto *CB : ci->second) {
+              Function *DC =
+                  const_cast<Function *>(CB->getCalledFunction());
+              if (!DC || getFuncDef(DC) !=
+                             getFuncDef(const_cast<Function *>(
+                                 A->getParent()))) {
+                all = false;
+                continue;
+              }
+              if (A->getArgNo() >= CB->arg_size()) {
+                all = false;
+                continue;
+              }
+              if (const auto *CF = dyn_cast<Function>(
+                      CB->getArgOperand(A->getArgNo())
+                          ->stripPointerCasts())) {
+                regs[Key].insert(CF->getName().str());
+                anyC = true;
+              } else {
+                all = false;
+              }
+            }
+          if (!all || !anyC) open.insert(Key);
         } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
           std::string SK = deepKey(LI->getPointerOperand(), DL);
           if (!SK.empty() && SK != Key)
@@ -11941,6 +12013,7 @@ void CallGraphPass::runRegFieldGapReport() {
                                   // flagged inner key must bring the
                                   // outer type into the nexus list too
                                   // (bpf_link for bpf_link_ops)
+    std::vector<const CallBase *> readers; // sites, for channel apply
   };
   std::map<std::string, Disp> disp;
   for (auto *CB : Ctx->IndirectCallInsts) {
@@ -11958,6 +12031,7 @@ void CallGraphPass::runRegFieldGapReport() {
     D.maxFan = std::max(D.maxFan, (size_t)ci->second.size());
     if (D.sample.empty())
       D.sample = CB->getFunction()->getName().str();
+    D.readers.push_back(CB);
     const Value *B = LI->getPointerOperand()->stripPointerCasts();
     while (const auto *G = dyn_cast<GEPOperator>(B))
       B = G->getPointerOperand()->stripPointerCasts();
@@ -12037,6 +12111,50 @@ void CallGraphPass::runRegFieldGapReport() {
     }
     errs() << "\n";
   }
+
+  // --cfl-regfield-apply: auto-generated identity channels for keys
+  // whose registration population is machine-certified CLOSED — every
+  // mutation path classified (witnessed stores/hops/copies/
+  // initializers), zero hazards (unwitnessed stores, atomics, bulk
+  // copies, escaping slot addresses). Resolution at the key's reader
+  // sites intersects with the table: monotone removal only (-N/+0 by
+  // construction), certified per key in the ledger below. OPEN keys
+  // are never touched — they remain report material for the manual
+  // channel pipeline. Residual assumption (shared with the hand-built
+  // channels): a write reaching the slot without any typed GEP to the
+  // struct (raw-arithmetic punning) is invisible to the certifier.
+  if (!CFLRegFieldApply) return;
+  size_t chKeys = 0, chSites = 0, chRemoved = 0;
+  for (auto &[K, D] : disp) {
+    auto ri = regs.find(K);
+    if (ri == regs.end() || ri->second.empty()) continue;
+    const std::string SN = K.substr(0, K.find('+'));
+    const bool closed = !open.count(K) && !hazAtomic.count(K) &&
+                        !hazEscape.count(K) && !hazBulk.count(SN) &&
+                        K.find("+var") == std::string::npos;
+    if (!closed) continue;
+    size_t rem = 0, kept = 0;
+    for (const CallBase *CB : D.readers) {
+      auto ci = Ctx->Callees.find(CB);
+      if (ci == Ctx->Callees.end()) continue;
+      FuncSet keep;
+      for (const Function *F : ci->second)
+        if (ri->second.count(F->getName().str()))
+          keep.insert(F);
+      rem += ci->second.size() - keep.size();
+      kept += keep.size();
+      ci->second = keep;
+    }
+    if (rem == 0) continue;
+    chKeys++;
+    chSites += D.readers.size();
+    chRemoved += rem;
+    errs() << "RegFieldChannel: CLOSED " << K << " table="
+           << ri->second.size() << " sites=" << D.readers.size()
+           << " -" << rem << "/+0 kept=" << kept << "\n";
+  }
+  errs() << "RegFieldChannel: applied " << chKeys << " closed keys, "
+         << chSites << " sites, -" << chRemoved << "/+0 pairs\n";
 }
 
 // --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries
@@ -14077,6 +14195,11 @@ bool CallGraphPass::doFinalization(Module *M) {
   }
 
   if (M == Ctx->Modules.back().first) {
+    // Regfield detector/channels run FIRST so an applied channel is
+    // reflected in the tally, the ICALL dump, and every downstream
+    // consumer (apply only touches CLOSED keys; report adds nothing).
+    if (CFLRegFieldReport || CFLRegFieldApply)
+      runRegFieldGapReport();
     // compare callees found by CFL and type matching
     size_t total = 0, match = 0;
     for (auto &it : calleeByType) {
@@ -14154,8 +14277,6 @@ bool CallGraphPass::doFinalization(Module *M) {
                  << " -> " << F->getName() << "\n";
       }
     }
-    if (CFLRegFieldReport)
-      runRegFieldGapReport(); // targeted-fs detector; adds nothing
     // check if all address-taken functions are used in indirect calls
     FuncSet allCallees;
     for (auto &it : Ctx->Callees)

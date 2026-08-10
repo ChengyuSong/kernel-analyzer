@@ -338,6 +338,19 @@ cl::opt<bool> CFLRegFieldReport(
            "--cfl-nexus-fields list. Report only, adds no edges"),
   cl::init(false));
 
+cl::opt<bool> CFLRegFieldApply(
+  "cfl-regfield-apply",
+  cl::desc("Auto-generated identity channels from the regfield "
+           "detector: for keys whose registration population is "
+           "machine-certified CLOSED (every mutation path classified; "
+           "zero unwitnessed stores, atomics, bulk copies, or "
+           "escaping slot addresses), intersect resolution at the "
+           "key's reader sites with the witnessed table — monotone "
+           "-N/+0 removal, certified per key in the RegFieldChannel "
+           "ledger. OPEN keys are never touched (they stay report "
+           "material for the manual channel pipeline)"),
+  cl::init(false));
+
 cl::opt<std::string> CFLProbeStratumAblate(
   "cfl-probe-stratum-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "

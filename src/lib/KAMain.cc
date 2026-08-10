@@ -351,6 +351,16 @@ cl::opt<bool> CFLRegFieldApply(
            "material for the manual channel pipeline)"),
   cl::init(false));
 
+cl::opt<bool> CFLRegFieldAudit(
+  "cfl-regfield-audit",
+  cl::desc("With --cfl-regfield-apply: emit a provenance certificate "
+           "for every applied key — per-source table breakdown "
+           "(const-initializer / store / install-hop / copy-closure) "
+           "+ risk class (GREEN rodata-structural, YELLOW "
+           "hazard-counter-dependent, ORANGE copy-closure-dependent) "
+           "+ the full table, for the channel audit"),
+  cl::init(false));
+
 cl::opt<std::string> CFLProbeStratumAblate(
   "cfl-probe-stratum-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "

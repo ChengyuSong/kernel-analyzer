@@ -9242,6 +9242,7 @@ void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
 // (int arguments, int call results, escapes via ret/call) are COUNTED
 // as explicit ledger entries, never dropped silently.
 static size_t g_intProvStores = 0, g_intProvLoads = 0;
+static size_t g_regfieldBarePtrFnStores = 0;
 static size_t g_intStoreUnmodeled = 0, g_intLoadUnmodeled = 0;
 
 static bool constantHasPtrToInt(const Constant *C, unsigned depth) {
@@ -11846,6 +11847,16 @@ void CallGraphPass::runRegFieldGapReport() {
   std::map<std::string, std::set<std::string>> regs; // key -> fn names
   std::set<std::string> open;                        // unwitnessed stores
   std::map<std::string, std::set<std::string>> copyIn; // dst <- src keys
+  // Audit provenance: which source contributed each name (0=const-
+  // global initializer, 1=store/cmpxchg-const, 2=install-API arg hop,
+  // 3=copy closure) + keys fed by a NON-const global's initializer.
+  std::map<std::string, std::array<std::set<std::string>, 4>> popSrc;
+  std::set<std::string> initNonConst;
+  auto addPop = [&](const std::string &Key, const std::string &N,
+                    int src) {
+    regs[Key].insert(N);
+    popSrc[Key][src].insert(N);
+  };
   // Channel-closedness hazards (a key may only auto-close with ALL of
   // these at zero — a channel table that misses a registrant drops
   // true pairs, so every unclassifiable mutation path must refuse):
@@ -11869,7 +11880,7 @@ void CallGraphPass::runRegFieldGapReport() {
           if (!Key.empty()) {
             if (const auto *Fn = dyn_cast<Function>(
                     AX->getNewValOperand()->stripPointerCasts()))
-              regs[Key].insert(Fn->getName().str());
+              addPop(Key, Fn->getName().str(), 1);
             else
               hazAtomic[Key]++;
           }
@@ -11878,13 +11889,27 @@ void CallGraphPass::runRegFieldGapReport() {
           if (!Key.empty()) hazAtomic[Key]++;
         } else if (const auto *MI = dyn_cast<AnyMemTransferInst>(&I)) {
           std::string Key = deepKey(MI->getRawDest(), DL);
+          const auto *SG = dyn_cast<GlobalVariable>(
+              MI->getRawSource()->stripPointerCasts());
+          // const-global source is covered by the initializer pass
+          // (same struct keys); anything else is an opaque write
+          const bool constSrc = SG && SG->isConstant() &&
+                                SG->hasInitializer();
           if (!Key.empty()) {
-            const auto *SG = dyn_cast<GlobalVariable>(
-                MI->getRawSource()->stripPointerCasts());
-            // const-global source is covered by the initializer pass
-            // (same struct keys); anything else is an opaque write
-            if (!(SG && SG->isConstant() && SG->hasInitializer()))
-              hazBulk.insert(Key.substr(0, Key.find('+')));
+            if (!constSrc) hazBulk.insert(Key.substr(0, Key.find('+')));
+          } else if (!constSrc) {
+            // bare-pointer memcpy: attribute via the source or dest
+            // alloca's allocated struct type when visible
+            for (const Value *P :
+                 {MI->getRawDest()->stripPointerCasts(),
+                  MI->getRawSource()->stripPointerCasts()})
+              if (const auto *AI = dyn_cast<AllocaInst>(P))
+                if (auto *ST =
+                        dyn_cast<StructType>(AI->getAllocatedType()))
+                  if (ST->hasName())
+                    hazBulk.insert(
+                        stripStructNameSuffix(ST->getStructName())
+                            .str());
           }
         }
         for (const Use &Op : I.operands()) {
@@ -11904,10 +11929,28 @@ void CallGraphPass::runRegFieldGapReport() {
         const auto *SI = dyn_cast<StoreInst>(&I);
         if (!SI) continue;
         std::string Key = deepKey(SI->getPointerOperand(), DL);
-        if (Key.empty()) continue;
+        if (Key.empty()) {
+          // Whole-object store through a bare pointer (no GEP):
+          // `*buf = (struct cpu_stop_work){.fn = fn}` writes fn
+          // fields with no field key. Invisible-but-unhazarded was a
+          // certifier hole (found by the km audit) — open every key
+          // of the VALUE's struct type. Scalar fn stores through
+          // bare pointers have no attributable type: counted as the
+          // global residual, reported below.
+          Type *VT = SI->getValueOperand()->getType();
+          if (auto *ST = dyn_cast<StructType>(VT)) {
+            if (ST->hasName())
+              hazBulk.insert(
+                  stripStructNameSuffix(ST->getStructName()).str());
+          } else if (isa<Function>(
+                         SI->getValueOperand()->stripPointerCasts())) {
+            g_regfieldBarePtrFnStores++;
+          }
+          continue;
+        }
         const Value *V = SI->getValueOperand()->stripPointerCasts();
         if (const auto *Fn = dyn_cast<Function>(V)) {
-          regs[Key].insert(Fn->getName().str());
+          addPop(Key, Fn->getName().str(), 1);
         } else if (const auto *A = dyn_cast<Argument>(V)) {
           // Install-API hop: the population is the constants at the
           // API's callers — but ONLY if EVERY caller witnesses one.
@@ -11939,7 +11982,7 @@ void CallGraphPass::runRegFieldGapReport() {
               if (const auto *CF = dyn_cast<Function>(
                       CB->getArgOperand(A->getArgNo())
                           ->stripPointerCasts())) {
-                regs[Key].insert(CF->getName().str());
+                addPop(Key, CF->getName().str(), 2);
                 anyC = true;
               } else {
                 all = false;
@@ -11967,11 +12010,13 @@ void CallGraphPass::runRegFieldGapReport() {
           for (unsigned i = 0; i < CS->getNumOperands(); i++) {
             const Constant *E = CS->getOperand(i);
             const auto *Fn = dyn_cast<Function>(E->stripPointerCasts());
-            if (Fn && ST->hasName())
-              regs[stripStructNameSuffix(ST->getStructName()).str() + "+" +
-                   std::to_string(SL->getElementOffset(i))]
-                  .insert(Fn->getName().str());
-            else if (!Fn)
+            if (Fn && ST->hasName()) {
+              std::string K =
+                  stripStructNameSuffix(ST->getStructName()).str() + "+" +
+                  std::to_string(SL->getElementOffset(i));
+              addPop(K, Fn->getName().str(), 0);
+              if (!GV.isConstant()) initNonConst.insert(K);
+            } else if (!Fn)
               walk(E);
           }
         } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
@@ -11993,8 +12038,11 @@ void CallGraphPass::runRegFieldGapReport() {
       bool wasOpen = open.count(dst);
       for (const auto &s : srcs) {
         auto ri = regs.find(s);
-        if (ri != regs.end())
+        if (ri != regs.end()) {
           D.insert(ri->second.begin(), ri->second.end());
+          auto &sc = popSrc[dst][3];
+          sc.insert(ri->second.begin(), ri->second.end());
+        }
         if (open.count(s)) open.insert(dst);
       }
       if (D.size() != before || (!wasOpen && open.count(dst)))
@@ -12152,9 +12200,38 @@ void CallGraphPass::runRegFieldGapReport() {
     errs() << "RegFieldChannel: CLOSED " << K << " table="
            << ri->second.size() << " sites=" << D.readers.size()
            << " -" << rem << "/+0 kept=" << kept << "\n";
+    if (CFLRegFieldAudit) {
+      // Provenance certificate per applied key: how each table entry
+      // was witnessed, and the risk class. GREEN = every entry from a
+      // CONST global's initializer (rodata-immutable — closedness is
+      // structural). YELLOW = store/arg-hop-witnessed or a non-const
+      // initializer (closedness rests on the hazard counters).
+      // ORANGE = table depends on copy-closure (longest inference
+      // chain — audit these first).
+      auto &S = popSrc[K];
+      const bool nonC = initNonConst.count(K) != 0;
+      const char *cls = !S[3].empty()
+                            ? "ORANGE"
+                            : (!S[1].empty() || !S[2].empty() || nonC)
+                                  ? "YELLOW"
+                                  : "GREEN";
+      errs() << "RegFieldAudit: " << cls << " " << K << " init="
+             << S[0].size() << (nonC ? "(nonconst)" : "")
+             << " store=" << S[1].size() << " hop=" << S[2].size()
+             << " copy=" << S[3].size() << " table:";
+      size_t n = 0;
+      for (const auto &N : ri->second) {
+        if (n++ >= 40) { errs() << " ..."; break; }
+        errs() << " " << N;
+      }
+      errs() << "\n";
+    }
   }
   errs() << "RegFieldChannel: applied " << chKeys << " closed keys, "
-         << chSites << " sites, -" << chRemoved << "/+0 pairs\n";
+         << chSites << " sites, -" << chRemoved << "/+0 pairs; RESIDUAL "
+         << g_regfieldBarePtrFnStores
+         << " fn stores through bare pointers (unattributable to any "
+         << "key — the certifier's stated blind spot)\n";
 }
 
 // --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries

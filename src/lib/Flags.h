@@ -68,6 +68,7 @@ extern cl::opt<bool> CFLInternPlanes;
 extern cl::opt<bool> CFLJoinFastpath;
 extern cl::opt<bool> CFLRegFieldReport;
 extern cl::opt<bool> CFLRegFieldApply;
+extern cl::opt<bool> CFLRegFieldAudit;
 extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<bool> CFLBundleProbe;
 extern cl::opt<unsigned> CFLBatchRoots;

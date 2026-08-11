@@ -18,6 +18,9 @@ run_one() { # run_one <name> <bclist> <mode: ft|sat>
   case $mode in
     ft)  flags="--cfl-flows-to --cfl-dump-icalls $KA_EXTRA_FLAGS"
          timeo=$KA_FT_TIMEOUT ;;
+    ftc) flags="--cfl-flows-to --cfl-dump-icalls --cfl-regfield-apply \
+--cfl-regfield-audit $KA_EXTRA_FLAGS"
+         timeo=$KA_FT_TIMEOUT ;;
     sat) flags=""
          timeo=$KA_SAT_TIMEOUT ;;
   esac
@@ -30,11 +33,23 @@ run_one() { # run_one <name> <bclist> <mode: ft|sat>
   set -e
   echo "exitcode: $rc" >> "$log"
   # Answer pin (deterministic; sha256 comparable across machines).
-  if [ "$mode" = ft ]; then
+  if [ "$mode" = ft ] || [ "$mode" = ftc ]; then
     grep "ICALL" "$log" | sed 's/^CallGraph: //' | sort \
-      > "$KA_RESULTS/$name-ft-icalls.sort" || true
-    sha256sum "$KA_RESULTS/$name-ft-icalls.sort" \
-      > "$KA_RESULTS/$name-ft-icalls.sort.sha256" || true
+      > "$KA_RESULTS/$name-$mode-icalls.sort" || true
+    sha256sum "$KA_RESULTS/$name-$mode-icalls.sort" \
+      > "$KA_RESULTS/$name-$mode-icalls.sort.sha256" || true
+  fi
+  # Auto-channel soundness gate: ftc must be a STRICT SUBSET of ft
+  # (any ftc-only pair = certifier bug, reported loudly).
+  if [ "$mode" = ftc ] && [ -s "$KA_RESULTS/$name-ft-icalls.sort" ]; then
+    local extra
+    extra=$(comm -13 "$KA_RESULTS/$name-ft-icalls.sort" \
+                     "$KA_RESULTS/$name-ftc-icalls.sort" | wc -l)
+    if [ "$extra" = 0 ]; then
+      echo "   subset check vs ft: OK"
+    else
+      echo "!! $name/ftc: $extra pairs NOT in ft pin — certifier bug" >&2
+    fi
   fi
   echo "   done (rc=$rc)"
 }

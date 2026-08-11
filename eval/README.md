@@ -47,6 +47,14 @@ backend objects only; optionally your bclist):
   `--cfl-flows-to`. Expected outcome at library/app scale under
   ~50 GB caps: OOM (that is the measured result, not a harness
   failure).
+- **ftc** (opt-in: `KA_MODES="ft ftc sat"`) — ft + auto-certified
+  identity channels (`--cfl-regfield-apply --cfl-regfield-audit`).
+  The run script verifies ftc's pin is a STRICT SUBSET of ft's (a
+  violation = certifier bug, reported loudly); the extraction adds
+  chan_keys/chan_removed columns and the log carries the per-key
+  provenance certificates (GREEN/YELLOW/ORANGE) + counted residual.
+  Kernel 6.18 reference: 1,997 keys, -1,487,417/+0 (-30.6%), fanout
+  p50 43->6, wall 1:46 (vs ft 2:07).
 
 ## Ablations (optional: `KA_ABLATE=1` or run `35-ablate.sh` directly)
 

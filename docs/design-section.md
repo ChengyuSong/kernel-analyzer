@@ -228,6 +228,39 @@ largest channels remove 1.50M and 1.20M pairs (32% of the pinned
 answer set combined) while making the solve *faster*, because the
 severed pool no longer propagates.
 
+**Automating the channel tier.** The hand-built channels have a
+common signature that turns out to be *detectable from a single
+field-insensitive run*: a (struct, offset) registration field whose
+*witnessed store population* is narrow while the resolved fanout at
+its reader sites is wide — the gap is exactly the pooled smear a
+channel would remove. A post-solve detector gathers each field's
+population from four sources (constant stores, one argument hop for
+install-API shapes, global-initializer slots, and a copy-closure
+between field keys for control-struct relays), and a *closedness
+certifier* decides, per key, whether that table is provably
+complete: every mutation path classified, and five hazard counters
+at zero (unwitnessed stores, atomics on the slot, bulk copies from
+non-constant sources, escaping slot addresses, variable-offset
+keys). Closed keys become channels in the same run — resolution at
+their reader sites intersects with the table; open keys are never
+touched, because same-slot instance pools look exactly like an
+unwitnessable population and must be left to the graph. On the
+kernel this removes a further 1.49M pairs (−30.6% *on top of* the
+hand-built channels) across 1,997 auto-certified keys in 8,089
+sites — the long tail of driver ops families no one would hand-
+build — at *negative* solve cost, with the median site fanout
+falling from 43 to 6 and the giant's hubs untouched (their keys
+correctly refuse to close). The discipline transfers with the
+automation: every applied key emits a provenance certificate
+(1,105 of 1,997 tables are const-initializer-only — closedness is
+rodata-structural; the copy-closure-dependent tail is 23 keys),
+the certifier's one blind spot (function stores through bare
+untyped pointers) is a counted ledger line (273 kernel-wide), and
+the audit that hardened it — a whole-struct-store shape that was
+invisible *and* unhazarded — de-closed exactly one kernel key and
+restored 572 true-risk pairs, the false-negative class caught
+before it shipped.
+
 **Semantics by data, not by name.** Transfer summaries
 (FRESH/CPY/ALIAS/ST/LD/NOOP atoms, plus the dispatch-binding atoms
 above) replace the inherited name-heuristics for allocators and
@@ -244,12 +277,24 @@ unsoundness exposure — the counters are the retirement criterion,
 not a trust assumption.
 
 **Field sensitivity as a precision instrument.** The surgical
-residues of §3.1 are also the precision story's second act: residues
-discriminate within the pool (the fs decomposition attributes ~30% of
-the discrimination to identity residues on shared-helper formals),
-and they add *sound recall* — member-to-container composition
-produces true pairs that field-insensitive propagation cannot derive,
-so FI is not an over-approximation of the fs answer set.
+residues of §3.1 are also the precision story's second act, and the
+same-binary kernel A/B fixes its *size*: selective fs removes ~1.7%
+of pairs at ~20–30x the solve cost, against the channels' 30%+ at
+negative cost — because the pool's dominant conflation is
+same-offset registration mixing, which offsets cannot discriminate
+(the ~2% that fs does remove is the cross-field artifact mode, and
+its deep collapses are precisely the sites the channel detector
+finds for free). What remains fs's own: residues discriminate
+within the pool (the fs decomposition attributes ~30% of the
+discrimination to identity residues on shared-helper formals), and
+member-to-container composition can derive true pairs FI cannot —
+verified at micro scale (t_container, t_allocinit); at km the HEAD
+same-binary A/B measured *zero* fs-only pairs, so the recall claim
+is stated at the scale it is proven and the kernel-scale
+verification is an explicit open item. fs's load-bearing role in
+the final design is the *instrument*: it produced the anatomy, the
+decomposition, and the reference answer sets that the cheap layers
+are certified against.
 
 ## 3.4 One problem, one currency
 
@@ -283,10 +328,19 @@ and provability climbing the same stairs.
   and keeps only design-side numbers.
 - Numbers used and their pins: first whole-kernel
   14,799/5.1M/~20min (kernel-full3); canonical pin 18,189/5.69M/2.98h
-  (kernel-idchan); wave 11–39x; #48 lookups 39.94M→96k / cycles
-  −21.5%; fs surgical 98.3%@1/3 cost + identity-residue 30% (task
-  #39); batch width 42.5→2.5KB, spill ~600x, 62GB desktop [PENDING
-  kernel fs completion]; identity channels −1.50M/−1.20M = 32%;
+  (kernel-idchan); NEW 6.18 big-machine baselines (2026-08-10):
+  kernel-fi-618 4,866,847/16,512/2:07 and AUDITED auto-channel pin
+  kernel-fi-autochan2 3,379,430 (−1,487,417/+0, 1,997 keys, fanout
+  p50 43→6, 1:46, certificates 1,105 GREEN/869 YELLOW/23 ORANGE,
+  residual 273, hole-fix restored 572 @search_nested_keyrings);
+  kernel fs completion 70h20m/365GB (old binary — feasibility pin
+  only); fs-worthiness A/B: genuine fs tightening −1.66%
+  (80,868 @7,694 sites, 73 deep-collapse sites = 18,376 pairs);
+  km targeted-fs verdict 60% capture at ~0.8x all+ids cost (NSHIFT-
+  structural floor) → channels won; wave 11–39x; #48 lookups
+  39.94M→96k / cycles −21.5%; fs surgical 98.3%@1/3 cost +
+  identity-residue 30% (task #39); batch width 42.5→2.5KB, spill
+  ~600x, 62GB desktop; identity channels −1.50M/−1.20M = 32%;
   anatomy 41/41,350, 0.98% welds, 93% giant; #44 recall +1,038 (km);
   falsifications: dedup×2, folding, delta re-offer, heap-split +11k,
   origin-split 0.000%, tracepoint cells v1/v2, lazy-mint A-loop

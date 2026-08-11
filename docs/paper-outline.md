@@ -319,6 +319,16 @@ moved here from the old design §3.2; §4 anatomy stays mid-paper
 - The INVOKE family (pair-correlated dispatch) as the earlier instance;
   design rule: identity lives at answer level until provenance cells
   exempt fn identity from the quotient.
+- AUTO-CERTIFIED TIER (added 2026-08-10): the channel signature is
+  detectable from one FI run (narrow witnessed store population vs
+  wide reader fanout); closedness certifier (4 population sources, 5
+  hazard counters) auto-closes 1,997 kernel keys -> -1,487,417/+0
+  (-30.6% ON TOP of hand channels), fanout p50 43->6, negative solve
+  cost, single run. Audit trail as artifact: GREEN/YELLOW/ORANGE
+  provenance certificates (1,105 rodata-structural), counted 273-store
+  residual, AT-unused delta 0, and the caught certifier hole
+  (whole-struct bare-pointer stores; 1 key, 572 restored pairs).
+  Three-tier arc: hand-derived -> census-confirmed -> auto-certified.
 
 ### 6. Surgical field sensitivity (2 pp) — C4, W2
 - Open by naming the ghost: residues re-fragment a-components, and
@@ -371,6 +381,13 @@ moved here from the old design §3.2; §4 anatomy stays mid-paper
   type-based -> flows-to v0 (14,799/5.1M) -> +summaries/invoke ->
   kernel-idchan (18,189/5.69M, 2.98 h, <45 GB). Sound micro suite +
   smoke gates.
+- E2b FS-worthiness A/B (DONE 2026-08-10, same-IR 6.18): selective fs
+  = -2.25% total (-1.66% genuine after vintage decomposition) at 33x
+  wall vs auto-channels -30.6% at negative cost; km targeted-fs probe
+  (detector-suggested nexus lists): 60% ceiling capture but cost is
+  NSHIFT-structural, not root-population -> channels win the deep
+  collapses; fs recall = 0 fs-only pairs at km HEAD (micro-scale
+  container_of recall claims stay micro-scoped until kernel-fs HEAD).
 - E2 Identity channels ablation (solo/union/synergy: removals =
   solo-union + 45,453 synergy exactly).
 - E3 fs dial: cost/precision curve at km; weld census FI vs fs;

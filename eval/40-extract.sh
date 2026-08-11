@@ -11,12 +11,13 @@ source "$(dirname "$0")/env.sh"
 
 csv="$KA_RESULTS/results.csv"
 md="$KA_RESULTS/results.md"
-echo "corpus,mode,outcome,wall,peak_rss_kb,type_pairs,cfl_pairs,sites,avg_fanout,max_fanout,classes,roots,facts,waves,pops,solve_ms,intprov_modeled,intprov_ledgered,extern_resolutions,icalls_sha256" > "$csv"
+echo "corpus,mode,outcome,wall,peak_rss_kb,type_pairs,cfl_pairs,sites,avg_fanout,max_fanout,classes,roots,facts,waves,pops,solve_ms,intprov_modeled,intprov_ledgered,extern_resolutions,chan_keys,chan_removed,icalls_sha256" > "$csv"
 
 last_num() { grep -oE "$2" "$1" | tail -1 | grep -oE '[0-9]+' | tail -1; }
 
 for log in "$KA_RESULTS"/*-*.log; do
   base=$(basename "$log" .log)
+  case $base in *-abl-*) continue ;; esac  # ablations own ablations.csv
   corpus=${base%-*}; mode=${base##*-}
   rc=$(grep -oE 'exitcode: [0-9]+' "$log" | tail -1 | grep -oE '[0-9]+' || echo "")
   outcome=ok
@@ -29,12 +30,12 @@ for log in "$KA_RESULTS"/*-*.log; do
 
   type_pairs=""; cfl_pairs=""; sites=""; avgf=""; maxf=""
   classes=""; roots=""; facts=""; waves=""; pops=""; solvems=""
-  ipm=""; ipl=""; extr=""; sha=""
-  if [ "$mode" = ft ] && [ "$outcome" = ok ]; then
+  ipm=""; ipl=""; extr=""; sha=""; chk=""; chr=""
+  if { [ "$mode" = ft ] || [ "$mode" = ftc ]; } && [ "$outcome" = ok ]; then
     tally=$(grep "Callee by type:" "$log" | tail -1 || true)
     type_pairs=$(echo "$tally" | grep -oE 'total [0-9]+' | grep -oE '[0-9]+' || true)
     cfl_pairs=$(echo "$tally" | grep -oE 'CFL [0-9]+' | grep -oE '[0-9]+' || true)
-    sort_pin="$KA_RESULTS/$corpus-ft-icalls.sort"
+    sort_pin="$KA_RESULTS/$corpus-$mode-icalls.sort"
     if [ -s "$sort_pin" ]; then
       read -r sites avgf maxf < <(sed 's/ -> [^ ]*$//' "$sort_pin" | sort | uniq -c \
         | awk '{n++; s+=$1; if($1>m) m=$1} END {printf "%d %.1f %d\n", n, s/n, m}')
@@ -52,8 +53,11 @@ for log in "$KA_RESULTS"/*-*.log; do
     ipl=$(echo "$ip" | grep -oE 'unmodeled [0-9]+' | head -1 | grep -oE '[0-9]+' || true)
     extr=$(grep "UniversalPtr LEDGER" "$log" | tail -1 \
       | grep -oE '[0-9]+ extern-global' | grep -oE '[0-9]+' || true)
+    ch=$(grep "RegFieldChannel: applied" "$log" | tail -1 || true)
+    chk=$(echo "$ch" | grep -oE 'applied [0-9]+' | grep -oE '[0-9]+' || true)
+    chr=$(echo "$ch" | grep -oE '\-[0-9]+/\+0' | grep -oE '[0-9]+' | head -1 || true)
   fi
-  echo "$corpus,$mode,$outcome,$wall,$rss,$type_pairs,$cfl_pairs,$sites,$avgf,$maxf,$classes,$roots,$facts,$waves,$pops,$solvems,$ipm,$ipl,$extr,$sha" >> "$csv"
+  echo "$corpus,$mode,$outcome,$wall,$rss,$type_pairs,$cfl_pairs,$sites,$avgf,$maxf,$classes,$roots,$facts,$waves,$pops,$solvems,$ipm,$ipl,$extr,$chk,$chr,$sha" >> "$csv"
 done
 
 {

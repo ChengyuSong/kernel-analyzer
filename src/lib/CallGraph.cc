@@ -14425,8 +14425,22 @@ bool CallGraphPass::doFinalization(Module *M) {
         // icalls (static_call trampolines dispatch through their key)
         if (CS->isInlineAsm() ||
             (CS->getCalledFunction() &&
-             !Ctx->IndirectCallInsts.count(const_cast<CallBase *>(CS))))
+             !Ctx->IndirectCallInsts.count(const_cast<CallBase *>(CS)))) {
+          // INVOKE re-attribution: summarized registrars carry their
+          // callback pairs at the DIRECT registration callsite
+          // (Callees entries beyond the direct callee). Ground-truth
+          // matching needs them; a distinct prefix keeps every ICALL
+          // pin byte-stable.
+          if (const Function *DC = CS->getCalledFunction()) {
+            const Function *DCD = getFuncDef(const_cast<Function *>(DC));
+            for (const Function *F : it.second)
+              if (F != DC && F != DCD)
+                errs() << "REGCALL " << CS->getFunction()->getName()
+                       << " :: " << DC->getName() << " -> "
+                       << F->getName() << "\n";
+          }
           continue;
+        }
         for (const Function *F : it.second)
           errs() << "ICALL " << CS->getFunction()->getName() << " :: " << *CS
                  << " -> " << F->getName() << "\n";

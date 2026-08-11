@@ -153,8 +153,39 @@ closure properties, which is what makes it dischargeable against an
 implementation by *checking* the properties (§4). Second, the
 direction: for a may-analysis, *soundness of the answer set* is
 *completeness of the solver* relative to the reference — the solver
-must find at least everything derivable. (The converse — the solver
-finds *only* derivable facts — is the precision direction; §5.)
+must find at least everything derivable.
+
+**Theorem 1b (least-closure equivalence).** [Lean:
+`sderiv_sound_fderiv`, `sderiv_iff_fderiv`] The converse holds for
+the *least* closure: with no carried base and minted ⊆ origins,
+every solver fact is a grammar flow — so at minted = origins the
+least solver closure and the rooted grammar derive exactly the same
+flows. (An arbitrary closed state has no upper bound — the universal
+relation satisfies the interface — which is why the equivalence is
+stated for the least closure, and why extra implementation roots
+beyond the origins are a widening, not an equivalence.)
+
+**Theorem 1c (surgical seed policy).** [Lean: `pol_solver_complete`,
+`pol_answers_complete`] The surgical mode mints non-nexus origins at
+the wildcard plane, which violates the zero-seed interface as
+written. Parameterizing by a per-root policy (exact vs widened) and
+abstracting a widened root's shifts to ⊤, every grammar-derivable
+flow appears at its policy-abstracted shift — and since answer
+acceptance {0, ⊤} is closed under the abstraction, a widened
+function root still reports every grammar answer. This is the
+theorem behind "wildcard minting is answer-complete for that
+origin".
+
+**Theorem 1d (residue abstraction).** [Lean: `ShiftHom`,
+`fderiv_shift_hom`, `intShifts`, `zpShifts`, `natToZp`] The
+production Z_P residues are a sound finite quotient of exact
+offsets: derivability transfers along any shift-monoid homomorphism
+(graph labels mapped), zero maps to zero, so exact-offset answers
+remain residue answers; collisions only add. The exact ground truth
+is modeled with signed offsets (`intShifts` — interior-pointer
+arithmetic goes both directions); the unsigned quotient map is
+instantiated (`natToZp`), the signed one is a named remaining
+instance (GAPS.md).
 
 **Theorem 2 (merge invariance).** [Lean: `fderiv_map`,
 `fderiv_quotient`, `fderiv_mono`] Derivability is preserved by (i)
@@ -175,7 +206,7 @@ computes the *same closure*, not an approximation of it:
   the from-scratch closure over m₂ (an iff). Seeding order is
   irrelevant to a least fixpoint. Necessity of the catch-up round is
   also machine-checked [Lean: `answer_not_derivable_restricted`]: a
-  five-node counterexample where an unminted witness origin loses a
+  seven-node counterexample where an unminted witness origin loses a
   grammar-derivable answer — the shape of the −5,737-pair
   whole-kernel deficit that refuted the "propagation loops suffice"
   conjecture.
@@ -211,11 +242,18 @@ each production run checks them on its own final state:
 
 | Hypothesis | Discharged by |
 |---|---|
-| closure fields (seed, step-a/f/fx, step-mal) | `--cfl-verify-closure`: one full non-delta scan of every propagation/join/bridge rule over the final planes, asserting none still fires — the certificate checks *exactly the interface fields* |
-| `origins_minted` | the minting criterion (origin-bearing classes + no-in-edge classes + functions), restored under lazy minting by the catch-up round, whose sufficiency is Theorem 3(a) |
-| Thm 3(b)'s "sound + closed table" | rounds repeat until a pass adds nothing (closedness = stabilization); soundness holds inductively from the empty table via `wderiv_sound` |
-| A3 termination | monotone growth over finite universes; the run itself is the witness |
+| closure fields (step-a/f/fx, step-mal) | `--cfl-verify-closure` C0–C5: one full non-delta scan of every propagation/join/bridge rule over the final planes, asserting none still fires |
+| seed presence | certificate C6: every minted root's seed fact survives in the final planes under its mint policy (exact at 0, widened at ⊤) |
+| `origins_minted` | certificate C7: the origin criterion re-checked against the FINAL quotient (every origin-bearing or in-edge-less class is minted, intentionally-pruned bidi-irrelevant origins excepted); the two historical violations would both have fired here |
+| Thm 3(b)'s "sound + closed table" | rounds repeat until the retained witness state is stable — no new merges, mints, OR cluster keys — matching the theorem's table-closure hypothesis; soundness holds inductively from the empty table via `wderiv_sound` |
+| A3 termination | monotone growth over finite universes; an outer fixpoint that would hit its iteration cap before a no-change round REFUSES to emit answers (no warn-and-continue) |
 | answer extraction | deterministic sort + sha256 pin; byte-compared across modes and machines |
+
+One honest scoping note: the closure certificate cannot run under
+batching (per-batch planes are released before a final scan could
+see them), so batched runs are covered by the stability test and the
+byte-identity gates against certified unbatched runs — the
+instrument per run is stated, never implied.
 
 The two historical violations of `origins_minted` — the July 2026
 presolve-merge minting bug and the lazy-mint deficit — both
@@ -226,23 +264,41 @@ them diagnosable, and both are now regression-tested.
 ## 5. What is not proven, stated plainly
 
 The trusted base is: A1/A2 (audited encoding + census, the only
-informal layer), the Lean kernel, the ~90-line closure-certificate
-scan (`CallGraph.cc:5768`), and the answer extraction. Beyond that, three honest gaps
+informal layer), the Lean kernel, the closure-certificate scan
+(C0–C7), and the answer extraction. Beyond that, the honest gaps
 (tracked in `proof/lean/GAPS.md`):
 
 - **Model-to-code refinement.** We do not prove the C++ constructs a
   `SolverClosure`; we check it per run. A run on which the
-  certificate is not exercised is covered by the byte-identity gates
-  against certified configurations, not by the theorem directly.
-- **The precision direction.** Theorem 2 gives merge *soundness*
-  (nothing lost); that merges lose no *precision* (a-SCC collapse
-  precision-neutrality — the converse homomorphism) is pending. The
-  paper's precision claims ride on measured −N/+0 certifications,
-  not on this proof.
+  certificate is not exercised (batching) is covered by the
+  stability test and byte-identity gates against certified
+  configurations, not by the theorem directly.
+- **The precision direction, above the least closure.** Theorem 1b
+  closes the equivalence for the least closure at exact seeds; what
+  remains open is precision-*neutrality* of specific merges (the
+  a-SCC collapse converse) and of the extra implementation roots
+  (identity/no-in-edge mints beyond the origins — a widening whose
+  extra facts are unquantified by the proof). The presolve component
+  quotient is deliberately coarse and is measured, not proved tight.
+- **The stable-table lemma.** The implementation's stop condition
+  (no new merges, mints, or keys) syntactically matches the
+  batching theorem's table-closure hypothesis, but the lemma
+  connecting them — a single-member key insert is alias-inert and
+  self-batch-closed — is argued in a code comment, not yet in Lean.
 - **Event-replay fidelity and touch-window delta completeness** (the
   worker/spill engineering below Theorem 3(b)'s abstraction) are
   covered by byte-identity gates across all mode combinations, not
   by Lean.
+- **The signed residue instance.** `fderiv_shift_hom` is proved for
+  any homomorphism and instantiated for the unsigned quotient
+  (`natToZp`); the signed normalization the implementation uses
+  (`((o % P) + P) % P` over `intShifts`) is a pending instance.
+- **Reported-answer semantics.** Identity channels, transfer
+  summaries, and post-filters transform answers outside the formal
+  relation; their soundness rides on the per-family completeness
+  contracts and closedness certificates (§3.3), not on this proof. A
+  formal `ReportedAnswer` with channel/fallback cases is future
+  work.
 
 The rooted grammar itself encodes one semantic decision reviewers
 should see: FDeriv seeds flows only at origins, so store/load cycles
@@ -265,9 +321,14 @@ makes `origins_minted` a dischargeable obligation.
   own the precision direction), Table T3 falsifications
   (`answer_not_derivable_restricted` pairs with the lazy-mint
   refutation entry).
-- Lean file is `proof/lean/CompositionalCFL/FlowsTo.lean` at
-  6a5fde1 (toolchain v4.32.2); `batched_answers_complete` is the
-  end-to-end composition if a single citable theorem name is wanted.
+- Lean file is `proof/lean/CompositionalCFL/FlowsTo.lean` (toolchain
+  tracks `stable`, builds clean at 4.33.0, no sorry/axioms);
+  `batched_answers_complete` is the end-to-end composition if a
+  single citable theorem name is wanted. Post-review additions
+  (2026-08-11): `sderiv_sound_fderiv`/`sderiv_iff_fderiv`,
+  `pol_solver_complete`/`pol_answers_complete`, `ShiftHom`/
+  `fderiv_shift_hom`/`intShifts`/`zpShifts`/`natToZp`, and the
+  `Core.lean` `boundary_sound` same-present-symbol fix.
 - The compositional-mode Lean development (Core.lean) is a separate
   older track with its own gaps — do not conflate; this section is
   about the flows-to solver only.

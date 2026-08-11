@@ -24,9 +24,13 @@ may-alias pooling that destroys precision are the same quantity, and
 the soundness machinery is what lets the other two axes move
 aggressively. Three principles run through everything:
 
-- **P1 — Anchor, don't materialize.** Never compute a relation larger
-  than the answers require. The fact space is anchored at origins;
-  everything pairwise is kept implicit in a union-find quotient.
+- **P1 — Anchor, don't materialize.** Never materialize the all-pairs
+  alias relation; materialize an origin-to-node witness relation whose
+  shape is rectangular — origins × reachable nodes — and empirically
+  far smaller, with everything pairwise kept implicit in a union-find
+  quotient. (This is a structural claim about *what* is stored, not an
+  output-sensitive worst-case bound: witness origins beyond the answer
+  alphabet are propagated too.)
 - **P2 — No silent approximation.** Every shortcut is (a) proven
   exact (machine-checked), (b) certified exact per run, or (c)
   counted in a ledger that a reader can audit. A cap that can fire
@@ -60,7 +64,8 @@ with respect to the CFL relation (machine-checked; §3.2). Fact mass
 drops from Σ|C|² to Σ|C|·(answer-relevant origins). The effect is
 categorical: the saturation baseline cannot finish a library, while
 the flows-to solver completes the 2,618-module kernel — the first
-sound whole-kernel run of this formulation — in twenty minutes.
+solver-certified whole-kernel run of this formulation (§3.2 defines
+the run-status vocabulary) — in twenty minutes.
 
 **Field sensitivity in the weight domain.** C field sensitivity
 cannot live in the Dyck parenthesis alphabet: `container_of` demands
@@ -69,15 +74,20 @@ that two interior-pointer steps compose to match one flat offset
 cannot express — and our attempt to encode composition
 grammatically explodes saturation (scaffolding × (P+1) shifts;
 measured OOM). Instead, offsets ride the *weight domain*: each fact
-carries a shift residue in Z_P composed along f-edges, with a
-wildcard ⊤ absorbing statically-unknown offsets. Because residues
-are per-fact annotations rather than graph structure, the encoding
-is exactly as summarizable as the FI solver. Field sensitivity is
-then applied *surgically*: origins whose types never carry dispatch
-state are provably field-insensitivity-identical and mint at ⊤,
-confining residue cost to the nexus-typed population — 98.3% of full
-field sensitivity at one third of its cost, with function roots never
-needing residues at all.
+carries a shift residue in Z_P — a *sound finite quotient* of exact
+signed offsets, not the offsets themselves: modular collisions and
+the wildcard ⊤ can only add flows, and the abstraction is
+machine-checked as a monoid homomorphism under which derivable
+answers remain derivable answers [Lean: `fderiv_shift_hom`,
+`zpShifts`]. Because residues are per-fact annotations rather than
+graph structure, the encoding is exactly as summarizable as the FI
+solver. Field sensitivity is then applied *surgically*: origins
+whose types never carry dispatch state mint at ⊤, and the per-root
+wildcard policy is itself covered by a machine-checked abstraction
+theorem — a widened root's grammar answers all surface at ⊤, which
+resolution accepts [Lean: `pol_answers_complete`] — confining
+residue cost to the nexus-typed population: 98.3% of full field
+sensitivity at one third of its cost.
 
 **Solver engineering as measured redundancy elimination (P3).** Every
 optimization in the solver names its redundancy: delta propagation
@@ -106,8 +116,11 @@ reformulation is bounded by turning memory into a dial without
 touching answers. Fact planes are pure derived state — the only
 cross-origin coupling is the quotient, the cluster keys, and the
 bridges — so origins solve in batches: seed K roots, drain, harvest,
-release every plane; outer rounds repeat until a pass adds no merges,
-which terminates at the same closure by monotonicity. Batches run in
+release every plane; outer rounds repeat until the retained witness
+state is stable — no new merges, no late mints, and no new cluster
+keys in a pass — which is precisely the stable-table hypothesis of
+the batching theorem, and terminates at the same closure by
+monotonicity over a finite universe. Batches run in
 forked copy-on-write workers that stream their effectual events
 (first-time key inserts, merges) for replay; batch-local fact
 universes shrink dense-plane width from whole-corpus to batch width
@@ -120,8 +133,14 @@ from two sides. Every mode — monolithic, batched, worker-parallel,
 spilled — is byte-identical to every other at every gate, and the
 staged-exactness arguments (catch-up confluence for lazily-minted
 roots, batch-union equality, spill-restore confluence) are
-machine-checked in Lean. A kernel-scale field-sensitive solve runs on
-a 62 GB desktop.
+machine-checked in Lean *at the declarative-closure level*; the
+refinement from event replay, snapshot serialization, and the
+touch-window delta schedule to those closures is carried by the
+byte-identity gates and named as an open obligation (GAPS.md), not
+claimed. "Memory becomes a dial" has a stated floor: the graph,
+presolve quotient, cluster registry, and worker multiplicity remain
+resident. A kernel-scale field-sensitive solve runs on a 62 GB
+desktop.
 
 ## 3.2 Soundness: no silent fallback, certified at every layer
 
@@ -152,27 +171,57 @@ to model and what evidence gates each modeled channel.
 
 **Approximation: proof where theory reaches, certificates where it
 does not.** The solver's central invariants are mechanized in Lean
-against a derivation-semantics model: the coupling of directional
-origin propagation with union-find unification is *fact-equivalent*
-to the grammar (unification is not Steensgaard-lossy here — the
-bidirected fragment is an equivalence, so merging loses nothing);
-lazy root minting is exact given a catch-up round (the sufficiency of
+against a derivation-semantics model, with the three merge kinds
+kept deliberately distinct. The least solver closure over
+exact-seeded roots is *two-sidedly equivalent* to the rooted grammar
+— completeness and soundness are separate theorems and both are
+machine-checked [Lean: `solver_complete`, `sderiv_sound_fderiv`,
+combined in `sderiv_iff_fderiv`]. Witness-keyed cell joins live
+inside that equivalence. The dynamic a-SCC collapse and the presolve
+component quotient are *sound* (any node quotient preserves
+derivability [Lean: `fderiv_quotient`]) but not claimed
+precision-neutral: the presolve quotient is deliberately coarse
+(§3.3 measures a 41-node mutual-flow core inside a 41,350-node
+component), and the a-SCC converse is a pending obligation. Lazy
+root minting is exact given a catch-up round (the sufficiency of
 propagation loops alone was *refuted* by a kernel counterexample —
 circular registration lists create mutual witness dependence — and
 the catch-up construction was then proved complete); batched solving
-equals the eager closure; spill-restore is confluent. The proofs are
+equals the eager closure; spill-restore is confluent; the surgical
+wildcard seed policy has its own abstraction theorem [Lean:
+`pol_answers_complete`]. The proofs are
 load-bearing in both directions: a July minting bug manifested as a
 violation of a formal hypothesis before it was understood as a code
-defect. Where the model's assumptions meet the implementation, every
-production run discharges them dynamically: a closure certificate
-checks the fixpoint against the solver's rule set (C0–C5) on the
-live run, per-icall differential baselines pin every change to an
-explicit ±diff, and every precision removal ships with a −N/+0
-certification — N pairs removed, zero pairs added, verified against
-the previous sound answer set. Configurations outside a validated
-envelope are *refused at startup* rather than degraded: incremental
-solving under field sensitivity, for example, exits with the named
-divergence rather than running approximately.
+defect. Where the model's assumptions meet the implementation, the
+run certificate discharges them on the live fixpoint: rule closure
+(C0–C5), *seed presence* for every minted root under its mint policy
+(C6), and *mint coverage* of the origin criterion at the final
+quotient (C7) — together, exactly the abstract theorem's hypotheses,
+checked per run. Where the certificate cannot run (batched planes
+are released before it could scan them), the strengthened stability
+test — no new merges, mints, or cluster keys — plus cross-mode
+byte-identity carry the argument, and the paper states which
+instrument covers which run. Differential evidence is labeled as
+what it is: a −N/+0 comparison proves the new answer set is a
+*subset* of the prior one — a regression and precision check — while
+*soundness* of each removal is carried by the removing mechanism's
+own completeness contract (census counters at zero, closedness
+certificates). Configurations outside a validated envelope are
+*refused* rather than degraded: incremental solving under field
+sensitivity exits with the named divergence, and an outer fixpoint
+that would hit its iteration cap before converging refuses to emit
+the capped answer set at all.
+
+**Run-status vocabulary.** Every reported run carries one of three
+statuses, so "sound" is never a layer-ambiguous word: (i)
+SOLVER-CERTIFIED — exact relative to the encoded grammar,
+certificate- or byte-identity-discharged; (ii) PROGRAM-SOUND —
+additionally, every soundness-relevant ledger reads zero, no
+rejecting post-filter is active, and no pointer-capable boundary
+case was declined; (iii) AUDITED-INCOMPLETE — known gaps quantified
+in nonzero ledgers. The kernel pins in this paper are
+SOLVER-CERTIFIED with ledgers reported; the census's declined
+channels are precisely the measured distance to PROGRAM-SOUND.
 
 This is R2 made structural: where the state of the art moves its
 unsoundness into resource caps at the least-auditable point (§2.1),
@@ -222,8 +271,12 @@ keyed notifier chains) — into a complete binding table, and
 is severed. Two disciplines keep this sound. Completeness counters:
 every construct the census cannot classify is counted, and the
 counter must read zero for the channel to activate — a nonzero count
-is a loud failure, not a fallback. And answer certification: each
-channel ships −N/+0 against the prior sound baseline. The two
+is a loud failure, not a fallback. The completeness contract is what
+carries each channel's *soundness* — producers enumerated, updates
+represented, consumers recognized, no severed alternate path — and
+the −N/+0 differential against the prior baseline is its *regression
+check*: proof that the channel only removed, never what it removed
+was false. The two
 largest channels remove 1.50M and 1.20M pairs (32% of the pinned
 answer set combined) while making the solve *faster*, because the
 severed pool no longer propagates.
@@ -273,8 +326,11 @@ callback invisible; the fix is exact-name, audited, and recovered
 +1,038 pairs of pure recall at km). Type and field compatibility
 remain in the pipeline but demoted to *post-filters* over
 flow-confirmed candidates, each rejection counted as explicit
-unsoundness exposure — the counters are the retirement criterion,
-not a trust assumption.
+unsoundness exposure. Counting makes the exposure visible; it does
+not make filtered output sound — a PROGRAM-SOUND configuration
+(§3.2) disables the rejecting filters or conservatively retains
+their rejects, and the counters price exactly what that switch
+costs. They are the retirement criterion, not a trust assumption.
 
 **Field sensitivity as a precision instrument.** The surgical
 residues of §3.1 are also the precision story's second act, and the

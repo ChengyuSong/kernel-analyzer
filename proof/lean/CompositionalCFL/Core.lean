@@ -477,8 +477,13 @@ structure BoundaryMerge (Q C B : Type) where
   merge : Q → C
   /-- Optional boundary symbol attached to each quotient node. -/
   symbol : Q → Option B
-  /-- If two nodes carry the same boundary symbol, they collapse to one rep. -/
-  boundary_sound : ∀ {x y : Q}, symbol x = symbol y → merge x = merge y
+  /-- If two nodes carry the same PRESENT boundary symbol, they collapse
+  to one representative. (Fixed 2026-08-11 per proof-review: the earlier
+  `symbol x = symbol y` form also related `none = none`, requiring every
+  unlabeled node to merge into a single class — stronger than any real
+  boundary union-find and not the intended invariant.) -/
+  boundary_sound : ∀ {x y : Q} {b : B},
+    symbol x = some b → symbol y = some b → merge x = merge y
   /-- Every quotient edge is simulated in the composed graph. -/
   merge_hom : GraphHom merge Gquot Gcomp
 
@@ -490,7 +495,8 @@ def mkBoundaryMerge
     (Gquot : Graph Q)
     (merge : Q → C)
     (symbol : Q → Option B)
-    (hBoundary : ∀ {x y : Q}, symbol x = symbol y → merge x = merge y) :
+    (hBoundary : ∀ {x y : Q} {b : B},
+      symbol x = some b → symbol y = some b → merge x = merge y) :
     BoundaryMerge Q C B where
   Gquot := Gquot
   Gcomp := composedGraph Gquot merge
@@ -507,16 +513,17 @@ structure UnionFindMerge (Q B : Type) where
   rep : Q → Q
   symbol : Q → Option B
   rep_idem : ∀ x : Q, rep (rep x) = rep x
-  same_symbol_same_rep : ∀ {x y : Q}, symbol x = symbol y → rep x = rep y
+  same_symbol_same_rep : ∀ {x y : Q} {b : B},
+    symbol x = some b → symbol y = some b → rep x = rep y
 
 /-- Boundary-soundness follows from the union-find invariant. -/
 theorem boundary_sound_of_unionfind
     {Q B : Type}
     (uf : UnionFindMerge Q B)
-    {x y : Q}
-    (hEq : uf.symbol x = uf.symbol y) :
+    {x y : Q} {b : B}
+    (hx : uf.symbol x = some b) (hy : uf.symbol y = some b) :
     uf.rep x = uf.rep y :=
-  uf.same_symbol_same_rep hEq
+  uf.same_symbol_same_rep hx hy
 
 /-- Build a `BoundaryMerge` directly from a union-find style representative map. -/
 def mkBoundaryMergeFromUF
@@ -529,18 +536,18 @@ def mkBoundaryMergeFromUF
   merge := uf.rep
   symbol := uf.symbol
   boundary_sound := by
-    intro x y hEq
-    exact boundary_sound_of_unionfind uf hEq
+    intro x y b hx hy
+    exact boundary_sound_of_unionfind uf hx hy
   merge_hom := composedGraph_hom Gquot uf.rep
 
 /-- Convenience lemma exposing the boundary merge relation. -/
 theorem merged_of_boundary_eq
     {Q C B : Type}
     (bm : BoundaryMerge Q C B)
-    {x y : Q}
-    (hEq : bm.symbol x = bm.symbol y) :
+    {x y : Q} {b : B}
+    (hx : bm.symbol x = some b) (hy : bm.symbol y = some b) :
     bm.merge x = bm.merge y :=
-  bm.boundary_sound hEq
+  bm.boundary_sound hx hy
 
 /-- Per-TU quotienting followed by boundary merge yields a simulation from
 the original TU graph into the composed graph. -/

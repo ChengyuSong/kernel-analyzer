@@ -91,11 +91,11 @@ The primary solver is now `runFlowsToResolution` (branch `orcfl`), modeled in
 - `fderiv_map` / `fderiv_quotient`: derivability preserved under node
   quotients — covers presolve copy/field merges, cell-cluster union-find
   merges, and the dynamic a-SCC collapse (soundness direction).
-- `solver_complete`: given the closure rules and the `coverage` invariant
-  (every node reached by some minted root), the solver derives every
+- `solver_complete`: given the closure rules and the `origins_minted` hypothesis
+  (origin ⊆ minted), the solver derives every
   grammar-derivable flow and alias.
 - `answers_complete`: icall answers (shift zero or ⊤ at the fptr) are found
-  whenever function nodes are minted and coverage holds.
+  whenever function nodes are minted and `origins_minted` holds.
 - `sderiv_catchup` / `catchup_answers_complete`: staged (lazy-mint)
   solving with a final catch-up to full minting equals the from-scratch
   closure — exactness of task #21's catch-up round.
@@ -218,3 +218,46 @@ NOT covered (implementation-level, below the model's abstraction):
   bijection, unverified.
 - Round termination (monotone merges) is argued informally; the model
   takes the stable table as a hypothesis rather than constructing it.
+
+## Review-response additions (2026-08-11, docs/proof-review.md)
+
+New machine-checked results (all in `FlowsTo.lean`, build clean on
+lean4 stable/4.33.0, no sorry):
+
+- `sderiv_sound_fderiv` + `sderiv_iff_fderiv`: the CONVERSE of
+  `solver_complete` for the least closure — least-closure/grammar
+  equivalence at exact seeds. Replaces the informal "fact-equivalent"
+  claim; F2 (a-SCC converse) and the extra-implementation-roots
+  widening remain open above the least closure.
+- `pol_solver_complete` + `pol_answers_complete`: per-root seed
+  POLICY (exact vs widened) — resolves proof-review finding #1: the
+  surgical wildcard mint now has its abstraction theorem (widened
+  origins' answers surface at ⊤, which acceptance includes).
+- `ShiftHom` / `fderiv_shift_hom` + `intShifts`/`zpShifts`/`natToZp`:
+  residue abstraction is a proved homomorphism transfer; partially
+  discharges F5. REMAINING: the signed instance intShifts → zpShifts
+  (the implementation's ((o % P) + P) % P normalization).
+- `Core.lean` `boundary_sound` fixed to same-PRESENT-symbol (the old
+  `symbol x = symbol y` form also related none = none).
+
+Certificate/code movements the model should eventually absorb:
+
+- C6 (seed presence per mint policy) and C7 (mint coverage at the
+  final quotient) added to --cfl-verify-closure: the SolverModel
+  hypotheses `seed` and `origins_minted` are now checked per run,
+  not assumed (proof-review finding #4).
+- F7 RESOLVED at the policy level: iteration-cap exhaustion now
+  REFUSES to emit answers (exit 1) unless --cfl-iter-cap-ok.
+- Batch stop condition strengthened to full retained-witness
+  stability (merges + mints + cluster keys), syntactically matching
+  `batched_exact`'s hclosed. OPEN (F12): the lemma that the weaker
+  merges-only condition already suffices — a single-member key
+  insert is alias-inert (joins need two co-clustered cells) and
+  self-batch-closed (facts carry their own origin, so only the
+  inserting batch can add the second member, and it just closed) —
+  is argued in a code comment, not yet in Lean.
+- OPEN (F13): formal `ReportedAnswer` semantics (identity channels,
+  transfer summaries, post-filters, fallback cases) — the
+  proof-review's repair #5; channel soundness currently rides on
+  per-family completeness contracts and the regfield closedness
+  certificate.

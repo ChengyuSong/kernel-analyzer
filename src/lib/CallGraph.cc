@@ -3651,12 +3651,18 @@ bool CallGraphPass::runFlowsToResolution() {
   // re-raise their own thread count after the fork — so workers-mode
   // disables it wholesale. (T>1-safe sharing = a future lever, paired
   // with target-partitioned exchange.)
-  const bool internOK =
-      CFLInternPlanes && solverThreads == 1 && CFLBatchWorkers <= 1;
+  // Batching (even sequential, no workers) is ALSO excluded: batch-
+  // local fact universes resize the dense-plane width per batch, and a
+  // COW-shared buffer adopted under one batch's universe can receive a
+  // bit past its width after the universe reshapes (BitVector::set OOB
+  // at km, found 2026-08-11 — a #46 regression dormant since a997bc1
+  // because no sequential-batch run had been taken since).
+  const bool internOK = CFLInternPlanes && solverThreads == 1 &&
+                        CFLBatchWorkers <= 1 && CFLBatchRoots == 0;
   FactSet::EnableShare = internOK;
   if (CFLInternPlanes && !internOK)
     CG_LOG("FlowsTo: plane interning inactive (requires a sequential "
-           "solve: T=1, no batch workers)\n");
+           "unbatched solve: T=1, no batch roots/workers)\n");
   bool parallelPhase = false; // true only inside a parallel wave phase
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
       new std::atomic<uint8_t>[solverCapN]);
@@ -5055,8 +5061,15 @@ bool CallGraphPass::runFlowsToResolution() {
       bool firstFact = true;
       // Fast path eligibility: the measurement flags reroute joins and
       // the prot path bypasses the registry — both must stay slow-path.
-      const bool fastJoinBase =
-          CFLJoinFastpath && sinkAblatePats.empty() && !CFLProbeRodataJoins;
+      // Batch mode excluded: cellJoined planes are FactSets sized by
+      // the BATCH-LOCAL universe, but grid is a GLOBAL rid —
+      // set(grid) overflows the dense width (BitVector OOB at km,
+      // 2026-08-11; #48 was validated mono-only). Real fix if batch
+      // joins ever profile hot: back cellJoined with globally-sized
+      // BitVectors instead of Universe-following FactSets.
+      const bool fastJoinBase = CFLJoinFastpath && CFLBatchRoots == 0 &&
+                                sinkAblatePats.empty() &&
+                                !CFLProbeRodataJoins;
       for (uint32_t o : ctx.sweepElems) {
         const uint32_t grid = g_ridBase + o;
         const bool fastJoin =
@@ -5565,6 +5578,7 @@ bool CallGraphPass::runFlowsToResolution() {
     for (;;) {
       const size_t mc0 = mergeCount;
       const uint32_t nR = nextRoot;
+      const size_t kc0 = clusterCount();
       // Frozen batch bounds; growth appends new (fresh) batches.
       while ((batchBounds.empty() ? 0u : batchBounds.back().second) < nR) {
         const uint32_t lo =
@@ -5753,11 +5767,24 @@ bool CallGraphPass::runFlowsToResolution() {
       } // sequential-batch path
       round++;
       const size_t dm = mergeCount - mc0;
+      // Key-insert term (proof-review #5): a single-member key insert
+      // is alias-inert (joins need two co-clustered cells) and
+      // self-batch-closed (a fact carries its own origin, so only the
+      // batch that inserted the key could add its second member — and
+      // that batch just closed over it), so dm==0 alone is arguably
+      // sufficient. Until that argument is a Lean lemma, stability of
+      // the retained WITNESS state — merges, mints, AND cluster keys —
+      // is the stop condition, matching batched_exact's hclosed
+      // hypothesis trivially.
+      const size_t dk =
+          dm == 0 ? clusterCount() - kc0 : (size_t)1; // merges shrink count
       CG_LOG("BatchRoots: round " << round << ": " << dm << " new merges, "
              << (nextRoot - nR) << " late mints, "
-             << ((nR + K - 1) / K) << " batches\n");
-      if (dm == 0 && nextRoot == nR)
-        break; // quotient stable: this round's harvest is valid
+             << ((nR + K - 1) / K) << " batches"
+             << (dm == 0 ? (", " + std::to_string(dk) + " new keys") : "")
+             << "\n");
+      if (dm == 0 && nextRoot == nR && dk == 0)
+        break; // retained witness state stable: harvest is valid
     }
   }
   // --cfl-verify-closure: certify the fixpoint. One full non-delta scan of
@@ -5847,11 +5874,40 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
     }
+    // C6: seed presence — every minted root's seed fact survives in
+    // the final planes under its mint policy (exact roots at shift 0,
+    // wildcard-minted at SHIFT_X). Discharges SolverClosure.seed for
+    // THIS run (proof-review finding #4: C0-C5 checked rule closure
+    // only — an empty relation is closed).
+    for (uint32_t rid = 0; rid < nextRoot; rid++) {
+      const uint32_t rep = find(rootClassOf[rid]);
+      const uint32_t s0 =
+          (nexusGate && !rootNexus[rid]) ? (uint32_t)SHIFT_X : 0u;
+      if (!R[rep][s0].test(rid) && !RB[rep][s0].test(rid))
+        report("C6-seed", rep, s0, rid);
+    }
+    // C7: mint coverage — every class satisfying the origin criterion
+    // at the FINAL quotient is minted, or is an intentionally pruned
+    // bidi-irrelevant origin (tracked in bidiPrunedCls) or a still-
+    // deferred lazy root (must be empty after catch-up). Discharges
+    // origins_minted per run; both historical violations (July mint
+    // bug, lazy-mint deficit) would have fired here.
+    {
+      boost::unordered_flat_set<uint32_t> pruned(bidiPrunedCls.begin(),
+                                                 bidiPrunedCls.end());
+      for (uint32_t n : lazyDeferred) report("C7-lazy", find(n), 0, n);
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n || isRoot[n]) continue;
+        if ((originBearing(toOrig[n]) || !hasIn[n]) && !pruned.count(n))
+          report("C7-mint", n, 0, n);
+      }
+    }
     if (viol) {
       errs() << "CLOSURE: " << viol << " violations — fixpoint NOT closed\n";
       assert(false && "flows-to fixpoint failed closure verification");
     } else {
-      CG_LOG("Closure verified: all rules saturated (0 violations)\n");
+      CG_LOG("Closure verified: all rules saturated + seeds present + "
+             "mint coverage (0 violations)\n");
     }
   }
 
@@ -7120,10 +7176,21 @@ bool CallGraphPass::runFlowsToResolution() {
     break; // converged: no callee flows were added
   }
   if (iteration + fpIter + 1 >= (int)CFLFlowsToMaxIters) {
+    // A cap that fires before a no-change round is an unsound result,
+    // not a warning condition (proof-review #7 / R2): refuse it unless
+    // the user explicitly accepted capped output.
+    if (!CFLIterCapOk) {
+      errs() << "ERROR: FlowsTo fixpoint hit iteration cap ("
+             << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
+             << " newly wired pairs unprocessed — result would be "
+             << "unsound. Raise --cfl-flows-to-max-iters, or pass "
+             << "--cfl-iter-cap-ok to accept UNSOUND capped output.\n";
+      exit(1);
+    }
     WARNING("[UNSOUND-RISK] FlowsTo fixpoint hit iteration cap ("
             << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
             << " newly wired pairs unprocessed; results may miss flows "
-            << "through those callees\n");
+            << "through those callees (--cfl-iter-cap-ok accepted)\n");
     break;
   }
   if (!CFLFlowsToIncremental)
@@ -11183,6 +11250,17 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
     errs() << "FuncSummary: cannot open " << path << "\n";
     assert(false && "--func-summaries file unreadable");
     return;
+  }
+  // The summary file is part of the trusted semantic specification
+  // (authoritative over hardcoded models when loaded) — pin its
+  // content hash in every log so answer pins are attributable to a
+  // specific spec version (design-review clarification #4).
+  if (auto mb = MemoryBuffer::getFile(path)) {
+    llvm::SHA256 H;
+    H.update((*mb)->getBuffer());
+    auto D = H.final();
+    CG_LOG("FuncSummary: spec sha256=" << llvm::toHex(D, true) << " ("
+           << (*mb)->getBufferSize() << " bytes) " << path << "\n");
   }
   auto parseRef = [](StringRef tok, int &out) -> bool {
     if (tok == "ret") { out = -1; return true; }

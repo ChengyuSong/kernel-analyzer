@@ -351,6 +351,14 @@ cl::opt<bool> CFLRegFieldApply(
            "material for the manual channel pipeline)"),
   cl::init(false));
 
+cl::opt<bool> CFLIterCapOk(
+  "cfl-iter-cap-ok",
+  cl::desc("Accept UNSOUND capped output when the flows-to outer "
+           "fixpoint hits --cfl-flows-to-max-iters before converging. "
+           "Default: refuse and exit(1) — a silently capped result is "
+           "a missing-flow answer set"),
+  cl::init(false));
+
 cl::opt<bool> CFLRegFieldAudit(
   "cfl-regfield-audit",
   cl::desc("With --cfl-regfield-apply: emit a provenance certificate "

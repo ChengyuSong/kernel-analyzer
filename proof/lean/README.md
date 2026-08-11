@@ -25,14 +25,14 @@ theorem schemas for the two analysis pipelines:
     quotients — covers presolve merges, union-find cell merges, and the
     dynamic a-SCC collapse (soundness direction)
   - `solver_complete`: the minted-root solver abstraction (`SolverModel`)
-    derives every grammar-derivable fact and alias GIVEN the `coverage`
+    derives every grammar-derivable fact and alias GIVEN the `origins_minted`
     invariant (every node reached by some minted root). The 2026-07-13
-    minting bug is precisely a `coverage` violation.
+    minting bug is precisely an `origins_minted` violation.
   - `answers_complete`: icall answers (shift 0 or ⊤ at the fptr) are found
-    whenever function nodes are minted and coverage holds
+    whenever function nodes are minted and `origins_minted` holds
 
 See the "Flows-to (ORCFL) model gaps" section of `GAPS.md` for what remains
-assumed (coverage discharge from the minting criterion, SCC-collapse
+assumed (`origins_minted` discharge from the minting criterion — now checked per run by certificate C7 — SCC-collapse
 precision-neutrality, bridge provenance, `Z_P` quotient, FactSet refinement,
 target filters).
 
@@ -95,3 +95,17 @@ lake build CompositionalCFL
 5. Compose these lemmas to discharge `hSim` for the real `q`.
 
 At that point, `compositional_sound`/`compositional_sound_iterative` become a fully mechanized proof schema for your implemented construction.
+
+## Review-response theorems (2026-08-11)
+
+- `sderiv_sound_fderiv` / `sderiv_iff_fderiv` — least-closure
+  soundness + two-sided equivalence with the rooted grammar at exact
+  seeds (the converse direction the review noted was missing).
+- `pol_solver_complete` / `pol_answers_complete` — per-root seed
+  policy (exact vs wildcard): the surgical minting mode's abstraction
+  theorem; widened origins report every grammar answer at ⊤.
+- `ShiftHom` / `fderiv_shift_hom` / `intShifts` / `zpShifts` /
+  `natToZp` — residue abstraction as a proved homomorphism transfer;
+  signed ground truth is `intShifts`, the signed→Z_P instance is the
+  remaining item (GAPS).
+- `Core.lean` `boundary_sound` corrected to same-present-symbol.

@@ -46,7 +46,7 @@ structure ShiftMonoid where
   add_zero : ∀ a, add a zero = a
 
 /-- Ground-truth instance: unbounded byte offsets. -/
-def natShifts : ShiftMonoid where
+@[reducible] def natShifts : ShiftMonoid where
   S := Nat
   add := Nat.add
   zero := 0
@@ -415,7 +415,7 @@ that mints everything still deferred. Two facts must hold:
    round's answers are identical to the eager solve by construction.
 2. `answer_not_derivable_restricted` — the catch-up is NECESSARY:
    `origins_minted` cannot be dropped, because an unminted witness origin
-   loses grammar-derivable answers (a five-node counterexample; the
+   loses grammar-derivable answers (a seven-node counterexample; the
    whole-kernel -5737-pair deficit is this shape at scale).
 -/
 
@@ -592,7 +592,7 @@ theorem catchup_answers_complete (M : ShiftMonoid) {N : Type}
 /-!
 ## Necessity of the catch-up: restricted minting loses answers
 
-Five-node counterexample (field-insensitive): function `fn` is stored
+Seven-node counterexample (field-insensitive): function `fn` is stored
 through pointer `pp` (cell `cs`) and loaded through pointer `qq` (cell
 `cl`) into the fptr; the aliasing witness is origin `ww`, which flows to
 both pointers. Minting only `fn` — a strict subset of the origins — the
@@ -1003,5 +1003,318 @@ theorem batched_answers_complete (M : ShiftMonoid) {N : Type}
     (SM := { toSolverClosure := sderivClosure M G m₂,
              origins_minted := hOrig })
     hAccept hReach
+
+/-!
+## Soundness of the least closure (proof-review repair: the converse)
+
+`solver_complete` bounds the solver from BELOW (no derivable fact is
+missed) but places no upper bound — the universal relation satisfies
+the closure interface. `sderiv_sound_fderiv` bounds the LEAST closure
+from above: with no carried base and roots inside the origins, every
+solver fact is a grammar flow. Together they give least-closure
+EQUIVALENCE for the exact-seeded configuration (`sderiv_iff_fderiv`),
+replacing the informal "fact-equivalent" claim with the two-sided
+theorem it meant.
+-/
+
+theorem sderiv_sound_fderiv (M : ShiftMonoid) {N : Type}
+    {origin : N → Prop} {G : FGraph N M.S} {minted : N → Prop}
+    (hm : ∀ n, minted n → origin n) :
+    ∀ {m : N} {c : Shift M} {x : N},
+      SDeriv M G minted (noBase M N) m c x →
+      FDeriv M origin G (.flow m c x) := by
+  intro m c x h
+  induction h with
+  | ofBase hB => exact hB.elim
+  | seed n hn => exact .flow_refl n (hm n hn)
+  | step_a _ hE ih => exact .flow_a ih hE
+  | step_f _ hE ih => exact .flow_f ih hE
+  | step_fx _ hE ih => exact .flow_fx ih hE
+  | join_e hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact .flow_m ihx (.mal_join hEp hEq ihp ihq)
+  | join_xl hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact .flow_m ihx (.mal_joinXL hEp hEq ihp ihq)
+  | join_xr hEp hEq hw _ _ _ ihp ihq ihx =>
+      exact .flow_m ihx (.mal_joinXR hEp hEq ihp ihq)
+
+/-- Least-closure equivalence at `minted = origin`: the from-scratch
+solver closure and the rooted grammar derive EXACTLY the same flows. -/
+theorem sderiv_iff_fderiv (M : ShiftMonoid) {N : Type}
+    {origin : N → Prop} {G : FGraph N M.S}
+    {m : N} {c : Shift M} {x : N} :
+    SDeriv M G origin (noBase M N) m c x ↔
+      FDeriv M origin G (.flow m c x) := by
+  constructor
+  · exact sderiv_sound_fderiv M (fun _ h => h)
+  · intro h
+    have hz : origin m := fderiv_flow_origin M h
+    have h2 := solver_complete M
+      (SM := { toSolverClosure := sderivClosure M G origin,
+               origins_minted := fun _ hz => hz }) h m (some M.zero) hz
+      (SDeriv.seed m hz)
+    rw [shiftComp_zero_left] at h2
+    exact h2
+
+/-!
+## Surgical seeding (proof-review repair: the wildcard mint policy)
+
+The surgical field-sensitive mode (`--cfl-nexus-fields`) mints
+non-nexus origins at the WILDCARD plane instead of exact shift zero,
+so a surgical run does not instantiate `SolverClosure.seed`. The right
+statement is an abstraction: a per-root policy chooses exact or
+widened tracking, the abstraction sends a widened origin's shifts to
+⊤, and every grammar-derivable fact appears at its policy-abstracted
+shift. Answer acceptance {0, ⊤} is closed under the abstraction, so a
+widened root still reports every grammar answer — the design's
+"wildcard minting is FI-identical for that origin", as a theorem.
+-/
+
+/-- Per-root seed policy: `true` = exact (seed at zero), `false` =
+widened (all facts live at ⊤). -/
+def SeedPolicy (N : Type) := N → Bool
+
+/-- Policy abstraction of a shift for origin `m`. -/
+def polShift (M : ShiftMonoid) {N : Type} (pol : SeedPolicy N) (m : N)
+    (c : Shift M) : Shift M :=
+  if pol m then c else none
+
+/-- Completeness of a POLICY-seeded closed solver state: every
+grammar-derivable flow appears at its policy-abstracted shift, and
+every derivable alias is a cluster join. Stated against explicit
+closure hypotheses (not `SolverClosure`, whose seed field hard-codes
+zero seeding). -/
+theorem pol_solver_complete (M : ShiftMonoid) {N : Type}
+    {origin : N → Prop} {G : FGraph N M.S} (pol : SeedPolicy N)
+    (minted : N → Prop) (SF : N → Shift M → N → Prop)
+    (seed : ∀ m, minted m → SF m (polShift M pol m (some M.zero)) m)
+    (step_a : ∀ {m : N} {c : Shift M} {x y : N},
+      SF m c x →
+      ({ src := x, lbl := .a, dst := y } : FEdge N M.S) ∈ G → SF m c y)
+    (step_f : ∀ {m : N} {c : Shift M} {x y : N} {r : M.S},
+      SF m c x →
+      ({ src := x, lbl := .f r, dst := y } : FEdge N M.S) ∈ G →
+      SF m (shiftComp M c (some r)) y)
+    (step_fx : ∀ {m : N} {c : Shift M} {x y : N},
+      SF m c x →
+      ({ src := x, lbl := .fx, dst := y } : FEdge N M.S) ∈ G →
+      SF m none y)
+    (step_mal : ∀ {m : N} {c : Shift M} {x y : N},
+      SF m c x → SAlias M G minted SF x y → SF m c y)
+    (hOrig : ∀ z, origin z → minted z) :
+    ∀ {j : FJudg N M.S}, FDeriv M origin G j →
+      (match j with
+       | .flow z c x => SF z (polShift M pol z c) x
+       | .mal x y => SAlias M G minted SF x y) := by
+  intro j h
+  induction h with
+  | flow_refl z hz => exact seed z (hOrig z hz)
+  | flow_a _ hE ih => exact step_a ih hE
+  | flow_f hd hE ih =>
+      rename_i z c x y r
+      cases hpz : pol z with
+      | true =>
+          have h2 := step_f ih hE
+          simpa [polShift, hpz] using h2
+      | false =>
+          have hz0 : polShift M pol z c = none := by
+            simp [polShift, hpz]
+          have ih' : SF z (polShift M pol z c) x := ih
+          rw [hz0] at ih'
+          have h2 := step_f ih' hE
+          simpa [polShift, hpz, shiftComp] using h2
+  | flow_fx hd hE ih =>
+      rename_i z c x y
+      have h2 := step_fx ih hE
+      cases hpz : pol z <;> simpa [polShift, hpz] using h2
+  | flow_m _ _ ih₁ ih₂ => exact step_mal ih₁ ih₂
+  | mal_join hEp hEq hp hq ihp ihq =>
+      rename_i p q cx cy z c
+      have hz : origin z := fderiv_flow_origin M hp
+      exact ⟨p, q, hEp, hEq, z, hOrig z hz,
+             Or.inl ⟨polShift M pol z c, ihp, ihq⟩⟩
+  | mal_joinXL hEp hEq hp hq ihp ihq =>
+      rename_i p q cx cy z c
+      have hz : origin z := fderiv_flow_origin M hp
+      have hpn : polShift M pol z (none : Shift M) = none := by
+        cases hpz : pol z <;> simp [polShift, hpz]
+      have ihp' : SF z (polShift M pol z none) p := ihp
+      rw [hpn] at ihp'
+      exact ⟨p, q, hEp, hEq, z, hOrig z hz,
+             Or.inr (Or.inl ⟨ihp', polShift M pol z c, ihq⟩)⟩
+  | mal_joinXR hEp hEq hp hq ihp ihq =>
+      rename_i p q cx cy z c
+      have hz : origin z := fderiv_flow_origin M hp
+      have hpn : polShift M pol z (none : Shift M) = none := by
+        cases hpz : pol z <;> simp [polShift, hpz]
+      have ihq' : SF z (polShift M pol z none) q := ihq
+      rw [hpn] at ihq'
+      exact ⟨p, q, hEp, hEq, z, hOrig z hz,
+             Or.inr (Or.inr ⟨⟨polShift M pol z c, ihp⟩, ihq'⟩)⟩
+
+/-- Answer completeness under surgical seeding: the policy-abstracted
+shift of an accepted answer shift is still accepted, so resolution
+finds every grammar answer whether its function root was minted
+exactly or widened. -/
+theorem pol_answers_complete (M : ShiftMonoid) {N : Type}
+    {origin : N → Prop} {G : FGraph N M.S} (pol : SeedPolicy N)
+    (minted : N → Prop) (SF : N → Shift M → N → Prop)
+    (seed : ∀ m, minted m → SF m (polShift M pol m (some M.zero)) m)
+    (step_a : ∀ {m : N} {c : Shift M} {x y : N},
+      SF m c x →
+      ({ src := x, lbl := .a, dst := y } : FEdge N M.S) ∈ G → SF m c y)
+    (step_f : ∀ {m : N} {c : Shift M} {x y : N} {r : M.S},
+      SF m c x →
+      ({ src := x, lbl := .f r, dst := y } : FEdge N M.S) ∈ G →
+      SF m (shiftComp M c (some r)) y)
+    (step_fx : ∀ {m : N} {c : Shift M} {x y : N},
+      SF m c x →
+      ({ src := x, lbl := .fx, dst := y } : FEdge N M.S) ∈ G →
+      SF m none y)
+    (step_mal : ∀ {m : N} {c : Shift M} {x y : N},
+      SF m c x → SAlias M G minted SF x y → SF m c y)
+    (hOrig : ∀ z, origin z → minted z)
+    {fnode fptr : N} {c : Shift M}
+    (hAccept : c = some M.zero ∨ c = none)
+    (hReach : FDeriv M origin G (.flow fnode c fptr)) :
+    SF fnode (polShift M pol fnode c) fptr ∧
+      (polShift M pol fnode c = some M.zero ∨
+       polShift M pol fnode c = none) := by
+  refine ⟨pol_solver_complete M pol minted SF seed step_a step_f step_fx
+            step_mal hOrig hReach, ?_⟩
+  rcases hAccept with h0 | hT
+  · subst h0
+    cases hp : pol fnode
+    · right; simp [polShift, hp]
+    · left; simp [polShift, hp]
+  · subst hT
+    right
+    cases hp : pol fnode <;> simp [polShift, hp]
+
+/-!
+## Shift-domain abstraction (proof-review repair: exact offsets → Z_P)
+
+The production residue domain is a finite quotient of exact offsets,
+not the exact offsets themselves. `ShiftHom` is a monoid homomorphism
+between shift domains; `fderiv_shift_hom` shows derivability transfers
+along it (with graph labels mapped), and zero maps to zero, so every
+exact-offset answer is a residue-domain answer — collisions can only
+ADD answers (the sound direction; residue analysis is deliberately not
+precision-equivalent to exact offsets). `intShifts` replaces Nat as
+the honest ground truth (interior-pointer arithmetic is signed);
+`zpShifts` is the production residue instance and `natToZp` the
+canonical quotient map.
+-/
+
+structure ShiftHom (M1 M2 : ShiftMonoid) where
+  map : M1.S → M2.S
+  map_zero : map M1.zero = M2.zero
+  map_add : ∀ a b, map (M1.add a b) = M2.add (map a) (map b)
+
+def mapShift {M1 M2 : ShiftMonoid} (h : ShiftHom M1 M2) :
+    Shift M1 → Shift M2
+  | none => none
+  | some a => some (h.map a)
+
+theorem mapShift_comp {M1 M2 : ShiftMonoid} (h : ShiftHom M1 M2)
+    (c d : Shift M1) :
+    mapShift h (shiftComp M1 c d) =
+      shiftComp M2 (mapShift h c) (mapShift h d) := by
+  cases c <;> cases d <;> simp [mapShift, shiftComp, h.map_add]
+
+/-- Relabel a graph's field steps through the homomorphism. -/
+def mapFLabel {M1 M2 : ShiftMonoid} (h : ShiftHom M1 M2) :
+    FLabel M1.S → FLabel M2.S
+  | .a => .a
+  | .d => .d
+  | .f r => .f (h.map r)
+  | .fx => .fx
+
+def homGraph {N : Type} {M1 M2 : ShiftMonoid} (h : ShiftHom M1 M2)
+    (G : FGraph N M1.S) : FGraph N M2.S :=
+  fun e2 => ∃ e1, e1 ∈ G ∧
+    ({ src := e1.src, lbl := mapFLabel h e1.lbl, dst := e1.dst } :
+      FEdge N M2.S) = e2
+
+def mapFJudgShift {N : Type} {M1 M2 : ShiftMonoid} (h : ShiftHom M1 M2) :
+    FJudg N M1.S → FJudg N M2.S
+  | .flow z c x => .flow z (mapShift h c) x
+  | .mal x y => .mal x y
+
+/-- Derivability transfers along a shift homomorphism. With
+`map_zero`, accepted answers (shift 0 or ⊤) map to accepted answers:
+the residue abstraction is sound. -/
+theorem fderiv_shift_hom {N : Type} {M1 M2 : ShiftMonoid}
+    (h : ShiftHom M1 M2) {origin : N → Prop} {G : FGraph N M1.S} :
+    ∀ {j : FJudg N M1.S}, FDeriv M1 origin G j →
+      FDeriv M2 origin (homGraph h G) (mapFJudgShift h j) := by
+  intro j hd
+  induction hd with
+  | flow_refl z hz =>
+      dsimp [mapFJudgShift, mapShift]
+      rw [h.map_zero]
+      exact .flow_refl z hz
+  | flow_a _ hE ih =>
+      exact .flow_a ih ⟨_, hE, rfl⟩
+  | flow_f hd hE ih =>
+      dsimp [mapFJudgShift] at ih ⊢
+      rw [mapShift_comp]
+      exact .flow_f ih ⟨_, hE, rfl⟩
+  | flow_fx _ hE ih =>
+      exact .flow_fx ih ⟨_, hE, rfl⟩
+  | flow_m _ _ ih₁ ih₂ => exact .flow_m ih₁ ih₂
+  | mal_join hEp hEq _ _ ihp ihq =>
+      exact .mal_join ⟨_, hEp, rfl⟩ ⟨_, hEq, rfl⟩ ihp ihq
+  | mal_joinXL hEp hEq _ _ ihp ihq =>
+      exact .mal_joinXL ⟨_, hEp, rfl⟩ ⟨_, hEq, rfl⟩ ihp ihq
+  | mal_joinXR hEp hEq _ _ ihp ihq =>
+      exact .mal_joinXR ⟨_, hEp, rfl⟩ ⟨_, hEq, rfl⟩ ihp ihq
+
+/-- Exact SIGNED byte offsets — the honest ground-truth instance
+(`down-8` composes with `up-8`; Nat cannot express the up direction). -/
+def intShifts : ShiftMonoid where
+  S := Int
+  add := Int.add
+  zero := 0
+  add_assoc := Int.add_assoc
+  zero_add := Int.zero_add
+  add_zero := Int.add_zero
+
+/-- The production residue domain: Z_P with wrap-around addition. -/
+@[reducible] def zpShifts (P : Nat) (hP : 0 < P) : ShiftMonoid where
+  S := Fin P
+  add := fun a b => ⟨(a.val + b.val) % P, Nat.mod_lt _ hP⟩
+  zero := ⟨0, hP⟩
+  add_assoc := by
+    intro a b c
+    apply Fin.ext
+    show ((a.val + b.val) % P + c.val) % P
+        = (a.val + (b.val + c.val) % P) % P
+    rw [Nat.mod_add_mod, Nat.add_mod_mod, Nat.add_assoc]
+  zero_add := by
+    intro a
+    apply Fin.ext
+    show (0 + a.val) % P = a.val
+    rw [Nat.zero_add]
+    exact Nat.mod_eq_of_lt a.isLt
+  add_zero := by
+    intro a
+    apply Fin.ext
+    show (a.val + 0) % P = a.val
+    rw [Nat.add_zero]
+    exact Nat.mod_eq_of_lt a.isLt
+
+/-- The canonical quotient map onto the residue domain (unsigned
+offsets; the signed normalization `((o % P) + P) % P` used by the
+implementation composes with this and remains an open instance —
+see GAPS.md). -/
+def natToZp (P : Nat) (hP : 0 < P) : ShiftHom natShifts (zpShifts P hP) where
+  map := fun n => ⟨(n : Nat) % P, Nat.mod_lt _ hP⟩
+  map_zero := by
+    apply Fin.ext
+    exact Nat.zero_mod P
+  map_add := by
+    intro a b
+    apply Fin.ext
+    exact Nat.add_mod a b P
 
 end FlowsToCFL

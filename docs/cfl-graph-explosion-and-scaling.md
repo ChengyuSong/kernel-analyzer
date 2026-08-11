@@ -4424,3 +4424,109 @@ RSS fits. RLIMIT_AS (--mem-limit) is per process and each child's AS
 includes the shared mappings — set it generously. Workers dirty the
 union-find via path compression (CoW duplicates those pages) — small
 (8B/class).
+
+## Bridge note (2026-08-10)
+
+Tasks #42–#48 were logged in commit messages and session records
+rather than here: #42 batch spill (zstd ~600×), #43 incremental
+exactness fix (stale bidi cone, b82985d), #44 body-skip recall fix
+(+1,038 km), #45 AddressTakenFuncs canonicalization + boundary
+census, #46 COW plane sharing (a997bc1), #47 bundling probe NO-GO
+(falsification #8), #48 cluster-mark join fast path (32d8793,
+lookups 39.94M→96k). See docs/design-section.md notes and the
+kernel-idchan / kmdef2 pins. This log resumes with the
+field-sensitivity worthiness arc.
+
+## Task #49: fs worthiness at kernel scale — the same-IR A/B (2026-08-09/10)
+
+The 70h20m/365 GB big-machine run (kernel-nexus-allids, old binary)
+was the FIRST kernel-scale field-sensitive completion — feasibility
+proven, no caps, exit 0, 5 wiring iterations × 3 batch rounds with
+round 3 = 0 merges every time (the batched_exact closedness
+hypothesis discharged in the log). But worthiness needed a
+same-binary A/B, and pins do not travel across IR builds
+(SSA/metadata renumbering: zero common lines — eval/50-compare.sh
+now aborts on that).
+
+HEAD FI on the same 6.18 bclist: 4,866,847 pairs / 16,512 sites /
+2:07:18 / 22.6 GB (kernel-fi-618, new FI baseline). Same-IR compare
+vs the fs run, vintage-decomposed:
+- net −2.25%; of which 32,696 "removals" at 86 fs-absent sites are
+  binary vintage (#44 recall in FI only) — partly ALSO real
+  site-emptying (same-binary km shows fs legitimately empties
+  slice-truncated sites: bpf_link_release 532→0);
+- genuine selective-fs tightening ≈ 80,868 pairs (−1.66%) at 7,694
+  sites — mostly shallow, PLUS 73 deep-collapse sites (≥90%
+  reduction, 18,376 pairs): acpi_ev_fixed_event_detect 1800→3,
+  __netlink_dump_start 1800→4 — removed populations are ONE shared
+  hub cone (netlink∩acpi removed overlap 1,793/1,796), survivors
+  are the true registrants.
+- CORRECTION: fs "sound recall" (+895 in the old km compare) was
+  kmdef2 vintage — same-binary km all+ids adds ZERO pairs over FI.
+  container_of recall claims stay micro-scoped until a kernel-fs
+  HEAD run.
+
+Mechanism verdict: the giant's dominant conflation is SAME-OFFSET
+registration mixing (fanout max 4,424→4,367 under fs — hubs
+intact); fs only cracks the cross-field artifact mode (~2%).
+Targeted fs (detector-suggested nexus lists, km): capture 27%→60%
+of the all+ids ceiling with outer-struct closure (bpf_link for
+bpf_link_ops), but cost is NSHIFT-STRUCTURAL — 1,104 exact roots
+already cost 24 min vs FI 1:49 vs ceiling 34:24 (plane scans
+~4.7×/solve + no incremental under fs). Root-population is not the
+dial; plane-occupancy skip is the (unbuilt) engineering lever.
+Verdict: fs = instrument and reference, NOT an operating point;
+the deep collapses belong to channels.
+
+## Task #50: auto-certified identity channels (regfield) — detector, apply, audit (2026-08-10)
+
+The deep-collapse signature is detectable from ONE FI run: a
+(struct+offset) registration field whose WITNESSED store population
+is narrow while resolved reader fanout is wide. --cfl-regfield-report
+(196e293, 5d11e22): population from constant stores + install-API
+argument hop + global-initializer slots + copy-edge closure
+(control-struct relays); two-level dispatch must suggest the
+ops-POINTER holder too (without bpf_link, bpf capture was 11/532).
+
+--cfl-regfield-apply (8ea40b1): keys whose population is
+machine-certified CLOSED (every mutation path classified; hazards at
+zero: unwitnessed stores, atomics, non-const bulk copies, escaping
+slot addresses, var keys) become channels in the SAME run —
+resolution at reader sites intersects the table; open keys are
+untouched (same-slot instance pools look exactly like unwitnessable
+populations, correctly refused). Two certifier bug classes caught
+during km bring-up: any-caller witnessing (partial tables could
+close) and indirect-caller arg-hop (smear-resolved callers pollute
+tables — clear_page_erms entering irqaction+0).
+
+Audit (16cfdb4): (1) AT-unused delta = 0/3,715 at kernel — −1.49M
+pairs de-dispatched no function entirely; (2) provenance
+certificates per key: GREEN const-init-only (rodata-structural) /
+YELLOW hazard-dependent / ORANGE copy-closure-dependent; (3)
+semantic sampling vs source found a REAL hole — whole-struct stores
+through bare pointers (*work_buf = {.fn = fn} in
+stop_one_cpu_nowait) were invisible AND unhazarded; fix opens the
+value's struct type (ditto bare-ptr memcpy via alloca type); the
+remaining blind spot (scalar fn stores through bare pointers) is a
+COUNTED residual, not prose.
+
+AUDITED KERNEL PIN (kernel-fi-autochan2, binary 16cfdb4): 1:46:37 /
+22.4 GB (vs FI 2:07), 1,997 closed keys / 8,087 sites /
+−1,487,417/+0 = −30.6% ON TOP of the hand-built channels; answers
+3,379,430 pairs, STRICT SUBSET of FI verified; fanout p50 43→6,
+p90 540→444, max unchanged (hubs = open keys, correct). Hole fix at
+kernel scale = 1 key de-closed (keyring_search_context+88),
+restoring 572 true-risk pairs at search_nested_keyrings — the
+predicted FN class, caught by the audit. Certificates: 1,105 GREEN /
+869 YELLOW / 23 ORANGE (the ORANGE list is the designed relay set:
+netlink_callback+24, netlink_sock, efivar_operations, Qdisc+8,
+hc_driver). Residual: 273 bare-pointer fn stores kernel-wide.
+
+Contrast that closes the precision ladder: selective fs −1.7% at
+20–30× cost; auto-channels −30.6% at NEGATIVE cost, one run, a
+certificate per key. Three-tier channel arc: hand-derived (−32%) →
+census-confirmed (INVOKE) → auto-certified (−30.6% more).
+Eval: ftc mode in eval/30-run.sh runs ft+apply+audit with a built-in
+strict-subset gate (8f2db62). Open tail: eyeball the 23 ORANGE keys
+vs source; kernel-fs HEAD run for the recall question; ORANGE→GREEN
+upgrades via rodata-source tracing if wanted.

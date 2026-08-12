@@ -175,6 +175,11 @@ kcalloc NONE
 kmalloc_array_node NONE
 kcalloc_node NONE
 krealloc_array NONE
+# glob-overreach exclusions (2026-08-11 census vs linux-5.18 defs):
+# lookups/helpers caught by the alloc globs — NOT allocators; FRESH
+# would fake a fresh return identity AND skip their bodies
+kmalloc_fix_flags NONE
+kmalloc_slab NONE
 kmalloc* FRESH
 __kmalloc* FRESH
 kzalloc* FRESH
@@ -183,12 +188,19 @@ kmem_cache_zalloc FRESH
 kvmalloc* FRESH
 kvzalloc* FRESH
 kvcalloc FRESH
+# glob-overreach exclusions for vmalloc*: init/lookup/query helpers
+vmalloc_init NONE
+vmalloc_to_page NONE
+vmalloc_to_pfn NONE
+vmalloc_dump_obj NONE
+vmalloc_nr_pages NONE
 vmalloc* FRESH
 vzalloc* FRESH
 __vmalloc* FRESH
 vcalloc FRESH
 
 # ---- kernel: managed / subsystem allocators (legacy migration) ----
+devm_kmalloc_release NONE
 devm_kmalloc* FRESH
 devm_kzalloc* FRESH
 alloc_dr FRESH

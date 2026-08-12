@@ -11439,8 +11439,19 @@ static const GlobalContext::FuncSummary *
 summaryForName(GlobalContext *Ctx, StringRef name) {
   for (const auto &sp : Ctx->SummarySpecs) {
     StringRef pat(sp.first);
+    bool glob = StringRef(sp.first).ends_with("*");
     bool hit = pat.consume_back("*") ? name.starts_with(pat) : name == pat;
-    if (hit) return sp.second.none ? nullptr : &sp.second;
+    if (hit) {
+      // Glob-expansion LEDGER: every name a glob classifies is one
+      // census line — glob overreach (vmalloc* catching vmalloc_init)
+      // silently mis-models whole bodies, so the expansion must be
+      // auditable from any verbose log, not rediscovered by bisection.
+      if (glob && name != StringRef(sp.first).drop_back())
+        CG_LOG("FuncSummary glob '" << sp.first << "' classified "
+               << name << (sp.second.none ? " (NONE)"
+                           : sp.second.fresh ? " (FRESH)" : "") << "\n");
+      return sp.second.none ? nullptr : &sp.second;
+    }
   }
   return nullptr;
 }

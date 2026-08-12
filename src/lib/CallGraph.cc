@@ -1230,6 +1230,7 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
       argNode = getCanonicalNode(argNode);
       CG_DEBUG("Create value node " << argNode << " for Arg " << *arg << "\n");
     }
+
     Value *farg = CF->getArg(i);
     NodeIndex formalNode = getRepNodeForValue(farg);
     if (formalNode == AndersNodeFactory::InvalidIndex) {
@@ -2699,8 +2700,23 @@ bool CallGraphPass::runFlowsToResolution() {
   std::unordered_map<NodeIndex, const Function *> funcOfCanon;
   for (const Function *F : Ctx->AddressTakenFuncs) {
     NodeIndex n = NF.getValueNodeFor(F);
-    if (n != AndersNodeFactory::InvalidIndex)
-      funcOfCanon[getCanonicalNode(n)] = F;
+    if (n == AndersNodeFactory::InvalidIndex) {
+      WARNING("FlowsTo: AT function has NO value node (never mintable): "
+              << F->getName() << "\n");
+      continue;
+    }
+    NodeIndex canon = getCanonicalNode(n);
+    auto [it, ins] = funcOfCanon.emplace(canon, F);
+    if (!ins && it->second != F && it->second->getName() != F->getName())
+      // Same-name entries are per-TU Function* copies of one symbol
+      // (the #45 display footgun) — only DIFFERENT functions sharing a
+      // class lose an identity.
+      WARNING("FlowsTo: AT function canonical collision: "
+              << F->getName() << " shares class with " << it->second->getName()
+              << " — only one identity minted\n");
+    if (!toDense.count(canon))
+      CG_LOG("FlowsTo: AT function class edge-less (not in dense graph, "
+             "never mintable this round): " << F->getName() << "\n");
   }
 
   // Derivation slice (1-bit taint): keep only classes that can appear in
@@ -14235,8 +14251,21 @@ bool CallGraphPass::doInitialization(Module *M) {
     if (!Ctx->SummarySpecs.empty()) {
       g_sumAuthoritative = true; // file owns skip lists too (NOOP)
       if (const auto *S = summaryForName(Ctx, F.getName())) {
-        Ctx->FuncSummaries[&F] = S;
-        if (S->fresh) Ctx->AllocFuncs.insert(&F);
+        // FRESH on a void-returning function is a glob overreach
+        // ("vmalloc*" caught void vmalloc_init): treating it as an
+        // allocator SKIPS ITS BODY, silently severing every registration
+        // it performs (5.18 GT FN: free_work via INIT_WORK in
+        // vmalloc_init). An allocator must return a value (pointer or
+        // address-as-integer, e.g. __get_free_pages). Refuse the
+        // classification loudly and keep the body.
+        if (S->fresh && F.getReturnType()->isVoidTy()) {
+          WARNING("FuncSummaries: FRESH pattern matched void-returning "
+                  "function " << F.getName()
+                  << " — allocator classification refused, body kept\n");
+        } else {
+          Ctx->FuncSummaries[&F] = S;
+          if (S->fresh) Ctx->AllocFuncs.insert(&F);
+        }
         if (S->noop) g_noopBodies.insert(&F);
       }
     } else {
@@ -15466,6 +15495,17 @@ void CallGraphPass::globalDedupScanCallEdges(
         continue;
       if (shouldSkipValue(arg))
         continue;
+      // Function/global actuals are identity barriers (same discipline as
+      // preSolveCopyFieldMerge): their value node is shared across every
+      // use, so unioning it with a formal fuses the identity class into
+      // the callee — for flows-to, a fn origin fused with an fptr-operand
+      // formal can leave the class edge-less (the actual->formal a-edge
+      // becomes a self-loop), so it is never minted and the target is
+      // underivable ANYWHERE (5.18 GT FNs: tcp_splice_data_recv,
+      // direct_splice_actor). The plain a-edge from wireCallArgs carries
+      // the flow instead.
+      if (isa<GlobalValue>(arg->stripPointerCasts()))
+        continue;
       NodeIndex argNode = NF.getValueNodeFor(arg);
       if (argNode == AndersNodeFactory::InvalidIndex)
         continue;
@@ -15485,6 +15525,8 @@ void CallGraphPass::globalDedupScanCallEdges(
           continue;
         if (shouldSkipValue(arg))
           continue;
+        if (isa<GlobalValue>(arg->stripPointerCasts()))
+          continue; // identity barrier — see fixed-arg loop above
         NodeIndex argNode = NF.getValueNodeFor(arg);
         if (argNode != AndersNodeFactory::InvalidIndex)
           globalUnion(argNode, varargNode);

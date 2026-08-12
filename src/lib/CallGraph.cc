@@ -6293,6 +6293,17 @@ bool CallGraphPass::runFlowsToResolution() {
         if (CFLCensusTypeRej) ctrAccFn.insert(F);
         if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
           filtFieldRej++;
+          // Field rejections were SILENT while type rejections had a
+          // full census — the one unaudited kill path in collect()
+          // (found via GT: aio work fns derived+type-accepted at
+          // process_one_work yet absent from answers).
+          if (CFLCensusTypeRej) {
+            static size_t g_fieldRejExemplars = 0;
+            if (g_fieldRejExemplars++ < 200)
+              errs() << "CENSUS-FIELDREJ [" << csStruct << "+" << csField
+                     << "] " << CS->getFunction()->getName() << " -/-> "
+                     << F->getName() << "\n";
+          }
           return;
         }
         targets.insert(F);
@@ -14958,16 +14969,42 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
       // Case 1: Direct store of function pointer to struct field
       //   store @func, (getelementptr %struct, %ptr, 0, N)
       if (auto *SI = dyn_cast<StoreInst>(&*II)) {
-        auto *StoredFunc = dyn_cast<Function>(
-            SI->getValueOperand()->stripPointerCasts());
-        if (!StoredFunc) continue;
-        Function *canonStoredFunc = getFuncDef(StoredFunc);
-        std::string sName;
-        unsigned fIdx = 0;
-        Type *fieldTy = nullptr;
-        if (getFieldKeyFromPointerOperand(SI->getPointerOperand(), sName, fIdx, fieldTy)) {
-          funcFieldStores[canonStoredFunc].insert({sName, fIdx});
-          directStores++;
+        const Value *stored = SI->getValueOperand()->stripPointerCasts();
+        if (auto *StoredFunc = dyn_cast<Function>(stored)) {
+          Function *canonStoredFunc = getFuncDef(const_cast<Function *>(StoredFunc));
+          std::string sName;
+          unsigned fIdx = 0;
+          Type *fieldTy = nullptr;
+          if (getFieldKeyFromPointerOperand(SI->getPointerOperand(), sName, fIdx, fieldTy)) {
+            funcFieldStores[canonStoredFunc].insert({sName, fIdx});
+            directStores++;
+          }
+          continue;
+        }
+        // Case 1b: scalar field-to-field pointer copy — a->f = b->g
+        // (load + store). The dst key must alias the src key or the
+        // field filter rejects every function registered at src when a
+        // dispatcher reads the CACHED dst field. THE process_one_work
+        // pattern: worker->current_func = work->func; ...;
+        // worker->current_func(work) — the callsite key is (worker,
+        // current_func) while every INIT_WORK store keys (work_struct,
+        // func); without this alias the filter rejected every
+        // WELL-TYPED work fn at the dispatcher and kept only fns whose
+        // stores escaped classification (untyped i8 geps) — 82 of the
+        // GT FNs. Aliases only widen acceptance of a reject-only
+        // filter: sound.
+        if (const auto *LI2 = dyn_cast<LoadInst>(stored)) {
+          if (LI2->getType()->isPointerTy()) {
+            std::string dName, sName2;
+            unsigned dIdx = 0, sIdx2 = 0;
+            Type *dTy = nullptr, *sTy = nullptr;
+            if (getFieldKeyFromPointerOperand(SI->getPointerOperand(), dName,
+                                              dIdx, dTy) &&
+                getFieldKeyFromPointerOperand(LI2->getPointerOperand(), sName2,
+                                              sIdx2, sTy) &&
+                addFieldAlias({dName, dIdx}, {sName2, sIdx2}))
+              copyAliases++;
+          }
         }
         continue;
       }

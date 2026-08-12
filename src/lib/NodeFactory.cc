@@ -230,6 +230,45 @@ NodeIndex AndersNodeFactory::getValueNodeFor(const Value* val) {
     }
 }
 
+// Single ptrtoint leaf of a folded integer/inttoptr constant chain: the
+// chain computes an address DERIVED from exactly one pointer (percpu
+// rebasing, tagged pointers in static initializers, address-as-integer
+// laundering). Two leaves = a pointer DIFFERENCE (PREL32 table entries,
+// ".long fn - .") — NOT a pointer; the LinkerArrays/offset_to_ptr
+// machinery owns those, so return null and leave them untouched.
+static const Constant* singlePtrToIntBase(const Constant* c,
+                                          unsigned depth = 0) {
+    if (depth > 8)
+        return nullptr;
+    const auto *ce = dyn_cast<ConstantExpr>(c);
+    if (!ce)
+        return nullptr;
+    switch (ce->getOpcode()) {
+        case Instruction::PtrToInt:
+            return cast<Constant>(ce->getOperand(0));
+        case Instruction::IntToPtr: // nested round trip
+        case Instruction::Trunc:
+        case Instruction::ZExt:
+        case Instruction::SExt:
+        case Instruction::BitCast:
+            return singlePtrToIntBase(cast<Constant>(ce->getOperand(0)),
+                                      depth + 1);
+        case Instruction::Add:
+        case Instruction::Sub:
+        case Instruction::Or: {
+            const Constant *l =
+                singlePtrToIntBase(cast<Constant>(ce->getOperand(0)), depth + 1);
+            const Constant *r =
+                singlePtrToIntBase(cast<Constant>(ce->getOperand(1)), depth + 1);
+            if (l && r)
+                return nullptr; // pointer difference: no single identity
+            return l ? l : r;
+        }
+        default:
+            return nullptr;
+    }
+}
+
 NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
     // Accept pointer types and vector-of-pointer types (e.g., <2 x ptr>)
     Type *cTy = c->getType();
@@ -238,8 +277,15 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
         if (auto *VT = dyn_cast<VectorType>(cTy))
             isPtr = VT->getElementType()->isPointerTy();
     }
-    if (!isPtr)
+    if (!isPtr) {
+        // Integer constant DERIVED from one pointer (folded ptrtoint
+        // chain): carry the base's identity instead of dropping to the
+        // inert int node — closes the address-as-integer laundering hole
+        // (store i64 ptrtoint(@gv) ... load ... inttoptr).
+        if (const Constant *base = singlePtrToIntBase(c))
+            return getValueNodeFor(base);
         return ConstantIntIndex;
+    }
 
     if (isa<ConstantPointerNull>(c) || isa<UndefValue>(c) ||
         isa<ConstantAggregateZero>(c))
@@ -296,19 +342,31 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
 
                 return srcNode;
             }
-            case Instruction::IntToPtr:
-                // FIXME
+            case Instruction::IntToPtr: {
+                // Rebased-pointer rule at the constant level (mirrors
+                // visitIntToPtrInst): a folded inttoptr whose integer
+                // chain has exactly one ptrtoint(p) IS a pointer into
+                // p's object. Pure-integer addresses (MMIO/fixmap/
+                // ERR_PTR-style) have no IR object: null.
+                if (const Constant *base =
+                        singlePtrToIntBase(cast<Constant>(ce->getOperand(0))))
+                    return getValueNodeFor(base);
                 return NullPtrIndex;
+            }
             case Instruction::PtrToInt:
-                // FIXME
+                // Integer-typed: unreachable through the isPtr gate
+                // except by recursion; identity handled by
+                // singlePtrToIntBase at both entry points.
                 return NullPtrIndex;
             default:
                 errs() << "Constant Expr not yet handled: " << *ce << "\n";
                 llvm_unreachable(0);
         }
     } else if (isa<BlockAddress>(c)) {
-        // FIXME return NULL now
-        return NullPtrIndex;
+        // Computed-goto label: give it its own identity instead of
+        // conflating with null, so jump-table slots hold a distinct
+        // value (never a function origin — cannot smear the callgraph).
+        return createValueNode(c); // createValueNode dedups via valueNodeMap
     }
 
     errs() << "Unknown constant pointer: " << *c << "\n";
@@ -357,10 +415,16 @@ NodeIndex AndersNodeFactory::getObjectNodeForConstant(const llvm::Constant* c) {
                 return getOffsetObjectNode(baseNode, constGEPtoFieldNum(ce));
             }
             case Instruction::IntToPtr:
-                // FIXME
+                // Same rebased-pointer rule as the value side: a folded
+                // inttoptr with one ptrtoint(p) leaf points into p's
+                // object (tagged pointers in static initializers).
+                if (const Constant *base =
+                        singlePtrToIntBase(cast<Constant>(ce->getOperand(0))))
+                    return getObjectNodeForConstant(base);
                 return NullObjectIndex;
             case Instruction::PtrToInt:
-                // FIXME
+                // Integer-typed; identity recovered via
+                // singlePtrToIntBase where it matters.
                 return NullObjectIndex;
             case Instruction::BitCast:
                 return getObjectNodeForConstant(ce->getOperand(0));
@@ -369,8 +433,12 @@ NodeIndex AndersNodeFactory::getObjectNodeForConstant(const llvm::Constant* c) {
                 llvm_unreachable(0);
         }
     } else if (isa<BlockAddress>(c)) {
-        // FIXME return NULL now
-        return NullObjectIndex;
+        // Distinct opaque object per label so initializer slots holding
+        // a blockaddress point at SOMETHING instead of null.
+        auto itr = objNodeMap.find(c);
+        if (itr != objNodeMap.end())
+            return itr->second;
+        return createOpaqueObjectNode(c, /*heap=*/false);
     }
 
     errs() << "Unknown constant pointer: " << *c << "\n";

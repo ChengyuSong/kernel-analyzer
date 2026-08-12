@@ -10013,6 +10013,12 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
       // nothing). The deref-pull below stays gated on self-read
       // (PREL32 array semantics, a different rule).
       CGP.addAssignmentEdge(base, dstNode);
+      // Field mode: instruction-form ptrtoint escapes get their
+      // wildcard in visitPtrToIntInst; CONSTANT-EXPR leaves have no
+      // instruction to visit, so apply the same escape discipline here
+      // (integer arithmetic can rebase to any field = disguised GEP).
+      if (CGP.EB.hasFieldLabels() && isa<Constant>(PTI))
+        CGP.addFieldWildcardLoop(base, "ptrtoint-ce-escape");
       bool selfRead = false;
       for (const LoadInst *LI : loadLeaves) {
         NodeIndex lp = CGP.getRepNodeForValue(

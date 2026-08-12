@@ -441,6 +441,18 @@ cl::opt<bool> CFLCensusTypeRej(
            "(cf. the certified static_call +29). Changes no answers"),
   cl::init(false));
 
+cl::opt<std::string> CFLGTTypeCensus(
+  "cfl-gt-type-census",
+  cl::desc("MEASUREMENT-ONLY ground-truth type census: file of "
+           "'frame1;frame2;... target' lines (dynamically observed "
+           "caller-chain -> callee). For each record, test isCompatible "
+           "between the target and every indirect callsite in every "
+           "recorded frame function; a record where sites exist but "
+           "NONE accepts the target is a WITNESSED type-filter "
+           "unsoundness (a runtime-true pair our type rules reject). "
+           "Runs after module init, then exits — no solve"),
+  cl::init(""));
+
 cl::opt<bool> CFLCensusExternBound(
   "cfl-census-extern-bound",
   cl::desc("MEASUREMENT-ONLY census (task #45): rank called-but-never-"

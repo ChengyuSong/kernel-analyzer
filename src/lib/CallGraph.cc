@@ -2637,7 +2637,110 @@ static size_t g_userCertCopySites = 0, g_userCertGetSites = 0;
 static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 static size_t g_tagRoundTrips = 0; // fs: ptrtoint wildcards suppressed
                                    // (tag-bit-only local closures)
+// Ground-truth type census (--cfl-gt-type-census): each input line is a
+// dynamically OBSERVED dispatch "frame1;frame2;... target" (inline chain
+// -> callee). We test our isCompatible rules against reality: a record
+// whose frame functions contain indirect callsites but where NO site
+// accepts the target is a WITNESSED type-filter unsoundness — a
+// runtime-true pair the filter would reject. This cannot prove the
+// filter sound (GT covers one config/workload); it can only convict.
+void CallGraphPass::runGTTypeCensus(const std::string &path) {
+  std::unordered_map<std::string, std::vector<const Function *>> defs;
+  for (auto &mp : Ctx->Modules)
+    for (Function &F : *mp.first)
+      if (!F.isDeclaration() && !F.empty())
+        defs[F.getName().str()].push_back(&F);
+  std::unordered_map<const Function *, std::vector<const CallBase *>>
+      siteCache;
+  auto sitesOf =
+      [&](const Function *F) -> const std::vector<const CallBase *> & {
+    auto [it, ins] = siteCache.emplace(F, std::vector<const CallBase *>{});
+    if (ins)
+      for (const Instruction &I :
+           instructions(*const_cast<Function *>(F)))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (!CB->getCalledFunction() && !CB->isInlineAsm() &&
+              !isa<Function>(
+                  CB->getCalledOperand()->stripPointerCastsAndAliases()))
+            it->second.push_back(CB);
+    return it->second;
+  };
+  std::ifstream in(path);
+  if (!in) {
+    errs() << "GT-TYPE census: cannot open " << path << "\n";
+    exit(1);
+  }
+  std::string line;
+  size_t total = 0, ok = 0, viol = 0, nosite = 0, nocaller = 0, notgt = 0;
+  while (std::getline(in, line)) {
+    if (line.empty())
+      continue;
+    auto sp = line.rfind(' ');
+    if (sp == std::string::npos)
+      continue;
+    std::string chain = line.substr(0, sp), tgt = line.substr(sp + 1);
+    total++;
+    auto dIt = defs.find(tgt);
+    if (dIt == defs.end()) {
+      notgt++;
+      continue;
+    }
+    bool compat = false, anyCaller = false;
+    size_t nSites = 0;
+    size_t pos = 0;
+    while (pos <= chain.size() && !compat) {
+      size_t e = chain.find(';', pos);
+      std::string frame =
+          chain.substr(pos, e == std::string::npos ? std::string::npos
+                                                   : e - pos);
+      pos = (e == std::string::npos) ? chain.size() + 1 : e + 1;
+      auto fIt = defs.find(frame);
+      if (fIt == defs.end())
+        continue;
+      anyCaller = true;
+      for (const Function *FF : fIt->second) {
+        for (const CallBase *CB : sitesOf(FF)) {
+          nSites++;
+          for (const Function *TF : dIt->second)
+            if (isCompatible(CB, TF)) {
+              compat = true;
+              break;
+            }
+          if (compat)
+            break;
+        }
+        if (compat)
+          break;
+      }
+    }
+    if (!anyCaller) {
+      nocaller++;
+      continue;
+    }
+    if (compat)
+      ok++;
+    else if (nSites == 0) {
+      nosite++;
+      errs() << "GT-TYPE NO-ICALL-IN-FRAMES " << line << "\n";
+    } else {
+      viol++;
+      errs() << "GT-TYPE VIOLATION (" << nSites << " sites tried) " << line
+             << "\n";
+    }
+  }
+  errs() << "GT-TYPE CENSUS: " << total << " records: " << ok
+         << " type-compatible, " << viol << " VIOLATIONS (runtime-true, "
+         << "type-rejected everywhere in-frame), " << nosite
+         << " no-icall-in-frames (devirt/inlined), " << nocaller
+         << " caller-absent, " << notgt << " target-absent\n";
+}
+
 bool CallGraphPass::runFlowsToResolution() {
+  if (!CFLGTTypeCensus.empty()) {
+    runGTTypeCensus(CFLGTTypeCensus);
+    errs() << "GT-TYPE census complete — exiting (census-only mode)\n";
+    exit(0);
+  }
   auto tStart = std::chrono::steady_clock::now();
   const auto &edges = EB.getEdges();
   const uint32_t la = EB.getLabelAssign();
@@ -6291,21 +6394,21 @@ bool CallGraphPass::runFlowsToResolution() {
           return;
         }
         if (CFLCensusTypeRej) ctrAccFn.insert(F);
-        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
+        // FIELD FILTER RETIRED FROM THE ANSWER PATH (2026-08-11):
+        // rejection soundness required a complete inventory of every
+        // store key AND every field-to-field copy path a fn pointer
+        // can take — alias analysis by syntax, undischargeable. It was
+        // OBSERVED rejecting dynamically-true, graph-derived pairs
+        // (GT process_one_work family: the worker->current_func cache
+        // made it reject every WELL-TYPED work fn while passing
+        // exactly the fns whose stores it failed to classify). Field
+        // precision must come from provable structure: in-graph field
+        // sensitivity (residue planes) and certified identity
+        // channels. filtFieldRej now only counts what the retired
+        // filter WOULD have rejected — exposure meter, answers
+        // untouched.
+        if (hasKey && !fieldFilterAccepts(F, csStruct, csField))
           filtFieldRej++;
-          // Field rejections were SILENT while type rejections had a
-          // full census — the one unaudited kill path in collect()
-          // (found via GT: aio work fns derived+type-accepted at
-          // process_one_work yet absent from answers).
-          if (CFLCensusTypeRej) {
-            static size_t g_fieldRejExemplars = 0;
-            if (g_fieldRejExemplars++ < 200)
-              errs() << "CENSUS-FIELDREJ [" << csStruct << "+" << csField
-                     << "] " << CS->getFunction()->getName() << " -/-> "
-                     << F->getName() << "\n";
-          }
-          return;
-        }
         targets.insert(F);
       });
     };
@@ -7110,9 +7213,10 @@ bool CallGraphPass::runFlowsToResolution() {
            << " joins skipped for rodata-bearing witness classes "
            << "(MEASUREMENT-ONLY over-removal)\n");
   CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
-         << filtTypeRej << " type-rejected, " << filtFieldRej
-         << " field-rejected (each rejection = unsoundness exposure; "
-         << "zero = filter retirable)\n");
+         << filtTypeRej << " type-rejected (unsoundness exposure; zero = "
+         << "filter retirable), " << filtFieldRej
+         << " field-flagged (filter RETIRED 2026-08-11 — count is what it "
+         << "would have rejected; answers untouched)\n");
   if (CFLCensusTypeRej) {
     errs() << "=== CENSUS-TYPEREJ: reverse type-filter census ===\n";
     errs() << "CENSUS-TYPEREJ sites-with-rejections " << ctrSitesWithRej
@@ -15235,13 +15339,13 @@ bool CallGraphPass::handleIndirectCall(const cfl_result_t &outputCFLGraph,
         // If we know the call site loads from a specific struct field,
         // and we have positive evidence of which fields this function is
         // stored into, reject if none match.
-        if (hasCallSiteField) {
-          if (!fieldFilterAccepts(CF, callSiteStruct, callSiteFieldIdx)) {
-            CG_LOG("FieldFilter: reject " << CF->getName()
-                   << " for " << callSiteStruct << " field " << callSiteFieldIdx << "\n");
-            continue;
-          }
-        }
+        // Field filter retired from the answer path (see the flows-to
+        // extraction site for the full rationale): counting only.
+        if (hasCallSiteField &&
+            !fieldFilterAccepts(CF, callSiteStruct, callSiteFieldIdx))
+          CG_LOG("FieldFilter(retired): would reject " << CF->getName()
+                 << " for " << callSiteStruct << " field "
+                 << callSiteFieldIdx << "\n");
         if (Ctx->Callees[CS].insert(CF).second) {
           // if new callee added, we need to rerun
           Changed = true;

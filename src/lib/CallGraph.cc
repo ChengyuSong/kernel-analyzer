@@ -10001,6 +10001,18 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
       if (base == AndersNodeFactory::InvalidIndex ||
           CGP.NF.isSpecialNode(base))
         continue;
+      // Rebased-pointer rule: inttoptr(add/sub-chain containing
+      // ptrtoint p) IS a pointer into p's object — same field-
+      // insensitive treatment as GEP (base -> result value alias).
+      // This is the percpu idiom (this_cpu_ptr = inttoptr(add(
+      // ptrtoint &var, __per_cpu_offset))): without it the rebased
+      // pointer carries no identity, so stores/loads through it never
+      // meet the static initializer's cells (5.18 GT FN:
+      // wake_up_klogd_work_func — irq_work_queue enqueues the rebased
+      // &wake_up_klogd_work, irq_work_single's ->func load finds
+      // nothing). The deref-pull below stays gated on self-read
+      // (PREL32 array semantics, a different rule).
+      CGP.addAssignmentEdge(base, dstNode);
       bool selfRead = false;
       for (const LoadInst *LI : loadLeaves) {
         NodeIndex lp = CGP.getRepNodeForValue(

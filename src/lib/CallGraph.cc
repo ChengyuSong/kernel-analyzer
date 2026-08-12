@@ -6361,7 +6361,7 @@ bool CallGraphPass::runFlowsToResolution() {
       errs() << "TRACE icall " << CS->getFunction()->getName() << " fptr c"
              << rep << " has-root=" << has << "\n";
     }
-    auto collect = [&](const FactSet &plane) {
+    auto collect = [&](const FactSet &plane, const char *planeTag) {
       plane.forEach([&](uint32_t o) {
         auto rIt = funcRootOf.find(o);
         if (rIt == funcRootOf.end()) return;
@@ -6407,8 +6407,23 @@ bool CallGraphPass::runFlowsToResolution() {
         // channels. filtFieldRej now only counts what the retired
         // filter WOULD have rejected — exposure meter, answers
         // untouched.
-        if (hasKey && !fieldFilterAccepts(F, csStruct, csField))
+        if (hasKey && !fieldFilterAccepts(F, csStruct, csField)) {
           filtFieldRej++;
+          // Retired-filter vs fs census: a would-be rejection of an
+          // EXACT-plane fact under NB>0 is the retired filter
+          // contradicting the sound field-sensitive analysis — the
+          // adjudication inventory justifying retirement (exact-plane
+          // admission is not proof of true flow: mod-P residues can
+          // collide; X-plane carries no field claim either way).
+          if (CFLCensusTypeRej) {
+            static size_t g_fieldRejExemplars = 0;
+            if (g_fieldRejExemplars++ < 5000)
+              errs() << "CENSUS-FIELDREJ(" << planeTag << ") [" << csStruct
+                     << "+" << csField << "] "
+                     << CS->getFunction()->getName() << " -/-> "
+                     << F->getName() << "\n";
+          }
+        }
         targets.insert(F);
       });
     };
@@ -6485,16 +6500,16 @@ bool CallGraphPass::runFlowsToResolution() {
       // stable round's accumulated answer bits (static-id keyed).
       auto aIt = fptrAcc.find(dIt->second);
       if (aIt != fptrAcc.end())
-        collect(aIt->second);
+        collect(aIt->second, "batch-acc");
     }
     if (!tpModelOwned && !sctModelOwned && !CFLBatchRoots) {
-      collect(R[rep][0]);
-      collect(RB[rep][0]);
+      collect(R[rep][0], NB > 0 ? "exact" : "fi");
+      collect(RB[rep][0], NB > 0 ? "exact" : "fi");
     }
     const size_t exactTargets = targets.size();
     if (!tpModelOwned && !sctModelOwned && !CFLBatchRoots && NB > 0) {
-      collect(R[rep][SHIFT_X]);
-      collect(RB[rep][SHIFT_X]);
+      collect(R[rep][SHIFT_X], "X");
+      collect(RB[rep][SHIFT_X], "X");
     }
     topOnlyPairs += targets.size() - exactTargets;
     if (CFLCensusTypeRej && filtTypeRej > ctrSiteR0) {

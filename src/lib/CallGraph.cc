@@ -1141,7 +1141,9 @@ void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
 static bool isPtrWidthInt(const llvm::Type *T, const llvm::DataLayout &DL);
 static bool mayCarryPtrProvenance(const llvm::Value *V, unsigned depth,
                                   bool &declined);
+static bool ptrToIntTagRoundTripOnly(const llvm::Value *PTI);
 static size_t g_intStoreUnmodeled = 0;
+static size_t g_intArgUnmodeled = 0;
 
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
                                int opsSkipArg) {
@@ -1225,6 +1227,9 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       if (callNode == AndersNodeFactory::InvalidIndex)
         callNode = getCanonicalNode(NF.createValueNode(CS));
       addAssignmentEdge(retNode, callNode);
+      // Segment-local field claim for the call-result segment.
+      if (EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CS))
+        addFieldWildcardLoop(callNode, "int-callret-dirty-segment");
     }
   }
 
@@ -1249,8 +1254,34 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
     Value *arg = CS->getArgOperand(i);
     // First-class aggregates ({ptr,ptr} closures, coerced small structs)
     // carry pointer identity by value — skip only pointer-free types.
-    if (!containsPointerType(arg->getType()))
-      continue; // skip non-pointer args
+    if (!containsPointerType(arg->getType())) {
+      // Laundered-pointer int ARGUMENT: the same idiom the return-side
+      // fixes (9f3639e/dc5e801) closed, on the other boundary — a
+      // tagged word passed by value severed provenance identically
+      // (`f((unsigned long)file | flag)` and the callee untags).
+      // Witness-gated like returns; defined callees only (the extern
+      // boundary is census-owned). Edges are inert unless real
+      // pointer facts flow.
+      bool declined = false;
+      if (curDL && isPtrWidthInt(arg->getType(), *curDL) && !CF->empty() &&
+          !shouldSkipValue(arg) && mayCarryPtrProvenance(arg, 8, declined)) {
+        NodeIndex argNode = getRepNodeForValue(arg);
+        if (argNode == AndersNodeFactory::InvalidIndex)
+          argNode = getCanonicalNode(NF.createValueNode(arg));
+        Value *farg = CF->getArg(i);
+        NodeIndex formalNode = getRepNodeForValue(farg);
+        if (formalNode == AndersNodeFactory::InvalidIndex)
+          formalNode = getCanonicalNode(NF.createValueNode(farg));
+        addAssignmentEdge(argNode, formalNode);
+        // Segment-local field claim for the formal's segment
+        // (idempotent across callsites: wildcard set dedups).
+        if (EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(farg))
+          addFieldWildcardLoop(formalNode, "int-formal-dirty-segment");
+      } else if (declined) {
+        g_intArgUnmodeled++;
+      }
+      continue;
+    }
     if (shouldSkipValue(arg)) {
       CG_DEBUG("Skipping compiler-introduced argument: " << *arg << "\n");
       continue;
@@ -1284,8 +1315,23 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
       varargNode = getCanonicalNode(varargNode);
       for (unsigned i = numFormals; i < numArgs; i++) {
         Value *arg = CS->getArgOperand(i);
-        if (!containsPointerType(arg->getType()))
-          continue; // skip non-pointer args
+        if (!containsPointerType(arg->getType())) {
+          // Laundered ints ride varargs too (non-benign-fmt callsites
+          // only; printf sinks are intercepted above). Same witness
+          // gate as fixed args.
+          bool declined = false;
+          if (curDL && isPtrWidthInt(arg->getType(), *curDL) &&
+              !CF->empty() && !shouldSkipValue(arg) &&
+              mayCarryPtrProvenance(arg, 8, declined)) {
+            NodeIndex argNode = getRepNodeForValue(arg);
+            if (argNode == AndersNodeFactory::InvalidIndex)
+              argNode = getCanonicalNode(NF.createValueNode(arg));
+            addAssignmentEdge(argNode, varargNode);
+          } else if (declined) {
+            g_intArgUnmodeled++;
+          }
+          continue;
+        }
         if (shouldSkipValue(arg)) {
           CG_DEBUG("Skipping compiler-introduced variadic argument: " << *arg << "\n");
           continue;
@@ -1374,8 +1420,22 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   for (unsigned i = 0; i < minArgs; i++) {
     Value *arg = CS->getArgOperand(i);
     // Must mirror handleCall: pointer-bearing aggregates are wired too.
-    if (!containsPointerType(arg->getType()))
-      continue; // skip non-pointer args
+    if (!containsPointerType(arg->getType())) {
+      // Mirror the witnessed int-arg wiring exactly (same gate, same
+      // witness call — deterministic), else retraction leaves stale
+      // laundered-int edges.
+      bool declined = false;
+      if (curDL && isPtrWidthInt(arg->getType(), *curDL) && !CF->empty() &&
+          !shouldSkipValue(arg) && mayCarryPtrProvenance(arg, 8, declined)) {
+        NodeIndex argNode = getRepNodeForValue(arg);
+        NodeIndex formalNode = getRepNodeForValue(CF->getArg(i));
+        if (argNode != AndersNodeFactory::InvalidIndex &&
+            formalNode != AndersNodeFactory::InvalidIndex)
+          EB.removeAssignmentEdges(getCanonicalNode(argNode),
+                                   getCanonicalNode(formalNode));
+      }
+      continue;
+    }
     if (shouldSkipValue(arg))
       continue; // handleCall never wired these
     NodeIndex argNode = getRepNodeForValue(arg);
@@ -1392,8 +1452,16 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     assert(varargNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
     for (unsigned i = numFormals; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
-      if (!containsPointerType(arg->getType()))
+      if (!containsPointerType(arg->getType())) {
+        bool declined = false;
+        if (curDL && isPtrWidthInt(arg->getType(), *curDL) && !CF->empty() &&
+            !shouldSkipValue(arg) && mayCarryPtrProvenance(arg, 8, declined)) {
+          NodeIndex argNode = getRepNodeForValue(arg);
+          if (argNode != AndersNodeFactory::InvalidIndex)
+            EB.removeAssignmentEdges(getCanonicalNode(argNode), varargNode);
+        }
         continue;
+      }
       if (shouldSkipValue(arg))
         continue; // handleCall never wired these
       NodeIndex argNode = getRepNodeForValue(arg);
@@ -1412,6 +1480,18 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     NodeIndex callNode = getRepNodeForValue(CS);
     if (callNode != AndersNodeFactory::InvalidIndex)
       EB.removeAssignmentEdges(getCanonicalNode(retNode), getCanonicalNode(callNode));
+  } else if (curDL && isPtrWidthInt(CF->getReturnType(), *curDL)) {
+    // Mirror the laundered-int return wiring (9f3639e/dc5e801) —
+    // retraction previously left these edges stale (latent asymmetry;
+    // imprecision, not unsoundness).
+    NodeIndex retNode = NF.getReturnNodeFor(CF);
+    if (retNode != AndersNodeFactory::InvalidIndex &&
+        retNode != NF.getUniversalPtrNode()) {
+      NodeIndex callNode = getRepNodeForValue(CS);
+      if (callNode != AndersNodeFactory::InvalidIndex)
+        EB.removeAssignmentEdges(getCanonicalNode(retNode),
+                                 getCanonicalNode(callNode));
+    }
   }
 
   return false;
@@ -9685,7 +9765,9 @@ static bool mayCarryPtrProvenance(const Value *V, unsigned depth,
     return constantHasPtrToInt(C, 6);
   }
   if (isa<LoadInst>(V)) return true; // slot-to-slot int copies stay live
-  if (isa<Argument>(V)) { declined = true; return false; } // ledger
+  if (isa<Argument>(V))
+    return true; // formals are wired witness-gated now: facts only if
+                 // some caller actually passed provenance
   if (isa<CallBase>(V)) {
     // An int-returning call may launder a pointer THROUGH its return —
     // the 5.18 fd chain is a two-hop instance (__fdget_pos returns
@@ -9719,7 +9801,14 @@ static bool mayBecomePointer(const Value *V, unsigned depth, bool &declined) {
       if (SI->getValueOperand() == V) return true; // flows onward via memory
       continue;
     }
-    if (isa<ReturnInst>(U) || isa<CallBase>(U)) { declined = true; continue; }
+    if (isa<ReturnInst>(U))
+      return true; // witnessed int returns are wired (9f3639e)
+    if (const auto *CB = dyn_cast<CallBase>(U)) {
+      if (CB->getCalledOperand() != V)
+        return true; // witnessed int args are wired now (formals
+                     // receive the facts; callee side re-proves)
+      continue;
+    }
     if (isa<BinaryOperator>(U) || isa<CastInst>(U) || isa<PHINode>(U) ||
         isa<SelectInst>(U) || isa<FreezeInst>(U) || isa<ExtractValueInst>(U))
       if (mayBecomePointer(U, depth - 1, declined))
@@ -9774,6 +9863,11 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
             CGP.addAssignmentEdge(CGP.getRepDerefNode(pN), valNode);
         }
         g_intProvLoads++;
+        // Segment-local field claim: facts arrive with the residues
+        // the producer proved; this segment (load -> ... -> inttoptr)
+        // must be tag-clean or the residue claim is wrong here.
+        if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(&I))
+          CGP.addFieldWildcardLoop(valNode, "int-load-dirty-segment");
       } else if (declined) {
         g_intLoadUnmodeled++; // ledger
       }
@@ -10030,6 +10124,10 @@ void CallGraphPass::InstHandler::visitAtomicRMWInst(AtomicRMWInst &I) {
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
   CGP.addAssignmentEdge(valNode, derefNode);
   CGP.addAssignmentEdge(derefNode, resNode);
+  // Segment-local field claim for the loaded-old-value side.
+  if (!containsPointerType(I.getType()) && CGP.EB.hasFieldLabels() &&
+      !ptrToIntTagRoundTripOnly(&I))
+    CGP.addFieldWildcardLoop(resNode, "int-load-dirty-segment");
 }
 
 // cmpxchg on a pointer slot: conditional store of the new value plus the
@@ -10071,6 +10169,10 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
   CGP.addAssignmentEdge(valNode, derefNode);
   CGP.addAssignmentEdge(derefNode, resNode);
+  // Segment-local field claim for the loaded-old-value projection.
+  if (!containsPointerType(I.getNewValOperand()->getType()) &&
+      CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(&I))
+    CGP.addFieldWildcardLoop(resNode, "int-load-dirty-segment");
 }
 
 static bool ptrToIntTagRoundTripOnly(const Value *PTI); // defined below
@@ -10562,6 +10664,49 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       }
       if (isa<ZExtInst>(U) || isa<BitCastInst>(U) || isa<FreezeInst>(U) ||
           isa<PHINode>(U) || isa<SelectInst>(U)) {
+        if (seen.insert(U).second)
+          wl.push_back(U);
+        continue;
+      }
+      // SEGMENT-LOCAL PROOF BOUNDARIES (2026-08-13): memory and calls
+      // cannot compute, so offset arithmetic lives only in register
+      // segments between provenance boundaries. Each boundary is a
+      // SAFE STOP here because the segment on the other side gets its
+      // own tag-cleanliness check at its head (int loads, call
+      // results, formals — see the int-segment consumer checks), and
+      // the fact plumbing across the boundary is residue-preserving
+      // (witnessed int store/load/ret/arg wiring).
+      if (const auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getValueOperand() == V)
+          continue; // value crosses into memory; load side re-proves
+        return false; // int as store ADDRESS: not expressible, bail
+      }
+      if (isa<ReturnInst>(U))
+        continue; // caller side re-proves at the call result
+      if (const auto *CB = dyn_cast<CallBase>(U)) {
+        if (CB->getCalledOperand() != V)
+          continue; // argument: callee side re-proves at the formal
+        return false; // int called as function: nonsense, bail
+      }
+      if (const auto *GEP2 = dyn_cast<GetElementPtrInst>(U)) {
+        if (GEP2->getPointerOperand() != V)
+          continue; // used as INDEX only: result inherits the BASE's
+                    // provenance (no edge from indices), the escaped
+                    // int never re-becomes a pointer to the source
+        return false;
+      }
+      if (const auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
+        if (RMW->getValOperand() == V &&
+            RMW->getOperation() == AtomicRMWInst::Xchg)
+          continue; // pure store: consumer side re-proves the result
+        return false; // arithmetic RMW COMPUTES in memory — bail
+      }
+      if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(U)) {
+        if (CX->getNewValOperand() == V || CX->getCompareOperand() == V)
+          continue; // conditional store / compare-only
+        return false;
+      }
+      if (isa<ExtractValueInst>(U)) { // {old,i1} projection of cmpxchg
         if (seen.insert(U).second)
           wl.push_back(U);
         continue;
@@ -14914,7 +15059,8 @@ bool CallGraphPass::doFinalization(Module *M) {
     CG_LOG("IntProvenance: modeled " << g_intProvStores << " int stores + "
            << g_intProvLoads << " int loads (witnessed); LEDGER unmodeled "
            << g_intStoreUnmodeled << " stores / " << g_intLoadUnmodeled
-           << " loads with interprocedural int provenance\n");
+           << " loads / " << g_intArgUnmodeled
+           << " args with interprocedural int provenance\n");
     CG_LOG("StaticCall LEDGER: " << g_staticCallWired
            << " __SCT__ callsites wired through their keys, "
            << g_staticCallUpdates << " updates wired per-callsite; "

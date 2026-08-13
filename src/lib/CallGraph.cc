@@ -10074,6 +10074,7 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
 }
 
 static bool ptrToIntTagRoundTripOnly(const Value *PTI); // defined below
+static void p2iEscapeCensus(const Value *PTI, const char *where); // defined below
 
 // phi/select of PTR-WIDTH INTS can carry pointer provenance — clang
 // folds `flag ? (ulong)&a : (ulong)&b` into a select whose operands
@@ -10120,8 +10121,10 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
     NodeIndex ptrN = CGP.getRepNodeForValue(CE->getOperand(0));
     if (ptrN == AndersNodeFactory::InvalidIndex || CGP.NF.isSpecialNode(ptrN))
       return;
-    if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CE))
+    if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CE)) {
+      p2iEscapeCensus(CE, "ce");
       CGP.addFieldWildcardLoop(ptrN, "ptrtoint-escape-ce");
+    }
     else if (CGP.EB.hasFieldLabels())
       g_tagRoundTrips++;
     CGP.addAssignmentEdge(ptrN, dstNode);
@@ -10172,8 +10175,10 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
     NodeIndex ptrN = CGP.getRepNodeForValue(CE->getOperand(0));
     if (ptrN == AndersNodeFactory::InvalidIndex || CGP.NF.isSpecialNode(ptrN))
       return;
-    if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CE))
+    if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CE)) {
+      p2iEscapeCensus(CE, "ce");
       CGP.addFieldWildcardLoop(ptrN, "ptrtoint-escape-ce");
+    }
     else if (CGP.EB.hasFieldLabels())
       g_tagRoundTrips++;
     CGP.addAssignmentEdge(ptrN, dstNode);
@@ -10370,8 +10375,10 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
         // wildcard in visitPtrToIntInst; CONSTANT-EXPR leaves have no
         // instruction to visit, so apply the same escape discipline
         // here (integer arithmetic can rebase to any field).
-        if (CGP.EB.hasFieldLabels() && isa<Constant>(PTI))
+        if (CGP.EB.hasFieldLabels() && isa<Constant>(PTI)) {
+          p2iEscapeCensus(&I, "ce-op");
           CGP.addFieldWildcardLoop(base, "ptrtoint-ce-escape");
+        }
       } else {
         g_rebasedPtrSkipped++;
       }
@@ -10402,6 +10409,121 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
 // memory is covered ONLY by the source wildcard), offset-destroying
 // masks (& ~0xfff), variable or non-tag arithmetic — keeps the
 // wildcard. Bounded walk; on cap, keep the wildcard (sound default).
+// Census (--cfl-census-type-rej): when a p2i escape wildcards, classify
+// WHY the tag-round-trip proof failed, over the FULL user cone (the
+// prover bails at the first kill; the census keeps walking so an escape
+// is judged by everything it does). Sizes the recoverable slice — a
+// cone whose only kill is CONST_ADDSUB is exactly what a
+// delta-carrying walker with f_(delta mod P) sink edges keeps exact —
+// against the irreducible classes (dynamic arithmetic = array indexing
+// in int clothes; offset-destroying masks; memory/call boundary
+// escapes where restoration happens after a reload).
+enum P2IKill : unsigned {
+  K_CONST_ADDSUB = 1u << 0,
+  K_DYN_ADDSUB = 1u << 1,
+  K_DESTROY_MASK = 1u << 2,
+  K_OTHER_BINOP = 1u << 3,
+  K_STORE = 1u << 4,
+  K_CALLRET = 1u << 5,
+  K_TRUNC = 1u << 6,
+  K_OTHER = 1u << 7,
+  K_CAP = 1u << 8,
+};
+static unsigned p2iEscapeKillMask(const Value *PTI) {
+  unsigned mask = 0;
+  SmallVector<const Value *, 16> wl{PTI};
+  SmallPtrSet<const Value *, 32> seen{PTI};
+  unsigned steps = 0;
+  while (!wl.empty()) {
+    if (++steps > 256) {
+      mask |= K_CAP;
+      break;
+    }
+    const Value *V = wl.pop_back_val();
+    for (const User *U : V->users()) {
+      if (isa<IntToPtrInst>(U) || isa<ICmpInst>(U) || isa<SwitchInst>(U))
+        continue;
+      if (const auto *BO = dyn_cast<BinaryOperator>(U)) {
+        const auto *CI = dyn_cast<ConstantInt>(
+            BO->getOperand(BO->getOperand(0) == V ? 1 : 0));
+        switch (BO->getOpcode()) {
+        case Instruction::Add:
+        case Instruction::Sub:
+          mask |= CI ? K_CONST_ADDSUB : K_DYN_ADDSUB;
+          break;
+        case Instruction::Or:
+        case Instruction::Xor:
+          if (!CI || CI->getZExtValue() >= 8)
+            mask |= K_DESTROY_MASK;
+          break;
+        case Instruction::And:
+          if (CI && CI->getZExtValue() < 8)
+            continue; // tag extraction: no pointer in result
+          if (!CI || ~CI->getZExtValue() >= 8)
+            mask |= K_DESTROY_MASK;
+          break;
+        default:
+          mask |= K_OTHER_BINOP;
+          break;
+        }
+        if (seen.insert(U).second)
+          wl.push_back(U);
+        continue;
+      }
+      if (isa<StoreInst>(U)) {
+        mask |= K_STORE;
+        continue;
+      }
+      if (isa<CallBase>(U) || isa<ReturnInst>(U)) {
+        mask |= K_CALLRET;
+        continue;
+      }
+      if (isa<TruncInst>(U)) {
+        mask |= K_TRUNC;
+        continue;
+      }
+      if (isa<ZExtInst>(U) || isa<BitCastInst>(U) || isa<FreezeInst>(U) ||
+          isa<PHINode>(U) || isa<SelectInst>(U)) {
+        if (seen.insert(U).second)
+          wl.push_back(U);
+        continue;
+      }
+      mask |= K_OTHER;
+    }
+  }
+  return mask;
+}
+
+static void p2iEscapeCensus(const Value *PTI, const char *where) {
+  if (!CFLCensusTypeRej)
+    return;
+  unsigned mask = p2iEscapeKillMask(PTI);
+  std::string s;
+  auto add = [&](unsigned bit, const char *name) {
+    if (mask & bit) {
+      if (!s.empty())
+        s += ',';
+      s += name;
+    }
+  };
+  add(K_CONST_ADDSUB, "const-addsub");
+  add(K_DYN_ADDSUB, "dyn-addsub");
+  add(K_DESTROY_MASK, "destroy-mask");
+  add(K_OTHER_BINOP, "other-binop");
+  add(K_STORE, "store");
+  add(K_CALLRET, "callret");
+  add(K_TRUNC, "trunc");
+  add(K_OTHER, "other");
+  add(K_CAP, "cap");
+  if (s.empty())
+    s = "none"; // prover bailed on step cap only
+  const Function *F = nullptr;
+  if (const auto *I = dyn_cast<Instruction>(PTI))
+    F = I->getFunction();
+  errs() << "P2I-ESCAPE-KILL(" << where << ") " << s << " in "
+         << (F ? F->getName() : StringRef("<constexpr>")) << "\n";
+}
+
 static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
   SmallVector<const Value *, 16> wl{PTI};
   SmallPtrSet<const Value *, 32> seen{PTI};
@@ -10466,10 +10588,12 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   // any field (disguised GEP); absorb with the wildcard loop at the source
   // — EXCEPT proven tag-bit round trips, which are exact at shift 0.
   if (CGP.EB.hasFieldLabels()) {
-    if (ptrToIntTagRoundTripOnly(&I))
+    if (ptrToIntTagRoundTripOnly(&I)) {
       g_tagRoundTrips++;
-    else
+    } else {
+      p2iEscapeCensus(&I, "inst");
       CGP.addFieldWildcardLoop(srcNode, "ptrtoint-escape");
+    }
   }
   CGP.addAssignmentEdge(srcNode, dstNode);
 }

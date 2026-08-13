@@ -1205,12 +1205,19 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       addAssignmentEdge(retNode, callNode);
   } else if (!retBound && curDL &&
              isPtrWidthInt(CF->getReturnType(), *curDL)) {
-    // Laundered-pointer int return (the __fdget idiom): wire ONLY when
-    // the callee's visitReturnInst created a return node (i.e., its
-    // return value may carry pointer provenance). No on-demand node
-    // for declared int-returning externs — the boundary census owns
-    // those.
+    // Laundered-pointer int return (the __fdget idiom). For DEFINED
+    // callees, create the return node on demand: waiting for the
+    // callee's visitReturnInst is visitation-order-dependent (5.18:
+    // read_write.o handled before file.o meant __fdget_pos had no
+    // return node when ksys_lseek's callsite was wired — FN). The
+    // callee's own return wiring is witness-gated, so an unwitnessed
+    // node stays fact-free and the edge is inert. Declared int
+    // externs still get nothing — the boundary census owns those.
     NodeIndex retNode = NF.getReturnNodeFor(CF);
+    if ((retNode == AndersNodeFactory::InvalidIndex ||
+         retNode == NF.getUniversalPtrNode()) &&
+        !CF->empty())
+      retNode = NF.createReturnNode(CF);
     if (retNode != AndersNodeFactory::InvalidIndex &&
         retNode != NF.getUniversalPtrNode()) {
       retNode = getCanonicalNode(retNode);
@@ -9646,10 +9653,16 @@ static bool mayCarryPtrProvenance(const Value *V, unsigned depth,
   }
   if (isa<LoadInst>(V)) return true; // slot-to-slot int copies stay live
   if (isa<Argument>(V)) { declined = true; return false; } // ledger
-  if (const auto *CB2 = dyn_cast<CallBase>(V)) {
-    (void)CB2;
-    declined = true; // int-returning call may launder a pointer: ledger
-    return false;
+  if (isa<CallBase>(V)) {
+    // An int-returning call may launder a pointer THROUGH its return —
+    // the 5.18 fd chain is a two-hop instance (__fdget_pos returns
+    // v = __fdget(fd), __fdget returns __fget_light(...)): declining
+    // here severed every hop above the ptrtoint and the whole
+    // file->f_op dispatch chain died (vfs_llseek GT FN). Conservative
+    // yes: the call result node carries facts only if the callee's own
+    // return was provenance-witnessed and wired, so plain error-code
+    // returns stay inert.
+    return true;
   }
   if (const auto *I = dyn_cast<Instruction>(V)) {
     if (isa<BinaryOperator>(I) || isa<CastInst>(I) || isa<PHINode>(I) ||

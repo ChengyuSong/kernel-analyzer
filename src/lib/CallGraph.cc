@@ -1135,6 +1135,14 @@ void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
   }
 }
 
+// Forward declarations (defined with the int-provenance machinery
+// further down): laundered-pointer detection for int-typed returns
+// (the __fdget idiom fix needs them in handleCall/visitReturnInst).
+static bool isPtrWidthInt(const llvm::Type *T, const llvm::DataLayout &DL);
+static bool mayCarryPtrProvenance(const llvm::Value *V, unsigned depth,
+                                  bool &declined);
+static size_t g_intStoreUnmodeled = 0;
+
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
                                int opsSkipArg) {
   if (CF->isIntrinsic()) {
@@ -1195,6 +1203,22 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
     NodeIndex callNode = getRepNodeForValue(CS);
     if (callNode != AndersNodeFactory::InvalidIndex)
       addAssignmentEdge(retNode, callNode);
+  } else if (!retBound && curDL &&
+             isPtrWidthInt(CF->getReturnType(), *curDL)) {
+    // Laundered-pointer int return (the __fdget idiom): wire ONLY when
+    // the callee's visitReturnInst created a return node (i.e., its
+    // return value may carry pointer provenance). No on-demand node
+    // for declared int-returning externs — the boundary census owns
+    // those.
+    NodeIndex retNode = NF.getReturnNodeFor(CF);
+    if (retNode != AndersNodeFactory::InvalidIndex &&
+        retNode != NF.getUniversalPtrNode()) {
+      retNode = getCanonicalNode(retNode);
+      NodeIndex callNode = getRepNodeForValue(CS);
+      if (callNode == AndersNodeFactory::InvalidIndex)
+        callNode = getCanonicalNode(NF.createValueNode(CS));
+      addAssignmentEdge(retNode, callNode);
+    }
   }
 
   return false;
@@ -9037,9 +9061,25 @@ bool CallGraphPass::runOnFunction(Function *F) {
 void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
   if (I.getNumOperands() > 0) {
     Value *rv = I.getOperand(0);
+    bool intProv = false;
     if (!containsPointerType(rv->getType())) {
-      // XXX only consider pointer type
-      return;
+      // Pointer-width integer returns can carry laundered pointer
+      // provenance — THE kernel idiom is __fdget/__fdget_pos returning
+      // the struct-file pointer with FDPUT flags in the low bits of an
+      // i64 (5.18 GT: every fd-based file access crosses this return,
+      // so the whole file->f_op dispatch chain was severed and only
+      // pool smear answered at f_op sites; vfs_llseek's clean phi
+      // exposed it). Wire the return when the value may carry
+      // provenance; consumers get facts only if real pointer facts
+      // flow, so the added edges are inert for plain integers.
+      bool dropped = false;
+      if (!(CGP.curDL && isPtrWidthInt(rv->getType(), *CGP.curDL)) ||
+          !mayCarryPtrProvenance(rv, 8, dropped)) {
+        if (dropped)
+          g_intStoreUnmodeled++;
+        return;
+      }
+      intProv = true;
     }
 
     // Skip nullptr and compiler-introduced values
@@ -9049,9 +9089,14 @@ void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
     }
 
     NodeIndex rvNode = CGP.getRepNodeForValue(rv);
+    if (intProv && rvNode == AndersNodeFactory::InvalidIndex)
+      return; // provenance-int with no node: nothing to carry
     assert(rvNode != AndersNodeFactory::InvalidIndex && "Return value node not found!");
     NodeIndex RT = CGP.NF.getReturnNodeFor(F);
-    assert(RT != AndersNodeFactory::InvalidIndex && "Return node not found!");
+    if (RT == AndersNodeFactory::InvalidIndex) {
+      // int-returning functions have no pre-created return node
+      RT = CGP.NF.createReturnNode(F);
+    }
     CGP.addAssignmentEdge(rvNode, RT);
   }
 }
@@ -9577,7 +9622,7 @@ void CallGraphPass::InstHandler::visitAllocaInst(AllocaInst &I) {
 // as explicit ledger entries, never dropped silently.
 static size_t g_intProvStores = 0, g_intProvLoads = 0;
 static size_t g_regfieldBarePtrFnStores = 0;
-static size_t g_intStoreUnmodeled = 0, g_intLoadUnmodeled = 0;
+static size_t g_intLoadUnmodeled = 0;
 
 static bool constantHasPtrToInt(const Constant *C, unsigned depth) {
   if (depth == 0) return true; // bail conservative

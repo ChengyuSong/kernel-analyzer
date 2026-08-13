@@ -269,6 +269,19 @@ static const Constant* singlePtrToIntBase(const Constant* c,
     }
 }
 
+// Percpu gate for the constant-level rebased-pointer identity
+// (narrowed 2026-08-12): only .data..percpu-section globals get their
+// identity carried through folded ptrtoint chains — the GT-demanded
+// population. Broad application multiplied the km closure ~3.8x.
+bool AndersNodeFactory::percpuPtiBase(const llvm::Constant* base) const {
+    const auto *gv = dyn_cast<GlobalVariable>(base->stripPointerCasts());
+    if (!gv)
+        return false;
+    if (const GlobalVariable *cg = canonicalizeGlobal(gv))
+        return cg->getSection().contains("percpu");
+    return gv->getSection().contains("percpu");
+}
+
 NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
     // Accept pointer types and vector-of-pointer types (e.g., <2 x ptr>)
     Type *cTy = c->getType();
@@ -283,7 +296,8 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
         // inert int node — closes the address-as-integer laundering hole
         // (store i64 ptrtoint(@gv) ... load ... inttoptr).
         if (const Constant *base = singlePtrToIntBase(c))
-            return getValueNodeFor(base);
+            if (percpuPtiBase(base))
+                return getValueNodeFor(base);
         return ConstantIntIndex;
     }
 
@@ -350,7 +364,8 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
                 // ERR_PTR-style) have no IR object: null.
                 if (const Constant *base =
                         singlePtrToIntBase(cast<Constant>(ce->getOperand(0))))
-                    return getValueNodeFor(base);
+                    if (percpuPtiBase(base))
+                        return getValueNodeFor(base);
                 return NullPtrIndex;
             }
             case Instruction::PtrToInt:
@@ -420,7 +435,8 @@ NodeIndex AndersNodeFactory::getObjectNodeForConstant(const llvm::Constant* c) {
                 // object (tagged pointers in static initializers).
                 if (const Constant *base =
                         singlePtrToIntBase(cast<Constant>(ce->getOperand(0))))
-                    return getObjectNodeForConstant(base);
+                    if (percpuPtiBase(base))
+                        return getObjectNodeForConstant(base);
                 return NullObjectIndex;
             case Instruction::PtrToInt:
                 // Integer-typed; identity recovered via

@@ -1191,12 +1191,20 @@ int main(int argc, char **argv) {
                   "#43); drop it or the fs flags\n";
         exit(1);
       }
+      // Re-validated 2026-08-12 at HEAD (field filter retired,
+      // percpu-gated identity rules): km incremental == from-scratch,
+      // 160,945 pairs, zero diff both directions. A false divergence
+      // alarm during the fs13 investigation came from comparing runs
+      // of DIFFERENT binary vintages (filter-active incremental vs
+      // filter-retired scratch) — vintage discipline matters: only
+      // same-binary pins may be diffed.
       if (flowsToActive && !fsConfig &&
           CFLFlowsToIncremental.getNumOccurrences() == 0 &&
           CFLBatchRoots == 0 && !CFLLazyMint) {
         CFLFlowsToIncremental = true;
         errs() << "FlowsTo: incremental cross-iteration solving "
-                  "auto-enabled (FI config, #43-validated envelope); "
+                  "auto-enabled (FI config, #43-validated envelope; "
+                  "re-validated at HEAD 2026-08-12); "
                   "--cfl-flows-to-incremental=false to opt out\n";
       }
     }

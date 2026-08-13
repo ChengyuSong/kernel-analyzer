@@ -1442,6 +1442,9 @@ NodeIndex CallGraphPass::getRepNodeForValue(const Value *V) {
 // now counted and reported so a repeat is loud, not a 3h kernel run.
 static size_t g_uniEdgeTouches = 0, g_uniDerefTouches = 0,
               g_uniFptrIcalls = 0;
+// Rebased-pointer rule residual: non-percpu ptrtoint chains whose
+// base identity is deliberately NOT aliased (declared residual).
+static size_t g_rebasedPtrSkipped = 0;
 
 NodeIndex CallGraphPass::getRepDerefNode(NodeIndex ptrNode) {
   if (ptrNode == NF.getUniversalPtrNode() ||
@@ -10131,24 +10134,38 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
       if (base == AndersNodeFactory::InvalidIndex ||
           CGP.NF.isSpecialNode(base))
         continue;
-      // Rebased-pointer rule: inttoptr(add/sub-chain containing
-      // ptrtoint p) IS a pointer into p's object — same field-
-      // insensitive treatment as GEP (base -> result value alias).
-      // This is the percpu idiom (this_cpu_ptr = inttoptr(add(
-      // ptrtoint &var, __per_cpu_offset))): without it the rebased
-      // pointer carries no identity, so stores/loads through it never
-      // meet the static initializer's cells (5.18 GT FN:
-      // wake_up_klogd_work_func — irq_work_queue enqueues the rebased
-      // &wake_up_klogd_work, irq_work_single's ->func load finds
-      // nothing). The deref-pull below stays gated on self-read
-      // (PREL32 array semantics, a different rule).
-      CGP.addAssignmentEdge(base, dstNode);
-      // Field mode: instruction-form ptrtoint escapes get their
-      // wildcard in visitPtrToIntInst; CONSTANT-EXPR leaves have no
-      // instruction to visit, so apply the same escape discipline here
-      // (integer arithmetic can rebase to any field = disguised GEP).
-      if (CGP.EB.hasFieldLabels() && isa<Constant>(PTI))
-        CGP.addFieldWildcardLoop(base, "ptrtoint-ce-escape");
+      // Rebased-pointer rule, PERCPU-GATED (narrowed 2026-08-12):
+      // inttoptr(add-chain containing ptrtoint p) IS a pointer into
+      // p's object, but applying the base->result alias to EVERY
+      // ptrtoint chain multiplied the km from-scratch closure ~3.8x
+      // (integer-laundered pointer arithmetic is ubiquitous and mostly
+      // pool-feeding). The GT-demanded population is exactly percpu
+      // rebasing (this_cpu_ptr/per_cpu_ptr on .data..percpu globals:
+      // wake_up_klogd_work_func, vfree_deferred). Gate on the
+      // canonical base being a percpu-section global; count the
+      // skipped remainder LOUDLY — it is a declared residual, not a
+      // silent drop. The self-read deref-pull below is unchanged.
+      const Value *baseV = PTI->getPointerOperand()->stripPointerCasts();
+      bool percpuBase = false;
+      if (const auto *GV = dyn_cast<GlobalVariable>(baseV)) {
+        const GlobalVariable *DGV = GV;
+        auto git = CGP.Ctx->Gobjs.find(GV->getGUID());
+        if (git != CGP.Ctx->Gobjs.end() && git->second)
+          if (const auto *D = dyn_cast<GlobalVariable>(git->second))
+            DGV = D;
+        percpuBase = DGV->getSection().contains("percpu");
+      }
+      if (percpuBase) {
+        CGP.addAssignmentEdge(base, dstNode);
+        // Field mode: instruction-form ptrtoint escapes get their
+        // wildcard in visitPtrToIntInst; CONSTANT-EXPR leaves have no
+        // instruction to visit, so apply the same escape discipline
+        // here (integer arithmetic can rebase to any field).
+        if (CGP.EB.hasFieldLabels() && isa<Constant>(PTI))
+          CGP.addFieldWildcardLoop(base, "ptrtoint-ce-escape");
+      } else {
+        g_rebasedPtrSkipped++;
+      }
       bool selfRead = false;
       for (const LoadInst *LI : loadLeaves) {
         NodeIndex lp = CGP.getRepNodeForValue(
@@ -14598,6 +14615,10 @@ bool CallGraphPass::doFinalization(Module *M) {
              << " edges touch universal, " << g_uniDerefTouches
              << " deref-throughs, " << g_uniFptrIcalls
              << " icalls read unknown extern memory directly\n");
+  if (g_rebasedPtrSkipped)
+    CG_LOG("RebasedPtr: " << g_rebasedPtrSkipped
+           << " non-percpu ptrtoint chains left identity-free (declared "
+           << "residual; percpu-gated rule)\n");
     }
     CG_LOG("PrintfSink: " << printfSinkCallsites << " benign vararg callsites ("
            << printfSinkArgsSkipped << " tail args unwired), "

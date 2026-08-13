@@ -137,6 +137,7 @@ private:
 
     unsigned constGEPtoFieldNum(const llvm::ConstantExpr* expr) const;
     const llvm::GlobalVariable* canonicalizeGlobal(const llvm::GlobalVariable* gv) const;
+    bool percpuPtiBase(const llvm::Constant* base) const;
     const llvm::Function* canonicalizeFunction(const llvm::Function* f) const;
     const llvm::Value* canonicalizeValueKey(const llvm::Value* v) const;
 public:

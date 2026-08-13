@@ -2738,7 +2738,117 @@ void CallGraphPass::runGTTypeCensus(const std::string &path) {
          << " caller-absent, " << notgt << " target-absent\n";
 }
 
+// Residue-modulus input census (--cfl-dump-fnptr-offsets): every
+// (deepest named struct, byte offset) slot observed to HOLD a function —
+// from global initializers (the ops-table population) and direct
+// fn-constant stores (INIT_WORK-style). The Z_P planes can only split
+// what P separates: any struct with two fn slots at offsets congruent
+// mod P is unsplittable at that P (fs13 exemplar: file_operations spans
+// ~30 slots > 13 residues — pigeonhole inside ONE struct). The offline
+// scorer picks P from this dump.
+void CallGraphPass::dumpFnPtrOffsets() {
+  boost::unordered_flat_set<std::string> emitted;
+  auto emit = [&](StringRef sName, uint64_t off, StringRef fn) {
+    std::string key = (sName + "\t" + std::to_string(off)).str();
+    if (!emitted.insert(key + "\t" + fn.str()).second)
+      return;
+    errs() << "FNPTR-OFFSET " << sName << " " << off << " " << fn << "\n";
+  };
+  std::function<void(const Constant *, Type *, const DataLayout &)> walk =
+      [&](const Constant *C, Type *Ty, const DataLayout &DL) {
+        if (auto *ST = dyn_cast<StructType>(Ty)) {
+          if (ST->isOpaque())
+            return;
+          const StructLayout *SL = DL.getStructLayout(ST);
+          for (unsigned i = 0; i < ST->getNumElements(); i++) {
+            const Constant *E = C->getAggregateElement(i);
+            if (!E)
+              continue;
+            Type *ET = ST->getElementType(i);
+            if (const auto *F =
+                    dyn_cast<Function>(E->stripPointerCasts())) {
+              if (!ST->isLiteral() && ST->hasName())
+                emit(stripStructNameSuffix(ST->getStructName()),
+                     SL->getElementOffset(i), F->getName());
+            } else if (isa<StructType>(ET) || isa<ArrayType>(ET)) {
+              walk(E, ET, DL);
+            }
+          }
+        } else if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+          for (unsigned i = 0; i < AT->getNumElements(); i++) {
+            const Constant *E = C->getAggregateElement(i);
+            if (E)
+              walk(E, AT->getElementType(), DL);
+          }
+        }
+      };
+  for (auto &mp : Ctx->Modules) {
+    const DataLayout &DL = mp.first->getDataLayout();
+    for (GlobalVariable &GV : mp.first->globals())
+      if (GV.hasInitializer())
+        walk(GV.getInitializer(), GV.getValueType(), DL);
+    // Direct fn-constant stores: deepest named struct + byte offset via
+    // the GEP's own index chain.
+    for (Function &F : *mp.first) {
+      if (F.isDeclaration() || F.empty())
+        continue;
+      for (inst_iterator II = inst_begin(F), IE = inst_end(F); II != IE;
+           ++II) {
+        auto *SI = dyn_cast<StoreInst>(&*II);
+        if (!SI)
+          continue;
+        const auto *SF =
+            dyn_cast<Function>(SI->getValueOperand()->stripPointerCasts());
+        if (!SF)
+          continue;
+        const auto *GEP = dyn_cast<GEPOperator>(
+            SI->getPointerOperand()->stripPointerCasts());
+        if (!GEP)
+          continue;
+        Type *CurTy = GEP->getSourceElementType();
+        StringRef deepName;
+        uint64_t deepOff = 0;
+        auto idx = GEP->idx_begin();
+        if (idx == GEP->idx_end())
+          continue;
+        ++idx; // skip pointer index
+        for (; idx != GEP->idx_end(); ++idx) {
+          if (auto *ST = dyn_cast<StructType>(CurTy)) {
+            auto *CI = dyn_cast<ConstantInt>(*idx);
+            if (!CI)
+              break;
+            unsigned fi = (unsigned)CI->getZExtValue();
+            if (fi >= ST->getNumElements())
+              break;
+            if (!ST->isLiteral() && ST->hasName()) {
+              deepName = stripStructNameSuffix(ST->getStructName());
+              deepOff = DL.getStructLayout(ST)->getElementOffset(fi);
+            } else if (!deepName.empty()) {
+              // literal/anon struct nested inside a named one: byte
+              // offset accumulates within the last named struct
+              deepOff += DL.getStructLayout(ST)->getElementOffset(fi);
+            }
+            CurTy = ST->getElementType(fi);
+          } else if (auto *AT = dyn_cast<ArrayType>(CurTy)) {
+            CurTy = AT->getElementType();
+          } else {
+            break;
+          }
+        }
+        if (!deepName.empty())
+          emit(deepName, deepOff, SF->getName());
+      }
+    }
+  }
+  errs() << "FNPTR-OFFSET census complete (" << emitted.size()
+         << " distinct slot records)\n";
+}
+
 bool CallGraphPass::runFlowsToResolution() {
+  if (CFLDumpFnptrOffsets) {
+    dumpFnPtrOffsets();
+    exit(0);
+  }
   if (!CFLGTTypeCensus.empty()) {
     runGTTypeCensus(CFLGTTypeCensus);
     errs() << "GT-TYPE census complete — exiting (census-only mode)\n";

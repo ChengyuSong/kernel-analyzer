@@ -53,6 +53,7 @@ extern cl::opt<bool> CFLCensusPtrToInt;
 extern cl::opt<bool> CFLCensusTracepoint;
 extern cl::opt<bool> CFLCensusTypeRej;
 extern cl::opt<std::string> CFLGTTypeCensus;
+extern cl::opt<bool> CFLDumpFnptrOffsets;
 extern cl::opt<bool> CFLCensusExternBound;
 extern cl::opt<bool> CFLTracepointKeys;
 extern cl::opt<bool> CFLStaticOpsTables;

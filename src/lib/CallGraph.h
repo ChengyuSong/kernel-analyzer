@@ -105,6 +105,7 @@ private:
   void sliceEdgesToFptrComponents(std::vector<size_t> &idx);
   bool runFlowsToResolution();
   void runGTTypeCensus(const std::string &path);
+  void dumpFnPtrOffsets();
   std::unordered_set<NodeIndex> fptrSliceKept;
   void emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
                               llvm::Type *Ty, unsigned depth);

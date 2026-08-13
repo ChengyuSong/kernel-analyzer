@@ -453,6 +453,15 @@ cl::opt<std::string> CFLGTTypeCensus(
            "Runs after module init, then exits — no solve"),
   cl::init(""));
 
+cl::opt<bool> CFLDumpFnptrOffsets(
+  "cfl-dump-fnptr-offsets",
+  cl::desc("MEASUREMENT-ONLY: dump every (struct, byte-offset) slot that "
+           "holds a FUNCTION — from global initializers (ops tables) and "
+           "direct fn-constant stores — as FNPTR-OFFSET lines, then exit. "
+           "Input to the residue-modulus (Z_P) collision scorer: P must "
+           "separate same-struct fn-ptr offsets or fs cannot split them"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusExternBound(
   "cfl-census-extern-bound",
   cl::desc("MEASUREMENT-ONLY census (task #45): rank called-but-never-"

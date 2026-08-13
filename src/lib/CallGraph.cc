@@ -6568,12 +6568,45 @@ bool CallGraphPass::runFlowsToResolution() {
           // admission is not proof of true flow: mod-P residues can
           // collide; X-plane carries no field claim either way).
           if (CFLCensusTypeRej) {
+            // Uncapped under the census flag: ranking WHERE the retired
+            // filter used to trim (per-key/caller/target attribution)
+            // needs the full stream, not a prefix sample. CLASS
+            // decomposes the trim against the filter's own inventory:
+            // XFIELD = target stored elsewhere in the SAME struct (FI
+            // cross-field smear — fs residue planes address this
+            // class in-graph); XSTRUCT = target stored only in OTHER
+            // structs (pooled-origin/hub leakage — channels/rodata
+            // territory). HOMES = up to 3 of the target's real store
+            // keys.
             static size_t g_fieldRejExemplars = 0;
-            if (g_fieldRejExemplars++ < 5000)
+            if (g_fieldRejExemplars++ < 5000000) {
+              const Function *canonF = F;
+              auto itDef = Ctx->Funcs.find(F->getGUID());
+              if (itDef != Ctx->Funcs.end())
+                canonF = itDef->second;
+              const char *cls = "XSTRUCT";
+              std::string homes;
+              auto fsIt = funcFieldStores.find(canonF);
+              if (fsIt != funcFieldStores.end()) {
+                int shown = 0;
+                for (const auto &k : fsIt->second) {
+                  if (k.first == csStruct)
+                    cls = "XFIELD";
+                  if (shown < 3) {
+                    homes += ' ';
+                    homes += k.first;
+                    homes += '+';
+                    homes += std::to_string(k.second);
+                    shown++;
+                  }
+                }
+              }
               errs() << "CENSUS-FIELDREJ(" << planeTag << ") [" << csStruct
                      << "+" << csField << "] "
                      << CS->getFunction()->getName() << " -/-> "
-                     << F->getName() << "\n";
+                     << F->getName() << " CLASS=" << cls << " HOMES:"
+                     << homes << "\n";
+            }
           }
         }
         targets.insert(F);

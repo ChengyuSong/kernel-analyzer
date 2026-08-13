@@ -10473,14 +10473,15 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
       }
       if (percpuBase) {
         CGP.addAssignmentEdge(base, dstNode);
-        // Field mode: instruction-form ptrtoint escapes get their
-        // wildcard in visitPtrToIntInst; CONSTANT-EXPR leaves have no
-        // instruction to visit, so apply the same escape discipline
-        // here (integer arithmetic can rebase to any field).
-        if (CGP.EB.hasFieldLabels() && isa<Constant>(PTI)) {
-          p2iEscapeCensus(&I, "ce-op");
-          CGP.addFieldWildcardLoop(base, "ptrtoint-ce-escape");
-        }
+        // Field mode: NO wildcard here (2026-08-13). Percpu rebasing
+        // (add of __per_cpu_offset[cpu]) is base-to-base relocation —
+        // the same position in another CPU's copy of the section —
+        // so intra-object offsets are PRESERVED and the shift-0 edge
+        // above is the exact encoding. This rides the same declared
+        // percpu invariant as the identity gate itself (7d7df8a):
+        // integer arithmetic on percpu-section p2i bases is per-cpu
+        // rebasing. A non-rebasing offset-changing use of a percpu
+        // base would violate that invariant, not just this rule.
       } else {
         g_rebasedPtrSkipped++;
       }
@@ -10664,6 +10665,19 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       }
       if (isa<ZExtInst>(U) || isa<BitCastInst>(U) || isa<FreezeInst>(U) ||
           isa<PHINode>(U) || isa<SelectInst>(U)) {
+        if (seen.insert(U).second)
+          wl.push_back(U);
+        continue;
+      }
+      if (isa<TruncInst>(U)) {
+        // Residue-neutral: truncation keeps the LOW bits, where all
+        // offset arithmetic lives; walking through (instead of
+        // bailing) still catches downstream offset-destroyers.
+        // Sub-pointer-width MEMORY crossings stay out of scope: the
+        // witnessed store/load modeling is ptr-width-gated, so a
+        // narrowed value that crosses memory carries no facts either
+        // way (declared residual — 32-bit slots cannot hold a kernel
+        // VA without out-of-band high bits).
         if (seen.insert(U).second)
           wl.push_back(U);
         continue;

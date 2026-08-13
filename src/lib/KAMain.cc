@@ -41,6 +41,8 @@
 #include "LLMAnalysis.h"
 #include "IRSidecar.h"
 #include "IRCensus.h"
+#include <map>
+#include <set>
 
 using namespace llvm;
 
@@ -452,6 +454,30 @@ cl::opt<std::string> CFLGTTypeCensus(
            "unsoundness (a runtime-true pair our type rules reject). "
            "Runs after module init, then exits — no solve"),
   cl::init(""));
+
+cl::opt<bool> CFLFieldBucketsAuto(
+  "cfl-field-buckets-auto",
+  cl::desc("Pick the residue modulus P from the loaded corpus: census "
+           "the fn-ptr slot offsets (same walk as "
+           "--cfl-dump-fnptr-offsets) and choose the smallest prime "
+           "whose same-struct collision residual is within "
+           "--cfl-auto-buckets-residual-bp, capped by "
+           "--cfl-auto-buckets-max. Explicit --cfl-field-buckets wins"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLAutoBucketsResidualBP(
+  "cfl-auto-buckets-residual-bp",
+  cl::desc("Auto bucket selection: max tolerated same-struct colliding "
+           "offset pairs, in basis points of all same-struct pairs "
+           "(10 = 0.10%)"),
+  cl::init(10));
+
+cl::opt<unsigned> CFLAutoBucketsMax(
+  "cfl-auto-buckets-max",
+  cl::desc("Auto bucket selection: largest P considered (memory scales "
+           "~linearly with P). If the residual target needs a larger P, "
+           "the cap is taken and the shortfall is reported LOUDLY"),
+  cl::init(127));
 
 cl::opt<bool> CFLDumpFnptrOffsets(
   "cfl-dump-fnptr-offsets",
@@ -1370,6 +1396,78 @@ int main(int argc, char **argv) {
   GlobalCtx.nodeFactory.setExtFuncMap(&GlobalCtx.ExtFuncs);
 
   // Main workflow
+
+  // Data-driven Z_P selection (--cfl-field-buckets-auto): modules are
+  // loaded, so census the fn-ptr slot offsets and pick the smallest
+  // prime meeting the residual target. Explicit --cfl-field-buckets
+  // takes precedence.
+  if (CFLFieldBucketsAuto) {
+    if (CFLFieldBuckets.getNumOccurrences() > 0) {
+      errs() << "FieldBucketsAuto: explicit --cfl-field-buckets="
+             << CFLFieldBuckets << " wins; auto selection skipped\n";
+    } else {
+      std::map<std::string, std::set<uint64_t>> slots;
+      kaCollectFnPtrOffsets(
+          GlobalCtx.Modules,
+          [&](StringRef sName, uint64_t off, StringRef) {
+            slots[sName.str()].insert(off);
+          });
+      uint64_t totalPairs = 0;
+      for (auto &kv : slots) {
+        uint64_t n = kv.second.size();
+        totalPairs += n * (n - 1) / 2;
+      }
+      auto residualAt = [&](unsigned P) {
+        uint64_t coll = 0;
+        for (auto &kv : slots) {
+          std::map<uint64_t, uint64_t> res;
+          for (uint64_t o : kv.second)
+            res[o % P]++;
+          for (auto &rc : res)
+            coll += rc.second * (rc.second - 1) / 2;
+        }
+        return coll;
+      };
+      auto isPrime = [](unsigned n) {
+        if (n < 2) return false;
+        for (unsigned d = 2; d * d <= n; d++)
+          if (n % d == 0) return false;
+        return true;
+      };
+      unsigned chosen = 0;
+      uint64_t chosenColl = 0;
+      const uint64_t budget =
+          totalPairs * (uint64_t)CFLAutoBucketsResidualBP / 10000;
+      for (unsigned P = 11; P <= CFLAutoBucketsMax; P++) {
+        if (!isPrime(P)) continue;
+        uint64_t c = residualAt(P);
+        if (c <= budget) { chosen = P; chosenColl = c; break; }
+      }
+      if (chosen == 0) {
+        // No prime within the cap meets the target: take the best
+        // prime under the cap and say so loudly (no silent fallback).
+        uint64_t bestC = UINT64_MAX;
+        for (unsigned P = 11; P <= CFLAutoBucketsMax; P++) {
+          if (!isPrime(P)) continue;
+          uint64_t c = residualAt(P);
+          if (c < bestC) { bestC = c; chosen = P; }
+        }
+        chosenColl = bestC;
+        errs() << "WARNING: FieldBucketsAuto: residual target "
+               << CFLAutoBucketsResidualBP << "bp needs P > cap "
+               << CFLAutoBucketsMax << "; taking P=" << chosen
+               << " with " << chosenColl << "/" << totalPairs
+               << " colliding same-struct pairs\n";
+      }
+      CFLFieldBuckets = chosen;
+      errs() << "FieldBucketsAuto: P=" << chosen << " ("
+             << slots.size() << " structs, " << totalPairs
+             << " same-struct offset pairs, " << chosenColl
+             << " colliding at P = "
+             << (totalPairs ? 10000.0 * chosenColl / totalPairs : 0.0)
+             << "bp; cap " << CFLAutoBucketsMax << ")\n";
+    }
+  }
 
   // CFL-reachability edge construction
   if (GrammarFile.empty()) {

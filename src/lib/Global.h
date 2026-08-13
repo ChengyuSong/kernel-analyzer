@@ -29,6 +29,15 @@
 #include "CFLEdgeBuilder.h"
 
 typedef std::vector< std::pair<llvm::Module*, llvm::StringRef> > ModuleList;
+
+// Fn-ptr slot census (CallGraph.cc): every (deepest named struct, byte
+// offset) observed to HOLD a function, from global initializers and
+// direct fn-constant stores. Shared by --cfl-dump-fnptr-offsets and
+// the --cfl-field-buckets-auto Z_P selector.
+void kaCollectFnPtrOffsets(
+    ModuleList &modules,
+    llvm::function_ref<void(llvm::StringRef, uint64_t, llvm::StringRef)>
+        sink);
 typedef std::unordered_map<llvm::Module*, llvm::StringRef> ModuleMap;
 
 typedef llvm::SmallPtrSet<const llvm::CallBase*, 8> CallInstSet;

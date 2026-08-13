@@ -2746,14 +2746,9 @@ void CallGraphPass::runGTTypeCensus(const std::string &path) {
 // mod P is unsplittable at that P (fs13 exemplar: file_operations spans
 // ~30 slots > 13 residues — pigeonhole inside ONE struct). The offline
 // scorer picks P from this dump.
-void CallGraphPass::dumpFnPtrOffsets() {
-  boost::unordered_flat_set<std::string> emitted;
-  auto emit = [&](StringRef sName, uint64_t off, StringRef fn) {
-    std::string key = (sName + "\t" + std::to_string(off)).str();
-    if (!emitted.insert(key + "\t" + fn.str()).second)
-      return;
-    errs() << "FNPTR-OFFSET " << sName << " " << off << " " << fn << "\n";
-  };
+void kaCollectFnPtrOffsets(
+    ModuleList &modules,
+    llvm::function_ref<void(StringRef, uint64_t, StringRef)> sink) {
   std::function<void(const Constant *, Type *, const DataLayout &)> walk =
       [&](const Constant *C, Type *Ty, const DataLayout &DL) {
         if (auto *ST = dyn_cast<StructType>(Ty)) {
@@ -2768,7 +2763,7 @@ void CallGraphPass::dumpFnPtrOffsets() {
             if (const auto *F =
                     dyn_cast<Function>(E->stripPointerCasts())) {
               if (!ST->isLiteral() && ST->hasName())
-                emit(stripStructNameSuffix(ST->getStructName()),
+                sink(stripStructNameSuffix(ST->getStructName()),
                      SL->getElementOffset(i), F->getName());
             } else if (isa<StructType>(ET) || isa<ArrayType>(ET)) {
               walk(E, ET, DL);
@@ -2782,13 +2777,11 @@ void CallGraphPass::dumpFnPtrOffsets() {
           }
         }
       };
-  for (auto &mp : Ctx->Modules) {
+  for (auto &mp : modules) {
     const DataLayout &DL = mp.first->getDataLayout();
     for (GlobalVariable &GV : mp.first->globals())
       if (GV.hasInitializer())
         walk(GV.getInitializer(), GV.getValueType(), DL);
-    // Direct fn-constant stores: deepest named struct + byte offset via
-    // the GEP's own index chain.
     for (Function &F : *mp.first) {
       if (F.isDeclaration() || F.empty())
         continue;
@@ -2824,8 +2817,6 @@ void CallGraphPass::dumpFnPtrOffsets() {
               deepName = stripStructNameSuffix(ST->getStructName());
               deepOff = DL.getStructLayout(ST)->getElementOffset(fi);
             } else if (!deepName.empty()) {
-              // literal/anon struct nested inside a named one: byte
-              // offset accumulates within the last named struct
               deepOff += DL.getStructLayout(ST)->getElementOffset(fi);
             }
             CurTy = ST->getElementType(fi);
@@ -2836,10 +2827,27 @@ void CallGraphPass::dumpFnPtrOffsets() {
           }
         }
         if (!deepName.empty())
-          emit(deepName, deepOff, SF->getName());
+          sink(deepName, deepOff, SF->getName());
       }
     }
   }
+}
+
+// Residue-modulus input census (--cfl-dump-fnptr-offsets): see
+// kaCollectFnPtrOffsets. The Z_P planes can only split what P
+// separates (fs13 exemplar: file_operations spans ~30 slots > 13
+// residues — pigeonhole inside ONE struct).
+void CallGraphPass::dumpFnPtrOffsets() {
+  boost::unordered_flat_set<std::string> emitted;
+  kaCollectFnPtrOffsets(
+      Ctx->Modules, [&](StringRef sName, uint64_t off, StringRef fn) {
+        std::string key =
+            (sName + "\t" + std::to_string(off) + "\t" + fn).str();
+        if (!emitted.insert(key).second)
+          return;
+        errs() << "FNPTR-OFFSET " << sName << " " << off << " " << fn
+               << "\n";
+      });
   errs() << "FNPTR-OFFSET census complete (" << emitted.size()
          << " distinct slot records)\n";
 }

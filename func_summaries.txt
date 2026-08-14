@@ -40,6 +40,46 @@ realloc FRESH CPY(ret<-arg0)
 strdup FRESH CPY(ret<-arg0)
 strndup FRESH CPY(ret<-arg0)
 
+# ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
+# apr_palloc carves from shared allocator blocks; FRESH on the leaf
+# dup/create family severs per-callsite object identity from the pool
+# blocks. APR source arg is arg1 (arg0 = pool). AUDIT RULE (learned
+# 2026-08-13 validation): a summary SKIPS the body, so NEVER summarize
+# a function whose body contains an indirect call — it starves.
+# REJECTED by that audit: apr_palloc + apr_psprintf/apr_pvsprintf
+# (pool->abort_fn dispatch in apr_palloc; psprintf_flush passed to
+# apr_vformatter inside apr_pvsprintf): measured -5 REAL pairs
+# (apr_palloc->abort_on_oom, apr_vformatter->psprintf_flush).
+# Entries below are audited dispatch-free bodies. A/B VERDICT
+# (2026-08-13, httpd HEAD FI): ANSWER-NEUTRAL (-0/+0 vs no-summary
+# base) — pool fusion does NOT drive httpd icall V-sets (ap_hook
+# channel territory); kept as audited-sound identity hygiene, same
+# policy as fwnode_connection_find_match. pstrcat is FRESH-only under
+# the declared text-serialization assumption (pointer cells do not
+# survive byte formatting).
+apr_pcalloc FRESH
+apr_pmemdup FRESH CPY(ret<-arg1)
+apr_pstrdup FRESH CPY(ret<-arg1)
+apr_pstrndup FRESH CPY(ret<-arg1)
+apr_pstrmemdup FRESH CPY(ret<-arg1)
+apr_pstrcat FRESH
+apr_bucket_alloc FRESH
+
+# ---- postgres memory contexts: WITHDRAWN (2026-08-13 validation) ----
+# The whole palloc/MemoryContextAlloc/repalloc/pstrdup family FAILS
+# the body-dispatch audit twice over: (1) every body reaches the
+# context->methods->{alloc,realloc} icall, so FRESH starved it —
+# measured repalloc 16->0 targets including the six REAL allocator
+# methods (AllocSetRealloc et al.), palloc-family 16->0 each, -474
+# pairs total, ALL unsound removals, zero precision value; (2) pg
+# recovers the owning context from a bit-packed CHUNK HEADER (pfree
+# -> GetMemoryChunkContext -> methods->free_p), so severing
+# caller-chunk/body-chunk identity breaks the free path in principle
+# (it survived only via unrelated smear). Re-adding needs (a) an
+# arg-preserving FRESH variant (wire actuals->formals, mint fresh
+# ret, drop body-ret binding) for hazard (1), and (b) explicit header
+# -channel modeling for hazard (2). Until both exist: NO pg entries.
+
 # ---- kernel: pair-correlated registration (task #28, INVOKE) ----
 # INVOKE(argF:fK<-argD): the fn at argF will be invoked with argD bound
 # to its formal K. Registration callsites bind (fn,data) directly and

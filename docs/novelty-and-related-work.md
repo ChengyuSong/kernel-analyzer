@@ -138,6 +138,59 @@ unavailable from the analysis environment):
   (WPDS instantiations) — whether the Z_P quotient has been used for
   interior pointers before.
 
+## Reviewed 2026-08-13: Li, Zhang & Reps, PLDI'20 — graph simplification for InterDyck
+
+*Fast Graph Simplification for Interleaved Dyck-Reachability.*
+Preprocessing that deletes edges provably on no InterDyck-accepted
+path, sound for any downstream over-approximating solver. Mechanics:
+exact contributing-edge identification is undecidable (reduction from
+InterDyck-reachability), so relax twice — bidirect the graph, then
+per component-Dyck contract all foreign-labeled edges — and on the
+bidirected projection Dyck reachability is an equivalence (Fast-Dyck,
+Zhang PLDI'13, O(m log m) union-find). Anchor-node criterion: an
+open-⟨k edge into v contributes iff v's union-find rep receives a
+second ⟨k edge (the Fast-Dyck merge IS the matched-partner witness);
+fail in any component language ⇒ delete; iterate to fixpoint.
+Eval: 95 Android taint graphs (avg 147k edges — toy scale; their CFL
+baseline times out >1K edges): ~26% edges deleted, 2.18x downstream
+speedup, 57% memory, over-approx solvers return 64.9% of pairs.
+
+Placement for us:
+- **Rediscovery bucket**: bidirect + union-find Dyck collapse = our
+  join layer's lineage (already cited); "prune what can't contribute,
+  computed on a relaxation" = bidi-prune's family. Cite this as the
+  simplify-then-solve preprocessing contract; anchor test = supply-
+  side cousin of answer-relevant roots / sink-seal.
+- **Positioning contrast**: they accept InterDyck and fight its
+  undecidability; we declined the interleaving (summaries for
+  context, Z_P quotient for fields = their "regularize one Dyck"
+  baseline, but deliberate, container_of-sound, solved EXACTLY).
+  Their precision gain exists only because their solvers
+  over-approximate; for an exact decidable formulation,
+  simplification buys time/memory, never answers.
+- **Borrowable: FI-as-simplifier for fs runs.** FI is a sound
+  quotient of fs-P (drop shifts: every fs derivation maps to an FI
+  derivation over the same edges), so edges participating in no FI
+  derivation of any icall answer are fs-dead. We hold the HEAD FI
+  closure (3:30h) + witness-exact attribution; target = the 70h/365GB
+  kernel fs run (same "recouped above 7s" economics, x1000 scale).
+  OPEN before claiming: (a) measure delta over bidi-prune's cone
+  intersection (closure-participation vs cone membership); (b)
+  collision check vs Ding–Zhang mutual-refinement line (~2023, two
+  abstractions pruning each other — closest published relative).
+  Also queue: Kjelstrøm–Pavlogiannis POPL'22 (bidirected InterDyck
+  decidability/complexity) for the formulation-contrast paragraph.
+
+Local resource (2026-08-13): ZJU-PL **Lotus/Phoenix** checkout at
+`/data/csong/opensource/lotus` carries reference code for both open
+items — `lib/CFL/MutualRefinement/` (SAS'23) and
+`lib/CFL/InterDyckGraphReduce/` (this PLDI'20 paper, matrix-based) —
+plus `lib/Alias/Specialized/FPA/` with FLTA/MLTA/enhanced-MLTA/Kelp
+reimplementations (USENIX Sec'24 lineage from the §5 diligence list)
+and Canary DyckAA (AGPL; unification-only bidirected Dyck = natural
+"join-layer-alone" ablation baseline). LLVM-14-only (typed-pointer
+era): kernel baseline runs need a clang-14 5.18 corpus.
+
 ## Measurement/ablation catalog as a contribution (2026-07-24, user-flagged)
 
 No existing CFL-reachability / kernel-callgraph paper reports the

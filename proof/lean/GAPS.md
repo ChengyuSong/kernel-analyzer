@@ -261,3 +261,20 @@ Certificate/code movements the model should eventually absorb:
   proof-review's repair #5; channel soundness currently rides on
   per-family completeness contracts and the regfield closedness
   certificate.
+
+## Origin bundles (Bundles.lean, 2026-08-15)
+
+Machine-checked: `bundle_exact` (quotient of closure-row-equal
+origins, bundled closure = per-origin closure member-by-member;
+mixed-witness joins collapse via row equality), `row_determined`
+(equal carried-base rows containing own seeds ⇒ equal closure rows —
+the drain-checkpoint full-state hash test justifies the RowEq
+hypothesis). Unverified engineering (v1 implementation gates):
+- rid renumbering pass = bijection on plane bits (runtime count
+  assertions);
+- cluster-key remap + L1 equal-or-absent assertion (coupling through
+  shared cells is BELOW the model, like event-replay order);
+- harvest/dump expansion of bundle bits to leaves;
+- exclusion completeness: prot rids and measurement-flag rids are
+  the only per-rid mechanisms post-seeding (audited 2026-08-15;
+  re-audit on any new addFact call site).

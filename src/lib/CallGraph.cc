@@ -4089,6 +4089,13 @@ bool CallGraphPass::runFlowsToResolution() {
   // the popcount-equality probe, whose per-pop full-plane scans were
   // the fs-scale regression.
   std::vector<uint8_t> virginPl((size_t)N * NSHIFT, 0);
+  // NOTE (2026-08-14 probe, do not rebuild): a per-class dirty-plane
+  // bitmask skipping empty planes in the pop loop was implemented and
+  // A/B'd byte-identical at km fs41 — and FLAT (-0.9%): occupancy is
+  // 93% LIVE planes at pop time and empty-plane peeks measure 0.005%
+  // of cycles (SolverProf scan). fs plane cost is real work, not
+  // iteration overhead; the levers are fact-mass reduction (origin
+  // bundles, channels), not plane skipping.
   auto internPlanes = [&]() {
     internSweeps++;
     auto prefixLen = [](llvm::ArrayRef<uintptr_t> W) {
@@ -7945,6 +7952,45 @@ bool CallGraphPass::runFlowsToResolution() {
            << "%), fact mass " << factsSuff << "/" << factsTotal << " ("
            << (factsTotal ? 100.0 * factsSuff / factsTotal : 0.0)
            << "%) — demand-driven upper bound\n";
+    // CONE-ACTIVE set: origins with >=1 fact on some fptr-ancestor
+    // class. THE sound fs-prune criterion (all-derivations-closed):
+    // any fs derivation of an answer maps through the FI quotient onto
+    // ancestor classes only, so an origin absent from every ancestor
+    // class's planes can appear in NO fs answer derivation. (The
+    // SUFFICIENT set above is single-witness-closed — sound for FI
+    // re-derivation, NOT for fs pruning.)
+    {
+      std::vector<char> coneAct(nextRoot, 0);
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n || !anc[n]) continue;
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          auto mk = [&](const FactSet &pl) {
+            pl.forEach([&](uint32_t o) { coneAct[o] = 1; });
+          };
+          mk(R[n][s]);
+          mk(RB[n][s]);
+        }
+      }
+      size_t nCone = 0;
+      for (uint32_t o = 0; o < nextRoot; o++) nCone += coneAct[o];
+      uint64_t factsCone = 0;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n) continue;
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          auto tly = [&](const FactSet &pl) {
+            pl.forEach([&](uint32_t o) { factsCone += coneAct[o]; });
+          };
+          tly(R[n][s]);
+          tly(RB[n][s]);
+        }
+      }
+      errs() << "RootRel: CONE-ACTIVE " << nCone << "/" << nextRoot
+             << " roots ("
+             << (nextRoot ? 100.0 * nCone / nextRoot : 0.0)
+             << "%), fact mass " << factsCone << "/" << factsTotal
+             << " (" << (factsTotal ? 100.0 * factsCone / factsTotal : 0.0)
+             << "%) — sound fs-prune keep-set\n";
+    }
   }
 
   // --cfl-conflation-report: rank FUNCTIONS (not classes) as candidates

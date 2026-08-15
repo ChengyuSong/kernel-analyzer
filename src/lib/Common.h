@@ -2,6 +2,7 @@
 #define _COMMON_H
 
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/Format.h>
 #include <llvm/Config/llvm-config.h>
 #include "Flags.h"
 
@@ -19,10 +20,21 @@
   #define LLVM_STRING_ENDS_WITH(str, suffix) (str).endswith(suffix)
 #endif
 
+// Elapsed seconds since the first KA_LOG (~process start). Anchor is a
+// function-local static: thread-safe init, no .cc file needed.
+inline double kaElapsedSec() {
+	static const auto anchor = std::chrono::steady_clock::now();
+	return std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - anchor).count();
+}
+
 #define KA_LOG(lv, stmt)							\
 	do {											\
-		if (VerboseLevel >= lv)						\
+		if (VerboseLevel >= lv) {					\
+			if (LogTimestamps)						\
+				llvm::errs() << llvm::format("[+%.1fs] ", kaElapsedSec()); \
 			llvm::errs() << stmt;					\
+		}										\
 	} while(0)
 
 

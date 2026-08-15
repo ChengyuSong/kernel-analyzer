@@ -227,6 +227,13 @@ cl::opt<bool> CFLSolverProfile(
            "sink before optimizing"),
   cl::init(false));
 
+cl::opt<bool> LogTimestamps(
+  "log-timestamps",
+  cl::desc("Prefix every KA_LOG line with [+<seconds>] elapsed since "
+           "process start (phase profiling; default off — the prefix "
+           "changes the log format pin-extraction scripts anchor on)"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLFieldBuckets(
   "cfl-field-buckets",
   cl::desc("Number of bucketed field-offset labels for field-sensitive CFL "
@@ -1086,6 +1093,7 @@ void doBasicInitialization(Module *M) {
 }
 
 int main(int argc, char **argv) {
+  kaElapsedSec(); // anchor the --log-timestamps clock at process start
 
 #ifdef SET_STACK_SIZE
   struct rlimit rl;

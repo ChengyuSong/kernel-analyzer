@@ -8,6 +8,7 @@ using namespace llvm;
 
 extern cl::list<std::string> InputFilenames;
 extern cl::opt<unsigned> VerboseLevel;
+extern cl::opt<bool> LogTimestamps;
 extern cl::opt<bool> CFLGlobalDedup;
 extern cl::opt<bool> CFLLocalAllocaSummary;
 extern cl::opt<bool> CFLCGCacheStrict;

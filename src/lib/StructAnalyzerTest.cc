@@ -26,6 +26,7 @@ using namespace llvm;
 
 // Satisfy the extern in Flags.h (KA_LOG); tests run silently.
 cl::opt<unsigned> VerboseLevel("verbose", cl::init(0));
+cl::opt<bool> LogTimestamps("log-timestamps", cl::init(false));
 
 static int failures = 0;
 #define CHECK(cond)                                                          \

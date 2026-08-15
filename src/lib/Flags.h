@@ -69,6 +69,8 @@ extern cl::opt<bool> CFLCensusNexus;
 extern cl::opt<std::string> CFLNexusFields;
 extern cl::opt<bool> CFLInternPlanes;
 extern cl::opt<bool> CFLJoinFastpath;
+extern cl::opt<bool> CFLOriginBundles;
+extern cl::opt<unsigned long long> CFLBundleEpochFacts;
 extern cl::opt<bool> CFLRegFieldReport;
 extern cl::opt<bool> CFLRegFieldApply;
 extern cl::opt<bool> CFLRegFieldAudit;

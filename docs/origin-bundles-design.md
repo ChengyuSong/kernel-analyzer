@@ -201,7 +201,33 @@ merges (rows) compose.
 - **Stage 2**: T2 proof + epoch coarsener behind
   `--cfl-origin-bundles` (default off), mono fs first. Assertions:
   L1 cluster equality, row verification, renumber bijection count.
-- **Gate 2**: km fs13 A/B byte-identical + SolverProf; wall target
-  ≥1.25x or stop.
-- **Stage 3**: T1+T3 proofs; batched-mode epochs (batch rounds);
-  km fs41 + batched A/B; kernel decision.
+- **Gate 2** (RUN 2026-08-15, VERDICT: **WALL FAIL — PARKED**):
+  km fs13 with `--cfl-origin-bundles` is BYTE-IDENTICAL (150,742;
+  2 epochs folding 74,891 → 48,910 ids = 1.53x width, iteration-0
+  resolution identical, every L1/presence assertion silent — the
+  exactness theory and the whole epoch/expansion pipeline are
+  validated at km scale) but the wall is 157m54s vs 32m27s: each
+  epoch's refine+remap streams all six plane families (440s/816s at
+  ~0.2/0.4B mass; expansion 425s) against 230s drains, and the
+  benefit dies at every drain-end expansion and from-scratch
+  iteration rebuild. Two implementation lessons are recorded in the
+  code: the partition-refinement pre-split-size snapshot (the first
+  L1 assertion catch was an under-split bug, not theory) and the
+  MEMOIZED-state discovery — row equality does NOT imply cluster
+  equality at a checkpoint (merge's joined-intersection erases row
+  evidence the registry keeps), so the epoch test must refine on
+  (presence, cluster class) per shift. The second L1 firing caught
+  exactly this; both are now part of the epoch test.
+- **Post-mortem (why the economics fail structurally at km)**: the
+  width lever pays on dense-plane streaming, but harvesting it costs
+  O(live mass) per epoch while co-travel only forms LATE in each
+  drain (0.67% foldable at 40k of 265k pops), the compressed state
+  dies at expansion, and fs iterations rebuild from scratch. At
+  kernel scale the question is moot: kernel fs runs are BATCHED, and
+  batch-local planes (K=4000 wide) are a stronger width compression
+  than bundles can reach. Decision experiment: fs41 batched vs mono
+  (if batched wins, batching subsumes the lever entirely).
+- **Stage 3** (only if a future config needs it): epoch cost would
+  have to drop ~20x (single-pass hashing + word-level remap have no
+  obvious path there) or bundles would need to survive expansion
+  (contradicts the v1 no-consumer-changes architecture).

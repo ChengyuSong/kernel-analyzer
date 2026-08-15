@@ -2400,6 +2400,31 @@ public:
       if (S.size() > kPromote) promote();
     }
   }
+  bool subsetOf(const FactSet &o) const { // this ⊆ o? read-only, no alloc
+    if (none()) return true;
+    if (o.none()) return false;
+    if (D && D == o.D) return true; // interned fast path: X ⊆ X
+    if (D && o.D) {
+      const auto &A = D->getData();
+      const auto &B = o.D->getData();
+      // Widths may differ (lazy widening): our bits past o's width fail.
+      const size_t nb = std::min(A.size(), B.size());
+      for (size_t i = 0; i < nb; i++)
+        if (A[i] & ~B[i]) return false;
+      for (size_t i = nb; i < A.size(); i++)
+        if (A[i]) return false;
+      return true;
+    }
+    if (D) { // dense this vs tiny sparse o: first unmatched bit exits
+      for (int i = D->find_first(); i != -1; i = D->find_next(i))
+        if (!std::binary_search(o.S.begin(), o.S.end(), (uint32_t)i))
+          return false;
+      return true;
+    }
+    for (uint32_t x : S)
+      if (!o.test(x)) return false;
+    return true;
+  }
   void subtract(const FactSet &o) { // this \= o
     if (none() || o.none()) return;
     if (D && D == o.D) { // interned fast path: X \ X = empty
@@ -4209,6 +4234,7 @@ bool CallGraphPass::runFlowsToResolution() {
   struct SolverCtx {
     FactSet nbA, promA, nbB;                 // add-path scratch
     FactSet d, todoS, dbS, dNatS, dBrS;      // pop-loop scratch
+    FactSet pendS;                           // cell-major sweep residual
     std::vector<uint32_t> sweepElems;
     std::vector<uint32_t> localWork;
     uint64_t localFacts = 0, pops = 0;
@@ -4219,6 +4245,7 @@ bool CallGraphPass::runFlowsToResolution() {
     uint64_t internHits = 0; // sharesDense early-outs (skipped copy+diff)
     uint64_t internShares = 0; // share-on-full-arrival adoptions
     uint64_t cellSkips = 0; // cluster-mark join fast-path hits
+    uint64_t wordSkips = 0; // whole-cell subset-certificate skips
   };
   // deque, not vector: forked batch workers grow it for their own
   // thread pool, and ctx0 below must stay a valid reference.
@@ -5412,38 +5439,92 @@ bool CallGraphPass::runFlowsToResolution() {
       dedupCells();
       if (prof) ctx.sweepOffered += todo.count();
       todo.subtract(joined[n][s]);
-      if (prof) ctx.sweepKept += todo.count();
-      // Snapshot: joinCluster can merge and mutate backing state.
-      ctx.sweepElems.clear();
-      todo.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
-      bool firstFact = true;
+      const uint64_t todoCnt = todo.count();
+      if (todoCnt == 0) { ctx.cyJoin += rd() - tp0; continue; }
+      if (prof) ctx.sweepKept += todoCnt;
       // Fast path eligibility: the measurement flags reroute joins and
       // the prot path bypasses the registry — both must stay slow-path.
       // Batch mode excluded: cellJoined planes are FactSets sized by
       // the BATCH-LOCAL universe, but grid is a GLOBAL rid —
       // set(grid) overflows the dense width (BitVector OOB at km,
-      // 2026-08-11; #48 was validated mono-only). Real fix if batch
-      // joins ever profile hot: back cellJoined with globally-sized
-      // BitVectors instead of Universe-following FactSets.
+      // 2026-08-11; #48 was validated mono-only). Enabling batch here
+      // needs grid-space marks: 64-align g_ridBase so the o-space
+      // backlog word-zips against grid-indexed planes at a whole-word
+      // offset (separate audit — clusterRep/rootRodata consumers).
       const bool fastJoinBase = CFLJoinFastpath && CFLBatchRoots == 0 &&
                                 sinkAblatePats.empty() &&
                                 !CFLProbeRodataJoins;
+      if (fastJoinBase) {
+        // CELL-MAJOR sweep (fs-cost lever, 2026-08-14): the fact-major
+        // loop paid ~350 cycles (find() chase + random bit probe) per
+        // (fact, cell) visit and 99.98% of visits were proven no-ops
+        // (km fs41: 9.0B skips vs 1.8M real joins — merge re-offers
+        // re-confirming absorbed planes). Inverting the loop answers
+        // the whole backlog per cell at word level: a read-only subset
+        // scan certifies "cluster already absorbed all of todo" in one
+        // pass, and the residual is a word-ANDN. Per-fact work remains
+        // only for genuine first joins.
+        assert(g_ridBase == 0 && "cell-major marks are o-space");
+        bool aborted = false;
+        // The outer bound re-reads cellsOf[n].size(): cells appended by
+        // mid-sweep merges (n as keeper) are swept with the same todo,
+        // which is what makes the end-of-sweep joined union sound.
+        for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
+          // Value copy: joinCluster's merges can splice/clear this
+          // very list — never index cellsOf[n] after the call.
+          const uint32_t cell = cellsOf[n][ci];
+          const uint32_t rep = find(cell);
+          if (todo.subsetOf(cellJoined[rep][s])) {
+            ctx.cellSkips += todoCnt; // whole backlog proven no-op
+            ctx.wordSkips++;
+            continue;
+          }
+          FactSet &pending = ctx.pendS;
+          pending.copyFrom(todo);
+          pending.subtract(cellJoined[rep][s]);
+          // Snapshot: joinCluster can merge and mutate backing state.
+          ctx.sweepElems.clear();
+          pending.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
+          ctx.cellSkips += todoCnt - ctx.sweepElems.size();
+          for (uint32_t o : ctx.sweepElems) {
+            // Prot rids bypass the registry inside joinCluster (bridge
+            // semantics): never marked, so never filtered above.
+            const bool mark = !(protOn && s == 0 && protRid.count(o));
+            if (mark && cellJoined[find(cell)][s].test(o)) {
+              ctx.cellSkips++; // mid-batch merge already carried the mark
+              continue;
+            }
+            ctx.nJoinLk++;
+            joinCluster(cell, o, s);
+            if (mark) cellJoined[find(cell)][s].set(o);
+            if (find(n) != n) { aborted = true; break; }
+          }
+          if (aborted) break;
+        }
+        // Every todo fact was offered to every (final) cell: one word-OR
+        // replaces the per-fact joined marks. On abort n was absorbed —
+        // its joined plane is released and the keeper re-offers its full
+        // plane, so skipping the union loses nothing and must not
+        // resurrect the dead plane.
+        if (!aborted) joined[n][s].unionWith(todo);
+        ctx.cyJoin += rd() - tp0;
+        if (find(n) != n) return;
+        continue;
+      }
+      // LEGACY fact-major sweep: batch workers (grid offset, see above)
+      // and the join-rerouting measurement flags.
+      ctx.sweepElems.clear();
+      todo.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
+      bool firstFact = true;
       for (uint32_t o : ctx.sweepElems) {
         const uint32_t grid = g_ridBase + o;
-        const bool fastJoin =
-            fastJoinBase && !(protOn && s == 0 && protRid.count(grid));
         bool aborted = false;
         for (size_t ci = 0; ci < cellsOf[n].size(); ci++) {
           // Value copy: joinCluster's merges can splice/clear this
           // very list — never index cellsOf[n] after the call.
           const uint32_t cell = cellsOf[n][ci];
-          if (fastJoin && cellJoined[find(cell)][s].test(grid)) {
-            ctx.cellSkips++; // registry no-op, proven by the mark
-            continue;
-          }
           ctx.nJoinLk++;
           joinCluster(cell, grid, s);
-          if (fastJoin) cellJoined[find(cell)][s].set(grid);
           if (find(n) != n) { aborted = true; break; }
         }
         if (aborted) break;
@@ -7620,7 +7701,8 @@ bool CallGraphPass::runFlowsToResolution() {
 
   // Reduce per-thread counters into the reporting totals.
   uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
-  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0, cellSkips = 0;
+  uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0, cellSkips = 0,
+           wordSkips = 0;
   for (auto &c : ctxs) {
     cyJoin += c.cyJoin; cyBridge += c.cyBridge; cyScan += c.cyScan;
     cyW += c.cyW; cyA += c.cyA; cyF += c.cyF;
@@ -7629,6 +7711,7 @@ bool CallGraphPass::runFlowsToResolution() {
     sweepOffered += c.sweepOffered;
     sweepKept += c.sweepKept;
     cellSkips += c.cellSkips;
+    wordSkips += c.wordSkips;
   }
   if (prof) {
     const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
@@ -7636,7 +7719,8 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "SolverProf: total " << cyTot << " cycles in pop loop\n";
     errs() << "SolverProf: join   " << cyJoin << " (" << pct(cyJoin)
            << "%), lookups " << nJoinLk << ", cluster-mark skips "
-           << cellSkips << " (seq sub-phase " << seqJoinCy
+           << cellSkips << ", whole-cell subset skips " << wordSkips
+           << " (seq sub-phase " << seqJoinCy
            << ", merge " << cyMerge << " cycles)\n";
     errs() << "SolverProf: bridge " << cyBridge << " (" << pct(cyBridge) << "%)\n";
     errs() << "SolverProf: scan   " << cyScan << " (" << pct(cyScan) << "%)\n";

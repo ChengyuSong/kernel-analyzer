@@ -2278,7 +2278,12 @@ class FactSet {
     return *D;
   }
   void promote() {
-    D = std::make_shared<llvm::BitVector>(Universe);
+    // Size to the content, not just the universe: grid-space mark
+    // planes (batch join fast path) hold GLOBAL rids past the
+    // batch-local Universe — BitVector(Universe) then set(o) was the
+    // #48-era batch OOB. S is sorted, so back() is the max.
+    D = std::make_shared<llvm::BitVector>(
+        std::max<uint32_t>(Universe, S.empty() ? 0 : S.back() + 1));
     for (uint32_t o : S) D->set(o);
     S.clear();
   }
@@ -2399,6 +2404,36 @@ public:
       S = std::move(merged);
       if (S.size() > kPromote) promote();
     }
+  }
+  void copyShifted(const FactSet &o, uint32_t base) { // this := {x+base}
+    assert(this != &o && "shifted copy cannot alias");
+    if (base == 0) { copyFrom(o); return; }
+    if (!o.D) { // sparse source: a constant shift preserves sort order
+      if (D && D.use_count() > 1) D.reset(); // never mutate a shared buffer
+      if (D) {
+        auto &B = *D; // unique scratch: reuse the buffer
+        B.reset();
+        for (uint32_t x : o.S) {
+          const uint32_t g = x + base;
+          if (g >= B.size()) B.resize(g + 1);
+          B.set(g);
+        }
+      } else {
+        S.clear();
+        for (uint32_t x : o.S) S.push_back(x + base);
+      }
+      return;
+    }
+    // Dense source: word copy, widen, then shift up. llvm's <<= keeps
+    // the size fixed (high bits would fall off), so widen FIRST; bit i
+    // then lands at i + base with zeroes below.
+    if (!D || D.use_count() > 1)
+      D = std::make_shared<llvm::BitVector>();
+    llvm::BitVector &B = *D;
+    B = *o.D;
+    B.resize(o.D->size() + base);
+    B <<= base;
+    S.clear();
   }
   bool subsetOf(const FactSet &o) const { // this ⊆ o? read-only, no alloc
     if (none()) return true;
@@ -4234,7 +4269,7 @@ bool CallGraphPass::runFlowsToResolution() {
   struct SolverCtx {
     FactSet nbA, promA, nbB;                 // add-path scratch
     FactSet d, todoS, dbS, dNatS, dBrS;      // pop-loop scratch
-    FactSet pendS;                           // cell-major sweep residual
+    FactSet pendS, todoGS;                   // cell-major sweep scratch
     std::vector<uint32_t> sweepElems;
     std::vector<uint32_t> localWork;
     uint64_t localFacts = 0, pops = 0;
@@ -5444,14 +5479,13 @@ bool CallGraphPass::runFlowsToResolution() {
       if (prof) ctx.sweepKept += todoCnt;
       // Fast path eligibility: the measurement flags reroute joins and
       // the prot path bypasses the registry — both must stay slow-path.
-      // Batch mode excluded: cellJoined planes are FactSets sized by
-      // the BATCH-LOCAL universe, but grid is a GLOBAL rid —
-      // set(grid) overflows the dense width (BitVector OOB at km,
-      // 2026-08-11; #48 was validated mono-only). Enabling batch here
-      // needs grid-space marks: 64-align g_ridBase so the o-space
-      // backlog word-zips against grid-indexed planes at a whole-word
-      // offset (separate audit — clusterRep/rootRodata consumers).
-      const bool fastJoinBase = CFLJoinFastpath && CFLBatchRoots == 0 &&
+      // Batch mode INCLUDED (2026-08-15): marks live in GLOBAL grid
+      // space — valid across batches and rounds because the cluster
+      // registry is global and clusters only grow; the promote() fix
+      // above retired the #48-era batch-local-width OOB. Workers set
+      // marks for their own drain's lifetime (fork CoW starts empty:
+      // conservative); sequential spill mode keeps them run-long.
+      const bool fastJoinBase = CFLJoinFastpath &&
                                 sinkAblatePats.empty() &&
                                 !CFLProbeRodataJoins;
       if (fastJoinBase) {
@@ -5464,7 +5498,16 @@ bool CallGraphPass::runFlowsToResolution() {
         // scan certifies "cluster already absorbed all of todo" in one
         // pass, and the residual is a word-ANDN. Per-fact work remains
         // only for genuine first joins.
-        assert(g_ridBase == 0 && "cell-major marks are o-space");
+        // Batch workers run with a nonzero rid base: image the o-space
+        // backlog into grid space ONCE per sweep (word-shifted copy) so
+        // every per-cell filter runs against the grid-indexed marks.
+        // Mono (base 0) uses todo directly.
+        const FactSet *tgp = &todo;
+        if (g_ridBase != 0) {
+          ctx.todoGS.copyShifted(todo, g_ridBase);
+          tgp = &ctx.todoGS;
+        }
+        const FactSet &todoG = *tgp;
         bool aborted = false;
         // The outer bound re-reads cellsOf[n].size(): cells appended by
         // mid-sweep merges (n as keeper) are swept with the same todo,
@@ -5474,29 +5517,29 @@ bool CallGraphPass::runFlowsToResolution() {
           // very list — never index cellsOf[n] after the call.
           const uint32_t cell = cellsOf[n][ci];
           const uint32_t rep = find(cell);
-          if (todo.subsetOf(cellJoined[rep][s])) {
+          if (todoG.subsetOf(cellJoined[rep][s])) {
             ctx.cellSkips += todoCnt; // whole backlog proven no-op
             ctx.wordSkips++;
             continue;
           }
           FactSet &pending = ctx.pendS;
-          pending.copyFrom(todo);
+          pending.copyFrom(todoG);
           pending.subtract(cellJoined[rep][s]);
           // Snapshot: joinCluster can merge and mutate backing state.
           ctx.sweepElems.clear();
-          pending.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
+          pending.forEach([&](uint32_t g) { ctx.sweepElems.push_back(g); });
           ctx.cellSkips += todoCnt - ctx.sweepElems.size();
-          for (uint32_t o : ctx.sweepElems) {
+          for (uint32_t grid : ctx.sweepElems) {
             // Prot rids bypass the registry inside joinCluster (bridge
             // semantics): never marked, so never filtered above.
-            const bool mark = !(protOn && s == 0 && protRid.count(o));
-            if (mark && cellJoined[find(cell)][s].test(o)) {
+            const bool mark = !(protOn && s == 0 && protRid.count(grid));
+            if (mark && cellJoined[find(cell)][s].test(grid)) {
               ctx.cellSkips++; // mid-batch merge already carried the mark
               continue;
             }
             ctx.nJoinLk++;
-            joinCluster(cell, o, s);
-            if (mark) cellJoined[find(cell)][s].set(o);
+            joinCluster(cell, grid, s);
+            if (mark) cellJoined[find(cell)][s].set(grid);
             if (find(n) != n) { aborted = true; break; }
           }
           if (aborted) break;
@@ -5511,8 +5554,8 @@ bool CallGraphPass::runFlowsToResolution() {
         if (find(n) != n) return;
         continue;
       }
-      // LEGACY fact-major sweep: batch workers (grid offset, see above)
-      // and the join-rerouting measurement flags.
+      // LEGACY fact-major sweep: the join-rerouting measurement flags
+      // only (marks would record joins that were skipped/rerouted).
       ctx.sweepElems.clear();
       todo.forEach([&](uint32_t o) { ctx.sweepElems.push_back(o); });
       bool firstFact = true;

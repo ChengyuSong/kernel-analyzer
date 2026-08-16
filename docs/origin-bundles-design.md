@@ -226,7 +226,11 @@ merges (rows) compose.
   kernel scale the question is moot: kernel fs runs are BATCHED, and
   batch-local planes (K=4000 wide) are a stronger width compression
   than bundles can reach. Decision experiment: fs41 batched vs mono
-  (if batched wins, batching subsumes the lever entirely).
+  — RESULT (2026-08-15): batched 108m vs mono 155m, byte-identical
+  (149,791), with 8 workers at 9.2x core utilization. Batching WINS
+  at both fs13 and fs41: it subsumes the width lever (K=4000-wide
+  batch planes) with better economics and no epoch cost. BUNDLES
+  CLOSED. Practical guidance: batched is the recommended fs mode.
 - **Stage 3** (only if a future config needs it): epoch cost would
   have to drop ~20x (single-pass hashing + word-level remap have no
   obvious path there) or bundles would need to survive expansion

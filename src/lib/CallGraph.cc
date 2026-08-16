@@ -4670,6 +4670,14 @@ bool CallGraphPass::runFlowsToResolution() {
       // keeper's old facts reach the loser's former neighbors via the
       // one-time direct push below, NOT via a full re-dirty (that made
       // every merge re-offer the whole fact set on the whole edge list).
+      // Micro-fusion tombstone (2026-08-16): fusing blocks 1+2 below
+      // into one word loop (addBits-style) was built, validated
+      // byte-identical at km fs41, and REVERTED: wall flat, merge
+      // cycles +14% (404B->462B). The merge bucket's mass is NOT this
+      // move math — it is the jdirty re-offer / joined-intersect
+      // unionWith traffic (whose COW adopt fast paths a word loop
+      // destroys) plus the loser-list pushes (already fused via
+      // addBits). Do not re-fuse here without profiling those first.
       if (R[b][s].any()) {
         FactSet &nb = mnbS;
         nb.copyFrom(R[b][s]);

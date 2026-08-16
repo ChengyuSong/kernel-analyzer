@@ -124,9 +124,14 @@ sequence took km fs41 from 4h13m to 1h32m (2.76x) and km fs13 to
   post-wiring graph. Skipping the re-run (`--cfl-presolve-once`) is
   faster AND strictly tighter — it attributes the task-#43
   incremental divergence (−504 pairs, all at opt_pre_handler) to
-  pool-smear manufactured by that re-run's coarsening. Validation of
-  the smear-free pin and the unblocked fs-incremental combo is in
-  flight.
+  pool-smear manufactured by that re-run's coarsening. VALIDATED
+  (2026-08-16): at fs41 the flag is byte-identical to the EAGER pin
+  (the smear family is a P=13 residue-collision artifact absent at
+  P=41) and 1.55x (fs41 mono 1h49m -> 1h11m); at fs13 it is strictly
+  tighter (-504, all opt_pre_handler) and faster. fs INCREMENTAL is
+  thereby unblocked: incremental + presolve-once is byte-identical
+  to the presolve-once scratch pin at km fs13 (150,238) at 13m52s —
+  the #43 divergence is closed by attribution, not by workaround.
 
 ### 3.2 Data structures and memory
 
@@ -241,8 +246,9 @@ tombstone or design-doc post-mortem:
 
 ## 5. Pending at time of writing
 
-- fs41 `--cfl-presolve-once` A/B (wall + smear-family delta check).
-- fs-incremental + presolve-once byte-identity against the
-  presolve-once scratch pin (micro gate already passes; would
-  collapse the 5x from-scratch iteration structure under fs).
+- fs41 incremental + presolve-once (collapsing iterations 2-5 to
+  deltas at the paper configuration) and batched + presolve-once.
 - Kernel-scale HEAD re-run inheriting the full optimization stack.
+- Default policy for --cfl-presolve-once: byte-identical at fs41,
+  answer-changing (tighter) at fs13 — stays opt-in until pins are
+  re-cut.

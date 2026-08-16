@@ -4361,6 +4361,8 @@ bool CallGraphPass::runFlowsToResolution() {
     uint64_t internShares = 0; // share-on-full-arrival adoptions
     uint64_t cellSkips = 0; // cluster-mark join fast-path hits
     uint64_t wordSkips = 0; // whole-cell subset-certificate skips
+    // occupancy probe (prof only): zero-word share of streamed planes
+    uint64_t wordsScanned = 0, wordsNzSrc = 0, wordsNzNb = 0;
   };
   // deque, not vector: forked batch workers grow it for their own
   // thread pool, and ctx0 below must stay a valid reference.
@@ -4439,11 +4441,25 @@ bool CallGraphPass::runFlowsToResolution() {
       const uint64_t *rW = RD ? RD->words() : nullptr;
       const size_t rwords = RD ? RD->numWords() : 0;
       uint64_t pop = 0;
-      for (size_t i = 0; i < swords; i++) {
-        const uint64_t w = sW[i] & ~(i < rwords ? rW[i] : (uint64_t)0);
-        nbW[i] = w;
-        pop += (uint64_t)__builtin_popcountll(w);
-      }
+      if (CFLSolverProfile) { // occupancy probe: zero-word share of streamed planes
+        uint64_t nzS = 0, nzNb = 0;
+        for (size_t i = 0; i < swords; i++) {
+          const uint64_t sv = sW[i];
+          const uint64_t w = sv & ~(i < rwords ? rW[i] : (uint64_t)0);
+          nbW[i] = w;
+          pop += (uint64_t)__builtin_popcountll(w);
+          nzS += sv != 0;
+          nzNb += w != 0;
+        }
+        ctx.wordsScanned += swords;
+        ctx.wordsNzSrc += nzS;
+        ctx.wordsNzNb += nzNb;
+      } else
+        for (size_t i = 0; i < swords; i++) {
+          const uint64_t w = sW[i] & ~(i < rwords ? rW[i] : (uint64_t)0);
+          nbW[i] = w;
+          pop += (uint64_t)__builtin_popcountll(w);
+        }
       if (!pop) { unlockC(n); return; }
       // Arrivals append to dirty and R equally, so a fill-from-empty
       // starts dirty==R — the virgin invariant (RB known empty here).
@@ -8278,7 +8294,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // Reduce per-thread counters into the reporting totals.
   uint64_t cyJoin = 0, cyBridge = 0, cyScan = 0, cyW = 0, cyA = 0, cyF = 0;
   uint64_t nJoinLk = 0, nAOr = 0, nFOr = 0, orWords = 0, cellSkips = 0,
-           wordSkips = 0;
+           wordSkips = 0, wordsScanned = 0, wordsNzSrc = 0, wordsNzNb = 0;
   for (auto &c : ctxs) {
     cyJoin += c.cyJoin; cyBridge += c.cyBridge; cyScan += c.cyScan;
     cyW += c.cyW; cyA += c.cyA; cyF += c.cyF;
@@ -8288,6 +8304,9 @@ bool CallGraphPass::runFlowsToResolution() {
     sweepKept += c.sweepKept;
     cellSkips += c.cellSkips;
     wordSkips += c.wordSkips;
+    wordsScanned += c.wordsScanned;
+    wordsNzSrc += c.wordsNzSrc;
+    wordsNzNb += c.wordsNzNb;
   }
   if (prof) {
     const uint64_t cyTot = cyJoin + cyBridge + cyScan + cyW + cyA + cyF;
@@ -8305,6 +8324,12 @@ bool CallGraphPass::runFlowsToResolution() {
            << "%), ORs " << nAOr << "\n";
     errs() << "SolverProf: f-prop " << cyF << " (" << pct(cyF)
            << "%), ORs " << nFOr << ", a-plane words " << orWords << "\n";
+    if (wordsScanned)
+      errs() << "SolverProf: occupancy — addBits src words " << wordsScanned
+             << ", nonzero " << wordsNzSrc << " ("
+             << (100.0 * wordsNzSrc / wordsScanned) << "%), delta nonzero "
+             << wordsNzNb << " (" << (100.0 * wordsNzNb / wordsScanned)
+             << "%)\n";
   }
 
   // Name the hub/web culprits: widest classes (fact volume, fan-out

@@ -54,6 +54,7 @@
 #include <unistd.h>
 
 #include "CallGraph.h"
+#include "BitPlane.h"
 #include "IRCensus.h"
 #include "Annotation.h"
 #include "VSnapshot.h"
@@ -2271,10 +2272,10 @@ class FactSet {
   // EnableShare is on (sequential solver: concurrent in-place OR-ins
   // at T>1 would race with COW pointer swaps); detach stays
   // unconditional so correctness never depends on the gate.
-  std::shared_ptr<llvm::BitVector> D; // non-null => dense mode
+  std::shared_ptr<ka::BitPlane> D; // non-null => dense mode
   static constexpr size_t kPromote = 128;
-  llvm::BitVector &mutD() {
-    if (D.use_count() > 1) D = std::make_shared<llvm::BitVector>(*D);
+  ka::BitPlane &mutD() {
+    if (D.use_count() > 1) D = std::make_shared<ka::BitPlane>(*D);
     return *D;
   }
   void promote() {
@@ -2282,7 +2283,7 @@ class FactSet {
     // planes (batch join fast path) hold GLOBAL rids past the
     // batch-local Universe — BitVector(Universe) then set(o) was the
     // #48-era batch OOB. S is sorted, so back() is the max.
-    D = std::make_shared<llvm::BitVector>(
+    D = std::make_shared<ka::BitPlane>(
         std::max<uint32_t>(Universe, S.empty() ? 0 : S.back() + 1));
     for (uint32_t o : S) D->set(o);
     S.clear();
@@ -2299,10 +2300,8 @@ public:
   // sharing one buffer are content-identical by construction.
   bool sharesDense(const FactSet &o) const { return D && D == o.D; }
   bool denseUnique() const { return D && D.use_count() == 1; }
-  const llvm::BitVector *denseData() const { return D.get(); }
-  size_t denseCapBytes() const {
-    return D ? D->getData().size() * sizeof(uintptr_t) : 0;
-  }
+  const ka::BitPlane *denseData() const { return D.get(); }
+  size_t denseCapBytes() const { return D ? D->capBytes() : 0; }
   void adoptDense(const FactSet &o) { // intern: content-equality proven
     assert(o.D && "adoptDense needs a dense source");
     D = o.D;
@@ -2311,6 +2310,25 @@ public:
   bool test(uint32_t o) const {
     if (D) return o < D->size() && D->test(o);
     return std::binary_search(S.begin(), S.end(), o);
+  }
+  // Fused-kernel support (single-pass delta-OR in addBits/addBitsBridged):
+  // expose a UNIQUE dense buffer for direct word access. mutDense
+  // preserves content (detach shared, promote sparse, widen narrow);
+  // scratchDense returns an exact-width buffer with UNSPECIFIED content
+  // (the caller overwrites every word).
+  ka::BitPlane &mutDense(uint32_t bits) {
+    if (!D) promote();
+    else if (D.use_count() > 1) D = std::make_shared<ka::BitPlane>(*D);
+    if (D->size() < bits) D->resize(std::max<uint32_t>(Universe, bits));
+    return *D;
+  }
+  ka::BitPlane &scratchDense(uint32_t bits) {
+    if (!D || D.use_count() > 1)
+      D = std::make_shared<ka::BitPlane>(bits);
+    else
+      D->resize(bits); // shrink truncates, grow zero-fills: exact width
+    S.clear();
+    return *D;
   }
   void set(uint32_t o) {
     if (D) {
@@ -2362,7 +2380,7 @@ public:
       } else if (D && D.use_count() == 1) {
         *D = *o.D; // reuse our unique buffer (hot scratch path)
       } else {
-        D = std::make_shared<llvm::BitVector>(*o.D);
+        D = std::make_shared<ka::BitPlane>(*o.D);
       }
       S.clear();
     } else if (D) {
@@ -2428,8 +2446,8 @@ public:
     // the size fixed (high bits would fall off), so widen FIRST; bit i
     // then lands at i + base with zeroes below.
     if (!D || D.use_count() > 1)
-      D = std::make_shared<llvm::BitVector>();
-    llvm::BitVector &B = *D;
+      D = std::make_shared<ka::BitPlane>();
+    ka::BitPlane &B = *D;
     B = *o.D;
     B.resize(o.D->size() + base);
     B <<= base;
@@ -2442,12 +2460,12 @@ public:
   // Universe to the NEW width first.
   void remapBits(const std::vector<uint32_t> &renum,
                  std::unordered_map<const void *,
-                                    std::shared_ptr<llvm::BitVector>>
+                                    std::shared_ptr<ka::BitPlane>>
                      &shareMap) {
     if (D) {
       auto it = shareMap.find(D.get());
       if (it != shareMap.end()) { D = it->second; return; }
-      auto nd = std::make_shared<llvm::BitVector>(Universe);
+      auto nd = std::make_shared<ka::BitPlane>(Universe);
       for (int i = D->find_first(); i != -1; i = D->find_next(i)) {
         assert((uint32_t)i < renum.size() && "plane bit outside rid space");
         const uint32_t g = renum[(uint32_t)i];
@@ -2469,12 +2487,12 @@ public:
   // Caller sets Universe back to the original width first.
   void expandBits(const std::vector<llvm::SmallVector<uint32_t, 1>> &leaves,
                   std::unordered_map<const void *,
-                                     std::shared_ptr<llvm::BitVector>>
+                                     std::shared_ptr<ka::BitPlane>>
                       &shareMap) {
     if (D) {
       auto it = shareMap.find(D.get());
       if (it != shareMap.end()) { D = it->second; return; }
-      auto nd = std::make_shared<llvm::BitVector>(Universe);
+      auto nd = std::make_shared<ka::BitPlane>(Universe);
       for (int i = D->find_first(); i != -1; i = D->find_next(i)) {
         assert((uint32_t)i < leaves.size() && "plane bit outside rid space");
         for (uint32_t l : leaves[(uint32_t)i]) {
@@ -2502,13 +2520,14 @@ public:
     if (o.none()) return false;
     if (D && D == o.D) return true; // interned fast path: X ⊆ X
     if (D && o.D) {
-      const auto &A = D->getData();
-      const auto &B = o.D->getData();
+      const uint64_t *A = D->words();
+      const uint64_t *B = o.D->words();
       // Widths may differ (lazy widening): our bits past o's width fail.
-      const size_t nb = std::min(A.size(), B.size());
+      const size_t na = D->numWords();
+      const size_t nb = std::min(na, o.D->numWords());
       for (size_t i = 0; i < nb; i++)
         if (A[i] & ~B[i]) return false;
-      for (size_t i = nb; i < A.size(); i++)
+      for (size_t i = nb; i < na; i++)
         if (A[i]) return false;
       return true;
     }
@@ -4220,29 +4239,28 @@ bool CallGraphPass::runFlowsToResolution() {
   // bundles, channels), not plane skipping.
   auto internPlanes = [&]() {
     internSweeps++;
-    auto prefixLen = [](llvm::ArrayRef<uintptr_t> W) {
-      size_t l = W.size();
-      while (l && W[l - 1] == 0) l--;
-      return l;
+    auto prefixLen = [](const uint64_t *W, size_t n) {
+      while (n && W[n - 1] == 0) n--;
+      return n;
     };
     boost::unordered_flat_map<uint64_t, llvm::SmallVector<FactSet *, 2>>
         buckets;
     auto sweepPlane = [&](FactSet &P) {
       if (!P.isDense()) return;
-      const auto W = P.denseData()->getData();
-      const size_t len = prefixLen(W);
+      const uint64_t *W = P.denseData()->words();
+      const size_t len = prefixLen(W, P.denseData()->numWords());
       if (!len) return; // empty planes: not worth an entry
       uint64_t h = 1469598103934665603ull ^ (uint64_t)len;
       for (size_t i = 0; i < len; i++) {
-        h ^= (uint64_t)W[i];
+        h ^= W[i];
         h *= 1099511628211ull;
       }
       auto &vec = buckets[h];
       for (FactSet *C : vec) {
         if (C->sharesDense(P)) return; // already unified earlier
-        const auto WC = C->denseData()->getData();
-        if (prefixLen(WC) != len ||
-            !std::equal(W.begin(), W.begin() + len, WC.begin()))
+        const uint64_t *WC = C->denseData()->words();
+        if (prefixLen(WC, C->denseData()->numWords()) != len ||
+            !std::equal(W, W + len, WC))
           continue; // hash collision, different content
         internBytesFreed += P.denseCapBytes();
         P.adoptDense(*C);
@@ -4401,6 +4419,56 @@ bool CallGraphPass::runFlowsToResolution() {
       push(n, ctx);
       return;
     }
+    // FUSED dense tail (2026-08-15): the general path below costs ~16
+    // plane streams per effective OR (copy, subtract, none, four
+    // separate unions each with its own COW check, count). The common
+    // case — dense src, no bridged bits to promote — does it in TWO
+    // fused loops: pass A computes nb = src & ~R with inline any +
+    // popcount; pass B ORs nb into R/dirty/jdirty/dirtyBr in one loop.
+    // Same lock discipline, byte-identical state by construction; the
+    // RB promotion split and sparse operands keep the general path.
+    if (src.isDense() && RB[n][s].none() &&
+        (R[n][s].isDense() || R[n][s].none())) {
+      const ka::BitPlane &SV = *src.denseData();
+      const uint64_t *sW = SV.words();
+      const size_t swords = SV.numWords();
+      ka::BitPlane &NB = nb.scratchDense(SV.size());
+      uint64_t *nbW = NB.words();
+      const ka::BitPlane *RD =
+          R[n][s].isDense() ? R[n][s].denseData() : nullptr;
+      const uint64_t *rW = RD ? RD->words() : nullptr;
+      const size_t rwords = RD ? RD->numWords() : 0;
+      uint64_t pop = 0;
+      for (size_t i = 0; i < swords; i++) {
+        const uint64_t w = sW[i] & ~(i < rwords ? rW[i] : (uint64_t)0);
+        nbW[i] = w;
+        pop += (uint64_t)__builtin_popcountll(w);
+      }
+      if (!pop) { unlockC(n); return; }
+      // Arrivals append to dirty and R equally, so a fill-from-empty
+      // starts dirty==R — the virgin invariant (RB known empty here).
+      if (R[n][s].none())
+        virginPl[(size_t)n * NSHIFT + s] = 1;
+      const uint32_t bits = SV.size();
+      uint64_t *rW2 = R[n][s].mutDense(bits).words();
+      uint64_t *dW2 = dirty[n][s].mutDense(bits).words();
+      uint64_t *jW2 = jdirty[n][s].mutDense(bits).words();
+      uint64_t *bW2 = dirtyBr[n][s].mutDense(bits).words();
+      for (size_t i = 0; i < swords; i++) {
+        const uint64_t w = nbW[i];
+        if (!w) continue;
+        rW2[i] |= w;
+        dW2[i] |= w;
+        jW2[i] |= w;
+        bW2[i] |= w;
+      }
+      ctx.localFacts += pop;
+      if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
+        traceHit(n, s, false);
+      unlockC(n);
+      push(n, ctx);
+      return;
+    }
     nb.copyFrom(src);
     nb.subtract(R[n][s]);
     if (nb.none()) { unlockC(n); return; }
@@ -4464,6 +4532,51 @@ bool CallGraphPass::runFlowsToResolution() {
     if (src.sharesDense(R[n][s]) || src.sharesDense(RB[n][s])) {
       ctx.internHits++;
       unlockC(n);
+      return;
+    }
+    // FUSED dense tail (see addBits): nb = src & ~RB & ~R in one pass,
+    // then one OR loop into RB/dirty/jdirty.
+    if (src.isDense() && (R[n][s].isDense() || R[n][s].none()) &&
+        (RB[n][s].isDense() || RB[n][s].none())) {
+      const ka::BitPlane &SV = *src.denseData();
+      const uint64_t *sW = SV.words();
+      const size_t swords = SV.numWords();
+      ka::BitPlane &NB = nb.scratchDense(SV.size());
+      uint64_t *nbW = NB.words();
+      const ka::BitPlane *RD =
+          R[n][s].isDense() ? R[n][s].denseData() : nullptr;
+      const ka::BitPlane *BD =
+          RB[n][s].isDense() ? RB[n][s].denseData() : nullptr;
+      const uint64_t *rW = RD ? RD->words() : nullptr;
+      const uint64_t *bW = BD ? BD->words() : nullptr;
+      const size_t rwords = RD ? RD->numWords() : 0;
+      const size_t bwords = BD ? BD->numWords() : 0;
+      uint64_t pop = 0;
+      for (size_t i = 0; i < swords; i++) {
+        uint64_t w = sW[i];
+        if (i < rwords) w &= ~rW[i];
+        if (i < bwords) w &= ~bW[i];
+        nbW[i] = w;
+        pop += (uint64_t)__builtin_popcountll(w);
+      }
+      if (!pop) { unlockC(n); return; }
+      const uint32_t bits = SV.size();
+      uint64_t *bW2 = RB[n][s].mutDense(bits).words();
+      uint64_t *dW2 = dirty[n][s].mutDense(bits).words();
+      uint64_t *jW2 = jdirty[n][s].mutDense(bits).words();
+      for (size_t i = 0; i < swords; i++) {
+        const uint64_t w = nbW[i];
+        if (!w) continue;
+        bW2[i] |= w;
+        dW2[i] |= w;
+        jW2[i] |= w;
+      }
+      virginPl[(size_t)n * NSHIFT + s] = 0; // dirty gains RB bits
+      ctx.localFacts += pop;
+      if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
+        traceHit(n, s, true);
+      unlockC(n);
+      push(n, ctx);
       return;
     }
     nb.copyFrom(src);
@@ -6079,7 +6192,7 @@ bool CallGraphPass::runFlowsToResolution() {
       return;
     }
     FactSet::Universe = newW; // set BEFORE remaps (new resize floor)
-    std::unordered_map<const void *, std::shared_ptr<llvm::BitVector>> sh;
+    std::unordered_map<const void *, std::shared_ptr<ka::BitPlane>> sh;
     forEachPlaneFam([&](FactSet &P) { P.remapBits(renum, sh); });
     rekeyClusters(&renum, &newArity);
     rekeyProt(&renum);
@@ -6102,7 +6215,7 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!bundlesActive) return;
     const auto t0 = std::chrono::steady_clock::now();
     FactSet::Universe = nextRoot;
-    std::unordered_map<const void *, std::shared_ptr<llvm::BitVector>> sh;
+    std::unordered_map<const void *, std::shared_ptr<ka::BitPlane>> sh;
     forEachPlaneFam([&](FactSet &P) { P.expandBits(bundleLeaves, sh); });
     rekeyClusters(nullptr, nullptr);
     rekeyProt(nullptr);

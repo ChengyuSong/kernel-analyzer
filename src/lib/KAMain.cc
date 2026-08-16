@@ -138,6 +138,19 @@ cl::opt<bool> CFLPreSolveMerge(
            "classes before the full CFL solve (default off)"),
   cl::init(false));
 
+cl::opt<bool> CFLPreSolveOnce(
+  "cfl-presolve-once",
+  cl::desc("Run the pre-solve copy/field merge only on the INITIAL graph "
+           "and skip it for wiring iterations >= 1 (flows-to from-scratch "
+           "mode). Rationale (2026-08-16 decomposition): the re-run on the "
+           "post-wiring graph is a one-time giant-SCC discovery costing "
+           "56% of km fs41 wall; the in-drain a-SCC collapse discovers the "
+           "same quotient (first sweep is pulled earlier when this is on). "
+           "Answers are preserved either way: pre-solve merges are "
+           "exactness-preserving, so withholding them changes speed, not "
+           "the closure. A/B-gated before any default flip"),
+  cl::init(false));
+
 cl::opt<bool> CFLFptrSlice(
   "cfl-fptr-slice",
   cl::desc("Keep only constraint-graph components reachable from function "
@@ -1259,12 +1272,20 @@ int main(int argc, char **argv) {
     {
       const bool fsConfig =
           CFLFieldBuckets > 0 || !CFLNexusFields.empty();
-      if (CFLFlowsToIncremental && fsConfig) {
+      if (CFLFlowsToIncremental && fsConfig && !CFLPreSolveOnce) {
         errs() << "ERROR: --cfl-flows-to-incremental is not exact under "
-                  "field sensitivity (known pool-smear divergence, task "
-                  "#43); drop it or the fs flags\n";
+                  "field sensitivity against the EAGER pre-solve pin: the "
+                  "task-#43 divergence (-504 opt_pre_handler) is pool-smear "
+                  "manufactured by the post-wiring pre-solve re-run, which "
+                  "incremental never executes (attributed 2026-08-16). "
+                  "Add --cfl-presolve-once to compare against the "
+                  "smear-free pin, or drop the fs flags\n";
         exit(1);
       }
+      if (CFLFlowsToIncremental && fsConfig && CFLPreSolveOnce)
+        errs() << "FlowsTo: fs + incremental + presolve-once — validating "
+                  "against the presolve-once scratch pin (A/B-gated "
+                  "combo, 2026-08-16)\n";
       // Re-validated 2026-08-12 at HEAD (field filter retired,
       // percpu-gated identity rules): km incremental == from-scratch,
       // 160,945 pairs, zero diff both directions. A false divergence

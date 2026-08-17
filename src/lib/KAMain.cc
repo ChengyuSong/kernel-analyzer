@@ -303,9 +303,13 @@ cl::opt<bool> CFLBidiPrune(
   "cfl-bidi-prune",
   cl::desc("Before the flows-to solve, compute the field-matched "
            "bidirected partition (union-find with label-collision "
-           "unification, O(m a(n))) and report how many origin roots are "
-           "statically prunable: their partition's d/f cone never touches "
-           "an fptr partition. Measurement only; minting unchanged"),
+           "unification, O(m a(n))) and PRUNE origin roots whose "
+           "partition's d/f cone never touches an fptr partition "
+           "(pruned set recorded; cone oracle re-admits at wiring — "
+           "#43 fix b82985d). Part of the canonical kernel config. "
+           "Answer-preserving at FI; under fs it is strictly TIGHTER "
+           "(pruned origins also stop feeding smear-producing cluster "
+           "merges) — flag-match pins when comparing"),
   cl::init(false));
 
 cl::opt<bool> CFLLazyMint(

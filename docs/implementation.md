@@ -244,10 +244,23 @@ tombstone or design-doc post-mortem:
   policies (union-by-rank wins), Lemma-3.4 small-to-large transfer
   (does not apply when merges carry plane payloads).
 
+### 3.4 Final configuration validation (2026-08-17)
+
+The canonical kernel config adds `--cfl-bidi-prune`; the bidi x
+presolve-once combo gate PASSED at km fs41 batched: byte-identical
+(148,703) between bidi and bidi+presolve-once, with bidi a strict
+subset of the no-bidi pin (149,791 - 1,088 suppressed smear pairs,
+zero added). Walls: bidi alone 95m43s (still pays the pre-solve
+re-run), bidi+presolve-once **27m22s** — the session's fastest fs41.
+Three pinned fs41 lineages now exist: no-bidi eager/presolve-once
+(149,791, byte-identical to each other) and bidi (148,703, tighter).
+
 ## 5. Status at time of writing
 
-- fs41 batched + presolve-once: 38m11s, byte-identical (149,791) —
-  the recommended fs41 mode; full-session arc 4h13m -> 38m (6.6x).
+- fs41 batched + presolve-once: 38m11s byte-identical (149,791);
+  with --cfl-bidi-prune (canonical kernel config): 27m22s at the
+  tighter bidi pin (148,703) — full-session arc 4h13m -> 27m (9.2x
+  on the canonical lineage).
 - fs41 incremental + presolve-once: OOM on the 62GB machine (the
   retained cross-iteration fixpoint needs ~55-65GB at fs41) — a
   machine constraint, not a method failure; viable on the big

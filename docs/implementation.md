@@ -244,11 +244,15 @@ tombstone or design-doc post-mortem:
   policies (union-by-rank wins), Lemma-3.4 small-to-large transfer
   (does not apply when merges carry plane payloads).
 
-## 5. Pending at time of writing
+## 5. Status at time of writing
 
-- fs41 incremental + presolve-once (collapsing iterations 2-5 to
-  deltas at the paper configuration) and batched + presolve-once.
-- Kernel-scale HEAD re-run inheriting the full optimization stack.
+- fs41 batched + presolve-once: 38m11s, byte-identical (149,791) —
+  the recommended fs41 mode; full-session arc 4h13m -> 38m (6.6x).
+- fs41 incremental + presolve-once: OOM on the 62GB machine (the
+  retained cross-iteration fixpoint needs ~55-65GB at fs41) — a
+  machine constraint, not a method failure; viable on the big
+  machine for the kernel-scale HEAD re-run, which now inherits the
+  full stack.
 - Default policy for --cfl-presolve-once: byte-identical at fs41,
   answer-changing (tighter) at fs13 — stays opt-in until pins are
   re-cut.

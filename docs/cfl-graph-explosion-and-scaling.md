@@ -4530,3 +4530,124 @@ Eval: ftc mode in eval/30-run.sh runs ft+apply+audit with a built-in
 strict-subset gate (8f2db62). Open tail: eyeball the 23 ORANGE keys
 vs source; kernel-fs HEAD run for the recall question; ORANGE→GREEN
 upgrades via rodata-source tracing if wanted.
+
+## Task #51: fs-cost probe day — two falsifications and the real profile (km, 2026-08-14)
+
+Question: why is fs 56× FI (km fs41 4h13m vs 273s)? Two candidate
+levers died honestly. (1) Plane-occupancy skip masks: implemented,
+A/B byte-identical AND wall-flat (15,074s vs 15,204s) — occupancy
+probe showed 93% of planes LIVE at pop and empty-plane scan at
+0.005% of cycles; reverted with tombstone (8b91235). (2)
+FI-prunes-fs (the PLDI'20-inspired simplification): the sound
+all-derivations keep-set (CONE-ACTIVE origins on fptr-ancestor
+classes) covers 52.5% of roots but 99.98% of fact mass — the hub is
+an fptr-ancestor, so sound pruning removes nothing; only the
+retired filter's unsound mode ever had anything to delete. What the
+day actually bought: SolverProf attribution (join 69.5% of pop
+cycles POST-#48 — 9.0B cluster-mark skips at ~350 cycles each vs
+1.8M real lookups), --log-timestamps, and origin co-travel sizing
+(53,794 roots → 33,358 distinct columns, fact compression 3.21× at
+FI). Levers ranked: join-work engineering, bundles, channels.
+
+## Task #52: cell-major join sweep + batch-mode grid marks (km, 2026-08-15)
+
+The join filter was fact-major: ~350 cycles (find() chase + random
+bit probe) per (fact,cell) visit, 99.98% proven no-ops — merge
+re-offers re-confirming absorbed planes. Inverted to cell-major
+(f13f8d6): per cell, one read-only subsetOf word scan (with the
+interned pointer fast path) certifies "cluster already absorbed the
+whole backlog"; word-ANDN residual; per-fact work only for first
+joins; per-fact joined marks became one end-of-sweep word-OR (sound
+because the outer bound re-reads cellsOf, so merge-appended cells
+see the same backlog). km fs41 byte-identical, 15,201s → 9,321s
+(1.63×), join 69.5% → 33.1%. Then batch mode (d105585): workers had
+NO fast path at all (the #48-era batch OOB = dense promotion sized
+to the batch-local universe — fixed by sizing promote() to content);
+marks moved to GLOBAL grid space (valid across batches/rounds —
+registry global, clusters only grow), backlog imaged per sweep by a
+word-shifted copy valid for any rid base. km fs13 batched 69m29s →
+25m18s (2.75×), event-replay structure identical, byte-identical;
+mono == batched re-pinned at HEAD.
+
+## Task #53: origin-equivalence bundles — proven exact, parked on economics (km, 2026-08-15)
+
+Design + Lean core first (781d506): bundle_exact (a quotient of
+closure-row-equal origins preserves the closure member-by-member —
+mixed-member join witnesses collapse via row equality) and
+row_determined (equal carried-base rows ⇒ equal closure rows = the
+drain-checkpoint full-state-hash test); L1 coupling lemma
+(joinCluster merges clusters through shared cells, so co-traveling
+origins' memory nodes are already one class — bundling shares
+nothing new); addFact audit → no split protocol needed (facts only
+enter at rid birth). Gate 0 passed with margin (fs13 root ratio
+1.95×, fact compression 4.84×, max bundle 31,771 = 43% of active
+roots). Epoch coarsener shipped default-off (adc1d31); the L1
+assertion earned its keep TWICE: a partition-refinement pre-split-
+size bug, then a genuine theory gap — row equality does NOT imply
+cluster equality at a checkpoint (the registry is MEMOIZED join
+history; merge's joined-intersection erases the row evidence) → the
+epoch test refines on (presence, cluster class) per shift. Gate 2:
+km fs13 BYTE-IDENTICAL through 2 epochs (74,891 → 48,910 ids) +
+expansion, every assertion silent — exactness validated at scale —
+but 157m54s vs 32m27s: epochs stream O(live mass) against 230s
+drains, co-travel forms late, and the compression dies at expansion
+and from-scratch rebuilds. PARKED (falsification #10-ish, of the
+economics not the theory). Decider: fs41 batched 108m vs mono 155m
+byte-identical — batching subsumes the width lever (K-wide batch
+planes), bundles CLOSED (5bac7ad).
+
+## Task #54: fused delta-OR kernels + BitPlane; two layout falsifications (km, 2026-08-15/16)
+
+addBits/addBitsBridged paid ~16 plane streams per effective OR;
+fused dense tails do it in two loops (delta with inline any +
+popcount; one OR loop into all targets), with the #46 adopt/interned
+fast paths preserved in front (c61ae11). Dense storage moved off
+llvm::BitVector (private word storage — user directive: no
+LLVM-internal APIs, self-contained) onto src/lib/BitPlane.h, ~150
+lines mirroring the consumed API with honest mutable words. km fs13
+mono 32m27s → 23m21s, fs41 mono → 1h49m, fs41 batched → 1h32m, FI →
+3m55s; a-prop and f-prop each ~3×; ALL byte-identical. Then two
+falsifications: merge-block fusion (c1122a8) — byte-identical but
+wall-flat with merge cycles +14%; the merge bucket's mass is the
+jdirty-re-offer/joined-intersect unionWith traffic whose COW adopt
+paths a word loop destroys, reverted with tombstone. Slab/chunked
+layouts (d51133e) — falsified PRE-BUILD by measurement: perf stat
+showed IPC 2.76 with LLC misses ~1.4% of cycles (compute-bound, no
+locality debt) and the occupancy probe showed streamed deltas
+already 92.7% zero-word-skipped. The earlier "2.4 GB/s vs 15 GB/s
+headroom" arithmetic was the multi-pass overhead the fusion
+harvested, not latent bandwidth.
+
+## Task #55: presolve-once — the hidden 56% and the #43 attribution (km, 2026-08-16/17)
+
+With the solver at its compute floor, wall decomposition (timestamps
++ the 4.5-CPU utilization anomaly) exposed a single hidden phase:
+the pre-solve sublanguage saturation RE-RUN on the post-wiring graph
+— a one-time giant-SCC discovery costing 56% of fs41 wall (~3,700s)
+and ~600s at fs13, invisible for months inside bigger numbers.
+--cfl-presolve-once (cd67728 — note: the core guard nearly shipped
+inert; the flag definition and the CallGraph.cc guard were split
+across commits) skips iterations ≥ 1 and pulls the first in-drain
+a-SCC sweep early. Verdicts: fs41 BYTE-IDENTICAL to the eager pin
+(the smear family is a P=13 residue-collision artifact absent at
+P=41) at 1.55× (mono 1h49m → 1h11m); fs13 strictly tighter — the
+−504 pairs are ALL at opt_pre_handler, i.e. EXACTLY the task-#43
+"incremental divergence": ATTRIBUTED to pool-smear manufactured by
+the pre-solve re-run's coarsening, not to incremental solving. fs
+INCREMENTAL thereby unblocked: fs13 incremental+presolve-once
+byte-identical to the presolve-once scratch pin (150,238) at
+13m52s. Combo gate with the canonical kernel config: bidi ==
+bidi+presolve-once byte-identical (148,703 = no-bidi − 1,088 strict
+subset; bidi is tighter under fs, not answer-invariant — flag-match
+pins), fs41 batched+bidi+presolve-once = 27m22s. SESSION ARC: km
+fs41 4h13m → 27m22s (9.2× on the canonical lineage), fs13 → 13m52s,
+FI → 3m55s, every step byte-identical or attributed. Falsified en
+route: --cfl-presolve-exact as kernel insurance — OOM-killed the
+62GB box in ~3 min at fs41 batched; the GraCFL pre-solve quotient
+is load-bearing for MEMORY (uncollapsed born-giant = the ~1000×
+plane replication, unfused). Kernel HEAD re-run restarted at
+cd67728 with the validated command (initial sublanguage graph
+36.4M edges = 15× the old vintage's 2.4M — the recall work's
+legitimate edges; ~68 saturation iterations expected for the
+all+ids family). Organized version of #51–#55:
+docs/implementation.md.

@@ -24,8 +24,8 @@ set(INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include")
 include_directories(${INCLUDE_DIR})
 set(VENDORED_BOOST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..") # provides boost/* under src/boost
 
-# Find OpenMP
-find_package(OpenMP)
+# Find OpenMP (required for parallel solvers)
+find_package(OpenMP REQUIRED)
 
 # External project support
 include(ExternalProject)

@@ -322,11 +322,28 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
 
                 if (baseNode == NullObjectIndex)
                     return NullPtrIndex;
+                // The IntToPtr case resolves pure-integer addresses
+                // (LIST_POISON1/2, ERR_PTR, MMIO/fixmap) to the null
+                // POINTER value — GEP arithmetic on such a sentinel is
+                // still the same object-less sentinel. Typed-pointer
+                // (LLVM-14) kernel IR folds poison+offset into exactly
+                // this shape; without the guard it fell through to the
+                // field mapper (negative-offset assert, 2026-08-18).
+                if (baseNode == NullPtrIndex)
+                    return NullPtrIndex;
 
                 if (baseNode == UniversalObjIndex) {
                     errs() << "GEP CE, universal obj " << *(ce->getOperand(0)) << "\n";
                     return UniversalPtrIndex;
                 }
+
+                // GEP off an absolute integer address (inttoptr CE that
+                // is not a rebased real pointer) is still an absolute
+                // address: LIST_POISON1/2 + folded arithmetic in
+                // typed-pointer (LLVM-14) kernel IR reach here. Sentinels
+                // carry no flows; field numbers are meaningless on them.
+                if (baseNode == ConstantIntIndex)
+                    return ConstantIntIndex;
 
                 unsigned fieldNum = constGEPtoFieldNum(ce);
                 if (fieldNum == 0)
@@ -512,6 +529,16 @@ unsigned AndersNodeFactory::constGEPtoFieldNum(const llvm::ConstantExpr* expr) c
                 // char*, offset = index
                 assert(GEP->getNumIndices() == 1 && "char* should have only one index!");
                 int64_t offset = CI->getSExtValue();
+                // Negative offsets must NOT silently map to field 0: that
+                // is a wrong positive field claim (unsound direction under
+                // fs). The observed LLVM-14 shapes (poison-sentinel GEPs)
+                // are routed to ConstantIntIndex at the call sites and
+                // never reach here; anything else fails loudly and gets
+                // its own sound treatment with evidence in hand.
+                if (offset < 0)
+                    errs() << "FATAL: negative char* const gep offset "
+                           << offset << " on non-sentinel base: " << *expr
+                           << "\n";
                 assert(offset >= 0 && "constexpr char* offset should be non-negative!");
                 auto ptr = dyn_cast<GlobalVariable>(GEP->getPointerOperand()->stripPointerCasts());
                 assert(ptr && "const gep expr ptr should be a global variable!");

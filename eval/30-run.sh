@@ -34,7 +34,17 @@ $KA_EXTRA_FLAGS"
       --bc-list="$bclist" > "$log" 2>&1
   local rc=$?
   set -e
-  echo "exitcode: $rc" >> "$log"
+  # Self-describing outcomes: timeouts/OOM-kills are RECORDED results
+  # of the eval (baseline bars), not script failures.
+  local outcome="ok"
+  case $rc in
+    0)   outcome="ok" ;;
+    124) outcome="TIMEOUT after ${timeo}s (recorded outcome)" ;;
+    137) outcome="KILLED (SIGKILL — likely OOM killer; recorded outcome)" ;;
+    134) outcome="ABORTED (assertion)" ;;
+    *)   outcome="rc=$rc" ;;
+  esac
+  echo "exitcode: $rc ($outcome)" >> "$log"
   # Answer pin (deterministic; sha256 comparable across machines).
   if [ "$mode" = ft ] || [ "$mode" = ftc ] || [ "$mode" = ftfs ]; then
     # ICALL + REGCALL: the answer-pin convention (REGCALL lines are
@@ -58,7 +68,7 @@ $KA_EXTRA_FLAGS"
       echo "!! $name/ftc: $extra pairs NOT in ft pin — certifier bug" >&2
     fi
   fi
-  echo "   done (rc=$rc)"
+  echo "   done (rc=$rc: $outcome)"
 }
 
 corpora=("$@")

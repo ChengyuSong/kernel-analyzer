@@ -18,6 +18,9 @@ run_one() { # run_one <name> <bclist> <mode: ft|sat>
   case $mode in
     ft)  flags="--cfl-flows-to --cfl-dump-icalls $KA_EXTRA_FLAGS"
          timeo=$KA_FT_TIMEOUT ;;
+    ftfs) flags="--cfl-flows-to --cfl-dump-icalls $KA_FS_FLAGS \
+$KA_EXTRA_FLAGS"
+         timeo=$KA_FT_TIMEOUT ;;
     ftc) flags="--cfl-flows-to --cfl-dump-icalls --cfl-regfield-apply \
 --cfl-regfield-audit $KA_EXTRA_FLAGS"
          timeo=$KA_FT_TIMEOUT ;;
@@ -33,8 +36,12 @@ run_one() { # run_one <name> <bclist> <mode: ft|sat>
   set -e
   echo "exitcode: $rc" >> "$log"
   # Answer pin (deterministic; sha256 comparable across machines).
-  if [ "$mode" = ft ] || [ "$mode" = ftc ]; then
-    grep "ICALL" "$log" | sed 's/^CallGraph: //' | sort \
+  if [ "$mode" = ft ] || [ "$mode" = ftc ] || [ "$mode" = ftfs ]; then
+    # ICALL + REGCALL: the answer-pin convention (REGCALL lines are
+    # INVOKE re-attributed pairs at direct registration sites; the km
+    # reference counts the UNION — ICALL-only undercounts by 427
+    # there). Pins cut before 2026-08-17 were ICALL-only.
+    grep -E "ICALL|REGCALL" "$log" | sed 's/^CallGraph: //' | sort \
       > "$KA_RESULTS/$name-$mode-icalls.sort" || true
     sha256sum "$KA_RESULTS/$name-$mode-icalls.sort" \
       > "$KA_RESULTS/$name-$mode-icalls.sort.sha256" || true

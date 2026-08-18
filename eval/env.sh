@@ -38,6 +38,15 @@ export KA_SAT_TIMEOUT="${KA_SAT_TIMEOUT:-14400}"
 export KA_FT_TIMEOUT="${KA_FT_TIMEOUT:-14400}"
 # Extra flags appended to every flows-to run (e.g. --func-summaries=...).
 export KA_EXTRA_FLAGS="${KA_EXTRA_FLAGS:-}"
+# Field-sensitive mode (KA_MODES+=" ftfs"): canonical fs config as of
+# 2026-08-17 — P=41 residues + presolve-once (byte-identical to the
+# eager pin at P=41; the pre-solve re-run it skips was 56% of fs41
+# wall). For kernel-scale corpora add the batch/bidi tier via
+# KA_EXTRA_FLAGS: --cfl-bidi-prune --cfl-batch-roots=4000
+# --cfl-batch-workers=<cores/4> --cfl-batch-spill=<big-disk-dir>
+# (spill dir NOT tmpfs; bidi answers are strictly tighter under fs —
+# flag-match pins).
+export KA_FS_FLAGS="${KA_FS_FLAGS:---cfl-field-buckets=41 --cfl-presolve-once}"
 # Optional: analyze a pre-existing bitcode list too (e.g. a kernel):
 #   KA_USER_BCLIST=/path/bclist KA_USER_NAME=linux-6.8
 export KA_USER_BCLIST="${KA_USER_BCLIST:-}"

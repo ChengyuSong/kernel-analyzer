@@ -5936,7 +5936,12 @@ bool CallGraphPass::runFlowsToResolution() {
   constexpr uint32_t kGrain = 16;
   std::vector<uint32_t> waveBuf;
   size_t waveCount = 0;
-  uint64_t nextSCC = 1u << 18, nextProg = 1u << 20, nextIntern = 1u << 16;
+  // presolve-once: the wired graph's giant copy-SCC is discovered
+  // in-drain instead of by the skipped pre-solve — pull the first
+  // collapse sweep early so per-member plane duplication stays short.
+  uint64_t nextSCC = (CFLPreSolveOnce && iteration > 0) ? (1u << 14)
+                                                        : (1u << 18);
+  uint64_t nextProg = 1u << 20, nextIntern = 1u << 16;
   size_t edgesConsumed = edges.size();
   int fpIter = 0;
   // Outer resolution fixpoint: drain -> resolve -> wire the new callee
@@ -17739,7 +17744,8 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     // Pre-solve copy/field merge before the monolithic dense mapping.
-    if ((CFLPreSolveMerge || CFLFlowsTo) && !CFLCompositional)
+    if ((CFLPreSolveMerge || CFLFlowsTo) && !CFLCompositional &&
+        (!CFLPreSolveOnce || iteration == 0))
       preSolveCopyFieldMerge(EB.getEdges(), nullptr);
 
     // ORCFL v0: answer-anchored resolution replaces the saturation solve.

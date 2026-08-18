@@ -9538,8 +9538,19 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
       bool allImm = !CI.Codes.empty();
       for (const std::string &Code : CI.Codes)
         allImm &= (Code == "i" || Code == "s" || Code == "n" || Code == "X");
-      if (allImm)
-        continue; // link-time symbol, no runtime access through it
+      if (allImm) {
+        // %gs:/%fs:-addressed immediates ARE runtime accesses: x86
+        // percpu codegen passes the percpu symbol as an "i" operand
+        // and the asm reads %gs:sym (this_cpu_read — pcpu_hot's
+        // current_task load = `current`). The segment rebase is
+        // base-to-base relocation under the declared percpu
+        // invariant, so *(sym) -> result is the exact model. Found
+        // via the th3 (LLVM-14) corpus: 226 dropped current-loads
+        // surfaced as IntToPtr src-node-not-found (2026-08-18).
+        StringRef AsmStr(IA->getAsmString());
+        if (!AsmStr.contains("%gs:") && !AsmStr.contains("%fs:"))
+          continue; // true link-time symbol, no runtime access
+      }
       NodeIndex pNode = getRepNodeForValue(A);
       if (pNode == AndersNodeFactory::InvalidIndex)
         continue;
@@ -11123,7 +11134,19 @@ void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
   }
   NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
-    WARNING("IntToPtr: src node not found: " << I << "\n");
+    // Dropping the edge here loses the int->ptr flow entirely — log
+    // enough to classify WHY the integer source has no node (operand
+    // kind + defining shape + function) so the ledger names the gap.
+    const Value *src = I.getOperand(0);
+    WARNING("IntToPtr: src node not found: " << I << " | src: " << *src
+            << " | kind: "
+            << (isa<Instruction>(src)
+                    ? cast<Instruction>(src)->getOpcodeName()
+                    : isa<Argument>(src)      ? "argument"
+                      : isa<ConstantExpr>(src)
+                          ? "constexpr"
+                          : isa<Constant>(src) ? "constant" : "other")
+            << " | fn: " << I.getFunction()->getName() << "\n");
     return;
   }
   NodeIndex dstNode = CGP.getRepNodeForValue(&I);

@@ -12914,6 +12914,31 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         break;
       addAssignmentEdge(getRepDerefNode(getCanonicalNode(s)),
                         getRepDerefNode(getCanonicalNode(d)));
+      // Residue-complete copy under field mode: CPY is memcpy
+      // semantics — a byte copy preserves offsets, so EVERY residue
+      // plane must relay, not just residue 0 (the deref edge above).
+      // Same layout-free encoding as the llvm.memcpy small-copy path,
+      // but NOT gated on --cfl-residue-copies: that flag bounds fact
+      // volume over ALL unknown-layout memcpys; summary atoms are a
+      // small hand-vetted struct-dup population, and skipping their
+      // residues DROPS dynamically-true flows — fib_rules_ops kmemdup
+      // lost 15/20 GT-true pairs at P=13, surviving field = offset
+      // 104 ≡ 0 (mod 13) by residue accident (found via the 5.18 GT
+      // target_absent shift 2026-08-18; invisible to t_kmemdup, whose
+      // source fields are runtime stores).
+      if (CFLFlowsTo && EB.hasFieldLabels()) {
+        const unsigned P = EB.getNumFieldBuckets();
+        NodeIndex sParent = getCanonicalNode(s);
+        NodeIndex dParent = getCanonicalNode(d);
+        for (unsigned r = 1; r < P; r++) {
+          NodeIndex sF = getFieldPtrNode(sParent, (int64_t)r);
+          NodeIndex dF = getFieldPtrNode(dParent, (int64_t)r);
+          EB.addFieldEdges(sParent, getCanonicalNode(sF), (int)r);
+          EB.addFieldEdges(dParent, getCanonicalNode(dF), (int)r);
+          addAssignmentEdge(getRepDerefNode(getCanonicalNode(sF)),
+                            getRepDerefNode(getCanonicalNode(dF)));
+        }
+      }
       g_sumCpy++;
       break;
     }

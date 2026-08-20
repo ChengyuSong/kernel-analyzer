@@ -12984,6 +12984,13 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
   if (S.noop)
     return false; // NOOP owns the callsite: nothing transfers
   bool needPooled = false;
+  auto nodeForGlobal = [&](const llvm::GlobalValue *G) -> NodeIndex {
+    NodeIndex n = getRepNodeForValue(G);
+    if (n == AndersNodeFactory::InvalidIndex)
+      n = getCanonicalNode(
+          NF.createValueNode(const_cast<llvm::GlobalValue *>(G)));
+    return n;
+  };
   auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
     const Value *v =
         ref < 0 ? (const Value *)CS
@@ -13036,7 +13043,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::Alias: {
-      NodeIndex d = nodeForRef(A.dst, true), s = nodeForRef(A.src, false);
+      NodeIndex d = nodeForRef(A.dst, true);
+      NodeIndex s = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, false);
       if (d == AndersNodeFactory::InvalidIndex ||
           s == AndersNodeFactory::InvalidIndex)
         break;
@@ -13046,9 +13054,10 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::Store: {
-      NodeIndex c = nodeForRef(A.dst, true);
-      NodeIndex v = A.gsrc ? getRepNodeForValue(A.gsrc)
-                           : nodeForRef(A.src, false);
+      NodeIndex c = A.gdst ? nodeForGlobal(A.gdst) : nodeForRef(A.dst, true);
+      NodeIndex v = A.gsrc    ? getRepNodeForValue(A.gsrc)
+                    : A.gsrc2 ? nodeForGlobal(A.gsrc2)
+                              : nodeForRef(A.src, false);
       if (A.gsrc && v == AndersNodeFactory::InvalidIndex)
         v = getCanonicalNode(NF.createValueNode(A.gsrc));
       if (c == AndersNodeFactory::InvalidIndex ||
@@ -13061,7 +13070,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::Move: {
-      NodeIndex d = nodeForRef(A.dst, true), c = nodeForRef(A.src, true);
+      NodeIndex d = A.gdst ? nodeForGlobal(A.gdst) : nodeForRef(A.dst, true);
+      NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
@@ -13250,7 +13260,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::Load: {
-      NodeIndex d = nodeForRef(A.dst, true), c = nodeForRef(A.src, true);
+      NodeIndex d = nodeForRef(A.dst, true);
+      NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
@@ -15702,6 +15713,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
   curDL = &M->getDataLayout();
   struct PAtom { // 0=ST 1=MV 2=LD(ret) 3=ALIAS(ret) 4=CPY
     int kind; int a1; int a2; int64_t o1; int64_t o2;
+    const GlobalValue *g1 = nullptr; // dst/container-side global
+    const GlobalValue *g2 = nullptr; // src/value-side global
   };
   boost::unordered_flat_map<const Function *, SmallVector<PAtom, 6>> props;
       boost::unordered_flat_set<const Function *> ok;
@@ -16167,19 +16180,24 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           for (const auto &A : S.atoms) {
             switch (A.kind) {
             case GlobalContext::SummaryAtom::Store:
-              if (A.gsrc || A.dst < 0 || A.src < 0) return false;
-              out.push_back({0, A.dst, A.src, A.dstByteOff, A.srcByteOff});
+              if (A.dst < 0 && !A.gdst) return false;
+              if (A.src < 0 && !A.gsrc && !A.gsrc2) return false;
+              out.push_back({0, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                             A.gdst, A.gsrc ? A.gsrc : A.gsrc2});
               break;
             case GlobalContext::SummaryAtom::Move:
-              out.push_back({1, A.dst, A.src, A.dstByteOff, A.srcByteOff});
+              if (A.dst < 0 && !A.gdst) return false;
+              if (A.src < 0 && !A.gsrc2) return false;
+              out.push_back({1, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                             A.gdst, A.gsrc2});
               break;
             case GlobalContext::SummaryAtom::Load:
-              if (A.dst != -1) return false;
-              out.push_back({2, 0, A.src, 0, A.srcByteOff});
+              if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
+              out.push_back({2, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
               break;
             case GlobalContext::SummaryAtom::Alias:
-              if (A.dst != -1 || A.src < 0) return false;
-              out.push_back({3, 0, A.src, 0, A.srcByteOff});
+              if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
+              out.push_back({3, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
               break;
             case GlobalContext::SummaryAtom::Cpy:
               if (A.dst < 0 || A.src < 0) return false; // ret-CPY: skip
@@ -16215,7 +16233,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           boost::unordered_flat_map<const Value *, int> argIdx;
           int ai = 0;
           for (const Argument &A : F.args()) argIdx[&A] = ai++;
-          struct Src { uint8_t kind; int arg; int64_t off; };
+          // kind: 0=ARGP(arg+off) 1=LOADARG(*arg@off) 2=NULLISH
+          //       3=GLOBALP(&g+off) 4=LOADGLOBAL(*g@off)
+          struct Src { uint8_t kind; int arg; int64_t off;
+                       const GlobalValue *gv = nullptr; };
           boost::unordered_flat_map<const Value *, SmallVector<Src, 4>> memo;
           boost::unordered_flat_set<const Value *> inProg;
           bool blockedOnCallee = false;
@@ -16234,6 +16255,12 @@ void CallGraphPass::runSummaryProvers(Module *M) {
               r.push_back({0, it2->second, 0}); okr = true;
             } else if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) {
               r.push_back({2, 0, 0}); okr = true;
+            } else if (const auto *G2 = dyn_cast<GlobalValue>(
+                           V->stripPointerCastsAndAliases())) {
+              // Global container/address ref (v2.2b): pointer identity,
+              // adopted-only (never serialized — internal linkage is
+              // name-ambiguous across TUs).
+              r.push_back({3, 0, 0, G2}); okr = true;
             } else if (const auto *G = dyn_cast<GEPOperator>(V)) {
               APInt Off(64, 0);
               if (G->accumulateConstantOffset(*curDL, Off)) {
@@ -16241,8 +16268,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 if (rez(G->getPointerOperand(), b)) {
                   okr = true;
                   for (auto sv : b) {
-                    if (sv.kind == 0) sv.off += Off.getSExtValue();
-                    else if (sv.kind == 1) okr = false;
+                    if (sv.kind == 0 || sv.kind == 3)
+                      sv.off += Off.getSExtValue();
+                    else if (sv.kind == 1 || sv.kind == 4) okr = false;
                     r.push_back(sv);
                   }
                 }
@@ -16265,6 +16293,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 okr = true;
                 for (auto sv : b) {
                   if (sv.kind == 0) r.push_back({1, sv.arg, sv.off});
+                  else if (sv.kind == 3)
+                    r.push_back({4, 0, sv.off, sv.gv});
                   else if (sv.kind == 2) continue;
                   else { okr = false; break; }
                 }
@@ -16293,24 +16323,30 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   okr = true;
                   bool anyRet = false;
                   for (const auto &A : cas) {
-                    if (A.kind == 3) { // ALIAS(ret<-argN[@off])
+                    if (A.kind == 3) { // ALIAS(ret<-argN[@off] | @g@off)
                       anyRet = true;
+                      if (A.g2) { r.push_back({3, 0, A.o2, A.g2}); continue; }
                       SmallVector<Src, 4> b;
                       if ((unsigned)A.a2 >= RC->arg_size() ||
                           !rez(RC->getArgOperand(A.a2), b)) { okr = false; break; }
                       for (auto sv : b) {
-                        if (sv.kind == 0) sv.off += A.o2;
-                        else if (sv.kind == 1 && A.o2) { okr = false; break; }
+                        if (sv.kind == 0 || sv.kind == 3) sv.off += A.o2;
+                        else if ((sv.kind == 1 || sv.kind == 4) && A.o2) {
+                          okr = false; break;
+                        }
                         r.push_back(sv);
                       }
-                    } else if (A.kind == 2) { // LD(ret<-*argC@off)
+                    } else if (A.kind == 2) { // LD(ret<-*argC@off | *@g@off)
                       anyRet = true;
+                      if (A.g2) { r.push_back({4, 0, A.o2, A.g2}); continue; }
                       SmallVector<Src, 4> b;
                       if ((unsigned)A.a2 >= RC->arg_size() ||
                           !rez(RC->getArgOperand(A.a2), b)) { okr = false; break; }
                       for (auto sv : b) {
                         if (sv.kind == 0)
                           r.push_back({1, sv.arg, sv.off + A.o2});
+                        else if (sv.kind == 3)
+                          r.push_back({4, 0, sv.off + A.o2, sv.gv});
                         else if (sv.kind == 2) continue;
                         else { okr = false; break; }
                       }
@@ -16357,30 +16393,43 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           };
           std::set<std::string> atomStrs;
           SmallVector<PAtom, 6> atoms;
+          auto refStr = [](const Src &x) -> std::string {
+            std::string r = x.kind == 0 || x.kind == 1
+                                ? "arg" + std::to_string(x.arg)
+                                : "@" + x.gv->getName().str();
+            if (x.off) r += "@" + std::to_string(x.off);
+            return r;
+          };
           auto emitStore = [&](const SmallVectorImpl<Src> &Ts,
                                const SmallVectorImpl<Src> &Vs,
                                std::string &ewhy) -> bool {
             for (auto &t : Ts) {
-              if (t.kind != 0 || t.off < 0) { ewhy = "store-target"; return false; }
+              if ((t.kind != 0 && t.kind != 3) || t.off < 0) {
+                ewhy = "store-target"; return false;
+              }
+              const bool tArg = t.kind == 0;
               for (auto &v : Vs) {
                 if (v.kind == 2) continue;
-                if (v.kind == 0 && v.off >= 0) {
-                  std::string a = "ST(*arg" + std::to_string(t.arg) +
-                      (t.off ? "@" + std::to_string(t.off) : "") +
-                      "<-arg" + std::to_string(v.arg) +
-                      (v.off ? "@" + std::to_string(v.off) : "") + ")";
+                if (v.off < 0) { ewhy = "interior-store"; return false; }
+                if (v.kind == 0 || v.kind == 3) { // value = address
+                  std::string a = "ST(*" + refStr(t) + "<-" + refStr(v) + ")";
                   if (atomStrs.insert(a).second)
-                    atoms.push_back({0, t.arg, v.arg, t.off, v.off});
-                } else if (v.kind == 1 && v.off >= 0) {
-                  if (v.arg == t.arg && v.off == t.off)
+                    atoms.push_back({0, tArg ? t.arg : -1,
+                                     v.kind == 0 ? v.arg : -1, t.off, v.off,
+                                     tArg ? nullptr : t.gv,
+                                     v.kind == 0 ? nullptr : v.gv});
+                } else { // kind 1/4: value = loaded cell -> MV
+                  if (v.kind == 1 && tArg && v.arg == t.arg && v.off == t.off)
                     continue; // self-move: cell self-loop, vacuous
-                  std::string a = "MV(*arg" + std::to_string(t.arg) +
-                      (t.off ? "@" + std::to_string(t.off) : "") +
-                      "<-*arg" + std::to_string(v.arg) +
-                      (v.off ? "@" + std::to_string(v.off) : "") + ")";
+                  if (v.kind == 4 && !tArg && v.gv == t.gv && v.off == t.off)
+                    continue;
+                  std::string a = "MV(*" + refStr(t) + "<-*" + refStr(v) + ")";
                   if (atomStrs.insert(a).second)
-                    atoms.push_back({1, t.arg, v.arg, t.off, v.off});
-                } else { ewhy = "interior-store"; return false; }
+                    atoms.push_back({1, tArg ? t.arg : -1,
+                                     v.kind == 1 ? v.arg : -1, t.off, v.off,
+                                     tArg ? nullptr : t.gv,
+                                     v.kind == 1 ? nullptr : v.gv});
+                }
               }
             }
             return true;
@@ -16435,26 +16484,36 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 // Translate callee EFFECT atoms into caller frame.
                 for (const auto &A : cas) {
                   if (A.kind == 2 || A.kind == 3) continue; // ret-only
-                  if ((unsigned)A.a1 >= CB->arg_size() ||
-                      (unsigned)A.a2 >= CB->arg_size()) {
+                  if ((!A.g1 &&
+                       (A.a1 < 0 || (unsigned)A.a1 >= CB->arg_size())) ||
+                      (!A.g2 &&
+                       (A.a2 < 0 || (unsigned)A.a2 >= CB->arg_size()))) {
                     why = "compose"; return false;
                   }
                   SmallVector<Src, 4> Cs, Xs;
-                  if (!rez(CB->getArgOperand(A.a1), Cs) ||
-                      !rez(CB->getArgOperand(A.a2), Xs)) {
+                  if (A.g1) Cs.push_back({3, 0, 0, A.g1});
+                  else if (!rez(CB->getArgOperand(A.a1), Cs)) {
                     why = "compose"; return false;
                   }
-                  if (A.kind == 0) { // callee ST: value = callee arg a2[@o2]
+                  if (A.g2) Xs.push_back({3, 0, 0, A.g2});
+                  else if (!rez(CB->getArgOperand(A.a2), Xs)) {
+                    why = "compose"; return false;
+                  }
+                  if (A.kind == 0) { // callee ST: value = arg a2[@o2] | @g2@o2
                     SmallVector<Src, 4> Ts2, Xs2;
                     for (auto t : Cs) {
                       if (t.kind == 2) continue;
-                      if (t.kind != 0) { why = "compose"; return false; }
+                      if (t.kind != 0 && t.kind != 3) {
+                        why = "compose"; return false;
+                      }
                       t.off += A.o1;
                       Ts2.push_back(t);
                     }
                     for (auto v : Xs) {
-                      if (v.kind == 0) v.off += A.o2;
-                      else if (v.kind == 1 && A.o2) { why = "compose"; return false; }
+                      if (v.kind == 0 || v.kind == 3) v.off += A.o2;
+                      else if ((v.kind == 1 || v.kind == 4) && A.o2) {
+                        why = "compose"; return false;
+                      }
                       Xs2.push_back(v);
                     }
                     std::string ewhy;
@@ -16462,12 +16521,19 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   } else if (A.kind == 1) { // callee MV
                     for (auto t : Cs) {
                       if (t.kind == 2) continue;
-                      if (t.kind != 0) { why = "compose"; return false; }
+                      if (t.kind != 0 && t.kind != 3) {
+                        why = "compose"; return false;
+                      }
                       for (auto v : Xs) {
                         if (v.kind == 2) continue;
-                        if (v.kind != 0) { why = "compose"; return false; }
-                        SmallVector<Src, 4> T1{{0, t.arg, t.off + A.o1}};
-                        SmallVector<Src, 4> V1{{1, v.arg, v.off + A.o2}};
+                        SmallVector<Src, 4> T1{
+                            {t.kind, t.arg, t.off + A.o1, t.gv}};
+                        SmallVector<Src, 4> V1;
+                        if (v.kind == 0)
+                          V1.push_back({1, v.arg, v.off + A.o2});
+                        else if (v.kind == 3)
+                          V1.push_back({4, 0, v.off + A.o2, v.gv});
+                        else { why = "compose"; return false; }
                         std::string ewhy;
                         if (!emitStore(T1, V1, ewhy)) { why = ewhy; return false; }
                       }
@@ -16534,7 +16600,15 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     for (auto &v : Is) {
                       if (!okc) break;
                       if (v.kind == 2) continue;
-                      if (v.kind == 0 && v.off >= 0) {
+                      if (v.kind == 3 && v.off >= 0) {
+                        std::string a = "ALIAS(ret<-" + refStr(v) + ")";
+                        if (atomStrs.insert(a).second)
+                          atoms.push_back({3, 0, -1, 0, v.off, nullptr, v.gv});
+                      } else if (v.kind == 4 && v.off >= 0) {
+                        std::string a = "LD(ret<-*" + refStr(v) + ")";
+                        if (atomStrs.insert(a).second)
+                          atoms.push_back({2, 0, -1, 0, v.off, nullptr, v.gv});
+                      } else if (v.kind == 0 && v.off >= 0) {
                         std::string a = "ALIAS(ret<-arg" +
                             std::to_string(v.arg) +
                             (v.off ? "@" + std::to_string(v.off) : "") + ")";
@@ -16563,7 +16637,15 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 }
                 for (auto &v : Rs) {
                   if (v.kind == 2) continue;
-                  if (v.kind == 0 && v.off >= 0) {
+                  if (v.kind == 3 && v.off >= 0) {
+                    std::string a = "ALIAS(ret<-" + refStr(v) + ")";
+                    if (atomStrs.insert(a).second)
+                      atoms.push_back({3, 0, -1, 0, v.off, nullptr, v.gv});
+                  } else if (v.kind == 4 && v.off >= 0) {
+                    std::string a = "LD(ret<-*" + refStr(v) + ")";
+                    if (atomStrs.insert(a).second)
+                      atoms.push_back({2, 0, -1, 0, v.off, nullptr, v.gv});
+                  } else if (v.kind == 0 && v.off >= 0) {
                     std::string a = "ALIAS(ret<-arg" + std::to_string(v.arg) +
                         (v.off ? "@" + std::to_string(v.off) : "") + ")";
                     if (atomStrs.insert(a).second)
@@ -16648,14 +16730,18 @@ void CallGraphPass::runSummaryProvers(Module *M) {
         switch (A.kind) {
         case 0: SA.kind = GlobalContext::SummaryAtom::Store; SA.dst = A.a1;
                 SA.src = A.a2; SA.dstByteOff = (int)A.o1;
-                SA.srcByteOff = (int)A.o2; break;
+                SA.srcByteOff = (int)A.o2; SA.gdst = A.g1; SA.gsrc2 = A.g2;
+                break;
         case 1: SA.kind = GlobalContext::SummaryAtom::Move; SA.dst = A.a1;
                 SA.src = A.a2; SA.dstByteOff = (int)A.o1;
-                SA.srcByteOff = (int)A.o2; break;
+                SA.srcByteOff = (int)A.o2; SA.gdst = A.g1; SA.gsrc2 = A.g2;
+                break;
         case 2: SA.kind = GlobalContext::SummaryAtom::Load; SA.dst = -1;
-                SA.src = A.a2; SA.srcByteOff = (int)A.o2; break;
+                SA.src = A.a2; SA.srcByteOff = (int)A.o2; SA.gsrc2 = A.g2;
+                break;
         case 3: SA.kind = GlobalContext::SummaryAtom::Alias; SA.dst = -1;
-                SA.src = A.a2; SA.srcByteOff = (int)A.o2; break;
+                SA.src = A.a2; SA.srcByteOff = (int)A.o2; SA.gsrc2 = A.g2;
+                break;
         case 4: SA.kind = GlobalContext::SummaryAtom::Cpy; SA.dst = A.a1;
                 SA.src = A.a2; break;
         default: assert(false && "unknown proposed atom kind");

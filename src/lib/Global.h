@@ -151,6 +151,15 @@ public:
     const llvm::GlobalValue *gsrc = nullptr; // Store: global-value source;
                                              // ChainReg: derived key global
                                              // (generated atoms only)
+    // Global-container refs (v2.2b, per-run adopted atoms only —
+    // pointer identity, never serialized: internal-linkage globals
+    // would be name-ambiguous across TUs). When set, they replace the
+    // corresponding arg ref: gdst = container/dst side (Store/Move
+    // target, byte at dstByteOff), gsrc2 = source side (Move/Load
+    // container or Store/Alias address-of-global value, byte at
+    // srcByteOff).
+    const llvm::GlobalValue *gdst = nullptr;
+    const llvm::GlobalValue *gsrc2 = nullptr;
     std::string gsym; // ChainReg: key global by symbol name (file syntax
                       // CHAINREG(@sym,...) for external-linkage heads)
   };

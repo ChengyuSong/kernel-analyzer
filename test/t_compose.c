@@ -38,3 +38,12 @@ void sb_overflow(struct sbuf *s) { s->len = s->size + 1; }
 unsigned long sb_len(struct sbuf *s) { return s->len + 1; }
 /* composes: calls sb_overflow (atoms) + sb_add (noop) */
 void sb_flush(struct sbuf *s, const char *m) { sb_add(s, m); sb_overflow(s); }
+/* --- v2.2b global-container micros --- */
+static struct ops *g_cur;
+static struct box g_box;
+void set_gcur(struct ops *o) { g_cur = o; }              /* ST(*@g_cur<-arg0) */
+struct ops *get_gcur(void) { return g_cur; }             /* LD(ret<-*@g_cur) */
+void set_gbox_ops(struct ops *o) { g_box.o = o; }        /* ST(*@g_box@8<-arg0) */
+void wrap_setg(struct ops *o) { set_gcur(o); }           /* composes global ST */
+struct box *addr_gbox(void) { return &g_box; }           /* ALIAS(ret<-@g_box) */
+void cross_g(struct box *b) { b->o = g_cur; }            /* MV(*arg0@8<-*@g_cur) */

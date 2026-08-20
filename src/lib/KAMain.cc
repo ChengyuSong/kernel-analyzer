@@ -728,8 +728,18 @@ cl::opt<bool> CFLProposeNoopSummaries(
            "zero pointer-relevant transfer (conservative refusal: any "
            "icall/asm/non-noop callee/pointer or laundering store/"
            "pointer return refuses the candidate; fixpoint over "
-           "callees). Prints NoopProp lines; adoption stays manual via "
-           "func_summaries.txt + the pin/GT gates"),
+           "callees). Prints NoopProp lines; adopt per-run via "
+           "--cfl-adopt-proposed-summaries (pin/GT gated)"),
+  cl::init(false));
+
+cl::opt<bool> CFLAdoptProposedSummaries(
+  "cfl-adopt-proposed-summaries",
+  cl::desc("Adopt the provers' proposals as summaries FOR THIS RUN: "
+           "NOOP + atom proofs are re-derived on the corpus being "
+           "analyzed (atom byte offsets are layout-specific, so they "
+           "never enter the shared func_summaries.txt). Runs the "
+           "provers as a pre-pass before graph construction. Requires "
+           "--func-summaries; monolithic mode only"),
   cl::init(false));
 
 cl::opt<bool> CFLProposeAtomSummaries(
@@ -740,7 +750,7 @@ cl::opt<bool> CFLProposeAtomSummaries(
            "refusal (variable GEPs, two-level derefs, interior-pointer "
            "stores, unsafe callees, laundering). Runs atop the NOOP "
            "fixpoint for its safe-callee set. Prints AtomProp lines; "
-           "adoption manual via func_summaries.txt + pin/GT gates"),
+           "adopt per-run via --cfl-adopt-proposed-summaries"),
   cl::init(false));
 
 cl::opt<bool> CFLBundleProbe(

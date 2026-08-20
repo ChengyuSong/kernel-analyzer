@@ -126,6 +126,7 @@ public:
       Alias, // dst value aliases src value (interior/identity return)
       Store, // *container <- value
       Load,  // dst value <- *container
+      Move,  // *dst@off <- *src@off (field-to-field cell move)
       FreshSub, // a fresh anonymous sub-object stored into *dst
       Invoke, // pair-correlated dispatch: fn at arg[dst] will be called
               // with arg[src] bound to its formal [aux] (C interface
@@ -142,6 +143,8 @@ public:
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)
+    int dstByteOff = 0; // Store/Move: byte offset within *dst
+    int srcByteOff = 0; // Load/Move: byte offset within *src container
     int aux = 0;  // Invoke: callee formal index receiving src
     int off = -1; // ChainReg: byte offset of the fn inside *arg[src]
     int fk = -1;  // ChainReg/ChainCall: callback formal index

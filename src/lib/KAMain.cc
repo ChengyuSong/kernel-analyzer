@@ -732,6 +732,17 @@ cl::opt<bool> CFLProposeNoopSummaries(
            "func_summaries.txt + the pin/GT gates"),
   cl::init(false));
 
+cl::opt<bool> CFLProposeAtomSummaries(
+  "cfl-propose-atom-summaries",
+  cl::desc("Census: propose transfer-atom summaries (ST/LD/MV/ALIAS "
+           "with byte offsets) by per-function proof that ALL pointer "
+           "effects are expressible over args/ret — conservative "
+           "refusal (variable GEPs, two-level derefs, interior-pointer "
+           "stores, unsafe callees, laundering). Runs atop the NOOP "
+           "fixpoint for its safe-callee set. Prints AtomProp lines; "
+           "adoption manual via func_summaries.txt + pin/GT gates"),
+  cl::init(false));
+
 cl::opt<bool> CFLBundleProbe(
   "cfl-bundle-probe",
   cl::desc("Post-solve probe for stage-2 root bundling (task #47): "

@@ -12746,6 +12746,17 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
     }
     return false;
   };
+  // "argN@K" / "ret@K": deref-side ref with a byte offset (field cell)
+  auto parseDerefRef = [&](StringRef tok, int &out, int &byteOff) -> bool {
+    byteOff = 0;
+    auto [base, offs] = tok.split('@');
+    if (!offs.empty()) {
+      unsigned v;
+      if (offs.getAsInteger(10, v)) return false;
+      byteOff = (int)v;
+    }
+    return parseRef(base, out);
+  };
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
          nNone = 0, nInv = 0, nChR = 0, nChC = 0, nNoop = 0;
@@ -12786,7 +12797,15 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       } else if (t.consume_front("ST(*") && t.consume_back(")")) {
         auto [c, v] = t.split("<-");
         A.kind = GlobalContext::SummaryAtom::Store;
-        bad = !parseRef(c, A.dst) || !parseRef(v, A.src) || A.dst < 0;
+        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+              !parseRef(v, A.src) || A.dst < 0;
+        nSt++;
+      } else if (t.consume_front("MV(*") && t.consume_back(")")) {
+        auto [c, v] = t.split("<-*");
+        A.kind = GlobalContext::SummaryAtom::Move;
+        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0 ||
+              A.src < 0;
         nSt++;
       } else if (t.consume_front("INVOKE(") && t.consume_back(")")) {
         auto [fnp, rest2] = t.split(":");
@@ -12858,7 +12877,8 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       } else if (t.consume_front("LD(") && t.consume_back(")")) {
         auto [d, c] = t.split("<-*");
         A.kind = GlobalContext::SummaryAtom::Load;
-        bad = !parseRef(d, A.dst) || !parseRef(c, A.src) || A.src < 0;
+        bad = !parseRef(d, A.dst) ||
+              !parseDerefRef(c, A.src, A.srcByteOff) || A.src < 0;
         nLd++;
       } else {
         bad = true;
@@ -12927,6 +12947,18 @@ const GlobalValue *CallGraphPass::canonChainKey(const GlobalValue *G) {
   auto eit = Ctx->ExtGobjs.find(G->getGUID());
   if (eit != Ctx->ExtGobjs.end() && eit->second) return eit->second;
   return G;
+}
+
+// Deref cell at a byte offset within *base — mirrors runtime
+// store/load field handling under fs (field-ptr node + matched
+// f-edges); at FI (or offset 0) the plain top cell.
+NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
+  NodeIndex canon = getCanonicalNode(base);
+  if (byteOff == 0 || !EB.hasFieldLabels())
+    return getRepDerefNode(canon);
+  NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
+  EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
+  return getRepDerefNode(getCanonicalNode(f));
 }
 
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
@@ -13005,7 +13037,17 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
           v == AndersNodeFactory::InvalidIndex)
         break;
       addAssignmentEdge(getCanonicalNode(v),
-                        getRepDerefNode(getCanonicalNode(c)));
+                        summaryDerefCell(c, A.dstByteOff));
+      g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Move: {
+      NodeIndex d = nodeForRef(A.dst, true), c = nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          c == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
+                        summaryDerefCell(d, A.dstByteOff));
       g_sumSt++;
       break;
     }
@@ -13193,7 +13235,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
-      addAssignmentEdge(getRepDerefNode(getCanonicalNode(c)),
+      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
                         getCanonicalNode(d));
       g_sumLd++;
       break;
@@ -17839,7 +17881,7 @@ bool CallGraphPass::doModulePass(Module *M) {
     // transfer per function, fixpoint over callees. Only summaries
     // marked noop count as safe callees (atom summaries have effects
     // a NOOP claim would hide). Conservative refusal everywhere.
-    if (CFLProposeNoopSummaries) {
+    if (CFLProposeNoopSummaries || CFLProposeAtomSummaries) {
       boost::unordered_flat_set<const Function *> ok;
       boost::unordered_flat_map<std::string, uint64_t> refuseHist;
       auto calleeSafe = [&](const Function *CF) {
@@ -18053,6 +18095,208 @@ bool CallGraphPass::doModulePass(Module *M) {
         hist += kv.first + "=" + std::to_string(kv.second) + " ";
       CG_LOG("NoopProp: " << ok.size() << " proposed (" << rounds
              << " rounds); first-round refusals: " << hist << "\n");
+
+      // ---- v2: transfer-atom generator (ST/LD/MV/ALIAS @byte-off) ----
+      if (CFLProposeAtomSummaries && curDL) {
+        boost::unordered_flat_map<std::string, uint64_t> aRefuse;
+        struct Src { uint8_t kind; int arg; int64_t off; }; // 0=ARGP 1=LOADARG 2=NULL
+        size_t nOk = 0;
+        auto tryFn = [&](const Function &F) -> bool {
+          if (F.arg_size() > 8) { aRefuse["many-args"]++; return false; }
+          size_t nInst = 0;
+          for (const auto &BB : F) nInst += BB.size();
+          if (nInst > 200) { aRefuse["too-big"]++; return false; }
+          boost::unordered_flat_map<const Value *, int> argIdx;
+          int ai = 0;
+          for (const Argument &A : F.args()) argIdx[&A] = ai++;
+          // memoized resolver
+          boost::unordered_flat_map<const Value *, SmallVector<Src, 4>> memo;
+          boost::unordered_flat_set<const Value *> inProg;
+          std::function<bool(const Value *, SmallVectorImpl<Src> &)> rez =
+              [&](const Value *V, SmallVectorImpl<Src> &out) -> bool {
+            V = V->stripPointerCasts();
+            auto mit = memo.find(V);
+            if (mit != memo.end()) {
+              out.append(mit->second.begin(), mit->second.end());
+              return true;
+            }
+            if (!inProg.insert(V).second) return false; // phi cycle
+            SmallVector<Src, 4> r;
+            bool okr = false;
+            if (auto it2 = argIdx.find(V); it2 != argIdx.end()) {
+              r.push_back({0, it2->second, 0}); okr = true;
+            } else if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) {
+              r.push_back({2, 0, 0}); okr = true;
+            } else if (const auto *G = dyn_cast<GEPOperator>(V)) {
+              APInt Off(64, 0);
+              if (G->accumulateConstantOffset(*curDL, Off)) {
+                SmallVector<Src, 4> b;
+                if (rez(G->getPointerOperand(), b)) {
+                  okr = true;
+                  for (auto sv : b) {
+                    if (sv.kind == 0) sv.off += Off.getSExtValue();
+                    else if (sv.kind == 1) okr = false; // gep on loaded ptr: 2-level cell math
+                    r.push_back(sv);
+                  }
+                }
+              }
+            } else if (const auto *PN = dyn_cast<PHINode>(V)) {
+              okr = true;
+              for (const Value *IV : PN->incoming_values()) {
+                SmallVector<Src, 4> b;
+                if (!rez(IV, b)) { okr = false; break; }
+                r.append(b.begin(), b.end());
+              }
+            } else if (const auto *SI2 = dyn_cast<SelectInst>(V)) {
+              SmallVector<Src, 4> b;
+              okr = rez(SI2->getTrueValue(), b) &&
+                    rez(SI2->getFalseValue(), b);
+              r = b;
+            } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
+              SmallVector<Src, 4> b;
+              if (rez(LI->getPointerOperand(), b)) {
+                okr = true;
+                for (auto sv : b) {
+                  if (sv.kind == 0) r.push_back({1, sv.arg, sv.off});
+                  else if (sv.kind == 2) continue;
+                  else { okr = false; break; } // load of loaded ptr
+                }
+              }
+            }
+            inProg.erase(V);
+            if (!okr || r.size() > 4) return false;
+            memo[V] = r;
+            out.append(r.begin(), r.end());
+            return true;
+          };
+          // effect collection
+          std::set<std::string> atoms;
+          for (const auto &BB : F) {
+            for (const auto &I : BB) {
+              if (const auto *CB = dyn_cast<CallBase>(&I)) {
+                if (CB->isInlineAsm()) {
+                  if (asmTransferFree(CB)) continue;
+                  aRefuse["asm"]++; return false;
+                }
+                if (const auto *II = dyn_cast<IntrinsicInst>(CB)) {
+                  switch (II->getIntrinsicID()) {
+                  case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+                  case Intrinsic::dbg_label:
+                  case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+                  case Intrinsic::assume: case Intrinsic::expect:
+                  case Intrinsic::prefetch: case Intrinsic::donothing:
+                  case Intrinsic::trap: case Intrinsic::ubsantrap:
+                  case Intrinsic::vastart: case Intrinsic::vaend:
+                  case Intrinsic::vacopy: case Intrinsic::memset:
+                  case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                    continue;
+                  default: {
+                    bool pure = !II->getType()->isPointerTy();
+                    for (const Value *Arg : II->args())
+                      pure &= !Arg->getType()->isPointerTy();
+                    if (pure) continue;
+                    aRefuse["intrinsic"]++; return false;
+                  }
+                  }
+                }
+                const Function *CF = dyn_cast<Function>(
+                    CB->getCalledOperand()->stripPointerCastsAndAliases());
+                if (!CF) { aRefuse["icall"]++; return false; }
+                if (!calleeSafe(CF)) { aRefuse["callee"]++; return false; }
+                continue;
+              }
+              if (const auto *SI3 = dyn_cast<StoreInst>(&I)) {
+                const Value *Val = SI3->getValueOperand();
+                SmallVector<Src, 4> Ts;
+                if (!rez(SI3->getPointerOperand(), Ts)) {
+                  aRefuse["store-target"]++; return false;
+                }
+                for (auto &t : Ts)
+                  if (t.kind != 0 || t.off < 0) {
+                    aRefuse["store-target"]++; return false;
+                  }
+                if (!Val->getType()->isPointerTy()) {
+                  if (isPtrWidthInt(Val->getType(), *curDL)) {
+                    bool declined = false;
+                    if (mayCarryPtrProvenance(Val, 8, declined) || declined) {
+                      aRefuse["int-launder-store"]++; return false;
+                    }
+                  }
+                  continue;
+                }
+                SmallVector<Src, 4> Vs;
+                if (!rez(Val, Vs)) { aRefuse["store-value"]++; return false; }
+                for (auto &t : Ts)
+                  for (auto &v : Vs) {
+                    if (v.kind == 2) continue;
+                    if (v.kind == 0 && v.off == 0)
+                      atoms.insert("ST(*arg" + std::to_string(t.arg) +
+                                   (t.off ? "@" + std::to_string(t.off) : "") +
+                                   "<-arg" + std::to_string(v.arg) + ")");
+                    else if (v.kind == 1 && v.off >= 0)
+                      atoms.insert("MV(*arg" + std::to_string(t.arg) +
+                                   (t.off ? "@" + std::to_string(t.off) : "") +
+                                   "<-*arg" + std::to_string(v.arg) +
+                                   (v.off ? "@" + std::to_string(v.off) : "") +
+                                   ")");
+                    else { aRefuse["interior-store"]++; return false; }
+                  }
+                continue;
+              }
+              if (isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I)) {
+                aRefuse["atomic"]++; return false;
+              }
+              if (isa<IndirectBrInst>(&I)) { aRefuse["indirectbr"]++; return false; }
+              if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
+                const Value *RV = RI->getReturnValue();
+                if (!RV) continue;
+                if (!RV->getType()->isPointerTy()) {
+                  if (isPtrWidthInt(RV->getType(), *curDL)) {
+                    bool declined = false;
+                    if (mayCarryPtrProvenance(RV, 8, declined) || declined) {
+                      aRefuse["ret-launder"]++; return false;
+                    }
+                  }
+                  continue;
+                }
+                SmallVector<Src, 4> Rs;
+                if (!rez(RV, Rs)) { aRefuse["ret"]++; return false; }
+                for (auto &v : Rs) {
+                  if (v.kind == 2) continue;
+                  if (v.kind == 0 && v.off == 0)
+                    atoms.insert("ALIAS(ret<-arg" + std::to_string(v.arg) + ")");
+                  else if (v.kind == 1 && v.off >= 0)
+                    atoms.insert("LD(ret<-*arg" + std::to_string(v.arg) +
+                                 (v.off ? "@" + std::to_string(v.off) : "") + ")");
+                  else { aRefuse["ret-interior"]++; return false; }
+                }
+              }
+            }
+          }
+          if (atoms.empty() || atoms.size() > 6) {
+            aRefuse[atoms.empty() ? "no-atoms" : "too-many-atoms"]++;
+            return false;
+          }
+          std::string line;
+          for (auto &a : atoms) line += " " + a;
+          CG_LOG("AtomProp: OK " << F.getName() << line << "\n");
+          nOk++;
+          return true;
+        };
+        for (auto &[mod, mname] : Ctx->Modules) {
+          for (const Function &F : *mod) {
+            if (F.isDeclaration()) continue;
+            const Function *canon = getFuncDef(const_cast<Function *>(&F));
+            if (canon != &F || ok.count(canon)) continue;
+            if (Ctx->FuncSummaries.count(canon)) continue;
+            tryFn(F);
+          }
+        }
+        std::string ah;
+        for (auto &kv : aRefuse)
+          ah += kv.first + "=" + std::to_string(kv.second) + " ";
+        CG_LOG("AtomProp: " << nOk << " proposed; refusals: " << ah << "\n");
+      }
     }
 
     // Pre-solve copy/field merge before the monolithic dense mapping.

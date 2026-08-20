@@ -12790,15 +12790,18 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         bad = !parseRef(d, A.dst) || !parseRef(s, A.src) || A.src < 0;
         nCpy++;
       } else if (t.consume_front("ALIAS(") && t.consume_back(")")) {
-        auto [d, s] = t.split("=");
+        // Both "ALIAS(ret=argN)" (legacy) and "ALIAS(ret<-argN[@K])"
+        // (generator) forms; @K = interior alias (ret = argN + K).
+        auto [d, s] = t.contains("<-") ? t.split("<-") : t.split("=");
         A.kind = GlobalContext::SummaryAtom::Alias;
-        bad = !parseRef(d, A.dst) || !parseRef(s, A.src) || A.src < 0;
+        bad = !parseRef(d, A.dst) ||
+              !parseDerefRef(s, A.src, A.srcByteOff) || A.src < 0;
         nAlias++;
       } else if (t.consume_front("ST(*") && t.consume_back(")")) {
         auto [c, v] = t.split("<-");
         A.kind = GlobalContext::SummaryAtom::Store;
         bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
-              !parseRef(v, A.src) || A.dst < 0;
+              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0;
         nSt++;
       } else if (t.consume_front("MV(*") && t.consume_back(")")) {
         auto [c, v] = t.split("<-*");
@@ -12961,6 +12964,20 @@ NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
   return getRepDerefNode(getCanonicalNode(f));
 }
 
+// Value-side interior ref "argN@K": the summarized callee produced a
+// pointer INTO the actual at byte K (seq_buf_init's s->seq.buffer =
+// s->buffer shape). Under field mode this is the actual's field-ptr
+// node (origin preserved, shift K); under FI it collapses to the base
+// — exactly what a walked GEP would do.
+NodeIndex CallGraphPass::summaryFieldPtr(NodeIndex base, int byteOff) {
+  NodeIndex canon = getCanonicalNode(base);
+  if (byteOff == 0 || !EB.hasFieldLabels())
+    return canon;
+  NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
+  EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
+  return getCanonicalNode(f);
+}
+
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S,
                                       bool *retBound) {
@@ -13023,7 +13040,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex ||
           s == AndersNodeFactory::InvalidIndex)
         break;
-      addAssignmentEdge(getCanonicalNode(s), getCanonicalNode(d));
+      addAssignmentEdge(summaryFieldPtr(s, A.srcByteOff),
+                        getCanonicalNode(d));
       g_sumAlias++;
       break;
     }
@@ -13036,7 +13054,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (c == AndersNodeFactory::InvalidIndex ||
           v == AndersNodeFactory::InvalidIndex)
         break;
-      addAssignmentEdge(getCanonicalNode(v),
+      addAssignmentEdge(A.gsrc ? getCanonicalNode(v)
+                               : summaryFieldPtr(v, A.srcByteOff),
                         summaryDerefCell(c, A.dstByteOff));
       g_sumSt++;
       break;
@@ -17892,6 +17911,165 @@ bool CallGraphPass::doModulePass(Module *M) {
           return true;
         return ok.count(CF) != 0;
       };
+      // Rule C: local launder walk — identical to mayCarryPtrProvenance
+      // except int returns of NOOP-safe callees are CLEAN (the NOOP
+      // claim/proof covers "ret is a count, not a laundered pointer";
+      // the fd-chain hazard that forced conservative-yes there is a
+      // provenance-witnessed return, which NOOP refuses by rule).
+      // Zero-provenance asm write predicate (mirrors handleInlineAsm's
+      // §2 j-loop exactly): an indirect-output slot gets store edges
+      // ONLY from ptr-typed or provenance-witnessed direct inputs. No
+      // such input => the main model emits nothing for the slot =>
+      // skipping the body drops nothing. (__raw_save_flags pushf/pop:
+      // zero inputs.) %gs/%fs excluded: percpu materialization paths
+      // have their own model.
+      auto asmInputsProvenanceFree = [&](const CallBase *ACB) -> bool {
+        const auto *IA2 = cast<InlineAsm>(ACB->getCalledOperand());
+        StringRef AS = IA2->getAsmString();
+        if (AS.contains("%gs:") || AS.contains("%fs:")) return false;
+        auto ACs = InlineAsm::ParseConstraints(IA2->getConstraintString());
+        unsigned ai2 = 0;
+        for (auto &CI : ACs) {
+          if (CI.Type == InlineAsm::isClobber
+#if LLVM_VERSION_MAJOR >= 15
+              || CI.Type == InlineAsm::isLabel
+#endif
+          )
+            continue;
+          if (!CI.hasArg()) continue;
+          if (ai2 >= ACB->arg_size()) return false;
+          const unsigned idx = ai2++;
+          if (CI.Type != InlineAsm::isInput || CI.isIndirect) continue;
+          const Value *A2 = ACB->getArgOperand(idx);
+          if (isa<PtrToIntOperator>(A2)) return false;
+          if (A2->getType()->isPointerTy()) return false;
+          if (curDL && isPtrWidthInt(A2->getType(), *curDL)) {
+            bool declined = false;
+            if (mayCarryPtrProvenance(A2, 8, declined) || declined)
+              return false;
+          }
+        }
+        return true;
+      };
+      // Flags-local pattern: an int loaded from a LOCAL alloca whose
+      // only writers are clean-int stores or zero-provenance asm slots
+      // (local_irq_save/restore) carries nothing. Cache per alloca;
+      // in-progress = dirty (cycle-safe).
+      boost::unordered_flat_map<const AllocaInst *, int> allocaCleanCache;
+      std::function<bool(const Value *, unsigned)> mayCarryLocal;
+      std::function<bool(const AllocaInst *)> allocaIntClean =
+          [&](const AllocaInst *AI) -> bool {
+        auto [it2, fresh] = allocaCleanCache.try_emplace(AI, -1);
+        if (!fresh) return it2->second == 1;
+        bool clean = true;
+        SmallVector<const User *, 16> wl(AI->users().begin(),
+                                         AI->users().end());
+        SmallPtrSet<const User *, 32> seen;
+        while (!wl.empty() && clean) {
+          const User *U = wl.pop_back_val();
+          if (!seen.insert(U).second) continue;
+          if (isa<LoadInst>(U)) continue;
+          if (const auto *SI2 = dyn_cast<StoreInst>(U)) {
+            const Value *SV = SI2->getValueOperand();
+            if (SV == AI || getUnderlyingObject(SV) == AI ||
+                SV->getType()->isPointerTy() || mayCarryLocal(SV, 6))
+              clean = false;
+            continue;
+          }
+          if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
+              isa<PHINode>(U) || isa<SelectInst>(U)) {
+            for (const User *UU : U->users()) wl.push_back(UU);
+            continue;
+          }
+          if (const auto *UC = dyn_cast<CallBase>(U)) {
+            if (const auto *II2 = dyn_cast<IntrinsicInst>(UC)) {
+              switch (II2->getIntrinsicID()) {
+              case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+              case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+                continue;
+              default: break;
+              }
+            }
+            if (UC->isInlineAsm() && UC->getCalledOperand() != AI &&
+                asmInputsProvenanceFree(UC))
+              continue; // slot read/write of a zero-provenance asm
+            clean = false;
+            continue;
+          }
+          clean = false;
+        }
+        allocaCleanCache[AI] = clean ? 1 : 0;
+        return clean;
+      };
+      mayCarryLocal =
+          [&](const Value *V, unsigned depth) -> bool {
+        if (depth == 0) return true;
+        if (isa<PtrToIntInst>(V)) return true;
+        if (const auto *C = dyn_cast<Constant>(V)) {
+          if (isa<ConstantInt>(C) || isa<ConstantData>(C)) return false;
+          return constantHasPtrToInt(C, 6);
+        }
+        if (const auto *LI2 = dyn_cast<LoadInst>(V)) {
+          const auto *AI = dyn_cast<AllocaInst>(
+              getUnderlyingObject(LI2->getPointerOperand()));
+          return !(AI && allocaIntClean(AI));
+        }
+        if (isa<Argument>(V)) return true;
+        if (const auto *RC = dyn_cast<CallBase>(V)) {
+          if (RC->isInlineAsm()) return true;
+          const Function *CF2 = dyn_cast<Function>(
+              RC->getCalledOperand()->stripPointerCastsAndAliases());
+          return !(CF2 && calleeSafe(CF2));
+        }
+        if (const auto *I = dyn_cast<Instruction>(V)) {
+          if (isa<BinaryOperator>(I) || isa<CastInst>(I) ||
+              isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I)) {
+            for (const Use &U : I->operands())
+              if ((U->getType()->isIntegerTy() ||
+                   U->getType()->isPointerTy()) &&
+                  mayCarryLocal(U.get(), depth - 1))
+                return true;
+            return false;
+          }
+        }
+        return false;
+      };
+      // Rules A/B: a callsite transfers nothing OF THE CALLER's args
+      // if every operand is caller-arg-independent — no matter what
+      // the callee does internally (its body and its other callsites
+      // are analyzed regardless). Unlocks printk/WARN/debug helpers
+      // as callees without summarizing them.
+      //   narrowConstants: the NOOP applier SKIPS the proposer's body
+      //   (g_noopBodies), so this callsite's edges vanish on adoption
+      //   — ptr constants must then be provenance-free content (string
+      //   literals, non-ptr scalar arrays). Atom-summarized bodies
+      //   stay walked, so any Constant keeps its edges: broad is fine.
+      auto ptrConstProvenanceFree = [&](const Value *V) -> bool {
+        const auto *GV =
+            dyn_cast<GlobalVariable>(V->stripPointerCastsAndAliases());
+        if (!GV || !GV->isConstant() || !GV->hasInitializer()) return false;
+        const Constant *Init = GV->getInitializer();
+        if (isa<ConstantAggregateZero>(Init)) return true;
+        const auto *CDS = dyn_cast<ConstantDataSequential>(Init);
+        return CDS && !CDS->getElementType()->isPointerTy() &&
+               !(curDL && isPtrWidthInt(CDS->getElementType(), *curDL));
+      };
+      auto callsiteArgIrrelevant = [&](const CallBase *CB,
+                                       bool narrowConstants) -> bool {
+        for (const Value *Arg : CB->args()) {
+          if (const auto *C = dyn_cast<Constant>(Arg)) {
+            if (!narrowConstants || !C->getType()->isPointerTy() ||
+                isa<ConstantPointerNull>(C) || ptrConstProvenanceFree(C))
+              continue;
+            return false;
+          }
+          Type *T = Arg->getType();
+          if (T->isPointerTy()) return false;
+          if (curDL && isPtrWidthInt(T, *curDL) && mayCarryLocal(Arg, 8))
+            return false;
+        }
+        return true;
+      };
       // Asm is transfer-free iff our own handleInlineAsm model would
       // emit no edges for it: no non-immediate pointer inputs, no
       // %gs/%fs segment access (immediates become accessed there), no
@@ -17940,6 +18118,12 @@ bool CallGraphPass::doModulePass(Module *M) {
               if (ET && !containsPointerType(ET) &&
                   !(curDL && isPtrWidthInt(ET->getScalarType(), *curDL)))
                 continue;
+              // Width-int slot (=*rm i64): the main model's store
+              // edges are input-driven; with no provenance-capable
+              // inputs it emits nothing (__raw_save_flags).
+              if (ET && !containsPointerType(ET) &&
+                  asmInputsProvenanceFree(CB))
+                continue;
               return false;
             }
             // Register/address ptr input: reads through it produce a
@@ -17947,8 +18131,7 @@ bool CallGraphPass::doModulePass(Module *M) {
             // if the asm may WRITE through it.
             if (mayWrite) return false;
           } else if (curDL && isPtrWidthInt(Arg->getType(), *curDL)) {
-            bool declined = false;
-            if (mayCarryPtrProvenance(Arg, 8, declined) || declined)
+            if (mayCarryLocal(Arg, 8))
               return false;
           }
         }
@@ -17991,6 +18174,11 @@ bool CallGraphPass::doModulePass(Module *M) {
                   CB->getCalledOperand()->stripPointerCastsAndAliases());
               if (!CF) { why = "icall"; return false; }
               if (!calleeSafe(CF)) {
+                // Rule A/B: unsafe callee, but the site passes nothing
+                // of the caller — narrow constants: this body is
+                // SKIPPED once the NOOP entry is adopted.
+                if (callsiteArgIrrelevant(CB, /*narrowConstants=*/true))
+                  continue;
                 why = ("callee " + CF->getName()).str(); return false;
               }
               continue;
@@ -18036,13 +18224,16 @@ bool CallGraphPass::doModulePass(Module *M) {
                     localOk = false;
                   }
                 }
-                if (!localOk) { why = "ptr-store"; return false; }
+                if (!localOk) {
+                  std::string t; raw_string_ostream os(t); os << I;
+                  why = "ptr-store " + os.str(); return false;
+                }
                 continue;
               }
               if (curDL && isPtrWidthInt(V->getType(), *curDL)) {
-                bool declined = false;
-                if (mayCarryPtrProvenance(V, 8, declined) || declined) {
-                  why = "int-launder-store"; return false;
+                if (mayCarryLocal(V, 8)) {
+                  std::string t; raw_string_ostream os(t); os << I;
+                  why = "int-launder-store " + os.str(); return false;
                 }
               }
               continue;
@@ -18056,8 +18247,7 @@ bool CallGraphPass::doModulePass(Module *M) {
               if (RV) {
                 if (RV->getType()->isPointerTy()) { why = "ret-ptr"; return false; }
                 if (curDL && isPtrWidthInt(RV->getType(), *curDL)) {
-                  bool declined = false;
-                  if (mayCarryPtrProvenance(RV, 8, declined) || declined) {
+                  if (mayCarryLocal(RV, 8)) {
                     why = "ret-launder"; return false;
                   }
                 }
@@ -18124,7 +18314,7 @@ bool CallGraphPass::doModulePass(Module *M) {
             switch (A.kind) {
             case GlobalContext::SummaryAtom::Store:
               if (A.gsrc || A.dst < 0 || A.src < 0) return false;
-              out.push_back({0, A.dst, A.src, A.dstByteOff, 0});
+              out.push_back({0, A.dst, A.src, A.dstByteOff, A.srcByteOff});
               break;
             case GlobalContext::SummaryAtom::Move:
               out.push_back({1, A.dst, A.src, A.dstByteOff, A.srcByteOff});
@@ -18135,7 +18325,7 @@ bool CallGraphPass::doModulePass(Module *M) {
               break;
             case GlobalContext::SummaryAtom::Alias:
               if (A.dst != -1 || A.src < 0) return false;
-              out.push_back({3, 0, A.src, 0, 0});
+              out.push_back({3, 0, A.src, 0, A.srcByteOff});
               break;
             case GlobalContext::SummaryAtom::Cpy:
               if (A.dst < 0 || A.src < 0) return false; // ret-CPY: skip
@@ -18237,12 +18427,16 @@ bool CallGraphPass::doModulePass(Module *M) {
                   okr = true;
                   bool anyRet = false;
                   for (const auto &A : cas) {
-                    if (A.kind == 3) { // ALIAS(ret<-argN)
+                    if (A.kind == 3) { // ALIAS(ret<-argN[@off])
                       anyRet = true;
                       SmallVector<Src, 4> b;
                       if ((unsigned)A.a2 >= RC->arg_size() ||
                           !rez(RC->getArgOperand(A.a2), b)) { okr = false; break; }
-                      r.append(b.begin(), b.end());
+                      for (auto sv : b) {
+                        if (sv.kind == 0) sv.off += A.o2;
+                        else if (sv.kind == 1 && A.o2) { okr = false; break; }
+                        r.push_back(sv);
+                      }
                     } else if (A.kind == 2) { // LD(ret<-*argC@off)
                       anyRet = true;
                       SmallVector<Src, 4> b;
@@ -18275,12 +18469,13 @@ bool CallGraphPass::doModulePass(Module *M) {
               if (t.kind != 0 || t.off < 0) { ewhy = "store-target"; return false; }
               for (auto &v : Vs) {
                 if (v.kind == 2) continue;
-                if (v.kind == 0 && v.off == 0) {
+                if (v.kind == 0 && v.off >= 0) {
                   std::string a = "ST(*arg" + std::to_string(t.arg) +
                       (t.off ? "@" + std::to_string(t.off) : "") +
-                      "<-arg" + std::to_string(v.arg) + ")";
+                      "<-arg" + std::to_string(v.arg) +
+                      (v.off ? "@" + std::to_string(v.off) : "") + ")";
                   if (atomStrs.insert(a).second)
-                    atoms.push_back({0, t.arg, v.arg, t.off, 0});
+                    atoms.push_back({0, t.arg, v.arg, t.off, v.off});
                 } else if (v.kind == 1 && v.off >= 0) {
                   std::string a = "MV(*arg" + std::to_string(t.arg) +
                       (t.off ? "@" + std::to_string(t.off) : "") +
@@ -18325,6 +18520,12 @@ bool CallGraphPass::doModulePass(Module *M) {
                     CB->getCalledOperand()->stripPointerCastsAndAliases());
                 if (!CF) { why = "icall"; return false; }
                 if (calleeSafe(CF)) continue; // NOOP: consumes, no effects
+                // Rules A/B (broad): atom-summarized bodies stay
+                // walked, so a site passing only constants and clean
+                // scalars keeps all its edges — irrelevant to F's
+                // transfer function regardless of the callee.
+                if (callsiteArgIrrelevant(CB, /*narrowConstants=*/false))
+                  continue;
                 SmallVector<PAtom, 6> cas;
                 int st = calleeAtoms(CF, cas);
                 if (st != 1) {
@@ -18343,16 +18544,21 @@ bool CallGraphPass::doModulePass(Module *M) {
                       !rez(CB->getArgOperand(A.a2), Xs)) {
                     why = "compose"; return false;
                   }
-                  if (A.kind == 0) { // callee ST: value = callee arg a2
-                    SmallVector<Src, 4> Ts2;
+                  if (A.kind == 0) { // callee ST: value = callee arg a2[@o2]
+                    SmallVector<Src, 4> Ts2, Xs2;
                     for (auto t : Cs) {
                       if (t.kind == 2) continue;
                       if (t.kind != 0) { why = "compose"; return false; }
                       t.off += A.o1;
                       Ts2.push_back(t);
                     }
+                    for (auto v : Xs) {
+                      if (v.kind == 0) v.off += A.o2;
+                      else if (v.kind == 1 && A.o2) { why = "compose"; return false; }
+                      Xs2.push_back(v);
+                    }
                     std::string ewhy;
-                    if (!emitStore(Ts2, Xs, ewhy)) { why = ewhy; return false; }
+                    if (!emitStore(Ts2, Xs2, ewhy)) { why = ewhy; return false; }
                   } else if (A.kind == 1) { // callee MV
                     for (auto t : Cs) {
                       if (t.kind == 2) continue;
@@ -18391,11 +18597,10 @@ bool CallGraphPass::doModulePass(Module *M) {
                   return false;
                 }
                 if (!Val->getType()->isPointerTy()) {
-                  if (isPtrWidthInt(Val->getType(), *curDL)) {
-                    bool declined = false;
-                    if (mayCarryPtrProvenance(Val, 8, declined) || declined) {
-                      why = "int-launder-store"; return false;
-                    }
+                  if (isPtrWidthInt(Val->getType(), *curDL) &&
+                      mayCarryLocal(Val, 8)) {
+                    retryable = true; // callee may become safe later
+                    why = "int-launder-store"; return false;
                   }
                   continue;
                 }
@@ -18417,11 +18622,10 @@ bool CallGraphPass::doModulePass(Module *M) {
                 const Value *RV = RI->getReturnValue();
                 if (!RV) continue;
                 if (!RV->getType()->isPointerTy()) {
-                  if (isPtrWidthInt(RV->getType(), *curDL)) {
-                    bool declined = false;
-                    if (mayCarryPtrProvenance(RV, 8, declined) || declined) {
-                      why = "ret-launder"; return false;
-                    }
+                  if (isPtrWidthInt(RV->getType(), *curDL) &&
+                      mayCarryLocal(RV, 8)) {
+                    retryable = true; // callee may become safe later
+                    why = "ret-launder"; return false;
                   }
                   continue;
                 }
@@ -18433,10 +18637,11 @@ bool CallGraphPass::doModulePass(Module *M) {
                 }
                 for (auto &v : Rs) {
                   if (v.kind == 2) continue;
-                  if (v.kind == 0 && v.off == 0) {
-                    std::string a = "ALIAS(ret<-arg" + std::to_string(v.arg) + ")";
+                  if (v.kind == 0 && v.off >= 0) {
+                    std::string a = "ALIAS(ret<-arg" + std::to_string(v.arg) +
+                        (v.off ? "@" + std::to_string(v.off) : "") + ")";
                     if (atomStrs.insert(a).second)
-                      atoms.push_back({3, 0, v.arg, 0, 0});
+                      atoms.push_back({3, 0, v.arg, 0, v.off});
                   } else if (v.kind == 1 && v.off >= 0) {
                     std::string a = "LD(ret<-*arg" + std::to_string(v.arg) +
                         (v.off ? "@" + std::to_string(v.off) : "") + ")";
@@ -18476,9 +18681,15 @@ bool CallGraphPass::doModulePass(Module *M) {
                 achanged = true;
               } else if (!retryable) {
                 permRefused.insert(canon);
-                if (around == 1) aRefuse[why]++;
+                if (around == 1) {
+                  aRefuse[why]++;
+                  CG_LOG("AtomProp: REFUSED " << F.getName() << " ["
+                         << why << "]\n");
+                }
               } else if (around == 1) {
                 aRefuse["compose-pending"]++;
+                CG_LOG("AtomProp: PENDING " << F.getName() << " ["
+                       << why << "]\n");
               }
             }
           }

@@ -136,6 +136,7 @@ private:
                           unsigned callSiteFieldIdx) const;
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   NodeIndex summaryDerefCell(NodeIndex base, int byteOff);
+  NodeIndex summaryFieldPtr(NodeIndex base, int byteOff);
   bool applySummaryAtoms(const llvm::CallBase *CS,
                          const GlobalContext::FuncSummary &S,
                          bool *retBound = nullptr);

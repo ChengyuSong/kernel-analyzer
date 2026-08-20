@@ -1772,13 +1772,43 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   // Source values must not glue unrelated classes: two slots holding the
   // same function/global would chain-merge through it (common-sink smear),
   // manufacturing false targets. Drop their edges from the sublanguage.
-  auto isBarrierNode = [&](NodeIndex canon) {
+  auto isBarrierNodeV = [&](NodeIndex canon) {
     if (NF.isSpecialNode(canon))
       return true;
     const Value *v = NF.getValueForNode(canon);
-    return v && (isa<Function>(v) || isa<GlobalVariable>(v));
+    if (!v)
+      return false;
+    // MEASUREMENT probe: cut context-insensitive call junctions
+    // (formals) and module-unique constant-expression nodes (one CE
+    // used in N functions = one node wired into all their webs —
+    // the same common-source smear rationale as the fn/global
+    // barriers below) — what glues the born component?
+    if (CFLProbeNoFormalPresolve &&
+        (isa<Argument>(v) || isa<ConstantExpr>(v)))
+      return true;
+    return isa<Function>(v) || isa<GlobalVariable>(v);
+  };
+  auto isBarrierNode = [&](NodeIndex canon) {
+    // Probe extension: DEREF nodes as barriers — memory cells acting
+    // as through-nodes in the memory-FREE sublanguage (asm reg-load
+    // and summary-CPY a-edges land on them; deref(@global) is
+    // module-shared, e.g. deref(pcpu_hot) fans into every `current`
+    // user).
+    if (CFLProbeNoFormalPresolve && NF.isDereferenceNode(canon))
+      return true;
+    return isBarrierNodeV(canon);
   };
 
+  // Probe census: name the junction formals — fan-in per Argument
+  // node in the sublanguage (who glues the born component?).
+  boost::unordered_flat_map<NodeIndex, uint32_t> formalFan;
+  auto tallyFormal = [&](NodeIndex canon) {
+    if (!CFLProbeNoFormalPresolve)
+      return;
+    const Value *v = NF.getValueForNode(canon);
+    if (v && isa<Argument>(v))
+      formalFan[canon]++;
+  };
   std::unordered_map<NodeIndex, uint32_t> toLocal;
   std::vector<NodeIndex> toCanon;
   std::vector<gracfl::Edge> subEdges;
@@ -1798,9 +1828,23 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
     NodeIndex to = getCanonicalNode(E.to);
     if (from == to)
       continue;
-    if (isBarrierNode(from) || isBarrierNode(to))
+    if (isBarrierNode(from) || isBarrierNode(to)) {
+      tallyFormal(from);
+      tallyFormal(to);
       continue;
+    }
     subEdges.emplace_back(localId(from), localId(to), E.label);
+  }
+  if (CFLProbeNoFormalPresolve && !formalFan.empty()) {
+    std::vector<std::pair<uint32_t, NodeIndex>> top;
+    for (auto &kv : formalFan) top.emplace_back(kv.second, kv.first);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    for (size_t i = 0; i < std::min<size_t>(25, top.size()); i++) {
+      const auto *A = cast<Argument>(NF.getValueForNode(top[i].second));
+      CG_LOG("JunctionFormals: x" << top[i].first << " "
+             << A->getParent()->getName() << "::arg" << A->getArgNo()
+             << "\n");
+    }
   }
   if (subEdges.empty())
     return;
@@ -17789,6 +17833,226 @@ bool CallGraphPass::doModulePass(Module *M) {
       for (const auto& [nodeId, degree] : topNodes) {
         NF.dumpNode(nodeId);
       }
+    }
+
+    // NOOP-summary census (2026-08-19): prove zero pointer-relevant
+    // transfer per function, fixpoint over callees. Only summaries
+    // marked noop count as safe callees (atom summaries have effects
+    // a NOOP claim would hide). Conservative refusal everywhere.
+    if (CFLProposeNoopSummaries) {
+      boost::unordered_flat_set<const Function *> ok;
+      boost::unordered_flat_map<std::string, uint64_t> refuseHist;
+      auto calleeSafe = [&](const Function *CF) {
+        if (!CF) return false;
+        CF = getFuncDef(const_cast<Function *>(CF));
+        auto sit = Ctx->FuncSummaries.find(CF);
+        if (sit != Ctx->FuncSummaries.end() && sit->second->noop)
+          return true;
+        return ok.count(CF) != 0;
+      };
+      // Asm is transfer-free iff our own handleInlineAsm model would
+      // emit no edges for it: no non-immediate pointer inputs, no
+      // %gs/%fs segment access (immediates become accessed there), no
+      // indirect pointer-capable outputs, no pointer-capable result.
+      // Covers jump-label asm goto, WARN/ud2, barriers, rdtsc.
+      auto asmTransferFree = [&](const CallBase *CB) {
+        // Results need no check: a produced value only matters if it
+        // ESCAPES, and the store/return/unsafe-callee rules catch
+        // every escape. Only inputs the asm could write through (or
+        // launder out-of-band) refuse.
+        const auto *IA = cast<InlineAsm>(CB->getCalledOperand());
+        auto Cs = InlineAsm::ParseConstraints(IA->getConstraintString());
+        // May the asm WRITE memory? (mirrors handleInlineAsm 2b)
+        bool memClobber = false, anyIndirectOut = false;
+        for (auto &CI : Cs) {
+          if (CI.Type == InlineAsm::isClobber) {
+            for (const std::string &Code : CI.Codes)
+              if (StringRef(Code).contains("memory")) memClobber = true;
+          } else if (CI.Type == InlineAsm::isOutput && CI.isIndirect) {
+            anyIndirectOut = true;
+          }
+        }
+        const bool mayWrite = memClobber || anyIndirectOut;
+        unsigned argIdx = 0;
+        for (auto &CI : Cs) {
+          if (CI.Type == InlineAsm::isClobber
+#if LLVM_VERSION_MAJOR >= 15
+              || CI.Type == InlineAsm::isLabel
+#endif
+          )
+            continue;
+          if (!CI.hasArg()) continue;
+          if (argIdx >= CB->arg_size()) return false;
+          const unsigned aIdx = argIdx++;
+          const Value *Arg = CB->getArgOperand(aIdx);
+          if (Arg->getType()->isPointerTy()) {
+            if (CI.isIndirect) {
+              // Memory operand. INPUT slots only produce values —
+              // escapes are governed downstream; allow. OUTPUT slots
+              // (asm writes) are transfer-free iff the slot cannot
+              // hold pointer content (handleInlineAsm's ptr/width
+              // slot gate) — covers percpu counter inc/add.
+              if (CI.Type == InlineAsm::isInput)
+                continue;
+              Type *ET = CB->getParamElementType(aIdx);
+              if (ET && !containsPointerType(ET) &&
+                  !(curDL && isPtrWidthInt(ET->getScalarType(), *curDL)))
+                continue;
+              return false;
+            }
+            // Register/address ptr input: reads through it produce a
+            // VALUE (escape-checked downstream); refusal needed only
+            // if the asm may WRITE through it.
+            if (mayWrite) return false;
+          } else if (curDL && isPtrWidthInt(Arg->getType(), *curDL)) {
+            bool declined = false;
+            if (mayCarryPtrProvenance(Arg, 8, declined) || declined)
+              return false;
+          }
+        }
+        return true;
+      };
+      auto eligible = [&](const Function &F, std::string &why) {
+        for (const auto &BB : F) {
+          for (const auto &I : BB) {
+            if (const auto *CB = dyn_cast<CallBase>(&I)) {
+              if (CB->isInlineAsm()) {
+                if (asmTransferFree(CB)) continue;
+                { std::string t; raw_string_ostream os(t); os << I;
+                  why = "asm " + os.str(); } return false;
+              }
+              if (const auto *II = dyn_cast<IntrinsicInst>(CB)) {
+                switch (II->getIntrinsicID()) {
+                case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+                case Intrinsic::dbg_label:
+                case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+                case Intrinsic::assume: case Intrinsic::expect:
+                case Intrinsic::prefetch: case Intrinsic::donothing:
+                case Intrinsic::trap: case Intrinsic::ubsantrap:
+                case Intrinsic::vastart: case Intrinsic::vaend:
+                case Intrinsic::memset:
+                case Intrinsic::vacopy:
+                case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                  continue;
+                default: {
+                  // pure intrinsics: no pointer-capable args, non-ptr
+                  // result — math/bit ops (ctpop, bswap, fshl, umax...)
+                  bool pure = !II->getType()->isPointerTy();
+                  for (const Value *Arg : II->args())
+                    pure &= !Arg->getType()->isPointerTy();
+                  if (pure) continue;
+                  why = "intrinsic"; return false;
+                }
+                }
+              }
+              const Function *CF = dyn_cast<Function>(
+                  CB->getCalledOperand()->stripPointerCastsAndAliases());
+              if (!CF) { why = "icall"; return false; }
+              if (!calleeSafe(CF)) {
+                why = ("callee " + CF->getName()).str(); return false;
+              }
+              continue;
+            }
+            if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+              const Value *V = SI->getValueOperand();
+              if (V->getType()->isPointerTy()) {
+                // Variadic idiom: spilling ptr args into a LOCAL
+                // alloca (va area) that never escapes the safe set.
+                const Value *base = getUnderlyingObject(
+                    SI->getPointerOperand());
+                bool localOk = false;
+                if (const auto *AI = dyn_cast<AllocaInst>(base)) {
+                  localOk = true;
+                  SmallVector<const User *, 16> wl(AI->users().begin(),
+                                                   AI->users().end());
+                  SmallPtrSet<const User *, 32> seen;
+                  while (!wl.empty() && localOk) {
+                    const User *U = wl.pop_back_val();
+                    if (!seen.insert(U).second) continue;
+                    if (isa<LoadInst>(U) || isa<StoreInst>(U)) continue;
+                    if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
+                        isa<PHINode>(U) || isa<SelectInst>(U)) {
+                      for (const User *UU : U->users()) wl.push_back(UU);
+                      continue;
+                    }
+                    if (const auto *UC = dyn_cast<CallBase>(U)) {
+                      if (const auto *II2 = dyn_cast<IntrinsicInst>(UC)) {
+                        switch (II2->getIntrinsicID()) {
+                        case Intrinsic::vastart: case Intrinsic::vaend:
+                        case Intrinsic::vacopy:
+                        case Intrinsic::lifetime_start:
+                        case Intrinsic::lifetime_end:
+                        case Intrinsic::memset:
+                          continue;
+                        default: break;
+                        }
+                      }
+                      const Function *UF = dyn_cast<Function>(
+                          UC->getCalledOperand()->stripPointerCastsAndAliases());
+                      if (UF && calleeSafe(UF)) continue;
+                    }
+                    localOk = false;
+                  }
+                }
+                if (!localOk) { why = "ptr-store"; return false; }
+                continue;
+              }
+              if (curDL && isPtrWidthInt(V->getType(), *curDL)) {
+                bool declined = false;
+                if (mayCarryPtrProvenance(V, 8, declined) || declined) {
+                  why = "int-launder-store"; return false;
+                }
+              }
+              continue;
+            }
+            if (isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I)) {
+              why = "atomic"; return false;
+            }
+            if (isa<IndirectBrInst>(&I)) { why = "indirectbr"; return false; }
+            if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
+              const Value *RV = RI->getReturnValue();
+              if (RV) {
+                if (RV->getType()->isPointerTy()) { why = "ret-ptr"; return false; }
+                if (curDL && isPtrWidthInt(RV->getType(), *curDL)) {
+                  bool declined = false;
+                  if (mayCarryPtrProvenance(RV, 8, declined) || declined) {
+                    why = "ret-launder"; return false;
+                  }
+                }
+              }
+            }
+          }
+        }
+        return true;
+      };
+      bool changed = true;
+      size_t rounds = 0;
+      while (changed && rounds++ < 20) {
+        changed = false;
+        for (auto &[mod, mname] : Ctx->Modules) {
+          for (const Function &F : *mod) {
+            if (F.isDeclaration() || ok.count(&F)) continue;
+            const Function *canon = getFuncDef(const_cast<Function *>(&F));
+            if (canon != &F || ok.count(canon)) continue;
+            auto sit = Ctx->FuncSummaries.find(canon);
+            if (sit != Ctx->FuncSummaries.end()) continue; // already covered
+            std::string why;
+            if (eligible(F, why)) { ok.insert(canon); changed = true; }
+            else if (rounds == 1) {
+              refuseHist[why.substr(0, why.find(' '))]++;
+              CG_LOG("NoopProp: REFUSED " << F.getName() << " [" << why
+                     << "]\n");
+            }
+          }
+        }
+      }
+      for (const Function *F : ok)
+        CG_LOG("NoopProp: OK " << F->getName() << "\n");
+      std::string hist;
+      for (auto &kv : refuseHist)
+        hist += kv.first + "=" + std::to_string(kv.second) + " ";
+      CG_LOG("NoopProp: " << ok.size() << " proposed (" << rounds
+             << " rounds); first-round refusals: " << hist << "\n");
     }
 
     // Pre-solve copy/field merge before the monolithic dense mapping.

@@ -711,6 +711,27 @@ cl::opt<unsigned long long> CFLBundleEpochFacts(
            "re-offer traffic is"),
   cl::init(1ull << 27));
 
+cl::opt<bool> CFLProbeNoFormalPresolve(
+  "cfl-probe-noformal-presolve",
+  cl::desc("MEASUREMENT ONLY: barrier formal-argument nodes in the "
+           "pre-solve copy/field sublanguage, so the born a-component "
+           "cannot glue through context-insensitive call junctions. "
+           "Tests the hypothesis that formal confluence causes the "
+           "born giant (2026-08-19). Changes the presolve quotient — "
+           "answers are NOT pin-comparable; read the Pre-solve merge / "
+           "BlobForm INITIAL lines only"),
+  cl::init(false));
+
+cl::opt<bool> CFLProposeNoopSummaries(
+  "cfl-propose-noop-summaries",
+  cl::desc("Census: propose NOOP summaries by per-function proof of "
+           "zero pointer-relevant transfer (conservative refusal: any "
+           "icall/asm/non-noop callee/pointer or laundering store/"
+           "pointer return refuses the candidate; fixpoint over "
+           "callees). Prints NoopProp lines; adoption stays manual via "
+           "func_summaries.txt + the pin/GT gates"),
+  cl::init(false));
+
 cl::opt<bool> CFLBundleProbe(
   "cfl-bundle-probe",
   cl::desc("Post-solve probe for stage-2 root bundling (task #47): "

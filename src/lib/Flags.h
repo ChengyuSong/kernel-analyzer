@@ -78,6 +78,8 @@ extern cl::opt<bool> CFLRegFieldAudit;
 extern cl::opt<bool> CFLIterCapOk;
 extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<bool> CFLBundleProbe;
+extern cl::opt<bool> CFLProposeNoopSummaries;
+extern cl::opt<bool> CFLProbeNoFormalPresolve;
 extern cl::opt<unsigned> CFLBatchRoots;
 extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<std::string> CFLBatchSpill;

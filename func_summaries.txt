@@ -508,3 +508,21 @@ strncpy NOOP
 # externs = kernel/bpf/verifier.o missing from bclist, 0 fn-ptr args;
 # memcpy family enters IR as llvm.memcpy intrinsics, modeled).
 __cxa_throw INVOKE(arg2:f0<-arg0)
+
+# --- printf/str leaf block (2026-08-19, junction-dissolution campaign) ---
+# Hand-audited chain bottoms for the NoopProp prover (they refuse
+# mechanically for reasons a human clears by contract):
+# - printf family: writes CHARS through the caller buffer; %p renders
+#   pointers as TEXT — no pointer value is stored retrievably. Bodies
+#   contain no indirect calls (format handlers are direct dispatch).
+# - strcspn: ret-launder refusal = pointer-subtraction count; a length
+#   is not an address by contract.
+# - dump_stack: diagnostics-only (unwinder prints; transfers nothing).
+vsnprintf NOOP
+vsprintf NOOP
+snprintf NOOP
+sprintf NOOP
+scnprintf NOOP
+vscnprintf NOOP
+strcspn NOOP
+dump_stack NOOP

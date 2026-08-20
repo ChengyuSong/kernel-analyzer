@@ -18057,6 +18057,13 @@ bool CallGraphPass::doModulePass(Module *M) {
       auto callsiteArgIrrelevant = [&](const CallBase *CB,
                                        bool narrowConstants) -> bool {
         for (const Value *Arg : CB->args()) {
+          if (const auto *II3 =
+                  dyn_cast<IntrinsicInst>(Arg->stripPointerCasts())) {
+            auto iid = II3->getIntrinsicID();
+            if (iid == Intrinsic::returnaddress ||
+                iid == Intrinsic::frameaddress)
+              continue; // factless in the main model: nothing to lose
+          }
           if (const auto *C = dyn_cast<Constant>(Arg)) {
             if (!narrowConstants || !C->getType()->isPointerTy() ||
                 isa<ConstantPointerNull>(C) || ptrConstProvenanceFree(C))
@@ -18158,6 +18165,11 @@ bool CallGraphPass::doModulePass(Module *M) {
                 case Intrinsic::memset:
                 case Intrinsic::vacopy:
                 case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                // returnaddress/frameaddress: handleCall emits nothing
+                // for intrinsics and no other path models these — the
+                // result node is factless, so every edge from it in a
+                // walked body is vacuous. Skip-exact.
+                case Intrinsic::returnaddress: case Intrinsic::frameaddress:
                   continue;
                 default: {
                   // pure intrinsics: no pointer-capable args, non-ptr
@@ -18185,6 +18197,13 @@ bool CallGraphPass::doModulePass(Module *M) {
             }
             if (const auto *SI = dyn_cast<StoreInst>(&I)) {
               const Value *V = SI->getValueOperand();
+              if (const auto *II3 =
+                      dyn_cast<IntrinsicInst>(V->stripPointerCasts())) {
+                auto iid = II3->getIntrinsicID();
+                if (iid == Intrinsic::returnaddress ||
+                    iid == Intrinsic::frameaddress)
+                  continue; // storing a factless value: vacuous edge
+              }
               if (V->getType()->isPointerTy()) {
                 // Variadic idiom: spilling ptr args into a LOCAL
                 // alloca (va area) that never escapes the safe set.
@@ -18232,8 +18251,35 @@ bool CallGraphPass::doModulePass(Module *M) {
               }
               if (curDL && isPtrWidthInt(V->getType(), *curDL)) {
                 if (mayCarryLocal(V, 8)) {
-                  std::string t; raw_string_ostream os(t); os << I;
-                  why = "int-launder-store " + os.str(); return false;
+                  // Self-slot update (s->count++, s->len += n): dirty
+                  // contributors that are loads from the SAME pointer
+                  // the store writes back through are cell self-loops
+                  // in the walked body — vacuous, skip-exact.
+                  std::function<bool(const Value *, unsigned)> selfOk =
+                      [&](const Value *V2, unsigned depth) -> bool {
+                    if (!mayCarryLocal(V2, 8)) return true;
+                    if (depth == 0) return false;
+                    if (const auto *L2 = dyn_cast<LoadInst>(V2))
+                      return L2->getPointerOperand() ==
+                             SI->getPointerOperand();
+                    if (const auto *I2 = dyn_cast<Instruction>(V2)) {
+                      if (isa<BinaryOperator>(I2) || isa<CastInst>(I2) ||
+                          isa<PHINode>(I2) || isa<SelectInst>(I2) ||
+                          isa<FreezeInst>(I2)) {
+                        for (const Use &U : I2->operands())
+                          if ((U->getType()->isIntegerTy() ||
+                               U->getType()->isPointerTy()) &&
+                              !selfOk(U.get(), depth - 1))
+                            return false;
+                        return true;
+                      }
+                    }
+                    return false;
+                  };
+                  if (!selfOk(V, 8)) {
+                    std::string t; raw_string_ostream os(t); os << I;
+                    why = "int-launder-store " + os.str(); return false;
+                  }
                 }
               }
               continue;
@@ -18416,6 +18462,18 @@ bool CallGraphPass::doModulePass(Module *M) {
                 }
               }
             } else if (const auto *RC = dyn_cast<CallBase>(V)) {
+              if (const auto *II3 = dyn_cast<IntrinsicInst>(RC)) {
+                auto iid = II3->getIntrinsicID();
+                if (iid == Intrinsic::returnaddress ||
+                    iid == Intrinsic::frameaddress) {
+                  // factless in the main model — contributes nothing
+                  r.push_back({2, 0, 0});
+                  inProg.erase(V);
+                  memo[V] = r;
+                  out.append(r.begin(), r.end());
+                  return true;
+                }
+              }
               // Composition: callee ret atoms define the result.
               const Function *CF = dyn_cast<Function>(
                   RC->getCalledOperand()->stripPointerCastsAndAliases());
@@ -18460,6 +18518,35 @@ bool CallGraphPass::doModulePass(Module *M) {
             out.append(r.begin(), r.end());
             return true;
           };
+          // Int-domain slot sources: a ptr-width int that fails the
+          // launder check may still be a MODELABLE slot copy — walk
+          // through int arithmetic; every dirty leaf must resolve via
+          // rez (loads from arg cells -> LOADARG => MV atoms; laundered
+          // args/call rets via their own atoms). Clean contributors
+          // vanish. Anything else refuses.
+          std::function<bool(const Value *, unsigned,
+                             SmallVectorImpl<Src> &)>
+              collectIntSrcs = [&](const Value *V, unsigned depth,
+                                   SmallVectorImpl<Src> &out) -> bool {
+            if (!mayCarryLocal(V, 8)) return true; // clean: no facts
+            if (depth == 0) return false;
+            if (V->getType()->isPointerTy() || isa<LoadInst>(V) ||
+                isa<CallBase>(V))
+              return rez(V, out);
+            if (const auto *I2 = dyn_cast<Instruction>(V)) {
+              if (isa<BinaryOperator>(I2) || isa<CastInst>(I2) ||
+                  isa<PHINode>(I2) || isa<SelectInst>(I2) ||
+                  isa<FreezeInst>(I2)) {
+                for (const Use &U : I2->operands())
+                  if ((U->getType()->isIntegerTy() ||
+                       U->getType()->isPointerTy()) &&
+                      !collectIntSrcs(U.get(), depth - 1, out))
+                    return false;
+                return true;
+              }
+            }
+            return false;
+          };
           std::set<std::string> atomStrs;
           SmallVector<PAtom, 6> atoms;
           auto emitStore = [&](const SmallVectorImpl<Src> &Ts,
@@ -18477,6 +18564,8 @@ bool CallGraphPass::doModulePass(Module *M) {
                   if (atomStrs.insert(a).second)
                     atoms.push_back({0, t.arg, v.arg, t.off, v.off});
                 } else if (v.kind == 1 && v.off >= 0) {
+                  if (v.arg == t.arg && v.off == t.off)
+                    continue; // self-move: cell self-loop, vacuous
                   std::string a = "MV(*arg" + std::to_string(t.arg) +
                       (t.off ? "@" + std::to_string(t.off) : "") +
                       "<-*arg" + std::to_string(v.arg) +
@@ -18506,6 +18595,7 @@ bool CallGraphPass::doModulePass(Module *M) {
                   case Intrinsic::vastart: case Intrinsic::vaend:
                   case Intrinsic::vacopy: case Intrinsic::memset:
                   case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                  case Intrinsic::returnaddress: case Intrinsic::frameaddress:
                     continue;
                   default: {
                     bool pure = !II->getType()->isPointerTy();
@@ -18599,6 +18689,11 @@ bool CallGraphPass::doModulePass(Module *M) {
                 if (!Val->getType()->isPointerTy()) {
                   if (isPtrWidthInt(Val->getType(), *curDL) &&
                       mayCarryLocal(Val, 8)) {
+                    SmallVector<Src, 4> Is;
+                    std::string ewhy;
+                    if (collectIntSrcs(Val, 8, Is) &&
+                        emitStore(Ts, Is, ewhy))
+                      continue; // modeled as MV/ST slot-copy atoms
                     retryable = true; // callee may become safe later
                     why = "int-launder-store"; return false;
                   }
@@ -18624,6 +18719,27 @@ bool CallGraphPass::doModulePass(Module *M) {
                 if (!RV->getType()->isPointerTy()) {
                   if (isPtrWidthInt(RV->getType(), *curDL) &&
                       mayCarryLocal(RV, 8)) {
+                    SmallVector<Src, 4> Is;
+                    bool okc = collectIntSrcs(RV, 8, Is);
+                    for (auto &v : Is) {
+                      if (!okc) break;
+                      if (v.kind == 2) continue;
+                      if (v.kind == 0 && v.off >= 0) {
+                        std::string a = "ALIAS(ret<-arg" +
+                            std::to_string(v.arg) +
+                            (v.off ? "@" + std::to_string(v.off) : "") + ")";
+                        if (atomStrs.insert(a).second)
+                          atoms.push_back({3, 0, v.arg, 0, v.off});
+                      } else if (v.kind == 1 && v.off >= 0) {
+                        std::string a = "LD(ret<-*arg" +
+                            std::to_string(v.arg) +
+                            (v.off ? "@" + std::to_string(v.off) : "") + ")";
+                        if (atomStrs.insert(a).second)
+                          atoms.push_back({2, 0, v.arg, 0, v.off});
+                      } else
+                        okc = false;
+                    }
+                    if (okc) continue;
                     retryable = true; // callee may become safe later
                     why = "ret-launder"; return false;
                   }

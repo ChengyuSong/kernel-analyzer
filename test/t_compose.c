@@ -28,3 +28,13 @@ void seqb_log(struct seqb *s, const char *msg) {
 }
 /* composes seqb_init AND seqb_log => atoms of init only */
 void seqb_setup(struct seqb *s, const char *m) { seqb_init(s); seqb_log(s, m); }
+/* --- v2.3 int-domain micros --- */
+struct sbuf { char *bp; unsigned long size; unsigned long len; };
+/* self-slot += of NOOP-callee ret => NOOP-provable (rule C2) */
+void sb_add(struct sbuf *s, const char *m) { s->len += mylen(m); }
+/* cross-field int slot copy => MV(*arg0@16<-*arg0@8) */
+void sb_overflow(struct sbuf *s) { s->len = s->size + 1; }
+/* int slot ret => LD(ret<-*arg0@16) */
+unsigned long sb_len(struct sbuf *s) { return s->len + 1; }
+/* composes: calls sb_overflow (atoms) + sb_add (noop) */
+void sb_flush(struct sbuf *s, const char *m) { sb_add(s, m); sb_overflow(s); }

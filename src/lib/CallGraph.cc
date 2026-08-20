@@ -16150,6 +16150,38 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           }
         }
       }
+      // File-entry redundancy census (post-fixpoint: proposed
+      // callees fully resolved; one-at-a-time deletion semantics —
+      // other file entries stay in the safe set). REDUNDANT = the
+      // prover re-derives this NOOP per-run, the hand entry can go
+      // (given propose/adopt stays on); CORE = the audit is
+      // load-bearing (prover refuses). Report-only.
+      {
+        size_t nRed = 0, nCore = 0;
+        for (auto &[mod, mname] : Ctx->Modules) {
+          for (const Function &F : *mod) {
+            if (F.isDeclaration()) continue;
+            const Function *canon = getFuncDef(const_cast<Function *>(&F));
+            if (canon != &F) continue;
+            auto sit = Ctx->FuncSummaries.find(canon);
+            if (sit == Ctx->FuncSummaries.end() || !sit->second->noop)
+              continue;
+            std::string why;
+            if (eligible(F, why)) {
+              CG_LOG("NoopProp: FILE-REDUNDANT " << F.getName() << "\n");
+              nRed++;
+            } else {
+              CG_LOG("NoopProp: FILE-CORE " << F.getName() << " ["
+                     << why.substr(0, why.find(' ')) << "]\n");
+              nCore++;
+            }
+          }
+        }
+        if (nRed + nCore)
+          CG_LOG("NoopProp: file NOOP entries with definitions here: "
+                 << nRed << " redundant (prover re-derives) / " << nCore
+                 << " core (audit load-bearing)\n");
+      }
       for (const Function *F : ok)
         CG_LOG("NoopProp: OK " << F->getName() << "\n");
       std::string hist;

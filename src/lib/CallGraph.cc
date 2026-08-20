@@ -18097,21 +18097,84 @@ bool CallGraphPass::doModulePass(Module *M) {
              << " rounds); first-round refusals: " << hist << "\n");
 
       // ---- v2: transfer-atom generator (ST/LD/MV/ALIAS @byte-off) ----
+      // v2.1: COMPOSITION — a summarized callee's atoms translate
+      // through the call site into caller-frame effects; callee ret
+      // atoms (LD/ALIAS) resolve call results in the caller. Outer
+      // fixpoint alternates with the NOOP set; refusal anywhere
+      // uncertain, retryable only when blocked on an unproposed
+      // callee (chains converge like the NOOP fixpoint).
       if (CFLProposeAtomSummaries && curDL) {
+        struct PAtom { // 0=ST 1=MV 2=LD(ret) 3=ALIAS(ret) 4=CPY
+          int kind; int a1; int a2; int64_t o1; int64_t o2;
+        };
+        boost::unordered_flat_map<const Function *, SmallVector<PAtom, 6>>
+            props;
+        boost::unordered_flat_set<const Function *> permRefused;
         boost::unordered_flat_map<std::string, uint64_t> aRefuse;
-        struct Src { uint8_t kind; int arg; int64_t off; }; // 0=ARGP 1=LOADARG 2=NULL
+        // Existing file entries usable for composition: pure
+        // Cpy/Alias/Store/Load/Move atom sets (no FRESH/INVOKE/CHAIN
+        // — those are callsite-contextual or allocator-owned).
+        auto fileAtoms = [&](const Function *CF,
+                             SmallVectorImpl<PAtom> &out) -> bool {
+          auto sit = Ctx->FuncSummaries.find(CF);
+          if (sit == Ctx->FuncSummaries.end()) return false;
+          const auto &S = *sit->second;
+          if (S.noop || S.none || S.fresh || S.atoms.empty()) return false;
+          for (const auto &A : S.atoms) {
+            switch (A.kind) {
+            case GlobalContext::SummaryAtom::Store:
+              if (A.gsrc || A.dst < 0 || A.src < 0) return false;
+              out.push_back({0, A.dst, A.src, A.dstByteOff, 0});
+              break;
+            case GlobalContext::SummaryAtom::Move:
+              out.push_back({1, A.dst, A.src, A.dstByteOff, A.srcByteOff});
+              break;
+            case GlobalContext::SummaryAtom::Load:
+              if (A.dst != -1) return false;
+              out.push_back({2, 0, A.src, 0, A.srcByteOff});
+              break;
+            case GlobalContext::SummaryAtom::Alias:
+              if (A.dst != -1 || A.src < 0) return false;
+              out.push_back({3, 0, A.src, 0, 0});
+              break;
+            case GlobalContext::SummaryAtom::Cpy:
+              if (A.dst < 0 || A.src < 0) return false; // ret-CPY: skip
+              out.push_back({4, A.dst, A.src, 0, 0});
+              break;
+            default:
+              return false;
+            }
+          }
+          return true;
+        };
+        auto calleeAtoms = [&](const Function *CF,
+                               SmallVectorImpl<PAtom> &out) -> int {
+          // 1 = atoms available, 0 = not (yet), -1 = permanently not
+          CF = getFuncDef(const_cast<Function *>(CF));
+          auto pit = props.find(CF);
+          if (pit != props.end()) {
+            out.append(pit->second.begin(), pit->second.end());
+            return 1;
+          }
+          if (fileAtoms(CF, out)) return 1;
+          if (permRefused.count(CF) || CF->isDeclaration()) return -1;
+          return 0;
+        };
         size_t nOk = 0;
-        auto tryFn = [&](const Function &F) -> bool {
-          if (F.arg_size() > 8) { aRefuse["many-args"]++; return false; }
+        auto tryFn = [&](const Function &F, bool &retryable,
+                         std::string &why) -> bool {
+          retryable = false;
+          if (F.arg_size() > 8) { why = "many-args"; return false; }
           size_t nInst = 0;
           for (const auto &BB : F) nInst += BB.size();
-          if (nInst > 200) { aRefuse["too-big"]++; return false; }
+          if (nInst > 600) { why = "too-big"; return false; }
           boost::unordered_flat_map<const Value *, int> argIdx;
           int ai = 0;
           for (const Argument &A : F.args()) argIdx[&A] = ai++;
-          // memoized resolver
+          struct Src { uint8_t kind; int arg; int64_t off; };
           boost::unordered_flat_map<const Value *, SmallVector<Src, 4>> memo;
           boost::unordered_flat_set<const Value *> inProg;
+          bool blockedOnCallee = false;
           std::function<bool(const Value *, SmallVectorImpl<Src> &)> rez =
               [&](const Value *V, SmallVectorImpl<Src> &out) -> bool {
             V = V->stripPointerCasts();
@@ -18120,7 +18183,7 @@ bool CallGraphPass::doModulePass(Module *M) {
               out.append(mit->second.begin(), mit->second.end());
               return true;
             }
-            if (!inProg.insert(V).second) return false; // phi cycle
+            if (!inProg.insert(V).second) return false;
             SmallVector<Src, 4> r;
             bool okr = false;
             if (auto it2 = argIdx.find(V); it2 != argIdx.end()) {
@@ -18135,7 +18198,7 @@ bool CallGraphPass::doModulePass(Module *M) {
                   okr = true;
                   for (auto sv : b) {
                     if (sv.kind == 0) sv.off += Off.getSExtValue();
-                    else if (sv.kind == 1) okr = false; // gep on loaded ptr: 2-level cell math
+                    else if (sv.kind == 1) okr = false;
                     r.push_back(sv);
                   }
                 }
@@ -18159,7 +18222,41 @@ bool CallGraphPass::doModulePass(Module *M) {
                 for (auto sv : b) {
                   if (sv.kind == 0) r.push_back({1, sv.arg, sv.off});
                   else if (sv.kind == 2) continue;
-                  else { okr = false; break; } // load of loaded ptr
+                  else { okr = false; break; }
+                }
+              }
+            } else if (const auto *RC = dyn_cast<CallBase>(V)) {
+              // Composition: callee ret atoms define the result.
+              const Function *CF = dyn_cast<Function>(
+                  RC->getCalledOperand()->stripPointerCastsAndAliases());
+              if (CF && !RC->isInlineAsm()) {
+                SmallVector<PAtom, 6> cas;
+                int st = calleeAtoms(CF, cas);
+                if (st == 0) blockedOnCallee = true;
+                else if (st == 1) {
+                  okr = true;
+                  bool anyRet = false;
+                  for (const auto &A : cas) {
+                    if (A.kind == 3) { // ALIAS(ret<-argN)
+                      anyRet = true;
+                      SmallVector<Src, 4> b;
+                      if ((unsigned)A.a2 >= RC->arg_size() ||
+                          !rez(RC->getArgOperand(A.a2), b)) { okr = false; break; }
+                      r.append(b.begin(), b.end());
+                    } else if (A.kind == 2) { // LD(ret<-*argC@off)
+                      anyRet = true;
+                      SmallVector<Src, 4> b;
+                      if ((unsigned)A.a2 >= RC->arg_size() ||
+                          !rez(RC->getArgOperand(A.a2), b)) { okr = false; break; }
+                      for (auto sv : b) {
+                        if (sv.kind == 0)
+                          r.push_back({1, sv.arg, sv.off + A.o2});
+                        else if (sv.kind == 2) continue;
+                        else { okr = false; break; }
+                      }
+                    }
+                  }
+                  if (!anyRet) okr = false; // ret unmodeled by atoms
                 }
               }
             }
@@ -18169,14 +18266,39 @@ bool CallGraphPass::doModulePass(Module *M) {
             out.append(r.begin(), r.end());
             return true;
           };
-          // effect collection
-          std::set<std::string> atoms;
+          std::set<std::string> atomStrs;
+          SmallVector<PAtom, 6> atoms;
+          auto emitStore = [&](const SmallVectorImpl<Src> &Ts,
+                               const SmallVectorImpl<Src> &Vs,
+                               std::string &ewhy) -> bool {
+            for (auto &t : Ts) {
+              if (t.kind != 0 || t.off < 0) { ewhy = "store-target"; return false; }
+              for (auto &v : Vs) {
+                if (v.kind == 2) continue;
+                if (v.kind == 0 && v.off == 0) {
+                  std::string a = "ST(*arg" + std::to_string(t.arg) +
+                      (t.off ? "@" + std::to_string(t.off) : "") +
+                      "<-arg" + std::to_string(v.arg) + ")";
+                  if (atomStrs.insert(a).second)
+                    atoms.push_back({0, t.arg, v.arg, t.off, 0});
+                } else if (v.kind == 1 && v.off >= 0) {
+                  std::string a = "MV(*arg" + std::to_string(t.arg) +
+                      (t.off ? "@" + std::to_string(t.off) : "") +
+                      "<-*arg" + std::to_string(v.arg) +
+                      (v.off ? "@" + std::to_string(v.off) : "") + ")";
+                  if (atomStrs.insert(a).second)
+                    atoms.push_back({1, t.arg, v.arg, t.off, v.off});
+                } else { ewhy = "interior-store"; return false; }
+              }
+            }
+            return true;
+          };
           for (const auto &BB : F) {
             for (const auto &I : BB) {
               if (const auto *CB = dyn_cast<CallBase>(&I)) {
                 if (CB->isInlineAsm()) {
                   if (asmTransferFree(CB)) continue;
-                  aRefuse["asm"]++; return false;
+                  why = "asm"; return false;
                 }
                 if (const auto *II = dyn_cast<IntrinsicInst>(CB)) {
                   switch (II->getIntrinsicID()) {
@@ -18195,58 +18317,102 @@ bool CallGraphPass::doModulePass(Module *M) {
                     for (const Value *Arg : II->args())
                       pure &= !Arg->getType()->isPointerTy();
                     if (pure) continue;
-                    aRefuse["intrinsic"]++; return false;
+                    why = "intrinsic"; return false;
                   }
                   }
                 }
                 const Function *CF = dyn_cast<Function>(
                     CB->getCalledOperand()->stripPointerCastsAndAliases());
-                if (!CF) { aRefuse["icall"]++; return false; }
-                if (!calleeSafe(CF)) { aRefuse["callee"]++; return false; }
+                if (!CF) { why = "icall"; return false; }
+                if (calleeSafe(CF)) continue; // NOOP: consumes, no effects
+                SmallVector<PAtom, 6> cas;
+                int st = calleeAtoms(CF, cas);
+                if (st != 1) {
+                  if (st == 0) retryable = true;
+                  why = "compose"; return false;
+                }
+                // Translate callee EFFECT atoms into caller frame.
+                for (const auto &A : cas) {
+                  if (A.kind == 2 || A.kind == 3) continue; // ret-only
+                  if ((unsigned)A.a1 >= CB->arg_size() ||
+                      (unsigned)A.a2 >= CB->arg_size()) {
+                    why = "compose"; return false;
+                  }
+                  SmallVector<Src, 4> Cs, Xs;
+                  if (!rez(CB->getArgOperand(A.a1), Cs) ||
+                      !rez(CB->getArgOperand(A.a2), Xs)) {
+                    why = "compose"; return false;
+                  }
+                  if (A.kind == 0) { // callee ST: value = callee arg a2
+                    SmallVector<Src, 4> Ts2;
+                    for (auto t : Cs) {
+                      if (t.kind == 2) continue;
+                      if (t.kind != 0) { why = "compose"; return false; }
+                      t.off += A.o1;
+                      Ts2.push_back(t);
+                    }
+                    std::string ewhy;
+                    if (!emitStore(Ts2, Xs, ewhy)) { why = ewhy; return false; }
+                  } else if (A.kind == 1) { // callee MV
+                    for (auto t : Cs) {
+                      if (t.kind == 2) continue;
+                      if (t.kind != 0) { why = "compose"; return false; }
+                      for (auto v : Xs) {
+                        if (v.kind == 2) continue;
+                        if (v.kind != 0) { why = "compose"; return false; }
+                        SmallVector<Src, 4> T1{{0, t.arg, t.off + A.o1}};
+                        SmallVector<Src, 4> V1{{1, v.arg, v.off + A.o2}};
+                        std::string ewhy;
+                        if (!emitStore(T1, V1, ewhy)) { why = ewhy; return false; }
+                      }
+                    }
+                  } else if (A.kind == 4) { // callee CPY: whole cells
+                    for (auto t : Cs)
+                      for (auto v : Xs) {
+                        if (t.kind == 2 || v.kind == 2) continue;
+                        if (t.kind != 0 || v.kind != 0 || t.off || v.off) {
+                          why = "compose"; return false;
+                        }
+                        std::string a = "CPY(arg" + std::to_string(t.arg) +
+                            "<-arg" + std::to_string(v.arg) + ")";
+                        if (atomStrs.insert(a).second)
+                          atoms.push_back({4, t.arg, v.arg, 0, 0});
+                      }
+                  }
+                }
                 continue;
               }
               if (const auto *SI3 = dyn_cast<StoreInst>(&I)) {
                 const Value *Val = SI3->getValueOperand();
                 SmallVector<Src, 4> Ts;
                 if (!rez(SI3->getPointerOperand(), Ts)) {
-                  aRefuse["store-target"]++; return false;
+                  why = blockedOnCallee ? (retryable = true, "compose")
+                                        : "store-target";
+                  return false;
                 }
-                for (auto &t : Ts)
-                  if (t.kind != 0 || t.off < 0) {
-                    aRefuse["store-target"]++; return false;
-                  }
                 if (!Val->getType()->isPointerTy()) {
                   if (isPtrWidthInt(Val->getType(), *curDL)) {
                     bool declined = false;
                     if (mayCarryPtrProvenance(Val, 8, declined) || declined) {
-                      aRefuse["int-launder-store"]++; return false;
+                      why = "int-launder-store"; return false;
                     }
                   }
                   continue;
                 }
                 SmallVector<Src, 4> Vs;
-                if (!rez(Val, Vs)) { aRefuse["store-value"]++; return false; }
-                for (auto &t : Ts)
-                  for (auto &v : Vs) {
-                    if (v.kind == 2) continue;
-                    if (v.kind == 0 && v.off == 0)
-                      atoms.insert("ST(*arg" + std::to_string(t.arg) +
-                                   (t.off ? "@" + std::to_string(t.off) : "") +
-                                   "<-arg" + std::to_string(v.arg) + ")");
-                    else if (v.kind == 1 && v.off >= 0)
-                      atoms.insert("MV(*arg" + std::to_string(t.arg) +
-                                   (t.off ? "@" + std::to_string(t.off) : "") +
-                                   "<-*arg" + std::to_string(v.arg) +
-                                   (v.off ? "@" + std::to_string(v.off) : "") +
-                                   ")");
-                    else { aRefuse["interior-store"]++; return false; }
-                  }
+                if (!rez(Val, Vs)) {
+                  why = blockedOnCallee ? (retryable = true, "compose")
+                                        : "store-value";
+                  return false;
+                }
+                std::string ewhy;
+                if (!emitStore(Ts, Vs, ewhy)) { why = ewhy; return false; }
                 continue;
               }
               if (isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I)) {
-                aRefuse["atomic"]++; return false;
+                why = "atomic"; return false;
               }
-              if (isa<IndirectBrInst>(&I)) { aRefuse["indirectbr"]++; return false; }
+              if (isa<IndirectBrInst>(&I)) { why = "indirectbr"; return false; }
               if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
                 const Value *RV = RI->getReturnValue();
                 if (!RV) continue;
@@ -18254,48 +18420,74 @@ bool CallGraphPass::doModulePass(Module *M) {
                   if (isPtrWidthInt(RV->getType(), *curDL)) {
                     bool declined = false;
                     if (mayCarryPtrProvenance(RV, 8, declined) || declined) {
-                      aRefuse["ret-launder"]++; return false;
+                      why = "ret-launder"; return false;
                     }
                   }
                   continue;
                 }
                 SmallVector<Src, 4> Rs;
-                if (!rez(RV, Rs)) { aRefuse["ret"]++; return false; }
+                if (!rez(RV, Rs)) {
+                  why = blockedOnCallee ? (retryable = true, "compose")
+                                        : "ret";
+                  return false;
+                }
                 for (auto &v : Rs) {
                   if (v.kind == 2) continue;
-                  if (v.kind == 0 && v.off == 0)
-                    atoms.insert("ALIAS(ret<-arg" + std::to_string(v.arg) + ")");
-                  else if (v.kind == 1 && v.off >= 0)
-                    atoms.insert("LD(ret<-*arg" + std::to_string(v.arg) +
-                                 (v.off ? "@" + std::to_string(v.off) : "") + ")");
-                  else { aRefuse["ret-interior"]++; return false; }
+                  if (v.kind == 0 && v.off == 0) {
+                    std::string a = "ALIAS(ret<-arg" + std::to_string(v.arg) + ")";
+                    if (atomStrs.insert(a).second)
+                      atoms.push_back({3, 0, v.arg, 0, 0});
+                  } else if (v.kind == 1 && v.off >= 0) {
+                    std::string a = "LD(ret<-*arg" + std::to_string(v.arg) +
+                        (v.off ? "@" + std::to_string(v.off) : "") + ")";
+                    if (atomStrs.insert(a).second)
+                      atoms.push_back({2, 0, v.arg, 0, v.off});
+                  } else { why = "ret-interior"; return false; }
                 }
               }
             }
           }
-          if (atoms.empty() || atoms.size() > 6) {
-            aRefuse[atoms.empty() ? "no-atoms" : "too-many-atoms"]++;
+          if (atomStrs.empty() || atomStrs.size() > 6) {
+            why = atomStrs.empty() ? "no-atoms" : "too-many-atoms";
             return false;
           }
           std::string line;
-          for (auto &a : atoms) line += " " + a;
+          for (auto &a : atomStrs) line += " " + a;
           CG_LOG("AtomProp: OK " << F.getName() << line << "\n");
+          props[&F] = atoms;
           nOk++;
           return true;
         };
-        for (auto &[mod, mname] : Ctx->Modules) {
-          for (const Function &F : *mod) {
-            if (F.isDeclaration()) continue;
-            const Function *canon = getFuncDef(const_cast<Function *>(&F));
-            if (canon != &F || ok.count(canon)) continue;
-            if (Ctx->FuncSummaries.count(canon)) continue;
-            tryFn(F);
+        bool achanged = true;
+        size_t around = 0;
+        while (achanged && around++ < 20) {
+          achanged = false;
+          for (auto &[mod, mname] : Ctx->Modules) {
+            for (const Function &F : *mod) {
+              if (F.isDeclaration()) continue;
+              const Function *canon = getFuncDef(const_cast<Function *>(&F));
+              if (canon != &F || ok.count(canon) || props.count(canon) ||
+                  permRefused.count(canon))
+                continue;
+              if (Ctx->FuncSummaries.count(canon)) continue;
+              bool retryable = false;
+              std::string why;
+              if (tryFn(F, retryable, why)) {
+                achanged = true;
+              } else if (!retryable) {
+                permRefused.insert(canon);
+                if (around == 1) aRefuse[why]++;
+              } else if (around == 1) {
+                aRefuse["compose-pending"]++;
+              }
+            }
           }
         }
         std::string ah;
         for (auto &kv : aRefuse)
           ah += kv.first + "=" + std::to_string(kv.second) + " ";
-        CG_LOG("AtomProp: " << nOk << " proposed; refusals: " << ah << "\n");
+        CG_LOG("AtomProp: " << nOk << " proposed (" << around
+               << " rounds); first-round refusals: " << ah << "\n");
       }
     }
 

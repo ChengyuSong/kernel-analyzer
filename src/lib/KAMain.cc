@@ -732,6 +732,17 @@ cl::opt<bool> CFLProposeNoopSummaries(
            "--cfl-adopt-proposed-summaries (pin/GT gated)"),
   cl::init(false));
 
+cl::opt<bool> CFLWitnessAnswers(
+  "cfl-witness-answers",
+  cl::desc("Per-witness answer read (rung 1): recompute the final "
+           "M-hop at load-shaped icall sites over the bipartite "
+           "key-cell structure instead of the union-find cluster - "
+           "content of exactly the cells sharing a key with the fptr "
+           "cell (+ VX mirror). Sound: pooled planes upstream, pooled "
+           "intersection downstream, pooled fallback anywhere "
+           "unresolvable. Monolithic unbatched solves only"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeWitnessSep(
   "cfl-probe-witness-sep",
   cl::desc("Census: record (key, fine cell) join anchors and report "

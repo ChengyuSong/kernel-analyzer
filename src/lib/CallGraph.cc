@@ -5056,7 +5056,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // solve runs unmodified. Contract gating is enforced at planting.
 
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
-    if (CFLProbeWitnessSep)
+    if (CFLProbeWitnessSep || CFLWitnessAnswers)
       witnessAnchors.emplace_back((uint64_t)o * NSHIFT + s, cell);
     if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
       g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
@@ -7196,6 +7196,53 @@ bool CallGraphPass::runFlowsToResolution() {
       }
   }
 
+  // ---- per-witness answer read (rung 1, --cfl-witness-answers) ----
+  // The pooled solve stays (memory-bearing over-approx); the LAST
+  // M-hop is recomputed exactly at load-shaped icall sites from the
+  // bipartite key×cell structure: the fptr cell's content =
+  // seeds/store-inflow of exactly the cells that SHARE A KEY with it
+  // (plus the VX wildcard mirror), not the whole union-find cluster.
+  // Sound by construction: every earlier hop uses pooled planes
+  // (⊇ truth), source planes are unioned across ALL shifts (⊇ any
+  // residue composition), and the result is intersected with the
+  // pooled answer bits. Any unresolvable piece falls back to the
+  // pooled read for that site. Gate-0 census (km fs13): giant cells'
+  // one-hop witness neighborhood is p50 = 0.01% of the cluster.
+  struct WitnessRead {
+    bool ready = false;
+    std::vector<std::pair<uint64_t, uint32_t>> anchors;
+    boost::unordered_flat_map<uint64_t, std::pair<uint32_t, uint32_t>>
+        keyRange;
+    boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint64_t, 4>>
+        cellKeys;
+    boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 4>> aIn;
+    boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
+        seedFn;
+  } WR;
+  size_t g_witnessSites = 0, g_witnessFallback = 0;
+  uint64_t g_witnessPooledPairs = 0, g_witnessRefinedPairs = 0;
+  if (CFLWitnessAnswers) {
+    if (CFLBatchRoots || CFLOriginBundles)
+      report_fatal_error("--cfl-witness-answers requires a monolithic "
+                         "unbatched solve (no --cfl-batch-roots / "
+                         "--cfl-origin-bundles): live planes and stable "
+                         "rid space are read directly");
+    WR.anchors = witnessAnchors;
+    std::sort(WR.anchors.begin(), WR.anchors.end());
+    WR.anchors.erase(std::unique(WR.anchors.begin(), WR.anchors.end()),
+                     WR.anchors.end());
+    for (uint32_t i = 0; i < WR.anchors.size(); i++) {
+      auto [it2, ins2] = WR.keyRange.try_emplace(WR.anchors[i].first,
+                                                 std::make_pair(i, i + 1));
+      if (!ins2) it2->second.second = i + 1;
+      WR.cellKeys[WR.anchors[i].second].push_back(WR.anchors[i].first);
+    }
+    for (auto [s2, t2] : aEdges) WR.aIn[t2].push_back(s2);
+    for (auto &[b2, r2, bk2] : fEdges) WR.aIn[r2].push_back(b2);
+    for (auto [cls2, rid2] : seeds)
+      if (funcRootOf.count(rid2)) WR.seedFn[cls2].push_back(rid2);
+    WR.ready = true;
+  }
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -7499,19 +7546,144 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
     }
-    if (!tpModelOwned && !sctModelOwned && CFLBatchRoots) {
+    bool witnessOwned = false;
+    if (CFLWitnessAnswers && WR.ready && !tpModelOwned && !sctModelOwned) {
+      // IR-walk the called operand down to load cells (casts/phi/select
+      // transparent; null/undef contribute nothing; anything else =
+      // unrefinable site -> pooled fallback).
+      SmallVector<uint32_t, 4> cells;
+      bool refinable = true;
+      {
+        SmallVector<const Value *, 8> wl{CS->getCalledOperand()};
+        SmallPtrSet<const Value *, 16> seen;
+        unsigned steps = 0;
+        while (!wl.empty() && refinable) {
+          const Value *v = wl.pop_back_val()->stripPointerCasts();
+          if (!seen.insert(v).second) continue;
+          if (++steps > 32) { refinable = false; break; }
+          if (const auto *LI = dyn_cast<LoadInst>(v)) {
+            NodeIndex pn = NF.getValueNodeFor(LI->getPointerOperand());
+            if (pn == AndersNodeFactory::InvalidIndex) { refinable = false; break; }
+            // The deref node was created for the pointer's canonical
+            // node AT BUILD TIME; pre-solve merging may have moved the
+            // canon since — probe both.
+            NodeIndex dn = NF.getDereferenceNodeFor(pn);
+            if (dn == AndersNodeFactory::InvalidIndex)
+              dn = NF.getDereferenceNodeFor(getCanonicalNode(pn));
+            if (dn == AndersNodeFactory::InvalidIndex) { refinable = false; break; }
+            auto cIt2 = toDense.find(getCanonicalNode(dn));
+            if (cIt2 == toDense.end()) { refinable = false; break; }
+            cells.push_back(cIt2->second);
+          } else if (const auto *PN = dyn_cast<PHINode>(v)) {
+            for (const Value *iv : PN->incoming_values()) wl.push_back(iv);
+          } else if (const auto *SEL = dyn_cast<SelectInst>(v)) {
+            wl.push_back(SEL->getTrueValue());
+            wl.push_back(SEL->getFalseValue());
+          } else if (isa<ConstantPointerNull>(v) || isa<UndefValue>(v)) {
+            // contributes nothing
+          } else {
+            refinable = false;
+          }
+        }
+      }
+      if (!refinable || cells.empty()) {
+        g_witnessFallback++;
+      } else {
+        witnessOwned = true;
+        g_witnessSites++;
+        // One bipartite hop: the fptr cells' keys (+ the VX wildcard
+        // mirror of exactly those keys), then those keys' cells. Keys
+        // of NEIGHBORHOOD cells are NOT taken — that would rebuild the
+        // transitive closure this read removes.
+        boost::unordered_flat_set<uint32_t> hood(cells.begin(), cells.end());
+        boost::unordered_flat_set<uint64_t> keysDone;
+        SmallVector<uint64_t, 32> kq;
+        auto addKey = [&](uint64_t k) {
+          if (keysDone.insert(k).second) kq.push_back(k);
+        };
+        for (uint32_t c : cells) {
+          auto ck = WR.cellKeys.find(c);
+          if (ck != WR.cellKeys.end())
+            for (uint64_t k : ck->second) addKey(k);
+        }
+        for (size_t qi = 0; qi < kq.size(); qi++) {
+          const uint64_t k = kq[qi];
+          const uint32_t ko = (uint32_t)(k / NSHIFT);
+          const uint32_t ks = (uint32_t)(k % NSHIFT);
+          if (NB > 0) {
+            if (ks == SHIFT_X) {
+              auto skIt = shiftKeysOf.find(ko);
+              if (skIt != shiftKeysOf.end())
+                for (uint64_t ek : skIt->second) addKey(ek);
+            } else {
+              addKey((uint64_t)ko * NSHIFT + SHIFT_X);
+            }
+          }
+          auto rg = WR.keyRange.find(k);
+          if (rg == WR.keyRange.end()) continue;
+          for (uint32_t i = rg->second.first; i < rg->second.second; i++)
+            hood.insert(WR.anchors[i].second);
+        }
+        // Content = seeds + a/f-in source planes (fn bits, ALL shifts,
+        // R+RB), accumulated word-level then masked.
+        ka::BitPlane acc(FactSet::Universe);
+        auto orPlane = [&](const FactSet &fs2) {
+          if (const ka::BitPlane *bp = fs2.denseData()) acc |= *bp;
+          else fs2.forEach([&](uint32_t o2) {
+            if (o2 < acc.size()) acc.set(o2);
+            });
+        };
+        boost::unordered_flat_set<uint32_t> srcSeen;
+        for (uint32_t c : hood) {
+          auto sf = WR.seedFn.find(c);
+          if (sf != WR.seedFn.end())
+            for (uint32_t rid2 : sf->second)
+              if (rid2 < acc.size()) acc.set(rid2);
+          auto ai = WR.aIn.find(c);
+          if (ai == WR.aIn.end()) continue;
+          for (uint32_t src : ai->second) {
+            const uint32_t sr = find(src);
+            if (!srcSeen.insert(sr).second) continue;
+            for (uint32_t s3 = 0; s3 < NSHIFT; s3++) {
+              orPlane(R[sr][s3]);
+              orPlane(RB[sr][s3]);
+            }
+          }
+        }
+        // Intersect with the pooled answer bits (both are sound upper
+        // bounds; the all-shift source union above is deliberately
+        // looser than the pooled shift composition).
+        FactSet wf;
+        size_t pooledFn = 0;
+        auto pooledHas = [&](uint32_t o2) {
+          return R[rep][0].test(o2) || RB[rep][0].test(o2) ||
+                 (NB > 0 && (R[rep][SHIFT_X].test(o2) ||
+                             RB[rep][SHIFT_X].test(o2)));
+        };
+        for (auto &[rid2, F2] : funcRootOf) {
+          if (!pooledHas(rid2)) continue;
+          pooledFn++;
+          if (rid2 < acc.size() && acc.test(rid2)) wf.set(rid2);
+        }
+        g_witnessPooledPairs += pooledFn;
+        g_witnessRefinedPairs += wf.count();
+        collect(wf, "witness");
+      }
+    }
+    if (!witnessOwned && !tpModelOwned && !sctModelOwned && CFLBatchRoots) {
       // Batched mode: live planes hold only the last batch — read the
       // stable round's accumulated answer bits (static-id keyed).
       auto aIt = fptrAcc.find(dIt->second);
       if (aIt != fptrAcc.end())
         collect(aIt->second, "batch-acc");
     }
-    if (!tpModelOwned && !sctModelOwned && !CFLBatchRoots) {
+    if (!witnessOwned && !tpModelOwned && !sctModelOwned && !CFLBatchRoots) {
       collect(R[rep][0], NB > 0 ? "exact" : "fi");
       collect(RB[rep][0], NB > 0 ? "exact" : "fi");
     }
     const size_t exactTargets = targets.size();
-    if (!tpModelOwned && !sctModelOwned && !CFLBatchRoots && NB > 0) {
+    if (!witnessOwned && !tpModelOwned && !sctModelOwned && !CFLBatchRoots &&
+        NB > 0) {
       collect(R[rep][SHIFT_X], "X");
       collect(RB[rep][SHIFT_X], "X");
     }
@@ -8227,6 +8399,11 @@ bool CallGraphPass::runFlowsToResolution() {
          << totalTargets << " targets (" << newPairs << " new pairs wired, "
          << topOnlyPairs << " via wildcard plane only), iteration "
          << (iteration + fpIter) << "\n");
+  if (CFLWitnessAnswers)
+    CG_LOG("WitnessAnswers: " << g_witnessSites << " sites refined ("
+           << g_witnessFallback << " pooled fallbacks); fn-plane pairs "
+           << g_witnessPooledPairs << " pooled -> " << g_witnessRefinedPairs
+           << " per-witness\n");
   if (CFLProbeRodataJoins)
     CG_LOG("RodataProbe: " << g_rodataJoinsSkipped
            << " joins skipped for rodata-bearing witness classes "

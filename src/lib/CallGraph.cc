@@ -3945,6 +3945,14 @@ bool CallGraphPass::runFlowsToResolution() {
   const bool protOn = NB == 0 && ((CFLOpsPairs && !opsPairs.empty()) ||
                                   CFLRodataCopy || CFLJoinCone);
   boost::unordered_flat_set<uint32_t> protRid;
+  // --cfl-probe-witness-sep: (key, fine cell) anchor ledger. The
+  // grammar's M is per-witness: cells alias iff they SHARE a key —
+  // a bipartite relation, not an equivalence. Union-find closes it
+  // transitively (the giant). This records the exact bipartite
+  // structure so the census below can measure the separation factor
+  // a per-witness answer read would buy: |one-hop witness
+  // neighborhood| vs |cluster| per cell.
+  std::vector<std::pair<uint64_t, uint32_t>> witnessAnchors;
   boost::unordered_flat_set<uint32_t> protCls; // container value classes
   boost::unordered_flat_map<uint32_t, ProtState> prot; // rid -> state
   boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
@@ -5048,6 +5056,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // solve runs unmodified. Contract gating is enforced at planting.
 
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
+    if (CFLProbeWitnessSep)
+      witnessAnchors.emplace_back((uint64_t)o * NSHIFT + s, cell);
     if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
       g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
       return;
@@ -8479,6 +8489,92 @@ bool CallGraphPass::runFlowsToResolution() {
              << keysPer.size() << " clusters, multi-key clusters " << multi
              << ", max keys/cluster " << maxK
              << ", transitive key-coalescing merges " << transKeyMerges
+             << "\n";
+    }
+    if (CFLProbeWitnessSep && !witnessAnchors.empty()) {
+      // Separation census: for each anchored fine cell c, W(c) = the
+      // number of distinct fine cells reachable in ONE bipartite hop
+      // (∪ over keys anchoring c of that key's cells) vs the cell
+      // count of c's final union-find cluster. W/cluster << 1 at the
+      // pool cells = a per-witness answer read splits the giant.
+      std::sort(witnessAnchors.begin(), witnessAnchors.end());
+      witnessAnchors.erase(
+          std::unique(witnessAnchors.begin(), witnessAnchors.end()),
+          witnessAnchors.end());
+      // key -> [cells] (contiguous ranges after sort)
+      boost::unordered_flat_map<uint64_t, std::pair<uint32_t, uint32_t>>
+          keyRange;
+      for (uint32_t i = 0; i < witnessAnchors.size(); i++) {
+        auto [it2, ins2] = keyRange.try_emplace(witnessAnchors[i].first,
+                                                std::make_pair(i, i + 1));
+        if (!ins2) it2->second.second = i + 1;
+      }
+      // cell -> keys
+      boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint64_t, 4>>
+          cellKeys;
+      for (auto &[k, c] : witnessAnchors) cellKeys[c].push_back(k);
+      // cluster -> distinct anchored cells
+      boost::unordered_flat_map<uint32_t, uint32_t> clusterCells;
+      for (auto &[c, ks] : cellKeys) clusterCells[find(c)]++;
+      // sample: all cells if <=20k, else every ceil(n/20k)-th
+      std::vector<uint32_t> stamp(solverCapN, 0);
+      uint32_t stampGen = 0;
+      const size_t nCells = cellKeys.size();
+      const size_t stride = nCells <= 20000 ? 1 : (nCells + 19999) / 20000;
+      std::vector<std::pair<double, uint32_t>> ratios; // (W/cluster, cell)
+      std::vector<uint32_t> Ws;
+      size_t idx = 0;
+      for (auto &[c, ks] : cellKeys) {
+        if (idx++ % stride) continue;
+        stampGen++;
+        uint32_t W = 0;
+        for (uint64_t k : ks) {
+          auto rg = keyRange[k];
+          for (uint32_t i = rg.first; i < rg.second; i++) {
+            uint32_t d = witnessAnchors[i].second;
+            if (stamp[d] != stampGen) { stamp[d] = stampGen; W++; }
+          }
+        }
+        const uint32_t cc = clusterCells[find(c)];
+        Ws.push_back(W);
+        ratios.push_back({cc ? (double)W / cc : 1.0, c});
+      }
+      std::sort(Ws.begin(), Ws.end());
+      std::vector<double> rs;
+      rs.reserve(ratios.size());
+      for (auto &pr : ratios) rs.push_back(pr.first);
+      std::sort(rs.begin(), rs.end());
+      auto pct = [&](std::vector<double> &v, double q) {
+        return v.empty() ? 0.0 : v[std::min(v.size() - 1,
+                                            (size_t)(q * v.size()))];
+      };
+      uint64_t maxCluster = 0;
+      for (auto &[cl, cc] : clusterCells)
+        maxCluster = std::max<uint64_t>(maxCluster, cc);
+      errs() << "WitnessSep: " << witnessAnchors.size() << " anchors, "
+             << keyRange.size() << " keys, " << nCells
+             << " anchored cells (" << Ws.size() << " sampled); W p50="
+             << (Ws.empty() ? 0 : Ws[Ws.size() / 2])
+             << " p90=" << (Ws.empty() ? 0 : Ws[Ws.size() * 9 / 10])
+             << " max=" << (Ws.empty() ? 0 : Ws.back())
+             << "; cluster max cells=" << maxCluster
+             << "; W/cluster p50=" << llvm::format("%.4f", pct(rs, 0.5))
+             << " p90=" << llvm::format("%.4f", pct(rs, 0.9))
+             << " p99=" << llvm::format("%.4f", pct(rs, 0.99)) << "\n";
+      // Giant-resident focus: ratio stats restricted to cells whose
+      // cluster is the biggest one (the pool itself).
+      uint32_t giantRep = 0; uint64_t best = 0;
+      for (auto &[cl, cc] : clusterCells)
+        if (cc > best) { best = cc; giantRep = cl; }
+      std::vector<double> grs;
+      for (auto &pr : ratios)
+        if (find(pr.second) == giantRep) grs.push_back(pr.first);
+      std::sort(grs.begin(), grs.end());
+      errs() << "WitnessSep: giant-resident sampled cells " << grs.size()
+             << "; W/cluster p50=" << llvm::format("%.4f", pct(grs, 0.5))
+             << " p90=" << llvm::format("%.4f", pct(grs, 0.9))
+             << " p99=" << llvm::format("%.4f", pct(grs, 0.99))
+             << " max=" << llvm::format("%.4f", grs.empty() ? 0 : grs.back())
              << "\n";
     }
     errs() << "ChurnStats: merges join=" << mergesFromJoin

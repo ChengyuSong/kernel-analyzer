@@ -526,3 +526,25 @@ scnprintf NOOP
 vscnprintf NOOP
 strcspn NOOP
 dump_stack NOOP
+# printk ring core (hand audit 2026-08-21): vprintk_store formats
+# fmt/args to TEXT via printk_sprint/vsnprintf into the ring record,
+# memcpys dev_printk_info (char subsystem[16]/device[48] — no
+# pointers) into the record, manages prb descriptors (int atomics).
+# No fn-pointer storage; ret = printed length (count). No in-body
+# icalls (console dispatch lives in console_unlock, NOT here).
+# Body-skip loses only ring TEXT stores + prb calls whose content is
+# char/int — nothing fn-ptr-relevant transits the printk ring (console
+# write callbacks receive (con, text, len); devkmsg reads text).
+# Provers bottom here: memcpy-of-formal-cells (untyped) + prb cmpxchg
+# asm — same audit class as vsnprintf.
+vprintk_store NOOP
+# uaccess copy core (hand audit 2026-08-21, backed by the user-copy
+# certificate work --cfl-cert-user-copy): _copy_from_user writes
+# USER-CONTROLLED bytes into the kernel buffer — user memory cannot
+# supply valid in-kernel fn-pointer identity (the certified user-copy
+# thesis); _copy_to_user moves kernel bytes OUT to user space — no
+# in-kernel flow is created. Neither transfers fn-ptr identity
+# between kernel objects; rets are copied-byte counts. Provers bottom
+# on the uaccess asm bodies.
+_copy_from_user NOOP
+_copy_to_user NOOP

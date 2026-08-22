@@ -174,6 +174,8 @@ public:
     NodeIndex getReturnNodeFor(const llvm::Function* f);
     NodeIndex getVarargNodeFor(const llvm::Function* f);
     NodeIndex getDereferenceNodeFor(const NodeIndex ptr);
+    const boost::unordered_flat_map<const NodeIndex, NodeIndex> &
+    getDerefMap() const { return derefMap; }
 
     // Node classification: distinguish function value nodes from
     // return/vararg nodes (all three store Function* as their value)

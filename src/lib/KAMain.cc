@@ -743,6 +743,16 @@ cl::opt<bool> CFLWitnessAnswers(
            "unresolvable. Monolithic unbatched solves only"),
   cl::init(false));
 
+cl::opt<bool> CFLProposeSolvedSummaries(
+  "cfl-propose-solved-summaries",
+  cl::desc("Stage A census: function-local abstract solve over the "
+           "atom-grammar value vocabulary; extract interface atoms "
+           "from the solved state (refuses only true interface "
+           "escapes, in-body icalls, unsafe asm). Zero-atom successes "
+           "become EMPTY-ATOM summaries (callsite wiring cut, body "
+           "kept). Adopt per-run via --cfl-adopt-proposed-summaries"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeWitnessSep(
   "cfl-probe-witness-sep",
   cl::desc("Census: record (key, fine cell) join anchors and report "

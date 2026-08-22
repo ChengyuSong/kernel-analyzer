@@ -1837,9 +1837,19 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   }
   if (CFLProbeNoFormalPresolve && !formalFan.empty()) {
     std::vector<std::pair<uint32_t, NodeIndex>> top;
-    for (auto &kv : formalFan) top.emplace_back(kv.second, kv.first);
+    uint64_t mass = 0;
+    for (auto &kv : formalFan) {
+      top.emplace_back(kv.second, kv.first);
+      mass += kv.second;
+    }
     std::sort(top.begin(), top.end(), std::greater<>());
-    for (size_t i = 0; i < std::min<size_t>(25, top.size()); i++) {
+    CG_LOG("JunctionFormals: " << top.size() << " junction formals, total "
+           << "fan-in mass " << mass << "\n");
+    // Full-depth dump (fan-in >= 4, cap 5000 lines): the reduction
+    // question is fan-in-WEIGHTED coverage of the prover over the
+    // functions that stitch the giant, not top-25 name-dropping.
+    for (size_t i = 0; i < std::min<size_t>(5000, top.size()); i++) {
+      if (top[i].first < 4) break;
       const auto *A = cast<Argument>(NF.getValueForNode(top[i].second));
       CG_LOG("JunctionFormals: x" << top[i].first << " "
              << A->getParent()->getName() << "::arg" << A->getArgNo()
@@ -5056,7 +5066,12 @@ bool CallGraphPass::runFlowsToResolution() {
   // solve runs unmodified. Contract gating is enforced at planting.
 
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
-    if (CFLProbeWitnessSep || CFLWitnessAnswers)
+    // NOTE: the cluster-mark fast path skips redundant joinCluster
+    // calls, so this census is APPROXIMATE (first-join-per-cluster
+    // only). The per-witness answer read does NOT use anchors — it
+    // tests owner-plane overlap instead (the exact key set of a cell
+    // IS its owner pointer-class's plane).
+    if (CFLProbeWitnessSep)
       witnessAnchors.emplace_back((uint64_t)o * NSHIFT + s, cell);
     if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
       g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
@@ -7210,14 +7225,16 @@ bool CallGraphPass::runFlowsToResolution() {
   // one-hop witness neighborhood is p50 = 0.01% of the cluster.
   struct WitnessRead {
     bool ready = false;
-    std::vector<std::pair<uint64_t, uint32_t>> anchors;
-    boost::unordered_flat_map<uint64_t, std::pair<uint32_t, uint32_t>>
-        keyRange;
-    boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint64_t, 4>>
-        cellKeys;
-    boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 4>> aIn;
-    boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
-        seedFn;
+    // cell (fine dense) -> owner pointer class (fine dense)
+    boost::unordered_flat_map<uint32_t, uint32_t> cellOwner;
+    // owner REP -> fn-bit upper bound of the content of its cells
+    // (union over a/f-in source planes, fn bits only, all shifts)
+    boost::unordered_flat_map<uint32_t, FactSet> ownerFnUB;
+    // owner REP -> all-shift plane union (lazy), for overlap tests
+    boost::unordered_flat_map<uint32_t, ka::BitPlane> uCache;
+    boost::unordered_flat_map<uint64_t, bool> overlapMemo;
+    // src REP -> fn bits of its plane (memo for the content pass)
+    boost::unordered_flat_map<uint32_t, FactSet> srcFnMemo;
   } WR;
   size_t g_witnessSites = 0, g_witnessFallback = 0;
   uint64_t g_witnessPooledPairs = 0, g_witnessRefinedPairs = 0;
@@ -7227,22 +7244,84 @@ bool CallGraphPass::runFlowsToResolution() {
                          "unbatched solve (no --cfl-batch-roots / "
                          "--cfl-origin-bundles): live planes and stable "
                          "rid space are read directly");
-    WR.anchors = witnessAnchors;
-    std::sort(WR.anchors.begin(), WR.anchors.end());
-    WR.anchors.erase(std::unique(WR.anchors.begin(), WR.anchors.end()),
-                     WR.anchors.end());
-    for (uint32_t i = 0; i < WR.anchors.size(); i++) {
-      auto [it2, ins2] = WR.keyRange.try_emplace(WR.anchors[i].first,
-                                                 std::make_pair(i, i + 1));
-      if (!ins2) it2->second.second = i + 1;
-      WR.cellKeys[WR.anchors[i].second].push_back(WR.anchors[i].first);
+    // cell -> owner from the deref registry (deref nodes were created
+    // per pointer node; canonicalize both sides into dense space).
+    for (auto &[ptrN, derefN] : NF.getDerefMap()) {
+      auto cIt2 = toDense.find(getCanonicalNode(derefN));
+      if (cIt2 == toDense.end()) continue;
+      auto oIt2 = toDense.find(getCanonicalNode(ptrN));
+      if (oIt2 == toDense.end()) continue;
+      WR.cellOwner.emplace(cIt2->second, oIt2->second);
     }
-    for (auto [s2, t2] : aEdges) WR.aIn[t2].push_back(s2);
-    for (auto &[b2, r2, bk2] : fEdges) WR.aIn[r2].push_back(b2);
-    for (auto [cls2, rid2] : seeds)
-      if (funcRootOf.count(rid2)) WR.seedFn[cls2].push_back(rid2);
+    // Content upper bound per owner rep: every a/f-edge into a cell
+    // contributes the fn bits of its source's pooled plane — this
+    // covers direct fn stores, initializer plants, summary-atom
+    // relays AND multi-hop memory copies (the source plane is the
+    // pooled ⊇-truth bound for the copied value).
+    auto fnbitsOfRep = [&](uint32_t rep2) -> const FactSet & {
+      auto pr3 = WR.srcFnMemo.try_emplace(rep2);
+      FactSet &slot = pr3.first->second;
+      if (pr3.second) {
+        auto grab = [&](const FactSet &pl) {
+          pl.forEach([&](uint32_t o3) {
+            if (funcRootOf.count(o3)) slot.set(o3);
+          });
+        };
+        for (uint32_t s3 = 0; s3 < NSHIFT; s3++) {
+          grab(R[rep2][s3]);
+          grab(RB[rep2][s3]);
+        }
+      }
+      return slot;
+    };
+    auto addContent = [&](uint32_t srcFine, uint32_t dstFine) {
+      auto co = WR.cellOwner.find(dstFine);
+      if (co == WR.cellOwner.end()) return; // not a cell
+      const FactSet &fb = fnbitsOfRep(find(srcFine));
+      if (fb.none()) return;
+      WR.ownerFnUB[find(co->second)].unionWith(fb);
+    };
+    for (auto [s2, t2] : aEdges) addContent(s2, t2);
+    for (auto &[b2, r2, bk2] : fEdges) addContent(b2, r2);
     WR.ready = true;
   }
+  auto witnessU = [&](uint32_t rep2) -> const ka::BitPlane & {
+    auto pr3 = WR.uCache.try_emplace(rep2, FactSet::Universe);
+    ka::BitPlane &u = pr3.first->second;
+    if (pr3.second) {
+      auto orIn = [&](const FactSet &pl) {
+        if (const ka::BitPlane *bp = pl.denseData()) u |= *bp;
+        else pl.forEach([&](uint32_t o3) {
+          if (o3 < u.size()) u.set(o3);
+        });
+      };
+      for (uint32_t s3 = 0; s3 < NSHIFT; s3++) {
+        orIn(R[rep2][s3]);
+        orIn(RB[rep2][s3]);
+      }
+    }
+    return u;
+  };
+  auto witnessOverlap = [&](uint32_t a2, uint32_t b2) -> bool {
+    if (a2 == b2) return true;
+    if (a2 > b2) std::swap(a2, b2);
+    const uint64_t k2 = ((uint64_t)a2 << 32) | b2;
+    auto pr3 = WR.overlapMemo.try_emplace(k2, false);
+    if (pr3.second) {
+      const ka::BitPlane &ua = witnessU(a2), &ub = witnessU(b2);
+      const size_t nw = std::min(ua.numWords(), ub.numWords());
+      const uint64_t *wa = ua.words(), *wb = ub.words();
+      bool hit = false;
+      for (size_t i3 = 0; i3 < nw; i3++)
+        if (wa[i3] & wb[i3]) { hit = true; break; }
+      pr3.first->second = hit;
+      return hit;
+    }
+    return pr3.first->second;
+  };
+  // Per distinct site-owner set: union of ownerFnUB over overlapping
+  // owner reps (the expensive sweep, cached — pool sites share owners).
+  boost::unordered_flat_map<uint32_t, FactSet> witnessSiteMemo;
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -7562,18 +7641,13 @@ bool CallGraphPass::runFlowsToResolution() {
           if (!seen.insert(v).second) continue;
           if (++steps > 32) { refinable = false; break; }
           if (const auto *LI = dyn_cast<LoadInst>(v)) {
+            // Site owner = the LOAD POINTER's value class: its plane
+            // is the exact key set of the loaded cell.
             NodeIndex pn = NF.getValueNodeFor(LI->getPointerOperand());
             if (pn == AndersNodeFactory::InvalidIndex) { refinable = false; break; }
-            // The deref node was created for the pointer's canonical
-            // node AT BUILD TIME; pre-solve merging may have moved the
-            // canon since — probe both.
-            NodeIndex dn = NF.getDereferenceNodeFor(pn);
-            if (dn == AndersNodeFactory::InvalidIndex)
-              dn = NF.getDereferenceNodeFor(getCanonicalNode(pn));
-            if (dn == AndersNodeFactory::InvalidIndex) { refinable = false; break; }
-            auto cIt2 = toDense.find(getCanonicalNode(dn));
-            if (cIt2 == toDense.end()) { refinable = false; break; }
-            cells.push_back(cIt2->second);
+            auto oIt2 = toDense.find(getCanonicalNode(pn));
+            if (oIt2 == toDense.end()) { refinable = false; break; }
+            cells.push_back(find(oIt2->second)); // owner rep, not cell
           } else if (const auto *PN = dyn_cast<PHINode>(v)) {
             for (const Value *iv : PN->incoming_values()) wl.push_back(iv);
           } else if (const auto *SEL = dyn_cast<SelectInst>(v)) {
@@ -7591,68 +7665,20 @@ bool CallGraphPass::runFlowsToResolution() {
       } else {
         witnessOwned = true;
         g_witnessSites++;
-        // One bipartite hop: the fptr cells' keys (+ the VX wildcard
-        // mirror of exactly those keys), then those keys' cells. Keys
-        // of NEIGHBORHOOD cells are NOT taken — that would rebuild the
-        // transitive closure this read removes.
-        boost::unordered_flat_set<uint32_t> hood(cells.begin(), cells.end());
-        boost::unordered_flat_set<uint64_t> keysDone;
-        SmallVector<uint64_t, 32> kq;
-        auto addKey = [&](uint64_t k) {
-          if (keysDone.insert(k).second) kq.push_back(k);
-        };
-        for (uint32_t c : cells) {
-          auto ck = WR.cellKeys.find(c);
-          if (ck != WR.cellKeys.end())
-            for (uint64_t k : ck->second) addKey(k);
-        }
-        for (size_t qi = 0; qi < kq.size(); qi++) {
-          const uint64_t k = kq[qi];
-          const uint32_t ko = (uint32_t)(k / NSHIFT);
-          const uint32_t ks = (uint32_t)(k % NSHIFT);
-          if (NB > 0) {
-            if (ks == SHIFT_X) {
-              auto skIt = shiftKeysOf.find(ko);
-              if (skIt != shiftKeysOf.end())
-                for (uint64_t ek : skIt->second) addKey(ek);
-            } else {
-              addKey((uint64_t)ko * NSHIFT + SHIFT_X);
-            }
+        // refined UB = ∪ ownerFnUB[r] over owner reps r whose all-shift
+        // plane overlaps ANY site owner's plane (shared key = the
+        // grammar's V-witness; any-shift union ⊇ the exact shift
+        // pairing — sound, and the pooled intersection below re-trims).
+        FactSet refinedUB;
+        for (uint32_t so : cells) {
+          auto [mIt, mIns] = witnessSiteMemo.try_emplace(so);
+          if (mIns) {
+            for (auto &kv2 : WR.ownerFnUB)
+              if (witnessOverlap(so, kv2.first))
+                mIt->second.unionWith(kv2.second);
           }
-          auto rg = WR.keyRange.find(k);
-          if (rg == WR.keyRange.end()) continue;
-          for (uint32_t i = rg->second.first; i < rg->second.second; i++)
-            hood.insert(WR.anchors[i].second);
+          refinedUB.unionWith(mIt->second);
         }
-        // Content = seeds + a/f-in source planes (fn bits, ALL shifts,
-        // R+RB), accumulated word-level then masked.
-        ka::BitPlane acc(FactSet::Universe);
-        auto orPlane = [&](const FactSet &fs2) {
-          if (const ka::BitPlane *bp = fs2.denseData()) acc |= *bp;
-          else fs2.forEach([&](uint32_t o2) {
-            if (o2 < acc.size()) acc.set(o2);
-            });
-        };
-        boost::unordered_flat_set<uint32_t> srcSeen;
-        for (uint32_t c : hood) {
-          auto sf = WR.seedFn.find(c);
-          if (sf != WR.seedFn.end())
-            for (uint32_t rid2 : sf->second)
-              if (rid2 < acc.size()) acc.set(rid2);
-          auto ai = WR.aIn.find(c);
-          if (ai == WR.aIn.end()) continue;
-          for (uint32_t src : ai->second) {
-            const uint32_t sr = find(src);
-            if (!srcSeen.insert(sr).second) continue;
-            for (uint32_t s3 = 0; s3 < NSHIFT; s3++) {
-              orPlane(R[sr][s3]);
-              orPlane(RB[sr][s3]);
-            }
-          }
-        }
-        // Intersect with the pooled answer bits (both are sound upper
-        // bounds; the all-shift source union above is deliberately
-        // looser than the pooled shift composition).
         FactSet wf;
         size_t pooledFn = 0;
         auto pooledHas = [&](uint32_t o2) {
@@ -7663,10 +7689,21 @@ bool CallGraphPass::runFlowsToResolution() {
         for (auto &[rid2, F2] : funcRootOf) {
           if (!pooledHas(rid2)) continue;
           pooledFn++;
-          if (rid2 < acc.size() && acc.test(rid2)) wf.set(rid2);
+          if (refinedUB.test(rid2)) wf.set(rid2);
         }
         g_witnessPooledPairs += pooledFn;
         g_witnessRefinedPairs += wf.count();
+        if (!CFLTraceFunc.empty() &&
+            CS->getFunction()->getName().contains(CFLTraceFunc)) {
+          errs() << "WTRACE site in " << CS->getFunction()->getName()
+                 << ": owners=" << cells.size() << " pooledFn=" << pooledFn
+                 << " refined=" << wf.count() << "\n";
+          for (auto &[rid2, F2] : funcRootOf) {
+            if (!pooledHas(rid2) || refinedUB.test(rid2)) continue;
+            errs() << "WTRACE   MISSING " << F2->getName() << " (r" << rid2
+                   << ")\n";
+          }
+        }
         collect(wf, "witness");
       }
     }
@@ -13023,7 +13060,9 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   auto parseDerefRef = [&](StringRef tok, int &out, int &byteOff) -> bool {
     byteOff = 0;
     auto [base, offs] = tok.split('@');
-    if (!offs.empty()) {
+    if (offs == "X") {
+      byteOff = -1; // wildcard offset (fx self-loop at apply)
+    } else if (!offs.empty()) {
       unsigned v;
       if (offs.getAsInteger(10, v)) return false;
       byteOff = (int)v;
@@ -13230,7 +13269,13 @@ const GlobalValue *CallGraphPass::canonChainKey(const GlobalValue *G) {
 // f-edges); at FI (or offset 0) the plain top cell.
 NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
   NodeIndex canon = getCanonicalNode(base);
-  if (byteOff == 0 || !EB.hasFieldLabels())
+  if (byteOff < 0 && EB.hasFieldLabels()) {
+    // wildcard offset (@X): base cell + fx self-loop — the same
+    // fallback the walked body uses for variable-offset GEP access
+    addFieldWildcardLoop(canon, "summary-wildcard");
+    return getRepDerefNode(canon);
+  }
+  if (byteOff <= 0 || !EB.hasFieldLabels())
     return getRepDerefNode(canon);
   NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
   EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
@@ -13244,7 +13289,11 @@ NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
 // — exactly what a walked GEP would do.
 NodeIndex CallGraphPass::summaryFieldPtr(NodeIndex base, int byteOff) {
   NodeIndex canon = getCanonicalNode(base);
-  if (byteOff == 0 || !EB.hasFieldLabels())
+  if (byteOff < 0 && EB.hasFieldLabels()) {
+    addFieldWildcardLoop(canon, "summary-wildcard");
+    return canon;
+  }
+  if (byteOff <= 0 || !EB.hasFieldLabels())
     return canon;
   NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
   EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
@@ -15990,6 +16039,62 @@ void CallGraphPass::runSummaryProvers(Module *M) {
     const GlobalValue *g2 = nullptr; // src/value-side global
   };
   boost::unordered_flat_map<const Function *, SmallVector<PAtom, 6>> props;
+  boost::unordered_flat_set<const Function *> permRefused;
+  boost::unordered_flat_map<std::string, uint64_t> aRefuse;
+  // Existing file entries usable for composition: pure
+  // Cpy/Alias/Store/Load/Move atom sets (no FRESH/INVOKE/CHAIN
+  // — those are callsite-contextual or allocator-owned).
+  auto fileAtoms = [&](const Function *CF,
+                 SmallVectorImpl<PAtom> &out) -> bool {
+    auto sit = Ctx->FuncSummaries.find(CF);
+    if (sit == Ctx->FuncSummaries.end()) return false;
+    const auto &S = *sit->second;
+    if (S.noop || S.none || S.fresh || S.atoms.empty()) return false;
+    for (const auto &A : S.atoms) {
+      switch (A.kind) {
+      case GlobalContext::SummaryAtom::Store:
+        if (A.dst < 0 && !A.gdst) return false;
+        if (A.src < 0 && !A.gsrc && !A.gsrc2) return false;
+        out.push_back({0, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                 A.gdst, A.gsrc ? A.gsrc : A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Move:
+        if (A.dst < 0 && !A.gdst) return false;
+        if (A.src < 0 && !A.gsrc2) return false;
+        out.push_back({1, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                 A.gdst, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Load:
+        if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
+        out.push_back({2, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Alias:
+        if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
+        out.push_back({3, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Cpy:
+        if (A.dst < 0 || A.src < 0) return false; // ret-CPY: skip
+        out.push_back({4, A.dst, A.src, 0, 0});
+        break;
+      default:
+        return false;
+      }
+    }
+    return true;
+  };
+  auto calleeAtoms = [&](const Function *CF,
+                   SmallVectorImpl<PAtom> &out) -> int {
+    // 1 = atoms available, 0 = not (yet), -1 = permanently not
+    CF = getFuncDef(const_cast<Function *>(CF));
+    auto pit = props.find(CF);
+    if (pit != props.end()) {
+      out.append(pit->second.begin(), pit->second.end());
+      return 1;
+    }
+    if (fileAtoms(CF, out)) return 1;
+    if (permRefused.count(CF) || CF->isDeclaration()) return -1;
+    return 0;
+  };
       boost::unordered_flat_set<const Function *> ok;
       boost::unordered_flat_map<std::string, uint64_t> refuseHist;
       auto calleeSafe = [&](const Function *CF) {
@@ -16471,62 +16576,6 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       // uncertain, retryable only when blocked on an unproposed
       // callee (chains converge like the NOOP fixpoint).
       if ((CFLProposeAtomSummaries || CFLAdoptProposedSummaries) && curDL) {
-        boost::unordered_flat_set<const Function *> permRefused;
-        boost::unordered_flat_map<std::string, uint64_t> aRefuse;
-        // Existing file entries usable for composition: pure
-        // Cpy/Alias/Store/Load/Move atom sets (no FRESH/INVOKE/CHAIN
-        // — those are callsite-contextual or allocator-owned).
-        auto fileAtoms = [&](const Function *CF,
-                             SmallVectorImpl<PAtom> &out) -> bool {
-          auto sit = Ctx->FuncSummaries.find(CF);
-          if (sit == Ctx->FuncSummaries.end()) return false;
-          const auto &S = *sit->second;
-          if (S.noop || S.none || S.fresh || S.atoms.empty()) return false;
-          for (const auto &A : S.atoms) {
-            switch (A.kind) {
-            case GlobalContext::SummaryAtom::Store:
-              if (A.dst < 0 && !A.gdst) return false;
-              if (A.src < 0 && !A.gsrc && !A.gsrc2) return false;
-              out.push_back({0, A.dst, A.src, A.dstByteOff, A.srcByteOff,
-                             A.gdst, A.gsrc ? A.gsrc : A.gsrc2});
-              break;
-            case GlobalContext::SummaryAtom::Move:
-              if (A.dst < 0 && !A.gdst) return false;
-              if (A.src < 0 && !A.gsrc2) return false;
-              out.push_back({1, A.dst, A.src, A.dstByteOff, A.srcByteOff,
-                             A.gdst, A.gsrc2});
-              break;
-            case GlobalContext::SummaryAtom::Load:
-              if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
-              out.push_back({2, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
-              break;
-            case GlobalContext::SummaryAtom::Alias:
-              if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
-              out.push_back({3, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
-              break;
-            case GlobalContext::SummaryAtom::Cpy:
-              if (A.dst < 0 || A.src < 0) return false; // ret-CPY: skip
-              out.push_back({4, A.dst, A.src, 0, 0});
-              break;
-            default:
-              return false;
-            }
-          }
-          return true;
-        };
-        auto calleeAtoms = [&](const Function *CF,
-                               SmallVectorImpl<PAtom> &out) -> int {
-          // 1 = atoms available, 0 = not (yet), -1 = permanently not
-          CF = getFuncDef(const_cast<Function *>(CF));
-          auto pit = props.find(CF);
-          if (pit != props.end()) {
-            out.append(pit->second.begin(), pit->second.end());
-            return 1;
-          }
-          if (fileAtoms(CF, out)) return 1;
-          if (permRefused.count(CF) || CF->isDeclaration()) return -1;
-          return 0;
-        };
         size_t nOk = 0;
         auto tryFn = [&](const Function &F, bool &retryable,
                          std::string &why) -> bool {
@@ -16630,6 +16679,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   for (const auto &A : cas) {
                     if (A.kind == 3) { // ALIAS(ret<-argN[@off] | @g@off)
                       anyRet = true;
+                      if (A.o2 < 0) { okr = false; break; } // wildcard
                       if (A.g2) { r.push_back({3, 0, A.o2, A.g2}); continue; }
                       SmallVector<Src, 4> b;
                       if ((unsigned)A.a2 >= RC->arg_size() ||
@@ -16643,6 +16693,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       }
                     } else if (A.kind == 2) { // LD(ret<-*argC@off | *@g@off)
                       anyRet = true;
+                      if (A.o2 < 0) { okr = false; break; } // wildcard
                       if (A.g2) { r.push_back({4, 0, A.o2, A.g2}); continue; }
                       SmallVector<Src, 4> b;
                       if ((unsigned)A.a2 >= RC->arg_size() ||
@@ -16789,6 +16840,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 // Translate callee EFFECT atoms into caller frame.
                 for (const auto &A : cas) {
                   if (A.kind == 2 || A.kind == 3) continue; // ret-only
+                  if (A.o1 < 0 || A.o2 < 0) { // wildcard atoms: solved-
+                    why = "compose"; return false; // pass territory
+                  }
                   if ((!A.g1 &&
                        (A.a1 < 0 || (unsigned)A.a1 >= CB->arg_size())) ||
                       (!A.g2 &&
@@ -17012,6 +17066,686 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           ah += kv.first + "=" + std::to_string(kv.second) + " ";
         CG_LOG("AtomProp: " << nOk << " proposed (" << around
                << " rounds); first-round refusals: " << ah << "\n");
+      }
+
+      // ---- Stage A: solver-based summary census ----
+      // (--cfl-propose-solved-summaries) Function-local abstract solve
+      // over the atom-grammar's value vocabulary; atoms extracted from
+      // the solved state. Complexity that stays local no longer
+      // refuses — only true interface escapes do. KEY INVARIANT:
+      // solved-class summaries keep BODIES WALKED (never g_noopBodies),
+      // so only FORMAL-ROOTED values (ARGP/LOADARG/formal-deep) are
+      // starved by adoption and need atom relay or escape refusal;
+      // global/external-derived flows survive via the walked body.
+      // Zero-atom successes -> okEmpty (EMPTY-ATOM summaries: callsite
+      // wiring cut, body kept — in-body registrations survive).
+      boost::unordered_flat_set<const Function *> okEmpty;
+      if (CFLProposeSolvedSummaries && curDL) {
+        // LV kinds: 0 ARGP(a,off) 1 LOADARG(a,off) 2 NULL 3 GLOBALP(g,off)
+        //           4 LOADGLOBAL(g,off) 5 LOCAL(id,off) 6 OPAQUE-EXT
+        //           7 OPAQUE-IF (formal-derived, must not escape/land)
+        //           off == -1: wildcard offset
+        struct LV {
+          uint8_t k; int a; int64_t off; const GlobalValue *g;
+          bool operator==(const LV &o) const {
+            return k == o.k && a == o.a && off == o.off && g == o.g;
+          }
+        };
+        using LVSet = llvm::SmallVector<LV, 4>;
+        auto addLV = [](LVSet &sset, const LV &v) -> bool {
+          for (auto &e : sset)
+            if (e == v) return false;
+          // Offset widening: >3 distinct offsets on the same base
+          // (pointer-advance loops: s++) widen to the wildcard @X —
+          // sound (fx-loop superset) and keeps loops convergent.
+          if (v.k == 0 || v.k == 1 || v.k == 3 || v.k == 4 || v.k == 5) {
+            unsigned sameBase = 0;
+            bool haveWild = false;
+            for (auto &e : sset)
+              if (e.k == v.k && e.a == v.a && e.g == v.g) {
+                sameBase++;
+                haveWild |= e.off < 0;
+              }
+            if (haveWild) return false; // wildcard subsumes
+            if (sameBase >= 3) {
+              sset.erase(std::remove_if(sset.begin(), sset.end(),
+                                        [&](const LV &e) {
+                                          return e.k == v.k && e.a == v.a &&
+                                                 e.g == v.g;
+                                        }),
+                         sset.end());
+              sset.push_back({v.k, v.a, -1, v.g});
+              return true;
+            }
+          }
+          if (sset.size() >= 8) { // width cap: collapse, keep worst kind
+            uint8_t worst = 6;
+            for (auto &e : sset)
+              if (e.k == 7 || e.k == 0 || e.k == 1) worst = 7;
+            if (v.k == 7 || v.k == 0 || v.k == 1) worst = 7;
+            for (auto &e : sset)
+              if (e.k == worst) return false;
+            sset.clear();
+            sset.push_back({worst, 0, 0, nullptr});
+            return true;
+          }
+          sset.push_back(v);
+          return true;
+        };
+        boost::unordered_flat_map<std::string, uint64_t> sRefuse;
+        boost::unordered_flat_set<const Function *> sPerm;
+        size_t nSolved = 0, nEmpty = 0;
+        auto trySolve = [&](const Function &F, bool &retryable,
+                            std::string &why) -> bool {
+          retryable = false;
+          if (F.arg_size() > 10) { why = "many-args"; return false; }
+          size_t nInst = 0;
+          for (const auto &BB : F) nInst += BB.size();
+          if (nInst > 2048) { why = "too-big"; return false; }
+          boost::unordered_flat_map<const Value *, int> argIdx;
+          int ai = 0;
+          for (const Argument &A : F.args()) argIdx[&A] = ai++;
+          std::map<const Value *, LVSet> env;
+          std::map<std::tuple<int, int, const GlobalValue *, int64_t>, LVSet>
+              cells;
+          int nextLocal = 0;
+          boost::unordered_flat_map<const Value *, int> localId;
+          bool changed = true;
+          std::string fail;
+          bool escRetry = false;
+          auto evalV = [&](const Value *V) -> LVSet {
+            V = V->stripPointerCasts();
+            if (auto it2 = argIdx.find(V); it2 != argIdx.end()) {
+              // Sub-pointer-width scalar formals (i32 sizes/flags,
+              // bools, floats) cannot carry pointer identity — clean.
+              Type *AT = V->getType();
+              if (!AT->isPointerTy() && !isPtrWidthInt(AT, *curDL))
+                return {};
+              return {LV{0, it2->second, 0, nullptr}};
+            }
+            if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V))
+              return {LV{2, 0, 0, nullptr}};
+            if (const auto *G2 =
+                    dyn_cast<GlobalValue>(V->stripPointerCastsAndAliases()))
+              return {LV{3, 0, 0, G2}};
+            if (!isa<Instruction>(V)) {
+              if (const auto *G = dyn_cast<GEPOperator>(V)) {
+                APInt Off(64, 0);
+                if (G->accumulateConstantOffset(*curDL, Off))
+                  if (const auto *G3 = dyn_cast<GlobalValue>(
+                          G->getPointerOperand()
+                              ->stripPointerCastsAndAliases()))
+                    return {LV{3, 0, Off.getSExtValue(), G3}};
+                return {LV{6, 0, 0, nullptr}};
+              }
+              if (const auto *C = dyn_cast<Constant>(V)) {
+                if (!C->getType()->isPointerTy()) return {};
+                return {LV{6, 0, 0, nullptr}};
+              }
+            }
+            auto eIt = env.find(V);
+            if (eIt != env.end()) return eIt->second;
+            return {};
+          };
+          auto mergeInto = [&](LVSet &dst, const LVSet &src) -> bool {
+            bool ch = false;
+            for (const LV &v : src) ch |= addLV(dst, v);
+            return ch;
+          };
+          auto setEnv = [&](const Value *V, const LVSet &lv) {
+            changed |= mergeInto(env[V], lv);
+          };
+          auto cellKey = [&](const LV &base)
+              -> std::optional<
+                  std::tuple<int, int, const GlobalValue *, int64_t>> {
+            if (base.k == 0)
+              return std::make_tuple(0, base.a, nullptr, base.off);
+            if (base.k == 3)
+              return std::make_tuple(3, 0, base.g, base.off);
+            if (base.k == 5)
+              return std::make_tuple(5, base.a, nullptr, base.off);
+            return std::nullopt;
+          };
+          // Sensitive = starved-by-adoption content: formal-rooted only.
+          auto lvSensitive = [&](const LV &v) {
+            return v.k == 0 || v.k == 1 || v.k == 7;
+          };
+          auto lvsSensitive = [&](const LVSet &sset) {
+            for (const LV &v : sset)
+              if (lvSensitive(v)) return true;
+            return false;
+          };
+          std::function<bool(int, int)> localSensitive =
+              [&](int lid, int depth) -> bool {
+            if (depth > 4) return true;
+            for (auto &kv : cells) {
+              if (std::get<0>(kv.first) != 5 || std::get<1>(kv.first) != lid)
+                continue;
+              for (const LV &v : kv.second) {
+                if (lvSensitive(v)) return true;
+                if (v.k == 5 && localSensitive(v.a, depth + 1)) return true;
+              }
+            }
+            return false;
+          };
+          auto anySensitive = [&](const LVSet &sset) -> bool {
+            if (lvsSensitive(sset)) return true;
+            for (const LV &v : sset)
+              if (v.k == 5 && localSensitive(v.a, 0)) return true;
+            return false;
+          };
+          for (unsigned round = 0; changed && fail.empty(); round++) {
+            if (round > 64) { fail = "no-fixpoint"; break; }
+            changed = false;
+            for (const auto &BB : F) {
+              for (const auto &I : BB) {
+                if (!fail.empty()) break;
+                if (const auto *AI = dyn_cast<AllocaInst>(&I)) {
+                  auto [lit, lins] = localId.try_emplace(AI, nextLocal);
+                  if (lins) nextLocal++;
+                  setEnv(AI, {LV{5, lit->second, 0, nullptr}});
+                } else if (const auto *G = dyn_cast<GEPOperator>(&I)) {
+                  LVSet b = evalV(G->getPointerOperand()), r;
+                  APInt Off(64, 0);
+                  const bool cst = G->accumulateConstantOffset(*curDL, Off);
+                  for (LV v : b) {
+                    if (v.k == 0 || v.k == 3 || v.k == 5) {
+                      if (v.off >= 0 && cst) v.off += Off.getSExtValue();
+                      else v.off = -1;
+                    } else if (v.k == 2) {
+                      continue;
+                    } else if (v.k == 1 || v.k == 4 || v.k == 7) {
+                      v = LV{v.k == 4 ? (uint8_t)6 : (uint8_t)7, 0, 0,
+                             nullptr}; // GEP on loaded ptr
+                    }
+                    r.push_back(v);
+                  }
+                  LVSet dd;
+                  mergeInto(dd, r);
+                  setEnv(&I, dd);
+                } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+                  LVSet b = evalV(LI->getPointerOperand()), r;
+                  for (const LV &v : b) {
+                    if (v.k == 2) continue;
+                    if (v.k == 0) {
+                      if (v.off < 0) {
+                        r.push_back({1, v.a, -1, nullptr}); // LOADARG@X
+                        auto cIt = cells.find(*cellKey(v));
+                        if (cIt != cells.end())
+                          for (const LV &c : cIt->second) r.push_back(c);
+                        continue;
+                      }
+                      r.push_back({1, v.a, v.off, nullptr});
+                      auto cIt = cells.find(*cellKey(v));
+                      if (cIt != cells.end())
+                        for (const LV &c : cIt->second) r.push_back(c);
+                    } else if (v.k == 3) {
+                      if (v.off < 0) { r.push_back({6, 0, 0, nullptr}); continue; }
+                      r.push_back({4, 0, v.off, v.g});
+                      auto cIt = cells.find(*cellKey(v));
+                      if (cIt != cells.end())
+                        for (const LV &c : cIt->second) r.push_back(c);
+                    } else if (v.k == 5) {
+                      if (v.off < 0) {
+                        r.push_back({localSensitive(v.a, 0) ? (uint8_t)7
+                                                            : (uint8_t)6,
+                                     0, 0, nullptr});
+                        continue;
+                      }
+                      auto cIt = cells.find(*cellKey(v));
+                      if (cIt != cells.end())
+                        for (const LV &c : cIt->second) r.push_back(c);
+                    } else if (v.k == 1 || v.k == 7) {
+                      r.push_back({7, 0, 0, nullptr}); // formal-deep
+                    } else {
+                      r.push_back({6, 0, 0, nullptr});
+                    }
+                  }
+                  LVSet dd;
+                  mergeInto(dd, r);
+                  setEnv(&I, dd);
+                } else if (const auto *SI2 = dyn_cast<StoreInst>(&I)) {
+                  LVSet val = evalV(SI2->getValueOperand());
+                  LVSet ptr = evalV(SI2->getPointerOperand());
+                  for (const LV &pb : ptr) {
+                    if (pb.k == 2) continue;
+                    auto ck = cellKey(pb);
+                    if (!ck) {
+                      // write through loaded/opaque pointer: refuse
+                      // only if the value carries starved content
+                      if (anySensitive(val)) { fail = "deep-store"; break; }
+                      continue;
+                    }
+                    // pb.off < 0: wildcard cell — extraction emits @X
+                    changed |= mergeInto(cells[*ck], val);
+                  }
+                } else if (const auto *PN = dyn_cast<PHINode>(&I)) {
+                  LVSet r;
+                  for (const Value *iv : PN->incoming_values())
+                    mergeInto(r, evalV(iv));
+                  setEnv(&I, r);
+                } else if (const auto *SEL = dyn_cast<SelectInst>(&I)) {
+                  LVSet r = evalV(SEL->getTrueValue());
+                  mergeInto(r, evalV(SEL->getFalseValue()));
+                  setEnv(&I, r);
+                } else if (isa<CastInst>(&I) || isa<FreezeInst>(&I)) {
+                  setEnv(&I, evalV(cast<Instruction>(&I)->getOperand(0)));
+                } else if (const auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                  // int arith over provenance-carrying values: keep the
+                  // identities, lose the offset (laundering-safe)
+                  LVSet r;
+                  for (unsigned oi = 0; oi < 2; oi++)
+                    for (LV v : evalV(BO->getOperand(oi))) {
+                      if (v.k == 0 || v.k == 3 || v.k == 5) v.off = -1;
+                      r.push_back(v);
+                    }
+                  LVSet dd;
+                  mergeInto(dd, r);
+                  setEnv(&I, dd);
+                } else if (isa<AtomicRMWInst>(&I) ||
+                           isa<AtomicCmpXchgInst>(&I)) {
+                  fail = "atomic";
+                } else if (isa<IndirectBrInst>(&I)) {
+                  fail = "indirectbr";
+                } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+                  if (CB->isInlineAsm()) {
+                    // Body-kept summaries: the asm stays modeled in the
+                    // walked body — the interface question is only
+                    // whether STARVED (formal-rooted) content moves
+                    // through it invisibly to the atoms.
+                    const auto *IA3 =
+                        cast<InlineAsm>(CB->getCalledOperand());
+                    auto ACs =
+                        InlineAsm::ParseConstraints(IA3->getConstraintString());
+                    bool memClob = false, anyIndOut = false;
+                    for (auto &CI : ACs) {
+                      if (CI.Type == InlineAsm::isClobber) {
+                        for (const std::string &Code : CI.Codes)
+                          if (StringRef(Code).contains("memory"))
+                            memClob = true;
+                      } else if (CI.Type == InlineAsm::isOutput &&
+                                 CI.isIndirect)
+                        anyIndOut = true;
+                    }
+                    const bool mayWrite = memClob || anyIndOut;
+                    bool sensIn = false;
+                    unsigned ai3 = 0;
+                    for (auto &CI : ACs) {
+                      if (CI.Type == InlineAsm::isClobber
+#if LLVM_VERSION_MAJOR >= 15
+                          || CI.Type == InlineAsm::isLabel
+#endif
+                      )
+                        continue;
+                      if (!CI.hasArg()) continue;
+                      if (ai3 >= CB->arg_size()) { fail = "asm"; break; }
+                      const Value *Arg = CB->getArgOperand(ai3++);
+                      LVSet av = evalV(Arg);
+                      const bool sens = anySensitive(av);
+                      if (CI.isIndirect) {
+                        if (CI.Type == InlineAsm::isOutput && sens) {
+                          // asm writes external content into interface
+                          // memory: not atom-expressible
+                          fail = "asm-slot";
+                          break;
+                        }
+                        if (sens) sensIn = true; // read slot of our data
+                      } else if (sens) {
+                        if (mayWrite) { fail = "asm-arg"; break; }
+                        sensIn = true;
+                      }
+                    }
+                    if (!fail.empty()) break;
+                    if (CB->getType()->isPointerTy() ||
+                        isPtrWidthInt(CB->getType(), *curDL))
+                      setEnv(&I, {LV{sensIn ? (uint8_t)7 : (uint8_t)6, 0, 0,
+                                     nullptr}});
+                    continue;
+                  }
+                  if (const auto *II = dyn_cast<IntrinsicInst>(CB)) {
+                    switch (II->getIntrinsicID()) {
+                    case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+                    case Intrinsic::dbg_label:
+                    case Intrinsic::lifetime_start:
+                    case Intrinsic::lifetime_end:
+                    case Intrinsic::assume: case Intrinsic::expect:
+                    case Intrinsic::prefetch: case Intrinsic::donothing:
+                    case Intrinsic::trap: case Intrinsic::ubsantrap:
+                    case Intrinsic::vastart: case Intrinsic::vaend:
+                    case Intrinsic::vacopy: case Intrinsic::memset:
+                    case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                    case Intrinsic::returnaddress:
+                    case Intrinsic::frameaddress:
+                      continue;
+                    default: {
+                      if (isa<MemTransferInst>(II)) {
+                        // memcpy/memmove: refuse only when starved
+                        // content is in motion
+                        const auto *MT = cast<MemTransferInst>(II);
+                        LVSet d2 = evalV(MT->getRawDest());
+                        LVSet s2 = evalV(MT->getRawSource());
+                        bool sens = anySensitive(d2) || anySensitive(s2);
+                        for (const LV &v : s2)
+                          if (v.k == 0) sens = true; // formal cells copied
+                        for (const LV &v : d2)
+                          if (v.k == 0) sens = true;
+                        if (sens) { fail = "memcpy"; break; }
+                        continue;
+                      }
+                      bool pure = !II->getType()->isPointerTy();
+                      for (const Value *Arg : II->args())
+                        pure &= !Arg->getType()->isPointerTy();
+                      if (pure) continue;
+                      for (const Value *Arg : II->args())
+                        if (anySensitive(evalV(Arg))) {
+                          fail = "intrinsic";
+                          break;
+                        }
+                      if (!fail.empty()) break;
+                      if (CB->getType()->isPointerTy())
+                        setEnv(&I, {LV{6, 0, 0, nullptr}});
+                      continue;
+                    }
+                    }
+                    continue;
+                  }
+                  const Function *CF = dyn_cast<Function>(
+                      CB->getCalledOperand()->stripPointerCastsAndAliases());
+                  if (!CF) {
+                    // In-body icall: solved-class summaries keep the
+                    // BODY WALKED, so the site survives and resolves
+                    // identically — refusal is needed only when
+                    // formal-derived content feeds the dispatch (its
+                    // fptr or args), i.e. real caller-dependent
+                    // dispatch. printk-class console icalls read the
+                    // registry, not caller args: formal-independent.
+                    bool sens = anySensitive(evalV(CB->getCalledOperand()));
+                    for (const Value *Arg : CB->args())
+                      if (!sens && anySensitive(evalV(Arg))) sens = true;
+                    if (sens) { fail = "icall"; break; }
+                    if (CB->getType()->isPointerTy())
+                      setEnv(&I, {LV{6, 0, 0, nullptr}});
+                    continue;
+                  }
+                  // Answer-site callees (__SCT__): body kept => the
+                  // site survives; treat as a normal unsummarized
+                  // callee (escape check below).
+                  const Function *CFc =
+                      getFuncDef(const_cast<Function *>(CF));
+                  const bool safeNoop = calleeSafe(CFc) || okEmpty.count(CFc);
+                  SmallVector<PAtom, 6> cas;
+                  int st = safeNoop ? 1 : calleeAtoms(CFc, cas);
+                  // The atom generator's permRefused is NOT permanence
+                  // here: the solved pass may still summarize that
+                  // callee in a later round. Permanent-unavailable =
+                  // declaration or solved-pass sPerm only.
+                  if (st == -1 && !CFc->isDeclaration() && !sPerm.count(CFc))
+                    st = 0;
+                  if (st != 1) {
+                    bool sens = false;
+                    for (const Value *Arg : CB->args())
+                      if (anySensitive(evalV(Arg))) { sens = true; break; }
+                    if (sens) {
+                      if (st == 0) escRetry = true;
+                      fail = ("escape " + CFc->getName()).str();
+                      break;
+                    }
+                    if (CB->getType()->isPointerTy())
+                      setEnv(&I, {LV{6, 0, 0, nullptr}});
+                    continue;
+                  }
+                  // summarized callee: apply its atoms on our LVs
+                  bool cok = true;
+                  LVSet retLVs;
+                  bool anyRet = false;
+                  auto resolveRef = [&](int argi,
+                                        const GlobalValue *g2) -> LVSet {
+                    if (g2) return {LV{3, 0, 0, g2}};
+                    if (argi < 0 || (unsigned)argi >= CB->arg_size())
+                      return {LV{6, 0, 0, nullptr}};
+                    return evalV(CB->getArgOperand(argi));
+                  };
+                  auto loadOf = [&](const LV &v, int64_t o2) -> LVSet {
+                    if (v.k == 0) {
+                      if (v.off < 0) return {LV{1, v.a, -1, nullptr}};
+                      return {LV{1, v.a, o2 < 0 ? -1 : v.off + o2,
+                                 nullptr}};
+                    }
+                    if (v.k == 3) {
+                      if (v.off < 0) return {LV{4, 0, -1, v.g}};
+                      return {LV{4, 0, o2 < 0 ? -1 : v.off + o2, v.g}};
+                    }
+                    if (v.k == 5) {
+                      if (v.off < 0)
+                        return {LV{localSensitive(v.a, 0) ? (uint8_t)7
+                                                          : (uint8_t)6,
+                                   0, 0, nullptr}};
+                      LVSet r2;
+                      auto cIt =
+                          cells.find(*cellKey(LV{5, v.a, v.off + o2, nullptr}));
+                      if (cIt != cells.end()) r2 = cIt->second;
+                      return r2;
+                    }
+                    if (v.k == 2) return {};
+                    return {LV{v.k == 1 || v.k == 7 ? (uint8_t)7 : (uint8_t)6,
+                               0, 0, nullptr}};
+                  };
+                  for (const PAtom &A : cas) {
+                    if (!cok) break;
+                    if (A.kind == 0 || A.kind == 1) {
+                      LVSet Cs = resolveRef(A.a1, A.g1);
+                      LVSet Vs0 = resolveRef(A.a2, A.g2);
+                      for (LV t : Cs) {
+                        if (t.k == 2) continue;
+                        t.off = (t.off < 0 || A.o1 < 0) ? -1 : t.off + A.o1;
+                        auto ck = cellKey(t);
+                        LVSet vals;
+                        if (A.kind == 0) {
+                          for (LV v : Vs0) {
+                            if (v.k == 0 || v.k == 3 || v.k == 5)
+                              v.off = (v.off < 0 || A.o2 < 0)
+                                          ? -1
+                                          : v.off + A.o2;
+                            else if (A.o2 && v.k != 2 && v.k != 6 &&
+                                     v.k != 7)
+                              v.off = -1;
+                            vals.push_back(v);
+                          }
+                        } else {
+                          for (const LV &v : Vs0) {
+                            LVSet lr = loadOf(v, A.o2);
+                            for (const LV &x : lr) vals.push_back(x);
+                          }
+                        }
+                        if (!ck) {
+                          bool sens = lvsSensitive(vals);
+                          for (const LV &v : vals)
+                            if (v.k == 5 && localSensitive(v.a, 0))
+                              sens = true;
+                          if (sens) { cok = false; break; }
+                          continue;
+                        }
+                        changed |= mergeInto(cells[*ck], vals);
+                      }
+                    } else if (A.kind == 4) {
+                      cok = false; // CPY compose: Stage A refusal
+                    } else if (A.kind == 2 || A.kind == 3) {
+                      anyRet = true;
+                      for (const LV &v : resolveRef(A.a2, A.g2)) {
+                        if (A.kind == 3) {
+                          LV w = v;
+                          if (w.k == 0 || w.k == 3 || w.k == 5)
+                            w.off = (w.off < 0 || A.o2 < 0)
+                                        ? -1
+                                        : w.off + A.o2;
+                          retLVs.push_back(w);
+                        } else {
+                          for (const LV &x : loadOf(v, A.o2))
+                            retLVs.push_back(x);
+                        }
+                      }
+                    }
+                  }
+                  if (!cok) { fail = "compose"; break; }
+                  if (CB->getType()->isPointerTy()) {
+                    LVSet dd;
+                    if (anyRet) mergeInto(dd, retLVs);
+                    else dd.push_back({6, 0, 0, nullptr});
+                    setEnv(&I, dd);
+                  }
+                }
+              }
+              if (!fail.empty()) break;
+            }
+          }
+          if (!fail.empty()) {
+            retryable = escRetry && StringRef(fail).starts_with("escape");
+            why = fail;
+            return false;
+          }
+          // ---- extraction ----
+          std::set<std::string> atomStrs;
+          SmallVector<PAtom, 12> atoms;
+          auto refStr = [](int a2, const GlobalValue *g2, int64_t off,
+                           bool deref) -> std::string {
+            std::string r = deref ? "*" : "";
+            if (g2)
+              r += "@" + (g2->hasName() ? g2->getName().str()
+                                        : std::string("<g>"));
+            else
+              r += "arg" + std::to_string(a2);
+            if (off > 0) r += "@" + std::to_string(off);
+            else if (off < 0) r += "@X";
+            return r;
+          };
+          std::string exWhy;
+          auto extractCells = [&]() -> bool {
+            for (auto &kv : cells) {
+              auto [kind, idx2, gv, off] = kv.first;
+              if (kind == 5) continue; // locals policed via escapes
+              // off < 0: wildcard cell — @X atoms below (fx loop at
+              // apply, same as the body's var-GEP fallback)
+              for (const LV &v : kv.second) {
+                if (v.k == 2) continue;
+                // GLOBAL-based cells: body-walked stores land in the
+                // real shared global cell — external/global-derived
+                // content is covered. FORMAL-based cells are the
+                // CALLER's memory: under adoption the body's store
+                // hits the EMPTY formal's deref cell, so EVERY
+                // non-null content must be atom-relayed or refused.
+                if (kind == 3 && (v.k == 3 || v.k == 4 || v.k == 6))
+                  continue;
+                if (v.k == 6) { exWhy = "ext-into-formal"; return false; }
+                PAtom A{};
+                A.o1 = off;
+                if (kind == 0) A.a1 = idx2, A.g1 = nullptr;
+                else A.a1 = -1, A.g1 = gv;
+                std::string tstr = refStr(A.a1, A.g1, off, true);
+                if (v.k == 0) {
+                  A.kind = 0; A.a2 = v.a; A.o2 = v.off;
+                } else if (v.k == 1) {
+                  A.kind = 1; A.a2 = v.a; A.o2 = v.off;
+                } else if (v.k == 3) {
+                  A.kind = 0; A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
+                } else if (v.k == 4) {
+                  A.kind = 1; A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
+                } else if (v.k == 5) {
+                  if (localSensitive(v.a, 0)) { exWhy = "local-escape"; return false; }
+                  continue; // dead local object: no interface content
+                } else {
+                  exWhy = v.k == 7 ? "formal-deep" : "wildcard-val";
+                  return false;
+                }
+                std::string a3 =
+                    (A.kind == 0 ? "ST(" : "MV(") + tstr + "<-" +
+                    refStr(A.a2, A.g2, A.o2, A.kind == 1) + ")";
+                if (atomStrs.insert(a3).second) atoms.push_back(A);
+              }
+            }
+            return true;
+          };
+          if (!extractCells()) { why = exWhy; return false; }
+          for (const auto &BB : F) {
+            const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+            if (!RI || !RI->getReturnValue()) continue;
+            const Value *RV = RI->getReturnValue();
+            if (!RV->getType()->isPointerTy() &&
+                !(isPtrWidthInt(RV->getType(), *curDL)))
+              continue;
+            for (const LV &v : evalV(RV)) {
+              if (v.k == 2) continue;
+              if (v.k == 6) { why = "ret-ext"; return false; }
+              PAtom A{};
+              if (v.k == 0) {
+                A.kind = 3; A.a2 = v.a; A.o2 = v.off; // off -1 = @X
+              } else if (v.k == 1) {
+                A.kind = 2; A.a2 = v.a; A.o2 = v.off;
+              } else if (v.k == 3) {
+                A.kind = 3; A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
+              } else if (v.k == 4) {
+                A.kind = 2; A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
+              } else {
+                why = v.k == 5 ? "ret-local" : "ret-deep";
+                return false;
+              }
+              std::string a3 =
+                  std::string(A.kind == 3 ? "ALIAS(ret<-" : "LD(ret<-") +
+                  refStr(A.a2, A.g2, A.o2, A.kind == 2) + ")";
+              if (atomStrs.insert(a3).second) atoms.push_back(A);
+            }
+          }
+          if (atoms.size() > 12) { why = "too-many-atoms"; return false; }
+          if (atoms.empty()) {
+            okEmpty.insert(&F);
+            nEmpty++;
+            CG_LOG("SolvedProp: OK-EMPTY " << F.getName() << "\n");
+          } else {
+            SmallVector<PAtom, 6> pv(atoms.begin(), atoms.end());
+            props[&F] = pv;
+            nSolved++;
+            std::string line;
+            for (auto &a3 : atomStrs) line += " " + a3;
+            CG_LOG("SolvedProp: OK " << F.getName() << line << "\n");
+          }
+          return true;
+        };
+        bool schanged = true;
+        size_t sround = 0;
+        while (schanged && sround++ < 20) {
+          schanged = false;
+          for (auto &[mod, mname] : Ctx->Modules) {
+            for (const Function &F : *mod) {
+              if (F.isDeclaration()) continue;
+              const Function *canon = getFuncDef(const_cast<Function *>(&F));
+              if (canon != &F || ok.count(canon) || okEmpty.count(canon) ||
+                  props.count(canon) || sPerm.count(canon))
+                continue;
+              if (Ctx->FuncSummaries.count(canon)) continue;
+              bool retryable = false;
+              std::string why;
+              if (trySolve(F, retryable, why)) {
+                schanged = true;
+              } else if (!retryable) {
+                sPerm.insert(canon);
+                if (sround == 1) {
+                  sRefuse[why.substr(0, why.find(' '))]++;
+                  CG_LOG("SolvedProp: REFUSED " << F.getName() << " ["
+                         << why << "]\n");
+                }
+              } else if (sround == 1) {
+                sRefuse["escape-pending"]++;
+                CG_LOG("SolvedProp: PENDING " << F.getName() << " ["
+                       << why << "]\n");
+              }
+            }
+          }
+        }
+        std::string sh;
+        for (auto &kv : sRefuse)
+          sh += kv.first + "=" + std::to_string(kv.second) + " ";
+        CG_LOG("SolvedProp: " << nSolved << " atom + " << nEmpty
+               << " empty summaries (" << sround
+               << " rounds); first-round refusals: " << sh << "\n");
       }
   if (CFLAdoptProposedSummaries) {
     if (FuncSummaryFile.empty()) {

@@ -13352,6 +13352,14 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
     return false; // NOOP owns the callsite: nothing transfers
   bool needPooled = false;
   auto nodeForGlobal = [&](const llvm::GlobalValue *G) -> NodeIndex {
+    // Resolve to the DEFINING instance (mirror getFuncDef): atoms may
+    // carry the adopting TU's DECLARATION pointer, whose node routes
+    // through the extern-symbol machinery — depositing there smeared
+    // via the extern hub (5.18 phy_ethtool family, +27k pool pairs).
+    if (G->isDeclaration() && G->hasName()) {
+      auto git = Ctx->Gobjs.find(G->getGUID());
+      if (git != Ctx->Gobjs.end()) G = git->second;
+    }
     NodeIndex n = getRepNodeForValue(G);
     if (n == AndersNodeFactory::InvalidIndex)
       n = getCanonicalNode(
@@ -16747,7 +16755,12 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                            V->stripPointerCastsAndAliases())) {
               // Global container/address ref (v2.2b): pointer identity,
               // adopted-only (never serialized — internal linkage is
-              // name-ambiguous across TUs).
+              // name-ambiguous across TUs). Record the DEFINING
+              // instance (declarations route through the extern hub).
+              if (G2->isDeclaration() && G2->hasName()) {
+                auto git2 = Ctx->Gobjs.find(G2->getGUID());
+                if (git2 != Ctx->Gobjs.end()) G2 = git2->second;
+              }
               r.push_back({3, 0, 0, G2}); okr = true;
             } else if (const auto *G = dyn_cast<GEPOperator>(V)) {
               APInt Off(64, 0);
@@ -17308,16 +17321,26 @@ void CallGraphPass::runSummaryProvers(Module *M) {
             if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V))
               return {LV{2, 0, 0, nullptr}};
             if (const auto *G2 =
-                    dyn_cast<GlobalValue>(V->stripPointerCastsAndAliases()))
+                    dyn_cast<GlobalValue>(V->stripPointerCastsAndAliases())) {
+              if (G2->isDeclaration() && G2->hasName()) {
+                auto git2 = Ctx->Gobjs.find(G2->getGUID());
+                if (git2 != Ctx->Gobjs.end()) G2 = git2->second;
+              }
               return {LV{3, 0, 0, G2}};
+            }
             if (!isa<Instruction>(V)) {
               if (const auto *G = dyn_cast<GEPOperator>(V)) {
                 APInt Off(64, 0);
                 if (G->accumulateConstantOffset(*curDL, Off))
                   if (const auto *G3 = dyn_cast<GlobalValue>(
                           G->getPointerOperand()
-                              ->stripPointerCastsAndAliases()))
+                              ->stripPointerCastsAndAliases())) {
+                    if (G3->isDeclaration() && G3->hasName()) {
+                      auto git3 = Ctx->Gobjs.find(G3->getGUID());
+                      if (git3 != Ctx->Gobjs.end()) G3 = git3->second;
+                    }
                     return {LV{3, 0, Off.getSExtValue(), G3}};
+                  }
                 return {LV{6, 0, 0, nullptr}};
               }
               if (const auto *C = dyn_cast<Constant>(V)) {

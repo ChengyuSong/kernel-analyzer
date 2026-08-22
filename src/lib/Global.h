@@ -136,10 +136,21 @@ public:
                 // from the constant initializer of the block global at
                 // arg[src], byte offset [off]; the block binds to the
                 // callback's formal [fk]
-      ChainCall // keyed pair-channel DISPATCH: key at arg[dst]; the
+      ChainCall, // keyed pair-channel DISPATCH: key at arg[dst]; the
                 // dispatch value at arg[src] binds to each registered
                 // callback's formal [fk]. Registration x dispatch pairs
                 // are wired per key at finalize (static_call precedent)
+      MoveX, // Move + wildcard shift on the DESTINATION: an interior-
+             // of-loaded value stored into a cell (skb_put tail
+             // advance). fx loop on dst absorbs the unknown delta
+      Store2, // value into **src-base@dstByteOff (2nd level wildcard):
+              // deref-of-deref chain at apply (nla_put memcpy class)
+      Move2,  // *src@srcByteOff content into **dst-base@dstByteOff
+      Load2,  // ret <- **src@srcByteOff (2nd level wildcard)
+      LoadX  // LD + wildcard shift on the RESULT: ret = interior of
+             // the pointer loaded from *src@srcByteOff (skb_put class:
+             // loaded_ptr + delta). Result gets an fx self-loop —
+             // covers any delta; exact at FI (solved-summary only)
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)

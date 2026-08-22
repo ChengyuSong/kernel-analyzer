@@ -13115,6 +13115,13 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
               !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0;
         nSt++;
+      } else if (t.consume_front("MVX(*") && t.consume_back(")")) {
+        auto [c, v] = t.split("<-*");
+        A.kind = GlobalContext::SummaryAtom::MoveX;
+        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0 ||
+              A.src < 0;
+        nSt++;
       } else if (t.consume_front("MV(*") && t.consume_back(")")) {
         auto [c, v] = t.split("<-*");
         A.kind = GlobalContext::SummaryAtom::Move;
@@ -13189,6 +13196,31 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
               fks.getAsInteger(10, fkv);
         A.fk = (int)fkv;
         nChC++;
+      } else if (t.consume_front("ST2(**") && t.consume_back(")")) {
+        auto [c, v] = t.split("<-");
+        A.kind = GlobalContext::SummaryAtom::Store2;
+        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0;
+        nSt++;
+      } else if (t.consume_front("MV2(**") && t.consume_back(")")) {
+        auto [c, v] = t.split("<-*");
+        A.kind = GlobalContext::SummaryAtom::Move2;
+        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0 ||
+              A.src < 0;
+        nSt++;
+      } else if (t.consume_front("LD2(") && t.consume_back(")")) {
+        auto [d, c] = t.split("<-**");
+        A.kind = GlobalContext::SummaryAtom::Load2;
+        bad = !parseRef(d, A.dst) ||
+              !parseDerefRef(c, A.src, A.srcByteOff) || A.src < 0;
+        nLd++;
+      } else if (t.consume_front("LDX(") && t.consume_back(")")) {
+        auto [d, c] = t.split("<-*");
+        A.kind = GlobalContext::SummaryAtom::LoadX;
+        bad = !parseRef(d, A.dst) ||
+              !parseDerefRef(c, A.src, A.srcByteOff) || A.src < 0;
+        nLd++;
       } else if (t.consume_front("LD(") && t.consume_back(")")) {
         auto [d, c] = t.split("<-*");
         A.kind = GlobalContext::SummaryAtom::Load;
@@ -13280,6 +13312,19 @@ NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
   NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
   EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
   return getRepDerefNode(getCanonicalNode(f));
+}
+
+// Two-level cell: deref(contents-of(cell(base@off1))), second level
+// wildcard — the deref-of-deref chain a walked load-then-store builds.
+// The cell node's plane IS the loaded pointers' value set, so its
+// deref covers the pointed-to cells; the fx loop absorbs the unknown
+// second-level offset/shift (FI: plain chain).
+NodeIndex CallGraphPass::summaryDeref2Cell(NodeIndex base, int byteOff) {
+  NodeIndex cellA = summaryDerefCell(base, byteOff);
+  NodeIndex canonCell = getCanonicalNode(cellA);
+  if (EB.hasFieldLabels())
+    addFieldWildcardLoop(canonCell, "summary-2lvl");
+  return getRepDerefNode(canonCell);
 }
 
 // Value-side interior ref "argN@K": the summarized callee produced a
@@ -13589,6 +13634,71 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         break;
       addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
                         getCanonicalNode(d));
+      g_sumLd++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Store2: {
+      NodeIndex c = A.gdst ? nodeForGlobal(A.gdst) : nodeForRef(A.dst, true);
+      NodeIndex v = A.gsrc2 ? nodeForGlobal(A.gsrc2)
+                            : nodeForRef(A.src, false);
+      if (c == AndersNodeFactory::InvalidIndex ||
+          v == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(summaryFieldPtr(v, A.srcByteOff),
+                        summaryDeref2Cell(c, A.dstByteOff));
+      g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Move2: {
+      NodeIndex d = A.gdst ? nodeForGlobal(A.gdst) : nodeForRef(A.dst, true);
+      NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          c == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
+                        summaryDeref2Cell(d, A.dstByteOff));
+      g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Load2: {
+      NodeIndex d = nodeForRef(A.dst, true);
+      NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          c == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(summaryDeref2Cell(c, A.srcByteOff),
+                        getCanonicalNode(d));
+      g_sumLd++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::MoveX: {
+      // interior-of-loaded stored into a cell: Move + shift-wildcard
+      // on the destination parent (the stored value's shift is the
+      // loaded value's + unknown delta; fx loop absorbs it — FI exact)
+      NodeIndex d = A.gdst ? nodeForGlobal(A.gdst) : nodeForRef(A.dst, true);
+      NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          c == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
+                        summaryDerefCell(d, A.dstByteOff));
+      if (EB.hasFieldLabels())
+        addFieldWildcardLoop(getCanonicalNode(d), "summary-mvx");
+      g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::LoadX: {
+      // interior-of-loaded: result = loaded value + unknown delta —
+      // LD, then wildcard the RESULT's shift (fx self-loop; FI no-op)
+      NodeIndex d = nodeForRef(A.dst, true);
+      NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
+      if (d == AndersNodeFactory::InvalidIndex ||
+          c == AndersNodeFactory::InvalidIndex)
+        break;
+      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
+                        getCanonicalNode(d));
+      if (EB.hasFieldLabels())
+        addFieldWildcardLoop(getCanonicalNode(d), "summary-ldx");
       g_sumLd++;
       break;
     }
@@ -16068,6 +16178,30 @@ void CallGraphPass::runSummaryProvers(Module *M) {
         if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
         out.push_back({2, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
         break;
+      case GlobalContext::SummaryAtom::LoadX:
+        if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
+        out.push_back({5, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Store2:
+        if (A.dst < 0 && !A.gdst) return false;
+        out.push_back({7, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                       A.gdst, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Move2:
+        if ((A.dst < 0 && !A.gdst) || (A.src < 0 && !A.gsrc2)) return false;
+        out.push_back({8, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                       A.gdst, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::Load2:
+        if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
+        out.push_back({9, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
+        break;
+      case GlobalContext::SummaryAtom::MoveX:
+        if (A.dst < 0 && !A.gdst) return false;
+        if (A.src < 0 && !A.gsrc2) return false;
+        out.push_back({6, A.dst, A.src, A.dstByteOff, A.srcByteOff,
+                       A.gdst, A.gsrc2});
+        break;
       case GlobalContext::SummaryAtom::Alias:
         if (A.dst != -1 || (A.src < 0 && !A.gsrc2)) return false;
         out.push_back({3, 0, A.src, 0, A.srcByteOff, nullptr, A.gsrc2});
@@ -16839,8 +16973,11 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 }
                 // Translate callee EFFECT atoms into caller frame.
                 for (const auto &A : cas) {
-                  if (A.kind == 2 || A.kind == 3) continue; // ret-only
-                  if (A.o1 < 0 || A.o2 < 0) { // wildcard atoms: solved-
+                  if (A.kind == 2 || A.kind == 3 || A.kind == 5 ||
+                      A.kind == 9)
+                    continue; // ret-only
+                  if (A.kind >= 6 || A.o1 < 0 || A.o2 < 0) {
+                    // MVX/2-level/wildcard atoms: solved-
                     why = "compose"; return false; // pass territory
                   }
                   if ((!A.g1 &&
@@ -17084,6 +17221,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
         // LV kinds: 0 ARGP(a,off) 1 LOADARG(a,off) 2 NULL 3 GLOBALP(g,off)
         //           4 LOADGLOBAL(g,off) 5 LOCAL(id,off) 6 OPAQUE-EXT
         //           7 OPAQUE-IF (formal-derived, must not escape/land)
+        //           8 INTERIOR-OF-LOADED: loaded from cell (a/g, off)
+        //             plus unknown delta — ret-expressible as LDX
+        //           9 TWO-LEVEL: loaded through *(cell(a/g, off)),
+        //             2nd level wildcard — LD2/ST2/MV2 territory
         //           off == -1: wildcard offset
         struct LV {
           uint8_t k; int a; int64_t off; const GlobalValue *g;
@@ -17098,7 +17239,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           // Offset widening: >3 distinct offsets on the same base
           // (pointer-advance loops: s++) widen to the wildcard @X —
           // sound (fx-loop superset) and keeps loops convergent.
-          if (v.k == 0 || v.k == 1 || v.k == 3 || v.k == 4 || v.k == 5) {
+          if (v.k == 0 || v.k == 1 || v.k == 3 || v.k == 4 || v.k == 5 ||
+              v.k == 8 || v.k == 9) {
             unsigned sameBase = 0;
             bool haveWild = false;
             for (auto &e : sset)
@@ -17204,11 +17346,15 @@ void CallGraphPass::runSummaryProvers(Module *M) {
               return std::make_tuple(3, 0, base.g, base.off);
             if (base.k == 5)
               return std::make_tuple(5, base.a, nullptr, base.off);
+            if (base.k == 1 || base.k == 8) // level-2: *(cell(base,off))
+              return std::make_tuple(9, base.g ? -1 : base.a, base.g,
+                                     base.off);
             return std::nullopt;
           };
           // Sensitive = starved-by-adoption content: formal-rooted only.
           auto lvSensitive = [&](const LV &v) {
-            return v.k == 0 || v.k == 1 || v.k == 7;
+            return v.k == 0 || v.k == 1 || v.k == 7 ||
+                   ((v.k == 8 || v.k == 9) && !v.g);
           };
           auto lvsSensitive = [&](const LVSet &sset) {
             for (const LV &v : sset)
@@ -17254,9 +17400,16 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       else v.off = -1;
                     } else if (v.k == 2) {
                       continue;
-                    } else if (v.k == 1 || v.k == 4 || v.k == 7) {
-                      v = LV{v.k == 4 ? (uint8_t)6 : (uint8_t)7, 0, 0,
-                             nullptr}; // GEP on loaded ptr
+                    } else if (v.k == 1) {
+                      v = LV{8, v.a, v.off, nullptr}; // interior of loaded
+                    } else if (v.k == 4) {
+                      v = LV{8, -1, v.off, v.g};
+                    } else if (v.k == 8 || v.k == 9) {
+                      // deeper interior: same base (wildcards absorb)
+                    } else if (v.k == 7) {
+                      v = LV{7, 0, 0, nullptr};
+                    } else if (v.k == 6) {
+                      v = LV{6, 0, 0, nullptr};
                     }
                     r.push_back(v);
                   }
@@ -17295,8 +17448,16 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       auto cIt = cells.find(*cellKey(v));
                       if (cIt != cells.end())
                         for (const LV &c : cIt->second) r.push_back(c);
-                    } else if (v.k == 1 || v.k == 7) {
-                      r.push_back({7, 0, 0, nullptr}); // formal-deep
+                    } else if (v.k == 1 || v.k == 8) {
+                      r.push_back({9, v.g ? -1 : v.a, v.off, v.g});
+                      auto ck2 = cellKey(v);
+                      if (ck2) {
+                        auto cIt2 = cells.find(*ck2);
+                        if (cIt2 != cells.end())
+                          for (const LV &c : cIt2->second) r.push_back(c);
+                      }
+                    } else if (v.k == 7 || (v.k == 9 && !v.g)) {
+                      r.push_back({7, 0, 0, nullptr}); // 3-level: deep
                     } else {
                       r.push_back({6, 0, 0, nullptr});
                     }
@@ -17336,7 +17497,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   LVSet r;
                   for (unsigned oi = 0; oi < 2; oi++)
                     for (LV v : evalV(BO->getOperand(oi))) {
-                      if (v.k == 0 || v.k == 3 || v.k == 5) v.off = -1;
+                      if (v.k == 0 || v.k == 3 || v.k == 5 || v.k == 8)
+                        v.off = -1;
                       r.push_back(v);
                     }
                   LVSet dd;
@@ -17419,17 +17581,48 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       continue;
                     default: {
                       if (isa<MemTransferInst>(II)) {
-                        // memcpy/memmove: refuse only when starved
-                        // content is in motion
+                        // memcpy/memmove as a wildcard cell transfer:
+                        // dst@X ∪= *src@X (CPY over unknown layout —
+                        // the fx-loop application covers any offset
+                        // pairing; FI = plain cell copy). Refuse only
+                        // when an endpoint is unlocatable AND starved
+                        // content would move through it.
                         const auto *MT = cast<MemTransferInst>(II);
                         LVSet d2 = evalV(MT->getRawDest());
                         LVSet s2 = evalV(MT->getRawSource());
-                        bool sens = anySensitive(d2) || anySensitive(s2);
-                        for (const LV &v : s2)
-                          if (v.k == 0) sens = true; // formal cells copied
-                        for (const LV &v : d2)
-                          if (v.k == 0) sens = true;
-                        if (sens) { fail = "memcpy"; break; }
+                        LVSet vals;
+                        for (const LV &v : s2) {
+                          if (v.k == 2) continue;
+                          if (v.k == 0)
+                            vals.push_back({1, v.a, -1, nullptr});
+                          else if (v.k == 3)
+                            vals.push_back({4, 0, -1, v.g});
+                          else if (v.k == 5) {
+                            for (auto &kv2 : cells)
+                              if (std::get<0>(kv2.first) == 5 &&
+                                  std::get<1>(kv2.first) == v.a)
+                                for (const LV &c2 : kv2.second)
+                                  vals.push_back(c2);
+                          } else if (v.k == 1 || v.k == 7 ||
+                                     (v.k == 8 && !v.g)) {
+                            vals.push_back({7, 0, 0, nullptr});
+                          } else {
+                            vals.push_back({6, 0, 0, nullptr});
+                          }
+                        }
+                        bool bad2 = false;
+                        for (const LV &t0 : d2) {
+                          if (t0.k == 2) continue;
+                          LV t = t0;
+                          t.off = -1; // whole-range wildcard
+                          auto ck = cellKey(t);
+                          if (!ck) {
+                            if (lvsSensitive(vals)) { bad2 = true; break; }
+                            continue;
+                          }
+                          changed |= mergeInto(cells[*ck], vals);
+                        }
+                        if (bad2) { fail = "memcpy"; break; }
                         continue;
                       }
                       bool pure = !II->getType()->isPointerTy();
@@ -17515,6 +17708,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       if (v.off < 0) return {LV{4, 0, -1, v.g}};
                       return {LV{4, 0, o2 < 0 ? -1 : v.off + o2, v.g}};
                     }
+                    if (v.k == 1 || v.k == 8)
+                      return {LV{9, v.g ? -1 : v.a, v.off, v.g}};
                     if (v.k == 5) {
                       if (v.off < 0)
                         return {LV{localSensitive(v.a, 0) ? (uint8_t)7
@@ -17527,7 +17722,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       return r2;
                     }
                     if (v.k == 2) return {};
-                    return {LV{v.k == 1 || v.k == 7 ? (uint8_t)7 : (uint8_t)6,
+                    return {LV{v.k == 1 || v.k == 7 || (v.k == 8 && !v.g)
+                                   ? (uint8_t)7
+                                   : (uint8_t)6,
                                0, 0, nullptr}};
                   };
                   for (const PAtom &A : cas) {
@@ -17567,8 +17764,103 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                         }
                         changed |= mergeInto(cells[*ck], vals);
                       }
+                    } else if (A.kind == 7 || A.kind == 8) { // ST2/MV2
+                      LVSet Cs = resolveRef(A.a1, A.g1);
+                      LVSet Vs0 = resolveRef(A.a2, A.g2);
+                      auto comb2 = [&](int64_t a3, int64_t b3) -> int64_t {
+                        return (a3 < 0 || b3 < 0) ? -1 : a3 + b3;
+                      };
+                      for (const LV &t0 : Cs) {
+                        if (t0.k == 2) continue;
+                        // target = level-2 cell of *(t0-cell@o1)
+                        LV base{0, 0, 0, nullptr};
+                        if (t0.k == 0)
+                          base = LV{1, t0.a, comb2(t0.off, A.o1), nullptr};
+                        else if (t0.k == 3)
+                          base = LV{1, -1, comb2(t0.off, A.o1), t0.g};
+                        else { cok = false; break; }
+                        auto ck = cellKey(base);
+                        LVSet vals;
+                        for (const LV &v : Vs0) {
+                          if (v.k == 2) continue;
+                          if (A.kind == 7) { // ST2: value = address
+                            LV w = v;
+                            if (w.k == 0 || w.k == 3 || w.k == 5)
+                              w.off = comb2(w.off, A.o2);
+                            vals.push_back(w);
+                          } else { // MV2: value = *src@o2
+                            for (const LV &x : loadOf(v, A.o2))
+                              vals.push_back(x);
+                          }
+                        }
+                        if (!ck) {
+                          if (lvsSensitive(vals)) { cok = false; break; }
+                          continue;
+                        }
+                        changed |= mergeInto(cells[*ck], vals);
+                      }
+                    } else if (A.kind == 9) { // LD2 ret
+                      anyRet = true;
+                      for (const LV &v : resolveRef(A.a2, A.g2)) {
+                        auto comb9 = [&](int64_t a3, int64_t b3) -> int64_t {
+                          return (a3 < 0 || b3 < 0) ? -1 : a3 + b3;
+                        };
+                        if (v.k == 0)
+                          retLVs.push_back({9, v.a, comb9(v.off, A.o2),
+                                            nullptr});
+                        else if (v.k == 3)
+                          retLVs.push_back({9, -1, comb9(v.off, A.o2), v.g});
+                        else if (v.k == 2)
+                          continue;
+                        else
+                          retLVs.push_back({7, 0, 0, nullptr});
+                      }
+                    } else if (A.kind == 6) { // MVX: k8 value into cell
+                      LVSet Cs = resolveRef(A.a1, A.g1);
+                      LVSet Vs0 = resolveRef(A.a2, A.g2);
+                      auto comb6 = [&](int64_t a3, int64_t b3) -> int64_t {
+                        return (a3 < 0 || b3 < 0) ? -1 : a3 + b3;
+                      };
+                      for (LV t : Cs) {
+                        if (t.k == 2) continue;
+                        t.off = comb6(t.off, A.o1);
+                        auto ck = cellKey(t);
+                        LVSet vals;
+                        for (const LV &v : Vs0) {
+                          if (v.k == 0)
+                            vals.push_back({8, v.a, comb6(v.off, A.o2),
+                                            nullptr});
+                          else if (v.k == 3)
+                            vals.push_back({8, -1, comb6(v.off, A.o2), v.g});
+                          else if (v.k == 2)
+                            continue;
+                          else
+                            vals.push_back({7, 0, 0, nullptr});
+                        }
+                        if (!ck) {
+                          if (lvsSensitive(vals)) { cok = false; break; }
+                          continue;
+                        }
+                        changed |= mergeInto(cells[*ck], vals);
+                      }
                     } else if (A.kind == 4) {
                       cok = false; // CPY compose: Stage A refusal
+                    } else if (A.kind == 5) { // LDX: interior of loaded
+                      anyRet = true;
+                      for (const LV &v : resolveRef(A.a2, A.g2)) {
+                        auto comb = [&](int64_t a3, int64_t b3) -> int64_t {
+                          return (a3 < 0 || b3 < 0) ? -1 : a3 + b3;
+                        };
+                        if (v.k == 0)
+                          retLVs.push_back({8, v.a, comb(v.off, A.o2),
+                                            nullptr});
+                        else if (v.k == 3)
+                          retLVs.push_back({8, -1, comb(v.off, A.o2), v.g});
+                        else if (v.k == 2)
+                          continue;
+                        else
+                          retLVs.push_back({7, 0, 0, nullptr});
+                      }
                     } else if (A.kind == 2 || A.kind == 3) {
                       anyRet = true;
                       for (const LV &v : resolveRef(A.a2, A.g2)) {
@@ -17623,6 +17915,43 @@ void CallGraphPass::runSummaryProvers(Module *M) {
             for (auto &kv : cells) {
               auto [kind, idx2, gv, off] = kv.first;
               if (kind == 5) continue; // locals policed via escapes
+              if (kind == 9) {
+                // level-2 cells: **base@off — ST2/MV2 atoms; global-
+                // level-2 with non-starved content is body-covered
+                for (const LV &v : kv.second) {
+                  if (v.k == 2) continue;
+                  const bool gbase = gv != nullptr;
+                  if (gbase && (v.k == 3 || v.k == 4 || v.k == 6)) continue;
+                  if (v.k == 6) { exWhy = "ext-into-formal"; return false; }
+                  PAtom A{};
+                  A.o1 = off;
+                  if (!gbase) A.a1 = idx2, A.g1 = nullptr;
+                  else A.a1 = -1, A.g1 = gv;
+                  A.kind = v.k == 0 || v.k == 3 ? 7 : 8; // ST2 : MV2
+                  if (v.k == 0 || v.k == 1) {
+                    A.a2 = v.a; A.o2 = v.off;
+                  } else if (v.k == 3 || v.k == 4) {
+                    A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
+                  } else if (v.k == 8) {
+                    A.kind = 8; // treat interior-of-loaded as its cell
+                    if (v.g) { A.a2 = -1; A.g2 = v.g; }
+                    else A.a2 = v.a;
+                    A.o2 = v.off;
+                  } else if (v.k == 5) {
+                    if (localSensitive(v.a, 0)) { exWhy = "local-escape"; return false; }
+                    continue;
+                  } else {
+                    exWhy = "deep-val"; return false;
+                  }
+                  std::string t2 = "**" + refStr(A.a1, A.g1, off, false)
+                                        .substr(0);
+                  std::string a3 =
+                      (A.kind == 7 ? std::string("ST2(") : std::string("MV2(")) +
+                      t2 + "<-" + refStr(A.a2, A.g2, A.o2, A.kind == 8) + ")";
+                  if (atomStrs.insert(a3).second) atoms.push_back(A);
+                }
+                continue;
+              }
               // off < 0: wildcard cell — @X atoms below (fx loop at
               // apply, same as the body's var-GEP fallback)
               for (const LV &v : kv.second) {
@@ -17652,13 +17981,23 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 } else if (v.k == 5) {
                   if (localSensitive(v.a, 0)) { exWhy = "local-escape"; return false; }
                   continue; // dead local object: no interface content
+                } else if (v.k == 8) {
+                  A.kind = 6; // MVX: interior-of-loaded into a cell
+                  if (v.g) { A.a2 = -1; A.g2 = v.g; }
+                  else A.a2 = v.a;
+                  A.o2 = v.off;
+                } else if (v.k == 9) {
+                  exWhy = "deep-val"; return false;
                 } else {
                   exWhy = v.k == 7 ? "formal-deep" : "wildcard-val";
                   return false;
                 }
                 std::string a3 =
-                    (A.kind == 0 ? "ST(" : "MV(") + tstr + "<-" +
-                    refStr(A.a2, A.g2, A.o2, A.kind == 1) + ")";
+                    (A.kind == 0   ? std::string("ST(")
+                     : A.kind == 6 ? std::string("MVX(")
+                                   : std::string("MV(")) +
+                    tstr + "<-" + refStr(A.a2, A.g2, A.o2, A.kind != 0) +
+                    ")";
                 if (atomStrs.insert(a3).second) atoms.push_back(A);
               }
             }
@@ -17684,17 +18023,30 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 A.kind = 3; A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
               } else if (v.k == 4) {
                 A.kind = 2; A.a2 = -1; A.g2 = v.g; A.o2 = v.off;
+              } else if (v.k == 8) {
+                A.kind = 5;
+                if (v.g) { A.a2 = -1; A.g2 = v.g; }
+                else A.a2 = v.a;
+                A.o2 = v.off;
+              } else if (v.k == 9) {
+                A.kind = 9;
+                if (v.g) { A.a2 = -1; A.g2 = v.g; }
+                else A.a2 = v.a;
+                A.o2 = v.off;
               } else {
                 why = v.k == 5 ? "ret-local" : "ret-deep";
                 return false;
               }
               std::string a3 =
-                  std::string(A.kind == 3 ? "ALIAS(ret<-" : "LD(ret<-") +
-                  refStr(A.a2, A.g2, A.o2, A.kind == 2) + ")";
+                  std::string(A.kind == 3   ? "ALIAS(ret<-"
+                              : A.kind == 5 ? "LDX(ret<-"
+                              : A.kind == 9 ? "LD2(ret<-*"
+                                            : "LD(ret<-") +
+                  refStr(A.a2, A.g2, A.o2, A.kind != 3) + ")";
               if (atomStrs.insert(a3).second) atoms.push_back(A);
             }
           }
-          if (atoms.size() > 12) { why = "too-many-atoms"; return false; }
+          if (atoms.size() > 16) { why = "too-many-atoms"; return false; }
           if (atoms.empty()) {
             okEmpty.insert(&F);
             nEmpty++;
@@ -17727,17 +18079,50 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 schanged = true;
               } else if (!retryable) {
                 sPerm.insert(canon);
-                if (sround == 1) {
+                if (sround == 1)
                   sRefuse[why.substr(0, why.find(' '))]++;
-                  CG_LOG("SolvedProp: REFUSED " << F.getName() << " ["
-                         << why << "]\n");
-                }
+                CG_LOG("SolvedProp: REFUSED " << F.getName() << " ["
+                       << why << (sround == 1 ? "" : " late") << "]\n");
               } else if (sround == 1) {
                 sRefuse["escape-pending"]++;
                 CG_LOG("SolvedProp: PENDING " << F.getName() << " ["
                        << why << "]\n");
               }
             }
+          }
+        }
+        // Late passes to TRUE quiescence (the main loop can converge
+        // prematurely across module boundaries), then the stuck report
+        // with the blockers that ACTUALLY held.
+        for (bool late = true; late;) {
+          late = false;
+          for (auto &[mod, mname] : Ctx->Modules) {
+            for (const Function &F : *mod) {
+              if (F.isDeclaration()) continue;
+              const Function *canon = getFuncDef(const_cast<Function *>(&F));
+              if (canon != &F || ok.count(canon) || okEmpty.count(canon) ||
+                  props.count(canon) || sPerm.count(canon))
+                continue;
+              if (Ctx->FuncSummaries.count(canon)) continue;
+              bool retryable = false;
+              std::string why;
+              if (trySolve(F, retryable, why)) late = true;
+            }
+          }
+        }
+        for (auto &[mod, mname] : Ctx->Modules) {
+          for (const Function &F : *mod) {
+            if (F.isDeclaration()) continue;
+            const Function *canon = getFuncDef(const_cast<Function *>(&F));
+            if (canon != &F || ok.count(canon) || okEmpty.count(canon) ||
+                props.count(canon) || sPerm.count(canon))
+              continue;
+            if (Ctx->FuncSummaries.count(canon)) continue;
+            bool retryable = false;
+            std::string why;
+            if (!trySolve(F, retryable, why))
+              CG_LOG("SolvedProp: STUCK " << F.getName() << " [" << why
+                     << "]\n");
           }
         }
         std::string sh;
@@ -17753,7 +18138,16 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 "(authoritative mode owns the body-skip lists)\n";
       assert(false && "adopt-proposed without func-summaries");
     }
-    size_t nNoop = 0, nAtom = 0;
+    size_t nNoop = 0, nAtom = 0, nEmptyAd = 0;
+    // Solved-class zero-atom fns: EMPTY-ATOM summaries — callsite
+    // wiring cut, body KEPT (never g_noopBodies: their proofs allow
+    // formal-independent icalls/asm which body-skip would erase).
+    for (const Function *F : okEmpty) {
+      GlobalContext::FuncSummary S;
+      Ctx->OwnedSummaries.push_back(std::move(S));
+      Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
+      nEmptyAd++;
+    }
     for (const Function *F : ok) {
       GlobalContext::FuncSummary S;
       S.noop = true;
@@ -17778,6 +18172,24 @@ void CallGraphPass::runSummaryProvers(Module *M) {
         case 2: SA.kind = GlobalContext::SummaryAtom::Load; SA.dst = -1;
                 SA.src = A.a2; SA.srcByteOff = (int)A.o2; SA.gsrc2 = A.g2;
                 break;
+        case 5: SA.kind = GlobalContext::SummaryAtom::LoadX; SA.dst = -1;
+                SA.src = A.a2; SA.srcByteOff = (int)A.o2; SA.gsrc2 = A.g2;
+                break;
+        case 6: SA.kind = GlobalContext::SummaryAtom::MoveX; SA.dst = A.a1;
+                SA.src = A.a2; SA.dstByteOff = (int)A.o1;
+                SA.srcByteOff = (int)A.o2; SA.gdst = A.g1; SA.gsrc2 = A.g2;
+                break;
+        case 7: SA.kind = GlobalContext::SummaryAtom::Store2; SA.dst = A.a1;
+                SA.src = A.a2; SA.dstByteOff = (int)A.o1;
+                SA.srcByteOff = (int)A.o2; SA.gdst = A.g1; SA.gsrc2 = A.g2;
+                break;
+        case 8: SA.kind = GlobalContext::SummaryAtom::Move2; SA.dst = A.a1;
+                SA.src = A.a2; SA.dstByteOff = (int)A.o1;
+                SA.srcByteOff = (int)A.o2; SA.gdst = A.g1; SA.gsrc2 = A.g2;
+                break;
+        case 9: SA.kind = GlobalContext::SummaryAtom::Load2; SA.dst = -1;
+                SA.src = A.a2; SA.srcByteOff = (int)A.o2; SA.gsrc2 = A.g2;
+                break;
         case 3: SA.kind = GlobalContext::SummaryAtom::Alias; SA.dst = -1;
                 SA.src = A.a2; SA.srcByteOff = (int)A.o2; SA.gsrc2 = A.g2;
                 break;
@@ -17792,7 +18204,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       nAtom++;
     }
     CG_LOG("SummaryAdopt: " << nNoop << " noop + " << nAtom
-           << " atom summaries adopted (per-corpus proofs)\n");
+           << " atom + " << nEmptyAd
+           << " empty summaries adopted (per-corpus proofs)\n");
   }
 }
 
@@ -18009,7 +18422,7 @@ bool CallGraphPass::doInitialization(Module *M) {
   // every handleCall/runOnFunction decision.
   if (iteration == 0 && M == Ctx->Modules.back().first &&
       (CFLProposeNoopSummaries || CFLProposeAtomSummaries ||
-       CFLAdoptProposedSummaries)) {
+       CFLProposeSolvedSummaries || CFLAdoptProposedSummaries)) {
     if (CFLAdoptProposedSummaries && CFLCompositional) {
       errs() << "--cfl-adopt-proposed-summaries is monolithic-only "
                 "(per-TU proofs unvalidated)\n";

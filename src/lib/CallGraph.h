@@ -137,6 +137,7 @@ private:
   bool handleContainerCall(const llvm::CallBase *CS, const llvm::Function *CF);
   NodeIndex summaryDerefCell(NodeIndex base, int byteOff);
   NodeIndex summaryFieldPtr(NodeIndex base, int byteOff);
+  NodeIndex summaryDeref2Cell(NodeIndex base, int byteOff);
   void runSummaryProvers(llvm::Module *M);
   bool applySummaryAtoms(const llvm::CallBase *CS,
                          const GlobalContext::FuncSummary &S,

@@ -1161,7 +1161,18 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
   bool retBound = false;
   {
     auto sit = Ctx->FuncSummaries.find(CF);
-    if (sit != Ctx->FuncSummaries.end()) {
+    // Summaries bind the callee's transfer to THIS callsite's actuals
+    // — correct at DIRECT callsites (the adoption contract). At
+    // INDIRECTLY-RESOLVED sites the callee set is answer-quality
+    // (pool smear included): applying atoms there welds the callee's
+    // cells to every wrongly-resolved site's actuals both ways (5.18:
+    // ethtool_set_ethtool_phy_ops's ST atom pulled ethtool_phy_ops'
+    // cell into the pool, 4 reader sites went full-pool, +27k pairs).
+    // Indirect resolutions keep the pooled arg/ret wiring.
+    const bool directSite =
+        CS->getCalledFunction() ||
+        !Ctx->IndirectCallInsts.count(const_cast<llvm::CallBase *>(CS));
+    if (sit != Ctx->FuncSummaries.end() && directSite) {
       if (!applySummaryAtoms(CS, *sit->second, &retBound))
         return false;
       // Invoke atom with dynamic fn at this callsite: fall through to
@@ -3798,11 +3809,50 @@ bool CallGraphPass::runFlowsToResolution() {
       auto dIt = toDense.find(getCanonicalNode(p.first));
       if (dIt != toDense.end()) certCls.insert(dIt->second);
     }
+  auto protBlameName2 = [&](uint32_t cls) -> std::string {
+    const Value *V2 = NF.getValueForNode(toOrig[cls]);
+    if (!V2) return "<synth>";
+    if (V2->hasName()) return V2->getName().str();
+    if (const auto *I2 = dyn_cast<Instruction>(V2))
+      return (I2->getFunction()->getName() + "::" + I2->getOpcodeName()).str();
+    if (const auto *A2 = dyn_cast<Argument>(V2))
+      return (A2->getParent()->getName() + "#arg" +
+              std::to_string(A2->getArgNo())).str();
+    return "<unnamed>";
+  };
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
     auto fit = funcOfCanon.find(toOrig[n]);
     const bool isFunc = fit != funcOfCanon.end();
     const bool isCert = !certCls.empty() && certCls.count(n);
+    // Adoption-starved formals/varargs: in-degree 0 because the
+    // summary OWNS the callsite wiring, not because the value is a
+    // source. Minting them creates tracer-dye origins that traverse
+    // the walked body's whole value web and weld every deref cell
+    // they touch into one cluster (5.18 3-TU repro: an unnamed
+    // formal origin fused the ethtool reader cells with the
+    // phy_fixup_list chains — reader sites went 3 -> 73 targets).
+    if (!hasIn[n] && !isFunc && !isCert && !hasOrigin[n]) {
+      auto starvedBy = [&](const Value *cv) -> const Function * {
+        if (const auto *A2 = dyn_cast_or_null<Argument>(cv))
+          return A2->getParent();
+        return nullptr;
+      };
+      const Function *PF = starvedBy(NF.getValueForNode(toOrig[n]));
+      if (!PF) {
+        auto mIt = canonicalClassMembers.find(toOrig[n]);
+        if (mIt != canonicalClassMembers.end())
+          for (NodeIndex m : mIt->second) {
+            PF = starvedBy(NF.getValueForNode(m));
+            if (!PF && NF.isVarargNode(m))
+              PF = dyn_cast_or_null<Function>(NF.getValueForNode(m));
+            if (PF) break;
+          }
+      }
+      if (PF &&
+          Ctx->FuncSummaries.count(getFuncDef(const_cast<Function *>(PF))))
+        continue;
+    }
     if (!hasIn[n] || isFunc || hasOrigin[n] || isCert) {
       if (!bidiMarked.empty() && !isFunc && !isCert && !bidiMarked[n]) {
         // Outside the fptr cone: this origin's facts can key joins only
@@ -5397,9 +5447,35 @@ bool CallGraphPass::runFlowsToResolution() {
         if (valueIsOrigin(m)) return true;
     return false;
   };
+  // Adoption-starved class: contains a formal (or vararg node) of a
+  // SUMMARIZED fn and bears no real origin. Its in-degree-0-ness is
+  // adoption-induced (the summary owns the callsite wiring) — minting
+  // it creates a tracer-dye identity that rides the walked body's
+  // value web and welds every deref cell it touches into one cluster.
+  auto starvedFormalClass = [&](uint32_t cls) -> bool {
+    NodeIndex canon = toOrig[find(cls)];
+    if (originBearing(canon)) return false;
+    auto chk = [&](NodeIndex m) -> bool {
+      const Value *cv = NF.getValueForNode(m);
+      const Function *PF = nullptr;
+      if (const auto *A2 = dyn_cast_or_null<Argument>(cv))
+        PF = A2->getParent();
+      else if (cv && NF.isVarargNode(m))
+        PF = dyn_cast<Function>(cv);
+      return PF && Ctx->FuncSummaries.count(
+                       getFuncDef(const_cast<Function *>(PF)));
+    };
+    if (chk(canon)) return true;
+    auto mit = canonicalClassMembers.find(canon);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m : mit->second)
+        if (chk(m)) return true;
+    return false;
+  };
   auto mintRoot = [&](uint32_t cls) {
     uint32_t rep = find(cls);
     if (isRoot[rep]) return;
+    if (CFLAdoptProposedSummaries && starvedFormalClass(rep)) return;
     isRoot[rep] = 1;
     uint32_t rid = nextRoot++;
     // Bundled epochs renumber the PLANE-space ids: tables stay
@@ -16910,6 +16986,14 @@ void CallGraphPass::runSummaryProvers(Module *M) {
               if ((t.kind != 0 && t.kind != 3) || t.off < 0) {
                 ewhy = "store-target"; return false;
               }
+              if (t.kind == 3 && !CFLAtomsGlobalStores) {
+                // QUARANTINE (2026-08-22): ST(*@g<-...) adoption at
+                // 5.18 welded ethtool_phy_ops' cell cluster into the
+                // pool (+27,741 pairs, 98% one setter's atom;
+                // mechanism not yet pinned — bisect2 attribution
+                // exact). Read-side @g atoms are clean (+12 residue).
+                ewhy = "global-store-quarantine"; return false;
+              }
               const bool tArg = t.kind == 0;
               for (auto &v : Vs) {
                 if (v.kind == 2) continue;
@@ -17938,6 +18022,14 @@ void CallGraphPass::runSummaryProvers(Module *M) {
             for (auto &kv : cells) {
               auto [kind, idx2, gv, off] = kv.first;
               if (kind == 5) continue; // locals policed via escapes
+              if ((kind == 3 || (kind == 9 && gv)) &&
+                  !CFLAtomsGlobalStores) {
+                bool starved = lvsSensitive(kv.second);
+                for (const LV &v : kv.second)
+                  if (v.k == 5 && localSensitive(v.a, 0)) starved = true;
+                if (starved) { exWhy = "global-store-quarantine"; return false; }
+                continue; // non-starved: body covers global cells
+              }
               if (kind == 9) {
                 // level-2 cells: **base@off — ST2/MV2 atoms; global-
                 // level-2 with non-starved content is body-covered
@@ -18162,16 +18254,32 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       assert(false && "adopt-proposed without func-summaries");
     }
     size_t nNoop = 0, nAtom = 0, nEmptyAd = 0;
+    auto adoptSkip = [&](const Function *F) -> bool {
+      if (CFLAdoptSkip.empty()) return false;
+      StringRef spec(CFLAdoptSkip);
+      while (!spec.empty()) {
+        auto [head, rest] = spec.split(',');
+        if (!head.empty() && F->getName() == head) {
+          CG_LOG("SummaryAdopt: SKIPPED " << F->getName()
+                 << " (--cfl-adopt-skip)\n");
+          return true;
+        }
+        spec = rest;
+      }
+      return false;
+    };
     // Solved-class zero-atom fns: EMPTY-ATOM summaries — callsite
     // wiring cut, body KEPT (never g_noopBodies: their proofs allow
     // formal-independent icalls/asm which body-skip would erase).
     for (const Function *F : okEmpty) {
+      if (adoptSkip(F)) continue;
       GlobalContext::FuncSummary S;
       Ctx->OwnedSummaries.push_back(std::move(S));
       Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
       nEmptyAd++;
     }
     for (const Function *F : ok) {
+      if (adoptSkip(F)) continue;
       GlobalContext::FuncSummary S;
       S.noop = true;
       Ctx->OwnedSummaries.push_back(std::move(S));
@@ -18180,6 +18288,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       nNoop++;
     }
     for (auto &[F, pas] : props) {
+      if (adoptSkip(F)) continue;
       GlobalContext::FuncSummary S;
       for (const PAtom &A : pas) {
         GlobalContext::SummaryAtom SA{};

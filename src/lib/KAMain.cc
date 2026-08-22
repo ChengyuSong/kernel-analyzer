@@ -761,6 +761,21 @@ cl::opt<bool> CFLProbeWitnessSep(
            "per-witness answer-read lever against the cluster giant"),
   cl::init(false));
 
+cl::opt<bool> CFLAtomsGlobalStores(
+  "cfl-atoms-global-stores",
+  cl::desc("Allow generated atoms with GLOBAL deref targets "
+           "(ST/MV*(*@g<-...)). QUARANTINED default-off: at 5.18 one "
+           "such adoption welded the target global's cell cluster "
+           "into the pool (+27k pairs); mechanism unpinned. Read-side "
+           "@g atoms (ALIAS/LD) are unaffected"),
+  cl::init(false));
+
+cl::opt<std::string> CFLAdoptSkip(
+  "cfl-adopt-skip",
+  cl::desc("Comma-separated fn names excluded from per-run summary "
+           "adoption (attribution bisection tool)"),
+  cl::init(""));
+
 cl::opt<bool> CFLAdoptProposedSummaries(
   "cfl-adopt-proposed-summaries",
   cl::desc("Adopt the provers' proposals as summaries FOR THIS RUN: "

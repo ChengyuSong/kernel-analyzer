@@ -81,6 +81,8 @@ extern cl::opt<bool> CFLBundleProbe;
 extern cl::opt<bool> CFLProposeNoopSummaries;
 extern cl::opt<bool> CFLProposeAtomSummaries;
 extern cl::opt<bool> CFLAdoptProposedSummaries;
+extern cl::opt<std::string> CFLAdoptSkip;
+extern cl::opt<bool> CFLAtomsGlobalStores;
 extern cl::opt<bool> CFLProposeSolvedSummaries;
 extern cl::opt<bool> CFLProbeWitnessSep;
 extern cl::opt<bool> CFLWitnessAnswers;

@@ -13260,16 +13260,23 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         }
         nChR++;
       } else if (t.consume_front("CHAINCALL(") && t.consume_back(")")) {
-        // CHAINCALL(argK:fN<-argV): key at argK; dispatch value argV ->
-        // each registered callback's formal fN
+        // CHAINCALL(argK:fN<-argV) or CHAINCALL(@sym:fN<-argV): key at
+        // argK / the named global; dispatch value argV -> each
+        // registered callback's formal fN
         auto [kp, rest2] = t.split(':');
         auto [fkp, vp] = rest2.split("<-");
         A.kind = GlobalContext::SummaryAtom::ChainCall;
         unsigned fkv = 0;
         StringRef fks = fkp;
-        bad = !parseRef(kp, A.dst) || A.dst < 0 || !parseRef(vp, A.src) ||
-              A.src < 0 || !fks.consume_front("f") ||
-              fks.getAsInteger(10, fkv);
+        if (kp.consume_front("@")) {
+          A.gsym = kp.str();
+          A.dst = -1;
+          bad = A.gsym.empty();
+        } else {
+          bad = !parseRef(kp, A.dst) || A.dst < 0;
+        }
+        bad = bad || !parseRef(vp, A.src) || A.src < 0 ||
+              !fks.consume_front("f") || fks.getAsInteger(10, fkv);
         A.fk = (int)fkv;
         nChC++;
       } else if (t.consume_front("ST2(**") && t.consume_back(")")) {
@@ -13419,6 +13426,33 @@ NodeIndex CallGraphPass::summaryFieldPtr(NodeIndex base, int byteOff) {
   NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
   EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
   return getCanonicalNode(f);
+}
+
+// Resolve a chain-key symbol name to its defining GlobalValue:
+// Gobjs -> ExtGobjs -> one-time unique-local-name scan (static chain
+// heads are in no global map and invisible from caller TUs).
+static const GlobalValue *resolveChainKeySym(GlobalContext *Ctx,
+                                             const CallBase *CS,
+                                             const std::string &sym) {
+  const uint64_t g = llvm::GlobalValue::getGUID(sym);
+  auto git = Ctx->Gobjs.find(g);
+  if (git != Ctx->Gobjs.end() && git->second) return git->second;
+  auto eit = Ctx->ExtGobjs.find(g);
+  if (eit != Ctx->ExtGobjs.end() && eit->second) return eit->second;
+  static std::unordered_map<std::string, const GlobalValue *> localByName;
+  static bool scanned = false;
+  if (!scanned) {
+    scanned = true;
+    for (auto &mp2 : Ctx->Modules)
+      for (const GlobalVariable &GV2 : mp2.first->globals()) {
+        if (!GV2.hasLocalLinkage() || !GV2.hasName()) continue;
+        auto [it2, ins2] = localByName.emplace(GV2.getName().str(), &GV2);
+        if (!ins2) it2->second = nullptr; // ambiguous
+      }
+  }
+  auto lit = localByName.find(sym);
+  if (lit != localByName.end() && lit->second) return lit->second;
+  return CS->getModule()->getNamedValue(sym);
 }
 
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
@@ -13596,44 +13630,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (A.gsrc) {
         key = A.gsrc; // derived (composition lift): already canonical
       } else if (!A.gsym.empty()) {
-        // resolve by GUID against the global maps: the callsite TU
-        // usually does NOT declare the chain head (the wrapper hides
-        // it) -- getNamedValue there returned null and 1,889 wrapper
-        // registrations fell back pooled (kernel-adopt2 identity check)
-        const uint64_t g = llvm::GlobalValue::getGUID(A.gsym);
-        auto git = Ctx->Gobjs.find(g);
-        if (git != Ctx->Gobjs.end() && git->second) {
-          key = git->second;
-        } else {
-          auto eit = Ctx->ExtGobjs.find(g);
-          if (eit != Ctx->ExtGobjs.end() && eit->second) {
-            key = eit->second;
-          } else {
-            // STATIC chain heads (pm_chain_head, oom_notify_list, ...)
-            // are in no global map and not visible from callers' TUs.
-            // Resolve by a one-time corpus scan of local-linkage
-            // globals; only a UNIQUE name match binds (ambiguous or
-            // absent -> dyn fallback, LEDGERed by the caller path).
-            static std::unordered_map<std::string, const GlobalValue *>
-                localByName; // nullptr sentinel = ambiguous
-            static bool scanned = false;
-            if (!scanned) {
-              scanned = true;
-              for (auto &mp2 : Ctx->Modules)
-                for (const GlobalVariable &GV2 : mp2.first->globals()) {
-                  if (!GV2.hasLocalLinkage() || !GV2.hasName()) continue;
-                  auto [it2, ins2] =
-                      localByName.emplace(GV2.getName().str(), &GV2);
-                  if (!ins2) it2->second = nullptr; // ambiguous
-                }
-            }
-            auto lit = localByName.find(A.gsym);
-            if (lit != localByName.end() && lit->second)
-              key = lit->second;
-            else
-              key = canonChainKey(CS->getModule()->getNamedValue(A.gsym));
-          }
-        }
+        key = resolveChainKeySym(Ctx, CS, A.gsym);
+        if (key && key->isDeclaration())
+          key = canonChainKey(key);
       } else if (A.dst >= 0) {
         key = canonChainKey(dyn_cast<GlobalValue>(
             CS->getArgOperand(A.dst)->stripPointerCasts()));
@@ -13677,11 +13676,14 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::ChainCall: {
-      if ((unsigned)A.dst >= CS->arg_size() ||
+      if ((A.gsym.empty() && (unsigned)A.dst >= CS->arg_size()) ||
           (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
       if (chainFinalized) { g_chainLate++; needPooled = true; break; }
-      const GlobalValue *key = canonChainKey(dyn_cast<GlobalValue>(
-          CS->getArgOperand(A.dst)->stripPointerCasts()));
+      const GlobalValue *key =
+          !A.gsym.empty()
+              ? resolveChainKeySym(Ctx, CS, A.gsym)
+              : canonChainKey(dyn_cast<GlobalValue>(
+                    CS->getArgOperand(A.dst)->stripPointerCasts()));
       if (!key) { g_chainCallDyn++; needPooled = true; break; }
       if (!chainDispatches.empty() && chainDispatches.back().cs == CS &&
           chainDispatches.back().key == key) {

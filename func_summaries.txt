@@ -548,3 +548,21 @@ vprintk_store NOOP
 # on the uaccess asm bodies.
 _copy_from_user NOOP
 _copy_to_user NOOP
+# Driver-core probe channel PILOT (hand model 2026-08-22, user-approved
+# explicit modeling of hard kernel fns): the (driver, device) pairing
+# is keyed by the BUS TYPE global — registration wrappers hardcode it,
+# device-add wrappers dispatch on it. CHAINREG reads the driver
+# struct's constant initializer (probe/remove members at 5.18 x86-64
+# byte offsets); CHAINCALL binds the device to the callback's formal 0
+# and attributes the pairs at the wrapper callsite (REGCALL). The
+# registration summary owning its callsite severs driver structs from
+# pooling into the bus machinery (drains really_probe's icall);
+# dispatch sites keep pooled wiring (fallback regs stay sound).
+# pci_driver: node(16) name(8) id_table(8) probe@32 remove@40; probe's
+# f1 = id-table entry (block interior) — block->f1 binding; remove has
+# no block formal -> f9 (out-of-range = no self bind).
+__pci_register_driver CHAINREG(@pci_bus_type,*arg0+32,f1) CHAINREG(@pci_bus_type,*arg0+40,f9)
+pci_device_add CHAINCALL(@pci_bus_type:f0<-arg0)
+# platform_driver: probe@0 remove@8
+__platform_driver_register CHAINREG(@platform_bus_type,*arg0+0,f9) CHAINREG(@platform_bus_type,*arg0+8,f9)
+platform_device_add CHAINCALL(@platform_bus_type:f0<-arg0)

@@ -1748,9 +1748,32 @@ static std::vector<NodeIndex> g_presolveConeCanon;
 static boost::unordered_flat_map<std::string, uint8_t> g_subsysIds;
 static boost::unordered_flat_map<std::string, uint32_t> g_weldRepOf;
 static std::vector<std::string> g_subsysNames;
+// Absolute-path bc-lists share a machine-specific prefix (/home/...) that
+// would collapse every module into one subsystem key; strip the corpus
+// root = longest common directory prefix over all module identifiers.
+static std::string g_subsysRoot;
+static void subsysComputeRoot(const ModuleList &mods) {
+  g_subsysRoot.clear();
+  bool first = true;
+  for (auto &mp : mods) {
+    llvm::StringRef p(mp.first->getModuleIdentifier());
+    if (first) {
+      g_subsysRoot = p.str();
+      first = false;
+      continue;
+    }
+    size_t n = 0, lim = std::min(g_subsysRoot.size(), (size_t)p.size());
+    while (n < lim && g_subsysRoot[n] == p[n])
+      n++;
+    g_subsysRoot.resize(n);
+  }
+  size_t sl = g_subsysRoot.rfind('/');
+  g_subsysRoot.resize(sl == std::string::npos ? 0 : sl + 1);
+}
 static uint8_t subsysBitOf(const llvm::Module *M2) {
   if (!M2) return 63;
   llvm::StringRef p2 = M2->getModuleIdentifier();
+  p2.consume_front(g_subsysRoot);
   p2.consume_front("./");
   size_t s1 = p2.find('/');
   size_t s2 = s1 == llvm::StringRef::npos ? s1 : p2.find('/', s1 + 1);
@@ -4138,6 +4161,7 @@ bool CallGraphPass::runFlowsToResolution() {
       weldBlame; // name -> (count, united-bits)
   size_t weldEvents = 0, mergeEvents = 0;
   if (CFLCensusCouplers) {
+    subsysComputeRoot(Ctx->Modules);
     ownedMask.assign(N, 0);
     for (uint32_t rid = 0; rid < nextRoot; rid++) {
       if (funcRootOf.count(rid))

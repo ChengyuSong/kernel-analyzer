@@ -268,15 +268,39 @@ Decompose the fanout at any fat site into two parts:
      killers are pooled locations by definition. Flow sensitivity's
      benefit is conditional on precision that is already gone.
 
-**Statement:** the kernel's precision is carried by *keys* — container
-instance globals, install-site constants, data keys — and a generic
-abstraction discards keys by construction. Generic dials refine
-partitions along axes (offsets, call strings, allocation sites, program
-points) the key structure does not align with; every dial measurably
-fails on the excess. Every lever that moved answers (tracepoint keys,
-static-call tables, bus channels, regfield populations) worked by
-reinstating a kernel key into the abstraction — generic mechanisms,
-domain-informed instantiation, each machine-certified.
+**Statement — generic containers, semantic keys.** The kernel's
+containers are deliberately generic: the same `list_head`/klist/slab
+code, offsets, and call shapes for every user — code-reuse genericity
+is a kernel design virtue. Consequently every abstraction axis that
+partitions by *program structure* (type, field offset, allocation
+site, call string, program point) sees identical structure for an ata
+port and a socket traversing the same container code, and the quotient
+collapses; the five dial failures above are one phenomenon. The
+discriminant was never structural — it is a *value*: which instance
+the head pointer equals, what the data key hashes to, which constant
+was installed. Three corollaries:
+1. The semantic key is statically evident at exactly one place — the
+   frame where it is still a constant (`dev->dev.bus = &pci_bus_type`
+   in the wrapper, `i_fop = &ext4_file_operations` at iget). That is
+   the unique frame where syntax and semantics coincide, which is why
+   the channel cut goes at the wrapper/install site and nowhere else;
+   a channel is the analysis *evaluating the key computation* rather
+   than refining a structural partition around it.
+2. This is the principled contrast with OO devirtualization: a C++
+   vtable is keyed by static type — structural — so class-hierarchy
+   analysis works generically. Kernel dispatch keys are runtime values
+   (instance pointers, IDs, names); type-based approaches (MLTA-family)
+   substitute struct type as a structural surrogate that only partially
+   correlates with the semantic key — the source of both their
+   imprecision and their unsoundness risk.
+3. "Semantic" does not mean dynamic: the keys are static facts — named
+   globals, rodata ID tables, closed install populations — recoverable
+   by tracking value identities and populations (the certified
+   channels), just not by refining structural partitions.
+Every lever that moved answers (tracepoint keys, static-call tables,
+bus channels, regfield populations) is an instance of reinstating a
+semantic key into the abstraction — generic mechanisms, key-guided
+instantiation, each machine-certified.
 
 **Scope of the claim:** this is an empirical impossibility argument
 with structural explanations, not a theorem over all abstractions.

@@ -120,3 +120,38 @@ fptr and the population share the key.
 - Anything we model here can cite the kernel's own registry rather
   than asserting idiom knowledge — relevant for the paper's
   "domain-informed but not folklore" positioning.
+
+## 7. Consumption design: grammar as the only interface
+
+The solver core stays generic — it knows planes, joins, and keyed
+channel cells; CHAINREG/CHAINCALL atoms are the sole channel
+interface. The registry is consumed by a producer of atoms, not by
+solver code:
+
+- **Not hand-transcription at scale.** Byte offsets are layout- and
+  version-specific (the same reason adopted atoms never enter the
+  shared func_summaries.txt); 109 hand-maintained bus entries would be
+  exactly the hardcoded-idiom-knowledge criticism §6 positions against.
+- **A per-run chain prover** (`--cfl-propose-chain-summaries`, regfield
+  discipline): detect wrappers by the thesis rule — the key is
+  constant at exactly one frame. REG side: store of a bus_type
+  global's address into a formal-reachable field + registration-call
+  reachability → CHAINREG for every fn-ptr slot of the formal's struct
+  (StructAnalyzer offsets: layout-correct by construction; all-slots =
+  sound superset, zero per-bus knowledge). CALL side: constant .bus
+  store reaching device_add → CHAINCALL. Certificate: every store to
+  the .bus field along the path is the constant, else refuse LOUDLY.
+  new_id-style dynamic tables are population-extending, never closing.
+- **Conservative binding policy**: fN formal binding is per-bus
+  semantics and a wrong bind is unsound; default f9 (no bind) unless
+  the wrapper body proves the correspondence — answer-side resolution
+  is where the win is.
+- **Two grammar generalizations only**: literal channel keys
+  ((namespace, string|const-index) for the §5.1 both-sides-static tier
+  and exact array-index dispatch), and a wildcard slot form
+  (*arg0+@X).
+- **Sequencing**: mechanical top-population buses as gated pilot lines
+  now → chain prover, gated by re-deriving the pilot lines
+  byte-for-byte on 5.18 → retire hand lines → literal-key tier last
+  (only step touching solver-side key plumbing). #35/#36 stay bespoke
+  (shipped, gated); re-expression as atoms is optional hygiene.

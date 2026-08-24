@@ -60,7 +60,11 @@ driver-core + timers/workqueue/rcu/klist):**
   is thousands of small junctions, not a cut vertex.
 - **Causal confirmation:** barriering formal arguments in the presolve
   (`--cfl-probe-noformal-presolve`) shatters the largest born class from
-  **49,515 to 381** (130x) — subsystem-sized fragments.
+  **49,515 to 381** (130x) — subsystem-sized fragments. Note this
+  isolates the cause, it is not a fix: the sound solve still propagates
+  through calls, and solve-time joins rebuild 41k-55k classes in the
+  same run. Removing the glue for real means summarizing or cloning the
+  junctions, not skipping them.
 
 **Recovery.** This is the context-sensitivity axis. Per-run summary
 adoption (∞-context for provably summarizable functions) removed

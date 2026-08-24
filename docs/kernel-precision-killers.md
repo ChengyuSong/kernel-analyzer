@@ -1,0 +1,213 @@
+# Kernel Precision Killers
+
+What actually destroys indirect-call precision when analyzing the Linux
+kernel with a sound, whole-program flows-to analysis — measured, not
+guessed. Every killer below carries its mechanism, the kernel idiom that
+produces it, the measured evidence, and what recovers it (or doesn't).
+Numbers are from the 5.18 / 6.18 campaigns and the 2026-08-23 slice
+attribution; repro pointers in the appendix.
+
+Running example: the false pair `__tcp_transmit_skb → ahci_error_handler`.
+At the kernel 6.18 fs pin, `__tcp_transmit_skb`'s single icall
+(`icsk->icsk_af_ops->queue_xmit`, net/ipv4/tcp_output.c) resolves to
+**10,402 targets, 120 of them ata/ahci functions**. The kernel's own
+devirt hint at that line (`INDIRECT_CALL_INET`) names the two expected
+targets. Everything below is an account of how the other 10,400 got in.
+
+## 0. The frame: the kernel is precise by construction — by keys we discard
+
+The kernel almost never retrieves an object by searching. Every container
+is keyed by a **named instance** first and runtime data second:
+
+| container | instance (a named global) | data key (runtime) |
+|---|---|---|
+| bus device/driver klists | `pci_bus_type`, `platform_bus_type`, … | `match()` over ID tables |
+| TCP established hash | `tcp_hashinfo` | netns + 4-tuple |
+| UDP hash | `udp_table` | netns + port |
+| fd table | per-process `files_struct` | int fd + `f_op == &socket_file_ops` |
+| notifier chains | chain-head global | none (call-all) |
+
+and per-object dispatch (`ops` pattern) is bound once at construction
+(`icsk->icsk_af_ops = &ipv4_specific` at `tcp_v4_init_sock`) and read
+back by field load — the key is object identity, installed where the
+constant is still visible.
+
+Two structural facts follow:
+
+1. The instance key is a **constant global exactly one frame above the
+   generic layer** (`dev->dev.bus = &pci_bus_type` in the subsystem
+   wrapper; the generic `bus_add_device` reads it back from the pooled
+   formal). Precision dies one field-read away from a constant.
+2. The instance partition tracks subsystem boundaries almost perfectly.
+   No kernel lookup keyed for a socket can return an `ata_port`. Every
+   cross-subsystem false pair is an artifact of the abstraction, never
+   of the kernel's data flow.
+
+## 1. Killer: context-insensitive call junctions (the born giant)
+
+**Mechanism.** Values from every caller meet in a shared function's
+formal parameter; assignment (`a`) edges make the union transitive. No
+memory, no cells — plain copy-graph confluence.
+
+**Evidence (2026-08-23 slice attribution, 223 TUs spanning net + libata +
+driver-core + timers/workqueue/rcu/klist):**
+- Before any memory join fires, one assignment-connected component of
+  **41,814 value nodes** already contains both worlds: e1000/tg3,
+  `skb_segment`, `alloc_workqueue`, `tick_setup_sched_timer`,
+  `ata_eh_recover`, `sock_setsockopt`.
+- It has **no hub**: largest strongly-connected core = 30 nodes; deleting
+  the 24 highest-degree nodes changes nothing (born-hub probe). The glue
+  is thousands of small junctions, not a cut vertex.
+- **Causal confirmation:** barriering formal arguments in the presolve
+  (`--cfl-probe-noformal-presolve`) shatters the largest born class from
+  **49,515 to 381** (130x) — subsystem-sized fragments.
+
+**Recovery.** This is the context-sensitivity axis. Per-run summary
+adoption (∞-context for provably summarizable functions) removed
+167,799 pairs and 17.5% of the born giant at 5.18 FI — and left the
+>5000-target caller count flat (353), because the fat sites' delivery
+chains (`device_add`-class plumbing) have zero summarizable hops. The
+remainder needs cloning/object sensitivity at ~468 dispatch functions,
+which is blocked on Killer 2/5 first (see §6 ordering).
+
+## 2. Killer: generic-layer registration formals (container welds)
+
+**Mechanism.** `device_add(dev)` is one function; its `dev` formal is one
+node receiving **every device in the kernel**. The insertion
+`klist_add_tail(&dev->p->knode_bus, &bus->p->klist_devices)` reads the
+bus — the kernel's key — from a field of that pooled formal, so all
+buses' containers collapse into one abstract container. Same shape:
+`driver_register`, `tracepoint_probe_register`, notifier registration.
+
+**Evidence.** Junction-formal census ranks these formals as the top
+union carriers; the km trim census attributes **96.7% of retired-filter
+trim to cross-struct hub leakage** (top polluters: `bpf_map_ops`,
+tracepoint args, `work_struct`). At 5.18, all fat sites' fptr planes
+equal `R[giant]` exactly (183,963) — one pool feeds every fat answer.
+
+**Recovery — the channel recipe (shipped, case studies):** capture the
+key at the last frame where it is a constant.
+- Tracepoint keyed channels (task #35, default on): per-`__tracepoint_*`
+  key; killed the family (zero unclassifiable sites at kernel scale).
+- static_call ops tables (task #36, default on).
+- Driver-core pilot (bf5ed0d): `CHAINREG(@pci_bus_type, *arg0+32, f1)` on
+  the registration wrappers + `CHAINCALL(@pci_bus_type:f0<-arg0)` at
+  dispatch. This *is* the kernel's stage-1 key, not an approximation;
+  per-bus is the sound ceiling because stage-2 `match()` depends on
+  hardware/DT data the corpus cannot see.
+
+## 3. Killer: the registry-probe idiom — `match(dev, drv)`
+
+**Mechanism.** Iterate all candidates in a registry, fire a per-candidate
+virtual predicate pairing a container element with a caller-supplied
+object: `drv->bus->match(dev, drv)` (`drivers/base/dd.c`); binutils'
+`bfd_check_format` over `bfd_target_vector` is the same shape. It smears
+**both directions at once**: the fptr is loaded from the pooled element
+(`drv->bus` → every bus's match function), and the caller's precise
+`dev` is passed into *all* candidates' formals, where `container_of`
+casts launder the pool into every subsystem's private types.
+
+**Recovery.** Free once Killer 2 is keyed: the predicate is a virtual
+method *of the key instance itself* (`.match` is a constant slot in the
+`bus_type` initializer), so instance keying resolves target set,
+argument junction, and downstream laundering in one move.
+
+## 4. Killer: per-object ops binding read through a merged pool
+
+**Mechanism.** The `ops` pattern: binding installed at init
+(`icsk_af_ops = &ipv4_specific`), retrieved by field load. The kernel's
+key is object identity — the one thing a pooled abstraction lacks. Once
+the object's class is welded into the giant, the field cell returns
+every ops table in the pool, and the arity/type filter keeps whatever
+fits (`ahci_error_handler` fits `queue_xmit`'s shape).
+
+**Evidence.** Field sensitivity alone does NOT fix this: the false pair
+survives the fs (all+ids) kernel pin. fs splits cells *within* a class;
+it does not prevent class merges.
+
+**Recovery.** Not object sensitivity — the field population.
+`(struct inet_connection_sock, offsetof(icsk_af_ops))` has ~19 witnessed
+install sites; the closed-population intersection is the regfield
+channel (`--cfl-regfield-apply`). Caveat measured from source: the
+population is not pure rodata — mptcp patches file-static copies, smc
+stores a mutable per-socket copy (`&smc->af_ops`) — so the certificate
+needs the copy-closure and lands ORANGE, not GREEN.
+
+## 5. Killer: syscall demux and infrastructure-global rendezvous cells
+
+**Mechanism.** A handful of cells where unrelated objects legitimately
+co-reside, welding otherwise-separate pools class-by-class.
+
+**Evidence — the measured accretion chain (blob-formation probe, slice):**
+the born 49.5k class grows to the 119,609-node final giant through ~56
+join events whose keys are *names*:
+1. `__se_sys_socketcall::alloca` — `sys_socketcall`'s `unsigned long
+   a[6]` demux array, pooling every socket syscall's arguments (the
+   first weld event on the socket side);
+2. `raw_sendmsg::alloca`, fib globals (`ping_table`, `arp_tbl`);
+3. infrastructure globals everything touches: `shadow_timekeeper`,
+   `tk_fast_mono`, `tick_cpu_device`, `rcu_state`, `fw_cache`;
+4. late events pull in `ahci_post_internal_cmd` et al.
+
+**Recovery.** This is the rendezvous-cell keying target — and the list
+is short and concrete. Several entries are cheaper than keying:
+timekeeper/tick/rcu state cells carry no fn-ptr-relevant content and are
+sink/NOOP-summary candidates; the socketcall demux is a scalar-args
+array a summary can prove non-pointer-laundering (long-typed loads).
+
+## 6. Killers already killed, and the ordering constraint
+
+Three independent falsifications prove precision must be paid in the
+abstraction, not at answer extraction:
+- **Witness-read** (`--cfl-witness-answers`): sound per-witness answer
+  reads equal the pooled answer *exactly* — the content really is in
+  the cluster.
+- **Origin-split probe**: counterfactual origin-indexed answers remove
+  0.000%; cluster diversity D == 1 at all 15,864 sites — object
+  indexing is worthless while the welds exist.
+- **Adoption vs the tail**: summaries removed 60k+ pairs from fat
+  callers, tail flat — only 0.16% of surviving fat-site mass was
+  summary-eligible.
+
+Hence the forced order: **fix the spine first** (channels at anchored
+idioms — done for tracepoints/static_call, piloted for driver-core;
+rendezvous-cell keying for §5), **then** per-object binding (§4) and
+cloning (§1 remainder) can pay. Field sensitivity (residue planes) is
+orthogonal and already in-graph; flow sensitivity has never been
+implicated by any measurement.
+
+## 7. Secondary killers (measured, smaller)
+
+- **Residue collisions (Z_P)**: fs uses offsets mod P (13 default); a
+  colliding pair re-welds two fields. Real case: GT recall loss where a
+  CPY summary atom relayed residue 0 only and the survivor was the
+  offset-104 ≡ 0 (mod 13) accident (fixed 7c152c5, residue-complete
+  atoms). `--cfl-field-buckets-auto` picks P against the fn-ptr-slot
+  collision census.
+- **rodata witness glue**: string literals / const structs as shared
+  join witnesses — 47% of km hub joins keyed by one `.str` global.
+  Copy-not-unify (`--cfl-rodata-copy`, reviewed model) severs it.
+- **Linker-materialized arrays / static_call trampolines**: soundness
+  levers, not precision killers, but their absence silently *drops*
+  flows — the inverse failure (`--cfl-linker-arrays`,
+  `--cfl-static-call`, both default on).
+
+## Appendix: repro
+
+- Slice corpus: `/data/csong/tmp/bclist-skweld` (223 TUs of 5.18:
+  net/core, net/ipv4, drivers/base, drivers/ata, kernel/time,
+  workqueue, rcu, klist/kobject, loopback, ethernet). The false pair
+  reproduces fully in it (1,207 targets incl. `ahci_error_handler`);
+  adding bpf/trace/events/VFS/security (v2, 317 TUs) only widens the
+  pool to 1,799 — riders, not causes.
+- Runs (logs in `/data/csong/tmp/`): `skweld3.log` (fixed coupler census,
+  14 subsystems + blob formation + `--cfl-trace-fptr`), `skweld-hub.log`
+  (born-hub shatter), `skweld-noformal.log` (formal-barrier presolve).
+- Flags: `--cfl-flows-to --cfl-nexus-fields=all+ids
+  --func-summaries=func_summaries.txt` plus per-run probe flags; see
+  docs/cli-reference.md §Probes.
+- Kernel-scale pins: 6.18 fs all+ids (16,472 icalls / 13.1M pairs),
+  5.18 FI adoption gates (−167,799/+167, GT 96 FN-list identical).
+- Instrument caveat recorded the hard way: slice ICALL dump targets are
+  after `" -> "`, not field 3; and the coupler census needs the
+  corpus-root fix (a3e579e) on absolute-path bc-lists.

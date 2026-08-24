@@ -753,6 +753,23 @@ cl::opt<bool> CFLProposeSolvedSummaries(
            "kept). Adopt per-run via --cfl-adopt-proposed-summaries"),
   cl::init(false));
 
+cl::opt<bool> CFLProposeChainSummaries(
+  "cfl-propose-chain-summaries",
+  cl::desc("Census: derive driver-core CHAINREG/CHAINCALL channel "
+           "summaries from IR evidence — a wrapper qualifies when it "
+           "stores a bus_type global's address into a formal-rooted "
+           "field AND passes that formal to driver_register/device_add "
+           "(the key-constant frame); channel slot offsets come from "
+           "the union of fn-bearing offsets in conforming callsites' "
+           "static initializers (layout-correct per corpus). Prints "
+           "ChainProp lines, reports MATCH/MISMATCH against existing "
+           "file entries (never overrides them), refuses LOUDLY on "
+           "fn-constant stores into the block (shim installers) or "
+           "internal-linkage keys. Adopt per-run via "
+           "--cfl-adopt-proposed-summaries; conservative bindings "
+           "(REG f9 no-bind; CALL f0 additive)"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeWitnessSep(
   "cfl-probe-witness-sep",
   cl::desc("Census: record (key, fine cell) join anchors and report "

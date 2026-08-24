@@ -18365,6 +18365,251 @@ void CallGraphPass::runSummaryProvers(Module *M) {
            << " atom + " << nEmptyAd
            << " empty summaries adopted (per-corpus proofs)\n");
   }
+
+  // --cfl-propose-chain-summaries (docs/kernel-id-keys.md §7): derive
+  // driver-core CHAINREG/CHAINCALL channels from the key-constant-frame
+  // rule. REG wrapper = stores a bus_type global's address into a
+  // formal-rooted field AND passes that same formal (or an interior GEP
+  // of it) to driver_register/bus_add_driver. CALL wrapper = same
+  // constant store + device_add/device_register on the formal. Slot
+  // offsets = union of fn-bearing byte offsets across all conforming
+  // callsites' static-initializer blocks (layout-correct per corpus by
+  // construction; non-conforming callsites fall back pooled inside the
+  // ChainReg atom application — sound). Bindings are conservative: REG
+  // f9 (no self-bind; a wrong bind would be unsound), CALL f0
+  // (additive over-approximation; dispatch keeps pooled wiring).
+  if (CFLProposeChainSummaries) {
+    struct ChainWrap {
+      const GlobalValue *bus = nullptr;
+      int blkArg = -1;          // formal carrying the driver block
+      std::set<int64_t> offs;   // fn-bearing byte offsets (union)
+      unsigned sites = 0, dynSites = 0;
+      std::string refuse;       // non-empty = census-only
+    };
+    struct CallWrap {
+      const GlobalValue *bus = nullptr;
+      int devArg = -1;          // formal carrying the device
+      std::string refuse;
+    };
+    std::map<const Function *, ChainWrap> regWraps;
+    std::map<const Function *, CallWrap> callWraps;
+    boost::unordered_flat_map<std::string, const Function *> regByName;
+
+    auto busGlobal = [&](const Value *V) -> const GlobalValue * {
+      const auto *G = dyn_cast<GlobalValue>(V->stripPointerCasts());
+      if (!G) return nullptr;
+      const auto *ST = dyn_cast<StructType>(G->getValueType());
+      if (!ST || !ST->hasName()) return nullptr;
+      StringRef n = ST->getStructName();
+      if (n != "struct.bus_type" && !n.starts_with("struct.bus_type."))
+        return nullptr;
+      return G;
+    };
+    auto rootFormal = [](const Value *V, const Function &F) -> int {
+      V = V->stripPointerCasts();
+      while (const auto *G = dyn_cast<GEPOperator>(V))
+        V = G->getPointerOperand()->stripPointerCasts();
+      if (const auto *A2 = dyn_cast<Argument>(V))
+        if (A2->getParent() == &F) return (int)A2->getArgNo();
+      return -1;
+    };
+
+    // Pass 1: qualify wrappers.
+    for (auto &mp : Ctx->Modules) {
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
+        const GlobalValue *bus = nullptr;
+        int busArg = -1;
+        bool busConflict = false, fnStore = false;
+        int regArg = -1, devArg = -1;
+        for (inst_iterator ii = inst_begin(F), ie = inst_end(F); ii != ie;
+             ++ii) {
+          if (const auto *SI = dyn_cast<StoreInst>(&*ii)) {
+            if (const GlobalValue *B = busGlobal(SI->getValueOperand())) {
+              int a = rootFormal(SI->getPointerOperand(), F);
+              if (a >= 0) {
+                if (bus && (bus != B || busArg != a)) busConflict = true;
+                bus = B; busArg = a;
+              }
+            } else if (isa<Function>(
+                           SI->getValueOperand()->stripPointerCasts())) {
+              if (rootFormal(SI->getPointerOperand(), F) >= 0)
+                fnStore = true; // shim installer (usb-style): refuse
+            }
+          } else if (const auto *CB = dyn_cast<CallBase>(&*ii)) {
+            const Function *CF = CB->getCalledFunction();
+            if (!CF || CB->arg_size() < 1) continue;
+            StringRef cn = CF->getName();
+            if (cn == "driver_register" || cn == "bus_add_driver")
+              regArg = rootFormal(CB->getArgOperand(0), F);
+            else if (cn == "device_add" || cn == "device_register")
+              devArg = rootFormal(CB->getArgOperand(0), F);
+          }
+        }
+        if (!bus || busArg < 0) continue;
+        std::string refuse;
+        if (busConflict) refuse = "bus-conflict";
+        else if (bus->hasInternalLinkage()) refuse = "internal-key";
+        else if (fnStore) refuse = "fn-shim-store";
+        if (regArg == busArg) {
+          ChainWrap W; W.bus = bus; W.blkArg = busArg; W.refuse = refuse;
+          regWraps[&F] = W;
+          regByName[F.getName().str()] = &F;
+        }
+        if (devArg == busArg) {
+          CallWrap W; W.bus = bus; W.devArg = busArg; W.refuse = refuse;
+          callWraps[&F] = W;
+        }
+      }
+    }
+
+    // Pass 2: collect fn-bearing offsets from conforming callsites.
+    std::function<void(const Constant *, uint64_t, const DataLayout &,
+                       std::set<int64_t> &)>
+        walkInit = [&](const Constant *C, uint64_t base,
+                       const DataLayout &DL, std::set<int64_t> &out) {
+          if (const auto *CSt = dyn_cast<ConstantStruct>(C)) {
+            const StructLayout *SL = DL.getStructLayout(CSt->getType());
+            for (unsigned e = 0; e < CSt->getNumOperands(); e++)
+              walkInit(CSt->getOperand(e), base + SL->getElementOffset(e),
+                       DL, out);
+          } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+            uint64_t es =
+                DL.getTypeAllocSize(CA->getType()->getElementType());
+            for (unsigned e = 0; e < CA->getNumOperands(); e++)
+              walkInit(CA->getOperand(e), base + e * es, DL, out);
+          } else if (isa<Function>(C->stripPointerCasts())) {
+            out.insert((int64_t)base);
+          }
+        };
+    for (auto &mp : Ctx->Modules) {
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration()) continue;
+        for (inst_iterator ii = inst_begin(F), ie = inst_end(F); ii != ie;
+             ++ii) {
+          const auto *CB = dyn_cast<CallBase>(&*ii);
+          if (!CB) continue;
+          const Function *CF = CB->getCalledFunction();
+          if (!CF) continue;
+          auto nit = regByName.find(CF->getName().str());
+          if (nit == regByName.end()) continue;
+          ChainWrap &W = regWraps[nit->second];
+          if ((unsigned)W.blkArg >= CB->arg_size()) continue;
+          W.sites++;
+          const auto *GV = dyn_cast<GlobalVariable>(
+              CB->getArgOperand(W.blkArg)->stripPointerCasts());
+          if (!GV || !GV->hasInitializer()) { W.dynSites++; continue; }
+          walkInit(GV->getInitializer(), 0,
+                   GV->getParent()->getDataLayout(), W.offs);
+        }
+      }
+    }
+
+    // Pass 3: report + adopt. File entries are never overridden — they
+    // are the correctness reference (MATCH/MISMATCH per wrapper).
+    size_t nReg = 0, nCall = 0, nMatch = 0, nRefused = 0;
+    auto fileHasChain = [&](const Function *F) -> const
+        GlobalContext::FuncSummary * {
+      auto it = Ctx->FuncSummaries.find(F);
+      return it == Ctx->FuncSummaries.end() ? nullptr : it->second;
+    };
+    for (auto &[F, W] : regWraps) {
+      std::string line;
+      for (int64_t o : W.offs)
+        line += " CHAINREG(@" + W.bus->getName().str() + ",*arg" +
+                std::to_string(W.blkArg) + "+" + std::to_string(o) + ",f9)";
+      if (const auto *S = fileHasChain(F)) {
+        bool anyChain = false, sameKey = true;
+        std::set<int64_t> fileOffs;
+        for (const auto &A : S->atoms)
+          if (A.kind == GlobalContext::SummaryAtom::ChainReg) {
+            anyChain = true;
+            fileOffs.insert(A.off);
+            if (A.gsym != W.bus->getName().str()) sameKey = false;
+          }
+        if (anyChain) {
+          bool cover = true; // derived must cover every file offset
+          for (int64_t o : fileOffs) cover &= W.offs.count(o) > 0;
+          CG_LOG("ChainProp: "
+                 << (W.offs.empty()
+                         ? "MATCH-KEY-ONLY " // wrapper+key derived; no
+                                             // conforming sites in corpus
+                         : sameKey && cover ? "MATCH-FILE "
+                                            : "MISMATCH-FILE ")
+                 << F->getName() << " derived" << line << " (file has "
+                 << fileOffs.size() << " offs)\n");
+          nMatch++;
+          continue; // file authoritative
+        }
+      }
+      if (!W.refuse.empty()) {
+        CG_LOG("ChainProp: REFUSED " << F->getName() << " [" << W.refuse
+               << "]" << line << "\n");
+        nRefused++;
+        continue;
+      }
+      if (W.offs.empty()) {
+        CG_LOG("ChainProp: NO-SITES " << F->getName() << " (sites="
+               << W.sites << " dyn=" << W.dynSites << ")\n");
+        continue;
+      }
+      CG_LOG("ChainProp: REG " << F->getName() << line << " (sites="
+             << W.sites << " dyn=" << W.dynSites << ")\n");
+      nReg++;
+      if (CFLAdoptProposedSummaries && !Ctx->FuncSummaries.count(F)) {
+        GlobalContext::FuncSummary S;
+        for (int64_t o : W.offs) {
+          GlobalContext::SummaryAtom SA{};
+          SA.kind = GlobalContext::SummaryAtom::ChainReg;
+          SA.gsrc = canonChainKey(W.bus); // pointer key, pre-canonicalized
+          SA.src = W.blkArg;
+          SA.off = (int)o;
+          SA.fk = 9; // conservative: no block self-bind
+          S.atoms.push_back(SA);
+        }
+        Ctx->OwnedSummaries.push_back(std::move(S));
+        Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
+      }
+    }
+    for (auto &[F, W] : callWraps) {
+      std::string line = " CHAINCALL(@" + W.bus->getName().str() +
+                         ":f0<-arg" + std::to_string(W.devArg) + ")";
+      if (const auto *S = fileHasChain(F)) {
+        bool anyChain = false;
+        for (const auto &A : S->atoms)
+          if (A.kind == GlobalContext::SummaryAtom::ChainCall)
+            anyChain = true;
+        if (anyChain) {
+          CG_LOG("ChainProp: MATCH-FILE " << F->getName() << " derived"
+                 << line << "\n");
+          nMatch++;
+          continue;
+        }
+      }
+      if (!W.refuse.empty()) {
+        CG_LOG("ChainProp: REFUSED " << F->getName() << " [" << W.refuse
+               << "]" << line << "\n");
+        nRefused++;
+        continue;
+      }
+      CG_LOG("ChainProp: CALL " << F->getName() << line << "\n");
+      nCall++;
+      if (CFLAdoptProposedSummaries && !Ctx->FuncSummaries.count(F)) {
+        GlobalContext::FuncSummary S;
+        GlobalContext::SummaryAtom SA{};
+        SA.kind = GlobalContext::SummaryAtom::ChainCall;
+        SA.gsym = W.bus->getName().str();
+        SA.src = W.devArg;
+        SA.fk = 0; // additive over-approx; dispatch keeps pooled wiring
+        S.atoms.push_back(SA);
+        Ctx->OwnedSummaries.push_back(std::move(S));
+        Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
+      }
+    }
+    CG_LOG("ChainProp: " << nReg << " REG + " << nCall << " CALL proposed, "
+           << nMatch << " file-matched, " << nRefused << " refused"
+           << (CFLAdoptProposedSummaries ? " (adopted)" : "") << "\n");
+  }
 }
 
 // exactly the dynamic residual. Without this, FRESH routes the function
@@ -18580,7 +18825,8 @@ bool CallGraphPass::doInitialization(Module *M) {
   // every handleCall/runOnFunction decision.
   if (iteration == 0 && M == Ctx->Modules.back().first &&
       (CFLProposeNoopSummaries || CFLProposeAtomSummaries ||
-       CFLProposeSolvedSummaries || CFLAdoptProposedSummaries)) {
+       CFLProposeSolvedSummaries || CFLProposeChainSummaries ||
+       CFLAdoptProposedSummaries)) {
     if (CFLAdoptProposedSummaries && CFLCompositional) {
       errs() << "--cfl-adopt-proposed-summaries is monolithic-only "
                 "(per-TU proofs unvalidated)\n";

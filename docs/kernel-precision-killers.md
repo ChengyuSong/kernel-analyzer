@@ -159,6 +159,48 @@ timekeeper/tick/rcu state cells carry no fn-ptr-relevant content and are
 sink/NOOP-summary candidates; the socketcall demux is a scalar-args
 array a summary can prove non-pointer-laundering (long-typed loads).
 
+## 5b. Killer: single-site object caches + singleton containers (the VFS road)
+
+**Mechanism.** VFS inverts the instance-key pattern of §0. Every
+`struct file` in the kernel comes from ONE allocation site
+(`__alloc_file` → `kmem_cache_zalloc(filp_cachep)`, fs/file_table.c:138),
+so under allocation-site heap identity all files — ext4's, sockets',
+chardevs', bpf's — are one abstract object before any weld fires. Its
+`f_op` cell is a universal rendezvous **by kernel design**:
+`sock_alloc_file` stores `socket_file_ops`, `chrdev_open` swaps in each
+driver's fops (`replace_fops`), every fs's `do_dentry_open` copies
+`inode->i_fop` there. Joining every fops table yields the *sound* wide
+answer ("any registered fops"). And the VFS containers are kernel-wide
+singletons (`dentry_hashtable`, `inode_hashtable`) whose keys carry
+object pointers (parent dentry, sb) — container-instance keying, the
+winning lever elsewhere, has nothing to split here.
+
+**Evidence (v2 slice attribution, 317 TUs).** `vfs_read` resolves to 312
+targets in-slice (2,761 at the 6.18 pin, 91% inside the one giant core)
+including `ata_tdev_match` and `__bpf_prog_run*` — non-fops content, so
+the file class itself is welded into the giant. The accretion log names
+three roads:
+1. **LSM hook formals** — the born component grows 49.5k → 75.2k with
+   fs/security TUs added and carries LSM-init members
+   (`append_ordered_lsm`); `security_file_alloc(f)` sits inside
+   `__alloc_file` itself, handing every file to the hook junctions.
+2. **`inode_hashtable` insertion** — repeated join events keyed at
+   `__insert_inode_hash`: the global singleton hash chains pool interior
+   pointers of every filesystem's inodes (the VFS analogue of the klist
+   weld).
+3. **The sockfs embedded inode** — join events pairing
+   `__sock_create::load` with `__destroy_inode::getelementptr`:
+   sockets ARE inodes (`struct socket_alloc`), bridging socket-world to
+   inode-world by construction.
+
+**Recovery.** The field-population channel (§4) on
+`(struct inode, i_fop)` / `(struct file, f_op)` with 1-2 copy hops
+(`do_dentry_open`, `replace_fops`) recovers the sound population and
+evicts the non-fops excess; below that population is rarely worth
+buying (any fs/chardev genuinely can be behind a generic file). The
+dcache's `d_op->d_compare` under `d_same_name` (fs/dcache.c:2251) is a
+third sighting of the §3 registry-probe idiom.
+
 ## 6. Killers already killed, and the ordering constraint
 
 Three independent falsifications prove precision must be paid in the

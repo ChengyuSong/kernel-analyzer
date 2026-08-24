@@ -238,6 +238,54 @@ implicated by any measurement.
   flows — the inverse failure (`--cfl-linker-arrays`,
   `--cfl-static-call`, both default on).
 
+## 8. The thesis: sound, and why generic dials cannot buy the precision back
+
+Decompose the fanout at any fat site into two parts:
+
+1. **The semantic floor** — the feasible population at a genuinely
+   polymorphic site ("any registered fops' read" at `vfs_read`). No
+   sound analysis can return less. The honest imprecision metric is
+   excess *beyond* the population, not raw fanout.
+2. **The abstraction excess** — the welds of §§1-5b. For this part,
+   each generic sensitivity dial is eliminated by a measurement or a
+   structural argument:
+   - *Field*: the tcp→ahci pair survives the fs kernel pin — fs splits
+     cells within a class, the killers are class merges.
+   - *Object/heap*: origin-split D==1, 0.000% excess at all sites; and
+     the union legitimately re-forms at retrieval containers (the fd
+     table soundly holds every file), so finer upstream identities
+     change nothing at the read.
+   - *Answer-side*: sound per-witness reads equal the pooled answer
+     exactly.
+   - *Context (generic k)*: the glue is diffuse (no hub; top-24 degree
+     removals flat) and the junctions have thousands of callers, so
+     bounded k either misses the junction or multiplies cost without
+     separating deep chains; ∞-context summaries — the strongest
+     generic contextual weapon — hit a measured 0.16% summarizable-mass
+     ceiling at fat sites, blocked semantically (in-body icalls,
+     external escapes), not by budget.
+   - *Flow*: strong updates require singleton abstract locations; the
+     killers are pooled locations by definition. Flow sensitivity's
+     benefit is conditional on precision that is already gone.
+
+**Statement:** the kernel's precision is carried by *keys* — container
+instance globals, install-site constants, data keys — and a generic
+abstraction discards keys by construction. Generic dials refine
+partitions along axes (offsets, call strings, allocation sites, program
+points) the key structure does not align with; every dial measurably
+fails on the excess. Every lever that moved answers (tracepoint keys,
+static-call tables, bus channels, regfield populations) worked by
+reinstating a kernel key into the abstraction — generic mechanisms,
+domain-informed instantiation, each machine-certified.
+
+**Scope of the claim:** this is an empirical impossibility argument
+with structural explanations, not a theorem over all abstractions.
+Unbounded context-sensitive heap cloning separates everything in
+principle; the measured structure (diffuse glue, single-site caches
+feeding universal containers, unions re-forming at retrieval) is why
+every tractable point on that spectrum pays exponentially for zero
+excess removed.
+
 ## Appendix: repro
 
 - Slice corpus: `/data/csong/tmp/bclist-skweld` (223 TUs of 5.18:

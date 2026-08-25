@@ -1542,6 +1542,8 @@ int main(int argc, char **argv) {
         << InputFilenames[i] << "'\n";
       continue;
     }
+    // (load failures are counted below; an all-failed corpus must not
+    // "succeed" on zero modules)
 
     Module *Module = M.release();
     StringRef MName = StringRef(strdup(InputFilenames[i].data()));
@@ -1550,6 +1552,18 @@ int main(int argc, char **argv) {
 
     doBasicInitialization(Module);
   }
+
+  if (GlobalCtx.Modules.empty() && !InputFilenames.empty()) {
+    errs() << argv[0] << ": FATAL: 0 of " << InputFilenames.size()
+           << " input files loaded (wrong paths / not bitcode?) — refusing "
+              "to run the analysis on an empty corpus\n";
+    return 1;
+  }
+  if (GlobalCtx.Modules.size() < InputFilenames.size())
+    errs() << "[WARN] " << (InputFilenames.size() - GlobalCtx.Modules.size())
+           << "/" << InputFilenames.size()
+           << " input files failed to load — answers cover the loaded "
+              "subset only\n";
 
   // one more preprocessing to clear defined global variables and functions
   for (auto &[id, gv] : GlobalCtx.Gobjs) { GlobalCtx.ExtGobjs.erase(id); }

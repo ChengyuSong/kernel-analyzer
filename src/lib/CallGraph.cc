@@ -4960,6 +4960,11 @@ bool CallGraphPass::runFlowsToResolution() {
             if (const auto *wi = dyn_cast<Instruction>(wv))
               who = (wi->getFunction()->getName() + "::" +
                      wi->getOpcodeName()).str();
+            else if (const auto *wa = dyn_cast<Argument>(wv))
+              // unnamed formals are the junction carriers — name them
+              // or the top blame bucket reads "ctx:join"
+              who = (wa->getParent()->getName() + "::arg" +
+                     Twine(wa->getArgNo())).str();
           } else {
             who = "<synthetic>/" + std::string(blobCtx);
           }

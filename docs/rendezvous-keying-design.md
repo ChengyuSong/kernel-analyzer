@@ -71,6 +71,41 @@ solver discipline.
   of the unkeyed closure that does not cross distinct instance keys;
   crossing derivations are exactly the removed set (the certificate).
 
+## Gate-0 verdict (2026-08-24, km 6.8.2 fs all+ids + adoption + chain)
+
+520 cross-subsystem welds / 48,579 merges over 63 subsystems; blame is
+now fully named (unnamed-formal fix). **The head is SHORT — but
+heterogeneous.** Ranked by subsystem span (the giant-forming metric;
+event counts are small because a weld fires once and transitivity does
+the rest):
+
+| weld family | span | mechanism class |
+|---|---|---|
+| `__traceiter_task_newtask::load` (tracepoint arg pooling) | 53 | part SEMANTIC FLOOR: all tasks are one population by kernel semantics; the excess is what rides transitively through task field cells |
+| `proc_dostring::arg0` + sysctl handler formals | 56 | NEW FAMILY: every subsystem's static `ctl_table` global flows into shared handler formals; `table->data` points into subsystem variables — instance-keyable (tables are named globals) |
+| `<synthetic>/join` residue | 58 | needs one more naming hop (assistant-node keys) |
+| task-adjacent formals (`copy_process::arg3`, `delayacct_add_tsk::arg0`) | 3-9 | task nexus, same floor caveat |
+| everything else | 2-4 | locally contained, not giant-formers |
+
+Plus the slice-study inventory (drivers corpus): bus klists,
+`inode_hashtable` chains + LSM formals, sockfs embedded inode,
+socketcall demux allocas, infra globals (timekeeper/rcu/tick).
+
+**Scope decision: A-list (option 1).** Campaign order by mechanism:
+1. sysctl `ctl_table` instance channel — cleanest new win: tables are
+   static named globals, registration is a walkable idiom
+   (tracepoint-keys shape), span 56.
+2. Driver-core container cells (klist) — instance keying proper, the
+   drafted mechanism.
+3. Socketcall demux + `__warn`/print args — sink/solved-summary
+   treatment, not keying (cheapest; printf-vararg-sink precedent).
+4. Tracepoint-arg keying — LAST and carefully: per-tracepoint arg
+   granularity already exists; the residual task-pool weld is partly
+   semantic floor. Measure the floor (population census) before
+   building anything.
+5. `inode_hashtable` — park until the sb-instance question is designed
+   (sbs are mount-dynamic; static ceiling may be per-fs-type).
+
 ## Gate ladder
 
 0. THIS CENSUS: ranked weld-cell inventory by welded mass + key-origin

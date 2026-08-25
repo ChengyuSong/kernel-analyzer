@@ -1172,7 +1172,21 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
     const bool directSite =
         CS->getCalledFunction() ||
         !Ctx->IndirectCallInsts.count(const_cast<llvm::CallBase *>(CS));
-    if (sit != Ctx->FuncSummaries.end() && directSite) {
+    // TRANSFER-FREE summaries (NOOP/EMPTY: zero atoms) are safe at
+    // indirectly-resolved sites too: they only SKIP wiring, so at a
+    // wrongly-resolved callee that's a no-op and at the real callee
+    // it's the proof. The ethtool hazard above is edge-ADDING atoms
+    // binding callee cells to wrong sites' actuals — those stay
+    // direct-only. This is what severs pooled-container wiring at
+    // icall dispatch (sysctl proc_handler family: every subsystem's
+    // ctl_table into every generic handler's formal, the km
+    // 56-subsystem weld).
+    const bool transferFree =
+        sit != Ctx->FuncSummaries.end() &&
+        (sit->second->noop ||
+         (sit->second->atoms.empty() && !sit->second->fresh &&
+          !sit->second->none));
+    if (sit != Ctx->FuncSummaries.end() && (directSite || transferFree)) {
       if (!applySummaryAtoms(CS, *sit->second, &retBound))
         return false;
       // Invoke atom with dynamic fn at this callsite: fall through to
@@ -13199,6 +13213,13 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         continue;
       } else if (t == "NOOP") {
         S.noop = true;
+        nNoop++;
+        continue;
+      } else if (t == "EMPTY") {
+        // Proven pointer-transfer-free with a body that must stay
+        // walked (in-body dispatch/asm survives): callsite wiring cut,
+        // zero atoms, no body-skip — the file form of the adopted
+        // EMPTY-ATOM class.
         nNoop++;
         continue;
       } else if (t.consume_front("CPY(") && t.consume_back(")")) {

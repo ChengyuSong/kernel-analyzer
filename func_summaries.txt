@@ -548,6 +548,35 @@ vprintk_store NOOP
 # on the uaccess asm bodies.
 _copy_from_user NOOP
 _copy_to_user NOOP
+# sysctl generic proc handlers (hand audit 2026-08-24; rendezvous-
+# keying campaign, Gate-0 top weld: every subsystem's static ctl_table
+# flowing into these formals welded 56 subsystems at km). Each handler
+# below moves SCALARS only: int/uint/u8/ulong/bool/jiffies/string
+# bytes between the user buffer (certified, see _copy_*_user above)
+# and table->data, plus *lenp/*ppos counts; extra1/extra2 reads are
+# bound ints. NO pointer is stored through any formal. EMPTY (not
+# NOOP): bodies stay walked so __do_proc_dointvec's conv icall — a
+# REAL dispatch to the file-local conv constants wired at the internal
+# DIRECT callsites — keeps resolving; only callsite wiring is cut,
+# including at the indirectly-resolved proc_sys dispatch
+# (transfer-free summaries apply at icall sites — handleCall). NOT
+# summarized on purpose: proc_do_large_bitmap (temp-bitmap alloc,
+# separate audit), proc_do_static_key (jump-label side effects),
+# every subsystem-custom handler (per-subsystem pooling is correct
+# granularity there).
+proc_dostring EMPTY
+proc_dobool EMPTY
+proc_dointvec EMPTY
+proc_dointvec_minmax EMPTY
+proc_douintvec EMPTY
+proc_douintvec_minmax EMPTY
+proc_dou8vec_minmax EMPTY
+proc_dointvec_jiffies EMPTY
+proc_dointvec_ms_jiffies EMPTY
+proc_dointvec_userhz_jiffies EMPTY
+proc_dointvec_ms_jiffies_minmax EMPTY
+proc_doulongvec_minmax EMPTY
+proc_doulongvec_ms_jiffies_minmax EMPTY
 # Driver-core probe channel PILOT (hand model 2026-08-22, user-approved
 # explicit modeling of hard kernel fns): the (driver, device) pairing
 # is keyed by the BUS TYPE global — registration wrappers hardcode it,

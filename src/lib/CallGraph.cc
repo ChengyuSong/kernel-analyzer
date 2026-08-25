@@ -13378,6 +13378,135 @@ summaryForName(GlobalContext *Ctx, StringRef name) {
   return nullptr;
 }
 
+// Byte offsets of direct Function constants inside a static initializer
+// (nested structs/arrays; pointers to other globals are NOT followed).
+static void walkInitFnOffsets(const Constant *C, uint64_t base,
+                              const DataLayout &DL,
+                              std::set<int64_t> &out) {
+  if (const auto *CSt = dyn_cast<ConstantStruct>(C)) {
+    const StructLayout *SL = DL.getStructLayout(CSt->getType());
+    for (unsigned e = 0; e < CSt->getNumOperands(); e++)
+      walkInitFnOffsets(CSt->getOperand(e), base + SL->getElementOffset(e),
+                        DL, out);
+  } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+    uint64_t es = DL.getTypeAllocSize(CA->getType()->getElementType());
+    for (unsigned e = 0; e < CA->getNumOperands(); e++)
+      walkInitFnOffsets(CA->getOperand(e), base + e * es, DL, out);
+  } else if (isa<Function>(C->stripPointerCasts())) {
+    out.insert((int64_t)base);
+  }
+}
+
+// File-entry decay validator (always on when a summary file is loaded).
+// The checked-in file must hold only version-portable semantics, but
+// names/keys/offsets silently decay as the kernel moves (6.18 renamed
+// scsi_register_driver -> __scsi_register_driver; pci_driver shifted
+// -16 bytes). A decayed entry never errors — it just stops matching
+// (sound, silently loses the model) — so decay must be a report line.
+// Offset validation is PARTIAL by nature: it catches offsets landing on
+// non-fn slots (alignment breaks), not fn-slot permutation — the chain
+// prover's supplement policy is the mitigation for the latter.
+static void checkFileSummaries(GlobalContext *Ctx) {
+  boost::unordered_flat_set<StringRef> fnNames, gvNames;
+  for (auto &mp : Ctx->Modules) {
+    for (Function &F : *mp.first) fnNames.insert(F.getName());
+    for (GlobalVariable &G : mp.first->globals()) gvNames.insert(G.getName());
+    for (GlobalAlias &A : mp.first->aliases()) {
+      fnNames.insert(A.getName());
+      gvNames.insert(A.getName());
+    }
+  }
+  size_t unmatched = 0, badKeys = 0, staleOffs = 0;
+  struct ChainCheck { int blkArg; std::set<int64_t> offs; };
+  boost::unordered_flat_map<StringRef, ChainCheck> chainSpecs;
+  for (const auto &sp : Ctx->SummarySpecs) {
+    StringRef pat(sp.first);
+    bool matched;
+    if (pat.ends_with("*")) {
+      StringRef p = pat.drop_back();
+      matched = false;
+      for (StringRef n : fnNames)
+        if (n.starts_with(p)) { matched = true; break; }
+    } else {
+      matched = fnNames.count(pat) != 0;
+    }
+    if (!matched) {
+      unmatched++;
+      CG_LOG("SummaryCheck: UNMATCHED '" << sp.first
+             << "' — dormant in this corpus (other-config/other-codebase "
+                "coverage, or renamed upstream)\n");
+    }
+    for (const auto &A : sp.second.atoms) {
+      if (!A.gsym.empty() && !gvNames.count(StringRef(A.gsym)) &&
+          !fnNames.count(StringRef(A.gsym))) {
+        badKeys++;
+        CG_LOG("SummaryCheck: BAD-KEY '@" << A.gsym << "' in '"
+               << sp.first << "' — key symbol absent from corpus "
+                              "(dormant config? — sites fall back "
+                              "pooled, sound)\n");
+      }
+      if (A.kind == GlobalContext::SummaryAtom::ChainReg && A.off >= 0 &&
+          !pat.ends_with("*") && matched) {
+        auto &CC = chainSpecs[pat];
+        CC.blkArg = A.src;
+        CC.offs.insert(A.off);
+      }
+    }
+  }
+  if (!chainSpecs.empty()) {
+    boost::unordered_flat_map<StringRef, std::pair<unsigned, std::set<int64_t>>>
+        seen; // name -> (conforming sites, fn-bearing offsets)
+    for (auto &mp : Ctx->Modules) {
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration()) continue;
+        for (inst_iterator ii = inst_begin(F), ie = inst_end(F); ii != ie;
+             ++ii) {
+          const auto *CB = dyn_cast<CallBase>(&*ii);
+          if (!CB) continue;
+          const Function *CF = CB->getCalledFunction();
+          if (!CF) continue;
+          auto it = chainSpecs.find(CF->getName());
+          if (it == chainSpecs.end() ||
+              (unsigned)it->second.blkArg >= CB->arg_size())
+            continue;
+          const auto *GV = dyn_cast<GlobalVariable>(
+              CB->getArgOperand(it->second.blkArg)->stripPointerCasts());
+          if (!GV || !GV->hasInitializer()) continue;
+          auto &rec = seen[it->first];
+          rec.first++;
+          walkInitFnOffsets(GV->getInitializer(), 0,
+                            GV->getParent()->getDataLayout(), rec.second);
+        }
+      }
+    }
+    for (auto &[name, CC] : chainSpecs) {
+      auto sit = seen.find(name);
+      if (sit == seen.end() || sit->second.first == 0) continue;
+      for (int64_t o : CC.offs)
+        if (!sit->second.second.count(o)) {
+          staleOffs++;
+          CG_LOG("SummaryCheck: STALE-OFFSET '" << name << "' CHAINREG off "
+                 << o << " is fn-bearing in 0/" << sit->second.first
+                 << " conforming callsites — layout drift\n");
+        }
+    }
+  }
+  // Absolute counts are a DORMANCY census (the file deliberately covers
+  // other configs/codebases); DECAY is the cross-version diff — comm
+  // the UNMATCHED/BAD-KEY lines of two kernels' logs: an entry live at
+  // one vintage and dormant at the next is the renamed/removed set.
+  if (unmatched || badKeys || staleOffs)
+    errs() << "[WARN] SummaryCheck: " << unmatched
+           << " entries dormant in this corpus, " << badKeys
+           << " unresolvable @keys, " << staleOffs
+           << " CHAINREG offsets not fn-bearing — see SummaryCheck lines "
+              "(--verbose=2); diff against another vintage's lines to "
+              "isolate decay\n";
+  else
+    CG_LOG("SummaryCheck: all " << Ctx->SummarySpecs.size()
+           << " file entries resolve in this corpus\n");
+}
+
 // Apply the non-FRESH atoms of a summary at a callsite. FRESH itself is
 // carried by the existing AllocFuncs machinery (per-callsite AllocSite +
 // opaque heap object). Cell-copy edges are shift-preserving by
@@ -18463,25 +18592,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       }
     }
 
-    // Pass 2: collect fn-bearing offsets from conforming callsites.
-    std::function<void(const Constant *, uint64_t, const DataLayout &,
-                       std::set<int64_t> &)>
-        walkInit = [&](const Constant *C, uint64_t base,
-                       const DataLayout &DL, std::set<int64_t> &out) {
-          if (const auto *CSt = dyn_cast<ConstantStruct>(C)) {
-            const StructLayout *SL = DL.getStructLayout(CSt->getType());
-            for (unsigned e = 0; e < CSt->getNumOperands(); e++)
-              walkInit(CSt->getOperand(e), base + SL->getElementOffset(e),
-                       DL, out);
-          } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
-            uint64_t es =
-                DL.getTypeAllocSize(CA->getType()->getElementType());
-            for (unsigned e = 0; e < CA->getNumOperands(); e++)
-              walkInit(CA->getOperand(e), base + e * es, DL, out);
-          } else if (isa<Function>(C->stripPointerCasts())) {
-            out.insert((int64_t)base);
-          }
-        };
+    // Pass 2: collect fn-bearing offsets from conforming callsites
+    // (walkInitFnOffsets shared with the file-entry validator).
     for (auto &mp : Ctx->Modules) {
       for (Function &F : *mp.first) {
         if (F.isDeclaration()) continue;
@@ -18499,8 +18611,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           const auto *GV = dyn_cast<GlobalVariable>(
               CB->getArgOperand(W.blkArg)->stripPointerCasts());
           if (!GV || !GV->hasInitializer()) { W.dynSites++; continue; }
-          walkInit(GV->getInitializer(), 0,
-                   GV->getParent()->getDataLayout(), W.offs);
+          walkInitFnOffsets(GV->getInitializer(), 0,
+                            GV->getParent()->getDataLayout(), W.offs);
         }
       }
     }
@@ -18844,6 +18956,13 @@ bool CallGraphPass::doInitialization(Module *M) {
         NF.createReturnNode(itr.second);
     }
   }
+
+  // File-entry decay validator: always on when a summary file is loaded
+  // (names/keys/offsets rot silently as the kernel moves; decay must be
+  // a report line, not a bisection discovery).
+  if (iteration == 0 && M == Ctx->Modules.back().first &&
+      !Ctx->SummarySpecs.empty())
+    checkFileSummaries(Ctx);
 
   // Summary provers pre-pass: after ALL modules' file-summary
   // attachment (last module, first init iteration), before any

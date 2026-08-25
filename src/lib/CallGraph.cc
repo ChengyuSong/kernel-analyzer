@@ -18677,33 +18677,20 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                  << F->getName() << " derived" << line << " (file has "
                  << fileOffs.size() << " offs)\n");
           nMatch++;
-          // File offsets are version-frozen (5.18 vintage) but struct
-          // layouts drift (6.18 pci_driver shifted -16). Registration
-          // is additive, so under adoption SUPPLEMENT the file entry
-          // with derived-but-missing slots: copy file summary + union.
-          if (CFLAdoptProposedSummaries && sameKey) {
-            SmallVector<int64_t, 8> extra;
-            for (int64_t o : W.offs)
-              if (!fileOffs.count(o)) extra.push_back(o);
-            if (!extra.empty()) {
-              GlobalContext::FuncSummary S2 = *S; // copy file atoms
-              for (int64_t o : extra) {
-                GlobalContext::SummaryAtom SA{};
-                SA.kind = GlobalContext::SummaryAtom::ChainReg;
-                SA.gsrc = canonChainKey(W.bus);
-                SA.src = W.blkArg;
-                SA.off = (int)o;
-                SA.fk = 9;
-                S2.atoms.push_back(SA);
-              }
-              Ctx->OwnedSummaries.push_back(std::move(S2));
-              Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
-              CG_LOG("ChainProp: SUPPLEMENT " << F->getName() << " +"
-                     << extra.size()
-                     << " derived slots alongside file entry\n");
-            }
-          }
-          continue; // file atoms preserved (possibly supplemented)
+          // SUPPLEMENT policy REVERTED (2026-08-25, 5.18 gate
+          // +32,575): a ChainReg atom whose offset is NULL in a
+          // callsite's initializer trips the runtime-installed-
+          // callback soundness net (needPooled) — supplemental
+          // suspend/resume/shutdown offsets are null in MOST drivers,
+          // so most pci/platform registration callsites fell back
+          // pooled, UN-severing the driver structs (their err_handler
+          // / pm-ops contents re-welded into the giant: 16 fns x
+          // 2,294 pool callers). Stale file offsets at other vintages
+          // are HARMLESS (additive channel; ahci caller set identical
+          // pin-vs-stale at 6.18). Proper v1 fix: per-callsite
+          // initializer walk (register every fn-bearing offset of
+          // THIS block; no global offset union, no null-slot misses).
+          continue; // file atoms authoritative, unsupplemented
         }
       }
       if (!W.refuse.empty()) {

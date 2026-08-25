@@ -156,6 +156,40 @@ synthetic bucket gets names (the same move that named the formals);
 re-appears named. The mechanism sketch above (registrar-anchored
 allocation cloning) stays as the design IF warranted.
 
+## Regfield re-founding: OBJECT populations, not fn tables (2026-08-25, user)
+
+The regfield-apply kernel gate found the prize and the bug in one run:
+-8,894,664/+0 at 5.18 FI (2,299 CLOSED keys) but GT 88->91 FN — a
+(slot -> fn-table) clamp bled across slots (drbg crypto_init site,
+never keyed, lost its true target to the crypto_fini table; the
+__SCT__ sched_wakeup pair fell to the same class of leak). Root
+diagnosis (user): the primitive is wrong — (struct, fn-slot) -> fn
+table IS the retired field filter with a writer certificate; the slot
+offset is a structural surrogate and surrogates lie.
+
+**Corrected primitive:** certify the OBJECT population of the
+container/field — lookup(pool, key) returns objects:
+  field (S, off) can point to exactly O = {certified ops globals}
+and derive fn answers by reading slots FROM those objects (initializer
+facts, machinery that already exists). Reader-side safety by
+construction: a slot misattribution reads a different slot of the
+RIGHT objects — bounded by fns-of(O), the semantic ceiling — and can
+never evict a true target via a neighboring slot's table.
+
+Ladder:
+1. Writer certificate: closed OBJECT population per (S, off) — the
+   const globals whose addresses are stored there, closure over
+   copies/install hops (the detector already collects this; it
+   aggregates into the wrong key today).
+2. Reader clamp v1: slot-AGNOSTIC membership in fns-of(O) at sites
+   whose base is certified (struct family only — a weaker, certifiable
+   site claim than exact offset). Ambiguity -> no clamp, LOUD.
+3. Optional slot-exact refinement ONLY where the load's offset
+   derivation is itself certified.
+Lineage: this is ops-pairs (#30) generalized — (ops-global, container)
+certificates — and matches the thesis: kernel keys discriminate
+OBJECTS in containers; fn tables were another structural surrogate.
+
 ## Gate ladder
 
 0. THIS CENSUS: ranked weld-cell inventory by welded mass + key-origin

@@ -18539,7 +18539,33 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                  << F->getName() << " derived" << line << " (file has "
                  << fileOffs.size() << " offs)\n");
           nMatch++;
-          continue; // file authoritative
+          // File offsets are version-frozen (5.18 vintage) but struct
+          // layouts drift (6.18 pci_driver shifted -16). Registration
+          // is additive, so under adoption SUPPLEMENT the file entry
+          // with derived-but-missing slots: copy file summary + union.
+          if (CFLAdoptProposedSummaries && sameKey) {
+            SmallVector<int64_t, 8> extra;
+            for (int64_t o : W.offs)
+              if (!fileOffs.count(o)) extra.push_back(o);
+            if (!extra.empty()) {
+              GlobalContext::FuncSummary S2 = *S; // copy file atoms
+              for (int64_t o : extra) {
+                GlobalContext::SummaryAtom SA{};
+                SA.kind = GlobalContext::SummaryAtom::ChainReg;
+                SA.gsrc = canonChainKey(W.bus);
+                SA.src = W.blkArg;
+                SA.off = (int)o;
+                SA.fk = 9;
+                S2.atoms.push_back(SA);
+              }
+              Ctx->OwnedSummaries.push_back(std::move(S2));
+              Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
+              CG_LOG("ChainProp: SUPPLEMENT " << F->getName() << " +"
+                     << extra.size()
+                     << " derived slots alongside file entry\n");
+            }
+          }
+          continue; // file atoms preserved (possibly supplemented)
         }
       }
       if (!W.refuse.empty()) {

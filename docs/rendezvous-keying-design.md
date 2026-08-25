@@ -133,6 +133,21 @@ Three findings, two of them structural:
    tcp traceiter args). No klist-family entry above x2. The km-era
    "klist top polluter" reading predates the chain/sysctl levers.
 
+**Item-2 attribution CLOSED (2026-08-25).** The naming ladder (formal
+args -> provenance tags on minted nodes -> field-node base walk ->
+special-node labels) resolved the synthetic bucket: the residual
+15-subsystem welds are keyed by origins on the UNIVERSAL class — the
+extern-boundary over-approximation itself. That is sound-required
+(unknown memory may alias anything it received); the lever is
+SHRINKING the universal class via extern summaries
+(--cfl-census-extern-bound worklist), never join skipping. A null-cell
+join hygiene guard shipped alongside (joins keyed by the null
+pseudo-object: UB-only flows, safe to drop) — it fires zero times on
+current corpora and stands as a documented invariant in ChurnStats.
+Slice-scale rendezvous A-list status: sysctl DONE, klist NOT RANKED,
+residue = extern boundary (item for the extern-summary campaign) +
+attribute_container (x2/10-subsys) + a 2-4-subsys tail.
+
 **Consequence: item 2 is re-scoped.** Before any keying build:
 (a) opaque-object provenance tagging — record the minting context
 (callsite / summary / extern symbol) on opaque nodes so the x20

@@ -1620,6 +1620,11 @@ void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
 
 // ---- Field-sensitive memory modeling helpers (--cfl-field-buckets > 0) ----
 
+// Provenance for anonymous minted nodes (field pointers, FRESHSUB
+// sub-objects): creation context by NF node index, consulted where
+// getValueForNode comes back null. Best-effort instrument.
+static boost::unordered_flat_map<NodeIndex, std::string> g_opaqueProvenance;
+
 int CallGraphPass::fieldBucket(int64_t off) const {
   const unsigned K = EB.getNumFieldBuckets();
   assert(K > 0 && "fieldBucket called without field labels");
@@ -1640,6 +1645,21 @@ NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
     return it->second;
   NodeIndex n = NF.createValueNode();
   fieldPtrNodes.emplace(key, n);
+  {
+    const Value *pv = NF.getValueForNode(parentCanon);
+    std::string pn = "#" + std::to_string(parentCanon);
+    if (pv && pv->hasName())
+      pn = pv->getName().str();
+    else if (pv) {
+      if (const auto *pi = dyn_cast<Instruction>(pv))
+        pn = (pi->getFunction()->getName() + "::" + pi->getOpcodeName())
+                 .str();
+      else if (const auto *pa = dyn_cast<Argument>(pv))
+        pn = (pa->getParent()->getName() + "::arg" + Twine(pa->getArgNo()))
+                 .str();
+    }
+    g_opaqueProvenance[n] = "fieldptr:" + pn + "+" + std::to_string(off);
+  }
   CG_DEBUG("Create field ptr node " << n << " for (" << parentCanon
            << ", +" << off << ")\n");
   return n;
@@ -4774,6 +4794,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // merge-triggered re-offer, and which classes get re-popped — the data
   // that sizes the delta-precision fix and names summarization targets.
   size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
+  size_t nullKeyJoinsSkipped = 0; // null-cell join hygiene LEDGER
   // --cfl-root-relevance: (root, keeper class) per join-triggered merge —
   // joins are the only consumer of individual root bits besides the final
   // icall answer read, so these witnesses + function roots form a
@@ -4980,7 +5001,37 @@ bool CallGraphPass::runFlowsToResolution() {
               who = (wa->getParent()->getName() + "::arg" +
                      Twine(wa->getArgNo())).str();
           } else {
-            who = "<synthetic>/" + std::string(blobCtx);
+            const NodeIndex bn = toOrig[rootClassOf[bOrig]];
+            auto pit = g_opaqueProvenance.find(bn);
+            if (pit != g_opaqueProvenance.end()) {
+              who = pit->second;
+            } else if (bn < NF.getNumNodes() && NF.isObjectNode(bn) &&
+                       NF.getObjectOffset(bn) > 0) {
+              // struct-object FIELD node: no Value of its own — name
+              // via the base object
+              const NodeIndex base = bn - NF.getObjectOffset(bn);
+              const Value *bv = NF.getValueForNode(base);
+              who = (bv && bv->hasName() ? bv->getName().str()
+                     : bv ? std::string("<anon-obj>")
+                          : std::string("<synthetic-base>")) +
+                    "+f" + std::to_string(NF.getObjectOffset(bn));
+            } else if (bn == NF.getUniversalPtrNode() ||
+                       bn == NF.getUniversalObjNode()) {
+              // extern-boundary class: joins keyed here are the
+              // REQUIRED unknown-memory over-approximation; the lever
+              // is shrinking this class (extern summaries,
+              // --cfl-census-extern-bound worklist), never skipping
+              who = "<extern-boundary>";
+            } else if (bn == NF.getNullPtrNode() ||
+                       bn == NF.getNullObjectNode()) {
+              who = "<null>"; // should not key joins (hygiene guard)
+            } else {
+              who = "<synthetic " +
+                    std::string(bn < NF.getNumNodes() && NF.isObjectNode(bn)
+                                    ? "obj"
+                                    : "val") +
+                    "#" + std::to_string(bn) + ">/" + std::string(blobCtx);
+            }
           }
         }
         auto &bl2 = weldBlame[who];
@@ -5169,6 +5220,24 @@ bool CallGraphPass::runFlowsToResolution() {
     if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
       g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
       return;
+    }
+    // Null-cell join hygiene (2026-08-25): joins keyed by the NULL
+    // pseudo-object's cells model store-through-null — UB, no real
+    // execution stores at null and none loads from it — yet they act
+    // as a universal rendezvous (x4 15-subsystem residual welds at the
+    // attribution slice; null constants flow into every maybe-null
+    // pointer class). Real targets of the same store still key their
+    // own joins; ONLY the null member's cell is dropped. Universal
+    // (#0/#1) joins are extern-boundary soundness and are NOT skipped.
+    {
+      const uint32_t rid0 = origRidOf(o);
+      if (rid0 != UINT32_MAX && rid0 < rootClassOf.size()) {
+        const NodeIndex on0 = toOrig[rootClassOf[rid0]];
+        if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode()) {
+          nullKeyJoinsSkipped++;
+          return;
+        }
+      }
     }
     if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
       g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
@@ -7473,7 +7542,12 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       auto nameOfClass = [&](uint32_t cls) -> std::string {
         const Value *V2 = cls < N ? NF.getValueForNode(toOrig[cls]) : nullptr;
-        if (!V2) return "<synthetic>";
+        if (!V2) {
+          auto pit = cls < N ? g_opaqueProvenance.find(toOrig[cls])
+                             : g_opaqueProvenance.end();
+          return pit != g_opaqueProvenance.end() ? pit->second
+                                                 : "<synthetic>";
+        }
         if (V2->hasName()) return V2->getName().str();
         if (const auto *I2 = dyn_cast<Instruction>(V2))
           return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
@@ -8209,6 +8283,11 @@ bool CallGraphPass::runFlowsToResolution() {
                 NF.getValueForNode(toOrig[rootClassOf[rid3]]);
             const llvm::Module *om3 = nullptr;
             std::string on3 = "<synthetic>";
+            if (!ov3) {
+              auto pit3 =
+                  g_opaqueProvenance.find(toOrig[rootClassOf[rid3]]);
+              if (pit3 != g_opaqueProvenance.end()) on3 = pit3->second;
+            }
             if (ov3) {
               if (const auto *oi3 = dyn_cast<Instruction>(ov3)) {
                 om3 = oi3->getModule();
@@ -8913,6 +8992,7 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "ChurnStats: merges join=" << mergesFromJoin
            << " scc=" << mergesFromSCC
            << ", redundant join lookups " << redundantJoins
+           << ", null-key joins skipped " << nullKeyJoinsSkipped
            << ", merge-reoffered " << reofferedFacts
            << " facts, sweeps offered " << sweepOffered << " kept "
            << sweepKept
@@ -13885,6 +13965,17 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex) break;
       NodeIndex subVal = getCanonicalNode(NF.createValueNode());
       NodeIndex subObj = NF.createOpaqueObjectNode(nullptr, true);
+      // Provenance tag: anonymous minted objects otherwise print as
+      // "<synthetic>" in weld blame / traces — the x20 15-subsys
+      // unattributable bucket (2026-08-25).
+      {
+        const Function *TF = CS->getCalledFunction();
+        std::string tag =
+            "freshsub:" + (TF ? TF->getName().str() : std::string("<icall>")) +
+            "@" + CS->getFunction()->getName().str();
+        g_opaqueProvenance[subVal] = tag;
+        g_opaqueProvenance[subObj] = tag;
+      }
       EB.addDereferenceEdges(subVal, subObj);
       AllocSites.insert(subVal); // origin identity for the mint loop
       addAssignmentEdge(subVal, getRepDerefNode(getCanonicalNode(d)));

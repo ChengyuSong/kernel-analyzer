@@ -106,6 +106,41 @@ socketcall demux allocas, infra globals (timekeeper/rcu/tick).
 5. `inode_hashtable` — park until the sb-instance question is designed
    (sbs are mount-dynamic; static ceiling may be per-fs-type).
 
+## Item-2 exploration: klist keying (2026-08-25) — REORDERED
+
+Three findings, two of them structural:
+
+1. **The klist containers are not cells of the instance globals.**
+   `bus_register` allocates ONE `subsys_private` for every bus
+   (drivers/base/bus.c:787) and `device_private_init` ONE
+   `device_private` for every device (core.c:3249). The container
+   cells (`klist_devices`/`klist_drivers`) live on a single shared
+   heap origin; the static `bus_type` global only holds the `->p`
+   pointer. Instance-keying those cells therefore REQUIRES per-bus
+   heap identity first — allocation-context cloning at `bus_register`
+   anchored on its constant bus argument (FRESHSUB-shaped, but the
+   body has kset/kobject pointer effects a summary would sever).
+2. **Even perfect container keying cannot split the members.** The
+   klist nodes are `device_private` interiors — one origin for all
+   devices — and device-class pooling is dominated by born formal
+   confluence (the noformal probe) anyway. Container keying alone
+   leaves member classes merged: same lesson as origin-split D==1.
+3. **Post-chain/post-sysctl, klist welding no longer ranks.** The
+   named residual blame at the 223-TU slice: `<synthetic>/join` x20
+   (15 subsys) — joins keyed by cells of OPAQUE objects (extern-return
+   / summary-minted anonymous objects, unattributable today) — then a
+   2-4-subsys tail (`put_cmsg::arg0`, `attribute_container` alloca,
+   tcp traceiter args). No klist-family entry above x2. The km-era
+   "klist top polluter" reading predates the chain/sysctl levers.
+
+**Consequence: item 2 is re-scoped.** Before any keying build:
+(a) opaque-object provenance tagging — record the minting context
+(callsite / summary / extern symbol) on opaque nodes so the x20
+synthetic bucket gets names (the same move that named the formals);
+(b) re-rank; build heap-context cloning for klist ONLY if it
+re-appears named. The mechanism sketch above (registrar-anchored
+allocation cloning) stays as the design IF warranted.
+
 ## Gate ladder
 
 0. THIS CENSUS: ranked weld-cell inventory by welded mass + key-origin

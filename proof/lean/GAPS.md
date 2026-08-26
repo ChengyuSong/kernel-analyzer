@@ -278,3 +278,23 @@ hypothesis). Unverified engineering (v1 implementation gates):
 - exclusion completeness: prot rids and measurement-flag rids are
   the only per-rid mechanisms post-seeding (audited 2026-08-15;
   re-audit on any new addFact call site).
+
+## Channels.lean (2026-08-25, answer-level levers)
+
+- `clamp_sound` (regfield): both hypotheses are ASSUMED from the
+  implementation side — `Closed` maps to the hazard-counter
+  certificate (unwitnessed stores/atomics/bulk copies/escapes refuse
+  the key), `attr` (clamped sites read the key) rests on the
+  GEP-derived site key, a structural surrogate the code does NOT
+  certify. `clamp_needs_attribution` is the machine-checked
+  counterexample for dropping `attr` — the reason the object-
+  population re-founding (docs/rendezvous-keying-design.md) exists.
+- `objclamp_sound`: the re-founding's safety argument — the site
+  obligation weakens to slot-agnostic object membership; slot
+  misattribution becomes harmless by construction. The implementation
+  does NOT yet aggregate populations this way (v2 item).
+- `nulljoin_sound`: `null_unrealizable` encodes store-through-null UB;
+  the guard ships (fires 0x on current corpora).
+- `skipwiring_sound`: `cert` (transferFree callees introduce no flow)
+  is the HAND AUDIT of the EMPTY/NOOP entries in func_summaries.txt —
+  per-entry English arguments, not discharged from IR.

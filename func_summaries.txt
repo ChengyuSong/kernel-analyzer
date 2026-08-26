@@ -208,6 +208,38 @@ vmemdup_user FRESH
 memdup_user_nul FRESH
 strndup_user FRESH
 
+# ---- kernel 6.10+ vintage: alloc_hooks renames (SummaryCheck decay
+# diff 2026-08-25, first cross-vintage use: these were live at 5.18,
+# dormant at 6.18). X() became a macro over X_noprof() (memory
+# allocation profiling); some moved behind __ prefixes. All verified
+# against linux-6.18.7 headers. Old names above stay for older
+# corpora — dormant entries are harmless by construction. Remaining
+# dormant set (raw spinlock family, consume_skb/kfree_skb_reason,
+# call_rcu_tasks, for_each_kernel_tracepoint) = config dormancy or
+# unverified renames — census material, not yet mirrored.
+kmemdup_noprof FRESH CPY(ret<-arg0)
+kmemdup_array_noprof FRESH CPY(ret<-arg0)
+kstrdup_noprof FRESH CPY(ret<-arg0)
+kstrdup_const_noprof FRESH CPY(ret<-arg0)
+kstrndup_noprof FRESH CPY(ret<-arg0)
+kvmemdup_noprof FRESH CPY(ret<-arg0)
+krealloc_noprof FRESH CPY(ret<-arg0)
+kvrealloc_noprof FRESH CPY(ret<-arg0)
+devm_kmemdup_noprof FRESH CPY(ret<-arg1)
+devm_krealloc_noprof FRESH CPY(ret<-arg1)
+memdup_user_noprof FRESH
+vmemdup_user_noprof FRESH
+__kvmalloc* FRESH
+alloc_pages_noprof FRESH
+alloc_pages_node_noprof FRESH
+alloc_pages_mpol_noprof FRESH
+get_free_pages_noprof FRESH
+pcpu_alloc_noprof FRESH
+vcalloc_noprof FRESH
+# timer API rename (init_timer_key -> timer_init_key, same shape:
+# fn at arg1 invoked with the timer at arg0 -> callback formal 0)
+timer_init_key INVOKE(arg1:f0<-arg0)
+
 # ---- kernel: slab/kmalloc families (legacy isAllocFn migration) ----
 # variable-length array forms were excluded in the legacy table
 kmalloc_array NONE

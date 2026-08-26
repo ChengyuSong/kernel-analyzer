@@ -28,6 +28,11 @@ ap.add_argument("--gt", required=True)
 ap.add_argument("--pairs", required=True)
 ap.add_argument("--funcs")
 ap.add_argument("--fn-out")
+ap.add_argument("--aux", help="DCALL/SCTCALL lines from --cfl-dump-gt-aux: "
+                "direct (devirtualized) and static_call-trampoline edges. "
+                "Used ONLY in the match test (monotone: can convert FN -> "
+                "matched, never the reverse), so FN lists stay comparable "
+                "with pre-aux pins")
 args = ap.parse_args()
 
 ours_pairs = set()
@@ -38,6 +43,13 @@ with open(args.pairs) as f:
             ours_pairs.add((parts[0], parts[1]))
 ours_callers = {c for c, _ in ours_pairs}
 ours_targets_any = {t for _, t in ours_pairs}
+aux_pairs = set()
+if args.aux:
+    with open(args.aux) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 3 and parts[0] in ("DCALL", "SCTCALL"):
+                aux_pairs.add((parts[1], parts[2]))
 ours_funcs = set()
 if args.funcs:
     with open(args.funcs) as f:
@@ -72,14 +84,17 @@ for frames, tgt, off in sorted(recs):
         continue
     if any((f, tgt) in ours_pairs for f in present):
         b["matched"] += 1
+    elif any((f, tgt) in aux_pairs for f in frames):
+        b["matched-aux"] += 1  # devirtualized / SCT-trampoline coverage
     else:
         b["FN"] += 1
         fns.append((frames, tgt))
 
 print(dict(b))
-tot = b["matched"] + b["FN"]
+tot = b["matched"] + b["matched-aux"] + b["FN"]
 if tot:
-    print(f"strict recall: {b['matched']}/{tot} = {100.0*b['matched']/tot:.2f}%")
+    m = b["matched"] + b["matched-aux"]
+    print(f"strict recall: {m}/{tot} = {100.0*m/tot:.2f}%")
 if not args.funcs:
     print("(no --funcs: target_absent under-classified; recall is a lower bound)")
 out = open(args.fn_out, "w") if args.fn_out else sys.stdout

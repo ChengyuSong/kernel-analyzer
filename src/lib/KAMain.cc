@@ -395,6 +395,13 @@ cl::opt<bool> CFLRegFieldAudit(
            "+ the full table, for the channel audit"),
   cl::init(false));
 
+cl::opt<std::string> CFLRegFieldWatch(
+  "cfl-regfield-watch",
+  cl::desc("With --cfl-regfield-apply: comma-separated fn names; log "
+           "'RegFieldWatch: key K removes FN at caller' for every clamp "
+           "that drops a watched fn — GT-loss attribution forensics"),
+  cl::init(""));
+
 cl::opt<std::string> CFLProbeStratumAblate(
   "cfl-probe-stratum-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "
@@ -502,6 +509,17 @@ cl::opt<unsigned> CFLAutoBucketsMax(
            "~linearly with P). If the residual target needs a larger P, "
            "the cap is taken and the shortfall is reported LOUDLY"),
   cl::init(127));
+
+cl::opt<bool> CFLDumpGTAux(
+  "cfl-dump-gt-aux",
+  cl::desc("MEASUREMENT-ONLY: dump DCALL (direct defined-callee call "
+           "edges) and SCTCALL (direct __SCT__* trampoline calls) lines "
+           "after module load, then exit. GT-matcher fidelity input "
+           "(tools/gt-match.py --aux): devirtualized dispatches and "
+           "static_call trampoline targets are otherwise creditable "
+           "only via pool smear, which precision levers remove — "
+           "surfacing phantom FN regressions. Config-independent"),
+  cl::init(false));
 
 cl::opt<bool> CFLDumpFnptrOffsets(
   "cfl-dump-fnptr-offsets",

@@ -3236,6 +3236,44 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "GT-TYPE census complete — exiting (census-only mode)\n";
     exit(0);
   }
+  if (CFLDumpGTAux) {
+    // GT-matcher fidelity aux (2026-08-25): the matcher consults only
+    // ICALL pairs, so (1) compiler-DEVIRTUALIZED dispatches (drbg
+    // crypto_init folded to a direct call under a single-table config)
+    // and (2) static_call trampoline targets (we resolve THROUGH
+    // __SCT__*, GT names the trampoline) can only be credited via pool
+    // smear — which precision levers then remove, surfacing phantom
+    // FNs. Dump DCALL (direct defined-callee edges) + SCTCALL (direct
+    // __SCT__* calls) for gt-match.py --aux; config-independent.
+    boost::unordered_flat_set<std::string> seen;
+    size_t nD = 0, nS = 0;
+    for (auto &mp : Ctx->Modules) {
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration()) continue;
+        for (inst_iterator ii = inst_begin(F), ie = inst_end(F); ii != ie;
+             ++ii) {
+          const auto *CB = dyn_cast<CallBase>(&*ii);
+          if (!CB) continue;
+          const Function *CF = CB->getCalledFunction();
+          if (!CF || CF->isIntrinsic()) continue;
+          const bool sct = CF->getName().starts_with("__SCT__");
+          if (!sct && CF->isDeclaration() &&
+              !getFuncDef(const_cast<Function *>(CF))->isDeclaration())
+            CF = getFuncDef(const_cast<Function *>(CF));
+          if (!sct && CF->isDeclaration()) continue;
+          std::string line = (sct ? "SCTCALL " : "DCALL ") +
+                             F.getName().str() + " " + CF->getName().str();
+          if (seen.insert(line).second) {
+            errs() << line << "\n";
+            (sct ? nS : nD)++;
+          }
+        }
+      }
+    }
+    errs() << "GT-AUX dump complete: " << nD << " DCALL + " << nS
+           << " SCTCALL edges — exiting (dump-only mode)\n";
+    exit(0);
+  }
   auto tStart = std::chrono::steady_clock::now();
   const auto &edges = EB.getEdges();
   const uint32_t la = EB.getLabelAssign();
@@ -14639,6 +14677,23 @@ void CallGraphPass::runRegFieldGapReport() {
       for (const Function *F : ci->second)
         if (ri->second.count(F->getName().str()))
           keep.insert(F);
+      if (!CFLRegFieldWatch.empty()) {
+        // Attribution instrument: which key removes a watched fn at
+        // which site (GT-loss forensics; see 2026-08-25 gate).
+        StringRef spec(CFLRegFieldWatch);
+        for (const Function *F : ci->second) {
+          if (keep.count(F)) continue;
+          StringRef rest = spec;
+          while (!rest.empty()) {
+            auto [head, tail] = rest.split(',');
+            if (!head.empty() && F->getName() == head)
+              errs() << "RegFieldWatch: key " << K << " removes "
+                     << F->getName() << " at "
+                     << CB->getFunction()->getName() << "\n";
+            rest = tail;
+          }
+        }
+      }
       rem += ci->second.size() - keep.size();
       kept += keep.size();
       ci->second = keep;

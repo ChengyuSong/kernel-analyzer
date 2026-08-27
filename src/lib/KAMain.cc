@@ -395,6 +395,22 @@ cl::opt<bool> CFLRegFieldAudit(
            "+ the full table, for the channel audit"),
   cl::init(false));
 
+cl::opt<bool> CFLRegFieldObj(
+  "cfl-regfield-obj",
+  cl::desc("OBJECT-population channels (the regfield re-founding, "
+           "docs/rendezvous-keying-design.md): certify which ops "
+           "GLOBALS can occupy an ops-pointer field (witnessed &global "
+           "stores + initializer slots + install hops + copy closure; "
+           "any computed/heap pointer or writable member refuses) and "
+           "clamp two-level dispatch sites with the objects' "
+           "initializer-slot fns — INCLUDING GEP-less slot-0 "
+           "dispatches, the class fn-slot keys cannot see (carried the "
+           "post-regfield fat tail: one 4,648-fn pool per site at 5.18 "
+           "fs). Slot-exact: no-GEP = offset 0 by construction. "
+           "Soundness schema: proof/lean Channels.objclamp_sound. "
+           "Requires --cfl-regfield-apply machinery (same walk)"),
+  cl::init(false));
+
 cl::opt<std::string> CFLRegFieldWatch(
   "cfl-regfield-watch",
   cl::desc("With --cfl-regfield-apply: comma-separated fn names; log "

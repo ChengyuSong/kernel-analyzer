@@ -14335,6 +14335,32 @@ void CallGraphPass::runRegFieldGapReport() {
   std::map<std::string, std::set<std::string>> regs; // key -> fn names
   std::set<std::string> open;                        // unwitnessed stores
   std::map<std::string, std::set<std::string>> copyIn; // dst <- src keys
+  // OBJECT-population channel (--cfl-regfield-obj, the re-founding):
+  // for ops-POINTER fields, certify WHICH ops globals can occupy the
+  // field; dispatch tables then derive from reading the objects'
+  // initializer slots (Lean objclamp_sound). This is the ONLY lever
+  // reaching GEP-less slot-0 dispatches (fn = load(load(&o->ops)):
+  // no named-struct GEP exists, so fn-slot keys cannot see the site
+  // — the class that carried the post-regfield fat tail).
+  std::map<std::string, std::set<const GlobalVariable *>> objRegs;
+  std::set<std::string> objOpen; // unwitnessed pointer store to the key
+  std::map<std::string, std::string> objOpenWhy; // first culprit (audit)
+  auto objOpenAt = [&](const std::string &K, const llvm::Instruction *I) {
+    objOpen.insert(K);
+    if (!objOpenWhy.count(K) && I)
+      objOpenWhy[K] = (I->getFunction()->getName() + "::" +
+                       I->getOpcodeName()).str();
+  };
+  std::map<std::string, std::set<std::string>> objCopyIn;
+  // Obj-channel bulk hazard, FINER than hazBulk: a whole-object copy
+  // whose SOURCE is the same struct type moves already-witnessed
+  // pointer values between instances (lock-duplication idiom) —
+  // population-preserving, NOT a hazard. Only transfers from unknown
+  // buffers can introduce unwitnessed pointers.
+  std::set<std::string> objHazBulk;
+  std::map<std::string, size_t> objCopySameOff; // untyped same-offset
+                                                // instance-copy rescues
+                                                // (stated assumption)
   // Audit provenance: which source contributed each name (0=const-
   // global initializer, 1=store/cmpxchg-const, 2=install-API arg hop,
   // 3=copy closure) + keys fed by a NON-const global's initializer.
@@ -14383,21 +14409,42 @@ void CallGraphPass::runRegFieldGapReport() {
           // (same struct keys); anything else is an opaque write
           const bool constSrc = SG && SG->isConstant() &&
                                 SG->hasInitializer();
+          // obj channel: source provably the SAME struct type =
+          // population-preserving copy, exempt from objHazBulk
+          auto srcTypeName = [&]() -> std::string {
+            const Value *S = MI->getRawSource()->stripPointerCasts();
+            if (const auto *AI = dyn_cast<AllocaInst>(S))
+              if (auto *ST = dyn_cast<StructType>(AI->getAllocatedType()))
+                if (ST->hasName())
+                  return stripStructNameSuffix(ST->getStructName()).str();
+            if (SG)
+              if (auto *ST = dyn_cast<StructType>(SG->getValueType()))
+                if (ST->hasName())
+                  return stripStructNameSuffix(ST->getStructName()).str();
+            return std::string();
+          };
           if (!Key.empty()) {
-            if (!constSrc) hazBulk.insert(Key.substr(0, Key.find('+')));
+            const std::string SN0 = Key.substr(0, Key.find('+'));
+            if (!constSrc) {
+              hazBulk.insert(SN0);
+              if (srcTypeName() != SN0) objHazBulk.insert(SN0);
+            }
           } else if (!constSrc) {
             // bare-pointer memcpy: attribute via the source or dest
             // alloca's allocated struct type when visible
+            const std::string STN = srcTypeName();
             for (const Value *P :
                  {MI->getRawDest()->stripPointerCasts(),
                   MI->getRawSource()->stripPointerCasts()})
               if (const auto *AI = dyn_cast<AllocaInst>(P))
                 if (auto *ST =
                         dyn_cast<StructType>(AI->getAllocatedType()))
-                  if (ST->hasName())
-                    hazBulk.insert(
-                        stripStructNameSuffix(ST->getStructName())
-                            .str());
+                  if (ST->hasName()) {
+                    const std::string N =
+                        stripStructNameSuffix(ST->getStructName()).str();
+                    hazBulk.insert(N);
+                    if (STN != N) objHazBulk.insert(N);
+                  }
           }
         }
         for (const Use &Op : I.operands()) {
@@ -14427,9 +14474,16 @@ void CallGraphPass::runRegFieldGapReport() {
           // global residual, reported below.
           Type *VT = SI->getValueOperand()->getType();
           if (auto *ST = dyn_cast<StructType>(VT)) {
-            if (ST->hasName())
+            if (ST->hasName()) {
               hazBulk.insert(
                   stripStructNameSuffix(ST->getStructName()).str());
+              // obj channel: whole-object store of a LOADED value =
+              // instance copy (population-preserving); anything else
+              // (insertvalue-built, unknown) can smuggle pointers
+              if (!isa<LoadInst>(SI->getValueOperand()))
+                objHazBulk.insert(
+                    stripStructNameSuffix(ST->getStructName()).str());
+            }
           } else if (isa<Function>(
                          SI->getValueOperand()->stripPointerCasts())) {
             g_regfieldBarePtrFnStores++;
@@ -14452,6 +14506,7 @@ void CallGraphPass::runRegFieldGapReport() {
           // clear_page_erms entering irqaction+0). An indirect
           // caller therefore opens the key.
           bool all = true, anyC = false;
+          bool allObj = true, anyObj = false;
           auto ci = Ctx->Callers.find(A->getParent());
           if (ci != Ctx->Callers.end())
             for (auto *CB : ci->second) {
@@ -14461,30 +14516,84 @@ void CallGraphPass::runRegFieldGapReport() {
                              getFuncDef(const_cast<Function *>(
                                  A->getParent()))) {
                 all = false;
+                allObj = false;
                 continue;
               }
               if (A->getArgNo() >= CB->arg_size()) {
                 all = false;
+                allObj = false;
                 continue;
               }
-              if (const auto *CF = dyn_cast<Function>(
-                      CB->getArgOperand(A->getArgNo())
-                          ->stripPointerCasts())) {
+              const Value *AV =
+                  CB->getArgOperand(A->getArgNo())->stripPointerCasts();
+              if (const auto *CF = dyn_cast<Function>(AV)) {
                 addPop(Key, CF->getName().str(), 2);
                 anyC = true;
+                allObj = false; // a fn constant is not an ops object
               } else {
                 all = false;
+                if (const auto *CG = dyn_cast<GlobalVariable>(AV)) {
+                  objRegs[Key].insert(CG); // install-API hop, obj side
+                  anyObj = true;
+                } else if (!isa<ConstantPointerNull>(AV)) {
+                  allObj = false;
+                }
               }
             }
           if (!all || !anyC) open.insert(Key);
+          // obj channel: ANY caller actual that is not a witnessed
+          // &global / null makes the field's object population
+          // unwitnessed (fn constants included: they mark a fn slot,
+          // where the obj channel is inapplicable anyway)
+          if (!allObj) objOpenAt(Key, SI);
+          (void)anyObj;
         } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
           std::string SK = deepKey(LI->getPointerOperand(), DL);
-          if (!SK.empty() && SK != Key)
+          if (!SK.empty() && SK != Key) {
             copyIn[Key].insert(SK);
-          else
-            open.insert(Key);
+            objCopyIn[Key].insert(SK);
+          } else {
+            open.insert(Key); // fn-channel semantics unchanged
+            // obj channel: SAME-key copy (lock duplication idiom:
+            // new->fl_ops = fl->fl_ops) is population-preserving —
+            // only an UNKEYED load source is unwitnessed. Instcombine
+            // asymmetry rescue: clang lowers same-struct field copies
+            // with the LOAD side as an untyped i8 GEP (posix_test_lock
+            // fl_lmops, 2026-08-26) — when the untyped source's
+            // constant byte offset EQUALS the dest key's offset, treat
+            // as an instance copy. STATED ASSUMPTION (audited as its
+            // own class): a same-byte-offset pointer copy targets the
+            // same field of the same struct type; GT gates it.
+            if (SK.empty()) {
+              bool sameOff = false;
+              const Value *LP =
+                  LI->getPointerOperand()->stripPointerCasts();
+              APInt loff(64, 0);
+              bool cst = true;
+              while (const auto *G = dyn_cast<GEPOperator>(LP)) {
+                if (!G->accumulateConstantOffset(DL, loff)) {
+                  cst = false;
+                  break;
+                }
+                LP = G->getPointerOperand()->stripPointerCasts();
+              }
+              const size_t plus = Key.rfind('+');
+              if (cst && plus != std::string::npos &&
+                  Key.substr(plus + 1) ==
+                      std::to_string(loff.getZExtValue()))
+                sameOff = true;
+              if (sameOff)
+                objCopySameOff[Key]++;
+              else
+                objOpenAt(Key, SI);
+            }
+          }
         } else if (containsPointerType(V->getType())) {
-          open.insert(Key);
+          open.insert(Key); // fn-channel semantics unchanged
+          if (const auto *OG = dyn_cast<GlobalVariable>(V))
+            objRegs[Key].insert(OG); // &ops_global registration
+          else if (!isa<ConstantPointerNull>(V))
+            objOpenAt(Key, SI); // computed/heap pointer: unwitnessed
         }
       }
     }
@@ -14504,8 +14613,17 @@ void CallGraphPass::runRegFieldGapReport() {
                   std::to_string(SL->getElementOffset(i));
               addPop(K, Fn->getName().str(), 0);
               if (!GV.isConstant()) initNonConst.insert(K);
-            } else if (!Fn)
+            } else if (!Fn) {
+              // obj channel: initializer slot holding &ops_global
+              if (ST->hasName())
+                if (const auto *OG = dyn_cast<GlobalVariable>(
+                        E->stripPointerCasts()))
+                  objRegs[stripStructNameSuffix(ST->getStructName())
+                              .str() +
+                          "+" + std::to_string(SL->getElementOffset(i))]
+                      .insert(OG);
               walk(E);
+            }
           }
         } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
           for (const Use &Op : CA->operands())
@@ -14534,6 +14652,27 @@ void CallGraphPass::runRegFieldGapReport() {
         if (open.count(s)) open.insert(dst);
       }
       if (D.size() != before || (!wasOpen && open.count(dst)))
+        changed = true;
+    }
+  }
+  // Obj-population copy closure (mirrors the fn closure above).
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto &[dst, srcs] : objCopyIn) {
+      auto &D = objRegs[dst];
+      size_t before = D.size();
+      bool wasOpen = objOpen.count(dst);
+      for (const auto &s : srcs) {
+        auto ri = objRegs.find(s);
+        if (ri != objRegs.end())
+          D.insert(ri->second.begin(), ri->second.end());
+        if (objOpen.count(s)) {
+          objOpen.insert(dst);
+          if (!objOpenWhy.count(dst) && objOpenWhy.count(s))
+            objOpenWhy[dst] = "copy<-" + s + "(" + objOpenWhy[s] + ")";
+        }
+      }
+      if (D.size() != before || (!wasOpen && objOpen.count(dst)))
         changed = true;
     }
   }
@@ -14750,6 +14889,155 @@ void CallGraphPass::runRegFieldGapReport() {
          << g_regfieldBarePtrFnStores
          << " fn stores through bare pointers (unattributable to any "
          << "key — the certifier's stated blind spot)\n";
+
+  // OBJECT-population apply (--cfl-regfield-obj): two-level dispatch
+  // sites, INCLUDING the GEP-less slot-0 class. Site claim: the fptr
+  // load's pointer is inner-offset (0 with no GEP, or all-constant
+  // GEP offsets) into a value LOADED from a certified outer key.
+  // Table = fn at that inner offset in each certified ops GLOBAL's
+  // initializer — slot-exact is justified because "no GEP" IS a
+  // certified offset derivation (exactly 0); ambiguous chains skip
+  // (fail-safe). Writable (non-const) population members refuse the
+  // key: their slots are runtime-patchable (mptcp af_ops pattern).
+  // Soundness schema: proof/lean Channels.objclamp_sound.
+  if (CFLRegFieldObj) {
+    auto fnAtInitOffset = [](const GlobalVariable *GV,
+                             uint64_t off) -> const Function * {
+      const DataLayout &DL = GV->getParent()->getDataLayout();
+      const Constant *C = GV->getInitializer();
+      while (C) {
+        if (const auto *CSt = dyn_cast<ConstantStruct>(C)) {
+          const StructLayout *SL = DL.getStructLayout(CSt->getType());
+          unsigned e = SL->getElementContainingOffset(off);
+          off -= SL->getElementOffset(e);
+          C = CSt->getOperand(e);
+        } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+          uint64_t es =
+              DL.getTypeAllocSize(CA->getType()->getElementType());
+          if (!es) return nullptr;
+          if (off / es >= CA->getNumOperands()) return nullptr;
+          C = CA->getOperand(off / es);
+          off %= es;
+        } else {
+          break;
+        }
+      }
+      if (!C || off != 0) return nullptr;
+      return dyn_cast<Function>(C->stripPointerCasts());
+    };
+    struct ObjLedger {
+      size_t sites = 0, rem = 0, kept = 0, objs = 0;
+    };
+    std::map<std::string, ObjLedger> led; // "key slot=N"
+    size_t objSkipOpen = 0, objSkipNonConst = 0;
+    for (auto *CB : Ctx->IndirectCallInsts) {
+      auto ci = Ctx->Callees.find(CB);
+      if (ci == Ctx->Callees.end() || ci->second.empty()) continue;
+      const auto *L1 =
+          dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
+      if (!L1) continue;
+      const DataLayout &DLm = L1->getModule()->getDataLayout();
+      const Value *P = L1->getPointerOperand()->stripPointerCasts();
+      APInt off(DLm.getIndexSizeInBits(0), 0);
+      bool okOff = true;
+      while (const auto *G = dyn_cast<GEPOperator>(P)) {
+        if (!G->accumulateConstantOffset(DLm, off)) {
+          okOff = false;
+          break;
+        }
+        P = G->getPointerOperand()->stripPointerCasts();
+      }
+      if (!okOff || off.isNegative()) continue;
+      const auto *L2 = dyn_cast<LoadInst>(P);
+      if (!L2) continue;
+      std::string OK = deepKey(L2->getPointerOperand(), DLm);
+      if (OK.empty()) continue;
+      auto oi = objRegs.find(OK);
+      if (oi == objRegs.end() || oi->second.empty()) continue;
+      const std::string SN = OK.substr(0, OK.find('+'));
+      const bool closed = !objOpen.count(OK) && !hazAtomic.count(OK) &&
+                          !hazEscape.count(OK) && !objHazBulk.count(SN) &&
+                          OK.find("+var") == std::string::npos;
+      if (!closed) {
+        objSkipOpen++;
+        if (CFLRegFieldAudit)
+          errs() << "RegFieldObj: SKIP " << OK << " objs="
+                 << oi->second.size() << " reason=["
+                 << (objOpen.count(OK)
+                         ? (" open@" + (objOpenWhy.count(OK)
+                                            ? objOpenWhy[OK]
+                                            : std::string("?")))
+                         : "")
+                 << (hazAtomic.count(OK) ? " atomic" : "")
+                 << (hazEscape.count(OK) ? " escape" : "")
+                 << (objHazBulk.count(SN) ? " bulk" : "")
+                 << (OK.find("+var") != std::string::npos ? " var" : "")
+                 << " ]\n";
+        continue;
+      }
+      const uint64_t innerOff = off.getZExtValue();
+      FuncSet table;
+      bool bad = false;
+      for (const GlobalVariable *GV : oi->second) {
+        if (!GV->isConstant() || !GV->hasInitializer()) {
+          bad = true; // writable ops object: slots patchable at runtime
+          break;
+        }
+        if (const Function *Fn = fnAtInitOffset(GV, innerOff))
+          table.insert(getFuncDef(const_cast<Function *>(Fn)));
+      }
+      if (bad) {
+        objSkipNonConst++;
+        continue;
+      }
+      FuncSet keep;
+      for (const Function *F : ci->second)
+        if (table.count(getFuncDef(const_cast<Function *>(F))))
+          keep.insert(F);
+      if (ci->second.size() == keep.size()) continue;
+      if (!CFLRegFieldWatch.empty()) {
+        StringRef spec(CFLRegFieldWatch);
+        for (const Function *F : ci->second) {
+          if (keep.count(F)) continue;
+          StringRef rest = spec;
+          while (!rest.empty()) {
+            auto [head, tail] = rest.split(',');
+            if (!head.empty() && F->getName() == head)
+              errs() << "RegFieldWatch: objkey " << OK << " slot="
+                     << innerOff << " removes " << F->getName() << " at "
+                     << CB->getFunction()->getName() << "\n";
+            rest = tail;
+          }
+        }
+      }
+      auto &LG = led[OK + " slot=" + std::to_string(innerOff)];
+      LG.sites++;
+      LG.rem += ci->second.size() - keep.size();
+      LG.kept += keep.size();
+      LG.objs = oi->second.size();
+      ci->second = keep;
+    }
+    size_t tKeys = 0, tSites = 0, tRem = 0;
+    for (auto &[K, L] : led) {
+      tKeys++;
+      tSites += L.sites;
+      tRem += L.rem;
+      errs() << "RegFieldObj: CLOSED " << K << " objs=" << L.objs
+             << " sites=" << L.sites << " -" << L.rem << "/+0 kept="
+             << L.kept;
+      {
+        const std::string bare = K.substr(0, K.find(' '));
+        auto ci2 = objCopySameOff.find(bare);
+        if (ci2 != objCopySameOff.end())
+          errs() << " [ASSUME same-off-copy x" << ci2->second << "]";
+      }
+      errs() << "\n";
+    }
+    errs() << "RegFieldObj: applied " << tKeys << " (key,slot) channels, "
+           << tSites << " sites, -" << tRem << "/+0 pairs; skipped "
+           << objSkipOpen << " open/hazard keys, " << objSkipNonConst
+           << " with writable population members\n";
+  }
 }
 
 // --cfl-confirm-invoke (task #28 tier 2): auto-confirm INVOKE summaries
@@ -19193,7 +19481,7 @@ bool CallGraphPass::doFinalization(Module *M) {
     // Regfield detector/channels run FIRST so an applied channel is
     // reflected in the tally, the ICALL dump, and every downstream
     // consumer (apply only touches CLOSED keys; report adds nothing).
-    if (CFLRegFieldReport || CFLRegFieldApply)
+    if (CFLRegFieldReport || CFLRegFieldApply || CFLRegFieldObj)
       runRegFieldGapReport();
     // compare callees found by CFL and type matching
     size_t total = 0, match = 0;

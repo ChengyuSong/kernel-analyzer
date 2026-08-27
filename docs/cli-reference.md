@@ -25,6 +25,14 @@ add `--cfl-bidi-prune --cfl-nexus-fields=all+ids --mem-limit-mode=rss --mem-limi
 **Per-run summary adoption (gates green at 5.18 FI + km FI/fs13, 2026-08-22):**
 add `--cfl-propose-solved-summaries --cfl-adopt-proposed-summaries`
 
+**Certified channels (CANONICAL since 2026-08-26; user-pinned):**
+add `--cfl-propose-chain-summaries --cfl-regfield-apply` (with the
+adoption flags above). 5.18 pins: FI = 518-fi-regfield-pairs.txt
+(6,721,630), fs = 518-fs-regf-pairs.txt (6,490,951); GT FN baseline =
+the 79-list (aux-matched, tools/gt-match.py --aux with
+--cfl-dump-gt-aux edges). Both -57%/+0 vs pre-regfield with FN lists
+byte-identical.
+
 Gate protocol for any answer-affecting change: pairs removals-only vs the
 pinned baseline (`^ICALL`/`^REGCALL` union, LC_ALL=C), GT FN-list identity
 (`tools/gt-match.py`), and for pool work: BlobForm INITIAL, ClusterTrans,
@@ -174,6 +182,9 @@ origin bundles (parked, see below).
 - **`--ir-census-out`** (default `""`): Write the full census as JSON to this path: dispositions, intrinsics, constexprs, ALL external callees, the classified inline-asm table, and the unsoundness ledger (implies running the census)
 - **`--cfl-regfield-report`** (default `false`): Post-solve targeted-fs detector: rank (struct+offset) registration fields by the gap between resolved icall fanout at their readers and the witnessed registration population stored through them (constant stores, one install-API argument hop, initializer slots, copy-edge closure). Narrow population under wide fanout = the deep-collapse signature; emits a suggested --cfl-nexus-fields list. Report only, adds no edges
 - **`--cfl-regfield-apply`** (default `false`): Auto-generated identity channels from the regfield detector: for keys whose registration population is machine-certified CLOSED (every mutation path classified; zero unwitnessed stores, atomics, bulk copies, or escaping slot addresses), intersect resolution at the key's reader sites with the witnessed table — monotone -N/+0 removal, certified per key in the RegFieldChannel ledger. OPEN keys are never touched (they stay report material for the manual channel pipeline)
+- **`--cfl-regfield-obj`** (default `false`): OBJECT-population channels (the regfield re-founding): certify which ops GLOBALS can occupy an ops-pointer field and clamp two-level dispatch sites with the objects' initializer-slot fns — including GEP-less slot-0 dispatches, the class fn-slot keys cannot see. Gated 5.18 FI 2026-08-26: −260,011/+0 vs the regfield pin, GT 79-identical, zero ASSUME-tagged keys applied. Soundness schema: proof/lean Channels.objclamp_sound
+- **`--cfl-regfield-watch`** (default `""`): comma-separated fn names; log every clamp that drops a watched fn with its key and caller — GT-loss attribution forensics
+- **`--cfl-dump-gt-aux`** (default `false`): MEASUREMENT-ONLY: dump DCALL (direct defined-callee) + SCTCALL (direct __SCT__* trampoline) edges after module load, then exit; input to tools/gt-match.py --aux (devirtualized and static_call targets are otherwise creditable only via pool smear)
 - **`--cfl-regfield-audit`** (default `false`): With --cfl-regfield-apply: emit a provenance certificate for every applied key — per-source table breakdown (const-initializer / store / install-hop / copy-closure) + risk class (GREEN rodata-structural, YELLOW hazard-counter-dependent, ORANGE copy-closure-dependent) + the full table, for the channel audit
 - **`--cfl-sink-instr`** (default `false`): Reviewed sink model (task #31/#32 design): seal cluster joins at trace-payload cells (ring_buffer_/trace_buf family) — stores keep their own cell, joins to stored objects' keys are suppressed. Auto-runs the read-back contract confirmer and REFUSES to run on any VIOLATION; ESCAPE sites are inventoried for the documented review
 - **`--cfl-field-buckets-auto`** (default `false`): Pick the residue modulus P from the loaded corpus: census the fn-ptr slot offsets (same walk as --cfl-dump-fnptr-offsets) and choose the smallest prime whose same-struct collision residual is within --cfl-auto-buckets-residual-bp, capped by --cfl-auto-buckets-max. Explicit --cfl-field-buckets wins

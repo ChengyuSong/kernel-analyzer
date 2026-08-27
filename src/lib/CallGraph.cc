@@ -14627,6 +14627,19 @@ void CallGraphPass::runRegFieldGapReport() {
            << " sites=" << R.d->sites << " fanout max=" << R.d->maxFan
            << " avg=" << (R.d->sumFan / R.d->sites) << " dispatch@"
            << R.d->sample;
+    {
+      // Closure-blocker attribution: WHY a flagged key was not applied
+      // — the worklist decision data (2,267 flagged-unapplied at 5.18
+      // fs carry the residual fat tail; fanout 4,648 vs pop 2-9).
+      const std::string SN2 = R.key->substr(0, R.key->find('+'));
+      std::string why;
+      if (R.op) why += " open-stores";
+      if (hazAtomic.count(*R.key)) why += " atomic";
+      if (hazEscape.count(*R.key)) why += " slot-escape";
+      if (hazBulk.count(SN2)) why += " bulk-copy";
+      if (R.key->find("+var") != std::string::npos) why += " var-off";
+      if (!why.empty()) errs() << " blocked:[" << why << " ]";
+    }
     auto ri = regs.find(*R.key);
     if (ri != regs.end()) {
       errs() << " fns:";

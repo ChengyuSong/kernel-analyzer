@@ -14361,6 +14361,34 @@ void CallGraphPass::runRegFieldGapReport() {
   std::map<std::string, size_t> objCopySameOff; // untyped same-offset
                                                 // instance-copy rescues
                                                 // (stated assumption)
+  std::map<std::string, size_t> objCopyListAnchor; // container_of-
+                                                   // anchored rescues
+  // Link-member offsets per struct: container_of sources are pointers
+  // anchored AT a link member (list traversal), so a copy's source
+  // offset reconciles as link_off + net == field_off. Direct members
+  // only (v1); covers the file_lock/fl_list shape.
+  std::map<std::string, std::set<int64_t>> linkOffs;
+  {
+    static const std::set<std::string> linkTys = {
+        "struct.list_head",   "struct.hlist_node",
+        "struct.hlist_bl_node", "struct.llist_node",
+        "struct.hlist_nulls_node", "struct.rb_node"};
+    for (auto &mp : Ctx->Modules) {
+      const DataLayout &DL = mp.first->getDataLayout();
+      for (StructType *ST : mp.first->getIdentifiedStructTypes()) {
+        if (!ST->hasName() || ST->isOpaque() || !ST->isSized()) continue;
+        const std::string SN0 =
+            stripStructNameSuffix(ST->getStructName()).str();
+        const StructLayout *SL = DL.getStructLayout(ST);
+        for (unsigned i = 0; i < ST->getNumElements(); i++)
+          if (auto *ET = dyn_cast<StructType>(ST->getElementType(i)))
+            if (ET->hasName() &&
+                linkTys.count(
+                    stripStructNameSuffix(ET->getStructName()).str()))
+              linkOffs[SN0].insert((int64_t)SL->getElementOffset(i));
+      }
+    }
+  }
   // Audit provenance: which source contributed each name (0=const-
   // global initializer, 1=store/cmpxchg-const, 2=install-API arg hop,
   // 3=copy closure) + keys fed by a NON-const global's initializer.
@@ -14456,6 +14484,11 @@ void CallGraphPass::runRegFieldGapReport() {
                Op.getOperandNo() == StoreInst::getPointerOperandIndex()) ||
               (isa<AtomicCmpXchgInst>(&I) && Op.getOperandNo() == 0) ||
               (isa<AtomicRMWInst>(&I) && Op.getOperandNo() == 0) ||
+              // memcpy/memmove/memset dest+src are pointer positions:
+              // bulk transfers have their OWN hazard (hazBulk); double-
+              // counting them as slot-address escapes blocked keys a
+              // field-range copy merely starts at (file_lock+168)
+              (isa<AnyMemIntrinsic>(&I) && Op.getOperandNo() <= 1) ||
               isa<GetElementPtrInst>(&I);
           if (ptrPos) continue;
           std::string Key = deepKey(G, DL);
@@ -14565,7 +14598,6 @@ void CallGraphPass::runRegFieldGapReport() {
             // own class): a same-byte-offset pointer copy targets the
             // same field of the same struct type; GT gates it.
             if (SK.empty()) {
-              bool sameOff = false;
               const Value *LP =
                   LI->getPointerOperand()->stripPointerCasts();
               APInt loff(64, 0);
@@ -14577,15 +14609,36 @@ void CallGraphPass::runRegFieldGapReport() {
                 }
                 LP = G->getPointerOperand()->stripPointerCasts();
               }
+              int64_t keyOff = -1;
               const size_t plus = Key.rfind('+');
-              if (cst && plus != std::string::npos &&
-                  Key.substr(plus + 1) ==
-                      std::to_string(loff.getZExtValue()))
-                sameOff = true;
-              if (sameOff)
-                objCopySameOff[Key]++;
-              else
+              if (plus != std::string::npos)
+                (void)!StringRef(Key).substr(plus + 1)
+                    .getAsInteger(10, keyOff);
+              const int64_t net = loff.getSExtValue();
+              if (cst && keyOff >= 0 && net == keyOff) {
+                objCopySameOff[Key]++; // base-anchored instance copy
+              } else if (cst && keyOff >= 0) {
+                // container_of anchor: source root points AT a link
+                // member (list traversal), so link_off + net ==
+                // field_off reconciles a same-field instance copy
+                // (posix_test_lock fl_lmops via fl_list). STATED
+                // ASSUMPTION, tagged per key, GT-gated like same-off.
+                bool anchored = false;
+                auto li2 =
+                    linkOffs.find(Key.substr(0, Key.find('+')));
+                if (li2 != linkOffs.end())
+                  for (int64_t L : li2->second)
+                    if (L + net == keyOff) {
+                      anchored = true;
+                      break;
+                    }
+                if (anchored)
+                  objCopyListAnchor[Key]++;
+                else
+                  objOpenAt(Key, SI);
+              } else {
                 objOpenAt(Key, SI);
+              }
             }
           }
         } else if (containsPointerType(V->getType())) {
@@ -14979,6 +15032,13 @@ void CallGraphPass::runRegFieldGapReport() {
       FuncSet table;
       bool bad = false;
       for (const GlobalVariable *GV : oi->second) {
+        // Cross-TU declarations must canonicalize to their defining
+        // TU's global (the extern-hub/98bdfd5 lesson): an `external
+        // constant` decl has no initializer and would misread as a
+        // writable member.
+        if (const auto *GC =
+                dyn_cast_or_null<GlobalVariable>(canonChainKey(GV)))
+          GV = GC;
         if (!GV->isConstant() || !GV->hasInitializer()) {
           bad = true; // writable ops object: slots patchable at runtime
           break;
@@ -15030,6 +15090,9 @@ void CallGraphPass::runRegFieldGapReport() {
         auto ci2 = objCopySameOff.find(bare);
         if (ci2 != objCopySameOff.end())
           errs() << " [ASSUME same-off-copy x" << ci2->second << "]";
+        auto ci3 = objCopyListAnchor.find(bare);
+        if (ci3 != objCopyListAnchor.end())
+          errs() << " [ASSUME list-anchored-copy x" << ci3->second << "]";
       }
       errs() << "\n";
     }

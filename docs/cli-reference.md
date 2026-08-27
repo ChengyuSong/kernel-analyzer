@@ -25,13 +25,14 @@ add `--cfl-bidi-prune --cfl-nexus-fields=all+ids --mem-limit-mode=rss --mem-limi
 **Per-run summary adoption (gates green at 5.18 FI + km FI/fs13, 2026-08-22):**
 add `--cfl-propose-solved-summaries --cfl-adopt-proposed-summaries`
 
-**Certified channels (CANONICAL since 2026-08-26; user-pinned):**
-add `--cfl-propose-chain-summaries --cfl-regfield-apply` (with the
-adoption flags above). 5.18 pins: FI = 518-fi-regfield-pairs.txt
-(6,721,630), fs = 518-fs-regf-pairs.txt (6,490,951); GT FN baseline =
-the 79-list (aux-matched, tools/gt-match.py --aux with
---cfl-dump-gt-aux edges). Both -57%/+0 vs pre-regfield with FN lists
-byte-identical.
+**Certified channels (CANONICAL; user-pinned 2026-08-26/27):**
+add `--cfl-propose-chain-summaries --cfl-regfield-apply
+--cfl-regfield-obj` (with the adoption flags above). 5.18 pins:
+FI = 518-fi-obj-pairs.txt (6,461,619), fs = 518-fs-obj-pairs.txt
+(6,242,725); GT FN baseline = the 79-list (aux-matched,
+tools/gt-match.py --aux with --cfl-dump-gt-aux edges). Cumulative vs
+pre-regfield: -59%/+0 with FN lists byte-identical at every step;
+obj arms applied with zero stated-assumption keys.
 
 Gate protocol for any answer-affecting change: pairs removals-only vs the
 pinned baseline (`^ICALL`/`^REGCALL` union, LC_ALL=C), GT FN-list identity

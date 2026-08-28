@@ -891,6 +891,27 @@ json::Object FuncEmitter::emit() {
       G["name"] = "@" + name;
       G["type"] = typeName(GV->getValueType());
       G["access"] = (bits == 3) ? "readwrite" : (bits == 2) ? "write" : "read";
+      // Initializer facts (consumer contract: a global may be assumed
+      // zero-at-start only when initializer_is_zero == true AND
+      // externally_initialized == false). Declarations carry
+      // initializer_ir = null and OMIT initializer_is_zero — the
+      // defining TU knows, this one does not.
+      G["externally_initialized"] = GV->isExternallyInitialized();
+      if (GV->hasInitializer()) {
+        std::string initIR;
+        raw_string_ostream OS(initIR);
+        GV->getInitializer()->printAsOperand(OS, /*PrintType=*/true,
+                                             GV->getParent());
+        OS.flush();
+        if (initIR.size() > 65536) {
+          initIR.resize(65536);
+          initIR += " ...(truncated)";
+        }
+        G["initializer_ir"] = initIR;
+        G["initializer_is_zero"] = GV->getInitializer()->isNullValue();
+      } else {
+        G["initializer_ir"] = nullptr;
+      }
       Globals.push_back(std::move(G));
     }
   }

@@ -15112,8 +15112,23 @@ void CallGraphPass::runRegFieldGapReport() {
           bad = true; // writable ops object: slots patchable at runtime
           break;
         }
-        if (const Function *Fn = fnAtInitOffset(GV, innerOff))
-          table.insert(getFuncDef(const_cast<Function *>(Fn)));
+        if (varElemSize == 0) {
+          if (const Function *Fn = fnAtInitOffset(GV, innerOff))
+            table.insert(getFuncDef(const_cast<Function *>(Fn)));
+        } else {
+          // variable ARRAY index inside the pointee (ss->cb[id].call,
+          // decoder->actions[act]): the slot is innerOff mod stride —
+          // union over ALL elements, exactly like the rodata branch.
+          // Reading element 0 only dropped true pairs (nfnetlink
+          // ctnetlink_* / x509_note_serial, GT 79->90, 2026-08-28).
+          std::set<int64_t> fnOffs2;
+          walkInitFnOffsets(GV->getInitializer(), 0,
+                            GV->getParent()->getDataLayout(), fnOffs2);
+          for (int64_t fo : fnOffs2)
+            if ((uint64_t)fo % varElemSize == innerOff % varElemSize)
+              if (const Function *Fn = fnAtInitOffset(GV, (uint64_t)fo))
+                table.insert(getFuncDef(const_cast<Function *>(Fn)));
+        }
       }
       if (bad) {
         objSkipNonConst++;

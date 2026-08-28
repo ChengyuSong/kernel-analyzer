@@ -28,8 +28,8 @@ add `--cfl-propose-solved-summaries --cfl-adopt-proposed-summaries`
 **Certified channels (CANONICAL; user-pinned 2026-08-26/27):**
 add `--cfl-propose-chain-summaries --cfl-regfield-apply
 --cfl-regfield-obj` (with the adoption flags above). 5.18 pins:
-FI = 518-fi-obj-pairs.txt (6,461,619), fs = 518-fs-obj-pairs.txt
-(6,242,725); GT FN baseline = the 79-list (aux-matched,
+FI = 518-fi-obj2-pairs.txt (6,296,327), fs = 518-fs-obj2-pairs.txt
+(6,088,455); GT FN baseline = the 79-list (aux-matched,
 tools/gt-match.py --aux with --cfl-dump-gt-aux edges). Cumulative vs
 pre-regfield: -59%/+0 with FN lists byte-identical at every step;
 obj arms applied with zero stated-assumption keys.

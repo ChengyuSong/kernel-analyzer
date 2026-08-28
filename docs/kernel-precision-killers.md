@@ -310,6 +310,45 @@ feeding universal containers, unions re-forming at retrieval) is why
 every tractable point on that spectrum pays exponentially for zero
 excess removed.
 
+## 9. How fat callsites are born: the site-shape taxonomy (2026-08-26/28)
+
+After the certified channels land, a callsite is fat for exactly one
+reason: **its dispatch shape carries no key the certifier can
+attribute, so it fail-safes into the pooled read**, and its answer is
+pool ∩ signature-shape. Direct evidence: the residual per-site pools
+are QUANTIZED by call shape — at 5.18 fs the unclamped sites read
+4,648 (void(ptr,ptr)) / 4,340 (void(ptr)) / 3,308 (i32(ptr,ptr)) /
+2,188 (i32(ptr,ptr,ptr)) targets, the same pool sliced four ways —
+and every fat caller is just 2-3 such sites summed. Fatness is a
+keyability gap, and keyability is enumerable by IR shape:
+
+| # | site shape (IR) | key carrier | lever / status |
+|---|---|---|---|
+| 1 | `fn = load(gep S, obj, fieldK)` — typed field GEP | (struct, slot) fn key | regfield-apply, CLOSED-certified (2,303 keys at 5.18) |
+| 2 | `fn = load(load(&obj->ops))` — GEP-less SLOT 0 | outer ops-pointer field, object population | regfield-obj; C puts the hot vfunc at slot 0, so this class carried the post-regfield tail (posix_lock_inode proof) |
+| 3 | `fn = load(gep(const_tbl, var_idx))` — rodata table, slot-0 element | the const global itself | rodata channels: initializer-bounded, certificate-free (svc_procedure.pc_func, xfrm_dispatch) |
+| 4 | `ss->cb[id].call` — var array index INSIDE a loaded pointee | outer field population x stride union | regfield-obj + stride union. LESSON: first cut read element 0 only and dropped TRUE pairs (GT 79->90, nfnetlink/asn1) — caught by the kernel GT bar alone; slice+smoke+per-key ledgers all green |
+| 5 | population member is `&table[i]` (interior pointer stored to a field: svc rq_procinfo) | (global, elemOff) members | NAMED, next build: widen objRegs members from GV to (GV, off/var) |
+| 6 | dispatch from a typed STACK COPY of the ops fields (dmaengine_desc_get_callback) | the local's key exists; population fails to FLOW (copy-edge witness gap) | named; copyIn witness-class extension |
+| 7 | container_of-rooted slot-0 (`notify->notify()` where notify = container_of(work)) | none statically at the site | OPEN: needs container_of-aware site keying (link-inventory applied to dispatch roots) or heap INVOKE pairs |
+| 8 | populations with WRITABLE members (i915 display funcs patched at init; mptcp af_ops copies) | refused by certificate | honest residual — may be the true floor for those keys |
+
+Witness-class engineering discipline that produced rows 2-6, worth
+stating as method: pick ONE control site (posix_lock_inode), make
+every refusal print its excuse (SKIP reason + open@culprit), convert
+each named excuse into either a witness class (same-typed bulk copies;
+untyped same-offset copies; container_of-anchored copies via a
+per-struct link-member inventory; Gobjs canonicalization of extern
+population decls; memcpy-escape declassification) or an honest
+refusal. Every class lands with its own audit tag; the total stated-
+assumption surface after all of it is TWO tagged keys kernel-wide.
+
+Campaign effect on the tail (5.18 fs, callers >= 5,000 targets):
+337 (pre-regfield) -> 92 (fn tables) -> 90 (+obj) -> 85 (+witness
+trio); pairs 15.1M -> 6.09M with GT FN-identity (79) held at every
+gate. The rodata/stride pair (rows 3-4) gates at FI (-6,977/+0);
+remaining tail mass = rows 5-8.
+
 ## Appendix: repro
 
 - Slice corpus: `/data/csong/tmp/bclist-skweld` (223 TUs of 5.18:

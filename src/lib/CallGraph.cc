@@ -56,6 +56,7 @@
 #include "CallGraph.h"
 #include "BitPlane.h"
 #include "IRCensus.h"
+#include "WitnessTaint.h"
 #include "Annotation.h"
 #include "VSnapshot.h"
 
@@ -19669,6 +19670,8 @@ bool CallGraphPass::doFinalization(Module *M) {
     // Regfield detector/channels run FIRST so an applied channel is
     // reflected in the tally, the ICALL dump, and every downstream
     // consumer (apply only touches CLOSED keys; report adds nothing).
+    if (CFLWitnessTaint)
+      runWitnessTaint(Ctx);
     if (CFLRegFieldReport || CFLRegFieldApply || CFLRegFieldObj)
       runRegFieldGapReport();
     // compare callees found by CFL and type matching

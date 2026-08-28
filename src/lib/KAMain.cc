@@ -411,6 +411,20 @@ cl::opt<bool> CFLRegFieldObj(
            "Requires --cfl-regfield-apply machinery (same walk)"),
   cl::init(false));
 
+cl::opt<bool> CFLWitnessTaint(
+  "cfl-witness-taint",
+  cl::desc("v2 population channels: demand-driven witness-taint "
+           "propagation over IR (strict lattice {Fn, Obj(root,off,"
+           "stride)} + poison; exact cells for globals/allocas, "
+           "typed (struct,off) cells as the heap fallback, escape-"
+           "based poisoning). Clamps an icall iff its fptr evaluates "
+           "poison-free to a pure fn set — subsumes the regfield "
+           "walk's witness classes WITH flow composition (two-hop "
+           "populations, stack copies) and uses no GEP-syntax site "
+           "attribution. Independent lever, same gate ladder; "
+           "watch via --cfl-regfield-watch"),
+  cl::init(false));
+
 cl::opt<std::string> CFLRegFieldWatch(
   "cfl-regfield-watch",
   cl::desc("With --cfl-regfield-apply: comma-separated fn names; log "

@@ -14342,7 +14342,40 @@ void CallGraphPass::runRegFieldGapReport() {
   // reaching GEP-less slot-0 dispatches (fn = load(load(&o->ops)):
   // no named-struct GEP exists, so fn-slot keys cannot see the site
   // — the class that carried the post-regfield fat tail).
-  std::map<std::string, std::set<const GlobalVariable *>> objRegs;
+  // Population members are (GV, base, stride): bare &G = (G,0,0);
+  // interior &G+off = (G,off,0); var-indexed &G[i]+f = (G,f,elemSize)
+  // — taxonomy row 5 (svc rq_procinfo: &table[i] stored into request
+  // fields). Stride composes with the dispatch-side stride at read.
+  using ObjMember = std::tuple<const GlobalVariable *, int64_t, uint64_t>;
+  std::map<std::string, std::set<ObjMember>> objRegs;
+  auto objMemberOf = [](const Value *V, const DataLayout &DLx)
+      -> std::optional<ObjMember> {
+    int64_t base = 0;
+    uint64_t stride = 0;
+    V = V->stripPointerCasts();
+    while (const auto *G = dyn_cast<GEPOperator>(V)) {
+      for (auto GTI = gep_type_begin(G), E2 = gep_type_end(G); GTI != E2;
+           ++GTI) {
+        if (const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand())) {
+          if (StructType *ST = GTI.getStructTypeOrNull())
+            base += (int64_t)DLx.getStructLayout(ST)->getElementOffset(
+                CI->getZExtValue());
+          else
+            base += CI->getSExtValue() *
+                    (int64_t)DLx.getTypeAllocSize(GTI.getIndexedType());
+        } else if (!GTI.getStructTypeOrNull() && stride == 0) {
+          stride = DLx.getTypeAllocSize(GTI.getIndexedType());
+          if (!stride) return std::nullopt;
+        } else {
+          return std::nullopt;
+        }
+      }
+      V = G->getPointerOperand()->stripPointerCasts();
+    }
+    const auto *GVr = dyn_cast<GlobalVariable>(V);
+    if (!GVr || base < 0) return std::nullopt;
+    return ObjMember{GVr, base, stride};
+  };
   std::set<std::string> objOpen; // unwitnessed pointer store to the key
   std::map<std::string, std::string> objOpenWhy; // first culprit (audit)
   auto objOpenAt = [&](const std::string &K, const llvm::Instruction *I) {
@@ -14565,8 +14598,9 @@ void CallGraphPass::runRegFieldGapReport() {
                 allObj = false; // a fn constant is not an ops object
               } else {
                 all = false;
-                if (const auto *CG = dyn_cast<GlobalVariable>(AV)) {
-                  objRegs[Key].insert(CG); // install-API hop, obj side
+                if (auto M = objMemberOf(
+                        AV, CB->getModule()->getDataLayout())) {
+                  objRegs[Key].insert(*M); // install-API hop, obj side
                   anyObj = true;
                 } else if (!isa<ConstantPointerNull>(AV)) {
                   allObj = false;
@@ -14643,8 +14677,8 @@ void CallGraphPass::runRegFieldGapReport() {
           }
         } else if (containsPointerType(V->getType())) {
           open.insert(Key); // fn-channel semantics unchanged
-          if (const auto *OG = dyn_cast<GlobalVariable>(V))
-            objRegs[Key].insert(OG); // &ops_global registration
+          if (auto M = objMemberOf(V, DL))
+            objRegs[Key].insert(*M); // &ops_global / &table[i] member
           else if (!isa<ConstantPointerNull>(V))
             objOpenAt(Key, SI); // computed/heap pointer: unwitnessed
         }
@@ -14669,12 +14703,11 @@ void CallGraphPass::runRegFieldGapReport() {
             } else if (!Fn) {
               // obj channel: initializer slot holding &ops_global
               if (ST->hasName())
-                if (const auto *OG = dyn_cast<GlobalVariable>(
-                        E->stripPointerCasts()))
+                if (auto M = objMemberOf(E, DL))
                   objRegs[stripStructNameSuffix(ST->getStructName())
                               .str() +
                           "+" + std::to_string(SL->getElementOffset(i))]
-                      .insert(OG);
+                      .insert(*M);
               walk(E);
             }
           }
@@ -15100,7 +15133,8 @@ void CallGraphPass::runRegFieldGapReport() {
       const uint64_t innerOff = off.getZExtValue();
       FuncSet table;
       bool bad = false;
-      for (const GlobalVariable *GV : oi->second) {
+      for (const auto &[GV0, mbase, mstride] : oi->second) {
+        const GlobalVariable *GV = GV0;
         // Cross-TU declarations must canonicalize to their defining
         // TU's global (the extern-hub/98bdfd5 lesson): an `external
         // constant` decl has no initializer and would misread as a
@@ -15112,20 +15146,27 @@ void CallGraphPass::runRegFieldGapReport() {
           bad = true; // writable ops object: slots patchable at runtime
           break;
         }
-        if (varElemSize == 0) {
-          if (const Function *Fn = fnAtInitOffset(GV, innerOff))
+        if (mstride && varElemSize) {
+          bad = true; // var on BOTH member and dispatch side: v1 refuses
+          break;
+        }
+        // Effective slot rule (member (GV, base, mstride) composed
+        // with dispatch innerOff/varElemSize): with a stride on either
+        // side the slot is (fo - base) mod stride == innerOff mod
+        // stride (union over elements — the stride-union lesson,
+        // GT 79->90); without, exactly base + innerOff.
+        const uint64_t stride2 = mstride ? mstride : varElemSize;
+        if (stride2 == 0) {
+          if (const Function *Fn = fnAtInitOffset(
+                  GV, (uint64_t)(mbase + (int64_t)innerOff)))
             table.insert(getFuncDef(const_cast<Function *>(Fn)));
         } else {
-          // variable ARRAY index inside the pointee (ss->cb[id].call,
-          // decoder->actions[act]): the slot is innerOff mod stride —
-          // union over ALL elements, exactly like the rodata branch.
-          // Reading element 0 only dropped true pairs (nfnetlink
-          // ctnetlink_* / x509_note_serial, GT 79->90, 2026-08-28).
           std::set<int64_t> fnOffs2;
           walkInitFnOffsets(GV->getInitializer(), 0,
                             GV->getParent()->getDataLayout(), fnOffs2);
           for (int64_t fo : fnOffs2)
-            if ((uint64_t)fo % varElemSize == innerOff % varElemSize)
+            if (fo >= mbase &&
+                (uint64_t)(fo - mbase) % stride2 == innerOff % stride2)
               if (const Function *Fn = fnAtInitOffset(GV, (uint64_t)fo))
                 table.insert(getFuncDef(const_cast<Function *>(Fn)));
         }

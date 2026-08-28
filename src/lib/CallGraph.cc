@@ -14993,14 +14993,83 @@ void CallGraphPass::runRegFieldGapReport() {
       const Value *P = L1->getPointerOperand()->stripPointerCasts();
       APInt off(DLm.getIndexSizeInBits(0), 0);
       bool okOff = true;
+      uint64_t varElemSize = 0; // one variable ARRAY index allowed:
+                                // element stride for rodata-table reads
       while (const auto *G = dyn_cast<GEPOperator>(P)) {
-        if (!G->accumulateConstantOffset(DLm, off)) {
+        // Per-index walk (accumulateConstantOffset can partially
+        // mutate on failure): const steps accumulate; exactly ONE
+        // variable index stepping an ARRAY is tolerated (rodata table
+        // dispatch: fn = load(gep(tbl, idx))).
+        bool bad2 = false;
+        for (auto GTI = gep_type_begin(G), E = gep_type_end(G);
+             GTI != E; ++GTI) {
+          if (const auto *CI2 = dyn_cast<ConstantInt>(GTI.getOperand())) {
+            if (StructType *ST2 = GTI.getStructTypeOrNull())
+              off += APInt(off.getBitWidth(),
+                           DLm.getStructLayout(ST2)->getElementOffset(
+                               CI2->getZExtValue()));
+            else
+              off += APInt(off.getBitWidth(),
+                           (uint64_t)(CI2->getSExtValue() *
+                                      (int64_t)DLm.getTypeAllocSize(
+                                          GTI.getIndexedType())));
+          } else if (!GTI.getStructTypeOrNull() && varElemSize == 0) {
+            varElemSize = DLm.getTypeAllocSize(GTI.getIndexedType());
+            if (!varElemSize) { bad2 = true; break; }
+          } else {
+            bad2 = true; // second var index / var struct step
+            break;
+          }
+        }
+        if (bad2) {
           okOff = false;
           break;
         }
         P = G->getPointerOperand()->stripPointerCasts();
       }
       if (!okOff || off.isNegative()) continue;
+      // Rodata-table dispatch: root is a CONST global read through at
+      // most one variable array index — the answer is bounded by the
+      // initializer contents, no closure certificate needed (pure
+      // rodata read; GREEN by construction). Covers the slot-0
+      // array-element class invisible to both fn keys (no struct GEP
+      // step for field 0) and the load-rooted obj path.
+      if (const auto *RG = dyn_cast<GlobalVariable>(P)) {
+        const GlobalVariable *RGc = RG;
+        if (const auto *RC =
+                dyn_cast_or_null<GlobalVariable>(canonChainKey(RG)))
+          RGc = RC;
+        if (!RGc->isConstant() || !RGc->hasInitializer()) continue;
+        const uint64_t innerOff = off.getZExtValue();
+        if (varElemSize && innerOff >= varElemSize)
+          continue; // const part must be the within-element field
+        std::set<int64_t> fnOffs;
+        walkInitFnOffsets(RGc->getInitializer(), 0,
+                          RGc->getParent()->getDataLayout(), fnOffs);
+        FuncSet table;
+        for (int64_t fo : fnOffs) {
+          const uint64_t sel =
+              varElemSize ? (uint64_t)fo % varElemSize : (uint64_t)fo;
+          if (sel != innerOff) continue;
+          if (const Function *Fn = fnAtInitOffset(RGc, (uint64_t)fo))
+            table.insert(getFuncDef(const_cast<Function *>(Fn)));
+        }
+        if (table.empty()) continue;
+        FuncSet keep;
+        for (const Function *F : ci->second)
+          if (table.count(getFuncDef(const_cast<Function *>(F))))
+            keep.insert(F);
+        if (ci->second.size() == keep.size()) continue;
+        auto &LG = led[std::string("RODATA:") + RGc->getName().str() +
+                       (varElemSize ? "[var]" : "") + " slot=" +
+                       std::to_string(innerOff)];
+        LG.sites++;
+        LG.rem += ci->second.size() - keep.size();
+        LG.kept += keep.size();
+        LG.objs = 1;
+        ci->second = keep;
+        continue;
+      }
       const auto *L2 = dyn_cast<LoadInst>(P);
       if (!L2) continue;
       std::string OK = deepKey(L2->getPointerOperand(), DLm);

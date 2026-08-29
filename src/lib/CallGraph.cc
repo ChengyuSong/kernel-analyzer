@@ -14392,6 +14392,16 @@ void CallGraphPass::runRegFieldGapReport() {
   // population-preserving, NOT a hazard. Only transfers from unknown
   // buffers can introduce unwitnessed pointers.
   std::set<std::string> objHazBulk;
+  // R3 (taxonomy: member-of-a-loaded-field): a field's population can
+  // be INDIRECT — pointers computed as gep(load(keyed field), off) —
+  // e.g. svc: rq_procinfo = versp->vs_proc + idx. Recorded as
+  // (source key, base, stride); expanded ONE level at apply by
+  // composing with the source key's own DIRECT members. Pure value
+  // composition through IR-stated keys — no type reconstruction
+  // (container_of downcasts are type-confusion-prone; user constraint
+  // 2026-08-29: never infer container types from raw arithmetic).
+  std::map<std::string, std::vector<std::tuple<std::string, int64_t,
+                                               uint64_t>>> objIndirect;
   std::map<std::string, size_t> objCopySameOff; // untyped same-offset
                                                 // instance-copy rescues
                                                 // (stated assumption)
@@ -14678,10 +14688,47 @@ void CallGraphPass::runRegFieldGapReport() {
           }
         } else if (containsPointerType(V->getType())) {
           open.insert(Key); // fn-channel semantics unchanged
-          if (auto M = objMemberOf(V, DL))
+          if (auto M = objMemberOf(V, DL)) {
             objRegs[Key].insert(*M); // &ops_global / &table[i] member
-          else if (!isa<ConstantPointerNull>(V))
-            objOpenAt(Key, SI); // computed/heap pointer: unwitnessed
+          } else if (!isa<ConstantPointerNull>(V)) {
+            // indirect member: gep-chain over a LOAD from a keyed
+            // field (svc rq_procinfo <- versp->vs_proc + idx)
+            const Value *W = V->stripPointerCasts();
+            int64_t ibase = 0;
+            uint64_t istride = 0;
+            bool okI = true;
+            while (const auto *G3 = dyn_cast<GEPOperator>(W)) {
+              for (auto GTI = gep_type_begin(G3), E3 = gep_type_end(G3);
+                   GTI != E3; ++GTI) {
+                if (const auto *CI3 =
+                        dyn_cast<ConstantInt>(GTI.getOperand())) {
+                  if (StructType *ST3 = GTI.getStructTypeOrNull())
+                    ibase += (int64_t)DL.getStructLayout(ST3)
+                                 ->getElementOffset(CI3->getZExtValue());
+                  else
+                    ibase += CI3->getSExtValue() *
+                             (int64_t)DL.getTypeAllocSize(
+                                 GTI.getIndexedType());
+                } else if (!GTI.getStructTypeOrNull() && istride == 0) {
+                  istride = DL.getTypeAllocSize(GTI.getIndexedType());
+                  if (!istride) { okI = false; break; }
+                } else {
+                  okI = false;
+                  break;
+                }
+              }
+              if (!okI) break;
+              W = G3->getPointerOperand()->stripPointerCasts();
+            }
+            const auto *LI3 = dyn_cast<LoadInst>(W);
+            std::string SK3;
+            if (okI && ibase >= 0 && LI3)
+              SK3 = deepKey(LI3->getPointerOperand(), DL);
+            if (!SK3.empty() && SK3 != Key)
+              objIndirect[Key].push_back({SK3, ibase, istride});
+            else
+              objOpenAt(Key, SI); // computed/heap pointer: unwitnessed
+          }
         }
       }
     }
@@ -15123,6 +15170,8 @@ void CallGraphPass::runRegFieldGapReport() {
         SmallVector<std::pair<const StoreInst *, int64_t>, 8> writers;
         SmallVector<std::tuple<const AnyMemTransferInst *, int64_t>, 4>
             copies; // (memcpy, dest-offset-of-AI-region)
+        SmallVector<std::tuple<const Function *, unsigned, int64_t>, 4>
+            hops; // (defined callee, formal no, AI-offset of formal)
         boost::unordered_flat_set<const Value *> seen2;
         while (!uq.empty() && !refuse) {
           const Value *Cur = uq.pop_back_val();
@@ -15170,8 +15219,21 @@ void CallGraphPass::runRegFieldGapReport() {
                 refuse = true;
                 break;
               }
+            } else if (const auto *CB2 = dyn_cast<CallBase>(Us)) {
+              // one-callee hop (svc_process: &process passed to
+              // svc_generic_init_request which writes the dispatch
+              // fn through its formal). Allowed ONLY into a direct
+              // DEFINED callee; the formal's writers are collected
+              // under the same exact-or-refuse rules, depth 1.
+              const Function *CF2 = CB2->getCalledFunction();
+              if (!CF2 || CB2->isCallee(&U)) { refuse = true; break; }
+              Function *DF2 = getFuncDef(const_cast<Function *>(CF2));
+              if (DF2->isDeclaration()) { refuse = true; break; }
+              unsigned an = U.getOperandNo();
+              if (an >= DF2->arg_size()) { refuse = true; break; }
+              hops.push_back({DF2, an, coff});
             } else {
-              refuse = true; // call arg / ptrtoint / phi: escaped
+              refuse = true; // ptrtoint / phi / indirect-call arg
               break;
             }
           }
@@ -15234,6 +15296,65 @@ void CallGraphPass::runRegFieldGapReport() {
               refuse = true;
               break;
             }
+          }
+        }
+        if (!refuse) {
+          for (auto &[HF, han, hbase] : hops) {
+            const Argument *HA = HF->getArg(han);
+            const DataLayout &DL4 = HF->getParent()->getDataLayout();
+            for (const Instruction &HI : instructions(*HF)) {
+              if (refuse) break;
+              const auto *HS = dyn_cast<StoreInst>(&HI);
+              if (!HS) {
+                // the formal must not escape further inside the hop
+                for (const Use &HU : HI.operands())
+                  if (HU.get() == HA &&
+                      !isa<LoadInst>(&HI) && !isa<StoreInst>(&HI) &&
+                      !isa<GetElementPtrInst>(&HI) &&
+                      !isa<ICmpInst>(&HI)) {
+                    refuse = true;
+                    break;
+                  }
+                continue;
+              }
+              // store rooted at the formal?
+              const Value *HP =
+                  HS->getPointerOperand()->stripPointerCasts();
+              APInt ho(64, 0);
+              bool okh = true;
+              while (const auto *HG = dyn_cast<GEPOperator>(HP)) {
+                if (!HG->accumulateConstantOffset(DL4, ho)) {
+                  okh = false;
+                  break;
+                }
+                HP = HG->getPointerOperand()->stripPointerCasts();
+              }
+              if (HP != HA) {
+                if (HS->getValueOperand()->stripPointerCasts() == HA) {
+                  refuse = true; // formal address stored away
+                  break;
+                }
+                continue; // unrelated store in callee
+              }
+              if (!okh) { refuse = true; break; }
+              if (hbase + ho.getSExtValue() != want) continue;
+              const Value *HV =
+                  HS->getValueOperand()->stripPointerCasts();
+              if (const auto *HFN = dyn_cast<Function>(HV)) {
+                table.insert(getFuncDef(const_cast<Function *>(HFN)));
+              } else if (isa<ConstantPointerNull>(HV)) {
+              } else if (const auto *HL = dyn_cast<LoadInst>(HV)) {
+                std::string HK = deepKey(HL->getPointerOperand(), DL4);
+                if (HK.empty() || !keyFns(HK, table)) {
+                  refuse = true;
+                  break;
+                }
+              } else {
+                refuse = true;
+                break;
+              }
+            }
+            if (refuse) break;
           }
         }
         if (!refuse) {
@@ -15307,7 +15428,44 @@ void CallGraphPass::runRegFieldGapReport() {
       const uint64_t innerOff = off.getZExtValue();
       FuncSet table;
       bool bad = false;
-      for (const auto &[GV0, mbase, mstride] : oi->second) {
+      // depth-1 expansion of indirect members: compose the source
+      // key's DIRECT members with (base, stride); refuse if the
+      // source key is open/hazarded, has its own indirect members
+      // (depth cap), or strides collide
+      std::vector<GlobalContext::SummaryAtom> dummy_; // (scope filler)
+      std::set<std::tuple<const GlobalVariable *, int64_t, uint64_t>>
+          expanded(oi->second.begin(), oi->second.end());
+      {
+        auto ii2 = objIndirect.find(OK);
+        if (ii2 != objIndirect.end()) {
+          for (const auto &[SK3, ib, is] : ii2->second) {
+            const std::string SN3 = SK3.substr(0, SK3.find('+'));
+            const bool closed3 =
+                !objOpen.count(SK3) && !hazAtomic.count(SK3) &&
+                !hazEscape.count(SK3) && !objHazBulk.count(SN3) &&
+                SK3.find("+var") == std::string::npos &&
+                !objIndirect.count(SK3); // depth cap = 1
+            auto sr = objRegs.find(SK3);
+            if (!closed3 || sr == objRegs.end() || sr->second.empty()) {
+              bad = true;
+              break;
+            }
+            for (const auto &[GV3, b3, s3] : sr->second) {
+              if (s3 && is) { bad = true; break; }
+              expanded.insert({GV3, b3 + ib, s3 ? s3 : is});
+            }
+            if (bad) break;
+          }
+        }
+      }
+      if (bad) {
+        objSkipOpen++;
+        if (CFLRegFieldAudit)
+          errs() << "RegFieldObj: SKIP " << OK
+                 << " reason=[ indirect-open ]\n";
+        continue;
+      }
+      for (const auto &[GV0, mbase, mstride] : expanded) {
         const GlobalVariable *GV = GV0;
         // Cross-TU declarations must canonicalize to their defining
         // TU's global (the extern-hub/98bdfd5 lesson): an `external

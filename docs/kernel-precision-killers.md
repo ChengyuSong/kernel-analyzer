@@ -240,6 +240,36 @@ implicated by any measurement.
 
 ## 8. The thesis: sound, and why generic dials cannot buy the precision back
 
+**Master formulation (user, 2026-08-29).** There is ONE source of
+imprecision: `store -> ptr -> load`. Dynamically, addresses partition
+perfectly — every object is its own channel. Statically, abstraction
+quotients addresses into channels; imprecision IS the coarseness of
+that quotient (stores from different real objects enter one channel,
+loads read the mixture). There is correspondingly ONE precision
+operation: split channels, by choosing a partition INDEX. Every
+technique is this operation with a different index:
+
+| technique | partition index | cost multiplier |
+|---|---|---|
+| field sensitivity | byte offset | x #fields (small) |
+| context sensitivity | call string | x #contexts (exponential) |
+| flow sensitivity | program point (temporal versions) | x #points |
+| heap cloning | allocation site (± context) | x #sites |
+| this work | the SEMANTIC KEY (instance global, table population, install constant) | x #population — small BY KERNEL DESIGN |
+
+Corollaries, each measured earlier in this doc: an index buys
+precision only insofar as it correlates with the dynamic partition —
+the structural indexes are uncorrelated with how the kernel
+distributes objects across channels, and the correlated coordinate is
+the value the kernel itself keys on (§0). The key index is also the
+CHEAP one: its multiplier is bounded by the kernel's own registries
+(109 buses, 55 id types, per-field populations of 2-20). Routing a
+store to the right sub-channel requires the key to be evaluable AT
+the store — possible exactly at the frame where it is still a
+constant (§2). And the semantic floor (§8 below) is the set of
+channels that are dynamically shared for real — one true channel, no
+index splits it, a "split" would be unsound rather than precise.
+
 Decompose the fanout at any fat site into two parts:
 
 1. **The semantic floor** — the feasible population at a genuinely

@@ -15015,6 +15015,7 @@ void CallGraphPass::runRegFieldGapReport() {
     struct ObjLedger {
       size_t sites = 0, rem = 0, kept = 0, objs = 0;
     };
+    boost::unordered_flat_map<std::string, const Function *> nameToFunc;
     std::map<std::string, ObjLedger> led; // "key slot=N"
     size_t objSkipOpen = 0, objSkipNonConst = 0;
     for (auto *CB : Ctx->IndirectCallInsts) {
@@ -15101,6 +15102,178 @@ void CallGraphPass::runRegFieldGapReport() {
         LG.rem += ci->second.size() - keep.size();
         LG.kept += keep.size();
         LG.objs = 1;
+        ci->second = keep;
+        continue;
+      }
+      // R1 (taxonomy row 6): typed-LOCAL dispatch — the fptr loads
+      // from a stack copy of ops fields (dmaengine_desc_callback:
+      // field-0 alloca loads emit no GEP, so fn keys never see the
+      // site, and the root is an alloca, not a load). Route the
+      // local's writers: fn constants directly; loads whose (S,off)
+      // key is CLOSED contribute that key's population (the
+      // fn-channel's own tables + closure tests); anything else, or
+      // an escaping local, refuses.
+      if (const auto *AI = dyn_cast<AllocaInst>(P)) {
+        if (varElemSize) continue; // strided locals: refuse (v1)
+        const int64_t want = (int64_t)off.getZExtValue();
+        bool refuse = false;
+        FuncSet table;
+        // escape scan over the alloca's use tree (direct + GEP/cast)
+        SmallVector<const Value *, 8> uq{AI};
+        SmallVector<std::pair<const StoreInst *, int64_t>, 8> writers;
+        SmallVector<std::tuple<const AnyMemTransferInst *, int64_t>, 4>
+            copies; // (memcpy, dest-offset-of-AI-region)
+        boost::unordered_flat_set<const Value *> seen2;
+        while (!uq.empty() && !refuse) {
+          const Value *Cur = uq.pop_back_val();
+          if (!seen2.insert(Cur).second) continue;
+          // offset of Cur relative to AI
+          int64_t coff = 0;
+          {
+            const Value *W = Cur;
+            APInt o2(64, 0);
+            bool okc = true;
+            while (W != AI) {
+              const auto *G2 = dyn_cast<GEPOperator>(W);
+              if (!G2 || !G2->accumulateConstantOffset(
+                             AI->getModule()->getDataLayout(), o2)) {
+                okc = false;
+                break;
+              }
+              W = G2->getPointerOperand()->stripPointerCasts();
+            }
+            if (!okc) { refuse = true; break; }
+            coff = o2.getSExtValue();
+          }
+          for (const Use &U : Cur->uses()) {
+            const User *Us = U.getUser();
+            if (const auto *G2 = dyn_cast<GEPOperator>(Us)) {
+              uq.push_back(G2);
+            } else if (isa<BitCastInst>(Us)) {
+              uq.push_back(cast<Value>(Us));
+            } else if (isa<LoadInst>(Us)) {
+              // reads are fine
+            } else if (const auto *S2 = dyn_cast<StoreInst>(Us)) {
+              if (S2->getValueOperand() == Cur) { refuse = true; break; }
+              writers.push_back({S2, coff});
+            } else if (const auto *MT = dyn_cast<AnyMemTransferInst>(Us)) {
+              if (MT->getRawDest()->stripPointerCasts() ==
+                  Cur->stripPointerCasts())
+                copies.push_back({MT, coff});
+              else { refuse = true; break; } // local used as SOURCE: ok
+                // actually source use is a read; but conservatively
+                // only dest is classified — source reads are benign:
+            } else if (const auto *II2 = dyn_cast<IntrinsicInst>(Us)) {
+              if (II2->getIntrinsicID() != Intrinsic::lifetime_start &&
+                  II2->getIntrinsicID() != Intrinsic::lifetime_end &&
+                  !II2->isAssumeLikeIntrinsic()) {
+                refuse = true;
+                break;
+              }
+            } else {
+              refuse = true; // call arg / ptrtoint / phi: escaped
+              break;
+            }
+          }
+        }
+        // resolve fn names of a CLOSED fn-channel key to Functions
+        auto keyFns = [&](const std::string &SK2, FuncSet &out) -> bool {
+          auto ri2 = regs.find(SK2);
+          if (ri2 == regs.end() || ri2->second.empty()) return false;
+          const std::string SN2 = SK2.substr(0, SK2.find('+'));
+          if (open.count(SK2) || hazAtomic.count(SK2) ||
+              hazEscape.count(SK2) || hazBulk.count(SN2) ||
+              SK2.find("+var") != std::string::npos)
+            return false;
+          if (nameToFunc.empty())
+            for (auto &mp2 : Ctx->Modules)
+              for (Function &F2 : *mp2.first)
+                if (!F2.isDeclaration())
+                  nameToFunc.emplace(F2.getName().str(),
+                                     getFuncDef(&F2));
+          for (const auto &N2 : ri2->second) {
+            auto fit2 = nameToFunc.find(N2);
+            if (fit2 == nameToFunc.end()) return false;
+            out.insert(fit2->second);
+          }
+          return true;
+        };
+        if (!refuse) {
+          for (auto &[S2, base2] : writers) {
+            const auto *SP = dyn_cast<GEPOperator>(
+                S2->getPointerOperand()->stripPointerCasts());
+            int64_t soff = base2;
+            if (SP) {
+              APInt o3(64, 0);
+              if (!SP->accumulateConstantOffset(
+                      S2->getModule()->getDataLayout(), o3)) {
+                refuse = true;
+                break;
+              }
+              soff = o3.getSExtValue(); // GEP offsets are AI-relative
+            } else if (S2->getPointerOperand()->stripPointerCasts() !=
+                       AI) {
+              soff = base2;
+            }
+            if (soff != want) continue; // other fields: irrelevant
+            const Value *V2 =
+                S2->getValueOperand()->stripPointerCasts();
+            if (const auto *F2 = dyn_cast<Function>(V2)) {
+              table.insert(getFuncDef(const_cast<Function *>(F2)));
+            } else if (isa<ConstantPointerNull>(V2)) {
+              // null: contributes nothing
+            } else if (const auto *L3 = dyn_cast<LoadInst>(V2)) {
+              std::string SK2 = deepKey(
+                  L3->getPointerOperand(),
+                  L3->getModule()->getDataLayout());
+              if (SK2.empty() || !keyFns(SK2, table)) {
+                refuse = true;
+                break;
+              }
+            } else {
+              refuse = true;
+              break;
+            }
+          }
+        }
+        if (!refuse) {
+          for (auto &[MT, dbase] : copies) {
+            // dest region [dbase, dbase+len) of AI; the queried slot
+            // must map back into the source's (S,off+delta) key
+            std::string SK2;
+            const auto *SGp = dyn_cast<GEPOperator>(
+                MT->getRawSource()->stripPointerCasts());
+            const DataLayout &DL3 = MT->getModule()->getDataLayout();
+            if (SGp) SK2 = deepKey(SGp, DL3);
+            if (SK2.empty()) { refuse = true; break; }
+            const size_t plus2 = SK2.rfind('+');
+            int64_t sBase = -1;
+            if (plus2 != std::string::npos)
+              (void)!StringRef(SK2).substr(plus2 + 1)
+                  .getAsInteger(10, sBase);
+            if (sBase < 0) { refuse = true; break; }
+            const std::string comp =
+                SK2.substr(0, plus2 + 1) +
+                std::to_string(sBase + (want - dbase));
+            if (!keyFns(comp, table)) { refuse = true; break; }
+          }
+        }
+        if (refuse || table.empty()) {
+          objSkipOpen++;
+          continue;
+        }
+        FuncSet keep;
+        for (const Function *F : ci->second)
+          if (table.count(getFuncDef(const_cast<Function *>(F))))
+            keep.insert(F);
+        if (ci->second.size() == keep.size()) continue;
+        auto &LG = led[std::string("LOCAL:") +
+                       CB->getFunction()->getName().str() + " slot=" +
+                       std::to_string(want)];
+        LG.sites++;
+        LG.rem += ci->second.size() - keep.size();
+        LG.kept += keep.size();
+        LG.objs = table.size();
         ci->second = keep;
         continue;
       }

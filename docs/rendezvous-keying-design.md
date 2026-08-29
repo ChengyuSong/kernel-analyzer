@@ -190,38 +190,23 @@ Lineage: this is ops-pairs (#30) generalized — (ops-global, container)
 certificates — and matches the thesis: kernel keys discriminate
 OBJECTS in containers; fn tables were another structural surrogate.
 
-## v2 consolidation: witness-taint propagation (2026-08-28)
+## v2 consolidation: RETIRED (2026-08-29) — the quotient, not the traversal
 
-The witness classes shipped this week (stores / initializer slots /
-install hops / copy closure / same-key / same-offset / list-anchored
-copies; interior-pointer members and stack-copy flow pending) are
-hand-written transfer rules of a small dataflow analysis, built one
-forensic incident at a time on a syntactic walk. The stride bug was
-the failure mode of that style (rule interaction no single rule's
-argument covers).
-
-**The general pass:** witness-taint propagation over the existing
-constraint graph. Strict lattice {fn constants, &G, &G+off} plus a
-poison bit per cell ("anything unwitnessed reached me"); clamp a
-dispatch iff its fptr cell is poison-free, table = the witnessed set.
-Subsumes every copy shape (graph edges already encode container_of /
-stack copies / interior pointers), install hops (call edges), cross-TU
-canonicalization, and ELIMINATES deepKey site attribution — taxonomy
-row 7 stops being special because sites read their own cell.
-Soundness degrades conservatively: graph over-approximation only adds
-inflows -> more poison or bigger tables, never a wrong clamp.
-Constraint: must run at CELL granularity WITHOUT cluster merging (over
-merged classes the giant poisons everything) — a non-pooling
-mini-solver over existing origins/residues/edges; bounded and fast on
-the strict lattice. Lean obligation: population closure as a least
-fixpoint whose transfer rules over-approximate concrete flows
-(extends Channels.lean).
-
-Adoption criterion: rows 5-6 land as walk rules now; the moment
-forensics demands ONE more copy-shape rule, stop patching and build
-this. Row 8 (writable populations) is a floor, not a gap — partially
-recoverable as init ∪ witnessed-stores, the rest is the semantic
-answer.
+witness-taint propagation was built (--cfl-witness-taint, default-off,
+kept as tombstoned experiment) and FALSIFIED by design review + the
+kernel GT gate (79->164 FN; NF_HOOK okfn + k_clock families = second-
+front-end re-implementation gaps). The retiring argument (user): the
+pass re-answers the flows-to question over the same flows — dataflow
+IS dataflow; the deficiency was never the traversal but the QUOTIENT
+(the cluster join collapsing channels), and witness-read had already
+proven the exact result unrecoverable from the merged state. Under
+the master formulation (killers doc §8): precision = re-INDEXING
+channels, not re-traversing them. If the walk's rule treadmill ever
+justifies consolidation, the correct form is IN-SOLVER selective
+exact joins at population cells — the existing protection machinery
+(copy-not-unify #25, reader bridges #30, join-cone #38) applied at
+key-indexed cells, refusal = demote-to-merge. No second front-end,
+ever.
 
 ## Gate ladder
 

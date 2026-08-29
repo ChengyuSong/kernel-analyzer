@@ -413,7 +413,13 @@ cl::opt<bool> CFLRegFieldObj(
 
 cl::opt<bool> CFLWitnessTaint(
   "cfl-witness-taint",
-  cl::desc("v2 population channels: demand-driven witness-taint "
+  cl::desc("RETIRED EXPERIMENT (falsification, 2026-08-29): re-answers "
+           "the flows-to question over the same flows with a no-merge/"
+           "refuse join — redundant by design review (the deficiency "
+           "is the cluster-join quotient, not the traversal) and "
+           "GT-red at kernel scale (79->164 FN, NF_HOOK okfn/k_clock "
+           "re-implementation gaps). Kept for study; NEVER pin. "
+           "Original intent: demand-driven witness-taint "
            "propagation over IR (strict lattice {Fn, Obj(root,off,"
            "stride)} + poison; exact cells for globals/allocas, "
            "typed (struct,off) cells as the heap fallback, escape-"

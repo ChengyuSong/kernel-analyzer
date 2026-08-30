@@ -214,12 +214,32 @@ points-to.
 
 An external literature survey (ChatGPT, user-supplied 2026-08-30)
 covering the field through Aug 2026 was triaged against the claims
-above. Provenance caveat: items at 2026 venues (SQUID/OOPSLA'26,
-CAT/ICSE'26, TnFix/ECOOP'26, FastMatrixCFPQ) are past our verified
-knowledge (Jan 2026) — VERIFY the papers exist as described before
-citing. The pre-2026 items (POCR, PEARL, FLARE, STG, skewed
+above. The pre-2026 items (POCR, PEARL, FLARE, STG, skewed
 tabulation, MoYe, MCFL POPL'25, dynamic Dyck POPL'24, KallGraph,
-Li'23) match verified knowledge.
+Li'23) match verified knowledge. 2026-venue items, verified
+2026-08-30 against downloaded PDFs (repo root):
+- SQUID — VERIFIED REAL (oopsla26-squid.pdf): Shi, Li, Lu & Li (ICT
+  CAS), PACMPL 10(OOPSLA1) Art. 162, Apr 2026, DOI
+  10.1145/3798270. Survey characterization accurate: relation
+  chaining (adaptive + differential) vs Skewed [Lei'24], Pearl
+  [Shi'23/24b], Soufflé; avg speedups 9.30/3.08/1.86× vs Skewed.
+  CRITICAL SCALE FACT for our positioning: its C/C++ benchmarks are
+  SPEC CPU 2017 PEGs/SVFGs topping out at ~1M edges (omnetpp,
+  perlbench) — three-plus orders below kernel closure workloads;
+  the engine-vs-output-size argument stands with a concrete
+  contrast.
+- FastMatrixCFPQ — VERIFIED REAL (FastMatrixCFPQ.pdf): Muravev &
+  Grigorev (SPbU), STTT / SOAP 2026, DOI 10.1007/s10009-026-00864-y,
+  May 2026. Universal GraphBLAS/SuiteSparse CFL-semiring solver,
+  O(n³) worst case; baselines Pearl/Gigascale/Graspan/MatrixCFPQ.
+  As characterized.
+- CAT (ICSE'26) — PAGE ONLY: the ICSE 2026 research-track page
+  exists (title "No Shot in the Dark: ... Context-Aware Tabulation")
+  but no paper is retrievable yet (checked 2026-08-30). The survey's
+  numbers (1.75/1.49/2.13×, 24–50% memory) are UNVERIFIABLE — if
+  cited before the paper appears, cite title/venue only, no numbers.
+- TnFix (ECOOP'26) — still unverified; peripheral (taint client),
+  only cite if the Dagstuhl page checks out.
 
 **Collision verdicts — all five claimed novelties SURVIVE:**
 1. Witness-exact unification: no survey entry couples exact

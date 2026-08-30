@@ -141,11 +141,18 @@ security mechanisms are asked to trust.
   triage (all five novelty claims survive; MoYe/CAT/FLARE are the
   must-cite client-structure neighbors; MCFL POPL'25 is the
   underapprox contrast; POPL'24 dynamic bidirected Dyck cited next
-  to our incremental with fragment scoping). STILL OPEN before
-  submission: verify the 2026-venue citations exist as described
-  (SQUID/OOPSLA'26, CAT/ICSE'26, TnFix/ECOOP'26, FastMatrixCFPQ —
-  all past our verified knowledge); group-weighted Dyck manual
-  check; no 2026 KallGraph successor removing the caps.
+  to our incremental with fragment scoping). SQUID and
+  FastMatrixCFPQ VERIFIED against PDFs in repo root
+  (oopsla26-squid.pdf: PACMPL 10(OOPSLA1) Art.162, DOI
+  10.1145/3798270; FastMatrixCFPQ.pdf: STTT/SOAP'26, DOI
+  10.1007/s10009-026-00864-y). CAT = ICSE'26 page only, no paper
+  retrievable 2026-08-30 — cite title/venue only, NO numbers, until
+  the PDF appears. TnFix unverified, peripheral. STILL OPEN:
+  group-weighted Dyck manual check; no 2026 KallGraph successor
+  removing the caps.
 - If asked "why not SQUID/FastMatrixCFPQ as the engine": same
   answer as GraCFL/POCR — the wall is closure output size (Σ|C|²),
-  which a faster engine reaches sooner but cannot lower.
+  which a faster engine reaches sooner but cannot lower. Now
+  concrete: SQUID's largest C/C++ graphs (SPEC CPU 2017 SVFGs) are
+  ~1M edges; the kernel corpus is orders beyond that before closure
+  even starts.

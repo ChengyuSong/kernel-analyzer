@@ -191,13 +191,64 @@ must be presented as adaptations.
    wildcard exchange pairwise (bridges) without hub transitivity; no
    known analog.
 
-## 4. Paper framing
+## 4. Paper position (settled with user, 2026-08-30)
 
-Lean into the rediscoveries: "the optimal bidirected-Dyck algorithm
-and Andersen's best engineering are the right COMPONENTS; we prove
-the composition exact where theory permits, certify it at runtime
-where theory is silent, and measure what the kernel actually
-requires." Rename internal vocabulary to the literature's terms:
+The paper is built on the project's two founding questions, answered:
+
+**Q1 — why doesn't CFL-reachability scale (or were we using it
+wrong)?** Not user error. The wall is closure OUTPUT size, not
+solver speed: pairwise facts ≈ Σ|a-component|² on IR graphs, with
+the components' mass driven by named C/kernel idioms. Verified by
+implemented negatives (dedup, folding — the graph shrinks, the
+closure doesn't) and by the 2026 engine crop's own evaluations
+(largest graphs ~1M edges, orders below kernel corpora). The
+constructive consequence: change WHAT is computed — the rooted
+relation F_G, origins as the only stored facts, the pairwise
+partition kept implicit in union-find — turning the output into
+Σ|C|·(answer-relevant origins).
+
+**Q2 — why are kernel callsites fat?** One imprecision source: the
+static quotient of addresses at store→ptr→load. The giant is built
+by quotient transitivity; its welds are NAMED (formal confluence,
+rendezvous chains, extern boundary). All classical sensitivities
+are re-indexings of this quotient (field=offset, context=call
+string, flow=program point, heap=alloc site); the index the kernel
+actually needs is its own SEMANTIC KEYS — registration identities —
+whose multiplier is bounded by the kernel's registries. Applied
+under certificates: −60% pairs with recall up; the un-splittable
+residue is a 5-class floor, each class named.
+
+**The unifying thesis:** both failures are properties of the same
+object — the address quotient. Coarse quotient = cheap AND fat.
+The paper makes the quotient explicit, proves exact the part theory
+gives for free (bidirected fragment), anchors the closure to the
+answers, and refines the quotient along a new axis with falsifiable
+evidence.
+
+**Honest contribution inventory (agreed labels):**
+1. The scaling diagnosis — closure-size law + falsification catalog
+   + engine-cap findings. SCIENCE contribution; no prior account of
+   WHERE the cost lives on real C at this scale.
+2. The rooted formulation with lossless quotient (machine-checked).
+   PRINCIPLED COMPOSITION of known parts (POPL'18 fragment
+   exactness, Das-style layering, Andersen engineering) — the new
+   part is the design rule "quotient exactly where theory says it is
+   free" and its exactness proof; present without novelty inflation.
+3. Z_P field sensitivity in the weight domain, sound for interior
+   pointers/container_of. NOVEL INSTANTIATION of a known framework
+   (WPDS) with a new soundness argument (group homomorphism ⇒ no
+   false negatives under offset arithmetic) where Dyck parens
+   provably fail.
+4. Semantic-key channels + the master formulation (sensitivities as
+   channel indexes; registration identity as the new index, consumed
+   via certificates with completeness contracts). THE genuinely new
+   idea — a precision AXIS, not a solver; no competitor in the
+   surveyed field; transferred to httpd/postgres unchanged.
+5. The kernel fat-site anatomy + 5-class floor. SCIENCE contribution
+   for the community that consumes these callgraphs.
+The solver core is expert integration of the literature's best
+components and is presented as exactly that — proudly, not
+defensively. Rename internal vocabulary to the literature's terms:
 joins → DSCC maintenance; wave scheduling → topological difference
 propagation; flows-to → answer-anchored (inverse) points-to.
 

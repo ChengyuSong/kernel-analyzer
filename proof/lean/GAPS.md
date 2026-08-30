@@ -298,3 +298,20 @@ hypothesis). Unverified engineering (v1 implementation gates):
 - `skipwiring_sound`: `cert` (transferFree callees introduce no flow)
   is the HAND AUDIT of the EMPTY/NOOP entries in func_summaries.txt —
   per-entry English arguments, not discharged from IR.
+
+## 2026-08-29 campaign close
+
+- Channels.lean gains `stride_union_sound` + `element0_unsound` (the
+  machine-checked form of the GT 79->90 regression: an unknown array
+  selector demands the union over the residue class, mirroring
+  `clamp_needs_attribution` for site keys) and the interior-member
+  note (row 5 = stride union composed with an offset shift).
+- NEW ASSUMPTION recorded: rodata channels treat a constant global's
+  initializer as its runtime content (kernel rodata immutability /
+  W^X). Not discharged from the corpus.
+- RETIRED: the witness-taint population-closure obligation (the pass
+  was retired by design review — same-computation redundancy; see the
+  rendezvous design doc tombstone). No Lean debt remains for it.
+- The clamp/objclamp/nulljoin/skipwiring schemas correspond to the
+  FINAL shipped mechanism set (row-5 pins = the empirical fixed point
+  of the semantic-key index; research log tasks #56-#62).

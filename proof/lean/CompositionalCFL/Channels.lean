@@ -177,4 +177,55 @@ theorem skipwiring_sound {Site Callee E : Type}
   intro e hf hm
   exact M.cert s c e hTF (M.flow_needs_call s c e hf hm) hm hf
 
+/-! ## 5. Rodata-table reads and the stride union (2026-08-28/29)
+
+The rodata channel clamps `fn = load(gep(const_table, idx))` with the
+table's initializer contents — certificate-free, because a constant
+object's cells are its initializer (assumption recorded in GAPS.md:
+rodata immutability). With a VARIABLE index the element is unknown,
+so the sound table is the UNION over the index residue class:
+`stride_union_sound`. The falsified variant (reading element 0 only —
+the GT 79->90 regression, nfnetlink/asn1) is `element0_unsound`:
+a machine-checked reminder that an unknown selector demands the
+union, mirroring `clamp_needs_attribution`'s role for site keys. -/
+
+/-- A const table: slot contents per element index (the initializer
+denotation; `none` = null slot). Runtime dispatch selects SOME
+element `i` and calls the fn in its slot. -/
+structure RodataModel (I Fn : Type) where
+  slot : I → Option Fn
+
+/-- The stride-union table: everything any element's slot holds. -/
+def RodataModel.unionTable {I Fn : Type} (M : RodataModel I Fn) :
+    Set Fn :=
+  fun f => ∃ i, M.slot i = some f
+
+/-- Stride-union soundness: whatever element the runtime index
+selects, its slot fn is in the union table. -/
+theorem stride_union_sound {I Fn : Type} (M : RodataModel I Fn)
+    (i : I) (f : Fn) (h : M.slot i = some f) : M.unionTable f :=
+  ⟨i, h⟩
+
+/-- The element-0 table is NOT sound under an unknown selector: with
+two elements holding distinct fns, clamping to element 0's slot drops
+element 1's true target. (Bool as the index; `false` plays element
+0.) -/
+theorem element0_unsound :
+    ∃ (M : RodataModel Bool Bool) (i : Bool) (f : Bool),
+      M.slot i = some f ∧
+      ¬ (fun g => M.slot false = some g) f := by
+  refine ⟨⟨fun i => some i⟩, true, true, rfl, ?_⟩
+  intro h
+  exact Bool.noConfusion (Option.some.inj h)
+
+/-! ## 6. Interior population members (row 5) as member shift
+
+An interior member `(G, base, stride)` contributes, at dispatch slot
+`off`, the fns of `G`'s initializer at offsets `base + k*stride +
+off`. Soundness is `stride_union_sound` composed with an offset
+shift; the both-sides-var refusal keeps the residue class
+well-defined (two independent strides would make the class the whole
+object — still sound as a union but not stated here; the
+implementation refuses instead). -/
+
 end Channels

@@ -4651,3 +4651,132 @@ cd67728 with the validated command (initial sublanguage graph
 legitimate edges; ~68 saturation iterations expected for the
 all+ids family). Organized version of #51–#55:
 docs/implementation.md.
+
+## Task #56: weld attribution — socket→device and the VFS road (2026-08-23/24)
+
+Question forced by the fat-tail proof: name the exact cells welding
+socket-world to device-world. Method: 223-TU slice reproducing
+`__tcp_transmit_skb → ahci_error_handler` end-to-end + coupler census
+(fixed: corpus-root stripping a3e579e, unnamed-formal naming, a
+provenance ladder for anonymous nodes) + blob-formation accretion log
++ formal-barrier presolve probe. VERDICT (docs/kernel-precision-
+killers.md §1-§5b): the born a-component IS the primary weld (41,814
+nodes, NO hub — noformal probe shatters 49,515→381, causally
+confirming formal confluence), then a SHORT named accretion chain
+(__se_sys_socketcall alloca, fib/infra globals). VFS road: filp_cachep
+single-site heap + f_op universal rendezvous + LSM hook formals +
+inode_hashtable + sockfs embedded inode. fs does NOT kill the pair
+(10,402 targets at the 6.18 pin). One giant confirmed at 6.18: six
+fat callers across subsystems share an EXACT 7,767-fn core.
+Falsified en route: my own slice-extraction (field-3 vs " -> " —
+produced a false exoneration, retracted).
+
+## Task #57: kernel ID/key study + chain prover (2026-08-23/24)
+
+The keys are documented BY THE KERNEL: mod_devicetable.h (55 id
+types), file2alias devtable (49 modalias namespaces), 109 bus_type
+.match instances censused, MODULE_DEVICE_TABLE populations ranked
+(docs/kernel-id-keys.md). Consumption = per-run CHAIN PROVER
+(--cfl-propose-chain-summaries): detects registration wrappers by the
+key-constant-frame rule, offsets from callsite initializers
+(layout-correct per corpus). 5.18 FI gate: −35,239/+0, GT STRICTLY
+BETTER (96→88 FN — the 7c152c5 residue-fix recall landing); re-derived
+the hand pilot as a SUPERSET + 6 new buses; usb refused
+(fn-shim-store, honest). 6.18 portability catch: pci_driver shifted
+−16 bytes — hand offsets wrong at 6.18, sound only because channels
+are additive. FALSIFIED: the supplement policy (union file+derived
+offsets) — +32,575 at 5.18: null-slot atoms trip the runtime-installed
+soundness net and UN-sever registrations (reverted; lesson: per-key
+−N/+0 ledgers are not soundness, only GT FN-identity is).
+
+## Task #58: rendezvous campaign — sysctl severance + klist descope (2026-08-24/25)
+
+Gate-0 weld-mass census (km): head SHORT but heterogeneous — sysctl
+ctl_table handler formals = NEW 56-subsystem family; tracepoint-args
+part semantic floor. Shipped: EMPTY file keyword (wiring cut, body
+kept) + transfer-free summaries apply at INDIRECTLY-resolved sites
+(safe: zero-atom summaries only skip wiring; the ethtool hazard is
+edge-ADDING atoms) + 13 audited scalar-mover proc handlers. Gates: km
+byte-identical with the weld DEAD in census (10→0), 5.18 FI
+−1,897/+0 GT-identical, 6.18 fs −1,682/+0. klist keying DESCOPED by
+structure: containers are single-alloc-site heap (subsys_private,
+device_private), members unsplittable, and post-channel it no longer
+ranks. Residual slice welds = the EXTERN BOUNDARY (universal-class
+origins) = sound-required. Also: null-join hygiene guard (fires 0×,
+kept as invariant), SummaryCheck decay validator → first cross-vintage
+diff caught the 6.18 alloc_hooks renames (whole FRESH family silently
+dead; vintage block ace0a42) + timer_init_key.
+
+## Task #59: regfield validation — the −8.9M gate and matcher fidelity (2026-08-25)
+
+--cfl-regfield-apply (built in #50, never kernel-gated) certified
+2,299 CLOSED keys at 5.18 FI: **−8,894,664/+0 (−57%)** — and FAILED
+GT 79→90. Forensics (--cfl-regfield-watch + IR): all three losses
+were GT-MATCHER DEBT, not unsoundness — drbg crypto_init is
+compiler-devirtualized (direct call; no icall exists) and __SCT__
+trampolines are targets we resolve THROUGH. Fix: --cfl-dump-gt-aux
+(DCALL/SCTCALL edges) + gt-match.py --aux (monotone, pin-comparable).
+Verdict: FN lists byte-identical (79=79), recall 98.66% both arms —
+and 9 of the historical 88 FN were matcher debt all along. User
+re-founding mandate: certify OBJECT populations, not fn tables (the
+slot surrogate is the retired field filter with a writer cert);
+formalized as Channels.lean clamp_needs_attribution.
+
+## Task #60: object populations, witness trio, rodata, interior members (2026-08-26/29)
+
+--cfl-regfield-obj: object populations per ops-pointer field; reaches
+GEP-less SLOT-0 dispatches (the class that carried the post-regfield
+tail: one 4,648-fn pool per site, quantized by signature shape).
+Gates: FI −260,011/+0, fs −248,226/+0, GT 79-identical, ZERO
+stated-assumption keys applied. Witness trio (container_of-anchored
+copies via link inventory + memcpy-escape declassification + Gobjs
+population canonicalization): FI −165,292/fs −154,270, GT-identical;
+fn channel grew 2,188→2,303 keys. Rodata-table channels
+(certificate-free const-array reads): first cut FAILED GT 79→90
+(var-in-pointee sites read element 0 only — nfnetlink/asn1) →
+stride-union fix → −6,977/+0 GT-clean. Interior members (row 5,
+ObjMember=(GV,base,stride)): FI −246/fs −5,103. FINAL PINS
+518-{fi,fs}-row5-pairs: 6,289,104 / 6,083,352, GT 79/98.66%, fs tail
+337→85, max 12,423→9,829.
+
+## Task #61: witness-taint — built, gated, RETIRED by design review (2026-08-28/29)
+
+The "v2 consolidation": demand-driven population dataflow (strict
+lattice + poison, exact + typed cells, escape poisoning). Three slice
+iterations (typed-fallback reads took top 9,641→1,755; deepKey-parity
+keying caught by the emptied-clamp review) → 6,902 sites/−1.75M at
+slice, complementary to the walk (−428k it can't reach). Kernel gate:
+**GT 79→164** (NF_HOOK okfn + k_clock families = second-front-end
+re-implementation gaps). Then retired on the design argument (user):
+it re-answers the flows-to question over the same flows — the
+deficiency was never the traversal but the QUOTIENT (cluster join),
+and witness-read had already proven exact results unrecoverable from
+merged state. Correct form if ever needed: in-solver selective exact
+joins at key-indexed cells (protection machinery). Tombstones in flag
+desc + rendezvous doc. Yielded the MASTER FORMULATION (killers §8):
+one imprecision source (store→ptr→load under an address quotient),
+one operation (split channels by a partition INDEX); field/context/
+flow/heap sensitivities and this work differ only in the index; the
+semantic key is the index that correlates with the kernel's dynamic
+partition AND is small by the kernel's own design.
+
+## Task #62: terminal falsification — the fixed point (2026-08-29)
+
+All 85 residual fat callers classified; the last key-bearing routing
+mechanisms built under the full constraint set (exact-or-refuse; NO
+type reconstruction from arithmetic — container_of downcasts are
+type-confusion-prone, user constraint; NO transitive trust of
+resolved answers/clamp-chains): R1 typed-local dispatch + one-callee
+hop (premise part-refuted: SROA promotes the locals; svc's local is
+written through an INDIRECT call → floor), R3 depth-1 indirect
+population members. Kernel FI gate: **BYTE-IDENTICAL to the row-5
+pins — zero firings**. Machinery removed per the pre-stated 0×
+criterion. The row-5 pins are the EMPIRICAL FIXED POINT of the
+semantic-key index under sound routing; the residual floor is
+documented in five classes (killers §9 terminal result). CAMPAIGN
+CLOSED: 5.18 fs 15.1M→6.08M pairs (−60%), GT recall 98.38→98.66%
+(FN 96→79 incl. matcher-debt retirement), fat tail 337→85 all
+floor-classified, stated-assumption surface = 2 tagged keys,
+falsification ledger 13 entries. Organized: docs/kernel-precision-
+killers.md (§0-§9), docs/kernel-id-keys.md, docs/rendezvous-keying-
+design.md, docs/cli-reference.md canonical section.

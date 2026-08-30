@@ -10,6 +10,77 @@ root) against our results log (cfl-graph-explosion-and-scaling.md).
 Caveat: literature knowledge is as of early 2026 and was NOT verified
 by a fresh search; see "Diligence before drafting" at the end.
 
+## 0. The semantic target — formal statement, non-goals, guarantee vector (2026-08-30)
+
+Added after the external claim-discipline review (see
+docs/review-chatgpt-2026-08-30.md). Everything below was already the
+operational practice; this section makes it the stated claim so no
+reader can attribute a stronger one to us.
+
+**The relation we compute.** Over the linked IR graph G, define the
+rooted flows-to relation
+
+    F_G(o, v, δ)  —  "origin o flows to node v with net field shift δ"
+
+as the least relation closed under the solver's derivation rules
+(assign/deref valley grammar with Z_P shift weights, seeded at
+origins: allocation sites, function addresses, globals). The client
+answer per indirect callsite c is
+
+    Ans_G(c) = { f : Function | F_G(f, ptr(c), δ) for an
+                 answer-accepting shift δ (identity residue, or any
+                 residue when the site is shift-ambiguous) }
+
+**Non-goals (explicitly NOT claimed).**
+1. Not all-pairs CFL reachability — we never materialize the full
+   V/M relation; the closure-size law (§ below) is precisely why.
+2. Not complete Andersen points-to sets for arbitrary pointers —
+   only origin facts are stored, and only function-typed origins are
+   answer-bearing for the callgraph client. Data-object facts exist
+   as witnesses, not as a queryable points-to API.
+3. Rooted, not saturated. The mechanized model (FlowsTo.lean) is
+   explicit that saturation over-approximates rooted derivations at
+   unrooted valley apexes; the shipped solver computes the rooted
+   relation, and byte-level pins are pins OF the rooted relation.
+4. Soundness is model-relative: "F_G over-approximates runtime
+   dispatch" holds under the stated boundary assumptions (assembly,
+   extern symbols, arch/build config, corpus completeness), each of
+   which is either summarized, ledgered, or refused — never silent.
+
+**The quotient is not may-alias.** The union-find memory layer
+equates (origin, shift) CELL CLASSES whose joint consequences the
+witness rules license; it is machine-checked fact-equivalent to the
+grammar's per-witness M relation (the POPL'18-style lemma pair). It
+is NOT a materialized transitive may-alias relation over program
+expressions, and no such relation is claimed or exported. Under the
+master formulation (kernel-precision-killers.md §8) the quotient is
+the single deliberate over-approximation — the address partition —
+and every precision lever is a re-indexing of that partition.
+
+**Layered guarantee vector.** Every reported run carries a
+four-component label ⟨closure, abstraction, boundary, reporting⟩:
+- closure: CLOSED (per-run closure certificate C0–C5 /
+  --cfl-verify-closure passed) vs AUDITED-INCOMPLETE (a cap fired
+  under explicit opt-in --cfl-iter-cap-ok; default REFUSES).
+- abstraction: OVERAPPROX (quotient direction proven; converse
+  handled conservatively) — the permanent value for this design.
+- boundary: LEDGERED (unsoundness ledger + SummaryCheck counters
+  reported; zero counters + --ir-census-strict = model-closed with a
+  TOTAL construct classifier under stated assumptions).
+- reporting: UNFILTERED vs FILTERED. The sound answer set is the
+  PRE-type-filter set; the type filter is a precision view that can
+  in principle remove true targets (measured via
+  --cfl-census-type-rej / --cfl-gt-type-census, which caught exactly
+  one witnessed instance: the certified static_call +29). Paper
+  tables state which view each number is, and pair them where the
+  gap matters.
+
+**Per-number attribution rule.** Every quantitative claim names its
+configuration (flags, corpus, binary vintage, baseline pin + sha).
+No mixing of numbers across configs in one sentence; speedups are
+same-answer (byte-identical or theorem-covered) or labeled
+different-answer.
+
 ## 1. Consistency with POPL'18 (Chatterjee et al.)
 
 Their results and our empirical findings agree everywhere they
@@ -27,6 +98,12 @@ results we obtained experimentally:
    grammar's per-witness M is their Soundness/Completeness lemma pair
    (3.1/3.2) in our setting. The solver-side note "bidirectional join
    copies ≡ union-find merges of cell clusters" IS their theorem.
+   SCOPE (claim discipline, 2026-08-30): their near-linear
+   O(m + n·α(n)) bound applies to the BIDIRECTED-DYCK FRAGMENT only —
+   in our solver, the memory/join layer and the bidi presolve. The
+   composite solver (directional a-edges + shift weights + rooted
+   propagation) inherits NO complexity guarantee from it, and we
+   claim none; point 3 below is why none is available.
 2. **The partition is cheap; the pairwise relation is the cost.**
    `BidirectedReach` computes the reachability partition in O(m)
    space and never materializes all pairs. Our measured diagnosis —
@@ -124,6 +201,15 @@ requires." Rename internal vocabulary to the literature's terms:
 joins → DSCC maintenance; wave scheduling → topological difference
 propagation; flows-to → answer-anchored (inverse) points-to.
 
+The one-sentence claim (narrowed per the 2026-08-30 review): a
+client-specific ROOTED pointer-flow formulation for kernel indirect
+calls — sound field sensitivity in the weight domain, registration
+identity as channel keys outside the address quotient — where every
+guarantee is carried by explicit evidence (mechanized lemma, per-run
+certificate, or ledger), not by construction folklore. NOT a general
+CFL-reachability engine claim, NOT a complexity claim, NOT complete
+points-to.
+
 ## 5. Diligence before drafting related work
 
 Highest collision risk, to be checked manually (web search
@@ -136,7 +222,15 @@ unavailable from the analysis environment):
   soundness claims;
 - group-/lattice-weighted Dyck reachability for C field sensitivity
   (WPDS instantiations) — whether the Z_P quotient has been used for
-  interior pointers before.
+  interior pointers before;
+- solver-engineering baselines the 2026-08-30 review names for
+  positioning: SVF (VFG infrastructure), SQUID, POCR/PEARL
+  (transitivity-aware CFL solving), CAT, STG, WaveDiff-style
+  difference propagation — our differentiator against ALL of them is
+  the formulation shift (rooted client-specific relation + semantic
+  channel keys + evidence-carrying runs), not solver speed; do not
+  let a table imply we out-solve dedicated CFL engines on their own
+  benchmarks.
 
 ## Reviewed 2026-08-13: Li, Zhang & Reps, PLDI'20 — graph simplification for InterDyck
 

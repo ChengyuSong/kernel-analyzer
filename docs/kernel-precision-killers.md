@@ -376,8 +376,24 @@ assumption surface after all of it is TWO tagged keys kernel-wide.
 Campaign effect on the tail (5.18 fs, callers >= 5,000 targets):
 337 (pre-regfield) -> 92 (fn tables) -> 90 (+obj) -> 85 (+witness
 trio); pairs 15.1M -> 6.09M with GT FN-identity (79) held at every
-gate. The rodata/stride pair (rows 3-4) gates at FI (-6,977/+0);
-remaining tail mass = rows 5-8.
+gate.
+
+**Terminal result (2026-08-29).** The last two key-routing mechanisms
+the 85 justified (typed-local dispatch with one-callee-hop writers;
+depth-1 indirect population members) were built under the full
+constraint set — exact-or-refuse, no type reconstruction from
+arithmetic (container_of downcasts are type-confusion-prone: typed
+GEPs are IR-stated and trusted, inferred container types are not),
+no transitive trust of resolved answers — and measured BYTE-IDENTICAL
+to the row-5 pins at kernel scale (0 firings; machinery removed per
+the pre-stated criterion). The pins are the empirical FIXED POINT of
+the semantic-key index under sound routing. The residual fat callers
+are the documented floor, each in one of five classes: (1) untyped
+container_of dispatch sites, (2) locals written behind indirect
+dispatch (clamp-chain trust refused), (3) writable populations with
+unwitnessed stores (x86_pmu boot patching), (4) dynamically
+instantiated ops (crypto templates), (5) dynamically shared channels
+(the §8 semantic floor proper).
 
 ## Appendix: repro
 

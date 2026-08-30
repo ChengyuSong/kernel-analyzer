@@ -14392,16 +14392,6 @@ void CallGraphPass::runRegFieldGapReport() {
   // population-preserving, NOT a hazard. Only transfers from unknown
   // buffers can introduce unwitnessed pointers.
   std::set<std::string> objHazBulk;
-  // R3 (taxonomy: member-of-a-loaded-field): a field's population can
-  // be INDIRECT — pointers computed as gep(load(keyed field), off) —
-  // e.g. svc: rq_procinfo = versp->vs_proc + idx. Recorded as
-  // (source key, base, stride); expanded ONE level at apply by
-  // composing with the source key's own DIRECT members. Pure value
-  // composition through IR-stated keys — no type reconstruction
-  // (container_of downcasts are type-confusion-prone; user constraint
-  // 2026-08-29: never infer container types from raw arithmetic).
-  std::map<std::string, std::vector<std::tuple<std::string, int64_t,
-                                               uint64_t>>> objIndirect;
   std::map<std::string, size_t> objCopySameOff; // untyped same-offset
                                                 // instance-copy rescues
                                                 // (stated assumption)
@@ -14688,47 +14678,10 @@ void CallGraphPass::runRegFieldGapReport() {
           }
         } else if (containsPointerType(V->getType())) {
           open.insert(Key); // fn-channel semantics unchanged
-          if (auto M = objMemberOf(V, DL)) {
+          if (auto M = objMemberOf(V, DL))
             objRegs[Key].insert(*M); // &ops_global / &table[i] member
-          } else if (!isa<ConstantPointerNull>(V)) {
-            // indirect member: gep-chain over a LOAD from a keyed
-            // field (svc rq_procinfo <- versp->vs_proc + idx)
-            const Value *W = V->stripPointerCasts();
-            int64_t ibase = 0;
-            uint64_t istride = 0;
-            bool okI = true;
-            while (const auto *G3 = dyn_cast<GEPOperator>(W)) {
-              for (auto GTI = gep_type_begin(G3), E3 = gep_type_end(G3);
-                   GTI != E3; ++GTI) {
-                if (const auto *CI3 =
-                        dyn_cast<ConstantInt>(GTI.getOperand())) {
-                  if (StructType *ST3 = GTI.getStructTypeOrNull())
-                    ibase += (int64_t)DL.getStructLayout(ST3)
-                                 ->getElementOffset(CI3->getZExtValue());
-                  else
-                    ibase += CI3->getSExtValue() *
-                             (int64_t)DL.getTypeAllocSize(
-                                 GTI.getIndexedType());
-                } else if (!GTI.getStructTypeOrNull() && istride == 0) {
-                  istride = DL.getTypeAllocSize(GTI.getIndexedType());
-                  if (!istride) { okI = false; break; }
-                } else {
-                  okI = false;
-                  break;
-                }
-              }
-              if (!okI) break;
-              W = G3->getPointerOperand()->stripPointerCasts();
-            }
-            const auto *LI3 = dyn_cast<LoadInst>(W);
-            std::string SK3;
-            if (okI && ibase >= 0 && LI3)
-              SK3 = deepKey(LI3->getPointerOperand(), DL);
-            if (!SK3.empty() && SK3 != Key)
-              objIndirect[Key].push_back({SK3, ibase, istride});
-            else
-              objOpenAt(Key, SI); // computed/heap pointer: unwitnessed
-          }
+          else if (!isa<ConstantPointerNull>(V))
+            objOpenAt(Key, SI); // computed/heap pointer: unwitnessed
         }
       }
     }
@@ -15062,7 +15015,6 @@ void CallGraphPass::runRegFieldGapReport() {
     struct ObjLedger {
       size_t sites = 0, rem = 0, kept = 0, objs = 0;
     };
-    boost::unordered_flat_map<std::string, const Function *> nameToFunc;
     std::map<std::string, ObjLedger> led; // "key slot=N"
     size_t objSkipOpen = 0, objSkipNonConst = 0;
     for (auto *CB : Ctx->IndirectCallInsts) {
@@ -15152,252 +15104,6 @@ void CallGraphPass::runRegFieldGapReport() {
         ci->second = keep;
         continue;
       }
-      // R1 (taxonomy row 6): typed-LOCAL dispatch — the fptr loads
-      // from a stack copy of ops fields (dmaengine_desc_callback:
-      // field-0 alloca loads emit no GEP, so fn keys never see the
-      // site, and the root is an alloca, not a load). Route the
-      // local's writers: fn constants directly; loads whose (S,off)
-      // key is CLOSED contribute that key's population (the
-      // fn-channel's own tables + closure tests); anything else, or
-      // an escaping local, refuses.
-      if (const auto *AI = dyn_cast<AllocaInst>(P)) {
-        if (varElemSize) continue; // strided locals: refuse (v1)
-        const int64_t want = (int64_t)off.getZExtValue();
-        bool refuse = false;
-        FuncSet table;
-        // escape scan over the alloca's use tree (direct + GEP/cast)
-        SmallVector<const Value *, 8> uq{AI};
-        SmallVector<std::pair<const StoreInst *, int64_t>, 8> writers;
-        SmallVector<std::tuple<const AnyMemTransferInst *, int64_t>, 4>
-            copies; // (memcpy, dest-offset-of-AI-region)
-        SmallVector<std::tuple<const Function *, unsigned, int64_t>, 4>
-            hops; // (defined callee, formal no, AI-offset of formal)
-        boost::unordered_flat_set<const Value *> seen2;
-        while (!uq.empty() && !refuse) {
-          const Value *Cur = uq.pop_back_val();
-          if (!seen2.insert(Cur).second) continue;
-          // offset of Cur relative to AI
-          int64_t coff = 0;
-          {
-            const Value *W = Cur;
-            APInt o2(64, 0);
-            bool okc = true;
-            while (W != AI) {
-              const auto *G2 = dyn_cast<GEPOperator>(W);
-              if (!G2 || !G2->accumulateConstantOffset(
-                             AI->getModule()->getDataLayout(), o2)) {
-                okc = false;
-                break;
-              }
-              W = G2->getPointerOperand()->stripPointerCasts();
-            }
-            if (!okc) { refuse = true; break; }
-            coff = o2.getSExtValue();
-          }
-          for (const Use &U : Cur->uses()) {
-            const User *Us = U.getUser();
-            if (const auto *G2 = dyn_cast<GEPOperator>(Us)) {
-              uq.push_back(G2);
-            } else if (isa<BitCastInst>(Us)) {
-              uq.push_back(cast<Value>(Us));
-            } else if (isa<LoadInst>(Us)) {
-              // reads are fine
-            } else if (const auto *S2 = dyn_cast<StoreInst>(Us)) {
-              if (S2->getValueOperand() == Cur) { refuse = true; break; }
-              writers.push_back({S2, coff});
-            } else if (const auto *MT = dyn_cast<AnyMemTransferInst>(Us)) {
-              if (MT->getRawDest()->stripPointerCasts() ==
-                  Cur->stripPointerCasts())
-                copies.push_back({MT, coff});
-              else { refuse = true; break; } // local used as SOURCE: ok
-                // actually source use is a read; but conservatively
-                // only dest is classified — source reads are benign:
-            } else if (const auto *II2 = dyn_cast<IntrinsicInst>(Us)) {
-              if (II2->getIntrinsicID() != Intrinsic::lifetime_start &&
-                  II2->getIntrinsicID() != Intrinsic::lifetime_end &&
-                  !II2->isAssumeLikeIntrinsic()) {
-                refuse = true;
-                break;
-              }
-            } else if (const auto *CB2 = dyn_cast<CallBase>(Us)) {
-              // one-callee hop (svc_process: &process passed to
-              // svc_generic_init_request which writes the dispatch
-              // fn through its formal). Allowed ONLY into a direct
-              // DEFINED callee; the formal's writers are collected
-              // under the same exact-or-refuse rules, depth 1.
-              const Function *CF2 = CB2->getCalledFunction();
-              if (!CF2 || CB2->isCallee(&U)) { refuse = true; break; }
-              Function *DF2 = getFuncDef(const_cast<Function *>(CF2));
-              if (DF2->isDeclaration()) { refuse = true; break; }
-              unsigned an = U.getOperandNo();
-              if (an >= DF2->arg_size()) { refuse = true; break; }
-              hops.push_back({DF2, an, coff});
-            } else {
-              refuse = true; // ptrtoint / phi / indirect-call arg
-              break;
-            }
-          }
-        }
-        // resolve fn names of a CLOSED fn-channel key to Functions
-        auto keyFns = [&](const std::string &SK2, FuncSet &out) -> bool {
-          auto ri2 = regs.find(SK2);
-          if (ri2 == regs.end() || ri2->second.empty()) return false;
-          const std::string SN2 = SK2.substr(0, SK2.find('+'));
-          if (open.count(SK2) || hazAtomic.count(SK2) ||
-              hazEscape.count(SK2) || hazBulk.count(SN2) ||
-              SK2.find("+var") != std::string::npos)
-            return false;
-          if (nameToFunc.empty())
-            for (auto &mp2 : Ctx->Modules)
-              for (Function &F2 : *mp2.first)
-                if (!F2.isDeclaration())
-                  nameToFunc.emplace(F2.getName().str(),
-                                     getFuncDef(&F2));
-          for (const auto &N2 : ri2->second) {
-            auto fit2 = nameToFunc.find(N2);
-            if (fit2 == nameToFunc.end()) return false;
-            out.insert(fit2->second);
-          }
-          return true;
-        };
-        if (!refuse) {
-          for (auto &[S2, base2] : writers) {
-            const auto *SP = dyn_cast<GEPOperator>(
-                S2->getPointerOperand()->stripPointerCasts());
-            int64_t soff = base2;
-            if (SP) {
-              APInt o3(64, 0);
-              if (!SP->accumulateConstantOffset(
-                      S2->getModule()->getDataLayout(), o3)) {
-                refuse = true;
-                break;
-              }
-              soff = o3.getSExtValue(); // GEP offsets are AI-relative
-            } else if (S2->getPointerOperand()->stripPointerCasts() !=
-                       AI) {
-              soff = base2;
-            }
-            if (soff != want) continue; // other fields: irrelevant
-            const Value *V2 =
-                S2->getValueOperand()->stripPointerCasts();
-            if (const auto *F2 = dyn_cast<Function>(V2)) {
-              table.insert(getFuncDef(const_cast<Function *>(F2)));
-            } else if (isa<ConstantPointerNull>(V2)) {
-              // null: contributes nothing
-            } else if (const auto *L3 = dyn_cast<LoadInst>(V2)) {
-              std::string SK2 = deepKey(
-                  L3->getPointerOperand(),
-                  L3->getModule()->getDataLayout());
-              if (SK2.empty() || !keyFns(SK2, table)) {
-                refuse = true;
-                break;
-              }
-            } else {
-              refuse = true;
-              break;
-            }
-          }
-        }
-        if (!refuse) {
-          for (auto &[HF, han, hbase] : hops) {
-            const Argument *HA = HF->getArg(han);
-            const DataLayout &DL4 = HF->getParent()->getDataLayout();
-            for (const Instruction &HI : instructions(*HF)) {
-              if (refuse) break;
-              const auto *HS = dyn_cast<StoreInst>(&HI);
-              if (!HS) {
-                // the formal must not escape further inside the hop
-                for (const Use &HU : HI.operands())
-                  if (HU.get() == HA &&
-                      !isa<LoadInst>(&HI) && !isa<StoreInst>(&HI) &&
-                      !isa<GetElementPtrInst>(&HI) &&
-                      !isa<ICmpInst>(&HI)) {
-                    refuse = true;
-                    break;
-                  }
-                continue;
-              }
-              // store rooted at the formal?
-              const Value *HP =
-                  HS->getPointerOperand()->stripPointerCasts();
-              APInt ho(64, 0);
-              bool okh = true;
-              while (const auto *HG = dyn_cast<GEPOperator>(HP)) {
-                if (!HG->accumulateConstantOffset(DL4, ho)) {
-                  okh = false;
-                  break;
-                }
-                HP = HG->getPointerOperand()->stripPointerCasts();
-              }
-              if (HP != HA) {
-                if (HS->getValueOperand()->stripPointerCasts() == HA) {
-                  refuse = true; // formal address stored away
-                  break;
-                }
-                continue; // unrelated store in callee
-              }
-              if (!okh) { refuse = true; break; }
-              if (hbase + ho.getSExtValue() != want) continue;
-              const Value *HV =
-                  HS->getValueOperand()->stripPointerCasts();
-              if (const auto *HFN = dyn_cast<Function>(HV)) {
-                table.insert(getFuncDef(const_cast<Function *>(HFN)));
-              } else if (isa<ConstantPointerNull>(HV)) {
-              } else if (const auto *HL = dyn_cast<LoadInst>(HV)) {
-                std::string HK = deepKey(HL->getPointerOperand(), DL4);
-                if (HK.empty() || !keyFns(HK, table)) {
-                  refuse = true;
-                  break;
-                }
-              } else {
-                refuse = true;
-                break;
-              }
-            }
-            if (refuse) break;
-          }
-        }
-        if (!refuse) {
-          for (auto &[MT, dbase] : copies) {
-            // dest region [dbase, dbase+len) of AI; the queried slot
-            // must map back into the source's (S,off+delta) key
-            std::string SK2;
-            const auto *SGp = dyn_cast<GEPOperator>(
-                MT->getRawSource()->stripPointerCasts());
-            const DataLayout &DL3 = MT->getModule()->getDataLayout();
-            if (SGp) SK2 = deepKey(SGp, DL3);
-            if (SK2.empty()) { refuse = true; break; }
-            const size_t plus2 = SK2.rfind('+');
-            int64_t sBase = -1;
-            if (plus2 != std::string::npos)
-              (void)!StringRef(SK2).substr(plus2 + 1)
-                  .getAsInteger(10, sBase);
-            if (sBase < 0) { refuse = true; break; }
-            const std::string comp =
-                SK2.substr(0, plus2 + 1) +
-                std::to_string(sBase + (want - dbase));
-            if (!keyFns(comp, table)) { refuse = true; break; }
-          }
-        }
-        if (refuse || table.empty()) {
-          objSkipOpen++;
-          continue;
-        }
-        FuncSet keep;
-        for (const Function *F : ci->second)
-          if (table.count(getFuncDef(const_cast<Function *>(F))))
-            keep.insert(F);
-        if (ci->second.size() == keep.size()) continue;
-        auto &LG = led[std::string("LOCAL:") +
-                       CB->getFunction()->getName().str() + " slot=" +
-                       std::to_string(want)];
-        LG.sites++;
-        LG.rem += ci->second.size() - keep.size();
-        LG.kept += keep.size();
-        LG.objs = table.size();
-        ci->second = keep;
-        continue;
-      }
       const auto *L2 = dyn_cast<LoadInst>(P);
       if (!L2) continue;
       std::string OK = deepKey(L2->getPointerOperand(), DLm);
@@ -15428,44 +15134,7 @@ void CallGraphPass::runRegFieldGapReport() {
       const uint64_t innerOff = off.getZExtValue();
       FuncSet table;
       bool bad = false;
-      // depth-1 expansion of indirect members: compose the source
-      // key's DIRECT members with (base, stride); refuse if the
-      // source key is open/hazarded, has its own indirect members
-      // (depth cap), or strides collide
-      std::vector<GlobalContext::SummaryAtom> dummy_; // (scope filler)
-      std::set<std::tuple<const GlobalVariable *, int64_t, uint64_t>>
-          expanded(oi->second.begin(), oi->second.end());
-      {
-        auto ii2 = objIndirect.find(OK);
-        if (ii2 != objIndirect.end()) {
-          for (const auto &[SK3, ib, is] : ii2->second) {
-            const std::string SN3 = SK3.substr(0, SK3.find('+'));
-            const bool closed3 =
-                !objOpen.count(SK3) && !hazAtomic.count(SK3) &&
-                !hazEscape.count(SK3) && !objHazBulk.count(SN3) &&
-                SK3.find("+var") == std::string::npos &&
-                !objIndirect.count(SK3); // depth cap = 1
-            auto sr = objRegs.find(SK3);
-            if (!closed3 || sr == objRegs.end() || sr->second.empty()) {
-              bad = true;
-              break;
-            }
-            for (const auto &[GV3, b3, s3] : sr->second) {
-              if (s3 && is) { bad = true; break; }
-              expanded.insert({GV3, b3 + ib, s3 ? s3 : is});
-            }
-            if (bad) break;
-          }
-        }
-      }
-      if (bad) {
-        objSkipOpen++;
-        if (CFLRegFieldAudit)
-          errs() << "RegFieldObj: SKIP " << OK
-                 << " reason=[ indirect-open ]\n";
-        continue;
-      }
-      for (const auto &[GV0, mbase, mstride] : expanded) {
+      for (const auto &[GV0, mbase, mstride] : oi->second) {
         const GlobalVariable *GV = GV0;
         // Cross-TU declarations must canonicalize to their defining
         // TU's global (the extern-hub/98bdfd5 lesson): an `external

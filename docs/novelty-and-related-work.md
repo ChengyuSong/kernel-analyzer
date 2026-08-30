@@ -246,6 +246,22 @@ evidence.
    surveyed field; transferred to httpd/postgres unchanged.
 5. The kernel fat-site anatomy + 5-class floor. SCIENCE contribution
    for the community that consumes these callgraphs.
+6. Data-structure and algorithm engineering with an answer-identity
+   discipline. ENGINEERING contribution, claimed as such: every
+   optimization shipped byte-identical or theorem-gated (cell-major
+   join sweep, fused kernels, self-contained BitPlane, presolve-once,
+   batched solving with mechanized exactness, COW plane sharing,
+   cluster-mark join fast path — fs41 lineage 4h13m→27m ≈ 9.2×,
+   kernel fs 70h→11.5h), and every FAILED perf lever reported with
+   its measured mechanism (merge-fusion, slab layout, origin
+   bundles). Perf work you can trust because wrongness was
+   detectable at every step.
+7. The artifact: open-source implementation WITH its corresponding
+   mechanized model (proof/lean: solver schemas, channel soundness,
+   counterexamples for the falsified variants) and per-run
+   certificates connecting model to binary, plus reproducible pins.
+   Few systems in this literature ship the model next to the code;
+   none ship run-level evidence that the code stayed inside it.
 The solver core is expert integration of the literature's best
 components and is presented as exactly that — proudly, not
 defensively. Rename internal vocabulary to the literature's terms:

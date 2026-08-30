@@ -66,9 +66,15 @@ ORCFL contains a silent budget.
 scales the CFL/Dyck closure computation itself: Graspan [Graspan]
 as out-of-core edge-pair joining, POCR [POCR] and Pearl [Pearl] via
 transitivity-aware solving, GraCFL [GraCFL] via cache-efficient
-worklists. Our saturation baseline builds on GraCFL, the strongest
-of these on our graphs — and that is the point: these engines are
-genuine successes at the engine level, and their success is what
+worklists, and most recently staged and restructured evaluation —
+grammar staging [STG], skewed tabulation [SkewedPLDI24], relation
+chaining [SQUID], sparse-matrix closure [FastMatrixCFPQ]. A sibling
+line exploits client structure without changing the relation:
+exact client-driven graph reduction [MoYe], context-aware summary
+pruning [CAT], and reachability indexing for repeated queries
+[FLARE]. Our saturation baseline builds on GraCFL, the strongest
+of the engines on our graphs — and that is the point: these engines
+are genuine successes at the engine level, and their success is what
 isolates the residual wall as the formulation's output size. Over
 LLVM-IR-scale graphs the pairwise alias closure is Θ(Σ|C|²) in the
 a-connected component masses; an optimal engine reaches that floor
@@ -131,7 +137,15 @@ security mechanisms are asked to trust.
   embeds cap truncation, ours embeds the hub). If evaluation adds a
   comparison, run their binary on our corpus, diff both directions,
   and instrument the caps.
-- Diligence still open before submission (from novelty doc §5):
-  InterDyck/mutual-refinement 2024-26; group-weighted Dyck for
-  interior pointers; verify no 2025-26 successor to KallGraph
-  removes the caps.
+- Diligence: novelty doc §5 now carries the full 2026-08-30 survey
+  triage (all five novelty claims survive; MoYe/CAT/FLARE are the
+  must-cite client-structure neighbors; MCFL POPL'25 is the
+  underapprox contrast; POPL'24 dynamic bidirected Dyck cited next
+  to our incremental with fragment scoping). STILL OPEN before
+  submission: verify the 2026-venue citations exist as described
+  (SQUID/OOPSLA'26, CAT/ICSE'26, TnFix/ECOOP'26, FastMatrixCFPQ —
+  all past our verified knowledge); group-weighted Dyck manual
+  check; no 2026 KallGraph successor removing the caps.
+- If asked "why not SQUID/FastMatrixCFPQ as the engine": same
+  answer as GraCFL/POCR — the wall is closure output size (Σ|C|²),
+  which a faster engine reaches sooner but cannot lower.

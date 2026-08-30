@@ -210,27 +210,82 @@ certificate, or ledger), not by construction folklore. NOT a general
 CFL-reachability engine claim, NOT a complexity claim, NOT complete
 points-to.
 
-## 5. Diligence before drafting related work
+## 5. Diligence before drafting related work — SURVEY TRIAGED 2026-08-30
 
-Highest collision risk, to be checked manually (web search
-unavailable from the analysis environment):
-- 2024–26 InterDyck / mutual-refinement solver lines (Ding, Zhang
-  et al.) — interaction of two Dyck languages vs our
-  valley-grammar + weight split;
-- recent kernel indirect-call work (Kelp/TFA/Unias lineage,
-  2023–25) — whether anyone couples CFL-based flow with kernel-scale
-  soundness claims;
-- group-/lattice-weighted Dyck reachability for C field sensitivity
-  (WPDS instantiations) — whether the Z_P quotient has been used for
-  interior pointers before;
-- solver-engineering baselines the 2026-08-30 review names for
-  positioning: SVF (VFG infrastructure), SQUID, POCR/PEARL
-  (transitivity-aware CFL solving), CAT, STG, WaveDiff-style
-  difference propagation — our differentiator against ALL of them is
-  the formulation shift (rooted client-specific relation + semantic
-  channel keys + evidence-carrying runs), not solver speed; do not
-  let a table imply we out-solve dedicated CFL engines on their own
-  benchmarks.
+An external literature survey (ChatGPT, user-supplied 2026-08-30)
+covering the field through Aug 2026 was triaged against the claims
+above. Provenance caveat: items at 2026 venues (SQUID/OOPSLA'26,
+CAT/ICSE'26, TnFix/ECOOP'26, FastMatrixCFPQ) are past our verified
+knowledge (Jan 2026) — VERIFY the papers exist as described before
+citing. The pre-2026 items (POCR, PEARL, FLARE, STG, skewed
+tabulation, MoYe, MCFL POPL'25, dynamic Dyck POPL'24, KallGraph,
+Li'23) match verified knowledge.
+
+**Collision verdicts — all five claimed novelties SURVIVE:**
+1. Witness-exact unification: no survey entry couples exact
+   union-find beneath directional propagation with a lossless proof.
+   The whole solver line (SQUID relation chaining, CAT context-aware
+   tabulation, STG staging, skewed tabulation, PEARL/POCR,
+   FastMatrixCFPQ) optimizes evaluation of the SAME relation.
+2. Z_P field sensitivity in the weight domain: nothing in the survey
+   places field offsets in a group weight domain or handles
+   container_of soundly. Nearest non-colliders to cite as contrast:
+   STG (stages the grammar but keeps field parens as parens), SPDS
+   POPL'19 and MCFL POPL'25 (multiple stacks — and MCFL is an
+   UNDERapproximation, the opposite soundness pole from us),
+   KallGraph's per-path byte-offset stack (already in the draft as
+   independent evidence for offsets-not-parens).
+3. Certificate-carrying runs: no analog anywhere in the survey,
+   kernel or generic. KallGraph remains the silent-caps contrast.
+4. Measured falsification catalog: no analog.
+5. 1-bit VX provenance: no analog.
+
+**Formulation claim — nearest neighbors now identified.** MoYe
+(OOPSLA'25: client-driven graph reduction, exact for given
+source-sink pairs), CAT (avoids unproductive summaries), FLARE
+(index once, query many) all exploit client structure — but as
+preprocessing/scheduling over the standard all-pairs relation. Ours
+changes the relation computed (rooted F_G, origins as the only
+stored facts, all icall queries sharing one propagation) and adds
+semantic channel keys. Must-cite trio for the "client structure"
+paragraph; the differentiator sentence stands.
+
+**Precision side — the channel-key lever has NO competitor in the
+survey.** Every precision entry is either a sensitivity knob
+(LDCR/P³Ctx callsite contexts, MCFL stacks) or a type hybrid
+(KallGraph, Li'23 hybrid — both already in our draft). Nobody keys
+channels by the kernel's own registration identities. This is the
+paper's clearest open ground, unchanged.
+
+**Incremental positioning.** POPL'24 dynamic bidirected Dyck
+(O(n·α(n)) updates incl. deletions) gets the same scoping treatment
+as POPL'18: bidirected fragment only. Our composite grammar is not
+bidirected; our incremental result (#43) is kernel-scale,
+addition-only, FI-validated/fs-refused, gated by byte-identity —
+different regime, cite side by side without implying either
+subsumes the other. (Their deletion support could in principle
+apply to our bidirected JOIN LAYER alone; our incremental blocker is
+the fs residue, not the join layer — a footnote, not a lever.)
+
+**Original three risk items, resolved as far as a survey can:**
+- InterDyck/mutual-refinement line: moved to MCFL hierarchy
+  (POPL'25, underapprox) — no collision, clean contrast.
+- Kernel indirect-call 2023–26: KallGraph (S&P'25) confirmed as the
+  latest; survey names no successor. Still verify no 2026 follow-up
+  removes the caps before submission.
+- Group-weighted Dyck for interior pointers: survey names nothing —
+  supports novelty #2, but absence-of-evidence; keep the manual
+  check on WPDS instantiations.
+
+**Positioning discipline (unchanged from the claim review):** our
+differentiator against ALL solver-line entries is the formulation
+shift (rooted client-specific relation + semantic channel keys +
+evidence-carrying runs), not solver speed; do not let a table imply
+we out-solve dedicated CFL engines on their own benchmarks. If a
+reviewer asks "why not SQUID/FastMatrixCFPQ as your engine": the
+wall is closure OUTPUT size (Σ|C|² law), which an optimal engine
+reaches faster but cannot lower — the same argument already made
+for GraCFL/POCR, now extended to the 2026 crop.
 
 ## Reviewed 2026-08-13: Li, Zhang & Reps, PLDI'20 — graph simplification for InterDyck
 

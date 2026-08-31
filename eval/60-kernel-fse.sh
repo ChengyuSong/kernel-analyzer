@@ -182,7 +182,7 @@ for a in "${ARMS[@]}"; do run_arm "$a" || exit 1; done
 # 0 for one-sided precision arms; nonzero is loud).
 SUMTSV="$OUT/summary.tsv"
 {
-  echo -e "arm\tfamily\tpairs\tremoved_vs_full\tadded_vs_full\tidentical\tge100_callers\tmax_fanout\tgt_fn\twall\tmaxrss_kb"
+  echo -e "arm\tfamily\tpairs\tremoved_vs_full\tadded_vs_full\tidentical\tge100_callers\tmax_fanout\tgt_fn\tsolve_s\twall\tmaxrss_kb"
   for a in "${ARMS[@]}"; do
     p="$OUT/$a-pairs.txt"; [[ -s "$p" ]] || continue
     n=$(wc -l < "$p")
@@ -197,9 +197,20 @@ SUMTSV="$OUT/summary.tsv"
     fi
     read -r c100 maxf <<< "$(fat_tail "$a")"
     fn=$(gt_match "$a")
+    # Solve-phase wall = last --log-timestamps stamp BEFORE the icall
+    # dump begins. End-to-end wall includes dumping millions of ICALL
+    # lines, which scales with the answer size and would credit
+    # precision arms with I/O savings, not solver savings.
+    firsticall=$(grep -nm1 '^ICALL ' "$OUT/$a.log" | cut -d: -f1)
+    if [[ -n "$firsticall" ]]; then
+      solve=$(head -n $((firsticall-1)) "$OUT/$a.log" \
+              | grep -oE '^\[\+[0-9]+\.[0-9]+s\]' | tail -1 | tr -d '[+s]')
+    else
+      solve=""
+    fi
     wall=$(grep -oE 'Elapsed \(wall clock\).*' "$OUT/$a.log" | awk '{print $NF}' | tail -1)
     rss=$(grep -oE 'Maximum resident set size.*[0-9]+' "$OUT/$a.log" | grep -oE '[0-9]+$' | tail -1)
-    echo -e "$a\t$fam\t$n\t$rem\t$add\t$ident\t$c100\t$maxf\t$fn\t${wall:--}\t${rss:--}"
+    echo -e "$a\t$fam\t$n\t$rem\t$add\t$ident\t$c100\t$maxf\t$fn\t${solve:--}\t${wall:--}\t${rss:--}"
   done
 } | tee "$SUMTSV"
 

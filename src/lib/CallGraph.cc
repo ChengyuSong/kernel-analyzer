@@ -124,6 +124,40 @@ static std::string normalizeModuleIdentifier(StringRef rawId) {
   return normalized.str().str();
 }
 
+// Q1 estimator (paper, 2026-08-30): full class-size distribution +
+// the closure-mass law Sigma|C|^2 — the fact count a saturating
+// solver would materialize over this partition (per shift plane).
+// Emitted at BlobForm INITIAL (input topology after presolve
+// compression) and FINAL (the realized bidirected quotient).
+static void cflDumpClassHist(const char *label,
+                             std::vector<uint64_t> &szs) {
+  std::sort(szs.begin(), szs.end(), std::greater<>());
+  unsigned long long sum = 0, sumSq = 0;
+  for (uint64_t s : szs) {
+    sum += s;
+    sumSq += (unsigned long long)s * s;
+  }
+  errs() << "ClassHist[" << label << "]: classes=" << szs.size()
+         << " mass=" << sum << " sumSq=" << sumSq << "\n";
+  for (size_t i = 0; i < std::min<size_t>(10, szs.size()); i++)
+    errs() << "ClassHist[" << label << "]: top" << i << " |C|=" << szs[i]
+           << " |C|^2=" << (unsigned long long)szs[i] * szs[i] << "\n";
+  // log2-bucketed tail: bucket b holds sizes in [2^b, 2^(b+1))
+  uint64_t bucketN[64] = {0}, bucketMass[64] = {0};
+  unsigned long long bucketSq[64] = {0};
+  for (uint64_t s : szs) {
+    unsigned b = 63 - __builtin_clzll(s);
+    bucketN[b]++;
+    bucketMass[b] += s;
+    bucketSq[b] += (unsigned long long)s * s;
+  }
+  for (unsigned b = 0; b < 64; b++)
+    if (bucketN[b])
+      errs() << "ClassHist[" << label << "]: bucket 2^" << b
+             << " n=" << bucketN[b] << " mass=" << bucketMass[b]
+             << " sumSq=" << bucketSq[b] << "\n";
+}
+
 static std::string computeSHA256Hex(StringRef content) {
   llvm::SHA256 hasher;
   hasher.update(content);
@@ -4061,6 +4095,22 @@ bool CallGraphPass::runFlowsToResolution() {
       clsSize[n2] = (uint32_t)cit2->second.size();
   }
   if (CFLProbeBlobFormation) {
+    // Q1 estimator: one entry per canonical class (dedupe by the
+    // canonical key), singletons included at size 1.
+    {
+      boost::unordered_flat_set<NodeIndex> seenCls;
+      std::vector<uint64_t> szs;
+      for (uint32_t n2 = 0; n2 < N; n2++) {
+        auto cit2 = canonicalClassMembers.find(toOrig[n2]);
+        if (cit2 == canonicalClassMembers.end() || cit2->second.size() <= 1) {
+          szs.push_back(1);
+          continue;
+        }
+        if (seenCls.insert(toOrig[n2]).second)
+          szs.push_back((uint64_t)cit2->second.size());
+      }
+      cflDumpClassHist("INITIAL", szs);
+    }
     std::vector<std::pair<uint32_t, uint32_t>> top0;
     for (uint32_t n2 = 0; n2 < N; n2++) top0.emplace_back(clsSize[n2], n2);
     std::partial_sort(top0.begin(), top0.begin() + std::min<size_t>(10, top0.size()),
@@ -8414,6 +8464,15 @@ bool CallGraphPass::runFlowsToResolution() {
            << " pendings without a fn source\n";
   }
   if (CFLProbeBlobFormation) {
+    // Q1 estimator: FINAL partition = the realized bidirected
+    // quotient; Sigma|C|^2 here is the saturation V-mass per plane.
+    {
+      std::vector<uint64_t> szs;
+      for (uint32_t n2 = 0; n2 < N; n2++)
+        if (find(n2) == n2)
+          szs.push_back(clsSize[n2]);
+      cflDumpClassHist("FINAL", szs);
+    }
     uint32_t giant = 0;
     for (uint32_t n2 = 0; n2 < N; n2++)
       if (find(n2) == n2 && clsSize[n2] > clsSize[giant])

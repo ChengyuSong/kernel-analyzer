@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include <iostream>
 #include <vector>
 #include "solvers/SolverFWTopo.hpp"
@@ -45,7 +46,7 @@ namespace gracfl
                 nodeSize,
                 terminate
             );
-            std::cout << "Iteration " << itr << std::endl;
+            gracfl::dbg() << "Iteration " << itr << std::endl;
         } while (!terminate);
     }
 

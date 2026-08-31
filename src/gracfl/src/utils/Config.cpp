@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include "utils/Config.hpp"
 #include <fstream>
 #include <algorithm>
@@ -242,15 +243,15 @@ void Config::printUsage(const char* prog) {
 
 
 void Config::printConfigs() const {
-    std::cout << "Configuration:\n"
+    gracfl::dbg() << "Configuration:\n"
               << "  graphFilepath       = " << graphFilepath      << "\n"
               << "  grammarFilepath     = " << grammarFilepath    << "\n"
               << "  executionMode       = " << executionMode      << "\n"
               << "  traversalDirection  = " << traversalDirection << "\n"
               << "  processingStrategy  = " << processingStrategy << "\n";
     if (executionMode == "parallel")
-        std::cout << "  numThreads          = " << numThreads << "\n";
-    std::cout << std::endl;
+        gracfl::dbg() << "  numThreads          = " << numThreads << "\n";
+    gracfl::dbg() << std::endl;
 }
 
 } // namespace gracfl

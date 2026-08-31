@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include <fstream>
 #include <sstream>
 #include <iostream> 
@@ -108,7 +109,7 @@ namespace gracfl
             }
 			else
 			{
-				std::cout << "An error happened during parsing the grammar!\n";
+				gracfl::dbg() << "An error happened during parsing the grammar!\n";
 				exit(0);
 			}
 		}

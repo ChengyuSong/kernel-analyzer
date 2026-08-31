@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include <iostream>
 #include "solvers/SolverFWGram.hpp"
 
@@ -40,7 +41,7 @@ namespace gracfl
                 grammar3indexLeft,
                 labelSize,
                 nodeSize);
-            std::cout << "Iteration " << itr << std::endl;
+            gracfl::dbg() << "Iteration " << itr << std::endl;
         } while(changed);
     }
 

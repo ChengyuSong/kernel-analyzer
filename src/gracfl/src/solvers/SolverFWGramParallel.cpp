@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include <iostream>
 #include <chrono>
 #include "solvers/SolverFWGramParallel.hpp"
@@ -60,7 +61,7 @@ namespace gracfl
 
         if (enableStats) {
             const double rssMb = stats::rss_kb() / 1024.0;
-            std::cout << "[GraCFL] FWGramParallel threads=" << numOfThreads_
+            gracfl::dbg() << "[GraCFL] FWGramParallel threads=" << numOfThreads_
                       << " reachability=" << kReachabilitySetKind
                       << " nodes=" << nodeSize
                       << " labels=" << labelSize
@@ -68,10 +69,10 @@ namespace gracfl
             if (deepStats) {
                 const ull initOut = count_total_edges(outEdges);
                 const ull initSet = graph_->countEdge();
-                std::cout << " initial_out=" << initOut
+                gracfl::dbg() << " initial_out=" << initOut
                           << " initial_set=" << initSet;
             }
-            std::cout
+            gracfl::dbg()
                       << std::endl;
         }
 
@@ -92,19 +93,19 @@ namespace gracfl
             if (enableStats && (itr % static_cast<uint>(statsInterval) == 0 || terminate)) {
                 const double rssMb = stats::rss_kb() / 1024.0;
                 const double iterSec = std::chrono::duration<double>(t1 - t0).count();
-                std::cout << "[GraCFL] itr=" << itr
+                gracfl::dbg() << "[GraCFL] itr=" << itr
                           << " +edges=" << frontierEdges
                           << " rss_mb=" << rssMb
                           << " iter_s=" << iterSec;
                 if (deepStats) {
                     const ull totalOut = count_total_edges(outEdges);
                     const ull totalSet = graph_->countEdge();
-                    std::cout << " total_out=" << totalOut
+                    gracfl::dbg() << " total_out=" << totalOut
                               << " total_set=" << totalSet;
                 }
-                std::cout << std::endl;
+                gracfl::dbg() << std::endl;
             } else {
-                std::cout << "Iteration " << itr << std::endl;
+                gracfl::dbg() << "Iteration " << itr << std::endl;
             }
         } while(!terminate);
     }

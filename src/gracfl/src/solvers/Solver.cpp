@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include <iostream>
 #include <chrono>     
 #include <stdexcept>  
@@ -78,9 +79,9 @@ namespace gracfl
     void Solver::solve()
     {
         ull initEdgeCnt = solver_->getEdgeCount();
-        std::cout << "---------------------------------------" << std::endl;
-        std::cout << "Start of the CFL Reachability Analysis" << std::endl;
-        std::cout << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "Start of the CFL Reachability Analysis" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
         std::chrono::time_point<std::chrono::steady_clock> start, finish;
         start = std::chrono::steady_clock::now();
 
@@ -89,20 +90,20 @@ namespace gracfl
         finish = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsedSeconds = finish - start;
 
-        std::cout << "---------------------------------------" << std::endl;
-        std::cout << "End of the CFL Reachability Analysis" << std::endl;
-        std::cout << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "End of the CFL Reachability Analysis" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
 
         ull newEdgeCnt = solver_->getEdgeCount() - initEdgeCnt;
 
-        std::cout << "---------------Results-----------------" << std::endl;
-        std::cout << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "---------------Results-----------------" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
 
-        std::cout << "Initial Edges\t= " << initEdgeCnt << std::endl;
-        std::cout << "New Edges\t= " << newEdgeCnt << std::endl;
-        std::cout << "Total Time\t= " << elapsedSeconds.count() << " seconds" << std::endl;
+        gracfl::dbg() << "Initial Edges\t= " << initEdgeCnt << std::endl;
+        gracfl::dbg() << "New Edges\t= " << newEdgeCnt << std::endl;
+        gracfl::dbg() << "Total Time\t= " << elapsedSeconds.count() << " seconds" << std::endl;
 
-        std::cout << "---------------END---------------------\n\n\n" << std::endl;
+        gracfl::dbg() << "---------------END---------------------\n\n\n" << std::endl;
     }
 
     std::vector<std::vector<std::unordered_set<ull>>> Solver::getGraph()
@@ -117,9 +118,9 @@ namespace gracfl
 
     void Solver::printLabelIDToSymbolMap() const
     {
-        std::cout << "---------------------------------------" << std::endl;
-        std::cout << "------- Label ID To Symbol Map --------" << std::endl;
-        std::cout << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
+        gracfl::dbg() << "------- Label ID To Symbol Map --------" << std::endl;
+        gracfl::dbg() << "---------------------------------------" << std::endl;
 
         const auto& idToSymbolMap = grammar_->getIDToSymbolMap();
 
@@ -127,9 +128,9 @@ namespace gracfl
         std::map<uint, std::string> sortedMap(idToSymbolMap.begin(), idToSymbolMap.end());
 
         for (const auto& kv : sortedMap) {
-            std::cout << kv.first << "\t->\t" << kv.second << '\n';
+            gracfl::dbg() << kv.first << "\t->\t" << kv.second << '\n';
         }
 
-        std::cout<<"\n";
+        gracfl::dbg()<<"\n";
     }
 }

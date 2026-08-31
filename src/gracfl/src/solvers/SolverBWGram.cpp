@@ -1,3 +1,4 @@
+#include "utils/DebugLog.hpp"
 #include <iostream>
 #include "solvers/SolverBWGram.hpp"
 
@@ -43,7 +44,7 @@ namespace gracfl
                 labelSize,
                 nodeSize,
                 terminate);
-            std::cout << "Iteration " << itr << std::endl;
+            gracfl::dbg() << "Iteration " << itr << std::endl;
         } while(!terminate);
     }
 

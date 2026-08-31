@@ -13368,7 +13368,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   };
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
-         nNone = 0, nInv = 0, nChR = 0, nChC = 0, nNoop = 0;
+         nNone = 0, nInv = 0, nChR = 0, nChC = 0, nNoop = 0, nChGated = 0;
   while (std::getline(in, line)) {
     lineNo++;
     StringRef L = StringRef(line).trim();
@@ -13376,6 +13376,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
     SmallVector<StringRef, 6> toks;
     L.split(toks, ' ', -1, false);
     GlobalContext::FuncSummary S;
+    bool hasChainAtom = false;
     bool bad = toks.size() < 2;
     for (size_t i = 1; i < toks.size() && !bad; i++) {
       StringRef t = toks[i].trim();
@@ -13464,6 +13465,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         SmallVector<StringRef, 3> ps;
         t.split(ps, ',');
         A.kind = GlobalContext::SummaryAtom::ChainReg;
+        hasChainAtom = true;
         bad = ps.size() != 3;
         if (!bad) {
           StringRef k = ps[0];
@@ -13494,6 +13496,7 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         auto [kp, rest2] = t.split(':');
         auto [fkp, vp] = rest2.split("<-");
         A.kind = GlobalContext::SummaryAtom::ChainCall;
+        hasChainAtom = true;
         unsigned fkv = 0;
         StringRef fks = fkp;
         if (kp.consume_front("@")) {
@@ -13551,13 +13554,24 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       assert(false && "malformed func-summaries line");
       continue;
     }
+    // Chain-channel lines (CHAINREG/CHAINCALL) are consumed only under
+    // --cfl-propose-chain-summaries. Skipping the WHOLE spec keeps the
+    // function on normal pooled wiring; dropping only the atom would
+    // leave an empty spec, which handleCall treats as transfer-free and
+    // would sever the registration without a channel replacing it.
+    if (hasChainAtom && !CFLProposeChainSummaries) {
+      nChGated++;
+      continue;
+    }
     Ctx->SummarySpecs.emplace_back(toks[0].str(), std::move(S));
   }
   CG_LOG("FuncSummary: loaded " << Ctx->SummarySpecs.size() << " specs from "
          << path << " (" << nFresh << " FRESH, " << nCpy << " CPY, "
          << nAlias << " ALIAS, " << nSt << " ST, " << nLd << " LD, "
          << nInv << " INVOKE, " << nChR << " CHAINREG, " << nChC
-         << " CHAINCALL, " << nNone << " NONE, " << nNoop << " NOOP)\n");
+         << " CHAINCALL, " << nNone << " NONE, " << nNoop << " NOOP; "
+         << nChGated << " chain-bearing specs GATED off: pass "
+         << "--cfl-propose-chain-summaries to consume them)\n");
 }
 
 // First-match-wins spec lookup ('*' suffix = prefix).

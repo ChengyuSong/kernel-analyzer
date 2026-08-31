@@ -27,6 +27,26 @@
 #               (name-heuristic fallback). NOT one-sided: summaries
 #               both remove conflation and recover real pairs.
 #
+# Arms (PERF family; answers must be BYTE-IDENTICAL to full — a
+# mismatch is a soundness bug, reported loudly; the measurement is
+# the wall/RSS delta):
+#   noshare     full + --cfl-intern-planes=false   (COW plane sharing)
+#   nofastjoin  full + --cfl-join-fastpath=false   (cluster-mark joins)
+#   scratch     full + --cfl-flows-to-incremental=false
+#               (FI-ONLY: incremental is refused under fs)
+#   lazymint    full + --cfl-lazy-mint             (additive arm)
+#   bidi        full + --cfl-bidi-prune            (additive arm)
+#               NOTE: perf family AT FI ONLY (answer-preserving,
+#               #43 cone re-admission). Under fs, bidi-prune is
+#               strictly TIGHTER (a precision lever, one-sided
+#               subset) — do not put it in the perf family there.
+#
+# This script is the FI campaign. The fs-only perf machinery
+# (batching, workers, spill, presolve-once) is ablated separately
+# at the km corpus (cheap, pinned baselines); kernel fs runs are
+# endpoints (full = row5 pin, base = one big-machine run), not a
+# matrix.
+#
 # One-sided expectation for the precision arms: the FULL answer set
 # must be a SUBSET of every ablated arm's (mechanisms only remove).
 # Any pairs in full but not in an arm beyond that arm's mechanism's
@@ -68,6 +88,11 @@ arm_flags() {
     noopstables) echo "${FULLPREC[@]} --cfl-static-ops-tables=false --func-summaries=$SUM" ;;
     noinvoke)    echo "${FULLPREC[@]} --func-summaries=$NOINV" ;;
     nosummaries) echo "${FULLPREC[@]}" ;;
+    noshare)     echo "${FULLPREC[@]} --cfl-intern-planes=false --func-summaries=$SUM" ;;
+    nofastjoin)  echo "${FULLPREC[@]} --cfl-join-fastpath=false --func-summaries=$SUM" ;;
+    scratch)     echo "${FULLPREC[@]} --cfl-flows-to-incremental=false --func-summaries=$SUM" ;;
+    lazymint)    echo "${FULLPREC[@]} --cfl-lazy-mint --func-summaries=$SUM" ;;
+    bidi)        echo "${FULLPREC[@]} --cfl-bidi-prune --func-summaries=$SUM" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }
@@ -123,9 +148,11 @@ fat_tail() { # arm -> "callers>=100targets maxfanout"
     "$OUT/$1-pairs.txt"
 }
 
+EXACT_ARMS=" noshare nofastjoin scratch lazymint bidi "
 ARMS=("$@")
 [[ ${#ARMS[@]} -eq 0 ]] && ARMS=(full base noregf nochain notpkeys
-                                 noopstables noinvoke nosummaries)
+                                 noopstables noinvoke nosummaries
+                                 noshare nofastjoin scratch lazymint bidi)
 
 gt_aux
 for a in "${ARMS[@]}"; do run_arm "$a" || exit 1; done
@@ -135,10 +162,15 @@ for a in "${ARMS[@]}"; do run_arm "$a" || exit 1; done
 # 0 for one-sided precision arms; nonzero is loud).
 SUMTSV="$OUT/summary.tsv"
 {
-  echo -e "arm\tpairs\tremoved_vs_full\tadded_vs_full\tge100_callers\tmax_fanout\tgt_fn\twall\tmaxrss_kb"
+  echo -e "arm\tfamily\tpairs\tremoved_vs_full\tadded_vs_full\tidentical\tge100_callers\tmax_fanout\tgt_fn\twall\tmaxrss_kb"
   for a in "${ARMS[@]}"; do
     p="$OUT/$a-pairs.txt"; [[ -s "$p" ]] || continue
     n=$(wc -l < "$p")
+    fam=precision; ident="-"
+    if [[ "$EXACT_ARMS" == *" $a "* ]]; then
+      fam=perf
+      if cmp -s "$p" "$OUT/full-pairs.txt"; then ident=yes; else ident="NO(BUG)"; fi
+    fi
     if [[ "$a" == full ]]; then rem=0; add=0; else
       rem=$(comm -23 "$p" "$OUT/full-pairs.txt" | wc -l)
       add=$(comm -13 "$p" "$OUT/full-pairs.txt" | wc -l)
@@ -147,13 +179,18 @@ SUMTSV="$OUT/summary.tsv"
     fn=$(gt_match "$a")
     wall=$(grep -oE 'Elapsed \(wall clock\).*' "$OUT/$a.log" | awk '{print $NF}' | tail -1)
     rss=$(grep -oE 'Maximum resident set size.*[0-9]+' "$OUT/$a.log" | grep -oE '[0-9]+$' | tail -1)
-    echo -e "$a\t$n\t$rem\t$add\t$c100\t$maxf\t$fn\t${wall:--}\t${rss:--}"
+    echo -e "$a\t$fam\t$n\t$rem\t$add\t$ident\t$c100\t$maxf\t$fn\t${wall:--}\t${rss:--}"
   done
 } | tee "$SUMTSV"
 
-# Loud one-sided check: precision arms must not have added_vs_full.
-awk -F'\t' 'NR>1 && $1!="full" && $1!="nosummaries" && $4+0>0 {
-  print "!! ONE-SIDED VIOLATION: arm " $1 " is missing " $4 \
+# Loud checks: precision arms must not miss pairs the full stack
+# reports; perf arms must be byte-identical.
+awk -F'\t' 'NR>1 && $2=="precision" && $1!="full" && $1!="nosummaries" && $5+0>0 {
+  print "!! ONE-SIDED VIOLATION: arm " $1 " is missing " $5 \
         " pairs that the FULL stack reports — investigate before use."
+  bad=1 }
+NR>1 && $2=="perf" && $6!="yes" {
+  print "!! EXACTNESS VIOLATION: perf arm " $1 " is not byte-identical" \
+        " to full — soundness bug, do not use."
   bad=1 } END{exit bad}' "$SUMTSV" || exit 2
 echo "== all arms complete: $SUMTSV"

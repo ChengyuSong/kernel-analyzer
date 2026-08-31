@@ -22,6 +22,15 @@ export KA_LLD="lld$KA_LLVM_SUFFIX"
 
 export KA_JOBS="${KA_JOBS:-$(nproc)}"
 
+# Fair-comparison thread policy. KA_THREADS bounds worker/OpenMP
+# threads for every tool we run (ours and baselines: GraCFL uses
+# OpenMP/TBB and grabs ALL cores by default — always set this for
+# any timed comparison row). KA_CPUSET pins the run to specific
+# CPUs (taskset -c list, e.g. "0-7"); with disjoint cpusets and
+# enough RAM, untimed arms can run in parallel.
+export KA_THREADS="${KA_THREADS:-}"
+export KA_CPUSET="${KA_CPUSET:-}"
+
 # Corpus versions (pinned; bump deliberately and re-pin answer hashes).
 export HTTPD_VER="${HTTPD_VER:-2.4.68}"
 export APR_VER="${APR_VER:-1.7.6}"

@@ -55,6 +55,22 @@
 # Per arm: <arm>.log, <arm>-pairs.txt (sorted unique), <arm>-gt.txt,
 # and a row in summary.tsv. Arms with an existing pairs file are
 # skipped (delete the file or set KA_FORCE=1 to re-run).
+#
+# THREADS / PINNING / PARALLEL ARMS:
+#   KA_THREADS=N   bounds OpenMP/TBB threads (exported as
+#                  OMP_NUM_THREADS; set it for ANY timed row so
+#                  baselines like GraCFL don't grab all cores).
+#   KA_CPUSET=A-B  pins the run via taskset -c.
+#   PERF-family arms are TIMED: run them alone on an otherwise
+#   idle machine (or an exclusive cpuset), one at a time.
+#   PRECISION-family arms are answer-only: their wall column is
+#   indicative, so instances MAY run in parallel — protocol:
+#     1. run any single arm first so gtaux.txt exists (avoids the
+#        dump race), e.g. eval/60-kernel-fse.sh full
+#     2. launch instances with DISJOINT arm lists and DISJOINT
+#        KA_CPUSET ranges; budget ~50 GB RSS per kernel-FI arm.
+#     3. finish with one plain invocation: completed arms are
+#        skipped and summary.tsv is rebuilt over everything.
 
 set -u
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
@@ -68,6 +84,10 @@ mkdir -p "$OUT"
 
 export LC_ALL=C
 export MALLOC_ARENA_MAX=2
+[[ -n "${KA_THREADS:-}" ]] && export OMP_NUM_THREADS="$KA_THREADS" \
+                                     TBB_NUM_THREADS="$KA_THREADS"
+PIN=()
+[[ -n "${KA_CPUSET:-}" ]] && PIN=(taskset -c "$KA_CPUSET")
 
 COMMON=(--verbose=2 --cfl-compositional=false --cfl-flows-to
         --cfl-dump-icalls --log-timestamps --mem-limit="$KA_MEMLIMIT")
@@ -111,7 +131,7 @@ run_arm() {
   local flags; flags=$(arm_flags "$arm") || return 1
   echo "== $arm: running ($(date -Is))"
   # shellcheck disable=SC2086
-  /usr/bin/time -v "$KA_BIN" "${COMMON[@]}" $flags \
+  /usr/bin/time -v "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" $flags \
       @"$KA_KERNEL_BCLIST" > "$log" 2>&1
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -127,7 +147,7 @@ gt_aux() {
   local aux="$OUT/gtaux.txt" log="$OUT/gtaux.log"
   [[ -s "$aux" && "${KA_FORCE:-0}" != 1 ]] && return 0
   echo "== gtaux: dumping direct/trampoline edges"
-  "$KA_BIN" "${COMMON[@]}" --cfl-dump-gt-aux --func-summaries="$SUM" \
+  "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" --cfl-dump-gt-aux --func-summaries="$SUM" \
       @"$KA_KERNEL_BCLIST" > "$log" 2>&1
   grep -E '^DCALL |^SCTCALL ' "$log" > "$aux"
   echo "== gtaux: $(wc -l < "$aux") edges"

@@ -74,9 +74,17 @@ run_one() {
         "$graph" "$GRAMMAR" "$KA_GRACFL_THREADS" > "$cfg" ;;
   esac
   echo "== $tag: running ($(date -Is))"
+  # The binary prints its self-measured solve time ("Total Time")
+  # BEFORE dumping the full closure to stdout (15 GB / 900M lines at
+  # httpd scale). Filter: keep non-edge lines, count edge triples —
+  # no giant log, no disk I/O in the number that matters. The
+  # citable time is the self-reported one (solve only); time -v
+  # wall includes the dump-formatting and is NOT citable.
   ( cd "$(dirname "$BIN")" && \
-    /usr/bin/time -v -o "$tlog" "${PIN[@]}" ./gracfl > "$log" 2>&1 )
-  local rc=$?
+    /usr/bin/time -v -o "$tlog" "${PIN[@]}" ./gracfl 2>&1 \
+      | awk '/^[0-9]+ [0-9]+ [0-9]+$/ {n++; next} {print} \
+             END {print "ResultEdges = " n}' > "$log" )
+  local rc=${PIPESTATUS[0]:-0}
   [[ $rc -ne 0 ]] && echo "!! $tag exited $rc — see $log" >&2
   return 0
 }
@@ -96,11 +104,13 @@ for g in "${GRAPHS[@]}"; do
   run_one "$g" "fw-${KA_GRACFL_THREADS}t"
 done
 
-echo -e "graph\tmode\tgrammar\twall\tmaxrss_kb" | tee "$OUT/summary.tsv"
+echo -e "graph\tmode\tgrammar\tsolve_s\tresult_edges\tmaxrss_kb" | tee "$OUT/summary.tsv"
 for t in "$OUT"/*.time; do
   [[ -s "$t" ]] || continue
   tag=$(basename "$t" .time)
-  wall=$(grep -oE 'Elapsed \(wall clock\).*' "$t" | awk '{print $NF}')
+  lg="$OUT/$tag.log"
+  solve=$(grep -oE 'Total Time[^0-9]*[0-9.]+' "$lg" 2>/dev/null | grep -oE '[0-9.]+' | tail -1)
+  edges=$(grep -oE 'ResultEdges = [0-9]+' "$lg" 2>/dev/null | grep -oE '[0-9]+')
   rss=$(grep -oE 'Maximum resident set size.*[0-9]+' "$t" | grep -oE '[0-9]+$')
-  echo -e "${tag%.*}\t${tag##*.}\t$GRAMMAR_NOTE\t$wall\t$rss" | tee -a "$OUT/summary.tsv"
+  echo -e "${tag%.*}\t${tag##*.}\t$GRAMMAR_NOTE\t${solve:--}\t${edges:--}\t$rss" | tee -a "$OUT/summary.tsv"
 done

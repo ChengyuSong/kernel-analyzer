@@ -31,6 +31,14 @@ export KA_JOBS="${KA_JOBS:-$(nproc)}"
 export KA_THREADS="${KA_THREADS:-}"
 export KA_CPUSET="${KA_CPUSET:-}"
 
+# Spill root for fs-mode (batched) runs ONLY; FI runs never spill.
+# Rules (stale-spill incident, 2026-08): every run gets a FRESH
+# subdirectory under this root (scripts mkdir -p a per-arm dir and
+# refuse to reuse a nonempty one); must be real disk, NOT tmpfs
+# (/tmp is tmpfs on our machines; spill ~ total fact mass); cleaned
+# on success. Empty default = recompute mode (no spill).
+export KA_SPILL_ROOT="${KA_SPILL_ROOT:-}"
+
 # Corpus versions (pinned; bump deliberately and re-pin answer hashes).
 export HTTPD_VER="${HTTPD_VER:-2.4.68}"
 export APR_VER="${APR_VER:-1.7.6}"

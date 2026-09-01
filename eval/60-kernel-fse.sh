@@ -141,7 +141,11 @@ extract_pairs() { # log -> sorted unique "caller target" pairs
 }
 
 run_arm() {
-  local arm="$1" pairs="$OUT/$arm-pairs.txt" log="$OUT/$arm.log"
+  # NOTE: one 'local' per self-referencing assignment — bash expands
+  # all args of a single 'local' before assigning (set -u trap).
+  local arm="$1"
+  local pairs="$OUT/$arm-pairs.txt"
+  local log="$OUT/$arm.log"
   if [[ -s "$pairs" && "${KA_FORCE:-0}" != 1 ]]; then
     echo "== $arm: pairs exist, skipping (KA_FORCE=1 to re-run)"
     return 0
@@ -162,13 +166,26 @@ run_arm() {
 
 # GT-aux dump (quick: loads corpus, dumps DCALL/SCTCALL, exits).
 gt_aux() {
-  local aux="$OUT/gtaux.txt" log="$OUT/gtaux.log"
+  local aux="$OUT/gtaux.txt"
+  local log="$OUT/gtaux.log"
   [[ -s "$aux" && "${KA_FORCE:-0}" != 1 ]] && return 0
   echo "== gtaux: dumping direct/trampoline edges"
   "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" --cfl-dump-gt-aux --func-summaries="$SUM" \
       @"$KA_KERNEL_BCLIST" > "$log" 2>&1
-  grep -E '^DCALL |^SCTCALL ' "$log" > "$aux"
-  echo "== gtaux: $(wc -l < "$aux") edges"
+  local rc=$?
+  grep -E '^DCALL |^SCTCALL ' "$log" > "$aux" || true
+  local n; n=$(wc -l < "$aux")
+  if [[ $rc -ne 0 || $n -eq 0 ]]; then
+    echo "!! gtaux FAILED (exit=$rc, edges=$n). Everything downstream" >&2
+    echo "!! depends on it — aborting. Last 15 lines of $log:" >&2
+    tail -15 "$log" >&2
+    echo "!! Common causes: binary not rebuilt after pull (unknown" >&2
+    echo "!! --cfl-dump-gt-aux flag), or non-absolute paths in" >&2
+    echo "!! KA_KERNEL_BCLIST (empty-corpus refusal)." >&2
+    rm -f "$aux"
+    exit 1
+  fi
+  echo "== gtaux: $n edges"
 }
 
 gt_match() { # arm -> FN count (or "-" if no GT)
@@ -195,7 +212,8 @@ ARMS=("$@")
 TIMED_ARMS=" full base noshare nofastjoin scratch lazymint bidi "
 
 timed_run() { # quiet second pass for reportable timing
-  local arm="$1" tlog="$OUT/$arm-timed.log"
+  local arm="$1"
+  local tlog="$OUT/$arm-timed.log"
   [[ "$TIMED_ARMS" == *" $arm "* ]] || return 0
   [[ -s "$tlog" && "${KA_FORCE:-0}" != 1 ]] && return 0
   local flags; flags=$(arm_flags "$arm") || return 1

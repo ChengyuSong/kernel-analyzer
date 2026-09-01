@@ -10,6 +10,15 @@
 #     KA_GT=/path/to/gt-pairs.txt \        # optional; skips GT if unset
 #     eval/60-kernel-fse.sh [arm ...]      # default: all arms
 #
+# NOTE ON KA_THREADS: the kernel-FI arms are SINGLE-THREADED; this
+# knob does not affect them. It exists for multi-threaded baseline
+# tools (e.g., standalone GraCFL) in comparison rows. On a big
+# machine, parallelism comes from running ARMS concurrently (see
+# protocol below); memory (~50 GB RSS/arm) is the constraint, not
+# cores. Example, 256 GB box: phase 1 = `full` alone, then answer
+# arms 4-5 at a time with disjoint KA_CPUSET; phase 2 = the quiet
+# timed runs sequentially on the idle machine.
+#
 # Arms (PRECISION family; the full stack is the reference):
 #   full        chain + regfield + obj            (arm 0, reference)
 #   base        no precision mechanisms beyond defaults

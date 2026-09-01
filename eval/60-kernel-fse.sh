@@ -20,7 +20,9 @@
 # timed runs sequentially on the idle machine.
 #
 # Arms (PRECISION family; the full stack is the reference):
-#   full        chain + regfield + obj            (arm 0, reference)
+#   full        chain + regfield + obj + per-run summary adoption
+#               (arm 0, reference; matches the canonical pin config
+#               in docs/cli-reference.md)
 #   base        no precision mechanisms beyond defaults
 #   noregf      full - regfield/obj tables
 #   nochain     full - chain summaries (gating f83e741 keeps the
@@ -32,6 +34,7 @@
 #   noinvoke    full - INVOKE callback/argument pairing (runs with a
 #               filtered summaries file; whole lines dropped so no
 #               spec is left empty = transfer-free)
+#   noadopt     full - per-run summary adoption
 #   nosummaries SOUNDNESS row: no --func-summaries at all
 #               (name-heuristic fallback). NOT one-sided: summaries
 #               both remove conflation and recover real pairs.
@@ -110,7 +113,10 @@ PIN=()
 COMMON=(--verbose=2 --cfl-compositional=false --cfl-flows-to
         --cfl-dump-icalls --log-timestamps --mem-limit="$KA_MEMLIMIT")
 FULLPREC=(--cfl-propose-chain-summaries --cfl-regfield-apply
-          --cfl-regfield-obj)
+          --cfl-regfield-obj --cfl-propose-solved-summaries
+          --cfl-adopt-proposed-summaries)
+NOADOPT=(--cfl-propose-chain-summaries --cfl-regfield-apply
+         --cfl-regfield-obj)
 
 # INVOKE-filtered summaries (generated fresh each invocation).
 NOINV="$OUT/func_summaries.noinvoke.txt"
@@ -120,8 +126,9 @@ arm_flags() {
   case "$1" in
     full)        echo "${FULLPREC[@]} --func-summaries=$SUM" ;;
     base)        echo "--func-summaries=$SUM" ;;
-    noregf)      echo "--cfl-propose-chain-summaries --func-summaries=$SUM" ;;
-    nochain)     echo "--cfl-regfield-apply --cfl-regfield-obj --func-summaries=$SUM" ;;
+    noadopt)     echo "${NOADOPT[@]} --func-summaries=$SUM" ;;
+    noregf)      echo "--cfl-propose-chain-summaries --cfl-propose-solved-summaries --cfl-adopt-proposed-summaries --func-summaries=$SUM" ;;
+    nochain)     echo "--cfl-regfield-apply --cfl-regfield-obj --cfl-propose-solved-summaries --cfl-adopt-proposed-summaries --func-summaries=$SUM" ;;
     notpkeys)    echo "${FULLPREC[@]} --cfl-tracepoint-keys=false --func-summaries=$SUM" ;;
     noopstables) echo "${FULLPREC[@]} --cfl-static-ops-tables=false --func-summaries=$SUM" ;;
     noinvoke)    echo "${FULLPREC[@]} --func-summaries=$NOINV" ;;
@@ -205,9 +212,10 @@ fat_tail() { # arm -> "callers>=100targets maxfanout"
 
 EXACT_ARMS=" noshare nofastjoin scratch lazymint bidi "
 ARMS=("$@")
-[[ ${#ARMS[@]} -eq 0 ]] && ARMS=(full base noregf nochain notpkeys
-                                 noopstables noinvoke nosummaries
-                                 noshare nofastjoin scratch lazymint bidi)
+[[ ${#ARMS[@]} -eq 0 ]] && ARMS=(full base noadopt noregf nochain
+                                 notpkeys noopstables noinvoke
+                                 nosummaries noshare nofastjoin
+                                 scratch lazymint bidi)
 
 TIMED_ARMS=" full base noshare nofastjoin scratch lazymint bidi "
 

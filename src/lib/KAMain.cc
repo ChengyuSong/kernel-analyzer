@@ -1117,6 +1117,17 @@ cl::opt<bool> CFLDumpICalls(
            "the lines to diff runs (5M+ lines on whole-kernel inputs)"),
   cl::init(false));
 
+cl::opt<std::string> CFLDumpIcallsJson(
+  "cfl-dump-icalls-json",
+  cl::desc("Write per-callsite answers as JSON keyed by the callsite's "
+           "debug location (\"file:line\": [target,...]) — the input "
+           "format of the SoK-MLTA comparison harness. Includes "
+           "EMPTY-answer icall sites (their AICT convention); sites "
+           "without debug info are skipped with a counted warning. "
+           "Dispatch (icall-classified) sites only; REGCALL "
+           "re-attributions are not emitted"),
+  cl::init(""));
+
 cl::opt<std::string> IRSidecarDir(
   "ir-sidecar-dir",
   cl::desc("Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)"),

@@ -19843,6 +19843,57 @@ bool CallGraphPass::doFinalization(Module *M) {
                  << " -> " << F->getName() << "\n";
       }
     }
+    extern cl::opt<std::string> CFLDumpIcallsJson;
+    if (!CFLDumpIcallsJson.empty()) {
+      // SoK-harness JSON: {"file:line": [targets...]}, deterministic
+      // key order, empty-answer sites included, no-debug sites
+      // counted and skipped (they cannot match a file:line GT key).
+      std::map<std::string, std::set<std::string>> byLoc;
+      size_t noDbg = 0;
+      for (const CallBase *CS : Ctx->IndirectCallInsts) {
+        const DebugLoc &DL = CS->getDebugLoc();
+        if (!DL) {
+          noDbg++;
+          continue;
+        }
+        std::string key = (DL->getScope()->getFilename() + ":" +
+                           Twine(DL->getLine())).str();
+        auto &tset = byLoc[key];
+        auto cit = Ctx->Callees.find(const_cast<CallBase *>(CS));
+        if (cit != Ctx->Callees.end())
+          for (const Function *F : cit->second)
+            tset.insert(F->getName().str());
+      }
+      std::error_code EC;
+      raw_fd_ostream OS(CFLDumpIcallsJson, EC, sys::fs::OF_Text);
+      if (EC) {
+        errs() << "FATAL: cannot write " << CFLDumpIcallsJson << ": "
+               << EC.message() << "\n";
+        exit(1);
+      }
+      OS << "{";
+      bool firstK = true;
+      for (auto &kv : byLoc) {
+        if (!firstK) OS << ",";
+        firstK = false;
+        OS << "\n  \"";
+        OS.write_escaped(kv.first);
+        OS << "\": [";
+        bool firstT = true;
+        for (auto &f : kv.second) {
+          if (!firstT) OS << ", ";
+          firstT = false;
+          OS << "\"";
+          OS.write_escaped(f);
+          OS << "\"";
+        }
+        OS << "]";
+      }
+      OS << "\n}\n";
+      CG_LOG("IcallJson: " << byLoc.size() << " callsite locations -> "
+             << CFLDumpIcallsJson << " (" << noDbg
+             << " sites without debug info skipped)\n");
+    }
     // check if all address-taken functions are used in indirect calls
     FuncSet allCallees;
     for (auto &it : Ctx->Callees)

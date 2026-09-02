@@ -33,6 +33,12 @@ ap.add_argument("--aux", help="DCALL/SCTCALL lines from --cfl-dump-gt-aux: "
                 "Used ONLY in the match test (monotone: can convert FN -> "
                 "matched, never the reverse), so FN lists stay comparable "
                 "with pre-aux pins")
+ap.add_argument("--icall-json", help="per-callsite answers keyed by debug "
+                "file:line (--cfl-dump-icalls-json). Debug locations survive "
+                "inlining, so this closes the inline-attribution FN class: "
+                "a GT record matches when its site location's answer set "
+                "contains the target, regardless of which caller the "
+                "inliner gave the copy. Monotone, like --aux")
 args = ap.parse_args()
 
 ours_pairs = set()
@@ -55,6 +61,18 @@ if args.funcs:
     with open(args.funcs) as f:
         ours_funcs = set(f.read().split())
 
+def normtgt(n):
+    # strip numeric clone suffixes ("foo.123" -> "foo")
+    h, _, s = n.rpartition(".")
+    return h if h and s.isdigit() else n
+
+loc_answers = {}
+if args.icall_json:
+    jd = json.load(open(args.icall_json))
+    for loc, tgts in jd.items():
+        loc_answers.setdefault(loc.lstrip("./"), set()).update(
+            normtgt(x) for x in tgts)
+
 d = json.load(open(args.gt))
 recs = set()
 for r in d["icall_records"]:
@@ -64,11 +82,13 @@ for r in d["icall_records"]:
         continue
     name, off = m.group(1), int(m.group(2))
     frames = tuple(fr.split(":")[0] for fr in site.split(";")) if site else ()
-    recs.add((frames, name, off))
+    locs = tuple(fr.split(":", 1)[1] for fr in site.split(";")
+                 if ":" in fr) if site else ()
+    recs.add((frames, locs, name, off))
 
 b = collections.Counter()
 fns = []
-for frames, tgt, off in sorted(recs):
+for frames, locs, tgt, off in sorted(recs):
     if off != 0:
         b["off"] += 1
         continue
@@ -86,14 +106,18 @@ for frames, tgt, off in sorted(recs):
         b["matched"] += 1
     elif any((f, tgt) in aux_pairs for f in frames):
         b["matched-aux"] += 1  # devirtualized / SCT-trampoline coverage
+    elif loc_answers and any(
+            normtgt(tgt) in loc_answers.get(l.lstrip("./"), ())
+            for l in locs):
+        b["matched-loc"] += 1  # inline-attribution coverage (debug loc)
     else:
         b["FN"] += 1
         fns.append((frames, tgt))
 
 print(dict(b))
-tot = b["matched"] + b["matched-aux"] + b["FN"]
+tot = b["matched"] + b["matched-aux"] + b["matched-loc"] + b["FN"]
 if tot:
-    m = b["matched"] + b["matched-aux"]
+    m = b["matched"] + b["matched-aux"] + b["matched-loc"]
     print(f"strict recall: {m}/{tot} = {100.0*m/tot:.2f}%")
 if not args.funcs:
     print("(no --funcs: target_absent under-classified; recall is a lower bound)")

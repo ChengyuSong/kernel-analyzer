@@ -160,7 +160,8 @@ run_arm() {
   local flags; flags=$(arm_flags "$arm") || return 1
   echo "== $arm: running ($(date -Is))"
   # shellcheck disable=SC2086
-  /usr/bin/time -v "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" $flags \
+  /usr/bin/time -v "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" \
+      --cfl-dump-icalls-json="$OUT/$arm-icalls.json" $flags \
       @"$KA_KERNEL_BCLIST" > "$log" 2>&1
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -199,8 +200,10 @@ gt_match() { # arm -> FN count (or "-" if no GT)
   local arm="$1"
   [[ -z "$KA_GT" ]] && { echo "-"; return; }
   local rep="$OUT/$arm-gt.txt"
+  local jopt=()
+  [[ -s "$OUT/$arm-icalls.json" ]] && jopt=(--icall-json "$OUT/$arm-icalls.json")
   python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" \
-      --pairs "$OUT/$arm-pairs.txt" --aux "$OUT/gtaux.txt" \
+      --pairs "$OUT/$arm-pairs.txt" --aux "$OUT/gtaux.txt" "${jopt[@]}" \
       --fn-out "$OUT/$arm-fns.txt" > "$rep" 2>&1
   grep -oE 'FN[ =:]+[0-9]+' "$rep" | grep -oE '[0-9]+' | head -1
 }

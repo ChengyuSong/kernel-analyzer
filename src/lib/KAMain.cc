@@ -1293,7 +1293,13 @@ void doBasicInitialization(Module *M) {
     }
   }
 
-  // Resolve global aliases (e.g., Itanium ABI C1->C2 constructor aliases)
+  // Resolve global aliases (e.g., Itanium ABI C1->C2 constructor
+  // aliases) with LINKER SEMANTICS: a strong alias overrides a weak
+  // definition (kernel COND_SYSCALL: sys_ni.o carries weak -ENOSYS
+  // stubs for hundreds of syscalls whose real bodies live elsewhere
+  // behind strong aliases; count==0-only insertion made the binding
+  // module-order-dependent — found via cross-machine pin divergence,
+  // 2026-09-01).
   for (GlobalAlias &GA : M->aliases()) {
     if (GA.hasLocalLinkage())
       continue;
@@ -1301,8 +1307,21 @@ void doBasicInitialization(Module *M) {
     if (!Aliasee || Aliasee->isDeclaration() || Aliasee->empty())
       continue;
     auto AliasID = GA.getGUID();
-    if (GlobalCtx.Funcs.count(AliasID) == 0)
+    auto it = GlobalCtx.Funcs.find(AliasID);
+    if (it == GlobalCtx.Funcs.end()) {
       GlobalCtx.Funcs[AliasID] = Aliasee;
+    } else if (!GA.isWeakForLinker() && it->second->isWeakForLinker()) {
+      // strong alias beats weak def (the COND_SYSCALL case). NOTE:
+      // the stored Function is the prior BINDING's target; for a
+      // prior strong-alias binding its aliasee's strength stands in
+      // for the alias's — exact only up to duplicate strong symbols,
+      // which are illegal input and warned below.
+      GlobalCtx.Funcs[AliasID] = Aliasee;
+    } else if (!GA.isWeakForLinker() && !it->second->isWeakForLinker() &&
+               it->second != Aliasee) {
+      WARNING("Alias " << GA.getName() << " conflicts with existing "
+              "strong binding " << it->second->getName() << "\n");
+    } // weak alias never overrides an existing binding
     // also remove from ExtFuncs if present
     GlobalCtx.ExtFuncs.erase(AliasID);
   }

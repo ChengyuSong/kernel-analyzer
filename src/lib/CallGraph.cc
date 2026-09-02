@@ -19831,16 +19831,24 @@ bool CallGraphPass::doFinalization(Module *M) {
           if (const Function *DC = CS->getCalledFunction()) {
             const Function *DCD = getFuncDef(const_cast<Function *>(DC));
             for (const Function *F : it.second)
-              if (F != DC && F != DCD)
+              if (F != DC && F != DCD) {
+                const Function *R = getFuncDef(const_cast<Function *>(F));
                 errs() << "REGCALL " << CS->getFunction()->getName()
                        << " :: " << DC->getName() << " -> "
-                       << F->getName() << "\n";
+                       << (R ? R : F)->getName() << "\n";
+              }
           }
           continue;
         }
-        for (const Function *F : it.second)
+        for (const Function *F : it.second) {
+          // Canonicalize through def/alias resolution: which object
+          // carried the flow (alias-named decl vs aliasee def) is
+          // input-order-dependent; the NAME must not be
+          // (cross-machine pin identity, 2026-09-01).
+          const Function *R = getFuncDef(const_cast<Function *>(F));
           errs() << "ICALL " << CS->getFunction()->getName() << " :: " << *CS
-                 << " -> " << F->getName() << "\n";
+                 << " -> " << (R ? R : F)->getName() << "\n";
+        }
       }
     }
     extern cl::opt<std::string> CFLDumpIcallsJson;
@@ -19861,8 +19869,10 @@ bool CallGraphPass::doFinalization(Module *M) {
         auto &tset = byLoc[key];
         auto cit = Ctx->Callees.find(const_cast<CallBase *>(CS));
         if (cit != Ctx->Callees.end())
-          for (const Function *F : cit->second)
-            tset.insert(F->getName().str());
+          for (const Function *F : cit->second) {
+            const Function *R = getFuncDef(const_cast<Function *>(F));
+            tset.insert((R ? R : F)->getName().str());
+          }
       }
       std::error_code EC;
       raw_fd_ostream OS(CFLDumpIcallsJson, EC, sys::fs::OF_Text);

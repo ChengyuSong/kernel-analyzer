@@ -35,9 +35,10 @@
 #               filtered summaries file; whole lines dropped so no
 #               spec is left empty = transfer-free)
 #   noadopt     full - per-run summary adoption
-#   nosummaries SOUNDNESS row: no --func-summaries at all
-#               (name-heuristic fallback). NOT one-sided: summaries
-#               both remove conflation and recover real pairs.
+#   nosummaries SOUNDNESS row: no --func-summaries and no adoption
+#               (adoption asserts without the file). Name-heuristic
+#               fallback. NOT one-sided: summaries both remove
+#               conflation and recover real pairs.
 #
 # Arms (PERF family; answers must be BYTE-IDENTICAL to full — a
 # mismatch is a soundness bug, reported loudly; the measurement is
@@ -132,7 +133,10 @@ arm_flags() {
     notpkeys)    echo "${FULLPREC[@]} --cfl-tracepoint-keys=false --func-summaries=$SUM" ;;
     noopstables) echo "${FULLPREC[@]} --cfl-static-ops-tables=false --func-summaries=$SUM" ;;
     noinvoke)    echo "${FULLPREC[@]} --func-summaries=$NOINV" ;;
-    nosummaries) echo "${FULLPREC[@]}" ;;
+    # adoption requires the summaries-file infrastructure (asserted
+    # in runSummaryProvers), so the soundness row drops both; the
+    # adoption delta is isolated by the noadopt arm.
+    nosummaries) echo "${NOADOPT[@]}" ;;
     noshare)     echo "${FULLPREC[@]} --cfl-intern-planes=false --func-summaries=$SUM" ;;
     nofastjoin)  echo "${FULLPREC[@]} --cfl-join-fastpath=false --func-summaries=$SUM" ;;
     scratch)     echo "${FULLPREC[@]} --cfl-flows-to-incremental=false --func-summaries=$SUM" ;;

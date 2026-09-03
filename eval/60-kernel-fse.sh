@@ -218,11 +218,11 @@ fat_tail() { # arm -> "callers>=100targets maxfanout"
 }
 
 EXACT_ARMS=" noshare nofastjoin scratch lazymint bidi "
+ALL_ARMS=(full base noadopt noregf nochain notpkeys noopstables
+          noinvoke nosummaries noshare nofastjoin scratch lazymint
+          bidi)
 ARMS=("$@")
-[[ ${#ARMS[@]} -eq 0 ]] && ARMS=(full base noadopt noregf nochain
-                                 notpkeys noopstables noinvoke
-                                 nosummaries noshare nofastjoin
-                                 scratch lazymint bidi)
+[[ ${#ARMS[@]} -eq 0 ]] && ARMS=("${ALL_ARMS[@]}")
 
 TIMED_ARMS=" full base noshare nofastjoin scratch lazymint bidi "
 
@@ -252,7 +252,10 @@ for a in "${ARMS[@]}"; do run_arm "$a" || exit 1; timed_run "$a"; done
 SUMTSV="$OUT/summary.tsv"
 {
   echo -e "arm\tfamily\tpairs\tremoved_vs_full\tadded_vs_full\tidentical\tge100_callers\tmax_fanout\tgt_fn\tsolve_s\ttimed_wall\ttimed_rss_kb"
-  for a in "${ARMS[@]}"; do
+  # Summarize EVERY arm with results on disk, not just this
+  # invocation's list — parallel instances previously overwrote
+  # summary.tsv with partial tables.
+  for a in "${ALL_ARMS[@]}"; do
     p="$OUT/$a-pairs.txt"; [[ -s "$p" ]] || continue
     n=$(wc -l < "$p")
     fam=precision; ident="-"

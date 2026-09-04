@@ -1484,14 +1484,25 @@ int main(int argc, char **argv) {
       // of DIFFERENT binary vintages (filter-active incremental vs
       // filter-retired scratch) — vintage discipline matters: only
       // same-binary pins may be diffed.
-      if (flowsToActive && !fsConfig &&
-          CFLFlowsToIncremental.getNumOccurrences() == 0 &&
-          CFLBatchRoots == 0 && !CFLLazyMint && !CFLOriginBundles) {
-        CFLFlowsToIncremental = true;
-        errs() << "FlowsTo: incremental cross-iteration solving "
-                  "auto-enabled (FI config, #43-validated envelope; "
-                  "re-validated at HEAD 2026-08-12); "
-                  "--cfl-flows-to-incremental=false to opt out\n";
+      // AUTO-ON RETIRED 2026-09-04: the #43 km-FI validation does
+      // NOT transfer to kernel corpora. At linux-5.18 FI the
+      // incremental solve drops a callback-argument flow family
+      // (decompressor error callbacks, i915 PTE walkers, netfs
+      // completions) relative to from-scratch: base -4,394, +0;
+      // present under every mechanism combination (channels mask
+      // part of it: full-stack -2,032). Two independent
+      // from-scratch witnesses (scratch, lazy-mint) agree
+      // byte-for-byte. Incremental is opt-in only, with the
+      // divergence stated; exactness repair is an open ticket
+      // (sibling of the fs -504 divergence).
+      if (flowsToActive && CFLFlowsToIncremental &&
+          CFLFlowsToIncremental.getNumOccurrences() > 0 && !fsConfig) {
+        errs() << "FlowsTo: WARNING: incremental cross-iteration "
+                  "solving is OPT-IN and KNOWN-DIVERGENT at kernel "
+                  "corpora (linux-5.18 FI: -4,394 pairs vs "
+                  "from-scratch, 2026-09-04; km FI remains "
+                  "byte-identical). Answers are NOT the canonical "
+                  "pin. See docs/incremental-518-divergence.md.\n";
       }
     }
     if (CFLBatchRoots > 0 &&

@@ -343,12 +343,19 @@ MODELED (statement + proof, no sorry):
                                         counterexamples)
 
 GATE-ONLY (backfill required; priority = silent-completeness risk):
-1. incremental cross-iteration ........ incr_exact: hypothesis =
-   touched-window covers every cell whose derivations the new
-   edges change. KNOWN-FALSE in impl at 518 (docs/
-   incremental-518-divergence.md). State theorem FIRST; expect the
-   statement to locate the missing coverage clause (July-minting
-   precedent). BLOCKS re-enablement.
+1. [THEOREM DONE 2026-09-04, Staging.lean::Incr.incr_exact]
+   incremental cross-iteration. Two-sided equivalence of the
+   fresh-triggered (delta-worklist) closure with from-scratch,
+   under `delta_seeds_complete`: every NEW instance (R' \ Rn)
+   with ALL-OLD premises must be seeded — instances with a fresh
+   premise self-fire; old instances already fired into Fn. The
+   518 miss is exactly this clause (new call edges joining old
+   actual-facts to old formal-cells). IMPL REPAIR STILL OPEN and
+   still blocks re-enablement: the seed enumeration must cover
+   R' \ Rn instance kinds with all-old premises. CERTIFICATE
+   VALIDATED 2026-09-04: opt-in incremental + --cfl-verify-closure
+   at 518 -> 5,101 violations, assertion abort (the per-run check
+   detects the hypothesis violation in ONE run).
 2. [DONE 2026-09-04, Staging.lean] bidi-prune at FI ...
    `prune_sound`: cone-miss origins appear in no answer; hypotheses
    = ans_at_dispatch + cone_covers-FOR-THE-CURRENT-GRAPH (the #43

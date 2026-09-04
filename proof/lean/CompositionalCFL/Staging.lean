@@ -128,3 +128,96 @@ theorem adopt_sound {E : Type} (M : AdoptModel E) :
   exact M.atoms_complete e hf (M.body_sound e hf)
 
 end Staging
+
+/-! ## 5. Incremental cross-iteration solving (`incr_exact`)
+
+The theorem the 2026-09-04 divergence was missing. Model: rules as
+instances (premise set, conclusion); a resolution iteration grows
+the instance set (Rn ⊆ R'). From-scratch = closure under R'. The
+incremental worklist retains Fn and fires an instance only when
+some premise is FRESH (not in Fn) — retained facts are never
+re-processed — plus an explicit seed set D0.
+
+The load-bearing hypothesis is `delta_seeds_complete`: every NEW
+instance (in R' but not Rn) all of whose premises are OLD facts
+must have its conclusion seeded. Instances with a fresh premise
+fire on their own; old-premises-only instances of OLD rules
+already fired into Fn. The 518 miss is exactly this clause: newly
+wired call edges (instances in R' \ Rn) connecting old
+actual-facts to old formal-cells — no fresh premise, so nothing
+triggers unless seeded, and the touched-window seeding missed the
+callback-argument edge kinds. The repair is now specified: the
+implementation's seed enumeration must cover R' \ Rn instance
+kinds with all-old premises, and the certificate's full rescan
+(C0–C5) checks the resulting closure per run. -/
+
+namespace Incr
+
+variable {F : Type}
+
+/-- Rule instances: premise set and conclusion. -/
+structure Inst (F : Type) where
+  prem : F → Prop
+  concl : F
+
+/-- Closure of seed set `A` under instance set `R`. -/
+inductive Cl (R : Inst F → Prop) (A : F → Prop) : F → Prop
+  | seed {a} : A a → Cl R A a
+  | step {i} : R i → (∀ p, i.prem p → Cl R A p) → Cl R A i.concl
+
+/-- Fresh-triggered closure: retained facts `Fn` and seeds `D0` are
+in; an instance fires only if some premise lies outside `Fn`
+(the delta-worklist discipline: old facts are never re-offered). -/
+inductive ICl (R : Inst F → Prop) (Fn D0 : F → Prop) : F → Prop
+  | retained {a} : Fn a → ICl R Fn D0 a
+  | seed {a} : D0 a → ICl R Fn D0 a
+  | step {i} : R i → (∀ p, i.prem p → ICl R Fn D0 p) →
+      (∃ p, i.prem p ∧ ¬ Fn p) → ICl R Fn D0 i.concl
+
+theorem incr_exact (Rn R' : Inst F → Prop) (Fn D0 : F → Prop)
+    (mono : ∀ i, Rn i → R' i)
+    -- Fn is the previous iteration's closure:
+    (fn_sound : ∀ a, Fn a → Cl Rn (fun _ => False) a)
+    (fn_closed : ∀ i, Rn i → (∀ p, i.prem p → Fn p) → Fn i.concl)
+    -- seeds are sound:
+    (d0_sound : ∀ a, D0 a → Cl R' (fun _ => False) a)
+    -- THE obligation (violated at 518): new instances with
+    -- all-old premises must be seeded:
+    (delta_seeds_complete : ∀ i, R' i → ¬ Rn i →
+        (∀ p, i.prem p → Fn p) → Fn i.concl ∨ D0 i.concl) :
+    ∀ a, ICl R' Fn D0 a ↔ Cl R' (fun _ => False) a := by
+  -- Fn ⊆ scratch closure (monotone lift of the old closure).
+  have fn_in : ∀ a, Fn a → Cl R' (fun _ => False) a := by
+    intro a ha
+    have lift : ∀ b, Cl Rn (fun _ => False) b →
+        Cl R' (fun _ => False) b := by
+      intro b hb
+      induction hb with
+      | seed h => exact absurd h (fun h => h)
+      | step hR _ ih => exact Cl.step (mono _ hR) ih
+    exact lift a (fn_sound a ha)
+  intro a
+  constructor
+  · -- soundness: incremental derives only scratch facts
+    intro h
+    induction h with
+    | retained h => exact fn_in _ h
+    | seed h => exact d0_sound _ h
+    | step hR _ _ ih => exact Cl.step hR ih
+  · -- completeness: every scratch fact is incrementally derived
+    intro h
+    induction h with
+    | seed h => exact absurd h (fun h => h)
+    | step hR hp ih =>
+      rename_i i
+      by_cases hfresh : ∃ p, i.prem p ∧ ¬ Fn p
+      · exact ICl.step hR ih hfresh
+      · have hall : ∀ p, i.prem p → Fn p := fun p hp =>
+          Classical.byContradiction (fun hn => hfresh ⟨p, hp, hn⟩)
+        by_cases hRn : Rn i
+        · exact ICl.retained (fn_closed i hRn hall)
+        · rcases delta_seeds_complete i hR hRn hall with h | h
+          · exact ICl.retained h
+          · exact ICl.seed h
+
+end Incr

@@ -116,8 +116,15 @@ export MALLOC_ARENA_MAX=2
 PIN=()
 [[ -n "${KA_CPUSET:-}" ]] && PIN=(taskset -c "$KA_CPUSET")
 
+# --cfl-verify-closure: the per-run C0-C5 certificate (full
+# non-delta scan at the fixpoint). This is the designed discharge
+# for the unverified delta machinery (GAPS.md F10) and was ABSENT
+# from the harness when the incremental divergence shipped —
+# never again. Answer runs carry it; quiet timed runs do not (it
+# adds a scan to the measured wall).
 COMMON=(--verbose=2 --cfl-compositional=false --cfl-flows-to
-        --cfl-dump-icalls --log-timestamps --mem-limit="$KA_MEMLIMIT")
+        --cfl-dump-icalls --cfl-verify-closure --log-timestamps
+        --mem-limit="$KA_MEMLIMIT")
 FULLPREC=(--cfl-propose-chain-summaries --cfl-regfield-apply
           --cfl-regfield-obj --cfl-propose-solved-summaries
           --cfl-adopt-proposed-summaries)

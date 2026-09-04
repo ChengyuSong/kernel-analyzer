@@ -43,6 +43,11 @@
 # Arms (PERF family; answers must be BYTE-IDENTICAL to full — a
 # mismatch is a soundness bug, reported loudly; the measurement is
 # the wall/RSS delta):
+#   NOTE 2026-09-04: incremental auto-on is RETIRED (known-divergent
+#   at kernel corpora; docs/incremental-518-divergence.md). full/base
+#   and all arms now solve from scratch by default; the scratch arm
+#   is the trivial guard-verification (must be identical), and an
+#   optional 'incr' arm documents the divergence.
 #   noshare     full + --cfl-intern-planes=false   (COW plane sharing)
 #   nofastjoin  full + --cfl-join-fastpath=false   (cluster-mark joins)
 #   scratch     full + --cfl-flows-to-incremental=false
@@ -140,6 +145,7 @@ arm_flags() {
     noshare)     echo "${FULLPREC[@]} --cfl-intern-planes=false --func-summaries=$SUM" ;;
     nofastjoin)  echo "${FULLPREC[@]} --cfl-join-fastpath=false --func-summaries=$SUM" ;;
     scratch)     echo "${FULLPREC[@]} --cfl-flows-to-incremental=false --func-summaries=$SUM" ;;
+    incr)        echo "${FULLPREC[@]} --cfl-flows-to-incremental --func-summaries=$SUM" ;;
     lazymint)    echo "${FULLPREC[@]} --cfl-lazy-mint --func-summaries=$SUM" ;;
     bidi)        echo "${FULLPREC[@]} --cfl-bidi-prune --func-summaries=$SUM" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;

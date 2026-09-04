@@ -349,24 +349,24 @@ GATE-ONLY (backfill required; priority = silent-completeness risk):
    incremental-518-divergence.md). State theorem FIRST; expect the
    statement to locate the missing coverage clause (July-minting
    precedent). BLOCKS re-enablement.
-2. bidi-prune at FI ................... answer-preservation is
-   gate-validated only (km + 518) yet the flag is a default-on
-   candidate. Needs: pruned-root irrelevance lemma (origins whose
-   partition cone misses all fptr partitions contribute no answers)
-   + the #43 cone re-admission as hypothesis.
-3. per-run summary adoption ........... NOT exactness: measured
-   -89,189 (a precision mechanism). Needs a Channels-style
-   soundness lemma: adopted summary's transfer completeness =
-   hypothesis; deployment condition = the proposer's gates.
+2. [DONE 2026-09-04, Staging.lean] bidi-prune at FI ...
+   `prune_sound`: cone-miss origins appear in no answer; hypotheses
+   = ans_at_dispatch + cone_covers-FOR-THE-CURRENT-GRAPH (the #43
+   re-admission obligation, now a named hypothesis).
+3. [DONE 2026-09-04, Staging.lean] adoption ... `adopt_sound`:
+   soundness (not exactness) under atoms_complete = the proposer's
+   completeness contract. Correctly reclassified as a precision
+   mechanism.
 4. COW plane sharing (#46) ............ detach-on-divergence
    exactness: shared plane mutation-isolation as bisimulation of
-   unshared planes. Data-layout-adjacent; medium risk.
-5. cluster-mark join fast path (#48) .. "marks can only be missed,
-   never wrongly present" is informal; one-directional lemma is
-   small and cheap.
-6. presolve-once (fs) ................. gate + combo-gate only;
-   statement: presolve fixpoint is input-graph-determined, so
-   re-runs are identity. Small.
+   unshared planes. Data-layout-adjacent; medium risk. OPEN.
+5. [DONE 2026-09-04, Staging.lean] join fast path ...
+   `mark_skip_exact`: conservative marks (mark_sound) + join
+   idempotence (member_noop) => skipping loses no effect;
+   one-directional by construction.
+6. [DONE 2026-09-04, Staging.lean] presolve-once ... `memo_exact`:
+   trivial theorem, load-bearing hypothesis (`unchanged` is what a
+   stale spill dir violates).
 ASSUMPTION-CLASS (bijections; theorem not required, assumption
 stated): fused kernels, BitPlane layout, batch-local universes
 (rid-blo translation), GUID interning.

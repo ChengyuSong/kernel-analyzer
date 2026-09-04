@@ -315,3 +315,58 @@ hypothesis). Unverified engineering (v1 implementation gates):
 - The clamp/objclamp/nulljoin/skipwiring schemas correspond to the
   FINAL shipped mechanism set (row-5 pins = the empirical fixed point
   of the semantic-key index; research log tasks #56-#62).
+
+## Modeling policy + backfill ledger (2026-09-04, user directive)
+
+POLICY: every optimization ships with a corresponding model-level
+statement of its exactness/soundness, with assumptions explicit.
+Byte-identity gates check executions; the theorem is the reference
+the implementation is checked AGAINST. Gates alone are a point
+check and do not license enablement outside their gated envelope
+(the incremental-518 lesson).
+
+Inventory audit:
+
+MODELED (statement + proof, no sorry):
+- cell quotient / witness joins ....... sderiv_iff_fderiv (2-sided)
+- node quotients (presolve, a-SCC) .... fderiv_quotient (sound;
+                                        precision-converse open)
+- Z_P offset abstraction .............. fderiv_shift_hom
+- selective wildcard seeding .......... pol_answers_complete
+- lazy minting + catch-up ............. sderiv_catchup (+ 7-node
+                                        counterexample for no-catchup)
+- batched solving ..................... batched_exact / wderiv_sound
+- spill restore ....................... wderiv_restore
+- origin bundles (parked) ............. bundle_exact / row_determined
+- channel mechanisms .................. Channels.lean (clamp/objclamp/
+                                        nulljoin/skipwiring/stride +
+                                        counterexamples)
+
+GATE-ONLY (backfill required; priority = silent-completeness risk):
+1. incremental cross-iteration ........ incr_exact: hypothesis =
+   touched-window covers every cell whose derivations the new
+   edges change. KNOWN-FALSE in impl at 518 (docs/
+   incremental-518-divergence.md). State theorem FIRST; expect the
+   statement to locate the missing coverage clause (July-minting
+   precedent). BLOCKS re-enablement.
+2. bidi-prune at FI ................... answer-preservation is
+   gate-validated only (km + 518) yet the flag is a default-on
+   candidate. Needs: pruned-root irrelevance lemma (origins whose
+   partition cone misses all fptr partitions contribute no answers)
+   + the #43 cone re-admission as hypothesis.
+3. per-run summary adoption ........... NOT exactness: measured
+   -89,189 (a precision mechanism). Needs a Channels-style
+   soundness lemma: adopted summary's transfer completeness =
+   hypothesis; deployment condition = the proposer's gates.
+4. COW plane sharing (#46) ............ detach-on-divergence
+   exactness: shared plane mutation-isolation as bisimulation of
+   unshared planes. Data-layout-adjacent; medium risk.
+5. cluster-mark join fast path (#48) .. "marks can only be missed,
+   never wrongly present" is informal; one-directional lemma is
+   small and cheap.
+6. presolve-once (fs) ................. gate + combo-gate only;
+   statement: presolve fixpoint is input-graph-determined, so
+   re-runs are identity. Small.
+ASSUMPTION-CLASS (bijections; theorem not required, assumption
+stated): fused kernels, BitPlane layout, batch-local universes
+(rid-blo translation), GUID interning.

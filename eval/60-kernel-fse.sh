@@ -7,7 +7,7 @@
 #   rsync the kernel IR corpus over, write a filelist of ABSOLUTE
 #   .bc paths, then:
 #     KA_KERNEL_BCLIST=/path/to/bclist \
-#     KA_GT=/path/to/gt-pairs.txt \        # optional; skips GT if unset
+#     KA_GT=/path/to/linux-5.18-groundtruth.json \  # optional; skips GT if unset
 #     eval/60-kernel-fse.sh [arm ...]      # default: all arms
 #
 # NOTE ON KA_THREADS: the kernel-FI arms are SINGLE-THREADED; this

@@ -322,15 +322,6 @@ cl::opt<bool> CFLLazyMint(
            "the full mint; only the propagated fact mass shrinks"),
   cl::init(false));
 
-cl::opt<bool> CFLProbeRodataJoins(
-  "cfl-probe-rodata-joins",
-  cl::desc("MEASUREMENT-ONLY UNSOUND PROBE: skip cluster joins keyed by "
-           "witness classes containing a constant (rodata) global — "
-           "upper-bounds the closure-size win of the copy-not-unify "
-           "refinement (task #25). Over-removes const-table read paths; "
-           "answers WILL drop. Do not combine with --cfl-verify-closure"),
-  cl::init(false));
-
 cl::opt<bool> CFLCensusInvoke(
   "cfl-census-invoke",
   cl::desc("MEASUREMENT-ONLY census: scan defined functions for the "
@@ -600,20 +591,6 @@ cl::opt<bool> CFLStaticOpsTables(
            "sites keep graph behavior. Requires --cfl-static-call"),
   cl::init(true));
 
-cl::opt<bool> CFLRodataCopy(
-  "cfl-rodata-copy",
-  cl::desc("REVIEWED MODEL (task #25): copy-not-unify for rodata "
-           "origins. Const globals are immutable, so their cells "
-           "transmit contents to readers (initializer-planted facts "
-           "still flow: const ops tables resolve) but never unify "
-           "reader classes with each other — the string-literal / "
-           "const-struct witness glue never forms. Reuses the #30 "
-           "provenance-protection machinery: writer joins (initializer "
-           "cells) merge, reader joins attach via non-transitive "
-           "bridges, mixed cells demote soundly. km over-removal upper "
-           "bound was -29,128/+0 (30%)"),
-  cl::init(false));
-
 cl::opt<bool> CFLCensusIcallShape(
   "cfl-census-icall-shape",
   cl::desc("MEASUREMENT-ONLY census (task #37): classify every fat "
@@ -650,16 +627,6 @@ cl::opt<bool> CFLPreSolveCone(
            "backward value-flow cone of icall operands — exactness "
            "only where answers live, bounded class-count increase"),
   cl::init(true));
-
-cl::opt<bool> CFLJoinCone(
-  "cfl-join-cone",
-  cl::desc("EXPERIMENT (task #38 rung 2): apply the answer-relevance "
-           "discipline to IN-SOLVE cluster joins — every origin is "
-           "protection-eligible, and pure-reader cells in the fptr "
-           "backward cone attach via non-transitive copy-out bridges "
-           "instead of merging (writers and non-cone readers merge as "
-           "today). Requires --cfl-presolve-cone for the cone"),
-  cl::init(false));
 
 cl::opt<bool> CFLCensusCouplers(
   "cfl-census-couplers",
@@ -895,28 +862,6 @@ cl::opt<std::string> CFLProbeSinkAblate(
            "channel's contribution to cell fusion, fact mass and "
            "answers (task #30 follow-on). NEVER a shipped config"),
   cl::init(""));
-
-cl::opt<bool> CFLProposeOpsSt(
-  "cfl-propose-ops-st",
-  cl::desc("PROPOSE (never auto-apply) ST/ALIAS transfer summaries for "
-           "registration-setter helpers discovered by the ops-pairs "
-           "call-escape walk: a helper qualifies only if EVERY "
-           "instruction is replicable per callsite (formal-base stores "
-           "of formal/null/scalar values, non-pointer reads, no "
-           "formal-derived call operands). Output is reviewable "
-           "func_summaries.txt syntax (task #30 store-side splitting)"),
-  cl::init(false));
-
-cl::opt<bool> CFLOpsPairs(
-  "cfl-ops-pairs",
-  cl::desc("Certify (ops-global, container) pair invariants from IR use "
-           "evidence (every use of a const fn-table global classified: "
-           "field store -> container captured; initializer embedding -> "
-           "parent global; else INCOMPLETE -> pooled) and, in step 2, "
-           "tighten certified member fns' receiver formals to their "
-           "paired containers (task #30). Certificates are derived, "
-           "never assumed; violations stay pooled + LEDGERed"),
-  cl::init(false));
 
 cl::opt<bool> CFLProbeOpsMono(
   "cfl-probe-ops-mono",
@@ -1321,7 +1266,6 @@ int main(int argc, char **argv) {
     requireFlowsTo(CFLResidueCopies, "--cfl-residue-copies");
     requireFlowsTo(CFLConflationReport, "--cfl-conflation-report");
     requireFlowsTo(CFLRootRelevance, "--cfl-root-relevance");
-    requireFlowsTo(CFLProbeRodataJoins, "--cfl-probe-rodata-joins");
     requireFlowsTo(CFLProbeOriginSplit, "--cfl-probe-origin-split");
     requireFlowsTo(CFLProbeOpsMono, "--cfl-probe-ops-mono");
     requireFlowsTo(CFLProbeBlobFormation, "--cfl-probe-blob-formation");
@@ -1350,12 +1294,10 @@ int main(int argc, char **argv) {
     }
     requireFlowsTo(CFLTracepointKeys, "--cfl-tracepoint-keys");
     requireFlowsTo(CFLStaticOpsTables, "--cfl-static-ops-tables");
-    requireFlowsTo(CFLRodataCopy, "--cfl-rodata-copy");
     requireFlowsTo(CFLCensusIcallShape, "--cfl-census-icall-shape");
     requireFlowsTo(CFLProbeBornHub, "--cfl-probe-born-hub");
     requireFlowsTo(CFLPreSolveExact, "--cfl-presolve-exact");
     requireFlowsTo(CFLPreSolveCone, "--cfl-presolve-cone");
-    requireFlowsTo(CFLJoinCone, "--cfl-join-cone");
     requireFlowsTo(CFLCensusCouplers, "--cfl-census-couplers");
     requireFlowsTo(CFLCensusNexus, "--cfl-census-nexus");
     requireFlowsTo(!CFLNexusFields.empty(), "--cfl-nexus-fields");
@@ -1382,14 +1324,6 @@ int main(int argc, char **argv) {
                 "(the batch size defines what each worker solves)\n";
       exit(1);
     }
-    if (CFLBatchRoots > 0 &&
-        (CFLOpsPairs || CFLRodataCopy || CFLJoinCone)) {
-      errs() << "ERROR: --cfl-batch-roots is untested with the "
-                "protected-cell machinery (--cfl-ops-pairs/"
-                "--cfl-rodata-copy/--cfl-join-cone) — prot state is not "
-                "in the batch event protocol\n";
-      exit(1);
-    }
     if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {
       if (CFLFieldBuckets.getNumOccurrences() == 0) {
         CFLFieldBuckets = 13;
@@ -1400,11 +1334,6 @@ int main(int argc, char **argv) {
                   "nexus precision)\n";
         exit(1);
       }
-    }
-    if (CFLJoinCone && !CFLPreSolveCone) {
-      errs() << "ERROR: --cfl-join-cone needs the presolve cone "
-                "(--cfl-presolve-cone)\n";
-      exit(1);
     }
     if (CFLPreSolveExact && CFLPreSolveCone) {
       errs() << "ERROR: --cfl-presolve-exact and --cfl-presolve-cone are "
@@ -1432,11 +1361,6 @@ int main(int argc, char **argv) {
     }
     if (!CFLProbeSinkAblate.empty() && !CFLFlowsTo) {
       errs() << "ERROR: --cfl-probe-sink-ablate requires --cfl-flows-to\n";
-      exit(1);
-    }
-    if (CFLProposeOpsSt && !CFLOpsPairs) {
-      errs() << "ERROR: --cfl-propose-ops-st requires --cfl-ops-pairs "
-                "(proposals derive from the certification walk)\n";
       exit(1);
     }
     requireFlowsTo(!CFLAblateMints.empty(), "--cfl-ablate-mints");

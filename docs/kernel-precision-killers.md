@@ -232,7 +232,10 @@ implicated by any measurement.
   collision census.
 - **rodata witness glue**: string literals / const structs as shared
   join witnesses — 47% of km hub joins keyed by one `.str` global.
-  Copy-not-unify (`--cfl-rodata-copy`, reviewed model) severs it.
+  A copy-not-unify treatment (`--cfl-rodata-copy`) severed it; that
+  mechanism was superseded by the null-join hygiene + channel work
+  and removed from the tree 2026-09-04 (fix-or-remove; history and
+  measurements in docs/cfl-graph-explosion-and-scaling.md task #25).
 - **Linker-materialized arrays / static_call trampolines**: soundness
   levers, not precision killers, but their absence silently *drops*
   flows — the inverse failure (`--cfl-linker-arrays`,

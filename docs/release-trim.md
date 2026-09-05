@@ -25,12 +25,23 @@ REMOVED:
   record/spec. Gates: cfl-smoke 4/4; libpng old-vs-new
   byte-identical; km all+ids mono + batched old-vs-new
   byte-identical (same-day binaries, same corpus).
+- superseded mechanisms (2026-09-04, trim pass 2): --cfl-ops-pairs
+  (+ its step-2 receiver tightening, certifyOpsPairs walk, and
+  --cfl-propose-ops-st proposer — existing func_summaries.txt
+  entries it produced stay; generator lives in git),
+  --cfl-rodata-copy, --cfl-join-cone, --cfl-probe-rodata-joins, and
+  the ENTIRE protected-cell (prot) machinery they exclusively
+  enabled (writer/reader/demote/collapse, protRid/protCls/coneIn,
+  rootRodata/classIsRodata, blame censuses). Verified first:
+  nothing canonical consumes prot (all three enablers default-off;
+  protOn unreachable in every pinned config). --cfl-presolve-cone
+  KEPT (its own mechanism; only its join-cone export removed).
+  Latent placement bug fixed on the way: the StrataAblate ledger
+  print lived inside the protOn block and only printed under prot
+  configs. Gates: same battery as pass 1, all byte-identical.
 
 QUEUED (each = its own gated pass):
 1. Flag census for the wider trim — candidates by class:
-   - superseded mechanisms: --cfl-ops-pairs, --cfl-rodata-copy,
-     --cfl-join-cone (predecessors of regfield/obj; verify nothing
-     canonical consumes the shared protection machinery first)
    - one-off measurement probes that produced their numbers and
      are recorded in docs: ablate-mints/ablate-funcs, probe-*,
      census-* (KEEP the ones the paper's instruments still use:

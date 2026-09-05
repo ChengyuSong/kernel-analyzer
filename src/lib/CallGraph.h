@@ -163,23 +163,9 @@ private:
   bool chainFinalized = false;
   void finalizeChainPairs();
   const llvm::GlobalValue *canonChainKey(const llvm::GlobalValue *G);
-  // Certified (ops-global, container) pairs (task #30): members from
-  // the const initializer; containers from the complete use walk.
-  struct OpsPairRec {
-    FuncSet members;
-    std::vector<const llvm::Value *> containers;
-  };
-  std::map<const llvm::GlobalVariable *, OpsPairRec> opsPairs;
-  void certifyOpsPairs();
   void runStrataCensus(); // task #32 stratum-bridge census
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF,
                     int skipArg = -1);
-  // ops-pairs step 2 (task #30): true when F may be tightened — every
-  // fn-table membership certified and F's address never escapes
-  // outside certified tables. Memoized.
-  bool opsFnTightenable(const llvm::Function *F);
-  std::map<const llvm::Function *, char> opsTightCache;
-  std::set<std::pair<const llvm::Function *, int>> opsPairWired;
   void confirmFreshWrappers();
   void runInvokeCensus();
   void runFieldChannelCensus();

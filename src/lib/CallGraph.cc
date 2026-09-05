@@ -1805,7 +1805,6 @@ void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
 
 // task #38 rung 2: canonical nodes of the presolve fptr backward cone,
 // persisted for the in-solve join-cone experiment (--cfl-join-cone).
-static std::vector<NodeIndex> g_presolveConeCanon;
 
 // --cfl-census-couplers (task #38, user thesis: kernel modularity at the
 // DATA-OBJECT level). Subsystem = first two path components of the
@@ -2258,10 +2257,6 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
           inCone[w] = 1;
           bfs.push_back(w);
         }
-    g_presolveConeCanon.clear();
-    for (uint32_t ln = 0; ln < Mc; ln++)
-      if (inCone[ln])
-        g_presolveConeCanon.push_back(toCanon[ln]);
     CG_LOG("Pre-solve merge (CONE): " << bfs.size() << "/" << Mc
            << " nodes in the fptr backward cone kept exact\n");
   }
@@ -2855,7 +2850,6 @@ static const GlobalVariable *traceiterKeyOf(const Function *F) {
   return key;
 }
 
-static size_t g_rodataJoinsSkipped = 0; // --cfl-probe-rodata-joins
 static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
 // --cfl-sink-instr / --cfl-confirm-sinks (task #31/#32 design)
 static size_t g_sinkSitesConfirmed = 0, g_sinkSitesEscaped = 0,
@@ -2983,7 +2977,6 @@ static std::vector<std::pair<NodeIndex, std::string>>
     g_userCertObjs; // (U object node, site label)
 static size_t g_userCertCopySites = 0, g_userCertGetSites = 0;
 
-static size_t g_opsTightSites = 0, g_opsTightRej = 0; // --cfl-ops-pairs step 2
 static size_t g_tagRoundTrips = 0; // fs: ptrtoint wildcards suppressed
                                    // (tag-bit-only local closures)
 // Ground-truth type census (--cfl-gt-type-census): each input line is a
@@ -3516,26 +3509,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // class with in-edged nodes; such a class still names a distinct object
   // and must be minted even with hasIn set — otherwise the object's
   // identity is silently erased (harfbuzz hb_map_iter sret/memcpy chains).
-  // --cfl-probe-rodata-joins: does this class contain a link-time
-  // constant global? Such an origin's identity keys joins between
-  // READERS of immutable memory — the aliasing carries no store->load
-  // flow (no runtime stores into rodata). The probe skips those joins
-  // wholesale to UPPER-BOUND the closure-size win of the copy-not-unify
-  // refinement (task #25); it over-removes (const-table home-cell reads
-  // also ride these joins), so answers may drop — measurement only.
-  auto valueIsRodata = [&](NodeIndex m) {
-    const Value *v = NF.getValueForNode(m);
-    const auto *GV = dyn_cast_or_null<GlobalVariable>(v);
-    return GV && GV->isConstant();
-  };
-  auto classIsRodata = [&](NodeIndex canon) {
-    if (valueIsRodata(canon)) return true;
-    auto mit = canonicalClassMembers.find(canon);
-    if (mit != canonicalClassMembers.end())
-      for (NodeIndex m : mit->second)
-        if (valueIsRodata(m)) return true;
-    return false;
-  };
   auto valueIsOrigin = [&](NodeIndex m) {
     if (!NF.isValueNode(m))
       return false;
@@ -3858,7 +3831,6 @@ bool CallGraphPass::runFlowsToResolution() {
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
   std::vector<char> rootParkable;    // rid -> pure no-in identity
-  std::vector<char> rootRodata;      // rid -> class holds a const global
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   size_t bidiPrunable = 0;
@@ -3965,7 +3937,6 @@ bool CallGraphPass::runFlowsToResolution() {
       // stops seeding its bit across newly wired edges — so obsolete
       // formal identities don't double the fact volume.
       rootParkable.push_back(!isFunc && !hasOrigin[n]);
-      rootRodata.push_back(!isFunc && classIsRodata(toOrig[n]));
       // Exact residues ONLY for nexus-typed OBJECT origins. Function
       // roots mint on the wildcard plane too: answers union the X
       // plane, rotation is absorbing at X, and the (fn,X) join key is
@@ -3979,21 +3950,6 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
 
-  // ---- Provenance-protected cells (task #30, --cfl-ops-pairs) ----
-  // Certified container origins get copy-out semantics: WRITER cells
-  // (any in-edge) merge into the per-origin protected cell as today;
-  // READER cells (no in-edge) BRIDGE to it — the solver's existing
-  // non-transitive pairwise fact exchange — instead of unifying. One
-  // polymorphic reader thus no longer collapses two containers' cells
-  // into a single class (the t_ops wall). Readers arriving before any
-  // writer wait and attach when the cell materializes; a bridged
-  // reader that later gains an in-edge is DEMOTED — merged into every
-  // cell it bridge-joined (soundness first, LEDGERed). Scoped to
-  // NB==0 (canonical field-insensitive config).
-  struct ProtState {
-    uint32_t cell = UINT32_MAX;
-    llvm::SmallVector<uint32_t, 2> waiting;
-  };
   // --cfl-probe-blob-formation (task #31): formation-time causality
   // for giant classes. Names captured AT MERGE TIME while both sides
   // are still small are faithful; the finished blob's member name is
@@ -4066,12 +4022,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
-  // Protection activates for certified ops containers (task #30) and/or
-  // rodata origins (task #25 copy-not-unify — same machinery: writer
-  // joins merge, reader joins bridge non-transitively, mixed demotes).
-  const bool protOn = NB == 0 && ((CFLOpsPairs && !opsPairs.empty()) ||
-                                  CFLRodataCopy || CFLJoinCone);
-  boost::unordered_flat_set<uint32_t> protRid;
   // --cfl-probe-witness-sep: (key, fine cell) anchor ledger. The
   // grammar's M is per-witness: cells alias iff they SHARE a key —
   // a bipartite relation, not an equivalence. Union-find closes it
@@ -4080,32 +4030,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // a per-witness answer read would buy: |one-hop witness
   // neighborhood| vs |cluster| per cell.
   std::vector<std::pair<uint64_t, uint32_t>> witnessAnchors;
-  boost::unordered_flat_set<uint32_t> protCls; // container value classes
-  boost::unordered_flat_map<uint32_t, ProtState> prot; // rid -> state
-  boost::unordered_flat_map<uint32_t, llvm::SmallVector<uint32_t, 2>>
-      readerBridgedTo; // reader class -> rids it bridge-joined
-  std::vector<uint32_t> protDemoteQ;
-  // Self-limiting protection: a cell class anchoring > K protected keys
-  // has already lost its discrimination (writer collapse) — bridging
-  // readers to it only COPIES its mega-plane per reader (the kernel
-  // iteration-1 OOM). Such classes are marked collapsed: existing
-  // bridge partners are merged back in and future readers merge (plain
-  // pooled semantics for that family).
-  boost::unordered_flat_map<uint32_t, uint32_t> protAnchor; // cell -> #keys
-  boost::unordered_flat_set<uint32_t> protCollapsed;
-  std::vector<uint32_t> protCollapseQ;
-  static constexpr uint32_t PROT_ANCHOR_K = 4;
-  // Coalescence census: when a writer class that already anchors one
-  // protected key joins ANOTHER key, the two families fuse — blame the
-  // writer (exemplar member instruction) so the hub's composition is
-  // measurable: few nameable helpers -> summary severing wins; diffuse
-  // -> field-keyed cells / provenance rework territory.
-  std::map<std::string, std::pair<size_t, uint32_t>> protCoalesceBlame;
-  // Writer-merge composition: name EVERY writer class at the moment it
-  // merges into a protected cell — before the blob swallows it and the
-  // exemplar drifts. This is the true composition census of the
-  // "connected registration-writer universe".
-  std::map<std::string, size_t> protWriterBlame;
 
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size())
@@ -4134,70 +4058,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     return "<unnamed>";
   };
-  std::vector<char> protIn; // hasIn, class-folded (private copy)
-  size_t protWriterMerges = 0, protReaderBridges = 0, protDemotions = 0,
-         protWaitAttached = 0, protCollapses = 0, protPooledReaders = 0;
-  std::vector<char> coneIn; // task #38 rung 2: answer-cone cell classes
-  if (protOn) {
-    protIn.assign(hasIn.begin(), hasIn.end());
-    if (CFLJoinCone) {
-      coneIn.assign(N, 0);
-      size_t marked = 0, unmapped = 0;
-      for (NodeIndex cn : g_presolveConeCanon) {
-        auto dIt = toDense.find(getCanonicalNode(cn));
-        if (dIt == toDense.end()) {
-          unmapped++;
-          continue;
-        }
-        if (!coneIn[dIt->second]) {
-          coneIn[dIt->second] = 1; // pre-merge: dense ids are canonical
-          marked++;
-        }
-      }
-      CG_LOG("JoinCone: " << marked << " cone cell classes marked ("
-             << unmapped << " unmapped)\n");
-    }
-    // EVERY certified container value class is protection-eligible:
-    // globals, helper-returned alloc callsites, locals. Readers that
-    // co-witness an UNPROTECTED origin merge through that key and
-    // drag the protected cells down with them (t_ops2: the mk_widget
-    // heap origin re-unified a1/b1's readers, then demotions collapsed
-    // both cells) — so the container set must be protected wholesale,
-    // INCLUDING the origins that feed a container value: the actual
-    // origin root of a RETALLOC container is minted on the alloc
-    // callsite class inside the helper, connected to the container by
-    // the static ret-chain a-edges. Close backward over a-edges
-    // (depth- and size-capped; partial closure is merely weaker
-    // protection, never unsound).
-    {
-      SmallVector<uint32_t, 32> frontier;
-      for (auto &kv : opsPairs)
-        for (const Value *C2 : kv.second.containers) {
-          NodeIndex vn = getRepNodeForValue(C2);
-          if (vn == AndersNodeFactory::InvalidIndex)
-            continue;
-          auto dit = toDense.find(getCanonicalNode(vn));
-          if (dit != toDense.end() && protCls.insert(dit->second).second)
-            frontier.push_back(dit->second);
-        }
-      for (int depth = 0; depth < 8 && !frontier.empty(); depth++) {
-        boost::unordered_flat_set<uint32_t> tgt(frontier.begin(),
-                                                frontier.end());
-        frontier.clear();
-        for (auto [ea, eb] : aEdges)
-          if (tgt.count(eb) && protCls.insert(ea).second)
-            frontier.push_back(ea);
-        if (protCls.size() > 8192) {
-          CG_LOG("ProtCells: backward closure capped at " << protCls.size()
-                 << " classes (depth " << depth << ")\n");
-          break;
-        }
-      }
-    }
-    for (auto &sd : seeds)
-      if (protCls.count(sd.first))
-        protRid.insert(sd.second);
-  }
   // Coupler census state: per-class subsystem masks over OWNED data
   // origins; weld events recorded in merge().
   std::vector<uint64_t> ownedMask;
@@ -4223,27 +4083,6 @@ bool CallGraphPass::runFlowsToResolution() {
     CG_LOG("Couplers: " << g_subsysNames.size()
            << " subsystems over data origins\n");
   }
-  if (CFLJoinCone && NB == 0) {
-    // rung 2 (task #38): every origin is protection-eligible; the
-    // reader path below then bridges ONLY answer-cone cells — the
-    // non-transitive copy-out is bought exactly where answers live.
-    for (uint32_t rid = 0; rid < nextRoot; rid++)
-      protRid.insert(rid);
-    CG_LOG("JoinCone: all " << nextRoot << " origins protection-eligible\n");
-  }
-  if (CFLRodataCopy && NB == 0) {
-    // task #25: every rodata origin is protection-eligible — const
-    // memory has exactly one writer (its initializer), so writer joins
-    // establish the cell and every reader bridges copy-out. rootRodata
-    // excludes function origins by construction.
-    size_t nRP = 0;
-    for (uint32_t rid = 0; rid < nextRoot; rid++)
-      if (rootRodata[rid] && protRid.insert(rid).second)
-        nRP++;
-    CG_LOG("RodataCopy: " << nRP
-           << " rodata origins protected (copy-not-unify)\n");
-  }
-
   // Root-class tracking so incremental wiring can mint identity roots
   // for classes that BECOME origins mid-fixpoint (new allocation sites)
   // without duplicating existing ones.
@@ -4966,8 +4805,6 @@ bool CallGraphPass::runFlowsToResolution() {
     wflag[a] |= wflag[b];
     if (!nexusCls.empty())
       nexusCls[a] |= nexusCls[b]; // nexus typing survives unions
-    if (!coneIn.empty())
-      coneIn[a] |= coneIn[b]; // cone membership survives unions
     if (!ownedMask.empty()) {
       mergeEvents++;
       const uint64_t na2 = ownedMask[a] & ~ownedMask[b];
@@ -5045,29 +4882,6 @@ bool CallGraphPass::runFlowsToResolution() {
                  : protBlameName(find(rootClassOf[blobCtxOrigin]))});
     }
     clsSize[a] += clsSize[b];
-    if (protOn) {
-      if (protIn[b])
-        protIn[a] = 1;
-      auto rb = readerBridgedTo.find(b);
-      if (rb != readerBridgedTo.end()) {
-        auto &va = readerBridgedTo[a];
-        va.append(rb->second.begin(), rb->second.end());
-        readerBridgedTo.erase(rb);
-      }
-      if (protIn[a] && readerBridgedTo.count(a))
-        protDemoteQ.push_back(a); // reader gained stores: demote later
-      auto pa = protAnchor.find(b);
-      if (pa != protAnchor.end()) {
-        uint32_t n2 = (protAnchor[a] += pa->second);
-        protAnchor.erase(b);
-        if (n2 > PROT_ANCHOR_K && !protCollapsed.count(a))
-          protCollapseQ.push_back(a); // no merge here: queue (reentrancy)
-      }
-      if (protCollapsed.count(b)) {
-        protCollapsed.erase(b);
-        protCollapsed.insert(a);
-      }
-    }
     push(a, ctx0);
     return a;
   };
@@ -5207,10 +5021,6 @@ bool CallGraphPass::runFlowsToResolution() {
     // IS its owner pointer-class's plane).
     if (CFLProbeWitnessSep)
       witnessAnchors.emplace_back((uint64_t)o * NSHIFT + s, cell);
-    if (CFLProbeRodataJoins && o < rootRodata.size() && rootRodata[o]) {
-      g_rodataJoinsSkipped++; // MEASUREMENT-ONLY over-removal (task #25)
-      return;
-    }
     // Null-cell join hygiene (2026-08-25): joins keyed by the NULL
     // pseudo-object's cells model store-through-null — UB, no real
     // execution stores at null and none loads from it — yet they act
@@ -5231,77 +5041,6 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
       g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
-      return;
-    }
-    if (protOn && s == 0 && protRid.count(o)) {
-      auto &ps = prot[o];
-      if (ps.cell != UINT32_MAX)
-        ps.cell = find(ps.cell);
-      const uint32_t cr = find(cell);
-      if (cr == ps.cell)
-        return;
-      if (protIn[cr]) {
-        // writer (or mixed): merges into the cell, exactly as today
-        protWriterBlame[protBlameName(cr)]++;
-        auto ait = protAnchor.find(cr);
-        if (ait != protAnchor.end() && ait->second > 0 &&
-            (ps.cell == UINT32_MAX || find(ps.cell) != cr))
-          { auto &bl = protCoalesceBlame[protBlameName(cr)];
-            bl.first++; bl.second = cr; } // key-family fusion
-        if (ps.cell == UINT32_MAX) {
-          ps.cell = cr;
-          uint32_t n2 = ++protAnchor[find(cr)];
-          if (n2 > PROT_ANCHOR_K && !CFLJoinCone &&
-              !protCollapsed.count(find(cr)))
-            protCollapseQ.push_back(find(cr)); // join-cone: readers are
-                                               // few (2% cone), allow
-                                               // wide anchors
-        } else {
-          blobCtx = "prot-writer"; blobCtxOrigin = o;
-          ps.cell = merge(ps.cell, cr);
-        }
-        protWriterMerges++;
-        if (!ps.waiting.empty()) {
-          auto pending = std::move(ps.waiting);
-          ps.waiting.clear();
-          for (uint32_t w : pending) {
-            w = find(w);
-            if (w == ps.cell)
-              continue;
-            addBridge(find(ps.cell), w);
-            protWaitAttached++;
-          }
-          ps.cell = find(ps.cell);
-        }
-      } else if (ps.cell != UINT32_MAX &&
-                 protCollapsed.count(find(ps.cell))) {
-        // collapsed family: no discrimination left — pooled semantics,
-        // and no per-reader plane copies
-        blobCtx = "prot-pooled-reader"; blobCtxOrigin = o;
-        ps.cell = merge(find(ps.cell), cr);
-        protPooledReaders++;
-      } else if (CFLJoinCone && (coneIn.empty() || !coneIn[cr])) {
-        // join-cone mode, NON-cone reader: pooled semantics exactly as
-        // without protection — the copy-out is reserved for cells in
-        // the answer cone.
-        blobCtx = "cone-pooled-reader"; blobCtxOrigin = o;
-        ps.cell = ps.cell == UINT32_MAX ? cr : merge(find(ps.cell), cr);
-        protPooledReaders++;
-      } else {
-        // reader: copy-out. Facts cross the bridge and re-emit native
-        // along a-edges (value flow launders provenance), but never
-        // re-cross another bridge — cells stay separate classes.
-        auto &v = readerBridgedTo[cr];
-        if (std::find(v.begin(), v.end(), o) != v.end())
-          return; // already attached to this origin's cell
-        v.push_back(o);
-        if (ps.cell == UINT32_MAX) {
-          ps.waiting.push_back(cr); // no writer yet: attach on arrival
-        } else {
-          addBridge(ps.cell, cr);
-          protReaderBridges++;
-        }
-      }
       return;
     }
     const uint64_t key = (uint64_t)o * NSHIFT + s;
@@ -5341,79 +5080,6 @@ bool CallGraphPass::runFlowsToResolution() {
         addBridge(it->second, xr);
     }
   };
-  // Demote bridged readers that gained an in-edge: stores landing in a
-  // reader class cross its bridge once but never re-cross, so other
-  // readers of the same cell would miss them — merge the reader into
-  // EVERY cell it bridge-joined (collapses those cells together if it
-  // joined several: exactly today's semantics, protection forfeited
-  // for them). Sequential contexts only (join sweeps / wiring).
-  auto processProtDemotions = [&]() {
-    while (!protDemoteQ.empty()) {
-      uint32_t c = find(protDemoteQ.back());
-      protDemoteQ.pop_back();
-      auto rb = readerBridgedTo.find(c);
-      if (rb == readerBridgedTo.end())
-        continue; // already handled (or folded away by a merge)
-      auto rids = std::move(rb->second);
-      readerBridgedTo.erase(rb);
-      if (rids.size() > 1) {
-        auto &bl = protCoalesceBlame["DEMOTE:" + protBlameName(c)];
-        bl.first += rids.size() - 1;
-        bl.second = c;
-      }
-      for (uint32_t o : rids) {
-        auto &ps = prot[o];
-        c = find(c);
-        if (ps.cell == UINT32_MAX) {
-          ps.cell = c; // waiting reader turned writer: it IS the cell
-          uint32_t n2 = ++protAnchor[find(c)];
-          if (n2 > PROT_ANCHOR_K && !protCollapsed.count(find(c)))
-            protCollapseQ.push_back(find(c));
-          continue;
-        }
-        ps.cell = find(ps.cell);
-        if (ps.cell != c) {
-          blobCtx = "prot-demote"; blobCtxOrigin = o;
-          ps.cell = merge(ps.cell, c);
-        }
-        protDemotions++;
-      }
-    }
-  };
-
-  // Collapse over-anchored cells: merge every bridge partner back in
-  // and mark the class so future readers merge too. Restores plain
-  // pooled semantics for families whose writers already coalesced —
-  // protection stops paying copy costs where it cannot discriminate.
-  auto processProtCollapses = [&]() {
-    while (!protCollapseQ.empty()) {
-      uint32_t c = find(protCollapseQ.back());
-      protCollapseQ.pop_back();
-      if (protCollapsed.count(c))
-        continue;
-      protCollapsed.insert(c);
-      protCollapses++;
-      bool again = true;
-      while (again) {
-        again = false;
-        for (uint32_t br : bridgesOf[c]) {
-          uint32_t bb = find(br);
-          if (bb != c) {
-            blobCtx = "prot-collapse"; blobCtxOrigin = UINT32_MAX;
-            uint32_t keeper = merge(c, bb);
-            if (!protCollapsed.count(keeper)) {
-              protCollapsed.erase(c);
-              protCollapsed.insert(keeper);
-            }
-            c = find(keeper);
-            again = true;
-            break; // bridgesOf[c] mutated by the merge: restart scan
-          }
-        }
-      }
-    }
-  };
-
   // Dynamic a-SCC collapse: classes mutually reachable over the current
   // (post-merge) shift-preserving edge graph — a-edges plus residue-0
   // f-edges — receive each other's every fact, so their planes are equal
@@ -5538,22 +5204,10 @@ bool CallGraphPass::runFlowsToResolution() {
     if (CFLAdoptProposedSummaries && starvedFormalClass(rep)) return;
     isRoot[rep] = 1;
     uint32_t rid = nextRoot++;
-    uint32_t cid = rid;
-    if (protOn)
-      for (uint32_t pc : protCls)
-        if (find(pc) == rep) {
-          protRid.insert(cid); // container origin minted mid-fixpoint
-          break;
-        }
     // widen BEFORE the first set of this bit
     FactSet::Universe = nextRoot;
     rootClassOf.push_back(rep);
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
-    rootRodata.push_back(classIsRodata(toOrig[rep]));
-    if (CFLRodataCopy && rootRodata.back())
-      protRid.insert(cid); // rodata origin minted mid-fixpoint (task #25)
-    if (CFLJoinCone)
-      protRid.insert(cid); // join-cone: all origins eligible (task #38)
     if (!ownedMask.empty() && !funcOfCanon.count(toOrig[rep])) {
       const Value *ov2 = NF.getValueForNode(toOrig[rep]);
       const llvm::Module *om2 = nullptr;
@@ -5573,7 +5227,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // (local bit space) — the new rid seeds inside its own appended
     // batch on the next round instead.
     if (CFLBatchRoots == 0)
-      addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, cid,
+      addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, rid,
               ctx0);
   };
 
@@ -5677,10 +5331,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // cycles and lost on kernel-shaped merge churn. A merge can absorb n
   // itself: stop; the keeper inherits the backlog and is re-queued.
   auto joinSweep = [&](uint32_t n, SolverCtx &ctx) {
-    if (protOn && !protDemoteQ.empty())
-      processProtDemotions();
-    if (protOn && !protCollapseQ.empty())
-      processProtCollapses();
     if (find(n) != n) return; // merged away; keeper carries the state
     for (uint32_t s = 0; s < NSHIFT; s++) {
       if (jdirty[n][s].none()) continue;
@@ -5714,9 +5364,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // above retired the #48-era batch-local-width OOB. Workers set
       // marks for their own drain's lifetime (fork CoW starts empty:
       // conservative); sequential spill mode keeps them run-long.
-      const bool fastJoinBase = CFLJoinFastpath &&
-                                sinkAblatePats.empty() &&
-                                !CFLProbeRodataJoins;
+      const bool fastJoinBase = CFLJoinFastpath && sinkAblatePats.empty();
       if (fastJoinBase) {
         // CELL-MAJOR sweep (fs-cost lever, 2026-08-14): the fact-major
         // loop paid ~350 cycles (find() chase + random bit probe) per
@@ -5759,16 +5407,13 @@ bool CallGraphPass::runFlowsToResolution() {
           pending.forEach([&](uint32_t g) { ctx.sweepElems.push_back(g); });
           ctx.cellSkips += todoCnt - ctx.sweepElems.size();
           for (uint32_t grid : ctx.sweepElems) {
-            // Prot rids bypass the registry inside joinCluster (bridge
-            // semantics): never marked, so never filtered above.
-            const bool mark = !(protOn && s == 0 && protRid.count(grid));
-            if (mark && cellJoined[find(cell)][s].test(grid)) {
+            if (cellJoined[find(cell)][s].test(grid)) {
               ctx.cellSkips++; // mid-batch merge already carried the mark
               continue;
             }
             ctx.nJoinLk++;
             joinCluster(cell, grid, s);
-            if (mark) cellJoined[find(cell)][s].set(grid);
+            cellJoined[find(cell)][s].set(grid);
             if (find(n) != n) { aborted = true; break; }
           }
           if (aborted) break;
@@ -7482,23 +7127,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
-    // ops-pairs step 2 (task #30): at a two-level dispatch site
-    // (obj->ops then ops->fn), the receiver base object is the value
-    // whose pooled actual->formal edge we can replace per-pair.
-    const Value *opsRecv = nullptr;
-    if (CFLOpsPairs && !opsPairs.empty() && !targets.empty()) {
-      if (const auto *L2 = dyn_cast<LoadInst>(fptr)) {
-        const Value *B = L2->getPointerOperand()->stripPointerCasts();
-        while (const auto *G2 = dyn_cast<GEPOperator>(B))
-          B = G2->getPointerOperand()->stripPointerCasts();
-        if (const auto *L1 = dyn_cast<LoadInst>(B)) {
-          const Value *RB = L1->getPointerOperand()->stripPointerCasts();
-          while (const auto *G3 = dyn_cast<GEPOperator>(RB))
-            RB = G3->getPointerOperand()->stripPointerCasts();
-          opsRecv = RB;
-        }
-      }
-    }
     for (const Function *F : targets) {
       if (!Ctx->Callees[CS].insert(F).second)
         continue; // wired in an earlier iteration
@@ -7525,130 +7153,20 @@ bool CallGraphPass::runFlowsToResolution() {
       } else if (Ctx->ContainerFuncs.count(CF)) {
         handleContainerCall(CS, CF);
       } else {
-        int k = -1;
-        if (opsRecv && opsFnTightenable(F)) {
-          // receiver position: the callsite arg that IS the base object
-          for (unsigned ai = 0;
-               ai < CS->arg_size() && ai < CF->arg_size(); ai++)
-            if (CS->getArgOperand(ai)->stripPointerCasts() == opsRecv) {
-              k = (int)ai;
-              break;
-            }
-        }
-        if (k >= 0) {
-          g_opsTightSites++;
-          if (opsPairWired.insert({F, k}).second) {
-            // per-pair binding: F's receiver formal <- every certified
-            // container of every table F belongs to (all certified, by
-            // opsFnTightenable)
-            Value *farg = CF->getArg(k);
-            NodeIndex fk = getRepNodeForValue(farg);
-            if (fk == AndersNodeFactory::InvalidIndex)
-              fk = NF.createValueNode(farg);
-            fk = getCanonicalNode(fk);
-            for (auto &kv : opsPairs) {
-              if (!kv.second.members.count(CF))
-                continue;
-              for (const Value *C2 : kv.second.containers) {
-                NodeIndex cn = getRepNodeForValue(C2);
-                if (cn == AndersNodeFactory::InvalidIndex)
-                  cn = NF.createValueNode(const_cast<Value *>(C2));
-                addAssignmentEdge(getCanonicalNode(cn), fk);
-              }
-            }
-          }
-          handleCall(CS, CF, k);
-        } else {
-          if (opsRecv)
-            g_opsTightRej++;
-          handleCall(CS, CF);
-        }
+        handleCall(CS, CF);
       }
     }
   }
-  if (CFLOpsPairs && (g_opsTightSites || g_opsTightRej))
-    CG_LOG("OpsPairs LEDGER: tightened " << g_opsTightSites
-           << " (callee,site) wirings so far, " << g_opsTightRej
-           << " two-level rejections (untightenable/no-recv-arg)\n");
-  if (protOn) {
-    size_t cells = 0, waiting = 0;
-    boost::unordered_flat_set<uint32_t> live;
-    for (auto &kv : prot) {
-      if (kv.second.cell != UINT32_MAX) {
-        cells++;
-        live.insert(find(kv.second.cell));
-      }
-      waiting += kv.second.waiting.size();
-    }
-    CG_LOG("ProtCells LEDGER: " << protRid.size() << " protected origins, "
-           << cells << " cells materialized (" << live.size()
-           << " distinct classes), " << protWriterMerges << " writer merges, "
-           << protReaderBridges << " reader bridges (+" << protWaitAttached
-           << " wait-attached), " << waiting << " readers still waiting, "
-           << protDemotions << " demotions, " << protCollapses
-           << " over-anchored cells collapsed (" << protPooledReaders
-           << " readers pooled)\n");
   if (g_strataAblated)
     errs() << "StrataAblate: " << g_strataAblated
            << " phys-stratum inttoptr bridges severed "
               "[MEASUREMENT-ONLY UNSOUND]\n";
-  if (protOn && !protWriterBlame.empty()) {
-    std::vector<std::pair<size_t, const std::string *>> wr2;
-    size_t wtot = 0;
-    for (auto &kv : protWriterBlame) {
-      wr2.emplace_back(kv.second, &kv.first);
-      wtot += kv.second;
-    }
-    std::sort(wr2.begin(), wr2.end(), std::greater<>());
-    errs() << "ProtWriters: " << wtot << " writer merges via "
-           << protWriterBlame.size() << " distinct pre-merge identities\n";
-    for (size_t i = 0; i < std::min<size_t>(40, wr2.size()); i++)
-      errs() << "ProtWriters: " << wr2[i].first << "x " << *wr2[i].second
-             << "\n";
-  }
-  if (protOn && !protCoalesceBlame.empty()) {
-    std::vector<std::pair<size_t, const std::string *>> br2;
-    size_t total2 = 0;
-    for (auto &kv : protCoalesceBlame) {
-      br2.emplace_back(kv.second.first, &kv.first);
-      total2 += kv.second.first;
-    }
-    std::sort(br2.begin(), br2.end(), std::greater<>());
-    errs() << "ProtCoalesce: " << total2 << " key-family fusions via "
-           << protCoalesceBlame.size() << " distinct writer classes\n";
-    for (size_t i = 0; i < std::min<size_t>(30, br2.size()); i++) {
-      uint32_t bc = find(protCoalesceBlame[*br2[i].second].second);
-      size_t facts = 0, bfacts = 0;
-      for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-        facts += R[bc][s2].count();
-        bfacts += RB[bc][s2].count();
-      }
-      size_t mem2 = 0;
-      if (bc < toOrig.size()) {
-        auto mit2 = canonicalClassMembers.find(toOrig[bc]);
-        if (mit2 != canonicalClassMembers.end())
-          mem2 = mit2->second.size();
-      }
-      auto aIt2 = protAnchor.find(bc);
-      errs() << "ProtCoalesce: " << br2[i].first << "x " << *br2[i].second
-             << "  [class c" << bc << ": members=" << mem2
-             << " facts=" << facts << "+" << bfacts << "br outA="
-             << outA[bc].size() << " cells=" << cellsOf[bc].size()
-             << " keysAnchored="
-             << (aIt2 == protAnchor.end() ? 0 : aIt2->second)
-             << (protCollapsed.count(bc) ? " COLLAPSED" : "") << "]\n";
-    }
-  }
-  }
   if (CFLProbeUserCopyAblate)
     errs() << "UserCopyAblate: " << g_userCopyAsmSevered
            << " copy-body + " << g_userGetAsmSevered
            << " get_user asm memory closures severed ("
            << g_userCopyDerefsSevered
            << " raw-ptr derefs) [MEASUREMENT-ONLY UNSOUND]\n";
-  // NOTE probe/model LEDGER prints must live HERE, after the protOn
-  // block closes — anything inside it only prints when protection is
-  // active (the ops-pairs config), which the canonical config is not.
   if (NB > 0 && g_tagRoundTrips)
     CG_LOG("TagRoundTrip: " << g_tagRoundTrips
            << " ptrtoint wildcards suppressed (tag-bit-only closures)\n");
@@ -8060,10 +7578,6 @@ bool CallGraphPass::runFlowsToResolution() {
            << g_witnessFallback << " pooled fallbacks); fn-plane pairs "
            << g_witnessPooledPairs << " pooled -> " << g_witnessRefinedPairs
            << " per-witness\n");
-  if (CFLProbeRodataJoins)
-    CG_LOG("RodataProbe: " << g_rodataJoinsSkipped
-           << " joins skipped for rodata-bearing witness classes "
-           << "(MEASUREMENT-ONLY over-removal)\n");
   CG_LOG("FilterStats: " << filtCandidates << " CFL candidates, "
          << filtTypeRej << " type-rejected (unsoundness exposure; zero = "
          << "filter retirable), " << filtFieldRej
@@ -15606,583 +15120,6 @@ void CallGraphPass::finalizeChainPairs() {
          << g_chainLate << " post-finalize\n");
 }
 
-// --cfl-ops-pairs (task #30): certify the (ops-global, container)
-// pair invariant per ops global, from IR use evidence (pre-merge, so
-// falsification #6 does not apply). An ops global g is CERTIFIED when
-// every use of g is classified:
-//   - store of &g into a field: the store base (container value) is
-//     captured as g's pair partner;
-//   - embedding in another constant initializer: the embedding global
-//     is the container;
-//   - icmp/ptrtoint-for-compare: benign;
-//   - anything else (escapes into calls, unanalyzable): INCOMPLETE ->
-//     g keeps fully pooled behavior (nothing changes, LEDGERed).
-// Certified pairs feed the step-2 receiver-formal tightening; this
-// pass alone is measurement + table building.
-static size_t g_opsCertified = 0, g_opsIncomplete = 0, g_opsContainers = 0,
-              g_opsEmbedded = 0, g_opsReadOnly = 0, g_opsV2CallCert = 0,
-              g_opsV2RetAlloc = 0, g_opsV2Level2 = 0, g_opsV2BaseUnres = 0,
-              g_opsV2NoBody = 0, g_opsV2Other = 0;
-// F is tightenable iff it belongs to >=1 certified table AND its
-// address appears ONLY inside certified fn-table initializers (walked
-// up constant chains), in direct calls, or in compares — any other
-// escape (raw store of &F, &F as a call argument) means uncertified
-// receivers could reach F, so it stays pooled.
-bool CallGraphPass::opsFnTightenable(const Function *F) {
-  auto it = opsTightCache.find(F);
-  if (it != opsTightCache.end())
-    return it->second;
-  bool inTable = false;
-  for (auto &kv : opsPairs)
-    if (kv.second.members.count(const_cast<Function *>(F))) {
-      inTable = true;
-      break;
-    }
-  bool ok = inTable;
-  if (ok) {
-    for (const User *U : F->users()) {
-      if (const auto *CB = dyn_cast<CallBase>(U)) {
-        if (CB->getCalledOperand()->stripPointerCasts() == F)
-          continue; // direct call
-        ok = false; // &F passed as an argument
-        break;
-      }
-      if (isa<ICmpInst>(U))
-        continue;
-      if (const auto *C = dyn_cast<Constant>(U)) {
-        // climb constant chains to owning globals; each must be a
-        // certified table
-        bool cok = true;
-        SmallVector<const Constant *, 8> cwl{C};
-        SmallPtrSet<const Constant *, 8> cseen;
-        while (!cwl.empty() && cok) {
-          const Constant *CC = cwl.pop_back_val();
-          if (!cseen.insert(CC).second)
-            continue;
-          if (const auto *PG = dyn_cast<GlobalVariable>(CC)) {
-            if (!opsPairs.count(PG))
-              cok = false;
-            continue;
-          }
-          bool owned = false;
-          for (const User *U2 : CC->users()) {
-            if (const auto *PC = dyn_cast<Constant>(U2)) {
-              owned = true;
-              cwl.push_back(PC);
-            } else {
-              cok = false; // constant used by an instruction directly
-              break;
-            }
-          }
-          if (!owned)
-            cok = false; // dangling constant use
-        }
-        if (!cok) {
-          ok = false;
-          break;
-        }
-        continue;
-      }
-      ok = false;
-      break;
-    }
-  }
-  opsTightCache[F] = ok;
-  return ok;
-}
-
-void CallGraphPass::certifyOpsPairs() {
-  auto collectFns = [&](const Constant *C, FuncSet &out,
-                        auto &&self) -> void {
-    if (const auto *F2 = dyn_cast<Function>(C->stripPointerCasts())) {
-      out.insert(getFuncDef(const_cast<Function *>(F2)));
-      return;
-    }
-    if (isa<ConstantAggregate>(C))
-      for (const Use &Op : C->operands())
-        if (const auto *CO = dyn_cast<Constant>(Op.get()))
-          self(CO, out, self);
-  };
-  // Interior pointers (gep(&g, k!=0) as a VALUE): only member reads and
-  // compares are benign. Anything else could store a derived pointer a
-  // two-level site later dispatches through, bypassing the container
-  // set -> the certificate must fail.
-  auto interiorOK = [&](const Constant *C0) -> bool {
-    SmallVector<const Constant *, 4> q{C0};
-    SmallPtrSet<const Constant *, 4> qs;
-    while (!q.empty()) {
-      const Constant *C = q.pop_back_val();
-      if (!qs.insert(C).second)
-        continue;
-      for (const User *U2 : C->users()) {
-        if (isa<ICmpInst>(U2))
-          continue;
-        if (const auto *L2 = dyn_cast<LoadInst>(U2)) {
-          if (L2->getPointerOperand()->stripPointerCasts() == C)
-            continue;
-          return false;
-        }
-        if (const auto *C2 = dyn_cast<ConstantExpr>(U2)) {
-          q.push_back(C2);
-          continue;
-        }
-        return false; // embedded in an initializer, call arg, store, ...
-      }
-    }
-    return true;
-  };
-  // Walker v2: one-level recursion into a direct callee's formal. The
-  // recipe classifies every use of formal [idx] (which holds &g at the
-  // callsites we instantiate from):
-  //   member reads / compares         -> benign
-  //   store into a field of formal k  -> container = caller actual k
-  //   store into a field of a global  -> container = that global
-  //   store into a call-result local
-  //     returned on every path        -> container = the callsite value
-  //   anything else (second-level call, phi, unresolved base) -> FAIL
-  struct FormalRecipe {
-    bool ok = false;
-    bool retAlloc = false;
-    SmallVector<unsigned, 2> formalIdx;
-    SmallVector<const GlobalVariable *, 2> globals;
-  };
-  std::map<std::pair<const Function *, unsigned>, FormalRecipe> recipeCache;
-  std::set<const Function *> stCandidates; // --cfl-propose-ops-st
-  auto walkFormal = [&](const Function *H0,
-                        unsigned idx) -> const FormalRecipe & {
-    auto key = std::make_pair(H0, idx);
-    auto cit = recipeCache.find(key);
-    if (cit != recipeCache.end())
-      return cit->second;
-    FormalRecipe &R2 = recipeCache[key];
-    const Function *H = getFuncDef(const_cast<Function *>(H0));
-    if (!H || H->empty() || idx >= H->arg_size()) {
-      g_opsV2NoBody++;
-      return R2;
-    }
-    const Argument *A = H->getArg(idx);
-    bool ok = true;
-    for (const User *U : A->users()) {
-      if (isa<ICmpInst>(U))
-        continue;
-      if (const auto *LI = dyn_cast<LoadInst>(U)) {
-        if (LI->getPointerOperand()->stripPointerCasts() == A)
-          continue; // member read through the table pointer
-        ok = false;
-        g_opsV2Other++;
-        break;
-      }
-      if (const auto *GI = dyn_cast<GetElementPtrInst>(U)) {
-        if (GI->getPointerOperand()->stripPointerCasts() != A) {
-          ok = false;
-          g_opsV2Other++;
-          break;
-        }
-        bool gok = true;
-        for (const User *GU : GI->users()) {
-          if (isa<ICmpInst>(GU))
-            continue;
-          const auto *GL = dyn_cast<LoadInst>(GU);
-          if (GL && GL->getPointerOperand()->stripPointerCasts() == GI)
-            continue;
-          gok = false;
-          break;
-        }
-        if (!gok) {
-          ok = false;
-          g_opsV2Other++;
-          break;
-        }
-        continue;
-      }
-      if (const auto *SI = dyn_cast<StoreInst>(U)) {
-        if (SI->getValueOperand()->stripPointerCasts() != A) {
-          ok = false; // formal used as a store TARGET base
-          g_opsV2Other++;
-          break;
-        }
-        const Value *B = SI->getPointerOperand()->stripPointerCasts();
-        while (const auto *G2 = dyn_cast<GEPOperator>(B))
-          B = G2->getPointerOperand()->stripPointerCasts();
-        if (const auto *BA = dyn_cast<Argument>(B)) {
-          if (BA->getParent() == H) {
-            R2.formalIdx.push_back(BA->getArgNo());
-            continue;
-          }
-          ok = false;
-          g_opsV2BaseUnres++;
-          break;
-        }
-        if (const auto *BG = dyn_cast<GlobalVariable>(B)) {
-          R2.globals.push_back(BG);
-          continue;
-        }
-        if (const auto *BC = dyn_cast<CallBase>(B)) {
-          // container allocated inside the helper: nameable at the
-          // caller iff every return path yields it (or null)
-          bool retOK = true, anyRet = false;
-          for (const BasicBlock &BB : *H)
-            if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
-              anyRet = true;
-              const Value *RV = RI->getReturnValue();
-              if (!RV) {
-                retOK = false;
-                break;
-              }
-              RV = RV->stripPointerCasts();
-              if (RV == BC || isa<ConstantPointerNull>(RV))
-                continue;
-              if (const auto *PH = dyn_cast<PHINode>(RV)) {
-                // mem2reg null-check shape: ret phi [B, ...], [null, ...]
-                bool phok = true;
-                for (const Value *IV : PH->incoming_values()) {
-                  const Value *IS = IV->stripPointerCasts();
-                  if (IS == BC || isa<ConstantPointerNull>(IS))
-                    continue;
-                  phok = false;
-                  break;
-                }
-                if (phok)
-                  continue;
-              }
-              retOK = false;
-              break;
-            }
-          if (retOK && anyRet) {
-            R2.retAlloc = true;
-            g_opsV2RetAlloc++;
-            continue;
-          }
-          ok = false;
-          g_opsV2BaseUnres++;
-          break;
-        }
-        ok = false;
-        g_opsV2BaseUnres++;
-        break;
-      }
-      if (isa<CallBase>(U)) {
-        ok = false; // second-level escape: one level only
-        g_opsV2Level2++;
-        break;
-      }
-      ok = false;
-      g_opsV2Other++;
-      break;
-    }
-    R2.ok = ok;
-    return R2;
-  };
-  for (auto &mp : Ctx->Modules) {
-    for (const GlobalVariable &GV : mp.first->globals()) {
-      if (!GV.hasInitializer() || !GV.isConstant()) continue;
-      FuncSet ms;
-      collectFns(GV.getInitializer(), ms, collectFns);
-      if (ms.size() < 2) continue;
-      // walk every use of g; the worklist carries the exact &g alias
-      // value so call-argument positions can be matched
-      bool complete = true;
-      std::vector<const Value *> containers;
-      SmallVector<const User *, 16> wl(GV.user_begin(), GV.user_end());
-      SmallPtrSet<const User *, 16> seen;
-      while (!wl.empty() && complete) {
-        const User *U = wl.pop_back_val();
-        if (!seen.insert(U).second) continue;
-        if (const auto *CE = dyn_cast<ConstantExpr>(U)) {
-          if (CE->stripPointerCasts() == &GV) {
-            for (const User *U2 : CE->users()) wl.push_back(U2);
-          } else if (!interiorOK(CE)) {
-            complete = false; // interior pointer escapes
-          }
-          continue;
-        }
-        if (const auto *CA = dyn_cast<Constant>(U)) {
-          // embedded in another global's initializer: find the global
-          bool foundG = false;
-          SmallVector<const User *, 8> cwl(CA->user_begin(), CA->user_end());
-          SmallPtrSet<const User *, 8> cseen;
-          while (!cwl.empty()) {
-            const User *CU = cwl.pop_back_val();
-            if (!cseen.insert(CU).second) continue;
-            if (const auto *PG = dyn_cast<GlobalVariable>(CU)) {
-              containers.push_back(PG);
-              foundG = true;
-              g_opsEmbedded++;
-            } else if (isa<Constant>(CU)) {
-              for (const User *CU2 : CU->users()) cwl.push_back(CU2);
-            } else {
-              complete = false; // constant used by an instruction we
-                                // did not classify at this level
-            }
-          }
-          if (!foundG && cseen.empty()) complete = false;
-          continue;
-        }
-        if (const auto *SI = dyn_cast<StoreInst>(U)) {
-          if (SI->getValueOperand()->stripPointerCasts() != &GV) {
-            complete = false; // g's address used as a store TARGET base?
-            continue;
-          }
-          const Value *B = SI->getPointerOperand()->stripPointerCasts();
-          while (const auto *G2 = dyn_cast<GEPOperator>(B))
-            B = G2->getPointerOperand()->stripPointerCasts();
-          containers.push_back(B);
-          continue;
-        }
-        if (isa<ICmpInst>(U)) continue;
-        if (const auto *LI = dyn_cast<LoadInst>(U)) {
-          if (LI->getPointerOperand()->stripPointerCasts() == &GV)
-            continue; // direct member read (v2: was counted an escape)
-          complete = false;
-          continue;
-        }
-        if (const auto *GI = dyn_cast<GetElementPtrInst>(U)) {
-          bool gok = GI->getPointerOperand()->stripPointerCasts() == &GV;
-          if (gok)
-            for (const User *GU : GI->users()) {
-              if (isa<ICmpInst>(GU)) continue;
-              const auto *GL = dyn_cast<LoadInst>(GU);
-              if (GL && GL->getPointerOperand()->stripPointerCasts() == GI)
-                continue;
-              gok = false;
-              break;
-            }
-          if (!gok) complete = false;
-          continue;
-        }
-        if (const auto *CB = dyn_cast<CallBase>(U)) {
-          // v2: &g escapes into a direct call — recurse one level into
-          // the callee's formal and instantiate the recipe per callsite
-          const auto *H =
-              dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
-          if (!H || CB->isInlineAsm()) {
-            complete = false; // indirect/asm callee: cannot follow
-            continue;
-          }
-          bool any = false, allok = true;
-          for (unsigned ai = 0; ai < CB->arg_size() && allok; ai++) {
-            if (CB->getArgOperand(ai)->stripPointerCasts() != &GV)
-              continue;
-            any = true;
-            const FormalRecipe &R2 = walkFormal(H, ai);
-            if (!R2.ok) {
-              allok = false;
-              break;
-            }
-            for (unsigned k : R2.formalIdx) {
-              if (k >= CB->arg_size()) {
-                allok = false;
-                break;
-              }
-              containers.push_back(CB->getArgOperand(k)->stripPointerCasts());
-            }
-            for (const GlobalVariable *BG : R2.globals)
-              containers.push_back(BG);
-            if (R2.retAlloc)
-              containers.push_back(CB);
-          }
-          if (!any || !allok)
-            complete = false;
-          else {
-            g_opsV2CallCert++;
-            if (CFLProposeOpsSt)
-              for (unsigned ai = 0; ai < CB->arg_size(); ai++)
-                if (CB->getArgOperand(ai)->stripPointerCasts() == &GV) {
-                  const auto &R2 = walkFormal(H, ai);
-                  if (R2.ok && !R2.formalIdx.empty())
-                    stCandidates.insert(getFuncDef(const_cast<Function *>(H)));
-                }
-          }
-          continue;
-        }
-        complete = false; // phi / select / ptrtoint / anything else
-      }
-      if (!complete) {
-        g_opsIncomplete++;
-        continue;
-      }
-      if (containers.empty()) {
-        // read-only table: never stored anywhere, so it can never sit
-        // behind a two-level receiver — certifying it (with an empty
-        // container set) is sound and unblocks opsFnTightenable for
-        // members shared with stored tables.
-        g_opsReadOnly++;
-      }
-      g_opsCertified++;
-      g_opsContainers += containers.size();
-      auto &rec = opsPairs[&GV];
-      rec.members = std::move(ms);
-      rec.containers = std::move(containers);
-    }
-  }
-  // --cfl-propose-ops-st: whole-body qualifier for registration-setter
-  // helpers. A helper is proposable iff EVERY instruction is
-  // replicable per callsite: stores with a formal (GEP-walked) base
-  // and formal/null/small-constant values; non-pointer reads;
-  // pointer loads only feeding null-checks; no call touching a
-  // formal-derived pointer; no pointer phi/select/alloca/atomics; ret
-  // void, non-pointer, constant, or a plain formal (-> ALIAS atom).
-  // Output lines are directly adoptable func_summaries.txt syntax, and
-  // PROPOSALS ONLY — reviewed before adoption, never auto-applied.
-  if (CFLProposeOpsSt) {
-    auto baseOfV = [](const Value *V) -> const Value * {
-      V = V->stripPointerCasts();
-      while (const auto *G2 = dyn_cast<GEPOperator>(V))
-        V = G2->getPointerOperand()->stripPointerCasts();
-      return V;
-    };
-    std::vector<std::string> lines;
-    for (const Function *H : stCandidates) {
-      if (!H || H->empty() || H->isVarArg())
-        continue;
-      std::set<std::string> atoms; // dedup repeated identical stores
-      std::string retAtom;
-      bool ok = true;
-      for (const BasicBlock &BB : *H) {
-        for (const Instruction &I : BB) {
-          if (!ok)
-            break;
-          if (const auto *SI = dyn_cast<StoreInst>(&I)) {
-            const Value *B = baseOfV(SI->getPointerOperand());
-            const auto *BA = dyn_cast<Argument>(B);
-            if (!BA || BA->getParent() != H) {
-              ok = false;
-              break;
-            }
-            const Value *V = SI->getValueOperand()->stripPointerCasts();
-            if (const auto *VA = dyn_cast<Argument>(V)) {
-              if (VA->getParent() != H) {
-                ok = false;
-                break;
-              }
-              // scalar formals (enum/flags) need no atom — only pointer
-              // identity must be replicated per callsite
-              if (containsPointerType(VA->getType()))
-                atoms.insert("ST(*arg" + std::to_string(BA->getArgNo()) +
-                             "<-arg" + std::to_string(VA->getArgNo()) + ")");
-              continue;
-            }
-            if (isa<ConstantPointerNull>(V))
-              continue; // null init: no pointer flow
-            if (const auto *CI = dyn_cast<ConstantInt>(V)) {
-              (void)CI;
-              continue; // constant scalar init
-            }
-            if (V->getType()->isPointerTy()) {
-              ok = false; // fn ptr / global / computed pointer value
-              break;
-            }
-            // non-constant scalar: reject ptr-width ints (possible
-            // laundered provenance), allow narrow scalars
-            if (curDL && V->getType()->isIntegerTy() &&
-                V->getType()->getIntegerBitWidth() >= 64) {
-              ok = false;
-              break;
-            }
-            continue;
-          }
-          if (const auto *LI = dyn_cast<LoadInst>(&I)) {
-            if (!containsPointerType(LI->getType()))
-              continue; // scalar read
-            bool nullChk = true;
-            for (const User *LU : LI->users())
-              if (!isa<ICmpInst>(LU)) {
-                nullChk = false;
-                break;
-              }
-            if (!nullChk) {
-              ok = false;
-              break;
-            }
-            continue;
-          }
-          if (const auto *CB2 = dyn_cast<CallBase>(&I)) {
-            if (const auto *II = dyn_cast<IntrinsicInst>(CB2))
-              if (II->isAssumeLikeIntrinsic() ||
-                  isa<DbgInfoIntrinsic>(II))
-                continue;
-            for (const Use &Op : CB2->args()) {
-              const Value *B = baseOfV(Op.get());
-              if (isa<Argument>(B) || isa<PHINode>(B) || isa<SelectInst>(B) ||
-                  isa<LoadInst>(B)) {
-                ok = false; // formal-derived (or unresolvable) escape
-                break;
-              }
-            }
-            if (!ok)
-              break;
-            continue;
-          }
-          if (const auto *RI = dyn_cast<ReturnInst>(&I)) {
-            const Value *RV = RI->getReturnValue();
-            if (!RV || !RV->getType()->isPointerTy())
-              continue;
-            RV = RV->stripPointerCasts();
-            if (const auto *RA = dyn_cast<Argument>(RV)) {
-              std::string a =
-                  "ALIAS(ret=arg" + std::to_string(RA->getArgNo()) + ")";
-              if (retAtom.empty() || retAtom == a) {
-                retAtom = a;
-                continue;
-              }
-            }
-            if (isa<ConstantPointerNull>(RV) || isa<UndefValue>(RV))
-              continue;
-            ok = false;
-            break;
-          }
-          if (isa<GetElementPtrInst>(I) || isa<ICmpInst>(I) ||
-              isa<BranchInst>(I) || isa<SwitchInst>(I) ||
-              isa<UnreachableInst>(I) || isa<FenceInst>(I))
-            continue;
-          if (const auto *CI2 = dyn_cast<CastInst>(&I)) {
-            if (isa<IntToPtrInst>(CI2) || isa<PtrToIntInst>(CI2)) {
-              ok = false;
-              break;
-            }
-            continue;
-          }
-          if (isa<BinaryOperator>(I))
-            continue;
-          if (isa<PHINode>(I) || isa<SelectInst>(I)) {
-            if (I.getType()->isPointerTy()) {
-              ok = false;
-              break;
-            }
-            continue;
-          }
-          ok = false; // alloca / atomics / aggregates / anything else
-          break;
-        }
-        if (!ok)
-          break;
-      }
-      if (!ok || atoms.empty() || atoms.size() > 6)
-        continue;
-      std::string line = H->getName().str();
-      for (const std::string &a : atoms)
-        line += " " + a;
-      if (!retAtom.empty())
-        line += " " + retAtom;
-      lines.push_back(line);
-    }
-    std::sort(lines.begin(), lines.end());
-    for (const std::string &L : lines)
-      errs() << "OpsST PROPOSAL: " << L << "\n";
-    errs() << "OpsST PROPOSAL: " << lines.size() << " of "
-           << stCandidates.size() << " escape helpers qualified\n";
-  }
-
-  CG_LOG("OpsPairs LEDGER: " << g_opsCertified << " ops globals CERTIFIED ("
-         << g_opsContainers << " containers, " << g_opsEmbedded
-         << " via initializer embedding, " << g_opsReadOnly
-         << " read-only), " << g_opsIncomplete << " incomplete -> pooled; v2: "
-         << g_opsV2CallCert << " call-escapes certified ("
-         << g_opsV2RetAlloc << " ret-alloc), rejections: " << g_opsV2Level2
-         << " second-level, " << g_opsV2BaseUnres << " base-unresolved, "
-         << g_opsV2NoBody << " no-body/vararg, " << g_opsV2Other
-         << " other\n");
-}
 // --cfl-census-strata (task #32): stratum-bridge census. The phys/page
 // stratum re-enters the typed-object universe through inlined
 // phys<->virt conversions — under KASLR these load the NAMED base
@@ -20788,9 +19725,6 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLCensusFields && iteration == 0 && M == Ctx->Modules.front().first)
     runFieldChannelCensus(); // measurement-only, adds no edges
-
-  if (CFLOpsPairs && iteration == 0 && M == Ctx->Modules.front().first)
-    certifyOpsPairs(); // pair certificates from IR use evidence
 
   if (CFLCensusStrata && iteration == 0 && M == Ctx->Modules.front().first)
     runStrataCensus(); // measurement-only, adds no edges

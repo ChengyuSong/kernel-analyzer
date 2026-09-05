@@ -1,0 +1,35 @@
+# Release trim: fix-or-remove ledger (started 2026-09-04)
+
+Policy (user): no tombstones, no parked code — fix it or remove it.
+History lives in git; the tree ships what works. Every removal is a
+pure deletion of default-off paths, gated by cfl-smoke + the
+canonical pin.
+
+REMOVED:
+- witness-taint (2026-09-04): retired experiment, falsified by
+  design review + GT. Files deleted; flag deleted.
+- incremental cross-iteration solving (2026-09-04): divergent at
+  kernel corpora (docs/incremental-518-divergence.md); the fix is
+  a perpetual seed-enumeration tax on every future edge kind for a
+  ~20% wall win that the PROVEN-EXACT lazymint+bidi pair largely
+  recovers. wireIncremental + flag + envelope guards deleted.
+  incr_exact (Staging.lean) retained as the specification for any
+  future reimplementation.
+
+QUEUED (each = its own gated pass):
+1. origin-bundles: parked feature, default-off; entangled with the
+   drain path (25 refs: bundlesActive/bundleLeaves/bundleCurNext +
+   epoch/expansion lambdas + 2 flags). Bundles.lean + design doc
+   stay as the record.
+2. Flag census for the wider trim — candidates by class:
+   - superseded mechanisms: --cfl-ops-pairs, --cfl-rodata-copy,
+     --cfl-join-cone (predecessors of regfield/obj; verify nothing
+     canonical consumes the shared protection machinery first)
+   - one-off measurement probes that produced their numbers and
+     are recorded in docs: ablate-mints/ablate-funcs, probe-*,
+     census-* (KEEP the ones the paper's instruments still use:
+     probe-blob-formation/ClassHist, census-couplers, gt dumps)
+   - legacy/task-specific listed in cli-reference "Other" section
+3. cli-reference.md regeneration after each pass (remove dead
+   entries).
+4. The trimmed tree then IS the FSE artifact base (anonymized).

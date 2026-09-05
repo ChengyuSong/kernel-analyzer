@@ -411,25 +411,6 @@ cl::opt<bool> CFLRegFieldObj(
            "Requires --cfl-regfield-apply machinery (same walk)"),
   cl::init(false));
 
-cl::opt<bool> CFLWitnessTaint(
-  "cfl-witness-taint",
-  cl::desc("RETIRED EXPERIMENT (falsification, 2026-08-29): re-answers "
-           "the flows-to question over the same flows with a no-merge/"
-           "refuse join — redundant by design review (the deficiency "
-           "is the cluster-join quotient, not the traversal) and "
-           "GT-red at kernel scale (79->164 FN, NF_HOOK okfn/k_clock "
-           "re-implementation gaps). Kept for study; NEVER pin. "
-           "Original intent: demand-driven witness-taint "
-           "propagation over IR (strict lattice {Fn, Obj(root,off,"
-           "stride)} + poison; exact cells for globals/allocas, "
-           "typed (struct,off) cells as the heap fallback, escape-"
-           "based poisoning). Clamps an icall iff its fptr evaluates "
-           "poison-free to a pure fn set — subsumes the regfield "
-           "walk's witness classes WITH flow composition (two-hop "
-           "populations, stack copies) and uses no GEP-syntax site "
-           "attribution. Independent lever, same gate ladder; "
-           "watch via --cfl-regfield-watch"),
-  cl::init(false));
 
 cl::opt<std::string> CFLRegFieldWatch(
   "cfl-regfield-watch",
@@ -1063,16 +1044,6 @@ cl::opt<bool> CFLRootRelevance(
            "lever (solver work ~ |E| x |roots|)"),
   cl::init(false));
 
-cl::opt<bool> CFLFlowsToIncremental(
-  "cfl-flows-to-incremental",
-  cl::desc("Continue the flows-to solve across resolution iterations "
-           "instead of re-solving from scratch. Task #43 (b82985d) "
-           "fixed the stale-bidi-cone divergence; km-validated EXACT "
-           "for FI configs (byte-identical, faster) and AUTO-ENABLED "
-           "there. Refused under field sensitivity (known pool-smear "
-           "divergence) and unvalidated with batching/lazy-mint (not "
-           "auto-enabled)"),
-  cl::init(false));
 
 cl::opt<unsigned> CFLSolverThreads(
   "cfl-solver-threads",
@@ -1388,7 +1359,6 @@ int main(int argc, char **argv) {
                             "--cfl-compositional=false");
     };
     requireFlowsTo(CFLLazyMint, "--cfl-lazy-mint");
-    requireFlowsTo(CFLFlowsToIncremental, "--cfl-flows-to-incremental");
     requireFlowsTo(CFLFlowsToSlice, "--cfl-flows-to-slice");
     requireFlowsTo(CFLResidueCopies, "--cfl-residue-copies");
     requireFlowsTo(CFLConflationReport, "--cfl-conflation-report");
@@ -1453,57 +1423,6 @@ int main(int argc, char **argv) {
       errs() << "ERROR: --cfl-batch-workers requires --cfl-batch-roots "
                 "(the batch size defines what each worker solves)\n";
       exit(1);
-    }
-    // Incremental cross-iteration solving (task #43, km-validated
-    // 2026-08-07): EXACT for FI configs (byte-identical, faster, bidi
-    // cone re-admit fixed) but DIVERGENT under field sensitivity
-    // (pool-smear, -504/+0 at km all+ids, bidi-independent). Enable by
-    // default inside the validated envelope; refuse explicit requests
-    // outside it.
-    {
-      const bool fsConfig =
-          CFLFieldBuckets > 0 || !CFLNexusFields.empty();
-      if (CFLFlowsToIncremental && fsConfig && !CFLPreSolveOnce) {
-        errs() << "ERROR: --cfl-flows-to-incremental is not exact under "
-                  "field sensitivity against the EAGER pre-solve pin: the "
-                  "task-#43 divergence (-504 opt_pre_handler) is pool-smear "
-                  "manufactured by the post-wiring pre-solve re-run, which "
-                  "incremental never executes (attributed 2026-08-16). "
-                  "Add --cfl-presolve-once to compare against the "
-                  "smear-free pin, or drop the fs flags\n";
-        exit(1);
-      }
-      if (CFLFlowsToIncremental && fsConfig && CFLPreSolveOnce)
-        errs() << "FlowsTo: fs + incremental + presolve-once — validating "
-                  "against the presolve-once scratch pin (A/B-gated "
-                  "combo, 2026-08-16)\n";
-      // Re-validated 2026-08-12 at HEAD (field filter retired,
-      // percpu-gated identity rules): km incremental == from-scratch,
-      // 160,945 pairs, zero diff both directions. A false divergence
-      // alarm during the fs13 investigation came from comparing runs
-      // of DIFFERENT binary vintages (filter-active incremental vs
-      // filter-retired scratch) — vintage discipline matters: only
-      // same-binary pins may be diffed.
-      // AUTO-ON RETIRED 2026-09-04: the #43 km-FI validation does
-      // NOT transfer to kernel corpora. At linux-5.18 FI the
-      // incremental solve drops a callback-argument flow family
-      // (decompressor error callbacks, i915 PTE walkers, netfs
-      // completions) relative to from-scratch: base -4,394, +0;
-      // present under every mechanism combination (channels mask
-      // part of it: full-stack -2,032). Two independent
-      // from-scratch witnesses (scratch, lazy-mint) agree
-      // byte-for-byte. Incremental is opt-in only, with the
-      // divergence stated; exactness repair is an open ticket
-      // (sibling of the fs -504 divergence).
-      if (flowsToActive && CFLFlowsToIncremental &&
-          CFLFlowsToIncremental.getNumOccurrences() > 0 && !fsConfig) {
-        errs() << "FlowsTo: WARNING: incremental cross-iteration "
-                  "solving is OPT-IN and KNOWN-DIVERGENT at kernel "
-                  "corpora (linux-5.18 FI: -4,394 pairs vs "
-                  "from-scratch, 2026-09-04; km FI remains "
-                  "byte-identical). Answers are NOT the canonical "
-                  "pin. See docs/incremental-518-divergence.md.\n";
-      }
     }
     if (CFLBatchRoots > 0 &&
         (CFLOpsPairs || CFLRodataCopy || CFLJoinCone)) {

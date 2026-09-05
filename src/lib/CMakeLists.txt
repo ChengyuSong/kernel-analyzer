@@ -11,7 +11,6 @@ set (KASource
   CompressedGraph.cc
   CallGraph.cc
   IRSidecar.cc
-  WitnessTaint.cc
   IRCensus.cc
 )
 

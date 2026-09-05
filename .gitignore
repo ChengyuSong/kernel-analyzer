@@ -7,3 +7,12 @@ GPATH
 GRTAGS
 GTAGS
 test/baselines/*icalls.sort.gz
+# big local artifacts — never commit (release-trim, 2026-09-04)
+*-pairs.txt
+*.pdf
+/debug*/
+/release/
+/.claude/
+/Notes
+/test/__pycache__/
+/tools/__pycache__/

@@ -56,7 +56,6 @@ per-caller target distribution.
 - **`--cfl-field-buckets`** (default `0`): Number of bucketed field-offset labels for field-sensitive CFL memory modeling (0 = field-insensitive, default)
 - **`--cfl-nexus-fields`** (default `""`): Surgical field sensitivity (task #39): comma-separated named struct list (e.g. task_struct,file,cred) or 'default' (the fat-object census list). ONLY origins of these nexus types carry exact field residues; every other origin mints on the wildcard plane, which is bit-identical to FI for it (one (o,X) join cluster, no exact keys, no VX bridges) — the residue-plane cost is confined to the nexus population. Requires --cfl-field-buckets>0 (auto-set to 13 if unset)
 - **`--cfl-flows-to-max-iters`** (default `10`): Cap on flows-to outer fixpoint iterations (resolve icalls -> wire callee arg/ret flows -> re-solve). Hitting the cap with unprocessed wirings is reported as an UNSOUND-RISK warning
-- **`--cfl-flows-to-incremental`** (default `false`): Continue the flows-to solve across resolution iterations instead of re-solving from scratch. Task #43 (b82985d) fixed the stale-bidi-cone divergence; km-validated EXACT for FI configs (byte-identical, faster) and AUTO-ENABLED there. Refused under field sensitivity (known pool-smear divergence) and unvalidated with batching/lazy-mint (not auto-enabled)
 
 ## Answer/dump
 

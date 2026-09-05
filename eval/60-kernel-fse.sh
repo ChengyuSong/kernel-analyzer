@@ -43,15 +43,12 @@
 # Arms (PERF family; answers must be BYTE-IDENTICAL to full — a
 # mismatch is a soundness bug, reported loudly; the measurement is
 # the wall/RSS delta):
-#   NOTE 2026-09-04: incremental auto-on is RETIRED (known-divergent
-#   at kernel corpora; docs/incremental-518-divergence.md). full/base
-#   and all arms now solve from scratch by default; the scratch arm
-#   is the trivial guard-verification (must be identical), and an
-#   optional 'incr' arm documents the divergence.
+#   NOTE 2026-09-04: incremental cross-iteration solving is REMOVED
+#   (fix-or-remove policy; docs/incremental-518-divergence.md — the
+#   proven-exact lazymint+bidi pair recovers the perf). All arms
+#   solve from scratch.
 #   noshare     full + --cfl-intern-planes=false   (COW plane sharing)
 #   nofastjoin  full + --cfl-join-fastpath=false   (cluster-mark joins)
-#   scratch     full + --cfl-flows-to-incremental=false
-#               (FI-ONLY: incremental is refused under fs)
 #   lazymint    full + --cfl-lazy-mint             (additive arm)
 #   bidi        full + --cfl-bidi-prune            (additive arm)
 #               NOTE: perf family AT FI ONLY (answer-preserving,
@@ -151,8 +148,6 @@ arm_flags() {
     nosummaries) echo "${NOADOPT[@]}" ;;
     noshare)     echo "${FULLPREC[@]} --cfl-intern-planes=false --func-summaries=$SUM" ;;
     nofastjoin)  echo "${FULLPREC[@]} --cfl-join-fastpath=false --func-summaries=$SUM" ;;
-    scratch)     echo "${FULLPREC[@]} --cfl-flows-to-incremental=false --func-summaries=$SUM" ;;
-    incr)        echo "${FULLPREC[@]} --cfl-flows-to-incremental --func-summaries=$SUM" ;;
     lazymint)    echo "${FULLPREC[@]} --cfl-lazy-mint --func-summaries=$SUM" ;;
     bidi)        echo "${FULLPREC[@]} --cfl-bidi-prune --func-summaries=$SUM" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
@@ -230,10 +225,9 @@ fat_tail() { # arm -> "callers>=100targets maxfanout"
     "$OUT/$1-pairs.txt"
 }
 
-EXACT_ARMS=" noshare nofastjoin scratch lazymint bidi "
+EXACT_ARMS=" noshare nofastjoin lazymint bidi "
 ALL_ARMS=(full base noadopt noregf nochain notpkeys noopstables
-          noinvoke nosummaries noshare nofastjoin scratch lazymint
-          bidi)
+          noinvoke nosummaries noshare nofastjoin lazymint bidi)
 ARMS=("$@")
 [[ ${#ARMS[@]} -eq 0 ]] && ARMS=("${ALL_ARMS[@]}")
 

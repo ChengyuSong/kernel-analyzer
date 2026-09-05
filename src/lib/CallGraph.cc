@@ -56,7 +56,6 @@
 #include "CallGraph.h"
 #include "BitPlane.h"
 #include "IRCensus.h"
-#include "WitnessTaint.h"
 #include "Annotation.h"
 #include "VSnapshot.h"
 
@@ -3640,7 +3639,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // Re-callable (#43): incremental wiring appends its edge deltas to
   // aEdges/dEdges/fEdges/wildcardNodes and recomputes — the prune's
   // soundness argument ("the oracle recomputes per outer iteration")
-  // otherwise breaks when --cfl-flows-to-incremental never rebuilds.
+  // otherwise breaks if the graph were reused across rebuilds.
   auto computeBidiCone = [&]() {
     auto tBidi = std::chrono::steady_clock::now();
     bidiUF.assign(N, 0);
@@ -5724,203 +5723,6 @@ bool CallGraphPass::runFlowsToResolution() {
       addFact(rep, (nexusGate && !rootNexus[rid]) ? SHIFT_X : 0, cid,
               ctx0);
   };
-  auto wireIncremental = [&](size_t lo) {
-    const uint32_t oldN = N;
-    const uint32_t rootsBefore = nextRoot;
-    // Phase 1: classify the appended EB edges (dense() grows the id
-    // space; per-class arrays follow in growTo before any indexing).
-    struct NewEdge { uint32_t kind, a, b, c; }; // 0=a 1=d 2=f 3=fx
-    std::vector<NewEdge> batch;
-    for (size_t i = lo; i < edges.size(); i++) {
-      const auto &E = edges[i];
-      NodeIndex cf = getCanonicalNode(E.from), ct = getCanonicalNode(E.to);
-      if (E.label == la) {
-        uint32_t x = dense(cf), y = dense(ct);
-        if (x != y) batch.push_back({0, x, y, 0});
-      } else if (E.label == ld) {
-        batch.push_back({1, dense(cf), dense(ct), 0});
-      } else if (NB > 0 && E.label == lfx) {
-        batch.push_back({3, dense(cf), 0, 0});
-      } else if (NB > 0) {
-        auto bIt = bucketOfLabel.find(E.label);
-        if (bIt != bucketOfLabel.end())
-          batch.push_back({2, dense(cf), dense(ct), bIt->second});
-      }
-    }
-    // Keep the bidi oracle's raw edge lists current: the cone is
-    // recomputed after this batch (phase 3.5) and must see the wired
-    // call edges, or origins they pull into the cone stay pruned.
-    if (!bidiMarked.empty())
-      for (const NewEdge &e : batch) {
-        if (e.kind == 0) aEdges.emplace_back(e.a, e.b);
-        else if (e.kind == 1) dEdges.emplace_back(e.a, e.b);
-        else if (e.kind == 2) fEdges.emplace_back(e.a, e.b, e.c);
-        else wildcardNodes.insert(e.a);
-      }
-    growTo((uint32_t)toOrig.size());
-    // Park obsolete identity roots: any parkable root whose class is the
-    // target of a new a/f edge is exactly a root the from-scratch
-    // rebuild would stop minting. Its bit stays where drain 0 already
-    // put it (joins made from it remain — sound over-approximation) but
-    // is masked out of all further edge seeding.
-    {
-      boost::unordered_flat_set<uint32_t> tgtReps;
-      for (const NewEdge &e : batch)
-        if (e.kind == 0 || e.kind == 2) tgtReps.insert(find(e.b));
-      size_t parked = 0;
-      for (uint32_t rid = 0; rid < (uint32_t)rootClassOf.size(); rid++) {
-        if (!rootParkable[rid] || parkedRoots.test(rid)) continue;
-        if (tgtReps.count(find(rootClassOf[rid]))) {
-          parkedRoots.set(rid);
-          parked++;
-        }
-      }
-      if (parked)
-        CG_LOG("FlowsTo incremental: parked " << parked
-               << " obsolete identity roots\n");
-    }
-    FactSet seedScratch;
-    auto seedBits = [&](uint32_t tgt, uint32_t s2, const FactSet &plane) {
-      if (plane.none()) return;
-      if (parkedRoots.none()) { addBits(tgt, s2, plane, ctx0); return; }
-      seedScratch.copyFrom(plane);
-      seedScratch.subtract(parkedRoots);
-      if (seedScratch.any()) addBits(tgt, s2, seedScratch, ctx0);
-    };
-    // Phase 2: apply. Edge lists live on the current rep (a merged-away
-    // class's lists were already moved); targets stay raw and resolve
-    // with find() at use, exactly like the initial build. Each new edge
-    // is seeded with the source class's full current planes — the same
-    // one-time push merge() does for moved edges.
-    // Spill composition: restored batches must re-offer facts at the
-    // sources of newly wired edges (their live-plane seeding below only
-    // covers whatever batch happens to be resident).
-    if (g_touchTrack)
-      for (const NewEdge &e : batch)
-        g_touchLog.push_back(find(e.a));
-    size_t nA = 0, nD = 0, nF = 0, nW = 0;
-    for (const NewEdge &e : batch) {
-      if (e.kind == 0) {
-        hasIn[e.b] = true;
-        if (protOn) {
-          const uint32_t pb = find(e.b);
-          if (!protIn[pb]) {
-            protIn[pb] = 1;
-            if (readerBridgedTo.count(pb))
-              protDemoteQ.push_back(pb);
-          }
-        }
-        uint32_t x = find(e.a), y = find(e.b);
-        if (x == y) continue;
-        outA[x].push_back(e.b);
-        nA++;
-        if (traceRoot >= 0) { tHow = "inc-wire-a"; tFrom = x; }
-        for (uint32_t s = 0; s < NSHIFT; s++) {
-          seedBits(y, s, R[x][s]);
-          seedBits(y, s, RB[x][s]);
-        }
-      } else if (e.kind == 1) {
-        uint32_t p = find(e.a);
-        auto &cs = cellsOf[p];
-        if (std::find(cs.begin(), cs.end(), e.b) == cs.end()) {
-          cs.push_back(e.b);
-          nD++;
-          // A new cell invalidates the all-cells joined marks: re-offer
-          // the class's full fact set; old cells re-confirm via the
-          // one-lookup fast path.
-          for (uint32_t s = 0; s < NSHIFT; s++) {
-            joined[p][s].clear();
-            if (R[p][s].any()) jdirty[p][s].unionWith(R[p][s]);
-            if (RB[p][s].any()) jdirty[p][s].unionWith(RB[p][s]);
-          }
-          push(p, ctx0);
-        }
-      } else if (e.kind == 2) {
-        hasIn[e.b] = true;
-        if (protOn) {
-          const uint32_t pb = find(e.b);
-          if (!protIn[pb]) {
-            protIn[pb] = 1;
-            if (readerBridgedTo.count(pb))
-              protDemoteQ.push_back(pb);
-          }
-        }
-        uint32_t b = find(e.a);
-        outF[b].emplace_back(e.b, e.c);
-        nF++;
-        if (traceRoot >= 0) { tHow = "inc-wire-f"; tFrom = b; }
-        for (uint32_t s = 0; s < NSHIFT; s++) {
-          uint32_t tt = find(e.b);
-          uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + e.c) % NB;
-          if (tt == b && s2 == s) continue;
-          seedBits(tt, s2, R[b][s]);
-          seedBits(tt, s2, RB[b][s]);
-        }
-      } else {
-        uint32_t w = find(e.a);
-        if (!wflag[w]) {
-          wflag[w] = 1;
-          nW++;
-          if (traceRoot >= 0) { tHow = "inc-wire-fx"; tFrom = w; }
-          for (uint32_t s = 0; s < NB; s++) {
-            if (R[w][s].any()) addBits(w, SHIFT_X, R[w][s], ctx0);
-            if (RB[w][s].any()) addBitsBridged(w, SHIFT_X, RB[w][s], ctx0);
-          }
-        }
-      }
-    }
-    // Phase 3: mint identity roots — new classes by the initial-minting
-    // criterion (heap objects, allocator callsite values, previously
-    // edge-less formals), plus existing classes that just became
-    // allocation sites (their identity was not origin-bearing when the
-    // initial mint ran).
-    for (uint32_t n2 = oldN; n2 < N; n2++)
-      if (!hasIn[n2] || originBearing(toOrig[n2])) {
-        // Lazy mode defers exactly like the initial mint: the
-        // post-drain expansion admits the class if/when it enters A.
-        if (CFLLazyMint) lazyDeferred.push_back(n2);
-        else mintRoot(n2);
-      }
-    for (NodeIndex an : newAllocNodes) {
-      auto dIt = toDense.find(getCanonicalNode(an));
-      assert(dIt != toDense.end() &&
-             "allocator callsite class missing from dense map");
-      if (CFLLazyMint) lazyDeferred.push_back(dIt->second);
-      else mintRoot(dIt->second);
-    }
-    newAllocNodes.clear();
-    // Phase 3.5 (#43, the #15 root cause): re-run the bidi relevance
-    // oracle over the updated edge lists. The from-scratch outer driver
-    // re-admitted pruned origins implicitly by rebuilding; incremental
-    // wiring must do it explicitly — the cone only grows (edges are
-    // append-only), so this is a monotone re-admission, never a
-    // re-prune. Skipped when nothing was ever pruned.
-    if (!bidiMarked.empty() && !bidiPrunedCls.empty()) {
-      computeBidiCone();
-      size_t readmit = 0;
-      std::vector<uint32_t> still;
-      still.reserve(bidiPrunedCls.size());
-      for (uint32_t pc : bidiPrunedCls) {
-        if (bidiMarked[pc]) {
-          if (CFLLazyMint) lazyDeferred.push_back(pc);
-          else mintRoot(pc);
-          readmit++;
-        } else {
-          still.push_back(pc);
-        }
-      }
-      bidiPrunedCls.swap(still);
-      if (readmit)
-        CG_LOG("FlowsTo incremental: bidi cone re-admitted " << readmit
-               << " pruned origins (" << bidiPrunedCls.size()
-               << " remain outside)\n");
-    }
-    flushCtx(ctx0);
-    CG_LOG("FlowsTo incremental: +" << (N - oldN) << " classes, +" << nA
-           << " a / +" << nD << " d / +" << nF << " f / +" << nW
-           << " fx edges, +" << (nextRoot - rootsBefore) << " roots ("
-           << nextRoot << " total)\n");
-  };
 
   // Lazy-mint expansion (task #21, rules 2+3): recompute A on the
   // CURRENT quotient — merges only coarsen it, so A only grows — and
@@ -6308,9 +6110,6 @@ bool CallGraphPass::runFlowsToResolution() {
     if (CFLBidiPrune)
       KA_ERR("--cfl-origin-bundles: bidi-prune parks rids per-id "
              "(unaudited per-rid mechanism); drop --cfl-bidi-prune\n");
-    if (CFLFlowsToIncremental)
-      KA_ERR("--cfl-origin-bundles: incremental solving is unvalidated "
-             "with bundles; drop --cfl-flows-to-incremental\n");
     if (CFLRootRelevance)
       KA_ERR("--cfl-origin-bundles: --cfl-root-relevance records "
              "per-rid merge witnesses mid-solve; drop one flag\n");
@@ -6735,9 +6534,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // Batch bounds FREEZE at creation (spill headers reference them);
   // root growth appends new batches. hasFile/cursor/touch state
   // persists across resolution passes so spilled fixpoints carry over
-  // wiring boundaries — the #15 incremental composition: with
-  // --cfl-flows-to-incremental the outer driver never rebuilds, and
-  // passes after the first restore + drain only the wiring delta.
+  // wiring boundaries (batch spill/restore).
   std::vector<std::pair<uint32_t, uint32_t>> batchBounds;
   std::vector<char> batchHasFile;
   std::vector<size_t> batchCursor; // touch-log length at last save
@@ -8853,11 +8650,7 @@ bool CallGraphPass::runFlowsToResolution() {
             << "through those callees (--cfl-iter-cap-ok accepted)\n");
     break;
   }
-  if (!CFLFlowsToIncremental)
-    return true; // from-scratch mode: driver rebuilds and re-solves
-  wireIncremental(edgesConsumed);
-  edgesConsumed = edges.size();
-  fpIter++;
+  return true; // driver rebuilds and re-solves each resolution iteration
   } // outer resolution fixpoint
 
   // Reduce per-thread counters into the reporting totals.
@@ -19743,8 +19536,6 @@ bool CallGraphPass::doFinalization(Module *M) {
     // Regfield detector/channels run FIRST so an applied channel is
     // reflected in the tally, the ICALL dump, and every downstream
     // consumer (apply only touches CLOSED keys; report adds nothing).
-    if (CFLWitnessTaint)
-      runWitnessTaint(Ctx);
     if (CFLRegFieldReport || CFLRegFieldApply || CFLRegFieldObj)
       runRegFieldGapReport();
     // compare callees found by CFL and type matching

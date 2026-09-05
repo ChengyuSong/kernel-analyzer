@@ -7,7 +7,6 @@
 #  loudly, never silently accepted):
 #    noshare    --cfl-intern-planes=false        (#46 COW plane sharing)
 #    nofastjoin --cfl-join-fastpath=false        (#48 cluster-mark skips)
-#    scratch    --cfl-flows-to-incremental=false (vs FI auto-enable)
 #    lazymint   --cfl-lazy-mint                  (demand-driven mint)
 #
 #  PRECISION family (identity channels / relevance discipline —
@@ -32,14 +31,13 @@ mkdir -p "$KA_RESULTS"
 csv="$KA_RESULTS/ablations.csv"
 echo "corpus,ablation,family,outcome,wall,peak_rss_kb,pairs,delta_pairs,check,sha256" > "$csv"
 
-ALL_ABL="noshare nofastjoin scratch lazymint notpkeys noopstables nocone nosummaries"
+ALL_ABL="noshare nofastjoin lazymint notpkeys noopstables nocone nosummaries"
 ABL_LIST=${KA_ABLATE_LIST:-$ALL_ABL}
 
 abl_flags() { # abl_flags <name> -> extra flags on stdout; rc=1 = skip
   case $1 in
     noshare)     echo "--cfl-intern-planes=false" ;;
     nofastjoin)  echo "--cfl-join-fastpath=false" ;;
-    scratch)     echo "--cfl-flows-to-incremental=false" ;;
     lazymint)    echo "--cfl-lazy-mint" ;;
     notpkeys)    echo "--cfl-tracepoint-keys=false" ;;
     noopstables) echo "--cfl-static-ops-tables=false" ;;
@@ -51,7 +49,7 @@ abl_flags() { # abl_flags <name> -> extra flags on stdout; rc=1 = skip
 
 abl_family() {
   case $1 in
-    noshare|nofastjoin|scratch|lazymint) echo exact ;;
+    noshare|nofastjoin|lazymint) echo exact ;;
     *)                                   echo precision ;;
   esac
 }

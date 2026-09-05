@@ -77,7 +77,6 @@ extern cl::opt<bool> CFLRegFieldReport;
 extern cl::opt<bool> CFLRegFieldApply;
 extern cl::opt<bool> CFLRegFieldAudit;
 extern cl::opt<std::string> CFLRegFieldWatch;
-extern cl::opt<bool> CFLWitnessTaint;
 extern cl::opt<bool> CFLRegFieldObj;
 extern cl::opt<bool> CFLIterCapOk;
 extern cl::opt<bool> CFLInternSweep;
@@ -106,7 +105,6 @@ extern cl::opt<std::string> CFLAblateMints;
 extern cl::opt<bool> CFLConfirmFresh;
 extern cl::opt<bool> CFLProbeRodataJoins;
 extern cl::opt<bool> CFLRootRelevance;
-extern cl::opt<bool> CFLFlowsToIncremental;
 extern cl::opt<unsigned> CFLSolverThreads;
 extern cl::opt<unsigned> CFLSolverBlock;
 

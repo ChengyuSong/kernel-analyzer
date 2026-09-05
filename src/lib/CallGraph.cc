@@ -2609,68 +2609,6 @@ public:
     B <<= base;
     S.clear();
   }
-  // Bundle epoch (docs/origin-bundles-design.md): remap every bit
-  // through a total old->new id map. Shared dense buffers are remapped
-  // ONCE via shareMap so the COW sharing structure (and its pointer-
-  // equality fast paths) survives the renumbering. Caller sets
-  // Universe to the NEW width first.
-  void remapBits(const std::vector<uint32_t> &renum,
-                 std::unordered_map<const void *,
-                                    std::shared_ptr<ka::BitPlane>>
-                     &shareMap) {
-    if (D) {
-      auto it = shareMap.find(D.get());
-      if (it != shareMap.end()) { D = it->second; return; }
-      auto nd = std::make_shared<ka::BitPlane>(Universe);
-      for (int i = D->find_first(); i != -1; i = D->find_next(i)) {
-        assert((uint32_t)i < renum.size() && "plane bit outside rid space");
-        const uint32_t g = renum[(uint32_t)i];
-        if (g >= nd->size()) nd->resize(std::max<uint32_t>(Universe, g + 1));
-        nd->set(g);
-      }
-      shareMap.emplace(D.get(), nd);
-      D = nd;
-      return;
-    }
-    for (auto &x : S) {
-      assert(x < renum.size() && "plane bit outside rid space");
-      x = renum[x];
-    }
-    std::sort(S.begin(), S.end());
-    S.erase(std::unique(S.begin(), S.end()), S.end());
-  }
-  // Drain-end de-bundling: expand every bit to its original-rid leaves.
-  // Caller sets Universe back to the original width first.
-  void expandBits(const std::vector<llvm::SmallVector<uint32_t, 1>> &leaves,
-                  std::unordered_map<const void *,
-                                     std::shared_ptr<ka::BitPlane>>
-                      &shareMap) {
-    if (D) {
-      auto it = shareMap.find(D.get());
-      if (it != shareMap.end()) { D = it->second; return; }
-      auto nd = std::make_shared<ka::BitPlane>(Universe);
-      for (int i = D->find_first(); i != -1; i = D->find_next(i)) {
-        assert((uint32_t)i < leaves.size() && "plane bit outside rid space");
-        for (uint32_t l : leaves[(uint32_t)i]) {
-          if (l >= nd->size())
-            nd->resize(std::max<uint32_t>(Universe, l + 1));
-          nd->set(l);
-        }
-      }
-      shareMap.emplace(D.get(), nd);
-      D = nd;
-      return;
-    }
-    llvm::SmallVector<uint32_t, 2> ns;
-    for (uint32_t x : S) {
-      assert(x < leaves.size() && "plane bit outside rid space");
-      for (uint32_t l : leaves[x]) ns.push_back(l);
-    }
-    std::sort(ns.begin(), ns.end());
-    ns.erase(std::unique(ns.begin(), ns.end()), ns.end());
-    S = std::move(ns);
-    if (S.size() > kPromote) promote();
-  }
   bool subsetOf(const FactSet &o) const { // this ⊆ o? read-only, no alloc
     if (none()) return true;
     if (o.none()) return false;
@@ -3347,12 +3285,7 @@ bool CallGraphPass::runFlowsToResolution() {
         fEdges.emplace_back(dense(cf), dense(ct), bIt->second);
     }
   }
-  uint32_t N = toOrig.size(); // grows when resolution wiring adds nodes
-  // Fixed-capacity headroom for the atomic per-class arrays (they cannot
-  // be resized in place): incremental wiring adds at most a few classes
-  // per resolved callsite (allocator callsite values, heap objects,
-  // previously edge-less formals).
-  const uint32_t solverCapN = N + (1u << 18);
+  const uint32_t N = toOrig.size();
   std::vector<std::vector<uint32_t>> outA(N);
   for (auto [s, t] : aEdges) outA[s].push_back(t);
   // f-edges as shift transformers: (target, residue).
@@ -3938,17 +3871,6 @@ bool CallGraphPass::runFlowsToResolution() {
       auto dIt = toDense.find(getCanonicalNode(p.first));
       if (dIt != toDense.end()) certCls.insert(dIt->second);
     }
-  auto protBlameName2 = [&](uint32_t cls) -> std::string {
-    const Value *V2 = NF.getValueForNode(toOrig[cls]);
-    if (!V2) return "<synth>";
-    if (V2->hasName()) return V2->getName().str();
-    if (const auto *I2 = dyn_cast<Instruction>(V2))
-      return (I2->getFunction()->getName() + "::" + I2->getOpcodeName()).str();
-    if (const auto *A2 = dyn_cast<Argument>(V2))
-      return (A2->getParent()->getName() + "#arg" +
-              std::to_string(A2->getArgNo())).str();
-    return "<unnamed>";
-  };
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
     auto fit = funcOfCanon.find(toOrig[n]);
@@ -4415,8 +4337,8 @@ bool CallGraphPass::runFlowsToResolution() {
            "unbatched solve: T=1, no batch roots/workers)\n");
   bool parallelPhase = false; // true only inside a parallel wave phase
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
-      new std::atomic<uint8_t>[solverCapN]);
-  for (uint32_t i = 0; i < solverCapN; i++)
+      new std::atomic<uint8_t>[N]);
+  for (uint32_t i = 0; i < N; i++)
     classLk[i].store(0, std::memory_order_relaxed);
   auto lockC = [&](uint32_t n) {
     if (!parallelPhase) return;
@@ -4493,8 +4415,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // A/B'd byte-identical at km fs41 — and FLAT (-0.9%): occupancy is
   // 93% LIVE planes at pop time and empty-plane peeks measure 0.005%
   // of cycles (SolverProf scan). fs plane cost is real work, not
-  // iteration overhead; the levers are fact-mass reduction (origin
-  // bundles, channels), not plane skipping.
+  // iteration overhead; the levers are fact-mass reduction (channels),
+  // not plane skipping.
   auto internPlanes = [&]() {
     internSweeps++;
     auto prefixLen = [](const uint64_t *W, size_t n) {
@@ -4593,8 +4515,8 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t i = 0; i < N; i++) topoRank[i] = nComp - 1 - topoRank[i];
   }
   std::vector<uint32_t> worklist;
-  std::unique_ptr<std::atomic<uint8_t>[]> inWL(new std::atomic<uint8_t>[solverCapN]);
-  for (uint32_t i = 0; i < solverCapN; i++)
+  std::unique_ptr<std::atomic<uint8_t>[]> inWL(new std::atomic<uint8_t>[N]);
+  for (uint32_t i = 0; i < N; i++)
     inWL[i].store(0, std::memory_order_relaxed);
   uint64_t factCount = 0;
   uint64_t iterations = 0;
@@ -4874,8 +4796,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // many cluster keys a class anchors; a join that merges a cell already
   // anchoring other keys coalesces key-clusters the grammar keeps apart.
   std::unique_ptr<std::atomic<uint32_t>[]> keyCount(
-      new std::atomic<uint32_t>[solverCapN]);
-  for (uint32_t i = 0; i < solverCapN; i++)
+      new std::atomic<uint32_t>[N]);
+  for (uint32_t i = 0; i < N; i++)
     keyCount[i].store(0, std::memory_order_relaxed);
   size_t transKeyMerges = 0;
   // Churn attribution: what triggers merges, how much join work is
@@ -4890,22 +4812,6 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::pair<uint32_t, uint32_t>> mergeWitness;
   uint64_t reofferedFacts = 0, sweepOffered = 0, sweepKept = 0;
   std::vector<uint32_t> popCount(N, 0);
-  // ---- Origin-equivalence bundles (docs/origin-bundles-design.md) ----
-  // During-drain-only rid quotient: between epochs, co-traveling origins
-  // share ONE plane-space id; expansion at drain end restores the
-  // original rid space before verification/resolution/instruments see
-  // anything. Tables (rootClassOf/funcRootOf/rootNexus/...) stay
-  // original-rid-indexed throughout; planes, clusterRep, prot and marks
-  // live in the current space; bundleLeaves bridges back.
-  bool bundlesActive = false;   // ≥1 epoch applied this drain
-  uint32_t bundleCurNext = 0;   // current plane-space width
-  std::vector<llvm::SmallVector<uint32_t, 1>> bundleLeaves; // cur -> orig
-  // Original rid for diagnostics naming (bundles pick the first leaf —
-  // representative-of-the-cohort semantics, label only).
-  auto origRidOf = [&](uint32_t o) -> uint32_t {
-    if (!bundlesActive) return o;
-    return o < bundleLeaves.size() ? bundleLeaves[o][0] : UINT32_MAX;
-  };
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   uint64_t cyMerge = 0;
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
@@ -5071,9 +4977,7 @@ bool CallGraphPass::runFlowsToResolution() {
         // object whose cell keyed this union) when available
         weldEvents++;
         std::string who = "ctx:" + std::string(blobCtx);
-        const uint32_t bOrig = blobCtxOrigin == UINT32_MAX
-                                   ? UINT32_MAX
-                                   : origRidOf(blobCtxOrigin);
+        const uint32_t bOrig = blobCtxOrigin;
         if (bOrig != UINT32_MAX && bOrig < rootClassOf.size()) {
           const Value *wv =
               NF.getValueForNode(toOrig[rootClassOf[bOrig]]);
@@ -5136,11 +5040,9 @@ bool CallGraphPass::runFlowsToResolution() {
           (sa + sb >= 4096 && sa < 4096) || (sa + sb >= 65536 && sa < 65536))
         blobEvents.push_back(
             {a, sa, sb, protBlameName(a), protBlameName(b), blobCtx,
-             blobCtxOrigin == UINT32_MAX ||
-                     origRidOf(blobCtxOrigin) == UINT32_MAX
+             blobCtxOrigin == UINT32_MAX
                  ? std::string()
-                 : protBlameName(
-                       find(rootClassOf[origRidOf(blobCtxOrigin)]))});
+                 : protBlameName(find(rootClassOf[blobCtxOrigin]))});
     }
     clsSize[a] += clsSize[b];
     if (protOn) {
@@ -5318,7 +5220,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // own joins; ONLY the null member's cell is dropped. Universal
     // (#0/#1) joins are extern-boundary soundness and are NOT skipped.
     {
-      const uint32_t rid0 = origRidOf(o);
+      const uint32_t rid0 = o;
       if (rid0 != UINT32_MAX && rid0 < rootClassOf.size()) {
         const NodeIndex on0 = toOrig[rootClassOf[rid0]];
         if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode()) {
@@ -5597,48 +5499,6 @@ bool CallGraphPass::runFlowsToResolution() {
   } // batched mode seeds per batch inside the round driver (task #40)
   flushCtx(ctx0);
 
-  // ---- Incremental cross-iteration wiring ----
-  // The outer fixpoint used to re-solve from scratch after every round
-  // of callee wiring (5 full solves on the kernel; iterations past the
-  // first mostly re-derive the previous fixpoint). Facts are monotone
-  // and resolution only ADDS edges, so instead: translate the EB edges
-  // appended by the wiring into solver form, seed them from the planes
-  // already computed, and continue draining from the previous fixpoint.
-  std::vector<NodeIndex> newAllocNodes; // callsites turned AllocSites
-  FactSet parkedRoots; // obsolete identity roots, masked out of seeding
-  auto growTo = [&](uint32_t N2) {
-    assert(N2 <= solverCapN &&
-           "flows-to incremental wiring exceeded class headroom");
-    if (N2 <= N) return;
-    R.resize(N2); RB.resize(N2); dirty.resize(N2); jdirty.resize(N2);
-    dirtyBr.resize(N2); joined.resize(N2); cellJoined.resize(N2);
-    for (uint32_t i = N; i < N2; i++) {
-      R[i].resize(NSHIFT); RB[i].resize(NSHIFT); dirty[i].resize(NSHIFT);
-      jdirty[i].resize(NSHIFT); dirtyBr[i].resize(NSHIFT);
-      joined[i].resize(NSHIFT); cellJoined[i].resize(NSHIFT);
-    }
-    virginPl.resize((size_t)N2 * NSHIFT, 0); // flat n*NSHIFT+s: rows append
-    outA.resize(N2); outF.resize(N2); cellsOf.resize(N2);
-    bridgesOf.resize(N2);
-    wflag.resize(N2, 0);
-    hasIn.resize(N2, false);
-    topoRank.resize(N2, 0); // rank is an order heuristic only
-    ufp.resize(N2); ufrank.resize(N2, 0);
-    for (uint32_t i = N; i < N2; i++) ufp[i] = i;
-    compactMark.resize(N2, 64);
-    popCount.resize(N2, 0);
-    mergeHits.resize(N2, 0);
-    isRoot.resize(N2, 0);
-    if (!inSlice.empty()) inSlice.resize(N2, 1); // new wiring is never sliced
-    if (!protIn.empty()) protIn.resize(N2, 0);
-    // New wiring-era classes default non-nexus: a late-minted nexus
-    // alloc degrades to FI for itself (sound, logged via mint tally).
-    if (!nexusCls.empty()) nexusCls.resize(N2, 0);
-    if (!coneIn.empty()) coneIn.resize(N2, 0);
-    if (!ownedMask.empty()) ownedMask.resize(N2, 0);
-    clsSize.resize(N2, 1);
-    N = N2;
-  };
   auto originBearing = [&](NodeIndex canon) {
     if (valueIsOrigin(canon)) return true;
     auto mit = canonicalClassMembers.find(canon);
@@ -5678,14 +5538,7 @@ bool CallGraphPass::runFlowsToResolution() {
     if (CFLAdoptProposedSummaries && starvedFormalClass(rep)) return;
     isRoot[rep] = 1;
     uint32_t rid = nextRoot++;
-    // Bundled epochs renumber the PLANE-space ids: tables stay
-    // original-rid-indexed, planes/prot/clusters use the current id;
-    // bundleLeaves bridges back at expansion.
     uint32_t cid = rid;
-    if (bundlesActive) {
-      cid = bundleCurNext++;
-      bundleLeaves.push_back({rid});
-    }
     if (protOn)
       for (uint32_t pc : protCls)
         if (find(pc) == rep) {
@@ -5693,7 +5546,7 @@ bool CallGraphPass::runFlowsToResolution() {
           break;
         }
     // widen BEFORE the first set of this bit
-    FactSet::Universe = bundlesActive ? bundleCurNext : nextRoot;
+    FactSet::Universe = nextRoot;
     rootClassOf.push_back(rep);
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
     rootRodata.push_back(classIsRodata(toOrig[rep]));
@@ -6090,7 +5943,6 @@ bool CallGraphPass::runFlowsToResolution() {
   uint64_t nextSCC = (CFLPreSolveOnce && iteration > 0) ? (1u << 14)
                                                         : (1u << 18);
   uint64_t nextProg = 1u << 20, nextIntern = 1u << 16;
-  size_t edgesConsumed = edges.size();
   int fpIter = 0;
   // Outer resolution fixpoint: drain -> resolve -> wire the new callee
   // edges incrementally -> drain again from the reached fixpoint. The
@@ -6098,312 +5950,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // Drain to fixpoint: rank-sorted waves until the worklist is empty.
   // Factored out so the origin-batched driver (task #40) can run it
   // once per batch.
-  // ---- Bundle epoch machinery (docs/origin-bundles-design.md) ----
-  // Exactness: bundle_exact + row_determined (proof/lean/Bundles.lean);
-  // the engineering layer below the model is guarded by the assertions
-  // here (L1 cluster equality, key-presence multiplicity). v1 refusals:
-  // combos with per-rid mechanisms outside the audited exclusion list.
-  if (CFLOriginBundles) {
-    if (CFLBatchRoots)
-      KA_ERR("--cfl-origin-bundles v1 is mono-only (batch epochs = "
-             "stage 3); drop --cfl-batch-roots\n");
-    if (CFLBidiPrune)
-      KA_ERR("--cfl-origin-bundles: bidi-prune parks rids per-id "
-             "(unaudited per-rid mechanism); drop --cfl-bidi-prune\n");
-    if (CFLRootRelevance)
-      KA_ERR("--cfl-origin-bundles: --cfl-root-relevance records "
-             "per-rid merge witnesses mid-solve; drop one flag\n");
-    if (CFLProbeRodataJoins)
-      KA_ERR("--cfl-origin-bundles: --cfl-probe-rodata-joins reroutes "
-             "joins per-rid; drop one flag\n");
-  }
-  uint64_t nextBundleEpoch = CFLBundleEpochFacts;
-  uint64_t bundleEpochsRun = 0, bundleRidsFolded = 0, bundleEpochMs = 0;
-  auto forEachPlaneFam = [&](auto f) {
-    for (uint32_t n = 0; n < N; n++) {
-      if (find(n) != n) continue;
-      for (uint32_t s = 0; s < NSHIFT; s++) {
-        f(R[n][s]); f(RB[n][s]); f(dirty[n][s]); f(jdirty[n][s]);
-        f(dirtyBr[n][s]); f(joined[n][s]);
-      }
-    }
-  };
-  // Rebuild the rid-keyed cluster state after a renumbering `renum`
-  // (nullptr = identity over leaves at expansion, expanding instead).
-  auto rekeyClusters = [&](const std::vector<uint32_t> *renum,
-                           const std::vector<uint32_t> *newArity) {
-    boost::unordered_flat_map<uint64_t, uint32_t> ncr;
-    ncr.reserve(clusterRep.size());
-    if (renum) {
-      boost::unordered_flat_map<uint64_t, uint32_t> multi;
-      for (auto &kv : clusterRep) {
-        const uint32_t o = (uint32_t)(kv.first / NSHIFT);
-        const uint32_t s = (uint32_t)(kv.first % NSHIFT);
-        assert(o < renum->size() && "cluster key outside rid space");
-        const uint64_t nk = (uint64_t)(*renum)[o] * NSHIFT + s;
-        const uint32_t r = find(kv.second);
-        auto [it, ins] = ncr.emplace(nk, r);
-        multi[nk]++;
-        if (!ins)
-          assert(find(it->second) == r &&
-                 "L1 violated: bundle members with distinct clusters");
-      }
-      // Presence multiplicity: a bundled key must have been contributed
-      // by ALL members (equal rows => equal join history) or be a
-      // singleton's key.
-      for (auto &kv : multi) {
-        const uint32_t no = (uint32_t)(kv.first / NSHIFT);
-        assert((kv.second == 1 || kv.second == (*newArity)[no]) &&
-               "L1 violated: bundle members with unequal key presence");
-        (void)no;
-      }
-    } else {
-      for (auto &kv : clusterRep) {
-        const uint32_t o = (uint32_t)(kv.first / NSHIFT);
-        const uint32_t s = (uint32_t)(kv.first % NSHIFT);
-        const uint32_t r = find(kv.second);
-        for (uint32_t l : bundleLeaves[o])
-          ncr.emplace((uint64_t)l * NSHIFT + s, r);
-      }
-    }
-    clusterRep.swap(ncr);
-    shiftKeysOf.clear();
-    if (NB > 0)
-      for (auto &kv : clusterRep) {
-        const uint32_t s = (uint32_t)(kv.first % NSHIFT);
-        if (s != SHIFT_X)
-          shiftKeysOf[(uint32_t)(kv.first / NSHIFT)].push_back(kv.first);
-      }
-    for (uint32_t n = 0; n < N; n++)
-      keyCount[n].store(0, std::memory_order_relaxed);
-    for (auto &kv : clusterRep)
-      keyCount[find(kv.second)].fetch_add(1, std::memory_order_relaxed);
-    // Cluster-mark planes reference the old rid space: drop them all —
-    // conservative, the sweep re-probes and re-warms (same policy as
-    // merge-time mark loss).
-    for (uint32_t n = 0; n < N; n++)
-      for (uint32_t s = 0; s < NSHIFT; s++)
-        cellJoined[n][s].release();
-  };
-  auto rekeyProt = [&](const std::vector<uint32_t> *renum) {
-    if (!protOn) return;
-    auto to = [&](uint32_t o) -> uint32_t {
-      if (renum) return (*renum)[o];
-      assert(bundleLeaves[o].size() == 1 &&
-             "prot rid bundled despite exclusion");
-      return bundleLeaves[o][0];
-    };
-    boost::unordered_flat_set<uint32_t> npr;
-    npr.reserve(protRid.size());
-    for (uint32_t r : protRid) npr.insert(to(r));
-    protRid.swap(npr);
-    boost::unordered_flat_map<uint32_t, ProtState> np;
-    np.reserve(prot.size());
-    for (auto &kv : prot) np.emplace(to(kv.first), std::move(kv.second));
-    prot.swap(np);
-    for (auto &kv : readerBridgedTo)
-      for (auto &o : kv.second) o = to(o);
-  };
-  // One epoch: exact partition refinement over the FULL per-rid state
-  // (all six plane families), then renumber groups >=2 to one id each
-  // and compact the rid space. Sequential caller context only.
-  auto bundleEpoch = [&]() {
-    const auto t0 = std::chrono::steady_clock::now();
-    const uint32_t W = bundlesActive ? bundleCurNext : nextRoot;
-    if (W < 2) return;
-    std::vector<uint32_t> grp(W, 0);
-    for (uint32_t r : protRid)
-      if (r < W) grp[r] = UINT32_MAX; // audited exclusion: prot rids
-    std::vector<uint32_t> gsize(1, 0);
-    for (uint32_t i = 0; i < W; i++)
-      if (grp[i] == 0) gsize[0]++;
-    uint32_t groupCount = 1;
-    // Per-plane scratch as group-indexed ARRAYS with a touched-list
-    // reset: a reused hash map's clear() scans its grown capacity, and
-    // at ~12M plane visits that alone ground the km run to a halt
-    // (2026-08-15). Arrays keep every refine() O(|inPlane|).
-    std::vector<uint32_t> inPlane, touched;
-    std::vector<uint32_t> cnt, splitTo, origSize; // group-indexed
-    auto refineList = [&](const std::vector<uint32_t> &ids) {
-      if (ids.empty()) return;
-      if (cnt.size() < gsize.size()) {
-        cnt.resize(gsize.size(), 0);
-        splitTo.resize(gsize.size(), UINT32_MAX);
-        origSize.resize(gsize.size(), 0);
-      }
-      touched.clear();
-      for (uint32_t o : ids) {
-        const uint32_t g = grp[o];
-        if (cnt[g]++ == 0) {
-          touched.push_back(g);
-          // Snapshot the PRE-SPLIT size: gsize[g] decrements as members
-          // move out, so the live value can spuriously equal cnt[g]
-          // mid-plane and strand in-plane members in the out-of-plane
-          // group (under-split = unequal rows bundled — the km L1
-          // assertion caught exactly this, 2026-08-15).
-          origSize[g] = gsize[g];
-        }
-      }
-      for (uint32_t o : ids) {
-        const uint32_t g = grp[o];
-        if (cnt[g] == origSize[g]) continue; // group fully inside
-        if (splitTo[g] == UINT32_MAX) {
-          splitTo[g] = groupCount++;
-          gsize.push_back(0);
-        }
-        grp[o] = splitTo[g];
-        gsize[splitTo[g]]++;
-        gsize[g]--;
-      }
-      for (uint32_t g : touched) {
-        cnt[g] = 0;
-        splitTo[g] = UINT32_MAX;
-      }
-    };
-    auto refine = [&](const FactSet &P) {
-      if (P.none()) return;
-      inPlane.clear();
-      P.forEach([&](uint32_t o) {
-        if (o < W && grp[o] != UINT32_MAX) inPlane.push_back(o);
-      });
-      refineList(inPlane);
-    };
-    forEachPlaneFam([&](FactSet &P) { refine(P); });
-    // Cluster-state refinement. The registry is MEMOIZED join history:
-    // a merge's joined-intersection can erase the ROW evidence (member
-    // re-offered) while its cluster keeps the joined cells, so row
-    // equality does NOT imply cluster equality at a checkpoint (km
-    // counterexample 2026-08-15: one member swept before an absorb,
-    // the other's re-sweep pending). Refine by (presence, class) per
-    // shift so bundles carry equal cluster state BY CONSTRUCTION; the
-    // rekey assertions below then check the invariant, not luck.
-    {
-      std::vector<std::vector<std::pair<uint32_t, uint32_t>>> byShift(
-          NSHIFT); // shift -> (origin, cluster class)
-      for (auto &kv : clusterRep) {
-        const uint32_t o = (uint32_t)(kv.first / NSHIFT);
-        const uint32_t s = (uint32_t)(kv.first % NSHIFT);
-        if (o < W && grp[o] != UINT32_MAX)
-          byShift[s].emplace_back(o, find(kv.second));
-      }
-      std::vector<uint32_t> present;
-      std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> gv;
-      for (uint32_t s = 0; s < NSHIFT; s++) {
-        auto &es = byShift[s];
-        if (es.empty()) continue;
-        // presence split (groups become uniformly present or absent)
-        present.clear();
-        for (auto &e : es) present.push_back(e.first);
-        refineList(present);
-        // value split: one subgroup per distinct cluster class
-        gv.clear();
-        gv.reserve(es.size());
-        for (auto &e : es) gv.emplace_back(grp[e.first], e.second, e.first);
-        std::sort(gv.begin(), gv.end());
-        for (size_t i = 0; i < gv.size();) {
-          size_t j = i;
-          const uint32_t g = std::get<0>(gv[i]);
-          while (j < gv.size() && std::get<0>(gv[j]) == g) j++;
-          size_t k = i;
-          bool first = true;
-          while (k < j) {
-            size_t m = k;
-            const uint32_t v = std::get<1>(gv[k]);
-            while (m < j && std::get<1>(gv[m]) == v) m++;
-            if (!first) {
-              const uint32_t ng = groupCount++;
-              gsize.push_back(0);
-              for (size_t t = k; t < m; t++) {
-                grp[std::get<2>(gv[t])] = ng;
-                gsize[ng]++;
-                gsize[g]--;
-              }
-            }
-            first = false;
-            k = m;
-          }
-          i = j;
-        }
-      }
-    }
-    // Renumber: stable order by smallest member; bundles take their
-    // smallest member's slot.
-    std::vector<uint32_t> renum(W, UINT32_MAX);
-    std::vector<uint32_t> gAssigned(groupCount, UINT32_MAX);
-    std::vector<llvm::SmallVector<uint32_t, 1>> newLeaves;
-    std::vector<uint32_t> newArity;
-    newLeaves.reserve(W);
-    uint32_t newW = 0;
-    uint64_t folded = 0;
-    auto leavesAt = [&](uint32_t i) -> llvm::SmallVector<uint32_t, 1> {
-      if (bundlesActive) return bundleLeaves[i];
-      return {i};
-    };
-    for (uint32_t i = 0; i < W; i++) {
-      const uint32_t g = grp[i];
-      if (g == UINT32_MAX || gsize[g] < 2) {
-        renum[i] = newW++;
-        newLeaves.push_back(leavesAt(i));
-        newArity.push_back(1);
-      } else if (gAssigned[g] == UINT32_MAX) {
-        gAssigned[g] = newW;
-        renum[i] = newW++;
-        newLeaves.push_back(leavesAt(i));
-        newArity.push_back(1);
-      } else {
-        renum[i] = gAssigned[g];
-        auto lv = leavesAt(i);
-        newLeaves[gAssigned[g]].append(lv.begin(), lv.end());
-        newArity[gAssigned[g]]++;
-        folded++;
-      }
-    }
-    if (folded * 20 < W) { // < 5% width gain: not worth the rewrite
-      CG_LOG("Bundles: epoch skipped at " << iterations << " pops — "
-             << folded << "/" << W << " rids foldable (<5%)\n");
-      bundleEpochMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - t0).count();
-      return;
-    }
-    FactSet::Universe = newW; // set BEFORE remaps (new resize floor)
-    std::unordered_map<const void *, std::shared_ptr<ka::BitPlane>> sh;
-    forEachPlaneFam([&](FactSet &P) { P.remapBits(renum, sh); });
-    rekeyClusters(&renum, &newArity);
-    rekeyProt(&renum);
-    bundleLeaves = std::move(newLeaves);
-    bundleCurNext = newW;
-    bundlesActive = true;
-    bundleEpochsRun++;
-    bundleRidsFolded += folded;
-    bundleEpochMs += std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0).count();
-    CG_LOG("Bundles: epoch " << bundleEpochsRun << " at " << iterations
-           << " pops: " << W << " -> " << newW << " ids (" << folded
-           << " folded, " << (groupCount) << " groups), "
-           << bundleEpochMs << " ms cumulative\n");
-  };
-  // Drain-end expansion: restore the original rid space so every
-  // downstream consumer (closure verification, resolution, dumps,
-  // instruments) is untouched by bundling.
-  auto expandBundles = [&]() {
-    if (!bundlesActive) return;
-    const auto t0 = std::chrono::steady_clock::now();
-    FactSet::Universe = nextRoot;
-    std::unordered_map<const void *, std::shared_ptr<ka::BitPlane>> sh;
-    forEachPlaneFam([&](FactSet &P) { P.expandBits(bundleLeaves, sh); });
-    rekeyClusters(nullptr, nullptr);
-    rekeyProt(nullptr);
-    CG_LOG("Bundles: expanded " << bundleCurNext << " -> " << nextRoot
-           << " rids at drain end ("
-           << std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - t0).count()
-           << " ms; " << bundleEpochsRun << " epochs, "
-           << bundleRidsFolded << " rids folded, " << bundleEpochMs
-           << " ms in epochs)\n");
-    bundlesActive = false;
-    bundleLeaves.clear();
-    bundleCurNext = nextRoot;
-  };
   auto drainWaves = [&]() {
   while (true) {
     for (auto &c : ctxs) flushCtx(c);
@@ -6465,17 +6011,6 @@ bool CallGraphPass::runFlowsToResolution() {
           CG_LOG("FlowsTo: intern sweep unified " << (internUnified - u0)
                  << " planes at " << iterations << " pops ("
                  << (internBytesFreed >> 20) << " MB cumulative)\n");
-      }
-      // Bundle epoch: sequential point (post-barrier, post-joins). Any
-      // checkpoint is exact (row_determined) — no quiescence needed.
-      // MASS-based trigger, doubling from the mass at the last attempt:
-      // co-travel forms late (hub saturation), refinement costs one
-      // stream over live mass, so this bounds total epoch cost at ~2
-      // final-mass passes and lands epochs where the traffic is.
-      if (CFLOriginBundles && factCount >= nextBundleEpoch) {
-        nextBundleEpoch = factCount * 2;
-        bundleEpoch();
-        flushCtx(ctx0);
       }
       if (iterations >= nextProg) {
         nextProg += 1u << 20;
@@ -6554,7 +6089,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // entered A on the merge-coarsened quotient, then drain the new
   // identity bits; stable A + empty backlog = restricted fixpoint.
   } while (lazyExpand() > 0);
-  expandBundles(); // restore original rid space before any consumer
   } else {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
@@ -6722,8 +6256,6 @@ bool CallGraphPass::runFlowsToResolution() {
       if (fresh) {
         tHow = "batch-seed"; tFrom = UINT32_MAX;
         for (uint32_t rid = blo; rid < bhi; rid++) {
-          if (parkedRoots.test(rid))
-            continue;
           const bool exact =
               !nexusGate || (rid < rootNexus.size() && rootNexus[rid]);
           addFact(find(rootClassOf[rid]), exact ? 0 : SHIFT_X, rid - blo,
@@ -7002,10 +6534,6 @@ bool CallGraphPass::runFlowsToResolution() {
         auto subsetViol = [&](const FactSet &a, const FactSet &b) {
           bool bad = false;
           a.forEach([&](uint32_t o) {
-            // Parked identity roots are exempt: they are deliberately
-            // masked out of incremental edge seeding (retired by the
-            // equivalent from-scratch rebuild).
-            if (parkedRoots.test(o)) return;
             if (!b.test(o)) bad = true;
           });
           return bad;
@@ -7313,11 +6841,10 @@ bool CallGraphPass::runFlowsToResolution() {
   size_t g_witnessSites = 0, g_witnessFallback = 0;
   uint64_t g_witnessPooledPairs = 0, g_witnessRefinedPairs = 0;
   if (CFLWitnessAnswers) {
-    if (CFLBatchRoots || CFLOriginBundles)
+    if (CFLBatchRoots)
       report_fatal_error("--cfl-witness-answers requires a monolithic "
-                         "unbatched solve (no --cfl-batch-roots / "
-                         "--cfl-origin-bundles): live planes and stable "
-                         "rid space are read directly");
+                         "unbatched solve (no --cfl-batch-roots): live "
+                         "planes are read directly");
     // cell -> owner from the deref registry (deref nodes were created
     // per pointer node; canonicalize both sides into dense space).
     for (auto &[ptrN, derefN] : NF.getDerefMap()) {
@@ -7989,7 +7516,6 @@ bool CallGraphPass::runFlowsToResolution() {
           callNode = getCanonicalNode(NF.createValueNode(CS));
         }
         AllocSites.insert(callNode);
-        newAllocNodes.push_back(callNode);
         NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
         EB.addDereferenceEdges(callNode, heapObj);
         auto sit = Ctx->FuncSummaries.find(CF);
@@ -8820,7 +8346,7 @@ bool CallGraphPass::runFlowsToResolution() {
       boost::unordered_flat_map<uint32_t, uint32_t> clusterCells;
       for (auto &[c, ks] : cellKeys) clusterCells[find(c)]++;
       // sample: all cells if <=20k, else every ceil(n/20k)-th
-      std::vector<uint32_t> stamp(solverCapN, 0);
+      std::vector<uint32_t> stamp(N, 0);
       uint32_t stampGen = 0;
       const size_t nCells = cellKeys.size();
       const size_t stride = nCells <= 20000 ? 1 : (nCells + 19999) / 20000;
@@ -9426,172 +8952,6 @@ bool CallGraphPass::runFlowsToResolution() {
            << " ms\n";
   }
 
-  // --cfl-bundle-probe (task #47): go/no-go data for stage-2 root
-  // bundling. Structural groups = roots co-traveling BY CONSTRUCTION:
-  // (a) roots whose minted classes sit in one quotient class (merged),
-  // (b) singleton-class roots whose classes share an identical
-  // post-merge a/f-successor signature (the ops-table confluence
-  // pattern). Then one pass over the final planes classifies each
-  // (plane, group) as FULL (all members present — bundleable; savings
-  // = members-1) or PARTIAL (proper subset — design 1's split events
-  // and design 2's exactness violations; end state suffices because
-  // join outcomes are order-independent by closure confluence).
-  // Own-seed singletons are the expected private prefix, reported
-  // separately.
-  if (CFLBundleProbe) {
-    auto mixb = [](uint64_t x) {
-      x += 0x9E3779B97F4A7C15ULL;
-      x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-      x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-      return x ^ (x >> 31);
-    };
-    // Pass 1: per-root presence + column hash (for the clean-group
-    // cross-check against end-state column equality).
-    std::vector<uint64_t> colHashB(nextRoot, 0);
-    std::vector<uint32_t> colCntB(nextRoot, 0);
-    for (uint32_t n = 0; n < N; n++) {
-      if (find(n) != n) continue;
-      for (uint32_t s = 0; s < NSHIFT; s++) {
-        const uint64_t cellKey = (uint64_t)n * NSHIFT + s;
-        R[n][s].forEach([&](uint32_t r) {
-          colHashB[r] ^= mixb(cellKey);
-          colCntB[r]++;
-        });
-      }
-    }
-    // Grouping: bucket active roots by quotient rep of the minted
-    // class; leftover singletons bucket by successor signature.
-    std::vector<uint32_t> groupOf(nextRoot, UINT32_MAX);
-    std::vector<uint32_t> groupSize, groupFn;
-    {
-      std::unordered_map<uint32_t, std::vector<uint32_t>> byRep;
-      uint64_t exactExcluded = 0;
-      for (uint32_t rid = 0; rid < nextRoot; rid++) {
-        if (!colCntB[rid]) continue;
-        // Under the nexus gate, exact-minted roots exist to DIVERGE
-        // (residue discrimination) — grouping them poisons co-travel;
-        // bundle candidates are the wildcard-minted (FI-behaving) bulk.
-        if (nexusGate && rid < rootNexus.size() && rootNexus[rid]) {
-          exactExcluded++;
-          continue;
-        }
-        byRep[find(rootClassOf[rid])].push_back(rid);
-      }
-      if (exactExcluded)
-        errs() << "BundleProbe: excluded " << exactExcluded
-               << " exact-minted roots from grouping\n";
-      std::unordered_map<uint64_t, std::vector<uint32_t>> bySig;
-      auto newGroup = [&](const std::vector<uint32_t> &v) {
-        const uint32_t gid = (uint32_t)groupSize.size();
-        uint32_t fn = 0;
-        for (uint32_t rid : v) {
-          groupOf[rid] = gid;
-          fn += funcRootOf.count(rid) ? 1 : 0;
-        }
-        groupSize.push_back((uint32_t)v.size());
-        groupFn.push_back(fn);
-      };
-      for (auto &[rep, v] : byRep) {
-        if (v.size() >= 2) {
-          newGroup(v);
-          continue;
-        }
-        llvm::SmallVector<uint32_t, 8> succ;
-        for (uint32_t t : outA[rep]) succ.push_back(find(t));
-        for (auto [t, rr] : outF[rep]) succ.push_back(find(t));
-        if (succ.empty()) continue;
-        std::sort(succ.begin(), succ.end());
-        succ.erase(std::unique(succ.begin(), succ.end()), succ.end());
-        uint64_t h = mixb(succ.size());
-        for (uint32_t t : succ) h = h * 1099511628211ull ^ mixb(t);
-        bySig[h].push_back(v[0]);
-      }
-      for (auto &[h, v] : bySig)
-        if (v.size() >= 2) newGroup(v);
-    }
-    const uint32_t nGroups = (uint32_t)groupSize.size();
-    // Pass 2: classify plane×group occupancy.
-    uint64_t totalFactsB = 0, ungrouped = 0, fullMass = 0, savings = 0,
-             fullPlanes = 0, partialMass = 0, partialPlanes = 0,
-             ownSeedMass = 0, fnSavings = 0;
-    std::unordered_map<uint32_t, uint32_t> tally, soleRid;
-    for (uint32_t n = 0; n < N; n++) {
-      if (find(n) != n) continue;
-      for (uint32_t s = 0; s < NSHIFT; s++) {
-        if (R[n][s].none()) continue;
-        tally.clear();
-        soleRid.clear();
-        R[n][s].forEach([&](uint32_t r) {
-          totalFactsB++;
-          const uint32_t g = groupOf[r];
-          if (g == UINT32_MAX) {
-            ungrouped++;
-            return;
-          }
-          soleRid[g] = r;
-          tally[g]++;
-        });
-        for (auto &[g, c] : tally) {
-          if (c == groupSize[g]) {
-            fullMass += c;
-            fullPlanes++;
-            savings += c - 1;
-            if (groupFn[g] == groupSize[g]) fnSavings += c - 1;
-          } else {
-            partialMass += c;
-            partialPlanes++;
-            if (c == 1 && find(rootClassOf[soleRid[g]]) == n)
-              ownSeedMass += 1;
-          }
-        }
-      }
-    }
-    // Clean groups: all members share one end-state column (identical
-    // (hash,count)) — these bundle with zero exactness machinery.
-    uint64_t cleanGroups = 0, cleanRoots = 0;
-    {
-      std::vector<uint64_t> gh(nGroups, 0);
-      std::vector<uint8_t> gClean(nGroups, 1), gSeen(nGroups, 0);
-      std::vector<uint32_t> gCnt(nGroups, 0);
-      for (uint32_t rid = 0; rid < nextRoot; rid++) {
-        const uint32_t g = groupOf[rid];
-        if (g == UINT32_MAX) continue;
-        const uint64_t key = mixb(colHashB[rid]) ^ mixb(colCntB[rid]);
-        if (!gSeen[g]) {
-          gSeen[g] = 1;
-          gh[g] = key;
-          gCnt[g] = colCntB[rid];
-        } else if (gh[g] != key || gCnt[g] != colCntB[rid]) {
-          gClean[g] = 0;
-        }
-      }
-      for (uint32_t g = 0; g < nGroups; g++)
-        if (gSeen[g] && gClean[g]) {
-          cleanGroups++;
-          cleanRoots += groupSize[g];
-        }
-    }
-    std::vector<uint32_t> topSz(groupSize);
-    std::sort(topSz.rbegin(), topSz.rend());
-    errs() << "BundleProbe: " << nGroups << " structural groups over "
-           << std::accumulate(groupSize.begin(), groupSize.end(), 0ull)
-           << " roots; top sizes";
-    for (size_t i = 0; i < topSz.size() && i < 5; i++)
-      errs() << " " << topSz[i];
-    errs() << "\n";
-    errs() << "BundleProbe: facts " << totalFactsB << ", ungrouped "
-           << ungrouped << "; FULL planes " << fullPlanes << " mass "
-           << fullMass << " -> savings " << savings << " ("
-           << (totalFactsB ? 100.0 * savings / totalFactsB : 0.0)
-           << "% of facts; fn-only-group share " << fnSavings << ")\n";
-    errs() << "BundleProbe: PARTIAL planes " << partialPlanes
-           << " mass " << partialMass << " ("
-           << (totalFactsB ? 100.0 * partialMass / totalFactsB : 0.0)
-           << "%), own-seed prefix singletons " << ownSeedMass << "\n";
-    errs() << "BundleProbe: clean groups (end-state-identical columns) "
-           << cleanGroups << "/" << nGroups << " covering " << cleanRoots
-           << " roots\n";
-  }
   if (CFLCoTravelStats) {
     auto mix64 = [](uint64_t x) {
       x += 0x9E3779B97F4A7C15ULL;

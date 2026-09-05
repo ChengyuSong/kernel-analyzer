@@ -15,13 +15,19 @@ REMOVED:
   recovers. wireIncremental + flag + envelope guards deleted.
   incr_exact (Staging.lean) retained as the specification for any
   future reimplementation.
+- origin-bundles (2026-09-04): parked feature (Gate 2 wall fail),
+  default-off. Removed: epoch machinery + remapBits/expandBits +
+  mintRoot/blame bridging + 3 flags (--cfl-origin-bundles,
+  --cfl-bundle-epoch-facts, --cfl-bundle-probe), plus leftover
+  incremental-wiring debris found by the warning sweep (growTo,
+  parkedRoots, newAllocNodes, edgesConsumed, protBlameName2,
+  solverCapN headroom). Bundles.lean + design doc stay as the
+  record/spec. Gates: cfl-smoke 4/4; libpng old-vs-new
+  byte-identical; km all+ids mono + batched old-vs-new
+  byte-identical (same-day binaries, same corpus).
 
 QUEUED (each = its own gated pass):
-1. origin-bundles: parked feature, default-off; entangled with the
-   drain path (25 refs: bundlesActive/bundleLeaves/bundleCurNext +
-   epoch/expansion lambdas + 2 flags). Bundles.lean + design doc
-   stay as the record.
-2. Flag census for the wider trim — candidates by class:
+1. Flag census for the wider trim — candidates by class:
    - superseded mechanisms: --cfl-ops-pairs, --cfl-rodata-copy,
      --cfl-join-cone (predecessors of regfield/obj; verify nothing
      canonical consumes the shared protection machinery first)
@@ -30,6 +36,6 @@ QUEUED (each = its own gated pass):
      census-* (KEEP the ones the paper's instruments still use:
      probe-blob-formation/ClassHist, census-couplers, gt dumps)
    - legacy/task-specific listed in cli-reference "Other" section
-3. cli-reference.md regeneration after each pass (remove dead
+2. cli-reference.md regeneration after each pass (remove dead
    entries).
-4. The trimmed tree then IS the FSE artifact base (anonymized).
+3. The trimmed tree then IS the FSE artifact base (anonymized).

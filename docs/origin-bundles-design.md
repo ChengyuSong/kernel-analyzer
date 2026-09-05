@@ -1,7 +1,18 @@
 # Origin-Equivalence Bundles: Design and Proof Obligations
 
-Status: DESIGN (2026-08-15). Gate 0 (fs-mode co-travel sizing) in
-flight. Nothing implemented; this document is the reviewable artifact.
+Status: REMOVED (2026-09-04, fix-or-remove policy). The v1
+implementation passed Gate 0 and was EXACT at km scale (fs13
+byte-identical through 2 epochs + expansion, all L1 assertions
+silent) but failed Gate 2 on wall time (157m vs 32m at km fs13):
+epoch passes stream O(live mass) against short drains, and the
+compression dies at expansion/rebuild. Kernel fs is batched
+(K-wide planes = stronger width compression), so the lever is moot
+where it was aimed. The implementation was deleted from the tree;
+this document + proof/lean/Bundles.lean (bundle_exact,
+row_determined — both machine-checked, no sorry) are the record and
+the spec for any future attempt. Two earned lessons kept below
+(§ pre-split-size snapshots; § row-vs-cluster equality at
+checkpoints).
 
 ## 1. Objective and honest sizing
 

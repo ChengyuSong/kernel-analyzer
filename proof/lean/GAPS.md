@@ -262,7 +262,12 @@ Certificate/code movements the model should eventually absorb:
   per-family completeness contracts and the regfield closedness
   certificate.
 
-## Origin bundles (Bundles.lean, 2026-08-15)
+## Origin bundles (Bundles.lean, 2026-08-15; implementation REMOVED 2026-09-04)
+
+The v1 implementation was removed under the fix-or-remove policy
+(Gate 2 wall fail; docs/origin-bundles-design.md). The theorems
+below stay as the specification for any future attempt — same
+policy as Incr.incr_exact.
 
 Machine-checked: `bundle_exact` (quotient of closure-row-equal
 origins, bundled closure = per-origin closure member-by-member;
@@ -337,7 +342,7 @@ MODELED (statement + proof, no sorry):
                                         counterexample for no-catchup)
 - batched solving ..................... batched_exact / wderiv_sound
 - spill restore ....................... wderiv_restore
-- origin bundles (parked) ............. bundle_exact / row_determined
+- origin bundles (impl removed) ....... bundle_exact / row_determined
 - channel mechanisms .................. Channels.lean (clamp/objclamp/
                                         nulljoin/skipwiring/stride +
                                         counterexamples)

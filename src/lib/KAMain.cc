@@ -715,37 +715,6 @@ cl::opt<bool> CFLJoinFastpath(
            "(perf measurement only)"),
   cl::init(true));
 
-cl::opt<bool> CFLOriginBundles(
-  "cfl-origin-bundles",
-  cl::desc("Origin-equivalence bundles (docs/origin-bundles-design.md): "
-           "at periodic drain checkpoints, exact partition refinement "
-           "over full per-rid state (all plane families) finds origins "
-           "that co-travel; each group is renumbered to ONE fact id and "
-           "the rid space is compacted (the width lever). At drain end "
-           "the planes are expanded back to the original rid space, so "
-           "resolution, verification and instruments are unaffected. "
-           "Exactness: bundle_exact + row_determined (proof/lean/"
-           "Bundles.lean) + runtime L1 cluster-equality assertions. "
-           "v1: mono only; refuses batch/bidi/incremental/probe combos. "
-           "STATUS (Gate 2, 2026-08-15): EXACT at km scale (fs13 "
-           "byte-identical through 2 epochs + expansion) but PARKED — "
-           "epoch passes cost O(live mass) against short drains and "
-           "the compression dies at expansion/rebuild (157m vs 32m at "
-           "km fs13); see docs/origin-bundles-design.md post-mortem"),
-  cl::init(false));
-
-cl::opt<unsigned long long> CFLBundleEpochFacts(
-  "cfl-bundle-epoch-facts",
-  cl::desc("Fact-mass threshold for the first bundle epoch (with "
-           "--cfl-origin-bundles); each next attempt waits for 2x the "
-           "mass at the last attempt. Mass-based, not pop-based: "
-           "co-travel forms as the hub saturates (late in the drain), "
-           "and a refinement pass costs one stream over live mass, so "
-           "doubling bounds total epoch cost at ~2 final-mass passes "
-           "while landing the effective epochs where the merge "
-           "re-offer traffic is"),
-  cl::init(1ull << 27));
-
 cl::opt<bool> CFLProbeNoFormalPresolve(
   "cfl-probe-noformal-presolve",
   cl::desc("MEASUREMENT ONLY: barrier formal-argument nodes in the "
@@ -847,17 +816,6 @@ cl::opt<bool> CFLProposeAtomSummaries(
            "stores, unsafe callees, laundering). Runs atop the NOOP "
            "fixpoint for its safe-callee set. Prints AtomProp lines; "
            "adopt per-run via --cfl-adopt-proposed-summaries"),
-  cl::init(false));
-
-cl::opt<bool> CFLBundleProbe(
-  "cfl-bundle-probe",
-  cl::desc("Post-solve probe for stage-2 root bundling (task #47): "
-           "group roots that co-travel BY CONSTRUCTION (co-resident "
-           "minted classes; identical successor signatures), then "
-           "classify every (plane,group) as FULL (bundleable; savings "
-           "= members-1) or PARTIAL (design-1 split events / design-2 "
-           "exactness violations). Decision data only; no behavior "
-           "change"),
   cl::init(false));
 
 cl::opt<bool> CFLInternSweep(

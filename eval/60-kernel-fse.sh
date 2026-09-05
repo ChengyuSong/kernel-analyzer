@@ -45,12 +45,18 @@
 # the wall/RSS delta):
 #   NOTE 2026-09-04: incremental cross-iteration solving is REMOVED
 #   (fix-or-remove policy; docs/incremental-518-divergence.md — the
-#   proven-exact lazymint+bidi pair recovers the perf). All arms
-#   solve from scratch.
+#   proven-exact lazymint+bidi pair recovers part of the perf:
+#   solve 7,248s vs 8,764s plain scratch vs 5,915s for the removed,
+#   unsound incremental mode). All arms solve from scratch.
 #   noshare     full + --cfl-intern-planes=false   (COW plane sharing)
 #   nofastjoin  full + --cfl-join-fastpath=false   (cluster-mark joins)
 #   lazymint    full + --cfl-lazy-mint             (additive arm)
 #   bidi        full + --cfl-bidi-prune            (additive arm)
+#   lazybidi    full + both (the RECOMMENDED production config:
+#               verified 2026-09-04 = exactly the from-scratch
+#               answer, 6,291,136 at 5.18 FI, and the strict
+#               superset (+2032/-0) of the removed incremental
+#               mode's pin — docs/incremental-518-divergence.md)
 #               NOTE: perf family AT FI ONLY (answer-preserving,
 #               #43 cone re-admission). Under fs, bidi-prune is
 #               strictly TIGHTER (a precision lever, one-sided
@@ -150,6 +156,7 @@ arm_flags() {
     nofastjoin)  echo "${FULLPREC[@]} --cfl-join-fastpath=false --func-summaries=$SUM" ;;
     lazymint)    echo "${FULLPREC[@]} --cfl-lazy-mint --func-summaries=$SUM" ;;
     bidi)        echo "${FULLPREC[@]} --cfl-bidi-prune --func-summaries=$SUM" ;;
+    lazybidi)    echo "${FULLPREC[@]} --cfl-lazy-mint --cfl-bidi-prune --func-summaries=$SUM" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }
@@ -225,13 +232,14 @@ fat_tail() { # arm -> "callers>=100targets maxfanout"
     "$OUT/$1-pairs.txt"
 }
 
-EXACT_ARMS=" noshare nofastjoin lazymint bidi "
+EXACT_ARMS=" noshare nofastjoin lazymint bidi lazybidi "
 ALL_ARMS=(full base noadopt noregf nochain notpkeys noopstables
-          noinvoke nosummaries noshare nofastjoin lazymint bidi)
+          noinvoke nosummaries noshare nofastjoin lazymint bidi
+          lazybidi)
 ARMS=("$@")
 [[ ${#ARMS[@]} -eq 0 ]] && ARMS=("${ALL_ARMS[@]}")
 
-TIMED_ARMS=" full base noshare nofastjoin scratch lazymint bidi "
+TIMED_ARMS=" full base noshare nofastjoin lazymint bidi lazybidi "
 
 timed_run() { # quiet second pass for reportable timing
   local arm="$1"

@@ -3542,6 +3542,7 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<char> bidiMarked; // partition-class relevance (by class id)
   std::vector<uint32_t> bidiUF;
   std::vector<uint32_t> bidiPrunedCls; // origins the cone gate skipped
+  std::vector<uint32_t> starvedCls;    // adoption-starved formals not minted
   // Re-callable (#43): incremental wiring appends its edge deltas to
   // aEdges/dEdges/fEdges/wildcardNodes and recomputes — the prune's
   // soundness argument ("the oracle recomputes per outer iteration")
@@ -3873,8 +3874,10 @@ bool CallGraphPass::runFlowsToResolution() {
           }
       }
       if (PF &&
-          Ctx->FuncSummaries.count(getFuncDef(const_cast<Function *>(PF))))
+          Ctx->FuncSummaries.count(getFuncDef(const_cast<Function *>(PF)))) {
+        starvedCls.push_back(n); // C7 mirrors this refusal
         continue;
+      }
     }
     if (!hasIn[n] || isFunc || hasOrigin[n] || isCert) {
       if (!bidiMarked.empty() && !isFunc && !isCert && !bidiMarked[n]) {
@@ -6148,7 +6151,11 @@ bool CallGraphPass::runFlowsToResolution() {
   // the closure property the delta/backlog machinery must maintain — the
   // Lean SolverModel's central assumption, and the layer where the
   // historical solver bugs (joined-marking, merge cascades) lived.
-  if (CFLVerifyClosure) {
+  // Called at the CONVERGED break only: intermediate drain rounds are
+  // legitimately non-final (lazy-mint roots still deferred pre-catch-up),
+  // and the certificate is defined over the answer-producing fixpoint.
+  auto verifyClosure = [&]() {
+    if (!CFLVerifyClosure) return;
     uint64_t viol = 0;
     auto report = [&](const char *rule, uint32_t n, uint32_t s,
                       uint32_t extra) {
@@ -6217,6 +6224,14 @@ bool CallGraphPass::runFlowsToResolution() {
         // cluster exists and contains all the cells.
         if (!cellsOf[n].empty()) {
           uniS.forEach([&](uint32_t o) {
+            // Null-cell join hygiene: joinCluster refuses to key joins
+            // for NULL-rooted facts (store-through-null is UB, and the
+            // null constant is a universal rendezvous) — mirror it.
+            if (o < rootClassOf.size()) {
+              const NodeIndex on0 = toOrig[rootClassOf[o]];
+              if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode())
+                return;
+            }
             const uint32_t cr = clusterFind((uint64_t)o * NSHIFT + s);
             if (cr == UINT32_MAX) { report("C4-key", n, s, o); return; }
             uint32_t rep = find(cr);
@@ -6247,6 +6262,10 @@ bool CallGraphPass::runFlowsToResolution() {
     {
       boost::unordered_flat_set<uint32_t> pruned(bidiPrunedCls.begin(),
                                                  bidiPrunedCls.end());
+      // Adoption-starved formals: the minter refuses these by design
+      // (the summary owns the callsite wiring — see the mint loop's
+      // starved-formal guard); the coverage criterion must mirror it.
+      pruned.insert(starvedCls.begin(), starvedCls.end());
       for (uint32_t n : lazyDeferred) report("C7-lazy", find(n), 0, n);
       for (uint32_t n = 0; n < N; n++) {
         if (find(n) != n || isRoot[n]) continue;
@@ -6261,7 +6280,7 @@ bool CallGraphPass::runFlowsToResolution() {
       CG_LOG("Closure verified: all rules saturated + seeds present + "
              "mint coverage (0 violations)\n");
     }
-  }
+  };
 
   uint64_t totalR = 0, totalRB = 0;
   uint32_t liveClasses = 0;
@@ -7670,6 +7689,7 @@ bool CallGraphPass::runFlowsToResolution() {
       fpIter++;
       continue; // re-drain with the full root set, then re-resolve
     }
+    verifyClosure(); // certificate over the answer-producing fixpoint
     break; // converged: no callee flows were added
   }
   if (iteration + fpIter + 1 >= (int)CFLFlowsToMaxIters) {

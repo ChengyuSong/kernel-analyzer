@@ -226,7 +226,12 @@ gt_match() { # arm -> FN count (or "-" if no GT)
   # (adoption arms scored 18 vs 3 before this fix — same pairs, moved
   # prefix). <arm>-pairs.txt stays ICALL-only: pins are byte-stable.
   local up="$OUT/$arm-union-pairs.txt"
-  awk '/^ICALL |^REGCALL /{print $2, $NF}' "$OUT/$arm.log" | sort -u -S1G > "$up"
+  # REGCALL credits BOTH the registration caller ($2) and the direct
+  # callee ($4): the summarized registrar's body held the dispatch, so
+  # GT frames name IT, not the registration caller.
+  awk '/^ICALL /{print $2, $NF}
+       /^REGCALL /{print $2, $NF; print $4, $NF}' \
+      "$OUT/$arm.log" | sort -u -S1G > "$up"
   # Corpus-determined eligibility: without --funcs the matcher
   # approximates "target/caller visible" by "appears in THIS ARM'S
   # answers", so each arm gets its own denominator and FN counts are

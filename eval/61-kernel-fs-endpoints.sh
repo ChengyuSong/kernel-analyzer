@@ -104,7 +104,9 @@ for a in fsfull fsbase; do
     # ICALL ∪ REGCALL union for GT (re-attributed registrar callbacks
     # live on REGCALL lines); pairs.txt stays ICALL-only — see eval/60.
     up="$OUT/$a-union-pairs.txt"
-    awk '/^ICALL |^REGCALL /{print $2, $NF}' "$OUT/$a.log" | sort -u -S1G > "$up"
+    awk '/^ICALL /{print $2, $NF}
+         /^REGCALL /{print $2, $NF; print $4, $NF}' \
+        "$OUT/$a.log" | sort -u -S1G > "$up"
     fopt=()  # corpus-determined eligibility (shared with eval/60)
     [[ -s "$OUT/defined-funcs.txt" ]] && fopt=(--funcs "$OUT/defined-funcs.txt")
     python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" --pairs "$up" \

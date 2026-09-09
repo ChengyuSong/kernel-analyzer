@@ -98,7 +98,10 @@ for frames, locs, tgt, off in sorted(recs):
     if tgt not in ours_funcs and tgt not in ours_targets_any:
         b["target_absent"] += 1
         continue
-    present = [f for f in frames if f in ours_callers]
+    # With --funcs, frame visibility is CORPUS-determined (comparable
+    # across answer sets); without it, fall back to answer-derived
+    # callers (lower-bound mode, NOT comparable across configs).
+    present = [f for f in frames if f in (ours_funcs or ours_callers)]
     if not present:
         b["caller_absent"] += 1
         continue

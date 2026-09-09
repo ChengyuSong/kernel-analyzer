@@ -227,10 +227,24 @@ gt_match() { # arm -> FN count (or "-" if no GT)
   # prefix). <arm>-pairs.txt stays ICALL-only: pins are byte-stable.
   local up="$OUT/$arm-union-pairs.txt"
   awk '/^ICALL |^REGCALL /{print $2, $NF}' "$OUT/$arm.log" | sort -u -S1G > "$up"
+  # Corpus-determined eligibility: without --funcs the matcher
+  # approximates "target/caller visible" by "appears in THIS ARM'S
+  # answers", so each arm gets its own denominator and FN counts are
+  # not comparable (adding pairs can RAISE FN by widening
+  # visibility). One llvm-nm sweep pins the denominator for all arms.
+  local funcs="$OUT/defined-funcs.txt"
+  if [[ ! -s "$funcs" ]]; then
+    echo "== gt: dumping defined-function list ($KA_NM over bclist)" >&2
+    xargs -a "$KA_KERNEL_BCLIST" "$KA_NM" --defined-only --format=posix \
+        2>/dev/null | awk '$2 ~ /^[TtWw]$/ {print $1}' | sort -u > "$funcs"
+    [[ -s "$funcs" ]] || { echo "!! defined-funcs dump EMPTY" >&2; rm -f "$funcs"; }
+  fi
+  local fopt=()
+  [[ -s "$funcs" ]] && fopt=(--funcs "$funcs")
   local jopt=()
   [[ -s "$OUT/$arm-icalls.json" ]] && jopt=(--icall-json "$OUT/$arm-icalls.json")
   python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" \
-      --pairs "$up" --aux "$OUT/gtaux.txt" "${jopt[@]}" \
+      --pairs "$up" --aux "$OUT/gtaux.txt" "${fopt[@]}" "${jopt[@]}" \
       --fn-out "$OUT/$arm-fns.txt" > "$rep" 2>&1
   grep -oE 'FN = [0-9]+' "$rep" | grep -oE '[0-9]+' | head -1
 }

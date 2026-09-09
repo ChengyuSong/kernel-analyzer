@@ -116,6 +116,7 @@ for frames, locs, tgt, off in sorted(recs):
 
 print(dict(b))
 tot = b["matched"] + b["matched-aux"] + b["matched-loc"] + b["FN"]
+print(f"FN = {b['FN']}")  # stable line; eval/60 greps 'FN[ =:]+[0-9]+'
 if tot:
     m = b["matched"] + b["matched-aux"] + b["matched-loc"]
     print(f"strict recall: {m}/{tot} = {100.0*m/tot:.2f}%")

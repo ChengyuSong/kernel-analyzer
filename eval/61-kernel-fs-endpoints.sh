@@ -101,10 +101,14 @@ for a in fsfull fsbase; do
   n=$(wc -l < "$p")
   gt="-"
   if [[ -n "$KA_GT" && -s "$OUT/gtaux.txt" ]]; then
-    python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" --pairs "$p" \
+    # ICALL ∪ REGCALL union for GT (re-attributed registrar callbacks
+    # live on REGCALL lines); pairs.txt stays ICALL-only — see eval/60.
+    up="$OUT/$a-union-pairs.txt"
+    awk '/^ICALL |^REGCALL /{print $2, $NF}' "$OUT/$a.log" | sort -u -S1G > "$up"
+    python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" --pairs "$up" \
         --aux "$OUT/gtaux.txt" --fn-out "$OUT/$a-fns.txt" \
         > "$OUT/$a-gt.txt" 2>&1
-    gt=$(grep -oE 'FN[ =:]+[0-9]+' "$OUT/$a-gt.txt" | grep -oE '[0-9]+' | head -1)
+    gt=$(grep -oE 'FN = [0-9]+' "$OUT/$a-gt.txt" | grep -oE '[0-9]+' | head -1)
   fi
   echo "== $a: pairs=$n gt_fn=$gt"
 done

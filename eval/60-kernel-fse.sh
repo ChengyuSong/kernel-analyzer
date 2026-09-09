@@ -219,12 +219,20 @@ gt_match() { # arm -> FN count (or "-" if no GT)
   local arm="$1"
   [[ -z "$KA_GT" ]] && { echo "-"; return; }
   local rep="$OUT/$arm-gt.txt"
+  # GT matching consumes the ICALL ∪ REGCALL union (gt-match.py's
+  # documented convention): summarized registrars re-attribute their
+  # callback pairs to REGCALL lines at the registration callsite, so
+  # ICALL-only matching miscounts re-attributed real dispatches as FNs
+  # (adoption arms scored 18 vs 3 before this fix — same pairs, moved
+  # prefix). <arm>-pairs.txt stays ICALL-only: pins are byte-stable.
+  local up="$OUT/$arm-union-pairs.txt"
+  awk '/^ICALL |^REGCALL /{print $2, $NF}' "$OUT/$arm.log" | sort -u -S1G > "$up"
   local jopt=()
   [[ -s "$OUT/$arm-icalls.json" ]] && jopt=(--icall-json "$OUT/$arm-icalls.json")
   python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" \
-      --pairs "$OUT/$arm-pairs.txt" --aux "$OUT/gtaux.txt" "${jopt[@]}" \
+      --pairs "$up" --aux "$OUT/gtaux.txt" "${jopt[@]}" \
       --fn-out "$OUT/$arm-fns.txt" > "$rep" 2>&1
-  grep -oE 'FN[ =:]+[0-9]+' "$rep" | grep -oE '[0-9]+' | head -1
+  grep -oE 'FN = [0-9]+' "$rep" | grep -oE '[0-9]+' | head -1
 }
 
 fat_tail() { # arm -> "callers>=100targets maxfanout"

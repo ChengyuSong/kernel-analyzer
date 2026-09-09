@@ -107,11 +107,14 @@ for a in fsfull fsbase; do
     awk '/^ICALL /{print $2, $NF}
          /^REGCALL /{print $2, $NF; print $4, $NF}' \
         "$OUT/$a.log" | sort -u -S1G > "$up"
+    rcf="$OUT/$a-regcall.txt"
+    awk '/^REGCALL /{print $2, $4, $NF}' "$OUT/$a.log" | sort -u > "$rcf"
+    ropt=(); [[ -s "$rcf" ]] && ropt=(--regcall "$rcf")
     fopt=()  # corpus-determined eligibility (shared with eval/60)
     [[ -s "$OUT/defined-funcs.txt" ]] && fopt=(--funcs "$OUT/defined-funcs.txt")
     python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" --pairs "$up" \
-        --aux "$OUT/gtaux.txt" "${fopt[@]}" --fn-out "$OUT/$a-fns.txt" \
-        > "$OUT/$a-gt.txt" 2>&1
+        --aux "$OUT/gtaux.txt" "${fopt[@]}" "${ropt[@]}" \
+        --fn-out "$OUT/$a-fns.txt" > "$OUT/$a-gt.txt" 2>&1
     gt=$(grep -oE 'FN = [0-9]+' "$OUT/$a-gt.txt" | grep -oE '[0-9]+' | head -1)
   fi
   echo "== $a: pairs=$n gt_fn=$gt"

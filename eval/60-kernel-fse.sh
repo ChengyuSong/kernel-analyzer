@@ -232,6 +232,12 @@ gt_match() { # arm -> FN count (or "-" if no GT)
   awk '/^ICALL /{print $2, $NF}
        /^REGCALL /{print $2, $NF; print $4, $NF}' \
       "$OUT/$arm.log" | sort -u -S1G > "$up"
+  # Hub re-attribution claims: pairs the atoms move from dispatch hubs
+  # (call_timer_fn, kthread, IRQ) to registration sites. Matched
+  # target-level into the separate matched-reg bucket (adjusted
+  # recall); never into strict recall or frame matching.
+  local rc="$OUT/$arm-regcall.txt"
+  awk '/^REGCALL /{print $2, $4, $NF}' "$OUT/$arm.log" | sort -u > "$rc"
   # Corpus-determined eligibility: without --funcs the matcher
   # approximates "target/caller visible" by "appears in THIS ARM'S
   # answers", so each arm gets its own denominator and FN counts are
@@ -248,9 +254,11 @@ gt_match() { # arm -> FN count (or "-" if no GT)
   [[ -s "$funcs" ]] && fopt=(--funcs "$funcs")
   local jopt=()
   [[ -s "$OUT/$arm-icalls.json" ]] && jopt=(--icall-json "$OUT/$arm-icalls.json")
+  local ropt=()
+  [[ -s "$rc" ]] && ropt=(--regcall "$rc")
   python3 "$KA_REPO/tools/gt-match.py" --gt "$KA_GT" \
       --pairs "$up" --aux "$OUT/gtaux.txt" "${fopt[@]}" "${jopt[@]}" \
-      --fn-out "$OUT/$arm-fns.txt" > "$rep" 2>&1
+      "${ropt[@]}" --fn-out "$OUT/$arm-fns.txt" > "$rep" 2>&1
   grep -oE 'FN = [0-9]+' "$rep" | grep -oE '[0-9]+' | head -1
 }
 

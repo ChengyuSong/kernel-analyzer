@@ -39,6 +39,13 @@ ap.add_argument("--icall-json", help="per-callsite answers keyed by debug "
                 "a GT record matches when its site location's answer set "
                 "contains the target, regardless of which caller the "
                 "inliner gave the copy. Monotone, like --aux")
+ap.add_argument("--regcall", help="'caller directcallee target' lines from "
+                "REGCALL dumps: callback pairs the summary atoms re-attribute "
+                "from the dispatch hub (call_timer_fn, kthread, IRQ dispatch) "
+                "to the registration callsite — the anti-welding convention. "
+                "GT frames name the hub, so these records can never match "
+                "frame-level; they land in a SEPARATE matched-reg bucket, "
+                "counted in adjusted recall only. Strict recall excludes it.")
 args = ap.parse_args()
 
 ours_pairs = set()
@@ -60,11 +67,18 @@ ours_funcs = set()
 if args.funcs:
     with open(args.funcs) as f:
         ours_funcs = set(f.read().split())
-
 def normtgt(n):
     # strip numeric clone suffixes ("foo.123" -> "foo")
     h, _, s = n.rpartition(".")
     return h if h and s.isdigit() else n
+
+reg_tgts = set()
+if args.regcall:
+    with open(args.regcall) as f:
+        for line in f:
+            parts = line.split()
+            if parts:
+                reg_tgts.add(normtgt(parts[-1]))
 
 loc_answers = {}
 if args.icall_json:
@@ -113,16 +127,22 @@ for frames, locs, tgt, off in sorted(recs):
             normtgt(tgt) in loc_answers.get(l.lstrip("./"), ())
             for l in locs):
         b["matched-loc"] += 1  # inline-attribution coverage (debug loc)
+    elif normtgt(tgt) in reg_tgts:
+        b["matched-reg"] += 1  # re-attributed at registration (hub frame)
     else:
         b["FN"] += 1
         fns.append((frames, tgt))
 
 print(dict(b))
-tot = b["matched"] + b["matched-aux"] + b["matched-loc"] + b["FN"]
+tot = (b["matched"] + b["matched-aux"] + b["matched-loc"]
+       + b["matched-reg"] + b["FN"])
 print(f"FN = {b['FN']}")  # stable line; eval/60 greps 'FN[ =:]+[0-9]+'
 if tot:
     m = b["matched"] + b["matched-aux"] + b["matched-loc"]
     print(f"strict recall: {m}/{tot} = {100.0*m/tot:.2f}%")
+    ma = m + b["matched-reg"]
+    print(f"adjusted recall (+reg re-attribution): {ma}/{tot} = "
+          f"{100.0*ma/tot:.2f}%")
 if not args.funcs:
     print("(no --funcs: target_absent under-classified; recall is a lower bound)")
 out = open(args.fn_out, "w") if args.fn_out else sys.stdout

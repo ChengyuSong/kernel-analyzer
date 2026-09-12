@@ -78,6 +78,32 @@ the default ft pin (so `30-run.sh` must run first):
 Note ablation runs cost roughly one ft run each — at kernel scale
 pick your subset deliberately.
 
+## FSE campaign scripts (60-series)
+
+The paper's evaluation is driven by dedicated, resumable scripts —
+one per campaign, all same-machine so timing columns are comparable
+and all runnable from the repo (artifact):
+
+- `60-kernel-fse.sh` — kernel 5.18 FI: frozen full stack, 14-arm
+  precision/perf matrix, GT matching (`tools/gt-match.py`), quiet
+  timed passes, one-sidedness + byte-identity gates, `summary.tsv`.
+- `61-kernel-fs-endpoints.sh` — kernel field-sensitive endpoints
+  (fsfull/fsbase, all+ids + batched + spill; big-machine).
+- `62-sok-arm.sh` — ORCFL over the SoK-MLTA (WOOT'26) bitcode
+  datasets, emitting their parsed_log JSON per program.
+- `63-gracfl-graspan.sh` — GraCFL engine on the Graspan-suite fixed
+  graphs (Q1 contrast: all-pairs points-to closure, NOT a callgraph
+  competitor row).
+- `64-usermode-fse.sh` — httpd + postgresql transfer RQ: FI
+  full/base + fs endpoints per corpus, one-sidedness checks, quiet
+  FI timed passes, `summary.tsv`. Memory-capped via RLIMIT_AS so a
+  blow-up fails cleanly in-process.
+- `65-sok-compare.sh` — merges 62's output into their harness
+  layout (canonical program names, keys aligned to LLVM-CFI's
+  exact strings) and runs THEIR `compare_approaches.py` in a
+  network-less Docker sandbox against their pre-computed baselines
+  (O0: LLVM-CFI + KallGraph; O3: LLVM-CFI + HPCFI).
+
 ## Outputs (`$KA_RESULTS`)
 
 - `<corpus>-<mode>.log` — full log incl. `/usr/bin/time -v` and

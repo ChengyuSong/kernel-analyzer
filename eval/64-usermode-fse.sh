@@ -34,9 +34,12 @@
 # fs, up to a named weld (kernel showed one 0.02% EFI weld) — any
 # added pairs are reported loudly either way.
 #
-# Pinned FI reference (this box, 2026-09-11):
-#   httpd  full 45,479 / base 81,049   (removes 35,570, adds 0)
-#   pg     full 435,979 / base 1,178,443 (removes 742,464, adds 0)
+# Pinned FI reference (this box, 2026-09-12, post regfield
+# witness-by-use fix — docs/regfield-literal-table-gap.md; the
+# 09-11 full pins 45,479/435,979 are pre-fix, superseded):
+#   httpd  full 46,313 / base 81,049
+#   pg     full 438,583 / base 1,178,443
+# fsfull pins (45,151 / 422,528) are pre-fix — re-cut pending.
 #
 # Usage:
 #   KA_WORK=~/fast/ka-bench eval/64-usermode-fse.sh \

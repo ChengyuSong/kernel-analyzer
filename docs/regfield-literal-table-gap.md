@@ -1,8 +1,25 @@
 # RegField table discovery misses literal-typed constant tables (UNSOUND)
 
-Status: OPEN — certifier gap, found 2026-09-12 by the SoK-MLTA fuzz
-ground truth (eval/62/65/66). Fix required before the regfield
-channel's results ship; design-first per the soundness discipline.
+Status: FIXED 2026-09-12 — witness-by-use implemented in
+`runRegFieldGapReport` (CallGraph.cc) plus a `--cfl-filter-ledger`
+audit instrument; all answer-level gates below passed. Found
+2026-09-12 by the SoK-MLTA fuzz ground truth (eval/62/65/66).
+
+Fix gates (all with the fixed binary, this box):
+- nm-new full config: 70,838 icalls (base 83,770; 12,932 pairs
+  still soundly filtered); filter ledger joined against the fuzz
+  GT = **0 observed records filtered** (was 90+ pre-fix, per-callsite).
+- PMU slice: `CLOSED struct.x86_pmu+192 table=3` now includes
+  amd_put_event_constraints / intel_put_event_constraints; cert green.
+- km (6.8.2 subset, 338 TUs) old-vs-new binary: +4,663/−0 pairs —
+  strictly additive; same 230 closed keys; cert 0 violations.
+- httpd FI full: 46,313 = old pin 45,479 +834/−0, ⊆ base, cert green.
+- pg FI full: 438,583 = old pin 435,979 +2,604/−0, ⊆ base, cert green.
+- cfl-smoke 4/4; libpng cert green (19 ICALLs, 0 FILTERED).
+
+Remaining (tracked outside this ticket): kernel 5.18 full-family
+matrix re-cut on the big machine; SoK eval/62+65 re-run; usermode
+fs pins (fsfull) re-cut via eval/64.
 
 ## Symptom
 
@@ -118,7 +135,13 @@ discovery can never be made complete.
   amd_get_event_constraints. ALL 5.18 full-family pins must be
   re-cut after the fix; the frames-based GT never caught this
   (PMU frames absent from the GT set).
-- httpd/postgres transfer pins: UNAFFECTED in IR — the clang-18
-  LTO corpora contain zero literal fn-table constants (scanned
-  2026-09-12), so the fixed binary must reproduce those pins
-  byte-identically (cheap re-gate, part of the fix's gates).
+- httpd/postgres transfer pins: the "byte-identical" prediction was
+  WRONG, in the sound direction. The corpora do contain zero literal
+  fn-table constants, but the fix's loose-table definition is wider
+  than "literal-typed": any initializer fn slot with no named-key
+  attribution counts (httpd has 1,598 such tables, pg 10), and the
+  coarse absorption rule (unresolved/open/EMPTY-population outer
+  keys absorb all loose tables) adds their entries at apply. Result:
+  httpd full 45,479 → 46,313 (+834/−0), pg full 435,979 → 438,583
+  (+2,604/−0); both still ⊆ base, certs green. FI transfer pins
+  re-cut to the new values; fsfull pins likewise need a re-cut.

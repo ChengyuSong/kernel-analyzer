@@ -12302,6 +12302,28 @@ static void walkInitFnOffsets(const Constant *C, uint64_t base,
   }
 }
 
+// (byte offset -> Function) slots of a static initializer — the
+// value-identified form of walkInitFnOffsets. Type-AGNOSTIC by
+// construction: literal and named struct constants walk identically
+// (the literal-table gap, docs/regfield-literal-table-gap.md — a
+// table's identity must never depend on its type's spelling).
+static void walkInitFnSlots(const Constant *C, uint64_t base,
+                            const DataLayout &DL,
+                            std::map<uint64_t, const Function *> &out) {
+  if (const auto *CSt = dyn_cast<ConstantStruct>(C)) {
+    const StructLayout *SL = DL.getStructLayout(CSt->getType());
+    for (unsigned e = 0; e < CSt->getNumOperands(); e++)
+      walkInitFnSlots(CSt->getOperand(e), base + SL->getElementOffset(e),
+                      DL, out);
+  } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+    uint64_t es = DL.getTypeAllocSize(CA->getType()->getElementType());
+    for (unsigned e = 0; e < CA->getNumOperands(); e++)
+      walkInitFnSlots(CA->getOperand(e), base + e * es, DL, out);
+  } else if (const auto *Fn = dyn_cast<Function>(C->stripPointerCasts())) {
+    out[base] = Fn;
+  }
+}
+
 // File-entry decay validator (always on when a summary file is loaded).
 // The checked-in file must hold only version-portable semantics, but
 // names/keys/offsets silently decay as the kernel moves (6.18 renamed
@@ -13201,6 +13223,50 @@ void CallGraphPass::runRegFieldGapReport() {
   std::set<std::string> hazBulk;            // struct hit by non-const
                                             // memcpy/memmove (all keys)
 
+  // WITNESS-BY-USE (docs/regfield-literal-table-gap.md): value-
+  // identified registry of every initialized global whose initializer
+  // carries function pointers, keyed by the canonical (defining)
+  // global. A NAMED-typed table is witnessed by the initializer walk
+  // below; a literal-typed one has no key of its own and must be
+  // witnessed at its USE sites instead — const-source copies attribute
+  // into the DESTINATION's keys, population membership feeds the
+  // fn-slot tables at apply, and keys whose reader base cannot be
+  // enumerated absorb every loose table (attribute-or-refuse; the
+  // refusal is coarse attribution, never a silent drop).
+  std::map<const GlobalVariable *, std::map<uint64_t, const Function *>>
+      fnTables;
+  std::map<const GlobalVariable *, size_t> initAttrCount; // walk-witnessed
+  std::set<const GlobalVariable *> looseCopied; // const-src copy, no
+                                                // dest layout context
+  for (auto &mp : Ctx->Modules) {
+    const DataLayout &DLg = mp.first->getDataLayout();
+    for (GlobalVariable &GV : mp.first->globals()) {
+      if (!GV.hasInitializer()) continue;
+      const GlobalVariable *GC = &GV;
+      if (const auto *C2 =
+              dyn_cast_or_null<GlobalVariable>(canonChainKey(&GV)))
+        GC = C2;
+      std::map<uint64_t, const Function *> slots;
+      walkInitFnSlots(GV.getInitializer(), 0, DLg, slots);
+      if (!slots.empty()) fnTables[GC].insert(slots.begin(), slots.end());
+    }
+  }
+
+  // --cfl-filter-ledger: per-pair provenance for every channel removal
+  // (all three clamp sites below). Joining the FILTERED lines against
+  // any ground truth certifies that no observed pair was filtered —
+  // and when one was, the line names the responsible key and site.
+  auto ledger = [](const char *mech, const std::string &key,
+                   const CallBase *CB, const Function *F) {
+    if (!CFLFilterLedger) return;
+    std::string loc = "-";
+    if (DILocation *DIL = CB->getDebugLoc())
+      loc = (DIL->getFilename() + ":" + Twine(DIL->getLine())).str();
+    errs() << "FILTERED " << mech << " " << key << " "
+           << CB->getFunction()->getName() << " @" << loc << " -> "
+           << F->getName() << "\n";
+  };
+
   for (auto &mp : Ctx->Modules) {
     const DataLayout &DL = mp.first->getDataLayout();
     // registration side: dynamic stores
@@ -13245,6 +13311,55 @@ void CallGraphPass::runRegFieldGapReport() {
                   return stripStructNameSuffix(ST->getStructName()).str();
             return std::string();
           };
+          // WITNESS-BY-USE fix A: a const-global source's fn slots are
+          // attributed into the DESTINATION struct's keys at copy-
+          // shifted offsets — by layout, never by the source's
+          // (possibly literal) type name. This replaces the vacuous
+          // "covered by the initializer pass" exemption: the 7
+          // literal-typed static x86_pmu tables at 5.18 were never
+          // covered, and the exemption let their keys close without
+          // them. Entries beyond the copy length are attributed too —
+          // table over-inclusion is sound (a bigger table removes
+          // less). A fn-bearing const source with NO destination
+          // layout context joins the loose set; unresolved-base keys
+          // absorb it at apply.
+          if (constSrc) {
+            const GlobalVariable *SGc = SG;
+            if (const auto *SC =
+                    dyn_cast_or_null<GlobalVariable>(canonChainKey(SG)))
+              SGc = SC;
+            auto ti = fnTables.find(SGc);
+            if (ti != fnTables.end()) {
+              std::string DN;
+              int64_t DOff = -1;
+              const size_t plus0 = Key.find('+');
+              if (!Key.empty() &&
+                  Key.find("+var") == std::string::npos) {
+                DN = Key.substr(0, plus0);
+                (void)!StringRef(Key).substr(plus0 + 1)
+                    .getAsInteger(10, DOff);
+              } else if (Key.empty()) {
+                const Value *DP = MI->getRawDest()->stripPointerCasts();
+                Type *DT = nullptr;
+                if (const auto *DG = dyn_cast<GlobalVariable>(DP))
+                  DT = DG->getValueType();
+                else if (const auto *DA = dyn_cast<AllocaInst>(DP))
+                  DT = DA->getAllocatedType();
+                auto *DST = dyn_cast_or_null<StructType>(DT);
+                if (DST && DST->hasName()) {
+                  DN = stripStructNameSuffix(DST->getStructName()).str();
+                  DOff = 0;
+                }
+              }
+              if (DOff >= 0) {
+                for (const auto &[fo, Fn] : ti->second)
+                  addPop(DN + "+" + std::to_string((uint64_t)DOff + fo),
+                         Fn->getName().str(), 1);
+              } else {
+                looseCopied.insert(SGc);
+              }
+            }
+          }
           if (!Key.empty()) {
             const std::string SN0 = Key.substr(0, Key.find('+'));
             if (!constSrc) {
@@ -13445,41 +13560,76 @@ void CallGraphPass::runRegFieldGapReport() {
         }
       }
     }
-    // registration side: global-initializer slots (immediate parent)
+    // registration side: global-initializer slots, attributed to the
+    // DEEPEST NAMED ancestor struct (deepKey's convention). Carrying
+    // the (name, offset) context downward also witnesses fn slots
+    // inside LITERAL structs nested in named ones — previously
+    // silently dropped (the literal-table gap's nested variant). A
+    // top-level literal table has no context: its slots stay in
+    // fnTables and are witnessed by use (copy / population / loose).
     for (GlobalVariable &GV : mp.first->globals()) {
       if (!GV.hasInitializer()) continue;
-      std::function<void(const Constant *)> walk = [&](const Constant *C) {
-        if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
-          StructType *ST = CS->getType();
-          const StructLayout *SL = DL.getStructLayout(ST);
-          for (unsigned i = 0; i < CS->getNumOperands(); i++) {
-            const Constant *E = CS->getOperand(i);
-            const auto *Fn = dyn_cast<Function>(E->stripPointerCasts());
-            if (Fn && ST->hasName()) {
-              std::string K =
-                  stripStructNameSuffix(ST->getStructName()).str() + "+" +
-                  std::to_string(SL->getElementOffset(i));
-              addPop(K, Fn->getName().str(), 0);
-              if (!GV.isConstant()) initNonConst.insert(K);
-            } else if (!Fn) {
-              // obj channel: initializer slot holding &ops_global
-              if (ST->hasName())
-                if (auto M = objMemberOf(E, DL))
-                  objRegs[stripStructNameSuffix(ST->getStructName())
-                              .str() +
-                          "+" + std::to_string(SL->getElementOffset(i))]
-                      .insert(*M);
-              walk(E);
+      const GlobalVariable *GVc = &GV;
+      if (const auto *C2 =
+              dyn_cast_or_null<GlobalVariable>(canonChainKey(&GV)))
+        GVc = C2;
+      std::function<void(const Constant *, const std::string &, uint64_t,
+                         bool)>
+          walk = [&](const Constant *C, const std::string &PN,
+                     uint64_t PO, bool haveP) {
+            if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
+              StructType *ST = CS->getType();
+              const StructLayout *SL = DL.getStructLayout(ST);
+              const bool named = ST->hasName();
+              const std::string SN =
+                  named ? stripStructNameSuffix(ST->getStructName()).str()
+                        : PN;
+              const bool haveCtx = named || haveP;
+              for (unsigned i = 0; i < CS->getNumOperands(); i++) {
+                const Constant *E = CS->getOperand(i);
+                const uint64_t EO =
+                    (named ? 0 : PO) + SL->getElementOffset(i);
+                const auto *Fn =
+                    dyn_cast<Function>(E->stripPointerCasts());
+                if (Fn) {
+                  if (haveCtx) {
+                    std::string K = SN + "+" + std::to_string(EO);
+                    addPop(K, Fn->getName().str(), 0);
+                    if (!GV.isConstant()) initNonConst.insert(K);
+                    initAttrCount[GVc]++;
+                  }
+                } else {
+                  // obj channel: initializer slot holding &ops_global
+                  if (haveCtx)
+                    if (auto M = objMemberOf(E, DL))
+                      objRegs[SN + "+" + std::to_string(EO)].insert(*M);
+                  walk(E, SN, EO, haveCtx);
+                }
+              }
+            } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+              uint64_t es = DL.getTypeAllocSize(
+                  CA->getType()->getElementType());
+              for (unsigned e = 0; e < CA->getNumOperands(); e++)
+                walk(cast<Constant>(CA->getOperand(e)), PN, PO + e * es,
+                     haveP);
             }
-          }
-        } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
-          for (const Use &Op : CA->operands())
-            walk(cast<Constant>(Op.get()));
-        }
-      };
-      walk(GV.getInitializer());
+          };
+      walk(GV.getInitializer(), "", 0, false);
     }
   }
+
+  // Loose tables: fn slots the initializer walk could not attribute
+  // to any named key (top-level literal-typed constants — the 7
+  // static x86_pmu instances at 5.18, bfd's cache_iovec) plus const
+  // sources copied without destination layout context. Witnessed by
+  // use at apply; NEVER silently dropped again.
+  std::set<const GlobalVariable *> looseTables(looseCopied);
+  for (const auto &[GVt, slots] : fnTables)
+    if (initAttrCount[GVt] < slots.size()) looseTables.insert(GVt);
+  if (!looseTables.empty())
+    errs() << "RegFieldGap: " << looseTables.size()
+           << " loose fn-tables (initializer fn slots with no named-key "
+              "attribution; witnessed by use at apply)\n";
 
   // Copy-edge closure (control-struct relays): populations and
   // openness both flow along key-to-key copies.
@@ -13536,6 +13686,13 @@ void CallGraphPass::runRegFieldGapReport() {
                                   // outer type into the nexus list too
                                   // (bpf_link for bpf_link_ops)
     std::vector<const CallBase *> readers; // sites, for channel apply
+    std::set<std::string> outerKeys; // full outer field keys — their
+                                     // populations feed this key's
+                                     // table at apply (witness-by-use)
+    std::set<const GlobalVariable *> baseGlobals; // direct-global bases
+    bool unresolvedBase = false; // some reader's instance is not
+                                 // enumerable (arg/phi/call base): the
+                                 // key absorbs ALL loose tables
   };
   std::map<std::string, Disp> disp;
   for (auto *CB : Ctx->IndirectCallInsts) {
@@ -13562,6 +13719,18 @@ void CallGraphPass::runRegFieldGapReport() {
       size_t p = OK.find('+');
       if (p != std::string::npos && D.outers.size() < 4)
         D.outers.insert(OK.substr(0, p));
+      if (!OK.empty())
+        D.outerKeys.insert(OK);
+      else
+        D.unresolvedBase = true;
+    } else if (const auto *BG = dyn_cast<GlobalVariable>(B)) {
+      D.baseGlobals.insert(BG);
+    } else if (!isa<AllocaInst>(B)) {
+      // arg/phi/select/call bases: the instance behind this reader
+      // is not enumerable — coarse witnessing at apply. (An alloca
+      // is a local instance whose slot writes are type-keyed stores
+      // or copies, both witnessed above.)
+      D.unresolvedBase = true;
     }
   }
 
@@ -13668,6 +13837,77 @@ void CallGraphPass::runRegFieldGapReport() {
                         !hazEscape.count(K) && !hazBulk.count(SN) &&
                         K.find("+var") == std::string::npos;
     if (!closed) continue;
+    // WITNESS-BY-USE enrichment (fix B): before intersecting, the
+    // table absorbs every enumerable instance whose IR spelling
+    // carries no type name — loose tables reachable through this
+    // key's reader bases (population members behind the outer field
+    // keys, direct global bases), and, for readers whose base is not
+    // enumerable, ALL loose tables. Purely additive (over-inclusion
+    // is sound); named-typed instances are already witnessed by the
+    // initializer walk. Offset-blind on purpose: a loose member may
+    // be an array of tables whose element geometry the key cannot
+    // see — precision costs bloat, never a dropped true pair.
+    {
+      size_t enriched = 0;
+      const std::string &KK = K; // lambdas cannot capture the binding
+      auto addLoose = [&](const GlobalVariable *GVl) {
+        if (!looseTables.count(GVl)) return;
+        auto ti2 = fnTables.find(GVl);
+        if (ti2 == fnTables.end()) return;
+        if (!GVl->isConstant()) initNonConst.insert(KK);
+        for (const auto &[fo, Fn] : ti2->second)
+          if (ri->second.insert(Fn->getName().str()).second) {
+            popSrc[KK][3].insert(Fn->getName().str());
+            enriched++;
+          }
+      };
+      // An OPEN or hazarded outer key means this key's instance set
+      // is NOT enumerable through the population (bfd->xvec: the vec
+      // addresses arrive as LOADED pointers from a pointer array, so
+      // membership is unwitnessed) — same coarse absorption as an
+      // unresolved base. Only a hazard-free population enumerates.
+      bool coarse = D.unresolvedBase;
+      for (const std::string &OK : D.outerKeys) {
+        const std::string OSN = OK.substr(0, OK.find('+'));
+        auto oi2 = objRegs.find(OK);
+        // No evidence is NOT clean: an outer key with an EMPTY
+        // population and no openness record means no store was ever
+        // witnessed under this spelling — either the field is fed
+        // through a spelling this key cannot see (LLVM unifies
+        // isomorphic structs per-TU under one name: bfd appeared as
+        // aout_data_struct in binutils) or the base is dead. Both
+        // mean the instance set is not enumerable here.
+        if (objOpen.count(OK) || hazAtomic.count(OK) ||
+            hazEscape.count(OK) || objHazBulk.count(OSN) ||
+            OK.find("+var") != std::string::npos ||
+            oi2 == objRegs.end() || oi2->second.empty())
+          coarse = true;
+        if (oi2 == objRegs.end()) continue;
+        for (const auto &[GV0, mbase, mstride] : oi2->second) {
+          (void)mbase;
+          (void)mstride;
+          const GlobalVariable *GVm = GV0;
+          if (const auto *GC2 =
+                  dyn_cast_or_null<GlobalVariable>(canonChainKey(GVm)))
+            GVm = GC2;
+          addLoose(GVm);
+        }
+      }
+      for (const GlobalVariable *BG0 : D.baseGlobals) {
+        const GlobalVariable *BG = BG0;
+        if (const auto *GC2 =
+                dyn_cast_or_null<GlobalVariable>(canonChainKey(BG)))
+          BG = GC2;
+        addLoose(BG);
+      }
+      if (coarse)
+        for (const GlobalVariable *LT : looseTables) addLoose(LT);
+      if (enriched && CFLRegFieldAudit)
+        errs() << "RegFieldChannel: ENRICH " << K << " +" << enriched
+               << " loose-table fns"
+               << (coarse ? " (coarse: unresolved base / open outer)" : "")
+               << "\n";
+    }
     size_t rem = 0, kept = 0;
     for (const CallBase *CB : D.readers) {
       auto ci = Ctx->Callees.find(CB);
@@ -13693,6 +13933,9 @@ void CallGraphPass::runRegFieldGapReport() {
           }
         }
       }
+      if (CFLFilterLedger)
+        for (const Function *F : ci->second)
+          if (!keep.count(F)) ledger("regfield-key", K, CB, F);
       rem += ci->second.size() - keep.size();
       kept += keep.size();
       ci->second = keep;
@@ -13854,6 +14097,13 @@ void CallGraphPass::runRegFieldGapReport() {
           if (table.count(getFuncDef(const_cast<Function *>(F))))
             keep.insert(F);
         if (ci->second.size() == keep.size()) continue;
+        if (CFLFilterLedger)
+          for (const Function *F : ci->second)
+            if (!keep.count(F))
+              ledger("regfield-rodata",
+                     std::string("RODATA:") + RGc->getName().str() +
+                         " slot=" + std::to_string(innerOff),
+                     CB, F);
         auto &LG = led[std::string("RODATA:") + RGc->getName().str() +
                        (varElemSize ? "[var]" : "") + " slot=" +
                        std::to_string(innerOff)];
@@ -13956,6 +14206,11 @@ void CallGraphPass::runRegFieldGapReport() {
           }
         }
       }
+      if (CFLFilterLedger)
+        for (const Function *F : ci->second)
+          if (!keep.count(F))
+            ledger("regfield-obj",
+                   OK + " slot=" + std::to_string(innerOff), CB, F);
       auto &LG = led[OK + " slot=" + std::to_string(innerOff)];
       LG.sites++;
       LG.rem += ci->second.size() - keep.size();

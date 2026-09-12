@@ -72,6 +72,7 @@ extern cl::opt<bool> CFLRegFieldApply;
 extern cl::opt<bool> CFLRegFieldAudit;
 extern cl::opt<std::string> CFLRegFieldWatch;
 extern cl::opt<bool> CFLRegFieldObj;
+extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<bool> CFLIterCapOk;
 extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<bool> CFLProposeNoopSummaries;

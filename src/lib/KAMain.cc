@@ -410,6 +410,17 @@ cl::opt<std::string> CFLRegFieldWatch(
            "that drops a watched fn — GT-loss attribution forensics"),
   cl::init(""));
 
+cl::opt<bool> CFLFilterLedger(
+  "cfl-filter-ledger",
+  cl::desc("Debug ledger: one 'FILTERED <mech> <key> <caller> "
+           "@<file:line> -> <target>' line for EVERY pair a channel "
+           "clamp removes (regfield fn-slot / rodata / obj). Join the "
+           "lines against a ground truth (kernel GT pairs, fuzz-observed "
+           "callsites) to certify no observed pair was filtered — a hit "
+           "localizes the unsound removal to the responsible key. "
+           "Answer-run instrument; output scales with removed pairs"),
+  cl::init(false));
+
 cl::opt<std::string> CFLProbeStratumAblate(
   "cfl-probe-stratum-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "

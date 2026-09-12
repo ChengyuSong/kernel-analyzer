@@ -55,23 +55,46 @@ global of named type S*. False — literal-typed constants alias S
 structurally and flow into `S*` fields (`store ptr @cache_iovec,
 ptr %bfd.iovec.addr`) without ever carrying the name.
 
-## Fix directions (decide, model, then implement)
+## Fix design (settled 2026-09-12 with user): witness-by-use
 
-1. **Certifier-side refusal (minimal, always sound):** while
-   certifying key (S, off), enumerate address-taken literal-struct
-   constants structurally compatible with S (same slot count/kinds,
-   fptr at off). If any exists that is not in the table, REFUSE the
-   key. Mirrors the cert-incident lesson: every solver optimism
-   needs a matching verifier check.
-2. **Flow-based table discovery (keeps precision):** collect
-   candidate tables from what actually flows into `S*`-typed bases
-   (stores of `&table` into fields/params that reach the dispatch
-   base), independent of the constant's own type; structural-match
-   literal constants extend the table (over-inclusion is sound).
+The channel key stays as-is (a unique id; name-derived where the
+dispatch GEP provides it). What must change is MEMBERSHIP
+WITNESSING, which today conflates identity with the type name.
+Attribution becomes value-flow-based (type-of-use, not
+type-of-name):
 
-Either way the premise must be stated in the hazard contract and
-reflected in the Lean channel model (same bookkeeping as the
-adoption×regfield store-completeness item).
+1. A literal (or otherwise unattributable) constant's fn slots are
+   witnessed AT ITS USE SITES, reading slots by layout offset of
+   the USE context: (a) bulk copy into a keyed destination
+   (`x86_pmu = amd_pmu`: the dest struct gives the key; walk the
+   const source's initializer at the dest's offsets,
+   init-attributed); (b) address stored into a keyed ops-pointer
+   field (`store &cache_iovec` into `bfd->iovec`: the obj-channel
+   population member's initializer, read by offset, feeds the
+   fn-slot keys).
+2. The same-type instance-copy rescue may only fire when the
+   SOURCE's population is witnessed; an unwitnessed (literal,
+   unattributable) source refuses the key. This repairs the YELLOW
+   assumption instead of deleting the rescue.
+3. Completeness argument (the Lean premise): a constant table can
+   only influence a dispatch if its address or contents flow into
+   live memory, and every such flow event is an instruction the
+   census already classifies (store / copy / install-API hop /
+   hazard). Attribute-or-refuse at those events is therefore
+   total; a nameless constant with NO classified use is
+   unreachable and sound to ignore. No corpus-wide poison needed.
+4. Certifier check mirroring the refusal: a key may close only if
+   every constant-global source feeding it (copy sources,
+   population members) has attributed slots; init=0 keys carrying
+   copy/rescue evidence must not close.
+
+Corpus survey (why option "global poison" was rejected): kernel
+5.18 = 7 literal fn-tables, all x86_pmu instances (poison would
+kill the channel corpus-wide); our httpd/pg clang-18 LTO corpora =
+0; the SoK clang-15 -O0 set = common (nm-new 19, ffmpeg 56,
+pdftotext 108, Bento4 284). Emission-pipeline-dependent — which is
+also why enumerated-spelling (type-name or structural-shape)
+discovery can never be made complete.
 
 ## Blast radius
 
@@ -79,12 +102,23 @@ adoption×regfield store-completeness item).
   until fixed (base rows unaffected). Re-run eval/62 (full config
   only) + eval/65 after the fix; regression gate = nm-new
   `cache_bseek` present and all four programs back at base recall.
-- Kernel 5.18/6.18 pins: no observed damage (noregf arm has the
-  same GT FN count as full; frames-based GT), but the hazard is
-  present in principle — a literal-typed ops-table constant in the
-  kernel corpus would be missed the same way. State in the paper's
-  soundness discussion once fixed; re-run the kernel noregf
-  comparison after the fix as confirmation.
-- httpd/postgres transfer pins: one-sidedness holds by
-  construction; independent GT not available. Same re-check logic
-  as kernel applies.
+- Kernel 5.18: AFFECTED, confirmed 2026-09-12. The corpus has 7
+  literal-typed fn-tables — the static x86_pmu instances (amd_pmu,
+  core_pmu, intel_pmu, p4/p6/knc/zhaoxin), literal because of the
+  anonymous-union member. 15 struct.x86_pmu keys CLOSED in the 5.18
+  full run; audit shows init=0 (no initializer witnessing) and
+  YELLOW (closed via the same-type instance-copy rescue, whose
+  population-preservation assumption is exactly what the unwitnessed
+  literal sources violate). Direct FN evidence on the
+  arch/x86/events + kernel/events slice: key +192 table =
+  {amd_put_event_constraints_f17h} only, while amd_pmu's literal
+  initializer holds amd_put_event_constraints at +192 (installed by
+  the boot copy x86_pmu = amd_pmu; reachable on every AMD f15
+  machine); +88 misses amd_pmu_hw_config; +184 misses plain
+  amd_get_event_constraints. ALL 5.18 full-family pins must be
+  re-cut after the fix; the frames-based GT never caught this
+  (PMU frames absent from the GT set).
+- httpd/postgres transfer pins: UNAFFECTED in IR — the clang-18
+  LTO corpora contain zero literal fn-table constants (scanned
+  2026-09-12), so the fixed binary must reproduce those pins
+  byte-identically (cheap re-gate, part of the fix's gates).

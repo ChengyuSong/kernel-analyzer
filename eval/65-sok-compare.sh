@@ -115,6 +115,48 @@ EOF
   done
 done
 
+# 1b. Locally-run baselines (eval/66), if present: merge each
+# approach's per-dataset parsed_log (ossfuzz + unifuzz share an opt
+# level) into one dir per approach; program names and keys are
+# already in their harness's own format.
+BASE_APPROACHES=""
+if [[ -d "$SOK_OUT/baselines" ]]; then
+  BASE_APPROACHES=$(python3 - "$SOK_OUT/baselines" "$MERGED" <<'EOF'
+import json, sys
+from pathlib import Path
+src, merged = Path(sys.argv[1]), Path(sys.argv[2])
+seen = set()
+for opt in ('O0', 'O3'):
+    per = {}   # approach -> prog -> key -> set(targets)
+    for tagdir in src.glob(f'*_{opt}'):
+        for adir in tagdir.iterdir():
+            # only the approaches eval/66 actually RUNS here — their
+            # harness also copies the pre-computed results into its
+            # output dir, and those must keep coming from /sok
+            if adir.name not in ('TFA', 'DeepType', 'MLTA', 'MLTA_Orig'):
+                continue
+            plog = adir / 'parsed_log'
+            if not plog.is_dir():
+                continue
+            for j in plog.glob('*.json'):
+                d = json.load(open(j))
+                prog = per.setdefault(adir.name, {}).setdefault(j.stem, {})
+                for k, v in d.items():
+                    prog.setdefault(k, set()).update(v)
+    for appr, progs in per.items():
+        dst = merged / opt / appr / 'parsed_log'
+        dst.mkdir(parents=True, exist_ok=True)
+        for prog, keys in progs.items():
+            out = {k: sorted(v) for k, v in sorted(keys.items())}
+            json.dump(out, open(dst / f'{prog}.json', 'w'), indent=1)
+        seen.add(appr)
+print(' '.join(sorted(seen)))
+EOF
+) || exit 1
+  [[ -n "$BASE_APPROACHES" ]] \
+    && echo "== local baselines merged: $BASE_APPROACHES"
+fi
+
 # 2. Sandbox image (the only networked step; skipped once built).
 if ! docker image inspect "$IMG" >/dev/null 2>&1; then
   echo "== building $IMG image"
@@ -133,6 +175,11 @@ for opt in O0 O3; do
     bl='"LLVM-CFI": "/sok/pre-computed/soundness/O3/LLVM-CFI/parsed_log/",
     "HPCFI": "/sok/pre-computed/soundness/O3/HPCFI/parsed_log/",'
   fi
+  for appr in $BASE_APPROACHES; do
+    [[ -d "$MERGED/$opt/$appr/parsed_log" ]] || continue
+    bl+="
+    \"$appr\": \"/results/$opt/$appr/parsed_log/\","
+  done
   cat > "$MERGED/cmp-$opt.json" <<EOF
 {
   "COMMON_PATH": "/results/$opt/",

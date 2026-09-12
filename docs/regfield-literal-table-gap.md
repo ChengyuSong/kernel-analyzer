@@ -17,9 +17,14 @@ ORCFL `full` scores below `base` on dynamically-observed recall
 | libjpeg-turbo djpeg-static O3 | 98.67% | 100% |
 
 A precision mechanism removed pairs that fuzzing OBSERVED. Ablation
-bisection on nm-new.bc: only the `noregf` arm recovers the missing
-targets (e.g. `cache_bseek`: full 0 pairs, noregf 2); noadopt /
-nochain / noopstables / noinvoke all reproduce full exactly.
+bisection on nm-new.bc, both directions, single cause:
+- removal side: only the `noregf` arm recovers the missing targets
+  (`cache_bseek`: full 0 pairs, noregf 2); noadopt / nochain /
+  noopstables / noinvoke all reproduce full exactly (14,342 pairs).
+- additive side: base+regfield ALONE reproduces full's answer count
+  exactly (83,770 → 14,342) and drops `cache_bseek`; base+chain and
+  base+adoption leave base unchanged (chain and adoption are inert
+  on this program).
 
 ## Root cause
 

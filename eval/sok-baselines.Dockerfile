@@ -34,7 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates cmake ninja-build build-essential python3 \
       zlib1g-dev libzstd-dev libxml2-dev libmysqlclient-dev \
-      libomp-14-dev \
+      libomp-14-dev libz3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/user
@@ -62,19 +62,22 @@ RUN git init llvm-project && cd llvm-project \
          -DLLVM_INCLUDE_BENCHMARKS=OFF \
     && ninja -C build
 
-# MLTA (PROGRAM_MLTA_ORIG). Patch points LLVM_BUILD at
-# /home/user/llvm-project/build.
+# MLTA (PROGRAM_MLTA_ORIG). The Makefiles hardcode author-specific
+# LLVM paths (mlta: its own llvm-project/prefix; DeepType:
+# /home/yufei/...) — the command-line LLVM_BUILD override retargets
+# them at this image's build tree (cmake resolves headers/libs via
+# llvm-config on PATH, so the build tree works like an install).
 RUN git clone https://github.com/umnsec/mlta.git && cd mlta \
     && git checkout ${MLTA_COMMIT} \
     && git apply /home/user/patches/mlta.patch \
-    && make \
+    && make LLVM_BUILD=/home/user/llvm-project/build \
     && test -x build/lib/kanalyzer
 
 # DeepType.
 RUN git clone https://github.com/s3team/DeepType.git && cd DeepType \
     && git checkout ${DEEPTYPE_COMMIT} \
     && git apply /home/user/patches/deeptype.patch \
-    && make \
+    && make LLVM_BUILD=/home/user/llvm-project/build \
     && test -x build/lib/kanalyzer
 
 # TFA, twice from one pinned tree. The full/MLTA-only split is the
@@ -85,14 +88,17 @@ RUN git clone https://github.com/s3team/DeepType.git && cd DeepType \
 RUN git clone https://github.com/dinghaoliu/TFA-project.git && cd TFA-project \
     && git checkout ${TFA_COMMIT} \
     && git apply /home/user/patches/tfa.patch \
-    && sed -i 's|/usr/lib/llvm-19/lib/clang/19/include|/usr/lib/llvm-14/include|; s|/usr/lib/llvm-19/lib/|/usr/lib/llvm-14/lib/|' src/CMakeLists.txt \
+    && sed -i 's|/usr/lib/llvm-19/lib/clang/19/include|/usr/lib/llvm-14/lib/clang/14.0.0/include|; s|/usr/lib/llvm-19/lib/|/usr/lib/llvm-14/lib/|' src/CMakeLists.txt \
+    && grep -q 'llvm-14/lib/clang/14.0.0/include' src/CMakeLists.txt \
     && cd /home/user && cp -r TFA-project TFA-project-MLTA \
     && cd TFA-project \
     && sed -i 's|^//#define ENABLE_DATA_FLOW_ANALYSIS|#define ENABLE_DATA_FLOW_ANALYSIS|' src/lib/Analyzer.cc \
     && grep -q '^#define ENABLE_DATA_FLOW_ANALYSIS' src/lib/Analyzer.cc \
-    && make && test -x build/lib/analyzer \
+    && make LLVM_BUILD=/home/user/llvm-project/build \
+    && test -x build/lib/analyzer \
     && cd /home/user/TFA-project-MLTA \
-    && make && test -x build/lib/analyzer
+    && make LLVM_BUILD=/home/user/llvm-project/build \
+    && test -x build/lib/analyzer
 
 # Runtime image: the four analyzers + llvm-objdump (their harness's
 # hardcoded path) + python for their driver. LLVM links statically,
@@ -101,7 +107,7 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-tqdm libomp5-14 libmysqlclient21 \
-      zlib1g libzstd1 libxml2 libtinfo6 \
+      zlib1g libzstd1 libxml2 libtinfo6 libz3-4 \
     && rm -rf /var/lib/apt/lists/*
 ENV LD_LIBRARY_PATH=/usr/lib/llvm-14/lib
 COPY --from=build /home/user/llvm-project/build/bin/llvm-objdump /home/user/llvm-project/build/bin/llvm-objdump

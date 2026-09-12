@@ -103,6 +103,11 @@ and all runnable from the repo (artifact):
   exact strings) and runs THEIR `compare_approaches.py` in a
   network-less Docker sandbox against their pre-computed baselines
   (O0: LLVM-CFI + KallGraph; O3: LLVM-CFI + HPCFI).
+- `66-sok-baselines.sh` + `sok-baselines.Dockerfile` — same-machine
+  timing rows: MLTA/DeepType/TFA (+ TFA's MLTA-only variant) built
+  from source at their pinned commits with their patches, run over
+  their released bitcodes by their `run_experiment.py`, all inside
+  a network-less container. Only the image build needs the network.
 
 ## Outputs (`$KA_RESULTS`)
 

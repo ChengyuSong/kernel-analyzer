@@ -1177,6 +1177,14 @@ static bool isPtrWidthInt(const llvm::Type *T, const llvm::DataLayout &DL);
 static bool mayCarryPtrProvenance(const llvm::Value *V, unsigned depth,
                                   bool &declined);
 static bool ptrToIntTagRoundTripOnly(const llvm::Value *PTI);
+// Census: the op class that made the last tag-walk refuse. The
+// either-or instrument: constant offsets are recoverable residues
+// (a future int-domain field edge), value-unknown arithmetic is a
+// justified admission — the split decides which lever applies.
+static const char *g_tagWalkWhy = "";
+static std::string tagWalkTag(const char *base) {
+  return std::string(base) + ":" + (*g_tagWalkWhy ? g_tagWalkWhy : "clean");
+}
 static size_t g_intStoreUnmodeled = 0;
 static size_t g_intArgUnmodeled = 0;
 
@@ -1289,7 +1297,8 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       addAssignmentEdge(retNode, callNode);
       // Segment-local field claim for the call-result segment.
       if (EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(CS))
-        addFieldWildcardLoop(callNode, "int-callret-dirty-segment");
+        addFieldWildcardLoop(callNode,
+                             tagWalkTag("int-callret-dirty-segment").c_str());
     }
   }
 
@@ -1336,7 +1345,8 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
         // Segment-local field claim for the formal's segment
         // (idempotent across callsites: wildcard set dedups).
         if (EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(farg))
-          addFieldWildcardLoop(formalNode, "int-formal-dirty-segment");
+          addFieldWildcardLoop(
+              formalNode, tagWalkTag("int-formal-dirty-segment").c_str());
       } else if (declined) {
         g_intArgUnmodeled++;
       }
@@ -9952,7 +9962,8 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
         // the producer proved; this segment (load -> ... -> inttoptr)
         // must be tag-clean or the residue claim is wrong here.
         if (CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(&I))
-          CGP.addFieldWildcardLoop(valNode, "int-load-dirty-segment");
+          CGP.addFieldWildcardLoop(
+              valNode, tagWalkTag("int-load-dirty-segment").c_str());
       } else if (declined) {
         g_intLoadUnmodeled++; // ledger
       }
@@ -10212,7 +10223,8 @@ void CallGraphPass::InstHandler::visitAtomicRMWInst(AtomicRMWInst &I) {
   // Segment-local field claim for the loaded-old-value side.
   if (!containsPointerType(I.getType()) && CGP.EB.hasFieldLabels() &&
       !ptrToIntTagRoundTripOnly(&I))
-    CGP.addFieldWildcardLoop(resNode, "int-load-dirty-segment");
+    CGP.addFieldWildcardLoop(resNode,
+                             tagWalkTag("int-load-dirty-segment").c_str());
 }
 
 // cmpxchg on a pointer slot: conditional store of the new value plus the
@@ -10257,7 +10269,8 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   // Segment-local field claim for the loaded-old-value projection.
   if (!containsPointerType(I.getNewValOperand()->getType()) &&
       CGP.EB.hasFieldLabels() && !ptrToIntTagRoundTripOnly(&I))
-    CGP.addFieldWildcardLoop(resNode, "int-load-dirty-segment");
+    CGP.addFieldWildcardLoop(resNode,
+                             tagWalkTag("int-load-dirty-segment").c_str());
 }
 
 static bool ptrToIntTagRoundTripOnly(const Value *PTI); // defined below
@@ -10727,10 +10740,13 @@ static void p2iEscapeCensus(const Value *PTI, const char *where) {
 static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
   SmallVector<const Value *, 16> wl{PTI};
   SmallPtrSet<const Value *, 32> seen{PTI};
+  g_tagWalkWhy = "";
   unsigned steps = 0;
   while (!wl.empty()) {
-    if (++steps > 128)
+    if (++steps > 128) {
+      g_tagWalkWhy = "depth";
       return false;
+    }
     const Value *V = wl.pop_back_val();
     for (const User *U : V->users()) {
       if (isa<IntToPtrInst>(U) || isa<ICmpInst>(U) || isa<SwitchInst>(U))
@@ -10738,22 +10754,31 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       if (const auto *BO = dyn_cast<BinaryOperator>(U)) {
         const auto *CI = dyn_cast<ConstantInt>(
             BO->getOperand(BO->getOperand(0) == V ? 1 : 0));
-        if (!CI)
+        if (!CI) {
+          g_tagWalkWhy = "arith-var";
           return false;
+        }
         const uint64_t c = CI->getZExtValue();
         switch (BO->getOpcode()) {
         case Instruction::Or:
         case Instruction::Xor:
-          if (c >= 8)
+          if (c >= 8) {
+            g_tagWalkWhy = "orxor-big";
             return false; // beyond sub-alignment bits
+          }
           break;
         case Instruction::And:
           if (c < 8)
             continue; // tag EXTRACTION: result carries no pointer
-          if (~c >= 8)
+          if (~c >= 8) {
+            g_tagWalkWhy = "mask-destroy";
             return false; // offset-destroying mask (& ~0xfff et al.)
+          }
           break; // tag clear (& ~7 and finer)
         default:
+          g_tagWalkWhy = BO->getOpcode() == Instruction::Add   ? "add-const"
+                         : BO->getOpcode() == Instruction::Sub ? "sub-const"
+                                                               : "arith-const";
           return false;
         }
         if (seen.insert(U).second)
@@ -10790,6 +10815,7 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       if (const auto *SI = dyn_cast<StoreInst>(U)) {
         if (SI->getValueOperand() == V)
           continue; // value crosses into memory; load side re-proves
+        g_tagWalkWhy = "int-as-addr";
         return false; // int as store ADDRESS: not expressible, bail
       }
       if (isa<ReturnInst>(U))
@@ -10797,6 +10823,7 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       if (const auto *CB = dyn_cast<CallBase>(U)) {
         if (CB->getCalledOperand() != V)
           continue; // argument: callee side re-proves at the formal
+        g_tagWalkWhy = "int-as-callee";
         return false; // int called as function: nonsense, bail
       }
       if (const auto *GEP2 = dyn_cast<GetElementPtrInst>(U)) {
@@ -10804,17 +10831,20 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
           continue; // used as INDEX only: result inherits the BASE's
                     // provenance (no edge from indices), the escaped
                     // int never re-becomes a pointer to the source
+        g_tagWalkWhy = "int-as-gep-base";
         return false;
       }
       if (const auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
         if (RMW->getValOperand() == V &&
             RMW->getOperation() == AtomicRMWInst::Xchg)
           continue; // pure store: consumer side re-proves the result
+        g_tagWalkWhy = "rmw-arith";
         return false; // arithmetic RMW COMPUTES in memory — bail
       }
       if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(U)) {
         if (CX->getNewValOperand() == V || CX->getCompareOperand() == V)
           continue; // conditional store / compare-only
+        g_tagWalkWhy = "cmpxchg";
         return false;
       }
       if (isa<ExtractValueInst>(U)) { // {old,i1} projection of cmpxchg
@@ -10822,6 +10852,7 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
           wl.push_back(U);
         continue;
       }
+      g_tagWalkWhy = "user-unmodeled";
       return false;
     }
   }
@@ -10848,7 +10879,7 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
       g_tagRoundTrips++;
     } else {
       p2iEscapeCensus(&I, "inst");
-      CGP.addFieldWildcardLoop(srcNode, "ptrtoint-escape");
+      CGP.addFieldWildcardLoop(srcNode, tagWalkTag("ptrtoint-escape").c_str());
     }
   }
   CGP.addAssignmentEdge(srcNode, dstNode);

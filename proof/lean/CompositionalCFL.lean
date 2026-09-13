@@ -2,4 +2,5 @@ import CompositionalCFL.Core
 import CompositionalCFL.FlowsTo
 import CompositionalCFL.Bundles
 import CompositionalCFL.Channels
+import CompositionalCFL.ChannelCells
 import CompositionalCFL.Staging

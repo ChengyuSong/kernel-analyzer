@@ -1772,6 +1772,19 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
 void CallGraphPass::addFieldWildcardLoop(NodeIndex n, const char *why) {
   if (n == AndersNodeFactory::InvalidIndex)
     return;
+  if (!CFLProbeWildcardAblate.empty()) {
+    // MEASUREMENT-ONLY UNSOUND probe: attribute welds to admission
+    // classes by suppressing matching mints outright.
+    StringRef spec(CFLProbeWildcardAblate), w(why);
+    while (!spec.empty()) {
+      auto [pat, rest] = spec.split(',');
+      if (!pat.empty() && w.contains(pat)) {
+        wildcardReasons[std::string("ABLATED:") + why]++;
+        return;
+      }
+      spec = rest;
+    }
+  }
   NodeIndex canon = getCanonicalNode(n);
   if (moduleFieldWildcardRoots.insert(canon).second) {
     EB.addFieldWildcardSelfLoop(canon);
@@ -6728,6 +6741,18 @@ bool CallGraphPass::runFlowsToResolution() {
           }
         errs() << " ]\n";
         printed++;
+      }
+      // Which (origin, shift) channels coalesced into the clusters this
+      // slice reads: cluster keys anchored anywhere in the visited set.
+      // One rep carrying keys at MANY shifts = cross-residue coalescence.
+      size_t keyShown = 0;
+      for (auto &[key2, crep2] : clusterRep) {
+        if (!vis.count(find(crep2))) continue;
+        if (keyShown++ > 400) { errs() << "TRACE-BWD   ...more keys\n"; break; }
+        uint32_t o2 = (uint32_t)(key2 / NSHIFT), s2 = (uint32_t)(key2 % NSHIFT);
+        errs() << "TRACE-BWD   slice-key c" << find(crep2) << " <- (r" << o2
+               << " " << nameOfClass(rootClassOf[o2]).substr(0, 50) << ", s"
+               << s2 << ")\n";
       }
     }
     if (traceRoot >= 0) {

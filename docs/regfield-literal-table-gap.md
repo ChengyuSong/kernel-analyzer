@@ -12,10 +12,17 @@ Fix gates (all with the fixed binary, this box):
 - PMU slice: `CLOSED struct.x86_pmu+192 table=3` now includes
   amd_put_event_constraints / intel_put_event_constraints; cert green.
 - km (6.8.2 subset, 338 TUs) old-vs-new binary: +4,663/−0 pairs —
-  strictly additive; same 230 closed keys; cert 0 violations.
-- httpd FI full: 46,313 = old pin 45,479 +834/−0, ⊆ base, cert green.
-- pg FI full: 438,583 = old pin 435,979 +2,604/−0, ⊆ base, cert green.
+  strictly additive; cert 0 violations. Final vintage (with the
+  addendum fixes, 24af384): 112,324 = +30 more, still additive.
+- httpd FI full: 46,313 = old pin 45,479 +834/−0, ⊆ base, cert
+  green; unchanged by the addendum fixes (byte-identical).
+- pg FI full: 438,583 = old pin 435,979 +2,604/−0; final vintage
+  438,690 (+107 more from the addendum fixes), ⊆ base, cert green.
 - cfl-smoke 4/4; libpng cert green (19 ICALLs, 0 FILTERED).
+- SoK recall table re-cut (eval/62+65, final binary): ORCFL full =
+  100% on every soundness program except cflow O3 (84.21% — full ≡
+  base there, and every baseline is sub-100 incl. LLVM-CFI 94.74%:
+  a shared corpus/GT artifact, not a mechanism).
 
 Remaining (tracked outside this ticket): kernel 5.18 full-family
 matrix re-cut on the big machine; SoK eval/62+65 re-run; usermode

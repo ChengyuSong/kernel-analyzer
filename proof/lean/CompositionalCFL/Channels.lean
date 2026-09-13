@@ -90,6 +90,74 @@ theorem clamp_needs_attribution :
   · intro h
     exact (h () () trivial).2 trivial
 
+/-! ## 1b. Witness-by-use totality (the literal-table campaign,
+2026-09-12)
+
+How the implementation discharges `Closed`. The falsified premise
+(docs/regfield-literal-table-gap.md) was ENUMERATION: "table
+discovery by named struct type sees every table." clang emits
+literal-typed constants (anon-union initializers) and LLVM renames
+isomorphic structs per-TU, so a whole install class can carry no
+name — and an install class with no witness is invisible, not
+absent. The repaired premise is TOTALITY over install classes:
+every runtime install is either witnessed (attributed to the key
+by value flow) or belongs to a refuse/absorb class the apply step
+handles additively (loose tables; empty-population copy sources
+OPEN the key instead of closing it). -/
+
+/-- Install-level model for one key: `Installed f` = at runtime, `f`
+ends up in the key's field (any store path); `witnessed` = the
+census-attributed population; `loose` = the additive absorption
+class (initializer fn slots with no named-key attribution). -/
+structure InstallModel (Fn : Type) where
+  Installed : Set Fn
+  witnessed : Set Fn
+  loose : Set Fn
+
+/-- The totality premise: no install class outside witness ∪ absorb.
+This is what the witness-by-use census must establish per key; a key
+where it cannot be established must stay OPEN. -/
+def InstallModel.Total {Fn : Type} (W : InstallModel Fn) : Prop :=
+  ∀ f, W.Installed f → W.witnessed f ∨ W.loose f
+
+/-- Dispatch reads deliver installed values: what a key-reading site
+calls is something some store put there. -/
+def DeliversInstalled {Site Fn : Type} (M : DispatchModel Site Fn)
+    (W : InstallModel Fn) : Prop :=
+  ∀ s f, M.Ev s f → M.readsKey s → W.Installed f
+
+/-- Discharge of `Closed`: totality + delivery, with the table taken
+as witnessed ∪ loose (the apply step's absorption). This is the
+whole soundness argument of the fixed channel — everything else is
+`clamp_sound`. -/
+theorem witness_totality_closed {Site Fn : Type}
+    (M : DispatchModel Site Fn) (W : InstallModel Fn)
+    (hT : W.Total) (hD : DeliversInstalled M W)
+    (htab : ∀ f, W.witnessed f ∨ W.loose f → M.table f) :
+    M.Closed := by
+  intro s f hev hrd
+  exact htab f (hT f (hD s f hev hrd))
+
+/-- The enumeration premise cannot replace totality: a model with one
+install outside the witnessed set (a literal-typed table, or a value
+relayed from an empty-population copy source) satisfies "every NAMED
+store is witnessed" vacuously, yet closing over the witnessed set
+alone erases the true target. Machine-checked record of the 2026-09
+bug class: nm-new's cache_bseek, the x86_pmu literal instances,
+libjpeg's sep_upsample relay. -/
+theorem enumeration_gap_unsound :
+    ∃ (M : DispatchModel Unit Unit) (W : InstallModel Unit),
+      DeliversInstalled M W ∧
+      (∀ f, W.witnessed f → M.table f) ∧
+      ¬ M.Closed := by
+  refine ⟨⟨fun _ _ => True, fun _ => True, fun _ => False⟩,
+          ⟨fun _ => True, fun _ => False, fun _ => False⟩,
+          ?_, ?_, ?_⟩
+  · intro _ _ _ _; trivial
+  · intro _ h; exact h.elim
+  · intro h
+    exact h () () trivial trivial
+
 /-! ## 2. Object-population clamping (the re-founding) -/
 
 /-- Object-level model: the field holds OBJECTS; `holds s o` = at

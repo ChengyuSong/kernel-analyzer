@@ -21,6 +21,28 @@ Remaining (tracked outside this ticket): kernel 5.18 full-family
 matrix re-cut on the big machine; SoK eval/62+65 re-run; usermode
 fs pins (fsfull) re-cut via eval/64.
 
+ADDENDUM 2026-09-12 (same day, found by the same ledger+GT
+methodology): two more holes surfaced once the literal-table fix
+landed —
+1. Summary proposers blind to varargs (adoption erased
+   sqlite3_config's mem-methods install) — separate ticket,
+   docs/summary-varargs-gap.md.
+2. Copy-closure empty-source hole (THIS channel): the census
+   records key-to-key copy edges (`copyIn`) and propagates
+   populations and openness along them, but a copy SOURCE with no
+   witnessed population and no openness contributed nothing and
+   let the dest close. libjpeg: jinit_upsampler installs
+   sep_upsample through my_upsampler+var (blocked: var-off), so
+   jpeg_upsampler+8 has stored=0; jdpostct.c then relays
+   `post->pub.post_process_data = cinfo->upsample->_upsample` —
+   jpeg_d_post_controller+8 closed over a table missing
+   sep_upsample and the ledger showed it FILTERED at the three GT
+   callsites (djpeg O3). Fix: a copy-in source with an EMPTY
+   witnessed population opens the dest (evidence-free is not
+   enumerable — the same rule the loose-table absorption already
+   applies to outer keys); mirrored in the obj closure. Gate:
+   djpeg O3 full == pure-base on the fuzz GT.
+
 ## Symptom
 
 ORCFL `full` scores below `base` on dynamically-observed recall

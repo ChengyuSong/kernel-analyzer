@@ -13641,10 +13641,19 @@ void CallGraphPass::runRegFieldGapReport() {
       bool wasOpen = open.count(dst);
       for (const auto &s : srcs) {
         auto ri = regs.find(s);
-        if (ri != regs.end()) {
+        if (ri != regs.end() && !ri->second.empty()) {
           D.insert(ri->second.begin(), ri->second.end());
           auto &sc = popSrc[dst][3];
           sc.insert(ri->second.begin(), ri->second.end());
+        } else if (!open.count(s)) {
+          // Copy-in from a key with NO witnessed population:
+          // evidence-free is not enumerable (the name-keyed census
+          // cannot distinguish "never stored" from "stored through a
+          // spelling it cannot see" — libjpeg installs sep_upsample
+          // into my_upsampler+var, blocked, then relays
+          // jpeg_upsampler+8 -> jpeg_d_post_controller+8). The dest
+          // table would silently miss the relayed value: refuse.
+          open.insert(dst);
         }
         if (open.count(s)) open.insert(dst);
       }
@@ -13661,8 +13670,14 @@ void CallGraphPass::runRegFieldGapReport() {
       bool wasOpen = objOpen.count(dst);
       for (const auto &s : srcs) {
         auto ri = objRegs.find(s);
-        if (ri != objRegs.end())
+        if (ri != objRegs.end() && !ri->second.empty())
           D.insert(ri->second.begin(), ri->second.end());
+        else if (!objOpen.count(s)) {
+          // Mirror of the fn closure's empty-source refusal.
+          objOpen.insert(dst);
+          if (!objOpenWhy.count(dst))
+            objOpenWhy[dst] = "copy<-" + s + "(empty population)";
+        }
         if (objOpen.count(s)) {
           objOpen.insert(dst);
           if (!objOpenWhy.count(dst) && objOpenWhy.count(s))
@@ -16291,8 +16306,16 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   case Intrinsic::assume: case Intrinsic::expect:
                   case Intrinsic::prefetch: case Intrinsic::donothing:
                   case Intrinsic::trap: case Intrinsic::ubsantrap:
-                  case Intrinsic::vastart: case Intrinsic::vaend:
-                  case Intrinsic::vacopy: case Intrinsic::memset:
+                  case Intrinsic::vastart: case Intrinsic::vacopy:
+                    // va_start/va_copy fill a local va_list with
+                    // CALLER tail args the local solve cannot see:
+                    // va_arg loads then read cells this interpreter
+                    // tracks as empty, so stores of that content
+                    // vanish instead of becoming atoms
+                    // (sqlite3_config lost the sqlite3_mem_methods
+                    // install). Attribute-or-refuse: refuse.
+                    why = "varargs"; return false;
+                  case Intrinsic::vaend: case Intrinsic::memset:
                   case Intrinsic::stacksave: case Intrinsic::stackrestore:
                   case Intrinsic::returnaddress: case Intrinsic::frameaddress:
                     continue;
@@ -16935,8 +16958,16 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     case Intrinsic::assume: case Intrinsic::expect:
                     case Intrinsic::prefetch: case Intrinsic::donothing:
                     case Intrinsic::trap: case Intrinsic::ubsantrap:
-                    case Intrinsic::vastart: case Intrinsic::vaend:
-                    case Intrinsic::vacopy: case Intrinsic::memset:
+                    case Intrinsic::vastart: case Intrinsic::vacopy:
+                      // Same varargs blindness as the atom pass: the
+                      // local solve never sees caller tail args, so
+                      // an "effect-complete" solved summary would
+                      // under-claim (sqlite3_config solved OK-EMPTY
+                      // while its body installs sqlite3_mem_methods
+                      // via va_arg + memcpy). Refuse.
+                      fail = "varargs";
+                      break;
+                    case Intrinsic::vaend: case Intrinsic::memset:
                     case Intrinsic::stacksave: case Intrinsic::stackrestore:
                     case Intrinsic::returnaddress:
                     case Intrinsic::frameaddress:

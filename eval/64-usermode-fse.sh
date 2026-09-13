@@ -34,11 +34,13 @@
 # fs, up to a named weld (kernel showed one 0.02% EFI weld) — any
 # added pairs are reported loudly either way.
 #
-# Pinned FI reference (this box, 2026-09-12, post regfield
-# witness-by-use fix — docs/regfield-literal-table-gap.md; the
+# Pinned FI reference (this box, 2026-09-12, post the three
+# soundness fixes — regfield witness-by-use + copy-closure
+# empty-source refusal (docs/regfield-literal-table-gap.md) and
+# summary varargs refusal (docs/summary-varargs-gap.md); the
 # 09-11 full pins 45,479/435,979 are pre-fix, superseded):
 #   httpd  full 46,313 / base 81,049
-#   pg     full 438,583 / base 1,178,443
+#   pg     full 438,690 / base 1,178,443
 # fsfull pins (45,151 / 422,528) are pre-fix — re-cut pending.
 #
 # Usage:

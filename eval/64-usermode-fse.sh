@@ -41,7 +41,10 @@
 # 09-11 full pins 45,479/435,979 are pre-fix, superseded):
 #   httpd  full 46,313 / base 81,049
 #   pg     full 438,690 / base 1,178,443
-# fsfull pins (45,151 / 422,528) are pre-fix — re-cut pending.
+# fs pins (same vintage; fsbase carries no channels/adoption, so
+# the fixes are inert there and those pins stand):
+#   httpd  fsfull 45,975 / fsbase 80,208   (fs-vs-fi -338/+0)
+#   pg     fsfull 425,239 / fsbase 1,159,606 (fs-vs-fi -13,451/+0)
 #
 # Usage:
 #   KA_WORK=~/fast/ka-bench eval/64-usermode-fse.sh \

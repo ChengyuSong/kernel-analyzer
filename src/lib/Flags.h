@@ -76,6 +76,8 @@ extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<std::string> CFLProbeWildcardAblate;
 extern cl::opt<bool> CFLProbeIdentityJoinAblate;
 extern cl::opt<bool> CFLChannelCells;
+extern cl::opt<bool> CFLProbeNoIcallWiring;
+extern cl::opt<bool> CFLProbeNoIntStores;
 extern cl::opt<bool> CFLIterCapOk;
 extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<bool> CFLProposeNoopSummaries;

@@ -1187,6 +1187,7 @@ static std::string tagWalkTag(const char *base) {
 }
 static size_t g_intStoreUnmodeled = 0;
 static size_t g_intArgUnmodeled = 0;
+static size_t g_icallWiringSkipped = 0; // --cfl-probe-no-icall-wiring ledger
 
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
                                int opsSkipArg) {
@@ -4207,8 +4208,26 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << "TRACE root " << rid << " = " << F->getName() << "\n";
         break;
       }
+    if (traceRoot < 0) {
+      // Not a function: trace an OBJECT origin by its value name (a
+      // global/alloca/alloc-site) — needed to follow how an object
+      // reaches a load's owner pointer (the breadth side of the
+      // derivation witness), not only how a function reaches the fptr.
+      for (uint32_t rid = 0; rid < rootClassOf.size() && traceRoot < 0;
+           rid++) {
+        const uint32_t rc = rootClassOf[rid];
+        if (rc >= toOrig.size()) continue;
+        const Value *OV = NF.getValueForNode(toOrig[rc]);
+        if (OV && OV->hasName() && OV->getName().contains(CFLTraceFunc)) {
+          traceRoot = rid;
+          errs() << "TRACE root " << rid << " = origin " << OV->getName()
+                 << "\n";
+        }
+      }
+    }
     if (traceRoot < 0)
-      errs() << "TRACE: no function root matches '" << CFLTraceFunc << "'\n";
+      errs() << "TRACE: no function/origin root matches '" << CFLTraceFunc
+             << "'\n";
   }
   size_t traceEvents = 0;
   const char *tHow = "seed";
@@ -7045,7 +7064,10 @@ bool CallGraphPass::runFlowsToResolution() {
       std::vector<uint32_t> q{rep};
       boost::unordered_flat_set<uint32_t> vis{rep};
       size_t printed = 0;
-      for (size_t qi = 0; qi < q.size() && printed < 300; qi++) {
+      // Traced runs are diagnostic: print the whole reachable slice
+      // (a giant cell cluster's root-carrying predecessor sat past the
+      // old 300-node / 200-edge caps and cut the derivation witness).
+      for (size_t qi = 0; qi < q.size() && printed < 50000; qi++) {
         uint32_t v = q[qi];
         bool has = false;
         for (uint32_t s = 0; s < NSHIFT && !has; s++)
@@ -7064,10 +7086,11 @@ bool CallGraphPass::runFlowsToResolution() {
         size_t shownE = 0;
         if (ie != inEdges.end())
           for (auto &e : ie->second) {
-            if (shownE++ > 200) { errs() << " ..."; break; }
+            if (shownE++ > 20000) { errs() << " ..."; break; }
             errs() << " " << e;
             uint32_t src2 = (uint32_t)std::stoul(e.substr(e.find("c") + 1));
-            if (vis.insert(src2).second && q.size() < 3000) q.push_back(src2);
+            if (vis.insert(src2).second && q.size() < 500000)
+              q.push_back(src2);
           }
         errs() << " ]\n";
         printed++;
@@ -7515,6 +7538,10 @@ bool CallGraphPass::runFlowsToResolution() {
       if (!Ctx->Callees[CS].insert(F).second)
         continue; // wired in an earlier iteration
       newPairs++;
+      if (CFLProbeNoIcallWiring) {
+        g_icallWiringSkipped++; // MEASUREMENT-ONLY UNSOUND: feedback share
+        continue;
+      }
       // Wire the callee's flows exactly as the saturation fixpoint does;
       // the new edges enter the NEXT iteration's solve.
       Function *CF = const_cast<Function *>(F);
@@ -7557,6 +7584,9 @@ bool CallGraphPass::runFlowsToResolution() {
   if (g_sinkAblatedJoins)
     errs() << "SinkAblate: " << g_sinkAblatedJoins
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
+  if (g_icallWiringSkipped)
+    errs() << "NoIcallWiring: " << g_icallWiringSkipped
+           << " resolved callees left unwired [MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLSinkInstr) {
     assert(g_sinkContractChecked &&
            "sink arena ran without the read-back contract check");
@@ -10398,6 +10428,10 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
             if (srcN != AndersNodeFactory::InvalidIndex)
               CGP.addAssignmentEdge(srcN, valNode);
           }
+        if (CFLProbeNoIntStores) {
+          g_intStoreUnmodeled++; // MEASUREMENT-ONLY UNSOUND: laundering share
+          return;
+        }
         Value *sp = I.getOperand(1);
         NodeIndex slotRep;
         if (CGP.resolveSummarizedAllocaSlot(sp, slotRep)) {

@@ -16734,6 +16734,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   case Intrinsic::assume: case Intrinsic::expect:
                   case Intrinsic::prefetch: case Intrinsic::donothing:
                   case Intrinsic::trap: case Intrinsic::ubsantrap:
+                  case Intrinsic::vaend: case Intrinsic::memset:
+                  case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                  case Intrinsic::returnaddress: case Intrinsic::frameaddress:
+                    continue;
                   case Intrinsic::vastart: case Intrinsic::vacopy:
                     // va_start/va_copy fill a local va_list with
                     // CALLER tail args the local solve cannot see:
@@ -16741,12 +16745,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     // tracks as empty, so stores of that content
                     // vanish instead of becoming atoms
                     // (sqlite3_config lost the sqlite3_mem_methods
-                    // install). Attribute-or-refuse: refuse.
+                    // install). Attribute-or-refuse: refuse. (Must
+                    // follow the benign list's `continue`, see the
+                    // solved pass's note on the 24af384 fall-through.)
                     why = "varargs"; return false;
-                  case Intrinsic::vaend: case Intrinsic::memset:
-                  case Intrinsic::stacksave: case Intrinsic::stackrestore:
-                  case Intrinsic::returnaddress: case Intrinsic::frameaddress:
-                    continue;
                   default: {
                     bool pure = !II->getType()->isPointerTy();
                     for (const Value *Arg : II->args())
@@ -17386,20 +17388,23 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     case Intrinsic::assume: case Intrinsic::expect:
                     case Intrinsic::prefetch: case Intrinsic::donothing:
                     case Intrinsic::trap: case Intrinsic::ubsantrap:
+                    case Intrinsic::vaend: case Intrinsic::memset:
+                    case Intrinsic::stacksave: case Intrinsic::stackrestore:
+                    case Intrinsic::returnaddress:
+                    case Intrinsic::frameaddress:
+                      continue;
                     case Intrinsic::vastart: case Intrinsic::vacopy:
                       // Same varargs blindness as the atom pass: the
                       // local solve never sees caller tail args, so
                       // an "effect-complete" solved summary would
                       // under-claim (sqlite3_config solved OK-EMPTY
                       // while its body installs sqlite3_mem_methods
-                      // via va_arg + memcpy). Refuse.
+                      // via va_arg + memcpy). Refuse. (Must follow the
+                      // benign list's `continue` — 24af384 placed it
+                      // inside the fall-through chain and refused every
+                      // function with a dbg/lifetime intrinsic.)
                       fail = "varargs";
                       break;
-                    case Intrinsic::vaend: case Intrinsic::memset:
-                    case Intrinsic::stacksave: case Intrinsic::stackrestore:
-                    case Intrinsic::returnaddress:
-                    case Intrinsic::frameaddress:
-                      continue;
                     default: {
                       if (isa<MemTransferInst>(II)) {
                         // memcpy/memmove as a wildcard cell transfer:

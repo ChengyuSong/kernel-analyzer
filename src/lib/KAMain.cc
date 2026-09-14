@@ -410,6 +410,23 @@ cl::opt<std::string> CFLRegFieldWatch(
            "that drops a watched fn — GT-loss attribution forensics"),
   cl::init(""));
 
+cl::opt<bool> CFLChannelCells(
+  "cfl-channel-cells",
+  cl::desc("Pairwise-witnessed M (docs/channel-cells-design.md): route "
+           "cell content through first-class (origin, shift) channel "
+           "nodes instead of union-find cluster merges. Strictly tighter "
+           "(removal-only vs clusters; Lean pair_le_cluster). v1: mono "
+           "solve only — refuses batch mode, --cfl-verify-closure, and "
+           "--cfl-solver-threads>1"),
+  cl::init(false));
+
+cl::opt<bool> CFLProbeIdentityJoinAblate(
+  "cfl-probe-identity-join-ablate",
+  cl::desc("MEASUREMENT-ONLY, UNSOUND: skip cluster joins keyed by "
+           "identity/synthetic origins (unwitnessed-content roots). "
+           "Quantifies the identity-web weld's share of the answer"),
+  cl::init(false));
+
 cl::opt<std::string> CFLProbeWildcardAblate(
   "cfl-probe-wildcard-ablate",
   cl::desc("MEASUREMENT-ONLY, UNSOUND: skip field-wildcard mints whose "
@@ -1342,6 +1359,27 @@ int main(int argc, char **argv) {
       errs() << "ERROR: --cfl-batch-workers requires --cfl-batch-roots "
                 "(the batch size defines what each worker solves)\n";
       exit(1);
+    }
+    if (CFLChannelCells) {
+      if (CFLBatchRoots > 0) {
+        errs() << "ERROR: --cfl-channel-cells v1 is mono-solve only "
+                  "(batch event replay records cluster joins; the "
+                  "channel analog is edge additions — not ported yet)\n";
+        exit(1);
+      }
+      if (CFLVerifyClosure) {
+        errs() << "ERROR: --cfl-channel-cells v1 does not support "
+                  "--cfl-verify-closure (C4-key mirrors the cluster "
+                  "join rule; the verifier must mirror the channel "
+                  "rule before certifying)\n";
+        exit(1);
+      }
+      if (CFLSolverThreads > 1) {
+        errs() << "ERROR: --cfl-channel-cells v1 requires a sequential "
+                  "solve (pend flush and node growth are barrier-"
+                  "serial)\n";
+        exit(1);
+      }
     }
     if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {
       if (CFLFieldBuckets.getNumOccurrences() == 0) {

@@ -3520,6 +3520,64 @@ bool CallGraphPass::runFlowsToResolution() {
     auto &cs = cellsOf[p];
     if (std::find(cs.begin(), cs.end(), c) == cs.end()) cs.push_back(c);
   }
+  // Channel cells (docs/channel-cells-design.md): classify each
+  // assistant cell's access role from the build-time a-edges — a load
+  // cell FEEDS its result (outgoing a), a store cell RECEIVES its value
+  // (incoming a). Roles OR under merges. role==3 (read-write: RMW /
+  // cmpxchg) cells wired in both directions would relay content between
+  // their channels (Lean: rw_conduit_leaks), so they keep merge
+  // semantics, ledgered.
+  std::vector<char> cellRole;
+  if (CFLChannelCells) {
+    cellRole.assign(N, 0);
+    std::vector<char> isCellN(N, 0);
+    for (auto [p, c] : dEdges) isCellN[c] = 1;
+    for (auto [ea, eb] : aEdges) {
+      if (isCellN[ea]) cellRole[ea] |= 1;
+      if (isCellN[eb]) cellRole[eb] |= 2;
+    }
+    // A load consumed only as a base pointer feeds f-edges, not a-edges
+    // (GEPs on the result) — still load-side. Missing this classified
+    // real loads as inert and severed their content (v1 GT explosion).
+    for (auto &[fb, fr, fbk] : fEdges)
+      if (isCellN[fb]) cellRole[fb] |= 1;
+    // A cell dereferenced onward (its content used as a pointer: the
+    // cell is the SOURCE of another d-edge) is also load-side.
+    for (auto [p2, c2] : dEdges)
+      if (isCellN[p2]) cellRole[p2] |= 1;
+    // Object nodes ARE storage: their seeded facts (initializer
+    // deposits) are the key's content — store-side, so they feed
+    // their channels. (Origins anchor at the ADDRESS value class,
+    // so an own-origin identity test at the cell cannot see this.)
+    for (auto [p3, c3] : dEdges)
+      if (c3 < toOrig.size() && NF.isObjectNode(toOrig[c3]))
+        cellRole[c3] |= 2;
+    if (VerboseLevel >= 3 && N < 200) {
+      // Tiny-graph full dump: every class with its edges — the whole
+      // truth for micro repros.
+      auto gnm = [&](uint32_t c2) -> std::string {
+        const Value *V2 = NF.getValueForNode(toOrig[c2]);
+        if (V2 && V2->hasName()) return V2->getName().str();
+        if (V2)
+          if (const auto *I2 = dyn_cast<Instruction>(V2))
+            return (I2->getFunction()->getName() + "::" +
+                    I2->getOpcodeName()).str();
+        return NF.isObjectNode(toOrig[c2]) ? "<obj>" : "<syn>";
+      };
+      for (uint32_t c = 0; c < N; c++) {
+        errs() << "G c" << c << " [" << gnm(c) << "]"
+               << (isCellN[c] ? " CELL" : "")
+               << " role=" << (int)(c < cellRole.size() ? cellRole[c] : 0);
+        for (auto [ea, eb] : aEdges)
+          if (ea == c) errs() << " a->c" << eb;
+        for (auto [pa, pb] : dEdges)
+          if (pa == c) errs() << " d->c" << pb;
+        for (auto &[fa, fb, fk] : fEdges)
+          if (fa == c) errs() << " f" << fk << "->c" << fb;
+        errs() << "\n";
+      }
+    }
+  }
   // Facts are (origin root, shift) pairs, stored as NSHIFT bit planes per
   // class: plane s is a bitset over origins present at shift s. Shift
   // values: 0..NB-1 exact residues, NB = unknown (X). Field-insensitive
@@ -4201,9 +4259,16 @@ bool CallGraphPass::runFlowsToResolution() {
     CG_LOG("FlowsTo: plane interning inactive (requires a sequential "
            "unbatched solve: T=1, no batch roots/workers)\n");
   bool parallelPhase = false; // true only inside a parallel wave phase
+  // Channel-cells headroom: channel nodes are appended at barrier
+  // flushes; the fixed atomic arrays (classLk/inWL/keyCount) cannot
+  // grow, so they get capacity up front. Vectors grow at the barrier
+  // (no live references across the flush).
+  // Headroom bound: realized keys ≤ origins × NSHIFT; origins ≤ N.
+  const uint32_t NCap =
+      CFLChannelCells ? N + std::max<uint32_t>(3 * N, 1u << 20) : N;
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
-      new std::atomic<uint8_t>[N]);
-  for (uint32_t i = 0; i < N; i++)
+      new std::atomic<uint8_t>[NCap]);
+  for (uint32_t i = 0; i < NCap; i++)
     classLk[i].store(0, std::memory_order_relaxed);
   auto lockC = [&](uint32_t n) {
     if (!parallelPhase) return;
@@ -4380,8 +4445,9 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t i = 0; i < N; i++) topoRank[i] = nComp - 1 - topoRank[i];
   }
   std::vector<uint32_t> worklist;
-  std::unique_ptr<std::atomic<uint8_t>[]> inWL(new std::atomic<uint8_t>[N]);
-  for (uint32_t i = 0; i < N; i++)
+  std::unique_ptr<std::atomic<uint8_t>[]> inWL(
+      new std::atomic<uint8_t>[NCap]);
+  for (uint32_t i = 0; i < NCap; i++)
     inWL[i].store(0, std::memory_order_relaxed);
   uint64_t factCount = 0;
   uint64_t iterations = 0;
@@ -4661,8 +4727,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // many cluster keys a class anchors; a join that merges a cell already
   // anchoring other keys coalesces key-clusters the grammar keeps apart.
   std::unique_ptr<std::atomic<uint32_t>[]> keyCount(
-      new std::atomic<uint32_t>[N]);
-  for (uint32_t i = 0; i < N; i++)
+      new std::atomic<uint32_t>[NCap]);
+  for (uint32_t i = 0; i < NCap; i++)
     keyCount[i].store(0, std::memory_order_relaxed);
   size_t transKeyMerges = 0;
   // Churn attribution: what triggers merges, how much join work is
@@ -4670,6 +4736,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // that sizes the delta-precision fix and names summarization targets.
   size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
   size_t nullKeyJoinsSkipped = 0; // null-cell join hygiene LEDGER
+  size_t g_idJoinsAblated = 0;    // identity-join ablation probe LEDGER
+  std::vector<int8_t> g_idJoinClass; // rid -> 1 = identity/synthetic
   // --cfl-root-relevance: (root, keeper class) per join-triggered merge —
   // joins are the only consumer of individual root bits besides the final
   // icall answer read, so these witnesses + function roots form a
@@ -4706,6 +4774,8 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     mergeCount++;
     mergeHits[a] += 1 + mergeHits[b];
+    if (!cellRole.empty())
+      cellRole[a] |= cellRole[b]; // access roles OR under merges
     keyCount[a].fetch_add(keyCount[b].load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
     keyCount[b].store(0, std::memory_order_relaxed);
@@ -5039,6 +5109,24 @@ bool CallGraphPass::runFlowsToResolution() {
   // binds payload-accessor returns to shared arena objects), so the
   // solve runs unmodified. Contract gating is enforced at planting.
 
+  // ---- Channel cells (docs/channel-cells-design.md): joins become
+  // pendings during rounds; channel nodes + directional edges are
+  // materialized at the drain barrier (node growth is barrier-serial,
+  // no live references across it).
+  struct ChanPend {
+    uint32_t cell, o, s;
+  };
+  std::vector<ChanPend> chanPend, chanRetry;
+  // Record-time dedup: one pend per (raw cell, key) for the whole
+  // solve — node ids are never reused, so raw ids are stable even
+  // across merges (re-offers after merges re-call joinCluster).
+  boost::unordered_flat_set<std::pair<uint64_t, uint32_t>,
+                            boost::hash<std::pair<uint64_t, uint32_t>>>
+      chanPendSeen;
+  boost::unordered_flat_set<uint64_t> chanEdgeSeen; // (src<<32)|dst
+  boost::unordered_flat_map<uint32_t, uint32_t> chanReadHalf; // rw splits
+  size_t chanNodes = 0, chanEdges = 0, chanRmwMerges = 0,
+         chanDeadSkipped = 0;
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     // NOTE: the cluster-mark fast path skips redundant joinCluster
     // calls, so this census is APPROXIMATE (first-join-per-cluster
@@ -5063,10 +5151,33 @@ bool CallGraphPass::runFlowsToResolution() {
           nullKeyJoinsSkipped++;
           return;
         }
+        // MEASUREMENT-ONLY UNSOUND probe: skip joins keyed by
+        // identity/synthetic origins (unwitnessed-content roots — the
+        // nm-new weld glue). Quantifies the prize of an object-indexed
+        // cell model / witness-gated identity joins.
+        if (CFLProbeIdentityJoinAblate) {
+          if (rid0 >= g_idJoinClass.size())
+            g_idJoinClass.resize(rid0 + 1, -1);
+          int8_t &cls = g_idJoinClass[rid0];
+          if (cls < 0) {
+            const llvm::Value *OV = NF.getValueForNode(on0);
+            cls = (!OV || llvm::isa<llvm::Instruction>(OV)) ? 1 : 0;
+          }
+          if (cls == 1) {
+            g_idJoinsAblated++;
+            return;
+          }
+        }
       }
     }
     if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
       g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
+      return;
+    }
+    if (CFLChannelCells) {
+      // Pairwise mode: record; the barrier flush wires the channel.
+      if (chanPendSeen.emplace((uint64_t)o * NSHIFT + s, cell).second)
+        chanPend.push_back({cell, o, s});
       return;
     }
     const uint64_t key = (uint64_t)o * NSHIFT + s;
@@ -5106,6 +5217,186 @@ bool CallGraphPass::runFlowsToResolution() {
         addBridge(it->second, xr);
     }
   };
+  // Channel-node factory: append one node to every solve-time parallel
+  // structure. Only called at the barrier flush (serial, no live refs).
+  // Channels must never become union-find keepers (post-solve sweeps
+  // and lazy-mint arrays are N-sized): rank stays 0 and the RMW merge
+  // below always passes the cell as the keeper side.
+  auto newSolverNode = [&]() -> uint32_t {
+    const uint32_t id = (uint32_t)ufp.size();
+    if (id >= NCap)
+      report_fatal_error("channel-cells: node capacity exhausted "
+                         "(raise the NCap headroom)");
+    ufp.push_back(id);
+    ufrank.push_back(0);
+    R.emplace_back(NSHIFT);
+    RB.emplace_back(NSHIFT);
+    dirty.emplace_back(NSHIFT);
+    jdirty.emplace_back(NSHIFT);
+    dirtyBr.emplace_back(NSHIFT);
+    joined.emplace_back(NSHIFT);
+    cellJoined.emplace_back(NSHIFT);
+    bridgesOf.emplace_back();
+    wflag.push_back(0);
+    cellsOf.emplace_back();
+    outA.emplace_back();
+    outF.emplace_back();
+    popCount.push_back(0);
+    topoRank.push_back(0);
+    mergeHits.push_back(0);
+    isRoot.push_back(0);
+    compactMark.push_back(64);
+    virginPl.insert(virginPl.end(), NSHIFT, 0);
+    if (!cellRole.empty()) cellRole.push_back(0);
+    chanNodes++;
+    return id;
+  };
+  // Barrier flush: materialize channels for pended (cell, o, s) joins
+  // and wire directional edges. Store cell -> channel(o,s); channel ->
+  // load cell. Content crosses store->load iff one shared witness key
+  // (Lean: chanflow_iff_pairflow). Seeding mirrors the pop loop's
+  // a-edge rule: emission is native (value flow launders bridge
+  // provenance).
+  auto flushChannelPends = [&]() -> size_t {
+    if (!CFLChannelCells || chanPend.empty()) return 0;
+    size_t work = 0;
+    for (const ChanPend &P : chanPend) {
+      const uint32_t cell = find(P.cell);
+      const uint64_t key = (uint64_t)P.o * NSHIFT + P.s;
+      uint32_t ch;
+      auto [it, ins] = clusterRep.emplace(key, UINT32_MAX);
+      if (ins) {
+        ch = newSolverNode();
+        it->second = ch;
+        if (NB > 0) { // VX linking between channel nodes (same scope)
+          if (P.s == SHIFT_X) {
+            for (uint64_t ek : shiftKeysOf[P.o]) {
+              const uint32_t er = clusterFind(ek);
+              if (er != UINT32_MAX) addBridge(ch, er);
+            }
+          } else {
+            shiftKeysOf[P.o].push_back(key);
+            const uint32_t xr =
+                clusterFind((uint64_t)P.o * NSHIFT + SHIFT_X);
+            if (xr != UINT32_MAX) addBridge(ch, xr);
+          }
+        }
+        work++;
+      } else {
+        ch = find(it->second);
+      }
+      if (ch == cell) continue; // RMW-merged earlier under this key
+      const char role = cell < cellRole.size() ? cellRole[cell] : 0;
+      if (VerboseLevel >= 3) {
+        auto nm = [&](uint32_t c2) -> std::string {
+          if (c2 >= N) return "<chan>";
+          const Value *V2 = NF.getValueForNode(toOrig[c2]);
+          if (V2 && V2->hasName()) return V2->getName().str();
+          if (V2)
+            if (const auto *I2 = dyn_cast<Instruction>(V2))
+              return (I2->getFunction()->getName() + "::" +
+                      I2->getOpcodeName()).str();
+          return NF.isObjectNode(toOrig[c2]) ? "<obj>" : "<syn>";
+        };
+        errs() << "ChanFlush: cell c" << cell << " (" << nm(cell)
+               << ") role=" << (int)role << " key=(r" << P.o << " "
+               << (P.o < rootClassOf.size() ? nm(find(rootClassOf[P.o]))
+                                            : "?")
+               << ", s" << P.s << ") ch=c" << ch << "\n";
+      }
+      if (role == 3) {
+        // Read-write cell: SPLIT. Bidirectional wiring (or a merge)
+        // would relay content between its channels (rw_conduit_leaks
+        // — the fs13 v1 run measured the merge fallback cascading
+        // into 125k channel welds ≈ cluster semantics). Write half =
+        // the cell itself: keeps its incoming value edges, feeds its
+        // channels. Read half = fresh node: takes over the cell's
+        // outgoing a-edges, fed by the channels.
+        auto [rhIt, rhNew] = chanReadHalf.try_emplace(cell, 0u);
+        if (rhNew) {
+          const uint32_t rh = newSolverNode();
+          rhIt->second = rh;
+          outA[rh].swap(outA[cell]);
+          // The loaded value's DEREF consumers (f-edges: GEPs on the
+          // result) read channel content too — leaving them on the
+          // write half severed them (fuzzershell fts3 GT loss). Same
+          // for the cell's own downstream cells: joins fire on the
+          // OWNER's facts, and the loaded value's facts live on the
+          // read half now.
+          outF[rh].swap(outF[cell]);
+          cellsOf[rh].swap(cellsOf[cell]);
+          // Carry the cell's current mixed content to the read half
+          // once (over-approx: stored∪loaded; future arrivals route
+          // through the channels).
+          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+            if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0);
+            if (RB[cell][s2].any()) addBits(rh, s2, RB[cell][s2], ctx0);
+          }
+          chanRmwMerges++; // ledger: rw splits
+        }
+        const uint32_t rh = rhIt->second;
+        if (chanEdgeSeen.insert(((uint64_t)cell << 32) | ch).second) {
+          outA[cell].push_back(ch);
+          chanEdges++;
+          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+            if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
+            if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
+          }
+        }
+        if (chanEdgeSeen.insert(((uint64_t)ch << 32) | rh).second) {
+          outA[ch].push_back(rh);
+          chanEdges++;
+          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+            if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0);
+            if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);
+          }
+        }
+        work++;
+        continue;
+      }
+      if (role == 0) {
+        // No value edges: object storage of any flavor (named object
+        // nodes, OPAQUE heap nodes — NF.isObjectNode misses those —
+        // or dead assistants). Storage content flows OUT only, so
+        // store-side wiring is universally safe here (nothing routes
+        // channel content INTO a role-0 cell — no relay). Defer while
+        // fact-free so dead assistants cost nothing.
+        bool hasFacts = false;
+        for (uint32_t s2 = 0; s2 < NSHIFT && !hasFacts; s2++)
+          hasFacts = R[cell][s2].any() || RB[cell][s2].any();
+        if (!hasFacts) {
+          chanRetry.push_back(P); // re-examined at every barrier; the
+          chanDeadSkipped++;      // fixpoint barrier sees final planes
+          continue;
+        }
+        if (chanEdgeSeen.insert(((uint64_t)cell << 32) | ch).second) {
+          outA[cell].push_back(ch);
+          chanEdges++;
+          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+            if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
+            if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
+          }
+          work++;
+        }
+        continue;
+      }
+      const uint32_t src = (role & 2) ? cell : ch;
+      const uint32_t dst = (role & 2) ? ch : cell;
+      if (!chanEdgeSeen.insert(((uint64_t)src << 32) | dst).second)
+        continue;
+      outA[src].push_back(dst);
+      chanEdges++;
+      work++;
+      for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+        if (R[src][s2].any()) addBits(dst, s2, R[src][s2], ctx0);
+        if (RB[src][s2].any()) addBits(dst, s2, RB[src][s2], ctx0);
+      }
+    }
+    chanPend.swap(chanRetry);
+    chanRetry.clear();
+    flushCtx(ctx0);
+    return work;
+  };
   // Dynamic a-SCC collapse: classes mutually reachable over the current
   // (post-merge) shift-preserving edge graph — a-edges plus residue-0
   // f-edges — receive each other's every fact, so their planes are equal
@@ -5114,10 +5405,12 @@ bool CallGraphPass::runFlowsToResolution() {
   // internal a-prop churn. Tarjan is O(N+E) (~ms); run periodically as
   // the graph coarsens (merges create new cycles).
   auto collapseSCCs = [&]() -> size_t {
-    std::vector<uint32_t> low(N), dfn(N, 0);
+    // Live node count: channel-cells appends nodes past N.
+    const uint32_t NL = (uint32_t)ufp.size();
+    std::vector<uint32_t> low(NL), dfn(NL, 0);
     std::vector<uint32_t> tarjanStack;
     std::vector<std::pair<uint32_t, size_t>> callStack;
-    std::vector<bool> onStk(N, false);
+    std::vector<bool> onStk(NL, false);
     std::vector<std::vector<uint32_t>> sccs;
     uint32_t timer = 1;
     auto edgeAt = [&](uint32_t u, size_t i) -> uint32_t {
@@ -5126,7 +5419,7 @@ bool CallGraphPass::runFlowsToResolution() {
       auto &[t, r] = outF[u][i - outA[u].size()];
       return r == 0 ? find(t) : UINT32_MAX;
     };
-    for (uint32_t start = 0; start < N; start++) {
+    for (uint32_t start = 0; start < NL; start++) {
       if (find(start) != start || dfn[start]) continue;
       callStack.emplace_back(start, 0);
       dfn[start] = low[start] = timer++;
@@ -5267,8 +5560,9 @@ bool CallGraphPass::runFlowsToResolution() {
   auto lazyExpand = [&]() -> size_t {
     if (lazyDeferred.empty()) return 0;
     auto tExp = std::chrono::steady_clock::now();
-    std::vector<std::vector<uint32_t>> rin(N);
-    for (uint32_t n = 0; n < N; n++) {
+    const uint32_t NL = (uint32_t)ufp.size(); // channel nodes included
+    std::vector<std::vector<uint32_t>> rin(NL);
+    for (uint32_t n = 0; n < NL; n++) {
       if (find(n) != n) continue;
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
@@ -5283,7 +5577,7 @@ bool CallGraphPass::runFlowsToResolution() {
         if (cc != n) rin[cc].push_back(n);
       }
     }
-    std::vector<char> A(N, 0);
+    std::vector<char> A(NL, 0);
     std::vector<uint32_t> bfs;
     for (auto *CS : Ctx->IndirectCallInsts) {
       Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
@@ -5759,7 +6053,9 @@ bool CallGraphPass::runFlowsToResolution() {
   // At every drain fixpoint, re-admit deferred roots whose classes
   // entered A on the merge-coarsened quotient, then drain the new
   // identity bits; stable A + empty backlog = restricted fixpoint.
-  } while (lazyExpand() > 0);
+  // Channel mode: also materialize pended channels/edges — new edges
+  // seed facts, so drain again until neither expands.
+  } while (lazyExpand() > 0 || flushChannelPends() > 0);
   } else {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
@@ -6609,6 +6905,40 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   // Per distinct site-owner set: union of ownerFnUB over overlapping
   // owner reps (the expensive sweep, cached — pool sites share owners).
+  if (traceRoot >= 0) {
+    // Fixpoint census of the traced root: every class holding it,
+    // channels included — locates the frontier where a flow stalls.
+    size_t nHold = 0, shown = 0;
+    const uint32_t NL2 = (uint32_t)ufp.size();
+    for (uint32_t c = 0; c < NL2; c++) {
+      if (find(c) != c) continue;
+      bool has = false;
+      for (uint32_t s3 = 0; s3 < NSHIFT && !has; s3++)
+        has = R[c][s3].test((uint32_t)traceRoot) ||
+              RB[c][s3].test((uint32_t)traceRoot);
+      if (!has) continue;
+      nHold++;
+      if (shown++ < 20) {
+        errs() << "TRACE-HOLD c" << c << " ";
+        if (c >= N) {
+          errs() << "<channel> outA=" << outA[c].size()
+                 << " inWLseen popCount=" << popCount[c];
+        } else {
+          const Value *HV = NF.getValueForNode(toOrig[c]);
+          if (HV && HV->hasName())
+            errs() << HV->getName().substr(0, 60);
+          else if (HV) {
+            if (const auto *HI = dyn_cast<Instruction>(HV))
+              errs() << HI->getFunction()->getName().substr(0, 40) << "::"
+                     << HI->getOpcodeName();
+          } else
+            errs() << (NF.isObjectNode(toOrig[c]) ? "<obj>" : "<syn>");
+        }
+        errs() << "\n";
+      }
+    }
+    errs() << "TRACE-HOLD total classes holding root: " << nHold << "\n";
+  }
   boost::unordered_flat_map<uint32_t, FactSet> witnessSiteMemo;
   for (auto *CS : Ctx->IndirectCallInsts) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
@@ -7979,6 +8309,13 @@ bool CallGraphPass::runFlowsToResolution() {
            << " scc=" << mergesFromSCC
            << ", redundant join lookups " << redundantJoins
            << ", null-key joins skipped " << nullKeyJoinsSkipped
+           << ", identity-joins ABLATED " << g_idJoinsAblated
+           << (CFLChannelCells
+                   ? (", CHANNELS " + std::to_string(chanNodes) + " nodes " +
+                      std::to_string(chanEdges) + " edges " +
+                      std::to_string(chanRmwMerges) + " rw-splits " +
+                      std::to_string(chanDeadSkipped) + " pool-merges")
+                   : std::string())
            << ", merge-reoffered " << reofferedFacts
            << " facts, sweeps offered " << sweepOffered << " kept "
            << sweepKept
@@ -8584,13 +8921,14 @@ bool CallGraphPass::runFlowsToResolution() {
     // mergeable with the existing merge() machinery — plane dedup and
     // removal of SCC-internal a-prop churn without a new representation.
     {
-      std::vector<uint32_t> comp(N, UINT32_MAX), low(N), dfn(N, 0);
+      const uint32_t NL = (uint32_t)ufp.size(); // channel nodes included
+      std::vector<uint32_t> comp(NL, UINT32_MAX), low(NL), dfn(NL, 0);
       std::vector<uint32_t> stk, tarjanStack;
       std::vector<std::pair<uint32_t, size_t>> callStack;
-      std::vector<bool> onStk(N, false);
+      std::vector<bool> onStk(NL, false);
       uint32_t timer = 1, nComp = 0;
       std::unordered_map<uint32_t, uint64_t> compSize;
-      for (uint32_t start = 0; start < N; start++) {
+      for (uint32_t start = 0; start < NL; start++) {
         if (find(start) != start || dfn[start]) continue;
         callStack.emplace_back(start, 0);
         dfn[start] = low[start] = timer++;

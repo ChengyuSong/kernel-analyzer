@@ -74,6 +74,8 @@ extern cl::opt<std::string> CFLRegFieldWatch;
 extern cl::opt<bool> CFLRegFieldObj;
 extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<std::string> CFLProbeWildcardAblate;
+extern cl::opt<bool> CFLProbeIdentityJoinAblate;
+extern cl::opt<bool> CFLChannelCells;
 extern cl::opt<bool> CFLIterCapOk;
 extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<bool> CFLProposeNoopSummaries;

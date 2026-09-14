@@ -76,6 +76,40 @@ Properties that fall out:
   semantics and scope as today's bridges.
 - Null hygiene: no channels for the NULL pseudo-object (same rule).
 
+## v1 lessons (2026-09-14) → v2 wiring design
+
+v1 reconstructed access direction from the dense graph (cell roles
+from a/f/d edge shapes). Six wiring holes later, the uniform root
+cause is clear: the encoding COLLAPSES access structure wherever
+that is answer-exact under cluster semantics — result-as-cell
+loads, store-cell ≡ stored-value (single-writer copy collapse, the
+store a-edge becomes an intra-class self-loop and vanishes),
+GEP ≡ base at FI, shared per-pointer deref nodes. Every collapse
+erases exactly the direction/position information pairwise routing
+needs; a class can simultaneously be the READER of one key and the
+STORAGE of another (t_reg2: c8 = reader of (tab,0) and collapsed
+content of (fd,+8)). Reconstruction downstream is unfixable by
+construction, not by patching.
+
+v2: record ACCESS MARKS in the instruction handlers, where the
+direction is syntactic and collapse-immune:
+  load  v = *p        -> mark (p, v, LOAD)
+  store *p = v        -> mark (p, v, STORE)
+  object/initializer  -> mark (addr, objNode, OBJECT)  (store-side)
+  rmw/cmpxchg         -> both marks
+The solver's channel flush iterates marks: for each fact (o,s) on
+find(p): LOAD wires chan(o,s) -> find(v); STORE wires find(v) ->
+chan(o,s). Marks reference node ids, so class merges never lose
+them. cellsOf/joinCluster remain the cluster path; channel mode
+replaces the join sweep's pend source with mark sweeps.
+
+Fast gate for every iteration (user directive): the small
+GT-bearing SoK programs (scratchpad fastgate.sh — tic, flvmeta,
+cflow, lame, tiffsplit, cjpeg, djpeg, fuzzershell), cluster vs
+channel: GT misses, mean fanout, one-sidedness; micro repros
+t_reg.ll (const table) / t_reg2.ll (heap + bucket relay — THE
+20-line reproducer of the sqlite3 fts3 loss) / t_litvt.ll.
+
 ## Gates
 
 1. Micro suite (test/t_*.bc incl. t_litvt) + cfl-smoke.

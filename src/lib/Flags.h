@@ -43,6 +43,7 @@ extern cl::opt<bool> CFLCensusFields;
 extern cl::opt<bool> CFLProbeOriginSplit;
 extern cl::opt<bool> CFLProbeOpsMono;
 extern cl::opt<std::string> CFLProbeSinkAblate;
+extern cl::opt<std::string> CFLProbeBlobGrep;
 extern cl::opt<bool> CFLProbeNoTransJoin;
 extern cl::opt<bool> CFLProbeBlobFormation;
 extern cl::opt<bool> CFLCensusStrata;

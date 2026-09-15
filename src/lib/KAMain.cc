@@ -913,6 +913,13 @@ cl::opt<bool> CFLProbeBlobFormation(
            "member names. Adds no edges"),
   cl::init(false));
 
+cl::opt<std::string> CFLProbeBlobGrep(
+  "cfl-probe-blob-grep",
+  cl::desc("With --cfl-probe-blob-formation: also print every merge in "
+           "the giant's lineage whose class names or join key contain "
+           "this substring"),
+  cl::init(""));
+
 cl::opt<std::string> CFLProbeSinkAblate(
   "cfl-probe-sink-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe: comma-separated name "

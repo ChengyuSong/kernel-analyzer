@@ -4622,15 +4622,20 @@ bool CallGraphPass::runFlowsToResolution() {
       // global/alloca/alloc-site) — needed to follow how an object
       // reaches a load's owner pointer (the breadth side of the
       // derivation witness), not only how a function reaches the fptr.
+      // Same naming as the blob probe / meet tracer, so unnamed O0
+      // values (allocation calls "fn::call:callee", locals
+      // "fn::alloca:struct.T") are addressable; cell roots ("*p") only
+      // when asked for explicitly.
       for (uint32_t rid = 0; rid < rootClassOf.size() && traceRoot < 0;
            rid++) {
         const uint32_t rc = rootClassOf[rid];
         if (rc >= toOrig.size()) continue;
-        const Value *OV = NF.getValueForNode(toOrig[rc]);
-        if (OV && OV->hasName() && OV->getName().contains(CFLTraceFunc)) {
+        std::string nm = protBlameName(rc);
+        if (!nm.empty() && nm[0] == '*' && !StringRef(CFLTraceFunc).starts_with("*"))
+          continue;
+        if (StringRef(nm).contains(CFLTraceFunc)) {
           traceRoot = rid;
-          errs() << "TRACE root " << rid << " = origin " << OV->getName()
-                 << "\n";
+          errs() << "TRACE root " << rid << " = origin " << nm << "\n";
         }
       }
     }
@@ -4648,7 +4653,9 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "TRACE + c" << n << " s" << s << (bridged ? " [br]" : "")
            << " via " << tHow << " from c";
     if (tFrom == UINT32_MAX) errs() << "?"; else errs() << tFrom;
-    errs() << "\n";
+    // Name at arrival time: later merges retire these ids, so the
+    // fixpoint census cannot name a chain read off this log.
+    errs() << "  " << protBlameName(n).substr(0, 70) << "\n";
   };
   // --cfl-trace-meet=A,B: two origins that must never alias. Record how
   // each arrives at every class (propagation kind, source class,
@@ -8344,7 +8351,15 @@ bool CallGraphPass::runFlowsToResolution() {
       const uint64_t after = (uint64_t)ev.szA + ev.szB;
       const bool isRecord = after * 4 > record * 5;
       if (isRecord) record = after;
-      if (shown < 300 && (isRecord || std::min(ev.szA, ev.szB) >= 64)) {
+      // --cfl-probe-blob-grep: also print every lineage event whose
+      // class names or key mention the substring (to find the one join
+      // that pulled a named cell into the giant).
+      const bool grepHit =
+          !CFLProbeBlobGrep.empty() &&
+          (StringRef(ev.nA).contains(CFLProbeBlobGrep) ||
+           StringRef(ev.nB).contains(CFLProbeBlobGrep) ||
+           StringRef(ev.origin).contains(CFLProbeBlobGrep));
+      if (shown < 300 && (isRecord || grepHit || std::min(ev.szA, ev.szB) >= 64)) {
         shown++;
         errs() << "BlobForm: EV#" << giantEvents << " @" << ev.at << " "
                << ev.ctx << (ev.origin.empty() ? "" : (" origin=" + ev.origin))

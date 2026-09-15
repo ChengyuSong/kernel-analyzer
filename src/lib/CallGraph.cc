@@ -7095,6 +7095,53 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << " ]\n";
         printed++;
       }
+      // Giant-class membership: for slice classes with huge in-degree,
+      // list what dense nodes they absorbed (kind + owning function).
+      // Attribution by in-edge SOURCE functions misled once (the
+      // byte-swapper story); membership is the ground truth.
+      {
+        std::vector<uint32_t> giants;
+        for (uint32_t v : vis) {
+          auto ie = inEdges.find(v);
+          if (ie != inEdges.end() && ie->second.size() > 1000)
+            giants.push_back(v);
+        }
+        for (uint32_t g : giants) {
+          size_t mem = 0;
+          std::map<std::string, size_t> kinds, funcs;
+          for (uint32_t n2 = 0; n2 < N; n2++) {
+            if (find(n2) != g) continue;
+            mem++;
+            const Value *MV = NF.getValueForNode(toOrig[n2]);
+            std::string kind = "<syn>";
+            if (MV) {
+              if (isa<Argument>(MV)) {
+                kind = "formal";
+                funcs[cast<Argument>(MV)->getParent()->getName().str()]++;
+              } else if (const auto *MI = dyn_cast<Instruction>(MV)) {
+                kind = std::string("inst:") + MI->getOpcodeName();
+                funcs[MI->getFunction()->getName().str()]++;
+              } else if (isa<Function>(MV)) kind = "function";
+              else if (isa<GlobalVariable>(MV)) kind = "global";
+              else kind = "const";
+            } else if (NF.isObjectNode(toOrig[n2])) kind = "<obj>";
+            kinds[kind]++;
+          }
+          errs() << "TRACE-BWD   giant c" << g << " members=" << mem
+                 << " kinds:";
+          for (auto &[k, c] : kinds) errs() << " " << k << "=" << c;
+          errs() << "\n";
+          std::vector<std::pair<size_t, std::string>> top;
+          for (auto &[f, c] : funcs) top.emplace_back(c, f);
+          std::sort(top.rbegin(), top.rend());
+          errs() << "TRACE-BWD   giant c" << g << " functions=" << funcs.size()
+                 << " top:";
+          for (size_t i = 0; i < top.size() && i < 12; i++)
+            errs() << " " << top[i].second.substr(0, 40) << "(" << top[i].first
+                   << ")";
+          errs() << "\n";
+        }
+      }
       // Which (origin, shift) channels coalesced into the clusters this
       // slice reads: cluster keys anchored anywhere in the visited set.
       // One rep carrying keys at MANY shifts = cross-residue coalescence.
@@ -8390,14 +8437,29 @@ bool CallGraphPass::runFlowsToResolution() {
               << " <not-in-graph>\n"; return; }
           uint32_t cl2 = find(dIt2->second);
           errs() << "TRACE-VAL  " << tag << " c" << cl2 << " facts:";
-          size_t fShown = 0;
-          for (uint32_t s4 = 0; s4 < NSHIFT && fShown <= 10; s4++) {
+          size_t fShown = 0, fTotal = 0;
+          auto rootName = [&](uint32_t o4) -> std::string {
+            if (o4 >= rootClassOf.size()) return "?";
+            const uint32_t rc4 = rootClassOf[o4];
+            if (rc4 >= toOrig.size()) return "?";
+            const Value *OV = NF.getValueForNode(toOrig[rc4]);
+            if (OV && OV->hasName()) return OV->getName().str();
+            if (OV)
+              if (const auto *OI = dyn_cast<Instruction>(OV))
+                return (OI->getFunction()->getName() + "::" +
+                        OI->getOpcodeName()).str();
+            return NF.isObjectNode(toOrig[rc4]) ? "<obj>" : "<syn>";
+          };
+          for (uint32_t s4 = 0; s4 < NSHIFT; s4++) {
             R[cl2][s4].forEach([&](uint32_t o4) {
-              if (fShown > 10) return;
-              if (fShown++ == 10) { errs() << " ..."; return; }
-              errs() << " (r" << o4 << ",s" << s4 << ")";
+              fTotal++;
+              if (fShown > 40) return;
+              if (fShown++ == 40) { errs() << " ..."; return; }
+              errs() << " (r" << o4 << "=" << rootName(o4).substr(0, 36)
+                     << ",s" << s4 << ")";
             });
           }
+          errs() << " [total " << fTotal << "]";
           bool hasTr2 = false;
           if (traceRoot >= 0)
             for (uint32_t s4 = 0; s4 < NSHIFT && !hasTr2; s4++)

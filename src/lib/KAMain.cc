@@ -1035,6 +1035,17 @@ cl::opt<bool> CFLDumpCalleeMismatch(
            "(can produce GBs of log on large inputs)"),
   cl::init(false));
 
+cl::opt<std::string> CFLDumpAGraph(
+  "cfl-dump-agraph",
+  cl::desc("Write the flows-to solver's dense value-flow graph once per "
+           "iteration to <prefix>.it<k>.{nodes,edges}, each edge "
+           "classified by what it models (direct-call actual->formal, "
+           "indirect-call actual->formal, return->callsite, store "
+           "value->cell, cell->load, copy) for offline attribution of "
+           "the value-flow components (which edge kind glues a giant "
+           "component together). Diagnostic only"),
+  cl::init(""));
+
 cl::opt<bool> CFLDumpICalls(
   "cfl-dump-icalls",
   cl::desc("Dump one ICALL line per resolved (callsite, callee) pair; sort "

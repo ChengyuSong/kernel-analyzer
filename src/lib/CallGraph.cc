@@ -3310,6 +3310,146 @@ bool CallGraphPass::runFlowsToResolution() {
   for (auto &[b, r, bk] : fEdges)
     outF[b].emplace_back(r, bk);
 
+  // --cfl-dump-agraph: the dense graph of this iteration, nodes =
+  // presolve classes, edges classified by what they model so an
+  // offline pass can attribute a value-flow component to the edge
+  // kind that closes its cycles (call web, memory round trips, ...).
+  if (!CFLDumpAGraph.empty()) {
+    std::set<std::tuple<const Value *, std::string, unsigned>> directActuals;
+    for (auto &Mp : Ctx->Modules)
+      for (Function &F2 : *Mp.first)
+        for (Instruction &I2 : instructions(F2))
+          if (auto *CB2 = dyn_cast<CallBase>(&I2))
+            if (const Function *CF2 = CB2->getCalledFunction())
+              for (unsigned i = 0; i < CB2->arg_size(); i++)
+                directActuals.insert(
+                    {CB2->getArgOperand(i), CF2->getName().str(), i});
+    boost::unordered_flat_map<NodeIndex, NodeIndex> cellPtr; // deref -> ptr
+    for (auto &[p3, d3] : NF.getDerefMap()) cellPtr[d3] = p3;
+    auto nodeName = [&](NodeIndex m3) -> std::string {
+      const Value *V3 = NF.getValueForNode(m3);
+      if (!V3) {
+        auto pit = g_opaqueProvenance.find(m3);
+        if (pit != g_opaqueProvenance.end()) return pit->second;
+        return NF.isObjectNode(m3) ? "<obj>" : "<syn>";
+      }
+      if (const auto *A2 = dyn_cast<Argument>(V3))
+        return (A2->getParent()->getName() + "::arg" + Twine(A2->getArgNo()))
+            .str();
+      if (const auto *I2 = dyn_cast<Instruction>(V3)) {
+        std::string s =
+            (I2->getFunction()->getName() + "::" + I2->getOpcodeName()).str();
+        if (const auto *CB2 = dyn_cast<CallBase>(I2)) {
+          const Function *CF2 = CB2->getCalledFunction();
+          s += ":" + (CF2 ? CF2->getName().str() : std::string("<icall>"));
+        }
+        return s;
+      }
+      if (V3->hasName()) return V3->getName().str();
+      if (const auto *CE2 = dyn_cast<ConstantExpr>(V3)) {
+        const Value *base = CE2;
+        while (const auto *U2 = dyn_cast<ConstantExpr>(base))
+          base = U2->getOperand(0);
+        return std::string("cexpr:") + CE2->getOpcodeName() + "(" +
+               (base->hasName() ? base->getName().str() : "?") + ")";
+      }
+      return "<const>";
+    };
+    auto nodeKind = [&](NodeIndex m3) -> std::string {
+      if (NF.isDereferenceNode(m3)) return "deref";
+      const Value *V3 = NF.getValueForNode(m3);
+      if (!V3) return NF.isObjectNode(m3) ? "obj" : "syn";
+      if (isa<Argument>(V3)) return "arg";
+      if (const auto *I2 = dyn_cast<Instruction>(V3))
+        return std::string("inst:") + I2->getOpcodeName();
+      if (isa<Function>(V3)) return "fn";
+      if (isa<GlobalVariable>(V3)) return "global";
+      if (isa<ConstantExpr>(V3)) return "cexpr";
+      return "const";
+    };
+    const std::string pfx =
+        CFLDumpAGraph + ".it" + std::to_string(iteration);
+    std::error_code ec1, ec2, ec3;
+    raw_fd_ostream nodesOut(pfx + ".nodes", ec1);
+    raw_fd_ostream edgesOut(pfx + ".edges", ec2);
+    raw_fd_ostream membersOut(pfx + ".members", ec3);
+    if (ec1 || ec2 || ec3) {
+      WARNING("FlowsTo: cannot write a-graph dump " << pfx << "\n");
+    } else {
+      // Presolve classes are named by their rep; list every member of
+      // a multi-member class so a value can be located by name.
+      for (uint32_t n = 0; n < N; n++) {
+        auto mit = canonicalClassMembers.find(toOrig[n]);
+        if (mit == canonicalClassMembers.end() || mit->second.size() <= 1)
+          continue;
+        for (NodeIndex m3 : mit->second)
+          membersOut << n << " " << nodeKind(m3) << " " << nodeName(m3) << "\n";
+      }
+      // Node line: id kind members name [ptr-id for cells].
+      for (uint32_t n = 0; n < N; n++) {
+        NodeIndex canon = toOrig[n];
+        size_t mem = 1;
+        auto mit = canonicalClassMembers.find(canon);
+        if (mit != canonicalClassMembers.end()) mem = mit->second.size();
+        nodesOut << n << " " << nodeKind(canon) << " " << mem << " ";
+        if (NF.isDereferenceNode(canon)) {
+          auto cp = cellPtr.find(canon);
+          NodeIndex p3 = cp == cellPtr.end() ? AndersNodeFactory::InvalidIndex
+                                             : cp->second;
+          nodesOut << "*" << (p3 == AndersNodeFactory::InvalidIndex
+                                  ? std::string("?")
+                                  : nodeName(p3));
+          auto dp = p3 == AndersNodeFactory::InvalidIndex
+                        ? toDense.end()
+                        : toDense.find(getCanonicalNode(p3));
+          if (dp != toDense.end()) nodesOut << " " << dp->second;
+        } else {
+          nodesOut << nodeName(canon);
+        }
+        nodesOut << "\n";
+      }
+      // Edge kind from the endpoint classes. A formal's in-edge is a
+      // DIRECT call edge when any member of the source class is an
+      // actual of a direct call to that function at that position;
+      // every other actual->formal edge is indirect-call wiring (or
+      // summary wiring, which is also site-pooled).
+      auto isDirectActual = [&](NodeIndex sc, const Argument *A2) {
+        auto chk = [&](NodeIndex m3) {
+          const Value *V3 = NF.getValueForNode(m3);
+          return V3 && directActuals.count({V3, A2->getParent()->getName().str(),
+                                            A2->getArgNo()});
+        };
+        if (chk(sc)) return true;
+        auto mit = canonicalClassMembers.find(sc);
+        if (mit != canonicalClassMembers.end())
+          for (NodeIndex m3 : mit->second)
+            if (chk(m3)) return true;
+        return false;
+      };
+      auto edgeKind = [&](uint32_t s, uint32_t t) -> std::string {
+        NodeIndex sc = toOrig[s], tc = toOrig[t];
+        const bool sd = NF.isDereferenceNode(sc), td = NF.isDereferenceNode(tc);
+        if (sd && td) return "memcpy";
+        if (td) return "store";
+        if (sd) return "load";
+        const Value *Vt = NF.getValueForNode(tc);
+        if (const auto *A2 = dyn_cast_or_null<Argument>(Vt))
+          return isDirectActual(sc, A2) ? "call" : "icall";
+        if (Vt && isa<CallBase>(Vt)) return "ret";
+        if (const auto *I2 = dyn_cast_or_null<Instruction>(Vt))
+          return std::string("copy:") + I2->getOpcodeName();
+        return "copy";
+      };
+      for (auto [s, t] : aEdges)
+        edgesOut << s << " " << t << " " << edgeKind(s, t) << "\n";
+      for (auto &[b, r, bk] : fEdges)
+        edgesOut << b << " " << r << " f" << bk << "\n";
+      CG_LOG("FlowsTo: a-graph dumped to " << pfx << ".{nodes,edges} (" << N
+             << " nodes, " << aEdges.size() << " a + " << fEdges.size()
+             << " f edges)\n");
+    }
+  }
+
   // In-degree over the FULL a/f-graph, before any slicing: a node whose
   // incoming edges are sliced away was not a value origin and must not be
   // minted as a root; a field-pointer result is fully described by its
@@ -4046,7 +4186,12 @@ bool CallGraphPass::runFlowsToResolution() {
     std::string nA, nB;
     const char *ctx;
     std::string origin; // join events: whose key coalesced them
+    uint64_t at;        // worklist pops at merge time (event order)
   };
+  // Small graphs afford the FULL merge log (a few 10k events), which
+  // lets the report show the giant's growth from its first merge; the
+  // size gate below is what keeps kernel-scale logs bounded.
+  const bool blobLogAll = CFLProbeBlobFormation && N < 200000;
   std::vector<BlobEv> blobEvents;
   const char *blobCtx = "?";
   uint32_t blobCtxOrigin = UINT32_MAX;
@@ -4116,32 +4261,75 @@ bool CallGraphPass::runFlowsToResolution() {
   // neighborhood| vs |cluster| per cell.
   std::vector<std::pair<uint64_t, uint32_t>> witnessAnchors;
 
+  boost::unordered_flat_map<NodeIndex, NodeIndex> derefToPtr; // cell -> ptr
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size())
       return "<synthetic>";
     NodeIndex canon = toOrig[cls];
-    const Value *V2 = NF.getValueForNode(canon);
-    auto nameOf = [](const Value *V3) -> std::string {
-      if (!V3)
+    auto nameOf = [&](NodeIndex m3) -> std::string {
+      std::string pre;
+      // derefMap is keyed by the POINTER; invert it so a cell is named
+      // after the pointer it dereferences ("*p", "**p").
+      for (int lvl = 0; lvl < 3 && NF.isDereferenceNode(m3); lvl++) {
+        if (derefToPtr.size() != NF.getDerefMap().size()) {
+          derefToPtr.clear();
+          for (auto &[p3, d3] : NF.getDerefMap()) derefToPtr[d3] = p3;
+        }
+        auto dit = derefToPtr.find(m3);
+        if (dit == derefToPtr.end()) return std::string();
+        pre += "*";
+        m3 = dit->second;
+      }
+      const Value *V3 = NF.getValueForNode(m3);
+      if (!V3) {
+        auto pit = g_opaqueProvenance.find(m3);
+        if (pit != g_opaqueProvenance.end()) return pre + pit->second;
+        if (NF.isObjectNode(m3))
+          return std::string("<obj") + (NF.isHeapObject(m3) ? " heap" : "") +
+                 (NF.isOpaqueObject(m3) ? " opaque" : "") + ">";
         return std::string();
-      if (const auto *I2 = dyn_cast<Instruction>(V3))
-        return (I2->getFunction()->getName() + "::" + I2->getOpcodeName())
-            .str();
+      }
       if (V3->hasName())
-        return V3->getName().str();
-      return std::string();
+        return pre + V3->getName().str();
+      if (const auto *I2 = dyn_cast<Instruction>(V3)) {
+        std::string s =
+            (I2->getFunction()->getName() + "::" + I2->getOpcodeName()).str();
+        if (const auto *CB2 = dyn_cast<CallBase>(I2)) {
+          const Function *CF2 = CB2->getCalledFunction();
+          s += ":" + (CF2 ? CF2->getName().str() : std::string("<icall>"));
+        }
+        return pre + s;
+      }
+      if (const auto *A2 = dyn_cast<Argument>(V3))
+        return pre + (A2->getParent()->getName() + "::arg" +
+                      Twine(A2->getArgNo())).str();
+      if (const auto *CE2 = dyn_cast<ConstantExpr>(V3)) {
+        // Name by the first global the expression is built on.
+        const Value *base = CE2;
+        while (const auto *U2 = dyn_cast<ConstantExpr>(base))
+          base = U2->getOperand(0);
+        return pre + "cexpr:" + CE2->getOpcodeName() + "(" +
+               (base->hasName() ? base->getName().str() : "?") + ")";
+      }
+      if (isa<Constant>(V3))
+        return pre + "const:" + std::string(V3->getType()->isPointerTy()
+                                                ? "ptr" : "data");
+      return pre + "<valnode#" + std::to_string(m3) + ">";
     };
-    std::string n = nameOf(V2);
+    std::string n = nameOf(canon);
     if (!n.empty())
       return n;
     auto mit = canonicalClassMembers.find(canon);
     if (mit != canonicalClassMembers.end())
       for (NodeIndex m2 : mit->second) {
-        n = nameOf(NF.getValueForNode(m2));
+        n = nameOf(m2);
         if (!n.empty())
           return n;
       }
-    return "<unnamed>";
+    return std::string(NF.isDereferenceNode(canon) ? "<deref#"
+                       : NF.isValueNode(canon)      ? "<valnode#"
+                                                    : "<node#") +
+           std::to_string(canon) + ">";
   };
   // Coupler census state: per-class subsystem masks over OWNED data
   // origins; weld events recorded in merge().
@@ -4985,16 +5173,20 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       ownedMask[a] |= ownedMask[b];
     }
-    if (CFLProbeBlobFormation && blobEvents.size() < 60000) {
+    if (CFLProbeBlobFormation &&
+        blobEvents.size() < (blobLogAll ? 400000u : 60000u)) {
       const uint32_t sa = clsSize[a], sb = clsSize[b];
       // log when both sides are substantial, or a milestone is crossed
-      if (std::min(sa, sb) >= 64 ||
+      if (blobLogAll || std::min(sa, sb) >= 64 ||
           (sa + sb >= 4096 && sa < 4096) || (sa + sb >= 65536 && sa < 65536))
         blobEvents.push_back(
             {a, sa, sb, protBlameName(a), protBlameName(b), blobCtx,
+             // Mint-time class: the origin's CURRENT rep is the blob
+             // itself once it has merged in, which names nothing.
              blobCtxOrigin == UINT32_MAX
                  ? std::string()
-                 : protBlameName(find(rootClassOf[blobCtxOrigin]))});
+                 : protBlameName(rootClassOf[blobCtxOrigin]),
+             iterations});
     }
     clsSize[a] += clsSize[b];
     push(a, ctx0);
@@ -7785,6 +7977,11 @@ bool CallGraphPass::runFlowsToResolution() {
     std::map<std::string, std::pair<size_t, uint64_t>> byCtx; // n, mass
     std::map<std::string, uint64_t> byFeeder;                 // absorbed
     size_t shown = 0, giantEvents = 0;
+    // Growth spine: in event order, print every lineage merge whose
+    // result beats the largest lineage class seen so far by 25% (the
+    // "record" merges), plus every merge with both sides >= 64. With
+    // the full log this starts at the giant's first two-member merge.
+    uint64_t record = 0;
     for (const BlobEv &ev : blobEvents) {
       if (find(ev.keeper) != giant)
         continue;
@@ -7797,12 +7994,16 @@ bool CallGraphPass::runFlowsToResolution() {
       ce.second += std::min(ev.szA, ev.szB);
       byFeeder[ev.szA < ev.szB ? ev.nA : ev.nB] +=
           std::min(ev.szA, ev.szB);
-      if (shown < 60) {
+      const uint64_t after = (uint64_t)ev.szA + ev.szB;
+      const bool isRecord = after * 4 > record * 5;
+      if (isRecord) record = after;
+      if (shown < 300 && (isRecord || std::min(ev.szA, ev.szB) >= 64)) {
         shown++;
-        errs() << "BlobForm: EV " << ev.ctx
-               << (ev.origin.empty() ? "" : (" origin=" + ev.origin))
-               << " " << ev.szA << "<" << ev.nA.substr(0, 50) << "> + "
-               << ev.szB << "<" << ev.nB.substr(0, 50) << ">\n";
+        errs() << "BlobForm: EV#" << giantEvents << " @" << ev.at << " "
+               << ev.ctx << (ev.origin.empty() ? "" : (" origin=" + ev.origin))
+               << " " << ev.szA << "<" << ev.nA.substr(0, 60) << "> + "
+               << ev.szB << "<" << ev.nB.substr(0, 60) << ">"
+               << (isRecord ? " =" + std::to_string(after) : "") << "\n";
       }
     }
     errs() << "BlobForm: " << giantEvents

@@ -4476,11 +4476,8 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::pair<uint64_t, uint32_t>> witnessAnchors;
 
   boost::unordered_flat_map<NodeIndex, NodeIndex> derefToPtr; // cell -> ptr
-  auto protBlameName = [&](uint32_t cls) -> std::string {
-    if (cls >= toOrig.size())
-      return "<synthetic>";
-    NodeIndex canon = toOrig[cls];
-    auto nameOf = [&](NodeIndex m3) -> std::string {
+  // Name of one factory node (value, cell "*p", object); "" when nameless.
+  auto nodeNameOf = [&](NodeIndex m3) -> std::string {
       std::string pre;
       // derefMap is keyed by the POINTER; invert it so a cell is named
       // after the pointer it dereferences ("*p", "**p").
@@ -4511,6 +4508,11 @@ bool CallGraphPass::runFlowsToResolution() {
         if (const auto *CB2 = dyn_cast<CallBase>(I2)) {
           const Function *CF2 = CB2->getCalledFunction();
           s += ":" + (CF2 ? CF2->getName().str() : std::string("<icall>"));
+        } else if (const auto *AI2 = dyn_cast<AllocaInst>(I2)) {
+          // Locals are unnamed at O0: the allocated struct type is the
+          // only handle a user has to name one ("...::alloca:struct.x").
+          if (const auto *ST2 = dyn_cast<StructType>(AI2->getAllocatedType()))
+            if (ST2->hasName()) s += ":" + ST2->getName().str();
         }
         return pre + s;
       }
@@ -4529,7 +4531,12 @@ bool CallGraphPass::runFlowsToResolution() {
         return pre + "const:" + std::string(V3->getType()->isPointerTy()
                                                 ? "ptr" : "data");
       return pre + "<valnode#" + std::to_string(m3) + ">";
-    };
+  };
+  auto protBlameName = [&](uint32_t cls) -> std::string {
+    if (cls >= toOrig.size())
+      return "<synthetic>";
+    NodeIndex canon = toOrig[cls];
+    auto &nameOf = nodeNameOf;
     std::string n = nameOf(canon);
     if (!n.empty())
       return n;
@@ -4634,12 +4641,126 @@ bool CallGraphPass::runFlowsToResolution() {
   size_t traceEvents = 0;
   const char *tHow = "seed";
   uint32_t tFrom = UINT32_MAX;
+  uint32_t tKeyO = UINT32_MAX, tKeyS = 0; // join/bridge key behind a merge-or-bridge arrival
+  uint32_t tCell = UINT32_MAX;            // the dereference cell whose join caused it
   auto traceHit = [&](uint32_t n, uint32_t s, bool bridged) {
     if (traceEvents++ > 200000) return;
     errs() << "TRACE + c" << n << " s" << s << (bridged ? " [br]" : "")
            << " via " << tHow << " from c";
     if (tFrom == UINT32_MAX) errs() << "?"; else errs() << tFrom;
     errs() << "\n";
+  };
+  // --cfl-trace-meet=A,B: two origins that must never alias. Record how
+  // each arrives at every class (propagation kind, source class,
+  // residue) and report the first classes that come to hold both, with
+  // both chains walked back to their seeds: the meeting class is where
+  // the analysis unions them, the chains say through which edges or
+  // merges.
+  int64_t meetRid[2] = {-1, -1};
+  if (!CFLTraceMeet.empty()) {
+    auto [nA, nB] = StringRef(CFLTraceMeet).split(',');
+    StringRef want[2] = {nA, nB};
+    for (int w = 0; w < 2; w++) {
+      for (uint32_t rid = 0; rid < rootClassOf.size() && meetRid[w] < 0; rid++) {
+        auto fit = funcRootOf.find(rid);
+        std::string nm = fit != funcRootOf.end()
+                             ? fit->second->getName().str()
+                             : protBlameName(rootClassOf[rid]);
+        // A cell root ("*p") matches only when asked for explicitly.
+        if (!nm.empty() && nm[0] == '*' && !want[w].starts_with("*")) continue;
+        bool hit = StringRef(nm).contains(want[w]);
+        if (!hit) {
+          // The rep may be another member of a merged class: scan them.
+          auto mit = canonicalClassMembers.find(toOrig[rootClassOf[rid]]);
+          if (mit != canonicalClassMembers.end())
+            for (NodeIndex m3 : mit->second) {
+              std::string mn = nodeNameOf(m3);
+              if (!mn.empty() && mn[0] != '*' && StringRef(mn).contains(want[w])) {
+                hit = true; nm = mn; break;
+              }
+            }
+        }
+        if (hit) {
+          meetRid[w] = rid;
+          errs() << "TRACE-MEET root " << (w ? "B" : "A") << " = r" << rid
+                 << " " << nm << "\n";
+        }
+      }
+      if (meetRid[w] < 0)
+        errs() << "TRACE-MEET: no root matches '" << want[w] << "'\n";
+    }
+    if (meetRid[0] < 0 || meetRid[1] < 0) meetRid[0] = meetRid[1] = -1;
+  }
+  // Every arrival of a traced origin at a class (capped), oldest first;
+  // the chain walk follows the OLDEST arrival's source. Merge and bridge
+  // arrivals carry the (origin, residue) key that caused them.
+  struct MeetArr { const char *how; uint32_t from, s, keyO, keyS, cell; };
+  std::unordered_map<uint32_t, SmallVector<MeetArr, 4>> meetArr[2];
+  size_t meetsShown = 0;
+  auto keyStr = [&](const MeetArr &m) -> std::string {
+    if (m.keyO == UINT32_MAX || m.keyO >= rootClassOf.size()) return "";
+    std::string r = " key=(r" + std::to_string(m.keyO) + " " +
+                    protBlameName(rootClassOf[m.keyO]).substr(0, 40) + ",s" +
+                    std::to_string(m.keyS) + ")";
+    if (m.cell != UINT32_MAX && m.cell < toOrig.size())
+      r += " by-cell=" + protBlameName(m.cell).substr(0, 50); // "*p": p joined the key
+    return r;
+  };
+  auto meetHit = [&](uint32_t n, uint32_t s, int w) {
+    auto &v = meetArr[w][n];
+    const bool first = v.empty();
+    const bool isMerge = StringRef(tHow).starts_with("merge");
+    const bool keyed = isMerge || StringRef(tHow) == "bridge-init";
+    if (v.size() < 4)
+      v.push_back({tHow, tFrom, s, keyed ? tKeyO : UINT32_MAX, tKeyS,
+                   isMerge ? tCell : UINT32_MAX});
+    if (!first || !meetArr[1 - w].count(n) || meetsShown >= 5) return;
+    meetsShown++;
+    errs() << "TRACE-MEET #" << meetsShown << " at c" << n << " size="
+           << clsSize[n] << " " << protBlameName(n).substr(0, 70) << "\n";
+    for (int k = 0; k < 2; k++) {
+      errs() << "TRACE-MEET   " << (k ? "B" : "A") << " chain (newest first):";
+      uint32_t cur = n;
+      boost::unordered_flat_set<uint32_t> seen;
+      for (int d = 0; d < 40; d++) {
+        auto it = meetArr[k].find(cur);
+        if (it == meetArr[k].end()) {
+          // Unhooked arrival (the root was already in this class when
+          // it became the merge keeper): name the class at least.
+          errs() << " [no record c" << cur << " size=" << clsSize[cur] << " "
+                 << protBlameName(cur).substr(0, 50) << "]";
+          break;
+        }
+        const MeetArr &m = it->second.front();
+        errs() << "\n" << "TRACE-MEET     c" << cur << " s" << m.s << " via "
+               << m.how << keyStr(m) << "  " << protBlameName(cur).substr(0, 64);
+        if (it->second.size() > 1) {
+          errs() << "  [also:";
+          for (size_t i = 1; i < it->second.size(); i++)
+            errs() << " " << it->second[i].how << "<c" << it->second[i].from
+                   << keyStr(it->second[i]);
+          errs() << "]";
+        }
+        if (m.from == UINT32_MAX || !seen.insert(cur).second) break;
+        cur = m.from;
+      }
+      errs() << "\n";
+    }
+  };
+  const bool traceAny = traceRoot >= 0 || meetRid[0] >= 0;
+  auto traceCheck = [&](uint32_t n, uint32_t s, bool br, const FactSet &bits) {
+    if (traceRoot >= 0 && bits.test((uint32_t)traceRoot)) traceHit(n, s, br);
+    if (meetRid[0] >= 0) {
+      if (bits.test((uint32_t)meetRid[0])) meetHit(n, s, 0);
+      if (bits.test((uint32_t)meetRid[1])) meetHit(n, s, 1);
+    }
+  };
+  auto traceCheckOne = [&](uint32_t n, uint32_t s, uint32_t o) {
+    if (traceRoot >= 0 && o == (uint32_t)traceRoot) traceHit(n, s, false);
+    if (meetRid[0] >= 0) {
+      if (o == (uint32_t)meetRid[0]) meetHit(n, s, 0);
+      if (o == (uint32_t)meetRid[1]) meetHit(n, s, 1);
+    }
   };
   // Threading: parallel phases freeze the union-find (no merges, no path
   // compression — find is a pure read walk) and guard every write to
@@ -4649,9 +4770,9 @@ bool CallGraphPass::runFlowsToResolution() {
   unsigned solverThreads = CFLSolverThreads == 0
                                ? std::max(1u, std::thread::hardware_concurrency())
                                : (unsigned)CFLSolverThreads;
-  if (traceRoot >= 0 && solverThreads > 1) {
-    CG_LOG("FlowsTo: --cfl-trace-func is single-threaded; forcing "
-           "--cfl-solver-threads=1\n");
+  if (traceAny && solverThreads > 1) {
+    CG_LOG("FlowsTo: --cfl-trace-func/--cfl-trace-meet are single-threaded; "
+           "forcing --cfl-solver-threads=1\n");
     solverThreads = 1;
   }
   if (CFLBatchWorkers > 1 && solverThreads > 1) {
@@ -4947,8 +5068,7 @@ bool CallGraphPass::runFlowsToResolution() {
       virginPl[(size_t)n * NSHIFT + s] = 1;
       ctx.localFacts += src.count();
       ctx.internShares++;
-      if (traceRoot >= 0 && src.test((uint32_t)traceRoot))
-        traceHit(n, s, false);
+      if (traceAny) traceCheck(n, s, false, src);
       unlockC(n);
       push(n, ctx);
       return;
@@ -5011,8 +5131,7 @@ bool CallGraphPass::runFlowsToResolution() {
         bW2[i] |= w;
       }
       ctx.localFacts += pop;
-      if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
-        traceHit(n, s, false);
+      if (traceAny) traceCheck(n, s, false, nb);
       unlockC(n);
       push(n, ctx);
       return;
@@ -5036,14 +5155,14 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!promoted.none()) {
       R[n][s].unionWith(promoted);
       dirtyBr[n][s].unionWith(promoted);
+      if (traceAny) traceCheck(n, s, false, promoted); // bridged -> native
     }
     if (!nb.none()) {
       dirty[n][s].unionWith(nb);
       jdirty[n][s].unionWith(nb);
       dirtyBr[n][s].unionWith(nb);
       ctx.localFacts += nb.count();
-      if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
-        traceHit(n, s, false);
+      if (traceAny) traceCheck(n, s, false, nb);
     }
     unlockC(n);
     push(n, ctx);
@@ -5055,6 +5174,7 @@ bool CallGraphPass::runFlowsToResolution() {
       RB[n][s].reset(o);
       R[n][s].set(o);
       dirtyBr[n][s].set(o);
+      if (traceAny) traceCheckOne(n, s, o); // bridged -> native promotion
       unlockC(n);
       push(n, ctx);
       return;
@@ -5066,7 +5186,7 @@ bool CallGraphPass::runFlowsToResolution() {
     jdirty[n][s].set(o);
     dirtyBr[n][s].set(o);
     ctx.localFacts++;
-    if (traceRoot >= 0 && o == (uint32_t)traceRoot) traceHit(n, s, false);
+    if (traceAny) traceCheckOne(n, s, o);
     unlockC(n);
     push(n, ctx);
   };
@@ -5121,8 +5241,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       virginPl[(size_t)n * NSHIFT + s] = 0; // dirty gains RB bits
       ctx.localFacts += pop;
-      if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
-        traceHit(n, s, true);
+      if (traceAny) traceCheck(n, s, true, nb);
       unlockC(n);
       push(n, ctx);
       return;
@@ -5136,8 +5255,7 @@ bool CallGraphPass::runFlowsToResolution() {
     jdirty[n][s].unionWith(nb);
     virginPl[(size_t)n * NSHIFT + s] = 0; // dirty gains RB bits: != R now
     ctx.localFacts += nb.count();
-    if (traceRoot >= 0 && nb.test((uint32_t)traceRoot))
-      traceHit(n, s, true);
+    if (traceAny) traceCheck(n, s, true, nb);
     unlockC(n);
     push(n, ctx);
   };
@@ -5221,6 +5339,7 @@ bool CallGraphPass::runFlowsToResolution() {
         nb.copyFrom(R[b][s]);
         nb.subtract(R[a][s]);
         if (nb.any()) {
+          if (traceAny) traceCheck(a, s, false, nb); // keeper gains b's facts
           // Split: bits only bridged at the keeper are promotions
           // (bridge-crossing newly allowed); the rest are fully new.
           FactSet &promoted = mprS;
@@ -5241,6 +5360,7 @@ bool CallGraphPass::runFlowsToResolution() {
         nb.subtract(R[a][s]);
         nb.subtract(RB[a][s]);
         if (nb.any()) {
+          if (traceAny) traceCheck(a, s, true, nb);
           RB[a][s].unionWith(nb);
           dirty[a][s].unionWith(nb);
         }
@@ -5467,9 +5587,11 @@ bool CallGraphPass::runFlowsToResolution() {
     bridgesOf[x].push_back(y);
     bridgesOf[y].push_back(x);
     bridgeCount++;
-    tHow = "bridge-init"; tFrom = x;
+    tHow = "bridge-init";
     for (uint32_t s = 0; s < NSHIFT; s++) {
+      tFrom = x;
       if (R[x][s].any()) addBitsBridged(y, s, R[x][s], ctx0);
+      tFrom = y;
       if (R[y][s].any()) addBitsBridged(x, s, R[y][s], ctx0);
     }
   };
@@ -5623,6 +5745,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       const size_t mc0 = mergeCount;
       blobCtx = "join"; blobCtxOrigin = o; blobCtxShift = s;
+      tKeyO = o; tKeyS = s; tCell = cell;
       it->second = merge(it->second, cell);
       if (mergeCount > mc0) {
         mergesFromJoin++;
@@ -5640,13 +5763,16 @@ bool CallGraphPass::runFlowsToResolution() {
       for (uint64_t ek : shiftKeysOf[o]) {
         const uint32_t er = clusterFind(ek);
         assert(er != UINT32_MAX && "shiftKeysOf names a missing cluster");
+        tKeyO = o; tKeyS = (uint32_t)(ek % NSHIFT);
         addBridge(it->second, er);
       }
     } else {
       shiftKeysOf[o].push_back(key);
       const uint32_t xr = clusterFind((uint64_t)o * NSHIFT + SHIFT_X);
-      if (xr != UINT32_MAX)
+      if (xr != UINT32_MAX) {
+        tKeyO = o; tKeyS = s;
         addBridge(it->second, xr);
+      }
     }
   };
   // Channel-node factory: append one node to every solve-time parallel
@@ -5893,7 +6019,7 @@ bool CallGraphPass::runFlowsToResolution() {
     size_t collapsed = 0;
     for (auto &scc : sccs) {
       uint32_t rep = find(scc[0]);
-      blobCtx = "a-scc"; blobCtxOrigin = UINT32_MAX;
+      blobCtx = "a-scc"; blobCtxOrigin = UINT32_MAX; tKeyO = UINT32_MAX;
       for (size_t i = 1; i < scc.size(); i++) {
         rep = merge(rep, scc[i]);
         collapsed++;

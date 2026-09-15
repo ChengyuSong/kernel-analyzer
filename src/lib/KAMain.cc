@@ -194,6 +194,16 @@ cl::opt<std::string> CFLTraceFptr(
            "where a flow is severed"),
   cl::init(""));
 
+cl::opt<std::string> CFLTraceMeet(
+  "cfl-trace-meet",
+  cl::desc("Two origin names (comma-separated substrings of a function, "
+           "global, alloca or allocation-call name such as "
+           "_bfd_new_bfd::call:bfd_zmalloc) that must never alias: report "
+           "the first classes that come to hold both, with each origin's "
+           "derivation chain (edge kind, source class, residue) walked "
+           "back to its seed — the exact place the analysis unions them"),
+  cl::init(""));
+
 cl::opt<std::string> CFLTraceValue(
   "cfl-trace-value",
   cl::desc("At the flows-to fixpoint, dump class/facts/cells for every "

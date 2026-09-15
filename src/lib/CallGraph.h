@@ -104,6 +104,9 @@ private:
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
   void sliceEdgesToFptrComponents(std::vector<size_t> &idx);
   bool runFlowsToResolution();
+  // --cfl-dump-agraph: raw (pre-presolve) constraint graph + icall
+  // site / function tables for offline reference solvers.
+  void dumpRawGraph(const std::string &prefix);
   void runGTTypeCensus(const std::string &path);
   void dumpFnPtrOffsets();
   std::unordered_set<NodeIndex> fptrSliceKept;

@@ -1827,6 +1827,219 @@ void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
   membersA.insert(b);
 }
 
+// Raw constraint graph for offline reference solvers: nodes are the
+// factory's own indices (pre-presolve; build-time merges are listed
+// separately in .raw.canon so a reader can apply or ignore them), GEP
+// edges carry their exact byte offset, and the indirect-call sites and
+// address-taken functions are tabulated so the reader can do its own
+// resolution and wiring instead of inheriting this solver's.
+void CallGraphPass::dumpRawGraph(const std::string &prefix) {
+  const std::string pfx = prefix + ".raw";
+  std::error_code e1, e2, e3, e4, e5;
+  raw_fd_ostream nodesOut(pfx + ".nodes", e1);
+  raw_fd_ostream edgesOut(pfx + ".edges", e2);
+  raw_fd_ostream canonOut(pfx + ".canon", e3);
+  raw_fd_ostream icallsOut(pfx + ".icalls", e4);
+  raw_fd_ostream funcsOut(pfx + ".funcs", e5);
+  if (e1 || e2 || e3 || e4 || e5) {
+    WARNING("FlowsTo: cannot write raw graph dump " << pfx << "\n");
+    return;
+  }
+  const DataLayout &DL0 = Ctx->Modules.front().first->getDataLayout();
+  boost::unordered_flat_map<NodeIndex, NodeIndex> cellPtr;
+  for (auto &[p, d] : NF.getDerefMap()) cellPtr[d] = p;
+  auto rawName = [&](NodeIndex m) -> std::string {
+    std::string pre;
+    for (int lvl = 0; lvl < 3 && NF.isDereferenceNode(m); lvl++) {
+      auto it = cellPtr.find(m);
+      if (it == cellPtr.end()) return pre + "<deref#" + std::to_string(m) + ">";
+      pre += "*";
+      m = it->second;
+    }
+    const Value *V = NF.getValueForNode(m);
+    if (!V) {
+      auto pit = g_opaqueProvenance.find(m);
+      if (pit != g_opaqueProvenance.end()) return pre + pit->second;
+      return pre + (NF.isObjectNode(m) ? "<obj>" : "<syn>");
+    }
+    if (const auto *A = dyn_cast<Argument>(V))
+      return pre + (A->getParent()->getName() + "::arg" + Twine(A->getArgNo())).str();
+    if (const auto *I = dyn_cast<Instruction>(V)) {
+      std::string s = (I->getFunction()->getName() + "::" + I->getOpcodeName()).str();
+      if (const auto *CB = dyn_cast<CallBase>(I)) {
+        const Function *CF = CB->getCalledFunction();
+        s += ":" + (CF ? CF->getName().str() : std::string("<icall>"));
+      }
+      return pre + s;
+    }
+    if (V->hasName()) return pre + V->getName().str();
+    if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+      const Value *base = CE;
+      while (const auto *U = dyn_cast<ConstantExpr>(base)) base = U->getOperand(0);
+      return pre + "cexpr:" + CE->getOpcodeName() + "(" +
+             (base->hasName() ? base->getName().str() : "?") + ")";
+    }
+    return pre + "<const>";
+  };
+  auto rawKind = [&](NodeIndex m) -> std::string {
+    if (NF.isDereferenceNode(m)) return "deref";
+    // Object nodes carry their allocation's Value (call, alloca, global,
+    // function): classify them as objects before looking at the Value.
+    if (NF.isObjectNode(m))
+      return std::string("obj") + (NF.isHeapObject(m) ? ":heap" : ":static") +
+             (NF.getObjectOffset(m) ? ":field" : "");
+    const Value *V = NF.getValueForNode(m);
+    if (!V) return "syn";
+    if (isa<Argument>(V)) return "arg";
+    if (const auto *I = dyn_cast<Instruction>(V))
+      return std::string("inst:") + I->getOpcodeName();
+    if (isa<Function>(V)) return "fn";
+    if (isa<GlobalVariable>(V)) return "global";
+    if (isa<ConstantExpr>(V)) return "cexpr";
+    return "const";
+  };
+  // GEP byte offset: 1 = constant (off set), 2 = variable index, 0 = not a GEP
+  auto gepOffset = [&](NodeIndex m, int64_t &off) -> int {
+    const Value *V = NF.getValueForNode(m);
+    const auto *G = dyn_cast_or_null<GEPOperator>(V);
+    if (!G || NF.isDereferenceNode(m)) return 0;
+    const DataLayout &DL =
+        isa<Instruction>(V) ? cast<Instruction>(V)->getModule()->getDataLayout()
+                            : DL0;
+    APInt ap(64, 0);
+    if (G->accumulateConstantOffset(DL, ap)) { off = ap.getSExtValue(); return 1; }
+    return 2;
+  };
+  std::set<std::tuple<const Value *, std::string, unsigned>> directActuals;
+  for (auto &Mp : Ctx->Modules)
+    for (Function &F : *Mp.first)
+      for (Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (const Function *CF = CB->getCalledFunction())
+            for (unsigned i = 0; i < CB->arg_size(); i++)
+              directActuals.insert({CB->getArgOperand(i), CF->getName().str(), i});
+  const auto &edges = EB.getEdges();
+  const auto la = EB.getLabelAssign(), ld = EB.getLabelDeref();
+  boost::unordered_flat_set<NodeIndex> seen;
+  auto noteNode = [&](NodeIndex n) { seen.insert(n); };
+  const bool fieldLabels = EB.getNumFieldBuckets() > 0;
+  for (const auto &E : edges) {
+    if (E.label != la && E.label != ld && !fieldLabels) continue;
+    noteNode(E.from); noteNode(E.to);
+    std::string kind;
+    if (E.label == ld) kind = "d";
+    else {
+      const bool sd = NF.isDereferenceNode(E.from), td = NF.isDereferenceNode(E.to);
+      int64_t off = 0;
+      int g = gepOffset(E.to, off);
+      if (E.label != la) kind = "f" + std::to_string(E.label);
+      if (sd && td) kind = "memcpy";
+      else if (td) kind = "store";
+      else if (sd) kind = "load";
+      else if (g == 1) kind = "gep:" + std::to_string(off);
+      else if (g == 2) kind = "gepX";
+      else {
+        const Value *Vt = NF.getValueForNode(E.to);
+        const Value *Vs = NF.getValueForNode(E.from);
+        if (const auto *A = dyn_cast_or_null<Argument>(Vt))
+          kind = (Vs && directActuals.count({Vs, A->getParent()->getName().str(),
+                                             A->getArgNo()}))
+                     ? "call" : "icall";
+        else if (Vt && isa<CallBase>(Vt)) kind = "ret";
+        else if (const auto *I = dyn_cast_or_null<Instruction>(Vt))
+          kind = std::string("copy:") + I->getOpcodeName();
+        else kind = kind.empty() ? "copy" : kind;
+      }
+    }
+    edgesOut << E.from << " " << E.to << " " << kind << "\n";
+  }
+  auto nodeOf = [&](const Value *V) -> NodeIndex {
+    NodeIndex n = NF.getValueNodeFor(V);
+    if (n == AndersNodeFactory::InvalidIndex)
+      if (const auto *C = dyn_cast<Constant>(V))
+        n = NF.getValueNodeForConstant(C);
+    return n;
+  };
+  size_t sid = 0;
+  for (auto *CS : Ctx->IndirectCallInsts) {
+    Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+    NodeIndex fn = NF.getValueNodeFor(fp);
+    if (fn == AndersNodeFactory::InvalidIndex) continue;
+    NodeIndex res = NF.getValueNodeFor(CS);
+    noteNode(fn);
+    if (res != AndersNodeFactory::InvalidIndex) noteNode(res);
+    std::string loc = "?";
+    if (const DILocation *L = CS->getDebugLoc())
+      loc = (L->getFilename() + ":" + Twine(L->getLine())).str();
+    icallsOut << "I " << sid << " " << fn << " "
+              << (res == AndersNodeFactory::InvalidIndex ? -1 : (int64_t)res)
+              << " " << loc << " " << CS->getFunction()->getName() << "\n";
+    for (unsigned i = 0; i < CS->arg_size(); i++) {
+      NodeIndex a = nodeOf(CS->getArgOperand(i));
+      if (a == AndersNodeFactory::InvalidIndex) continue;
+      noteNode(a);
+      icallsOut << "A " << sid << " " << i << " " << a << "\n";
+    }
+    for (const Function *F : Ctx->AddressTakenFuncs)
+      if (isCompatible(CS, F))
+        icallsOut << "C " << sid << " " << F->getName() << "\n";
+    sid++;
+  }
+  for (const Function *F0 : Ctx->AddressTakenFuncs) {
+    Function *F = getFuncDef(const_cast<Function *>(F0));
+    NodeIndex fn = NF.getValueNodeFor(F);
+    if (fn == AndersNodeFactory::InvalidIndex) continue;
+    NodeIndex ret = F->isDeclaration() ? AndersNodeFactory::InvalidIndex
+                                       : NF.getReturnNodeFor(F);
+    noteNode(fn);
+    if (ret != AndersNodeFactory::InvalidIndex) noteNode(ret);
+    funcsOut << "F " << F->getName() << " " << fn << " "
+             << (ret == AndersNodeFactory::InvalidIndex ? -1 : (int64_t)ret)
+             << " " << (F->isVarArg() ? 1 : 0) << " "
+             << F->getFunctionType()->getNumParams() << "\n";
+    for (const Argument &A : F->args()) {
+      NodeIndex a = NF.getValueNodeFor(&A);
+      if (a == AndersNodeFactory::InvalidIndex) continue;
+      noteNode(a);
+      funcsOut << "P " << F->getName() << " " << A.getArgNo() << " " << a << "\n";
+    }
+  }
+  // Object identity for cells: a deref node's pointer, and every
+  // object node's base + offset, so a reader can key cells by
+  // (object, byte offset) itself.
+  for (NodeIndex n : seen) {
+    nodesOut << n << " " << rawKind(n) << " " << rawName(n);
+    if (NF.isDereferenceNode(n)) {
+      auto it = cellPtr.find(n);
+      nodesOut << " ptr=" << (it == cellPtr.end() ? -1 : (int64_t)it->second);
+    }
+    // Object extent where the IR states it (allocas, globals); heap
+    // objects have none — the reader must bound them itself.
+    if (const Value *V = NF.getValueForNode(n)) {
+      if (const auto *AI = dyn_cast<AllocaInst>(V)) {
+        if (!AI->isArrayAllocation())
+          nodesOut << " size=" << AI->getModule()->getDataLayout().getTypeAllocSize(
+                                     AI->getAllocatedType());
+      } else if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+        nodesOut << " size=" << GV->getParent()->getDataLayout().getTypeAllocSize(
+                                   GV->getValueType());
+      } else if (isa<Function>(V)) {
+        nodesOut << " size=1"; // one address: the entry
+      }
+    }
+    // Allocation-site value nodes are origins in their own right (the
+    // pointer IS the address of the fresh object), like globals,
+    // allocas and functions; mark them so a reader can seed them.
+    if (AllocSites.count(n)) nodesOut << " alloc";
+    nodesOut << "\n";
+    NodeIndex c = getCanonicalNode(n);
+    if (c != n) canonOut << n << " " << c << "\n";
+  }
+  CG_LOG("FlowsTo: raw graph dumped to " << pfx << ".{nodes,edges,canon,icalls,funcs} ("
+         << seen.size() << " nodes, " << edges.size() << " edges, " << sid
+         << " icall sites)\n");
+}
+
 // task #38 rung 2: canonical nodes of the presolve fptr backward cone,
 // persisted for the in-solve join-cone experiment (--cfl-join-cone).
 
@@ -4195,6 +4408,7 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<BlobEv> blobEvents;
   const char *blobCtx = "?";
   uint32_t blobCtxOrigin = UINT32_MAX;
+  uint32_t blobCtxShift = 0; // residue of the join key (fs runs)
   clsSize.assign(N, 1);
   for (uint32_t n2 = 0; n2 < N; n2++) {
     auto cit2 = canonicalClassMembers.find(toOrig[n2]);
@@ -4944,6 +5158,7 @@ bool CallGraphPass::runFlowsToResolution() {
   size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
   size_t nullKeyJoinsSkipped = 0; // null-cell join hygiene LEDGER
   size_t g_idJoinsAblated = 0;    // identity-join ablation probe LEDGER
+  size_t g_transJoinsRefused = 0; // --cfl-probe-no-trans-join LEDGER
   std::vector<int8_t> g_idJoinClass; // rid -> 1 = identity/synthetic
   // --cfl-root-relevance: (root, keeper class) per join-triggered merge —
   // joins are the only consumer of individual root bits besides the final
@@ -5185,7 +5400,9 @@ bool CallGraphPass::runFlowsToResolution() {
              // itself once it has merged in, which names nothing.
              blobCtxOrigin == UINT32_MAX
                  ? std::string()
-                 : protBlameName(rootClassOf[blobCtxOrigin]),
+                 : protBlameName(rootClassOf[blobCtxOrigin]) +
+                       (NSHIFT > 1 ? ",s" + std::to_string(blobCtxShift)
+                                   : std::string()),
              iterations});
     }
     clsSize[a] += clsSize[b];
@@ -5399,9 +5616,13 @@ bool CallGraphPass::runFlowsToResolution() {
         redundantJoins++; // already one cluster: pure lookup, no work
       } else if (keyCount[cellRep].load(std::memory_order_relaxed) > 0) {
         transKeyMerges++; // cell anchors other keys: key-clusters coalesce
+        if (CFLProbeNoTransJoin) {
+          g_transJoinsRefused++; // MEASUREMENT-ONLY UNSOUND: flow dropped
+          return;
+        }
       }
       const size_t mc0 = mergeCount;
-      blobCtx = "join"; blobCtxOrigin = o;
+      blobCtx = "join"; blobCtxOrigin = o; blobCtxShift = s;
       it->second = merge(it->second, cell);
       if (mergeCount > mc0) {
         mergesFromJoin++;
@@ -8485,17 +8706,56 @@ bool CallGraphPass::runFlowsToResolution() {
     // key-coalescing merges bound the over-approximation (Lean gap F3).
     {
       std::unordered_map<uint32_t, uint32_t> keysPer;
-      for (auto &[k, rep] : clusterRep) keysPer[find(rep)]++;
-      uint64_t multi = 0, maxK = 0;
+      std::unordered_map<uint32_t, uint64_t> shiftsPer; // rep -> residue mask
+      for (auto &[k, rep] : clusterRep) {
+        keysPer[find(rep)]++;
+        shiftsPer[find(rep)] |= 1ull << (k % NSHIFT);
+      }
+      uint64_t multi = 0, maxK = 0, mixed = 0, mixedKeys = 0;
+      uint32_t giantRep = UINT32_MAX;
       for (auto &[cls, kc] : keysPer) {
         if (kc > 1) multi++;
-        maxK = std::max<uint64_t>(maxK, kc);
+        if (kc > maxK) { maxK = kc; giantRep = cls; }
+        // A cluster holding keys at more than one residue reads and
+        // writes across fields: the field split is lost inside it.
+        if (__builtin_popcountll(shiftsPer[cls]) > 1) { mixed++; mixedKeys += kc; }
       }
       errs() << "ClusterTrans: " << clusterCount() << " keys in "
              << keysPer.size() << " clusters, multi-key clusters " << multi
              << ", max keys/cluster " << maxK
              << ", transitive key-coalescing merges " << transKeyMerges
              << "\n";
+      if (NSHIFT > 1) {
+        errs() << "ClusterTrans: residue-mixed clusters " << mixed << " holding "
+               << mixedKeys << " keys; largest cluster spans "
+               << (giantRep == UINT32_MAX
+                       ? 0 : __builtin_popcountll(shiftsPer[giantRep]))
+               << " of " << NSHIFT << " residues\n";
+        // Which POINTER classes carry facts at several residues: each
+        // such class welds every key it holds into one cluster, so
+        // these are the cross-field couplers. Histogram + top classes.
+        std::vector<uint32_t> hist(NSHIFT + 1, 0);
+        std::vector<std::pair<uint32_t, uint32_t>> top; // (#residues, class)
+        for (uint32_t c = 0; c < N; c++) {
+          if (find(c) != c) continue;
+          uint32_t k = 0;
+          for (uint32_t s = 0; s < NSHIFT; s++)
+            if (R[c][s].any() || RB[c][s].any()) k++;
+          hist[k]++;
+          if (k >= 2) top.emplace_back(k, c);
+        }
+        errs() << "ResidueSpread: classes by #residues carrying facts:";
+        for (uint32_t k = 0; k <= NSHIFT; k++)
+          if (hist[k]) errs() << " " << k << ":" << hist[k];
+        errs() << "\n";
+        std::sort(top.rbegin(), top.rend());
+        for (size_t i = 0; i < std::min<size_t>(25, top.size()); i++) {
+          const uint32_t c = top[i].second;
+          errs() << "ResidueSpread: " << top[i].first << " residues, class c" << c
+                 << " size=" << clsSize[c] << " " << protBlameName(c).substr(0, 70)
+                 << "\n";
+        }
+      }
     }
     if (CFLProbeWitnessSep && !witnessAnchors.empty()) {
       // Separation census: for each anchored fine cell c, W(c) = the
@@ -8588,6 +8848,7 @@ bool CallGraphPass::runFlowsToResolution() {
            << ", redundant join lookups " << redundantJoins
            << ", null-key joins skipped " << nullKeyJoinsSkipped
            << ", identity-joins ABLATED " << g_idJoinsAblated
+           << ", transitive joins REFUSED " << g_transJoinsRefused
            << (CFLChannelCells
                    ? (", CHANNELS " + std::to_string(chanNodes) + " nodes " +
                       std::to_string(chanEdges) + " edges " +
@@ -20851,6 +21112,9 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
 
+    if (!CFLDumpAGraph.empty() && iteration == 0 && CFLFlowsTo &&
+        !CFLCompositional)
+      dumpRawGraph(CFLDumpAGraph); // before presolve: raw value nodes
     // Pre-solve copy/field merge before the monolithic dense mapping.
     if ((CFLPreSolveMerge || CFLFlowsTo) && !CFLCompositional &&
         (!CFLPreSolveOnce || iteration == 0))

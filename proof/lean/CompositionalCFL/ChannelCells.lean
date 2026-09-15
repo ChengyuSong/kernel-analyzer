@@ -142,4 +142,41 @@ theorem rw_conduit_leaks :
   · intro h
     exact (cluster_exceeds_pair).2 ((chanflow_iff_pairflow m3 _ _).mp h)
 
+/-! ## Unconditional split (v2, 2026-09-15)
+
+PREMISE (implementation): every assistant cell is split at the
+flush: the cell itself is the write half (it keeps the build-time
+in-edges — the values stored through its owner pointer — and feeds
+channel k for every key k of the owner); a fresh read half takes
+over the cell's build-time out-edges (the loads it feeds, GEPs on
+its content, its own downstream cells) and is fed by those channels.
+No role is inferred from the graph: in-edges ARE stores and
+out-edges ARE reads, by construction of the builder. In this model a
+cell is therefore two `CellModel` cells with the same key set — one
+`isStore`, one `isLoad` — and the flush wires each in one direction
+only, so `rw_conduit_leaks` cannot arise: the read half never feeds a
+channel, the write half never receives one. The same-pointer relay
+(`*p = w; v = *p`) still flows, through the channel of any shared
+key — `split_self_flow` below. -/
+
+/-- Split a cell model: each original cell `c` becomes a write cell
+`(c, false)` and a read cell `(c, true)` with the same keys. -/
+def split (M : CellModel C K) : CellModel (C × Bool) K where
+  keys := fun ⟨c, _⟩ => M.keys c
+  isStore := fun ⟨_, r⟩ => r = false
+  isLoad := fun ⟨_, r⟩ => r = true
+
+/-- Routing over the split model is still exactly the grammar's M
+(no new flows appear from splitting). -/
+theorem split_chanflow_iff (c d : C) (r r' : Bool) :
+    ChanFlow (split M) (c, r) (d, r') ↔ PairFlow (split M) (c, r) (d, r') :=
+  chanflow_iff_pairflow (split M) _ _
+
+/-- A store and a load through the SAME owner pointer (same key set)
+still exchange content whenever the owner has any key at all: the
+split loses no same-pointer flow. -/
+theorem split_self_flow (c : C) (k : K) (hk : M.keys c k) :
+    ChanFlow (split M) (c, false) (c, true) :=
+  ⟨k, ⟨rfl, hk⟩, rfl, hk⟩
+
 end ChannelCells

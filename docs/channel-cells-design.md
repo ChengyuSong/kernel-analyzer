@@ -110,6 +110,42 @@ channel: GT misses, mean fanout, one-sidedness; micro repros
 t_reg.ll (const table) / t_reg2.ll (heap + bucket relay — THE
 20-line reproducer of the sqlite3 fts3 loss) / t_litvt.ll.
 
+## v2 as built (2026-09-15): unconditional split, no roles, no marks
+
+The access-marks plan above turned out to be unnecessary. The
+builder already states direction: a cell's build-time in-edges are
+the values stored through its owner, its out-edges are the reads
+(loads it feeds, GEPs on its content, its own downstream cells).
+What v1 got wrong was inferring a ROLE per cell from the dense graph
+after merges and then wiring one node in one direction (or merging
+it). The flush now splits every cell unconditionally:
+
+  write half = the cell itself: keeps its in-edges, gets an edge
+               cell -> chan(o,s) for every key (o,s) of the owner;
+  read half  = a fresh node taking over the cell's outA/outF/cellsOf,
+               fed by chan(o,s) -> read-half for the same keys;
+               not created for cells with no out-edges (object
+               storage, dead assistants).
+
+Two nodes cannot relay between the owner's keys (the write half never
+receives channel content, the read half never feeds one), so
+`rw_conduit_leaks` does not arise; a same-pointer store/load pair
+still flows through the channel of any shared key
+(`split_self_flow`). A cell merged with values by the exact presolve
+(mutual flow) splits the same way: the merged node's in-edges are
+stores, its out-edges are the uses — the RMW "read then write back
+to the same location" is modelled without moving content between the
+owner's keys, which is more precise than Andersen's rule and still
+sound (a write-back to the location just read is a no-op).
+
+Channel mode forces the exact presolve quotient and disables the
+V-component cone quotient: both are symmetric unifications of the
+kind the pairwise model removes (direction rule, 2026-09-15).
+
+First measurements: t_reg / t_reg2 identical to cluster mode (t_reg2
+no longer loses a target); default path byte-identical (smoke 4/4).
+nm-new fs13 and the fastgate suite: see the campaign memory.
+
 ## Gates
 
 1. Micro suite (test/t_*.bc incl. t_litvt) + cfl-smoke.

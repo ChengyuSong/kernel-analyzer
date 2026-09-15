@@ -2209,7 +2209,10 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   // over-unification: at km it manufactures a 41,350-member born class
   // whose true mutual-flow core is 41 nodes. Exact mode trades that
   // compression back for precision; cost measured, not assumed.
-  if (CFLPreSolveExact) {
+  // Channel cells require the exact quotient: the V-component merge is
+  // itself a symmetric (Steensgaard-style) unification, the class of
+  // merge the pairwise cell model exists to remove.
+  if (CFLPreSolveExact || CFLChannelCells) {
     const uint32_t M2 = (uint32_t)toCanon.size();
     const uint32_t laX = EB.getLabelAssign();
     auto isFwdX = [&](uint32_t l) {
@@ -2456,7 +2459,7 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
   // this buys the precision where it counts at a bounded class-count
   // increase (|cone|).
   std::vector<char> inCone;
-  if (CFLPreSolveCone) {
+  if (CFLPreSolveCone && !CFLChannelCells) {
     const uint32_t Mc = (uint32_t)toCanon.size();
     inCone.assign(Mc, 0);
     const uint32_t laC = EB.getLabelAssign();
@@ -3874,38 +3877,12 @@ bool CallGraphPass::runFlowsToResolution() {
     auto &cs = cellsOf[p];
     if (std::find(cs.begin(), cs.end(), c) == cs.end()) cs.push_back(c);
   }
-  // Channel cells (docs/channel-cells-design.md): classify each
-  // assistant cell's access role from the build-time a-edges — a load
-  // cell FEEDS its result (outgoing a), a store cell RECEIVES its value
-  // (incoming a). Roles OR under merges. role==3 (read-write: RMW /
-  // cmpxchg) cells wired in both directions would relay content between
-  // their channels (Lean: rw_conduit_leaks), so they keep merge
-  // semantics, ledgered.
-  std::vector<char> cellRole;
+  // Channel cells (docs/channel-cells-design.md): no access role is
+  // inferred here any more — the flush splits every cell into its
+  // write half (in-edges) and read half (out-edges) unconditionally.
   if (CFLChannelCells) {
-    cellRole.assign(N, 0);
     std::vector<char> isCellN(N, 0);
     for (auto [p, c] : dEdges) isCellN[c] = 1;
-    for (auto [ea, eb] : aEdges) {
-      if (isCellN[ea]) cellRole[ea] |= 1;
-      if (isCellN[eb]) cellRole[eb] |= 2;
-    }
-    // A load consumed only as a base pointer feeds f-edges, not a-edges
-    // (GEPs on the result) — still load-side. Missing this classified
-    // real loads as inert and severed their content (v1 GT explosion).
-    for (auto &[fb, fr, fbk] : fEdges)
-      if (isCellN[fb]) cellRole[fb] |= 1;
-    // A cell dereferenced onward (its content used as a pointer: the
-    // cell is the SOURCE of another d-edge) is also load-side.
-    for (auto [p2, c2] : dEdges)
-      if (isCellN[p2]) cellRole[p2] |= 1;
-    // Object nodes ARE storage: their seeded facts (initializer
-    // deposits) are the key's content — store-side, so they feed
-    // their channels. (Origins anchor at the ADDRESS value class,
-    // so an own-origin identity test at the cell cannot see this.)
-    for (auto [p3, c3] : dEdges)
-      if (c3 < toOrig.size() && NF.isObjectNode(toOrig[c3]))
-        cellRole[c3] |= 2;
     if (VerboseLevel >= 3 && N < 200) {
       // Tiny-graph full dump: every class with its edges — the whole
       // truth for micro repros.
@@ -3920,8 +3897,7 @@ bool CallGraphPass::runFlowsToResolution() {
       };
       for (uint32_t c = 0; c < N; c++) {
         errs() << "G c" << c << " [" << gnm(c) << "]"
-               << (isCellN[c] ? " CELL" : "")
-               << " role=" << (int)(c < cellRole.size() ? cellRole[c] : 0);
+               << (isCellN[c] ? " CELL" : "");
         for (auto [ea, eb] : aEdges)
           if (ea == c) errs() << " a->c" << eb;
         for (auto [pa, pb] : dEdges)
@@ -5321,8 +5297,6 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     mergeCount++;
     mergeHits[a] += 1 + mergeHits[b];
-    if (!cellRole.empty())
-      cellRole[a] |= cellRole[b]; // access roles OR under merges
     keyCount[a].fetch_add(keyCount[b].load(std::memory_order_relaxed),
                           std::memory_order_relaxed);
     keyCount[b].store(0, std::memory_order_relaxed);
@@ -5673,7 +5647,7 @@ bool CallGraphPass::runFlowsToResolution() {
   struct ChanPend {
     uint32_t cell, o, s;
   };
-  std::vector<ChanPend> chanPend, chanRetry;
+  std::vector<ChanPend> chanPend;
   // Record-time dedup: one pend per (raw cell, key) for the whole
   // solve — node ids are never reused, so raw ids are stable even
   // across merges (re-offers after merges re-call joinCluster).
@@ -5681,9 +5655,9 @@ bool CallGraphPass::runFlowsToResolution() {
                             boost::hash<std::pair<uint64_t, uint32_t>>>
       chanPendSeen;
   boost::unordered_flat_set<uint64_t> chanEdgeSeen; // (src<<32)|dst
-  boost::unordered_flat_map<uint32_t, uint32_t> chanReadHalf; // rw splits
-  size_t chanNodes = 0, chanEdges = 0, chanRmwMerges = 0,
-         chanDeadSkipped = 0;
+  // cell -> its read half (UINT32_MAX: cell has no reads, no half made)
+  boost::unordered_flat_map<uint32_t, uint32_t> chanReadHalf;
+  size_t chanNodes = 0, chanEdges = 0, chanSplits = 0;
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     // NOTE: the cluster-mark fast path skips redundant joinCluster
     // calls, so this census is APPROXIMATE (first-join-per-cluster
@@ -5812,7 +5786,12 @@ bool CallGraphPass::runFlowsToResolution() {
     isRoot.push_back(0);
     compactMark.push_back(64);
     virginPl.insert(virginPl.end(), NSHIFT, 0);
-    if (!cellRole.empty()) cellRole.push_back(0);
+    // merge() adds clsSize[b] into clsSize[a] for ANY keeper, channel
+    // nodes included (the SCC collapse merges them): an ungrown
+    // clsSize was an out-of-bounds write (fs13 channel segfaults,
+    // 2026-09-15).
+    clsSize.push_back(1);
+    if (!ownedMask.empty()) ownedMask.push_back(0);
     chanNodes++;
     return id;
   };
@@ -5851,114 +5830,72 @@ bool CallGraphPass::runFlowsToResolution() {
         ch = find(it->second);
       }
       if (ch == cell) continue; // RMW-merged earlier under this key
-      const char role = cell < cellRole.size() ? cellRole[cell] : 0;
       if (VerboseLevel >= 3) {
-        auto nm = [&](uint32_t c2) -> std::string {
-          if (c2 >= N) return "<chan>";
-          const Value *V2 = NF.getValueForNode(toOrig[c2]);
-          if (V2 && V2->hasName()) return V2->getName().str();
-          if (V2)
-            if (const auto *I2 = dyn_cast<Instruction>(V2))
-              return (I2->getFunction()->getName() + "::" +
-                      I2->getOpcodeName()).str();
-          return NF.isObjectNode(toOrig[c2]) ? "<obj>" : "<syn>";
-        };
-        errs() << "ChanFlush: cell c" << cell << " (" << nm(cell)
-               << ") role=" << (int)role << " key=(r" << P.o << " "
-               << (P.o < rootClassOf.size() ? nm(find(rootClassOf[P.o]))
-                                            : "?")
+        errs() << "ChanFlush: cell c" << cell << " ("
+               << protBlameName(cell).substr(0, 50) << ") key=(r" << P.o
+               << " "
+               << (P.o < rootClassOf.size()
+                       ? protBlameName(rootClassOf[P.o]).substr(0, 40)
+                       : "?")
                << ", s" << P.s << ") ch=c" << ch << "\n";
       }
-      if (role == 3) {
-        // Read-write cell: SPLIT. Bidirectional wiring (or a merge)
-        // would relay content between its channels (rw_conduit_leaks
-        // — the fs13 v1 run measured the merge fallback cascading
-        // into 125k channel welds ≈ cluster semantics). Write half =
-        // the cell itself: keeps its incoming value edges, feeds its
-        // channels. Read half = fresh node: takes over the cell's
-        // outgoing a-edges, fed by the channels.
-        auto [rhIt, rhNew] = chanReadHalf.try_emplace(cell, 0u);
-        if (rhNew) {
+      // Every cell is SPLIT, unconditionally: the cell itself is the
+      // write half (it keeps the value edges stored INTO it and feeds
+      // the channels of every key its owner may point to); a fresh
+      // read half takes over the cell's outgoing edges (the loads it
+      // feeds, GEPs on its content, its own downstream cells) and is
+      // fed BY those channels. No access role is inferred from the
+      // graph — direction is what the build-time edges already say:
+      // in-edges are stores, out-edges are reads. A cell with no
+      // out-edges (object storage, dead assistants) gets no read half.
+      // Wiring one node both ways would relay content between the
+      // owner's keys (Lean: rw_conduit_leaks); two nodes cannot: the
+      // write half never receives channel content, the read half
+      // never feeds a channel.
+      auto [rhIt, rhNew] = chanReadHalf.try_emplace(cell, UINT32_MAX);
+      if (rhNew) {
+        if (!outA[cell].empty() || !outF[cell].empty() ||
+            !cellsOf[cell].empty()) {
           const uint32_t rh = newSolverNode();
           rhIt->second = rh;
           outA[rh].swap(outA[cell]);
-          // The loaded value's DEREF consumers (f-edges: GEPs on the
-          // result) read channel content too — leaving them on the
-          // write half severed them (fuzzershell fts3 GT loss). Same
-          // for the cell's own downstream cells: joins fire on the
-          // OWNER's facts, and the loaded value's facts live on the
-          // read half now.
           outF[rh].swap(outF[cell]);
           cellsOf[rh].swap(cellsOf[cell]);
-          // Carry the cell's current mixed content to the read half
-          // once (over-approx: stored∪loaded; future arrivals route
-          // through the channels).
+          // Content the cell accumulated before its split is a mix of
+          // stored and (cluster-era) loaded facts; hand it to the read
+          // half once so nothing already derived is lost. Future
+          // arrivals route through the channels.
           for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
             if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0);
             if (RB[cell][s2].any()) addBits(rh, s2, RB[cell][s2], ctx0);
           }
-          chanRmwMerges++; // ledger: rw splits
+          chanSplits++;
         }
-        const uint32_t rh = rhIt->second;
-        if (chanEdgeSeen.insert(((uint64_t)cell << 32) | ch).second) {
-          outA[cell].push_back(ch);
-          chanEdges++;
-          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-            if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
-            if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
-          }
-        }
-        if (chanEdgeSeen.insert(((uint64_t)ch << 32) | rh).second) {
-          outA[ch].push_back(rh);
-          chanEdges++;
-          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-            if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0);
-            if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);
-          }
-        }
+      }
+      const uint32_t rh = rhIt->second;
+      // write half -> channel
+      if (chanEdgeSeen.insert(((uint64_t)cell << 32) | ch).second) {
+        outA[cell].push_back(ch);
+        chanEdges++;
         work++;
-        continue;
-      }
-      if (role == 0) {
-        // No value edges: object storage of any flavor (named object
-        // nodes, OPAQUE heap nodes — NF.isObjectNode misses those —
-        // or dead assistants). Storage content flows OUT only, so
-        // store-side wiring is universally safe here (nothing routes
-        // channel content INTO a role-0 cell — no relay). Defer while
-        // fact-free so dead assistants cost nothing.
-        bool hasFacts = false;
-        for (uint32_t s2 = 0; s2 < NSHIFT && !hasFacts; s2++)
-          hasFacts = R[cell][s2].any() || RB[cell][s2].any();
-        if (!hasFacts) {
-          chanRetry.push_back(P); // re-examined at every barrier; the
-          chanDeadSkipped++;      // fixpoint barrier sees final planes
-          continue;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
+          if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
         }
-        if (chanEdgeSeen.insert(((uint64_t)cell << 32) | ch).second) {
-          outA[cell].push_back(ch);
-          chanEdges++;
-          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-            if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
-            if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
-          }
-          work++;
-        }
-        continue;
       }
-      const uint32_t src = (role & 2) ? cell : ch;
-      const uint32_t dst = (role & 2) ? ch : cell;
-      if (!chanEdgeSeen.insert(((uint64_t)src << 32) | dst).second)
-        continue;
-      outA[src].push_back(dst);
-      chanEdges++;
-      work++;
-      for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-        if (R[src][s2].any()) addBits(dst, s2, R[src][s2], ctx0);
-        if (RB[src][s2].any()) addBits(dst, s2, RB[src][s2], ctx0);
+      // channel -> read half
+      if (rh != UINT32_MAX &&
+          chanEdgeSeen.insert(((uint64_t)ch << 32) | rh).second) {
+        outA[ch].push_back(rh);
+        chanEdges++;
+        work++;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0);
+          if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);
+        }
       }
     }
-    chanPend.swap(chanRetry);
-    chanRetry.clear();
+    chanPend.clear();
     flushCtx(ctx0);
     return work;
   };
@@ -6085,6 +6022,9 @@ bool CallGraphPass::runFlowsToResolution() {
   auto mintRoot = [&](uint32_t cls) {
     uint32_t rep = find(cls);
     if (isRoot[rep]) return;
+    // Channel nodes / read halves (ids past the dense graph) are solver
+    // plumbing, never value origins: hasIn/toOrig do not cover them.
+    if (rep >= N) return;
     if (CFLAdoptProposedSummaries && starvedFormalClass(rep)) return;
     isRoot[rep] = 1;
     uint32_t rid = nextRoot++;
@@ -6410,7 +6350,7 @@ bool CallGraphPass::runFlowsToResolution() {
       unlockC(n);
       // Bridge crossings: native backlog only, arriving bridged.
       if (doBr) {
-        if (traceRoot >= 0) { tHow = "bridge"; tFrom = n; }
+        if (traceAny) { tHow = "bridge"; tFrom = n; }
         for (uint32_t br : bridgesOf[n]) {
           uint32_t bb = find(br);
           if (bb != n) addBitsBridged(bb, s, db, ctx);
@@ -6424,7 +6364,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // the delta is the whole plane, the scratch snapshot otherwise.
       const FactSet &pay = dFull ? R[n][s] : d;
       if (wproj) {
-        if (traceRoot >= 0) { tHow = "wflag"; tFrom = n; }
+        if (traceAny) { tHow = "wflag"; tFrom = n; }
         if (dFull) {
           // Delta == R and RB empty: the native split is R itself.
           addBits(n, SHIFT_X, pay, ctx, true);
@@ -6439,7 +6379,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // OR along f-edges (X absorbs). Emission is native — value flow
       // launders bridge provenance, exactly like the grammar (M-hops
       // are separated by a-steps in every V derivation).
-      if (traceRoot >= 0) { tHow = "a-prop"; tFrom = n; }
+      if (traceAny) { tHow = "a-prop"; tFrom = n; }
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
         if (tt != n) { ctx.nAOr++; addBits(tt, s, pay, ctx, dFull); }
@@ -6447,7 +6387,7 @@ bool CallGraphPass::runFlowsToResolution() {
       uint64_t tp5 = rd();
       ctx.cyA += tp5 - tp4;
       if (prof) ctx.orWords += (uint64_t)pay.count() * outA[n].size();
-      if (traceRoot >= 0) { tHow = "f-prop"; tFrom = n; }
+      if (traceAny) { tHow = "f-prop"; tFrom = n; }
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
@@ -8993,8 +8933,7 @@ bool CallGraphPass::runFlowsToResolution() {
            << (CFLChannelCells
                    ? (", CHANNELS " + std::to_string(chanNodes) + " nodes " +
                       std::to_string(chanEdges) + " edges " +
-                      std::to_string(chanRmwMerges) + " rw-splits " +
-                      std::to_string(chanDeadSkipped) + " pool-merges")
+                      std::to_string(chanSplits) + " split cells")
                    : std::string())
            << ", merge-reoffered " << reofferedFacts
            << " facts, sweeps offered " << sweepOffered << " kept "

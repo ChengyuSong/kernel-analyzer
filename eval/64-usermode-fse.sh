@@ -46,7 +46,8 @@
 # fs pins (same vintage; fsbase carries no channels/adoption, so
 # the fixes are inert there and those pins stand):
 #   httpd  fsfull 45,975 / fsbase 80,208   (fs-vs-fi -338/+0)
-#   pg     fsfull 425,239 / fsbase 1,159,606 (fs-vs-fi -13,451/+0)
+#   pg     fsfull 425,176 / fsbase 1,159,606 (fs-vs-fi -13,451/+0;
+#          425,239 was the contaminated-adoption cut, see pg full)
 #
 # Usage:
 #   KA_WORK=~/fast/ka-bench eval/64-usermode-fse.sh \

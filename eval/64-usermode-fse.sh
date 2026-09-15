@@ -40,7 +40,9 @@
 # summary varargs refusal (docs/summary-varargs-gap.md); the
 # 09-11 full pins 45,479/435,979 are pre-fix, superseded):
 #   httpd  full 46,313 / base 81,049
-#   pg     full 438,690 / base 1,178,443
+#   pg     full 438,627 / base 1,178,443   (438,690 was cut on a
+#          binary whose summary proposers mis-refused every function
+#          with a dbg/lifetime intrinsic — lost adoption, fixed 4eeeb75)
 # fs pins (same vintage; fsbase carries no channels/adoption, so
 # the fixes are inert there and those pins stand):
 #   httpd  fsfull 45,975 / fsbase 80,208   (fs-vs-fi -338/+0)

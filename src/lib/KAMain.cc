@@ -205,15 +205,16 @@ cl::opt<bool> CFLChannelCone(
 
 cl::opt<bool> CFLExtGlobalsOwnIdentity(
   "cfl-ext-globals-own-identity",
-  cl::desc("Whole-program mode only: give every declared-but-undefined "
-           "global its own node and cell (as PointTo does) instead of the "
+  cl::desc("Whole-program mode: every declared-but-undefined global gets "
+           "its own node and cell (as PointTo does) instead of the "
            "universal pointer, so stores into one extern global are not "
            "read back from every other; the cell's content stays an "
            "unknown (identity) object. Linker-bounds symbols keep the "
            "--cfl-linker-arrays treatment. Ignored under "
            "--cfl-compositional, where an extern global may be defined by "
-           "an unseen TU"),
-  cl::init(false));
+           "an unseen TU. =false restores the universal fallback "
+           "(pre-2026-09-16 behaviour)"),
+  cl::init(true));
 
 cl::opt<bool> CFLProbeNoCellIdentity(
   "cfl-probe-no-cell-identity",

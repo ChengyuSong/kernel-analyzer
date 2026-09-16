@@ -19,6 +19,7 @@
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/Support/Debug.h>
 #include <llvm/IR/InstIterator.h>
+#include <llvm/IR/CFG.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/ADT/StringExtras.h>
@@ -12744,7 +12745,7 @@ void CallGraphPass::wireLinkerSectionArrays() {
 //      memset. Rejections are tallied by reason (LEDGER).
 static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
               g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
-              g_freshHelperComposed = 0;
+              g_freshHelperComposed = 0, g_freshCpy = 0;
 static std::map<std::string, size_t> g_escapeBuckets;
 static std::map<std::string, size_t> g_escapeCallees;
 void CallGraphPass::confirmFreshWrappers() {
@@ -12946,6 +12947,64 @@ void CallGraphPass::confirmFreshWrappers() {
     return inf;
   };
   auto &initOnlyInfo = initOnlyInfoRef;
+  // O0 shape (2026-09-16): formals and call results are spilled into
+  // local slots and reloaded. A slot whose only users are loads, stores
+  // INTO it and debug/lifetime markers never escapes; a load from it
+  // reads the stores that REACH it — the last store before it in its
+  // block, else the last store of each predecessor path (the mem2reg
+  // answer, computed on demand). Without this every O0 wrapper failed
+  // R1 at its first reload (cflow/binutils: xrealloc, bfd_malloc).
+  auto isSpillSlot = [](const Value *v) -> const AllocaInst * {
+    const auto *AI = dyn_cast<AllocaInst>(v);
+    if (!AI) return nullptr;
+    for (const User *U : AI->users()) {
+      if (isa<LoadInst>(U)) continue;
+      if (const auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getPointerOperand() == AI && SI->getValueOperand() != AI)
+          continue;
+        return nullptr;
+      }
+      if (const auto *II = dyn_cast<IntrinsicInst>(U)) {
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+        case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+          continue;
+        default: break;
+        }
+      }
+      return nullptr;
+    }
+    return AI;
+  };
+  auto reachingSlotStores = [](const LoadInst *L, const AllocaInst *AI,
+                               SmallVectorImpl<const StoreInst *> &out) {
+    auto lastStoreBefore = [&](const BasicBlock *BB,
+                               const Instruction *upto) -> const StoreInst * {
+      const StoreInst *last = nullptr;
+      for (const Instruction &I : *BB) {
+        if (&I == upto) break;
+        if (const auto *SI = dyn_cast<StoreInst>(&I))
+          if (SI->getPointerOperand() == AI) last = SI;
+      }
+      return last;
+    };
+    if (const StoreInst *S0 = lastStoreBefore(L->getParent(), L)) {
+      out.push_back(S0);
+      return;
+    }
+    SmallVector<const BasicBlock *, 8> wl(pred_begin(L->getParent()),
+                                          pred_end(L->getParent()));
+    SmallPtrSet<const BasicBlock *, 16> seen;
+    while (!wl.empty()) {
+      const BasicBlock *B = wl.pop_back_val();
+      if (!seen.insert(B).second) continue;
+      if (const StoreInst *S = lastStoreBefore(B, nullptr)) {
+        out.push_back(S);
+        continue;
+      }
+      for (const BasicBlock *P : predecessors(B)) wl.push_back(P);
+    }
+  };
   size_t round = 0;
   bool changed = true;
   while (changed) {
@@ -12958,14 +13017,37 @@ void CallGraphPass::confirmFreshWrappers() {
         if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
           continue;
         if (Ctx->FuncSummaries.count(&F)) continue;
+        // Fresh sources: allocator callees (file FRESH, promoted, or
+        // hardcoded). A callee whose summary also carries CPY(ret<-argK)
+        // (the realloc/strdup shape) is a fresh source that COPIES: the
+        // wrapper inherits the copy from whichever of its own formals
+        // reaches the callee's argK (resolved after R3). A callee with
+        // any other atom (init stores, invoke) is not composed here.
+        SmallVector<std::pair<const CallBase *, int>, 4> cpySrcs;
         auto calleeFresh = [&](const CallBase *CB) {
           const Function *CF = CB->getCalledFunction();
-          return CF && Ctx->AllocFuncs.count(CF);
+          if (!CF || !Ctx->AllocFuncs.count(CF)) return false;
+          auto sit = Ctx->FuncSummaries.find(CF);
+          if (sit == Ctx->FuncSummaries.end())
+            sit = Ctx->FuncSummaries.find(
+                getFuncDef(const_cast<Function *>(CF)));
+          if (sit == Ctx->FuncSummaries.end()) return true; // hardcoded
+          for (const auto &A : sit->second->atoms) {
+            if (A.kind == GlobalContext::SummaryAtom::Fresh) continue;
+            if (A.kind == GlobalContext::SummaryAtom::Cpy && A.dst == -1 &&
+                A.src >= 0) {
+              cpySrcs.push_back({CB, A.src});
+              continue;
+            }
+            return false;
+          }
+          return true;
         };
         // R1: trace returns to fresh sources.
         SmallPtrSet<const Value *, 16> onRetPath;
         SmallVector<const Value *, 8> work;
         bool ok = true;
+        const Value *r1bad = nullptr; // first non-fresh return source
         for (auto &BB : F)
           if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
             if (RI->getReturnValue()) work.push_back(RI->getReturnValue());
@@ -12980,7 +13062,7 @@ void CallGraphPass::confirmFreshWrappers() {
             continue;
           }
           if (const auto *CB = dyn_cast<CallBase>(v)) {
-            if (!calleeFresh(CB)) ok = false;
+            if (!calleeFresh(CB)) { ok = false; r1bad = v; }
             continue;
           }
           if (const auto *PN = dyn_cast<PHINode>(v)) {
@@ -12999,9 +13081,30 @@ void CallGraphPass::confirmFreshWrappers() {
               continue;
             }
           }
+          if (const auto *L = dyn_cast<LoadInst>(v)) {
+            // O0 reload of a spill slot: the stores that reach it.
+            if (const AllocaInst *AI = isSpillSlot(L->getPointerOperand())) {
+              SmallVector<const StoreInst *, 4> defs;
+              reachingSlotStores(L, AI, defs);
+              if (defs.empty()) { ok = false; continue; } // uninitialised
+              for (const StoreInst *D : defs)
+                work.push_back(D->getValueOperand());
+              continue;
+            }
+          }
           ok = false; // GEP, load, argument, anything else: not pure fresh
+          r1bad = v;
         }
-        if (!ok) { g_freshRejRet++; continue; }
+        if (!ok) {
+          g_freshRejRet++;
+          static size_t r1Samples = 0;
+          if (r1Samples++ < 20 && r1bad) {
+            std::string t; raw_string_ostream os(t); os << *r1bad;
+            CG_LOG("ConfirmFresh R1: " << F.getName() << " returns "
+                   << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
+          }
+          continue;
+        }
         // R2/B: classify every use of the fresh object graph. Allowed:
         // the return path, null checks, and — the STEP-B extension —
         // GEP chains off the fresh pointer whose leaves are stores of
@@ -13041,6 +13144,19 @@ void CallGraphPass::confirmFreshWrappers() {
                 // pointer ITSELF somewhere else is an escape — bucket
                 // it by where it lands.
                 if (SI->getValueOperand() == v) {
+                  if (const AllocaInst *AI =
+                          isSpillSlot(SI->getPointerOperand())) {
+                    // O0 spill of the fresh pointer: the reloads this
+                    // store reaches ARE the pointer — classify their
+                    // uses with the same rules.
+                    for (const User *LU : AI->users())
+                      if (const auto *L2 = dyn_cast<LoadInst>(LU)) {
+                        SmallVector<const StoreInst *, 4> defs;
+                        reachingSlotStores(L2, AI, defs);
+                        if (llvm::is_contained(defs, SI)) gwork.push_back(L2);
+                      }
+                    continue;
+                  }
                   const Value *pb =
                       SI->getPointerOperand()->stripPointerCasts();
                   while (const auto *G2 = dyn_cast<GetElementPtrInst>(pb))
@@ -13124,6 +13240,19 @@ void CallGraphPass::confirmFreshWrappers() {
                            EC->getName().starts_with("llvm.lifetime") ||
                            EC->getName().starts_with("llvm.dbg"))) {
                   continue; // zeroing/markers: no pointer content moved
+                }
+                if (const auto *MT = dyn_cast<MemTransferInst>(CB2)) {
+                  // Bytes copied INTO the fresh object (xmemdup shape):
+                  // a residue-preserving copy from the source's pointee
+                  // — CPY(ret<-argJ) once the source traces to formal J
+                  // (checked after R3 with the callee-CPY sources).
+                  // The fresh pointer as SOURCE stays an escape.
+                  if (MT->getRawDest()->stripPointerCasts() == v &&
+                      !isa<GetElementPtrInst>(v)) { // whole object, offset 0
+                    cpySrcs.push_back({CB2, 1});
+                    initCalls.insert(CB2);
+                    continue;
+                  }
                 }
                 // Curated benign-init callees: lock/waitqueue/completion
                 // initializers store no program function pointers at
@@ -13226,6 +13355,9 @@ void CallGraphPass::confirmFreshWrappers() {
           const Instruction *I2 = &*II;
           if (const auto *SI = dyn_cast<StoreInst>(I2)) {
             if (initStores.count(I2)) continue;
+            // A store into a non-escaping local slot moves nothing out
+            // of the function; the reload's uses are judged above.
+            if (isSpillSlot(SI->getPointerOperand())) continue;
             if (containsPointerType(SI->getValueOperand()->getType()))
               ok = false;
             continue;
@@ -13236,6 +13368,11 @@ void CallGraphPass::confirmFreshWrappers() {
             if (CF && (isNoopIntrinsic(CF) || Ctx->AllocFuncs.count(CF) ||
                        isFreeFn(CF->getName())))
               continue;
+            if (CF) { // NOOP-summarized callee (strlen in xstrdup):
+              auto nit = Ctx->FuncSummaries.find(CF); // transfers nothing
+              if (nit != Ctx->FuncSummaries.end() && nit->second->noop)
+                continue;
+            }
             bool ptrInvolved =
                 containsPointerType(CB->getType()) && !onRetPath.count(CB);
             for (const Value *a2 : CB->args())
@@ -13248,11 +13385,61 @@ void CallGraphPass::confirmFreshWrappers() {
             ok = false;
         }
         if (!ok) { g_freshRejSide++; continue; }
+        // Inherit CPY(ret<-argK) from a copying fresh callee: the actual
+        // at argK must be one of F's own formals (through spill reloads
+        // and casts) or null (realloc(NULL, n) is malloc). Anything else
+        // — a local object, a global, a loaded pointer, a call result in
+        // a loop — is not composable and rejects the wrapper.
+        SmallVector<int, 4> cpyArgs;
+        bool cpyOk = true;
+        for (auto &[CCB, K] : cpySrcs) {
+          if (K >= (int)CCB->arg_size()) { cpyOk = false; break; }
+          SmallVector<const Value *, 4> tw{
+              CCB->getArgOperand(K)->stripPointerCasts()};
+          SmallPtrSet<const Value *, 8> tseen;
+          while (!tw.empty() && cpyOk) {
+            const Value *tv = tw.pop_back_val();
+            if (!tseen.insert(tv).second) continue;
+            if (const auto *TA = dyn_cast<Argument>(tv)) {
+              if (TA->getParent() == &F) {
+                cpyArgs.push_back((int)TA->getArgNo());
+                continue;
+              }
+              cpyOk = false;
+              break;
+            }
+            if (isa<ConstantPointerNull>(tv)) continue;
+            if (const auto *TL = dyn_cast<LoadInst>(tv)) {
+              if (const AllocaInst *AI = isSpillSlot(TL->getPointerOperand())) {
+                SmallVector<const StoreInst *, 4> defs;
+                reachingSlotStores(TL, AI, defs);
+                if (defs.empty()) { cpyOk = false; break; }
+                for (const StoreInst *D : defs)
+                  tw.push_back(D->getValueOperand()->stripPointerCasts());
+                continue;
+              }
+            }
+            if (const auto *TC = dyn_cast<CastInst>(tv)) {
+              tw.push_back(TC->getOperand(0));
+              continue;
+            }
+            cpyOk = false;
+          }
+          if (!cpyOk) break;
+        }
+        if (!cpyOk) {
+          g_freshRejEscape++;
+          g_escapeBuckets["cpy-src-untraced"]++;
+          continue;
+        }
+        std::sort(cpyArgs.begin(), cpyArgs.end());
+        cpyArgs.erase(std::unique(cpyArgs.begin(), cpyArgs.end()),
+                      cpyArgs.end());
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
         if (initArgs.empty() && initGlobals.empty() && !selfStore &&
-            subAllocs == 0) {
+            subAllocs == 0 && cpyArgs.empty()) {
           Ctx->FuncSummaries[&F] = &pureFresh;
         } else {
           Ctx->OwnedSummaries.emplace_back();
@@ -13294,20 +13481,30 @@ void CallGraphPass::confirmFreshWrappers() {
               S.atoms.push_back(A);
             }
           }
+          for (int cj : cpyArgs) {
+            GlobalContext::SummaryAtom A{};
+            A.kind = GlobalContext::SummaryAtom::Cpy;
+            A.dst = -1; // *ret <- *argcj, residue-complete at apply
+            A.src = cj;
+            S.atoms.push_back(A);
+          }
           Ctx->FuncSummaries[&F] = &S;
-          g_freshInit++;
+          if (!cpyArgs.empty()) g_freshCpy++;
+          else g_freshInit++;
         }
         g_freshPromoted++;
         changed = true;
         if (g_freshPromoted <= 20)
           CG_LOG("ConfirmFresh: promoted " << F.getName()
-                 << (initArgs.empty() ? "" : " [alloc-init]") << " (round "
+                 << (initArgs.empty() ? "" : " [alloc-init]")
+                 << (cpyArgs.empty() ? "" : " [copy]") << " (round "
                  << round << ")\n");
       }
     }
   }
   CG_LOG("ConfirmFresh: " << g_freshPromoted << " wrappers promoted ("
-         << g_freshInit << " alloc-init with ST atoms) in " << round
+         << g_freshInit << " alloc-init with ST atoms, " << g_freshCpy
+         << " copying with CPY atoms) in " << round
          << " rounds; " << g_freshHelperComposed << " init-helper calls "
          << "composed; rejected " << g_freshRejRet << " ret-not-fresh, "
          << g_freshRejEscape << " escapes, " << g_freshRejSide
@@ -16915,6 +17112,34 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           return true;
         return ok.count(CF) != 0;
       };
+      // A local slot that never escapes (users: loads, stores INTO it,
+      // debug/lifetime markers) — the O0 spill of a formal. A store into
+      // it moves nothing out of the function; whatever the stored value
+      // carries is judged again where the reload is used (a reload from
+      // a slot fed by a formal stays "may carry" in mayCarryLocal).
+      auto nonEscapingLocalSlot = [](const Value *base) -> bool {
+        const auto *AI = dyn_cast<AllocaInst>(base);
+        if (!AI) return false;
+        for (const User *U : AI->users()) {
+          if (isa<LoadInst>(U)) continue;
+          if (const auto *SI2 = dyn_cast<StoreInst>(U)) {
+            if (SI2->getPointerOperand() == AI &&
+                SI2->getValueOperand() != AI)
+              continue;
+            return false;
+          }
+          if (const auto *II2 = dyn_cast<IntrinsicInst>(U)) {
+            switch (II2->getIntrinsicID()) {
+            case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+            case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+              continue;
+            default: break;
+            }
+          }
+          return false;
+        }
+        return true;
+      };
       // ANSWER-SITE callees: a direct call the analysis reclassifies
       // as a resolution site (static_call trampolines dispatch through
       // their __SCK__ key). Body-skip would erase the SITE, not just
@@ -17264,6 +17489,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 continue;
               }
               if (curDL && isPtrWidthInt(V->getType(), *curDL)) {
+                // O0 spill of an integer formal into a local slot:
+                // nothing leaves the function through this store.
+                if (nonEscapingLocalSlot(SI->getPointerOperand())) continue;
                 if (mayCarryLocal(V, 8)) {
                   // Self-slot update (s->count++, s->len += n): dirty
                   // contributors that are loads from the SAME pointer

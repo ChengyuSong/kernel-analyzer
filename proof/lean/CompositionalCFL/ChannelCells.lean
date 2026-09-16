@@ -179,4 +179,64 @@ theorem split_self_flow (c : C) (k : K) (hk : M.keys c k) :
     ChanFlow (split M) (c, false) (c, true) :=
   ⟨k, ⟨rfl, hk⟩, rfl, hk⟩
 
+/-! ## Identity of unwritten content: per key, not per access (2026-09-15)
+
+PREMISE (docs/channel-cells-design.md, "Identity of unwritten
+content"): the content a program never writes to location (o,s) is
+the external world's value — a property of the LOCATION, so its
+stand-in origin is one ι(o,s) per key. The implementation today
+mints one root per ACCESS cell without in-edge instead: two loads of
+the same never-written field yield two different origins.
+
+The handle case: `a = p->f` and `b = q->f` read the same unwritten
+field (one key `k0`); then `a->x = fn` stores through one handle and
+`call b->x` loads through the other. The downstream cells are keyed
+by (handle origin, x). With one identity per key both downstream
+cells share the key (ι(k0), x) and the grammar's M connects them;
+with one identity per access they carry (ι_a, x) and (ι_b, x) and
+nothing connects them — the store is lost to the load. -/
+
+/-- Handle origins: one per key under the location rule, one per
+access cell under the current implementation. -/
+inductive Handle (C K : Type)
+  | ofKey (k : K)
+  | ofAccess (c : C)
+
+/-- Downstream cells of the handle case: the store `a->x` and the
+load `b->x`, keyed by their handle's origin and the field `x`. -/
+inductive HC | store | load
+deriving DecidableEq
+
+/-- Two loads `a`, `b` of one never-written field `k0`: under the
+location rule both handles are `ofKey k0`. -/
+def mKey (k0 : K) : CellModel HC (Handle HC K × Unit) where
+  keys
+    | .store => fun h => h = (.ofKey k0, ())
+    | .load  => fun h => h = (.ofKey k0, ())
+  isStore c := c = .store
+  isLoad c := c = .load
+
+/-- The same two loads under per-access roots: the handle of `a` is
+`ofAccess a`, of `b` is `ofAccess b`, with `a ≠ b`. -/
+def mAccess (a b : HC) : CellModel HC (Handle HC K × Unit) where
+  keys
+    | .store => fun h => h = (.ofAccess a, ())
+    | .load  => fun h => h = (.ofAccess b, ())
+  isStore c := c = .store
+  isLoad c := c = .load
+
+/-- Location identities connect the handle case. -/
+theorem handle_flow_key_identity (k0 : K) :
+    PairFlow (mKey k0) HC.store HC.load :=
+  ⟨rfl, rfl, (.ofKey k0, ()), rfl, rfl⟩
+
+/-- Per-access identities lose it: the store through one handle never
+reaches the load through the other. -/
+theorem handle_flow_per_access_fails (a b : HC) (hab : a ≠ b) :
+    ¬ PairFlow (mAccess (K := K) a b) HC.store HC.load := by
+  rintro ⟨-, -, ⟨h, u⟩, hs, hl⟩
+  have h1 : h = .ofAccess a := congrArg Prod.fst hs
+  have h2 : h = .ofAccess b := congrArg Prod.fst hl
+  exact hab (Handle.ofAccess.inj (h1.symm.trans h2))
+
 end ChannelCells

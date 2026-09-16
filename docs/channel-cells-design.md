@@ -166,3 +166,87 @@ channel graph realizes M's one-shared-witness quantifier. The
 model is single-hop: multi-hop content movement composes through
 the outer closure identically under both semantics, so the
 containment/strictness statements lift hop-wise.
+
+## What remains under pairwise cells (2026-09-15, cflow + nm-new)
+
+With the welds gone (zero join merges), the classes that hold a
+function still hold literals, heap, stack and data globals — one bag,
+not per-pair leaks. Measured on cflow (channel mode, P=13; census =
+classes holding a function fact / of those also holding a literal):
+
+| configuration                                   | iteration 0 | full run  | wall (iter 0 / full) |
+|-------------------------------------------------|-------------|-----------|----------------------|
+| cluster mode (before)                           | —           | 2586/2497 | —                    |
+| channel mode                                    | 1860/1765   | 2153/2056 | 7.5 min / —          |
+| + gnulib x-allocator summaries                  | 1812/1715   | 2121/2022 |                      |
+| + extern globals with their own node (flag)     | 1884/1787   | 2112/2013 | 3.8 / 10.6 min       |
+| + no per-access cell identity roots (probe)     | 2424/2323   | 2787/2684 | 0.7 / 1.1 min        |
+| + no X↔residue bridges (probe)                  | 1822/1725   | 2112/2013 |                      |
+| P = 11 / P = 41 / P = 0 (field-insensitive)     | 1870/1720 / — / 2584/2446 | | 5 s at P=0     |
+
+The indirect-call answer is the same in every row (42 sites, 74
+pairs; cflow has one ground-truth site). Two user hypotheses were
+confirmed and measured: the flows-to path sends every declared-but-
+undefined global to the universal pointer (unlike PointTo.cc; now
+`--cfl-ext-globals-own-identity`), and the gnulib x-allocators had no
+summary. Both are real and both are small. Neither the unknown-offset
+bridges nor the modulus hold the bag. What does:
+
+1. Andersen's own width: context-insensitive formals and returns of
+   generic helpers (convert_options, group_parse, xrealloc) and
+   read-modify-write cycles collapsed by the SCC step. Not a device
+   of ours; the user has deferred context sensitivity.
+2. Identity roots for read-access cells. They are 1,222 of cflow's
+   roots and 90% of the pairwise wall (7.5 min → 39 s without them),
+   because every one of them is a key on every pointer loaded from
+   its cell. They are also the wrong object, see below.
+
+### Identity of unwritten content: per key, not per access
+
+Today an identity root is minted for every cell that has no in-edge,
+including the cell of every load whose pointer no store reaches
+("*p" for an instruction p). Semantically the root stands for the
+content the program never wrote: the external world's value. That is
+a property of the LOCATION (origin, shift), not of the access. Two
+loads of the same never-written field get two different roots today,
+so a store through one loaded handle is invisible to a load through
+the other (the identity-join ablation on nm-new lost 5 of 223
+ground-truth records at reloc.c for exactly this reason: the
+bfd_link_callbacks handles). At the same time each root becomes a key
+of every pointer loaded from the cell and wires unrelated accesses
+together (the identity-root web of the AICT attribution).
+
+Design (premises stated; Lean: `ChannelCells.handle_*`):
+
+- P1 (content). The content of location (o,s) is the union of the
+  values stored through pointers whose plane contains (o,s), plus
+  the location's initial content.
+- P2 (initial content). Defined globals: their initializer (edges
+  exist). Heap and stack objects: nothing — a read before any write
+  is undefined behaviour and carries no function pointer of ours.
+  External origins — pointees of formals with no caller, extern
+  globals, wildcard results, and fields of external objects — hold
+  an unknown external object.
+- Rule. The unknown external object of location (o,s) is one origin
+  ι(o,s), minted when the channel (o,s) is created and o is external;
+  it is added to the channel's content. Fields of ι(o,s) map back to
+  ι(o,s) (depth-one self loop), which keeps the set finite: at most
+  one identity per external channel key. No identity is minted for an
+  access cell, and none for internal origins.
+- Consequences. Two loads of the same external field share the
+  handle, so the store/load pair through two copies of it connects
+  (`handle_flow_key_identity`); with per-access roots it does not
+  (`handle_flow_per_access_fails`). Internal objects' unwritten fields
+  read as empty. Identities can only key accesses reachable from an
+  external object, so they cannot glue internal objects together.
+- Cost. Keys per pointer drop from (owner keys + one root per
+  access) to owner keys; on cflow the probe shows this is the whole
+  pairwise cost problem.
+- Parking. When resolution wiring gives a formal real callers, its
+  identity and the identities of its channels are parked exactly as
+  formal identities are parked today (rootParkable + re-admit); no
+  new mechanism.
+
+Gate: nm-new ground truth 223/223 with the sound rule (the probe that
+mints nothing is expected to lose the reloc.c records), then the
+census and cost on nm-new; then km.

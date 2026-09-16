@@ -258,3 +258,89 @@ yet (over-approximation only).
 Gate: nm-new ground truth 223/223 with the sound rule (the probe that
 mints nothing is expected to lose the reloc.c records), then the
 census and cost on nm-new; then km.
+
+### Holder-keyed object identity (2026-09-16)
+
+The generic-container finding on cflow: every lazily created list is
+one abstract object because `deref_linked_list` allocates it at one
+site (`if (!*plist) *plist = xmalloc(24)`); the caller then sets
+`free_data`, and every list's callback slot and every list's items pool
+in that one object (static_free and free in one slot; every appended
+Symbol in one `data` slot). The retrieval key of such a list is its
+holder: `&sym->caller`, `&sym->callee`, a global head. Nothing else
+identifies the instance.
+
+Rule. When a fresh allocation result is stored through a pointer q
+(`*q = v`, v traced to a unique allocation call through casts and
+O0 spill reloads), the object stored under holder key k ∈ keys(q) is
+the clone (site, k), a distinct origin with its own channels. The
+base origin (site) remains the identity of the pointer v itself.
+
+Premises:
+- P3 (holder access). After the store, the program reaches the object
+  through the holder, through values loaded from the holder's cell,
+  or through v and its copies made before the store. There is no
+  third route: an object is not addressed by anything but pointers to
+  it, and every pointer to it descends from v or from the holder.
+- P4 (holders do not alias by accident). Two holder keys are two
+  locations; the same object is under two holders only when a pointer
+  loaded from one is stored into the other, which is a copy the
+  analysis sees.
+
+Consequences and wiring:
+- Stores through v (constructor-internal initialisation, uses of v
+  after the store) go to the base channels (site, s), which feed every
+  clone's channel (site,k,s): an a-edge base → clone per residue and
+  for X. Sound: v may be any of the clones.
+- Loads through v read the base channel and every clone channel: the
+  read half of a cell keyed (site, s) is fed by (site, s) and by every
+  (site,k,s). Sound for the same reason; clones never feed each other,
+  so no content crosses holders.
+- Stores and loads through a value loaded from holder k use (site,k,s)
+  only: the instance is separated from every other holder's instance.
+- A copy of the object's pointer stored into another holder k' is NOT
+  relabelled (only the fresh-store access relabels), so the object
+  keeps identity (site,k) under both holders: P4 is respected by
+  construction.
+- Bounds. No clone for an X holder key, for a constant-data key, or
+  once a fresh-store cell has more than 32 holder keys (the base then
+  receives the fact as today). A fresh-store cell whose class was
+  merged by the SCC step is not relabelled either (its plane mixes
+  other content).
+
+Lean (`ChannelCells.holder_*`): in the split model a store through
+holder h reaches a load through holder h' iff h = h' and the merged
+model flows; a store through the base reaches the loads of every
+holder; erasing holders maps every split flow to a merged flow
+(removal-only relative to today).
+
+Cost: clones are origins, so keys grow by (fresh-store cells × holder
+keys), bounded above; the base→clone and clone→reader edges are one
+per (clone, residue).
+
+Built as `--cfl-holder-identity` (default off). Result on cflow
+(P=13 full run and P=29 iteration 0): mechanically correct — 87
+fresh-store cells, clones minted and relabelled as designed, base bit
+dropped on the pre-split direct edges and the split carry — and NO
+change to the census or to the static_free/.str.5 pair. Cause: the
+holder pointer is already the bag. `plist` in deref_linked_list has
+3,927 distinct holder origins at iteration 0, because every Symbol
+pointer comes out of the hash table's `void *data` slot and every hash
+table shares one bucket-array allocation inside hash_initialize (one
+constructor site for all tables), so `&sym->caller` is "field of
+anything". With the 32-key bound that cell gets no clones and the base
+flows; without the bound the clones become holder keys of other
+fresh-store cells (clones of clones), the universe grows into every
+dense plane, and the run dies at 46 GB. The X holder keys, exempt from
+cloning, carry the base into the X channels in either case.
+
+Lesson: holder identity presupposes narrow holders. The container that
+pollutes the holders has to be split first, and on cflow that is the
+hash table: hash_initialize is rejected by the wrapper confirmer
+(`table->bucket_limit = table->bucket + n`, an interior pointer of the
+sub-allocation stored into the fresh object), so all tables are one
+object. Order of work: (1) confirmer accepts interior pointers of a
+FreshSub sub-allocation as init stores, promoting hash_initialize per
+call site; (2) measure holder identity again, at P ≥ 29 so residue
+collisions do not pre-pollute the holders; (3) only then decide
+default-on or removal.

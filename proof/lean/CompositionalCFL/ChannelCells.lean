@@ -239,4 +239,66 @@ theorem handle_flow_per_access_fails (a b : HC) (hab : a ≠ b) :
   have h2 : h = .ofAccess b := congrArg Prod.fst hl
   exact hab (Handle.ofAccess.inj (h1.symm.trans h2))
 
+/-! ## Holder-keyed object identity (2026-09-16)
+
+PREMISE (docs/channel-cells-design.md, "Holder-keyed object identity",
+P3/P4): an object stored under holder key h (`*q = fresh`, h ∈ keys q)
+is reached afterwards only through that holder, through values loaded
+from it, or through the fresh pointer itself and its pre-store copies.
+The rule gives the object one identity per holder — origin (site, h) —
+while the fresh pointer keeps the base identity (site, none).
+
+Accesses are modelled by WHO holds the pointer: `.base` = the fresh
+pointer or a copy of it, `.holder h` = a value loaded from holder h.
+Content moves through the channel of the identity the access uses; a
+base access writes to the base channel, which feeds every holder's
+channel, and reads the base channel and every holder's channel. -/
+
+/-- The identity an access uses. -/
+inductive Via (H : Type)
+  | base
+  | holder (h : H)
+
+/-- One-hop content flow under the holder rule: the store's identity
+must be the load's, or the store is through the base (then it reaches
+every holder), or the load is through the base (then it sees every
+holder). Holders never feed each other. -/
+def HolderFlow {H : Type} (s l : Via H) : Prop :=
+  s = l ∨ s = Via.base ∨ l = Via.base
+
+/-- Separation: a store through holder h reaches a load through holder
+h' only when h = h'. -/
+theorem holder_separates {H : Type} (h h' : H)
+    (hf : HolderFlow (Via.holder h) (Via.holder h')) : h = h' := by
+  rcases hf with e | e | e
+  · exact Via.holder.inj e
+  · exact absurd e (by simp)
+  · exact absurd e (by simp)
+
+/-- Same holder: the instance's own store/load pair still flows. -/
+theorem holder_self_flow {H : Type} (h : H) :
+    HolderFlow (Via.holder h) (Via.holder h) :=
+  Or.inl rfl
+
+/-- The base pointer may be any clone: its stores reach every holder's
+loads and its loads see every holder's stores. -/
+theorem base_reaches_every_holder {H : Type} (h : H) :
+    HolderFlow Via.base (Via.holder h) ∧ HolderFlow (Via.holder h) Via.base :=
+  ⟨Or.inr (Or.inl rfl), Or.inr (Or.inr rfl)⟩
+
+/-- Today's model: one object per site, so every access pair flows. -/
+def MergedFlow {H : Type} (_ _ : Via H) : Prop := True
+
+/-- Removal-only: every holder-rule flow is a flow of the single-object
+model; the rule only removes cross-holder pairs. -/
+theorem holder_le_merged {H : Type} (s l : Via H) (_ : HolderFlow s l) :
+    MergedFlow s l := trivial
+
+/-- Strictness: two holders never flow into each other under the rule,
+while the single-object model lets them. -/
+theorem holder_lt_merged {H : Type} (h h' : H) (hne : h ≠ h') :
+    MergedFlow (Via.holder h) (Via.holder h') ∧
+    ¬ HolderFlow (Via.holder h) (Via.holder h') :=
+  ⟨trivial, fun hf => hne (holder_separates h h' hf)⟩
+
 end ChannelCells

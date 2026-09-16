@@ -238,6 +238,20 @@ cl::opt<bool> CFLKeyIdentity(
            "ChannelCells.handle_*"),
   cl::init(false));
 
+cl::opt<bool> CFLHolderIdentity(
+  "cfl-holder-identity",
+  cl::desc("With --cfl-channel-cells: a fresh allocation stored through a "
+           "pointer q (`*q = alloc`, traced through casts and O0 spill "
+           "reloads) gets one clone origin per holder key of q, so lists "
+           "and tables created lazily at one site are one object per "
+           "holder (sym->caller, sym->callee, a global head). The fresh "
+           "pointer itself keeps the base identity: its stores feed every "
+           "clone, its loads see every clone. Bounds: no clone for X or "
+           "constant-data holder keys, at most 32 holder keys per "
+           "fresh-store cell, none for merged cells. Design: "
+           "docs/channel-cells-design.md; Lean ChannelCells.holder_*"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeNoXBridges(
   "cfl-probe-no-x-bridges",
   cl::desc("MEASUREMENT-ONLY, UNSOUND: with --cfl-channel-cells, do not "

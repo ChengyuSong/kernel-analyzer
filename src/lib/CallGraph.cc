@@ -21,6 +21,17 @@
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/CFG.h>
 #include <llvm/IR/Module.h>
+#include <functional>
+
+// O0 spill-slot helpers (defined before confirmFreshWrappers below; used by
+// the holder-identity rule in the solver as well).
+static const llvm::AllocaInst *spillSlotOf(const llvm::Value *v);
+static void reachingSlotStoresOf(const llvm::LoadInst *L,
+                                 const llvm::AllocaInst *AI,
+                                 llvm::SmallVectorImpl<const llvm::StoreInst *> &out);
+static const llvm::CallBase *
+uniqueAllocSource(const llvm::Value *v,
+                  const std::function<bool(const llvm::CallBase *)> &isAlloc);
 #include <llvm/IR/Constants.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/SmallPtrSet.h>
@@ -5103,6 +5114,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // merges, join apply, SCC collapse) always use ctxs[0].
   struct SolverCtx {
     FactSet nbA, promA, nbB;                 // add-path scratch
+    FactSet relabelS;                        // holder-identity relabel scratch
     FactSet d, todoS, dbS, dNatS, dBrS;      // pop-loop scratch
     FactSet pendS, todoGS;                   // cell-major sweep scratch
     std::vector<uint32_t> sweepElems;
@@ -5956,8 +5968,165 @@ bool CallGraphPass::runFlowsToResolution() {
       return Ctx->ExtGobjs.count(G->getGUID()) && NF.isExtGobjOverride(G->getGUID());
     return false;
   };
+  // --cfl-holder-identity (docs/channel-cells-design.md, "Holder-keyed
+  // object identity"): a fresh allocation stored through q becomes one
+  // clone origin per holder key of q. The fresh pointer keeps the base
+  // origin: its channels feed every clone (stores through it), its
+  // readers are fed by every clone (loads through it); clones never
+  // feed each other. State is written on the main thread (flush) only;
+  // waves read it through holderRelabel.
+  const bool holderMode = CFLHolderIdentity && CFLChannelCells;
+  boost::unordered_flat_map<uint32_t, uint32_t> freshStoreCells; // cell -> base rid
+  boost::unordered_flat_set<uint32_t> freshBases;                // rids with clones possible
+  bool freshStoreBuilt = false;
+  boost::unordered_flat_map<uint64_t, uint32_t> cloneOf;   // (base<<32|key) -> clone
+  boost::unordered_flat_map<uint32_t, uint32_t> cloneBase; // clone -> base
+  boost::unordered_flat_map<uint32_t, SmallVector<uint32_t, 4>> clonesOfBase;
+  boost::unordered_flat_map<uint32_t, SmallVector<std::pair<uint32_t, uint32_t>, 2>>
+      chanRelabel;                                            // channel -> (base, clone)
+  boost::unordered_flat_map<uint64_t, SmallVector<uint32_t, 4>> baseReaders; // base key -> rh
+  boost::unordered_flat_map<uint32_t, uint32_t> holderKeyCount;
+  size_t holderClones = 0, holderCellsDisabled = 0;
+  auto buildFreshStoreCells = [&]() {
+    if (freshStoreBuilt || !holderMode) return;
+    freshStoreBuilt = true;
+    boost::unordered_flat_map<uint32_t, uint32_t> ridOfRep;
+    for (uint32_t rid = 0; rid < rootClassOf.size(); rid++)
+      if (rootClassOf[rid] < N) ridOfRep[find(rootClassOf[rid])] = rid;
+    auto isAlloc = [&](const CallBase *CB) {
+      return Ctx->AllocSites.count(CB) != 0;
+    };
+    for (auto &mp : Ctx->Modules)
+      for (Function &F : *mp.first) {
+        if (F.isDeclaration()) continue;
+        for (auto &BB : F)
+          for (auto &I : BB) {
+            auto *SI = dyn_cast<StoreInst>(&I);
+            if (!SI || !SI->getValueOperand()->getType()->isPointerTy())
+              continue;
+            const CallBase *AC =
+                uniqueAllocSource(SI->getValueOperand(), isAlloc);
+            if (!AC) continue;
+            NodeIndex vN = getRepNodeForValue(AC);
+            NodeIndex pN = getRepNodeForValue(SI->getPointerOperand());
+            if (vN == AndersNodeFactory::InvalidIndex ||
+                pN == AndersNodeFactory::InvalidIndex)
+              continue;
+            auto vit = toDense.find(getCanonicalNode(vN));
+            if (vit == toDense.end()) continue;
+            auto rit = ridOfRep.find(find(vit->second));
+            if (rit == ridOfRep.end()) continue;
+            auto cit = toDense.find(getCanonicalNode(getRepDerefNode(pN)));
+            if (cit == toDense.end()) continue;
+            freshStoreCells[cit->second] = rit->second;
+            freshBases.insert(rit->second);
+            if (!CFLTraceFunc.empty())
+              CG_LOG("HolderIdentity: fresh-store cell c" << cit->second
+                     << " " << protBlameName(cit->second).substr(0, 50)
+                     << " <- r" << rit->second << " "
+                     << F.getName() << "\n");
+          }
+      }
+    CG_LOG("HolderIdentity: " << freshStoreCells.size()
+           << " fresh-store cells over " << freshBases.size()
+           << " allocation origins\n");
+  };
+  auto holderClone = [&](uint32_t b, uint64_t key) -> uint32_t {
+    auto [it, ins] = cloneOf.try_emplace(((uint64_t)b << 32) | key, 0);
+    if (!ins) return it->second;
+    const uint32_t home = rootClassOf[b];
+    const uint32_t rid = nextRoot++;
+    FactSet::Universe = nextRoot; // widen BEFORE the first set
+    rootClassOf.push_back(home);  // named/classified like its base
+    rootConstData.push_back(0);
+    rootParkable.push_back(0);
+    if (nexusGate) rootNexus.push_back(0);
+    it->second = rid;
+    cloneBase[rid] = b;
+    clonesOfBase[b].push_back(rid);
+    holderClones++;
+    return rid;
+  };
+  boost::unordered_flat_set<uint32_t> chanIds;        // channel nodes
+  boost::unordered_flat_set<uint32_t> holderReleased; // keyless cells
+  // Payload pushed out of fresh-store cell `src`. Into a holder channel
+  // the base bit becomes that holder's clone bit. Along any other edge
+  // (the pre-split direct edges to the same-pointer loads, the split
+  // carry into the read half) the base bit is DROPPED: the object comes
+  // back to those readers as clones through the holder channels — a
+  // reload of *p after `*p = fresh` yields the object under whichever
+  // holder p denotes. A cell whose owner never gets a key is released
+  // (holderReleaseKeyless) so that same-pointer flow is not lost.
+  // Scratch results are not adoptable.
+  auto holderRelabel = [&](uint32_t src, uint32_t dst, const FactSet &pay,
+                           SolverCtx &ctx, bool &relabeled) -> const FactSet & {
+    relabeled = false;
+    if (clsSize[src] != 1 || holderReleased.count(src)) return pay;
+    auto fit = freshStoreCells.find(src);
+    if (fit == freshStoreCells.end()) return pay;
+    const uint32_t b = fit->second;
+    if (!pay.test(b)) return pay;
+    if (chanIds.count(dst)) {
+      auto cit = chanRelabel.find(dst);
+      if (cit == chanRelabel.end()) return pay; // past the key bound
+      for (auto &[bb, c] : cit->second) {
+        if (bb != b) continue;
+        ctx.relabelS.copyFrom(pay);
+        ctx.relabelS.reset(b);
+        ctx.relabelS.set(c);
+        relabeled = true;
+        return ctx.relabelS;
+      }
+      return pay;
+    }
+    ctx.relabelS.copyFrom(pay);
+    ctx.relabelS.reset(b);
+    relabeled = true;
+    return ctx.relabelS;
+  };
+  // A fresh-store cell whose owner has no holder key by the time the
+  // flush runs dry: hand the base to its direct readers after all (the
+  // same-pointer flow `*p = v; w = *p` with an unknown p stays).
+  auto holderReleaseKeyless = [&]() -> size_t {
+    if (!holderMode) return 0;
+    size_t n = 0;
+    for (auto &[cell, b] : freshStoreCells) {
+      if (holderKeyCount.count(cell) || holderReleased.count(cell) ||
+          clsSize[cell] != 1)
+        continue;
+      holderReleased.insert(cell);
+      SmallVector<uint32_t, 8> targets(outA[cell].begin(), outA[cell].end());
+      auto rhIt = chanReadHalf.find(cell);
+      if (rhIt != chanReadHalf.end() && rhIt->second != UINT32_MAX)
+        targets.push_back(rhIt->second);
+      for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+        if (!R[cell][s2].test(b)) continue;
+        for (uint32_t t : targets) {
+          const uint32_t tt = find(t);
+          if (tt != cell) addFact(tt, s2, b, ctx0);
+        }
+      }
+      n++;
+    }
+    return n;
+  };
+  auto linkChan = [&](uint32_t x, uint32_t y) {
+    x = find(x); y = find(y);
+    if (x == y || !chanEdgeSeen.insert(((uint64_t)x << 32) | y).second) return;
+    outA[x].push_back(y);
+    chanEdges++;
+    for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+      if (R[x][s2].any()) addBits(y, s2, R[x][s2], ctx0, true);
+      if (RB[x][s2].any()) addBits(y, s2, RB[x][s2], ctx0);
+    }
+  };
+  // Before the first wave: the pre-split direct edges out of a fresh-store
+  // cell must already drop the base bit (holderRelabel), so the table is
+  // built here, not at the first flush.
+  buildFreshStoreCells();
   auto flushChannelPends = [&]() -> size_t {
-    if (!CFLChannelCells || chanPend.empty()) return 0;
+    if (!CFLChannelCells) return 0;
+    if (chanPend.empty()) return holderReleaseKeyless();
     const auto tFlush0 = std::chrono::steady_clock::now();
     const size_t pendsIn = chanPend.size();
     size_t work = 0;
@@ -5969,12 +6138,14 @@ bool CallGraphPass::runFlowsToResolution() {
       if (ins) {
         ch = newSolverNode();
         it->second = ch;
+        if (holderMode) chanIds.insert(ch);
         chanNodeName[ch] =
             "chan(r" + std::to_string(P.o) + " " +
             (P.o < rootClassOf.size()
                  ? protBlameName(rootClassOf[P.o]).substr(0, 40)
                  : std::string("?")) +
-            ",s" + std::to_string(P.s) + ")";
+            ",s" + std::to_string(P.s) +
+            (cloneBase.count(P.o) ? "[h])" : ")");
         // Tracer provenance for the bridge/wiring arrivals below: the
         // flush runs on the main thread between waves, so the stale
         // labels of the last wave step must not be inherited.
@@ -6000,6 +6171,27 @@ bool CallGraphPass::runFlowsToResolution() {
             keyIdentityMinted++;
             addFact(ch, 0, rid, ctx0);
           }
+        }
+        if (holderMode) {
+          // A clone's channel is fed by the base channel of the same
+          // residue (stores through the fresh pointer) and feeds the
+          // base key's readers (loads through the fresh pointer).
+          auto cb = cloneBase.find(P.o);
+          if (cb != cloneBase.end()) {
+            const uint64_t bkey = (uint64_t)cb->second * NSHIFT + P.s;
+            const uint32_t bch = clusterFind(bkey);
+            if (bch != UINT32_MAX) linkChan(bch, ch);
+            auto br = baseReaders.find(bkey);
+            if (br != baseReaders.end())
+              for (uint32_t rh2 : br->second) linkChan(ch, rh2);
+          }
+          // A base channel created after its clones feeds them.
+          auto cl = clonesOfBase.find(P.o);
+          if (cl != clonesOfBase.end())
+            for (uint32_t c : cl->second) {
+              const uint32_t cch = clusterFind((uint64_t)c * NSHIFT + P.s);
+              if (cch != UINT32_MAX) linkChan(ch, cch);
+            }
         }
         // --cfl-probe-no-x-bridges: MEASUREMENT-ONLY UNSOUND PROBE — the
         // unknown-offset channel of an origin is not bridged to its
@@ -6063,7 +6255,13 @@ bool CallGraphPass::runFlowsToResolution() {
           // the wave does for full-plane pushes.
           tHow = "chan-carry"; tFrom = cell; tKeyO = UINT32_MAX; tCell = cell;
           for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-            if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0, true);
+            if (R[cell][s2].any()) {
+              bool rl = false; // holder rule: the base bit is not carried
+              const FactSet &pay =
+                  holderMode ? holderRelabel(cell, rh, R[cell][s2], ctx0, rl)
+                             : R[cell][s2];
+              addBits(rh, s2, pay, ctx0, !rl);
+            }
             if (RB[cell][s2].any()) addBits(rh, s2, RB[cell][s2], ctx0);
           }
           chanSplits++;
@@ -6076,8 +6274,44 @@ bool CallGraphPass::runFlowsToResolution() {
         chanEdges++;
         work++;
         tHow = "chan-in"; tFrom = cell; tKeyO = P.o; tKeyS = P.s; tCell = cell;
+        // Holder rule: a fresh-store cell feeds this holder's channel
+        // with the CLONE of its allocation, not the base. No clone for
+        // X or constant-data holder keys, for a cell merged by the SCC
+        // step, or past 32 holder keys (the base then flows, as today).
+        if (holderMode) {
+          auto fit = freshStoreCells.find(cell);
+          if (fit != freshStoreCells.end() && !CFLTraceFunc.empty())
+            CG_LOG("HolderIdentity: chan-in cell c" << cell << " size "
+                   << clsSize[cell] << " key (r" << P.o << ",s" << P.s
+                   << ") base r" << fit->second << " keys so far "
+                   << holderKeyCount[cell] << "\n");
+          if (fit != freshStoreCells.end() && clsSize[cell] == 1 &&
+              P.s != SHIFT_X && fit->second != P.o &&
+              !(P.o < rootConstData.size() && rootConstData[P.o])) {
+            uint32_t &kc = holderKeyCount[cell];
+            if (kc < 32) {
+              kc++;
+              const uint32_t c = holderClone(fit->second, key);
+              auto &rl = chanRelabel[ch];
+              const uint32_t base = fit->second;
+              if (llvm::none_of(rl, [base](const std::pair<uint32_t, uint32_t> &pr) {
+                    return pr.first == base;
+                  }))
+                rl.push_back({base, c});
+            } else if (kc == 32) {
+              kc++;
+              holderCellsDisabled++;
+            }
+          }
+        }
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-          if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0, true);
+          if (R[cell][s2].any()) {
+            bool rl = false;
+            const FactSet &pay =
+                holderMode ? holderRelabel(cell, ch, R[cell][s2], ctx0, rl)
+                           : R[cell][s2];
+            addBits(ch, s2, pay, ctx0, !rl);
+          }
           if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
         }
       }
@@ -6092,6 +6326,21 @@ bool CallGraphPass::runFlowsToResolution() {
           if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0, true);
           if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);
         }
+      }
+      if (holderMode && rh != UINT32_MAX && P.s != SHIFT_X &&
+          freshBases.count(P.o)) {
+        // A reader keyed by the BASE sees every clone's channel (the
+        // fresh pointer may be any clone); remembered for clones whose
+        // channel is created later.
+        auto &rd = baseReaders[key];
+        if (llvm::none_of(rd, [rh](uint32_t r2) { return r2 == rh; }))
+          rd.push_back(rh);
+        auto cl = clonesOfBase.find(P.o);
+        if (cl != clonesOfBase.end())
+          for (uint32_t c : cl->second) {
+            const uint32_t cch = clusterFind((uint64_t)c * NSHIFT + P.s);
+            if (cch != UINT32_MAX) linkChan(cch, rh);
+          }
       }
     }
     if (VerboseLevel >= 2 && pendsIn >= 100000) {
@@ -6607,7 +6856,15 @@ bool CallGraphPass::runFlowsToResolution() {
       if (traceAny) { tHow = "a-prop"; tFrom = n; }
       for (uint32_t t : outA[n]) {
         uint32_t tt = find(t);
-        if (tt != n) { ctx.nAOr++; addBits(tt, s, pay, ctx, dFull); }
+        if (tt == n) continue;
+        ctx.nAOr++;
+        if (holderMode) { // fresh-store cell -> holder channel: clone bit
+          bool rl = false;
+          const FactSet &p2 = holderRelabel(n, tt, pay, ctx, rl);
+          addBits(tt, s, p2, ctx, dFull && !rl);
+        } else {
+          addBits(tt, s, pay, ctx, dFull);
+        }
       }
       uint64_t tp5 = rd();
       ctx.cyA += tp5 - tp4;
@@ -9071,6 +9328,10 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << "KeyIdentity: " << keyIdentityMinted
                << " channel identities minted, " << keyIdentitySelf
                << " self-loop wirings\n";
+      if (holderMode)
+        errs() << "HolderIdentity: " << holderClones << " clones over "
+               << freshStoreCells.size() << " fresh-store cells; "
+               << holderCellsDisabled << " cells past the key bound\n";
       errs() << "MixCensus: classes holding fn facts " << nFn << ": pure-fn " << nPure
              << ", +literal " << nLit << ", +heap " << nHeap << ", +alloca " << nAlloca
              << ", +global " << nGlob << ", +identity " << nId << "\n";
@@ -12755,6 +13016,96 @@ void CallGraphPass::wireLinkerSectionArrays() {
 //      pointers unless the callee is itself fresh/allocator (its
 //      formals are dead ends), intrinsics limited to the NOOP set +
 //      memset. Rejections are tallied by reason (LEDGER).
+// O0 spill slots, shared by the wrapper confirmer and the holder-identity
+// rule: a local alloca whose only users are loads, stores INTO it and
+// debug/lifetime markers never escapes; a load from it reads the stores
+// that REACH it — the last store before it in its block, else the last
+// store on each predecessor path (the mem2reg answer, on demand).
+static const AllocaInst *spillSlotOf(const Value *v) {
+  const auto *AI = dyn_cast<AllocaInst>(v);
+  if (!AI) return nullptr;
+  for (const User *U : AI->users()) {
+    if (isa<LoadInst>(U)) continue;
+    if (const auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getPointerOperand() == AI && SI->getValueOperand() != AI)
+        continue;
+      return nullptr;
+    }
+    if (const auto *II = dyn_cast<IntrinsicInst>(U)) {
+      switch (II->getIntrinsicID()) {
+      case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
+      case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
+        continue;
+      default: break;
+      }
+    }
+    return nullptr;
+  }
+  return AI;
+}
+static void reachingSlotStoresOf(const LoadInst *L, const AllocaInst *AI,
+                                 SmallVectorImpl<const StoreInst *> &out) {
+  auto lastStoreBefore = [&](const BasicBlock *BB,
+                             const Instruction *upto) -> const StoreInst * {
+    const StoreInst *last = nullptr;
+    for (const Instruction &I : *BB) {
+      if (&I == upto) break;
+      if (const auto *SI = dyn_cast<StoreInst>(&I))
+        if (SI->getPointerOperand() == AI) last = SI;
+    }
+    return last;
+  };
+  if (const StoreInst *S0 = lastStoreBefore(L->getParent(), L)) {
+    out.push_back(S0);
+    return;
+  }
+  SmallVector<const BasicBlock *, 8> wl(pred_begin(L->getParent()),
+                                        pred_end(L->getParent()));
+  SmallPtrSet<const BasicBlock *, 16> seen;
+  while (!wl.empty()) {
+    const BasicBlock *B = wl.pop_back_val();
+    if (!seen.insert(B).second) continue;
+    if (const StoreInst *S = lastStoreBefore(B, nullptr)) {
+      out.push_back(S);
+      continue;
+    }
+    for (const BasicBlock *P : predecessors(B)) wl.push_back(P);
+  }
+}
+// The unique allocation call a pointer value descends from, through
+// casts and spill reloads; nullptr when any path yields anything else.
+static const CallBase *
+uniqueAllocSource(const Value *v,
+                  const std::function<bool(const CallBase *)> &isAlloc) {
+  const CallBase *found = nullptr;
+  SmallVector<const Value *, 8> wl{v->stripPointerCasts()};
+  SmallPtrSet<const Value *, 16> seen;
+  while (!wl.empty()) {
+    const Value *x = wl.pop_back_val();
+    if (!seen.insert(x).second) continue;
+    if (const auto *CB = dyn_cast<CallBase>(x)) {
+      if (!isAlloc(CB) || (found && found != CB)) return nullptr;
+      found = CB;
+      continue;
+    }
+    if (const auto *C = dyn_cast<CastInst>(x)) {
+      wl.push_back(C->getOperand(0)->stripPointerCasts());
+      continue;
+    }
+    if (const auto *L = dyn_cast<LoadInst>(x)) {
+      if (const AllocaInst *AI = spillSlotOf(L->getPointerOperand())) {
+        SmallVector<const StoreInst *, 4> defs;
+        reachingSlotStoresOf(L, AI, defs);
+        if (defs.empty()) return nullptr;
+        for (const StoreInst *D : defs)
+          wl.push_back(D->getValueOperand()->stripPointerCasts());
+        continue;
+      }
+    }
+    return nullptr;
+  }
+  return found;
+}
 static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
               g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
               g_freshHelperComposed = 0, g_freshCpy = 0;
@@ -12967,55 +13318,11 @@ void CallGraphPass::confirmFreshWrappers() {
   // answer, computed on demand). Without this every O0 wrapper failed
   // R1 at its first reload (cflow/binutils: xrealloc, bfd_malloc).
   auto isSpillSlot = [](const Value *v) -> const AllocaInst * {
-    const auto *AI = dyn_cast<AllocaInst>(v);
-    if (!AI) return nullptr;
-    for (const User *U : AI->users()) {
-      if (isa<LoadInst>(U)) continue;
-      if (const auto *SI = dyn_cast<StoreInst>(U)) {
-        if (SI->getPointerOperand() == AI && SI->getValueOperand() != AI)
-          continue;
-        return nullptr;
-      }
-      if (const auto *II = dyn_cast<IntrinsicInst>(U)) {
-        switch (II->getIntrinsicID()) {
-        case Intrinsic::dbg_declare: case Intrinsic::dbg_value:
-        case Intrinsic::lifetime_start: case Intrinsic::lifetime_end:
-          continue;
-        default: break;
-        }
-      }
-      return nullptr;
-    }
-    return AI;
+    return spillSlotOf(v);
   };
   auto reachingSlotStores = [](const LoadInst *L, const AllocaInst *AI,
                                SmallVectorImpl<const StoreInst *> &out) {
-    auto lastStoreBefore = [&](const BasicBlock *BB,
-                               const Instruction *upto) -> const StoreInst * {
-      const StoreInst *last = nullptr;
-      for (const Instruction &I : *BB) {
-        if (&I == upto) break;
-        if (const auto *SI = dyn_cast<StoreInst>(&I))
-          if (SI->getPointerOperand() == AI) last = SI;
-      }
-      return last;
-    };
-    if (const StoreInst *S0 = lastStoreBefore(L->getParent(), L)) {
-      out.push_back(S0);
-      return;
-    }
-    SmallVector<const BasicBlock *, 8> wl(pred_begin(L->getParent()),
-                                          pred_end(L->getParent()));
-    SmallPtrSet<const BasicBlock *, 16> seen;
-    while (!wl.empty()) {
-      const BasicBlock *B = wl.pop_back_val();
-      if (!seen.insert(B).second) continue;
-      if (const StoreInst *S = lastStoreBefore(B, nullptr)) {
-        out.push_back(S);
-        continue;
-      }
-      for (const BasicBlock *P : predecessors(B)) wl.push_back(P);
-    }
+    reachingSlotStoresOf(L, AI, out);
   };
   size_t round = 0;
   bool changed = true;

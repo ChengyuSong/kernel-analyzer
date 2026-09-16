@@ -4558,6 +4558,10 @@ bool CallGraphPass::runFlowsToResolution() {
           if (const auto *ST2 = dyn_cast<StructType>(AI2->getAllocatedType()))
             if (ST2->hasName()) s += ":" + ST2->getName().str();
         }
+        // Source line when debug info is present ("fn::load@736"): the
+        // opcode alone does not identify an access in a big function.
+        if (const DebugLoc &DL2 = I2->getDebugLoc())
+          if (DL2.getLine()) s += "@" + std::to_string(DL2.getLine());
         return pre + s;
       }
       if (const auto *A2 = dyn_cast<Argument>(V3))
@@ -4676,17 +4680,21 @@ bool CallGraphPass::runFlowsToResolution() {
   int64_t traceRoot = -1;
   // "r<N>" names a root by id (ids are printed by the meet tracer and
   // the channel names, so a smear can be followed by the exact origin).
+  // Ids past the presolve roots name roots minted DURING the solve (key
+  // identities, lazy mints): accepted, resolved when they appear.
   auto ridOf = [&](StringRef s) -> int64_t {
     uint32_t v;
-    return s.size() > 1 && s[0] == 'r' && !s.substr(1).getAsInteger(10, v) &&
-                   v < rootClassOf.size()
+    return s.size() > 1 && s[0] == 'r' && !s.substr(1).getAsInteger(10, v)
                ? (int64_t)v
                : -1;
   };
   if (!CFLTraceFunc.empty() && ridOf(CFLTraceFunc) >= 0) {
     traceRoot = ridOf(CFLTraceFunc);
     errs() << "TRACE root " << traceRoot << " = "
-           << protBlameName(rootClassOf[traceRoot]) << " (by id)\n";
+           << ((uint64_t)traceRoot < rootClassOf.size()
+                   ? protBlameName(rootClassOf[traceRoot])
+                   : std::string("<minted during the solve>"))
+           << " (by id)\n";
   } else if (!CFLTraceFunc.empty()) {
     for (auto &[rid, F] : funcRootOf)
       if (F->getName().contains(CFLTraceFunc)) {
@@ -4748,7 +4756,11 @@ bool CallGraphPass::runFlowsToResolution() {
       if (ridOf(want[w]) >= 0) {
         meetRid[w] = ridOf(want[w]);
         errs() << "TRACE-MEET root " << (w ? "B" : "A") << " = r" << meetRid[w]
-               << " " << protBlameName(rootClassOf[meetRid[w]]) << " (by id)\n";
+               << " "
+               << ((uint64_t)meetRid[w] < rootClassOf.size()
+                       ? protBlameName(rootClassOf[meetRid[w]])
+                       : std::string("<minted during the solve>"))
+               << " (by id)\n";
       }
       for (uint32_t rid = 0; rid < rootClassOf.size() && meetRid[w] < 0; rid++) {
         auto fit = funcRootOf.find(rid);

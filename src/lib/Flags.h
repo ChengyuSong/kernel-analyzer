@@ -33,6 +33,7 @@ extern cl::opt<std::string> CFLTraceMeet;
 extern cl::opt<bool> CFLChannelCone;
 extern cl::opt<bool> CFLExtGlobalsOwnIdentity;
 extern cl::opt<bool> CFLProbeNoCellIdentity;
+extern cl::opt<bool> CFLKeyIdentity;
 extern cl::opt<bool> CFLProbeNoXBridges;
 extern cl::opt<bool> CFLCoTravelStats;
 extern cl::opt<bool> CFLSolverProfile;

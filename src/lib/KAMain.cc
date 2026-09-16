@@ -223,6 +223,20 @@ cl::opt<bool> CFLProbeNoCellIdentity(
            "Quantifies the per-access identity-root web"),
   cl::init(false));
 
+cl::opt<bool> CFLKeyIdentity(
+  "cfl-key-identity",
+  cl::desc("With --cfl-channel-cells: identity of never-written content "
+           "per channel key instead of per read-access cell. No identity "
+           "root is minted for any dereference cell; when a channel (o,s) "
+           "is created for an EXTERNAL origin o (formal without callers, "
+           "extern global, synthetic value, or another key identity) one "
+           "identity origin is minted into it (a key identity's own "
+           "channels get the identity itself back: depth-one self loop). "
+           "Heap, stack and defined-global fields with no writer read as "
+           "empty. Design: docs/channel-cells-design.md, Lean "
+           "ChannelCells.handle_*"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeNoXBridges(
   "cfl-probe-no-x-bridges",
   cl::desc("MEASUREMENT-ONLY, UNSOUND: with --cfl-channel-cells, do not "

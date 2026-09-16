@@ -4354,15 +4354,20 @@ bool CallGraphPass::runFlowsToResolution() {
       // is an instruction value no store reaches); the cells of globals
       // and formals keep theirs (their content is external). Quantifies
       // the per-access identity-root web under pairwise cells.
-      if (CFLProbeNoCellIdentity && !isFunc && !isCert && !hasOrigin[n] &&
-          NF.isDereferenceNode(toOrig[n])) {
+      if ((CFLProbeNoCellIdentity || CFLKeyIdentity) && !isFunc && !isCert &&
+          !hasOrigin[n] && NF.isDereferenceNode(toOrig[n])) {
         if (probeDerefToPtr.empty())
           for (auto &[p3, d3] : NF.getDerefMap()) probeDerefToPtr[d3] = p3;
         auto dit = probeDerefToPtr.find(toOrig[n]);
         const Value *pv = dit == probeDerefToPtr.end()
                               ? nullptr
                               : NF.getValueForNode(dit->second);
-        if (!(pv && (isa<GlobalVariable>(pv) || isa<Argument>(pv)))) {
+        // --cfl-key-identity: NO dereference cell gets a root — the
+        // content identity lives on the channel key (minted at channel
+        // creation for external origins). The probe keeps the cells of
+        // globals and formals.
+        if (CFLKeyIdentity ||
+            !(pv && (isa<GlobalVariable>(pv) || isa<Argument>(pv)))) {
           cellIdentityAblated++;
           continue;
         }
@@ -4663,6 +4668,9 @@ bool CallGraphPass::runFlowsToResolution() {
   if (CFLProbeNoCellIdentity)
     CG_LOG("[MEASUREMENT-ONLY UNSOUND] cell identity roots NOT minted: "
            << cellIdentityAblated << "\n");
+  else if (CFLKeyIdentity)
+    CG_LOG("KeyIdentity: " << cellIdentityAblated
+           << " dereference cells left without a per-access root\n");
   // --cfl-trace-func: follow one function root's fact through the solve.
   int64_t traceRoot = -1;
   // "r<N>" names a root by id (ids are printed by the meet tracer and
@@ -5912,6 +5920,29 @@ bool CallGraphPass::runFlowsToResolution() {
   // (Lean: chanflow_iff_pairflow). Seeding mirrors the pop loop's
   // a-edge rule: emission is native (value flow launders bridge
   // provenance).
+  // --cfl-key-identity: identity of never-written content, one origin
+  // per channel key of an EXTERNAL origin (docs/channel-cells-design.md,
+  // "Identity of unwritten content"). External = a formal without
+  // callers (its own identity root), an extern global with its own
+  // node, a synthetic (value-less) class, or a key identity itself.
+  // Heap, stack and defined globals are internal: a field nobody
+  // writes reads as empty (premise P2).
+  boost::unordered_flat_set<uint32_t> keyIdentityRoots; // rids
+  size_t keyIdentityMinted = 0, keyIdentitySelf = 0;
+  auto isExternalOrigin = [&](uint32_t o) -> bool {
+    if (keyIdentityRoots.count(o)) return true;
+    if (o >= rootClassOf.size()) return false;
+    const uint32_t rc = rootClassOf[o];
+    if (rc >= toOrig.size()) return false; // solver plumbing: never
+    if (funcRootOf.count(o)) return false;
+    const NodeIndex canon = toOrig[rc];
+    const Value *V = NF.getValueForNode(canon);
+    if (!V) return !NF.isObjectNode(canon); // synthetic value class
+    if (isa<Argument>(V)) return true;
+    if (const auto *G = dyn_cast<GlobalVariable>(V))
+      return Ctx->ExtGobjs.count(G->getGUID()) && NF.isExtGobjOverride(G->getGUID());
+    return false;
+  };
   auto flushChannelPends = [&]() -> size_t {
     if (!CFLChannelCells || chanPend.empty()) return 0;
     const auto tFlush0 = std::chrono::steady_clock::now();
@@ -5935,6 +5966,28 @@ bool CallGraphPass::runFlowsToResolution() {
         // flush runs on the main thread between waves, so the stale
         // labels of the last wave step must not be inherited.
         tKeyO = P.o; tKeyS = P.s; tCell = cell;
+        if (CFLKeyIdentity && isExternalOrigin(P.o)) {
+          tHow = "key-identity"; tFrom = ch;
+          if (keyIdentityRoots.count(P.o)) {
+            // Fields of an external identity are the identity itself
+            // (depth-one self loop keeps the identity set finite).
+            addFact(ch, 0, P.o, ctx0);
+            keyIdentitySelf++;
+          } else {
+            // Mint the channel's content identity (mirrors mintRoot for
+            // a solver node: no hasIn/toOrig/ownedMask apply).
+            isRoot[ch] = 1;
+            const uint32_t rid = nextRoot++;
+            FactSet::Universe = nextRoot; // widen BEFORE the first set
+            rootClassOf.push_back(ch);
+            rootConstData.push_back(0);
+            rootParkable.push_back(0);
+            if (nexusGate) rootNexus.push_back(0);
+            keyIdentityRoots.insert(rid);
+            keyIdentityMinted++;
+            addFact(ch, 0, rid, ctx0);
+          }
+        }
         // --cfl-probe-no-x-bridges: MEASUREMENT-ONLY UNSOUND PROBE — the
         // unknown-offset channel of an origin is not bridged to its
         // residue channels (quantifies the X-plane spread).
@@ -8998,6 +9051,10 @@ bool CallGraphPass::runFlowsToResolution() {
         }
         if (h && exHeap.size() < 8) exHeap.push_back(protBlameName(c).substr(0, 45));
       }
+      if (CFLKeyIdentity)
+        errs() << "KeyIdentity: " << keyIdentityMinted
+               << " channel identities minted, " << keyIdentitySelf
+               << " self-loop wirings\n";
       errs() << "MixCensus: classes holding fn facts " << nFn << ": pure-fn " << nPure
              << ", +literal " << nLit << ", +heap " << nHeap << ", +alloca " << nAlloca
              << ", +global " << nGlob << ", +identity " << nId << "\n";

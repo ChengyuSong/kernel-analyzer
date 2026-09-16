@@ -4284,6 +4284,9 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   size_t bidiPrunable = 0;
+  // --cfl-probe-no-cell-identity bookkeeping (cell -> owning pointer).
+  boost::unordered_flat_map<NodeIndex, NodeIndex> probeDerefToPtr;
+  size_t cellIdentityAblated = 0;
   // usercopy-certificate classes must be minted unconditionally: letting
   // the bidi/lazy oracles skip them would pre-decide the very question
   // the certificate asks (does this origin reach an fptr operand?).
@@ -4345,6 +4348,24 @@ bool CallGraphPass::runFlowsToResolution() {
         // live quotient and mints the moment the class enters A.
         lazyDeferred.push_back(n);
         continue;
+      }
+      // --cfl-probe-no-cell-identity: MEASUREMENT-ONLY UNSOUND PROBE —
+      // do not mint identity roots for read-access cells ("*p" where p
+      // is an instruction value no store reaches); the cells of globals
+      // and formals keep theirs (their content is external). Quantifies
+      // the per-access identity-root web under pairwise cells.
+      if (CFLProbeNoCellIdentity && !isFunc && !isCert && !hasOrigin[n] &&
+          NF.isDereferenceNode(toOrig[n])) {
+        if (probeDerefToPtr.empty())
+          for (auto &[p3, d3] : NF.getDerefMap()) probeDerefToPtr[d3] = p3;
+        auto dit = probeDerefToPtr.find(toOrig[n]);
+        const Value *pv = dit == probeDerefToPtr.end()
+                              ? nullptr
+                              : NF.getValueForNode(dit->second);
+        if (!(pv && (isa<GlobalVariable>(pv) || isa<Argument>(pv)))) {
+          cellIdentityAblated++;
+          continue;
+        }
       }
       // --cfl-ablate-mints: MEASUREMENT-ONLY UNSOUND PROBE — skip
       // minting identity roots whose canonical value matches a named
@@ -4639,6 +4660,9 @@ bool CallGraphPass::runFlowsToResolution() {
            << "% of candidates)\n");
   for (auto &[why, cnt] : wildcardReasons)
     CG_LOG("FlowsTo wildcard[" << why << "]: " << cnt << "\n");
+  if (CFLProbeNoCellIdentity)
+    CG_LOG("[MEASUREMENT-ONLY UNSOUND] cell identity roots NOT minted: "
+           << cellIdentityAblated << "\n");
   // --cfl-trace-func: follow one function root's fact through the solve.
   int64_t traceRoot = -1;
   // "r<N>" names a root by id (ids are printed by the meet tracer and
@@ -5911,7 +5935,10 @@ bool CallGraphPass::runFlowsToResolution() {
         // flush runs on the main thread between waves, so the stale
         // labels of the last wave step must not be inherited.
         tKeyO = P.o; tKeyS = P.s; tCell = cell;
-        if (NB > 0) { // VX linking between channel nodes (same scope)
+        // --cfl-probe-no-x-bridges: MEASUREMENT-ONLY UNSOUND PROBE — the
+        // unknown-offset channel of an origin is not bridged to its
+        // residue channels (quantifies the X-plane spread).
+        if (NB > 0 && !CFLProbeNoXBridges) { // VX linking between channel nodes (same scope)
           if (P.s == SHIFT_X) {
             for (uint64_t ek : shiftKeysOf[P.o]) {
               const uint32_t er = clusterFind(ek);
@@ -19295,6 +19322,18 @@ bool CallGraphPass::doInitialization(Module *M) {
       // their OWN identity (closed world) instead of the universal
       // fallback — registered BEFORE any edges are built so every
       // load of the symbol resolves to the dedicated node
+      {
+        // Whole-program own identity for every other extern global
+        // (--cfl-ext-globals-own-identity); linker-bounds symbols are
+        // left to the closed-world logic below, which keeps universal
+        // when their membership is incomplete.
+        std::vector<std::string> ex0, pr0;
+        const bool isBounds =
+            CFLLinkerArrays &&
+            linkerBoundsSectionKeys(itr.second->getName(), ex0, pr0);
+        if (CFLExtGlobalsOwnIdentity && !CFLCompositional && !isBounds)
+          NF.addExtGobjOverride(itr.first);
+      }
       if (CFLLinkerArrays) {
         StringRef N = itr.second->getName();
         std::vector<std::string> exact, prefix;

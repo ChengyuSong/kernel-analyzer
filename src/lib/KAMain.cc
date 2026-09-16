@@ -203,6 +203,33 @@ cl::opt<bool> CFLChannelCone(
            "=false wires every cell"),
   cl::init(true));
 
+cl::opt<bool> CFLExtGlobalsOwnIdentity(
+  "cfl-ext-globals-own-identity",
+  cl::desc("Whole-program mode only: give every declared-but-undefined "
+           "global its own node and cell (as PointTo does) instead of the "
+           "universal pointer, so stores into one extern global are not "
+           "read back from every other; the cell's content stays an "
+           "unknown (identity) object. Linker-bounds symbols keep the "
+           "--cfl-linker-arrays treatment. Ignored under "
+           "--cfl-compositional, where an extern global may be defined by "
+           "an unseen TU"),
+  cl::init(false));
+
+cl::opt<bool> CFLProbeNoCellIdentity(
+  "cfl-probe-no-cell-identity",
+  cl::desc("MEASUREMENT-ONLY, UNSOUND: do not mint identity roots for "
+           "read-access cells (\"*p\" with p an instruction value that no "
+           "store reaches); cells of globals and formals keep theirs. "
+           "Quantifies the per-access identity-root web"),
+  cl::init(false));
+
+cl::opt<bool> CFLProbeNoXBridges(
+  "cfl-probe-no-x-bridges",
+  cl::desc("MEASUREMENT-ONLY, UNSOUND: with --cfl-channel-cells, do not "
+           "bridge an origin's unknown-offset channel to its residue "
+           "channels. Quantifies the X-plane spread"),
+  cl::init(false));
+
 cl::opt<std::string> CFLTraceMeet(
   "cfl-trace-meet",
   cl::desc("Two origin names (comma-separated substrings of a function, "

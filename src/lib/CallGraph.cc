@@ -9332,6 +9332,43 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << "HolderIdentity: " << holderClones << " clones over "
                << freshStoreCells.size() << " fresh-store cells; "
                << holderCellsDisabled << " cells past the key bound\n";
+      if (!CFLDumpClass.empty()) {
+        // Members of every class whose rep name matches, by function.
+        std::unordered_map<uint32_t, std::vector<uint32_t>> members;
+        for (uint32_t n2 = 0; n2 < (uint32_t)ufp.size(); n2++)
+          members[find(n2)].push_back(n2);
+        for (auto &[rep, mem] : members) {
+          if (mem.size() < 2) continue;
+          const std::string rn = protBlameName(rep);
+          if (!StringRef(rn).contains(CFLDumpClass)) continue;
+          std::map<std::string, std::pair<size_t, std::string>> byFn;
+          size_t synthetic = 0;
+          for (uint32_t m2 : mem) {
+            if (m2 >= toOrig.size()) { synthetic++; continue; }
+            const Value *V2 = NF.getValueForNode(toOrig[m2]);
+            std::string fnName = "<no fn>";
+            if (const auto *I3 = dyn_cast_or_null<Instruction>(V2))
+              fnName = I3->getFunction()->getName().str();
+            else if (const auto *A3 = dyn_cast_or_null<Argument>(V2))
+              fnName = A3->getParent()->getName().str();
+            else if (V2 && isa<GlobalValue>(V2)) fnName = "<global>";
+            else if (NF.isDereferenceNode(toOrig[m2])) fnName = "<cell>";
+            auto &e = byFn[fnName];
+            e.first++;
+            if (e.second.size() < 120) e.second += " " + protBlameName(m2).substr(0, 28);
+          }
+          errs() << "DumpClass: c" << rep << " " << rn.substr(0, 60) << " size "
+                 << mem.size() << " (" << synthetic << " channel/read-half)\n";
+          std::vector<std::pair<size_t, std::string>> order;
+          for (auto &[fn, e] : byFn) order.push_back({e.first, fn});
+          std::sort(order.begin(), order.end(), std::greater<>());
+          size_t shown = 0;
+          for (auto &[cnt, fn] : order) {
+            if (shown++ >= 40) { errs() << "DumpClass:   ... " << order.size() - 40 << " more functions\n"; break; }
+            errs() << "DumpClass:   " << cnt << " " << fn << ":" << byFn[fn].second << "\n";
+          }
+        }
+      }
       errs() << "MixCensus: classes holding fn facts " << nFn << ": pure-fn " << nPure
              << ", +literal " << nLit << ", +heap " << nHeap << ", +alloca " << nAlloca
              << ", +global " << nGlob << ", +identity " << nId << "\n";

@@ -250,6 +250,16 @@ cl::opt<std::string> CFLClonePerCaller(
            "instrument; the original is erased when no use remains"),
   cl::init(""));
 
+cl::opt<std::string> CFLDumpClass(
+  "cfl-dump-class",
+  cl::desc("After the flows-to fixpoint, for every solver class whose name "
+           "contains this substring: size, and its members grouped by "
+           "function (count per function, a few member names), plus how "
+           "many members are channel/read-half nodes. Answers 'why is X in "
+           "one class with Y' when the union is an SCC merge, which the "
+           "tracers do not record"),
+  cl::init(""));
+
 cl::opt<bool> CFLHolderIdentity(
   "cfl-holder-identity",
   cl::desc("With --cfl-channel-cells: a fresh allocation stored through a "
@@ -1291,10 +1301,11 @@ static void clonePerCaller(Module *M) {
       C->setLinkage(GlobalValue::InternalLinkage);
       CB->setCalledFunction(C);
     }
-    const bool erased = F->use_empty();
-    if (erased) F->eraseFromParent();
+    // The original stays (uncalled): later phases hold raw Function*
+    // observers, and erasing it left them dangling (teardown crash).
     errs() << "ClonePerCaller: " << nm << " -> " << k << " clones"
-           << (erased ? " (original erased)" : " (original kept: address taken)")
+           << (F->use_empty() ? " (original now uncalled)"
+                              : " (original kept: address taken)")
            << "\n";
   }
 }

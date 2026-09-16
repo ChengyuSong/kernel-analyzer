@@ -4641,7 +4641,20 @@ bool CallGraphPass::runFlowsToResolution() {
     CG_LOG("FlowsTo wildcard[" << why << "]: " << cnt << "\n");
   // --cfl-trace-func: follow one function root's fact through the solve.
   int64_t traceRoot = -1;
-  if (!CFLTraceFunc.empty()) {
+  // "r<N>" names a root by id (ids are printed by the meet tracer and
+  // the channel names, so a smear can be followed by the exact origin).
+  auto ridOf = [&](StringRef s) -> int64_t {
+    uint32_t v;
+    return s.size() > 1 && s[0] == 'r' && !s.substr(1).getAsInteger(10, v) &&
+                   v < rootClassOf.size()
+               ? (int64_t)v
+               : -1;
+  };
+  if (!CFLTraceFunc.empty() && ridOf(CFLTraceFunc) >= 0) {
+    traceRoot = ridOf(CFLTraceFunc);
+    errs() << "TRACE root " << traceRoot << " = "
+           << protBlameName(rootClassOf[traceRoot]) << " (by id)\n";
+  } else if (!CFLTraceFunc.empty()) {
     for (auto &[rid, F] : funcRootOf)
       if (F->getName().contains(CFLTraceFunc)) {
         traceRoot = rid;
@@ -4699,6 +4712,11 @@ bool CallGraphPass::runFlowsToResolution() {
     auto [nA, nB] = StringRef(CFLTraceMeet).split(',');
     StringRef want[2] = {nA, nB};
     for (int w = 0; w < 2; w++) {
+      if (ridOf(want[w]) >= 0) {
+        meetRid[w] = ridOf(want[w]);
+        errs() << "TRACE-MEET root " << (w ? "B" : "A") << " = r" << meetRid[w]
+               << " " << protBlameName(rootClassOf[meetRid[w]]) << " (by id)\n";
+      }
       for (uint32_t rid = 0; rid < rootClassOf.size() && meetRid[w] < 0; rid++) {
         auto fit = funcRootOf.find(rid);
         std::string nm = fit != funcRootOf.end()
@@ -4748,10 +4766,11 @@ bool CallGraphPass::runFlowsToResolution() {
     auto &v = meetArr[w][n];
     const bool first = v.empty();
     const bool isMerge = StringRef(tHow).starts_with("merge");
-    const bool keyed = isMerge || StringRef(tHow) == "bridge-init";
+    const bool chanHop = StringRef(tHow).starts_with("chan"); // flush wiring
+    const bool keyed = isMerge || chanHop || StringRef(tHow) == "bridge-init";
     if (v.size() < 4)
       v.push_back({tHow, tFrom, s, keyed ? tKeyO : UINT32_MAX, tKeyS,
-                   isMerge ? tCell : UINT32_MAX});
+                   (isMerge || chanHop) ? tCell : UINT32_MAX});
     if (!first || !meetArr[1 - w].count(n) || meetsShown >= 5) return;
     meetsShown++;
     errs() << "TRACE-MEET #" << meetsShown << " at c" << n << " size="
@@ -5888,6 +5907,10 @@ bool CallGraphPass::runFlowsToResolution() {
                  ? protBlameName(rootClassOf[P.o]).substr(0, 40)
                  : std::string("?")) +
             ",s" + std::to_string(P.s) + ")";
+        // Tracer provenance for the bridge/wiring arrivals below: the
+        // flush runs on the main thread between waves, so the stale
+        // labels of the last wave step must not be inherited.
+        tKeyO = P.o; tKeyS = P.s; tCell = cell;
         if (NB > 0) { // VX linking between channel nodes (same scope)
           if (P.s == SHIFT_X) {
             for (uint64_t ek : shiftKeysOf[P.o]) {
@@ -5942,6 +5965,7 @@ bool CallGraphPass::runFlowsToResolution() {
           // stored and (cluster-era) loaded facts; hand it to the read
           // half once so nothing already derived is lost. Future
           // arrivals route through the channels.
+          tHow = "chan-carry"; tFrom = cell; tKeyO = UINT32_MAX; tCell = cell;
           for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
             if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0);
             if (RB[cell][s2].any()) addBits(rh, s2, RB[cell][s2], ctx0);
@@ -5955,6 +5979,7 @@ bool CallGraphPass::runFlowsToResolution() {
         outA[cell].push_back(ch);
         chanEdges++;
         work++;
+        tHow = "chan-in"; tFrom = cell; tKeyO = P.o; tKeyS = P.s; tCell = cell;
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
           if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
           if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
@@ -5966,6 +5991,7 @@ bool CallGraphPass::runFlowsToResolution() {
         outA[ch].push_back(rh);
         chanEdges++;
         work++;
+        tHow = "chan-out"; tFrom = ch; tKeyO = P.o; tKeyS = P.s; tCell = cell;
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
           if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0);
           if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);

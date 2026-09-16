@@ -40,6 +40,25 @@ realloc FRESH CPY(ret<-arg0)
 strdup FRESH CPY(ret<-arg0)
 strndup FRESH CPY(ret<-arg0)
 
+# ---- gnulib / libiberty xalloc family (2026-09-16) ----
+# Same semantics as the libc functions they wrap, plus abort on
+# failure. Without these the wrapper's body is analyzed once and its
+# single return node unions every caller's argument (cflow: token_stack
+# received pp_finalize's obstack buffer through xrealloc).
+xmalloc FRESH
+xzalloc FRESH
+xcalloc FRESH
+xcharalloc FRESH
+xnmalloc FRESH
+xrealloc FRESH CPY(ret<-arg0)
+xreallocarray FRESH CPY(ret<-arg0)
+xnrealloc FRESH CPY(ret<-arg0)
+x2realloc FRESH CPY(ret<-arg0)
+x2nrealloc FRESH CPY(ret<-arg0)
+xstrdup FRESH CPY(ret<-arg0)
+xstrndup FRESH CPY(ret<-arg0)
+xmemdup FRESH CPY(ret<-arg0)
+
 # ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
 # apr_palloc carves from shared allocator blocks; FRESH on the leaf
 # dup/create family severs per-callsite object identity from the pool

@@ -13110,7 +13110,9 @@ void CallGraphPass::confirmFreshWrappers() {
         if (!ok) {
           g_freshRejRet++;
           static size_t r1Samples = 0;
-          if (r1Samples++ < 20 && r1bad) {
+          if ((r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
+            // With --cfl-trace-func every R1 rejection is logged (a
+            // wrapper that should have been promoted is debugged here).
             std::string t; raw_string_ostream os(t); os << *r1bad;
             CG_LOG("ConfirmFresh R1: " << F.getName() << " returns "
                    << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
@@ -13144,9 +13146,16 @@ void CallGraphPass::confirmFreshWrappers() {
             freshGraph.insert(v);
             for (const User *U : v->users()) {
               const Value *uv = cast<Value>(U);
-              if (onRetPath.count(uv) || isa<ICmpInst>(U) ||
-                  isa<ReturnInst>(U))
+              if (isa<ICmpInst>(U) || isa<ReturnInst>(U)) continue;
+              if (onRetPath.count(uv)) {
+                // A return-path value (cast, phi, reload) is the fresh
+                // pointer too: its OTHER users must be classified — at
+                // O0 the cast is also spilled into a slot; at O2 a
+                // return-path phi stored elsewhere would be an escape
+                // that skipping it here silently missed.
+                gwork.push_back(uv);
                 continue;
+              }
               if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
                 gwork.push_back(uv);
                 continue;
@@ -13197,6 +13206,35 @@ void CallGraphPass::confirmFreshWrappers() {
                 if (!containsPointerType(sv->getType())) {
                   initStores.insert(SI);
                   continue;
+                }
+                // O0: the stored value is a reload of a spilled formal
+                // (`list->free_data = fun`). Resolve through the slot;
+                // every reaching value must classify as an init source.
+                if (const auto *SL = dyn_cast<LoadInst>(sv)) {
+                  if (const AllocaInst *SAI =
+                          isSpillSlot(SL->getPointerOperand())) {
+                    SmallVector<const StoreInst *, 4> defs;
+                    reachingSlotStores(SL, SAI, defs);
+                    bool allOk = !defs.empty();
+                    SmallVector<int, 2> args2;
+                    SmallVector<const GlobalValue *, 2> globs2;
+                    for (const StoreInst *D : defs) {
+                      const Value *dv = D->getValueOperand()->stripPointerCasts();
+                      if (isa<ConstantPointerNull>(dv)) continue;
+                      if (const auto *DA = dyn_cast<Argument>(dv)) {
+                        if (DA->getParent() == &F) { args2.push_back((int)DA->getArgNo()); continue; }
+                      }
+                      if (const auto *DG = dyn_cast<GlobalValue>(dv)) { globs2.push_back(DG); continue; }
+                      allOk = false;
+                      break;
+                    }
+                    if (allOk) {
+                      initStores.insert(SI);
+                      initArgs.append(args2.begin(), args2.end());
+                      initGlobals.append(globs2.begin(), globs2.end());
+                      continue;
+                    }
+                  }
                 }
                 if (const auto *A2 = dyn_cast<Argument>(sv)) {
                   if (A2->getParent() == &F) {
@@ -13362,6 +13400,7 @@ void CallGraphPass::confirmFreshWrappers() {
         }
         // R3: no pointer side effects elsewhere (classified init stores
         // are exempt — they become atoms).
+        const Instruction *r3bad = nullptr;
         for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
              ++II) {
           const Instruction *I2 = &*II;
@@ -13370,8 +13409,10 @@ void CallGraphPass::confirmFreshWrappers() {
             // A store into a non-escaping local slot moves nothing out
             // of the function; the reload's uses are judged above.
             if (isSpillSlot(SI->getPointerOperand())) continue;
-            if (containsPointerType(SI->getValueOperand()->getType()))
+            if (containsPointerType(SI->getValueOperand()->getType())) {
               ok = false;
+              r3bad = I2;
+            }
             continue;
           }
           if (const auto *CB = dyn_cast<CallBase>(I2)) {
@@ -13389,14 +13430,24 @@ void CallGraphPass::confirmFreshWrappers() {
                 containsPointerType(CB->getType()) && !onRetPath.count(CB);
             for (const Value *a2 : CB->args())
               if (containsPointerType(a2->getType())) ptrInvolved = true;
-            if (!CF || ptrInvolved) ok = false; // indirect or ptr-carrying
+            if (!CF || ptrInvolved) { ok = false; r3bad = I2; }
             continue;
           }
           if (isa<PtrToIntInst>(I2) || isa<AtomicRMWInst>(I2) ||
-              isa<AtomicCmpXchgInst>(I2))
+              isa<AtomicCmpXchgInst>(I2)) {
             ok = false;
+            r3bad = I2;
+          }
         }
-        if (!ok) { g_freshRejSide++; continue; }
+        if (!ok) {
+          g_freshRejSide++;
+          if (!CFLTraceFunc.empty() && r3bad) {
+            std::string t; raw_string_ostream os(t); os << *r3bad;
+            CG_LOG("ConfirmFresh R3: " << F.getName() << " side effect "
+                   << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
+          }
+          continue;
+        }
         // Inherit CPY(ret<-argK) from a copying fresh callee: the actual
         // at argK must be one of F's own formals (through spill reloads
         // and casts) or null (realloc(NULL, n) is malloc). Anything else

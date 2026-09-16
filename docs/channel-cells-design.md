@@ -247,6 +247,14 @@ Design (premises stated; Lean: `ChannelCells.handle_*`):
   formal identities are parked today (rootParkable + re-admit); no
   new mechanism.
 
+Built as `--cfl-key-identity` (74326b9). cflow, full run: wall 10:39
+→ 1:38, indirect-call answer identical (42 sites / 74 pairs), 1,754
+cells without a per-access root, 61 channel identities and 482 self
+loops; the census equals the mint-nothing probe (2787/2684), i.e. the
+per-access roots were partitions, not content. Parking of a formal's
+channel identities when the formal gets callers is not implemented
+yet (over-approximation only).
+
 Gate: nm-new ground truth 223/223 with the sound rule (the probe that
 mints nothing is expected to lose the reloc.c records), then the
 census and cost on nm-new; then km.

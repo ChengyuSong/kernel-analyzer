@@ -8885,6 +8885,78 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << "\n";
       }
     }
+    // Mix census: of the classes that hold a function-pointer fact, how
+    // many also point to something a function pointer can never
+    // legitimately share a value with — a string literal, a heap object,
+    // a stack object, a data global, an identity root. This is the
+    // "what remains" inventory for the cell-model change: every such
+    // class is a value where the analysis believes one pointer may be
+    // a function or a byte buffer.
+    if (VerboseLevel >= 2) {
+      FactSet mFn, mLit, mHeap, mAlloca, mGlob, mId;
+      for (uint32_t rid = 0; rid < nextRoot; rid++) {
+        if (funcRootOf.count(rid)) { mFn.set(rid); continue; }
+        if (rid < rootConstData.size() && rootConstData[rid]) { mLit.set(rid); continue; }
+        const uint32_t rc = rid < rootClassOf.size() ? rootClassOf[rid] : UINT32_MAX;
+        const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
+        if (!V) mId.set(rid);
+        else if (isa<AllocaInst>(V)) mAlloca.set(rid);
+        else if (isa<GlobalVariable>(V)) mGlob.set(rid);
+        else if (isa<Argument>(V) || (rc < toOrig.size() && NF.isDereferenceNode(toOrig[rc])))
+          mId.set(rid);
+        else mHeap.set(rid); // allocation-call results and other value origins
+      }
+      FactSet tmp;
+      auto holds = [&](uint32_t c, const FactSet &mask) {
+        for (uint32_t s = 0; s < NSHIFT; s++) {
+          tmp.copyFrom(R[c][s]); tmp.intersectWith(mask); if (tmp.any()) return true;
+          tmp.copyFrom(RB[c][s]); tmp.intersectWith(mask); if (tmp.any()) return true;
+        }
+        return false;
+      };
+      size_t nFn = 0, nLit = 0, nHeap = 0, nAlloca = 0, nGlob = 0, nId = 0, nPure = 0;
+      std::vector<std::string> exLit, exHeap, exPure;
+      for (uint32_t c = 0; c < N; c++) {
+        if (find(c) != c || !holds(c, mFn)) continue;
+        nFn++;
+        const bool l = holds(c, mLit), h = holds(c, mHeap), a = holds(c, mAlloca),
+                   g = holds(c, mGlob), i = holds(c, mId);
+        nLit += l; nHeap += h; nAlloca += a; nGlob += g; nId += i;
+        if (!(l || h || a || g || i)) {
+          nPure++;
+          if (exPure.size() < 6) exPure.push_back(protBlameName(c).substr(0, 45));
+        }
+        if (l && exLit.size() < 8) {
+          std::string e = protBlameName(c).substr(0, 45);
+          if (exLit.size() < 3) {
+            // Name what it holds: two functions and two literals.
+            int nf = 0, nl = 0;
+            for (uint32_t s = 0; s < NSHIFT && (nf < 2 || nl < 2); s++)
+              R[c][s].forEach([&](uint32_t o) {
+                if (nf < 2 && funcRootOf.count(o)) {
+                  e += " fn:" + funcRootOf[o]->getName().str(); nf++;
+                } else if (nl < 2 && o < rootConstData.size() && rootConstData[o]) {
+                  e += " lit:" + protBlameName(rootClassOf[o]).substr(0, 20) + "@s" +
+                       std::to_string(s); nl++;
+                }
+              });
+          }
+          exLit.push_back(e);
+        }
+        if (h && exHeap.size() < 8) exHeap.push_back(protBlameName(c).substr(0, 45));
+      }
+      errs() << "MixCensus: classes holding fn facts " << nFn << ": pure-fn " << nPure
+             << ", +literal " << nLit << ", +heap " << nHeap << ", +alloca " << nAlloca
+             << ", +global " << nGlob << ", +identity " << nId << "\n";
+      auto show = [&](const char *tag, const std::vector<std::string> &ex) {
+        errs() << "MixCensus:   " << tag << ":";
+        for (auto &e : ex) errs() << " [" << e << "]";
+        errs() << "\n";
+      };
+      show("fn+literal e.g.", exLit);
+      show("fn+heap e.g.", exHeap);
+      show("pure-fn e.g.", exPure);
+    }
     // Cluster-transitivity audit: union-find clusters are coarser-or-equal
     // vs the grammar's per-witness M; multi-key clusters and transitive
     // key-coalescing merges bound the over-approximation (Lean gap F3).

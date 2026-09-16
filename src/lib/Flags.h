@@ -30,6 +30,7 @@ extern cl::opt<std::string> CFLTraceFunc;
 extern cl::opt<std::string> CFLTraceFptr;
 extern cl::opt<std::string> CFLTraceValue;
 extern cl::opt<std::string> CFLTraceMeet;
+extern cl::opt<bool> CFLChannelCone;
 extern cl::opt<bool> CFLCoTravelStats;
 extern cl::opt<bool> CFLSolverProfile;
 extern cl::opt<bool> CFLVerifyClosure;

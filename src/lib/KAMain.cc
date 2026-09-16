@@ -194,6 +194,15 @@ cl::opt<std::string> CFLTraceFptr(
            "where a flow is severed"),
   cl::init(""));
 
+cl::opt<bool> CFLChannelCone(
+  "cfl-channel-cone",
+  cl::desc("With --cfl-channel-cells: wire channels only for cells that "
+           "can influence some indirect call's callee expression "
+           "(backward over a/f edges with Steensgaard may-alias jumps and "
+           "owner-pointer hops). Answer-preserving by construction; "
+           "=false wires every cell"),
+  cl::init(true));
+
 cl::opt<std::string> CFLTraceMeet(
   "cfl-trace-meet",
   cl::desc("Two origin names (comma-separated substrings of a function, "

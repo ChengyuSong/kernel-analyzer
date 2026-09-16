@@ -3701,7 +3701,15 @@ bool CallGraphPass::runFlowsToResolution() {
   // over-approximated by Steensgaard classes (unification), which the
   // precise shared-root join then refines on the slice.
   std::vector<char> inSlice; // empty => no slicing
-  if (CFLFlowsToSlice) {
+  // Channel-cell wiring cone: classes that can influence an indirect
+  // call's callee expression at all — backward over a/f edges from the
+  // callee expressions, jumping at a cell to every cell of its
+  // Steensgaard class (may-alias over-approximation) AND to those
+  // cells' owner pointers (a pointer produced by a load needs its own
+  // cell wired before it can acquire keys). Cells outside this cone
+  // never need a channel: their content cannot reach any answer.
+  std::vector<char> wireCone; // empty => wire every cell
+  if (CFLFlowsToSlice || (CFLChannelCells && CFLChannelCone)) {
     auto tSlice = std::chrono::steady_clock::now();
     // Steensgaard: union a-edge endpoints; one representative cell per
     // class, unioning cells whenever their owning classes merge.
@@ -3794,6 +3802,35 @@ bool CallGraphPass::runFlowsToResolution() {
     std::vector<char> Fm(N, 0), Bm(N, 0);
     sweep(Fm, fSeeds, outAF);
     sweep(Bm, bSeeds, inA);
+    if (CFLChannelCells && CFLChannelCone) {
+      wireCone.assign(N, 0);
+      boost::unordered_flat_set<uint32_t> jumpedW;
+      std::vector<uint32_t> qW;
+      auto addW = [&](uint32_t v) {
+        if (!wireCone[v]) { wireCone[v] = 1; qW.push_back(v); }
+      };
+      for (uint32_t v : bSeeds) addW(v);
+      while (!qW.empty()) {
+        uint32_t v = qW.back();
+        qW.pop_back();
+        if (isCell[v]) {
+          uint32_t cls = find(v);
+          if (jumpedW.insert(cls).second)
+            for (uint32_t c : classCells[cls]) {
+              addW(c);
+              for (uint32_t p : cellParents[c]) addW(p);
+            }
+          for (uint32_t p : cellParents[v]) addW(p);
+        }
+        for (uint32_t u : inA[v]) addW(u);
+      }
+      size_t nCone = 0;
+      for (uint32_t v = 0; v < N; v++) nCone += wireCone[v];
+      CG_LOG("ChannelCone: " << nCone << "/" << N
+             << " classes can influence a callee expression; channels are "
+                "wired for their cells only\n");
+    }
+    if (CFLFlowsToSlice) { // slice pruning proper (cone-only runs keep the graph)
 
     // Evidence closure: a memory join on a kept derivation is justified by
     // value origins its two parents share, and those origins flow to the
@@ -3867,6 +3904,7 @@ bool CallGraphPass::runFlowsToResolution() {
            << std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::steady_clock::now() - tSlice).count()
            << " ms\n");
+    } // slice pruning
   }
 
   // Every load/store has its own assistant cell node, so a pointer class
@@ -4452,6 +4490,9 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::pair<uint64_t, uint32_t>> witnessAnchors;
 
   boost::unordered_flat_map<NodeIndex, NodeIndex> derefToPtr; // cell -> ptr
+  // Solver-made nodes (channel hubs, read halves) have no factory node;
+  // the flush records a name so traces can show them.
+  std::unordered_map<uint32_t, std::string> chanNodeName;
   // Name of one factory node (value, cell "*p", object); "" when nameless.
   auto nodeNameOf = [&](NodeIndex m3) -> std::string {
       std::string pre;
@@ -4509,8 +4550,10 @@ bool CallGraphPass::runFlowsToResolution() {
       return pre + "<valnode#" + std::to_string(m3) + ">";
   };
   auto protBlameName = [&](uint32_t cls) -> std::string {
-    if (cls >= toOrig.size())
-      return "<synthetic>";
+    if (cls >= toOrig.size()) {
+      auto cn = chanNodeName.find(cls);
+      return cn != chanNodeName.end() ? cn->second : "<synthetic>";
+    }
     NodeIndex canon = toOrig[cls];
     auto &nameOf = nodeNameOf;
     std::string n = nameOf(canon);
@@ -4568,6 +4611,18 @@ bool CallGraphPass::runFlowsToResolution() {
   // equalized member fact sets anyway). Propagation is word-parallel:
   // OR whole planes across a-edges, plane-rotated OR across f-edges.
   FactSet::Universe = nextRoot;
+  // Constant globals without pointer-typed content (string literals,
+  // lookup tables): nothing can store into them, so their cells never
+  // carry a pointer and a channel for them is pure fan-out. Per root.
+  auto isConstDataRoot = [&](uint32_t cls) -> char {
+    if (cls >= toOrig.size()) return 0;
+    const auto *GV =
+        dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(toOrig[cls]));
+    return GV && GV->isConstant() && !containsPointerType(GV->getValueType());
+  };
+  std::vector<char> rootConstData(nextRoot, 0);
+  for (uint32_t rid = 0; rid < nextRoot; rid++)
+    rootConstData[rid] = isConstDataRoot(rootClassOf[rid]);
   if (!bidiMarked.empty())
     CG_LOG("BidiPrune: pruned " << bidiPrunable << " origins outside the "
            << "fptr cone; minted " << nextRoot << " roots ("
@@ -5301,6 +5356,7 @@ bool CallGraphPass::runFlowsToResolution() {
                           std::memory_order_relaxed);
     keyCount[b].store(0, std::memory_order_relaxed);
     isRoot[a] |= isRoot[b];
+    if (!wireCone.empty()) wireCone[a] |= wireCone[b];
     tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
@@ -5657,7 +5713,8 @@ bool CallGraphPass::runFlowsToResolution() {
   boost::unordered_flat_set<uint64_t> chanEdgeSeen; // (src<<32)|dst
   // cell -> its read half (UINT32_MAX: cell has no reads, no half made)
   boost::unordered_flat_map<uint32_t, uint32_t> chanReadHalf;
-  size_t chanNodes = 0, chanEdges = 0, chanSplits = 0;
+  size_t chanNodes = 0, chanEdges = 0, chanSplits = 0, chanConeSkipped = 0,
+         chanConstSkipped = 0;
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     // NOTE: the cluster-mark fast path skips redundant joinCluster
     // calls, so this census is APPROXIMATE (first-join-per-cluster
@@ -5707,6 +5764,16 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     if (CFLChannelCells) {
       // Pairwise mode: record; the barrier flush wires the channel.
+      // Cells outside the wiring cone cannot influence any answer.
+      if (!wireCone.empty() && !wireCone[find(cell)]) {
+        chanConeSkipped++;
+        return;
+      }
+      // A constant data-only global's cells never hold a pointer.
+      if (o < rootConstData.size() && rootConstData[o]) {
+        chanConstSkipped++;
+        return;
+      }
       if (chanPendSeen.emplace((uint64_t)o * NSHIFT + s, cell).second)
         chanPend.push_back({cell, o, s});
       return;
@@ -5792,6 +5859,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // 2026-09-15).
     clsSize.push_back(1);
     if (!ownedMask.empty()) ownedMask.push_back(0);
+    if (!wireCone.empty()) wireCone.push_back(1); // made from an in-cone cell
     chanNodes++;
     return id;
   };
@@ -5803,6 +5871,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // provenance).
   auto flushChannelPends = [&]() -> size_t {
     if (!CFLChannelCells || chanPend.empty()) return 0;
+    const auto tFlush0 = std::chrono::steady_clock::now();
+    const size_t pendsIn = chanPend.size();
     size_t work = 0;
     for (const ChanPend &P : chanPend) {
       const uint32_t cell = find(P.cell);
@@ -5812,6 +5882,12 @@ bool CallGraphPass::runFlowsToResolution() {
       if (ins) {
         ch = newSolverNode();
         it->second = ch;
+        chanNodeName[ch] =
+            "chan(r" + std::to_string(P.o) + " " +
+            (P.o < rootClassOf.size()
+                 ? protBlameName(rootClassOf[P.o]).substr(0, 40)
+                 : std::string("?")) +
+            ",s" + std::to_string(P.s) + ")";
         if (NB > 0) { // VX linking between channel nodes (same scope)
           if (P.s == SHIFT_X) {
             for (uint64_t ek : shiftKeysOf[P.o]) {
@@ -5858,6 +5934,7 @@ bool CallGraphPass::runFlowsToResolution() {
             !cellsOf[cell].empty()) {
           const uint32_t rh = newSolverNode();
           rhIt->second = rh;
+          chanNodeName[rh] = "rh(" + protBlameName(cell).substr(0, 50) + ")";
           outA[rh].swap(outA[cell]);
           outF[rh].swap(outF[cell]);
           cellsOf[rh].swap(cellsOf[cell]);
@@ -5895,8 +5972,26 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
     }
+    if (VerboseLevel >= 2 && pendsIn >= 100000) {
+      // Fan-out census: which cells (owners) carry the pend mass.
+      std::unordered_map<uint32_t, uint32_t> perCell;
+      for (const ChanPend &P : chanPend) perCell[find(P.cell)]++;
+      std::vector<std::pair<uint32_t, uint32_t>> top(perCell.begin(), perCell.end());
+      std::partial_sort(top.begin(), top.begin() + std::min<size_t>(8, top.size()),
+                        top.end(), [](auto &a, auto &b) { return a.second > b.second; });
+      errs() << "ChanFlush: " << perCell.size() << " distinct cells; top:";
+      for (size_t i = 0; i < std::min<size_t>(8, top.size()); i++)
+        errs() << " " << top[i].second << "x[" << protBlameName(top[i].first).substr(0, 40) << "]";
+      errs() << "\n";
+    }
     chanPend.clear();
     flushCtx(ctx0);
+    CG_LOG("ChanFlush: " << pendsIn << " pends, " << work << " new wirings; "
+           << "channels " << chanNodes << " edges " << chanEdges
+           << " splits " << chanSplits << ", "
+           << std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - tFlush0).count()
+           << " ms\n");
     return work;
   };
   // Dynamic a-SCC collapse: classes mutually reachable over the current
@@ -6031,6 +6126,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // widen BEFORE the first set of this bit
     FactSet::Universe = nextRoot;
     rootClassOf.push_back(rep);
+    rootConstData.push_back(isConstDataRoot(rep));
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
     if (!ownedMask.empty() && !funcOfCanon.count(toOrig[rep])) {
       const Value *ov2 = NF.getValueForNode(toOrig[rep]);
@@ -6163,6 +6259,13 @@ bool CallGraphPass::runFlowsToResolution() {
       FactSet &todo = ctx.todoS;
       todo.copyFrom(jdirty[n][s]);
       jdirty[n][s].clear();
+      // Channel mode: bridged facts (o,s) exist only as VX images of a
+      // native (o,X) or (o,s') fact, and the channel nodes of one
+      // origin are bridged with each other at creation — so wiring the
+      // cell to every residue's channel would repeat, per cell, what the
+      // channel-level bridges already do (P-fold pend fan-out). Join on
+      // native facts only.
+      if (CFLChannelCells) todo.intersectWith(R[n][s]);
       if (cellsOf[n].empty()) { ctx.cyJoin += rd() - tp0; continue; }
       // Dedup stale cell entries to live union-find reps: after the
       // FIRST fact of a shift joins the cells they all share one rep,
@@ -8933,7 +9036,9 @@ bool CallGraphPass::runFlowsToResolution() {
            << (CFLChannelCells
                    ? (", CHANNELS " + std::to_string(chanNodes) + " nodes " +
                       std::to_string(chanEdges) + " edges " +
-                      std::to_string(chanSplits) + " split cells")
+                      std::to_string(chanSplits) + " split cells " +
+                      std::to_string(chanConeSkipped) + " pends outside cone " +
+                      std::to_string(chanConstSkipped) + " const-data keys")
                    : std::string())
            << ", merge-reoffered " << reofferedFacts
            << " facts, sweeps offered " << sweepOffered << " kept "

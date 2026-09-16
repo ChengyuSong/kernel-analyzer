@@ -6045,9 +6045,12 @@ bool CallGraphPass::runFlowsToResolution() {
           // stored and (cluster-era) loaded facts; hand it to the read
           // half once so nothing already derived is lost. Future
           // arrivals route through the channels.
+          // R planes are class planes (stable): let an empty target
+          // adopt the buffer copy-on-write instead of streaming it, as
+          // the wave does for full-plane pushes.
           tHow = "chan-carry"; tFrom = cell; tKeyO = UINT32_MAX; tCell = cell;
           for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-            if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0);
+            if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0, true);
             if (RB[cell][s2].any()) addBits(rh, s2, RB[cell][s2], ctx0);
           }
           chanSplits++;
@@ -6061,7 +6064,7 @@ bool CallGraphPass::runFlowsToResolution() {
         work++;
         tHow = "chan-in"; tFrom = cell; tKeyO = P.o; tKeyS = P.s; tCell = cell;
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-          if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0);
+          if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0, true);
           if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
         }
       }
@@ -6073,7 +6076,7 @@ bool CallGraphPass::runFlowsToResolution() {
         work++;
         tHow = "chan-out"; tFrom = ch; tKeyO = P.o; tKeyS = P.s; tCell = cell;
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
-          if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0);
+          if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0, true);
           if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);
         }
       }

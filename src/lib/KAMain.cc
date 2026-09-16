@@ -19,6 +19,7 @@
 #include <llvm/Support/SystemUtils.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/Path.h>
@@ -237,6 +238,17 @@ cl::opt<bool> CFLKeyIdentity(
            "empty. Design: docs/channel-cells-design.md, Lean "
            "ChannelCells.handle_*"),
   cl::init(false));
+
+cl::opt<std::string> CFLClonePerCaller(
+  "cfl-clone-per-caller",
+  cl::desc("Comma-separated function names to expand per call site at load "
+           "time (each direct call site gets its own clone; names are "
+           "processed in order, so a later name is cloned per the clones "
+           "of an earlier one). The load-time equivalent of a per-call-site "
+           "summary for a small generic helper such as linked_list_append: "
+           "its allocation sites and formals become per site. Experiment "
+           "instrument; the original is erased when no use remains"),
+  cl::init(""));
 
 cl::opt<bool> CFLHolderIdentity(
   "cfl-holder-identity",
@@ -1258,6 +1270,35 @@ void IterativeModulePass::run(ModuleList &modules) {
   Diag << "[" << ID << "] Done!\n\n";
 }
 
+// --cfl-clone-per-caller: expand listed functions per direct call site.
+static void clonePerCaller(Module *M) {
+  if (CFLClonePerCaller.empty()) return;
+  SmallVector<StringRef, 8> names;
+  StringRef(CFLClonePerCaller).split(names, ',', -1, false);
+  for (StringRef nm : names) {
+    Function *F = M->getFunction(nm.trim());
+    if (!F || F->isDeclaration()) continue;
+    SmallVector<CallBase *, 16> sites;
+    for (User *U : F->users())
+      if (auto *CB = dyn_cast<CallBase>(U))
+        if (CB->getCalledOperand() == F) sites.push_back(CB);
+    if (sites.size() < 2) continue;
+    unsigned k = 0;
+    for (CallBase *CB : sites) {
+      ValueToValueMapTy VMap;
+      Function *C = CloneFunction(F, VMap);
+      C->setName(F->getName() + ".site" + Twine(k++));
+      C->setLinkage(GlobalValue::InternalLinkage);
+      CB->setCalledFunction(C);
+    }
+    const bool erased = F->use_empty();
+    if (erased) F->eraseFromParent();
+    errs() << "ClonePerCaller: " << nm << " -> " << k << " clones"
+           << (erased ? " (original erased)" : " (original kept: address taken)")
+           << "\n";
+  }
+}
+
 void doBasicInitialization(Module *M) {
   // struct analysis
   GlobalCtx.structAnalyzer.run(M, &(M->getDataLayout()));
@@ -1620,6 +1661,7 @@ int main(int argc, char **argv) {
     GlobalCtx.Modules.push_back(std::make_pair(Module, MName));
     GlobalCtx.ModuleMaps[Module] = InputFilenames[i];
 
+    clonePerCaller(Module);
     doBasicInitialization(Module);
   }
 

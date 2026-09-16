@@ -19,6 +19,7 @@ set (EXECUTABLE_OUTPUT_PATH ${KA_BINARY_DIR})
 link_directories (${KA_BINARY_DIR}/lib)
 add_executable(KAMain ${KASource})
 target_link_libraries(KAMain
+  LLVMTransformUtils
   LLVMAsmParser
   LLVMSupport
   LLVMCore

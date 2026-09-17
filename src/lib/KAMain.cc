@@ -1194,6 +1194,15 @@ cl::opt<std::string> CFLDumpTypeJson(
            "flow answer can be compared with its type bound per site"),
   cl::init(""));
 
+cl::opt<std::string> CFLDumpMerges(
+  "cfl-dump-merges",
+  cl::desc("MEASUREMENT-ONLY: write every solve-time class union of the "
+           "final iteration with its cause (join key + the pointer class "
+           "whose sweep issued it, or a-SCC collapse) plus a node-name "
+           "table, so an offline replay can answer 'which union first put "
+           "nodes X and Y in one class, and why' (scratch merges.py)"),
+  cl::init(""));
+
 cl::opt<bool> CFLVarargsStrict(
   "cfl-varargs-strict",
   cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "

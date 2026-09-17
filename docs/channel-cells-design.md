@@ -452,3 +452,56 @@ call-context question, settled 2026-09-14 as context-free call/return
 wiring), and which of them the type filter keeps. Field residues, cells,
 X bridges, allocator and libc summaries are all answer-neutral here and
 were confirmed so per site, not by census.
+
+### Why the wrong target arrives at the pointer (2026-09-17, cluster mode)
+
+A type rule only says which arrivals were wrong. The user's question is
+how `binary_get_symbol_info` reaches the einfo pointer at all. Three
+instruments answer it, all P=29, cluster mode:
+
+- `--cfl-trace-func=<root>` arrivals now carry `key=(o,s) by-ptr=<class>`
+  on join-triggered merges: the pointer class whose cell sweep issued the
+  join. `scratchpad/chainid.py` walks a class id back to the seed within
+  one solve iteration.
+- `--cfl-dump-merges=<tsv>` writes every union of the final solve with its
+  cause (join key and issuing pointer, or SCC collapse) and a node-name
+  table with presolve-class aliases. `tools/merges.py LOG X Y` replays it
+  and names the first union that put two nodes in one class.
+- `--cfl-dump-scc` and `--cfl-dump-class` now match member names, so a
+  node folded into a presolve class or an earlier merge is addressable;
+  the cycle search skips a merged class's own self-loop.
+
+The chain, oldest hop first:
+
+1. The function root is seeded into the initializer cell of
+   `binary_vec+528` (`_bfd_get_symbol_info`). Correct.
+2. Union 11,639 of 22,601 joins that cell's cluster, key
+   (`binary_vec`, 528 mod 29), into the universal cell cluster U. It is a
+   cell-sweep join issued by the class holding `section`, the `asection *`
+   formal of `_bfd_generic_link_add_one_symbol` (reload at linker.c:1394):
+   that class held the fact (`binary_vec`, 6) and its dereference cell was
+   already in U (it had joined U at union 6,158 under a string-literal
+   key, issued by the same pointer).
+3. The einfo load's cell is in U, so the load's class gets the root by
+   one a-edge.
+
+Why `section` holds a `bfd_target` fact: `section` is in U itself,
+absorbed by the a-SCC collapse. The shortest a-cycle through it at the
+first collapse has four hops: the formal → its reload → a cell cluster
+(rep: the buffer allocated at cofflink.c:721, holding the hash entry's
+`u.def.section` and the symbol's `section` slots) → the load `p->section`
+at linker.c:1167 in `generic_link_add_symbol_list` → the actual of the
+next `_bfd_generic_link_add_one_symbol` call → the formal. A value that
+is stored into a cell and loaded back from it has exactly the cell's
+facts, so collapsing the cycle is exact; the damage is that the cell
+cluster is coalesced: cluster mode joins cells of different keys whenever
+one pointer holds both keys, and U holds `binary_vec` legitimately
+through the `xvec` cells of bfd objects (`abfd->xvec = *target`,
+format.c:289). The section-flow recursion (hash entry slot ↔ symbol slot)
+then carries all of U's content into every `asection *` value, whose cells
+join every cluster keyed by those facts, which is step 2.
+
+So, for this site: the mechanism is key-cluster coalescence through
+multi-key pointers plus context-free formals, entered through the
+section-flow recursion of the generic linker. The pairwise-cell mode
+reached the same 51 targets by a route not yet traced with these tools.

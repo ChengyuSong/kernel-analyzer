@@ -4602,6 +4602,22 @@ bool CallGraphPass::runFlowsToResolution() {
                                                 ? "ptr" : "data");
       return pre + "<valnode#" + std::to_string(m3) + ">";
   };
+  // Name match for instruments that address a node by name: a dense id
+  // names its presolve-canonical node, so a node folded into a presolve
+  // class is only reachable through that class's member list.
+  auto denseNameMatches = [&](uint32_t d, StringRef sub) -> bool {
+    if (d >= toOrig.size()) {
+      auto cn = chanNodeName.find(d);
+      return cn != chanNodeName.end() && StringRef(cn->second).contains(sub);
+    }
+    const NodeIndex canon = toOrig[d];
+    if (StringRef(nodeNameOf(canon)).contains(sub)) return true;
+    auto mit = canonicalClassMembers.find(canon);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m2 : mit->second)
+        if (StringRef(nodeNameOf(m2)).contains(sub)) return true;
+    return false;
+  };
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size()) {
       auto cn = chanNodeName.find(cls);
@@ -4755,6 +4771,7 @@ bool CallGraphPass::runFlowsToResolution() {
   uint32_t tFrom = UINT32_MAX;
   uint32_t tKeyO = UINT32_MAX, tKeyS = 0; // join/bridge key behind a merge-or-bridge arrival
   uint32_t tCell = UINT32_MAX;            // the dereference cell whose join caused it
+  uint32_t tPtr = UINT32_MAX;             // the pointer class whose sweep issued the join
   auto traceHit = [&](uint32_t n, uint32_t s, bool bridged) {
     if (traceEvents++ > 200000) return;
     errs() << "TRACE + c" << n << " s" << s << (bridged ? " [br]" : "")
@@ -4762,7 +4779,20 @@ bool CallGraphPass::runFlowsToResolution() {
     if (tFrom == UINT32_MAX) errs() << "?"; else errs() << tFrom;
     // Name at arrival time: later merges retire these ids, so the
     // fixpoint census cannot name a chain read off this log.
-    errs() << "  " << protBlameName(n).substr(0, 70) << "\n";
+    errs() << "  " << protBlameName(n).substr(0, 70);
+    // A join-triggered merge is explained by its key and by the pointer
+    // whose facts carried that key into the sweep: "why did these two
+    // cells become one" is answered by naming that pointer, then asking
+    // why IT holds both keys.
+    if (StringRef(tHow).starts_with("merge") && tKeyO != UINT32_MAX &&
+        tKeyO < rootClassOf.size()) {
+      errs() << "  key=(r" << tKeyO << " "
+             << protBlameName(rootClassOf[tKeyO]).substr(0, 40) << ",s"
+             << tKeyS << ")";
+      if (tPtr != UINT32_MAX)
+        errs() << " by-ptr=c" << tPtr << ":" << protBlameName(tPtr).substr(0, 60);
+    }
+    errs() << "\n";
   };
   // --cfl-trace-meet=A,B: two origins that must never alias. Record how
   // each arrives at every class (propagation kind, source class,
@@ -5412,9 +5442,16 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<uint32_t> popCount(N, 0);
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   uint64_t cyMerge = 0;
+  // --cfl-dump-merges: every union with its cause, replayed offline to
+  // answer "which union first put X and Y in one class, and why".
+  struct MergeEv { uint32_t a, b, keyO, keyS, ptr; const char *why; };
+  std::vector<MergeEv> mergeLog;
+  const char *mergeWhy = "other";
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
     if (a == b) return a;
+    if (!CFLDumpMerges.empty())
+      mergeLog.push_back({a, b, tKeyO, tKeyS, tPtr, mergeWhy});
     struct MergeTimer {
       uint64_t &acc, t0;
       MergeTimer(uint64_t &a_) : acc(a_), t0(__builtin_ia32_rdtsc()) {}
@@ -6457,13 +6494,20 @@ bool CallGraphPass::runFlowsToResolution() {
       // the very edges the collapse followed (a, residue-0 f; channel
       // wiring edges are a-edges), before the SCC is merged away.
       static size_t sccDumps = 0;
+      // Resolve the named node by MEMBER name once per collapse: a node
+      // merged earlier sits in a class named after its rep, so matching
+      // SCC members (class reps) by name misses it.
+      uint32_t target = UINT32_MAX;
+      for (uint32_t n2 = 0; n2 < (uint32_t)toOrig.size() && target == UINT32_MAX;
+           n2++)
+        if (denseNameMatches(n2, CFLDumpSCC)) target = n2;
+      if (target == UINT32_MAX)
+        errs() << "DumpSCC: no node named like '" << CFLDumpSCC << "'\n";
       for (auto &scc : sccs) {
-        if (sccDumps >= 4) break;
+        if (sccDumps >= 4 || target == UINT32_MAX) break;
         boost::unordered_flat_set<uint32_t> in(scc.begin(), scc.end());
-        uint32_t hit = UINT32_MAX;
-        for (uint32_t m : scc)
-          if (StringRef(protBlameName(m)).contains(CFLDumpSCC)) { hit = m; break; }
-        if (hit == UINT32_MAX) continue;
+        const uint32_t hit = find(target);
+        if (!in.count(hit)) continue;
         sccDumps++;
         size_t syn = 0;
         for (uint32_t m : scc) if (m >= N) syn++;
@@ -6483,6 +6527,7 @@ bool CallGraphPass::runFlowsToResolution() {
             const uint32_t v = edgeAt(u, i);
             if (v == UINT32_MAX || !in.count(v)) continue;
             const char *kind = i < na ? "a" : "f0";
+            if (v == u) continue; // a merged class's internal edge is not a cycle
             if (v == hit) { back = u; backKind = kind; break; }
             if (pred.emplace(v, std::make_pair(u, kind)).second) q.push_back(v);
           }
@@ -6499,6 +6544,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
     size_t collapsed = 0;
+    mergeWhy = "scc";
     for (auto &scc : sccs) {
       uint32_t rep = find(scc[0]);
       blobCtx = "a-scc"; blobCtxOrigin = UINT32_MAX; tKeyO = UINT32_MAX;
@@ -6508,6 +6554,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       compactLists(rep);
     }
+    mergeWhy = "other";
     return collapsed;
   };
   tHow = "seed"; tFrom = UINT32_MAX;
@@ -6783,7 +6830,10 @@ bool CallGraphPass::runFlowsToResolution() {
               continue;
             }
             ctx.nJoinLk++;
+            tPtr = n; mergeWhy = "join";
             joinCluster(cell, grid, s);
+            tPtr = UINT32_MAX; tKeyO = UINT32_MAX; // stale keys must not label later merges
+            mergeWhy = "other";
             cellJoined[find(cell)][s].set(grid);
             if (find(n) != n) { aborted = true; break; }
           }
@@ -6812,7 +6862,9 @@ bool CallGraphPass::runFlowsToResolution() {
           // very list — never index cellsOf[n] after the call.
           const uint32_t cell = cellsOf[n][ci];
           ctx.nJoinLk++;
+          tPtr = n; mergeWhy = "join";
           joinCluster(cell, grid, s);
+          tPtr = UINT32_MAX; tKeyO = UINT32_MAX; mergeWhy = "other";
           if (find(n) != n) { aborted = true; break; }
         }
         if (aborted) break;
@@ -9343,6 +9395,40 @@ bool CallGraphPass::runFlowsToResolution() {
     // "what remains" inventory for the cell-model change: every such
     // class is a value where the analysis believes one pointer may be
     // a function or a byte buffer.
+    if (!CFLDumpMerges.empty()) {
+      // Node-name table (canonical name + presolve-class member aliases)
+      // then every union of this solve in order, with its cause.
+      std::error_code EC;
+      raw_fd_ostream OS(CFLDumpMerges, EC, sys::fs::OF_Text);
+      if (EC) {
+        errs() << "FATAL: cannot write " << CFLDumpMerges << ": "
+               << EC.message() << "\n";
+        exit(1);
+      }
+      for (uint32_t d = 0; d < (uint32_t)toOrig.size(); d++) {
+        const std::string n = protBlameName(d);
+        if (!n.empty()) OS << "N\t" << d << "\t" << n << "\n";
+        auto mit = canonicalClassMembers.find(toOrig[d]);
+        if (mit != canonicalClassMembers.end())
+          for (NodeIndex m2 : mit->second) {
+            const std::string an = nodeNameOf(m2);
+            if (!an.empty() && an != n) OS << "A\t" << d << "\t" << an << "\n";
+          }
+      }
+      for (auto &[cn, cname] : chanNodeName) OS << "N\t" << cn << "\t" << cname << "\n";
+      for (const MergeEv &e : mergeLog) {
+        OS << "M\t" << e.a << "\t" << e.b << "\t" << e.why << "\t";
+        if (e.why == StringRef("join") && e.keyO != UINT32_MAX &&
+            e.keyO < rootClassOf.size())
+          OS << e.keyO << "\t" << protBlameName(rootClassOf[e.keyO]).substr(0, 50)
+             << "\t" << e.keyS << "\t" << e.ptr;
+        else
+          OS << "-\t-\t-\t-";
+        OS << "\n";
+      }
+      CG_LOG("DumpMerges: " << mergeLog.size() << " unions -> " << CFLDumpMerges
+             << "\n");
+    }
     if (VerboseLevel >= 2) {
       FactSet mFn, mLit, mHeap, mAlloca, mGlob, mId;
       for (uint32_t rid = 0; rid < nextRoot; rid++) {
@@ -9409,10 +9495,15 @@ bool CallGraphPass::runFlowsToResolution() {
         std::unordered_map<uint32_t, std::vector<uint32_t>> members;
         for (uint32_t n2 = 0; n2 < (uint32_t)ufp.size(); n2++)
           members[find(n2)].push_back(n2);
+        // Match on MEMBER names: a node merged early lives in a class
+        // named after its rep, so matching reps alone misses it.
+        boost::unordered_flat_set<uint32_t> wanted;
+        for (uint32_t n2 = 0; n2 < (uint32_t)toOrig.size(); n2++)
+          if (denseNameMatches(n2, CFLDumpClass))
+            wanted.insert(find(n2));
         for (auto &[rep, mem] : members) {
-          if (mem.size() < 2) continue;
+          if (mem.size() < 2 || !wanted.count(rep)) continue;
           const std::string rn = protBlameName(rep);
-          if (!StringRef(rn).contains(CFLDumpClass)) continue;
           std::map<std::string, std::pair<size_t, std::string>> byFn;
           size_t synthetic = 0;
           for (uint32_t m2 : mem) {

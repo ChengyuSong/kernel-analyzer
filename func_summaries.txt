@@ -1409,3 +1409,12 @@ pci_device_add CHAINCALL(@pci_bus_type:f0<-arg0)
 # platform_driver: probe@0 remove@8
 __platform_driver_register CHAINREG(@platform_bus_type,*arg0+0,f9) CHAINREG(@platform_bus_type,*arg0+8,f9)
 platform_device_add CHAINCALL(@platform_bus_type:f0<-arg0)
+
+# ---- bfd / libiberty callback dispatchers: per-site pairing (2026-09-17) ----
+# bfd_hash_table.table @0 = bucket array of entry pointers (every entry is stored into it);
+# htab.entries @24 = slot array (the callback receives a slot address). bfd_map_over_sections
+# walks a `next`-linked list, which one reference cannot express soundly: clone it per caller.
+bfd_hash_traverse DISPATCH(arg1:f0<-**arg0@0) DISPATCH(arg1:f1<-arg2)
+bfd_link_hash_traverse DISPATCH(arg1:f0<-**arg0@0) DISPATCH(arg1:f1<-arg2)
+htab_traverse_noresize DISPATCH(arg1:f0<-*arg0@24) DISPATCH(arg1:f1<-arg2)
+htab_traverse DISPATCH(arg1:f0<-*arg0@24@htab_traverse_noresize) DISPATCH(arg1:f1<-arg2@htab_traverse_noresize)

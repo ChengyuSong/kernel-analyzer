@@ -1281,6 +1281,28 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       return false;
   }
 
+  // --cfl-probe-block-hub-formals: KallGraph's static hub block, after
+  // the summary branch so allocators keep their identity (KallGraph
+  // skips the kmalloc family by name). Direct call sites counted once.
+  if (CFLProbeBlockHubFormals) {
+    static std::unordered_map<const Function *, unsigned> directSites;
+    auto it = directSites.find(CF);
+    if (it == directSites.end()) {
+      unsigned n = 0;
+      for (const User *U : CF->users())
+        if (const auto *CB = dyn_cast<CallBase>(U))
+          if (CB->getCalledFunction() == CF) n++;
+      it = directSites.emplace(CF, n).first;
+    }
+    if (it->second > CFLProbeBlockHubFormals) {
+      static size_t blocked = 0;
+      if (blocked++ == 0)
+        WARNING("[MEASUREMENT-ONLY UNSOUND] hub-formal block active (> "
+                << CFLProbeBlockHubFormals << " direct sites)\n");
+      return false;
+    }
+  }
+
   wireCallArgs(CS, CF, opsSkipArg);
 
   // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
@@ -5966,16 +5988,21 @@ bool CallGraphPass::runFlowsToResolution() {
       g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
       return;
     }
+    // A constant data-only global (string literal, lookup table) never
+    // holds a pointer and cannot be stored into, so it witnesses no
+    // pointer-carrying alias: a cluster keyed by it would only fuse the
+    // cells of every char pointer that may point at it (nm-new: 1,236
+    // joins under "\n" glued the literal soup to struct cells). Both
+    // modes; channel mode adopted this rule first (2026-09-15).
+    if (o < rootConstData.size() && rootConstData[o]) {
+      chanConstSkipped++;
+      return;
+    }
     if (CFLChannelCells) {
       // Pairwise mode: record; the barrier flush wires the channel.
       // Cells outside the wiring cone cannot influence any answer.
       if (!wireCone.empty() && !wireCone[find(cell)]) {
         chanConeSkipped++;
-        return;
-      }
-      // A constant data-only global's cells never hold a pointer.
-      if (o < rootConstData.size() && rootConstData[o]) {
-        chanConstSkipped++;
         return;
       }
       if (chanPendSeen.emplace((uint64_t)o * NSHIFT + s, cell).second)

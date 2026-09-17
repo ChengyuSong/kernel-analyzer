@@ -39,6 +39,7 @@ extern cl::opt<std::string> CFLDumpClass;
 extern cl::opt<std::string> CFLDumpSCC;
 extern cl::opt<bool> CFLProbeNoXBridges;
 extern cl::opt<bool> CFLVarargsStrict;
+extern cl::opt<unsigned> CFLProbeBlockHubFormals;
 extern cl::opt<std::string> CFLDumpMerges;
 extern cl::opt<bool> CFLCoTravelStats;
 extern cl::opt<bool> CFLSolverProfile;

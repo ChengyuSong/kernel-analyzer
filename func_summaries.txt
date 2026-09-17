@@ -74,7 +74,9 @@ xmemdup FRESH CPY(ret<-arg0)
 #   struct linked_list: free_data@0 head@8 tail@16; entries are modelled
 #   AS the list object, payload slot synthetic @24; an entry pointer is
 #   the list pointer (append returns it, unlink takes it).
-hash_initialize FRESH ST(*ret@48<-arg2) ST(*ret@56<-arg3) ST(*ret@64<-arg4)
+# hash_initialize is NOT summarized: its body substitutes raw_hasher /
+# raw_comparator when the caller passes NULL, and a FRESH entry would
+# drop that path (sound only for callers that pass real functions).
 hash_insert ST(*arg0@80<-arg1) ALIAS(ret=arg1) DISPATCH(*arg0@48:f0<-arg1@safe_hasher) DISPATCH(*arg0@56:f0<-arg1@hash_find_entry) DISPATCH(*arg0@56:f1<-*arg0@80@hash_find_entry)
 hash_lookup LD(ret<-*arg0@80) DISPATCH(*arg0@48:f0<-arg1@safe_hasher) DISPATCH(*arg0@56:f0<-arg1@hash_lookup) DISPATCH(*arg0@56:f1<-*arg0@80@hash_lookup)
 hash_do_for_each DISPATCH(arg1:f0<-*arg0@80) DISPATCH(arg1:f1<-arg2)

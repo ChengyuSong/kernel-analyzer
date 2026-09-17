@@ -260,6 +260,15 @@ cl::opt<std::string> CFLDumpClass(
            "tracers do not record"),
   cl::init(""));
 
+cl::opt<std::string> CFLDumpSCC(
+  "cfl-dump-scc",
+  cl::desc("At each a-SCC collapse, for the first SCCs (up to 4) that "
+           "contain a node whose name contains this substring: size, "
+           "channel share, and the SHORTEST CYCLE through that node over "
+           "the a / residue-0 f edges the collapse followed, node by node. "
+           "Shows how an unexplained merge was built"),
+  cl::init(""));
+
 cl::opt<bool> CFLHolderIdentity(
   "cfl-holder-identity",
   cl::desc("With --cfl-channel-cells: a fresh allocation stored through a "

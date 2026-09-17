@@ -37,8 +37,12 @@ _ZnajRKSt9nothrow_t FRESH
 _Znam FRESH
 _ZnamRKSt9nothrow_t FRESH
 realloc FRESH CPY(ret<-arg0)
-strdup FRESH CPY(ret<-arg0)
-strndup FRESH CPY(ret<-arg0)
+# strdup/strndup copy CHARACTERS: a C string holds no pointer, so the
+# residue-complete CPY only relays content that reached the source
+# string through an unknown-offset fold (cflow: a wordsplit field store
+# copied by strdup into a string, then into the scanner buffer). FRESH only.
+strdup FRESH
+strndup FRESH
 
 # ---- gnulib / libiberty xalloc family (2026-09-16) ----
 # Same semantics as the libc functions they wrap, plus abort on
@@ -55,8 +59,8 @@ xreallocarray FRESH CPY(ret<-arg0)
 xnrealloc FRESH CPY(ret<-arg0)
 x2realloc FRESH CPY(ret<-arg0)
 x2nrealloc FRESH CPY(ret<-arg0)
-xstrdup FRESH CPY(ret<-arg0)
-xstrndup FRESH CPY(ret<-arg0)
+xstrdup FRESH
+xstrndup FRESH
 xmemdup FRESH CPY(ret<-arg0)
 
 # ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----

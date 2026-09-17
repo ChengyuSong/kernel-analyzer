@@ -6381,14 +6381,29 @@ bool CallGraphPass::runFlowsToResolution() {
     std::vector<bool> onStk(NL, false);
     std::vector<std::vector<uint32_t>> sccs;
     uint32_t timer = 1;
+    // Pairwise cells: memory nodes (cells, channels, read halves) are
+    // never merged — an a-cycle through memory (a read-modify-write
+    // through a wide pointer) is left to propagation, which reaches the
+    // same fixpoint; merging it unified the slot cells of every object
+    // the pointer may reach (cflow: yyin's FILE* cell with a list head's
+    // free_data). Only value-to-value cycles collapse.
+    auto isMemoryNode = [&](uint32_t v) -> bool {
+      if (!CFLChannelCells) return false;
+      if (v >= N) return true; // channel / read half
+      return NF.isDereferenceNode(toOrig[v]);
+    };
     auto edgeAt = [&](uint32_t u, size_t i) -> uint32_t {
       // Unified edge index: outA first, then residue-0 outF entries.
-      if (i < outA[u].size()) return find(outA[u][i]);
-      auto &[t, r] = outF[u][i - outA[u].size()];
-      return r == 0 ? find(t) : UINT32_MAX;
+      uint32_t v;
+      if (i < outA[u].size()) v = find(outA[u][i]);
+      else {
+        auto &[t, r] = outF[u][i - outA[u].size()];
+        v = r == 0 ? find(t) : UINT32_MAX;
+      }
+      return (v != UINT32_MAX && isMemoryNode(v)) ? UINT32_MAX : v;
     };
     for (uint32_t start = 0; start < NL; start++) {
-      if (find(start) != start || dfn[start]) continue;
+      if (find(start) != start || dfn[start] || isMemoryNode(start)) continue;
       callStack.emplace_back(start, 0);
       dfn[start] = low[start] = timer++;
       tarjanStack.push_back(start);
@@ -6424,6 +6439,52 @@ bool CallGraphPass::runFlowsToResolution() {
             low[callStack.back().first] =
                 std::min(low[callStack.back().first], low[uu]);
         }
+      }
+    }
+    if (!CFLDumpSCC.empty()) {
+      // --cfl-dump-scc: the shortest cycle through the named node, over
+      // the very edges the collapse followed (a, residue-0 f; channel
+      // wiring edges are a-edges), before the SCC is merged away.
+      static size_t sccDumps = 0;
+      for (auto &scc : sccs) {
+        if (sccDumps >= 4) break;
+        boost::unordered_flat_set<uint32_t> in(scc.begin(), scc.end());
+        uint32_t hit = UINT32_MAX;
+        for (uint32_t m : scc)
+          if (StringRef(protBlameName(m)).contains(CFLDumpSCC)) { hit = m; break; }
+        if (hit == UINT32_MAX) continue;
+        sccDumps++;
+        size_t syn = 0;
+        for (uint32_t m : scc) if (m >= N) syn++;
+        errs() << "DumpSCC: size " << scc.size() << " (" << syn
+               << " channel/read-half) contains "
+               << protBlameName(hit).substr(0, 60) << "\n";
+        std::unordered_map<uint32_t, std::pair<uint32_t, const char *>> pred;
+        std::deque<uint32_t> q{hit};
+        pred[hit] = {UINT32_MAX, ""};
+        uint32_t back = UINT32_MAX;
+        const char *backKind = "";
+        while (!q.empty() && back == UINT32_MAX) {
+          const uint32_t u = q.front();
+          q.pop_front();
+          const size_t na = outA[u].size();
+          for (size_t i = 0; i < na + outF[u].size(); i++) {
+            const uint32_t v = edgeAt(u, i);
+            if (v == UINT32_MAX || !in.count(v)) continue;
+            const char *kind = i < na ? "a" : "f0";
+            if (v == hit) { back = u; backKind = kind; break; }
+            if (pred.emplace(v, std::make_pair(u, kind)).second) q.push_back(v);
+          }
+        }
+        if (back == UINT32_MAX) continue;
+        std::vector<std::pair<uint32_t, const char *>> path;
+        for (uint32_t x = back; x != hit; x = pred[x].first)
+          path.push_back({x, pred[x].second});
+        std::reverse(path.begin(), path.end());
+        errs() << "DumpSCC:   " << protBlameName(hit).substr(0, 70) << "\n";
+        for (auto &[x, k] : path)
+          errs() << "DumpSCC:   -" << k << "-> " << protBlameName(x).substr(0, 70) << "\n";
+        errs() << "DumpSCC:   -" << backKind << "-> (back to the start)\n";
       }
     }
     size_t collapsed = 0;

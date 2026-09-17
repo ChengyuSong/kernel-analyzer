@@ -425,12 +425,18 @@ callee cannot be rejected from the IR alone (about 2,300 pairs). Telling
 those apart needs the source prototype, which is in the debug type of the
 loaded pointer (`DISubroutineType` with a trailing null for variadic);
 not built. The one non-variadic site that changed is `coffgen.c:2154`
-(`bfd_coff_print_aux` through the COFF backend table), which drops from 2
-targets to 0. That is the same site that dropped to 0 under pairwise
-cells: its two targets arrive only through paths the lenient rule opens,
-so the legitimate path (nm's bfd object → `xvec` → `backend_data` →
-`_bfd_coff_print_aux`) is missing. This is a flow soundness gap, not a
-consequence of the rule; under investigation.
+(`bfd_coff_print_aux` through the COFF backend table in
+`coff_print_symbol`), which drops from 2 targets to 0, the same site that
+dropped to 0 under pairwise cells. Traced per value: in the baseline the
+`abfd` formal of `coff_print_symbol` has exactly one pointee, the format
+string of the einfo call at `reloc.c:8424`, because the lenient rule
+admits `coff_print_symbol` (four parameters) at that four-actual variadic
+call. `abfd->xvec->backend_data->_bfd_coff_print_aux` is then a read
+through a string literal's content, which sits in the universal soup, and
+`coff_print_aux` falls out. No instruction in nm-new reads the
+`_bfd_print_symbol` slot of `bfd_target`, so `coff_print_symbol` is never
+dispatched in this program: 0 is the correct answer, and the earlier
+"probable soundness hole" reading of this site is withdrawn.
 
 **Accounting of the 51.**
 

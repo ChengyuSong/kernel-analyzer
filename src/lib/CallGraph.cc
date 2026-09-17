@@ -13967,6 +13967,16 @@ void CallGraphPass::confirmFreshWrappers() {
                  << (initArgs.empty() ? "" : " [alloc-init]")
                  << (cpyArgs.empty() ? "" : " [copy]") << " (round "
                  << round << ")\n");
+        {
+          // The promotion as a summary-file line (harvestable: a library
+          // run's output becomes its interface summary).
+          std::string ln = F.getName().str() + " FRESH";
+          for (int an : initArgs) ln += " ST(*ret<-arg" + std::to_string(an) + ")";
+          for (int cj : cpyArgs) ln += " CPY(ret<-arg" + std::to_string(cj) + ")";
+          if (selfStore) ln += " # +self-store";
+          if (subAllocs) ln += " # +" + std::to_string(subAllocs) + " sub-alloc";
+          CG_LOG("ConfirmFresh: LINE " << ln << "\n");
+        }
       }
     }
   }
@@ -14179,7 +14189,10 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
           auto [fk, dp] = rest2.split("<-");
           if (dp.consume_back(":ret"))
             A.off = 1; // data binding + ret-transparency
-          bad = !parseRef(dp, A.src) || A.src < 0;
+          // argD, or argD@X: the callback receives an INTERIOR pointer
+          // into the data argument (qsort's comparator over the base
+          // array) — bound with the wildcard shift.
+          bad = !parseDerefRef(dp, A.src, A.srcByteOff) || A.src < 0;
           unsigned fkv = 0;
           if (!bad) {
             StringRef fks = fk;
@@ -14719,7 +14732,11 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         if (fn2 == AndersNodeFactory::InvalidIndex)
           fn2 = getCanonicalNode(NF.createValueNode(DF->getArg(A.aux)));
         if (dn != AndersNodeFactory::InvalidIndex) {
-          addAssignmentEdge(getCanonicalNode(dn), getCanonicalNode(fn2));
+          // argD@X / argD@K: the formal receives an interior pointer.
+          const NodeIndex src2 = A.srcByteOff != 0
+                                     ? summaryFieldPtr(dn, A.srcByteOff)
+                                     : getCanonicalNode(dn);
+          addAssignmentEdge(src2, getCanonicalNode(fn2));
           g_sumInvoke++;
         }
       }

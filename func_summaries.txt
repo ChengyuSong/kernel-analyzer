@@ -90,6 +90,738 @@ linked_list_iterate DISPATCH(arg1:f0<-**arg0@24) DISPATCH(arg1:f1<-arg2)
 linked_list_destroy DISPATCH(**arg0@0:f0<-**arg0@24)
 linked_list_unlink DISPATCH(*arg0@0:f0<-*arg1@24)
 
+# ---- libc callback interfaces (2026-09-16, from the man pages) ----
+# The registration pairs of userspace: the callback's data-carrying
+# formals are bound at the registration site (INVOKE), which also
+# re-attributes the call-graph edge there (the site inside libc is not
+# in the module). argD@X = the callback receives an INTERIOR pointer
+# into the data argument (an element of the array). Formals that
+# receive libc-internal objects (dirent, FTSENT, stat, tree nodes) are
+# left unbound; tsearch/twalk/hsearch/scandir/nftw/glob have no entry.
+qsort INVOKE(arg3:f0<-arg0@X) INVOKE(arg3:f1<-arg0@X)
+qsort_r INVOKE(arg3:f0<-arg0@X) INVOKE(arg3:f1<-arg0@X) INVOKE(arg3:f2<-arg4)
+bsearch INVOKE(arg4:f0<-arg0) INVOKE(arg4:f1<-arg1@X) ALIAS(ret<-arg1@X)
+lfind INVOKE(arg4:f0<-arg0) INVOKE(arg4:f1<-arg1@X) ALIAS(ret<-arg1@X)
+pthread_create INVOKE(arg2:f0<-arg3)
+pthread_atfork INVOKE(arg0:ret) INVOKE(arg1:ret) INVOKE(arg2:ret)
+
+# ---- libc interface, DERIVED from musl 1.2.6 (2026-09-16) ----
+# Harvested from one run of the wrapper confirmer and the NOOP/solved
+# proposers over musl built as bitcode (scratchpad/musl-run.sh):
+# NOOP = proven transfer-free body (no pointer effect at any callsite),
+# atom lines = the solved transfer summary (proposals that referenced
+# a musl-internal global are left out: a partial line would claim
+# completeness it does not have). Names already in this file above
+# keep their hand-written entry (first match wins). The transfer
+# semantics are those of the C standard, which glibc shares.
+getutxent FRESH
+getutxid FRESH
+getutxline FRESH
+pututxline FRESH
+getspent FRESH
+getservent FRESH
+getnetbyaddr FRESH
+getnetbyname FRESH
+gethostent FRESH
+getnetent FRESH
+wctrans FRESH
+rule_to_secs LD(ret<-*arg0@X)
+zi_dotprod LD(ret<-*arg1@X)
+getint MVX(*arg0<-*arg0)
+pthread_rwlock_init MV(*arg0@8<-*arg1)
+pthread_mutexattr_setrobust MV(*arg0<-*arg0)
+pthread_mutexattr_setprotocol MV(*arg0<-*arg0)
+pthread_mutex_init MV(*arg0<-*arg1)
+pthread_barrier_init MV(*arg0@X<-*arg1)
+pthread_attr_setstacksize ST(*arg0<-arg1)
+pthread_attr_setstack ST(*arg0<-arg2) ST(*arg0@16<-arg1@X) ST(*arg0@16<-arg2@X)
+pthread_attr_getguardsize MV(*arg1<-*arg0@8)
+pthread_attr_getstack MV(*arg1<-*arg0) MV(*arg1<-*arg0@16) MV(*arg1<-*arg2) MV(*arg2<-*arg0)
+pthread_attr_getstacksize MV(*arg1<-*arg0)
+pthread_attr_setguardsize ST(*arg0@8<-arg1)
+wmemset ALIAS(ret<-arg0@X)
+wmemmove ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wmemcpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wmemchr ALIAS(ret<-arg0@X)
+wcsnlen ALIAS(ret<-arg0@X) ALIAS(ret<-arg1)
+wcsncpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wcslen ALIAS(ret<-arg0@X)
+wcschr ALIAS(ret<-arg0@X)
+wcscpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wcscat ALIAS(ret<-arg0) MV(*arg0@X<-*arg1@X)
+wcpcpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+wcpncpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+twobyte_strstr ALIAS(ret<-arg0@X)
+threebyte_strstr ALIAS(ret<-arg0@X)
+fourbyte_strstr ALIAS(ret<-arg0@X)
+strspn ALIAS(ret<-arg0@X)
+strtok_r ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) LD(ret<-*arg2) LDX(ret<-*arg2) MVX(*arg2<-*arg2) ST(*arg2<-arg0@X)
+strsep LD(ret<-*arg0) LDX(ret<-*arg0) MVX(*arg0<-*arg0)
+strpbrk ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+strncat ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) MV(*arg0<-*arg1@X) MV(*arg0@X<-*arg1@X)
+strlcpy ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@1) MV(*arg0<-*arg1@X) MV(*arg0@1<-*arg1) MV(*arg0@1<-*arg1@1) MV(*arg0@1<-*arg1@X) MV(*arg0@X<-*arg1) MV(*arg0@X<-*arg1@1) MV(*arg0@X<-*arg1@X)
+strcasestr ALIAS(ret<-arg0@X)
+strchr ALIAS(ret<-arg0@X)
+strcat ALIAS(ret<-arg0)
+twobyte_memmem ALIAS(ret<-arg0@X)
+threebyte_memmem ALIAS(ret<-arg0@X)
+fourbyte_memmem ALIAS(ret<-arg0@X)
+twoway_memmem ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+memchr ALIAS(ret<-arg0) ALIAS(ret<-arg0@1) ALIAS(ret<-arg0@X)
+memccpy ALIAS(ret<-arg0@1) ALIAS(ret<-arg0@2) ALIAS(ret<-arg0@X) MV(*arg0<-*arg1) MV(*arg0<-*arg1@1) MV(*arg0<-*arg1@X) MV(*arg0@1<-*arg1) MV(*arg0@1<-*arg1@1) MV(*arg0@1<-*arg1@X) MV(*arg0@X<-*arg1) MV(*arg0@X<-*arg1@1) MV(*arg0@X<-*arg1@X)
+index ALIAS(ret<-arg0@X)
+shr MV(*arg0<-*arg0) MV(*arg0<-*arg0@8) MV(*arg0@8<-*arg0@8)
+shl MV(*arg0<-*arg0) MV(*arg0@8<-*arg0) MV(*arg0@8<-*arg0@8)
+llabs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+labs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+gcvt ALIAS(ret<-arg2)
+imaxabs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+atoll LD(ret<-*arg0@X)
+atol LD(ret<-*arg0@X)
+fmt_o ALIAS(ret<-arg1) ALIAS(ret<-arg1@X) ST(*arg1@X<-arg0@X)
+fmt_u ALIAS(ret<-arg1) ALIAS(ret<-arg1@X) ST(*arg1@X<-arg0@X)
+store_int ST(*arg0<-arg2)
+setvbuf MV(*arg0<-*arg0) ST(*arg0@88<-arg1@8) ST(*arg0@96<-arg3@X)
+setlinebuf MV(*arg0<-*arg0)
+setbuffer MV(*arg0<-*arg0) ST(*arg0@88<-arg1@8) ST(*arg0@96<-arg2@X)
+setbuf MV(*arg0<-*arg0) ST(*arg0@88<-arg1@8)
+combine_to_from ALIAS(ret<-arg0@X) ALIAS(ret<-arg1@X)
+extract_to ALIAS(ret<-arg0@X)
+extract_from ALIAS(ret<-arg0@X)
+wcsxfrm MV(*arg0<-*arg1) MV(*arg0<-*arg1@4) MV(*arg0<-*arg1@8) MV(*arg0@4<-*arg1) MV(*arg0@4<-*arg1@4) MV(*arg0@4<-*arg1@8) MV(*arg0@8<-*arg1) MV(*arg0@8<-*arg1@4) MV(*arg0@8<-*arg1@8) MV(*arg0@X<-*arg1@X)
+vstrfmon_l ALIAS(ret<-arg0@X) MV(*arg0<-*arg3) MV(*arg0<-*arg3@X) MV(*arg0@1<-*arg3) MV(*arg0@1<-*arg3@X) MV(*arg0@X<-*arg3) MV(*arg0@X<-*arg3@X) MV(*arg4@4<-*arg4@4) MVX(*arg4@8<-*arg4@8)
+parseop ALIAS(ret<-arg1) ALIAS(ret<-arg1@1) ALIAS(ret<-arg1@2)
+binop MV(*arg0<-*arg0) ST(*arg0<-arg2@X)
+skipspace ALIAS(ret<-arg0@X)
+dummy ALIAS(ret<-arg0)
+count_syms_gnu LD(ret<-*arg0@X)
+aio_return LD(ret<-*arg0@120)
+fixup MV(*arg0<-*arg1@8) MV(*arg0@16<-*arg1@16) MV(*arg0@24<-*arg1@24) MV(*arg0@32<-*arg1@32) MV(*arg0@40<-*arg1@40) MV(*arg0@48<-*arg1@48) MV(*arg0@56<-*arg1@48) MV(*arg0@64<-*arg1@56) MV(*arg0@72<-*arg1@80) MV(*arg0@80<-*arg1@64) MV(*arg0@88<-*arg1) MV(*arg0@8<-*arg1@72) MV(*arg0@8<-*arg1@8)
+sigorset MV(*arg0@X<-*arg1@X) MV(*arg0@X<-*arg2@X)
+sigdelset MV(*arg0@X<-*arg0@X)
+sigandset MV(*arg0@X<-*arg1@X) MV(*arg0@X<-*arg2@X)
+sigaddset MV(*arg0@X<-*arg0@X)
+keyhash LD(ret<-*arg0@X)
+parse_dup_count ALIAS(ret<-arg0@X) MV(*arg1<-*arg0@X) MV(*arg1<-*arg1)
+tre_fill_pmatch MV(*arg1@X<-*arg4@X) ST(*arg1@X<-arg5)
+posix_spawnattr_setsigmask MV(*arg0@X<-*arg1@X)
+posix_spawnattr_setsigdefault MV(*arg0@X<-*arg1@X)
+posix_spawnattr_getsigdefault MV(*arg1@X<-*arg0@X)
+posix_spawnattr_getsigmask MV(*arg1@X<-*arg0@X)
+lcg64 ALIAS(ret<-arg0@X)
+itoa ALIAS(ret<-arg0) ALIAS(ret<-arg0@11) ALIAS(ret<-arg0@X)
+atou MVX(*arg0<-*arg0)
+ns_get32 LD(ret<-*arg0@X)
+ns_initparse ST(*arg2<-arg0) ST(*arg2<-arg0@X) ST(*arg2@8<-arg0@X) ST(*arg2@X<-arg0@X)
+ns_parserr MV(*arg0@68<-*arg0@68) MV(*arg0@72<-*arg0@X) MV(*arg3@1040<-*arg0@72) MV(*arg3@1040<-*arg0@X) MVX(*arg0@72<-*arg0@72) MVX(*arg0@72<-*arg0@X) MVX(*arg3@1040<-*arg0@72) MVX(*arg3@1040<-*arg0@X)
+inet_ntop ALIAS(ret<-arg2)
+ether_ntoa_r ALIAS(ret<-arg1) ALIAS(ret<-arg1@X)
+slash_len ALIAS(ret<-arg0@X)
+unescape_ent ALIAS(ret<-arg0) MV(*arg0<-*arg0@X) MV(*arg0@1<-*arg0@X) MV(*arg0@2<-*arg0@X) MV(*arg0@X<-*arg0@X)
+hasmntopt LD(ret<-*arg0@24) LDX(ret<-*arg0@24)
+permute MV(*arg0@X<-*arg0@X)
+getsubopt MV(*arg0<-*arg0) MVX(*arg0<-*arg0) MVX(*arg2<-*arg0)
+telldir LD(ret<-*arg0)
+ror ALIAS(ret<-arg0@X)
+get_meta LD(ret<-*arg0@X)
+get_nominal_size ALIAS(ret<-arg0@X) ALIAS(ret<-arg1@X)
+mul ST(*arg0<-arg2@X) ST(*arg0<-arg3@X) ST(*arg1<-arg2@X) ST(*arg1<-arg3@X)
+getoff MVX(*arg0<-*arg0)
+twoway_wcsstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+wcsspn ALIAS(ret<-arg0@X)
+wcsrchr ALIAS(ret<-arg0@X)
+wcsncat ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) MV(*arg0<-*arg1@X) MV(*arg0@X<-*arg1@X)
+wcscspn ALIAS(ret<-arg0@X)
+twoway_strstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+strnlen ALIAS(ret<-arg0@X) ALIAS(ret<-arg1)
+strrchr ALIAS(ret<-arg0@X)
+strlcat MV(*arg0@X<-*arg1) MV(*arg0@X<-*arg1@1) MV(*arg0@X<-*arg1@X)
+rindex ALIAS(ret<-arg0@X)
+memmem ALIAS(ret<-arg0) ALIAS(ret<-arg0@1) ALIAS(ret<-arg0@X)
+parse_dup ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) MV(*arg2<-*arg0@X) MV(*arg3<-*arg0@X)
+wcsstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+wcstok ALIAS(ret<-arg0) ALIAS(ret<-arg0@X) LD(ret<-*arg2) LDX(ret<-*arg2) MVX(*arg2<-*arg2) ST(*arg2<-arg0@X)
+wcswcs ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+wcspbrk ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+strstr ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
+a_crash NOOP
+put_16 NOOP
+ccos NOOP
+killpg NOOP
+fp_barrier NOOP
+fp_force_eval NOOP
+nexttowardf NOOP
+y0 NOOP
+fmaxl NOOP
+llrintl NOOP
+pthread_mutexattr_getrobust NOOP
+wms_close NOOP
+posix_spawnattr_getschedparam NOOP
+ponef NOOP
+top12 NOOP
+malloc_atfork NOOP
+a_or NOOP
+setresgid NOOP
+a_store NOOP
+abs NOOP
+fp_force_evalf NOOP
+eval_as_double NOOP
+daemon NOOP
+endhostent NOOP
+zeroinfnan NOOP
+erfc1 NOOP
+nexttoward NOOP
+nexttowardl NOOP
+common NOOP
+rol NOOP
+a_cas NOOP
+pthread_condattr_destroy NOOP
+cacosh NOOP
+posix_spawnattr_getpgroup NOOP
+pthread_setcanceltype NOOP
+a_dec NOOP
+cfgetospeed NOOP
+cargl NOOP
+tanhl NOOP
+rint NOOP
+jnf NOOP
+set_size NOOP
+a_inc NOOP
+a_spin NOOP
+islower NOOP
+activate_group NOOP
+a_fetch_add NOOP
+lckpwdf NOOP
+dd_mul NOOP
+ns_name_uncompress NOOP
+seteuid NOOP
+atoi NOOP
+getoffs NOOP
+posix_openpt NOOP
+fp_force_evall NOOP
+ynf NOOP
+fminl NOOP
+quick_exit NOOP
+ispunct NOOP
+processblock NOOP
+record_seq NOOP
+cleanup NOOP
+pthread_getconcurrency NOOP
+creall NOOP
+catanhl NOOP
+casin NOOP
+catanhf NOOP
+pone NOOP
+ceil NOOP
+sha512_init NOOP
+sq NOOP
+addrcmp NOOP
+remainderf NOOP
+nearbyintl NOOP
+pzero NOOP
+fminf NOOP
+pthread_spin_unlock NOOP
+setregid NOOP
+clogf NOOP
+ether_line NOOP
+remainder NOOP
+fdiml NOOP
+sqrtf NOOP
+sigemptyset NOOP
+eval_as_float NOOP
+iswdigit NOOP
+upgradelock NOOP
+fabsl NOOP
+a_swap NOOP
+pthread_condattr_getclock NOOP
+atanhl NOOP
+is_leap NOOP
+brk NOOP
+ccoshl NOOP
+cacos NOOP
+tre_tag_order NOOP
+tgamma NOOP
+setgid NOOP
+endutxent NOOP
+j0 NOOP
+a_barrier NOOP
+conj NOOP
+log_inline NOOP
+qzero NOOP
+iswalnum NOOP
+remquol NOOP
+gettid NOOP
+isspace NOOP
+des_cipher NOOP
+match NOOP
+pthread_barrierattr_setpshared NOOP
+wmemcmp NOOP
+asinh NOOP
+iswpunct NOOP
+confstr NOOP
+getlogin_r NOOP
+swab NOOP
+setspent NOOP
+endspent NOOP
+inet_netof NOOP
+checkint NOOP
+copysignf NOOP
+init_file_lock NOOP
+csqrt NOOP
+csin NOOP
+posix_spawnattr_setschedparam NOOP
+mblen NOOP
+powf NOOP
+fmaf NOOP
+pthread_mutex_setprioceiling NOOP
+pthread_mutex_getprioceiling NOOP
+cprojl NOOP
+casinhf NOOP
+asin NOOP
+get_slot_index NOOP
+fabs NOOP
+tanf NOOP
+wcscoll NOOP
+tanhf NOOP
+specialcase NOOP
+BF_swap NOOP
+csqrtl NOOP
+csinhl NOOP
+tre_compare_lit NOOP
+temper NOOP
+getpid NOOP
+dummy_0 NOOP
+isupper NOOP
+allzerop NOOP
+if_freenameindex NOOP
+finitef NOOP
+account_bounce NOOP
+pthread_condattr_getpshared NOOP
+pthread_mutexattr_gettype NOOP
+ctanf NOOP
+S NOOP
+scalblnf NOOP
+dd_add NOOP
+asinf NOOP
+sinf NOOP
+legacy_map NOOP
+swapc NOOP
+qone NOOP
+coshf NOOP
+pthread_spin_destroy NOOP
+pthread_rwlockattr_setpshared NOOP
+pthread_barrierattr_destroy NOOP
+pzerof NOOP
+resetlock NOOP
+difftime NOOP
+nice NOOP
+csinf NOOP
+iswxdigit NOOP
+isalpha NOOP
+exp2 NOOP
+updwtmpx NOOP
+casefold NOOP
+nodtor NOOP
+cabs NOOP
+mkptr4 NOOP
+wcrtomb NOOP
+ilogb NOOP
+sinl NOOP
+pthread_attr_getschedpolicy NOOP
+aio_error NOOP
+exp2_inline NOOP
+acoshl NOOP
+fp_barrierf NOOP
+step_seq NOOP
+acoshf NOOP
+tan NOOP
+erfl NOOP
+towlower NOOP
+exp_inline NOOP
+cosl NOOP
+ctanhf NOOP
+getppid NOOP
+cpow NOOP
+sort NOOP
+lgammaf NOOP
+wcswidth NOOP
+BF_encrypt NOOP
+casinl NOOP
+sigisemptyset NOOP
+tre_stack_num_objects NOOP
+ulckpwdf NOOP
+dn_skipname NOOP
+nearbyintf NOOP
+logb NOOP
+floor NOOP
+isgraph NOOP
+is_bouncing NOOP
+sin NOOP
+exit NOOP
+posix_close NOOP
+jn NOOP
+size_to_class NOOP
+dummy1 NOOP
+ctan NOOP
+ctanl NOOP
+pthread_condattr_setpshared NOOP
+csqrtf NOOP
+lcg31 NOOP
+yn NOOP
+isdigit NOOP
+size_overflows NOOP
+pthread_attr_getschedparam NOOP
+rintf NOOP
+iswprint NOOP
+ascii_is_unsafe NOOP
+pthread_attr_setinheritsched NOOP
+setprotoent NOOP
+isxdigit NOOP
+pthread_attr_setscope NOOP
+sched_getparam NOOP
+R NOOP
+lrintl NOOP
+casinhl NOOP
+lgammal NOOP
+isastream NOOP
+ccosh NOOP
+logf NOOP
+cfgetispeed NOOP
+cmp NOOP
+ignore_err NOOP
+remquof NOOP
+atan2 NOOP
+iswblank NOOP
+get_32 NOOP
+conjf NOOP
+tre_stack_destroy NOOP
+a_clz_32 NOOP
+cacosl NOOP
+sync NOOP
+wcscasecmp_l NOOP
+put_32 NOOP
+c16rtomb NOOP
+nextafterl NOOP
+nearbyint NOOP
+ascii_to_bin NOOP
+sincosf NOOP
+cpowl NOOP
+qonef NOOP
+posix_spawnattr_destroy NOOP
+mbtowc NOOP
+trunc NOOP
+y0f NOOP
+setservent NOOP
+endprotoent NOOP
+sin_pi NOOP
+erfcf NOOP
+pthread_mutexattr_getprotocol NOOP
+carg NOOP
+posix_spawnattr_getschedpolicy NOOP
+setutxent NOOP
+cabsf NOOP
+grantpt NOOP
+scalbnl NOOP
+cbrtf NOOP
+log2 NOOP
+log1p NOOP
+alphasort NOOP
+getegid NOOP
+cfmakeraw NOOP
+top16 NOOP
+copysignl NOOP
+pthread_getcpuclockid NOOP
+inotify_init NOOP
+stub_dladdr NOOP
+res_init NOOP
+wcwidth NOOP
+getpagesize NOOP
+prefixmatch NOOP
+sethostent NOOP
+wctomb NOOP
+fmin NOOP
+BF_decode NOOP
+zi_read32 NOOP
+sem_destroy NOOP
+ccosl NOOP
+rintl NOOP
+fmodl NOOP
+clogl NOOP
+cabsl NOOP
+ilogbl NOOP
+sinhl NOOP
+y1 NOOP
+setresuid NOOP
+strverscmp NOOP
+strcasecmp NOOP
+iconv_close NOOP
+freelist NOOP
+erf NOOP
+getuid NOOP
+sem_trywait NOOP
+nextafterf NOOP
+remainderl NOOP
+pthread_spin_init NOOP
+fesetexceptflag NOOP
+round NOOP
+acos NOOP
+cproj NOOP
+sched_setscheduler NOOP
+setup_salt NOOP
+pthread_barrierattr_getpshared NOOP
+roundf NOOP
+iswlower NOOP
+catanl NOOP
+ether_ntohost NOOP
+iswspace NOOP
+sqrtl NOOP
+setuid NOOP
+pthread_attr_getinheritsched NOOP
+csinh NOOP
+atan NOOP
+fesetround NOOP
+endservent NOOP
+login_tty NOOP
+pthread_mutex_consistent NOOP
+cnd_destroy NOOP
+catanf NOOP
+scopeof NOOP
+erfc2 NOOP
+iswalpha NOOP
+fabsf NOOP
+sincosl NOOP
+sigfillset NOOP
+hexval NOOP
+ilogbf NOOP
+exp10 NOOP
+isblank NOOP
+catan NOOP
+toascii NOOP
+iswcntrl NOOP
+setpgrp NOOP
+cfsetspeed NOOP
+y1f NOOP
+getgid NOOP
+memcmp NOOP
+casinh NOOP
+j1f NOOP
+isalnum NOOP
+csinhf NOOP
+sigismember NOOP
+acosf NOOP
+geteuid NOOP
+cimagf NOOP
+mbsinit NOOP
+stirf NOOP
+pow NOOP
+cimagl NOOP
+wctob NOOP
+reducl NOOP
+modfl NOOP
+nanl NOOP
+nan NOOP
+qzerof NOOP
+cfsetospeed NOOP
+scalblnl NOOP
+asinhl NOOP
+pthread_attr_setschedparam NOOP
+fegetexceptflag NOOP
+posix_spawnattr_setflags NOOP
+ns_get16 NOOP
+ns_put32 NOOP
+fmod NOOP
+exp10f NOOP
+crealf NOOP
+log10 NOOP
+fmax NOOP
+setegid NOOP
+wcsncasecmp NOOP
+pthread_rwlock_destroy NOOP
+tre_stack_pop_int NOOP
+posix_spawnattr_setpgroup NOOP
+posix_spawnattr_getflags NOOP
+cosh NOOP
+uni_to_jis NOOP
+lgamma NOOP
+dirfd NOOP
+iswctype NOOP
+get_nprocs NOOP
+wcsncasecmp_l NOOP
+remquo NOOP
+copysign NOOP
+towupper NOOP
+str_next NOOP
+tcflow NOOP
+sched_setparam NOOP
+encrypt NOOP
+setreuid NOOP
+pthread_attr_destroy NOOP
+epoll_create NOOP
+posix_spawnattr_setschedpolicy NOOP
+log10f NOOP
+timer_handler NOOP
+strncasecmp NOOP
+bcmp NOOP
+ctanhl NOOP
+conjl NOOP
+log2_inline NOOP
+tss_delete NOOP
+pthread_mutexattr_destroy NOOP
+cimag NOOP
+ccoshf NOOP
+mkptr6 NOOP
+iswgraph NOOP
+strcoll NOOP
+cosf NOOP
+inet_lnaof NOOP
+atanh NOOP
+hypotl NOOP
+fuzzycmp NOOP
+log2f NOOP
+BF_set_key NOOP
+pthread_mutexattr_settype NOOP
+pthread_attr_setschedpolicy NOOP
+ms_close NOOP
+nanf NOOP
+logbl NOOP
+thrd_yield NOOP
+wcsncmp NOOP
+wcscmp NOOP
+dns_parse_callback NOOP
+cargf NOOP
+height NOOP
+regfree NOOP
+inet_makeaddr NOOP
+getlens NOOP
+decay_bounces NOOP
+sqrt NOOP
+pthread_rwlockattr_destroy NOOP
+erfcl NOOP
+atanhf NOOP
+cbrt NOOP
+week_num NOOP
+btowc NOOP
+versionsort NOOP
+mclose NOOP
+get_16 NOOP
+checkver NOOP
+rand NOOP
+j0f NOOP
+ldexpl NOOP
+fdimf NOOP
+isascii NOOP
+sincos NOOP
+cfsetispeed NOOP
+pthread_mutexattr_getpshared NOOP
+c32rtomb NOOP
+significandf NOOP
+floorf NOOP
+finite NOOP
+asinhf NOOP
+strxfrm NOOP
+catanh NOOP
+log1pf NOOP
+tcflush NOOP
+pthread_rwlockattr_getpshared NOOP
+is_lost_conn NOOP
+expm1f NOOP
+iscntrl NOOP
+get_nprocs_conf NOOP
+sem_getvalue NOOP
+expf NOOP
+cacoshl NOOP
+days_in_month NOOP
+pthread_mutexattr_setpshared NOOP
+tolower NOOP
+isprint NOOP
+md5_init NOOP
+wcscasecmp NOOP
+tanh NOOP
+scalbf NOOP
+fmaxf NOOP
+ctanh NOOP
+cpowf NOOP
+cacosf NOOP
+scalbn NOOP
+toupper NOOP
+exp NOOP
+cacoshf NOOP
+towctrans NOOP
+pthread_mutex_destroy NOOP
+tcsendbreak NOOP
+roundl NOOP
+ldexpf NOOP
+a_ctz_32 NOOP
+pthread_attr_getscope NOOP
+sched_getscheduler NOOP
+rand_r NOOP
+logbf NOOP
+tgammal NOOP
+a_and NOOP
+casinf NOOP
+tre_purge_regset NOOP
+sinh NOOP
+modff NOOP
+exp2f NOOP
+ns_put16 NOOP
+sinpi NOOP
+ceilf NOOP
+tre_neg_char_classes_match NOOP
+mtx_destroy NOOP
+acosh NOOP
+pthread_attr_getdetachstate NOOP
+cexpf NOOP
+tgammaf NOOP
+j1 NOOP
+pthread_setconcurrency NOOP
+cprojf NOOP
+scalbln NOOP
+modf NOOP
+atanf NOOP
+ns_skiprr NOOP
+cos NOOP
+getpgrp NOOP
+freeifaddrs NOOP
+ether_hostton NOOP
+exp10l NOOP
+cbrtl NOOP
+setkey NOOP
+pthread_condattr_setclock NOOP
+ccosf NOOP
+sinhf NOOP
+nextafter NOOP
+tanl NOOP
+significand NOOP
+log NOOP
+fdim NOOP
+closedir NOOP
+sha256_init NOOP
+sem_init NOOP
+cexpl NOOP
+scalb NOOP
+coshl NOOP
+iswupper NOOP
+creal NOOP
+cexp NOOP
+atan2f NOOP
+pthread_spin_trylock NOOP
+issetugid NOOP
+truncf NOOP
+erff NOOP
+erfc NOOP
+pthread_spin_lock NOOP
+csinl NOOP
+gethostid NOOP
+scalbnf NOOP
+expm1 NOOP
+BF_encode NOOP
+pthread_attr_setdetachstate NOOP
+in_set NOOP
+clog NOOP
+ldexp NOOP
+fmodf NOOP
+casemap NOOP
+
 # ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
 # apr_palloc carves from shared allocator blocks; FRESH on the leaf
 # dup/create family severs per-callsite object identity from the pool

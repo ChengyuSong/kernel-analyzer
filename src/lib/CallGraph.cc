@@ -4618,6 +4618,47 @@ bool CallGraphPass::runFlowsToResolution() {
         if (StringRef(nodeNameOf(m2)).contains(sub)) return true;
     return false;
   };
+  // Edge-kind label for a class (by its canonical node): tells a chain
+  // reader whether an a-edge arrival is a call (into a formal), a return
+  // (into a call result), a load from a cell, a store into a cell, or a
+  // copy. Formals are further marked when their function has no direct
+  // caller (reached only through icall wiring) or is fixed-arity yet
+  // admitted at a variadic-typed call (the lenient varargs rule).
+  std::unordered_map<const Function *, std::string> formalMarkMemo;
+  auto nodeKind = [&](uint32_t cls) -> std::string {
+    if (cls >= toOrig.size()) return "chan";
+    const NodeIndex canon = toOrig[cls];
+    if (NF.isDereferenceNode(canon)) return "cell";
+    const Value *V = NF.getValueForNode(canon);
+    if (!V) return NF.isObjectNode(canon) ? "obj" : "value";
+    if (const auto *A = dyn_cast<Argument>(V)) {
+      const Function *F = A->getParent();
+      auto it = formalMarkMemo.find(F);
+      if (it == formalMarkMemo.end()) {
+        bool direct = false, varargAdmitted = false;
+        auto cit = Ctx->Callers.find(F);
+        if (cit != Ctx->Callers.end())
+          for (const CallBase *CB : cit->second) {
+            if (CB->getCalledFunction() == F) direct = true;
+            else if (!F->isVarArg() && CB->getFunctionType()->isVarArg())
+              varargAdmitted = true;
+          }
+        std::string m = "formal";
+        if (!direct) m += "/icall-only";
+        if (varargAdmitted) m += "/vararg-admitted";
+        it = formalMarkMemo.emplace(F, m).first;
+      }
+      return it->second;
+    }
+    if (isa<CallBase>(V)) return "callret";
+    if (isa<LoadInst>(V)) return "load";
+    if (isa<GetElementPtrInst>(V)) return "gep";
+    if (isa<PHINode>(V) || isa<SelectInst>(V) || isa<CastInst>(V)) return "copy";
+    if (isa<AllocaInst>(V)) return "alloca";
+    if (isa<GlobalValue>(V)) return "global";
+    if (isa<Constant>(V)) return "const";
+    return "value";
+  };
   auto protBlameName = [&](uint32_t cls) -> std::string {
     if (cls >= toOrig.size()) {
       auto cn = chanNodeName.find(cls);
@@ -4726,45 +4767,73 @@ bool CallGraphPass::runFlowsToResolution() {
                ? (int64_t)v
                : -1;
   };
-  if (!CFLTraceFunc.empty() && ridOf(CFLTraceFunc) >= 0) {
-    traceRoot = ridOf(CFLTraceFunc);
-    errs() << "TRACE root " << traceRoot << " = "
-           << ((uint64_t)traceRoot < rootClassOf.size()
-                   ? protBlameName(rootClassOf[traceRoot])
-                   : std::string("<minted during the solve>"))
-           << " (by id)\n";
-  } else if (!CFLTraceFunc.empty()) {
-    for (auto &[rid, F] : funcRootOf)
-      if (F->getName().contains(CFLTraceFunc)) {
-        traceRoot = rid;
-        errs() << "TRACE root " << rid << " = " << F->getName() << "\n";
-        break;
-      }
-    if (traceRoot < 0) {
-      // Not a function: trace an OBJECT origin by its value name (a
-      // global/alloca/alloc-site) — needed to follow how an object
-      // reaches a load's owner pointer (the breadth side of the
-      // derivation witness), not only how a function reaches the fptr.
-      // Same naming as the blob probe / meet tracer, so unnamed O0
-      // values (allocation calls "fn::call:callee", locals
-      // "fn::alloca:struct.T") are addressable; cell roots ("*p") only
-      // when asked for explicitly.
-      for (uint32_t rid = 0; rid < rootClassOf.size() && traceRoot < 0;
-           rid++) {
-        const uint32_t rc = rootClassOf[rid];
-        if (rc >= toOrig.size()) continue;
-        std::string nm = protBlameName(rc);
-        if (!nm.empty() && nm[0] == '*' && !StringRef(CFLTraceFunc).starts_with("*"))
-          continue;
-        if (StringRef(nm).contains(CFLTraceFunc)) {
-          traceRoot = rid;
-          errs() << "TRACE root " << rid << " = origin " << nm << "\n";
-        }
-      }
+  // A comma-separated list traces several roots in one solve (the
+  // coupler census needs the key origins of many joins); arrivals are
+  // tagged root=r<N>. traceRoot stays the first root for the single-root
+  // consumers (final-reach dump, per-value trace).
+  std::vector<uint32_t> traceRoots;
+  std::vector<uint8_t> traceMark; // rid -> traced (grown on demand)
+  auto resolveRoot = [&](StringRef want) -> int64_t {
+    if (ridOf(want) >= 0) {
+      const int64_t r = ridOf(want);
+      errs() << "TRACE root " << r << " = "
+             << ((uint64_t)r < rootClassOf.size()
+                     ? protBlameName(rootClassOf[r])
+                     : std::string("<minted during the solve>"))
+             << " (by id)\n";
+      return r;
     }
-    if (traceRoot < 0)
-      errs() << "TRACE: no function/origin root matches '" << CFLTraceFunc
-             << "'\n";
+    for (auto &[rid, F] : funcRootOf)
+      if (F->getName() == want) {
+        errs() << "TRACE root " << rid << " = " << F->getName() << "\n";
+        return rid;
+      }
+    for (auto &[rid, F] : funcRootOf)
+      if (F->getName().contains(want)) {
+        errs() << "TRACE root " << rid << " = " << F->getName() << "\n";
+        return rid;
+      }
+    // Not a function: trace an OBJECT origin by its value name (a
+    // global/alloca/alloc-site) — needed to follow how an object
+    // reaches a load's owner pointer (the breadth side of the
+    // derivation witness), not only how a function reaches the fptr.
+    // Same naming as the blob probe / meet tracer, so unnamed O0
+    // values (allocation calls "fn::call:callee", locals
+    // "fn::alloca:struct.T") are addressable; cell roots ("*p") only
+    // when asked for explicitly. Exact name wins over substring.
+    int64_t sub = -1;
+    for (uint32_t rid = 0; rid < rootClassOf.size(); rid++) {
+      const uint32_t rc = rootClassOf[rid];
+      if (rc >= toOrig.size()) continue;
+      std::string nm = protBlameName(rc);
+      if (nm.empty()) continue;
+      if (nm[0] == '*' && !want.starts_with("*")) continue;
+      if (StringRef(nm) == want) {
+        errs() << "TRACE root " << rid << " = origin " << nm << "\n";
+        return rid;
+      }
+      if (sub < 0 && StringRef(nm).contains(want)) sub = rid;
+    }
+    if (sub >= 0)
+      errs() << "TRACE root " << sub << " = origin "
+             << protBlameName(rootClassOf[sub]) << " (substring)\n";
+    else
+      errs() << "TRACE: no function/origin root matches '" << want << "'\n";
+    return sub;
+  };
+  if (!CFLTraceFunc.empty()) {
+    StringRef spec(CFLTraceFunc);
+    while (!spec.empty()) {
+      auto [head, rest] = spec.split(',');
+      spec = rest;
+      if (head.empty()) continue;
+      const int64_t r = resolveRoot(head);
+      if (r < 0) continue;
+      traceRoots.push_back((uint32_t)r);
+      if (traceMark.size() <= (size_t)r) traceMark.resize(r + 1, 0);
+      traceMark[r] = 1;
+    }
+    if (!traceRoots.empty()) traceRoot = traceRoots.front();
   }
   size_t traceEvents = 0;
   const char *tHow = "seed";
@@ -4772,11 +4841,21 @@ bool CallGraphPass::runFlowsToResolution() {
   uint32_t tKeyO = UINT32_MAX, tKeyS = 0; // join/bridge key behind a merge-or-bridge arrival
   uint32_t tCell = UINT32_MAX;            // the dereference cell whose join caused it
   uint32_t tPtr = UINT32_MAX;             // the pointer class whose sweep issued the join
-  auto traceHit = [&](uint32_t n, uint32_t s, bool bridged) {
-    if (traceEvents++ > 200000) return;
+  const size_t traceCap = 200000 * std::max<size_t>(1, traceRoots.size());
+  auto traceHit = [&](uint32_t n, uint32_t s, bool bridged,
+                      int64_t rid = -1) {
+    if (traceEvents++ > traceCap) return;
     errs() << "TRACE + c" << n << " s" << s << (bridged ? " [br]" : "")
-           << " via " << tHow << " from c";
+           << " via " << tHow;
+    // Edge kind of an a-edge arrival: what the target class is (formal,
+    // call result, load, cell, copy) — the reader needs "call into a
+    // formal" vs "load from a cell" to tell a root cause from propagation.
+    if (StringRef(tHow) == "a-prop" || StringRef(tHow).starts_with("merge-move"))
+      errs() << "[" << (tFrom == UINT32_MAX ? std::string("?") : nodeKind(tFrom))
+             << ">" << nodeKind(n) << "]";
+    errs() << " from c";
     if (tFrom == UINT32_MAX) errs() << "?"; else errs() << tFrom;
+    if (rid >= 0 && traceRoots.size() > 1) errs() << " root=r" << rid;
     // Name at arrival time: later merges retire these ids, so the
     // fixpoint census cannot name a chain read off this log.
     errs() << "  " << protBlameName(n).substr(0, 70);
@@ -4903,14 +4982,15 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   const bool traceAny = traceRoot >= 0 || meetRid[0] >= 0;
   auto traceCheck = [&](uint32_t n, uint32_t s, bool br, const FactSet &bits) {
-    if (traceRoot >= 0 && bits.test((uint32_t)traceRoot)) traceHit(n, s, br);
+    for (uint32_t r : traceRoots)
+      if (bits.test(r)) traceHit(n, s, br, r);
     if (meetRid[0] >= 0) {
       if (bits.test((uint32_t)meetRid[0])) meetHit(n, s, 0);
       if (bits.test((uint32_t)meetRid[1])) meetHit(n, s, 1);
     }
   };
   auto traceCheckOne = [&](uint32_t n, uint32_t s, uint32_t o) {
-    if (traceRoot >= 0 && o == (uint32_t)traceRoot) traceHit(n, s, false);
+    if (o < traceMark.size() && traceMark[o]) traceHit(n, s, false, o);
     if (meetRid[0] >= 0) {
       if (o == (uint32_t)meetRid[0]) meetHit(n, s, 0);
       if (o == (uint32_t)meetRid[1]) meetHit(n, s, 1);
@@ -6537,9 +6617,11 @@ bool CallGraphPass::runFlowsToResolution() {
         for (uint32_t x = back; x != hit; x = pred[x].first)
           path.push_back({x, pred[x].second});
         std::reverse(path.begin(), path.end());
-        errs() << "DumpSCC:   " << protBlameName(hit).substr(0, 70) << "\n";
+        errs() << "DumpSCC:   " << protBlameName(hit).substr(0, 70) << " ["
+               << nodeKind(hit) << "]\n";
         for (auto &[x, k] : path)
-          errs() << "DumpSCC:   -" << k << "-> " << protBlameName(x).substr(0, 70) << "\n";
+          errs() << "DumpSCC:   -" << k << "-> " << protBlameName(x).substr(0, 70)
+                 << " [" << nodeKind(x) << "]\n";
         errs() << "DumpSCC:   -" << backKind << "-> (back to the start)\n";
       }
     }

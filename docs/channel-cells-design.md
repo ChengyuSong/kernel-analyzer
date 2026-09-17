@@ -344,3 +344,105 @@ FreshSub sub-allocation as init stores, promoting hash_initialize per
 call site; (2) measure holder identity again, at P ≥ 29 so residue
 collisions do not pre-pollute the holders; (3) only then decide
 default-on or removal.
+
+## Per-site accounting of one nm-new site (2026-09-17)
+
+The user's standard for user-mode corpora: a wide answer is acceptable
+when every target at a site can be explained. This section is the first
+full accounting, for the site the SoK harness keys as
+`elf64-x86-64.c:4221`: `info->callbacks->einfo(...)` in
+`elf_x86_64_finish_dynamic_symbol`, a variadic error callback loaded from
+`bfd_link_callbacks` at byte 88. The fuzzing ground truth has no record
+for this line; the only callback ever installed in that slot in nm-new is
+`simple_dummy_einfo` (bfd/simple.c). `_bfd_error_handler`, the other
+variadic function we report, is stored only in `elf_backend_data` as
+`link_order_error_handler`, a different slot.
+
+Our answer: 51 targets. All runs below are cluster mode, exact presolve,
+the nm-new summary file, P=29 unless stated.
+
+| run | pairs | site |
+|---|---|---|
+| P=13 (reference) | 63,202 | 51 |
+| P=29 | 63,202 | 51 |
+| P=29, no X bridges (probe) | 63,202 | 51 |
+| type-only candidate set (`--cfl-dump-type-json`) | 89,947 | 117 |
+
+Every answer above is byte-identical: residue collisions and unknown-index
+bridges do not decide this site or any other nm-new site. The type filter
+alone would admit 117 functions here; the flow analysis removes 66 of
+them, so the 51 are not the type bound.
+
+**Where the two kinds of targets come from.** The meet trace between
+`simple_dummy_einfo` and a vtable member (`binary_get_symbol_info`) has
+the same shape at P=13 and P=29. The callback side: the store into
+`callbacks.einfo` is a cell keyed (callbacks alloca, 88 mod P); that
+class joins a 15,000-node class as soon as a pointer in that class reads
+the callbacks struct. The vtable side: the initializer cell of
+`binary_vec+528` (`_bfd_get_symbol_info`) joins the same class through a
+read `abfd->xvec->member` by a pointer already in it. The residue partner
+differs by P (528 shares a residue with 840 at P=13 and with 760 at P=29;
+`bfd_target` has 107 members over 880 bytes, so some pair collides at any
+P below 110) but the answer does not change because every slot that is
+read anywhere by a pointer in the class enters it regardless of residue.
+
+The per-value trace at the site (`--cfl-trace-value`) shows the three
+values `info`, `info->callbacks`, `callbacks->einfo` in three distinct
+classes, each carrying the same 380,430 facts: the universal pointee set.
+`info` is not in any a-edge SCC (`--cfl-dump-scc` finds no cycle through
+it); it is universal by propagation from its only actuals, the backend
+table calls in `elf_link_output_extsym`, whose `flinfo` is the `data`
+formal of the hash-table traversal callback. That formal is universal
+because `bfd_hash_traverse` is wired context-free: its `data` formal is
+the union of five actuals, one of which is the `bfd_link_info *info` of
+`elf_x86_64_finish_dynamic_sections` itself, so every traversal callback
+receives a universal `data`. A dispatch summary for `bfd_hash_traverse`
+would pair callback and data per call site but cannot narrow `info`,
+which is universal before it reaches the traversal.
+
+**Why the 49 pass the type filter.** The site's call type is
+`void (ptr, ...)`. `isCompatible` requires a fixed-arity callee to match
+the number of actuals (3), not the call type's fixed-parameter count (1).
+So every address-taken function with three pointer parameters that
+reaches the universal class is admitted: `bfd_target` and
+`elf_backend_data` members such as `_bfd_elf_get_symbol_info`,
+`bfd_generic_lookup_section_flags`, `elf_x86_64_info_to_howto`.
+Corpus-wide, 66 nm-new sites have a variadic call type; they carry 4,931
+pairs, of which 4,798 are fixed-arity callees. Calling a fixed-arity
+function through a variadic pointer is undefined in C, and clang types an
+unprototyped (K&R) call as variadic with every actual as a fixed
+parameter, so requiring `numParams(F) == fixed params of the call type`
+keeps K&R dispatch intact. This rule is `--cfl-varargs-strict` (default
+off; pins are measured without it).
+
+Measured on nm-new (P=29, same flags): 63,202 → 60,742 pairs, 39 sites
+changed, none looser, ground truth recall unchanged (223/223); median
+width 51 → 34; this site 51 → 2. Only 38 of the 66 variadic-typed sites
+change: the other 28 pass a single actual (`einfo("...")` with no
+arguments), so their call type `(ptr, ...)` is byte-identical to an
+unprototyped call with one pointer actual, and a fixed-arity one-pointer
+callee cannot be rejected from the IR alone (about 2,300 pairs). Telling
+those apart needs the source prototype, which is in the debug type of the
+loaded pointer (`DISubroutineType` with a trailing null for variadic);
+not built. The one non-variadic site that changed is `coffgen.c:2154`
+(`bfd_coff_print_aux` through the COFF backend table), which drops from 2
+targets to 0. That is the same site that dropped to 0 under pairwise
+cells: its two targets arrive only through paths the lenient rule opens,
+so the legitimate path (nm's bfd object → `xvec` → `backend_data` →
+`_bfd_coff_print_aux`) is missing. This is a flow soundness gap, not a
+consequence of the rule; under investigation.
+
+**Accounting of the 51.**
+
+- 2 variadic functions: `simple_dummy_einfo` (the true target) and
+  `_bfd_error_handler` (reaches the universal class through the backend
+  table; a flow false positive).
+- 49 fixed-arity three-pointer functions admitted only by the lenient
+  varargs rule; each reaches the site through the universal class.
+
+**What this settles.** For nm-new the per-site question reduces to two
+independent facts: which functions enter the universal class (a
+call-context question, settled 2026-09-14 as context-free call/return
+wiring), and which of them the type filter keeps. Field residues, cells,
+X bridges, allocator and libc summaries are all answer-neutral here and
+were confirmed so per site, not by census.

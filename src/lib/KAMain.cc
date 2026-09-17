@@ -1186,6 +1186,25 @@ cl::opt<std::string> CFLDumpIcallsJson(
            "re-attributions are not emitted"),
   cl::init(""));
 
+cl::opt<std::string> CFLDumpTypeJson(
+  "cfl-dump-type-json",
+  cl::desc("MEASUREMENT-ONLY: write the TYPE-ONLY candidate set of every "
+           "icall site (the filter's own isCompatible over address-taken "
+           "functions) in the --cfl-dump-icalls-json format, so a site's "
+           "flow answer can be compared with its type bound per site"),
+  cl::init(""));
+
+cl::opt<bool> CFLVarargsStrict(
+  "cfl-varargs-strict",
+  cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "
+           "call (\"T (A, ...)\") must have exactly the call type's fixed "
+           "parameter count. clang types an unprototyped (K&R) call as "
+           "variadic with every actual as a fixed parameter, so K&R "
+           "dispatch keeps its callees; only genuine \"(fmt, ...)\" "
+           "prototypes lose fixed-arity candidates (nm-new: 66 sites, "
+           "4,798 pairs). Default off: pins are measured without it"),
+  cl::init(false));
+
 cl::opt<std::string> IRSidecarDir(
   "ir-sidecar-dir",
   cl::desc("Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)"),

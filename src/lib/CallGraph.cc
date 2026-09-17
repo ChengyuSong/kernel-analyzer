@@ -1021,6 +1021,17 @@ bool CallGraphPass::isCompatible(const CallBase *CS, const Function *F) {
     // For non-vararg, require exact argument count match
     if (NumActualArgs != NumFixedParams)
       return false;
+    // --cfl-varargs-strict: behind a variadic-typed pointer ("T (A, ...)")
+    // a fixed-arity callee must match the pointer's fixed-parameter count,
+    // not the actual count. clang types an unprototyped (K&R) call as
+    // variadic with every actual as a fixed parameter, so K&R dispatch is
+    // unaffected; a genuine "(fmt, ...)" prototype stops admitting every
+    // address-taken function of the actuals' arity (nm-new einfo sites).
+    if (CFLVarargsStrict) {
+      const FunctionType *CTy = CS->getFunctionType();
+      if (CTy->isVarArg() && CTy->getNumParams() != NumFixedParams)
+        return false;
+    }
   }
 
   // Return type: if the callsite result is unused, accept any return type.
@@ -20401,10 +20412,14 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     extern cl::opt<std::string> CFLDumpIcallsJson;
-    if (!CFLDumpIcallsJson.empty()) {
-      // SoK-harness JSON: {"file:line": [targets...]}, deterministic
-      // key order, empty-answer sites included, no-debug sites
-      // counted and skipped (they cannot match a file:line GT key).
+    extern cl::opt<std::string> CFLDumpTypeJson;
+    // SoK-harness JSON: {"file:line": [targets...]}, deterministic
+    // key order, empty-answer sites included, no-debug sites
+    // counted and skipped (they cannot match a file:line GT key).
+    // Shared by the flow answer (Ctx->Callees) and the type-only
+    // candidate set (calleeByType) so both land in one key space.
+    auto writeSiteJson = [&](const std::string &path, const CalleeMap &ans,
+                             const char *tag) {
       std::map<std::string, std::set<std::string>> byLoc;
       size_t noDbg = 0;
       for (const CallBase *CS : Ctx->IndirectCallInsts) {
@@ -20416,18 +20431,18 @@ bool CallGraphPass::doFinalization(Module *M) {
         std::string key = (DL->getScope()->getFilename() + ":" +
                            Twine(DL->getLine())).str();
         auto &tset = byLoc[key];
-        auto cit = Ctx->Callees.find(const_cast<CallBase *>(CS));
-        if (cit != Ctx->Callees.end())
+        auto cit = ans.find(const_cast<CallBase *>(CS));
+        if (cit != ans.end())
           for (const Function *F : cit->second) {
             const Function *R = getFuncDef(const_cast<Function *>(F));
             tset.insert((R ? R : F)->getName().str());
           }
       }
       std::error_code EC;
-      raw_fd_ostream OS(CFLDumpIcallsJson, EC, sys::fs::OF_Text);
+      raw_fd_ostream OS(path, EC, sys::fs::OF_Text);
       if (EC) {
-        errs() << "FATAL: cannot write " << CFLDumpIcallsJson << ": "
-               << EC.message() << "\n";
+        errs() << "FATAL: cannot write " << path << ": " << EC.message()
+               << "\n";
         exit(1);
       }
       OS << "{";
@@ -20449,10 +20464,13 @@ bool CallGraphPass::doFinalization(Module *M) {
         OS << "]";
       }
       OS << "\n}\n";
-      CG_LOG("IcallJson: " << byLoc.size() << " callsite locations -> "
-             << CFLDumpIcallsJson << " (" << noDbg
-             << " sites without debug info skipped)\n");
-    }
+      CG_LOG(tag << ": " << byLoc.size() << " callsite locations -> " << path
+                 << " (" << noDbg << " sites without debug info skipped)\n");
+    };
+    if (!CFLDumpIcallsJson.empty())
+      writeSiteJson(CFLDumpIcallsJson, Ctx->Callees, "IcallJson");
+    if (!CFLDumpTypeJson.empty())
+      writeSiteJson(CFLDumpTypeJson, calleeByType, "TypeJson");
     // check if all address-taken functions are used in indirect calls
     FuncSet allCallees;
     for (auto &it : Ctx->Callees)

@@ -14089,10 +14089,13 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
               !parseDerefRef(s, A.src, A.srcByteOff) || A.src < 0;
         nAlias++;
       } else if (t.consume_front("ST(*") && t.consume_back(")")) {
+        // ST(*argC@K<-argV) or ST(*ret@K<-argV): the latter initialises
+        // a field of the fresh result (what the confirmer's alloc-init
+        // atoms say; hash_initialize's hasher/comparator slots).
         auto [c, v] = t.split("<-");
         A.kind = GlobalContext::SummaryAtom::Store;
         bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
-              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0;
+              !parseDerefRef(v, A.src, A.srcByteOff);
         nSt++;
       } else if (t.consume_front("MVX(*") && t.consume_back(")")) {
         auto [c, v] = t.split("<-*");
@@ -14108,6 +14111,58 @@ static void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
               !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0 ||
               A.src < 0;
         nSt++;
+      } else if (t.consume_front("FRESHSUB(*") && t.consume_back(")")) {
+        // FRESHSUB(*argN): a fresh per-callsite object stored into *argN
+        // (the lazily created container of linked_list_append).
+        int off0 = 0;
+        A.kind = GlobalContext::SummaryAtom::FreshSub;
+        bad = !parseDerefRef(t, A.dst, off0) || A.dst < 0;
+        nFresh++;
+      } else if (t.consume_front("ST2(**") && t.consume_back(")")) {
+        // ST2(**argN@off<-argV[@K]): value into field off of the object
+        // the pointer in *argN@0 points to (exact, no wildcard).
+        auto [c, v] = t.split("<-");
+        A.kind = GlobalContext::SummaryAtom::Store2;
+        A.exact2 = true;
+        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+              !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0 || A.src < 0;
+        nSt++;
+      } else if (t.consume_front("LD2(ret<-**") && t.consume_back(")")) {
+        A.kind = GlobalContext::SummaryAtom::Load2;
+        A.exact2 = true;
+        A.dst = -1;
+        bad = !parseDerefRef(t, A.src, A.srcByteOff) || A.src < 0;
+        nLd++;
+      } else if (t.consume_front("DISPATCH(") && t.consume_back(")")) {
+        // DISPATCH(fnref:fK<-valref[@siteFn]); ref = argN | *argN@off |
+        // **argN@off. The indirect call(s) inside siteFn (default: the
+        // summarized callee) take their callee from fnref and formal K
+        // from valref; the site keeps its identity for the answer.
+        A.kind = GlobalContext::SummaryAtom::Dispatch;
+        auto parseLvl = [&](StringRef r, int &idx, int &off, int &lvl) {
+          lvl = 0;
+          while (r.consume_front("*")) lvl++;
+          return parseDerefRef(r, idx, off) && idx >= 0 && lvl <= 2;
+        };
+        auto [fnp, rest2] = t.split(':');
+        bad = !parseLvl(fnp, A.dst, A.dstByteOff, A.fnLevel);
+        auto [fk, rest3] = rest2.split("<-");
+        StringRef vp = rest3;
+        const size_t at = rest3.rfind('@');
+        if (at != StringRef::npos) {
+          StringRef tail = rest3.substr(at + 1);
+          unsigned tmpv;
+          if (tail != "X" && tail.getAsInteger(10, tmpv)) { // a name
+            A.siteFn = tail.str();
+            vp = rest3.substr(0, at);
+          }
+        }
+        bad = bad || !parseLvl(vp, A.src, A.srcByteOff, A.valLevel);
+        unsigned fkv = 0;
+        StringRef fks = fk;
+        bad = bad || !fks.consume_front("f") || fks.getAsInteger(10, fkv);
+        A.aux = (int)fkv;
+        nInv++;
       } else if (t.consume_front("INVOKE(") && t.consume_back(")")) {
         auto [fnp, rest2] = t.split(":");
         A.kind = GlobalContext::SummaryAtom::Invoke;
@@ -14428,6 +14483,7 @@ static void checkFileSummaries(GlobalContext *Ctx) {
 // aligned whole-buffer dups (kmemdup family); prefix copies
 // over-approximate soundly.
 static size_t g_sumInvokeRet = 0; // INVOKE :ret bindings applied
+static size_t g_sumDispatch = 0;
 static size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
               g_sumSkipped = 0, g_sumFreshSub = 0, g_sumInvoke = 0,
               g_sumInvokeDyn = 0, g_chainReg = 0, g_chainRegDyn = 0,
@@ -14808,9 +14864,54 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (c == AndersNodeFactory::InvalidIndex ||
           v == AndersNodeFactory::InvalidIndex)
         break;
+      // File ST2: the pointer in *c@0, then field dstByteOff of what it
+      // points to (exact); generated Store2 keeps its wildcard level 2.
       addAssignmentEdge(summaryFieldPtr(v, A.srcByteOff),
-                        summaryDeref2Cell(c, A.dstByteOff));
+                        A.exact2 ? summaryDerefCell(summaryDerefCell(c, 0),
+                                                    A.dstByteOff)
+                                 : summaryDeref2Cell(c, A.dstByteOff));
       g_sumSt++;
+      break;
+    }
+    case GlobalContext::SummaryAtom::Dispatch: {
+      auto refNode = [&](int idx, int lvl, int off) -> NodeIndex {
+        NodeIndex b = nodeForRef(idx, false);
+        if (b == AndersNodeFactory::InvalidIndex) return b;
+        if (lvl == 0) return getCanonicalNode(b);
+        if (lvl == 1) return summaryDerefCell(b, off);
+        return summaryDerefCell(summaryDerefCell(b, 0), off);
+      };
+      const NodeIndex fnv = refNode(A.dst, A.fnLevel, A.dstByteOff);
+      const NodeIndex valv = refNode(A.src, A.valLevel, A.srcByteOff);
+      if (fnv == AndersNodeFactory::InvalidIndex) { g_sumSkipped++; break; }
+      Function *siteF = nullptr;
+      if (!A.siteFn.empty()) {
+        siteF = CS->getModule()->getFunction(A.siteFn);
+      } else if (const Function *TF = CS->getCalledFunction()) {
+        siteF = const_cast<Function *>(TF);
+      }
+      if (siteF) siteF = getFuncDef(siteF);
+      if (!siteF || siteF->isDeclaration()) { g_sumSkipped++; break; }
+      for (auto II = inst_begin(*siteF), IE = inst_end(*siteF); II != IE; ++II) {
+        auto *IC = dyn_cast<CallBase>(&*II);
+        if (!IC || IC->isInlineAsm() || IC->getCalledFunction()) continue;
+        Value *fop = IC->getCalledOperand()->stripPointerCastsAndAliases();
+        if (isa<Function>(fop)) continue;
+        NodeIndex icf = getRepNodeForValue(fop);
+        if (icf == AndersNodeFactory::InvalidIndex)
+          icf = getCanonicalNode(NF.createValueNode(fop));
+        addAssignmentEdge(fnv, getCanonicalNode(icf)); // cell -> operand: a load
+        if (valv != AndersNodeFactory::InvalidIndex &&
+            (unsigned)A.aux < IC->arg_size()) {
+          Value *av = IC->getArgOperand(A.aux)->stripPointerCasts();
+          NodeIndex ica = getRepNodeForValue(av);
+          if (ica == AndersNodeFactory::InvalidIndex)
+            ica = getCanonicalNode(NF.createValueNode(av));
+          addAssignmentEdge(valv, getCanonicalNode(ica));
+        }
+        Ctx->IndirectCallInsts.insert(IC);
+        g_sumDispatch++;
+      }
       break;
     }
     case GlobalContext::SummaryAtom::Move2: {
@@ -14830,7 +14931,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
-      addAssignmentEdge(summaryDeref2Cell(c, A.srcByteOff),
+      addAssignmentEdge(A.exact2 ? summaryDerefCell(summaryDerefCell(c, 0),
+                                                    A.srcByteOff)
+                                 : summaryDeref2Cell(c, A.srcByteOff),
                         getCanonicalNode(d));
       g_sumLd++;
       break;

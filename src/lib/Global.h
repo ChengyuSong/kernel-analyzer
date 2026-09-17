@@ -147,10 +147,18 @@ public:
               // deref-of-deref chain at apply (nla_put memcpy class)
       Move2,  // *src@srcByteOff content into **dst-base@dstByteOff
       Load2,  // ret <- **src@srcByteOff (2nd level wildcard)
-      LoadX  // LD + wildcard shift on the RESULT: ret = interior of
+      LoadX, // LD + wildcard shift on the RESULT: ret = interior of
              // the pointer loaded from *src@srcByteOff (skb_put class:
              // loaded_ptr + delta). Result gets an fx self-loop —
              // covers any delta; exact at FI (solved-summary only)
+      Dispatch // container dispatch (2026-09-16): the indirect call(s)
+               // inside function [siteFn] (default: the summarized
+               // callee) take their callee from ref (dst, fnLevel,
+               // dstByteOff) and their argument [aux] from ref (src,
+               // valLevel, srcByteOff); refs are argN (level 0),
+               // *argN@off (level 1), **argN@off (level 2: the pointer
+               // in *argN@0, then field off). The site keeps its own
+               // identity for the answer (GT sites inside the body).
     } kind;
     int dst = -1; // arg index, or -1 = callsite return value
     int src = -1; // arg index (Cpy/Alias src; Store: value; Load: container)
@@ -173,6 +181,12 @@ public:
     const llvm::GlobalValue *gsrc2 = nullptr;
     std::string gsym; // ChainReg: key global by symbol name (file syntax
                       // CHAINREG(@sym,...) for external-linkage heads)
+    int fnLevel = 0;  // Dispatch: deref depth of the callee ref
+    int valLevel = 0; // Dispatch: deref depth of the value ref
+    bool exact2 = false; // Store2/Load2 from the file: level-2 offset is
+                         // exact (field of the pointed-to object), not
+                         // the generated wildcard
+    std::string siteFn; // Dispatch: function holding the icall site(s)
   };
   struct FuncSummary {
     std::vector<SummaryAtom> atoms;

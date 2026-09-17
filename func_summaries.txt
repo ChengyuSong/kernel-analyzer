@@ -63,6 +63,31 @@ xstrdup FRESH
 xstrndup FRESH
 xmemdup FRESH CPY(ret<-arg0)
 
+# ---- gnulib hash / cflow linked list: instance channels (2026-09-16) ----
+# Container APIs summarized so their bodies (unknown-index bucket walks,
+# list traversals) stop pooling every instance's payload. The dispatch
+# sites inside the bodies keep their identity through DISPATCH atoms
+# (the SoK ground truth keys hash.c:253/272/383/805/833 and
+# linked-list.c:87/111/128 by those sites). Layout (x86-64):
+#   struct hash_table: hasher@48 comparator@56 data_freer@64; the payload
+#   slot is synthetic @80 (past the 80-byte struct).
+#   struct linked_list: free_data@0 head@8 tail@16; entries are modelled
+#   AS the list object, payload slot synthetic @24; an entry pointer is
+#   the list pointer (append returns it, unlink takes it).
+hash_initialize FRESH ST(*ret@48<-arg2) ST(*ret@56<-arg3) ST(*ret@64<-arg4)
+hash_insert ST(*arg0@80<-arg1) ALIAS(ret=arg1) DISPATCH(*arg0@48:f0<-arg1@safe_hasher) DISPATCH(*arg0@56:f0<-arg1@hash_find_entry) DISPATCH(*arg0@56:f1<-*arg0@80@hash_find_entry)
+hash_lookup LD(ret<-*arg0@80) DISPATCH(*arg0@48:f0<-arg1@safe_hasher) DISPATCH(*arg0@56:f0<-arg1@hash_lookup) DISPATCH(*arg0@56:f1<-*arg0@80@hash_lookup)
+hash_do_for_each DISPATCH(arg1:f0<-*arg0@80) DISPATCH(arg1:f1<-arg2)
+hash_free DISPATCH(*arg0@64:f0<-*arg0@80)
+hash_get_first LD(ret<-*arg0@80)
+hash_get_next LD(ret<-*arg0@80)
+linked_list_create FRESH ST(*ret@0<-arg0)
+linked_list_append FRESHSUB(*arg0) ST2(**arg0@24<-arg1) LD(ret<-*arg0)
+linked_list_prepend FRESHSUB(*arg0) ST2(**arg0@24<-arg1) LD(ret<-*arg0)
+linked_list_iterate DISPATCH(arg1:f0<-**arg0@24) DISPATCH(arg1:f1<-arg2)
+linked_list_destroy DISPATCH(**arg0@0:f0<-**arg0@24)
+linked_list_unlink DISPATCH(*arg0@0:f0<-*arg1@24)
+
 # ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
 # apr_palloc carves from shared allocator blocks; FRESH on the leaf
 # dup/create family severs per-callsite object identity from the pool

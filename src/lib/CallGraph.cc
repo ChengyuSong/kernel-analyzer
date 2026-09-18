@@ -1734,23 +1734,23 @@ int CallGraphPass::fieldBucket(int64_t off) const {
   return (int)(r < 0 ? r + (int64_t)K : r);
 }
 
-uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride) {
+uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith) {
   if (lazyLabels.empty()) {
-    lazyLabels.push_back({0, 0});
-    lazyLabelIdx[{0, 0}] = 0;
+    lazyLabels.push_back({0, 0, false});
+    lazyLabelIdx[{0, 0, false}] = 0;
   }
-  auto [it, ins] = lazyLabelIdx.emplace(std::make_pair(off, stride),
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith),
                                         (uint32_t)lazyLabels.size());
-  if (ins) lazyLabels.push_back({off, stride});
+  if (ins) lazyLabels.push_back({off, stride, arith});
   return it->second;
 }
 
 void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
-                                       int64_t off, uint32_t stride) {
+                                       int64_t off, uint32_t stride, bool arith) {
   EB.addFieldEdges(src, dst, fieldBucket(off));
   if (!CFLLazyAddress) return;
   const uint64_t ek = ((uint64_t)src << 32) | (uint64_t)dst;
-  const uint32_t li = lazyLabelFor(off, stride);
+  const uint32_t li = lazyLabelFor(off, stride, arith);
   auto [it, ins] = lazyLabelOfEdge.emplace(ek, li);
   assert((ins || it->second == li) &&
          "lazy label: one edge cannot carry two exact offsets");
@@ -1817,7 +1817,9 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       const uint64_t esz = DL.getTypeAllocSize(Ty);
       if (const auto *CI = dyn_cast<ConstantInt>(idx)) {
         int64_t off = CI->getSExtValue() * (int64_t)esz;
-        if (off != 0)
+        if (off > 0 && off < ((int64_t)1 << 40))
+          levels.push_back(off | kArithLevelTag); // element step: walk candidate
+        else if (off != 0)
           levels.push_back(off);
       } else {
         if (esz <= 1 || esz > 0x3fffffffULL)
@@ -1854,9 +1856,11 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                           : getFieldPtrNode(cur, levels[k]);
     if (next == cur)
       continue;
-    if (levels[k] & kStridedLevelTag) // variable array index: strided step
+    if (levels[k] > 0 && (levels[k] & kStridedLevelTag)) // strided step (negative = container_of offset)
       addFieldEdgesExact(cur, next, 0,
                          (uint32_t)((levels[k] >> 32) & 0x3fffffff));
+    else if (levels[k] > 0 && (levels[k] & kArithLevelTag))
+      addFieldEdgesExact(cur, next, levels[k] & ~kArithLevelTag, 0, true);
     else
       addFieldEdgesExact(cur, next, levels[k]);
     cur = next;
@@ -4877,26 +4881,55 @@ bool CallGraphPass::runFlowsToResolution() {
     return !V || NF.isDereferenceNode(toOrig[rc]);
   };
   size_t lazyCapped = 0;
-  std::function<uint32_t(uint32_t, int64_t, uint32_t)> mintAddr;
-  mintAddr = [&](uint32_t obj, int64_t off, uint32_t stride) -> uint32_t {
+  // Progression widening (walks through memory are invisible to the SCC
+  // pass): an arithmetic exact mint e whose object already holds e-s and
+  // e-2s is a walk; the run becomes one strided root (base, s), which
+  // absorbs the rest. Member offsets never take part.
+  std::unordered_map<uint32_t, std::set<int64_t>> arithOffs;
+  std::unordered_map<uint32_t, std::vector<std::pair<int64_t, uint32_t>>> objStrided;
+  size_t lazyWidened = 0, lazyAbsorbed = 0;
+  std::function<uint32_t(uint32_t, int64_t, uint32_t, bool)> mintAddr;
+  mintAddr = [&](uint32_t obj, int64_t off, uint32_t stride, bool arith) -> uint32_t {
     if (stride != UINT32_MAX) {
       const int64_t sz = objBytes(obj);
       if (off < 0 || (sz > 0 && off >= sz) || off > ((int64_t)1 << 20))
-        return mintAddr(obj, 0, UINT32_MAX);
+        return mintAddr(obj, 0, UINT32_MAX, false);
     } else off = 0;
+    if (stride == 0 && arith) {
+      for (auto &[b, st] : objStrided[obj]) // covered by a strided root already
+        if (off >= b && (off - b) % (int64_t)st == 0) { lazyAbsorbed++; return mintAddr(obj, b, st, false); }
+      auto &offs = arithOffs[obj];
+      offs.insert(off);
+      auto it0 = offs.find(off);
+      int scanned = 0;
+      for (auto it1 = it0; it1 != offs.begin() && scanned < 8; scanned++) {
+        --it1;
+        const int64_t st = off - *it1;
+        if (st <= 0 || st > ((int64_t)1 << 20)) continue;
+        if (!offs.count(*it1 - st)) continue;
+        int64_t base = *it1 - st;
+        while (offs.count(base - st)) base -= st;
+        lazyWidened++;
+        return mintAddr(obj, base, (uint32_t)st, false);
+      }
+    }
     auto [it, ins] = addrIndex.try_emplace(std::make_tuple(obj, off, stride), 0u);
     if (!ins) return it->second;
     if (stride != UINT32_MAX) {
       uint32_t &cnt = addrCountOf[obj];
-      if (!isConstGlobalRoot(obj) &&
-          cnt >= (isIdentityRoot(obj) ? kLazyCapId : kLazyCap)) {
+      // Constant globals are never walked by the program but byte
+      // arithmetic over them still mints offset by offset: a higher cap
+      // (above any vtable's slot count) keeps their slots exact.
+      const uint32_t capHere = isConstGlobalRoot(obj) ? std::max<uint32_t>(128, 4 * kLazyCap)
+                               : isIdentityRoot(obj) ? kLazyCapId : kLazyCap;
+      if (cnt >= capHere) {
         addrIndex.erase(it);
         if (lazyCapped++ == 0)
           WARNING("LazyAddr: object r" << obj << " ("
                   << protBlameName(rootClassOf[obj]).substr(0, 50)
                   << ") passed " << kLazyCap
                   << " exact addresses; further offsets are its range\n");
-        return mintAddr(obj, 0, UINT32_MAX);
+        return mintAddr(obj, 0, UINT32_MAX, false);
       }
       cnt++;
     }
@@ -4915,7 +4948,8 @@ bool CallGraphPass::runFlowsToResolution() {
     addrIsObj[rid] = 1;
     it->second = rid;
     lazyMinted++;
-    if (stride == UINT32_MAX) lazyX++; else if (stride) lazyStrided++;
+    if (stride == UINT32_MAX) lazyX++;
+    else if (stride) { lazyStrided++; objStrided[obj].emplace_back(off, stride); }
     return rid;
   };
   // Pointer-walk cycles: an f-edge inside an a/f SCC with nonzero net
@@ -4926,8 +4960,26 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<uint32_t> sccIdOf;
   std::vector<int64_t> sccG;
   std::vector<char> sccX;
-  // Fact remap across the f-edge (from -> to) with exact label `label`.
+  // Per-root memo of remaps: (label, cycle?) -> result. A remap is an
+  // indexed lookup on the hot path; the tuple map is touched only when a
+  // new address is minted.
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> remapMemo;
+  std::function<uint32_t(uint32_t, uint32_t, uint32_t, uint32_t)> remapRidSlow;
   auto remapRid = [&](uint32_t rid, uint32_t label, uint32_t from, uint32_t to) -> uint32_t {
+    addrGrow();
+    if (!addrIsObj[rid] || addrStride[rid] == UINT32_MAX) return rid;
+    const bool cyc = from < sccIdOf.size() && to < sccIdOf.size() &&
+                     sccIdOf[from] == sccIdOf[to] &&
+                     (sccG[sccIdOf[from]] != 0 || sccX[sccIdOf[from]]);
+    const uint32_t key = (label << 1) | (cyc ? 1u : 0u);
+    if (remapMemo.size() <= rid) remapMemo.resize(nextRoot + 1024);
+    for (auto &pr : remapMemo[rid]) if (pr.first == key) return pr.second;
+    const uint32_t res = remapRidSlow(rid, label, from, to);
+    if (remapMemo.size() <= rid) remapMemo.resize(nextRoot + 1024);
+    remapMemo[rid].emplace_back(key, res);
+    return res;
+  };
+  remapRidSlow = [&](uint32_t rid, uint32_t label, uint32_t from, uint32_t to) -> uint32_t {
     addrGrow();
     if (!addrIsObj[rid]) return rid;
     const uint32_t st = addrStride[rid];
@@ -4938,28 +4990,33 @@ bool CallGraphPass::runFlowsToResolution() {
                      sccIdOf[from] == sccIdOf[to] &&
                      (sccG[sccIdOf[from]] != 0 || sccX[sccIdOf[from]]);
     if (cyc) {
-      if (sccX[sccIdOf[from]] || L.stride != 0) return mintAddr(obj, 0, UINT32_MAX);
+      if (sccX[sccIdOf[from]] || L.stride != 0) return mintAddr(obj, 0, UINT32_MAX, false);
       const int64_t g = sccG[sccIdOf[from]];
-      if (g == 1) return mintAddr(obj, 0, UINT32_MAX); // byte walk: every offset
-      if (st == 0) return mintAddr(obj, addrOff[rid], (uint32_t)g);
-      return mintAddr(obj, addrOff[rid], (uint32_t)std::gcd((int64_t)st, g));
+      if (g == 1) return mintAddr(obj, 0, UINT32_MAX, false); // byte walk: every offset
+      if (st == 0) return mintAddr(obj, addrOff[rid], (uint32_t)g, false);
+      return mintAddr(obj, addrOff[rid], (uint32_t)std::gcd((int64_t)st, g), false);
     }
     if (L.stride == 0) {
       if (st != 0 && L.off >= 0 && L.off % (int64_t)st == 0) return rid; // absorbed
-      return mintAddr(obj, addrOff[rid] + L.off, st);
+      return mintAddr(obj, addrOff[rid] + L.off, st, L.arith && st == 0);
     }
-    if (st == 0) return mintAddr(obj, addrOff[rid] + L.off, L.stride);
-    return mintAddr(obj, 0, UINT32_MAX); // two variable indices
+    if (st == 0) return mintAddr(obj, addrOff[rid] + L.off, L.stride, false);
+    return mintAddr(obj, 0, UINT32_MAX, false); // two variable indices
   };
   auto mintX = [&](uint32_t rid) -> uint32_t {
     addrGrow();
     if (!addrIsObj[rid]) return rid;
-    return mintAddr(addrObj[rid], 0, UINT32_MAX);
+    return mintAddr(addrObj[rid], 0, UINT32_MAX, false);
   };
   auto remapPlane = [&](const FactSet &src, uint32_t label, uint32_t from,
                         uint32_t to, FactSet &out) {
     out.clear();
     src.forEach([&](uint32_t bit) { out.set(remapRid(bit, label, from, to)); });
+  };
+  // Scratch for the remapped plane: one per thread, capacity retained.
+  auto remapScratch = [&]() -> FactSet & {
+    static thread_local FactSet rm;
+    return rm;
   };
   auto addrOverlap = [&](uint32_t a, uint32_t b) -> bool {
     if (addrObj[a] != addrObj[b]) return false;
@@ -5947,7 +6004,7 @@ bool CallGraphPass::runFlowsToResolution() {
     for (auto [t, r] : outF[b]) {
       uint32_t tt = find(t);
       if (lazyAddr) {
-        FactSet rm;
+        FactSet &rm = remapScratch();
         if (R[a][0].any()) { remapPlane(R[a][0], r, b, t, rm); if (rm.any()) addBits(tt, 0, rm, ctx0); }
         if (RB[a][0].any()) { remapPlane(RB[a][0], r, b, t, rm); if (rm.any()) addBits(tt, 0, rm, ctx0); }
         continue;
@@ -7417,7 +7474,7 @@ bool CallGraphPass::runFlowsToResolution() {
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
         if (lazyAddr) { // exact remap per bit (mints addresses on demand)
-          FactSet rm;
+          FactSet &rm = remapScratch();
           remapPlane(pay, r, n, t, rm);
           if (rm.any()) { ctx.nFOr++; addBits(tt, 0, rm, ctx); }
           continue;
@@ -9912,8 +9969,9 @@ bool CallGraphPass::runFlowsToResolution() {
         errs() << "LazyAddr: " << lazyMinted << " addresses minted ("
                << lazyStrided << " strided, " << lazyX << " range), "
                << lazyOverlapBridges << " overlap bridges, "
-               << lazyLabels.size() << " exact labels, " << lazyCapped
-               << " capped mint attempts\n";
+               << lazyLabels.size() << " exact labels, " << lazyWidened
+               << " progressions widened, " << lazyAbsorbed << " absorbed, "
+               << lazyCapped << " capped mint attempts\n";
       if (CFLKeyIdentity)
         errs() << "KeyIdentity: " << keyIdentityMinted
                << " channel identities minted, " << keyIdentitySelf

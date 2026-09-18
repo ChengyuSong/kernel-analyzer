@@ -5070,21 +5070,36 @@ bool CallGraphPass::runFlowsToResolution() {
     const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
     return V && isa<CallBase>(V) && !NF.isDereferenceNode(toOrig[rc]);
   };
+  size_t lazyTypedDrops = 0;
   auto noteTypeWitness = [&](uint32_t obj, const StructType *S2, int64_t base,
-                             uint32_t from, uint32_t to) {
+                             uint32_t from, uint32_t to) -> bool { // true = compatible
     witnessChecks++;
     auto pit = objPrimary.find(obj);
     if (pit == objPrimary.end()) {
       const StructType *D = declaredType(obj);
-      if (!D && !isAllocatedObject(obj)) { untypedSkipped++; return; } // identity / synthetic: no type of its own
+      if (!D && !isAllocatedObject(obj) &&
+          !(CFLLazyTypeIdentity && isIdentityRoot(obj) && obj < rootClassOf.size() &&
+            rootClassOf[obj] < toOrig.size())) {
+        untypedSkipped++; return true; // synthetic: no type of its own
+      }
+      if (!D) {
+        // Heap: the first typed access defines the object, unless the
+        // allocation size is constant and this type does not fit it (an
+        // early confused access must not mistype the object).
+        const int64_t sz = objBytes(obj);
+        const int64_t s2sz = S2->isOpaque() ? 0 : (int64_t)lazyDL->getStructLayout(const_cast<StructType *>(S2))->getSizeInBytes();
+        if (sz > 0 && s2sz > 0 && s2sz != sz && sz % s2sz != 0) return true;
+      }
       pit = objPrimary.emplace(obj, TypeWitness{D ? D : S2, D ? 0 : base}).first;
       typedObjects++;
-      if (!D) return; // heap: first typed access defines the object
+      if (!D) return true;
     }
-    if (typeCompatible(pit->second, S2, base)) return;
-    if (!objConflictTys[obj].insert(S2).second) return;
-    if (typeConflicts.size() < 500000) typeConflicts.push_back({obj, from, to, S2, base});
-    conflictEdgeCount[protBlameName(from).substr(0, 70)]++;
+    if (typeCompatible(pit->second, S2, base)) return true;
+    if (objConflictTys[obj].insert(S2).second) {
+      if (typeConflicts.size() < 500000) typeConflicts.push_back({obj, from, to, S2, base});
+      conflictEdgeCount[protBlameName(from).substr(0, 70)]++;
+    }
+    return false;
   };
   typeConflictReport = [&](size_t firstN) {
     errs() << "TypeConfusion: " << objConflictTys.size() << " objects with conflicting access types of "
@@ -5118,8 +5133,12 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!addrIsObj[rid]) return rid;
     {
       const LazyLabel &L0 = lazyLabels[label];
-      if (L0.ty && L0.stride == 0 && addrStride[rid] == 0)
-        noteTypeWitness(addrObj[rid], L0.ty, addrOff[rid], from, to);
+      if (L0.ty && L0.stride == 0 && addrStride[rid] == 0 &&
+          !noteTypeWitness(addrObj[rid], L0.ty, addrOff[rid], from, to) &&
+          CFLLazyTypedAccess) {
+        lazyTypedDrops++;
+        return UINT32_MAX; // typed access: no address for a mistyped object
+      }
     }
     if (lazyTraced(addrObj[rid])) {
       const LazyLabel &L = lazyLabels[label];
@@ -5159,7 +5178,10 @@ bool CallGraphPass::runFlowsToResolution() {
   auto remapPlane = [&](const FactSet &src, uint32_t label, uint32_t from,
                         uint32_t to, FactSet &out) {
     out.clear();
-    src.forEach([&](uint32_t bit) { out.set(remapRid(bit, label, from, to)); });
+    src.forEach([&](uint32_t bit) {
+      const uint32_t r2 = remapRid(bit, label, from, to);
+      if (r2 != UINT32_MAX) out.set(r2);
+    });
   };
   // Scratch for the remapped plane: one per thread, capacity retained.
   auto remapScratch = [&]() -> FactSet & {
@@ -10120,6 +10142,7 @@ bool CallGraphPass::runFlowsToResolution() {
                << lazyOverlapBridges << " overlap bridges, "
                << lazyLabels.size() << " exact labels, " << lazyWidened
                << " progressions widened, " << lazyAbsorbed << " absorbed, "
+               << lazyTypedDrops << " typed-access drops, "
                << lazyCapped << " capped mint attempts\n";
       if (CFLKeyIdentity)
         errs() << "KeyIdentity: " << keyIdentityMinted

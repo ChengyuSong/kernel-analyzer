@@ -1235,6 +1235,23 @@ cl::opt<std::string> CFLLazyTraceObject(
            "name contains this substring (source address, label, edge)"),
   cl::init(""));
 
+cl::opt<bool> CFLLazyTypedAccess(
+  "cfl-lazy-typed-access",
+  cl::desc("--cfl-lazy-address: a member step of struct S applied to an "
+           "address whose object has an incompatible type yields no address "
+           "(the union-member typed read, applied at the first typed use). "
+           "Sound iff the program has no type confusion; every drop is a "
+           "census conflict and is counted"),
+  cl::init(false));
+
+cl::opt<bool> CFLLazyTypeIdentity(
+  "cfl-lazy-type-identity",
+  cl::desc("--cfl-lazy-typed-access: identity roots (the unknown pointee of "
+           "an unwritten cell) take the type of their first typed access, "
+           "like heap objects; sound iff the underlying field is not a void* "
+           "or union slot (census conflicts show where it is)"),
+  cl::init(false));
+
 cl::opt<bool> CFLVarargsStrict(
   "cfl-varargs-strict",
   cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "

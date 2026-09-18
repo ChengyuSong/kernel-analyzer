@@ -1229,6 +1229,12 @@ cl::opt<unsigned> CFLLazyCap(
            "a quarter; constant globals: unbounded, they are never walked)"),
   cl::init(32));
 
+cl::opt<std::string> CFLLazyTraceObject(
+  "cfl-lazy-trace-object",
+  cl::desc("--cfl-lazy-address: log every address minted on objects whose "
+           "name contains this substring (source address, label, edge)"),
+  cl::init(""));
+
 cl::opt<bool> CFLVarargsStrict(
   "cfl-varargs-strict",
   cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "

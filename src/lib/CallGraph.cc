@@ -1192,8 +1192,8 @@ void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
       NodeIndex dParent = getCanonicalNode(dstAddr);
       sF = getFieldPtrNode(sParent, off);
       dF = getFieldPtrNode(dParent, off);
-      addFieldEdgesExact(sParent, getCanonicalNode(sF), off);
-      addFieldEdgesExact(dParent, getCanonicalNode(dF), off);
+      addFieldEdgesExact(sParent, getCanonicalNode(sF), off, 0, false, STy);
+      addFieldEdgesExact(dParent, getCanonicalNode(dF), off, 0, false, STy);
     }
     emitFieldwiseCopyEdges(sF, dF, elemTy, depth + 1);
   }
@@ -1734,25 +1734,27 @@ int CallGraphPass::fieldBucket(int64_t off) const {
   return (int)(r < 0 ? r + (int64_t)K : r);
 }
 
-uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith) {
+uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith,
+                                     const StructType *ty) {
   if (lazyLabels.empty()) {
-    lazyLabels.push_back({0, 0, false});
-    lazyLabelIdx[{0, 0, false}] = 0;
+    lazyLabels.push_back({0, 0, false, nullptr});
+    lazyLabelIdx[{0, 0, false, nullptr}] = 0;
   }
-  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith),
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty),
                                         (uint32_t)lazyLabels.size());
-  if (ins) lazyLabels.push_back({off, stride, arith});
+  if (ins) lazyLabels.push_back({off, stride, arith, ty});
   return it->second;
 }
 
 void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
-                                       int64_t off, uint32_t stride, bool arith) {
+                                       int64_t off, uint32_t stride, bool arith,
+                                       const StructType *ty) {
   EB.addFieldEdges(src, dst, fieldBucket(off));
   if (!CFLLazyAddress) return;
   // Recorded per edge (not per endpoint pair): canonical merging can
   // fold two field nodes into one destination, and each edge keeps its
   // own exact label.
-  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith));
+  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith, ty));
 }
 
 NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
@@ -1794,8 +1796,10 @@ NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
 //     wildcard fallback
 bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
                                        const DataLayout &DL,
-                                       SmallVectorImpl<int64_t> &levels) const {
+                                       SmallVectorImpl<int64_t> &levels,
+                                       SmallVectorImpl<const StructType *> *types) const {
   levels.clear();
+  if (types) types->clear();
   bool first = true;
   for (auto GTI = gep_type_begin(GEP), E = gep_type_end(GEP); GTI != E; ++GTI) {
     const Value *idx = GTI.getOperand();
@@ -1805,8 +1809,10 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
         return false; // malformed; be conservative
       const StructLayout *SL = DL.getStructLayout(STy);
       int64_t off = (int64_t)SL->getElementOffset(CI->getZExtValue());
-      if (off != 0)
+      if (off != 0) {
         levels.push_back(off);
+        if (types) types->push_back(STy);
+      }
     } else if (CFLLazyAddress) {
       // Exact addresses: a constant array index is an exact element
       // offset (element k is distinct from element 0); one variable index
@@ -1816,14 +1822,18 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       const uint64_t esz = DL.getTypeAllocSize(Ty);
       if (const auto *CI = dyn_cast<ConstantInt>(idx)) {
         int64_t off = CI->getSExtValue() * (int64_t)esz;
-        if (off > 0 && off < ((int64_t)1 << 40))
+        if (off > 0 && off < ((int64_t)1 << 40)) {
           levels.push_back(off | kArithLevelTag); // element step: walk candidate
-        else if (off != 0)
+          if (types) types->push_back(nullptr);
+        } else if (off != 0) {
           levels.push_back(off);
+          if (types) types->push_back(nullptr);
+        }
       } else {
         if (esz <= 1 || esz > 0x3fffffffULL)
           return false; // wildcard fallback
         levels.push_back(kStridedLevelTag | ((int64_t)esz << 32));
+        if (types) types->push_back(nullptr);
       }
     } else if (first) {
       Type *Ty = GTI.getIndexedType();
@@ -1836,8 +1846,10 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
         // -O1-folded positive byte offsets from mid-object pointers.
         int64_t off =
             CI->getSExtValue() * (int64_t)DL.getTypeAllocSize(Ty);
-        if (off != 0)
+        if (off != 0) {
           levels.push_back(off);
+          if (types) types->push_back(nullptr);
+        }
       }
     }
     first = false;
@@ -1846,7 +1858,8 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
 }
 
 void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
-                                       ArrayRef<int64_t> levels) {
+                                       ArrayRef<int64_t> levels,
+                                       ArrayRef<const StructType *> types) {
   assert(!levels.empty() && "addFieldChainEdges requires at least one level");
   NodeIndex cur = getCanonicalNode(baseNode);
   for (size_t k = 0; k < levels.size(); k++) {
@@ -1861,7 +1874,8 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
     else if (levels[k] > 0 && (levels[k] & kArithLevelTag))
       addFieldEdgesExact(cur, next, levels[k] & ~kArithLevelTag, 0, true);
     else
-      addFieldEdgesExact(cur, next, levels[k]);
+      addFieldEdgesExact(cur, next, levels[k], 0, false,
+                         k < types.size() ? types[k] : nullptr);
     cur = next;
   }
 }
@@ -4893,6 +4907,7 @@ bool CallGraphPass::runFlowsToResolution() {
   std::unordered_map<uint32_t, std::set<int64_t>> arithOffs;
   std::unordered_map<uint32_t, std::vector<std::pair<int64_t, uint32_t>>> objStrided;
   size_t lazyWidened = 0, lazyAbsorbed = 0;
+  std::function<void(size_t)> typeConflictReport; // defined with the census below
   std::function<uint32_t(uint32_t, int64_t, uint32_t, bool)> mintAddr;
   mintAddr = [&](uint32_t obj, int64_t off, uint32_t stride, bool arith) -> uint32_t {
     if (stride != UINT32_MAX) {
@@ -4938,10 +4953,12 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       cnt++;
     }
-    if (lazyMinted && lazyMinted % 50000 == 0)
+    if (lazyMinted && lazyMinted % 50000 == 0) {
       CG_LOG("LazyAddr: " << lazyMinted << " addresses so far; last r" << obj
              << " " << protBlameName(rootClassOf[obj]).substr(0, 40) << " +" << off
              << " stride " << stride << "\n");
+      if (lazyMinted == 50000 && typeConflictReport) typeConflictReport(60);
+    }
     const uint32_t rid = nextRoot++;
     FactSet::Universe = nextRoot; // widen BEFORE the first set
     rootClassOf.push_back(rootClassOf[obj]); // named after its object
@@ -4984,9 +5001,135 @@ bool CallGraphPass::runFlowsToResolution() {
     remapMemo[rid].emplace_back(key, res);
     return res;
   };
+  // Typed-heap conflict census (docs/lazy-address-design.md, user 09-17):
+  // an object has one type; every member access whose struct is not
+  // compatible with it (same type at an element boundary, embedded at that
+  // offset, or embedding it: container_of) is a conflict = a real type
+  // confusion or the first imprecise arrival of a pointer at the object.
+  // Recorded in solve order with the delivering edge; never prunes.
+  struct TypeWitness { const StructType *ty; int64_t base; };
+  struct TypeConflict { uint32_t obj, from, to; const StructType *ty; int64_t base; };
+  std::unordered_map<uint32_t, TypeWitness> objPrimary;
+  std::unordered_map<uint32_t, std::set<const StructType *>> objConflictTys;
+  std::vector<TypeConflict> typeConflicts;
+  std::unordered_map<std::string, uint32_t> conflictEdgeCount;
+  size_t typedObjects = 0, witnessChecks = 0;
+  const DataLayout *lazyDL = Ctx->Modules.empty() ? nullptr : &Ctx->Modules.front().first->getDataLayout();
+  auto sameStruct = [&](const StructType *a, const StructType *b) -> bool {
+    if (a == b) return true;
+    if (!a || !b || !a->hasName() || !b->hasName()) return false;
+    return stripStructNameSuffix(a->getName()) == stripStructNameSuffix(b->getName());
+  };
+  // A C union is lowered to a struct holding its largest member; any
+  // member type that fits at offset 0 of a union is a legitimate view.
+  auto isUnionTy = [&](const StructType *T) -> bool {
+    return T && T->hasName() && T->getName().starts_with("union.");
+  };
+  std::function<bool(const StructType *, int64_t, const StructType *)> embeds;
+  embeds = [&](const StructType *Sy, int64_t off, const StructType *S2) -> bool {
+    if (off == 0 && sameStruct(Sy, S2)) return true;
+    if (off < 0 || !lazyDL || Sy->isOpaque() || Sy->getNumElements() == 0) return false;
+    const StructLayout *SL = lazyDL->getStructLayout(const_cast<StructType *>(Sy));
+    if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+    if (off == 0 && isUnionTy(Sy) && !S2->isOpaque() &&
+        lazyDL->getStructLayout(const_cast<StructType *>(S2))->getSizeInBytes() <= SL->getSizeInBytes())
+      return true;
+    const unsigned idx = SL->getElementContainingOffset((uint64_t)off);
+    int64_t fo = (int64_t)SL->getElementOffset(idx);
+    Type *FT = Sy->getElementType(idx);
+    while (auto *AT = dyn_cast<ArrayType>(FT)) {
+      const int64_t es = (int64_t)lazyDL->getTypeAllocSize(AT->getElementType());
+      if (es <= 0) return false;
+      fo += ((off - fo) / es) * es;
+      FT = AT->getElementType();
+    }
+    if (auto *FS = dyn_cast<StructType>(FT)) return embeds(FS, off - fo, S2);
+    return false;
+  };
+  auto typeCompatible = [&](const TypeWitness &P, const StructType *S2, int64_t b2) -> bool {
+    if (!lazyDL || !P.ty) return true;
+    int64_t rel = b2 - P.base;
+    const int64_t psz = P.ty->isOpaque() ? 0 : (int64_t)lazyDL->getStructLayout(const_cast<StructType *>(P.ty))->getSizeInBytes();
+    if (psz > 0 && rel >= 0) rel %= psz; // arrays of the primary type
+    if (rel >= 0 && embeds(P.ty, rel, S2)) return true;   // S2 inside P
+    if (rel <= 0 && embeds(S2, -rel, P.ty)) return true;  // P inside S2 (container_of)
+    return false;
+  };
+  auto declaredType = [&](uint32_t obj) -> const StructType * {
+    const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
+    const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
+    Type *T = nullptr;
+    if (const auto *GV = dyn_cast_or_null<GlobalVariable>(V)) T = GV->getValueType();
+    else if (const auto *AI = dyn_cast_or_null<AllocaInst>(V)) T = AI->getAllocatedType();
+    while (T && isa<ArrayType>(T)) T = cast<ArrayType>(T)->getElementType();
+    return dyn_cast_or_null<StructType>(T);
+  };
+  size_t untypedSkipped = 0;
+  auto isAllocatedObject = [&](uint32_t obj) -> bool { // heap: an allocation call
+    const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
+    const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
+    return V && isa<CallBase>(V) && !NF.isDereferenceNode(toOrig[rc]);
+  };
+  auto noteTypeWitness = [&](uint32_t obj, const StructType *S2, int64_t base,
+                             uint32_t from, uint32_t to) {
+    witnessChecks++;
+    auto pit = objPrimary.find(obj);
+    if (pit == objPrimary.end()) {
+      const StructType *D = declaredType(obj);
+      if (!D && !isAllocatedObject(obj)) { untypedSkipped++; return; } // identity / synthetic: no type of its own
+      pit = objPrimary.emplace(obj, TypeWitness{D ? D : S2, D ? 0 : base}).first;
+      typedObjects++;
+      if (!D) return; // heap: first typed access defines the object
+    }
+    if (typeCompatible(pit->second, S2, base)) return;
+    if (!objConflictTys[obj].insert(S2).second) return;
+    if (typeConflicts.size() < 500000) typeConflicts.push_back({obj, from, to, S2, base});
+    conflictEdgeCount[protBlameName(from).substr(0, 70)]++;
+  };
+  typeConflictReport = [&](size_t firstN) {
+    errs() << "TypeConfusion: " << objConflictTys.size() << " objects with conflicting access types of "
+           << typedObjects << " typed (" << witnessChecks << " checks, " << typeConflicts.size()
+           << " (object,type) conflicts; " << untypedSkipped
+           << " checks on identity/synthetic content skipped)\n";
+    size_t shown = 0;
+    for (const TypeConflict &c : typeConflicts) {
+      if (shown++ >= firstN) break;
+      const TypeWitness &P = objPrimary[c.obj];
+      errs() << "TypeConfusion:  #" << shown << " obj r" << c.obj << " "
+             << protBlameName(rootClassOf[c.obj]).substr(0, 44) << " primary "
+             << (P.ty && P.ty->hasName() ? stripStructNameSuffix(P.ty->getName()).str() : "?")
+             << " <- " << (c.ty->hasName() ? stripStructNameSuffix(c.ty->getName()).str() : "?")
+             << "@" << c.base << " via " << protBlameName(c.from).substr(0, 50) << " ["
+             << nodeKind(c.from) << "] -> " << protBlameName(c.to).substr(0, 40) << "\n";
+    }
+    std::vector<std::pair<uint32_t, std::string>> top;
+    for (auto &[nm, cnt] : conflictEdgeCount) top.push_back({cnt, nm});
+    std::sort(top.begin(), top.end(), std::greater<>());
+    errs() << "TypeConfusion: top pointers by (object,type) conflicts they deliver:\n";
+    for (size_t i2 = 0; i2 < top.size() && i2 < 20; i2++)
+      errs() << "TypeConfusion:   " << top[i2].first << "  " << top[i2].second << "\n";
+  };
+  auto lazyTraced = [&](uint32_t obj) -> bool {
+    if (CFLLazyTraceObject.empty()) return false;
+    return StringRef(protBlameName(rootClassOf[obj])).contains(CFLLazyTraceObject);
+  };
   remapRidSlow = [&](uint32_t rid, uint32_t label, uint32_t from, uint32_t to) -> uint32_t {
     addrGrow();
     if (!addrIsObj[rid]) return rid;
+    {
+      const LazyLabel &L0 = lazyLabels[label];
+      if (L0.ty && L0.stride == 0 && addrStride[rid] == 0)
+        noteTypeWitness(addrObj[rid], L0.ty, addrOff[rid], from, to);
+    }
+    if (lazyTraced(addrObj[rid])) {
+      const LazyLabel &L = lazyLabels[label];
+      errs() << "LazyTrace: obj r" << addrObj[rid] << " from address r" << rid
+             << " (+" << addrOff[rid] << " s" << addrStride[rid] << ") label +" << L.off
+             << " stride " << L.stride << (L.arith ? " arith" : " member")
+             << " edge " << protBlameName(from).substr(0, 60) << " -> "
+             << protBlameName(to).substr(0, 60) << " [" << nodeKind(from) << ">"
+             << nodeKind(to) << "]\n";
+    }
     const uint32_t st = addrStride[rid];
     if (st == UINT32_MAX) return rid; // X stays X
     const LazyLabel &L = lazyLabels[label];
@@ -9970,6 +10113,7 @@ bool CallGraphPass::runFlowsToResolution() {
         }
         if (h && exHeap.size() < 8) exHeap.push_back(protBlameName(c).substr(0, 45));
       }
+      if (lazyAddr) typeConflictReport(60);
       if (lazyAddr)
         errs() << "LazyAddr: " << lazyMinted << " addresses minted ("
                << lazyStrided << " strided, " << lazyX << " range), "
@@ -12386,13 +12530,14 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
 
   if (CGP.EB.hasFieldLabels()) {
     SmallVector<int64_t, 4> levels;
+    SmallVector<const StructType *, 4> ltys;
     const DataLayout &DL = GEP.getModule()->getDataLayout();
-    if (!CGP.decomposeGEPLevels(cast<GEPOperator>(&GEP), DL, levels))
+    if (!CGP.decomposeGEPLevels(cast<GEPOperator>(&GEP), DL, levels, &ltys))
       CGP.applyFieldFallback(ptrNode, valNode, "gep-variable-offset");
     else if (levels.empty())
       CGP.addAssignmentEdge(ptrNode, valNode);
     else
-      CGP.addFieldChainEdges(ptrNode, valNode, levels);
+      CGP.addFieldChainEdges(ptrNode, valNode, levels, ltys);
     return;
   }
 
@@ -13372,7 +13517,8 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         if (off != 0) {
           NodeIndex parentCanon = getCanonicalNode(addrNode);
           childAddr = getFieldPtrNode(parentCanon, off);
-          addFieldEdgesExact(parentCanon, getCanonicalNode(childAddr), off);
+          addFieldEdgesExact(parentCanon, getCanonicalNode(childAddr), off, 0,
+                             false, STy);
         }
         childCell = getRepDerefNode(childAddr);
       }

@@ -93,6 +93,7 @@ extern cl::opt<bool> CFLProbeIdentityJoinAblate;
 extern cl::opt<bool> CFLChannelCells;
 extern cl::opt<bool> CFLLazyAddress;
 extern cl::opt<unsigned> CFLLazyCap;
+extern cl::opt<std::string> CFLLazyTraceObject;
 extern cl::opt<bool> CFLProbeNoIcallWiring;
 extern cl::opt<bool> CFLProbeNoIntStores;
 extern cl::opt<bool> CFLIterCapOk;

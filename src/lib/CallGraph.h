@@ -98,21 +98,27 @@ private:
   // arith: the step came from element indexing or byte arithmetic (a
   // walk candidate), not from a struct member; only arithmetic offsets
   // take part in progression widening.
-  struct LazyLabel { int64_t off; uint32_t stride; bool arith; }; // stride 0 = exact
+  // ty: the struct whose member this step selects (type witness for the
+  // typed-heap conflict census); null for arithmetic / strided steps.
+  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; };
   std::vector<LazyLabel> lazyLabels;
-  std::map<std::tuple<int64_t, uint32_t, bool>, uint32_t> lazyLabelIdx;
+  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *>, uint32_t> lazyLabelIdx;
   std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
-  uint32_t lazyLabelFor(int64_t off, uint32_t stride, bool arith = false);
+  uint32_t lazyLabelFor(int64_t off, uint32_t stride, bool arith = false,
+                        const llvm::StructType *ty = nullptr);
   void addFieldEdgesExact(NodeIndex src, NodeIndex dst, int64_t off,
-                          uint32_t stride = 0, bool arith = false);
+                          uint32_t stride = 0, bool arith = false,
+                          const llvm::StructType *ty = nullptr);
   static constexpr int64_t kStridedLevelTag = (int64_t)1 << 62;
   static constexpr int64_t kArithLevelTag = (int64_t)1 << 61;
   NodeIndex getFieldPtrNode(NodeIndex parentCanon, int64_t off);
   bool decomposeGEPLevels(const llvm::GEPOperator *GEP,
                           const llvm::DataLayout &DL,
-                          llvm::SmallVectorImpl<int64_t> &levels) const;
+                          llvm::SmallVectorImpl<int64_t> &levels,
+                          llvm::SmallVectorImpl<const llvm::StructType *> *types = nullptr) const;
   void addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
-                          llvm::ArrayRef<int64_t> levels);
+                          llvm::ArrayRef<int64_t> levels,
+                          llvm::ArrayRef<const llvm::StructType *> types = {});
   void applyFieldFallback(NodeIndex baseNode, NodeIndex resultNode,
                           const char *why);
   void addFieldWildcardLoop(NodeIndex n, const char *why);

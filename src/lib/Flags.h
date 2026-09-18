@@ -27,6 +27,7 @@ extern cl::opt<bool> CFLFlowsTo;
 extern cl::opt<bool> CFLFlowsToSlice;
 extern cl::opt<bool> CFLResidueCopies;
 extern cl::opt<std::string> CFLTraceFunc;
+extern cl::opt<bool> CFLTraceFirst;
 extern cl::opt<std::string> CFLTraceFptr;
 extern cl::opt<std::string> CFLTraceValue;
 extern cl::opt<std::string> CFLTraceMeet;

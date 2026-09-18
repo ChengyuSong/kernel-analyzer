@@ -5319,9 +5319,16 @@ bool CallGraphPass::runFlowsToResolution() {
   uint32_t tCell = UINT32_MAX;            // the dereference cell whose join caused it
   uint32_t tPtr = UINT32_MAX;             // the pointer class whose sweep issued the join
   const size_t traceCap = 200000 * std::max<size_t>(1, traceRoots.size());
+  // --cfl-trace-first: log only the first arrival of a root at a class
+  // (what a chain walk uses), so the log is bounded by the class count
+  // and the event cap never truncates the chain to a far site.
+  boost::unordered_flat_set<uint64_t> traceFirstSeen;
   auto traceHit = [&](uint32_t n, uint32_t s, bool bridged,
                       int64_t rid = -1) {
-    if (traceEvents++ > traceCap) return;
+    if (CFLTraceFirst) {
+      const uint64_t k = ((uint64_t)(rid < 0 ? traceRoot : rid) << 40) | ((uint64_t)n << 8) | (s & 0xff);
+      if (!traceFirstSeen.insert(k).second) return;
+    } else if (traceEvents++ > traceCap) return;
     errs() << "TRACE + c" << n << " s" << s << (bridged ? " [br]" : "")
            << " via " << tHow;
     // Edge kind of an a-edge arrival: what the target class is (formal,
@@ -7432,6 +7439,19 @@ bool CallGraphPass::runFlowsToResolution() {
             auto &k = perKind[x];
             errs() << "    entry a=" << k[0] << " f=" << k[1] << " o=" << k[2] << " x=" << k[3]
                    << " " << describe(x) << "\n";
+            if (nodeKind(x).rfind("formal", 0) != 0) continue;
+            // For a formal: the callers inside the component are what
+            // make it universal; the callers outside are what it lets in.
+            std::vector<std::pair<int64_t, uint32_t>> inside, outside;
+            for (auto [y, kd] : rin[x])
+              (comp[y] == cur ? inside : outside).push_back({factsOf(y), y});
+            std::sort(inside.begin(), inside.end(), [](auto &a, auto &b) { return a.first > b.first; });
+            std::sort(outside.begin(), outside.end(), [](auto &a, auto &b) { return a.first > b.first; });
+            errs() << "      callers inside " << inside.size() << ", outside " << outside.size() << "\n";
+            for (size_t i = 0; i < std::min<size_t>(4, inside.size()); i++)
+              errs() << "        in  " << describe(inside[i].second) << "\n";
+            for (size_t i = 0; i < std::min<size_t>(3, outside.size()); i++)
+              errs() << "        out " << describe(outside[i].second) << "\n";
           }
           break;
         }
@@ -10476,6 +10496,45 @@ bool CallGraphPass::runFlowsToResolution() {
           }
       }
       for (auto &[cn, cname] : chanNodeName) OS << "N\t" << cn << "\t" << cname << "\n";
+      // T lines: the static type of a cell (what its owner pointer's
+      // instruction says it dereferences): a GEP's source struct and
+      // field, an alloca's type, a global's type. Untyped owners (formals,
+      // loads, call results, casts) get no line. Lets a replay find the
+      // first union that fused cells of two different struct types.
+      {
+        boost::unordered_flat_map<NodeIndex, NodeIndex> ownerOf;
+        for (auto &[ptr, cell] : NF.getDerefMap()) ownerOf[cell] = ptr;
+        auto tyName = [&](Type *T) -> std::string {
+          std::string s2; raw_string_ostream os(s2); T->print(os); return os.str();
+        };
+        for (uint32_t d = 0; d < (uint32_t)toOrig.size(); d++) {
+          const NodeIndex canon = toOrig[d];
+          if (!NF.isDereferenceNode(canon)) continue;
+          auto oit = ownerOf.find(canon);
+          if (oit == ownerOf.end()) continue;
+          const Value *V = NF.getValueForNode(oit->second);
+          if (!V) continue;
+          std::string ty;
+          if (const auto *G = dyn_cast<GetElementPtrInst>(V)) {
+            ty = tyName(G->getSourceElementType());
+            if (G->getNumIndices() >= 2)
+              if (const auto *CI = dyn_cast<ConstantInt>(G->getOperand(2)))
+                ty += " field " + std::to_string(CI->getZExtValue());
+          } else if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+            if (CE->getOpcode() == Instruction::GetElementPtr) {
+              ty = tyName(cast<GEPOperator>(CE)->getSourceElementType());
+              if (CE->getNumOperands() >= 3)
+                if (const auto *CI = dyn_cast<ConstantInt>(CE->getOperand(2)))
+                  ty += " field " + std::to_string(CI->getZExtValue());
+            }
+          } else if (const auto *A = dyn_cast<AllocaInst>(V)) {
+            ty = tyName(A->getAllocatedType());
+          } else if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+            ty = tyName(GV->getValueType());
+          }
+          if (!ty.empty()) OS << "T\t" << d << "\t" << ty << "\n";
+        }
+      }
       for (const MergeEv &e : mergeLog) {
         OS << "M\t" << e.a << "\t" << e.b << "\t" << e.why << "\t";
         if (e.why == StringRef("join") && e.keyO != UINT32_MAX &&
@@ -16133,18 +16192,26 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::MoveX: {
-      // interior-of-loaded stored into a cell: Move + shift-wildcard
-      // on the destination parent (the stored value's shift is the
-      // loaded value's + unknown delta; fx loop absorbs it — FI exact)
+      // interior-of-loaded stored into a cell: the stored VALUE is the
+      // loaded value plus an unknown delta. The wildcard belongs to
+      // that value (a fresh node with the fx self-loop, as LoadX does
+      // for its result), NOT to the destination parent: a wildcard on
+      // the parent makes every field of the destination object
+      // offset-insensitive, fusing all its pointer fields regardless
+      // of type (nm-new: pe_ILF_save_relocs's `vars->reltab +=
+      // vars->relcount` collapsed the caller's pe_ILF_vars struct, and
+      // its bfd* and bfd_in_memory* fields became one cell).
       NodeIndex d = A.gdst ? nodeForGlobal(A.gdst) : nodeForRef(A.dst, true);
       NodeIndex c = A.gsrc2 ? nodeForGlobal(A.gsrc2) : nodeForRef(A.src, true);
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
-      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
-                        summaryDerefCell(d, A.dstByteOff));
+      NodeIndex v = NF.createValueNode();
+      g_opaqueProvenance[v] = "mvx-value";
+      addAssignmentEdge(summaryDerefCell(c, A.srcByteOff), v);
       if (EB.hasFieldLabels())
-        addFieldWildcardLoop(getCanonicalNode(d), "summary-mvx");
+        addFieldWildcardLoop(v, "summary-mvx");
+      addAssignmentEdge(v, summaryDerefCell(d, A.dstByteOff));
       g_sumSt++;
       break;
     }

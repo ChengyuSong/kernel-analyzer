@@ -187,6 +187,13 @@ cl::opt<std::string> CFLTraceFunc(
            "flow is lost"),
   cl::init(""));
 
+cl::opt<bool> CFLTraceFirst(
+  "cfl-trace-first",
+  cl::desc("With --cfl-trace-func: log only the first arrival of each "
+           "traced root at each class (bounded by the class count, no "
+           "event cap), which is what a backward chain walk reads"),
+  cl::init(false));
+
 cl::opt<std::string> CFLTraceFptr(
   "cfl-trace-fptr",
   cl::desc("After the flows-to fixpoint, dump a backward slice from the "

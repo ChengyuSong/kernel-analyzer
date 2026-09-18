@@ -1132,6 +1132,12 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
       const unsigned P = EB.getNumFieldBuckets();
       NodeIndex sParent = getCanonicalNode(srcNode);
       NodeIndex dParent = getCanonicalNode(dstNode);
+      if (CFLLazyAddress) {
+        // Exact addresses have no finite residue set to copy over: an
+        // unknown-layout copy is the range wildcard on both sides.
+        addFieldWildcardLoop(sParent, "memcpy-unknown-layout");
+        addFieldWildcardLoop(dParent, "memcpy-unknown-layout");
+      } else
       for (unsigned r = 1; r < P; r++) {
         NodeIndex sF = getFieldPtrNode(sParent, (int64_t)r);
         NodeIndex dF = getFieldPtrNode(dParent, (int64_t)r);
@@ -1186,8 +1192,8 @@ void CallGraphPass::emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
       NodeIndex dParent = getCanonicalNode(dstAddr);
       sF = getFieldPtrNode(sParent, off);
       dF = getFieldPtrNode(dParent, off);
-      EB.addFieldEdges(sParent, getCanonicalNode(sF), fieldBucket(off));
-      EB.addFieldEdges(dParent, getCanonicalNode(dF), fieldBucket(off));
+      addFieldEdgesExact(sParent, getCanonicalNode(sF), off);
+      addFieldEdgesExact(dParent, getCanonicalNode(dF), off);
     }
     emitFieldwiseCopyEdges(sF, dF, elemTy, depth + 1);
   }
@@ -1728,6 +1734,28 @@ int CallGraphPass::fieldBucket(int64_t off) const {
   return (int)(r < 0 ? r + (int64_t)K : r);
 }
 
+uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride) {
+  if (lazyLabels.empty()) {
+    lazyLabels.push_back({0, 0});
+    lazyLabelIdx[{0, 0}] = 0;
+  }
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_pair(off, stride),
+                                        (uint32_t)lazyLabels.size());
+  if (ins) lazyLabels.push_back({off, stride});
+  return it->second;
+}
+
+void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
+                                       int64_t off, uint32_t stride) {
+  EB.addFieldEdges(src, dst, fieldBucket(off));
+  if (!CFLLazyAddress) return;
+  const uint64_t ek = ((uint64_t)src << 32) | (uint64_t)dst;
+  const uint32_t li = lazyLabelFor(off, stride);
+  auto [it, ins] = lazyLabelOfEdge.emplace(ek, li);
+  assert((ins || it->second == li) &&
+         "lazy label: one edge cannot carry two exact offsets");
+}
+
 NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
   auto key = std::make_pair(parentCanon, off);
   auto it = fieldPtrNodes.find(key);
@@ -1780,6 +1808,22 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       int64_t off = (int64_t)SL->getElementOffset(CI->getZExtValue());
       if (off != 0)
         levels.push_back(off);
+    } else if (CFLLazyAddress) {
+      // Exact addresses: a constant array index is an exact element
+      // offset (element k is distinct from element 0); one variable index
+      // over an element of size > 1 is a strided step; byte arithmetic
+      // (element size 1) is the range wildcard.
+      Type *Ty = GTI.getIndexedType();
+      const uint64_t esz = DL.getTypeAllocSize(Ty);
+      if (const auto *CI = dyn_cast<ConstantInt>(idx)) {
+        int64_t off = CI->getSExtValue() * (int64_t)esz;
+        if (off != 0)
+          levels.push_back(off);
+      } else {
+        if (esz <= 1 || esz > 0x3fffffffULL)
+          return false; // wildcard fallback
+        levels.push_back(kStridedLevelTag | ((int64_t)esz << 32));
+      }
     } else if (first) {
       Type *Ty = GTI.getIndexedType();
       if (!Ty->isStructTy() && !Ty->isArrayTy() && !Ty->isVectorTy()) {
@@ -1810,7 +1854,11 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                           : getFieldPtrNode(cur, levels[k]);
     if (next == cur)
       continue;
-    EB.addFieldEdges(cur, next, fieldBucket(levels[k]));
+    if (levels[k] & kStridedLevelTag) // variable array index: strided step
+      addFieldEdgesExact(cur, next, 0,
+                         (uint32_t)((levels[k] >> 32) & 0x3fffffff));
+    else
+      addFieldEdgesExact(cur, next, levels[k]);
     cur = next;
   }
 }
@@ -3528,11 +3576,16 @@ bool CallGraphPass::runFlowsToResolution() {
   const auto &edges = EB.getEdges();
   const uint32_t la = EB.getLabelAssign();
   const uint32_t ld = EB.getLabelDeref();
-  const unsigned NB = EB.getNumFieldBuckets(); // 0 = field-insensitive
+  // Lazy addresses (docs/lazy-address-design.md): the grammar labels still
+  // exist (f-edges are collected from them) but the solver runs ONE fact
+  // plane; exact offsets live in per-edge labels and per-root descriptors.
+  const bool lazyAddr = CFLLazyAddress;
+  const unsigned NBg = EB.getNumFieldBuckets(); // grammar field buckets
+  const unsigned NB = lazyAddr ? 0 : NBg;        // solver planes; 0 = one plane
   std::unordered_map<uint32_t, uint32_t> bucketOfLabel;
   uint32_t lfx = UINT32_MAX;
-  if (NB > 0) {
-    for (unsigned b = 0; b < NB; b++)
+  if (NBg > 0) {
+    for (unsigned b = 0; b < NBg; b++)
       bucketOfLabel[EB.getLabelField(b)] = b;
     lfx = EB.getLabelFieldAny();
   }
@@ -3555,11 +3608,16 @@ bool CallGraphPass::runFlowsToResolution() {
       if (cf != ct) aEdges.emplace_back(dense(cf), dense(ct));
     } else if (E.label == ld) {
       dEdges.emplace_back(dense(cf), dense(ct));
-    } else if (NB > 0 && E.label == lfx) {
+    } else if (NBg > 0 && E.label == lfx) {
       wildcardNodes.insert(dense(cf));
-    } else if (NB > 0) {
+    } else if (NBg > 0) {
       auto bIt = bucketOfLabel.find(E.label);
-      if (bIt != bucketOfLabel.end())
+      if (bIt == bucketOfLabel.end()) continue;
+      if (lazyAddr) {
+        auto le = lazyLabelOfEdge.find(((uint64_t)E.from << 32) | (uint64_t)E.to);
+        assert(le != lazyLabelOfEdge.end() && "lazy: f-edge without exact label");
+        fEdges.emplace_back(dense(cf), dense(ct), le->second);
+      } else
         fEdges.emplace_back(dense(cf), dense(ct), bIt->second);
     }
   }
@@ -4755,6 +4813,176 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<char> rootConstData(nextRoot, 0);
   for (uint32_t rid = 0; rid < nextRoot; rid++)
     rootConstData[rid] = isConstDataRoot(rootClassOf[rid]);
+  // Lazy addresses: per-root descriptor (object root, byte offset, stride:
+  // 0 exact, UINT32_MAX = the object's range wildcard). Non-address roots
+  // (functions, identities, channel-minted ids) never remap.
+  std::vector<uint32_t> addrObj;
+  std::vector<int64_t> addrOff;
+  std::vector<uint32_t> addrStride;
+  std::vector<char> addrIsObj;
+  std::map<std::tuple<uint32_t, int64_t, uint32_t>, uint32_t> addrIndex;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> addrKeysOfObj;
+  size_t lazyMinted = 0, lazyStrided = 0, lazyX = 0, lazyOverlapBridges = 0;
+  auto addrGrow = [&]() {
+    if (addrIsObj.size() < nextRoot) {
+      addrObj.resize(nextRoot, UINT32_MAX);
+      addrOff.resize(nextRoot, 0);
+      addrStride.resize(nextRoot, 0);
+      addrIsObj.resize(nextRoot, 0);
+    }
+  };
+  // Object extent in bytes (0 = unknown): exact offsets outside it, and
+  // negative offsets, are the range wildcard, so pointer walks over an
+  // object of known size terminate at its end.
+  std::unordered_map<uint32_t, int64_t> objBytesMemo;
+  auto objBytes = [&](uint32_t obj) -> int64_t {
+    auto it = objBytesMemo.find(obj);
+    if (it != objBytesMemo.end()) return it->second;
+    int64_t sz = 0;
+    const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
+    const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
+    if (const auto *GV = dyn_cast_or_null<GlobalVariable>(V)) {
+      sz = (int64_t)GV->getParent()->getDataLayout().getTypeAllocSize(GV->getValueType());
+    } else if (const auto *AI = dyn_cast_or_null<AllocaInst>(V)) {
+      const DataLayout &DLa = AI->getModule()->getDataLayout();
+      sz = (int64_t)DLa.getTypeAllocSize(AI->getAllocatedType());
+      if (const auto *CI = dyn_cast<ConstantInt>(AI->getArraySize())) sz *= CI->getSExtValue();
+      else sz = 0;
+    } else if (const auto *CB = dyn_cast_or_null<CallBase>(V)) {
+      if (CB->arg_size() >= 1)
+        if (const auto *CI = dyn_cast<ConstantInt>(CB->getArgOperand(0)))
+          if (CI->getType()->isIntegerTy(64) || CI->getType()->isIntegerTy(32)) sz = CI->getSExtValue();
+    }
+    if (sz < 0) sz = 0;
+    objBytesMemo[obj] = sz;
+    return sz;
+  };
+  // Per-object cap: a walk whose cycle passes through memory (store,
+  // reload, increment) is invisible to the a/f SCC pass; after kLazyCap
+  // distinct exact addresses an object's further exact mints become its
+  // range root (sound: X over-approximates every offset).
+  const uint32_t kLazyCap = CFLLazyCap;      // per writable object
+  const uint32_t kLazyCapId = std::max<uint32_t>(2, CFLLazyCap / 4); // identity roots
+  std::unordered_map<uint32_t, uint32_t> addrCountOf;
+  auto isConstGlobalRoot = [&](uint32_t obj) -> bool { // never walked: uncapped
+    const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
+    if (rc >= toOrig.size()) return false;
+    const auto *GV = dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(toOrig[rc]));
+    return GV && GV->isConstant();
+  };
+  auto isIdentityRoot = [&](uint32_t obj) -> bool {
+    const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
+    if (rc >= toOrig.size()) return true;
+    const Value *V = NF.getValueForNode(toOrig[rc]);
+    return !V || NF.isDereferenceNode(toOrig[rc]);
+  };
+  size_t lazyCapped = 0;
+  std::function<uint32_t(uint32_t, int64_t, uint32_t)> mintAddr;
+  mintAddr = [&](uint32_t obj, int64_t off, uint32_t stride) -> uint32_t {
+    if (stride != UINT32_MAX) {
+      const int64_t sz = objBytes(obj);
+      if (off < 0 || (sz > 0 && off >= sz) || off > ((int64_t)1 << 20))
+        return mintAddr(obj, 0, UINT32_MAX);
+    } else off = 0;
+    auto [it, ins] = addrIndex.try_emplace(std::make_tuple(obj, off, stride), 0u);
+    if (!ins) return it->second;
+    if (stride != UINT32_MAX) {
+      uint32_t &cnt = addrCountOf[obj];
+      if (!isConstGlobalRoot(obj) &&
+          cnt >= (isIdentityRoot(obj) ? kLazyCapId : kLazyCap)) {
+        addrIndex.erase(it);
+        if (lazyCapped++ == 0)
+          WARNING("LazyAddr: object r" << obj << " ("
+                  << protBlameName(rootClassOf[obj]).substr(0, 50)
+                  << ") passed " << kLazyCap
+                  << " exact addresses; further offsets are its range\n");
+        return mintAddr(obj, 0, UINT32_MAX);
+      }
+      cnt++;
+    }
+    if (lazyMinted && lazyMinted % 50000 == 0)
+      CG_LOG("LazyAddr: " << lazyMinted << " addresses so far; last r" << obj
+             << " " << protBlameName(rootClassOf[obj]).substr(0, 40) << " +" << off
+             << " stride " << stride << "\n");
+    const uint32_t rid = nextRoot++;
+    FactSet::Universe = nextRoot; // widen BEFORE the first set
+    rootClassOf.push_back(rootClassOf[obj]); // named after its object
+    rootConstData.push_back(rootConstData[obj]);
+    rootParkable.push_back(rootParkable[obj]);
+    if (nexusGate) rootNexus.push_back(rootNexus[obj]);
+    addrGrow();
+    addrObj[rid] = obj; addrOff[rid] = off; addrStride[rid] = stride;
+    addrIsObj[rid] = 1;
+    it->second = rid;
+    lazyMinted++;
+    if (stride == UINT32_MAX) lazyX++; else if (stride) lazyStrided++;
+    return rid;
+  };
+  // Pointer-walk cycles: an f-edge inside an a/f SCC with nonzero net
+  // shift is a strided walk (stride = gcd of the SCC's exact shifts); a
+  // cycle with a negative or strided step is the range wildcard. Computed
+  // once over the presolved graph; the fixpoint terminates because a
+  // strided root absorbs further steps that are multiples of its stride.
+  std::vector<uint32_t> sccIdOf;
+  std::vector<int64_t> sccG;
+  std::vector<char> sccX;
+  // Fact remap across the f-edge (from -> to) with exact label `label`.
+  auto remapRid = [&](uint32_t rid, uint32_t label, uint32_t from, uint32_t to) -> uint32_t {
+    addrGrow();
+    if (!addrIsObj[rid]) return rid;
+    const uint32_t st = addrStride[rid];
+    if (st == UINT32_MAX) return rid; // X stays X
+    const LazyLabel &L = lazyLabels[label];
+    const uint32_t obj = addrObj[rid];
+    const bool cyc = from < sccIdOf.size() && to < sccIdOf.size() &&
+                     sccIdOf[from] == sccIdOf[to] &&
+                     (sccG[sccIdOf[from]] != 0 || sccX[sccIdOf[from]]);
+    if (cyc) {
+      if (sccX[sccIdOf[from]] || L.stride != 0) return mintAddr(obj, 0, UINT32_MAX);
+      const int64_t g = sccG[sccIdOf[from]];
+      if (g == 1) return mintAddr(obj, 0, UINT32_MAX); // byte walk: every offset
+      if (st == 0) return mintAddr(obj, addrOff[rid], (uint32_t)g);
+      return mintAddr(obj, addrOff[rid], (uint32_t)std::gcd((int64_t)st, g));
+    }
+    if (L.stride == 0) {
+      if (st != 0 && L.off >= 0 && L.off % (int64_t)st == 0) return rid; // absorbed
+      return mintAddr(obj, addrOff[rid] + L.off, st);
+    }
+    if (st == 0) return mintAddr(obj, addrOff[rid] + L.off, L.stride);
+    return mintAddr(obj, 0, UINT32_MAX); // two variable indices
+  };
+  auto mintX = [&](uint32_t rid) -> uint32_t {
+    addrGrow();
+    if (!addrIsObj[rid]) return rid;
+    return mintAddr(addrObj[rid], 0, UINT32_MAX);
+  };
+  auto remapPlane = [&](const FactSet &src, uint32_t label, uint32_t from,
+                        uint32_t to, FactSet &out) {
+    out.clear();
+    src.forEach([&](uint32_t bit) { out.set(remapRid(bit, label, from, to)); });
+  };
+  auto addrOverlap = [&](uint32_t a, uint32_t b) -> bool {
+    if (addrObj[a] != addrObj[b]) return false;
+    const uint32_t sa = addrStride[a], sb = addrStride[b];
+    if (sa == UINT32_MAX || sb == UINT32_MAX) return true;
+    if (sa == 0 && sb == 0) return addrOff[a] == addrOff[b];
+    if (sa == 0)
+      return addrOff[a] >= addrOff[b] && (addrOff[a] - addrOff[b]) % (int64_t)sb == 0;
+    if (sb == 0)
+      return addrOff[b] >= addrOff[a] && (addrOff[b] - addrOff[a]) % (int64_t)sa == 0;
+    const int64_t g = std::gcd((int64_t)sa, (int64_t)sb);
+    return ((addrOff[a] - addrOff[b]) % g) == 0; // bounds ignored: conservative
+  };
+  if (lazyAddr) {
+    addrGrow();
+    for (uint32_t rid = 0; rid < nextRoot; rid++) {
+      const uint32_t rc = rootClassOf[rid];
+      addrObj[rid] = rid; addrOff[rid] = 0; addrStride[rid] = 0;
+      addrIsObj[rid] = !funcRootOf.count(rid) && rc < toOrig.size();
+      addrIndex[std::make_tuple(rid, (int64_t)0, (uint32_t)0)] = rid;
+    }
+    if (lazyLabels.empty()) lazyLabelFor(0, 0);
+  }
   if (!bidiMarked.empty())
     CG_LOG("BidiPrune: pruned " << bidiPrunable << " origins outside the "
            << "fptr cone; minted " << nextRoot << " roots ("
@@ -5088,6 +5316,51 @@ bool CallGraphPass::runFlowsToResolution() {
     while (ufp[x] != x) { ufp[x] = ufp[ufp[x]]; x = ufp[x]; }
     return x;
   };
+  if (lazyAddr) {
+    sccIdOf.assign(N, UINT32_MAX);
+    std::vector<uint32_t> idx(N, UINT32_MAX), low(N, 0), stk;
+    std::vector<char> on(N, 0);
+    uint32_t counter = 0, nscc = 0;
+    auto succ = [&](uint32_t u, size_t i) -> uint32_t {
+      return i < outA[u].size() ? find(outA[u][i]) : find(outF[u][i - outA[u].size()].first);
+    };
+    for (uint32_t s0 = 0; s0 < N; s0++) {
+      if (find(s0) != s0 || idx[s0] != UINT32_MAX) continue;
+      std::vector<std::pair<uint32_t, size_t>> cs{{s0, 0}};
+      idx[s0] = low[s0] = counter++; stk.push_back(s0); on[s0] = 1;
+      while (!cs.empty()) {
+        uint32_t u = cs.back().first; size_t &i = cs.back().second;
+        const size_t deg = outA[u].size() + outF[u].size();
+        if (i < deg) {
+          const uint32_t v = succ(u, i++);
+          if (idx[v] == UINT32_MAX) {
+            idx[v] = low[v] = counter++; stk.push_back(v); on[v] = 1;
+            cs.push_back({v, 0});
+          } else if (on[v]) low[u] = std::min(low[u], idx[v]);
+        } else {
+          if (low[u] == idx[u]) {
+            uint32_t w;
+            do { w = stk.back(); stk.pop_back(); on[w] = 0; sccIdOf[w] = nscc; } while (w != u);
+            nscc++;
+          }
+          cs.pop_back();
+          if (!cs.empty()) low[cs.back().first] = std::min(low[cs.back().first], low[u]);
+        }
+      }
+    }
+    for (uint32_t n2 = 0; n2 < N; n2++) if (find(n2) != n2) sccIdOf[n2] = sccIdOf[find(n2)];
+    sccG.assign(nscc, 0); sccX.assign(nscc, 0);
+    for (uint32_t u = 0; u < N; u++)
+      for (auto [t, r] : outF[u]) {
+        const uint32_t su = sccIdOf[u], st = sccIdOf[t];
+        if (su != st) continue;
+        const LazyLabel &L = lazyLabels[r];
+        if (L.stride != 0 || L.off < 0) sccX[su] = 1;
+        else if (L.off != 0) sccG[su] = std::gcd(sccG[su], L.off);
+      }
+    size_t nCyc = 0; for (uint32_t i2 = 0; i2 < nscc; i2++) nCyc += (sccG[i2] != 0 || sccX[i2]);
+    CG_LOG("LazyAddr: " << nscc << " a/f SCCs, " << nCyc << " with a nonzero-shift cycle\n");
+  }
   // Per-class planes: R = native facts; RB = bridged facts (arrived over
   // a VX bridge; disjoint from R). Bridged facts behave identically in
   // joins, a/f propagation (emitting native downstream — a load out of
@@ -5673,6 +5946,12 @@ bool CallGraphPass::runFlowsToResolution() {
     tHow = "merge-move-f"; tFrom = a;
     for (auto [t, r] : outF[b]) {
       uint32_t tt = find(t);
+      if (lazyAddr) {
+        FactSet rm;
+        if (R[a][0].any()) { remapPlane(R[a][0], r, b, t, rm); if (rm.any()) addBits(tt, 0, rm, ctx0); }
+        if (RB[a][0].any()) { remapPlane(RB[a][0], r, b, t, rm); if (rm.any()) addBits(tt, 0, rm, ctx0); }
+        continue;
+      }
       for (uint32_t s = 0; s < NSHIFT; s++) {
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
         if (tt == a && s2 == s) continue;
@@ -6351,7 +6630,23 @@ bool CallGraphPass::runFlowsToResolution() {
         // --cfl-probe-no-x-bridges: MEASUREMENT-ONLY UNSOUND PROBE — the
         // unknown-offset channel of an origin is not bridged to its
         // residue channels (quantifies the X-plane spread).
-        if (NB > 0 && !CFLProbeNoXBridges) { // VX linking between channel nodes (same scope)
+        if (lazyAddr) {
+          // Address overlap: bridge this channel with every channel of the
+          // same object whose address set intersects (exact/strided/X).
+          addrGrow();
+          if (P.o < addrIsObj.size() && addrIsObj[P.o]) {
+            auto &ks = addrKeysOfObj[addrObj[P.o]];
+            for (uint32_t k2 : ks) {
+              if (!addrOverlap(P.o, k2)) continue;
+              const uint32_t ch2 = clusterFind((uint64_t)k2 * NSHIFT);
+              if (ch2 == UINT32_MAX) continue;
+              tKeyO = k2; tKeyS = 0;
+              addBridge(ch, ch2);
+              lazyOverlapBridges++;
+            }
+            ks.push_back(P.o);
+          }
+        } else if (NB > 0 && !CFLProbeNoXBridges) { // VX linking between channel nodes (same scope)
           if (P.s == SHIFT_X) {
             for (uint64_t ek : shiftKeysOf[P.o]) {
               const uint32_t er = clusterFind(ek);
@@ -6671,7 +6966,8 @@ bool CallGraphPass::runFlowsToResolution() {
     size_t exactMint = 0, wildMint = 0;
     for (auto [n, rid] : seeds) {
       const bool exact = !nexusGate || rootNexus[rid];
-      addFact(find(n), exact ? 0 : SHIFT_X, rid, ctx0);
+      if (lazyAddr && !exact) addFact(find(n), 0, mintX(rid), ctx0);
+      else addFact(find(n), exact ? 0 : SHIFT_X, rid, ctx0);
       (exact ? exactMint : wildMint)++;
     }
     if (nexusGate)
@@ -6727,6 +7023,12 @@ bool CallGraphPass::runFlowsToResolution() {
     rootClassOf.push_back(rep);
     rootConstData.push_back(isConstDataRoot(rep));
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
+    if (lazyAddr) {
+      addrGrow();
+      addrObj[rid] = rid; addrOff[rid] = 0; addrStride[rid] = 0;
+      addrIsObj[rid] = !funcOfCanon.count(toOrig[rep]);
+      addrIndex[std::make_tuple(rid, (int64_t)0, (uint32_t)0)] = rid;
+    }
     if (!ownedMask.empty() && !funcOfCanon.count(toOrig[rep])) {
       const Value *ov2 = NF.getValueForNode(toOrig[rep]);
       const llvm::Module *om2 = nullptr;
@@ -7021,6 +7323,7 @@ bool CallGraphPass::runFlowsToResolution() {
       FactSet &db = ctx.dbS;
       FactSet &d = ctx.d;
       const bool wproj = NB > 0 && wflag[n] && s != SHIFT_X;
+      const bool wlazy = lazyAddr && wflag[n]; // fx: every object also at X
       lockC(n);
       const bool doBr = dirtyBr[n][s].any() && !bridgesOf[n].empty();
       if (doBr) db.copyFrom(dirtyBr[n][s]);
@@ -7080,6 +7383,14 @@ bool CallGraphPass::runFlowsToResolution() {
           if (ctx.dBrS.any()) addBitsBridged(n, SHIFT_X, ctx.dBrS, ctx);
         }
       }
+      if (wlazy) {
+        FactSet xs;
+        pay.forEach([&](uint32_t bit) {
+          const uint32_t x = mintX(bit);
+          if (x != bit) xs.set(x);
+        });
+        if (xs.any()) { if (traceAny) { tHow = "wflag"; tFrom = n; } addBits(n, 0, xs, ctx); }
+      }
       uint64_t tp4 = rd();
       ctx.cyW += tp4 - tp3;
       // Propagate the delta: whole-plane OR along a-edges, plane-rotated
@@ -7105,6 +7416,12 @@ bool CallGraphPass::runFlowsToResolution() {
       if (traceAny) { tHow = "f-prop"; tFrom = n; }
       for (auto [t, r] : outF[n]) {
         uint32_t tt = find(t);
+        if (lazyAddr) { // exact remap per bit (mints addresses on demand)
+          FactSet rm;
+          remapPlane(pay, r, n, t, rm);
+          if (rm.any()) { ctx.nFOr++; addBits(tt, 0, rm, ctx); }
+          continue;
+        }
         uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
         if (tt != n || s2 != s) { ctx.nFOr++; addBits(tt, s2, pay, ctx, dFull); }
       }
@@ -9591,6 +9908,12 @@ bool CallGraphPass::runFlowsToResolution() {
         }
         if (h && exHeap.size() < 8) exHeap.push_back(protBlameName(c).substr(0, 45));
       }
+      if (lazyAddr)
+        errs() << "LazyAddr: " << lazyMinted << " addresses minted ("
+               << lazyStrided << " strided, " << lazyX << " range), "
+               << lazyOverlapBridges << " overlap bridges, "
+               << lazyLabels.size() << " exact labels, " << lazyCapped
+               << " capped mint attempts\n";
       if (CFLKeyIdentity)
         errs() << "KeyIdentity: " << keyIdentityMinted
                << " channel identities minted, " << keyIdentitySelf
@@ -12986,8 +13309,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         if (off != 0) {
           NodeIndex parentCanon = getCanonicalNode(addrNode);
           childAddr = getFieldPtrNode(parentCanon, off);
-          EB.addFieldEdges(parentCanon, getCanonicalNode(childAddr),
-                           fieldBucket(off));
+          addFieldEdgesExact(parentCanon, getCanonicalNode(childAddr), off);
         }
         childCell = getRepDerefNode(childAddr);
       }
@@ -14740,7 +15062,7 @@ NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
   if (byteOff <= 0 || !EB.hasFieldLabels())
     return getRepDerefNode(canon);
   NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
-  EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
+  addFieldEdgesExact(canon, getCanonicalNode(f), (int64_t)byteOff);
   return getRepDerefNode(getCanonicalNode(f));
 }
 
@@ -14771,7 +15093,7 @@ NodeIndex CallGraphPass::summaryFieldPtr(NodeIndex base, int byteOff) {
   if (byteOff <= 0 || !EB.hasFieldLabels())
     return canon;
   NodeIndex f = getFieldPtrNode(canon, (int64_t)byteOff);
-  EB.addFieldEdges(canon, getCanonicalNode(f), fieldBucket(byteOff));
+  addFieldEdgesExact(canon, getCanonicalNode(f), (int64_t)byteOff);
   return getCanonicalNode(f);
 }
 
@@ -14858,7 +15180,12 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       // 104 ≡ 0 (mod 13) by residue accident (found via the 5.18 GT
       // target_absent shift 2026-08-18; invisible to t_kmemdup, whose
       // source fields are runtime stores).
-      if (CFLFlowsTo && EB.hasFieldLabels()) {
+      if (CFLFlowsTo && EB.hasFieldLabels() && CFLLazyAddress) {
+        // Exact addresses: no residue set to relay; a byte copy of
+        // unknown extent is the range wildcard on both sides.
+        addFieldWildcardLoop(getCanonicalNode(s), "cpy-unknown-extent");
+        addFieldWildcardLoop(getCanonicalNode(d), "cpy-unknown-extent");
+      } else if (CFLFlowsTo && EB.hasFieldLabels()) {
         const unsigned P = EB.getNumFieldBuckets();
         NodeIndex sParent = getCanonicalNode(s);
         NodeIndex dParent = getCanonicalNode(d);

@@ -91,6 +91,18 @@ private:
   std::unordered_set<NodeIndex> moduleFieldWildcardRoots;
   std::unordered_set<NodeIndex> moduleConstGEPFieldDone;
   int fieldBucket(int64_t off) const;
+  // Lazy addresses (--cfl-lazy-address, docs/lazy-address-design.md):
+  // every f-edge carries an exact {offset, stride} label recorded out of
+  // band (the grammar's residue labels are untouched). Index 0 is
+  // reserved for offset 0 so "residue-0 f edge" keeps its meaning.
+  struct LazyLabel { int64_t off; uint32_t stride; }; // stride 0 = exact
+  std::vector<LazyLabel> lazyLabels;
+  std::map<std::pair<int64_t, uint32_t>, uint32_t> lazyLabelIdx;
+  std::unordered_map<uint64_t, uint32_t> lazyLabelOfEdge; // src<<32|dst
+  uint32_t lazyLabelFor(int64_t off, uint32_t stride);
+  void addFieldEdgesExact(NodeIndex src, NodeIndex dst, int64_t off,
+                          uint32_t stride = 0);
+  static constexpr int64_t kStridedLevelTag = (int64_t)1 << 62;
   NodeIndex getFieldPtrNode(NodeIndex parentCanon, int64_t off);
   bool decomposeGEPLevels(const llvm::GEPOperator *GEP,
                           const llvm::DataLayout &DL,

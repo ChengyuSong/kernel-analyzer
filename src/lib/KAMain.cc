@@ -1213,6 +1213,22 @@ cl::opt<unsigned> CFLProbeBlockHubFormals(
            "rides through hub formals"),
   cl::init(0));
 
+cl::opt<bool> CFLLazyAddress(
+  "cfl-lazy-address",
+  cl::desc("Exact byte-offset addresses as facts, materialized on demand "
+           "(docs/lazy-address-design.md): one fact plane, f-edges remap "
+           "per bit, variable array indices are strided addresses, storage "
+           "identity is the address. Implies --cfl-channel-cells; refuses "
+           "batch, bidi-prune and the closure verifier"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLLazyCap(
+  "cfl-lazy-cap",
+  cl::desc("--cfl-lazy-address: exact addresses minted per writable object "
+           "before further offsets become its range root (identity roots: "
+           "a quarter; constant globals: unbounded, they are never walked)"),
+  cl::init(32));
+
 cl::opt<bool> CFLVarargsStrict(
   "cfl-varargs-strict",
   cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "
@@ -1643,6 +1659,16 @@ int main(int argc, char **argv) {
                    "--cfl-solver-threads");
     requireFlowsTo(CFLSolverBlock.getNumOccurrences() > 0,
                    "--cfl-solver-block");
+    if (CFLLazyAddress) {
+      requireFlowsTo(true, "--cfl-lazy-address");
+      CFLChannelCells = true; // storage identity = the address channel
+      if (CFLFieldBuckets == 0) CFLFieldBuckets = 13; // f-edge labels only
+      if (CFLBatchRoots > 0 || CFLVerifyClosure)
+        cliErrors.push_back("--cfl-lazy-address refuses batch mode and "
+                            "the closure verifier (single plane, exact "
+                            "labels)");
+      CFLBidiPrune = false; // cone is residue-based; not ported
+    }
     if (!cliErrors.empty()) {
       for (const auto &e : cliErrors)
         errs() << argv[0] << ": CLI sanity: " << e << "\n";

@@ -6044,6 +6044,27 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<uint32_t> popCount(N, 0);
   FactSet mnbS, mprS; // merge scratch (merge never nests inside itself)
   uint64_t cyMerge = 0;
+  // --cfl-channel-demand: relevance = "can reach an indirect call's callee
+  // operand" (static reverse closure over a/f edges, extended through
+  // every wired store). Reads outside it and stores to undemanded keys
+  // are deferred and replayed when relevance or demand arrives.
+  struct ChanPend {
+    uint32_t cell, o, s;
+  };
+  const bool demandMode = CFLChannelCells && CFLChannelDemand;
+  std::vector<char> demRelNode, demRelClass;
+  std::vector<std::vector<uint32_t>> demRin;
+  bool demInitDone = false;
+  boost::unordered_flat_set<uint64_t> demandedKeys;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> demDeferredStores; // key -> pend idx
+  std::unordered_map<uint32_t, std::vector<uint32_t>> demDeferredReads;  // cell -> pend idx
+  std::unordered_map<uint32_t, std::vector<uint32_t>> demClassCells;     // class -> cells
+  std::vector<uint32_t> demRelDirty;
+  std::vector<ChanPend> demKeep; // deferred pends (chanPend is cleared per flush)
+  size_t demDeferredR = 0, demDeferredS = 0, demReplayed = 0, demRelevantNodes = 0;
+  auto demRelSize = [&](uint32_t x) {
+    if (demRelClass.size() <= x) demRelClass.resize(x + 1024, 0);
+  };
   // --cfl-dump-merges: every union with its cause, replayed offline to
   // answer "which union first put X and Y in one class, and why".
   struct MergeEv { uint32_t a, b, keyO, keyS, ptr; const char *why; };
@@ -6083,6 +6104,19 @@ bool CallGraphPass::runFlowsToResolution() {
     keyCount[b].store(0, std::memory_order_relaxed);
     isRoot[a] |= isRoot[b];
     if (!wireCone.empty()) wireCone[a] |= wireCone[b];
+    if (demandMode) {
+      demRelSize(std::max(a, b));
+      if (demRelClass[a] != demRelClass[b]) {
+        demRelClass[a] = 1;
+        demRelDirty.push_back(a); // deferred reads of the newly relevant side replay
+      }
+      auto dc = demClassCells.find(b);
+      if (dc != demClassCells.end()) {
+        auto &da = demClassCells[a];
+        da.insert(da.end(), dc->second.begin(), dc->second.end());
+        demClassCells.erase(dc);
+      }
+    }
     tHow = "merge"; tFrom = b;
     for (uint32_t s = 0; s < NSHIFT; s++) {
       // Propagation delta: only facts genuinely new to the keeper. The
@@ -6432,9 +6466,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // pendings during rounds; channel nodes + directional edges are
   // materialized at the drain barrier (node growth is barrier-serial,
   // no live references across it).
-  struct ChanPend {
-    uint32_t cell, o, s;
-  };
   std::vector<ChanPend> chanPend;
   // Record-time dedup: one pend per (raw cell, key) for the whole
   // solve — node ids are never reused, so raw ids are stable even
@@ -6785,15 +6816,117 @@ bool CallGraphPass::runFlowsToResolution() {
   // cell must already drop the base bit (holderRelabel), so the table is
   // built here, not at the first flush.
   buildFreshStoreCells();
+  auto demMarkNode = [&](uint32_t x) -> bool {
+    if (x >= demRelNode.size()) demRelNode.resize(x + 1024, 0);
+    if (demRelNode[x]) return false;
+    demRelNode[x] = 1;
+    demRelevantNodes++;
+    const uint32_t c = find(x);
+    demRelSize(c);
+    if (!demRelClass[c]) { demRelClass[c] = 1; demRelDirty.push_back(c); }
+    return true;
+  };
+  auto demRelevantFrom = [&](uint32_t seed) {
+    std::vector<uint32_t> q;
+    if (demMarkNode(seed)) q.push_back(seed);
+    while (!q.empty()) {
+      const uint32_t x = q.back(); q.pop_back();
+      if (x >= demRin.size()) continue;
+      for (uint32_t y : demRin[x]) if (demMarkNode(y)) q.push_back(y);
+    }
+  };
+  // Demand is per OBJECT (all keys of an object: exact, strided and range
+  // overlap through bridges, so a store under one key must be wired when
+  // a read of any key of the same object is relevant).
+  auto demObjOf = [&](uint32_t o) -> uint64_t {
+    if (lazyAddr) {
+      addrGrow();
+      if (o < addrIsObj.size() && addrIsObj[o]) return addrObj[o];
+    }
+    return o;
+  };
+  auto demInit = [&]() {
+    demInitDone = true;
+    demRin.assign(N, {});
+    for (uint32_t n = 0; n < N; n++) {
+      for (uint32_t t : outA[n]) if (t < N) demRin[t].push_back(n);
+      for (auto [t, r] : outF[n]) if (t < N) demRin[t].push_back(n);
+      // A relevant cell makes its owner pointer relevant: the owner's
+      // facts select which keys the cell reads (owner-pointer hop).
+      for (uint32_t c : cellsOf[n]) if (c < N) demRin[c].push_back(n);
+    }
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto it = toDense.find(getCanonicalNode(fn));
+      if (it != toDense.end()) demRelevantFrom(it->second);
+    }
+    CG_LOG("ChannelDemand: " << demRelevantNodes << " nodes relevant at start\n");
+  };
   auto flushChannelPends = [&]() -> size_t {
     if (!CFLChannelCells) return 0;
-    if (chanPend.empty()) return holderReleaseKeyless();
+    if (chanPend.empty() && demRelDirty.empty()) return holderReleaseKeyless();
     const auto tFlush0 = std::chrono::steady_clock::now();
     const size_t pendsIn = chanPend.size();
     size_t work = 0;
-    for (const ChanPend &P : chanPend) {
+    if (demandMode && !demInitDone) demInit();
+    auto demReplayDirty = [&]() {
+      std::vector<uint32_t> dirty; dirty.swap(demRelDirty);
+      for (uint32_t c : dirty) {
+        auto it = demClassCells.find(c);
+        if (it == demClassCells.end()) continue;
+        std::vector<uint32_t> cells; cells.swap(it->second);
+        demClassCells.erase(it);
+        for (uint32_t cn : cells) {
+          auto dr = demDeferredReads.find(cn);
+          if (dr == demDeferredReads.end()) continue;
+          for (uint32_t idx : dr->second) chanPend.push_back(demKeep[idx]);
+          demReplayed += dr->second.size();
+          demDeferredReads.erase(dr);
+        }
+      }
+    };
+    if (demandMode) demReplayDirty();
+    for (size_t pi = 0; pi < chanPend.size(); pi++) {
+      if (demandMode && pi + 1 == chanPend.size() && !demRelDirty.empty()) demReplayDirty();
+      const ChanPend P = chanPend[pi]; // copy: replays append to the vector
       const uint32_t cell = find(P.cell);
       const uint64_t key = (uint64_t)P.o * NSHIFT + P.s;
+      if (demandMode) {
+        const bool isRead = !outA[cell].empty() || !outF[cell].empty() ||
+                            !cellsOf[cell].empty() || chanReadHalf.count(cell);
+        demRelSize(cell);
+        const bool rel = demRelClass[cell];
+        const uint64_t dkey = demObjOf(P.o);
+        if (isRead && rel) {
+          if (demandedKeys.insert(dkey).second) {
+            auto ds = demDeferredStores.find(dkey);
+            if (ds != demDeferredStores.end()) {
+              for (uint32_t idx : ds->second) chanPend.push_back(demKeep[idx]);
+              demReplayed += ds->second.size();
+              demDeferredStores.erase(ds);
+            }
+          }
+        } else if (!demandedKeys.count(dkey)) {
+          demKeep.push_back(P);
+          const uint32_t kidx = (uint32_t)demKeep.size() - 1;
+          // A cell can be both a read and a store (an initializer cell
+          // that is also loaded, RMW): defer it on both lists; whichever
+          // arrives first, demand or relevance, replays it.
+          if (isRead) {
+            demDeferredReads[P.cell].push_back(kidx);
+            demClassCells[cell].push_back(P.cell);
+            demDeferredR++;
+          }
+          if (!isRead || (P.cell < N && hasIn[P.cell])) {
+            demDeferredStores[dkey].push_back(kidx);
+            demDeferredS++;
+          }
+          continue;
+        }
+        if (P.cell < N && hasIn[P.cell]) demRelevantFrom(P.cell); // wired store: its sources matter
+      }
       uint32_t ch;
       auto [it, ins] = clusterRep.emplace(key, UINT32_MAX);
       if (ins) {
@@ -7034,6 +7167,10 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     chanPend.clear();
     flushCtx(ctx0);
+    if (demandMode)
+      CG_LOG("ChannelDemand: relevant nodes " << demRelevantNodes << ", demanded keys "
+             << demandedKeys.size() << ", deferred reads " << demDeferredR
+             << " stores " << demDeferredS << ", replayed " << demReplayed << "\n");
     CG_LOG("ChanFlush: " << pendsIn << " pends, " << work << " new wirings; "
            << "channels " << chanNodes << " edges " << chanEdges
            << " splits " << chanSplits << ", "

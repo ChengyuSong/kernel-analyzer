@@ -1252,6 +1252,16 @@ cl::opt<bool> CFLLazyTypeIdentity(
            "or union slot (census conflicts show where it is)"),
   cl::init(false));
 
+cl::opt<bool> CFLChannelDemand(
+  "cfl-channel-demand",
+  cl::desc("With --cfl-channel-cells: demand-driven wiring. A read cell is "
+           "wired to its keys' channels only once its value can reach an "
+           "indirect call (static reverse closure from the callee operands, "
+           "extended through every wired store); a store is wired to a key "
+           "only once some relevant read demands that key. Deferred pends "
+           "replay when demand or relevance arrives. Answer-preserving"),
+  cl::init(false));
+
 cl::opt<bool> CFLVarargsStrict(
   "cfl-varargs-strict",
   cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "

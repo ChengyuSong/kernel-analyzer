@@ -101,7 +101,7 @@ private:
   struct LazyLabel { int64_t off; uint32_t stride; bool arith; }; // stride 0 = exact
   std::vector<LazyLabel> lazyLabels;
   std::map<std::tuple<int64_t, uint32_t, bool>, uint32_t> lazyLabelIdx;
-  std::unordered_map<uint64_t, uint32_t> lazyLabelOfEdge; // src<<32|dst
+  std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
   uint32_t lazyLabelFor(int64_t off, uint32_t stride, bool arith = false);
   void addFieldEdgesExact(NodeIndex src, NodeIndex dst, int64_t off,
                           uint32_t stride = 0, bool arith = false);

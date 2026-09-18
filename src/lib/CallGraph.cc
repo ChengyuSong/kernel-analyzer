@@ -1749,11 +1749,10 @@ void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
                                        int64_t off, uint32_t stride, bool arith) {
   EB.addFieldEdges(src, dst, fieldBucket(off));
   if (!CFLLazyAddress) return;
-  const uint64_t ek = ((uint64_t)src << 32) | (uint64_t)dst;
-  const uint32_t li = lazyLabelFor(off, stride, arith);
-  auto [it, ins] = lazyLabelOfEdge.emplace(ek, li);
-  assert((ins || it->second == li) &&
-         "lazy label: one edge cannot carry two exact offsets");
+  // Recorded per edge (not per endpoint pair): canonical merging can
+  // fold two field nodes into one destination, and each edge keeps its
+  // own exact label.
+  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith));
 }
 
 NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
@@ -3617,12 +3616,18 @@ bool CallGraphPass::runFlowsToResolution() {
     } else if (NBg > 0) {
       auto bIt = bucketOfLabel.find(E.label);
       if (bIt == bucketOfLabel.end()) continue;
-      if (lazyAddr) {
-        auto le = lazyLabelOfEdge.find(((uint64_t)E.from << 32) | (uint64_t)E.to);
-        assert(le != lazyLabelOfEdge.end() && "lazy: f-edge without exact label");
-        fEdges.emplace_back(dense(cf), dense(ct), le->second);
-      } else
+      if (!lazyAddr) // lazy mode takes its f-edges from lazyFEdges below
         fEdges.emplace_back(dense(cf), dense(ct), bIt->second);
+    }
+  }
+  if (lazyAddr) {
+    // Exact-labelled f-edges, one per recorded edge (self-loops kept:
+    // a field edge folded onto its own class is a walk).
+    std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenF;
+    for (auto &[f, t, li] : lazyFEdges) {
+      const uint32_t cf = dense(getCanonicalNode(f)), ct = dense(getCanonicalNode(t));
+      if (seenF.insert(std::make_tuple(cf, ct, li)).second)
+        fEdges.emplace_back(cf, ct, li);
     }
   }
   const uint32_t N = toOrig.size();

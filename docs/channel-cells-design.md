@@ -505,3 +505,40 @@ So, for this site: the mechanism is key-cluster coalescence through
 multi-key pointers plus context-free formals, entered through the
 section-flow recursion of the generic linker. The pairwise-cell mode
 reached the same 51 targets by a route not yet traced with these tools.
+
+## Single-site query and the widening report (2026-09-18)
+
+`--cfl-demand-site=<file:line | function>` turns a run into a single-site
+query: only the matching indirect-call sites seed demand relevance
+(`--cfl-channel-demand`) and lazy-mint relevance, and at the end of the
+solve a widening report walks the fact flow backward from the site's
+callee operand. Answers for other sites are not valid in this mode.
+
+The report builds the reverse fact-flow graph over classes with four
+edge kinds: `a` (assignment), `f` (field), `o` (owner hop: a cell's keys
+are the facts of its owner pointer) and `x` (VX bridge). Fact counts are
+R plus RB (bridged facts land in RB; a load re-emits them as native).
+The slice is condensed into strongly connected components; a widening
+component has at least twice the facts of every input component. The
+spine walks from the operand's component to the largest input until the
+first widening component, then dumps every member class that receives an
+edge from outside (the entries), with the external in-degree by kind.
+
+nm-new, cluster mode, iteration 0, site elf64-x86-64.c:4688 (74 targets,
+all through the universal set; the enclosing function has no direct
+caller). The operand is one `a` hop from a single widening component:
+9,143 classes, 23,115 members, 271,352 facts, 8,500 input components of
+which 8,341 carry fewer than 16 facts and the largest carries 1,860
+(0.7%). Entries: 127 formals of 108 functions (610 call edges; bfd_seek
+arg0 64, bfd_get_section_by_name arg0 52, bfd_bread arg2 45, bfd_bwrite
+arg2 39, bfd_malloc_and_get_section arg0 26, bfd_release arg0 21), the
+merged cluster class (1,848 stores, 5,777 owner pointers), 94 cells, 92
+loads. So for this site universality is not inherited from any input: it
+is produced by one cycle closed by generic `bfd *`, `asection *` and
+`void *` formals and by cluster-joined cells, and fed by thousands of
+tiny inputs. This is the per-site form of the leak-point result: no
+single input matters, the cycle does.
+
+cflow, lazy demand, site wordsplit.c:2374: 21 relevant nodes, answer
+identical to the all-sites run (6 targets), spine load, read half,
+channel, cell with 6 stores, global.

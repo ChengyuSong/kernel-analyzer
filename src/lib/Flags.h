@@ -97,6 +97,7 @@ extern cl::opt<std::string> CFLLazyTraceObject;
 extern cl::opt<bool> CFLLazyTypedAccess;
 extern cl::opt<bool> CFLLazyTypeIdentity;
 extern cl::opt<bool> CFLChannelDemand;
+extern cl::opt<std::string> CFLDemandSite;
 extern cl::opt<bool> CFLProbeNoIcallWiring;
 extern cl::opt<bool> CFLProbeNoIntStores;
 extern cl::opt<bool> CFLIterCapOk;

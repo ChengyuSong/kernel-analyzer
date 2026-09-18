@@ -6052,6 +6052,21 @@ bool CallGraphPass::runFlowsToResolution() {
     uint32_t cell, o, s;
   };
   const bool demandMode = CFLChannelCells && CFLChannelDemand;
+  // --cfl-demand-site: a single-site query. Only matching indirect-call
+  // sites seed relevance (demand mode and lazy-mint relevance), and the
+  // widening report at the end walks the fact flow backward from their
+  // callee operands.
+  auto demSiteWanted = [&](const CallBase *CS) -> bool {
+    if (CFLDemandSite.empty()) return true;
+    const StringRef want(CFLDemandSite);
+    if (const Function *PF = CS->getFunction())
+      if (PF->getName() == want) return true;
+    const DebugLoc &DL = CS->getDebugLoc();
+    if (!DL) return false;
+    const std::string key =
+        (DL->getScope()->getFilename() + ":" + Twine(DL->getLine())).str();
+    return StringRef(key).contains(want);
+  };
   std::vector<char> demRelNode, demRelClass;
   std::vector<std::vector<uint32_t>> demRin;
   bool demInitDone = false;
@@ -6855,14 +6870,17 @@ bool CallGraphPass::runFlowsToResolution() {
       // facts select which keys the cell reads (owner-pointer hop).
       for (uint32_t c : cellsOf[n]) if (c < N) demRin[c].push_back(n);
     }
+    size_t seeds = 0;
     for (auto *CS : Ctx->IndirectCallInsts) {
+      if (!demSiteWanted(CS)) continue;
       Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
       NodeIndex fn = NF.getValueNodeFor(fp);
       if (fn == AndersNodeFactory::InvalidIndex) continue;
       auto it = toDense.find(getCanonicalNode(fn));
-      if (it != toDense.end()) demRelevantFrom(it->second);
+      if (it != toDense.end()) { demRelevantFrom(it->second); seeds++; }
     }
-    CG_LOG("ChannelDemand: " << demRelevantNodes << " nodes relevant at start\n");
+    CG_LOG("ChannelDemand: " << demRelevantNodes << " nodes relevant at start ("
+           << seeds << " seed sites)\n");
   };
   auto flushChannelPends = [&]() -> size_t {
     if (!CFLChannelCells) return 0;
@@ -7179,6 +7197,255 @@ bool CallGraphPass::runFlowsToResolution() {
            << " ms\n");
     return work;
   };
+  // --cfl-demand-site widening report: walk the fact flow backward from
+  // the site's callee operand over the reverse a/f graph (classes), and
+  // find the widening points: classes whose fact count is at least twice
+  // the largest count among their in-neighbours. A widening point with
+  // many small in-neighbours is a confluence (a formal fed by many
+  // callers, a cell fed by many stores); one inside a large merged class
+  // is a cluster/SCC (the merge log says why it formed). The spine is
+  // the greedy largest-in-neighbour walk from the operand to the first
+  // widening point: the node where this site's answer became universal.
+  auto wideningReport = [&]() {
+    if (CFLDemandSite.empty()) return;
+    const uint32_t NL = (uint32_t)std::min(ufp.size(), outA.size());
+    std::vector<uint32_t> seeds;
+    for (auto *CS : Ctx->IndirectCallInsts) {
+      if (!demSiteWanted(CS)) continue;
+      Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
+      NodeIndex fn = NF.getValueNodeFor(fp);
+      if (fn == AndersNodeFactory::InvalidIndex) continue;
+      auto dIt = toDense.find(getCanonicalNode(fn));
+      if (dIt == toDense.end()) continue;
+      const uint32_t rep = find(dIt->second);
+      if (std::find(seeds.begin(), seeds.end(), rep) == seeds.end())
+        seeds.push_back(rep);
+    }
+    errs() << "WIDEN site '" << CFLDemandSite << "': " << seeds.size()
+           << " callee-operand classes\n";
+    if (seeds.empty()) return;
+    // Reverse fact-flow graph over classes: (source class, kind) per
+    // target class. Kind: 'a' edge, 'f' edge.
+    std::vector<std::vector<std::pair<uint32_t, char>>> rin(NL);
+    boost::unordered_flat_set<uint64_t> seenE;
+    for (uint32_t n = 0; n < NL; n++) {
+      const uint32_t sn = find(n);
+      for (uint32_t t : outA[n]) {
+        if (t >= NL) continue;
+        const uint32_t tt = find(t);
+        if (tt != sn && seenE.insert(((uint64_t)tt << 32) | sn).second)
+          rin[tt].emplace_back(sn, 'a');
+      }
+      if (n < outF.size())
+        for (auto [t, r] : outF[n]) {
+          if (t >= NL) continue;
+          const uint32_t tt = find(t);
+          if (tt != sn && seenE.insert(((uint64_t)tt << 32) | sn).second)
+            rin[tt].emplace_back(sn, 'f');
+        }
+      // VX bridge ('x'): facts cross between the (o,X) cluster and the
+      // exact clusters of o in both directions (they land in RB).
+      if (n < bridgesOf.size())
+        for (uint32_t br : bridgesOf[n]) {
+          if (br >= NL) continue;
+          const uint32_t bb = find(br);
+          if (bb == sn) continue;
+          if (seenE.insert(((uint64_t)bb << 32) | sn).second) rin[bb].emplace_back(sn, 'x');
+          if (seenE.insert(((uint64_t)sn << 32) | bb).second) rin[sn].emplace_back(bb, 'x');
+        }
+      // Owner hop ('o'): a cell's facts are selected by the keys its owner
+      // pointer holds (cluster delivery / channel wiring), so the owner is
+      // a fact-flow input of the cell even without an a/f edge.
+      if (n < cellsOf.size())
+        for (uint32_t c : cellsOf[n]) {
+          if (c >= NL) continue;
+          const uint32_t cc = find(c);
+          if (cc != sn && seenE.insert(((uint64_t)cc << 32) | sn).second)
+            rin[cc].emplace_back(sn, 'o');
+        }
+    }
+    std::vector<uint32_t> members(NL, 0);
+    for (uint32_t n = 0; n < NL; n++) members[find(n)]++;
+    std::vector<int64_t> fc(NL, -1);
+    auto factsOf = [&](uint32_t x) -> int64_t {
+      if (fc[x] >= 0) return fc[x];
+      int64_t c = 0;
+      if (x < R.size())
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+          c += (int64_t)R[x][s2].count() + (int64_t)RB[x][s2].count();
+      return fc[x] = c;
+    };
+    // Backward closure from the seeds (the site's slice).
+    std::vector<char> vis(NL, 0);
+    std::vector<uint32_t> order, q;
+    for (uint32_t sd : seeds) if (!vis[sd]) { vis[sd] = 1; q.push_back(sd); }
+    while (!q.empty()) {
+      const uint32_t x = q.back(); q.pop_back();
+      order.push_back(x);
+      for (auto [y, k] : rin[x]) if (!vis[y]) { vis[y] = 1; q.push_back(y); }
+    }
+    // Condense the slice into strongly connected components: a class
+    // inside a cycle receives the cycle's whole fact set back, so per-class
+    // in-neighbour counts see only the cycle. Widening is judged per
+    // component against its inputs from OTHER components.
+    std::unordered_map<uint32_t, uint32_t> comp; // class -> component
+    {
+      std::unordered_map<uint32_t, uint32_t> idx, low;
+      std::vector<uint32_t> st; std::vector<char> onSt; onSt.assign(NL, 0);
+      uint32_t counter = 0, ncomp = 0;
+      struct Fr { uint32_t x; size_t i; };
+      for (uint32_t root : order) {
+        if (idx.count(root)) continue;
+        std::vector<Fr> cs{{root, 0}};
+        idx[root] = low[root] = counter++; st.push_back(root); onSt[root] = 1;
+        while (!cs.empty()) {
+          Fr &f = cs.back();
+          if (f.i < rin[f.x].size()) {
+            const uint32_t y = rin[f.x][f.i++].first;
+            if (!vis[y]) continue;
+            auto it = idx.find(y);
+            if (it == idx.end()) {
+              idx[y] = low[y] = counter++; st.push_back(y); onSt[y] = 1;
+              cs.push_back({y, 0});
+            } else if (onSt[y]) {
+              low[f.x] = std::min(low[f.x], it->second);
+            }
+            continue;
+          }
+          if (low[f.x] == idx[f.x]) {
+            for (;;) {
+              const uint32_t y = st.back(); st.pop_back(); onSt[y] = 0;
+              comp[y] = ncomp;
+              if (y == f.x) break;
+            }
+            ncomp++;
+          }
+          const uint32_t x = f.x; cs.pop_back();
+          if (!cs.empty()) low[cs.back().x] = std::min(low[cs.back().x], low[x]);
+        }
+      }
+    }
+    const uint32_t NC = comp.empty() ? 0 : 1 + std::max_element(
+        comp.begin(), comp.end(), [](auto &a, auto &b) { return a.second < b.second; })->second;
+    std::vector<int64_t> compF(NC, 0);
+    std::vector<uint32_t> compCls(NC, 0), compMem(NC, 0), compRep(NC, UINT32_MAX);
+    // inputs: component -> (source class, target class, kind) per source component
+    std::vector<std::unordered_map<uint32_t, std::tuple<uint32_t, uint32_t, char>>> compIn(NC);
+    std::vector<std::unordered_map<uint32_t, uint32_t>> entryEdges(NC); // member -> #external in-edges
+    for (uint32_t x : order) {
+      const uint32_t c = comp[x];
+      compCls[c]++; compMem[c] += members[x];
+      if (factsOf(x) > compF[c] || compRep[c] == UINT32_MAX) { compF[c] = factsOf(x); compRep[c] = x; }
+      for (auto [y, k] : rin[x]) {
+        const uint32_t cy = comp[y];
+        if (cy == c) continue;
+        entryEdges[c][x]++;
+        auto it = compIn[c].find(cy);
+        if (it == compIn[c].end() || factsOf(y) > factsOf(std::get<0>(it->second)))
+          compIn[c][cy] = {y, x, k};
+      }
+    }
+    std::vector<uint32_t> wcs; std::vector<char> isW(NC, 0);
+    std::vector<int64_t> maxInF(NC, 0);
+    for (uint32_t c = 0; c < NC; c++) {
+      for (auto &[cy, e] : compIn[c]) maxInF[c] = std::max(maxInF[c], compF[cy]);
+      if (compF[c] >= 16 && compF[c] >= 2 * maxInF[c]) { wcs.push_back(c); isW[c] = 1; }
+    }
+    std::sort(wcs.begin(), wcs.end(), [&](uint32_t a, uint32_t b) { return compF[a] > compF[b]; });
+    errs() << "WIDEN slice: " << order.size() << " classes, " << NC
+           << " components; " << wcs.size()
+           << " widening components (F >= 2x every input component)\n";
+    auto describe = [&](uint32_t x) {
+      return "c" + std::to_string(x) + " " + nodeKind(x) + " members=" +
+             std::to_string(members[x]) + " F=" + std::to_string(factsOf(x)) +
+             " " + protBlameName(x).substr(0, 70);
+    };
+    auto showComp = [&](uint32_t c, size_t k) {
+      std::vector<std::pair<int64_t, uint32_t>> ins;
+      for (auto &[cy, e] : compIn[c]) ins.push_back({compF[cy], cy});
+      std::sort(ins.begin(), ins.end(), [](auto &a, auto &b) { return a.first > b.first; });
+      size_t small = 0, mid = 0, big = 0;
+      for (auto &e : ins) (e.first < 16 ? small : e.first < 256 ? mid : big)++;
+      errs() << "      inputs " << ins.size() << " components (F<16: " << small
+             << ", 16..255: " << mid << ", >=256: " << big << ")\n";
+      for (size_t i = 0; i < std::min(k, ins.size()); i++) {
+        auto [y, x, kd] = compIn[c][ins[i].second];
+        errs() << "      <-" << kd << "- " << describe(y) << "  into "
+               << nodeKind(x) << " " << protBlameName(x).substr(0, 50) << "\n";
+      }
+      // entry classes of the component by kind: what shape of node lets
+      // the outside in (formals = call confluence, cells = store confluence)
+      std::map<std::string, std::pair<uint32_t, uint32_t>> byKind; // kind -> (#classes, #edges)
+      std::vector<std::pair<uint32_t, uint32_t>> top;
+      for (auto &[x, n] : entryEdges[c]) {
+        auto &bk = byKind[nodeKind(x)]; bk.first++; bk.second += n;
+        top.push_back({n, x});
+      }
+      if (compCls[c] > 1) {
+        errs() << "      entry classes by kind:";
+        for (auto &[kd, v] : byKind) errs() << " " << kd << "=" << v.first << "(" << v.second << " edges)";
+        errs() << "\n";
+        std::sort(top.begin(), top.end(), [](auto &a, auto &b) { return a.first > b.first; });
+        for (size_t i = 0; i < std::min<size_t>(6, top.size()); i++)
+          errs() << "      entry " << top[i].first << " edges: " << describe(top[i].second) << "\n";
+      }
+    };
+    size_t shown = 0;
+    for (uint32_t c : wcs) {
+      if (shown++ >= 20) break;
+      errs() << "WIDEN-COMP #" << shown << " classes=" << compCls[c] << " members="
+             << compMem[c] << " F=" << compF[c] << " maxIn=" << maxInF[c]
+             << " rep " << describe(compRep[c]) << "\n";
+      showComp(c, 5);
+    }
+    // Spine per seed over the condensation: largest input component
+    // until the first widening component.
+    for (uint32_t sd : seeds) {
+      errs() << "SPINE from callee operand " << describe(sd) << "\n";
+      uint32_t cur = comp[sd];
+      std::vector<char> onPath(NC, 0);
+      for (int hop = 0; hop < 80; hop++) {
+        onPath[cur] = 1;
+        errs() << "  hop " << hop << " comp classes=" << compCls[cur] << " members="
+               << compMem[cur] << " F=" << compF[cur] << " rep " << describe(compRep[cur]) << "\n";
+        if (isW[cur]) {
+          errs() << "  hop " << hop << " WIDENING COMPONENT\n";
+          showComp(cur, 10);
+          // Full entry dump: every member class that receives an edge
+          // from outside the component, with its external in-degree by
+          // edge kind. The formals here are the context-free confluences
+          // that close the cycle; the cells are the store confluences.
+          std::vector<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> ent; // edgesA,F,O,X per member
+          std::unordered_map<uint32_t, std::array<uint32_t, 4>> perKind;
+          for (uint32_t x : order) {
+            if (comp[x] != cur) continue;
+            std::array<uint32_t, 4> k{0, 0, 0, 0};
+            for (auto [y, kd] : rin[x])
+              if (comp[y] != cur) k[kd == 'a' ? 0 : kd == 'f' ? 1 : kd == 'o' ? 2 : 3]++;
+            if (k[0] + k[1] + k[2] + k[3]) perKind[x] = k;
+          }
+          std::vector<std::pair<uint32_t, uint32_t>> ord2;
+          for (auto &[x, k] : perKind) ord2.push_back({k[0] + k[1] + k[2] + k[3], x});
+          std::sort(ord2.begin(), ord2.end(), [](auto &a, auto &b) { return a.first > b.first; });
+          errs() << "  WIDEN-ENTRIES " << ord2.size() << " member classes with external inputs (a/f/o/x edges)\n";
+          for (auto &[n2, x] : ord2) {
+            auto &k = perKind[x];
+            errs() << "    entry a=" << k[0] << " f=" << k[1] << " o=" << k[2] << " x=" << k[3]
+                   << " " << describe(x) << "\n";
+          }
+          break;
+        }
+        int64_t mx = -1; uint32_t nxt = UINT32_MAX;
+        for (auto &[cy, e] : compIn[cur])
+          if (!onPath[cy] && compF[cy] > mx) { mx = compF[cy]; nxt = cy; }
+        if (nxt == UINT32_MAX) { errs() << "  hop " << hop << " END (no input)\n"; break; }
+        auto [y, x, kd] = compIn[cur][nxt];
+        errs() << "      via <-" << kd << "- " << describe(y) << " into "
+               << protBlameName(x).substr(0, 50) << "\n";
+        cur = nxt;
+      }
+    }
+  };
   // Dynamic a-SCC collapse: classes mutually reachable over the current
   // (post-merge) shift-preserving edge graph — a-edges plus residue-0
   // f-edges — receive each other's every fact, so their planes are equal
@@ -7446,6 +7713,7 @@ bool CallGraphPass::runFlowsToResolution() {
     std::vector<char> A(NL, 0);
     std::vector<uint32_t> bfs;
     for (auto *CS : Ctx->IndirectCallInsts) {
+      if (!demSiteWanted(CS)) continue;
       Value *fp = CS->getCalledOperand()->stripPointerCastsAndAliases();
       NodeIndex fn = NF.getValueNodeFor(fp);
       if (fn == AndersNodeFactory::InvalidIndex) continue;
@@ -10030,10 +10298,12 @@ bool CallGraphPass::runFlowsToResolution() {
       fpIter++;
       continue; // re-drain with the full root set, then re-resolve
     }
+    wideningReport();
     verifyClosure(); // certificate over the answer-producing fixpoint
     break; // converged: no callee flows were added
   }
   if (iteration + fpIter + 1 >= (int)CFLFlowsToMaxIters) {
+    wideningReport();
     // A cap that fires before a no-change round is an unsound result,
     // not a warning condition (proof-review #7 / R2): refuse it unless
     // the user explicitly accepted capped output.

@@ -1262,6 +1262,17 @@ cl::opt<bool> CFLChannelDemand(
            "replay when demand or relevance arrives. Answer-preserving"),
   cl::init(false));
 
+cl::opt<std::string> CFLDemandSite(
+  "cfl-demand-site",
+  cl::desc("Single-site query: only indirect-call sites whose file:line "
+           "contains this string (or whose function has this name) seed "
+           "demand relevance (--cfl-channel-demand) and lazy-mint "
+           "relevance; at the end, a widening report walks the fact flow "
+           "backward from the site's callee operand and names the classes "
+           "where the fact set widens (>= 2x every in-neighbour). Answers "
+           "for other sites are NOT valid in this mode"),
+  cl::init(""));
+
 cl::opt<bool> CFLVarargsStrict(
   "cfl-varargs-strict",
   cl::desc("Type filter: a NON-variadic callee behind a variadic-typed "

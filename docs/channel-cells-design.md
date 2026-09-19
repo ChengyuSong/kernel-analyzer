@@ -542,3 +542,40 @@ single input matters, the cycle does.
 cflow, lazy demand, site wordsplit.c:2374: 21 relevant nodes, answer
 identical to the all-sites run (6 targets), spine load, read half,
 channel, cell with 6 stores, global.
+
+## Delta debugging: the 18-function reproducer and the exact-model verdict (2026-09-19)
+
+tools/dd-funcs.py runs ddmin over function bodies (`--cfl-ablate-funcs`,
+monotone: an ablated body emits no flows, callers still wire formals)
+with the property "site elf64-x86-64.c:4688 has a target outside the 11
+that slot 103 and its bucket-7 neighbours of the 19 target vectors can
+deliver". From 1,693 functions, 1,294 tests (6 in parallel, 10 s to
+2 min each) reached a 1-minimal set of 18 bodies that still gives 71 of
+the 74 targets: the site function, nm's display_file and
+display_archive, bfd_openr, bfd_fopen, bfd_find_target,
+bfd_openr_next_archived_file, bfd_get_section_contents,
+bfd_get_full_section_contents, bfd_get_reloc_upper_bound,
+bfd_generic_get_relocated_section_contents, and seven generic linker
+routines (_bfd_generic_link_add_symbols, _bfd_generic_link_add_archive_symbols,
+generic_link_add_object_symbols, bfd_generic_link_read_symbols,
+_bfd_generic_link_output_symbols, _bfd_generic_final_link,
+default_indirect_link_order). bfd_check_format_matches is not needed.
+
+On the same reproducer the exact model (lazy addresses, channel cells,
+demand) converges in 8 seconds with 8 relevant nodes and gives 0 targets
+at the site, which is the flow-insensitive, context-insensitive truth at
+iteration 0: the site function has no callers, so nothing is ever stored
+under its bfd's xvec key. Cluster mode gives 71. The site's width is
+therefore entirely cluster-mode coalescence, not program semantics.
+
+The traced chain for one wrong target (_bfd_archive_close_and_cleanup)
+in the reproducer: global → slot 31 of i386_pei_vec → merged with slot
+89 of the same vector (272 ≡ 736 mod 29, bucket collision) → merged
+with slot cells of every other vector by key (i386_pei_vec, s11) issued
+by the BFD_SEND slot access in bfd_generic_link_read_symbols, whose xvec
+pointer holds all vectors (transitive key coalescence at a context-free
+helper) → merged with the *elf64_x86_64_bed backend-data cell by a key
+whose object is the function _bfd_bool_bfd_false_error (a function
+root used as a key once slot contents flowed into the xvec-holding
+class) → VX bridge into the exact slot-103 cell of x86_64_elf64_vec →
+the site's load. Four model mechanisms, no program mechanism.

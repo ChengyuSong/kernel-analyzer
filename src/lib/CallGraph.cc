@@ -5343,6 +5343,35 @@ bool CallGraphPass::runFlowsToResolution() {
     // Name at arrival time: later merges retire these ids, so the
     // fixpoint census cannot name a chain read off this log.
     errs() << "  " << protBlameName(n).substr(0, 70);
+    // Use-type tag: the struct types this value is dereferenced as (GEP
+    // source element types over its users), so a scan can find the
+    // first arrival of an object at a value used as a foreign type.
+    {
+      static std::unordered_map<uint32_t, std::string> useMemo;
+      auto um = useMemo.find(n);
+      if (um == useMemo.end()) {
+        std::string tag;
+        if (n < toOrig.size())
+          if (const Value *V = NF.getValueForNode(toOrig[n]))
+            if (V->getType()->isPointerTy()) {
+              SmallVector<StringRef, 4> tys;
+              for (const User *U : V->users()) {
+                const auto *G = dyn_cast<GetElementPtrInst>(U);
+                if (!G || G->getPointerOperand() != V) continue;
+                const auto *ST = dyn_cast<StructType>(G->getSourceElementType());
+                if (!ST || !ST->hasName()) continue;
+                StringRef nm = ST->getName();
+                nm.consume_front("struct."); nm.consume_front("union.");
+                nm = nm.rsplit('.').first.empty() ? nm : nm.rsplit('.').first; // strip .NNN
+                if (std::find(tys.begin(), tys.end(), nm) == tys.end()) tys.push_back(nm);
+                if (tys.size() == 3) break;
+              }
+              for (StringRef t : tys) tag += (tag.empty() ? " use=" : ",") + t.str();
+            }
+        um = useMemo.emplace(n, tag).first;
+      }
+      errs() << um->second;
+    }
     // A join-triggered merge is explained by its key and by the pointer
     // whose facts carried that key into the sweep: "why did these two
     // cells become one" is answered by naming that pointer, then asking

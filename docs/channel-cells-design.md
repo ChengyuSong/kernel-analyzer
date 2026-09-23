@@ -579,3 +579,66 @@ whose object is the function _bfd_bool_bfd_false_error (a function
 root used as a key once slot contents flowed into the xvec-holding
 class) → VX bridge into the exact slot-103 cell of x86_64_elf64_vec →
 the site's load. Four model mechanisms, no program mechanism.
+
+## Delta debugging over the exact model: the 46-function reproducer and the bulk-memcpy fix (2026-09-22)
+
+The exact model (byte-exact lazy addresses, write/read cell halves,
+demand wiring) removes the site's cluster-mode width, but its full
+nm-new run is slow because a few pointers hold thousands of address
+keys (the hash-table bucket cell, the stabs and eh_frame byte writers,
+char* locals). A second delta-debugging run used that as the property:
+keep a subset of function bodies (all others ablated) such that the
+single-site exact solve still has a cell with more than 5,000 keys.
+Plain ddmin stalled at 72 functions because 26 of them were removable
+one at a time but ddmin removes one per round; a greedy step that
+first tries the union of the individually-removable functions (still
+verified by a test) brought the set to 46 in one step, and that set is
+1-minimal.
+
+The 46 functions are the bfd hash-table core (init, lookup, insert,
+the entry constructors), section lookup and creation, the link-hash
+helpers, stabs and merged-section handling, ELF symbol and relocation
+reading, and the i386 and x86-64 check_relocs and relocate_section.
+The widest pointers there are the link-hash entry `h` and the section
+`sec` in relocate_section and elf_link_output_extsym, with about 5,900
+facts: string literals, the std-section array, the global symbol
+array, and thousands of synthetic objects. These are single-member
+classes with no merges: the width arrives by flow, not by class union.
+
+Tracing one string literal back from `h` (first-arrival trace and a
+chain walk) gave the route: the literal is the name of a std section;
+it is read as the content of that section object by the as-needed
+rehash loop in elf_link_add_object_symbols, `memcpy (old_ent, p,
+entsize)`; the memcpy fallback for variable-length copies aliased its
+two pointer arguments bidirectionally, so every hash entry `p` became
+an alias of the scratch buffer and the buffer's contents (strings,
+next pointers, and through an integer path even a constructor's
+address) flowed into entry pointers, from there into the sym_hashes
+array, and into `h` in check_relocs and relocate_section.
+
+A copy never makes its destination point where its source points, so
+the alias was not needed for soundness. Under flows-to the fallback is
+now a directional content move: the wildcard on each pointer makes the
+existing deref-to-deref edge read every cell of the source objects and
+write every cell of the destination objects. On the reproducer the
+top cell fell from 5,537 to 3,516 keys and the solve from 560 s to 264
+s; on the full cluster-mode nm-new run pairs went from 44,695 to
+44,691 with recall unchanged at 207/223 and wall time from 3:24 to
+2:04. The smoke suite passes. Commit 3cc90e8.
+
+After the fix, `h` in elf_link_output_extsym still holds 4,865 facts
+of the same mixture. Ablating identity joins (measurement-only probe)
+collapses it to 3 facts, the channel graph from 6,572 nodes to 58, and
+the solve to 16 s: everything that remains in the reproducer flows
+through cells keyed by identity roots, the unknown contents of
+unwritten cells and callerless formals. Part of that is an artefact
+of ablation (every kept function whose callers are ablated has
+callerless formals), but the same probe on the full cluster-mode run
+removed 5,180 pairs and 20 true targets, so identity joins carry real
+flows there too. The next traced chain crosses functions only through
+identity-keyed cells: a section's map_head read in elf_link_sort_relocs
+is stored into another section's map_tail whose cell is keyed by an
+identity root minted in elf_link_add_object_symbols, and from there
+reaches `h`. The open design question is the one already noted in the
+join code: witness-gated identity joins or an object-indexed cell
+model.

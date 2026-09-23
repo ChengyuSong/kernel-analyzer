@@ -35,6 +35,8 @@ extern cl::opt<bool> CFLChannelCone;
 extern cl::opt<bool> CFLExtGlobalsOwnIdentity;
 extern cl::opt<bool> CFLProbeNoCellIdentity;
 extern cl::opt<bool> CFLKeyIdentity;
+extern cl::opt<bool> CFLReachable;
+extern cl::opt<std::string> CFLEntryList;
 extern cl::opt<bool> CFLHolderIdentity;
 extern cl::opt<std::string> CFLDumpClass;
 extern cl::opt<std::string> CFLDumpSCC;

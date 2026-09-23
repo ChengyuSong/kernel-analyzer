@@ -69,6 +69,11 @@ private:
 
   llvm::Function *getFuncDef(llvm::Function*);
   bool runOnFunction(llvm::Function*);
+  // --cfl-reachable: process F's body (and, transitively, its direct and
+  // summary-bound callees) the first time it is reached.
+  void reachFunction(llvm::Function *F);
+  void seedReachable();
+  void reachLedger();
   bool handleMemcpy(const llvm::CallBase*);
   bool handleCall(const llvm::CallBase*, const llvm::Function*,
                   int opsSkipArg = -1);

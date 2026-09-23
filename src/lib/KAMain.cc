@@ -232,6 +232,23 @@ cl::opt<bool> CFLProbeNoCellIdentity(
            "Quantifies the per-access identity-root web"),
   cl::init(false));
 
+cl::opt<bool> CFLReachable(
+  "cfl-reachable",
+  cl::desc("Reachability-driven body processing: a function's edges are "
+           "emitted only once the function is reached from an entry "
+           "(--cfl-entry-list; default: main and llvm.global_ctors) "
+           "through a direct call, a resolved indirect call, or a summary "
+           "callback binding. Closed-world premise: an unreached body "
+           "never runs, so it neither emits flows nor holds external "
+           "inputs. Unreached address-taken functions are ledgered"),
+  cl::init(false));
+
+cl::opt<std::string> CFLEntryList(
+  "cfl-entry-list",
+  cl::desc("--cfl-reachable: file with one entry function name per line "
+           "(library exports, kernel asm-called functions)"),
+  cl::init(""));
+
 cl::opt<bool> CFLKeyIdentity(
   "cfl-key-identity",
   cl::desc("With --cfl-channel-cells: identity of never-written content "
@@ -1710,6 +1727,10 @@ int main(int argc, char **argv) {
                    "--cfl-solver-threads");
     requireFlowsTo(CFLSolverBlock.getNumOccurrences() > 0,
                    "--cfl-solver-block");
+    requireFlowsTo(CFLReachable, "--cfl-reachable");
+    if (CFLReachable && CFLCompositional)
+      cliErrors.push_back("--cfl-reachable needs the monolithic flows-to "
+                          "solve (bodies enter as edge deltas)");
     if (CFLLazyAddress) {
       requireFlowsTo(true, "--cfl-lazy-address");
       CFLChannelCells = true; // storage identity = the address channel

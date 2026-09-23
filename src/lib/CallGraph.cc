@@ -9194,7 +9194,12 @@ bool CallGraphPass::runFlowsToResolution() {
     errs() << "TRACE-HOLD total classes holding root: " << nHold << "\n";
   }
   boost::unordered_flat_map<uint32_t, FactSet> witnessSiteMemo;
-  for (auto *CS : Ctx->IndirectCallInsts) {
+  // --cfl-reachable processes newly reached bodies inside this loop,
+  // which adds indirect-call sites; iterate a snapshot (new sites are
+  // resolved in the next resolution pass).
+  const std::vector<const CallBase *> icallSnapshot(
+      Ctx->IndirectCallInsts.begin(), Ctx->IndirectCallInsts.end());
+  for (const CallBase *CS : icallSnapshot) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     NodeIndex fn = NF.getValueNodeFor(fptr);
     if (fn == AndersNodeFactory::InvalidIndex) continue;
@@ -9827,6 +9832,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // Wire the callee's flows exactly as the saturation fixpoint does;
       // the new edges enter the NEXT iteration's solve.
       Function *CF = const_cast<Function *>(F);
+      reachFunction(CF); // --cfl-reachable: body (and its callees) first
       if (Ctx->AllocFuncs.count(CF)) {
         Ctx->AllocSites.insert(CS);
         NodeIndex callNode = getRepNodeForValue(CS);
@@ -10286,6 +10292,7 @@ bool CallGraphPass::runFlowsToResolution() {
          << totalTargets << " targets (" << newPairs << " new pairs wired, "
          << topOnlyPairs << " via wildcard plane only), iteration "
          << (iteration + fpIter) << "\n");
+  reachLedger();
   if (CFLWitnessAnswers)
     CG_LOG("WitnessAnswers: " << g_witnessSites << " sites refined ("
            << g_witnessFallback << " pooled fallbacks); fn-plane pairs "
@@ -23487,6 +23494,134 @@ void CallGraphPass::runInvokeCensus() {
            << " more with evidence (raise the cap to see them)\n";
 }
 
+// ---- --cfl-reachable: reachability-driven body processing -------------
+// A flows-to graph assumes every instruction executes: a body's sources
+// (function and global addresses it passes as arguments, its allocation
+// sites, its literals) enter the graph whether or not the function is
+// ever called. Under the closed-world premise a function no call
+// reaches never runs, so its body is processed only once it is reached:
+// from an entry by direct calls, by indirect calls as they resolve
+// (wiring), or by summary callback bindings. Bodies processed after the
+// first solve enter the next solve as edge deltas, like wiring edges.
+static boost::unordered_flat_set<const llvm::Function *> g_reachSeen;
+static boost::unordered_flat_set<const llvm::Function *> g_reachProcessed;
+static std::vector<llvm::Function *> g_reachWork;
+static size_t g_reachBodies = 0, g_reachSeeds = 0, g_reachSkippedFilter = 0;
+
+void CallGraphPass::reachFunction(Function *F0) {
+  if (!CFLReachable || !F0) return;
+  auto push = [&](const Function *CF) {
+    if (!CF) return;
+    Function *F = getFuncDef(const_cast<Function *>(CF));
+    if (!F || F->isDeclaration()) return;
+    if (g_reachSeen.insert(F).second) g_reachWork.push_back(F);
+  };
+  push(F0);
+  while (!g_reachWork.empty()) {
+    Function *F = g_reachWork.back();
+    g_reachWork.pop_back();
+    if (F->isIntrinsic() || F->empty()) continue;
+    if ((Ctx->AllocFuncs.count(F) && !summaryInvokeKeepsBody(Ctx, F)) ||
+        Ctx->ContainerFuncs.count(F) || shouldSkipFunction(F)) {
+      g_reachSkippedFilter++;
+      continue; // summarized: no body, same as the eager loop
+    }
+    if (!g_reachProcessed.insert(F).second) continue;
+    const DataLayout *savedDL = curDL;
+    curDL = &F->getParent()->getDataLayout();
+    runOnFunction(F);
+    curDL = savedDL;
+    g_reachBodies++;
+    for (auto II = inst_begin(*F), IE = inst_end(*F); II != IE; ++II) {
+      const auto *CB = dyn_cast<CallBase>(&*II);
+      if (!CB) continue;
+      if (const Function *CF = CB->getCalledFunction()) {
+        push(CF);
+      } else if (const auto *SV = dyn_cast<Function>(
+                     CB->getCalledOperand()->stripPointerCastsAndAliases())) {
+        push(SV);
+      }
+      // Summary bindings made while processing the body (INVOKE with a
+      // constant callback, DISPATCH re-attribution) are callees too.
+      auto cit = Ctx->Callees.find(CB);
+      if (cit != Ctx->Callees.end())
+        for (const Function *T : cit->second) push(T);
+    }
+  }
+}
+
+void CallGraphPass::seedReachable() {
+  std::vector<std::string> names;
+  if (!CFLEntryList.empty()) {
+    std::ifstream ifs(CFLEntryList);
+    if (!ifs) {
+      errs() << "ERROR: --cfl-entry-list: cannot open " << CFLEntryList << "\n";
+      exit(1);
+    }
+    std::string line;
+    while (std::getline(ifs, line)) {
+      StringRef s = StringRef(line).trim();
+      if (!s.empty() && s[0] != '#') names.push_back(s.str());
+    }
+  } else {
+    names.push_back("main");
+  }
+  for (const std::string &nm : names) {
+    bool found = false;
+    for (auto &[Mod, _] : Ctx->Modules)
+      if (Function *F = Mod->getFunction(nm)) {
+        if (F->isDeclaration()) continue;
+        found = true;
+        g_reachSeeds++;
+        reachFunction(F);
+      }
+    if (!found)
+      WARNING("--cfl-reachable: entry '" << nm << "' has no definition\n");
+  }
+  // Static constructors and destructors run without a call in the IR.
+  for (auto &[Mod, _] : Ctx->Modules)
+    for (const char *gn : {"llvm.global_ctors", "llvm.global_dtors"}) {
+      const GlobalVariable *GV = Mod->getNamedGlobal(gn);
+      if (!GV || !GV->hasInitializer()) continue;
+      const auto *arr = dyn_cast<ConstantArray>(GV->getInitializer());
+      if (!arr) continue;
+      for (const Use &U : arr->operands()) {
+        const auto *st = dyn_cast<ConstantStruct>(U.get());
+        if (!st || st->getNumOperands() < 2) continue;
+        if (const auto *F = dyn_cast<Function>(
+                st->getOperand(1)->stripPointerCasts())) {
+          g_reachSeeds++;
+          reachFunction(const_cast<Function *>(F));
+        }
+      }
+    }
+  CG_LOG("Reach: " << g_reachSeeds << " entries seeded, " << g_reachBodies
+         << " bodies processed by direct reachability, "
+         << g_reachSkippedFilter << " summarized callees skipped\n");
+}
+
+void CallGraphPass::reachLedger() {
+  if (!CFLReachable) return;
+  size_t defined = 0, unreachedAT = 0;
+  std::vector<StringRef> sample;
+  for (auto &[Mod, _] : Ctx->Modules)
+    for (Function &F : *Mod) {
+      if (F.isDeclaration() || F.isIntrinsic()) continue;
+      defined++;
+      if (Ctx->AddressTakenFuncs.count(&F) && !g_reachProcessed.count(&F) &&
+          !g_reachSeen.count(&F)) {
+        unreachedAT++;
+        if (sample.size() < 40) sample.push_back(F.getName());
+      }
+    }
+  CG_LOG("Reach: LEDGER " << g_reachBodies << " bodies processed of "
+         << defined << " defined; " << unreachedAT
+         << " address-taken functions never reached (candidates for a "
+         << "missing entry if any should run)\n");
+  if (VerboseLevel >= 2)
+    for (StringRef n : sample) errs() << "Reach:   unreached " << n << "\n";
+}
+
 bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
@@ -23575,6 +23710,11 @@ bool CallGraphPass::doModulePass(Module *M) {
       }
     }
 
+    if (CFLReachable) {
+      // Bodies enter by reachability from the entries; seeded once, after
+      // every module's global initializers are in the graph.
+      if (M == Ctx->Modules.back().first) seedReachable();
+    } else
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
           (Ctx->AllocFuncs.count(&F) && !summaryInvokeKeepsBody(Ctx, &F)) ||

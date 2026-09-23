@@ -627,18 +627,58 @@ s; on the full cluster-mode nm-new run pairs went from 44,695 to
 2:04. The smoke suite passes. Commit 3cc90e8.
 
 After the fix, `h` in elf_link_output_extsym still holds 4,865 facts
-of the same mixture. Ablating identity joins (measurement-only probe)
-collapses it to 3 facts, the channel graph from 6,572 nodes to 58, and
-the solve to 16 s: everything that remains in the reproducer flows
-through cells keyed by identity roots, the unknown contents of
-unwritten cells and callerless formals. Part of that is an artefact
-of ablation (every kept function whose callers are ablated has
-callerless formals), but the same probe on the full cluster-mode run
-removed 5,180 pairs and 20 true targets, so identity joins carry real
-flows there too. The next traced chain crosses functions only through
+of the same mixture. The identity-join ablation probe collapses it to
+3 facts, the channel graph from 6,572 nodes to 58, and the solve to
+16 s, but that probe removes every join whose key origin has no value
+or is an instruction, which includes all allocation-site objects, so
+it is an upper bound on what heap-keyed flow carries, not an
+attribution to identity roots. Denying external identity to the
+callerless formals of non-entry functions (`--cfl-closed-world=main`,
+884 formal classes on the full run, 95 on the reproducer) changes no
+number in either the cluster run or the reproducer, so the formal
+identities are not the residue either. On the full cluster-mode run
+the probe removed 5,180 pairs and 20 true targets. The next traced chain crosses functions only through
 identity-keyed cells: a section's map_head read in elf_link_sort_relocs
 is stored into another section's map_tail whose cell is keyed by an
 identity root minted in elf_link_add_object_symbols, and from there
 reaches `h`. The open design question is the one already noted in the
 join code: witness-gated identity joins or an object-indexed cell
 model.
+
+### Key identity was off in every nm-new run (2026-09-22)
+
+`--cfl-key-identity` defaults to off and none of the nm-new scripts
+passed it; lazy-address mode only turned on channel cells. So every
+cluster and exact-model number since the 18th, including the two
+multi-day exact runs, was taken with per-access identity roots, the
+model the section above replaced. The join-ablation census on the
+reproducer showed it directly: 622 of the ablated key origins were
+value-less cells `*fn::gep@N`, the per-access roots.
+
+With key identity on:
+
+| run | before | after |
+|---|---|---|
+| 46-function reproducer, solve | 268 s | 96 s |
+| reproducer, channel nodes | 6,572 | 3,566 |
+| reproducer, widest cell (keys) | 3,516 | 1,584 |
+| reproducer, `h` in elf_link_output_extsym (facts) | 4,865 | 2,575 |
+| reproducer, classes mixing functions and literals | 1,624 | 0 |
+| cluster all-sites nm-new, pairs | 44,691 | 42,582 (61 sites tighter, none looser) |
+| cluster all-sites, recall | 207/223 | 207/223 |
+| cluster all-sites, wall / RSS | 2:04 / 8.5 GB | 1:32 / 3.9 GB |
+
+Channel cells now default key identity on (`--cfl-key-identity=false`
+restores per-access roots). In cluster mode, which has no channels,
+the flag mints no content identity at all, so it stays opt-in there.
+What remains on the reproducer after key identity is the hash-lookup
+transport (`*bfd_hash_lookup::load@488`, 1,565 keys), the
+elf_link_add_object_symbols loads and the stabs byte writer: the
+context-free helper returns, which the per-caller summary direction
+addresses. A closed-world rule for callerless formals (formals of
+non-entry functions hold no external object) was built and measured:
+it changes nothing on the full runs, and leaving such formals rootless
+breaks indirect-call wiring (recall 80/223), so it was removed. The
+identity-join ablation probe classifies allocation-site objects as
+identity too, so its collapse of `h` to 3 facts was an upper bound on
+heap-keyed flow, not an identity attribution.

@@ -1720,6 +1720,14 @@ int main(int argc, char **argv) {
                             "labels)");
       CFLBidiPrune = false; // cone is residue-based; not ported
     }
+    if (CFLChannelCells && CFLKeyIdentity.getNumOccurrences() == 0) {
+      // Channel cells carry the identity of never-written content on
+      // the channel key (docs/channel-cells-design.md, "Identity of
+      // unwritten content"); per-access cell roots are the old model.
+      // Default it on whenever channels exist; --cfl-key-identity=false
+      // restores per-access roots for comparison.
+      CFLKeyIdentity = true;
+    }
     if (!cliErrors.empty()) {
       for (const auto &e : cliErrors)
         errs() << argv[0] << ": CLI sanity: " << e << "\n";

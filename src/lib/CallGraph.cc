@@ -6578,6 +6578,11 @@ bool CallGraphPass::runFlowsToResolution() {
           if (cls < 0) {
             const llvm::Value *OV = NF.getValueForNode(on0);
             cls = (!OV || llvm::isa<llvm::Instruction>(OV)) ? 1 : 0;
+            if (VerboseLevel >= 2 && cls == 1)
+              errs() << "IdJoinAblate: rid " << rid0 << " "
+                     << (!OV ? (NF.isObjectNode(on0) ? "valueless-object" : "valueless-value")
+                             : (llvm::isa<llvm::CallBase>(OV) ? "call-inst" : "other-inst"))
+                     << " " << protBlameName(rootClassOf[rid0]).substr(0, 70) << "\n";
           }
           if (cls == 1) {
             g_idJoinsAblated++;
@@ -7032,6 +7037,23 @@ bool CallGraphPass::runFlowsToResolution() {
             keyIdentityRoots.insert(rid);
             keyIdentityMinted++;
             addFact(ch, 0, rid, ctx0);
+            if (VerboseLevel >= 2) {
+              // Census: which external origin kinds mint content
+              // identities (attribution of the identity residue).
+              const char *kind = "?";
+              const uint32_t rc0 = P.o < rootClassOf.size() ? rootClassOf[P.o] : UINT32_MAX;
+              if (rc0 != UINT32_MAX && rc0 < toOrig.size()) {
+                const Value *OV = NF.getValueForNode(toOrig[rc0]);
+                if (!OV) kind = NF.isObjectNode(toOrig[rc0]) ? "valueless-object" : "valueless-value";
+                else if (isa<Argument>(OV)) kind = "formal";
+                else if (isa<GlobalVariable>(OV)) kind = "ext-global";
+                else kind = "other";
+              } else kind = "key-identity";
+              errs() << "KeyIdentity: mint r" << rid << " for key (r" << P.o
+                     << " " << kind << " "
+                     << (rc0 != UINT32_MAX ? protBlameName(rc0).substr(0, 70) : std::string("?"))
+                     << ", s" << P.s << ") cell " << protBlameName(cell).substr(0, 60) << "\n";
+            }
           }
         }
         if (holderMode) {

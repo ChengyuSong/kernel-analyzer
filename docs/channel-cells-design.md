@@ -682,3 +682,61 @@ breaks indirect-call wiring (recall 80/223), so it was removed. The
 identity-join ablation probe classifies allocation-site objects as
 identity too, so its collapse of `h` to 3 facts was an upper bound on
 heap-keyed flow, not an identity attribution.
+
+## Reachability-driven body processing (2026-09-23)
+
+A flows-to graph assumes every instruction executes. Formals are the
+one conditional place (no caller, no actual-to-formal edge), but a
+body's sources are not: the function and global addresses it passes as
+arguments, its allocation sites and its literals enter the graph
+whether or not the function is ever called. In nm-new the ELF final
+link is never invoked, yet bfd_elf_final_link's traverse call hands
+elf_link_output_extsym to bfd_hash_traverse, and the callback site
+hash.c:657 answers with four linker callbacks the program can never
+call there. The pass visited all 1,396 bodies up front.
+
+`--cfl-reachable` processes a body only once the function is reached:
+from the entries (`--cfl-entry-list`, one name per line; default
+`main` plus `llvm.global_ctors` and `llvm.global_dtors`) by direct
+calls and by summary callback bindings, transitively; at indirect-call
+wiring, before the callee's formals are wired, as sites resolve; and
+by escape, when a function constant is passed (possibly through
+select, phi or a constant expression) to a callee that has no
+definition in the corpus, since the outside may call it with arguments
+we never see. Bodies processed after the first solve enter the next
+solve exactly as wiring edges do: each resolution pass rebuilds the
+dense graph from all edges. The wiring loop iterates a snapshot of the
+indirect-call sites because new bodies add sites. Unreached
+address-taken functions are ledgered at every pass as candidates for a
+missing entry. The mode needs the multi-pass fixpoint: with
+`--cfl-flows-to-max-iters=1`, the single-pass configuration of the
+nm-new pins, sites reached only through resolution are never solved
+(191 pairs, recall 43/202, not a bug).
+
+Entries for the other corpora: a library's interface is its defined
+functions with external linkage and default visibility after the
+version script, plus the fuzzer entry; the kernel's outside callers
+are assembly and hardware, so its entries are the functions assembly
+calls (the undefined symbols of the `.S` objects, `asmlinkage` and
+`__visible`), `start_kernel` and `start_secondary`, plus
+`EXPORT_SYMBOL` when modules count as outside callers. Everything else
+(syscall table, initcalls, IRQ actions, work items, timers, kthreads)
+is reached from those through C dispatchers the graph already models.
+
+nm-new, cluster configuration, full fixpoint:
+
+| | baseline | reachable |
+|---|---|---|
+| resolution passes | 4 | 5 |
+| bodies processed | 1,396 | 1,381 of 1,693 defined |
+| address-taken never reached | | 18 (iovec of bfd_openr_iovec, mmap paths, from_remote_memory, a select-passed qsort comparator before the escape rule) |
+| pairs / recall | 63,200 / 223 | 63,200 / 223, byte-identical |
+| wall / RSS | 12:36 / 10.8 GB | 11:25 / 10.8 GB |
+
+Identical answers because in cluster mode the link-add-symbols slot
+call at simple.c:259 resolves to 115 targets including
+bfd_elf_final_link (same function type, slot offsets collide under the
+buckets), which makes the whole linker reachable. Whether the linker
+falls out under exact addressing is what the single-site exact query
+for simple.c:259 decides; the exact single-site run for site 4688 with
+key identity, reachability and the multi-pass fixpoint is running.

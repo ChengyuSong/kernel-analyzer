@@ -23546,6 +23546,34 @@ void CallGraphPass::reachFunction(Function *F0) {
       auto cit = Ctx->Callees.find(CB);
       if (cit != Ctx->Callees.end())
         for (const Function *T : cit->second) push(T);
+      // Escape to the outside: a function handed to an external callee
+      // (a declaration with no definition in the corpus) may be called
+      // from there with arguments we never see. Constants through
+      // select/phi/cast chains are found here; a callback that reaches
+      // an external argument only through memory is not (ledgered by
+      // the extern-bound census).
+      const Function *CF2 = CB->getCalledFunction();
+      if (CF2 && getFuncDef(const_cast<Function *>(CF2))->isDeclaration()) {
+        SmallVector<const Value *, 8> work;
+        boost::unordered_flat_set<const Value *> seenV;
+        for (const Use &U : CB->args()) work.push_back(U.get());
+        while (!work.empty()) {
+          const Value *V = work.pop_back_val()->stripPointerCasts();
+          if (!seenV.insert(V).second) continue;
+          if (const auto *FV = dyn_cast<Function>(V)) {
+            push(FV);
+          } else if (const auto *SI = dyn_cast<SelectInst>(V)) {
+            work.push_back(SI->getTrueValue());
+            work.push_back(SI->getFalseValue());
+          } else if (const auto *PN = dyn_cast<PHINode>(V)) {
+            for (const Value *IV : PN->incoming_values()) work.push_back(IV);
+          } else if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+            for (const Use &U : CE->operands()) work.push_back(U.get());
+          } else if (const auto *CA = dyn_cast<ConstantAggregate>(V)) {
+            for (const Use &U : CA->operands()) work.push_back(U.get());
+          }
+        }
+      }
     }
   }
 }

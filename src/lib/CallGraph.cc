@@ -1146,6 +1146,20 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
         addAssignmentEdge(getRepDerefNode(getCanonicalNode(sF)),
                           getRepDerefNode(getCanonicalNode(dF)));
       }
+    } else if (CFLFlowsTo) {
+      // Bulk / unknown-layout copy under flows-to: a directional content
+      // move over every offset of both objects. The wildcard on each
+      // pointer makes the deref-to-deref edge above read all cells of
+      // the source objects and write all cells of the destination
+      // objects. No value alias: memcpy never makes dst point where
+      // src points. The old bidirectional pointer alias welded the
+      // copied object and the byte buffer into one points-to set
+      // (nm-new: elf_link_add_object_symbols' as-needed rehash
+      // `memcpy(old_ent, p, entsize)` made every hash entry alias the
+      // scratch buffer, which then carried strings and function
+      // addresses into asection/link-hash pointers).
+      addFieldWildcardLoop(srcNode, "memcpy-bulk");
+      addFieldWildcardLoop(dstNode, "memcpy-bulk");
     } else {
       addAssignmentEdge(srcNode, dstNode);
       addAssignmentEdge(dstNode, srcNode);

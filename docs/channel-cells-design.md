@@ -768,3 +768,30 @@ passes at 63,200 pairs and 223 of 223; the exact all-sites run with
 key identity and reachability is the corresponding measurement and is
 in flight. The two remaining single-pass exact runs, four and a half
 days in, will produce unsound answers when they finish.
+
+### The link-add-symbols slot is not a bucket collision (2026-09-24)
+
+The single-pass exact query for simple.c:259 (key identity, 33 h)
+answers exactly the same 115 targets as cluster mode, including
+bfd_elf_final_link, so the earlier explanation for that site, slot
+offsets colliding under the buckets, was wrong. The spine shows the
+mechanism: the callee operand, with 75,277 facts, is read from
+`abfd->xvec` through a channel keyed by the content identity of the
+formal `output_bfd` of `_bfd_x86_elf_always_size_sections`, an
+unrelated linker callback, and that channel's content is the
+universal widening component. In a single pass every callback formal
+is callerless and holds an identity root; the identities of different
+callbacks meet in shared helpers; a slot read through such a channel
+sees everything ever stored through any holder of that identity. Both
+answers of the single-pass exact model are therefore wrong in opposite
+directions: empty at 4688, the full soup at 259, and for the same
+reason.
+
+This also says what reachability mode buys beyond dead code. A
+callback's body is processed when its call site resolves, with the
+actual-to-formal edges already present, so the next rebuild mints no
+identity root for it; plain multi-pass mode mints those roots at pass
+zero and never parks them. The comparison that decides it is the
+exact all-sites run with key identity and reachability against the
+exact multi-pass single-site run for 4688 without reachability, both
+in flight.

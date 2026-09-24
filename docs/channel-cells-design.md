@@ -740,3 +740,31 @@ buckets), which makes the whole linker reachable. Whether the linker
 falls out under exact addressing is what the single-site exact query
 for simple.c:259 decides; the exact single-site run for site 4688 with
 key identity, reachability and the multi-pass fixpoint is running.
+
+### Correction: the single-pass exact-model answers are unsound (2026-09-24)
+
+The exact-model single-site runs were configured with
+`--cfl-flows-to-max-iters=1 --cfl-iter-cap-ok`, the single-pass
+setting of the cluster-mode pins. The corrected single-site run for
+elf64-x86-64.c:4688 (key identity, 30 h, 16 GB) answered 0 targets;
+the ground truth records `_bfd_elf_get_dynamic_reloc_upper_bound`
+there and the cluster answer contains it. The log says why: the
+fixpoint hit the cap with 13,664 newly wired pairs unprocessed. The
+site's function, elf_x86_64_get_synthetic_symtab, is reached only
+through the get-synthetic-symtab slot call at nm.c:1159; that pair is
+wired at the end of the single pass and never solved, so the formal
+`abfd` holds only its identity root, the slot cell reads as its
+content identity, and the answer is empty. Scored over all sites the
+single-pass exact answer set has recall 76 of 223; an earlier one had
+14 of 223. Cluster mode at a single pass still answers such sites
+because key coalescence carries the true target along with the soup.
+
+So the verdict of the 18-function reproducer, exact 0 against cluster
+71, compared a recall failure with a precision failure. Every
+exact-model number in this document taken from a single-pass run is a
+lower bound on the answer, not the answer. A fair comparison needs the
+multi-pass fixpoint on both sides: cluster mode converges in four
+passes at 63,200 pairs and 223 of 223; the exact all-sites run with
+key identity and reachability is the corresponding measurement and is
+in flight. The two remaining single-pass exact runs, four and a half
+days in, will produce unsound answers when they finish.

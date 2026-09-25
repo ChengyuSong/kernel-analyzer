@@ -7462,6 +7462,50 @@ bool CallGraphPass::runFlowsToResolution() {
           errs() << "      entry " << top[i].first << " edges: " << describe(top[i].second) << "\n";
       }
     };
+    // Junction ranking: the edges INSIDE the widening component that pass
+    // through a call boundary (into a formal, out of a return) are what
+    // close its cycles. Rank functions by how many internal edges enter
+    // their formals or leave through their returns: these are the
+    // context-insensitive junctions where the union is formed.
+    auto junctionRank = [&](uint32_t c) {
+      struct J { uint32_t formalsIn = 0, retsOut = 0, formalCls = 0; };
+      std::map<const Function *, J> jn;
+      std::map<char, uint32_t> byKind;
+      uint32_t internal = 0;
+      for (uint32_t x : order) {
+        if (comp[x] != c) continue;
+        uint32_t inHere = 0;
+        for (auto [y, k] : rin[x]) {
+          if (comp[y] != c) continue;
+          internal++; byKind[k]++; inHere++;
+        }
+        if (inHere == 0 || x >= toOrig.size()) continue;
+        const Value *V = NF.getValueForNode(toOrig[x]);
+        if (const auto *A = dyn_cast_or_null<Argument>(V)) {
+          auto &j = jn[A->getParent()]; j.formalsIn += inHere; j.formalCls++;
+        } else if (const auto *CB = dyn_cast_or_null<CallBase>(V)) {
+          if (const Function *CF = CB->getCalledFunction()) {
+            jn[getFuncDef(const_cast<Function *>(CF))].retsOut += inHere;
+          } else {
+            auto cit = Ctx->Callees.find(CB);
+            if (cit != Ctx->Callees.end())
+              for (const Function *T : cit->second) jn[T].retsOut += inHere;
+          }
+        }
+      }
+      errs() << "WIDEN-JUNCTIONS: " << internal << " internal edges (";
+      for (auto &[k, n] : byKind) errs() << k << "=" << n << " ";
+      errs() << "); functions ranked by internal edges into formals + out of returns:\n";
+      std::vector<std::pair<uint32_t, const Function *>> rk;
+      for (auto &[F, j] : jn) rk.push_back({j.formalsIn + j.retsOut, F});
+      std::sort(rk.begin(), rk.end(), [](auto &a, auto &b) { return a.first > b.first; });
+      for (size_t i = 0; i < std::min<size_t>(40, rk.size()); i++) {
+        auto &j = jn[rk[i].second];
+        errs() << "WIDEN-JUNCTION " << rk[i].first << " " << rk[i].second->getName()
+               << " formals-in=" << j.formalsIn << " (" << j.formalCls
+               << " formal classes) returns-out=" << j.retsOut << "\n";
+      }
+    };
     size_t shown = 0;
     for (uint32_t c : wcs) {
       if (shown++ >= 20) break;
@@ -7469,6 +7513,7 @@ bool CallGraphPass::runFlowsToResolution() {
              << compMem[c] << " F=" << compF[c] << " maxIn=" << maxInF[c]
              << " rep " << describe(compRep[c]) << "\n";
       showComp(c, 5);
+      if (shown == 1) junctionRank(c);
     }
     // Spine per seed over the condensation: largest input component
     // until the first widening component.

@@ -922,3 +922,45 @@ implemented tonight:
   implemented): the identity then stops seeding across the newly wired
   edges, and the welding it caused in earlier passes must be undone,
   which the incremental solver cannot do without a rebuild.
+
+### Carving census (`--cfl-census-carve`, 2026-09-26)
+
+The archive block of the previous section (`bfd_zmalloc` of `struct
+areltdata` + `struct ar_hdr`, archive.c:1868) is the program acting as
+its own allocator: one block, two objects, told apart only by offset.
+Arena allocators look the same from outside. The census asks how common
+that is. For every allocation call (the `FRESH` summaries), it follows
+the result inside the function through alloca slots, GEPs, casts, phis
+and selects, keeping the byte offset from the allocation; a struct-typed
+GEP applied at offset o types the range [o, o + sizeof S). The type at
+offset 0 is the object's type T. A typed use at or beyond sizeof T is a
+carve unless an array of T explains it (offset mod sizeof T is 0 with
+the same type, or lands on a member of T of that type, nested members
+included). Variable-index derivations, the wildcard producers, are
+counted per site with the range they start from. Reporting only.
+
+nm-new: 540 allocation sites, 76 with a constant size. 165 have a struct
+type at offset 0, 375 have none inside their function (byte buffers, and
+wrappers that return the block: `bfd_malloc_and_get_section` and the
+like; typing those needs the callers' uses), 14 have several types at
+offset 0. 28 sites are arrays of the offset-0 type. Two carves:
+
+- `bfd_ar_hdr_from_filesystem::call:bfd_zmalloc@1868`: `areltdata(56)
+  +56:ar_hdr(60)`. The genuine one.
+- `coff_get_normalized_symtab::call:bfd_zalloc@1821`:
+  `coff_ptr_struct(56) +64:internal_syment(40)`. A false positive: the
+  member at +8 is an anonymous union, which LLVM lowers to its largest
+  member (`%union.anon.14 = { %union.internal_auxent }`), so the
+  `internal_syment` view never appears in the layout. Unions are the
+  blind spot of layout-based typing.
+
+So carving is rare in libbfd once the arena allocators are summarized
+(`bfd_alloc`, `bfd_zalloc`, `bfd_hash_allocate` are `FRESH`; had they
+not been, `_objalloc_alloc` would be the carve). The wildcard producers
+are elsewhere: 25,555 variable-index derivations at 153 sites, led by
+byte-buffer parsing (`do_slurp_bsd_armap::call:bfd_zalloc@971`, 3,333
+derivations, untyped) and typed arrays (`bfd_symbol[i]` in
+`_bfd_x86_elf_get_synthetic_symtab`, 802). The first is the typed-store
+lever (byte stores of pointer-free values should not put a block on the
+wildcard plane); the second is the strided address the lazy model
+already has. Bounded sub-object ranges would matter for one site here.

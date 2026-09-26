@@ -54,6 +54,7 @@ extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLLazyMint;
 extern cl::opt<bool> CFLCensusInvoke;
 extern cl::opt<bool> CFLCensusFields;
+extern cl::opt<bool> CFLCensusCarve;
 extern cl::opt<bool> CFLProbeOriginSplit;
 extern cl::opt<bool> CFLProbeOpsMono;
 extern cl::opt<std::string> CFLProbeSinkAblate;

@@ -463,6 +463,17 @@ cl::opt<bool> CFLCensusInvoke(
            "edges"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusCarve(
+  "cfl-census-carve",
+  cl::desc("MEASUREMENT-ONLY census of allocation-site carving: per "
+           "allocation call (FRESH summaries), the constant size, the "
+           "struct type of the first typed use at offset 0, and every "
+           "address formed on the result at or beyond that type's extent "
+           "with the type it is then used as (a sub-allocation the program "
+           "carves itself: areltdata+ar_hdr blocks, arena chunks, tail "
+           "structures), plus variable-offset derivations. Adds no edges"),
+  cl::init(false));
+
 cl::opt<bool> CFLCensusFields(
   "cfl-census-fields",
   cl::desc("MEASUREMENT-ONLY census of family-2/3 store-side "

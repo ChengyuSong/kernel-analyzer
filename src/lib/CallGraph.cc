@@ -19109,6 +19109,185 @@ void CallGraphPass::finalizeChainPairs() {
 // a depth-limited backward walk of its int computation, plus census
 // the user-boundary copy interfaces. Measurement only.
 
+// --cfl-census-carve (docs/channel-cells-design.md, "Constant globals are
+// channels" follow-up, 2026-09-26): does the program act as its own
+// allocator? For every allocation call (FRESH summaries), follow the
+// result intra-procedurally through alloca slots, GEPs, casts, phis and
+// selects, tracking the byte offset from the allocation. A struct-typed
+// GEP applied at offset o types the range [o, o + sizeof S). The first
+// such type at offset 0 is the object's type T; an address at or beyond
+// sizeof T that is then used with another struct type is a carved
+// sub-object (bfd's areltdata + ar_hdr block, arena chunks, tail
+// structures). Variable-index derivations (the wildcard producers) are
+// counted per site, with the range they start from. Reporting only.
+void CallGraphPass::runCarveCensus() {
+  const int64_t kUnknown = INT64_MIN;
+  struct TyUse { std::string name; uint64_t size; };
+  size_t sites = 0, constSize = 0, carved = 0, multiType0 = 0, untyped = 0, arraySites = 0,
+         varOffSites = 0, varOffDerivs = 0, varOffFromCarved = 0, overflow = 0,
+         passedOut = 0;
+  std::vector<std::string> carveLines, varLines;
+  std::map<std::string, size_t> carvedByAllocator, sitesByAllocator;
+  for (auto &mp : Ctx->Modules) {
+    Module &M = *mp.first;
+    const DataLayout &DL = M.getDataLayout();
+    for (Function &F : M) {
+      if (F.empty()) continue;
+      for (Instruction &I : instructions(F)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || !CB->getType()->isPointerTy()) continue;
+        Function *CF = CB->getCalledFunction();
+        if (!CF) {
+          if (auto *GA = dyn_cast_or_null<GlobalAlias>(CB->getCalledOperand()->stripPointerCasts()))
+            CF = dyn_cast<Function>(GA->getAliasee()->stripPointerCasts());
+        }
+        if (!CF || !Ctx->AllocFuncs.count(CF)) continue;
+        sites++;
+        sitesByAllocator[CF->getName().str()]++;
+        // Allocation size: product of the constant integer arguments;
+        // unknown if any integer argument is not constant.
+        int64_t size = 1; bool sizeKnown = false, sizeBad = false;
+        for (Value *A : CB->args()) {
+          if (!A->getType()->isIntegerTy()) continue;
+          if (auto *CI = dyn_cast<ConstantInt>(A)) { size *= CI->getSExtValue(); sizeKnown = true; }
+          else sizeBad = true;
+        }
+        if (!sizeKnown || sizeBad) size = -1; else constSize++;
+        // Forward dataflow over derived values: value -> set of offsets.
+        std::map<const Value *, std::set<int64_t>> offs;
+        std::vector<std::pair<const Value *, int64_t>> work;
+        auto push = [&](const Value *V, int64_t o) {
+          if (offs[V].insert(o).second) work.push_back({V, o});
+        };
+        push(CB, 0);
+        std::map<int64_t, std::map<std::string, uint64_t>> typesAt; // offset -> type -> size
+        std::map<std::string, StructType *> tyOf;                     // stripped name -> a type
+        std::map<int64_t, size_t> varFrom; // start offset of variable-index derivations
+        size_t siteVar = 0, sitePassed = 0;
+        size_t steps = 0;
+        while (!work.empty() && steps++ < 20000) {
+          auto [V, o] = work.back(); work.pop_back();
+          for (const User *U : V->users()) {
+            if (auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getValueOperand() != V) continue;
+              if (auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
+                for (const User *LU : AI->users())
+                  if (auto *LI = dyn_cast<LoadInst>(LU))
+                    if (LI->getPointerOperand()->stripPointerCasts() == AI) push(LI, o);
+              continue;
+            }
+            if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+              if (G->getPointerOperand() != V) continue;
+              Type *ST = G->getSourceElementType();
+              bool allConst = true;
+              for (auto &Ix : G->indices()) if (!isa<ConstantInt>(Ix)) { allConst = false; break; }
+              if (auto *Sty = dyn_cast<StructType>(ST); Sty && !Sty->isLiteral() && Sty->hasName()) {
+                if (o != kUnknown) {
+                  const std::string nm = stripStructNameSuffix(Sty->getName()).str();
+                  typesAt[o][nm] = DL.getTypeAllocSize(Sty);
+                  tyOf.emplace(nm, Sty);
+                }
+              }
+              if (allConst && o != kUnknown) {
+                SmallVector<Value *, 8> idx(G->idx_begin(), G->idx_end());
+                push(G, o + DL.getIndexedOffsetInType(ST, idx));
+              } else {
+                if (!allConst) { siteVar++; varFrom[o]++; }
+                push(G, kUnknown);
+              }
+              continue;
+            }
+            if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U) || isa<PHINode>(U) || isa<SelectInst>(U)) {
+              push(cast<Value>(U), o);
+              continue;
+            }
+            if (auto *CB2 = dyn_cast<CallBase>(U)) {
+              if (CB2->getCalledOperand() != V) { sitePassed++; }
+              continue;
+            }
+          }
+        }
+        // Type at offset 0 and its extent.
+        std::string t0; uint64_t ext0 = 0; size_t nT0 = 0;
+        auto it0 = typesAt.find(0);
+        if (it0 != typesAt.end()) {
+          nT0 = it0->second.size();
+          for (auto &[n, sz] : it0->second) { if (sz > ext0) { ext0 = sz; t0 = n; } }
+        }
+        if (nT0 == 0) untyped++;
+        if (nT0 > 1) multiType0++;
+        // Carving: a struct-typed use at an offset >= the extent of T0
+        // that an ARRAY of T0 does not explain: offset mod sizeof(T0) must
+        // be 0 with the same type, or land on a member of T0 of that type
+        // (nested members included). Anything else is a second object the
+        // program carved out of the block.
+        std::function<bool(StructType *, uint64_t, const std::string &)> memberAt =
+            [&](StructType *T, uint64_t r, const std::string &want) -> bool {
+          if (r == 0 && stripStructNameSuffix(T->getName()) == want) return true;
+          const StructLayout *SL = DL.getStructLayout(T);
+          if (r >= SL->getSizeInBytes()) return false;
+          unsigned e = SL->getElementContainingOffset(r);
+          Type *ET = T->getElementType(e);
+          uint64_t r2 = r - SL->getElementOffset(e);
+          while (auto *AT = dyn_cast<ArrayType>(ET)) { // arrays of structs inside
+            uint64_t es = DL.getTypeAllocSize(AT->getElementType());
+            if (!es) return false;
+            r2 %= es; ET = AT->getElementType();
+          }
+          if (auto *ST2 = dyn_cast<StructType>(ET); ST2 && !ST2->isLiteral() && ST2->hasName())
+            return memberAt(ST2, r2, want);
+          return false;
+        };
+        std::string carve;
+        bool isCarved = false, ovf = false;
+        size_t arrayLike = 0;
+        StructType *T0 = t0.empty() ? nullptr : tyOf[t0];
+        for (auto &[o, tys] : typesAt) {
+          if (o <= 0 || ext0 == 0 || (uint64_t)o < ext0) continue;
+          for (auto &[n, sz] : tys) {
+            if (T0 && memberAt(T0, (uint64_t)o % ext0, n)) { arrayLike++; continue; }
+            isCarved = true;
+            carve += " +" + std::to_string(o) + ":" + n + "(" + std::to_string(sz) + ")";
+            if (size > 0 && o + (int64_t)sz > size) ovf = true;
+          }
+        }
+        if (arrayLike && !isCarved) arraySites++;
+        // Variable-index derivations starting inside a carved range.
+        size_t varCarved = 0;
+        for (auto &[o, n] : varFrom) if (o != kUnknown && ext0 && o >= (int64_t)ext0) varCarved += n;
+        varOffDerivs += siteVar; varOffFromCarved += varCarved; passedOut += sitePassed;
+        if (siteVar) varOffSites++;
+        std::string site = F.getName().str() + "::call:" + CF->getName().str();
+        if (const DebugLoc &DLc = CB->getDebugLoc()) site += "@" + std::to_string(DLc.getLine());
+        std::string t0s = t0.empty() ? std::string("<untyped>") : t0 + "(" + std::to_string(ext0) + ")";
+        if (isCarved) {
+          carved++; carvedByAllocator[CF->getName().str()]++;
+          if (ovf) overflow++;
+          if (carveLines.size() < 120)
+            carveLines.push_back("CARVE " + site + " size=" + (size >= 0 ? std::to_string(size) : std::string("?")) +
+                                 " " + t0s + carve + (ovf ? " OVERFLOW" : "") +
+                                 (siteVar ? " var-index=" + std::to_string(siteVar) + (varCarved ? "(" + std::to_string(varCarved) + " in carved)" : "") : ""));
+        } else if (siteVar && varLines.size() < 40) {
+          varLines.push_back("VARIDX " + site + " size=" + (size >= 0 ? std::to_string(size) : std::string("?")) +
+                             " " + t0s + " var-index=" + std::to_string(siteVar));
+        }
+      }
+    }
+  }
+  errs() << "CarveCensus: " << sites << " allocation sites (" << constSize
+         << " constant size); type at offset 0: " << (sites - untyped)
+         << " typed, " << untyped << " untyped, " << multiType0
+         << " with several types; " << arraySites << " arrays of the offset-0 type; CARVED " << carved << " (" << overflow
+         << " beyond the allocation size); variable-index derivations "
+         << varOffDerivs << " at " << varOffSites << " sites, "
+         << varOffFromCarved << " of them from inside a carved range; "
+         << passedOut << " derived pointers passed to callees\n";
+  for (auto &[n, c] : carvedByAllocator)
+    errs() << "CarveCensus:  carved by " << n << ": " << c << " of " << sitesByAllocator[n] << " sites\n";
+  for (auto &l : carveLines) errs() << "CarveCensus: " << l << "\n";
+  if (VerboseLevel >= 2) for (auto &l : varLines) errs() << "CarveCensus: " << l << "\n";
+}
+
 void CallGraphPass::runStrataCensus() {
   static const char *bname[STRATA_NBUCK] = {
       "directmap", "vmemmap", "kernelmap", "mm-fn", "trace", "OTHER"};
@@ -23933,6 +24112,9 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLCensusFields && iteration == 0 && M == Ctx->Modules.front().first)
     runFieldChannelCensus(); // measurement-only, adds no edges
+
+  if (CFLCensusCarve && iteration == 0 && M == Ctx->Modules.front().first)
+    runCarveCensus(); // measurement-only, adds no edges
 
   if (CFLCensusStrata && iteration == 0 && M == Ctx->Modules.front().first)
     runStrataCensus(); // measurement-only, adds no edges

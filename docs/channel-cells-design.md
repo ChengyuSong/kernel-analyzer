@@ -795,3 +795,130 @@ zero and never parks them. The comparison that decides it is the
 exact all-sites run with key identity and reachability against the
 exact multi-pass single-site run for 4688 without reachability, both
 in flight.
+
+## The BFD_SEND dispatch: constant channels, identity welding (2026-09-25)
+
+The junction ranking of the site-4688 widening component (commit 7e697f4)
+put the union at the BFD_SEND dispatch: 16 target-vector slot functions,
+each with 105 internal in-edges from one formal class, each with 12
+return edges out. The 105 edges are the `abfd->xvec->slot` and
+`abfd->iovec->op` reads. The obvious reading was that the slot cells of
+the constant target vectors coalesce (one wide read cell merges the 19
+keys `(vec_i, s)` into one cluster, a second read of another slot in the
+same bucket joins it, and every dispatch site resolves to every slot
+function). That reading was tested and is wrong. This section records
+the test, the mechanism that actually carries the width, and the cost of
+removing it.
+
+### Constant globals as channels (`--cfl-key-channels`, default off)
+
+The target vectors, the iovecs and the vector table are LLVM `constant`
+globals with pointer content: 101 of them in nm-new. Nothing can store
+into them, so their memory holds exactly their initializer, and a key of
+such an object has nothing to gain from a cluster (a cluster unifies the
+store cells and load cells of one location; a constant location has no
+store cells). The flag treats those keys the way the exact model treats
+every key: `joinCluster` pends them instead of merging, and the barrier
+flush wires one channel node per key. Writers are the initializer cells
+only (`CallGraphPass::constInitCells`, recorded in `processInitializer`;
+1.59 M store cells whose pointer may point into a constant were not
+wired: constant memory cannot be written, and wiring them would pour the
+universal cluster into the channel). Readers are served through a read
+half per class: a solver node holding a copy of the class's loads
+(out-edges to nodes below N, field edges, nested cells), fed by the
+channel, never feeding one. The half follows the class through merges
+(the loser's loads are appended to the keeper's half and the half's
+content is pushed along them; the loser's half keeps serving the
+loser's keys, whose marks are dropped and re-offered). Channel keys
+join on native facts only; read halves and channels are memory nodes
+for the a-SCC collapse.
+
+Three versions were needed, each falsified by a 16-minute run:
+
+1. Channel into the reader cell itself (no half): byte-identical to the
+   baseline. The reader cell is also a member of the mutable clusters
+   its pointer reaches, so it carried the slot functions into the
+   universal cluster: the conduit.
+2. Read half keyed by the raw cell, with any cell with in-edges as a
+   writer: recall 28/223. Cluster mode keeps its "already joined" marks
+   per class and deduplicates cell lists to class representatives, so a
+   key pended by one member of a merged class was never pended for the
+   others and their halves were never made (bfdio.c:211 lost
+   `cache_bread` while the same site kept `memory_bread`).
+3. Per-class read halves as described above. Sound: bfdio.c:211 has
+   `cache_bread` again, fixpoint answers byte-identical to the baseline.
+
+Measurement (nm-new, cluster fixpoint, 29 field buckets, same machine):
+
+| run | pairs | recall | site 4688 | simple.c:259 | hash.c:657 | wall | RSS |
+|---|---|---|---|---|---|---|---|
+| baseline (clusters) | 63,200 | 223/223 | 74 | 115 | 4 | 12:36 | 10.8 GB |
+| constant channels | 63,200 | 223/223 | 74 | 115 | 4 | 27:57 | 11.1 GB |
+
+Iteration 0 resolves 1148 icalls / 58,976 targets against 58,978: the
+two targets removed are the only effect. The constant slot cells are not
+the carrier of the width. The flag stays off by default.
+
+### What carries the 74 targets to site 4688
+
+`--cfl-trace-value=elf_x86_64_get_synthetic_symtab` on a single pass
+dumps the fact count of every pointer value in the function holding the
+site (IR: `%46 = load abfd; %47 = gep %46, xvec; %48 = load %47;
+%49 = gep %48, slot 103; %50 = load %49; call %50`):
+
+| value | facts |
+|---|---|
+| `abfd` formal (arg0), `%46`, `%47` | 1 (a synthetic identity root, r10124) |
+| `%48 = abfd->xvec` | 235,860 |
+| `%49`, `%50` (the callee) | 235,860 |
+| `bfd_get_section_by_name(abfd, ...)` result | 235,860 |
+
+The function is a target-vector slot (`_bfd_get_synthetic_symtab`),
+reached only through BFD_SEND. In the pass its formal has no wired
+caller, so it carries only its identity root. The load `abfd->xvec`
+reads the key `(r10124, s_xvec)`, and its cluster holds the whole soup.
+The identity r10124 is passed as the actual of the very call at the
+site (`%50(%51)`, `%51 = abfd`), so it flows into all 74 candidate
+callees; in each of them `abfd->field` cells join keys `(r10124, s)` and
+are merged with whatever else those cells' pointers reach. The identity
+of one unwired formal is a universal key: every function it flows into,
+over-approximated callees included, has its field cells welded into one
+class per bucket. The 74 targets are the bucket-103 content of that
+class; the same mechanism produced the `section` formal chain of the
+2026-09-24 note and the formal-confluence glue of the kernel tcp/ahci
+weld. It is self-reinforcing: the wider the answer at the site, the
+more callees receive the identity.
+
+### Identity roots as channels (`--cfl-identity-channels`, default off)
+
+The same machinery with identity roots (14,782 of 20,872 roots in
+nm-new: classes minted only because they have no in-edge, plus extern
+globals) as channel keys, stores through the identity being the
+writers. Correct on the small reproducers (scratch `cc/vt{,2,3,4}.c`,
+including a callee reached only through the dispatch), and exactly the
+exact model's treatment of external origins. On nm-new the first drain
+never reaches a flush: 16.8 G facts and 46 GB after 10 minutes (killed;
+the baseline never prints a progress line, its drains stay under 1 M
+pops). Unwelding the identities gives the unmerged closure of the exact
+model, and the merged planes of the welded classes were what kept
+cluster mode at 10 GB. The width and the speed of cluster mode are the
+same thing.
+
+### Where this leaves the fix
+
+The imprecision at the dispatch sites is the identity of an unwired
+formal acting as a key while the formal is at the same time being passed
+into the functions the site resolves to. Two directions remain, neither
+implemented tonight:
+
+- Do not let an identity root serve as a join key at all: a load
+  through a callerless formal reads nothing but a fresh identity (the
+  exact model's key identity), and stores through it are dropped from
+  keying. Sound only across the outer fixpoint (the formal gets real
+  actuals once its callers are wired, which is why single-pass exact
+  answers were declared unsound on 2026-09-24), and the fact volume of
+  the unwelded closure has to be paid somewhere.
+- Park the identity when the formal is wired (noted in memory as not
+  implemented): the identity then stops seeding across the newly wired
+  edges, and the welding it caused in earlier passes must be undone,
+  which the incremental solver cannot do without a rebuild.

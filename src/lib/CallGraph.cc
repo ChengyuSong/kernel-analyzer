@@ -4850,6 +4850,77 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<char> rootConstData(nextRoot, 0);
   for (uint32_t rid = 0; rid < nextRoot; rid++)
     rootConstData[rid] = isConstDataRoot(rootClassOf[rid]);
+  // --cfl-const-channels (docs/channel-cells-design.md, "Constant
+  // globals are channels"): a never-written global WITH pointer content
+  // (LLVM `constant`: dispatch tables, iovecs, target vectors). Its
+  // memory holds exactly its initializer, so a key (o, s) of such a
+  // root has nothing to gain from a cluster: merging a wide reader cell
+  // into it is the route by which the slot cells of every table
+  // coalesced (nm-new BFD_SEND: 105 `abfd->xvec->slot` reads, each
+  // reaching all 19 vectors, unified every slot of every vector). These
+  // keys are pended and wired directionally at the barrier flush.
+  auto isConstPtrRoot = [&](uint32_t cls) -> char {
+    if (cls >= toOrig.size()) return 0;
+    const auto *GV =
+        dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(toOrig[cls]));
+    return GV && GV->isConstant() && GV->hasInitializer() &&
+           containsPointerType(GV->getValueType());
+  };
+  // Identity roots (kind 2): minted only because the class has no
+  // in-edge — a callerless formal, a per-access cell, a synthetic
+  // class — or an extern global with its own node. Their "memory" is
+  // whatever is stored through the identity; a cluster keyed by one of
+  // them unifies the field cells of every function the identity flows
+  // into (over-approximated callees included), which is the welding
+  // route the widening reports kept ending at.
+  auto isExtGlobalRoot = [&](uint32_t cls) -> bool {
+    if (cls >= toOrig.size()) return false;
+    const auto *G =
+        dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(toOrig[cls]));
+    return G && Ctx->ExtGobjs.count(G->getGUID()) &&
+           NF.isExtGobjOverride(G->getGUID());
+  };
+  const bool constChan = CFLKeyChannels && !CFLChannelCells;
+  std::vector<char> rootChanKind(nextRoot, 0); // 0 cluster, 1 constant, 2 identity
+  size_t constPtrRoots = 0, identityRoots = 0;
+  for (uint32_t rid = 0; rid < nextRoot; rid++) {
+    if (isConstPtrRoot(rootClassOf[rid])) { rootChanKind[rid] = 1; constPtrRoots++; }
+    else if (CFLIdentityChannels &&
+             (rootParkable[rid] || isExtGlobalRoot(rootClassOf[rid]))) {
+      rootChanKind[rid] = 2; identityRoots++;
+    }
+  }
+  size_t constChanPends = 0, constChanWriters = 0, constChanReaders = 0,
+         constChanStoresDropped = 0;
+  // Per-CLASS state (cells merge in cluster mode; a class is the unit
+  // the joined marks speak about). classHasInit: the class holds an
+  // initializer cell of a constant global (the only writer such a key
+  // has). classHasIn: some member has in-edges (a store cell; the
+  // writer of an identity key). readHalfOf: the class's read half, a
+  // solver node whose out-edges are copies of the class's loads (and
+  // grow with the class); channels feed it, it never feeds a channel,
+  // and constant/identity content therefore never enters the class.
+  std::vector<char> classHasInit, classHasIn;
+  boost::unordered_flat_map<uint32_t, uint32_t> readHalfOf;
+  if (constChan) {
+    classHasInit.assign(N, 0);
+    for (NodeIndex n : constInitCells) {
+      auto it = toDense.find(getCanonicalNode(n));
+      if (it != toDense.end() && it->second < N) classHasInit[it->second] = 1;
+    }
+    classHasIn.assign(N, 0);
+    for (uint32_t n = 0; n < N; n++) classHasIn[n] = hasIn[n];
+  }
+  // Roots of channel keys as a fact set (split of a sweep's backlog).
+  FactSet constMask;
+  if (constChan)
+    for (uint32_t rid = 0; rid < nextRoot; rid++)
+      if (rootChanKind[rid]) constMask.set(rid);
+  if (constChan)
+    CG_LOG("KeyChannels: " << constPtrRoots
+           << " never-written pointer-bearing globals and " << identityRoots
+           << " identity roots wired directionally (of " << nextRoot
+           << " roots)\n");
   // Lazy addresses: per-root descriptor (object root, byte offset, stride:
   // 0 exact, UINT32_MAX = the object's range wildcard). Non-address roots
   // (functions, identities, channel-minted ids) never remap.
@@ -4977,6 +5048,8 @@ bool CallGraphPass::runFlowsToResolution() {
     FactSet::Universe = nextRoot; // widen BEFORE the first set
     rootClassOf.push_back(rootClassOf[obj]); // named after its object
     rootConstData.push_back(rootConstData[obj]);
+    rootChanKind.push_back(rootChanKind[obj]);
+    if (constChan && rootChanKind[obj]) constMask.set(rid);
     rootParkable.push_back(rootParkable[obj]);
     if (nexusGate) rootNexus.push_back(rootNexus[obj]);
     addrGrow();
@@ -5567,8 +5640,14 @@ bool CallGraphPass::runFlowsToResolution() {
   // grow, so they get capacity up front. Vectors grow at the barrier
   // (no live references across the flush).
   // Headroom bound: realized keys ≤ origins × NSHIFT; origins ≤ N.
+  // --cfl-const-channels: one channel per realized key of a
+  // never-written global (no read halves are made); lazy addresses
+  // mint per-offset roots of those objects, so take the full headroom.
   const uint32_t NCap =
-      CFLChannelCells ? N + std::max<uint32_t>(3 * N, 1u << 20) : N;
+      (CFLChannelCells || (constChan && lazyAddr))
+          ? N + std::max<uint32_t>(3 * N, 1u << 20)
+          : constChan ? N + std::max<uint32_t>(3 * N, 1u << 20) // keys + read halves
+                  : N;
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
       new std::atomic<uint8_t>[NCap]);
   for (uint32_t i = 0; i < NCap; i++)
@@ -5810,6 +5889,7 @@ bool CallGraphPass::runFlowsToResolution() {
     FactSet relabelS;                        // holder-identity relabel scratch
     FactSet d, todoS, dbS, dNatS, dBrS;      // pop-loop scratch
     FactSet pendS, todoGS;                   // cell-major sweep scratch
+    FactSet constS;                          // never-written-key part of a sweep
     std::vector<uint32_t> sweepElems;
     std::vector<uint32_t> localWork;
     uint64_t localFacts = 0, pops = 0;
@@ -6297,6 +6377,51 @@ bool CallGraphPass::runFlowsToResolution() {
       src.clear();
       src.shrink_to_fit();
     };
+    if (constChan && a < N && b < N) {
+      classHasInit[a] |= classHasInit[b];
+      classHasIn[a] |= classHasIn[b];
+      // The keeper's read half must reach the loser's loads: the
+      // keeper's joined marks survive the merge, so a key the keeper
+      // already pended is never re-offered for the loser's cells. The
+      // loser's own half keeps serving the loser's keys (its marks are
+      // dropped, so they are re-offered to the merged class anyway).
+      auto ra = readHalfOf.find(a);
+      auto rb = readHalfOf.find(b);
+      if (ra != readHalfOf.end()) {
+        const uint32_t rh = ra->second;
+        for (uint32_t t : outA[b]) if (t < N) outA[rh].push_back(t);
+        for (auto e : outF[b]) outF[rh].push_back(e);
+        for (uint32_t c : cellsOf[b]) cellsOf[rh].push_back(c);
+        tHow = "rh-grow"; tFrom = rh;
+        for (uint32_t t : outA[b]) {
+          if (t >= N) continue;
+          const uint32_t tt = find(t);
+          for (uint32_t s = 0; s < NSHIFT; s++) {
+            if (R[rh][s].any()) addBits(tt, s, R[rh][s], ctx0);
+            if (RB[rh][s].any()) addBits(tt, s, RB[rh][s], ctx0);
+          }
+        }
+        for (auto [t, r] : outF[b]) {
+          const uint32_t tt = find(t);
+          for (uint32_t s = 0; s < NSHIFT; s++) {
+            const uint32_t s2 = (NB == 0 || s == SHIFT_X) ? s : (s + r) % NB;
+            if (R[rh][s].any()) addBits(tt, s2, R[rh][s], ctx0);
+            if (RB[rh][s].any()) addBits(tt, s2, RB[rh][s], ctx0);
+          }
+        }
+        if (!cellsOf[b].empty()) {
+          for (uint32_t s = 0; s < NSHIFT; s++) {
+            joined[rh][s].clear();
+            jdirty[rh][s].unionWith(R[rh][s]);
+            jdirty[rh][s].unionWith(RB[rh][s]);
+          }
+          push(rh, ctx0);
+        }
+      } else if (rb != readHalfOf.end()) {
+        readHalfOf.emplace(a, rb->second);
+      }
+      if (rb != readHalfOf.end()) readHalfOf.erase(rb);
+    }
     append(outA[a], outA[b]);
     append(outF[a], outF[b]);
     append(cellsOf[a], cellsOf[b]);
@@ -6605,6 +6730,14 @@ bool CallGraphPass::runFlowsToResolution() {
       chanConstSkipped++;
       return;
     }
+    if (constChan && o < rootChanKind.size() && rootChanKind[o]) {
+      // Channel key: no cluster is ever formed for it. The flush wires
+      // writer cells into a channel and the channel into read halves.
+      if (chanPendSeen.emplace((uint64_t)o * NSHIFT + s, cell).second)
+        chanPend.push_back({cell, o, s});
+      constChanPends++;
+      return;
+    }
     if (CFLChannelCells) {
       // Pairwise mode: record; the barrier flush wires the channel.
       // Cells outside the wiring cone cannot influence any answer.
@@ -6801,6 +6934,7 @@ bool CallGraphPass::runFlowsToResolution() {
     FactSet::Universe = nextRoot; // widen BEFORE the first set
     rootClassOf.push_back(home);  // named/classified like its base
     rootConstData.push_back(0);
+    rootChanKind.push_back(0);
     rootParkable.push_back(0);
     if (nexusGate) rootNexus.push_back(0);
     it->second = rid;
@@ -6938,7 +7072,7 @@ bool CallGraphPass::runFlowsToResolution() {
            << seeds << " seed sites)\n");
   };
   auto flushChannelPends = [&]() -> size_t {
-    if (!CFLChannelCells) return 0;
+    if (!CFLChannelCells && !constChan) return 0;
     if (chanPend.empty() && demRelDirty.empty()) return holderReleaseKeyless();
     const auto tFlush0 = std::chrono::steady_clock::now();
     const size_t pendsIn = chanPend.size();
@@ -7032,6 +7166,8 @@ bool CallGraphPass::runFlowsToResolution() {
             FactSet::Universe = nextRoot; // widen BEFORE the first set
             rootClassOf.push_back(ch);
             rootConstData.push_back(0);
+            rootChanKind.push_back(CFLIdentityChannels ? 2 : 0); // a content identity is an identity root
+            if (constChan && rootChanKind.back()) constMask.set(rid);
             rootParkable.push_back(0);
             if (nexusGate) rootNexus.push_back(0);
             keyIdentityRoots.insert(rid);
@@ -7114,6 +7250,59 @@ bool CallGraphPass::runFlowsToResolution() {
         ch = find(it->second);
       }
       if (ch == cell) continue; // RMW-merged earlier under this key
+      if (constChan) {
+        // Cluster mode, channel key. `cell` is a class (cells merge by
+        // their object keys); it must neither receive channel content
+        // (it would carry it into every cluster it belongs to: the
+        // universal-cluster conduit) nor feed the channel unless it
+        // writes the key (a constant's initializer cell; a store cell
+        // for an identity). Content goes to the class's read half.
+        assert(P.o < rootChanKind.size() && rootChanKind[P.o] &&
+               "cluster mode pends only channel keys");
+        const bool writer =
+            cell < N && (rootChanKind[P.o] == 1 ? (bool)classHasInit[cell]
+                                                : (bool)classHasIn[cell]);
+        if (writer) {
+          if (chanEdgeSeen.insert(((uint64_t)cell << 32) | ch).second) {
+            outA[cell].push_back(ch);
+            chanEdges++;
+            work++;
+            constChanWriters++;
+            tHow = "chan-in"; tFrom = cell; tKeyO = P.o; tKeyS = P.s; tCell = cell;
+            for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+              if (R[cell][s2].any()) addBits(ch, s2, R[cell][s2], ctx0, true);
+              if (RB[cell][s2].any()) addBits(ch, s2, RB[cell][s2], ctx0);
+            }
+          }
+        } else if (cell < N && classHasIn[cell]) {
+          constChanStoresDropped++;
+        }
+        uint32_t rh;
+        auto rhIt = readHalfOf.find(cell);
+        if (rhIt == readHalfOf.end()) {
+          rh = newSolverNode();
+          readHalfOf.emplace(cell, rh);
+          chanNodeName[rh] = "rh(" + protBlameName(cell).substr(0, 50) + ")";
+          for (uint32_t t : outA[cell]) if (t < N) outA[rh].push_back(t);
+          outF[rh] = outF[cell];
+          cellsOf[rh] = cellsOf[cell];
+          chanSplits++;
+        } else {
+          rh = rhIt->second;
+        }
+        if (chanEdgeSeen.insert(((uint64_t)ch << 32) | rh).second) {
+          outA[ch].push_back(rh);
+          chanEdges++;
+          work++;
+          constChanReaders++;
+          tHow = "chan-out"; tFrom = ch; tKeyO = P.o; tKeyS = P.s; tCell = cell;
+          for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+            if (R[ch][s2].any()) addBits(rh, s2, R[ch][s2], ctx0, true);
+            if (RB[ch][s2].any()) addBits(rh, s2, RB[ch][s2], ctx0);
+          }
+        }
+        continue;
+      }
       if (VerboseLevel >= 3) {
         errs() << "ChanFlush: cell c" << cell << " ("
                << protBlameName(cell).substr(0, 50) << ") key=(r" << P.o
@@ -7599,7 +7788,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // the pointer may reach (cflow: yyin's FILE* cell with a list head's
     // free_data). Only value-to-value cycles collapse.
     auto isMemoryNode = [&](uint32_t v) -> bool {
-      if (!CFLChannelCells) return false;
+      if (!CFLChannelCells) return constChan && v >= N; // const channels
       if (v >= N) return true; // channel / read half
       return NF.isDereferenceNode(toOrig[v]);
     };
@@ -7784,6 +7973,11 @@ bool CallGraphPass::runFlowsToResolution() {
     rootClassOf.push_back(rep);
     rootConstData.push_back(isConstDataRoot(rep));
     rootParkable.push_back(!hasIn[rep] && !originBearing(toOrig[rep]));
+    rootChanKind.push_back(isConstPtrRoot(rep) ? 1
+                           : (CFLIdentityChannels &&
+                              (rootParkable.back() || isExtGlobalRoot(rep))) ? 2
+                                                                             : 0);
+    if (constChan && rootChanKind.back()) constMask.set((uint32_t)rootChanKind.size() - 1);
     if (lazyAddr) {
       addrGrow();
       addrObj[rid] = rid; addrOff[rid] = 0; addrStride[rid] = 0;
@@ -7947,6 +8141,23 @@ bool CallGraphPass::runFlowsToResolution() {
       const uint64_t todoCnt = todo.count();
       if (todoCnt == 0) { ctx.cyJoin += rd() - tp0; continue; }
       if (prof) ctx.sweepKept += todoCnt;
+      if (constChan && constMask.any()) {
+        // Channel keys join on native facts only, as channel mode does:
+        // the (o,X) and (o,s) channels of one origin are bridged at
+        // creation, so a pend per bridged image would repeat that per
+        // cell. Bridged-only channel facts are marked offered and dropped.
+        FactSet &ct = ctx.constS;
+        ct.copyFrom(todo);
+        ct.intersectWith(constMask);
+        if (ct.any()) {
+          ct.subtract(R[n][s]);
+          if (ct.any()) {
+            joined[n][s].unionWith(ct);
+            todo.subtract(ct);
+            if (todo.none()) { ctx.cyJoin += rd() - tp0; continue; }
+          }
+        }
+      }
       // Fast path eligibility: the measurement flags reroute joins and
       // the prot path bypasses the registry — both must stay slow-path.
       // Batch mode INCLUDED (2026-08-15): marks live in GLOBAL grid
@@ -10943,7 +11154,17 @@ bool CallGraphPass::runFlowsToResolution() {
                       std::to_string(chanSplits) + " split cells " +
                       std::to_string(chanConeSkipped) + " pends outside cone " +
                       std::to_string(chanConstSkipped) + " const-data keys")
-                   : std::string())
+                   : constChan
+                         ? (", KEY-CHANNELS " + std::to_string(chanNodes) +
+                            " nodes " + std::to_string(constChanPends) +
+                            " pends " + std::to_string(constChanWriters) +
+                            " writer edges " +
+                            std::to_string(constChanReaders) +
+                            " reader edges " + std::to_string(chanSplits) +
+                            " read halves " +
+                            std::to_string(constChanStoresDropped) +
+                            " may-alias stores not wired")
+                         : std::string())
            << ", merge-reoffered " << reofferedFacts
            << " facts, sweeps offered " << sweepOffered << " kept "
            << sweepKept
@@ -14065,6 +14286,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     }
     // ptr = &globalvar: add assignment edges globalvar_val -> ptr
     EB.addAssignmentEdges(valNode, ptrNode);
+    if (inConstInit) constInitCells.insert(ptrNode);
     CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (isa<Function>(init)) {
     auto *storedFunc = cast<Function>(init);
@@ -14075,6 +14297,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     }
     // ptr = &function: add assignment edges function_val -> ptr
     EB.addAssignmentEdges(valNode, ptrNode);
+    if (inConstInit) constInitCells.insert(ptrNode);
     // Record direct function store into struct field. A store WITHOUT a
     // derivable key (literal-struct initializer like sysctl tables, plain
     // global, top-level array) must mark the function evidence-incomplete:
@@ -23777,9 +24000,11 @@ bool CallGraphPass::doModulePass(Module *M) {
         EB.addDereferenceEdges(valNode, deref);
         CG_DEBUG("Processing initializer for GV " << GV.getName() << "\n");
         auto init = GV.getInitializer();
+        inConstInit = GV.isConstant();
         processInitializer(deref, init, "", -1,
                            EB.hasFieldLabels() ? valNode
                                                : AndersNodeFactory::InvalidIndex);
+        inConstInit = false;
       }
     }
 

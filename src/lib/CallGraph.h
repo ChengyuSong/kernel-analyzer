@@ -332,6 +332,12 @@ private:
   // Soundness of the field filter requires per-function completeness: any
   // unclassified escape of a function's address disables filtering for it.
   std::unordered_set<const llvm::Function*> funcFieldStoresIncomplete;
+  // --cfl-const-channels: the cells a never-written (LLVM `constant`)
+  // global's initializer stores into. The only legitimate writers of
+  // constant memory; a store through a pointer that may point there is
+  // impossible at run time and is not wired.
+  std::unordered_set<NodeIndex> constInitCells;
+  bool inConstInit = false;
   llvm::DenseSet<std::pair<const llvm::CallBase*, unsigned>> fieldTraceOK;
   // Set when any fixed-point loop stops at its iteration cap: the result may
   // under-approximate. Reported in the callgraph JSON.

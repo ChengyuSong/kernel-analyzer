@@ -564,6 +564,34 @@ cl::opt<bool> CFLChannelCells(
            "--cfl-solver-threads>1"),
   cl::init(false));
 
+cl::opt<bool> CFLKeyChannels(
+  "cfl-key-channels",
+  cl::desc("Cluster mode: keys of never-written globals (LLVM `constant` "
+           "with pointer content: dispatch tables, iovecs, target vectors) "
+           "are wired directionally through channel nodes at the barrier "
+           "flush (initializer cell -> channel -> the reader class's read "
+           "half) instead of merging the reader into a key cluster. Sound "
+           "(nm-new fixpoint: answers byte-identical to clusters, recall "
+           "223/223) and measured to change NOTHING there (the slot "
+           "functions reach the dispatch sites through the identity of an "
+           "unwired formal, see --cfl-identity-channels), at 2.2x the wall "
+           "time. Needs the sequential mono solve; auto-off otherwise "
+           "unless set explicitly (then an error)"),
+  cl::init(false));
+
+cl::opt<bool> CFLIdentityChannels(
+  "cfl-identity-channels",
+  cl::desc("With --cfl-key-channels: identity roots (callerless formals, "
+           "per-access cells, extern globals) are channel keys too, stores "
+           "through the identity being the writers. Removes the welding of "
+           "every function's field cells reached by one identity, which is "
+           "the route by which 74 targets reach elf64-x86-64.c:4688 in "
+           "nm-new. EXPERIMENTAL: on nm-new the unwelded closure is the "
+           "exact model's (16.8 G facts, 46 GB before the first flush, "
+           "killed) — the merged planes were what kept cluster mode "
+           "small"),
+  cl::init(false));
+
 cl::opt<bool> CFLProbeIdentityJoinAblate(
   "cfl-probe-identity-join-ablate",
   cl::desc("MEASUREMENT-ONLY, UNSOUND: skip cluster joins keyed by "
@@ -1680,6 +1708,31 @@ int main(int argc, char **argv) {
                   "serial)\n";
         exit(1);
       }
+    }
+    if (CFLKeyChannels && !CFLChannelCells && flowsToActive) {
+      const bool mono = CFLBatchRoots == 0 && CFLSolverThreads <= 1 &&
+                        !CFLVerifyClosure;
+      if (!mono) {
+        if (CFLKeyChannels.getNumOccurrences() > 0) {
+          errs() << "ERROR: --cfl-key-channels needs the sequential mono "
+                    "solve (no batch roots, one solver thread, no "
+                    "--cfl-verify-closure): the pend flush and node growth "
+                    "are barrier-serial\n";
+          exit(1);
+        }
+        CFLKeyChannels = false;
+        errs() << "KeyChannels: OFF (batch/parallel/verify-closure solve; "
+                  "constant-global keys merge as clusters)\n";
+      }
+    }
+    if (CFLKeyChannels.getNumOccurrences() > 0)
+      requireFlowsTo(CFLKeyChannels, "--cfl-key-channels");
+    if (CFLIdentityChannels && !CFLKeyChannels) {
+      if (CFLKeyChannels.getNumOccurrences() > 0) {
+        errs() << "ERROR: --cfl-identity-channels needs --cfl-key-channels\n";
+        exit(1);
+      }
+      CFLKeyChannels = true;
     }
     if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {
       if (CFLFieldBuckets.getNumOccurrences() == 0) {

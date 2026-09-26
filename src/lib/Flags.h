@@ -94,6 +94,8 @@ extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<std::string> CFLProbeWildcardAblate;
 extern cl::opt<bool> CFLProbeIdentityJoinAblate;
 extern cl::opt<bool> CFLChannelCells;
+extern cl::opt<bool> CFLKeyChannels;
+extern cl::opt<bool> CFLIdentityChannels;
 extern cl::opt<bool> CFLLazyAddress;
 extern cl::opt<unsigned> CFLLazyCap;
 extern cl::opt<std::string> CFLLazyTraceObject;

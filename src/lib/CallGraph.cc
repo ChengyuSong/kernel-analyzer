@@ -1749,26 +1749,27 @@ int CallGraphPass::fieldBucket(int64_t off) const {
 }
 
 uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith,
-                                     const StructType *ty) {
+                                     const StructType *ty, uint32_t extent) {
   if (lazyLabels.empty()) {
-    lazyLabels.push_back({0, 0, false, nullptr});
-    lazyLabelIdx[{0, 0, false, nullptr}] = 0;
+    lazyLabels.push_back({0, 0, false, nullptr, 0});
+    lazyLabelIdx[{0, 0, false, nullptr, 0}] = 0;
   }
-  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty),
+  if (stride == 0) extent = 0; // an extent only qualifies a strided step
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent),
                                         (uint32_t)lazyLabels.size());
-  if (ins) lazyLabels.push_back({off, stride, arith, ty});
+  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent});
   return it->second;
 }
 
 void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
                                        int64_t off, uint32_t stride, bool arith,
-                                       const StructType *ty) {
+                                       const StructType *ty, uint32_t extent) {
   EB.addFieldEdges(src, dst, fieldBucket(off));
   if (!CFLLazyAddress) return;
   // Recorded per edge (not per endpoint pair): canonical merging can
   // fold two field nodes into one destination, and each edge keeps its
   // own exact label.
-  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith, ty));
+  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith, ty, extent));
 }
 
 NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
@@ -1815,8 +1816,14 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
   levels.clear();
   if (types) types->clear();
   bool first = true;
+  // The aggregate the current index steps inside (null at the pointer
+  // level): a variable index over an array of known length is bounded
+  // by that length.
+  Type *container = nullptr;
   for (auto GTI = gep_type_begin(GEP), E = gep_type_end(GEP); GTI != E; ++GTI) {
     const Value *idx = GTI.getOperand();
+    Type *containerHere = container;
+    container = GTI.getIndexedType();
     if (StructType *STy = GTI.getStructTypeOrNull()) {
       const auto *CI = dyn_cast<ConstantInt>(idx);
       if (!CI)
@@ -1846,7 +1853,15 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       } else {
         if (esz <= 1 || esz > 0x3fffffffULL)
           return false; // wildcard fallback
-        levels.push_back(kStridedLevelTag | ((int64_t)esz << 32));
+        // Low 32 bits: element count of the array being indexed (0 =
+        // unbounded: pointer-level index, scalable vector, unknown).
+        uint64_t count = 0;
+        if (const auto *AT = dyn_cast_or_null<ArrayType>(containerHere))
+          count = AT->getNumElements();
+        else if (const auto *VT = dyn_cast_or_null<FixedVectorType>(containerHere))
+          count = VT->getNumElements();
+        if (count > 0xffffffffULL || count * esz > 0xffffffffULL) count = 0;
+        levels.push_back(kStridedLevelTag | ((int64_t)esz << 32) | (int64_t)count);
         if (types) types->push_back(nullptr);
       }
     } else if (first) {
@@ -1882,9 +1897,11 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                           : getFieldPtrNode(cur, levels[k]);
     if (next == cur)
       continue;
-    if (levels[k] > 0 && (levels[k] & kStridedLevelTag)) // strided step (negative = container_of offset)
-      addFieldEdgesExact(cur, next, 0,
-                         (uint32_t)((levels[k] >> 32) & 0x3fffffff));
+    if (levels[k] > 0 && (levels[k] & kStridedLevelTag)) { // strided step (negative = container_of offset)
+      const uint32_t stride = (uint32_t)((levels[k] >> 32) & 0x3fffffff);
+      const uint32_t count = (uint32_t)(levels[k] & 0xffffffff);
+      addFieldEdgesExact(cur, next, 0, stride, false, nullptr, count * stride);
+    }
     else if (levels[k] > 0 && (levels[k] & kArithLevelTag))
       addFieldEdgesExact(cur, next, levels[k] & ~kArithLevelTag, 0, true);
     else
@@ -4927,8 +4944,9 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<uint32_t> addrObj;
   std::vector<int64_t> addrOff;
   std::vector<uint32_t> addrStride;
+  std::vector<uint32_t> addrExtent; // strided: byte length covered from addrOff (0 = to the object's end)
   std::vector<char> addrIsObj;
-  std::map<std::tuple<uint32_t, int64_t, uint32_t>, uint32_t> addrIndex;
+  std::map<std::tuple<uint32_t, int64_t, uint32_t, uint32_t>, uint32_t> addrIndex;
   std::unordered_map<uint32_t, std::vector<uint32_t>> addrKeysOfObj;
   size_t lazyMinted = 0, lazyStrided = 0, lazyX = 0, lazyOverlapBridges = 0;
   auto addrGrow = [&]() {
@@ -4936,6 +4954,7 @@ bool CallGraphPass::runFlowsToResolution() {
       addrObj.resize(nextRoot, UINT32_MAX);
       addrOff.resize(nextRoot, 0);
       addrStride.resize(nextRoot, 0);
+      addrExtent.resize(nextRoot, 0);
       addrIsObj.resize(nextRoot, 0);
     }
   };
@@ -4990,19 +5009,26 @@ bool CallGraphPass::runFlowsToResolution() {
   // e-2s is a walk; the run becomes one strided root (base, s), which
   // absorbs the rest. Member offsets never take part.
   std::unordered_map<uint32_t, std::set<int64_t>> arithOffs;
-  std::unordered_map<uint32_t, std::vector<std::pair<int64_t, uint32_t>>> objStrided;
+  std::unordered_map<uint32_t, std::vector<std::tuple<int64_t, uint32_t, uint32_t>>> objStrided; // off, stride, extent
   size_t lazyWidened = 0, lazyAbsorbed = 0;
   std::function<void(size_t)> typeConflictReport; // defined with the census below
-  std::function<uint32_t(uint32_t, int64_t, uint32_t, bool)> mintAddr;
-  mintAddr = [&](uint32_t obj, int64_t off, uint32_t stride, bool arith) -> uint32_t {
+  std::function<uint32_t(uint32_t, int64_t, uint32_t, bool, uint32_t)> mintAddrE;
+  auto mintAddr = [&](uint32_t obj, int64_t off, uint32_t stride, bool arith) -> uint32_t {
+    return mintAddrE(obj, off, stride, arith, 0);
+  };
+  mintAddrE = [&](uint32_t obj, int64_t off, uint32_t stride, bool arith, uint32_t extent) -> uint32_t {
+    if (stride == 0 || stride == UINT32_MAX) extent = 0;
     if (stride != UINT32_MAX) {
       const int64_t sz = objBytes(obj);
       if (off < 0 || (sz > 0 && off >= sz) || off > ((int64_t)1 << 20))
         return mintAddr(obj, 0, UINT32_MAX, false);
     } else off = 0;
     if (stride == 0 && arith) {
-      for (auto &[b, st] : objStrided[obj]) // covered by a strided root already
-        if (off >= b && (off - b) % (int64_t)st == 0) { lazyAbsorbed++; return mintAddr(obj, b, st, false); }
+      for (auto &[b, st, ex] : objStrided[obj]) // covered by a strided root already
+        if (off >= b && (off - b) % (int64_t)st == 0 && (ex == 0 || off < b + (int64_t)ex)) {
+          lazyAbsorbed++;
+          return mintAddrE(obj, b, st, false, ex);
+        }
       auto &offs = arithOffs[obj];
       offs.insert(off);
       auto it0 = offs.find(off);
@@ -5018,7 +5044,7 @@ bool CallGraphPass::runFlowsToResolution() {
         return mintAddr(obj, base, (uint32_t)st, false);
       }
     }
-    auto [it, ins] = addrIndex.try_emplace(std::make_tuple(obj, off, stride), 0u);
+    auto [it, ins] = addrIndex.try_emplace(std::make_tuple(obj, off, stride, extent), 0u);
     if (!ins) return it->second;
     if (stride != UINT32_MAX) {
       uint32_t &cnt = addrCountOf[obj];
@@ -5053,12 +5079,12 @@ bool CallGraphPass::runFlowsToResolution() {
     rootParkable.push_back(rootParkable[obj]);
     if (nexusGate) rootNexus.push_back(rootNexus[obj]);
     addrGrow();
-    addrObj[rid] = obj; addrOff[rid] = off; addrStride[rid] = stride;
+    addrObj[rid] = obj; addrOff[rid] = off; addrStride[rid] = stride; addrExtent[rid] = extent;
     addrIsObj[rid] = 1;
     it->second = rid;
     lazyMinted++;
     if (stride == UINT32_MAX) lazyX++;
-    else if (stride) { lazyStrided++; objStrided[obj].emplace_back(off, stride); }
+    else if (stride) { lazyStrided++; objStrided[obj].emplace_back(off, stride, extent); }
     return rid;
   };
   // Pointer-walk cycles: an f-edge inside an a/f SCC with nonzero net
@@ -5251,10 +5277,14 @@ bool CallGraphPass::runFlowsToResolution() {
       return mintAddr(obj, addrOff[rid], (uint32_t)std::gcd((int64_t)st, g), false);
     }
     if (L.stride == 0) {
-      if (st != 0 && L.off >= 0 && L.off % (int64_t)st == 0) return rid; // absorbed
-      return mintAddr(obj, addrOff[rid] + L.off, st, L.arith && st == 0);
+      if (st != 0 && L.off >= 0 && L.off % (int64_t)st == 0 &&
+          (addrExtent[rid] == 0 || L.off < (int64_t)addrExtent[rid]))
+        return rid; // absorbed: a member step inside the strided range
+      // A member step off a strided address shifts the whole family; the
+      // covered length is unchanged.
+      return mintAddrE(obj, addrOff[rid] + L.off, st, L.arith && st == 0, addrExtent[rid]);
     }
-    if (st == 0) return mintAddr(obj, addrOff[rid] + L.off, L.stride, false);
+    if (st == 0) return mintAddrE(obj, addrOff[rid] + L.off, L.stride, false, L.extent);
     return mintAddr(obj, 0, UINT32_MAX, false); // two variable indices
   };
   auto mintX = [&](uint32_t rid) -> uint32_t {
@@ -5275,25 +5305,34 @@ bool CallGraphPass::runFlowsToResolution() {
     static thread_local FactSet rm;
     return rm;
   };
+  // A strided address covers {off + k*stride : k >= 0, off + k*stride <
+  // off + extent} (extent 0: to the object's end). The bound is what
+  // keeps a variable index into `[4 x ptr]` from reading every later slot.
+  auto strEnd = [&](uint32_t s) -> int64_t {
+    return addrExtent[s] ? addrOff[s] + (int64_t)addrExtent[s] : INT64_MAX;
+  };
   auto addrOverlap = [&](uint32_t a, uint32_t b) -> bool {
     if (addrObj[a] != addrObj[b]) return false;
     const uint32_t sa = addrStride[a], sb = addrStride[b];
     if (sa == UINT32_MAX || sb == UINT32_MAX) return true;
     if (sa == 0 && sb == 0) return addrOff[a] == addrOff[b];
     if (sa == 0)
-      return addrOff[a] >= addrOff[b] && (addrOff[a] - addrOff[b]) % (int64_t)sb == 0;
+      return addrOff[a] >= addrOff[b] && addrOff[a] < strEnd(b) &&
+             (addrOff[a] - addrOff[b]) % (int64_t)sb == 0;
     if (sb == 0)
-      return addrOff[b] >= addrOff[a] && (addrOff[b] - addrOff[a]) % (int64_t)sa == 0;
+      return addrOff[b] >= addrOff[a] && addrOff[b] < strEnd(a) &&
+             (addrOff[b] - addrOff[a]) % (int64_t)sa == 0;
+    if (addrOff[a] >= strEnd(b) || addrOff[b] >= strEnd(a)) return false; // disjoint ranges
     const int64_t g = std::gcd((int64_t)sa, (int64_t)sb);
-    return ((addrOff[a] - addrOff[b]) % g) == 0; // bounds ignored: conservative
+    return ((addrOff[a] - addrOff[b]) % g) == 0; // residues compatible; conservative within the overlap
   };
   if (lazyAddr) {
     addrGrow();
     for (uint32_t rid = 0; rid < nextRoot; rid++) {
       const uint32_t rc = rootClassOf[rid];
-      addrObj[rid] = rid; addrOff[rid] = 0; addrStride[rid] = 0;
+      addrObj[rid] = rid; addrOff[rid] = 0; addrStride[rid] = 0; addrExtent[rid] = 0;
       addrIsObj[rid] = !funcRootOf.count(rid) && rc < toOrig.size();
-      addrIndex[std::make_tuple(rid, (int64_t)0, (uint32_t)0)] = rid;
+      addrIndex[std::make_tuple(rid, (int64_t)0, (uint32_t)0, (uint32_t)0)] = rid;
     }
     if (lazyLabels.empty()) lazyLabelFor(0, 0);
   }
@@ -7982,7 +8021,7 @@ bool CallGraphPass::runFlowsToResolution() {
       addrGrow();
       addrObj[rid] = rid; addrOff[rid] = 0; addrStride[rid] = 0;
       addrIsObj[rid] = !funcOfCanon.count(toOrig[rep]);
-      addrIndex[std::make_tuple(rid, (int64_t)0, (uint32_t)0)] = rid;
+      addrIndex[std::make_tuple(rid, (int64_t)0, (uint32_t)0, (uint32_t)0)] = rid;
     }
     if (!ownedMask.empty() && !funcOfCanon.count(toOrig[rep])) {
       const Value *ov2 = NF.getValueForNode(toOrig[rep]);

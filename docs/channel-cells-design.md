@@ -964,3 +964,39 @@ derivations, untyped) and typed arrays (`bfd_symbol[i]` in
 lever (byte stores of pointer-free values should not put a block on the
 wildcard plane); the second is the strided address the lazy model
 already has. Bounded sub-object ranges would matter for one site here.
+
+### Field-insensitive channels, and the array extent bound (2026-09-26)
+
+A channel-cell run of nm-new with no field model at all (`--cfl-channel-cells
+--cfl-field-buckets=0`, key identity, multi-pass) gives 63,203 pairs,
+recall 223/223, site 4688 = 74, simple.c:259 = 115, hash.c:657 = 4 in
+25:48 and 2.1 GB. Cluster mode at 29 and at 137 residues gives 63,200 and
+the same site answers; the exact model at pass 1 (demRA) averages 56
+targets per site against cluster mode's 61. Not unifying changes nothing
+on nm-new, and residues change nothing: every model reads the dispatch
+tables field-insensitively at the same instruction,
+
+    BFD_SEND_FMT (abfd, _bfd_check_format, (abfd))            format.c:322
+    %206 = getelementptr [4 x ptr], ptr %198, i64 0, i64 %fmt
+
+The field-insensitive model returns the whole vector by definition; the
+cluster puts the variable index on the wildcard plane, which bridges to
+every residue; the exact model minted a strided address (offset 264,
+stride 8) whose overlap test ignored bounds ("conservative"), so it met
+every 8-aligned slot at or after 264: about 75 of the vector's 107
+slots, for each of the 19 vectors. The signature filter then trims the
+thousand functions read to the 74 and the 115.
+
+The bound: a lazy label carries the extent of the array a variable index
+steps inside (element count from the GEP's indexed array type, times the
+element size; 0 for a pointer-level index or an unknown count), the
+address descriptor carries it, a member step off a strided address
+shifts the family and keeps the extent, two strided steps still widen to
+the range, and `addrOverlap` stops at the extent. Sound under C's own
+array bound (no out-of-bounds indexing). Measured: a micro test with an
+array of two slots followed by two more function pointers reads only the
+two; the 46-function exact reproducer of the universal pointer at site
+4688 resolves it to nothing (correct for that slice), with addresses
+12,679 → 7,684, range addresses 716 → 231, overlap bridges 10,933 →
+6,252. Unification bought nothing on this program and cost memory
+(10.8 GB against 2.1 GB without it); the width was the tables' arrays.

@@ -105,15 +105,20 @@ private:
   // take part in progression widening.
   // ty: the struct whose member this step selects (type witness for the
   // typed-heap conflict census); null for arithmetic / strided steps.
-  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; };
+  // extent: byte length of the array a strided step indexes (0 = unbounded,
+  // a pointer-level index or an unknown count). A variable index into
+  // `[4 x ptr]` steps 8 bytes over 32; without the bound the strided
+  // address overlapped every later slot of the object (bfd_target: 75 of
+  // 107 slots read for `_bfd_check_format[fmt]`).
+  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; uint32_t extent; };
   std::vector<LazyLabel> lazyLabels;
-  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *>, uint32_t> lazyLabelIdx;
+  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *, uint32_t>, uint32_t> lazyLabelIdx;
   std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
   uint32_t lazyLabelFor(int64_t off, uint32_t stride, bool arith = false,
-                        const llvm::StructType *ty = nullptr);
+                        const llvm::StructType *ty = nullptr, uint32_t extent = 0);
   void addFieldEdgesExact(NodeIndex src, NodeIndex dst, int64_t off,
                           uint32_t stride = 0, bool arith = false,
-                          const llvm::StructType *ty = nullptr);
+                          const llvm::StructType *ty = nullptr, uint32_t extent = 0);
   static constexpr int64_t kStridedLevelTag = (int64_t)1 << 62;
   static constexpr int64_t kArithLevelTag = (int64_t)1 << 61;
   NodeIndex getFieldPtrNode(NodeIndex parentCanon, int64_t off);

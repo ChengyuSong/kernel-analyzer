@@ -4988,9 +4988,21 @@ bool CallGraphPass::runFlowsToResolution() {
   // reload, increment) is invisible to the a/f SCC pass; after kLazyCap
   // distinct exact addresses an object's further exact mints become its
   // range root (sound: X over-approximates every offset).
-  const uint32_t kLazyCap = CFLLazyCap;      // per writable object
-  const uint32_t kLazyCapId = std::max<uint32_t>(2, CFLLazyCap / 4); // identity roots
+  // The cap exists for objects of UNKNOWN size: an object whose byte size
+  // is known has finitely many in-bounds offsets (an offset at or past the
+  // size is already the range), so counting them buys nothing and cost
+  // every struct with more than 32 fields its field sensitivity (bfd ~45,
+  // elf_backend_data 103, asection ~40: 9.1 M capped mints on nm-new,
+  // which made the exact model field-insensitive on exactly the objects
+  // the dispatch reads go through). Identity roots have no size; they
+  // get a cap wide enough for any struct they stand for.
+  const uint32_t kLazyCap = CFLLazyCap;      // per writable object without a struct type
+  const uint32_t kLazyCapId = CFLLazyCap;    // identity roots
   std::unordered_map<uint32_t, uint32_t> addrCountOf;
+  std::unordered_set<uint32_t> lazyCappedObjs;
+  // Struct-typed objects get one address per 8-byte slot plus slack (the
+  // type is known only after the typed-access census below is declared).
+  std::function<uint32_t(uint32_t)> capForTypedObj;
   auto isConstGlobalRoot = [&](uint32_t obj) -> bool { // never walked: uncapped
     const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
     if (rc >= toOrig.size()) return false;
@@ -5051,15 +5063,17 @@ bool CallGraphPass::runFlowsToResolution() {
       // Constant globals are never walked by the program but byte
       // arithmetic over them still mints offset by offset: a higher cap
       // (above any vtable's slot count) keeps their slots exact.
-      const uint32_t capHere = isConstGlobalRoot(obj) ? std::max<uint32_t>(128, 4 * kLazyCap)
-                               : isIdentityRoot(obj) ? kLazyCapId : kLazyCap;
+      uint32_t capHere = isConstGlobalRoot(obj) ? std::max<uint32_t>(128, 4 * kLazyCap)
+                         : isIdentityRoot(obj) ? kLazyCapId : kLazyCap;
+      if (capForTypedObj) capHere = std::max(capHere, capForTypedObj(obj));
       if (cnt >= capHere) {
         addrIndex.erase(it);
-        if (lazyCapped++ == 0)
+        if (lazyCappedObjs.insert(obj).second && lazyCappedObjs.size() <= 5)
           WARNING("LazyAddr: object r" << obj << " ("
                   << protBlameName(rootClassOf[obj]).substr(0, 50)
-                  << ") passed " << kLazyCap
+                  << ", size " << objBytes(obj) << ") passed " << capHere
                   << " exact addresses; further offsets are its range\n");
+        lazyCapped++;
         return mintAddr(obj, 0, UINT32_MAX, false);
       }
       cnt++;
@@ -5184,6 +5198,23 @@ bool CallGraphPass::runFlowsToResolution() {
     return V && isa<CallBase>(V) && !NF.isDereferenceNode(toOrig[rc]);
   };
   size_t lazyTypedDrops = 0;
+  // Cap hook for mintAddrE: a struct-typed object (declared type of a
+  // global or alloca; the first typed access of a heap object) has one
+  // address per 8-byte slot at most, so its field offsets are never
+  // capped away (bfd ~45 fields, elf_backend_data 103 hooks). Untyped
+  // objects (byte buffers, arrays walked through memory) keep the count
+  // cap, which is what it was for.
+  capForTypedObj = [&](uint32_t obj) -> uint32_t {
+    const StructType *T = declaredType(obj);
+    if (!T) {
+      auto it = objPrimary.find(obj);
+      if (it != objPrimary.end()) T = it->second.ty;
+    }
+    if (!T || T->isOpaque() || !lazyDL) return 0;
+    const uint64_t sz = lazyDL->getStructLayout(const_cast<StructType *>(T))->getSizeInBytes();
+    if (sz > (1u << 20)) return 0;
+    return (uint32_t)(sz / 8 + 8);
+  };
   auto noteTypeWitness = [&](uint32_t obj, const StructType *S2, int64_t base,
                              uint32_t from, uint32_t to) -> bool { // true = compatible
     witnessChecks++;
@@ -10976,7 +11007,8 @@ bool CallGraphPass::runFlowsToResolution() {
                << lazyLabels.size() << " exact labels, " << lazyWidened
                << " progressions widened, " << lazyAbsorbed << " absorbed, "
                << lazyTypedDrops << " typed-access drops, "
-               << lazyCapped << " capped mint attempts\n";
+               << lazyCapped << " capped mint attempts on "
+               << lazyCappedObjs.size() << " objects\n";
       if (CFLKeyIdentity)
         errs() << "KeyIdentity: " << keyIdentityMinted
                << " channel identities minted, " << keyIdentitySelf

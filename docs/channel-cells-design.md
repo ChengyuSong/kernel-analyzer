@@ -1000,3 +1000,31 @@ two; the 46-function exact reproducer of the universal pointer at site
 12,679 → 7,684, range addresses 716 → 231, overlap bridges 10,933 →
 6,252. Unification bought nothing on this program and cost memory
 (10.8 GB against 2.1 GB without it); the width was the tables' arrays.
+
+### The exact-address cap was the field-insensitivity of the exact model (2026-09-27)
+
+With the array bound alone, the bounded exact model on nm-new (reachable,
+two passes) gave pass 0 = 45 sites / 172 targets (unbounded: 240) and
+pass 1 = 467 / 25,473 (unbounded: 476 / 26,630), 5:11 and 3.6 GB; the
+site answers were unchanged (4688 = 74, format.c:322 = 34). Its census
+line ends with "9,142,125 capped mint attempts": every writable object
+was allowed 32 exact addresses (identity roots 8) before further offsets
+became its range root, and `struct bfd` (~45 fields), `elf_backend_data`
+(103, an `internal global`), `asection` and `elf_obj_tdata` all exceed
+32. Their reads therefore returned the object's range, the whole object,
+and the exact model was field-insensitive on exactly the objects the
+dispatch reads go through. In pass 0 only two strided addresses touch
+`x86_64_elf64_vec` (both now bounded) and pass 0 takes ten seconds; the
+width and the cost arrive with pass 1's 1,302 bodies.
+
+The cap now depends on the object's type: a struct-typed object (the
+declared type of a global or alloca, or the first typed access of a heap
+object) may mint one address per 8-byte slot plus slack, so its field
+offsets are never capped away; objects without a struct type (byte
+buffers, arrays walked through memory) keep the count cap, which is what
+the cap was for. A first attempt, "no cap for any object of known size
+up to 4 KB", let element walks over small arrays mint thousands of
+addresses per pointer (a single load in `elf_link_add_object_symbols`
+pended 7,208 addresses) and turned the one-minute reproducer into a
+runaway; the type criterion keeps it at 1:36 with 94 untyped objects
+capped.

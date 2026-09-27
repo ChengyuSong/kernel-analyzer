@@ -1288,8 +1288,10 @@ cl::opt<bool> CFLLazyAddress(
 cl::opt<unsigned> CFLLazyCap(
   "cfl-lazy-cap",
   cl::desc("--cfl-lazy-address: exact addresses minted per writable object "
-           "before further offsets become its range root (identity roots: "
-           "a quarter; constant globals: unbounded, they are never walked)"),
+           "of UNKNOWN size before further offsets become its range root "
+           "(objects of known size up to 4096 bytes are uncapped: their "
+           "in-bounds offsets are finite; identity roots: four times this; "
+           "constant globals: at least 128)"),
   cl::init(32));
 
 cl::opt<std::string> CFLLazyTraceObject(

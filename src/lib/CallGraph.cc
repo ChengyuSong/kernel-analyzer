@@ -5000,6 +5000,7 @@ bool CallGraphPass::runFlowsToResolution() {
   const uint32_t kLazyCapId = CFLLazyCap;    // identity roots
   std::unordered_map<uint32_t, uint32_t> addrCountOf;
   std::unordered_set<uint32_t> lazyCappedObjs;
+  std::unordered_map<uint32_t, uint64_t> lazyCappedHits; // obj -> refused mints
   // Struct-typed objects get one address per 8-byte slot plus slack (the
   // type is known only after the typed-access census below is declared).
   std::function<uint32_t(uint32_t)> capForTypedObj;
@@ -5068,12 +5069,20 @@ bool CallGraphPass::runFlowsToResolution() {
       if (capForTypedObj) capHere = std::max(capHere, capForTypedObj(obj));
       if (cnt >= capHere) {
         addrIndex.erase(it);
+        // Measured 2026-09-27: falling back to the strided root (off mod
+        // sizeof T, stride sizeof T) instead of the range keeps fields
+        // apart across an array's elements but mints a family per field
+        // per object and bridges each with every exact address it
+        // overlaps: the 46-function exact reproducer went from 1:36 to
+        // 67 min (14,725 families, 243,863 bridges, 296 M facts) with no
+        // change in its answer. The range stays the fallback.
         if (lazyCappedObjs.insert(obj).second && lazyCappedObjs.size() <= 5)
           WARNING("LazyAddr: object r" << obj << " ("
                   << protBlameName(rootClassOf[obj]).substr(0, 50)
                   << ", size " << objBytes(obj) << ") passed " << capHere
                   << " exact addresses; further offsets are its range\n");
         lazyCapped++;
+        lazyCappedHits[obj]++;
         return mintAddr(obj, 0, UINT32_MAX, false);
       }
       cnt++;
@@ -5205,15 +5214,27 @@ bool CallGraphPass::runFlowsToResolution() {
   // objects (byte buffers, arrays walked through memory) keep the count
   // cap, which is what it was for.
   capForTypedObj = [&](uint32_t obj) -> uint32_t {
-    const StructType *T = declaredType(obj);
-    if (!T) {
-      auto it = objPrimary.find(obj);
-      if (it != objPrimary.end()) T = it->second.ty;
+    if (!lazyDL) return 0;
+    // Declared objects: the whole value type (an array of structs is as
+    // many slots as the array has).
+    const uint32_t rc = obj < rootClassOf.size() ? rootClassOf[obj] : UINT32_MAX;
+    const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
+    Type *Full = nullptr;
+    if (const auto *GV = dyn_cast_or_null<GlobalVariable>(V)) Full = GV->getValueType();
+    else if (const auto *AI = dyn_cast_or_null<AllocaInst>(V)) Full = AI->getAllocatedType();
+    if (Full && declaredType(obj)) {
+      const uint64_t sz = lazyDL->getTypeAllocSize(Full);
+      return sz > (1u << 20) ? 0 : (uint32_t)(sz / 8 + 8);
     }
-    if (!T || T->isOpaque() || !lazyDL) return 0;
+    auto it = objPrimary.find(obj);
+    const StructType *T = it != objPrimary.end() ? it->second.ty : nullptr;
+    if (!T || T->isOpaque()) return 0;
     const uint64_t sz = lazyDL->getStructLayout(const_cast<StructType *>(T))->getSizeInBytes();
     if (sz > (1u << 20)) return 0;
-    return (uint32_t)(sz / 8 + 8);
+    // A heap object of known size holding k copies of its type: k slots' worth.
+    const int64_t ob = objBytes(obj);
+    const uint64_t span = (ob > 0 && (uint64_t)ob > sz) ? (uint64_t)ob : sz;
+    return span > (1u << 20) ? 0 : (uint32_t)(span / 8 + 8);
   };
   auto noteTypeWitness = [&](uint32_t obj, const StructType *S2, int64_t base,
                              uint32_t from, uint32_t to) -> bool { // true = compatible
@@ -11009,6 +11030,38 @@ bool CallGraphPass::runFlowsToResolution() {
                << lazyTypedDrops << " typed-access drops, "
                << lazyCapped << " capped mint attempts on "
                << lazyCappedObjs.size() << " objects\n";
+        if (VerboseLevel >= 2 && !lazyCappedHits.empty()) {
+          // Who is capped, by kind: the rule is right only if this list
+          // holds byte buffers and arrays walked through memory.
+          std::vector<std::pair<uint64_t, uint32_t>> top;
+          for (auto &[o, c] : lazyCappedHits) top.emplace_back(c, o);
+          std::sort(top.rbegin(), top.rend());
+          std::map<std::string, std::pair<size_t, uint64_t>> byKind;
+          for (auto &[c, o] : top) {
+            const uint32_t rc = o < rootClassOf.size() ? rootClassOf[o] : UINT32_MAX;
+            const Value *V = rc < toOrig.size() ? NF.getValueForNode(toOrig[rc]) : nullptr;
+            std::string kind = !V ? (rc < toOrig.size() && NF.isDereferenceNode(toOrig[rc]) ? "identity-cell" : "synthetic")
+                             : isa<GlobalVariable>(V) ? "global" : isa<AllocaInst>(V) ? "alloca"
+                             : isa<Argument>(V) ? "identity-formal" : isa<CallBase>(V)
+                             ? (cast<CallBase>(V)->getCalledFunction() ? "heap-call" : "icall-return") : "other";
+            const StructType *T = declaredType(o);
+            if (!T) { auto it = objPrimary.find(o); if (it != objPrimary.end()) T = it->second.ty; }
+            auto &bk = byKind[kind + (T ? "/typed" : "/untyped")]; bk.first++; bk.second += c;
+          }
+          errs() << "LazyAddr: capped objects by kind:";
+          for (auto &[k, v] : byKind) errs() << " " << k << " " << v.first << " objs/" << v.second << " mints;";
+          errs() << "\n";
+          size_t shown = 0;
+          for (auto &[c, o] : top) {
+            if (shown++ >= 25) break;
+            const StructType *T = declaredType(o);
+            if (!T) { auto it = objPrimary.find(o); if (it != objPrimary.end()) T = it->second.ty; }
+            errs() << "LazyAddr:   capped r" << o << " " << protBlameName(rootClassOf[o]).substr(0, 60)
+                   << " size " << objBytes(o) << " type "
+                   << (T && T->hasName() ? stripStructNameSuffix(T->getName()).str() : std::string("-"))
+                   << " refused " << c << "\n";
+          }
+        }
       if (CFLKeyIdentity)
         errs() << "KeyIdentity: " << keyIdentityMinted
                << " channel identities minted, " << keyIdentitySelf

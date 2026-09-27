@@ -1028,3 +1028,22 @@ addresses per pointer (a single load in `elf_link_add_object_symbols`
 pended 7,208 addresses) and turned the one-minute reproducer into a
 runaway; the type criterion keeps it at 1:36 with 94 untyped objects
 capped.
+
+The type-aware cap did not move the pass-1 answers either (467 / 25,473,
+site 4688 = 74, 6:25, 3.8 GB): 10.2 M mints were still capped on 680
+objects, and the census of capped objects (now printed at verbose 2, by
+kind) says which: heap objects WITH a type whose offsets exceed one
+struct's worth (arrays of hash entries allocated with unknown size, 50
+objects on the reproducer), identity formals of hash callbacks with no
+type (11), the static section array (sized from its element type; now
+from the whole declared type), and untyped "other" roots (28). Two
+remedies were tried and both are negative results on cost: falling back
+to the strided root (offset mod sizeof T, stride sizeof T) instead of the
+range for a typed object over its cap took the 1:36 reproducer to 67 min
+(14,725 families, 243,863 bridges, 296 M facts) with no change in its
+answer; exempting strided mints from the count cap with a residue
+normalization took it past 10 min. Both reverted. What remains true: the
+exact model on nm-new is field-insensitive at pass 1 through the capped
+objects, overlap bridging is symmetric, and every dereference launders
+bridged content into native content, so one wide address on an object
+reaches every exact reader of it within a few hops.

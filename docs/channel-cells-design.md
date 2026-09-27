@@ -1047,3 +1047,17 @@ exact model on nm-new is field-insensitive at pass 1 through the capped
 objects, overlap bridging is symmetric, and every dereference launders
 bridged content into native content, so one wide address on an object
 reaches every exact reader of it within a few hops.
+
+Correction (2026-09-27, measured with the pre-bound binary built from
+b38fb2a in a worktree): the 46-function reproducer's answer was NOT
+changed by the array bound. Before and after the bound it resolves site
+4688 to nothing with identical address counts (7,684 minted, 1,231
+strided, 231 range, 6,252 bridges). Its single spurious target had
+already disappeared with the key-identity default of dfec6c2; the
+reproducer was minimized for the per-access identity route, and none of
+its 46 bodies indexes a slot array, so it cannot witness the array
+route at all. The bound's evidence is elsewhere: the micro tests (an
+array of two slots followed by two function pointers reads 8 targets
+without the bound, 4 with it) and nm-new pass 0 (45 sites: 240 targets
+and 3,190 overlap bridges without the bound, 172 targets and 146 bridges
+with it). Pass 1 is unchanged by it, for the reasons above.

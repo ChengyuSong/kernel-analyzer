@@ -33,9 +33,10 @@
 #   KA_LOTUS_SRC     Lotus git checkout for `build` (commit pinned in eval/67)
 #   KA_BIN           KAMain binary (env.sh default: $KA_REPO/release/lib/KAMain)
 #
-# Outputs: $W/sok (LLVM 15 set: ORCFL + SVF rows), $W/sok-llvm14 (LLVM 14
-# set: ORCFL + Lotus rows), $W/merged-llvm15, $W/merged-llvm14 (their
-# tables, pair-*/ tables), $W/report.md, $W/jobs/*.log.
+# Outputs: $W/sok (ORCFL, SVF and Lotus rows, all on the LLVM 15 files;
+# Lotus reads their LLVM-14 conversion), $W/merged-llvm15 (their tables,
+# pair-*/ tables), $W/report.md, $W/jobs/*.log. KA_BIGBOX_LLVM14=1 adds
+# ORCFL on the artifact's own LLVM 14 build ($W/sok-llvm14).
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
@@ -115,9 +116,21 @@ prepare() {
       rm -f "$dst"; cp "$src" "$dst"      # rm first: never write through a hard link
     done
   done
+  # Lotus is LLVM 14 only: convert the (APR-completed) LLVM 15 sets so
+  # Lotus rows read the same programs as ORCFL and SVF (eval/sok-downgrade.sh)
+  for s in $SETS15; do
+    docker run --rm --network none -u "$(id -u):$(id -g)" \
+      -v "$KA_REPO":/repo:ro -v "$ROOT":/root_ \
+      sok-toolchain bash /repo/eval/sok-downgrade.sh \
+      "/root_/bitcodes/llvm15/$s" "/root_/bitcodes/llvm15down/$s" \
+      >> "$W/jobs/downgrade.log" 2>&1 \
+      || { echo "!! downgrade failed: $W/jobs/downgrade.log" >&2; exit 1; }
+  done
+  grep '^==' "$W/jobs/downgrade.log"
   {
     echo "overlay of $KA_SOK_ROOT, $(date -Is)"
     echo "httpd.bc (llvm14/llvm15 x O0/O3) = artifact httpd.bc + APR 1.7.6 + APR-util 1.6.4 (eval/68)"
+    echo "llvm15down/ = llvm15/ converted for LLVM 14 (eval/sok-downgrade.sh), read by the Lotus rows"
     sha256sum "$ROOT"/bitcodes/llvm1?/soundness_ossfuzz/*/httpd/bin/httpd.bc
   } > "$ROOT/PROVENANCE"
   echo "== overlay ready: $ROOT"
@@ -146,15 +159,16 @@ run() {
     launch "orcfl-llvm15-${s//\//_}" \
       "KA_SOK_BC=$ROOT/bitcodes/llvm15/$s KA_SOK_OUT=$W/sok '$HERE/62-sok-arm.sh'"
   done
-  for s in $SETS14; do
-    launch "orcfl-llvm14-${s//\//_}" \
-      "KA_SOK_BC=$ROOT/bitcodes/llvm14/$s KA_SOK_OUT=$W/sok-llvm14 '$HERE/62-sok-arm.sh'"
-  done
-  local a out
-  for a in $APPR; do
-    case "$a" in SVF-*) out="$W/sok" ;; *) out="$W/sok-llvm14" ;; esac
+  if [[ "${KA_BIGBOX_LLVM14:-0}" == 1 ]]; then   # artifact's own LLVM 14 build
+    for s in $SETS14; do
+      launch "orcfl-llvm14-${s//\//_}" \
+        "KA_SOK_BC=$ROOT/bitcodes/llvm14/$s KA_SOK_OUT=$W/sok-llvm14 '$HERE/62-sok-arm.sh'"
+    done
+  fi
+  local a
+  for a in $APPR; do   # Lotus rows read llvm15down: all rows in ONE table
     launch "base-$a" \
-      "KA_SOK_ROOT=$ROOT KA_SOK_OUT=$out '$HERE/67-dataflow-baselines.sh' run $a"
+      "KA_SOK_ROOT=$ROOT KA_SOK_OUT=$W/sok KA_LOTUS_BCSET=llvm15down '$HERE/67-dataflow-baselines.sh' run $a"
   done
   wait
   echo "== all jobs finished; non-zero:"
@@ -164,15 +178,18 @@ run() {
 report() {
   : "${KA_SOK_REPO:?set KA_SOK_REPO to the SoK-MLTA code checkout}"
   local pair
-  for pair in "sok:merged-llvm15" "sok-llvm14:merged-llvm14"; do
+  local pairs="sok:merged-llvm15"
+  [[ -d "$W/sok-llvm14" ]] && pairs="$pairs sok-llvm14:merged-llvm14"
+  for pair in $pairs; do
     rm -rf "$W/${pair##*:}"
     KA_SOK_ROOT="$ROOT" KA_SOK_OUT="$W/${pair%%:*}" \
       KA_SOK_MERGED="$W/${pair##*:}" KA_SOK_PAIRWISE=1 \
       "$HERE/65-sok-compare.sh" > "$W/jobs/compare-${pair##*:}.log" 2>&1
   done
+  local m="$W/merged-llvm15" t="$W/sok"
+  [[ -d "$W/merged-llvm14" ]] && { m="$m,$W/merged-llvm14"; t="$t,$W/sok-llvm14"; }
   KA_SOK_ROOT="$ROOT" python3 "$KA_REPO/tools/sok-report.py" \
-    --merged "$W/merged-llvm15,$W/merged-llvm14" \
-    --times "$W/sok,$W/sok-llvm14" > "$W/report.md"
+    --merged "$m" --times "$t" > "$W/report.md"
   echo "== report: $W/report.md"
 }
 

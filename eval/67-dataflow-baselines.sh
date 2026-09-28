@@ -124,9 +124,19 @@ SVF_SETS="ossfuzz_O0=llvm15/soundness_ossfuzz/O0_12.15.2025
 ossfuzz_O3=llvm15/soundness_ossfuzz/O3_12.15.2025
 unifuzz_O0=llvm15/soundness_unifuzz/build_O0
 unifuzz_O3=llvm15/soundness_unifuzz/build_O3"
+# KA_LOTUS_BCSET=llvm15down: the LLVM 15 files converted for LLVM 14 by
+# eval/sok-downgrade.sh (the SAME programs every other row reads, incl.
+# unifuzz O3); default llvm14 = the artifact's own LLVM 14 build.
+if [[ "${KA_LOTUS_BCSET:-llvm14}" == llvm15down ]]; then
+LOTUS_SETS="ossfuzz_O0=llvm15down/soundness_ossfuzz/O0_12.15.2025
+ossfuzz_O3=llvm15down/soundness_ossfuzz/O3_12.15.2025
+unifuzz_O0=llvm15down/soundness_unifuzz/build_O0
+unifuzz_O3=llvm15down/soundness_unifuzz/build_O3"
+else
 LOTUS_SETS="ossfuzz_O0=llvm14/soundness_ossfuzz/O0_12.15.2025
 ossfuzz_O3=llvm14/soundness_ossfuzz/O3_12.15.2025
 unifuzz_O0=llvm14/soundness_unifuzz/build_O0"
+fi
 
 cmd_for() {  # approach, container json path, container bc path
   case "$1" in

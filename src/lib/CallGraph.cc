@@ -1230,6 +1230,10 @@ static std::string tagWalkTag(const char *base) {
 }
 static size_t g_intStoreUnmodeled = 0;
 static size_t g_intArgUnmodeled = 0;
+// Global-initializer constant expressions that may carry a pointer but
+// have no transfer rule (e.g. sub/add/trunc over ptrtoint: relative
+// references); declined, counted, reported -- never dropped silently.
+static size_t g_initCEDeclined = 0;
 static size_t g_icallWiringSkipped = 0; // --cfl-probe-no-icall-wiring ledger
 
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
@@ -14529,7 +14533,25 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         // EB.addAssignmentEdges(NF.getConstantIntNode(), ptrNode);
         break;
       }
+      case Instruction::PtrToInt: {
+        // An address kept as a pointer-width integer still carries the
+        // address into the cell: Itanium member-function pointers are
+        // {ptrtoint fn, adj} pairs (xpdf's Gfx::opTab: 73 operator
+        // handlers were dropped here, so the dispatch at Gfx.cc:826 and
+        // every call inside a handler resolved to nothing -- 73 of 535
+        // fuzz-observed pdftotext targets missed; with this case
+        // 535/535, 2026-09-27). Loads of such slots are integer loads;
+        // the witnessed int-provenance rules carry them to inttoptr.
+        processInitializer(ptrNode, CE->getOperand(0), enclosingStruct,
+                           enclosingFieldIdx, addrNode);
+        break;
+      }
       default:
+        if (constantHasPtrToInt(CE, 6) ||
+            llvm::any_of(CE->operands(), [](const Use &U) {
+              return U->getType()->isPointerTy();
+            }))
+          g_initCEDeclined++;
         CG_DEBUG("Unhandled constant expression: " << *init << "\n");
     }
   }
@@ -22201,6 +22223,9 @@ bool CallGraphPass::doFinalization(Module *M) {
       }
     }
     CG_LOG("Callee by type: total " << total << ", match by CFL " << match << "\n");
+    CG_LOG("InitCE LEDGER: " << g_initCEDeclined
+           << " pointer-carrying constant expressions in global "
+              "initializers without a transfer rule (declined)\n");
     CG_LOG("IntProvenance: modeled " << g_intProvStores << " int stores + "
            << g_intProvLoads << " int loads (witnessed); LEDGER unmodeled "
            << g_intStoreUnmodeled << " stores / " << g_intLoadUnmodeled

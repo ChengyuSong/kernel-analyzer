@@ -1322,6 +1322,14 @@ strncpy NOOP
 # externs = kernel/bpf/verifier.o missing from bclist, 0 fn-ptr args;
 # memcpy family enters IR as llvm.memcpy intrinsics, modeled).
 __cxa_throw INVOKE(arg2:f0<-arg0)
+# __dynamic_cast(obj, src_tinfo, dst_tinfo, hint): the Itanium ABI
+# returns null or a pointer into obj's own complete object -- offset 0
+# for a same-subobject cast, another offset (possibly negative) for a
+# cast across a secondary base. Unmodeled, its result was a synthetic
+# root with no content: every virtual call on a dynamic_cast result
+# resolved to NOTHING (SoK mp42aac: 21 of 168 fuzz-observed targets
+# missed at 19 sites; with this entry 168/168, 2026-09-27).
+__dynamic_cast ALIAS(ret<-arg0) ALIAS(ret<-arg0@X)
 
 # --- printf/str leaf block (2026-08-19, junction-dissolution campaign) ---
 # Hand-audited chain bottoms for the NoopProp prover (they refuse

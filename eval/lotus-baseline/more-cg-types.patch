@@ -1,0 +1,116 @@
+[kanalyzer eval patch] applied after icall-sites.patch and resolution-rule.patch.
+1. GPG: record the indirect calls that GPGAnalysisEngine::addFallbackIndirectTargets
+   fills (empty after the points-to fixpoint -> every address-taken,
+   signature-compatible function); exposed as fallbackIndirectCalls().
+   No analysis change.
+2. lotus-alias-call-graph: -cg-type=aserpta-origin (AserPTA with KOrigin<1>
+   and the origin rule of lotus-alias-aser-aa.cpp).
+
+diff -ruN a/include/Alias/InclusionBased/GPG/Analysis.h b/include/Alias/InclusionBased/GPG/Analysis.h
+--- a/include/Alias/InclusionBased/GPG/Analysis.h	2026-09-27 20:27:07.962941826 -0700
++++ b/include/Alias/InclusionBased/GPG/Analysis.h	2026-09-27 20:27:07.963941810 -0700
+@@ -31,6 +31,13 @@
+   const GPG *summary(const llvm::Function *function) const;
+   const GPG *initialGPG(const llvm::Function *function) const;
+   const ProgramModel &programModel() const { return model_; }
++  // [kanalyzer eval patch] indirect calls whose target set was still empty
++  // after the points-to fixpoint, so addFallbackIndirectTargets() filled
++  // them with every address-taken, signature-compatible function. Their
++  // targets in result() come from that fallback, not from points-to.
++  const std::set<const llvm::CallBase *> &fallbackIndirectCalls() const {
++    return fallback_calls_;
++  }
+ 
+ private:
+   using TargetSet = std::set<const llvm::Function *>;
+@@ -46,6 +53,7 @@
+   std::map<const llvm::Function *, GPG> initial_graphs_;
+   std::map<const llvm::Function *, GPG> summaries_;
+   TargetMap indirect_targets_;
++  std::set<const llvm::CallBase *> fallback_calls_; // [kanalyzer eval patch]
+   GPUSet observed_gpus_;
+   GPGResult result_;
+   AnalysisStats stats_;
+diff -ruN a/lib/Alias/InclusionBased/GPG/Analysis.cpp b/lib/Alias/InclusionBased/GPG/Analysis.cpp
+--- a/lib/Alias/InclusionBased/GPG/Analysis.cpp	2026-09-27 20:27:07.968941731 -0700
++++ b/lib/Alias/InclusionBased/GPG/Analysis.cpp	2026-09-27 20:27:07.969941715 -0700
+@@ -621,6 +621,7 @@
+       if (block.kind != GPBKind::IndirectCall || !block.callsite ||
+           !indirect_targets_[block.callsite].empty())
+         continue;
++      fallback_calls_.insert(block.callsite); // [kanalyzer eval patch]
+       for (llvm::Function &candidate : module_) {
+         if (candidate.isIntrinsic() || !candidate.hasAddressTaken() ||
+             !signaturesCompatible(*block.callsite, candidate))
+@@ -689,6 +690,7 @@
+ void GPGAnalysisEngine::run() {
+   result_.clear();
+   indirect_targets_.clear();
++  fallback_calls_.clear(); // [kanalyzer eval patch]
+   observed_gpus_.clear();
+   buildInitialGraphs();
+ 
+diff -ruN a/tools/alias/lotus-alias-call-graph.cpp b/tools/alias/lotus-alias-call-graph.cpp
+--- a/tools/alias/lotus-alias-call-graph.cpp	2026-09-27 20:27:07.973941651 -0700
++++ b/tools/alias/lotus-alias-call-graph.cpp	2026-09-27 20:27:07.974941635 -0700
+@@ -16,6 +16,7 @@
+ #include "llvm/Support/raw_ostream.h"
+ 
+ #include "Alias/InclusionBased/AserPTA/PointerAnalysis/Context/KCallSite.h"
++#include "Alias/InclusionBased/AserPTA/PointerAnalysis/Context/KOrigin.h"
+ #include "Alias/InclusionBased/AserPTA/PointerAnalysis/Context/NoCtx.h"
+ #include "Alias/InclusionBased/AserPTA/PointerAnalysis/Models/LanguageModel/DefaultLangModel/DefaultLangModel.h"
+ #include "Alias/InclusionBased/AserPTA/PointerAnalysis/Models/MemoryModel/FieldSensitive/FSMemModel.h"
+@@ -65,7 +66,8 @@
+   FPA_KELP,
+   AserPTA_CI,
+   AserPTA_1CFA,
+-  AserPTA_2CFA
++  AserPTA_2CFA,
++  AserPTA_Origin // [kanalyzer eval patch]
+ };
+ 
+ static cl::opt<CGType> AnalysisType(
+@@ -81,7 +83,9 @@
+         clEnumValN(CGType::AserPTA_CI, "aserpta-ci",
+                    "AserPTA (Context-Insensitive)"),
+         clEnumValN(CGType::AserPTA_1CFA, "aserpta-1cfa", "AserPTA (1-CFA)"),
+-        clEnumValN(CGType::AserPTA_2CFA, "aserpta-2cfa", "AserPTA (2-CFA)")),
++        clEnumValN(CGType::AserPTA_2CFA, "aserpta-2cfa", "AserPTA (2-CFA)"),
++        clEnumValN(CGType::AserPTA_Origin, "aserpta-origin",
++                   "AserPTA (origin-sensitive, KOrigin<1>)")),
+     cl::init(CGType::DyckAA), cl::cat(CGCat));
+ 
+ static cl::opt<bool>
+@@ -370,6 +374,23 @@
+   case CGType::AserPTA_2CFA:
+     buildCGWithAserPTAImpl<KCallSite<2>>(M, CG);
+     break;
++  case CGType::AserPTA_Origin:
++    // [kanalyzer eval patch] origin-sensitive AserPTA with the origin rule
++    // of tools/alias/lotus-alias-aser-aa.cpp (thread-spawn call sites
++    // start a new origin; everything else stays in its origin).
++    KOrigin<1>::setOriginRules(
++        [](const KOrigin<1> *, const llvm::Instruction *I) -> bool {
++          if (auto *CB = llvm::dyn_cast<llvm::CallBase>(I)) {
++            if (auto *F = CB->getCalledFunction()) {
++              llvm::StringRef Name = F->getName();
++              return Name.equals("pthread_create") || Name.contains("spawn") ||
++                     Name.contains("thread");
++            }
++          }
++          return false;
++        });
++    buildCGWithAserPTAImpl<KOrigin<1>>(M, CG);
++    break;
+   default:
+     llvm::WithColor::error() << "Invalid AserPTA variant\n";
+     break;
+@@ -449,6 +470,7 @@
+     case CGType::AserPTA_CI:
+     case CGType::AserPTA_1CFA:
+     case CGType::AserPTA_2CFA:
++    case CGType::AserPTA_Origin:
+       buildCGWithAserPTA(*M, CG, AnalysisType);
+       break;
+     default:

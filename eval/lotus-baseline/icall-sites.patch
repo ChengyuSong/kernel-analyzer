@@ -1,0 +1,128 @@
+--- a/tools/alias/lotus-alias-call-graph.cpp	2026-09-27 19:36:25.720499197 -0700
++++ b/tools/alias/lotus-alias-call-graph.cpp	2026-09-27 19:45:47.451552612 -0700
+@@ -47,6 +47,9 @@
+ #include <memory>
+ #include <system_error>
+ #include <vector>
++#include <set>
++#include <string>
++#include <llvm/Support/FileSystem.h>
+ 
+ namespace cl = llvm::cl;
+ 
+@@ -96,6 +99,14 @@
+               cl::cat(CGCat));
+ static cl::opt<std::string> IRFile(cl::Positional, cl::Required,
+                                    cl::desc("<LLVM IR file>"), cl::cat(CGCat));
++// [kanalyzer eval patch] per-site indirect-call targets in the SoK
++// parsed_log key space: "<DILocation scope filename>:<line>" -> callee
++// names (sites on one line union; unresolved sites keep an empty list).
++static cl::opt<std::string>
++    IcallSitesJson("emit-icall-sites-json",
++                   cl::desc("Write per-site indirect-call targets (JSON)"),
++                   cl::init(""), cl::cat(CGCat));
++static void printIcallSitesJson(llvm::CallGraph &CG, llvm::StringRef Path);
+ static cl::opt<int> FPAMaxTypeLayer("fpa-max-type-layer",
+                                     cl::desc("Max type layer for FPA"),
+                                     cl::init(10), cl::cat(CGCat));
+@@ -460,14 +471,21 @@
+     return *OS;
+   };
+ 
+-  const bool EmitDefaultDot =
+-      EmitCGAsDot.getNumOccurrences() == 0 && !static_cast<bool>(EmitCGAsJson);
++  // [kanalyzer eval patch] no default DOT when only per-site JSON is
++  // wanted: AserPTA's preprocessing passes rewrite the IR after CG was
++  // built, so some CG records hold null call-site handles, and the DOT
++  // printer dereferences them (segfault on httpd).
++  const bool EmitDefaultDot = EmitCGAsDot.getNumOccurrences() == 0 &&
++                              !static_cast<bool>(EmitCGAsJson) &&
++                              IcallSitesJson.empty();
+   if (EmitCGAsDot || EmitDefaultDot)
+     printCGAsDot(CG, GetOS());
+   if (EmitCGAsJson)
+     printCGAsJson(CG, GetOS());
+   if (EmitStats)
+     computeCGStats(CG, llvm::errs());
++  if (!IcallSitesJson.empty())
++    printIcallSitesJson(CG, IcallSitesJson);
+ 
+   return 0;
+ }
+@@ -682,3 +700,76 @@
+   }
+   OS << "\n    ]\n  }\n}\n";
+ }
++
++static void printIcallSitesJson(llvm::CallGraph &CG, llvm::StringRef Path) {
++  llvm::Module &M = CG.getModule();
++  std::map<std::string, std::set<std::string>> ByLoc;
++  size_t Sites = 0, NoDbg = 0, Unresolved = 0;
++  for (llvm::Function &F : M) {
++    if (F.isDeclaration())
++      continue;
++    llvm::CallGraphNode *Node = CG[&F];
++    for (llvm::BasicBlock &BB : F) {
++      for (llvm::Instruction &I : BB) {
++        auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
++        if (!CB || CB->isInlineAsm())
++          continue;
++        if (llvm::isa<llvm::Function>(
++                CB->getCalledOperand()->stripPointerCastsAndAliases()))
++          continue;
++        Sites++;
++        const llvm::DebugLoc &DL = CB->getDebugLoc();
++        if (!DL) {
++          NoDbg++;
++          continue;
++        }
++        std::string Key = (DL->getScope()->getFilename() + ":" +
++                           llvm::Twine(DL->getLine()))
++                              .str();
++        std::set<std::string> &Targets = ByLoc[Key];
++        size_t Before = Targets.size();
++        bool Any = false;
++        if (Node)
++          for (auto &Record : *Node) {
++            if (!Record.first.hasValue() ||
++                Record.first.getValue() != static_cast<llvm::Value *>(CB))
++              continue;
++            if (Record.second && Record.second->getFunction()) {
++              Targets.insert(Record.second->getFunction()->getName().str());
++              Any = true;
++            }
++          }
++        (void)Before;
++        if (!Any)
++          Unresolved++;
++      }
++    }
++  }
++  std::error_code EC;
++  llvm::raw_fd_ostream OS(Path, EC, llvm::sys::fs::OF_Text);
++  if (EC) {
++    llvm::errs() << "FATAL: cannot write " << Path << ": " << EC.message()
++                 << "\n";
++    std::exit(2);
++  }
++  OS << "{";
++  bool FirstK = true;
++  for (const auto &KV : ByLoc) {
++    OS << (FirstK ? "" : ",") << "\n  \"";
++    FirstK = false;
++    OS.write_escaped(KV.first);
++    OS << "\": [";
++    bool FirstT = true;
++    for (const std::string &T : KV.second) {
++      OS << (FirstT ? "" : ", ") << "\"";
++      FirstT = false;
++      OS.write_escaped(T);
++      OS << "\"";
++    }
++    OS << "]";
++  }
++  OS << "\n}\n";
++  llvm::errs() << "icall-sites: sites=" << Sites << " keys=" << ByLoc.size()
++               << " no-dbg=" << NoDbg << " unresolved=" << Unresolved
++               << "\n";
++}

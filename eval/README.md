@@ -108,6 +108,38 @@ and all runnable from the repo (artifact):
   from source at their pinned commits with their patches, run over
   their released bitcodes by their `run_experiment.py`, all inside
   a network-less container. Only the image build needs the network.
+- `67-dataflow-baselines.sh` + `svf-baseline.Dockerfile` +
+  `lotus-baseline.Dockerfile` — whole-program pointer-analysis
+  baselines, which the SoK did not evaluate: SVF 3.2 Andersen and
+  versioned flow-sensitive (LLVM 15 bitcode, same files as 62), and
+  via Lotus (LLVM 14 only) AserPTA CI/1-CFA/2-CFA, DyckAA, SeaDsa.
+  Per-site dumpers (`svf-baseline/svf-icalls.cpp`,
+  `lotus-baseline/icall-sites.patch`, `lotus-baseline/seadsa-icalls.cpp`)
+  write 62's JSON key space and change no analysis. Lotus rows pair
+  with 62 run on the SAME LLVM 14 files (`KA_SOK_BC=<llvm14 dirs>`).
+  Each tool's own resolution filter is recorded in the script header.
+- `68-sok-httpd-apr.sh` — completes the artifact's httpd.bc (887
+  undefined symbols, 423 of them APR/APR-util) by building APR 1.7.6 +
+  APR-util 1.6.4 to bitcode with the artifact's compiler major (typed
+  pointers for LLVM 15) and llvm-linking them in; httpd's own IR and
+  call-site keys are unchanged.
+- `69-sok-bigbox.sh` + `sok-toolchain.Dockerfile` — the whole SoK
+  comparison for a big server. Runbook:
+  ```
+  # on a machine with network (or: images-save here, images-load there)
+  eval/69-sok-bigbox.sh build                 # needs KA_LOTUS_SRC
+  eval/69-sok-bigbox.sh images-save sok-images.tar.zst
+  # on the big server (repo pulled, KAMain built: cmake --build release)
+  eval/69-sok-bigbox.sh images-load sok-images.tar.zst
+  export KA_SOK_ROOT=/path/to/sok-mlta KA_SOK_REPO=/path/to/SoK-MLTA \
+         KA_BIGBOX_WORK=/big/disk/sok-bigbox KA_BIGBOX_PAR=48 \
+         KA_DF_MEM=256g KA_DF_TIMEOUT=14400
+  eval/69-sok-bigbox.sh all                   # prepare + run + report
+  ```
+  Output: `$KA_BIGBOX_WORK/report.md` (per-site, no LLVM-CFI fallback),
+  their tables in `merged-llvm15/`, `merged-llvm14/` (+ `pair-*/`).
+  Timings from a parallel run share memory bandwidth; for timing rows
+  rerun the chosen approaches with `KA_BIGBOX_PAR=1`.
 
 ## Outputs (`$KA_RESULTS`)
 

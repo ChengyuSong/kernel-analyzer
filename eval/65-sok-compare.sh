@@ -115,38 +115,73 @@ EOF
   done
 done
 
-# 1b. Locally-run baselines (eval/66), if present: merge each
-# approach's per-dataset parsed_log (ossfuzz + unifuzz share an opt
-# level) into one dir per approach; program names and keys are
-# already in their harness's own format.
+# 1b. Locally-run baselines, if present: merge each approach's
+# per-dataset parsed_log (ossfuzz + unifuzz share an opt level) into
+# one dir per approach. eval/66 output (their harness) is already in
+# their names and keys. eval/67 output (our per-site dumpers) uses
+# eval/62's convention, so it gets the SAME canonical program names and
+# the SAME key alignment onto LLVM-CFI's strings as the ORCFL rows.
 BASE_APPROACHES=""
 if [[ -d "$SOK_OUT/baselines" ]]; then
-  BASE_APPROACHES=$(python3 - "$SOK_OUT/baselines" "$MERGED" <<'EOF'
+  BASE_APPROACHES=$(python3 - "$SOK_OUT/baselines" "$MERGED" \
+      "$KA_SOK_ROOT/pre-computed/soundness" \
+      "$KA_SOK_ROOT/fuzz_groundtruth" <<'EOF'
 import json, sys
 from pathlib import Path
 src, merged = Path(sys.argv[1]), Path(sys.argv[2])
+pre_root, gt = Path(sys.argv[3]), Path(sys.argv[4])
+THEIRS = ('TFA', 'DeepType', 'MLTA', 'MLTA_Orig')           # eval/66
+OURS = ('SVF-Andersen', 'SVF-VFS', 'AserPTA-CI', 'AserPTA-1CFA',
+        'AserPTA-2CFA', 'DyckAA', 'SeaDsa', 'AserPTA-CI-shape',
+        'DyckAA-shape', 'GPG-FSCS', 'GPG-FICS', 'GPG-FICI',
+        'LotusAA', 'TPA-K0', 'TPA-K1', 'FSPTA', 'VFSPTA', 'VFPTA',
+        'SparrowAA', 'BootstrapAA', 'DDA-Flow', 'AserPTA-Origin',
+        'CHA', 'RTA', 'VTA', 'OTF')                           # eval/67
+def boundary_suffix(a, b):   # a agrees with b up to a path boundary
+    return a == b or a.endswith('/' + b) or b.endswith('/' + a)
 seen = set()
 for opt in ('O0', 'O3'):
+    pre = pre_root / opt
+    canon = {p.stem for p in gt.glob('*.json')}
+    for d in pre.glob('*/parsed_log'):
+        canon |= {p.stem for p in d.glob('*.json')}
+    def canonical(prog):
+        if prog in canon:
+            return prog
+        m = [c for c in canon if c.endswith('__' + prog)]
+        if len(m) > 1:
+            sys.exit(f'!! ambiguous canonical name for {prog}: {m}')
+        return m[0] if m else prog
     per = {}   # approach -> prog -> key -> set(targets)
     for tagdir in src.glob(f'*_{opt}'):
         for adir in tagdir.iterdir():
-            # only the approaches eval/66 actually RUNS here — their
-            # harness also copies the pre-computed results into its
-            # output dir, and those must keep coming from /sok
-            if adir.name not in ('TFA', 'DeepType', 'MLTA', 'MLTA_Orig'):
+            # only the approaches eval/66 and eval/67 actually RUN here —
+            # their harness also copies the pre-computed results into
+            # its output dir, and those must keep coming from /sok
+            if adir.name not in THEIRS + OURS:
                 continue
             plog = adir / 'parsed_log'
             if not plog.is_dir():
                 continue
             for j in plog.glob('*.json'):
                 d = json.load(open(j))
-                prog = per.setdefault(adir.name, {}).setdefault(j.stem, {})
+                name = canonical(j.stem) if adir.name in OURS else j.stem
+                prog = per.setdefault(adir.name, {}).setdefault(name, {})
                 for k, v in d.items():
                     prog.setdefault(k, set()).update(v)
     for appr, progs in per.items():
         dst = merged / opt / appr / 'parsed_log'
         dst.mkdir(parents=True, exist_ok=True)
         for prog, keys in progs.items():
+            cfi_file = pre / 'LLVM-CFI' / 'parsed_log' / f'{prog}.json'
+            if appr in OURS and cfi_file.exists():
+                cfi_keys = list(json.load(open(cfi_file)))
+                aligned = {}
+                for k, v in keys.items():
+                    m = [c for c in cfi_keys if boundary_suffix(k, c)]
+                    kk = max(m, key=len) if m else k
+                    aligned.setdefault(kk, set()).update(v)
+                keys = aligned
             out = {k: sorted(v) for k, v in sorted(keys.items())}
             json.dump(out, open(dst / f'{prog}.json', 'w'), indent=1)
         seen.add(appr)
@@ -206,5 +241,44 @@ for opt in O0 O3; do
     python compare_approaches.py --json "/results/cmp-$opt.json" \
     2>&1 | tee "$MERGED/$opt/compare.log"
 done
+
+# 5. Pairwise tables (KA_SOK_PAIRWISE=1): their script keeps a program
+# only if EVERY configured approach has it, so one baseline that times
+# out or is killed on a program drops that program for all. Pairwise
+# runs compare each local baseline with ORCFL (full, base) and
+# LLVM-CFI over the sites those share, same script, same formulas.
+if [[ "${KA_SOK_PAIRWISE:-0}" == 1 ]]; then
+  for opt in O0 O3; do
+    for appr in $BASE_APPROACHES; do
+      [[ -d "$MERGED/$opt/$appr/parsed_log" ]] || continue
+      pdir="$MERGED/$opt/pair-$appr"
+      mkdir -p "$pdir/common"
+      cat > "$MERGED/cmp-$opt-pair-$appr.json" <<EOF
+{
+  "COMMON_PATH": "/results/$opt/pair-$appr/",
+  "RESULT_DIRS": {
+    "LLVM-CFI": "/sok/pre-computed/soundness/$opt/LLVM-CFI/parsed_log/",
+    "$appr": "/results/$opt/$appr/parsed_log/",
+    "ORCFL": "/results/$opt/ORCFL-full/parsed_log/",
+    "ORCFL-base": "/results/$opt/ORCFL-base/parsed_log/"
+  },
+  "GEN_HYBRID_RESULTS": false,
+  "ENABLE_FUZZING_RESULTS": true,
+  "RESULT_DIR_FUZZ": "/sok/fuzz_groundtruth/"
+}
+EOF
+      echo "== compare_approaches $opt pairwise $appr"
+      docker run --rm --network none -u "$(id -u):$(id -g)" \
+        -v "$KA_SOK_REPO/scripts":/scripts:ro \
+        -v "$KA_SOK_ROOT":/sok:ro \
+        -v "$MERGED":/results \
+        -w /scripts "$IMG" \
+        python compare_approaches.py \
+          --json "/results/cmp-$opt-pair-$appr.json" \
+        > "$pdir/compare.log" 2>&1
+    done
+  done
+  echo "== pairwise tables: $MERGED/{O0,O3}/pair-*/comparison_*.csv"
+fi
 
 echo "== done. Tables: $MERGED/{O0,O3}/comparison_*.csv"

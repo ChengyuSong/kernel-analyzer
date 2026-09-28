@@ -51,6 +51,10 @@ for cfg in full base; do
     mkdir -p "$pdir"
     while IFS= read -r bc; do
       prog=$(basename "$bc" .bc)
+      # KA_SOK_PROGS: optional space-separated program filter (smoke runs)
+      if [[ -n "${KA_SOK_PROGS:-}" && " $KA_SOK_PROGS " != *" $prog "* ]]; then
+        continue
+      fi
       json="$pdir/$prog.json"
       log="$OUT/$cfg/$tag/$prog.log"
       if [[ -s "$json" && "${KA_FORCE:-0}" != 1 ]]; then

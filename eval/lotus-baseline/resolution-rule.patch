@@ -1,0 +1,59 @@
+diff -ru ra/lib/Alias/InclusionBased/AserPTA/Util/Util.cpp rb/lib/Alias/InclusionBased/AserPTA/Util/Util.cpp
+--- a/lib/Alias/InclusionBased/AserPTA/Util/Util.cpp	2026-09-27 20:01:12.025817188 -0700
++++ b/lib/Alias/InclusionBased/AserPTA/Util/Util.cpp	2026-09-27 20:01:12.046816852 -0700
+@@ -14,6 +14,17 @@
+ using namespace llvm;
+ using namespace aser;
+ 
++// [kanalyzer eval patch] -aser-shape-compat: resolve indirect calls with
++// a signature SHAPE rule (arity, void-ness and pointer-ness of return and
++// parameters) instead of an exact return type, so the baseline uses the
++// same resolution rule as KAMain's answer path. Default: off (upstream).
++#include "llvm/Support/CommandLine.h"
++static llvm::cl::opt<bool> AserShapeCompat(
++    "aser-shape-compat",
++    llvm::cl::desc("Resolve indirect calls by signature shape, not exact "
++                   "return type"),
++    llvm::cl::init(false));
++
+ /**
+  * @brief Pretty print a function signature.
+  *
+@@ -61,7 +72,12 @@
+     return true;
+   }
+ 
+-  if (CS.getType() != target->getReturnType()) {
++  if (AserShapeCompat) {
++    Type *RT = target->getReturnType();
++    if (!indirectCall->use_empty() && !CS.getType()->isVoidTy() &&
++        (RT->isVoidTy() || RT->isPointerTy() != CS.getType()->isPointerTy()))
++      return false;
++  } else if (CS.getType() != target->getReturnType()) {
+     return false;
+   }
+ 
+diff -ru ra/lib/Alias/UnificationBased/DyckAA/AAAnalyzer.cpp rb/lib/Alias/UnificationBased/DyckAA/AAAnalyzer.cpp
+--- a/lib/Alias/UnificationBased/DyckAA/AAAnalyzer.cpp	2026-09-27 20:01:12.030817108 -0700
++++ b/lib/Alias/UnificationBased/DyckAA/AAAnalyzer.cpp	2026-09-27 20:01:12.046816852 -0700
+@@ -24,7 +24,7 @@
+ #include <llvm/IR/InstIterator.h>
+ 
+ static cl::opt<unsigned> FunctionTypeCheckLevel(
+-    "function-type-check-level", cl::init(4), cl::Hidden,
++    "function-type-check-level", cl::init(4),
+     cl::desc("The level of checking the compatability of function types"
+              "4: equivalent function types"
+              "3: same # parameters and same store size of each param"
+@@ -246,7 +246,10 @@
+   // otherwise, new a root
+   auto RIt = TyRoots.begin();
+   while (RIt != TyRoots.end()) {
+-    if ((unsigned)isCompatible((*RIt)->FuncTy, Ty) ==
++    // [kanalyzer eval patch] ">=": join a group when the types are AT
++    // LEAST this compatible (the option's documented meaning); "==" made
++    // levels < 4 split identical-shape types. Default level 4 unchanged.
++    if ((unsigned)isCompatible((*RIt)->FuncTy, Ty) >=
+         FunctionTypeCheckLevel.getValue()) {
+       auto *TyNode = new FunctionTypeNode;
+       TyNode->FuncTy = Ty;

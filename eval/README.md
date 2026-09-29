@@ -124,17 +124,15 @@ and all runnable from the repo (artifact):
   pointers for LLVM 15) and llvm-linking them in; httpd's own IR and
   call-site keys are unchanged.
 - `69-sok-bigbox.sh` + `sok-toolchain.Dockerfile` — the whole SoK
-  comparison for a big server. Runbook:
+  comparison for a big server, built entirely from pinned sources
+  (SoK-MLTA, Lotus and SVF at pinned commits, APR tarballs sha256-checked,
+  images built from the Dockerfiles). Only the SoK authors' dataset is a
+  manual download (Google Drive link in the script). Runbook:
   ```
-  # on a machine with network (or: images-save here, images-load there)
-  eval/69-sok-bigbox.sh build                 # needs KA_LOTUS_SRC
-  eval/69-sok-bigbox.sh images-save sok-images.tar.zst
-  # on the big server (repo pulled, KAMain built: cmake --build release)
-  eval/69-sok-bigbox.sh images-load sok-images.tar.zst
-  export KA_SOK_ROOT=/path/to/sok-mlta KA_SOK_REPO=/path/to/SoK-MLTA \
-         KA_BIGBOX_WORK=/big/disk/sok-bigbox KA_BIGBOX_PAR=48 \
-         KA_DF_MEM=256g KA_DF_TIMEOUT=14400
-  eval/69-sok-bigbox.sh all                   # prepare + run + report
+  export KA_SOK_ROOT=/path/to/sok-dataset KA_BIGBOX_WORK=/big/disk/sok \
+         KA_BIGBOX_PAR=12 KA_DF_MEM=128g KA_DF_TIMEOUT=14400
+  eval/69-sok-bigbox.sh setup     # once: clone + build (network)
+  eval/69-sok-bigbox.sh all       # prepare + run + report
   ```
   Output: `$KA_BIGBOX_WORK/report.md` (per-site, no LLVM-CFI fallback),
   their tables in `merged-llvm15/`, `merged-llvm14/` (+ `pair-*/`).

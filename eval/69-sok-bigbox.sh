@@ -5,11 +5,19 @@
 # (eval/65, incl. pairwise tables) and our per-site report without their
 # LLVM-CFI fallback (tools/sok-report.py).
 #
-# Steps (run in order, or `all`):
-#   build        images: sok-toolchain, svf-baseline, lotus-baseline-next
-#                (network; Lotus source from KA_LOTUS_SRC at the pinned
-#                commit) -- OR `images-load FILE` a bundle made elsewhere
-#                with `images-save FILE`
+# Everything is built from pinned sources on the machine that runs it;
+# the only manual input is the SoK authors' dataset (data, hosted on
+# Google Drive; see artifact_help below).
+#   export KA_SOK_ROOT=/path/to/sok-dataset  KA_BIGBOX_WORK=/big/sok
+#   eval/69-sok-bigbox.sh setup    # once: clone + build (network)
+#   eval/69-sok-bigbox.sh all      # prepare + run + report
+#
+# Steps (run in order, or `all` after `setup`):
+#   setup        checks docker/git/curl; clones SoK-MLTA and Lotus at pinned
+#                commits into $W/src; downloads APR/APR-util (sha256-
+#                checked); docker-builds sok-toolchain, svf-baseline (SVF at
+#                a pinned commit) and lotus-baseline-next; writes
+#                $W/bigbox.env so later steps need only KA_BIGBOX_WORK
 #   prepare      overlay artifact root under $W/sok-root: real copies (hard
 #                links when possible) of the artifact's bitcodes, ground
 #                truth and pre-computed logs, with every httpd.bc replaced
@@ -20,17 +28,16 @@
 #   all          prepare + run + report
 #
 # Env:
-#   KA_SOK_ROOT      original artifact root (bitcodes/, pre-computed/,
-#                    fuzz_groundtruth/)                          [required]
-#   KA_SOK_REPO      SoK-MLTA code checkout (scripts/compare_approaches.py)
+#   KA_SOK_ROOT      SoK dataset root (bitcodes/, pre-computed/,
+#                    fuzz_groundtruth/)                 [required for setup]
+#   KA_SOK_REPO      SoK-MLTA checkout (default: setup's clone)
 #   KA_BIGBOX_WORK   work dir (default $KA_RESULTS/sok-bigbox) = $W
 #   KA_BIGBOX_PAR    concurrent jobs (default 24); use 1 for a solo-timed pass
 #   KA_DF_MEM        per-baseline container memory (default 256g)
 #   KA_DF_TIMEOUT    per-baseline, per-program timeout (default 14400 s)
 #   KA_BIGBOX_APPR   baseline approaches (default: all of eval/67)
-#   KA_APR_SRC       dir with apr-1.7.6.tar.gz + apr-util-1.6.4.tar.gz
-#                    (downloaded from archive.apache.org when missing)
-#   KA_LOTUS_SRC     Lotus git checkout for `build` (commit pinned in eval/67)
+#   KA_APR_SRC       APR tarball dir (default $W/apr-src; downloaded and
+#                    sha256-checked by setup/prepare)
 #   KA_BIN           KAMain binary (env.sh default: $KA_REPO/release/lib/KAMain)
 #
 # Outputs: $W/sok (ORCFL, SVF and Lotus rows, all on the LLVM 15 files;
@@ -43,11 +50,17 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 ka_require docker python3
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 W="${KA_BIGBOX_WORK:-$KA_RESULTS/sok-bigbox}"
+# `setup` records its paths; explicit env wins.
+if [[ -f "$W/bigbox.env" ]]; then
+  _r="${KA_SOK_ROOT:-}"; _p="${KA_SOK_REPO:-}"; _a="${KA_APR_SRC:-}"
+  source "$W/bigbox.env"
+  [[ -n "$_r" ]] && KA_SOK_ROOT=$_r; [[ -n "$_p" ]] && KA_SOK_REPO=$_p
+  [[ -n "$_a" ]] && KA_APR_SRC=$_a
+fi
 PAR="${KA_BIGBOX_PAR:-24}"
 export KA_DF_MEM="${KA_DF_MEM:-256g}"
 export KA_DF_TIMEOUT="${KA_DF_TIMEOUT:-14400}"
 APR_SRC="${KA_APR_SRC:-$W/apr-src}"
-IMAGES="sok-toolchain svf-baseline lotus-baseline lotus-baseline-next"
 ALL_APPR="SVF-Andersen SVF-VFS AserPTA-CI AserPTA-1CFA AserPTA-2CFA DyckAA \
 SeaDsa AserPTA-CI-shape DyckAA-shape GPG-FSCS GPG-FICS GPG-FICI LotusAA \
 TPA-K0 TPA-K1 FSPTA VFSPTA VFPTA SparrowAA BootstrapAA DDA-Flow \
@@ -62,22 +75,74 @@ mkdir -p "$W/jobs"
 
 need_root() { : "${KA_SOK_ROOT:?set KA_SOK_ROOT to the SoK artifact root}"; }
 
-build() {
-  docker build -f "$HERE/sok-toolchain.Dockerfile" -t sok-toolchain "$HERE"
-  "$HERE/67-dataflow-baselines.sh" build
+
+# Pinned sources (everything that can be cloned or built is, by `setup`).
+SOK_REPO_URL=https://github.com/yufeidu/SoK-MLTA
+SOK_REPO_COMMIT=d438079b2f272a8a6bd90d193f3e9f27ef94f886
+LOTUS_URL=https://github.com/ZJU-PL/lotus.git
+LOTUS_COMMIT=0da4c2813005249bce390329d28810a2c4ac0e76   # = eval/67's pin
+declare -A APR_SHA256=(
+  [apr-1.7.6.tar.gz]=6a10e7f7430510600af25fabf466e1df61aaae910bf1dc5d10c44a4433ccc81d
+  [apr-util-1.6.4.tar.gz]=9160444764bd1d804d7e6ee50783ec9442a88b5a8984e62470832b06983eeaa4 )
+SOK_DRIVE=https://drive.google.com/drive/folders/1na-6VsbZcPwDwezQWNHCpjwkp5ZhFTOL
+
+clone_at() {  # url dir commit: fetch exactly one commit, check it out
+  local url=$1 dir=$2 sha=$3
+  if [[ ! -d "$dir/.git" ]]; then git init -q "$dir"; git -C "$dir" remote add origin "$url"; fi
+  git -C "$dir" fetch -q --depth 1 origin "$sha"
+  git -C "$dir" checkout -q --detach "$sha"
+  [[ "$(git -C "$dir" rev-parse HEAD)" == "$sha" ]] || { echo "!! $dir not at $sha" >&2; exit 1; }
 }
 
-images_save() {
-  local f="${1:?usage: images-save FILE}"
-  local have=(); for i in $IMAGES; do
-    docker image inspect "$i" >/dev/null 2>&1 && have+=("$i"); done
-  echo "== saving: ${have[*]} -> $f"
-  docker save "${have[@]}" | zstd -T0 -q -o "$f"
+fetch_apr() {  # download (if missing) and verify the APR tarballs
+  mkdir -p "$APR_SRC"; local t
+  for t in "${!APR_SHA256[@]}"; do
+    [[ -s "$APR_SRC/$t" ]] || curl -fsSL -o "$APR_SRC/$t" "https://archive.apache.org/dist/apr/$t"
+    echo "${APR_SHA256[$t]}  $APR_SRC/$t" | sha256sum -c --quiet \
+      || { echo "!! checksum mismatch: $APR_SRC/$t" >&2; exit 1; }
+  done
 }
 
-images_load() {
-  local f="${1:?usage: images-load FILE}"
-  zstd -dc "$f" | docker load
+check_artifact() {  # the one manual input: the SoK authors' dataset (data, not code)
+  local d; need_root
+  for d in pre-computed fuzz_groundtruth; do
+    [[ -d "$KA_SOK_ROOT/$d" ]] || { echo "!! $KA_SOK_ROOT/$d missing" >&2; artifact_help; }
+  done
+  for d in $SETS15; do [[ -d "$KA_SOK_ROOT/bitcodes/llvm15/$d" ]] || { echo "!! missing bitcodes/llvm15/$d" >&2; artifact_help; }; done
+  for d in $SETS14; do [[ -d "$KA_SOK_ROOT/bitcodes/llvm14/$d" ]] || { echo "!! missing bitcodes/llvm14/$d" >&2; artifact_help; }; done
+}
+artifact_help() {
+  echo "   The SoK-MLTA dataset (pre-built bitcodes, pre-computed LLVM-CFI/KallGraph/HPCFI" >&2
+  echo "   results, fuzz ground truth) is hosted by its authors at $SOK_DRIVE ." >&2
+  echo "   Download and decompress it, then set KA_SOK_ROOT to the directory holding" >&2
+  echo "   bitcodes/, pre-computed/ and fuzz_groundtruth/." >&2
+  exit 1
+}
+
+setup() {  # clone + build everything from pinned sources on this machine
+  local miss=() t
+  for t in docker git curl python3 tar sha256sum; do command -v $t >/dev/null || miss+=("$t"); done
+  (( ${#miss[@]} )) && { echo "!! install first: ${miss[*]}" >&2; exit 1; }
+  docker info >/dev/null 2>&1 || { echo "!! docker daemon not reachable by $(id -un)" >&2; exit 1; }
+  check_artifact
+  echo "== SoK-MLTA scripts @ ${SOK_REPO_COMMIT:0:12}"
+  clone_at "$SOK_REPO_URL" "$W/src/SoK-MLTA" "$SOK_REPO_COMMIT"
+  echo "== Lotus @ ${LOTUS_COMMIT:0:12}"
+  clone_at "$LOTUS_URL" "$W/src/lotus" "$LOTUS_COMMIT"
+  echo "== APR sources (sha256-checked)"
+  fetch_apr
+  echo "== building images from Dockerfiles (sok-toolchain, svf-baseline, lotus-baseline-next)"
+  docker build -f "$HERE/sok-toolchain.Dockerfile" -t sok-toolchain "$HERE" > "$W/jobs/build-toolchain.log" 2>&1 \
+    || { echo "!! see $W/jobs/build-toolchain.log" >&2; exit 1; }
+  KA_LOTUS_SRC="$W/src/lotus" KA_LOTUS_COMMIT="$LOTUS_COMMIT" \
+    "$HERE/67-dataflow-baselines.sh" build > "$W/jobs/build-baselines.log" 2>&1 \
+    || { echo "!! see $W/jobs/build-baselines.log" >&2; exit 1; }
+  cat > "$W/bigbox.env" <<ENV
+KA_SOK_ROOT=$KA_SOK_ROOT
+KA_SOK_REPO=$W/src/SoK-MLTA
+KA_APR_SRC=$APR_SRC
+ENV
+  echo "== ready ($W/bigbox.env). Next: KA_BIGBOX_WORK=$W $0 all"
 }
 
 copy_tree() {  # src dst: hard links when on the same filesystem, else copy
@@ -86,18 +151,14 @@ copy_tree() {  # src dst: hard links when on the same filesystem, else copy
 }
 
 prepare() {
-  need_root
+  check_artifact
   rm -rf "$ROOT"; mkdir -p "$ROOT/bitcodes"
   copy_tree "$KA_SOK_ROOT/pre-computed" "$ROOT/pre-computed"
   copy_tree "$KA_SOK_ROOT/fuzz_groundtruth" "$ROOT/fuzz_groundtruth"
   for s in $SETS15; do copy_tree "$KA_SOK_ROOT/bitcodes/llvm15/$s" "$ROOT/bitcodes/llvm15/$s"; done
   for s in $SETS14; do copy_tree "$KA_SOK_ROOT/bitcodes/llvm14/$s" "$ROOT/bitcodes/llvm14/$s"; done
 
-  mkdir -p "$APR_SRC"
-  for t in apr-1.7.6.tar.gz apr-util-1.6.4.tar.gz; do
-    [[ -s "$APR_SRC/$t" ]] || curl -fsSL -o "$APR_SRC/$t" \
-      "https://archive.apache.org/dist/apr/$t"
-  done
+  fetch_apr
   for v in 15 14; do
     echo "== APR bitcode, LLVM $v (inside sok-toolchain)"
     docker run --rm --network none -u "$(id -u):$(id -g)" \
@@ -194,12 +255,10 @@ report() {
 }
 
 case "${1:-}" in
-  build) build ;;
-  images-save) images_save "${2:-}" ;;
-  images-load) images_load "${2:-}" ;;
+  setup) setup ;;
   prepare) prepare ;;
   run) run ;;
   report) report ;;
   all) prepare; run; report ;;
-  *) echo "usage: $0 build|images-save F|images-load F|prepare|run|report|all" >&2; exit 2 ;;
+  *) echo "usage: $0 setup|prepare|run|report|all" >&2; exit 2 ;;
 esac

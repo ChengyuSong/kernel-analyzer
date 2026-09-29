@@ -126,12 +126,13 @@ and all runnable from the repo (artifact):
 - `69-sok-bigbox.sh` + `sok-toolchain.Dockerfile` — the whole SoK
   comparison for a big server, built entirely from pinned sources
   (SoK-MLTA, Lotus and SVF at pinned commits, APR tarballs sha256-checked,
-  images built from the Dockerfiles). Only the SoK authors' dataset is a
-  manual download (Google Drive link in the script). Runbook:
+  images built from the Dockerfiles; the SoK authors' dataset downloaded
+  from their Google Drive folder with a pinned gdown, sha256-checked).
+  Runbook:
   ```
-  export KA_SOK_ROOT=/path/to/sok-dataset KA_BIGBOX_WORK=/big/disk/sok \
+  export KA_BIGBOX_WORK=/big/disk/sok \
          KA_BIGBOX_PAR=12 KA_DF_MEM=128g KA_DF_TIMEOUT=14400
-  eval/69-sok-bigbox.sh setup     # once: clone + build (network)
+  eval/69-sok-bigbox.sh setup     # once: download + clone + build (network)
   eval/69-sok-bigbox.sh all       # prepare + run + report
   ```
   Output: `$KA_BIGBOX_WORK/report.md` (per-site, no LLVM-CFI fallback),

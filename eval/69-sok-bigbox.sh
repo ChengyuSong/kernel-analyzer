@@ -5,15 +5,16 @@
 # (eval/65, incl. pairwise tables) and our per-site report without their
 # LLVM-CFI fallback (tools/sok-report.py).
 #
-# Everything is built from pinned sources on the machine that runs it;
-# the only manual input is the SoK authors' dataset (data, hosted on
-# Google Drive; see artifact_help below).
-#   export KA_SOK_ROOT=/path/to/sok-dataset  KA_BIGBOX_WORK=/big/sok
-#   eval/69-sok-bigbox.sh setup    # once: clone + build (network)
+# Everything is fetched and built from pinned sources on the machine that
+# runs it, including the SoK authors' dataset (Google Drive, via a pinned
+# gdown; archives sha256-checked):
+#   export KA_BIGBOX_WORK=/big/sok
+#   eval/69-sok-bigbox.sh setup    # once: download + clone + build (network)
 #   eval/69-sok-bigbox.sh all      # prepare + run + report
 #
 # Steps (run in order, or `all` after `setup`):
-#   setup        checks docker/git/curl; clones SoK-MLTA and Lotus at pinned
+#   setup        checks docker/git/curl; downloads the SoK dataset unless
+#                KA_SOK_ROOT is given; clones SoK-MLTA and Lotus at pinned
 #                commits into $W/src; downloads APR/APR-util (sha256-
 #                checked); docker-builds sok-toolchain, svf-baseline (SVF at
 #                a pinned commit) and lotus-baseline-next; writes
@@ -28,8 +29,8 @@
 #   all          prepare + run + report
 #
 # Env:
-#   KA_SOK_ROOT      SoK dataset root (bitcodes/, pre-computed/,
-#                    fuzz_groundtruth/)                 [required for setup]
+#   KA_SOK_ROOT      existing SoK dataset root (bitcodes/, pre-computed/,
+#                    fuzz_groundtruth/); unset: setup downloads it
 #   KA_SOK_REPO      SoK-MLTA checkout (default: setup's clone)
 #   KA_BIGBOX_WORK   work dir (default $KA_RESULTS/sok-bigbox) = $W
 #   KA_BIGBOX_PAR    concurrent jobs (default 24); use 1 for a solo-timed pass
@@ -53,7 +54,7 @@ W="${KA_BIGBOX_WORK:-$KA_RESULTS/sok-bigbox}"
 # `setup` records its paths; explicit env wins.
 if [[ -f "$W/bigbox.env" ]]; then
   _r="${KA_SOK_ROOT:-}"; _p="${KA_SOK_REPO:-}"; _a="${KA_APR_SRC:-}"
-  source "$W/bigbox.env"
+  set -a; source "$W/bigbox.env"; set +a   # exported: child stages read them
   [[ -n "$_r" ]] && KA_SOK_ROOT=$_r; [[ -n "$_p" ]] && KA_SOK_REPO=$_p
   [[ -n "$_a" ]] && KA_APR_SRC=$_a
 fi
@@ -85,6 +86,38 @@ declare -A APR_SHA256=(
   [apr-1.7.6.tar.gz]=6a10e7f7430510600af25fabf466e1df61aaae910bf1dc5d10c44a4433ccc81d
   [apr-util-1.6.4.tar.gz]=9160444764bd1d804d7e6ee50783ec9442a88b5a8984e62470832b06983eeaa4 )
 SOK_DRIVE=https://drive.google.com/drive/folders/1na-6VsbZcPwDwezQWNHCpjwkp5ZhFTOL
+# The dataset archives in that folder (Drive file id, sha256, content), as
+# downloaded and checked against our working copy on 2026-09-28:
+#   bitcodes.tgz      4.4 GB  bitcodes/llvm{14,15}/...
+#   pre-computed.tgz  2.3 MB  pre-computed/ + fuzz_groundtruth/
+declare -A SOK_FILE_ID=(
+  [bitcodes.tgz]=1xVMdB7ZYlt3ywc9WS_ofEKGy8bhC9JB4
+  [pre-computed.tgz]=1sjsJdrkBtQHU2sBurPAFhWv1zDmZO1Kk )
+declare -A SOK_SHA256=(
+  [bitcodes.tgz]=41e0a2597ad37aea06b6868437b5ab518656476e9b495e3864fea79c2476765a
+  [pre-computed.tgz]=ab10952f77871c96b4a32ff80f175e99f43aa94c3364af42d4d52048531d7dad )
+GDOWN_IMAGE=python@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+GDOWN_VERSION=6.4.0
+
+fetch_dataset() {  # Drive -> $W/sok-dataset (only the sets eval/69 uses)
+  local dl="$W/downloads" f d; mkdir -p "$dl"
+  for f in "${!SOK_FILE_ID[@]}"; do
+    if ! echo "${SOK_SHA256[$f]}  $dl/$f" | sha256sum -c --quiet 2>/dev/null; then
+      echo "== downloading $f from the SoK authors' Drive folder"
+      docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$dl":/out "$GDOWN_IMAGE" \
+        sh -c "pip install -q --user gdown==$GDOWN_VERSION >/dev/null 2>&1 && python -m gdown -q -O /out/$f ${SOK_FILE_ID[$f]}" \
+        || { echo "!! download of $f failed (Drive quota? retry later, or download $SOK_DRIVE by hand into $dl)" >&2; exit 1; }
+      echo "${SOK_SHA256[$f]}  $dl/$f" | sha256sum -c --quiet \
+        || { echo "!! $f checksum mismatch: the dataset changed upstream" >&2; exit 1; }
+    fi
+  done
+  local root="$W/sok-dataset" sub=() s; mkdir -p "$root"
+  tar -xzf "$dl/pre-computed.tgz" -C "$root"
+  for s in $SETS15; do sub+=("bitcodes/llvm15/$s"); done
+  for s in $SETS14; do sub+=("bitcodes/llvm14/$s"); done
+  tar -xzf "$dl/bitcodes.tgz" -C "$root" "${sub[@]}"
+  export KA_SOK_ROOT="$root"
+}
 
 clone_at() {  # url dir commit: fetch exactly one commit, check it out
   local url=$1 dir=$2 sha=$3
@@ -124,6 +157,9 @@ setup() {  # clone + build everything from pinned sources on this machine
   for t in docker git curl python3 tar sha256sum; do command -v $t >/dev/null || miss+=("$t"); done
   (( ${#miss[@]} )) && { echo "!! install first: ${miss[*]}" >&2; exit 1; }
   docker info >/dev/null 2>&1 || { echo "!! docker daemon not reachable by $(id -un)" >&2; exit 1; }
+  # dataset: an existing KA_SOK_ROOT is used as is; otherwise it is
+  # downloaded (gdown, pinned) and sha256-checked
+  [[ -n "${KA_SOK_ROOT:-}" ]] || fetch_dataset
   check_artifact
   echo "== SoK-MLTA scripts @ ${SOK_REPO_COMMIT:0:12}"
   clone_at "$SOK_REPO_URL" "$W/src/SoK-MLTA" "$SOK_REPO_COMMIT"
@@ -134,7 +170,7 @@ setup() {  # clone + build everything from pinned sources on this machine
   echo "== building images from Dockerfiles (sok-toolchain, svf-baseline, lotus-baseline-next)"
   docker build -f "$HERE/sok-toolchain.Dockerfile" -t sok-toolchain "$HERE" > "$W/jobs/build-toolchain.log" 2>&1 \
     || { echo "!! see $W/jobs/build-toolchain.log" >&2; exit 1; }
-  KA_LOTUS_SRC="$W/src/lotus" KA_LOTUS_COMMIT="$LOTUS_COMMIT" \
+  KA_SOK_ROOT="$KA_SOK_ROOT" KA_LOTUS_SRC="$W/src/lotus" KA_LOTUS_COMMIT="$LOTUS_COMMIT" \
     "$HERE/67-dataflow-baselines.sh" build > "$W/jobs/build-baselines.log" 2>&1 \
     || { echo "!! see $W/jobs/build-baselines.log" >&2; exit 1; }
   cat > "$W/bigbox.env" <<ENV

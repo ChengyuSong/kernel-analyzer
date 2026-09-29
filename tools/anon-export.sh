@@ -30,7 +30,7 @@ TRACKED=(
   eval/env.sh eval/lib-fetch.sh eval/sok-downgrade.sh
   eval/kernel-toolchain.Dockerfile eval/sok-toolchain.Dockerfile
   eval/sok-baselines.Dockerfile eval/svf-baseline.Dockerfile eval/svf-baseline
-  eval/lotus-baseline.Dockerfile eval/lotus-baseline eval/gracfl
+  eval/lotus-baseline.Dockerfile eval/lotus-baseline eval/gracfl eval/kernel
   tools/gt-match.py tools/sok-persite.py tools/sok-report.py
   tools/derive-libc-summaries.sh
   test/cfl-smoke.sh

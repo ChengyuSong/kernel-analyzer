@@ -1,0 +1,352 @@
+--- a/arch/x86/entry/vdso/vdso.lds.S
++++ b/arch/x86/entry/vdso/vdso.lds.S
+@@ -27,7 +27,9 @@
+ 		__vdso_time;
+ 		clock_getres;
+ 		__vdso_clock_getres;
++#ifdef CONFIG_X86_SGX
+ 		__vdso_sgx_enter_enclave;
++#endif
+ 	local: *;
+ 	};
+ }
+--- a/arch/x86/kernel/paravirt.c
++++ b/arch/x86/kernel/paravirt.c
+@@ -95,6 +95,12 @@
+ 		static_branch_disable(&virt_spin_lock_key);
+ }
+ 
++/* Match pv_mmu_ops.tlb_remove_table prototype; avoid -Wcast-function-type-strict. */
++static void native_tlb_remove_table(struct mmu_gather *tlb, void *table)
++{
++	tlb_remove_page(tlb, table);
++}
++
+ unsigned int paravirt_patch(u8 type, void *insn_buff, unsigned long addr,
+ 			    unsigned int len)
+ {
+@@ -316,8 +322,7 @@
+ 	.mmu.flush_tlb_kernel	= native_flush_tlb_global,
+ 	.mmu.flush_tlb_one_user	= native_flush_tlb_one_user,
+ 	.mmu.flush_tlb_multi	= native_flush_tlb_multi,
+-	.mmu.tlb_remove_table	=
+-			(void (*)(struct mmu_gather *, void *))tlb_remove_page,
++	.mmu.tlb_remove_table	= native_tlb_remove_table,
+ 
+ 	.mmu.exit_mmap		= paravirt_nop,
+ 	.mmu.notify_page_enc_status_changed	= paravirt_nop,
+--- a/drivers/firmware/dmi-id.c
++++ b/drivers/firmware/dmi-id.c
+@@ -169,9 +169,14 @@
+ 	return 0;
+ }
+ 
++static void dmi_dev_release(struct device *dev)
++{
++	kfree(dev);
++}
++
+ static struct class dmi_class = {
+ 	.name = "dmi",
+-	.dev_release = (void(*)(struct device *)) kfree,
++	.dev_release = dmi_dev_release,
+ 	.dev_uevent = dmi_dev_uevent,
+ };
+ 
+--- a/fs/ext4/sysfs.c
++++ b/fs/ext4/sysfs.c
+@@ -502,10 +502,15 @@
+ 	.release	= ext4_sb_release,
+ };
+ 
++static void ext4_feat_release(struct kobject *kobj)
++{
++	kfree(kobj);
++}
++
+ static struct kobj_type ext4_feat_ktype = {
+ 	.default_groups = ext4_feat_groups,
+ 	.sysfs_ops	= &ext4_attr_ops,
+-	.release	= (void (*)(struct kobject *))kfree,
++	.release	= ext4_feat_release,
+ };
+ 
+ void ext4_notify_error_sysfs(struct ext4_sb_info *sbi)
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -1132,6 +1132,11 @@
+ 	return 0;
+ }
+ 
++static int perf_mux_hrtimer_restart_ipi(void *arg)
++{
++	return perf_mux_hrtimer_restart(arg);
++}
++
+ void perf_pmu_disable(struct pmu *pmu)
+ {
+ 	int *count = this_cpu_ptr(pmu->pmu_disable_count);
+@@ -10971,8 +10976,7 @@
+ 		cpuctx = per_cpu_ptr(pmu->pmu_cpu_context, cpu);
+ 		cpuctx->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * timer);
+ 
+-		cpu_function_call(cpu,
+-			(remote_function_f)perf_mux_hrtimer_restart, cpuctx);
++		cpu_function_call(cpu, perf_mux_hrtimer_restart_ipi, cpuctx);
+ 	}
+ 	cpus_read_unlock();
+ 	mutex_unlock(&mux_interval_mutex);
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4736,15 +4736,15 @@
+ 
+ #ifdef CONFIG_SMP
+ 
+-static void do_balance_callbacks(struct rq *rq, struct callback_head *head)
++static void do_balance_callbacks(struct rq *rq, struct balance_callback *head)
+ {
+ 	void (*func)(struct rq *rq);
+-	struct callback_head *next;
++	struct balance_callback *next;
+ 
+ 	lockdep_assert_rq_held(rq);
+ 
+ 	while (head) {
+-		func = (void (*)(struct rq *))head->func;
++		func = head->func;
+ 		next = head->next;
+ 		head->next = NULL;
+ 		head = next;
+@@ -4755,14 +4755,14 @@
+ 
+ static void balance_push(struct rq *rq);
+ 
+-struct callback_head balance_push_callback = {
++struct balance_callback balance_push_callback = {
+ 	.next = NULL,
+-	.func = (void (*)(struct callback_head *))balance_push,
++	.func = balance_push,
+ };
+ 
+-static inline struct callback_head *splice_balance_callbacks(struct rq *rq)
++static inline struct balance_callback *splice_balance_callbacks(struct rq *rq)
+ {
+-	struct callback_head *head = rq->balance_callback;
++	struct balance_callback *head = rq->balance_callback;
+ 
+ 	lockdep_assert_rq_held(rq);
+ 	if (head)
+@@ -4776,7 +4776,7 @@
+ 	do_balance_callbacks(rq, splice_balance_callbacks(rq));
+ }
+ 
+-static inline void balance_callbacks(struct rq *rq, struct callback_head *head)
++static inline void balance_callbacks(struct rq *rq, struct balance_callback *head)
+ {
+ 	unsigned long flags;
+ 
+@@ -4793,12 +4793,12 @@
+ {
+ }
+ 
+-static inline struct callback_head *splice_balance_callbacks(struct rq *rq)
++static inline struct balance_callback *splice_balance_callbacks(struct rq *rq)
+ {
+ 	return NULL;
+ }
+ 
+-static inline void balance_callbacks(struct rq *rq, struct callback_head *head)
++static inline void balance_callbacks(struct rq *rq, struct balance_callback *head)
+ {
+ }
+ 
+@@ -6070,7 +6070,7 @@
+ 	preempt_enable();
+ }
+ 
+-static DEFINE_PER_CPU(struct callback_head, core_balance_head);
++static DEFINE_PER_CPU(struct balance_callback, core_balance_head);
+ 
+ static void queue_core_balance(struct rq *rq)
+ {
+@@ -7224,7 +7224,7 @@
+ 	int oldpolicy = -1, policy = attr->sched_policy;
+ 	int retval, oldprio, newprio, queued, running;
+ 	const struct sched_class *prev_class;
+-	struct callback_head *head;
++	struct balance_callback *head;
+ 	struct rq_flags rf;
+ 	int reset_on_fork;
+ 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -608,8 +608,8 @@
+ 	return rq->online && dl_task(prev);
+ }
+ 
+-static DEFINE_PER_CPU(struct callback_head, dl_push_head);
+-static DEFINE_PER_CPU(struct callback_head, dl_pull_head);
++static DEFINE_PER_CPU(struct balance_callback, dl_push_head);
++static DEFINE_PER_CPU(struct balance_callback, dl_pull_head);
+ 
+ static void push_dl_tasks(struct rq *);
+ static void pull_dl_task(struct rq *);
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -360,8 +360,8 @@
+ 	return !plist_head_empty(&rq->rt.pushable_tasks);
+ }
+ 
+-static DEFINE_PER_CPU(struct callback_head, rt_push_head);
+-static DEFINE_PER_CPU(struct callback_head, rt_pull_head);
++static DEFINE_PER_CPU(struct balance_callback, rt_push_head);
++static DEFINE_PER_CPU(struct balance_callback, rt_pull_head);
+ 
+ static void push_rt_tasks(struct rq *);
+ static void pull_rt_task(struct rq *);
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -901,6 +901,12 @@
+ DECLARE_STATIC_KEY_FALSE(sched_uclamp_used);
+ #endif /* CONFIG_UCLAMP_TASK */
+ 
++struct rq;
++struct balance_callback {
++	struct balance_callback *next;
++	void (*func)(struct rq *rq);
++};
++
+ /*
+  * This is the main, per-CPU runqueue data structure.
+  *
+@@ -993,7 +999,7 @@
+ 	unsigned long		cpu_capacity;
+ 	unsigned long		cpu_capacity_orig;
+ 
+-	struct callback_head	*balance_callback;
++	struct balance_callback	*balance_callback;
+ 
+ 	unsigned char		nohz_idle_balance;
+ 	unsigned char		idle_balance;
+@@ -1501,7 +1507,7 @@
+ #endif
+ };
+ 
+-extern struct callback_head balance_push_callback;
++extern struct balance_callback balance_push_callback;
+ 
+ /*
+  * Lockdep annotation that avoids accidental unlocks; it's like a
+@@ -1681,7 +1687,7 @@
+ 
+ static inline void
+ queue_balance_callback(struct rq *rq,
+-		       struct callback_head *head,
++		       struct balance_callback *head,
+ 		       void (*func)(struct rq *rq))
+ {
+ 	lockdep_assert_rq_held(rq);
+@@ -1689,7 +1695,7 @@
+ 	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
+ 		return;
+ 
+-	head->func = (void (*)(struct callback_head *))func;
++	head->func = func;
+ 	head->next = rq->balance_callback;
+ 	rq->balance_callback = head;
+ }
+--- a/scripts/Makefile.clang
++++ b/scripts/Makefile.clang
+@@ -36,6 +36,9 @@
+ # so they can be implemented or wrapped in cc-option.
+ CLANG_FLAGS	+= -Werror=unknown-warning-option
+ CLANG_FLAGS	+= -Werror=ignored-optimization-argument
++# Clang's -Wcast-function-type-strict is noisier than GCC's
++# -Wcast-function-type and trips many existing kernel casts under -Werror.
++CLANG_FLAGS	+= -Wno-cast-function-type-strict
+ KBUILD_CFLAGS	+= $(CLANG_FLAGS)
+ KBUILD_AFLAGS	+= $(CLANG_FLAGS)
+ export CLANG_FLAGS
+--- a/sound/core/seq/seq_memory.c
++++ b/sound/core/seq/seq_memory.c
+@@ -113,15 +113,19 @@
+  * expand the variable length event to linear buffer space.
+  */
+ 
+-static int seq_copy_in_kernel(char **bufptr, const void *src, int size)
++static int seq_copy_in_kernel(void *ptr, void *src, int size)
+ {
++	char **bufptr = ptr;
++
+ 	memcpy(*bufptr, src, size);
+ 	*bufptr += size;
+ 	return 0;
+ }
+ 
+-static int seq_copy_in_user(char __user **bufptr, const void *src, int size)
++static int seq_copy_in_user(void *ptr, void *src, int size)
+ {
++	char __user **bufptr = ptr;
++
+ 	if (copy_to_user(*bufptr, src, size))
+ 		return -EFAULT;
+ 	*bufptr += size;
+@@ -151,8 +155,7 @@
+ 		return newlen;
+ 	}
+ 	err = snd_seq_dump_var_event(event,
+-				     in_kernel ? (snd_seq_dump_func_t)seq_copy_in_kernel :
+-				     (snd_seq_dump_func_t)seq_copy_in_user,
++				     in_kernel ? seq_copy_in_kernel : seq_copy_in_user,
+ 				     &buf);
+ 	return err < 0 ? err : newlen;
+ }
+--- a/sound/core/seq/seq_midi.c
++++ b/sound/core/seq/seq_midi.c
+@@ -112,6 +112,12 @@
+ 	return 0;
+ }
+ 
++/* callback for snd_seq_dump_var_event(), bridging to dump_midi() */
++static int __dump_midi(void *ptr, void *buf, int count)
++{
++	return dump_midi(ptr, buf, count);
++}
++
+ static int event_process_midi(struct snd_seq_event *ev, int direct,
+ 			      void *private_data, int atomic, int hop)
+ {
+@@ -131,7 +137,7 @@
+ 			pr_debug("ALSA: seq_midi: invalid sysex event flags = 0x%x\n", ev->flags);
+ 			return 0;
+ 		}
+-		snd_seq_dump_var_event(ev, (snd_seq_dump_func_t)dump_midi, substream);
++		snd_seq_dump_var_event(ev, __dump_midi, substream);
+ 		snd_midi_event_reset_decode(msynth->parser);
+ 	} else {
+ 		if (msynth->parser == NULL)
+--- a/sound/core/seq/seq_virmidi.c
++++ b/sound/core/seq/seq_virmidi.c
+@@ -62,6 +62,13 @@
+ /*
+  * decode input event and put to read buffer of each opened file
+  */
++
++/* callback for snd_seq_dump_var_event(), bridging to snd_rawmidi_receive() */
++static int dump_to_rawmidi(void *ptr, void *buf, int count)
++{
++	return snd_rawmidi_receive(ptr, buf, count);
++}
++
+ static int snd_virmidi_dev_receive_event(struct snd_virmidi_dev *rdev,
+ 					 struct snd_seq_event *ev,
+ 					 bool atomic)
+@@ -80,7 +87,7 @@
+ 		if (ev->type == SNDRV_SEQ_EVENT_SYSEX) {
+ 			if ((ev->flags & SNDRV_SEQ_EVENT_LENGTH_MASK) != SNDRV_SEQ_EVENT_LENGTH_VARIABLE)
+ 				continue;
+-			snd_seq_dump_var_event(ev, (snd_seq_dump_func_t)snd_rawmidi_receive, vmidi->substream);
++			snd_seq_dump_var_event(ev, dump_to_rawmidi, vmidi->substream);
+ 			snd_midi_event_reset_decode(vmidi->parser);
+ 		} else {
+ 			len = snd_midi_event_decode(vmidi->parser, msg, sizeof(msg), ev);

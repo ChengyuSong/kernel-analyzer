@@ -50,7 +50,10 @@ SED=(
   -e 's#/home/csong#/home/user#g'
   -e 's#/data/csong#/data#g'
 )
-LEAK='chengyu|csong|ucr\.edu|gatech|haochen|zeng10|claude-1000|\bUCR\b|riverside|groundtruth\.json'
+# text: case-insensitive; binaries: exact identity strings only (random
+# bytes in bitcode can spell short words like "ucR")
+LEAK_TEXT='chengyu|csong|ucr\.edu|gatech|haochen|zeng10|claude-1000|\bUCR\b|riverside'
+LEAK_BIN='Chengyu|chengyu|csong|ucr\.edu|gatech|Haochen|zeng10|claude-1000'
 
 cd "$REPO"
 for p in "${TRACKED[@]}"; do
@@ -124,10 +127,13 @@ CFL engines on the Graspan graphs:
 EOF
 
 # hard check: no identifying term anywhere, text or binary
-leaks=$(grep -rilaE "$LEAK" "$OUT" || true)
+leaks=$( { grep -rIilE "$LEAK_TEXT" "$OUT"
+          find "$OUT" -type f ! -exec grep -Iq . {} \; -print0 \
+            | xargs -0 -r grep -laE "$LEAK_BIN"
+          find "$OUT" -name '*groundtruth*.json'; } | sort -u || true)
 if [[ -n "$leaks" ]]; then
-  echo "!! identifying terms remain in:" >&2; echo "$leaks" >&2
-  grep -rnaioE "$LEAK" "$OUT" | head -20 >&2
+  echo "!! identifying terms or third-party data remain in:" >&2; echo "$leaks" >&2
+  grep -rnIioE "$LEAK_TEXT" "$OUT" | head -20 >&2
   exit 1
 fi
 tar -C "$(dirname "$OUT")" -czf "$OUT.tar.gz" "$(basename "$OUT")"

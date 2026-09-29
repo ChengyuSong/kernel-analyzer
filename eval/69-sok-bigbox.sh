@@ -48,6 +48,7 @@
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/lib-fetch.sh"
 ka_require docker python3
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 W="${KA_BIGBOX_WORK:-$KA_RESULTS/sok-bigbox}"
@@ -96,20 +97,13 @@ declare -A SOK_FILE_ID=(
 declare -A SOK_SHA256=(
   [bitcodes.tgz]=41e0a2597ad37aea06b6868437b5ab518656476e9b495e3864fea79c2476765a
   [pre-computed.tgz]=ab10952f77871c96b4a32ff80f175e99f43aa94c3364af42d4d52048531d7dad )
-GDOWN_IMAGE=python@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
-GDOWN_VERSION=6.4.0
 
 fetch_dataset() {  # Drive -> $W/sok-dataset (only the sets eval/69 uses)
-  local dl="$W/downloads" f d; mkdir -p "$dl"
+  local dl="$W/downloads" f
   for f in "${!SOK_FILE_ID[@]}"; do
-    if ! echo "${SOK_SHA256[$f]}  $dl/$f" | sha256sum -c --quiet 2>/dev/null; then
-      echo "== downloading $f from the SoK authors' Drive folder"
-      docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$dl":/out "$GDOWN_IMAGE" \
-        sh -c "pip install -q --user gdown==$GDOWN_VERSION >/dev/null 2>&1 && python -m gdown -q -O /out/$f ${SOK_FILE_ID[$f]}" \
-        || { echo "!! download of $f failed (Drive quota? retry later, or download $SOK_DRIVE by hand into $dl)" >&2; exit 1; }
-      echo "${SOK_SHA256[$f]}  $dl/$f" | sha256sum -c --quiet \
-        || { echo "!! $f checksum mismatch: the dataset changed upstream" >&2; exit 1; }
-    fi
+    echo "== SoK dataset: $f"
+    fetch_gdrive "${SOK_FILE_ID[$f]}" "$dl/$f" "${SOK_SHA256[$f]}" \
+      || { echo "   (or download $SOK_DRIVE by hand into $dl)" >&2; exit 1; }
   done
   local root="$W/sok-dataset" sub=() s; mkdir -p "$root"
   tar -xzf "$dl/pre-computed.tgz" -C "$root"
@@ -119,20 +113,10 @@ fetch_dataset() {  # Drive -> $W/sok-dataset (only the sets eval/69 uses)
   export KA_SOK_ROOT="$root"
 }
 
-clone_at() {  # url dir commit: fetch exactly one commit, check it out
-  local url=$1 dir=$2 sha=$3
-  if [[ ! -d "$dir/.git" ]]; then git init -q "$dir"; git -C "$dir" remote add origin "$url"; fi
-  git -C "$dir" fetch -q --depth 1 origin "$sha"
-  git -C "$dir" checkout -q --detach "$sha"
-  [[ "$(git -C "$dir" rev-parse HEAD)" == "$sha" ]] || { echo "!! $dir not at $sha" >&2; exit 1; }
-}
-
 fetch_apr() {  # download (if missing) and verify the APR tarballs
-  mkdir -p "$APR_SRC"; local t
+  local t
   for t in "${!APR_SHA256[@]}"; do
-    [[ -s "$APR_SRC/$t" ]] || curl -fsSL -o "$APR_SRC/$t" "https://archive.apache.org/dist/apr/$t"
-    echo "${APR_SHA256[$t]}  $APR_SRC/$t" | sha256sum -c --quiet \
-      || { echo "!! checksum mismatch: $APR_SRC/$t" >&2; exit 1; }
+    fetch_url "https://archive.apache.org/dist/apr/$t" "$APR_SRC/$t" "${APR_SHA256[$t]}" || exit 1
   done
 }
 

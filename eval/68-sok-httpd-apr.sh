@@ -16,15 +16,16 @@
 #
 # Version note: the artifact does not record its APR version. httpd
 # 2.4.52 (Dec 2021) pairs with APR 1.7.x / APR-util 1.6.x; both lines
-# keep a stable ABI within the minor version, so 1.7.6 / 1.6.4 (the
-# tarballs in ka-bench) have the struct layouts httpd.bc was compiled
+# keep a stable ABI within the minor version, so 1.7.6 / 1.6.4 have the
+# struct layouts httpd.bc was compiled
 # against. Reported, not hidden.
 #
 # Output: $OUT/<llvmNN>/<O0|O3>/httpd.bc  + undefined.txt (what is still
 #         external after linking) + build logs.
 # Usage:  eval/68-sok-httpd-apr.sh          (LLVM 15, O0 and O3)
 # Env:    KA_SOK_ROOT, KA_APR_LLVM (default 15), KA_APR_OPTS ("O0 O3"),
-#         KA_APR_SRC (dir with apr-1.7.6.tar.gz, apr-util-1.6.4.tar.gz)
+#         KA_APR_SRC (tarball dir; default $KA_WORK/apr-src, downloaded
+#         from archive.apache.org and sha256-checked)
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
@@ -32,9 +33,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 : "${KA_SOK_ROOT:?set KA_SOK_ROOT to the SoK artifact root (bitcodes/)}"
 V="${KA_APR_LLVM:-15}"
 OPTS="${KA_APR_OPTS:-O0 O3}"
-SRC="${KA_APR_SRC:-$HOME/fast/ka-bench}"
+source "$(dirname "${BASH_SOURCE[0]}")/lib-fetch.sh"
+SRC="${KA_APR_SRC:-$KA_WORK/apr-src}"
 APR=apr-1.7.6
 APU=apr-util-1.6.4
+fetch_url "https://archive.apache.org/dist/apr/$APR.tar.gz" "$SRC/$APR.tar.gz" \
+  6a10e7f7430510600af25fabf466e1df61aaae910bf1dc5d10c44a4433ccc81d || exit 1
+fetch_url "https://archive.apache.org/dist/apr/$APU.tar.gz" "$SRC/$APU.tar.gz" \
+  9160444764bd1d804d7e6ee50783ec9442a88b5a8984e62470832b06983eeaa4 || exit 1
 OUT="${KA_SOK_OUT:-$KA_RESULTS/sok}/httpd-linked/llvm$V"
 CC="/usr/lib/llvm-$V/bin/clang"
 AR="/usr/lib/llvm-$V/bin/llvm-ar"

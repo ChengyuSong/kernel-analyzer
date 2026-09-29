@@ -50,7 +50,7 @@
 #          425,239 was the contaminated-adoption cut, see pg full)
 #
 # Usage:
-#   KA_WORK=~/fast/ka-bench eval/64-usermode-fse.sh \
+#   KA_WORK=/path/to/work eval/64-usermode-fse.sh \
 #       [httpd|pg ...] (default both; KA_UM_ARMS picks arms)
 #   Batched fs (only if mono fs does not fit):
 #     KA_UM_FS_WORKERS=4 KA_SPILL_ROOT=/data/spill ...

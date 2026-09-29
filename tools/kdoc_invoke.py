@@ -16,7 +16,7 @@ index (fK) is not derivable from docs — proposals carry f? for review
 against the callback typedef.
 
 Usage:
-  kdoc_invoke.py --kernel-tree ~/fast/linux/linux-6.8.2 \
+  kdoc_invoke.py --kernel-tree /path/to/linux-6.8.2 \
                  --census-log km-census2.log \
                  [--summaries func_summaries.txt]   # skip adopted names
 """

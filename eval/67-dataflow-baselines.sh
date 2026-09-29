@@ -84,13 +84,15 @@ set -u
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 ka_require docker
 
-: "${KA_SOK_ROOT:?set KA_SOK_ROOT to the SoK artifact root (bitcodes/)}"
+[[ "${1:-}" == build ]] || : "${KA_SOK_ROOT:?set KA_SOK_ROOT to the SoK artifact root (bitcodes/)}"
 OUT="${KA_SOK_OUT:-$KA_RESULTS/sok}/baselines"
 TIMEOUT="${KA_DF_TIMEOUT:-3600}"
 MEM="${KA_DF_MEM:-64g}"
 BC="$KA_SOK_ROOT/bitcodes"
-LOTUS_SRC="${KA_LOTUS_SRC:-/data/csong/opensource/lotus}"
+source "$(dirname "${BASH_SOURCE[0]}")/lib-fetch.sh"
+LOTUS_URL=https://github.com/ZJU-PL/lotus.git
 LOTUS_COMMIT="${KA_LOTUS_COMMIT:-0da4c2813005249bce390329d28810a2c4ac0e76}"
+LOTUS_SRC="${KA_LOTUS_SRC:-$KA_WORK/src/lotus}"   # cloned at the pin by build
 
 # approach | image | llvm | datasets ("<dataset>_<opt>=<dir under llvmNN>")
 declare -A IMAGE=( [SVF-Andersen]=svf-baseline [SVF-VFS]=svf-baseline
@@ -174,6 +176,7 @@ build() {
   local here; here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   docker build -f "$here/svf-baseline.Dockerfile" -t svf-baseline \
     "$here/svf-baseline" || exit 1
+  [[ -d "$LOTUS_SRC/.git" ]] || clone_at "$LOTUS_URL" "$LOTUS_SRC" "$LOTUS_COMMIT" || exit 1
   local ctx; ctx=$(mktemp -d)
   git -C "$LOTUS_SRC" archive -o "$ctx/lotus.tar" "$LOTUS_COMMIT" || exit 1
   cp "$here/lotus-baseline/icall-sites.patch" \

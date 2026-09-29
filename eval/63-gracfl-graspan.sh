@@ -14,17 +14,37 @@
 # our DefaultP2Grammar is emitted — same language and alphabet
 # (a/-a/d/-d), our normalization — and the summary marks it.
 #
+# Sources (fetched and verified; nothing machine-specific):
+#   GraCFL   upstream AutomataLab/GraCFL at a pinned commit, plus
+#            eval/gracfl/fork.patch (edge-list graph construction,
+#            grammar-id dump, and a SIGFPE fix in the BW solvers)
+#   graphs   the Graspan benchmark graphs from GraCFL's own Drive folder
+#            (README of GraCFL), sha256-pinned; KA_GRACFL_GRAMMAR=graspan
+#            uses the Graspan points-to grammar from the same folder
 # Usage:
-#   KA_GRASPAN_DIR=~/fast/ka-scratch/graspan \
-#     eval/63-gracfl-graspan.sh [graph-file ...]
+#   eval/63-gracfl-graspan.sh [graph-file ...]
 # Default graphs: linux kernel_afterInline (their "linux PT" row),
 # postgres wholegraph, httpd wholegraph.
 
 set -u
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 
-KA_GRASPAN_DIR="${KA_GRASPAN_DIR:-$HOME/fast/ka-scratch/graspan}"
-KA_GRACFL_SRC="${KA_GRACFL_SRC:-/data/csong/opensource/GraCFL}"
+source "$(dirname "${BASH_SOURCE[0]}")/lib-fetch.sh"
+KA_GRASPAN_DIR="${KA_GRASPAN_DIR:-$KA_WORK/graspan}"
+KA_GRACFL_SRC="${KA_GRACFL_SRC:-$KA_WORK/src/GraCFL}"
+GRACFL_URL=https://github.com/AutomataLab/GraCFL.git
+GRACFL_BASE=e36e0bf4bb297365110d962600097847d9dd1d2f
+# path under KA_GRASPAN_DIR | Drive id (GraCFL README folder) | sha256
+GRASPAN_FILES="linux-4-4-p2/kernel_afterInline.txt|1KIIIq59iDh7qd5HRV06uNiKrQNm_2GuN|2eb55acb151508c8e9495815c06c5ee850a9fa7e6364fa878f6e7e33bf15a601
+postgresql-8.3.9-p2/wholegraph/PostgreSQL_8.3.9_pointsto_graph|1a1sh6o-njQUj7S_pClMhWxTDgzzPLmmQ|2dc06408d70aab7823c820157b7b8bfed7803719df243440c7613daa7525a973
+httpd-2.2.18-p2/Apache_httpd_2.2.18_pointsto_graph|1VAnCSJOM0Kcql3ZyISOVp_tIYlh4xIe9|8e478ea0c65bc119295a27970bf43e2a889b8f9f555721ec71d45bd827be4122
+linux-4.4-df/lnx_kernel_df|128zIrPyMSDmKELEtiyOP7J3GCgclvnyW|cae6b50538a30151f15e4c7021d796e6b87a1ea766744fb3028e08486abbd4a3
+grammars/rules_pointsto.txt|1ws1XU8rU1ffnF3SVqrN1IyuvXuZYRtJH|c4e5cf64820ded75e3fb5c37315c2b406d06449b6f2b9fe36d94c81d7f8ab26f"
+if [[ "${KA_GRASPAN_FETCH:-1}" == 1 ]]; then
+  while IFS='|' read -r rel id sha; do
+    fetch_gdrive "$id" "$KA_GRASPAN_DIR/$rel" "$sha" || exit 1
+  done <<< "$GRASPAN_FILES"
+fi
 KA_GRACFL_THREADS="${KA_GRACFL_THREADS:-32}"
 OUT="${KA_GRACFL_OUT:-$KA_RESULTS/gracfl-graspan}"
 mkdir -p "$OUT"
@@ -35,6 +55,11 @@ PIN=()
 # --- build upstream GraCFL once ---
 BIN="$KA_GRACFL_SRC/build/bin/gracfl"
 if [[ ! -x "$BIN" ]]; then
+  if [[ ! -d "$KA_GRACFL_SRC/.git" || "$KA_GRACFL_SRC" == "$KA_WORK/src/GraCFL" ]]; then
+    clone_at "$GRACFL_URL" "$KA_GRACFL_SRC" "$GRACFL_BASE" || exit 1
+    git -C "$KA_GRACFL_SRC" apply --check "$KA_REPO/eval/gracfl/fork.patch" 2>/dev/null \
+      && git -C "$KA_GRACFL_SRC" apply "$KA_REPO/eval/gracfl/fork.patch"
+  fi
   echo "== building GraCFL ($KA_GRACFL_SRC)"
   cmake -S "$KA_GRACFL_SRC" -B "$KA_GRACFL_SRC/build" \
         -DCMAKE_BUILD_TYPE=Release > "$OUT/build.log" 2>&1 \
@@ -46,6 +71,7 @@ fi
 
 # --- grammar ---
 GRAMMAR="${KA_GRACFL_GRAMMAR:-}"
+[[ "$GRAMMAR" == graspan ]] && GRAMMAR="$KA_GRASPAN_DIR/grammars/rules_pointsto.txt"
 GRAMMAR_NOTE="graspan-original"
 if [[ -z "$GRAMMAR" ]]; then
   GRAMMAR="$OUT/p2-grammar.txt"

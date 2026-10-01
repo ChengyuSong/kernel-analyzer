@@ -197,6 +197,31 @@ prepare() {
       rm -f "$dst"; cp "$src" "$dst"      # rm first: never write through a hard link
     done
   done
+  # LLVM 18's bitcode reader rejects some valid LLVM 15 files. It moves a
+  # constant expression in a phi operand into a new block, and a phi with
+  # two entries from one switch (two cases, same target) comes out broken
+  # (ncurses toe at -O3). LLVM 15 reads and verifies these files.
+  # Splitting critical edges with LLVM 15 gives each entry its own empty
+  # block and leaves every instruction unchanged. Done before the LLVM 14
+  # conversion, so every tool reads the same files.
+  local dis="llvm-dis$KA_LLVM_SUFFIX" f n=0
+  command -v "$dis" >/dev/null || { echo "!! $dis not found" >&2; exit 1; }
+  : > "$W/jobs/llvm18-split.txt"
+  for s in $SETS15; do
+    while IFS= read -r f; do
+      # probe in a subshell that reports the reader abort to /dev/null
+      ( ulimit -c 0; "$dis" "$f" -o /dev/null; exit $? ) >/dev/null 2>&1 && continue
+      docker run --rm --network none -u "$(id -u):$(id -g)" \
+        -v "$(dirname "$f")":/d sok-toolchain \
+        /usr/lib/llvm-15/bin/opt -passes=break-crit-edges \
+        "/d/$(basename "$f")" -o /d/.split.bc \
+        || { echo "!! edge split failed: $f" >&2; exit 1; }
+      mv "$(dirname "$f")/.split.bc" "$f"   # new inode: never writes through a hard link
+      "$dis" "$f" -o /dev/null || { echo "!! LLVM 18 still rejects $f" >&2; exit 1; }
+      echo "${f#"$ROOT"/}" >> "$W/jobs/llvm18-split.txt"; n=$((n + 1))
+    done < <(find "$ROOT/bitcodes/llvm15/$s" -name '*.bc' | sort)
+  done
+  echo "== LLVM 18 readability: $n file(s) edge-split ($W/jobs/llvm18-split.txt)"
   # Lotus is LLVM 14 only: convert the (APR-completed) LLVM 15 sets so
   # Lotus rows read the same programs as ORCFL and SVF (eval/sok-downgrade.sh)
   for s in $SETS15; do
@@ -212,6 +237,8 @@ prepare() {
     echo "overlay of $KA_SOK_ROOT, $(date -Is)"
     echo "httpd.bc (llvm14/llvm15 x O0/O3) = artifact httpd.bc + APR 1.7.6 + APR-util 1.6.4 (eval/68)"
     echo "llvm15down/ = llvm15/ converted for LLVM 14 (eval/sok-downgrade.sh), read by the Lotus rows"
+    echo "edge-split with LLVM 15 opt -passes=break-crit-edges (LLVM 18 reader workaround):"
+    sed 's/^/  /' "$W/jobs/llvm18-split.txt"
     sha256sum "$ROOT"/bitcodes/llvm1?/soundness_ossfuzz/*/httpd/bin/httpd.bc
   } > "$ROOT/PROVENANCE"
   echo "== overlay ready: $ROOT"

@@ -20814,6 +20814,51 @@ void CallGraphPass::runSummaryProvers(Module *M) {
               if (v.k == 5 && localSensitive(v.a, 0)) return true;
             return false;
           };
+          // Content of the cell at (base, off). A wildcard-offset write
+          // (memcpy, a variable index, an unmodeled callee) lands in the
+          // base's @X cell and may sit at ANY offset, so an exact-offset
+          // read sees that cell too.
+          auto readCell = [&](LVSet &r, const LV &v) {
+            auto ck = cellKey(v);
+            if (!ck) return;
+            auto cIt = cells.find(*ck);
+            if (cIt != cells.end())
+              for (const LV &c : cIt->second) r.push_back(c);
+            if (v.off < 0) return;
+            LV w = v;
+            w.off = -1;
+            auto wIt = cells.find(*cellKey(w));
+            if (wIt != cells.end())
+              for (const LV &c : wIt->second) r.push_back(c);
+          };
+          // An unmodeled callee (declaration without a summary, in-body
+          // icall, inline asm, unknown intrinsic) may write any external
+          // value anywhere in a local object it reaches through its
+          // pointer arguments, including locals whose addresses are stored
+          // there. Without this a slot filled by posix_memalign(&p, ...)
+          // reads back empty, and a fresh object handed to the caller
+          // through a formal (`*s = p`, ffmpeg avio_open_dyn_buf at -O3)
+          // vanished from an OK-EMPTY summary whose adoption then cut the
+          // only wiring that carried it (fuzz-observed dyn_buf_write lost
+          // at aviobuf.c:163). With the clobber the hand-off is OPAQUE-EXT
+          // into a formal and the summary is refused (ext-into-formal).
+          auto clobberLocals = [&](const CallBase *CB) {
+            SmallVector<int, 4> work;
+            boost::unordered_flat_set<int> seen;
+            for (const Value *Arg : CB->args())
+              for (const LV &v : evalV(Arg))
+                if (v.k == 5 && seen.insert(v.a).second) work.push_back(v.a);
+            while (!work.empty()) {
+              int id = work.pop_back_val();
+              for (auto &kv : cells)
+                if (std::get<0>(kv.first) == 5 && std::get<1>(kv.first) == id)
+                  for (const LV &c : kv.second)
+                    if (c.k == 5 && seen.insert(c.a).second)
+                      work.push_back(c.a);
+              changed |= mergeInto(cells[*cellKey(LV{5, id, -1, nullptr})],
+                                   LVSet{LV{6, 0, 0, nullptr}});
+            }
+          };
           for (unsigned round = 0; changed && fail.empty(); round++) {
             if (round > 64) { fail = "no-fixpoint"; break; }
             changed = false;
@@ -20857,21 +20902,15 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     if (v.k == 0) {
                       if (v.off < 0) {
                         r.push_back({1, v.a, -1, nullptr}); // LOADARG@X
-                        auto cIt = cells.find(*cellKey(v));
-                        if (cIt != cells.end())
-                          for (const LV &c : cIt->second) r.push_back(c);
+                        readCell(r, v);
                         continue;
                       }
                       r.push_back({1, v.a, v.off, nullptr});
-                      auto cIt = cells.find(*cellKey(v));
-                      if (cIt != cells.end())
-                        for (const LV &c : cIt->second) r.push_back(c);
+                      readCell(r, v);
                     } else if (v.k == 3) {
                       if (v.off < 0) { r.push_back({6, 0, 0, nullptr}); continue; }
                       r.push_back({4, 0, v.off, v.g});
-                      auto cIt = cells.find(*cellKey(v));
-                      if (cIt != cells.end())
-                        for (const LV &c : cIt->second) r.push_back(c);
+                      readCell(r, v);
                     } else if (v.k == 5) {
                       if (v.off < 0) {
                         r.push_back({localSensitive(v.a, 0) ? (uint8_t)7
@@ -20879,17 +20918,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                                      0, 0, nullptr});
                         continue;
                       }
-                      auto cIt = cells.find(*cellKey(v));
-                      if (cIt != cells.end())
-                        for (const LV &c : cIt->second) r.push_back(c);
+                      readCell(r, v);
                     } else if (v.k == 1 || v.k == 8) {
                       r.push_back({9, v.g ? -1 : v.a, v.off, v.g});
-                      auto ck2 = cellKey(v);
-                      if (ck2) {
-                        auto cIt2 = cells.find(*ck2);
-                        if (cIt2 != cells.end())
-                          for (const LV &c : cIt2->second) r.push_back(c);
-                      }
+                      readCell(r, v);
                     } else if (v.k == 7 || (v.k == 9 && !v.g)) {
                       r.push_back({7, 0, 0, nullptr}); // 3-level: deep
                     } else {
@@ -20992,6 +21024,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       }
                     }
                     if (!fail.empty()) break;
+                    if (mayWrite) clobberLocals(CB);
                     if (CB->getType()->isPointerTy() ||
                         isPtrWidthInt(CB->getType(), *curDL))
                       setEnv(&I, {LV{sensIn ? (uint8_t)7 : (uint8_t)6, 0, 0,
@@ -21080,6 +21113,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                           break;
                         }
                       if (!fail.empty()) break;
+                      clobberLocals(CB);
                       if (CB->getType()->isPointerTy())
                         setEnv(&I, {LV{6, 0, 0, nullptr}});
                       continue;
@@ -21101,6 +21135,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     for (const Value *Arg : CB->args())
                       if (!sens && anySensitive(evalV(Arg))) sens = true;
                     if (sens) { fail = "icall"; break; }
+                    clobberLocals(CB);
                     if (CB->getType()->isPointerTy())
                       setEnv(&I, {LV{6, 0, 0, nullptr}});
                     continue;
@@ -21128,6 +21163,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                       fail = ("escape " + CFc->getName()).str();
                       break;
                     }
+                    clobberLocals(CB);
                     if (CB->getType()->isPointerTy())
                       setEnv(&I, {LV{6, 0, 0, nullptr}});
                     continue;
@@ -21156,14 +21192,13 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     if (v.k == 1 || v.k == 8)
                       return {LV{9, v.g ? -1 : v.a, v.off, v.g}};
                     if (v.k == 5) {
-                      if (v.off < 0)
+                      // wildcard base or wildcard atom offset: any cell
+                      if (v.off < 0 || o2 < 0)
                         return {LV{localSensitive(v.a, 0) ? (uint8_t)7
                                                           : (uint8_t)6,
                                    0, 0, nullptr}};
                       LVSet r2;
-                      auto cIt =
-                          cells.find(*cellKey(LV{5, v.a, v.off + o2, nullptr}));
-                      if (cIt != cells.end()) r2 = cIt->second;
+                      readCell(r2, LV{5, v.a, v.off + o2, nullptr});
                       return r2;
                     }
                     if (v.k == 2) return {};

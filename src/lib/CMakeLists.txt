@@ -11,6 +11,13 @@ set (KACoreSource
   LLMAnalysis.cc
   ConstraintGraph.cc
   CallGraph.cc
+  GraphBuild.cc
+  Presolve.cc
+  FlowsToSolver.cc
+  Names.cc
+  Summaries.cc
+  Census.cc
+  Dump.cc
   IRSidecar.cc
   IRCensus.cc
 )

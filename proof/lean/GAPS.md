@@ -382,3 +382,31 @@ GATE-ONLY (backfill required; priority = silent-completeness risk):
 ASSUMPTION-CLASS (bijections; theorem not required, assumption
 stated): fused kernels, BitPlane layout, batch-local universes
 (rid-blo translation), GUID interning.
+
+## Presolve V-components without GraCFL (2026-10-02, plan-named-cells A.1)
+
+The default presolve (cone hybrid) quotients the memory-free a/f
+sublanguage by the connected components of V. Until 2026-10-02 V was
+materialized by a GraCFL closure of that sublanguage; it is now
+computed by `ka::valleyComponents` (src/lib/SCC.h).
+
+STATEMENT (prose, not mechanized). Over exact edges u ->_r v (a: r=0,
+f<b>: r=b mod P; fx edges excluded, as no V rule consumes them),
+  x V y  iff  exists z, s. z ~>_s x and z ~>_s y.
+Let ROOT be the SCCs of the edge graph that no edge enters from
+another SCC, and pick any member w_R of each. Then
+  components(V) = components of the union over R of
+                  { {x : w_R ~>_s x} : s in Z_P }.
+Proof: (<=) each group is a set of nodes sharing the token (w_R, s).
+(=>) if x, y share the token (z, s), some root member w reaches z
+with shift d (follow predecessors to a source SCC; inside an SCC
+every member reaches every other), so x and y share (w, s + d).
+Representative choice and component numbering do not matter: the
+presolve merges each component into its first member in local-id
+order, as before.
+GATE: cross-checked against the GraCFL closure (partition identity,
+no mismatch) on libpng FI/P=13/P=16/all+ids/cone-off, nm-new O0
+FI/P=13/all+ids, cflow O3 FI/P=13/all+ids, km FI full; answers
+byte-identical on the consumer gate (test/consumer-gate.sh).
+BACKLOG: mechanize as `valley_components_exact` next to
+fderiv_quotient.

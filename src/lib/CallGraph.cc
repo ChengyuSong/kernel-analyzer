@@ -72,6 +72,7 @@ uniqueAllocSource(const llvm::Value *v,
 #include "VSnapshot.h"
 
 #include "gracfl/include/solvers/Solver.hpp"
+#include "SCC.h"
 
 #define CG_LOG(stmt) KA_LOG(2, "CallGraph: " << stmt)
 #define CG_DEBUG(stmt) KA_LOG(3, "CallGraph: " << stmt)
@@ -2376,51 +2377,17 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
     for (auto &E : subEdges)
       if (isFwdX(E.label))
         adjX[E.from].push_back(E.to);
-    // iterative Tarjan
-    std::vector<uint32_t> idx(M2, UINT32_MAX), low(M2, 0), comp(M2,
-                                                                UINT32_MAX);
-    std::vector<char> onStk(M2, 0);
-    std::vector<uint32_t> stk;
-    uint32_t counter = 0, nComp = 0;
-    std::vector<std::pair<uint32_t, size_t>> call;
-    for (uint32_t s2 = 0; s2 < M2; s2++) {
-      if (idx[s2] != UINT32_MAX)
-        continue;
-      call.emplace_back(s2, 0);
-      while (!call.empty()) {
-        auto &[u, ci] = call.back();
-        if (ci == 0) {
-          idx[u] = low[u] = counter++;
-          stk.push_back(u);
-          onStk[u] = 1;
-        }
-        if (ci < adjX[u].size()) {
-          uint32_t w = adjX[u][ci++];
-          if (idx[w] == UINT32_MAX) {
-            call.emplace_back(w, 0);
-          } else if (onStk[w]) {
-            low[u] = std::min(low[u], idx[w]);
-          }
-        } else {
-          if (low[u] == idx[u]) {
-            while (true) {
-              uint32_t w = stk.back();
-              stk.pop_back();
-              onStk[w] = 0;
-              comp[w] = nComp;
-              if (w == u)
-                break;
-            }
-            nComp++;
-          }
-          uint32_t uu = u;
-          call.pop_back();
-          if (!call.empty())
-            low[call.back().first] =
-                std::min(low[call.back().first], low[uu]);
-        }
-      }
-    }
+    std::vector<uint32_t> comp(M2, UINT32_MAX);
+    uint32_t nComp = 0;
+    ka::tarjanSCC(
+        M2, [](uint32_t) { return false; },
+        [&](uint32_t u) { return adjX[u].size(); },
+        [&](uint32_t u, size_t i) { return adjX[u][i]; },
+        [&](const std::vector<uint32_t> &members) {
+          for (uint32_t w : members)
+            comp[w] = nComp;
+          nComp++;
+        });
     std::vector<NodeIndex> repX(nComp, AndersNodeFactory::InvalidIndex);
     size_t mergedX = 0;
     uint32_t biggest = 0;
@@ -2443,13 +2410,25 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edge
            << " ms; V-component merge SKIPPED\n");
     return;
   }
-  gracfl::SolverFWGramParallel sub(subEdges, *EB.getGrammar(), cflThreads);
-  sub.runCFL();
-  const auto &graph = sub.getReachability();
-
+  // V-components of the sublanguage (ka::valleyComponents states the
+  // relation and why walking from root SCCs computes it exactly).
   std::vector<uint32_t> nodeToSCC;
   uint32_t numSCCs = 0;
-  computeVSCC(graph, EB.getLabelV(), nodeToSCC, numSCCs);
+  {
+    const unsigned NB = EB.getNumFieldBuckets();
+    std::unordered_map<uint32_t, uint32_t> shiftOfLabel{{la, 0}};
+    for (unsigned b = 0; b < NB; b++)
+      shiftOfLabel[EB.getLabelField(b)] = b;
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> outV(
+        toCanon.size());
+    for (auto &E : subEdges) {
+      auto it = shiftOfLabel.find(E.label);
+      if (it != shiftOfLabel.end())
+        outV[E.from].emplace_back(E.to, it->second);
+    }
+    numSCCs = ka::valleyComponents((uint32_t)toCanon.size(),
+                                   NB > 0 ? NB : 1, outV, nodeToSCC);
+  }
 
   // --cfl-probe-born-hub (task #38): is the BORN giant held together by
   // a few articulation hubs, or is it a dense expander? Induce the
@@ -5917,51 +5896,18 @@ bool CallGraphPass::runFlowsToResolution() {
   // static heuristic — any pop order converges to the same fixpoint.
   std::vector<uint32_t> topoRank(N, 0);
   {
-    std::vector<uint32_t> low(N), dfn(N, 0), tstk;
-    std::vector<std::pair<uint32_t, size_t>> cstk;
-    std::vector<bool> onS(N, false);
-    uint32_t timer = 1, nComp = 0;
-    auto succAt = [&](uint32_t u, size_t i) -> uint32_t {
-      if (i < outA[u].size()) return outA[u][i];
-      return outF[u][i - outA[u].size()].first;
-    };
-    for (uint32_t st = 0; st < N; st++) {
-      if (dfn[st]) continue;
-      cstk.emplace_back(st, 0);
-      dfn[st] = low[st] = timer++;
-      tstk.push_back(st);
-      onS[st] = true;
-      while (!cstk.empty()) {
-        auto &[u, ei] = cstk.back();
-        if (ei < outA[u].size() + outF[u].size()) {
-          uint32_t v = succAt(u, ei++);
-          if (!dfn[v]) {
-            dfn[v] = low[v] = timer++;
-            tstk.push_back(v);
-            onS[v] = true;
-            cstk.emplace_back(v, 0);
-          } else if (onS[v]) {
-            low[u] = std::min(low[u], dfn[v]);
-          }
-        } else {
-          if (low[u] == dfn[u]) {
-            while (true) {
-              uint32_t w = tstk.back();
-              tstk.pop_back();
-              onS[w] = false;
-              topoRank[w] = nComp;
-              if (w == u) break;
-            }
-            nComp++;
-          }
-          uint32_t uu = u;
-          cstk.pop_back();
-          if (!cstk.empty())
-            low[cstk.back().first] =
-                std::min(low[cstk.back().first], low[uu]);
-        }
-      }
-    }
+    uint32_t nComp = 0;
+    ka::tarjanSCC(
+        N, [](uint32_t) { return false; },
+        [&](uint32_t u) { return outA[u].size() + outF[u].size(); },
+        [&](uint32_t u, size_t i) -> uint32_t {
+          if (i < outA[u].size()) return outA[u][i];
+          return outF[u][i - outA[u].size()].first;
+        },
+        [&](const std::vector<uint32_t> &members) {
+          for (uint32_t w : members) topoRank[w] = nComp;
+          nComp++;
+        });
     // Tarjan emits SCCs in reverse topological order: invert so sources
     // carry the smallest ranks.
     for (uint32_t i = 0; i < N; i++) topoRank[i] = nComp - 1 - topoRank[i];
@@ -7870,12 +7816,7 @@ bool CallGraphPass::runFlowsToResolution() {
   auto collapseSCCs = [&]() -> size_t {
     // Live node count: channel-cells appends nodes past N.
     const uint32_t NL = (uint32_t)ufp.size();
-    std::vector<uint32_t> low(NL), dfn(NL, 0);
-    std::vector<uint32_t> tarjanStack;
-    std::vector<std::pair<uint32_t, size_t>> callStack;
-    std::vector<bool> onStk(NL, false);
     std::vector<std::vector<uint32_t>> sccs;
-    uint32_t timer = 1;
     // Pairwise cells: memory nodes (cells, channels, read halves) are
     // never merged — an a-cycle through memory (a read-modify-write
     // through a wide pointer) is left to propagation, which reaches the
@@ -7897,45 +7838,14 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       return (v != UINT32_MAX && isMemoryNode(v)) ? UINT32_MAX : v;
     };
-    for (uint32_t start = 0; start < NL; start++) {
-      if (find(start) != start || dfn[start] || isMemoryNode(start)) continue;
-      callStack.emplace_back(start, 0);
-      dfn[start] = low[start] = timer++;
-      tarjanStack.push_back(start);
-      onStk[start] = true;
-      while (!callStack.empty()) {
-        auto &[u, ei] = callStack.back();
-        if (ei < outA[u].size() + outF[u].size()) {
-          uint32_t v = edgeAt(u, ei++);
-          if (v == UINT32_MAX || v == u) continue;
-          if (!dfn[v]) {
-            dfn[v] = low[v] = timer++;
-            tarjanStack.push_back(v);
-            onStk[v] = true;
-            callStack.emplace_back(v, 0);
-          } else if (onStk[v]) {
-            low[u] = std::min(low[u], dfn[v]);
-          }
-        } else {
-          if (low[u] == dfn[u]) {
-            std::vector<uint32_t> scc;
-            while (true) {
-              uint32_t w = tarjanStack.back();
-              tarjanStack.pop_back();
-              onStk[w] = false;
-              scc.push_back(w);
-              if (w == u) break;
-            }
-            if (scc.size() > 1) sccs.push_back(std::move(scc));
-          }
-          uint32_t uu = u;
-          callStack.pop_back();
-          if (!callStack.empty())
-            low[callStack.back().first] =
-                std::min(low[callStack.back().first], low[uu]);
-        }
-      }
-    }
+    ka::tarjanSCC(
+        NL,
+        [&](uint32_t v) { return find(v) != v || isMemoryNode(v); },
+        [&](uint32_t u) { return outA[u].size() + outF[u].size(); },
+        edgeAt,
+        [&](const std::vector<uint32_t> &members) {
+          if (members.size() > 1) sccs.push_back(members);
+        });
     if (!CFLDumpSCC.empty()) {
       // --cfl-dump-scc: the shortest cycle through the named node, over
       // the very edges the collapse followed (a, residue-0 f; channel
@@ -11914,53 +11824,18 @@ bool CallGraphPass::runFlowsToResolution() {
     // removal of SCC-internal a-prop churn without a new representation.
     {
       const uint32_t NL = (uint32_t)ufp.size(); // channel nodes included
-      std::vector<uint32_t> comp(NL, UINT32_MAX), low(NL), dfn(NL, 0);
-      std::vector<uint32_t> stk, tarjanStack;
-      std::vector<std::pair<uint32_t, size_t>> callStack;
-      std::vector<bool> onStk(NL, false);
-      uint32_t timer = 1, nComp = 0;
+      std::vector<uint32_t> comp(NL, UINT32_MAX);
+      uint32_t nComp = 0;
       std::unordered_map<uint32_t, uint64_t> compSize;
-      for (uint32_t start = 0; start < NL; start++) {
-        if (find(start) != start || dfn[start]) continue;
-        callStack.emplace_back(start, 0);
-        dfn[start] = low[start] = timer++;
-        tarjanStack.push_back(start);
-        onStk[start] = true;
-        while (!callStack.empty()) {
-          auto &[u, ei] = callStack.back();
-          if (ei < outA[u].size()) {
-            uint32_t v = find(outA[u][ei++]);
-            if (v == u) continue;
-            if (!dfn[v]) {
-              dfn[v] = low[v] = timer++;
-              tarjanStack.push_back(v);
-              onStk[v] = true;
-              callStack.emplace_back(v, 0);
-            } else if (onStk[v]) {
-              low[u] = std::min(low[u], dfn[v]);
-            }
-          } else {
-            if (low[u] == dfn[u]) {
-              uint32_t c = nComp++;
-              uint64_t sz = 0;
-              while (true) {
-                uint32_t w = tarjanStack.back();
-                tarjanStack.pop_back();
-                onStk[w] = false;
-                comp[w] = c;
-                sz++;
-                if (w == u) break;
-              }
-              compSize[c] = sz;
-            }
-            uint32_t uu = u;
-            callStack.pop_back();
-            if (!callStack.empty())
-              low[callStack.back().first] =
-                  std::min(low[callStack.back().first], low[uu]);
-          }
-        }
-      }
+      ka::tarjanSCC(
+          NL, [&](uint32_t v) { return find(v) != v; },
+          [&](uint32_t u) { return outA[u].size(); },
+          [&](uint32_t u, size_t i) { return find(outA[u][i]); },
+          [&](const std::vector<uint32_t> &members) {
+            const uint32_t c = nComp++;
+            for (uint32_t w : members) comp[w] = c;
+            compSize[c] = members.size();
+          });
       uint64_t nontrivial = 0, collapsible = 0, maxScc = 0;
       for (auto &[c, sz] : compSize) {
         if (sz > 1) { nontrivial++; collapsible += sz - 1; }

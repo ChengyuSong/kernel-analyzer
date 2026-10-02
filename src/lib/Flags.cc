@@ -734,17 +734,6 @@ cl::opt<bool> CFLJoinFastpath(
            "(perf measurement only)"),
   cl::init(true));
 
-cl::opt<bool> CFLProbeNoFormalPresolve(
-  "cfl-probe-noformal-presolve",
-  cl::desc("MEASUREMENT ONLY: barrier formal-argument nodes in the "
-           "pre-solve copy/field sublanguage, so the born a-component "
-           "cannot glue through context-insensitive call junctions. "
-           "Tests the hypothesis that formal confluence causes the "
-           "born giant (2026-08-19). Changes the presolve quotient — "
-           "answers are NOT pin-comparable; read the Pre-solve merge / "
-           "BlobForm INITIAL lines only"),
-  cl::init(false));
-
 cl::opt<bool> CFLProposeNoopSummaries(
   "cfl-propose-noop-summaries",
   cl::desc("Census: propose NOOP summaries by per-function proof of "

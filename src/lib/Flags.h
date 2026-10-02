@@ -85,7 +85,6 @@ extern cl::opt<bool> CFLCensusNexus;
 extern cl::opt<std::string> CFLNexusFields;
 extern cl::opt<bool> CFLInternPlanes;
 extern cl::opt<bool> CFLJoinFastpath;
-extern cl::opt<bool> CFLProbeNoFormalPresolve;
 extern cl::opt<bool> CFLProposeNoopSummaries;
 extern cl::opt<bool> CFLWitnessAnswers;
 extern cl::opt<bool> CFLProposeSolvedSummaries;

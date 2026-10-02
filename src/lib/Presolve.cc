@@ -20,42 +20,13 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
   // Source values must not glue unrelated classes: two slots holding the
   // same function/global would chain-merge through it (common-sink smear),
   // manufacturing false targets. Drop their edges from the sublanguage.
-  auto isBarrierNodeV = [&](NodeIndex canon) {
+  auto isBarrierNode = [&](NodeIndex canon) {
     if (NF.isSpecialNode(canon))
       return true;
     const Value *v = NF.getValueForNode(canon);
     if (!v)
       return false;
-    // MEASUREMENT probe: cut context-insensitive call junctions
-    // (formals) and module-unique constant-expression nodes (one CE
-    // used in N functions = one node wired into all their webs —
-    // the same common-source smear rationale as the fn/global
-    // barriers below) — what glues the born component?
-    if (CFLProbeNoFormalPresolve &&
-        (isa<Argument>(v) || isa<ConstantExpr>(v)))
-      return true;
     return isa<Function>(v) || isa<GlobalVariable>(v);
-  };
-  auto isBarrierNode = [&](NodeIndex canon) {
-    // Probe extension: DEREF nodes as barriers — memory cells acting
-    // as through-nodes in the memory-FREE sublanguage (asm reg-load
-    // and summary-CPY a-edges land on them; deref(@global) is
-    // module-shared, e.g. deref(pcpu_hot) fans into every `current`
-    // user).
-    if (CFLProbeNoFormalPresolve && NF.isDereferenceNode(canon))
-      return true;
-    return isBarrierNodeV(canon);
-  };
-
-  // Probe census: name the junction formals — fan-in per Argument
-  // node in the sublanguage (who glues the born component?).
-  boost::unordered_flat_map<NodeIndex, uint32_t> formalFan;
-  auto tallyFormal = [&](NodeIndex canon) {
-    if (!CFLProbeNoFormalPresolve)
-      return;
-    const Value *v = NF.getValueForNode(canon);
-    if (v && isa<Argument>(v))
-      formalFan[canon]++;
   };
   std::unordered_map<NodeIndex, uint32_t> toLocal;
   std::vector<NodeIndex> toCanon;
@@ -82,37 +53,10 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
     NodeIndex to = getCanonicalNode(E.to);
     if (from == to)
       continue;
-    if (isBarrierNode(from) || isBarrierNode(to)) {
-      // once per direction: the census counts edges as the grammar does
-      for (int dir = 0; dir < 2; dir++) {
-        tallyFormal(from);
-        tallyFormal(to);
-      }
+    if (isBarrierNode(from) || isBarrierNode(to))
       continue;
-    }
     const uint32_t lf = localId(from), lt = localId(to);
     subEdges.push_back({lf, lt, E.kind, E.bucket});
-  }
-  if (CFLProbeNoFormalPresolve && !formalFan.empty()) {
-    std::vector<std::pair<uint32_t, NodeIndex>> top;
-    uint64_t mass = 0;
-    for (auto &kv : formalFan) {
-      top.emplace_back(kv.second, kv.first);
-      mass += kv.second;
-    }
-    std::sort(top.begin(), top.end(), std::greater<>());
-    CG_LOG("JunctionFormals: " << top.size() << " junction formals, total "
-           << "fan-in mass " << mass << "\n");
-    // Full-depth dump (fan-in >= 4, cap 5000 lines): the reduction
-    // question is fan-in-WEIGHTED coverage of the prover over the
-    // functions that stitch the giant, not top-25 name-dropping.
-    for (size_t i = 0; i < std::min<size_t>(5000, top.size()); i++) {
-      if (top[i].first < 4) break;
-      const auto *A = cast<Argument>(NF.getValueForNode(top[i].second));
-      CG_LOG("JunctionFormals: x" << top[i].first << " "
-             << A->getParent()->getName() << "::arg" << A->getArgNo()
-             << "\n");
-    }
   }
   if (subEdges.empty())
     return;

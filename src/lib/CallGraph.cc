@@ -661,9 +661,6 @@ bool CallGraphPass::doModulePass(Module *M) {
   if (CFLCensusFields && iteration == 0 && M == Ctx->Modules.front().first)
     runFieldChannelCensus(); // measurement-only, adds no edges
 
-  if (CFLCensusCarve && iteration == 0 && M == Ctx->Modules.front().first)
-    runCarveCensus(); // measurement-only, adds no edges
-
   if (CFLCensusStrata && iteration == 0 && M == Ctx->Modules.front().first)
     runStrataCensus(); // measurement-only, adds no edges
 

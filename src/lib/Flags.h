@@ -49,7 +49,6 @@ extern cl::opt<bool> CFLLinkerArrays;
 extern cl::opt<bool> CFLBidiPrune;
 extern cl::opt<bool> CFLLazyMint;
 extern cl::opt<bool> CFLCensusInvoke;
-extern cl::opt<bool> CFLCensusCarve;
 extern cl::opt<bool> CFLCensusFields;
 extern cl::opt<bool> CFLRegFieldReport;
 extern cl::opt<bool> CFLRegFieldApply;

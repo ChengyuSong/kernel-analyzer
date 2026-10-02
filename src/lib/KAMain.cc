@@ -90,6 +90,8 @@ static const RemovedFlag RemovedFlags[] = {
    "retired: constant-global channels measured answer-neutral (docs/channel-cells-design.md; docs/release-trim.md)"},
   {"cfl-identity-channels",
    "retired: identity-root channels did not fit (docs/channel-cells-design.md; docs/release-trim.md)"},
+  {"cfl-census-carve",
+   "retired one-off census; result in docs/channel-cells-design.md (docs/release-trim.md)"},
 };
 
 int main(int argc, char **argv) {

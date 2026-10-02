@@ -96,6 +96,8 @@ static const RemovedFlag RemovedFlags[] = {
    "retired one-off census; result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
   {"cfl-census-ptrtoint",
    "retired one-off census; result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
+  {"cfl-census-fields",
+   "retired one-off census (superseded by --cfl-regfield-report); result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
 };
 
 int main(int argc, char **argv) {

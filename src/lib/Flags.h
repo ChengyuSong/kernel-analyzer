@@ -77,7 +77,6 @@ extern cl::opt<bool> CFLCensusTracepoint;
 extern cl::opt<bool> CFLTracepointKeys;
 extern cl::opt<bool> CFLStaticOpsTables;
 extern cl::opt<bool> CFLCensusIcallShape;
-extern cl::opt<bool> CFLProbeBornHub;
 extern cl::opt<bool> CFLPreSolveExact;
 extern cl::opt<bool> CFLPreSolveCone;
 extern cl::opt<bool> CFLCensusCouplers;

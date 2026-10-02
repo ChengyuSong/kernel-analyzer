@@ -653,15 +653,6 @@ cl::opt<bool> CFLCensusIcallShape(
            "answer-level campaigns"),
   cl::init(false));
 
-cl::opt<bool> CFLProbeBornHub(
-  "cfl-probe-born-hub",
-  cl::desc("MEASUREMENT-ONLY probe (task #38): after the pre-solve "
-           "mutual-V' merge, induce the forward-flow subgraph on the "
-           "largest (born-giant) SCC and iteratively remove the "
-           "highest-degree node, reporting the largest-SCC shatter "
-           "curve — decides whether phase-1 hub cutting is viable"),
-  cl::init(false));
-
 cl::opt<bool> CFLPreSolveExact(
   "cfl-presolve-exact",
   cl::desc("EXPERIMENT (task #38): pre-solve merge quotients only raw "

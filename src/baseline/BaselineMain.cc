@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 
     std::vector<std::string> flowsToOnly;
     for (cl::opt<bool> *O :
-         {&CFLLazyMint, &CFLFlowsToSlice, &CFLResidueCopies, &CFLConflationReport, &CFLRootRelevance, &CFLProbeOriginSplit, &CFLProbeOpsMono, &CFLProbeBlobFormation, &CFLCensusStrata, &CFLCertUserCopy, &CFLConfirmSinks, &CFLSinkInstr, &CFLCensusPtrToInt, &CFLCensusTracepoint, &CFLCensusTypeRej, &CFLCensusExternBound, &CFLTracepointKeys, &CFLStaticOpsTables, &CFLCensusIcallShape, &CFLProbeBornHub, &CFLPreSolveExact, &CFLPreSolveCone, &CFLCensusCouplers, &CFLCensusNexus, &CFLKeyChannels, &CFLReachable, &CFLLazyAddress})
+         {&CFLLazyMint, &CFLFlowsToSlice, &CFLResidueCopies, &CFLConflationReport, &CFLRootRelevance, &CFLProbeOriginSplit, &CFLProbeOpsMono, &CFLProbeBlobFormation, &CFLCensusStrata, &CFLCertUserCopy, &CFLConfirmSinks, &CFLSinkInstr, &CFLCensusPtrToInt, &CFLCensusTracepoint, &CFLCensusTypeRej, &CFLCensusExternBound, &CFLTracepointKeys, &CFLStaticOpsTables, &CFLCensusIcallShape, &CFLPreSolveExact, &CFLPreSolveCone, &CFLCensusCouplers, &CFLCensusNexus, &CFLKeyChannels, &CFLReachable, &CFLLazyAddress})
       if (*O)
         flowsToOnly.push_back(O->ArgStr.str());
     for (const cl::Option *O : std::initializer_list<const cl::Option *>{

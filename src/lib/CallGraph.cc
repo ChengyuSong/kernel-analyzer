@@ -10935,7 +10935,7 @@ bool CallGraphPass::runFlowsToResolution() {
         if (h && exHeap.size() < 8) exHeap.push_back(protBlameName(c).substr(0, 45));
       }
       if (lazyAddr) typeConflictReport(60);
-      if (lazyAddr)
+      if (lazyAddr) {
         errs() << "LazyAddr: " << lazyMinted << " addresses minted ("
                << lazyStrided << " strided, " << lazyX << " range), "
                << lazyOverlapBridges << " overlap bridges, "
@@ -10976,6 +10976,7 @@ bool CallGraphPass::runFlowsToResolution() {
                    << " refused " << c << "\n";
           }
         }
+      }
       if (CFLKeyIdentity)
         errs() << "KeyIdentity: " << keyIdentityMinted
                << " channel identities minted, " << keyIdentitySelf

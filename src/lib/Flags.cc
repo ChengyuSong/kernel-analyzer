@@ -877,16 +877,6 @@ cl::opt<bool> CFLProbeBlobFormation(
            "member names. Adds no edges"),
   cl::init(false));
 
-cl::opt<std::string> CFLProbeSinkAblate(
-  "cfl-probe-sink-ablate",
-  cl::desc("MEASUREMENT-ONLY UNSOUND probe: comma-separated name "
-           "substrings; cells whose class belongs to a matching "
-           "function/global are treated as write-only sinks (all "
-           "cluster joins skipped). Quantifies an instrumentation "
-           "channel's contribution to cell fusion, fact mass and "
-           "answers (task #30 follow-on). NEVER a shipped config"),
-  cl::init(""));
-
 cl::opt<bool> CFLProbeNoTransJoin(
   "cfl-probe-no-trans-join",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe: refuse the cluster join that "

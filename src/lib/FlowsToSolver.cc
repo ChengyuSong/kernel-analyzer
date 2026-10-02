@@ -484,7 +484,6 @@ size_t g_tpKeyModelAnswered = 0, g_tpKeyDynProbe = 0,
               g_tpKeyFallbackSites = 0, g_tpKeyTypeRej = 0;
 
 static bool g_sctTableBuilt = false;
-static size_t g_sinkAblatedJoins = 0; // --cfl-probe-sink-ablate (UNSOUND)
 // --cfl-sink-instr / --cfl-confirm-sinks (task #31/#32 design)
 size_t g_sinkSitesConfirmed = 0, g_sinkSitesEscaped = 0,
               g_sinkSitesViolated = 0;
@@ -3525,65 +3524,6 @@ bool CallGraphPass::runFlowsToResolution() {
       if (R[y][s].any()) addBitsBridged(x, s, R[y][s], ctx0);
     }
   };
-  // --cfl-probe-sink-ablate (MEASUREMENT-ONLY, UNSOUND): pretend cells
-  // whose class contains an instruction from a matching function (or a
-  // matching global) are write-only sinks — skip ALL their cluster
-  // joins. Quantifies a channel's contribution to fusion/fact-mass/
-  // answers and previews a reviewed sink model. Memoized per rep at
-  // query time; merges can stale the memo — acceptable for a probe.
-  SmallVector<StringRef, 8> sinkAblatePats;
-  {
-    StringRef spec(CFLProbeSinkAblate);
-    while (!spec.empty()) {
-      auto [head, rest] = spec.split(',');
-      if (!head.empty())
-        sinkAblatePats.push_back(head);
-      spec = rest;
-    }
-    if (!sinkAblatePats.empty())
-      WARNING("[MEASUREMENT-ONLY UNSOUND] sink-ablate active: "
-              << CFLProbeSinkAblate << "\n");
-  }
-  auto classMatchesPats = [&](uint32_t cls, ArrayRef<StringRef> pats,
-                              boost::unordered_flat_map<uint32_t, char>
-                                  &memo) -> bool {
-    auto it2 = memo.find(cls);
-    if (it2 != memo.end())
-      return it2->second;
-    bool hit = false;
-    auto nameHit = [&](const Value *V3) {
-      if (!V3)
-        return;
-      StringRef nm;
-      if (const auto *I3 = dyn_cast<Instruction>(V3))
-        nm = I3->getFunction()->getName();
-      else if (V3->hasName())
-        nm = V3->getName();
-      for (StringRef p : pats)
-        if (!nm.empty() && nm.contains(p)) {
-          hit = true;
-          return;
-        }
-    };
-    if (cls < toOrig.size()) {
-      nameHit(NF.getValueForNode(toOrig[cls]));
-      if (!hit) {
-        auto mit2 = canonicalClassMembers.find(toOrig[cls]);
-        if (mit2 != canonicalClassMembers.end())
-          for (NodeIndex m3 : mit2->second) {
-            nameHit(NF.getValueForNode(m3));
-            if (hit)
-              break;
-          }
-      }
-    }
-    memo[cls] = hit;
-    return hit;
-  };
-  boost::unordered_flat_map<uint32_t, char> sinkAblateMemo;
-  auto sinkAblateClass = [&](uint32_t cls) {
-    return classMatchesPats(cls, sinkAblatePats, sinkAblateMemo);
-  };
   // --cfl-sink-instr needs no code here: the opaque-arena model (task
   // #34 v3) is applied structurally at graph-build time (visitCallBase
   // binds payload-accessor returns to shared arena objects), so the
@@ -3623,10 +3563,6 @@ bool CallGraphPass::runFlowsToResolution() {
           return;
         }
       }
-    }
-    if (!sinkAblatePats.empty() && sinkAblateClass(find(cell))) {
-      g_sinkAblatedJoins++; // MEASUREMENT-ONLY UNSOUND channel removal
-      return;
     }
     // A constant data-only global (string literal, lookup table) never
     // holds a pointer and cannot be stored into, so it witnesses no
@@ -5035,7 +4971,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // above retired the #48-era batch-local-width OOB. Workers set
       // marks for their own drain's lifetime (fork CoW starts empty:
       // conservative); sequential spill mode keeps them run-long.
-      const bool fastJoinBase = CFLJoinFastpath && sinkAblatePats.empty();
+      const bool fastJoinBase = CFLJoinFastpath;
       if (fastJoinBase) {
         // CELL-MAJOR sweep (fs-cost lever, 2026-08-14): the fact-major
         // loop paid ~350 cycles (find() chase + random bit probe) per
@@ -6980,9 +6916,6 @@ bool CallGraphPass::runFlowsToResolution() {
   if (NB > 0 && g_tagRoundTrips)
     CG_LOG("TagRoundTrip: " << g_tagRoundTrips
            << " ptrtoint wildcards suppressed (tag-bit-only closures)\n");
-  if (g_sinkAblatedJoins)
-    errs() << "SinkAblate: " << g_sinkAblatedJoins
-           << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLSinkInstr) {
     assert(g_sinkContractChecked &&
            "sink arena ran without the read-back contract check");

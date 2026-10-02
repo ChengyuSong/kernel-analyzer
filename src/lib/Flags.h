@@ -88,7 +88,6 @@ extern cl::opt<bool> CFLProposeNoopSummaries;
 extern cl::opt<bool> CFLWitnessAnswers;
 extern cl::opt<bool> CFLProposeSolvedSummaries;
 extern cl::opt<bool> CFLProposeChainSummaries;
-extern cl::opt<bool> CFLProbeWitnessSep;
 extern cl::opt<bool> CFLAtomsGlobalStores;
 extern cl::opt<std::string> CFLAdoptSkip;
 extern cl::opt<bool> CFLAdoptProposedSummaries;

@@ -773,14 +773,6 @@ cl::opt<bool> CFLProposeChainSummaries(
            "(REG f9 no-bind; CALL f0 additive). Default on (the reported configuration); =false to opt out"),
   cl::init(true));
 
-cl::opt<bool> CFLProbeWitnessSep(
-  "cfl-probe-witness-sep",
-  cl::desc("Census: record (key, fine cell) join anchors and report "
-           "the bipartite separation factor — one-hop witness neighborhood "
-           "size vs union-find cluster size per cell. Sizes the "
-           "per-witness answer-read lever against the cluster giant"),
-  cl::init(false));
-
 cl::opt<bool> CFLAtomsGlobalStores(
   "cfl-atoms-global-stores",
   cl::desc("Allow generated atoms with GLOBAL deref targets "

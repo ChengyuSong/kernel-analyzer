@@ -121,14 +121,6 @@ cl::opt<bool> CFLExtGlobalsOwnIdentity(
            "(pre-2026-09-16 behaviour)"),
   cl::init(true));
 
-cl::opt<bool> CFLProbeNoCellIdentity(
-  "cfl-probe-no-cell-identity",
-  cl::desc("MEASUREMENT-ONLY, UNSOUND: do not mint identity roots for "
-           "read-access cells (\"*p\" with p an instruction value that no "
-           "store reaches); cells of globals and formals keep theirs. "
-           "Quantifies the per-access identity-root web"),
-  cl::init(false));
-
 cl::opt<bool> CFLReachable(
   "cfl-reachable",
   cl::desc("Reachability-driven body processing: a function's edges are "

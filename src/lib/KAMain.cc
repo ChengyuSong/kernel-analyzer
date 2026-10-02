@@ -52,6 +52,8 @@ static const RemovedFlag RemovedFlags[] = {
   {"kernel-src", "only the removed kerneldoc mining used it"},
   {"allocator-file", "allocators come from --func-summaries (FRESH)"},
   {"container-file", "containers come from --func-summaries"},
+  {"cfl-probe-no-cell-identity",
+   "retired measurement probe; its finding is recorded in docs/release-trim.md (flag census)"},
 };
 
 int main(int argc, char **argv) {

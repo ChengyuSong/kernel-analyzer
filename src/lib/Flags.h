@@ -25,7 +25,6 @@ extern cl::opt<bool> CFLTraceFirst;
 extern cl::opt<std::string> CFLTraceFptr;
 extern cl::opt<bool> CFLChannelCone;
 extern cl::opt<bool> CFLExtGlobalsOwnIdentity;
-extern cl::opt<bool> CFLProbeNoCellIdentity;
 extern cl::opt<bool> CFLReachable;
 extern cl::opt<std::string> CFLEntryList;
 extern cl::opt<bool> CFLKeyIdentity;

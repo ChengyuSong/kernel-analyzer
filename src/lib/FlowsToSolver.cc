@@ -1352,9 +1352,7 @@ bool CallGraphPass::runFlowsToResolution() {
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
   size_t bidiPrunable = 0;
-  // --cfl-probe-no-cell-identity bookkeeping (cell -> owning pointer).
-  boost::unordered_flat_map<NodeIndex, NodeIndex> probeDerefToPtr;
-  size_t cellIdentityAblated = 0;
+  size_t cellIdentityAblated = 0; // --cfl-key-identity: cells left rootless
   // usercopy-certificate classes must be minted unconditionally: letting
   // the bidi/lazy oracles skip them would pre-decide the very question
   // the certificate asks (does this origin reach an fptr operand?).
@@ -1417,28 +1415,13 @@ bool CallGraphPass::runFlowsToResolution() {
         lazyDeferred.push_back(n);
         continue;
       }
-      // --cfl-probe-no-cell-identity: MEASUREMENT-ONLY UNSOUND PROBE —
-      // do not mint identity roots for read-access cells ("*p" where p
-      // is an instruction value no store reaches); the cells of globals
-      // and formals keep theirs (their content is external). Quantifies
-      // the per-access identity-root web under pairwise cells.
-      if ((CFLProbeNoCellIdentity || CFLKeyIdentity) && !isFunc && !isCert &&
-          !hasOrigin[n] && NF.isDereferenceNode(toOrig[n])) {
-        if (probeDerefToPtr.empty())
-          for (auto &[p3, d3] : NF.getDerefMap()) probeDerefToPtr[d3] = p3;
-        auto dit = probeDerefToPtr.find(toOrig[n]);
-        const Value *pv = dit == probeDerefToPtr.end()
-                              ? nullptr
-                              : NF.getValueForNode(dit->second);
-        // --cfl-key-identity: NO dereference cell gets a root — the
-        // content identity lives on the channel key (minted at channel
-        // creation for external origins). The probe keeps the cells of
-        // globals and formals.
-        if (CFLKeyIdentity ||
-            !(pv && (isa<GlobalVariable>(pv) || isa<Argument>(pv)))) {
-          cellIdentityAblated++;
-          continue;
-        }
+      // --cfl-key-identity: NO dereference cell gets a root — the
+      // content identity lives on the channel key (minted at channel
+      // creation for external origins).
+      if (CFLKeyIdentity && !isFunc && !isCert && !hasOrigin[n] &&
+          NF.isDereferenceNode(toOrig[n])) {
+        cellIdentityAblated++;
+        continue;
       }
       // --cfl-ablate-mints: MEASUREMENT-ONLY UNSOUND PROBE — skip
       // minting identity roots whose canonical value matches a named
@@ -2315,10 +2298,7 @@ bool CallGraphPass::runFlowsToResolution() {
            << "% of candidates)\n");
   for (auto &[why, cnt] : wildcardReasons)
     CG_LOG("FlowsTo wildcard[" << why << "]: " << cnt << "\n");
-  if (CFLProbeNoCellIdentity)
-    CG_LOG("[MEASUREMENT-ONLY UNSOUND] cell identity roots NOT minted: "
-           << cellIdentityAblated << "\n");
-  else if (CFLKeyIdentity)
+  if (CFLKeyIdentity)
     CG_LOG("KeyIdentity: " << cellIdentityAblated
            << " dereference cells left without a per-access root\n");
   // --cfl-trace-func: follow one function root's fact through the solve.

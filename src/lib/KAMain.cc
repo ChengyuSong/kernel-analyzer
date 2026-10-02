@@ -84,6 +84,8 @@ static const RemovedFlag RemovedFlags[] = {
    "retired measurement probe; finding in docs/release-trim.md (flag census)"},
   {"cfl-probe-origin-split",
    "retired measurement probe; finding in docs/release-trim.md (flag census)"},
+  {"cfl-probe-block-hub-formals",
+   "retired measurement probe; finding in docs/release-trim.md (flag census)"},
 };
 
 int main(int argc, char **argv) {

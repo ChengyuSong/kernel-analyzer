@@ -1009,16 +1009,6 @@ cl::opt<std::string> CFLDumpMerges(
            "nodes X and Y in one class, and why' (scratch merges.py)"),
   cl::init(""));
 
-cl::opt<unsigned> CFLProbeBlockHubFormals(
-  "cfl-probe-block-hub-formals",
-  cl::desc("MEASUREMENT-ONLY, UNSOUND: replicate KallGraph's static hub "
-           "block — a callee with more than N direct call sites gets NO "
-           "argument or return wiring at any call site (KallGraph blocks "
-           "formals/returns of functions with > baseNum*5 = 250 call edges "
-           "per parameter). 0 = off. Quantifies how much of the flow answer "
-           "rides through hub formals"),
-  cl::init(0));
-
 cl::opt<bool> CFLLazyAddress(
   "cfl-lazy-address",
   cl::desc("Exact byte-offset addresses as facts, materialized on demand "

@@ -114,7 +114,6 @@ extern cl::opt<bool> CFLDumpICalls;
 extern cl::opt<std::string> CFLDumpIcallsJson;
 extern cl::opt<std::string> CFLDumpTypeJson;
 extern cl::opt<std::string> CFLDumpMerges;
-extern cl::opt<unsigned> CFLProbeBlockHubFormals;
 extern cl::opt<bool> CFLLazyAddress;
 extern cl::opt<unsigned> CFLLazyCap;
 extern cl::opt<std::string> CFLLazyTraceObject;

@@ -807,28 +807,6 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       return false;
   }
 
-  // --cfl-probe-block-hub-formals: KallGraph's static hub block, after
-  // the summary branch so allocators keep their identity (KallGraph
-  // skips the kmalloc family by name). Direct call sites counted once.
-  if (CFLProbeBlockHubFormals) {
-    static std::unordered_map<const Function *, unsigned> directSites;
-    auto it = directSites.find(CF);
-    if (it == directSites.end()) {
-      unsigned n = 0;
-      for (const User *U : CF->users())
-        if (const auto *CB = dyn_cast<CallBase>(U))
-          if (CB->getCalledFunction() == CF) n++;
-      it = directSites.emplace(CF, n).first;
-    }
-    if (it->second > CFLProbeBlockHubFormals) {
-      static size_t blocked = 0;
-      if (blocked++ == 0)
-        WARNING("[MEASUREMENT-ONLY UNSOUND] hub-formal block active (> "
-                << CFLProbeBlockHubFormals << " direct sites)\n");
-      return false;
-    }
-  }
-
   wireCallArgs(CS, CF, opsSkipArg);
 
   // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})

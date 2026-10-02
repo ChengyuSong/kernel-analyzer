@@ -121,7 +121,6 @@ extern bool g_sinkContractChecked;
 bool isSinkPayloadAccessor(StringRef n);
 extern size_t g_sinkArenaSites;
 StrataBucket strataClassify(const Value *V0, const Function *F);
-extern size_t g_strataAblated;
 extern size_t g_userCopyAsmSevered;
 extern size_t g_userGetAsmSevered;
 extern size_t g_userCopyDerefsSevered;

@@ -1609,11 +1609,6 @@ StrataBucket strataClassify(const Value *V0, const Function *F) {
     return STRATA_MMFN;
   return STRATA_OTHER;
 }
-static bool strataIsPhys(StrataBucket b) {
-  return b == STRATA_DIRECTMAP || b == STRATA_VMEMMAP ||
-         b == STRATA_KERNELMAP || b == STRATA_MMFN;
-}
-size_t g_strataAblated = 0; // probe: severed inttoptr bridges
 
 // --cfl-probe-usercopy-ablate (task #32): user ingress reaches kernel
 // memory through two uaccess shapes, both severed here.
@@ -3462,32 +3457,6 @@ void CallGraphPass::InstHandler::visitInsertValueInst(InsertValueInst &IVI) {
 }
 
 void CallGraphPass::InstHandler::visitIntToPtrInst(IntToPtrInst &I) {
-  if (!CFLProbeStratumAblate.empty() &&
-      [&] {
-        StrataBucket b = strataClassify(I.getOperand(0), I.getFunction());
-        StringRef sel(CFLProbeStratumAblate);
-        if (sel == "phys")
-          return strataIsPhys(b); // legacy: all four buckets
-        // bucket-selective: comma list of directmap,vmemmap,kernelmap,
-        // mmfn — struct page descriptors are TYPED KERNEL OBJECTS
-        // (vmemmap = metadata stratum), only the direct map exposes
-        // page CONTENTS; the separation test severs contents access.
-        if (b == STRATA_DIRECTMAP && sel.contains("directmap"))
-          return true;
-        if (b == STRATA_VMEMMAP && sel.contains("vmemmap"))
-          return true;
-        if (b == STRATA_KERNELMAP && sel.contains("kernelmap"))
-          return true;
-        if (b == STRATA_MMFN && sel.contains("mmfn"))
-          return true;
-        return false;
-      }()) {
-    // MEASUREMENT-ONLY UNSOUND: sever the phys-stratum bridge — the
-    // result becomes an opaque identity (no in-edge -> its own root),
-    // as if phys<->virt conversions returned a fresh stratum handle.
-    g_strataAblated++;
-    return;
-  }
   NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
     // Dropping the edge here loses the int->ptr flow entirely — log

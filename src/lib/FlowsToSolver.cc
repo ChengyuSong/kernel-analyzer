@@ -6998,10 +6998,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
-  if (g_strataAblated)
-    errs() << "StrataAblate: " << g_strataAblated
-           << " phys-stratum inttoptr bridges severed "
-              "[MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLProbeUserCopyAblate)
     errs() << "UserCopyAblate: " << g_userCopyAsmSevered
            << " copy-body + " << g_userGetAsmSevered

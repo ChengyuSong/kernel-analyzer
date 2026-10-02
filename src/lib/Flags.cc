@@ -495,15 +495,6 @@ cl::opt<bool> CFLFilterLedger(
            "Answer-run instrument; output scales with removed pairs"),
   cl::init(false));
 
-cl::opt<std::string> CFLProbeStratumAblate(
-  "cfl-probe-stratum-ablate",
-  cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value "
-           "severs inttoptr bridges classified as phys-stratum "
-           "(directmap/vmemmap/kernelmap/mm-fn) — the result becomes an "
-           "opaque identity root. Measures blob fragmentation and the "
-           "answer delta of stratum separation. NEVER a shipped config"),
-  cl::init(""));
-
 cl::opt<bool> CFLProbeUserCopyAblate(
   "cfl-probe-usercopy-ablate",
   cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): sever the memory "

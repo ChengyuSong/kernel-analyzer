@@ -110,7 +110,7 @@ int main(int argc, char **argv) {
     for (const cl::Option *O : std::initializer_list<const cl::Option *>{
              &CFLNexusFields, &CFLBatchRoots, &CFLAblateMints,
              &CFLFlowsToMaxIters, &CFLSolverThreads, &CFLSolverBlock,
-             &CFLProbeStratumAblate, &CFLProbeSinkAblate, &CFLDumpAGraph})
+             &CFLProbeSinkAblate, &CFLDumpAGraph})
       if (O->getNumOccurrences() > 0)
         flowsToOnly.push_back(O->ArgStr.str());
     for (const std::string &Name : flowsToOnly)

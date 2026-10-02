@@ -98,7 +98,6 @@ extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<std::string> CFLBatchSpill;
 extern cl::opt<bool> CFLCensusStrata;
 extern cl::opt<bool> CFLProbeBlobFormation;
-extern cl::opt<std::string> CFLProbeBlobGrep;
 extern cl::opt<std::string> CFLProbeSinkAblate;
 extern cl::opt<bool> CFLProbeNoTransJoin;
 extern cl::opt<bool> CFLProbeOpsMono;

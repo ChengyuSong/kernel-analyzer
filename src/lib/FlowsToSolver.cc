@@ -7154,15 +7154,7 @@ bool CallGraphPass::runFlowsToResolution() {
       const uint64_t after = (uint64_t)ev.szA + ev.szB;
       const bool isRecord = after * 4 > record * 5;
       if (isRecord) record = after;
-      // --cfl-probe-blob-grep: also print every lineage event whose
-      // class names or key mention the substring (to find the one join
-      // that pulled a named cell into the giant).
-      const bool grepHit =
-          !CFLProbeBlobGrep.empty() &&
-          (StringRef(ev.nA).contains(CFLProbeBlobGrep) ||
-           StringRef(ev.nB).contains(CFLProbeBlobGrep) ||
-           StringRef(ev.origin).contains(CFLProbeBlobGrep));
-      if (shown < 300 && (isRecord || grepHit || std::min(ev.szA, ev.szB) >= 64)) {
+      if (shown < 300 && (isRecord || std::min(ev.szA, ev.szB) >= 64)) {
         shown++;
         errs() << "BlobForm: EV#" << giantEvents << " @" << ev.at << " "
                << ev.ctx << (ev.origin.empty() ? "" : (" origin=" + ev.origin))

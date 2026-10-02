@@ -100,6 +100,8 @@ static const RemovedFlag RemovedFlags[] = {
    "retired one-off census (superseded by --cfl-regfield-report); result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
   {"cfl-census-tracepoint",
    "retired one-off census (sized the adopted --cfl-tracepoint-keys); result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
+  {"cfl-census-icall-shape",
+   "retired one-off census; result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
 };
 
 int main(int argc, char **argv) {

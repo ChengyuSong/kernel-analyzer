@@ -572,16 +572,6 @@ cl::opt<bool> CFLStaticOpsTables(
            "sites keep graph behavior. Requires --cfl-static-call"),
   cl::init(true));
 
-cl::opt<bool> CFLCensusIcallShape(
-  "cfl-census-icall-shape",
-  cl::desc("MEASUREMENT-ONLY census (task #37): classify every fat "
-           "answer site (>=100 targets) by the IR shape of its fptr "
-           "chain (formal param / struct-field load / global load / "
-           "phi-select) and by whether its operand class is the giant "
-           "quotient class — names the families for the next "
-           "answer-level campaigns"),
-  cl::init(false));
-
 cl::opt<bool> CFLPreSolveExact(
   "cfl-presolve-exact",
   cl::desc("EXPERIMENT (task #38): pre-solve merge quotients only raw "

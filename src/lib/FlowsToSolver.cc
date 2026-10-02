@@ -5832,24 +5832,6 @@ bool CallGraphPass::runFlowsToResolution() {
            << g_sctPendingNoTable << " pendings with no fn source)\n");
   }
 
-  // --cfl-census-icall-shape (task #37): classify every FAT answer site
-  // (>=100 targets) by the IR shape of its fptr chain and by whether its
-  // operand class is THE giant — separates "resolved to the quotient"
-  // from "genuinely unresolved" and names the families for the next
-  // answer-level campaigns. Measurement only.
-  struct IcallShapeFam { size_t sites = 0, pairs = 0, giantSites = 0;
-                         std::string exemplar; };
-  std::map<std::string, IcallShapeFam> shapeFams;
-  uint32_t censusGiantRep = UINT32_MAX;
-  if (CFLCensusIcallShape) {
-    uint32_t best = 0;
-    for (uint32_t n2 = 0; n2 < N; n2++)
-      if (find(n2) == n2 && clsSize[n2] > best) {
-        best = clsSize[n2];
-        censusGiantRep = n2;
-      }
-  }
-
   // ---- per-witness answer read (rung 1, --cfl-witness-answers) ----
   // The pooled solve stays (memory-bearing over-approx); the LAST
   // M-hop is recomputed exactly at load-shaped icall sites from the
@@ -6475,58 +6457,6 @@ bool CallGraphPass::runFlowsToResolution() {
       ctrTop.push_back({filtTypeRej - ctrSiteR0, CS,
                         filtCandidates - ctrSiteC0, targets.size()});
     }
-    if (CFLCensusIcallShape && targets.size() >= 100) {
-      auto shapeOf = [&]() -> std::string {
-        const Value *co = CS->getCalledOperand()->stripPointerCasts();
-        if (const auto *A = dyn_cast<Argument>(co))
-          return ("formal " + A->getParent()->getName() + "#" +
-                  std::to_string(A->getArgNo()))
-              .str();
-        const auto *LI = dyn_cast<LoadInst>(co);
-        if (!LI) {
-          if (isa<PHINode>(co)) return "phi";
-          if (isa<SelectInst>(co)) return "select";
-          const auto *IC = dyn_cast<Instruction>(co);
-          return std::string("other:") +
-                 (IC ? IC->getOpcodeName() : "non-inst");
-        }
-        const Value *P = LI->getPointerOperand()->stripPointerCasts();
-        if (const auto *GO = dyn_cast<GEPOperator>(P)) {
-          const auto *ST3 =
-              dyn_cast<StructType>(GO->getSourceElementType());
-          std::string fld = "?";
-          if (GO->getNumIndices() == 2)
-            if (const auto *ci = dyn_cast<ConstantInt>(GO->getOperand(2)))
-              fld = std::to_string(ci->getZExtValue());
-          const Value *B = GO->getPointerOperand()->stripPointerCasts();
-          std::string base = isa<LoadInst>(B)      ? " [2level]"
-                             : isa<Argument>(B)    ? " [parambase]"
-                             : isa<GlobalVariable>(B) ? " [globalbase]"
-                                                      : "";
-          if (ST3 && ST3->hasName())
-            return ("load " + sctCanonStructName(ST3->getName()) + "." +
-                    fld + base)
-                .str();
-          return "load gep-untyped" + base;
-        }
-        if (isa<GlobalVariable>(P))
-          return ("load @" + P->getName()).str();
-        if (isa<Argument>(P)) return "load *param";
-        if (isa<PHINode>(P)) return "load phi-ptr";
-        if (isa<LoadInst>(P)) return "load **indirect";
-        return "load other";
-      };
-      auto &fam = shapeFams[shapeOf()];
-      fam.sites++;
-      fam.pairs += targets.size();
-      if (rep == censusGiantRep) fam.giantSites++;
-      if (fam.exemplar.empty())
-        fam.exemplar = (CS->getFunction()->getName() + " (" +
-                        std::to_string(targets.size()) + " tgts, cls " +
-                        std::to_string(clsSize[rep]) + ", R " +
-                        std::to_string(R[rep][0].count()) + ")")
-                           .str();
-    }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
     for (const Function *F : targets) {
       if (!Ctx->Callees[CS].insert(F).second)
@@ -6829,108 +6759,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       errs() << "UserCert: site " << kv.first << " reaches " << kv.second
              << " icalls\n";
-    }
-  }
-  if (CFLCensusIcallShape && !shapeFams.empty()) {
-    std::vector<std::pair<size_t, const std::string *>> fr;
-    size_t totP = 0, totS = 0;
-    for (auto &kv : shapeFams) {
-      fr.emplace_back(kv.second.pairs, &kv.first);
-      totP += kv.second.pairs;
-      totS += kv.second.sites;
-    }
-    std::sort(fr.begin(), fr.end(), std::greater<>());
-    errs() << "IcallShape: " << totS << " fat sites (>=100 tgts) / "
-           << totP << " pairs in " << shapeFams.size() << " families\n";
-    for (size_t i2 = 0; i2 < std::min<size_t>(40, fr.size()); i2++) {
-      auto &fam = shapeFams[*fr[i2].second];
-      errs() << "IcallShape: " << fam.pairs << " pairs / " << fam.sites
-             << " sites (" << fam.giantSites << " giant-cls) "
-             << *fr[i2].second << "  e.g. " << fam.exemplar << "\n";
-    }
-    // Giant anatomy (task #38): fn identity is destroyed by TWO distinct
-    // mechanisms — fn value CLASSES union-find-merged into the giant
-    // (class-identity destruction) vs fn ROOTS accumulated into
-    // R[giant] by fact propagation (every real flow into any cell the
-    // giant absorbed). The forensics and the injection points differ,
-    // so count them separately.
-    if (censusGiantRep != UINT32_MAX) {
-      const uint32_t gr = find(censusGiantRep);
-      size_t fnClasses = 0, fnClassesInGiant = 0;
-      std::vector<StringRef> ex;
-      for (auto &kv : funcOfCanon) {
-        auto dIt2 = toDense.find(kv.first);
-        if (dIt2 == toDense.end())
-          continue;
-        fnClasses++;
-        if (find(dIt2->second) == gr) {
-          fnClassesInGiant++;
-          if (ex.size() < 12)
-            ex.push_back(kv.second->getName());
-        }
-      }
-      size_t rootsInGiant = 0, fnRootsInGiant = 0;
-      R[gr][0].forEach([&](uint32_t o) {
-        rootsInGiant++;
-        if (funcRootOf.count(o))
-          fnRootsInGiant++;
-      });
-      errs() << "GiantAnatomy: rep c" << gr << " members " << clsSize[gr]
-             << "; fn CLASSES merged in " << fnClassesInGiant << "/"
-             << fnClasses << " address-taken; R[giant] roots "
-             << rootsInGiant << " of which " << fnRootsInGiant
-             << " are fn roots\n";
-      for (StringRef n2 : ex)
-        errs() << "GiantAnatomy: merged-fn-class " << n2 << "\n";
-      // Entry-cell histogram: fn identities reach the giant through
-      // their FIRST-HOP a-edge targets (exemplar acct_pin_kill: one
-      // store into the fs_pin cell chain, already giant-merged). Count
-      // the DISTINCT giant-member entry classes over all fn roots —
-      // few nameable channels => targeted guards; thousands => the
-      // full provenance-cells redesign.
-      {
-        boost::unordered_flat_set<uint32_t> fnDense;
-        for (auto &kv : funcOfCanon) {
-          auto dIt3 = toDense.find(kv.first);
-          if (dIt3 != toDense.end())
-            fnDense.insert(dIt3->second);
-        }
-        boost::unordered_flat_map<uint32_t, uint32_t> entryFnCount;
-        size_t fnEdges = 0, fnEdgesToGiant = 0;
-        for (auto [s2, t2] : aEdges) {
-          if (!fnDense.count(s2))
-            continue;
-          fnEdges++;
-          if (find(t2) != gr)
-            continue;
-          fnEdgesToGiant++;
-          entryFnCount[t2]++;
-        }
-        auto entryName = [&](uint32_t cls) -> std::string {
-          const Value *V2 =
-              cls < toOrig.size() ? NF.getValueForNode(toOrig[cls]) : nullptr;
-          if (!V2)
-            return "<synthetic>";
-          if (V2->hasName())
-            return V2->getName().str();
-          if (const auto *I3 = dyn_cast<Instruction>(V2))
-            return (I3->getFunction()->getName() + "::" +
-                    I3->getOpcodeName())
-                .str();
-          return "<unnamed>";
-        };
-        std::vector<std::pair<uint32_t, uint32_t>> top;
-        for (auto &kv : entryFnCount)
-          top.emplace_back(kv.second, kv.first);
-        std::sort(top.begin(), top.end(), std::greater<>());
-        errs() << "GiantAnatomy: fn out-a edges " << fnEdges << ", into "
-               << "giant " << fnEdgesToGiant << " via "
-               << entryFnCount.size() << " distinct entry classes\n";
-        for (size_t i3 = 0; i3 < std::min<size_t>(30, top.size()); i3++)
-          errs() << "GiantAnatomy: entry x" << top[i3].first << " c"
-                 << top[i3].second << " " << entryName(top[i3].second)
-                 << "\n";
-      }
     }
   }
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, "

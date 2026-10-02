@@ -70,7 +70,6 @@ extern cl::opt<bool> CFLDumpFnptrOffsets;
 extern cl::opt<bool> CFLCensusExternBound;
 extern cl::opt<bool> CFLTracepointKeys;
 extern cl::opt<bool> CFLStaticOpsTables;
-extern cl::opt<bool> CFLCensusIcallShape;
 extern cl::opt<bool> CFLPreSolveExact;
 extern cl::opt<bool> CFLPreSolveCone;
 extern cl::opt<bool> CFLCensusCouplers;

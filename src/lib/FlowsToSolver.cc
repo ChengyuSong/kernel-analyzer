@@ -3100,7 +3100,6 @@ bool CallGraphPass::runFlowsToResolution() {
   // that sizes the delta-precision fix and names summarization targets.
   size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
   size_t nullKeyJoinsSkipped = 0; // null-cell join hygiene LEDGER
-  size_t g_transJoinsRefused = 0; // --cfl-probe-no-trans-join LEDGER
   // --cfl-root-relevance: (root, keeper class) per join-triggered merge —
   // joins are the only consumer of individual root bits besides the final
   // icall answer read, so these witnesses + function roots form a
@@ -3601,10 +3600,6 @@ bool CallGraphPass::runFlowsToResolution() {
         redundantJoins++; // already one cluster: pure lookup, no work
       } else if (keyCount[cellRep].load(std::memory_order_relaxed) > 0) {
         transKeyMerges++; // cell anchors other keys: key-clusters coalesce
-        if (CFLProbeNoTransJoin) {
-          g_transJoinsRefused++; // MEASUREMENT-ONLY UNSOUND: flow dropped
-          return;
-        }
       }
       const size_t mc0 = mergeCount;
       blobCtx = "join"; blobCtxOrigin = o; blobCtxShift = s;
@@ -7871,7 +7866,6 @@ bool CallGraphPass::runFlowsToResolution() {
            << " scc=" << mergesFromSCC
            << ", redundant join lookups " << redundantJoins
            << ", null-key joins skipped " << nullKeyJoinsSkipped
-           << ", transitive joins REFUSED " << g_transJoinsRefused
            << (CFLChannelCells
                    ? (", CHANNELS " + std::to_string(chanNodes) + " nodes " +
                       std::to_string(chanEdges) + " edges " +

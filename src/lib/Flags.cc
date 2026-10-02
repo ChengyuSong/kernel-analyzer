@@ -877,16 +877,6 @@ cl::opt<bool> CFLProbeBlobFormation(
            "member names. Adds no edges"),
   cl::init(false));
 
-cl::opt<bool> CFLProbeNoTransJoin(
-  "cfl-probe-no-trans-join",
-  cl::desc("MEASUREMENT-ONLY UNSOUND probe: refuse the cluster join that "
-           "would coalesce two key-clusters (a cell already anchoring one "
-           "(origin,residue) key asked to join another). Drops flows, so "
-           "its answer is a LOWER bound on what a pairwise (non-transitive) "
-           "cell model can give: a site that stays wide under this probe "
-           "cannot be fixed by removing cluster transitivity"),
-  cl::init(false));
-
 cl::opt<bool> CFLProbeOpsMono(
   "cfl-probe-ops-mono",
   cl::desc("MEASUREMENT-ONLY probe (task #30): classify each two-level "

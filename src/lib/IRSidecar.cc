@@ -39,6 +39,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/ModuleSlotTracker.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/Value.h>
 #include <llvm/Support/FileSystem.h>
@@ -132,13 +133,6 @@ static std::string typeName(Type *T) {
   std::string s;
   raw_string_ostream os(s);
   T->print(os);
-  return os.str();
-}
-
-static std::string bbName(const BasicBlock *BB) {
-  std::string s;
-  raw_string_ostream os(s);
-  BB->printAsOperand(os, /*PrintType=*/false);
   return os.str();
 }
 
@@ -303,7 +297,10 @@ namespace {
 class FuncEmitter {
 public:
   FuncEmitter(const Function *F_, GlobalContext *Ctx_)
-    : F(F_), Ctx(Ctx_), DL(F_->getParent()->getDataLayout()) {}
+    : F(F_), Ctx(Ctx_), DL(F_->getParent()->getDataLayout()),
+      MST(F_->getParent()) {
+    MST.incorporateFunction(*F_);
+  }
 
   json::Object emit();
 
@@ -311,6 +308,25 @@ private:
   const Function *F;
   GlobalContext *Ctx;
   const DataLayout &DL;
+  // One slot numbering per function: printAsOperand without a tracker
+  // renumbers the whole module on every call (quadratic in the module's
+  // unnamed values; hours on single-module programs).
+  ModuleSlotTracker MST;
+
+  std::string ssaName(const Value *V) {
+    if (isa<MetadataAsValue>(V))
+      return ::ssaName(V); // metadata slots: the tracker the default makes
+    std::string s;
+    raw_string_ostream os(s);
+    V->printAsOperand(os, /*PrintType=*/false, MST);
+    return os.str();
+  }
+  std::string bbName(const BasicBlock *BB) {
+    std::string s;
+    raw_string_ostream os(s);
+    BB->printAsOperand(os, /*PrintType=*/false, MST);
+    return os.str();
+  }
 
   unsigned eIdCounter = 0, bIdCounter = 0, ioIdCounter = 0, rIdCounter = 0;
 
@@ -900,8 +916,7 @@ json::Object FuncEmitter::emit() {
       if (GV->hasInitializer()) {
         std::string initIR;
         raw_string_ostream OS(initIR);
-        GV->getInitializer()->printAsOperand(OS, /*PrintType=*/true,
-                                             GV->getParent());
+        GV->getInitializer()->printAsOperand(OS, /*PrintType=*/true, MST);
         OS.flush();
         if (initIR.size() > 65536) {
           initIR.resize(65536);

@@ -1,197 +1,198 @@
-# KAMain CLI Reference
+# KAMain and KABaseline command-line reference
 
-Generated 2026-08-23 from the `cl::opt` declarations in `src/lib/KAMain.cc`
-(the descriptions there are the source of truth and are kept current; this
-file adds grouping, defaults, and pointers to the mechanism docs). For the
-always-current flat list, run `KAMain --help`.
+Generated 2026-10-02 by `tools/gen-cli-reference.py` from the
+`cl::opt` definitions (`src/lib/Flags.cc` for options both binaries share,
+`src/baseline/BaselineMain.cc` for the baseline's own). The descriptions in
+the code are the source of truth; the grouping is the flag census of
+`docs/release-trim.md`. `KAMain --help` prints the flat list.
 
-Companion docs: `docs/implementation.md` (soundness mechanisms + perf
-engineering), `docs/cfl-graph-explosion-and-scaling.md` (research log),
-`docs/novelty-and-related-work.md` (positioning), `func_summaries.txt`
-header comments (hand-audit rationale per entry).
+## The binaries
 
-## Canonical configurations
+- `release/lib/KAMain` resolves indirect calls with the rooted flows-to
+  solver, its only mode. With no options it runs the reported
+  configuration: the five channel and adoption mechanisms on
+  (`--cfl-propose-chain-summaries`, `--cfl-propose-solved-summaries`,
+  `--cfl-adopt-proposed-summaries`, `--cfl-regfield-apply`,
+  `--cfl-regfield-obj`) and the repository's `func_summaries.txt` loaded.
+- `release/baseline/KABaseline` is the CFL-reachability baseline: the same
+  IR front end and constraint graph, saturated by GraCFL with the points-to
+  grammar, per translation unit with composition (default) or monolithic
+  (`--cfl-compositional=false`). It keeps the old saturation defaults (the
+  five mechanisms off, no summary file) and refuses options only the
+  flows-to solver honors.
 
-**Kernel FI (canonical pin config):**
+## Common configurations
+
+Kernel, field-insensitive:
 ```
-KAMain --verbose=2 --cfl-compositional=false --cfl-flows-to --cfl-dump-icalls \
-  --func-summaries=func_summaries.txt --log-timestamps @filelist
+KAMain --verbose=2 --cfl-dump-icalls --log-timestamps @filelist
 ```
 
-**Kernel fs (all+ids instrument, big-machine validated 2026-08-17):**
-add `--cfl-bidi-prune --cfl-nexus-fields=all+ids --mem-limit-mode=rss --mem-limit=90 \
-  --cfl-batch-roots=4000 --cfl-batch-workers=32 --cfl-batch-spill=<fresh-dir> --cfl-presolve-once`
+Kernel, field-sensitive (all+ids instrument, big machine): add
+```
+--cfl-bidi-prune --cfl-nexus-fields=all+ids --mem-limit-mode=rss --mem-limit=90
+--cfl-batch-roots=4000 --cfl-batch-workers=32 --cfl-batch-spill=<fresh-dir>
+--cfl-presolve-once
+```
 
-**Per-run summary adoption (gates green at 5.18 FI + km FI/fs13, 2026-08-22):**
-add `--cfl-propose-solved-summaries --cfl-adopt-proposed-summaries`
+Base (summaries, no channel mechanisms): add `--cfl-propose-chain-summaries=false
+--cfl-regfield-apply=false --cfl-regfield-obj=false
+--cfl-propose-solved-summaries=false --cfl-adopt-proposed-summaries=false`;
+`eval/env.sh` provides `ka_config` for this.
 
-**Certified channels (CANONICAL; user-pinned 2026-08-26/27):**
-add `--cfl-propose-chain-summaries --cfl-regfield-apply
---cfl-regfield-obj` (with the adoption flags above). 5.18 pins:
-FI = 518-fi-row5-pairs.txt (6,289,104), fs = 518-fs-row5-pairs.txt
-(6,083,352); GT FN baseline = the 79-list (aux-matched,
-tools/gt-match.py --aux with --cfl-dump-gt-aux edges). Cumulative vs
-pre-regfield: -59%/+0 with FN lists byte-identical at every step;
-obj arms applied with zero stated-assumption keys.
+Gate protocol for an answer-affecting change: pairs removal-only against the
+pinned baseline (`^ICALL`/`^REGCALL` union, `LC_ALL=C`), ground-truth FN
+lists unchanged (`tools/gt-match.py`); for a refactor, `test/consumer-gate.sh`
+plus `test/consumer-diff.sh` old binary against new.
 
-Gate protocol for any answer-affecting change: pairs removals-only vs the
-pinned baseline (`^ICALL`/`^REGCALL` union, LC_ALL=C), GT FN-list identity
-(`tools/gt-match.py`), and for pool work: BlobForm INITIAL, ClusterTrans,
-per-caller target distribution.
+Removed options are errors that name their replacement; the list is in
+`docs/release-trim.md`.
 
-## Input, output, general
+## Inputs, outputs, driver
 
 - **`--bc-list`** (default `""`): File containing input bitcode file paths, one per line
 - **`--verbose`** (default `0`): Verbose level
 - **`--log-timestamps`** (default `false`): Prefix every KA_LOG line with [+<seconds>] elapsed since process start (phase profiling; default off — the prefix changes the log format pin-extraction scripts anchor on)
 - **`--mem-limit`** (default `80`): Memory limit as percentage of physical RAM (0 = unlimited, default 80)
 - **`--mem-limit-mode`** (default `"rss"`): How --mem-limit is enforced: 'rss' (default) = watchdog thread on /proc/self/status VmRSS — measures RESIDENT memory, immune to allocator reservations / transient doublings / mapped files that inflate virtual size; 'as' = legacy RLIMIT_AS on virtual address space (overcounts by 1.2-2x under many threads); 'off' = no in-process limit — use when a cgroup enforces it (docker --memory)
-- **`--dump-bid-mapping`** (default `""`): Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum
-- **`--func-summaries`** (default `""`): Transfer-summary file (atoms: FRESH/CPY/ALIAS/ST/LD/NONE, ordered, first-match-wins, trailing '*' = prefix). When set, it is AUTHORITATIVE: replaces the hardcoded isAllocFn allocator table and adds copy/alias/container semantics at summarized callsites. See func_summaries.txt
-
-## Core analysis modes
-
-- **`--cfl-compositional`** (default `true`): Run per-TU CFL solving and compose compressed results. The flows-to solver requires `--cfl-compositional=false` (monolithic); the default-on value serves the legacy saturation pipeline
-- **`--cfl-flows-to`** (default `false`): Resolve icalls by answer-anchored root propagation instead of all-pairs CFL saturation (v0: field-insensitive, monolithic)
-- **`--cfl-field-buckets`** (default `0`): Number of bucketed field-offset labels for field-sensitive CFL memory modeling (0 = field-insensitive, default)
-- **`--cfl-nexus-fields`** (default `""`): Surgical field sensitivity (task #39): comma-separated named struct list (e.g. task_struct,file,cred) or 'default' (the fat-object census list). ONLY origins of these nexus types carry exact field residues; every other origin mints on the wildcard plane, which is bit-identical to FI for it (one (o,X) join cluster, no exact keys, no VX bridges) — the residue-plane cost is confined to the nexus population. Requires --cfl-field-buckets>0 (auto-set to 13 if unset)
-- **`--cfl-flows-to-max-iters`** (default `10`): Cap on flows-to outer fixpoint iterations (resolve icalls -> wire callee arg/ret flows -> re-solve). Hitting the cap with unprocessed wirings is reported as an UNSOUND-RISK warning
-
-## Answer/dump
-
+- **`--callgraph-json`** (default `""`): Export call graph to JSON file
 - **`--cfl-dump-icalls`** (default `false`): Dump one ICALL line per resolved (callsite, callee) pair; sort the lines to diff runs (5M+ lines on whole-kernel inputs)
-
-## Soundness levers (default-on or canonical)
-
-- **`--cfl-global-dedup`** (default `true`): Enable global union-find dedup with dense ID remapping for CFL edge construction
-- **`--cfl-local-alloca-summary`** (default `true`): Enable non-escaping local alloca store/load summarization in CFL edge construction
-- **`--cfl-linker-arrays`** (default `true`): Model linker-materialized pointer arrays: alias each undefined __start_X/__stop_X extern global to the union of section-X members (IR globals with that section attribute plus module-asm PREL32 entry targets), and treat module-asm-referenced functions as address-taken. Kernel initcalls / __param / pci_fixup / ftrace_events / setup / bpf_raw_tp. Off = those loads resolve to nothing (pre-#22 behavior)
-- **`--cfl-static-call`** (default `true`): Model kernel static_call: direct calls to undefined __SCT__X trampolines dispatch through __SCK__X's func slot (initializer + in-corpus __static_call_update stores are already IR-visible); the callsite becomes an icall resolved by flows-to. Off = trampoline stays an opaque extern call (pre-#14 boundary assumption)
-- **`--cfl-tracepoint-keys`** (default `true`): ADOPTED MODEL (task #35, default ON; =false to opt out): per-tracepoint keyed probe channels. Every tracepoint_probe_register-family callsite is severed from the generic body (whose shared tp formal is the channel that pools ALL tracepoints' probes into every __traceiter_* dispatch); CONST-key sites bind probe/data to the key global's channel cells directly, and the two struct-mediated registrars (trace_event_reg, bpf_probe_register) are covered by walking the trace_event_call / bpf_raw_event_map static initializers for (tp, probe) pairs. __traceiter_* icalls read their own key's channel. Unclassifiable sites keep generic wiring and are counted LOUDLY (census: zero at kernel scale)
-- **`--cfl-static-ops-tables`** (default `true`): ADOPTED MODEL (task #36, default ON; =false to opt out): answer-level channel for static_call keys updated from ops-struct tables. At __static_call_update(key, ops->field) sites the IR names the struct type and field index; the binding inventory is the set of same-typed global initializers (vmx/svm kvm_x86_ops, intel/amd x86_pmu, apic drivers). __SCT__ dispatch sites whose key is tabled take their targets from the table instead of the (type-fallback) graph answer; non-conforming update args untable the key LOUDLY and its sites keep graph behavior. Requires --cfl-static-call
-- **`--cfl-lazy-mint`** (default `false`): Demand-driven flows-to roots: mint only origin/identity roots backward-reachable from an fptr class (a/f flow edges plus cell->owner hops), re-expanding at every drain fixpoint as merges coarsen the quotient. Function roots (the answer alphabet) are always minted. Answers must be IDENTICAL to the full mint; only the propagated fact mass shrinks
-- **`--cfl-residue-copies`** (default `false`): Encode unknown-layout memcpy and aggregate accesses as per-residue field copies instead of wildcard loops (flows-to only; precise for struct-copy idioms, costly on container-churn C++ — evaluate per target codebase)
-- **`--cfl-printf-vararg-sink`** (default `true`): Skip vararg-summary wiring at variadic callsites whose constant format string (last fixed param, __printf convention) proves the varargs are read-only renderer inputs: no capture, no dispatch, no %pV forwarding, no %n. Non-constant or non-benign formats keep full wiring
-
-## Precision levers
-
-- **`--cfl-bidi-prune`** (default `false`): Before the flows-to solve, compute the field-matched bidirected partition (union-find with label-collision unification, O(m a(n))) and PRUNE origin roots whose partition's d/f cone never touches an fptr partition (pruned set recorded; cone oracle re-admits at wiring — #43 fix b82985d). Part of the canonical kernel config. Answer-preserving at FI; under fs it is strictly TIGHTER (pruned origins also stop feeding smear-producing cluster merges) — flag-match pins when comparing
-- **`--cfl-confirm-invoke`** (default `false`): Auto-confirm INVOKE pair summaries where the proof is local (task #28 tier 2): DIRECT synchronous invocation of a fn formal, and PASSTHRU forwarding into already-summarized INVOKE callees (wrapper-chain fixpoint) — both under the completeness discipline (every pointer formal accounted or reject to LEDGER). Deferred FIELD/COSTORE shapes stay census-reported for human review
-- **`--cfl-confirm-fresh`** (default `false`): Body-confirm PURE-FRESH allocation wrappers (returns trace only to fresh sources, no escapes, no pointer side effects) and promote them to allocator status, to fixpoint over wrapper chains — per-callsite object identities for their callers (task #17). Rejections tallied by reason
-- **`--cfl-fptr-slice`** (default `false`): Keep only constraint-graph components reachable from function pointers (callgraph-only slicing, default off)
-- **`--cfl-root-relevance`** (default `false`): After the flows-to fixpoint, measure the answer-relevant root fraction: function roots read at icall planes plus roots whose cluster key triggered a merge whose class lies on a backward path from some fptr class. Sizes the demand-driven-roots lever (solver work ~ |E| x |roots|)
-
-## Per-run summary machinery (2026-08)
-
-- **`--cfl-propose-noop-summaries`** (default `false`): Census: propose NOOP summaries by per-function proof of zero pointer-relevant transfer (conservative refusal: any icall/asm/non-noop callee/pointer or laundering store/pointer return refuses the candidate; fixpoint over callees). Prints NoopProp lines; adopt per-run via --cfl-adopt-proposed-summaries (pin/GT gated)
-- **`--cfl-propose-atom-summaries`** (default `false`): Census: propose transfer-atom summaries (ST/LD/MV/ALIAS with byte offsets) by per-function proof that ALL pointer effects are expressible over args/ret — conservative refusal (variable GEPs, two-level derefs, interior-pointer stores, unsafe callees, laundering). Runs atop the NOOP fixpoint for its safe-callee set. Prints AtomProp lines; adopt per-run via --cfl-adopt-proposed-summaries
-- **`--cfl-propose-solved-summaries`** (default `false`): Stage A census: function-local abstract solve over the atom-grammar value vocabulary; extract interface atoms from the solved state (refuses only true interface escapes, in-body icalls, unsafe asm). Zero-atom successes become EMPTY-ATOM summaries (callsite wiring cut, body kept). Adopt per-run via --cfl-adopt-proposed-summaries
-- **`--cfl-propose-chain-summaries`** (default `false`): Census: derive driver-core CHAINREG/CHAINCALL channel summaries from IR evidence — a wrapper qualifies when it stores a bus_type global's address into a formal-rooted field AND passes that formal to driver_register/device_add (the key-constant frame); channel slot offsets come from the union of fn-bearing offsets in conforming callsites' static initializers (layout-correct per corpus). Prints ChainProp lines, reports MATCH/MISMATCH against existing file entries (never overrides them), refuses LOUDLY on fn-constant stores into the block (shim installers) or internal-linkage keys. Adopt per-run via --cfl-adopt-proposed-summaries; conservative bindings (REG f9 no-bind; CALL f0 additive). See docs/kernel-id-keys.md §7
-- **`--cfl-adopt-proposed-summaries`** (default `false`): Adopt the provers' proposals as summaries FOR THIS RUN: NOOP + atom proofs are re-derived on the corpus being analyzed (atom byte offsets are layout-specific, so they never enter the shared func_summaries.txt). Runs the provers as a pre-pass before graph construction. Requires --func-summaries; monolithic mode only
-- **`--cfl-adopt-skip`** (default `""`): Comma-separated fn names excluded from per-run summary adoption (attribution bisection tool)
-- **`--cfl-atoms-global-stores`** (default `false`): Allow generated atoms with GLOBAL deref targets (ST/MV*(*@g<-...)). QUARANTINED default-off: at 5.18 one such adoption welded the target global's cell cluster into the pool (+27k pairs); mechanism unpinned. Read-side @g atoms (ALIAS/LD) are unaffected
-
-## Performance / scaling
-
-Measured lineage on the km fs41 workload (byte-identical answers at every
-step): baseline 4h13m → cell-major join sweep + fused kernels 1h49m →
-batching + spill 1h32m → +presolve-once 1h11m → batched+bidi+presolve-once
-**27m22s** (9.2x). The join fast path (#48) removed 99.8% of redundant
-registry probes (km FI 3:21→2:34); COW plane sharing (#46) holds RSS flat.
-Falsified levers were removed under the fix-or-remove policy
-(docs/release-trim.md); their post-mortems live in git history and the
-design docs (merge-fusion: mass is re-offer traffic; slab allocation:
-profile says compute-bound, IPC 2.76; origin bundles:
-docs/origin-bundles-design.md).
-
-- **`--cfl-presolve-merge`** (default `false`): Solve the memory-free a/f sublanguage first and merge mutual-V' classes before the full CFL solve (default off)
-- **`--cfl-presolve-once`** (default `false`): Run the pre-solve copy/field merge only on the INITIAL graph and skip it for wiring iterations >= 1 (flows-to from-scratch mode). Rationale (2026-08-16 decomposition): the re-run on the post-wiring graph is a one-time giant-SCC discovery costing 56% of km fs41 wall; the in-drain a-SCC collapse discovers the same quotient (first sweep is pulled earlier when this is on). Answers are preserved either way: pre-solve merges are exactness-preserving, so withholding them changes speed, not the closure. A/B-gated before any default flip
-- **`--cfl-presolve-exact`** (default `false`): EXPERIMENT (task #38): pre-solve merge quotients only raw mutual-flow SCCs (provable value equality) instead of V-alias-connectivity components (Steensgaard-style over-unification that manufactures the born giant). Precision can only improve; cost is the question
-- **`--cfl-presolve-cone`** (default `true`): ADOPTED (task #38, default ON; =false to opt out): keep the pre-solve V-component quotient for the data plane but exclude nodes in the backward value-flow cone of icall operands — exactness only where answers live, bounded class-count increase
-- **`--cfl-batch-roots`** (default `0`): Origin-batched flows-to solving (task #40): mint and drain roots K at a time, releasing all fact planes between batches; only the union-find quotient, join keys, bridges and harvested answer bits persist. Outer rounds repeat until a full pass adds no merges (same closure, monotone-merge argument). Memory = graph + one batch's planes. 0 = off (monolithic). Diagnostics that read live planes post-solve see only the last batch
-- **`--cfl-batch-workers`** (default `0`): Process-parallel batches (task #41, requires --cfl-batch-roots): fork P workers after graph build — the graph and quotient are shared copy-on-write, so memory = graph + P live batch plane-sets. Workers drain single-threaded and stream effectual events (key inserts, merges) + harvested answer bits through /tmp scratch files; the parent replays them (Jacobi rounds, same closure). Size P by what fits: peak ~ graph + P * (plane total / #batches). 0/1 = sequential batches
-- **`--cfl-batch-spill`** (default `""`): Plane spill/restore for batched solving (task #42, requires --cfl-batch-roots): serialize each batch's fact planes to this directory after its drain; later rounds RESTORE and drain only the cross-batch delta (classes touched by merges/bridges since the save) instead of re-deriving from seeds — offload over recompute. Point it at a filesystem with space (NOT tmpfs; spill ~ total fact mass as u32 lists, and a docker volume works). Empty = recompute mode
-- **`--cfl-solver-threads`** (default `1`): Worker threads for the flows-to solver's bulk-synchronous wave phases (1 = sequential, 0 = hardware concurrency)
-- **`--cfl-solver-block`** (default `8192`): Classes per rank-ordered block within a solver wave; smaller blocks keep more within-wave downhill forwarding, larger blocks expose more parallelism
-- **`--cfl-intern-planes`** (default `true`): Share dense fact planes copy-on-write (task #46): a full-plane delta arriving at an empty plane is ADOPTED (O(1)) instead of copied, the share walks copy chains via full-plane pushes, and pointer-equality fast paths skip the copy+diff on re-offers. Byte-identical answers by construction (COW detach on first divergent write). Only effective in the sequential solver (T=1): at T>1 concurrent in-place OR-ins would race with COW pointer swaps
-- **`--cfl-join-fastpath`** (default `true`): Cluster-mark join fast path (task #48): skip the cluster-rep registry probe when the (cluster, origin, shift) join has already been performed — the cellJoined planes are a monotone mirror of join effects, so a hit is always safe to skip and a miss only falls through to the full probe. Byte-identical answers by construction; =false to ablate (perf measurement only)
-
-## Certificates / verification
-
-- **`--cfl-verify-closure`** (default `false`): After the flows-to fixpoint, run one full non-delta scan of all propagation/join/bridge rules and assert none still fires — a per-run certificate of the closure property the delta/backlog machinery is supposed to maintain (the Lean SolverModel assumption)
-- **`--cfl-iter-cap-ok`** (default `false`): Accept UNSOUND capped output when the flows-to outer fixpoint hits --cfl-flows-to-max-iters before converging. Default: refuse and exit(1) — a silently capped result is a missing-flow answer set
-
-## Probes and censuses (measurement-only / diagnosis)
-
-- **`--cfl-census-invoke`** (default `false`): MEASUREMENT-ONLY census: scan defined functions for the (fn,data) registration shapes behind the INVOKE summary atom (fptr formal invoked with another formal; formal stored into another formal's field; formals co-stored into one object), then rank candidates by constant-Function evidence at their direct callsites. Emits proposal lines for review; adds no edges
-- **`--cfl-census-fields`** (default `false`): MEASUREMENT-ONLY census of family-2/3 store-side registration channels: (struct,offset) field keys with constant-Function stores on the registration side and field-load-fed icalls on the dispatch side, with paired sibling-store and ops-struct tallies (task #29). Adds no edges
-- **`--cfl-probe-stratum-ablate`** (default `""`): MEASUREMENT-ONLY UNSOUND probe (task #32): non-empty value severs inttoptr bridges classified as phys-stratum (directmap/vmemmap/kernelmap/mm-fn) — the result becomes an opaque identity root. Measures blob fragmentation and the answer delta of stratum separation. NEVER a shipped config
-- **`--cfl-probe-usercopy-ablate`** (default `false`): MEASUREMENT-ONLY UNSOUND probe (task #32): sever the memory edges introduced by the from-user copy primitives (_copy_from_user et al.) — the uaccess `~{memory}`-clobber asm raw-ptr closure that carries user bytes into the destination buffer. Tests whether user-copied memory affects the indirect-call graph (expect -0/+0). NEVER a shipped config
-- **`--cfl-cert-usercopy`** (default `false`): MEASUREMENT-ONLY certificate (task #32): tag the from-user memory ingress sites (the same copy-body + __get_user asm closures the ablation probe severs) with synthetic origin roots and report which indirect-call operands their bytes reach in the flows-to closure — the positive-direction crossing inventory (expect empty modulo certified crossings). Adds measurement roots; answers may smear — never compare its answer set against pins
-- **`--cfl-confirm-sinks`** (default `false`): MEASUREMENT-ONLY confirmer (task #32): machine-check the trace-payload read-back contract — walk every payload accessor callsite (ring_buffer_event_data, perf_trace_buf_alloc) and verify no value loaded back out of a payload cell feeds an indirect call. Reports CONFIRMED/ESCAPE/VIOLATION per site; adds no edges
-- **`--cfl-census-ptrtoint`** (default `false`): MEASUREMENT-ONLY census (task #33): classify every ptrtoint by its forward use-chains (escape > other > variable-arith > mask > const-add-chain-to-inttoptr > compare-only) — sizes the int-provenance residue design: const chains are GEPs in disguise (residue-encodable, wildcard-suppressible), cmp-only sites need no wildcard at all. Adds no edges
-- **`--cfl-census-type-rej`** (default `false`): MEASUREMENT-ONLY reverse census of the type filter: per icall, CFL-derived fn candidates vs after isCompatible, rejected pairs bucketed by the first failing check (argc / ret / param kind); crossed with acceptance elsewhere — a function derived somewhere but type-rejected at every deriving site is the candidate missing-target inventory (cf. the certified static_call +29). Changes no answers
-- **`--cfl-gt-type-census`** (default `""`): MEASUREMENT-ONLY ground-truth type census: file of 'frame1;frame2;... target' lines (dynamically observed caller-chain -> callee). For each record, test isCompatible between the target and every indirect callsite in every recorded frame function; a record where sites exist but NONE accepts the target is a WITNESSED type-filter unsoundness (a runtime-true pair our type rules reject). Runs after module init, then exits — no solve
-- **`--cfl-dump-fnptr-offsets`** (default `false`): MEASUREMENT-ONLY: dump every (struct, byte-offset) slot that holds a FUNCTION — from global initializers (ops tables) and direct fn-constant stores — as FNPTR-OFFSET lines, then exit. Input to the residue-modulus (Z_P) collision scorer: P must separate same-struct fn-ptr offsets or fs cannot split them
-- **`--cfl-census-extern-bound`** (default `false`): MEASUREMENT-ONLY census (task #45): rank called-but-never-defined functions (asm-defined symbols, firmware stubs) by pointer args / fn-ptr args / pointer returns — the summary-writing worklist for the extern boundary; sum=1 marks names the --func-summaries file already covers. Adds no edges
-- **`--cfl-census-tracepoint`** (default `false`): MEASUREMENT-ONLY census (task #35): size the tracepoint keyed-channel design. Classifies every tracepoint_probe_register-family callsite by how the tp argument is named (CONST @__tracepoint_* global = directly keyable / LOAD = struct-mediated, needs initializer pair correlation / FORMAL = in-family wrapper / OTHER), and checks every __traceiter_* body names its key global at the funcs-head load. Adds no edges
-- **`--cfl-census-icall-shape`** (default `false`): MEASUREMENT-ONLY census (task #37): classify every fat answer site (>=100 targets) by the IR shape of its fptr chain (formal param / struct-field load / global load / phi-select) and by whether its operand class is the giant quotient class — names the families for the next answer-level campaigns
-- **`--cfl-probe-born-hub`** (default `false`): MEASUREMENT-ONLY probe (task #38): after the pre-solve mutual-V' merge, induce the forward-flow subgraph on the largest (born-giant) SCC and iteratively remove the highest-degree node, reporting the largest-SCC shatter curve — decides whether phase-1 hub cutting is viable
-- **`--cfl-census-couplers`** (default `false`): MEASUREMENT-ONLY census (task #38, modularity thesis): track per-class subsystem masks over owned DATA origins (fn identities excluded) and record every cross-subsystem WELD at merge time, blamed by the shared join origin; report top welders + icall-operand data-subsystem diversity. Tests whether the kernel's object plane is naturally compartmentalized
-- **`--cfl-census-nexus`** (default `false`): MEASUREMENT-ONLY census (task #38): discover nexus structs — rank named struct types by how many subsystems store POINTERS through GEPs into them (the FI-cell coupling carriers), with reader diversity alongside
-- **`--cfl-probe-noformal-presolve`** (default `false`): MEASUREMENT ONLY: barrier formal-argument nodes in the pre-solve copy/field sublanguage, so the born a-component cannot glue through context-insensitive call junctions. Tests the hypothesis that formal confluence causes the born giant (2026-08-19). Changes the presolve quotient — answers are NOT pin-comparable; read the Pre-solve merge / BlobForm INITIAL lines only
-- **`--cfl-probe-witness-sep`** (default `false`): Census: record (key, fine cell) join anchors and report the bipartite separation factor — one-hop witness neighborhood size vs union-find cluster size per cell. Sizes the per-witness answer-read lever against the cluster giant
-- **`--cfl-census-strata`** (default `false`): MEASUREMENT-ONLY census (task #32): classify every inttoptr/ptrtoint by its int computation (page_offset_base/vmemmap_base/phys_base loads, direct-map constants, mm/trace function context) + census user-copy boundary interfaces — the stratum-crossing site inventory for the separation theorem. Adds no edges
-- **`--cfl-probe-blob-formation`** (default `false`): MEASUREMENT-ONLY probe (task #31): log merge events while both classes are still small/nameable (min side >= 64 or size milestones), tagged by channel (join key origin, a-scc, protection paths). Report reconstructs the final giant class's growth history — causal channels instead of member names. Adds no edges
-- **`--cfl-probe-sink-ablate`** (default `""`): MEASUREMENT-ONLY UNSOUND probe: comma-separated name substrings; cells whose class belongs to a matching function/global are treated as write-only sinks (all cluster joins skipped). Quantifies an instrumentation channel's contribution to cell fusion, fact mass and answers (task #30 follow-on). NEVER a shipped config
-- **`--cfl-probe-ops-mono`** (default `false`): MEASUREMENT-ONLY probe (task #30): classify each two-level dispatch site (obj->ops->fn) by whether its resolved targets lie inside a single ops-global member set — derives the kernel-modularity invariant from the sound analysis (mono sites certify per-ops pairing; polymorphic sites form the violation/imprecision ledger). Adds no edges
-- **`--cfl-probe-origin-split`** (default `false`): MEASUREMENT-ONLY probe (task #29): at each flows-to resolution round, compare the pooled icall answer against the counterfactual origin-indexed answer (targets present in the merged cluster classes of the container origins the fptr was loaded from) and report cluster diversity — sizes the same-origin binding lever and how much of it needs witness-based unmerging. Adds no edges, changes no answers
-- **`--cfl-ablate-mints`** (default `""`): MEASUREMENT-ONLY UNSOUND PROBE: comma-separated names; skip minting identity roots whose canonical value is the named global or an instruction inside the named function. Separates hub-seeding witnesses from hub-riding ones (task #25)
-- **`--cfl-ablate-funcs`** (default `""`): MEASUREMENT-ONLY UNSOUND PROBE: comma-separated function names whose bodies emit no edges (treated as opaque), to causally attribute hub-class gluing in the conflation report. Every ablation is WARNED loudly
-
-## Other / task-specific / legacy
-
-- **`--dump-func-info`** (default `""`): Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum
-- **`--dump-annotated-ir`** (default `""`): Dump annotated IR
-- **`--grammar-file`** (default `""`): Grammar file for CFL-reachability analysis
-- **`--cfl-edge-output`** (default `""`): Output file for CFL-reachability edges
-- **`--v-snapshot`** (default `""`): Output file for compact CFL V-relation snapshot
-- **`--llm-server-host`** (default `""`): Hostname of local LLM server
-- **`--llm-server-port`** (default `0`): Port of local LLM server
-- **`--invoke-proposals`** (default `""`): Mine kerneldoc for INVOKE registration contracts (task #28 tier 3) and write REVIEW proposals to this file, then exit. Requires --kernel-src and an LLM server (--llm-server-host/-port), or --invoke-mine-dry to validate extraction offline. Proposals are never auto-applied
-- **`--kernel-src`** (default `""`): Kernel source tree for kerneldoc extraction
-- **`--invoke-mine-dry`** (default `false`): Extract + prefilter kerneldoc candidates and record batch prompts without contacting the LLM
-- **`--query-llm`** (default `false`): Run LLM queries, save results to files, then exit
-- **`--allocator-file`** (default `""`): Path to allocator candidates JSON file (read or write)
-- **`--container-file`** (default `""`): Path to container functions JSON file (read or write)
-- **`--cfl-compressed-output`** (default `""`): Output compressed CFL constraint graph
-- **`--cfl-compressed-input`** (list): Compressed graph files for compositional solving (may be given multiple times)
-- **`--cfl-flows-to-slice`** (default `false`): Before flows-to propagation, prune to the derivation slice: 1-bit function->fptr taint with Steensgaard-class memory jumps, closed under alias-evidence origins
-- **`--cfl-trace-func`** (default `""`): Trace flows-to fact propagation for the address-taken function whose name contains this substring: log every class its root reaches (capped) and the final reach set, to localize where a flow is lost
-- **`--cfl-trace-fptr`** (default `""`): After the flows-to fixpoint, dump a backward slice from the fptr class of icalls in functions whose name contains this substring, annotated with traced-root presence, to localize where a flow is severed
-- **`--cfl-trace-value`** (default `""`): At the flows-to fixpoint, dump class/facts/cells for every pointer value in functions whose name contains this substring
-- **`--cfl-cotravel-stats`** (default `false`): After the flows-to fixpoint, report root co-travel statistics: roots with identical (class, shift) incidence columns are bundleable into one plane bit — the ratio bounds the root-bundling win (native R planes only, bridged RB excluded)
-- **`--cfl-solver-profile`** (default `false`): rdtsc phase accounting inside the flows-to pop loop (join / bridge / scan / wflag / a-prop / f-prop) to locate the time sink before optimizing
+- **`--cfl-dump-icalls-json`** (default `""`): Write per-callsite answers as JSON keyed by the callsite's debug location ("file:line": [target,...]) — the input format of the SoK-MLTA comparison harness. Includes EMPTY-answer icall sites (their AICT convention); sites without debug info are skipped with a counted warning. Dispatch (icall-classified) sites only; REGCALL re-attributions are not emitted
+- **`--ir-sidecar-dir`** (default `""`): Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)
 - **`--ir-census`** (default `false`): Enumerate every IR construct kind in the corpus, classify each against the edge builder's disposition table (handled / justified no-op / suspect / undispositioned), print the census, then exit — the encoder totality audit
 - **`--ir-census-strict`** (default `false`): Closed-world enforcement: run the census and ABORT if any construct kind in the corpus lacks a disposition. With --ir-census: audit-and-exit (exit 1 on violation). Alone: gate — census summary runs before the analysis and a violation kills the run instead of silently dropping edges
 - **`--ir-census-out`** (default `""`): Write the full census as JSON to this path: dispositions, intrinsics, constexprs, ALL external callees, the classified inline-asm table, and the unsoundness ledger (implies running the census)
+- **`--cfl-clone-per-caller`** (default `""`): Comma-separated function names to expand per call site at load time (each direct call site gets its own clone; names are processed in order, so a later name is cloned per the clones of an earlier one). The load-time equivalent of a per-call-site summary for a small generic helper such as linked_list_append: its allocation sites and formals become per site. Experiment instrument; the original is erased when no use remains
+- **`--dump-bid-mapping`** (default `""`): Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum
+- **`--dump-func-info`** (default `""`): Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum
+- **`--dump-annotated-ir`** (default `""`): Dump annotated IR
+
+## Solver and graph build
+
+- **`--cfl-global-dedup`** (default `true`): Enable global union-find dedup with dense ID remapping for CFL edge construction
+- **`--cfl-local-alloca-summary`** (default `true`): Enable non-escaping local alloca store/load summarization in CFL edge construction
+- **`--cfl-ext-globals-own-identity`** (default `true`): Whole-program mode: every declared-but-undefined global gets its own node and cell (as PointTo does) instead of the universal pointer, so stores into one extern global are not read back from every other; the cell's content stays an unknown (identity) object. Linker-bounds symbols keep the --cfl-linker-arrays treatment. Ignored under --cfl-compositional, where an extern global may be defined by an unseen TU. =false restores the universal fallback (pre-2026-09-16 behaviour)
+- **`--cfl-linker-arrays`** (default `true`): Model linker-materialized pointer arrays: alias each undefined __start_X/__stop_X extern global to the union of section-X members (IR globals with that section attribute plus module-asm PREL32 entry targets), and treat module-asm-referenced functions as address-taken. Kernel initcalls / __param / pci_fixup / ftrace_events / setup / bpf_raw_tp. Off = those loads resolve to nothing (pre-#22 behavior)
+- **`--cfl-static-call`** (default `true`): Model kernel static_call: direct calls to undefined __SCT__X trampolines dispatch through __SCK__X's func slot (initializer + in-corpus __static_call_update stores are already IR-visible); the callsite becomes an icall resolved by flows-to. Off = trampoline stays an opaque extern call (pre-#14 boundary assumption)
+- **`--cfl-printf-vararg-sink`** (default `true`): Skip vararg-summary wiring at variadic callsites whose constant format string (last fixed param, __printf convention) proves the varargs are read-only renderer inputs: no capture, no dispatch, no %pV forwarding, no %n. Non-constant or non-benign formats keep full wiring
+- **`--cfl-tracepoint-keys`** (default `true`): ADOPTED MODEL (task #35, default ON; =false to opt out): per-tracepoint keyed probe channels. Every tracepoint_probe_register-family callsite is severed from the generic body (whose shared tp formal is the channel that pools ALL tracepoints' probes into every __traceiter_* dispatch); CONST-key sites bind probe/data to the key global's channel cells directly, and the two struct-mediated registrars (trace_event_reg, bpf_probe_register) are covered by walking the trace_event_call / bpf_raw_event_map static initializers for (tp, probe) pairs. __traceiter_* icalls read their own key's channel. Unclassifiable sites keep generic wiring and are counted LOUDLY (census: zero at kernel scale)
+- **`--cfl-static-ops-tables`** (default `true`): ADOPTED MODEL (task #36, default ON; =false to opt out): answer-level channel for static_call keys updated from ops-struct tables. At __static_call_update(key, ops->field) sites the IR names the struct type and field index; the binding inventory is the set of same-typed global initializers (vmx/svm kvm_x86_ops, intel/amd x86_pmu, apic drivers). __SCT__ dispatch sites whose key is tabled take their targets from the table instead of the (type-fallback) graph answer; non-conforming update args untable the key LOUDLY and its sites keep graph behavior. Requires --cfl-static-call
+- **`--cfl-presolve-cone`** (default `true`): ADOPTED (task #38, default ON; =false to opt out): keep the pre-solve V-component quotient for the data plane but exclude nodes in the backward value-flow cone of icall operands — exactness only where answers live, bounded class-count increase
+- **`--cfl-presolve-exact`** (default `false`): EXPERIMENT (task #38): pre-solve merge quotients only raw mutual-flow SCCs (provable value equality) instead of V-alias-connectivity components (Steensgaard-style over-unification that manufactures the born giant). Precision can only improve; cost is the question
+- **`--cfl-presolve-once`** (default `false`): Run the pre-solve copy/field merge only on the INITIAL graph and skip it for wiring iterations >= 1 (flows-to from-scratch mode). Rationale (2026-08-16 decomposition): the re-run on the post-wiring graph is a one-time giant-SCC discovery costing 56% of km fs41 wall; the in-drain a-SCC collapse discovers the same quotient (first sweep is pulled earlier when this is on). Answers are preserved either way: pre-solve merges are exactness-preserving, so withholding them changes speed, not the closure. A/B-gated before any default flip
+- **`--cfl-flows-to-max-iters`** (default `10`): Cap on flows-to outer fixpoint iterations (resolve icalls -> wire callee arg/ret flows -> re-solve). Hitting the cap with unprocessed wirings is reported as an UNSOUND-RISK warning
+- **`--cfl-iter-cap-ok`** (default `false`): Accept UNSOUND capped output when the flows-to outer fixpoint hits --cfl-flows-to-max-iters before converging. Default: refuse and exit(1) — a silently capped result is a missing-flow answer set
+- **`--cfl-verify-closure`** (default `false`): After the flows-to fixpoint, run one full non-delta scan of all propagation/join/bridge rules and assert none still fires — a per-run certificate of the closure property the delta/backlog machinery is supposed to maintain (the Lean SolverModel assumption)
+- **`--cfl-varargs-strict`** (default `false`): Type filter: a NON-variadic callee behind a variadic-typed call ("T (A, ...)") must have exactly the call type's fixed parameter count. clang types an unprototyped (K&R) call as variadic with every actual as a fixed parameter, so K&R dispatch keeps its callees; only genuine "(fmt, ...)" prototypes lose fixed-arity candidates (nm-new: 66 sites, 4,798 pairs). Default off: pins are measured without it
+- **`--cfl-reachable`** (default `false`): Reachability-driven body processing: a function's edges are emitted only once the function is reached from an entry (--cfl-entry-list; default: main and llvm.global_ctors) through a direct call, a resolved indirect call, or a summary callback binding. Closed-world premise: an unreached body never runs, so it neither emits flows nor holds external inputs. Unreached address-taken functions are ledgered
+- **`--cfl-entry-list`** (default `""`): --cfl-reachable: file with one entry function name per line (library exports, kernel asm-called functions)
+- **`--cfl-bidi-prune`** (default `false`): Before the flows-to solve, compute the field-matched bidirected partition (union-find with label-collision unification, O(m a(n))) and PRUNE origin roots whose partition's d/f cone never touches an fptr partition (pruned set recorded; cone oracle re-admits at wiring — #43 fix b82985d). Part of the canonical kernel config. Answer-preserving at FI; under fs it is strictly TIGHTER (pruned origins also stop feeding smear-producing cluster merges) — flag-match pins when comparing
+- **`--cfl-lazy-mint`** (default `false`): Demand-driven flows-to roots: mint only origin/identity roots backward-reachable from an fptr class (a/f flow edges plus cell->owner hops), re-expanding at every drain fixpoint as merges coarsen the quotient. Function roots (the answer alphabet) are always minted. Answers must be IDENTICAL to the full mint; only the propagated fact mass shrinks
+- **`--cfl-intern-planes`** (default `true`): Share dense fact planes copy-on-write (task #46): a full-plane delta arriving at an empty plane is ADOPTED (O(1)) instead of copied, the share walks copy chains via full-plane pushes, and pointer-equality fast paths skip the copy+diff on re-offers. Byte-identical answers by construction (COW detach on first divergent write). Only effective in the sequential solver (T=1): at T>1 concurrent in-place OR-ins would race with COW pointer swaps
+- **`--cfl-intern-sweep`** (default `false`): Additionally run a periodic content-hash sweep unifying already-materialized duplicate R/joined planes (requires --cfl-intern-planes). Measured 2026-08-07: finds ~9% of planes mid-drain but yields no fast-path hits and no RSS high-water change (temporal divergence — duplication is an end-state property), costs ~11% at library scale. Kept as an instrument
+- **`--cfl-join-fastpath`** (default `true`): Cluster-mark join fast path (task #48): skip the cluster-rep registry probe when the (cluster, origin, shift) join has already been performed — the cellJoined planes are a monotone mirror of join effects, so a hit is always safe to skip and a miss only falls through to the full probe. Byte-identical answers by construction; =false to ablate (perf measurement only)
+- **`--cfl-witness-answers`** (default `false`): Per-witness answer read (rung 1): recompute the final M-hop at load-shaped icall sites over the bipartite key-cell structure instead of the union-find cluster - content of exactly the cells sharing a key with the fptr cell (+ VX mirror). Sound: pooled planes upstream, pooled intersection downstream, pooled fallback anywhere unresolvable. Monolithic unbatched solves only
+- **`--cfl-flows-to-slice`** (default `false`): Before flows-to propagation, prune to the derivation slice: 1-bit function->fptr taint with Steensgaard-class memory jumps, closed under alias-evidence origins
+- **`--cfl-residue-copies`** (default `false`): Encode unknown-layout memcpy and aggregate accesses as per-residue field copies instead of wildcard loops (flows-to only; precise for struct-copy idioms, costly on container-churn C++ — evaluate per target codebase)
+
+## Threading and batching
+
+- **`--cfl-solver-threads`** (default `1`): Worker threads for the flows-to solver's bulk-synchronous wave phases (1 = sequential, 0 = hardware concurrency)
+- **`--cfl-solver-block`** (default `8192`): Classes per rank-ordered block within a solver wave; smaller blocks keep more within-wave downhill forwarding, larger blocks expose more parallelism
+- **`--cfl-batch-roots`** (default `0`): Origin-batched flows-to solving (task #40): mint and drain roots K at a time, releasing all fact planes between batches; only the union-find quotient, join keys, bridges and harvested answer bits persist. Outer rounds repeat until a full pass adds no merges (same closure, monotone-merge argument). Memory = graph + one batch's planes. 0 = off (monolithic). Diagnostics that read live planes post-solve see only the last batch
+- **`--cfl-batch-workers`** (default `0`): Process-parallel batches (task #41, requires --cfl-batch-roots): fork P workers after graph build — the graph and quotient are shared copy-on-write, so memory = graph + P live batch plane-sets. Workers drain single-threaded and stream effectual events (key inserts, merges) + harvested answer bits through /tmp scratch files; the parent replays them (Jacobi rounds, same closure). Size P by what fits: peak ~ graph + P * (plane total / #batches). 0/1 = sequential batches
+- **`--cfl-batch-spill`** (default `""`): Plane spill/restore for batched solving (task #42, requires --cfl-batch-roots): serialize each batch's fact planes to this directory after its drain; later rounds RESTORE and drain only the cross-batch delta (classes touched by merges/bridges since the save) instead of re-deriving from seeds — offload over recompute. Point it at a filesystem with space (NOT tmpfs; spill ~ total fact mass as u32 lists, and a docker volume works). Empty = recompute mode
+
+## Summaries, provers, confirmers
+
+- **`--func-summaries`** (default `the repository's func_summaries.txt`): Transfer-summary file (atoms: FRESH/CPY/ALIAS/ST/LD/NONE, ordered, first-match-wins, trailing '*' = prefix). When set, it is AUTHORITATIVE: replaces the hardcoded isAllocFn allocator table and adds copy/alias/container semantics at summarized callsites. See func_summaries.txt. Default: the repository's func_summaries.txt (the reported configuration); --func-summaries= runs without a summary file
+- **`--cfl-propose-chain-summaries`** (default `true`): Census: derive driver-core CHAINREG/CHAINCALL channel summaries from IR evidence — a wrapper qualifies when it stores a bus_type global's address into a formal-rooted field AND passes that formal to driver_register/device_add (the key-constant frame); channel slot offsets come from the union of fn-bearing offsets in conforming callsites' static initializers (layout-correct per corpus). Prints ChainProp lines, reports MATCH/MISMATCH against existing file entries (never overrides them), refuses LOUDLY on fn-constant stores into the block (shim installers) or internal-linkage keys. Adopt per-run via --cfl-adopt-proposed-summaries; conservative bindings (REG f9 no-bind; CALL f0 additive). Default on (the reported configuration); =false to opt out
+- **`--cfl-propose-solved-summaries`** (default `true`): Stage A census: function-local abstract solve over the atom-grammar value vocabulary; extract interface atoms from the solved state (refuses only true interface escapes, in-body icalls, unsafe asm). Zero-atom successes become EMPTY-ATOM summaries (callsite wiring cut, body kept). Adopt per-run via --cfl-adopt-proposed-summaries. Default on (the reported configuration); =false to opt out
+- **`--cfl-adopt-proposed-summaries`** (default `true`): Adopt the provers' proposals as summaries FOR THIS RUN: NOOP + atom proofs are re-derived on the corpus being analyzed (atom byte offsets are layout-specific, so they never enter the shared func_summaries.txt). Runs the provers as a pre-pass before graph construction. Requires --func-summaries; monolithic mode only. Default on (the reported configuration); =false to opt out
+- **`--cfl-propose-noop-summaries`** (default `false`): Census: propose NOOP summaries by per-function proof of zero pointer-relevant transfer (conservative refusal: any icall/asm/non-noop callee/pointer or laundering store/pointer return refuses the candidate; fixpoint over callees). Prints NoopProp lines; adopt per-run via --cfl-adopt-proposed-summaries (pin/GT gated)
+- **`--cfl-propose-atom-summaries`** (default `false`): Census: propose transfer-atom summaries (ST/LD/MV/ALIAS with byte offsets) by per-function proof that ALL pointer effects are expressible over args/ret — conservative refusal (variable GEPs, two-level derefs, interior-pointer stores, unsafe callees, laundering). Runs atop the NOOP fixpoint for its safe-callee set. Prints AtomProp lines; adopt per-run via --cfl-adopt-proposed-summaries
+- **`--cfl-atoms-global-stores`** (default `false`): Allow generated atoms with GLOBAL deref targets (ST/MV*(*@g<-...)). QUARANTINED default-off: at 5.18 one such adoption welded the target global's cell cluster into the pool (+27k pairs); mechanism unpinned. Read-side @g atoms (ALIAS/LD) are unaffected
+- **`--cfl-adopt-skip`** (default `""`): Comma-separated fn names excluded from per-run summary adoption (attribution bisection tool)
+- **`--cfl-confirm-fresh`** (default `false`): Body-confirm PURE-FRESH allocation wrappers (returns trace only to fresh sources, no escapes, no pointer side effects) and promote them to allocator status, to fixpoint over wrapper chains — per-callsite object identities for their callers (task #17). Rejections tallied by reason
+- **`--cfl-confirm-invoke`** (default `false`): Auto-confirm INVOKE pair summaries where the proof is local (task #28 tier 2): DIRECT synchronous invocation of a fn formal, and PASSTHRU forwarding into already-summarized INVOKE callees (wrapper-chain fixpoint) — both under the completeness discipline (every pointer formal accounted or reject to LEDGER). Deferred FIELD/COSTORE shapes stay census-reported for human review
+- **`--cfl-census-invoke`** (default `false`): MEASUREMENT-ONLY census: scan defined functions for the (fn,data) registration shapes behind the INVOKE summary atom (fptr formal invoked with another formal; formal stored into another formal's field; formals co-stored into one object), then rank candidates by constant-Function evidence at their direct callsites. Emits proposal lines for review; adds no edges
+- **`--cfl-census-extern-bound`** (default `false`): MEASUREMENT-ONLY census (task #45): rank called-but-never-defined functions (asm-defined symbols, firmware stubs) by pointer args / fn-ptr args / pointer returns — the summary-writing worklist for the extern boundary; sum=1 marks names the --func-summaries file already covers. Adds no edges
+
+## Names: field and object tables
+
+- **`--cfl-regfield-apply`** (default `true`): Auto-generated identity channels from the regfield detector: for keys whose registration population is machine-certified CLOSED (every mutation path classified; zero unwitnessed stores, atomics, bulk copies, or escaping slot addresses), intersect resolution at the key's reader sites with the witnessed table — monotone -N/+0 removal, certified per key in the RegFieldChannel ledger. OPEN keys are never touched (they stay report material for the manual channel pipeline). Default on (the reported configuration); =false to opt out
+- **`--cfl-regfield-obj`** (default `true`): OBJECT-population channels (the regfield re-founding, docs/rendezvous-keying-design.md): certify which ops GLOBALS can occupy an ops-pointer field (witnessed &global stores + initializer slots + install hops + copy closure; any computed/heap pointer or writable member refuses) and clamp two-level dispatch sites with the objects' initializer-slot fns — INCLUDING GEP-less slot-0 dispatches, the class fn-slot keys cannot see (carried the post-regfield fat tail: one 4,648-fn pool per site at 5.18 fs). Slot-exact: no-GEP = offset 0 by construction. Soundness schema: proof/lean Channels.objclamp_sound. Requires --cfl-regfield-apply machinery (same walk). Default on (the reported configuration); =false to opt out
 - **`--cfl-regfield-report`** (default `false`): Post-solve targeted-fs detector: rank (struct+offset) registration fields by the gap between resolved icall fanout at their readers and the witnessed registration population stored through them (constant stores, one install-API argument hop, initializer slots, copy-edge closure). Narrow population under wide fanout = the deep-collapse signature; emits a suggested --cfl-nexus-fields list. Report only, adds no edges
-- **`--cfl-regfield-apply`** (default `false`): Auto-generated identity channels from the regfield detector: for keys whose registration population is machine-certified CLOSED (every mutation path classified; zero unwitnessed stores, atomics, bulk copies, or escaping slot addresses), intersect resolution at the key's reader sites with the witnessed table — monotone -N/+0 removal, certified per key in the RegFieldChannel ledger. OPEN keys are never touched (they stay report material for the manual channel pipeline)
-- **`--cfl-regfield-obj`** (default `false`): OBJECT-population channels (the regfield re-founding): certify which ops GLOBALS can occupy an ops-pointer field and clamp two-level dispatch sites with the objects' initializer-slot fns — including GEP-less slot-0 dispatches, the class fn-slot keys cannot see. Gated 5.18 FI 2026-08-26: −260,011/+0 vs the regfield pin, GT 79-identical, zero ASSUME-tagged keys applied. Soundness schema: proof/lean Channels.objclamp_sound
-- **`--cfl-regfield-watch`** (default `""`): comma-separated fn names; log every clamp that drops a watched fn with its key and caller — GT-loss attribution forensics
-- **`--cfl-dump-gt-aux`** (default `false`): MEASUREMENT-ONLY: dump DCALL (direct defined-callee) + SCTCALL (direct __SCT__* trampoline) edges after module load, then exit; input to tools/gt-match.py --aux (devirtualized and static_call targets are otherwise creditable only via pool smear)
 - **`--cfl-regfield-audit`** (default `false`): With --cfl-regfield-apply: emit a provenance certificate for every applied key — per-source table breakdown (const-initializer / store / install-hop / copy-closure) + risk class (GREEN rodata-structural, YELLOW hazard-counter-dependent, ORANGE copy-closure-dependent) + the full table, for the channel audit
+- **`--cfl-regfield-watch`** (default `""`): With --cfl-regfield-apply: comma-separated fn names; log 'RegFieldWatch: key K removes FN at caller' for every clamp that drops a watched fn — GT-loss attribution forensics
+- **`--cfl-filter-ledger`** (default `false`): Debug ledger: one 'FILTERED <mech> <key> <caller> @<file:line> -> <target>' line for EVERY pair a channel clamp removes (regfield fn-slot / rodata / obj). Join the lines against a ground truth (kernel GT pairs, fuzz-observed callsites) to certify no observed pair was filtered — a hit localizes the unsound removal to the responsible key. Answer-run instrument; output scales with removed pairs
+
+## Certificates and contract gates
+
+- **`--cfl-cert-usercopy`** (default `false`): MEASUREMENT-ONLY certificate (task #32): tag the from-user memory ingress sites (the same copy-body + __get_user asm closures the ablation probe severs) with synthetic origin roots and report which indirect-call operands their bytes reach in the flows-to closure — the positive-direction crossing inventory (expect empty modulo certified crossings). Adds measurement roots; answers may smear — never compare its answer set against pins
+- **`--cfl-confirm-sinks`** (default `false`): MEASUREMENT-ONLY confirmer (task #32): machine-check the trace-payload read-back contract — walk every payload accessor callsite (ring_buffer_event_data, perf_trace_buf_alloc) and verify no value loaded back out of a payload cell feeds an indirect call. Reports CONFIRMED/ESCAPE/VIOLATION per site; adds no edges
 - **`--cfl-sink-instr`** (default `false`): Reviewed sink model (task #31/#32 design): seal cluster joins at trace-payload cells (ring_buffer_/trace_buf family) — stores keep their own cell, joins to stored objects' keys are suppressed. Auto-runs the read-back contract confirmer and REFUSES to run on any VIOLATION; ESCAPE sites are inventoried for the documented review
+
+## Field sensitivity and cell models (decided in Part B)
+
+- **`--cfl-field-buckets`** (default `0`): Number of bucketed field-offset labels for field-sensitive CFL memory modeling (0 = field-insensitive, default)
 - **`--cfl-field-buckets-auto`** (default `false`): Pick the residue modulus P from the loaded corpus: census the fn-ptr slot offsets (same walk as --cfl-dump-fnptr-offsets) and choose the smallest prime whose same-struct collision residual is within --cfl-auto-buckets-residual-bp, capped by --cfl-auto-buckets-max. Explicit --cfl-field-buckets wins
 - **`--cfl-auto-buckets-residual-bp`** (default `10`): Auto bucket selection: max tolerated same-struct colliding offset pairs, in basis points of all same-struct pairs (10 = 0.10%)
 - **`--cfl-auto-buckets-max`** (default `127`): Auto bucket selection: largest P considered (memory scales ~linearly with P). If the residual target needs a larger P, the cap is taken and the shortfall is reported LOUDLY
-- **`--cfl-witness-answers`** (default `false`): Per-witness answer read (rung 1): recompute the final M-hop at load-shaped icall sites over the bipartite key-cell structure instead of the union-find cluster - content of exactly the cells sharing a key with the fptr cell (+ VX mirror). Sound: pooled planes upstream, pooled intersection downstream, pooled fallback anywhere unresolvable. Monolithic unbatched solves only
-- **`--cfl-intern-sweep`** (default `false`): Additionally run a periodic content-hash sweep unifying already-materialized duplicate R/joined planes (requires --cfl-intern-planes). Measured 2026-08-07: finds ~9% of planes mid-drain but yields no fast-path hits and no RSS high-water change (temporal divergence — duplication is an end-state property), costs ~11% at library scale. Kept as an instrument
+- **`--cfl-nexus-fields`** (default `""`): Surgical field sensitivity (task #39): comma-separated named struct list (e.g. task_struct,file,cred) or 'default' (the fat-object census list). ONLY origins of these nexus types carry exact field residues; every other origin mints on the wildcard plane, which is bit-identical to FI for it (one (o,X) join cluster, no exact keys, no VX bridges) — the residue-plane cost is confined to the nexus population. Requires --cfl-field-buckets>0 (auto-set to 13 if unset)
+- **`--cfl-channel-cells`** (default `false`): Pairwise-witnessed M (docs/channel-cells-design.md): route cell content through first-class (origin, shift) channel nodes instead of union-find cluster merges. Strictly tighter (removal-only vs clusters; Lean pair_le_cluster). v1: mono solve only — refuses batch mode, --cfl-verify-closure, and --cfl-solver-threads>1
+- **`--cfl-channel-cone`** (default `true`): With --cfl-channel-cells: wire channels only for cells that can influence some indirect call's callee expression (backward over a/f edges with Steensgaard may-alias jumps and owner-pointer hops). Answer-preserving by construction; =false wires every cell
+- **`--cfl-channel-demand`** (default `false`): With --cfl-channel-cells: demand-driven wiring. A read cell is wired to its keys' channels only once its value can reach an indirect call (static reverse closure from the callee operands, extended through every wired store); a store is wired to a key only once some relevant read demands that key. Deferred pends replay when demand or relevance arrives. Answer-preserving
+- **`--cfl-demand-site`** (default `""`): Single-site query: only indirect-call sites whose file:line contains this string (or whose function has this name) seed demand relevance (--cfl-channel-demand) and lazy-mint relevance; at the end, a widening report walks the fact flow backward from the site's callee operand and names the classes where the fact set widens (>= 2x every in-neighbour). Answers for other sites are NOT valid in this mode
+- **`--cfl-key-identity`** (default `false`): With --cfl-channel-cells: identity of never-written content per channel key instead of per read-access cell. No identity root is minted for any dereference cell; when a channel (o,s) is created for an EXTERNAL origin o (formal without callers, extern global, synthetic value, or another key identity) one identity origin is minted into it (a key identity's own channels get the identity itself back: depth-one self loop). Heap, stack and defined-global fields with no writer read as empty. Design: docs/channel-cells-design.md, Lean ChannelCells.handle_*
+- **`--cfl-holder-identity`** (default `false`): With --cfl-channel-cells: a fresh allocation stored through a pointer q (`*q = alloc`, traced through casts and O0 spill reloads) gets one clone origin per holder key of q, so lists and tables created lazily at one site are one object per holder (sym->caller, sym->callee, a global head). The fresh pointer itself keeps the base identity: its stores feed every clone, its loads see every clone. Bounds: no clone for X or constant-data holder keys, at most 32 holder keys per fresh-store cell, none for merged cells. Design: docs/channel-cells-design.md; Lean ChannelCells.holder_*
+- **`--cfl-lazy-address`** (default `false`): Exact byte-offset addresses as facts, materialized on demand (docs/lazy-address-design.md): one fact plane, f-edges remap per bit, variable array indices are strided addresses, storage identity is the address. Implies --cfl-channel-cells; refuses batch, bidi-prune and the closure verifier
+- **`--cfl-lazy-cap`** (default `32`): --cfl-lazy-address: exact addresses minted per writable object of UNKNOWN size before further offsets become its range root (objects of known size up to 4096 bytes are uncapped: their in-bounds offsets are finite; identity roots: four times this; constant globals: at least 128)
+- **`--cfl-lazy-trace-object`** (default `""`): --cfl-lazy-address: log every address minted on objects whose name contains this substring (source address, label, edge)
+- **`--cfl-lazy-typed-access`** (default `false`): --cfl-lazy-address: a member step of struct S applied to an address whose object has an incompatible type yields no address (the union-member typed read, applied at the first typed use). Sound iff the program has no type confusion; every drop is a census conflict and is counted
+- **`--cfl-lazy-type-identity`** (default `false`): --cfl-lazy-typed-access: identity roots (the unknown pointee of an unwritten cell) take the type of their first typed access, like heap objects; sound iff the underlying field is not a void* or union slot (census conflicts show where it is)
+
+## Measurement instruments
+
+- **`--cfl-probe-blob-formation`** (default `false`): MEASUREMENT-ONLY probe (task #31): log merge events while both classes are still small/nameable (min side >= 64 or size milestones), tagged by channel (join key origin, a-scc, protection paths). Report reconstructs the final giant class's growth history — causal channels instead of member names. Adds no edges
+- **`--cfl-census-couplers`** (default `false`): MEASUREMENT-ONLY census (task #38, modularity thesis): track per-class subsystem masks over owned DATA origins (fn identities excluded) and record every cross-subsystem WELD at merge time, blamed by the shared join origin; report top welders + icall-operand data-subsystem diversity. Tests whether the kernel's object plane is naturally compartmentalized
+- **`--cfl-census-nexus`** (default `false`): MEASUREMENT-ONLY census (task #38): discover nexus structs — rank named struct types by how many subsystems store POINTERS through GEPs into them (the FI-cell coupling carriers), with reader diversity alongside
+- **`--cfl-census-type-rej`** (default `false`): MEASUREMENT-ONLY reverse census of the type filter: per icall, CFL-derived fn candidates vs after isCompatible, rejected pairs bucketed by the first failing check (argc / ret / param kind); crossed with acceptance elsewhere — a function derived somewhere but type-rejected at every deriving site is the candidate missing-target inventory (cf. the certified static_call +29). Changes no answers
+- **`--cfl-gt-type-census`** (default `""`): MEASUREMENT-ONLY ground-truth type census: file of 'frame1;frame2;... target' lines (dynamically observed caller-chain -> callee). For each record, test isCompatible between the target and every indirect callsite in every recorded frame function; a record where sites exist but NONE accepts the target is a WITNESSED type-filter unsoundness (a runtime-true pair our type rules reject). Runs after module init, then exits — no solve
+- **`--cfl-dump-gt-aux`** (default `false`): MEASUREMENT-ONLY: dump DCALL (direct defined-callee call edges) and SCTCALL (direct __SCT__* trampoline calls) lines after module load, then exit. GT-matcher fidelity input (tools/gt-match.py --aux): devirtualized dispatches and static_call trampoline targets are otherwise creditable only via pool smear, which precision levers remove — surfacing phantom FN regressions. Config-independent
+- **`--cfl-ablate-mints`** (default `""`): MEASUREMENT-ONLY UNSOUND PROBE: comma-separated names; skip minting identity roots whose canonical value is the named global or an instruction inside the named function. Separates hub-seeding witnesses from hub-riding ones (task #25)
+- **`--cfl-ablate-funcs`** (default `""`): MEASUREMENT-ONLY UNSOUND PROBE: comma-separated function names whose bodies emit no edges (treated as opaque), to causally attribute hub-class gluing in the conflation report. Every ablation is WARNED loudly
 - **`--cfl-conflation-report`** (default `false`): After the flows-to fixpoint, rank functions as summary/clone candidates: shared-formal conflation (callers x facts in a pointer-formal's class) and allocation-site identity spread (classes carrying an internal alloc root x wrapper callers). The input queue for the offline proposer+confirmer loop
-- **`--cfl-cache-strict`** (default `true`): Strict compositional cache validation (coverage/freshness/compatibility)
-- **`--cfl-cache-repair`** (default `false`): Repair compositional cache by recomputing missing/stale/incompatible modules
-- **`--cfl-cache-allow-duplicate-coverage`** (default `false`): Allow multiple input .cflcg files to claim the same covered module
-- **`--callgraph-json`** (default `""`): Export call graph to JSON file
+- **`--cfl-root-relevance`** (default `false`): After the flows-to fixpoint, measure the answer-relevant root fraction: function roots read at icall planes plus roots whose cluster key triggered a merge whose class lies on a backward path from some fptr class. Sizes the demand-driven-roots lever (solver work ~ |E| x |roots|)
+- **`--cfl-cotravel-stats`** (default `false`): After the flows-to fixpoint, report root co-travel statistics: roots with identical (class, shift) incidence columns are bundleable into one plane bit — the ratio bounds the root-bundling win (native R planes only, bridged RB excluded)
+- **`--cfl-solver-profile`** (default `false`): rdtsc phase accounting inside the flows-to pop loop (join / bridge / scan / wflag / a-prop / f-prop) to locate the time sink before optimizing
+
+## Trace and dump
+
+- **`--cfl-trace-func`** (default `""`): Trace flows-to fact propagation for the address-taken function whose name contains this substring: log every class its root reaches (capped) and the final reach set, to localize where a flow is lost
+- **`--cfl-trace-first`** (default `false`): With --cfl-trace-func: log only the first arrival of each traced root at each class (bounded by the class count, no event cap), which is what a backward chain walk reads
+- **`--cfl-trace-fptr`** (default `""`): After the flows-to fixpoint, dump a backward slice from the fptr class of icalls in functions whose name contains this substring, annotated with traced-root presence, to localize where a flow is severed
+- **`--cfl-trace-meet`** (default `""`): Two origin names (comma-separated substrings of a function, global, alloca or allocation-call name such as _bfd_new_bfd::call:bfd_zmalloc) that must never alias: report the first classes that come to hold both, with each origin's derivation chain (edge kind, source class, residue) walked back to its seed — the exact place the analysis unions them
+- **`--cfl-trace-value`** (default `""`): At the flows-to fixpoint, dump class/facts/cells for every pointer value in functions whose name contains this substring
+- **`--cfl-dump-class`** (default `""`): After the flows-to fixpoint, for every solver class whose name contains this substring: size, and its members grouped by function (count per function, a few member names), plus how many members are channel/read-half nodes. Answers 'why is X in one class with Y' when the union is an SCC merge, which the tracers do not record
+- **`--cfl-dump-scc`** (default `""`): At each a-SCC collapse, for the first SCCs (up to 4) that contain a node whose name contains this substring: size, channel share, and the SHORTEST CYCLE through that node over the a / residue-0 f edges the collapse followed, node by node. Shows how an unexplained merge was built
+- **`--cfl-dump-merges`** (default `""`): MEASUREMENT-ONLY: write every solve-time class union of the final iteration with its cause (join key + the pointer class whose sweep issued it, or a-SCC collapse) plus a node-name table, so an offline replay can answer 'which union first put nodes X and Y in one class, and why' (scratch merges.py)
+- **`--cfl-dump-agraph`** (default `""`): Write the flows-to solver's dense value-flow graph once per iteration to <prefix>.it<k>.{nodes,edges}, each edge classified by what it models (direct-call actual->formal, indirect-call actual->formal, return->callsite, store value->cell, cell->load, copy) for offline attribution of the value-flow components (which edge kind glues a giant component together). Diagnostic only
+- **`--cfl-dump-type-json`** (default `""`): MEASUREMENT-ONLY: write the TYPE-ONLY candidate set of every icall site (the filter's own isCompatible over address-taken functions) in the --cfl-dump-icalls-json format, so a site's flow answer can be compared with its type bound per site
 - **`--cfl-dump-callee-mismatch`** (default `false`): Per-callsite WARNING for callees found by type but not by CFL (can produce GBs of log on large inputs)
-- **`--ir-sidecar-dir`** (default `""`): Directory to write per-bc IR fact sidecar JSON files (<bc>.facts.json)
+- **`--cfl-dump-fnptr-offsets`** (default `false`): MEASUREMENT-ONLY: dump every (struct, byte-offset) slot that holds a FUNCTION — from global initializers (ops tables) and direct fn-constant stores — as FNPTR-OFFSET lines, then exit. Input to the residue-modulus (Z_P) collision scorer: P must separate same-struct fn-ptr offsets or fs cannot split them
+
+## KABaseline only
+
+- **`--cfl-cache-allow-duplicate-coverage`** (default `false`): Allow multiple input .cflcg files to claim the same covered module
+- **`--cfl-cache-repair`** (default `false`): Repair compositional cache by recomputing missing/stale/incompatible modules
+- **`--cfl-cache-strict`** (default `true`): Strict compositional cache validation (coverage/freshness/compatibility)
+- **`--cfl-compositional`** (default `true`): Run per-TU CFL solving and compose compressed results (default on)
+- **`--cfl-compressed-input`**: Compressed graph files for compositional solving
+- **`--cfl-compressed-output`** (default `""`): Output compressed CFL constraint graph
+- **`--cfl-edge-output`** (default `""`): Output file for CFL-reachability edges
+- **`--cfl-fptr-slice`** (default `false`): Keep only constraint-graph components reachable from function pointers (callgraph-only slicing, default off)
+- **`--cfl-presolve-merge`** (default `false`): Solve the memory-free a/f sublanguage first and merge mutual-V' classes before the full CFL solve (default off)
+- **`--grammar-file`** (default `""`): Grammar file for CFL-reachability analysis
+- **`--v-snapshot`** (default `""`): Output file for compact CFL V-relation snapshot
 

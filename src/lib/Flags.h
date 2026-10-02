@@ -62,7 +62,6 @@ extern cl::opt<bool> CFLProbeNoIntStores;
 extern cl::opt<bool> CFLChannelCells;
 extern cl::opt<bool> CFLKeyChannels;
 extern cl::opt<bool> CFLIdentityChannels;
-extern cl::opt<std::string> CFLProbeWildcardAblate;
 extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<std::string> CFLProbeStratumAblate;
 extern cl::opt<bool> CFLProbeUserCopyAblate;

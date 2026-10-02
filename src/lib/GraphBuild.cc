@@ -1416,19 +1416,6 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
 void CallGraphPass::addFieldWildcardLoop(NodeIndex n, const char *why) {
   if (n == AndersNodeFactory::InvalidIndex)
     return;
-  if (!CFLProbeWildcardAblate.empty()) {
-    // MEASUREMENT-ONLY UNSOUND probe: attribute welds to admission
-    // classes by suppressing matching mints outright.
-    StringRef spec(CFLProbeWildcardAblate), w(why);
-    while (!spec.empty()) {
-      auto [pat, rest] = spec.split(',');
-      if (!pat.empty() && w.contains(pat)) {
-        wildcardReasons[std::string("ABLATED:") + why]++;
-        return;
-      }
-      spec = rest;
-    }
-  }
   NodeIndex canon = getCanonicalNode(n);
   if (moduleFieldWildcardRoots.insert(canon).second) {
     Graph.addFieldAnyLoop(canon);

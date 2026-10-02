@@ -484,14 +484,6 @@ cl::opt<bool> CFLIdentityChannels(
            "small"),
   cl::init(false));
 
-cl::opt<std::string> CFLProbeWildcardAblate(
-  "cfl-probe-wildcard-ablate",
-  cl::desc("MEASUREMENT-ONLY, UNSOUND: skip field-wildcard mints whose "
-           "reason contains any of these comma-separated substrings "
-           "(e.g. 'dirty-segment' or ':arith-var'). Attribution probe: "
-           "which admission class carries a weld"),
-  cl::init(""));
-
 cl::opt<bool> CFLFilterLedger(
   "cfl-filter-ledger",
   cl::desc("Debug ledger: one 'FILTERED <mech> <key> <caller> "

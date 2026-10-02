@@ -1451,7 +1451,7 @@ void CallGraphPass::mergeCanonicalClasses(NodeIndex a, NodeIndex b) {
 // entry points; the census (km + kernel, 2026-08-02) classifies 100%
 // of their callsites as CONST-key or one of the two struct-mediated
 // registrars, and 100% of __traceiter_* bodies name their key.
-bool isTracepointRegFn(StringRef n) {
+static bool isTracepointRegFn(StringRef n) {
   return n == "tracepoint_probe_register" ||
          n == "tracepoint_probe_register_prio" ||
          n == "tracepoint_probe_register_prio_may_exist" ||

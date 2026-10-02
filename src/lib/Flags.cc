@@ -540,18 +540,6 @@ cl::opt<bool> CFLCensusExternBound(
            "the --func-summaries file already covers. Adds no edges"),
   cl::init(false));
 
-cl::opt<bool> CFLCensusTracepoint(
-  "cfl-census-tracepoint",
-  cl::desc("MEASUREMENT-ONLY census (task #35): size the tracepoint "
-           "keyed-channel design. Classifies every "
-           "tracepoint_probe_register-family callsite by how the tp "
-           "argument is named (CONST @__tracepoint_* global = directly "
-           "keyable / LOAD = struct-mediated, needs initializer pair "
-           "correlation / FORMAL = in-family wrapper / OTHER), and "
-           "checks every __traceiter_* body names its key global at "
-           "the funcs-head load. Adds no edges"),
-  cl::init(false));
-
 cl::opt<bool> CFLTracepointKeys(
   "cfl-tracepoint-keys",
   cl::desc("ADOPTED MODEL (task #35, default ON; =false to opt out): "

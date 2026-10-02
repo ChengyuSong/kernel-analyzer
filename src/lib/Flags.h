@@ -68,7 +68,6 @@ extern cl::opt<unsigned> CFLAutoBucketsMax;
 extern cl::opt<bool> CFLDumpGTAux;
 extern cl::opt<bool> CFLDumpFnptrOffsets;
 extern cl::opt<bool> CFLCensusExternBound;
-extern cl::opt<bool> CFLCensusTracepoint;
 extern cl::opt<bool> CFLTracepointKeys;
 extern cl::opt<bool> CFLStaticOpsTables;
 extern cl::opt<bool> CFLCensusIcallShape;

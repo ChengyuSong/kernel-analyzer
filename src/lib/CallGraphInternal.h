@@ -93,7 +93,6 @@ extern size_t g_uniEdgeTouches, g_uniDerefTouches, g_uniFptrIcalls;
 extern size_t g_rebasedPtrSkipped;
 extern boost::unordered_flat_map<NodeIndex, std::string> g_opaqueProvenance;
 uint8_t subsysBitOf(const llvm::Module *M2);
-bool isTracepointRegFn(StringRef n);
 extern size_t g_tpKeyConstBinds, g_tpKeyMediatorBinds, g_tpKeyDispatchWires, g_tpKeyUnclassified, g_tpKeyKeylessIter, g_tpKeyUnmapped, g_tpKeyClassFnSkipped, g_tpKeyMediatorDataPools, g_tpKeyIterLoadsSevered;
 extern std::vector<const GlobalVariable *> g_tpWalkerKeys;
 extern boost::unordered_flat_map<NodeIndex, FuncSet> g_tpKeyProbes;

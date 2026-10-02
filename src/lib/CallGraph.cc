@@ -662,10 +662,6 @@ bool CallGraphPass::doModulePass(Module *M) {
       M == Ctx->Modules.front().first)
     runSinkConfirmer(); // contract gate BEFORE any sealing can happen
 
-  if (CFLCensusTracepoint && iteration == 0 &&
-      M == Ctx->Modules.front().first)
-    runTracepointCensus(); // measurement-only, adds no edges
-
   if (CFLTracepointKeys && iteration == 0 &&
       M == Ctx->Modules.front().first)
     bindTracepointMediatorPairs(); // before any callsite is visited

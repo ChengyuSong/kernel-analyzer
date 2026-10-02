@@ -208,7 +208,6 @@ protected:
   void runRegFieldGapReport(); // targeted-fs detector (post-solve)
   void confirmInvokeSummaries();
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
-  void runTracepointCensus(); // task #35: keyed-channel design sizing
   void runNexusCensus();      // task #38: nexus-struct discovery
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>

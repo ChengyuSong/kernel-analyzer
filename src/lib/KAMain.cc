@@ -54,6 +54,8 @@ static const RemovedFlag RemovedFlags[] = {
   {"container-file", "containers come from --func-summaries"},
   {"cfl-probe-no-cell-identity",
    "retired measurement probe; its finding is recorded in docs/release-trim.md (flag census)"},
+  {"cfl-probe-no-x-bridges",
+   "retired measurement probe; finding in docs/release-trim.md (flag census)"},
 };
 
 int main(int argc, char **argv) {

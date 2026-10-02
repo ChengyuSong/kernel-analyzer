@@ -196,13 +196,6 @@ cl::opt<bool> CFLHolderIdentity(
            "docs/channel-cells-design.md; Lean ChannelCells.holder_*"),
   cl::init(false));
 
-cl::opt<bool> CFLProbeNoXBridges(
-  "cfl-probe-no-x-bridges",
-  cl::desc("MEASUREMENT-ONLY, UNSOUND: with --cfl-channel-cells, do not "
-           "bridge an origin's unknown-offset channel to its residue "
-           "channels. Quantifies the X-plane spread"),
-  cl::init(false));
-
 cl::opt<std::string> CFLTraceMeet(
   "cfl-trace-meet",
   cl::desc("Two origin names (comma-separated substrings of a function, "

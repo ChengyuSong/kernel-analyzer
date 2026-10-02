@@ -32,7 +32,6 @@ extern cl::opt<std::string> CFLClonePerCaller;
 extern cl::opt<std::string> CFLDumpClass;
 extern cl::opt<std::string> CFLDumpSCC;
 extern cl::opt<bool> CFLHolderIdentity;
-extern cl::opt<bool> CFLProbeNoXBridges;
 extern cl::opt<std::string> CFLTraceMeet;
 extern cl::opt<std::string> CFLTraceValue;
 extern cl::opt<bool> CFLCoTravelStats;

@@ -4162,9 +4162,6 @@ bool CallGraphPass::runFlowsToResolution() {
               if (cch != UINT32_MAX) linkChan(ch, cch);
             }
         }
-        // --cfl-probe-no-x-bridges: MEASUREMENT-ONLY UNSOUND PROBE — the
-        // unknown-offset channel of an origin is not bridged to its
-        // residue channels (quantifies the X-plane spread).
         if (lazyAddr) {
           // Address overlap: bridge this channel with every channel of the
           // same object whose address set intersects (exact/strided/X).
@@ -4181,7 +4178,7 @@ bool CallGraphPass::runFlowsToResolution() {
             }
             ks.push_back(P.o);
           }
-        } else if (NB > 0 && !CFLProbeNoXBridges) { // VX linking between channel nodes (same scope)
+        } else if (NB > 0) { // VX linking between channel nodes (same scope)
           if (P.s == SHIFT_X) {
             for (uint64_t ek : shiftKeysOf[P.o]) {
               const uint32_t er = clusterFind(ek);

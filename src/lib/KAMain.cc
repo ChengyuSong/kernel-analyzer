@@ -92,6 +92,8 @@ static const RemovedFlag RemovedFlags[] = {
    "retired: identity-root channels did not fit (docs/channel-cells-design.md; docs/release-trim.md)"},
   {"cfl-census-carve",
    "retired one-off census; result in docs/channel-cells-design.md (docs/release-trim.md)"},
+  {"cfl-census-strata",
+   "retired one-off census; result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
 };
 
 int main(int argc, char **argv) {

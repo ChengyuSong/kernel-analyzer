@@ -1540,53 +1540,6 @@ size_t g_sinkArenaSites = 0;
 static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
                                       AndersNodeFactory::InvalidIndex};
 
-StrataBucket strataClassify(const Value *V0, const Function *F) {
-  SmallVector<const Value *, 16> wl{V0};
-  SmallPtrSet<const Value *, 16> seen;
-  unsigned steps = 0;
-  while (!wl.empty() && steps++ < 64) {
-    const Value *V = wl.pop_back_val();
-    if (!seen.insert(V).second)
-      continue;
-    if (const auto *CI = dyn_cast<ConstantInt>(V)) {
-      uint64_t c = CI->getZExtValue();
-      if (c == 0xffff888000000000ull)
-        return STRATA_DIRECTMAP;
-      if (c == 0xffffea0000000000ull)
-        return STRATA_VMEMMAP;
-      if (c == 0xffffffff80000000ull)
-        return STRATA_KERNELMAP;
-      continue;
-    }
-    if (const auto *LI = dyn_cast<LoadInst>(V)) {
-      const Value *P = LI->getPointerOperand()->stripPointerCasts();
-      if (const auto *GV = dyn_cast<GlobalVariable>(P)) {
-        StringRef n = GV->getName();
-        if (n == "page_offset_base")
-          return STRATA_DIRECTMAP;
-        if (n == "vmemmap_base")
-          return STRATA_VMEMMAP;
-        if (n == "phys_base")
-          return STRATA_KERNELMAP;
-      }
-      continue; // don't walk through memory
-    }
-    if (const auto *I2 = dyn_cast<Instruction>(V)) {
-      if (isa<BinaryOperator>(I2) || isa<CastInst>(I2) ||
-          isa<SelectInst>(I2) || isa<PHINode>(I2))
-        for (const Use &Op : I2->operands())
-          wl.push_back(Op.get());
-    }
-  }
-  StringRef fn = F->getName();
-  if (fn.starts_with("perf_trace_") || fn.contains("trace_event") ||
-      fn.starts_with("__bpf_trace_"))
-    return STRATA_TRACE;
-  if (fn.contains("pte") || fn.contains("pmd") || fn.contains("pud") ||
-      fn.contains("pgd") || fn.contains("pfn") || fn.contains("_page"))
-    return STRATA_MMFN;
-  return STRATA_OTHER;
-}
 
 // User ingress (task #32): user bytes reach kernel memory through two
 // uaccess shapes, which --cfl-cert-usercopy tags.

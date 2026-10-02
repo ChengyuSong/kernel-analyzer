@@ -93,7 +93,6 @@ extern cl::opt<bool> CFLInternSweep;
 extern cl::opt<unsigned> CFLBatchRoots;
 extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<std::string> CFLBatchSpill;
-extern cl::opt<bool> CFLCensusStrata;
 extern cl::opt<bool> CFLProbeBlobFormation;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConfirmFresh;

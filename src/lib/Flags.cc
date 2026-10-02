@@ -818,16 +818,6 @@ cl::opt<std::string> CFLBatchSpill(
            "docker volume works). Empty = recompute mode"),
   cl::init(""));
 
-cl::opt<bool> CFLCensusStrata(
-  "cfl-census-strata",
-  cl::desc("MEASUREMENT-ONLY census (task #32): classify every "
-           "inttoptr/ptrtoint by its int computation (page_offset_base/"
-           "vmemmap_base/phys_base loads, direct-map constants, mm/trace "
-           "function context) + census user-copy boundary interfaces — "
-           "the stratum-crossing site inventory for the separation "
-           "theorem. Adds no edges"),
-  cl::init(false));
-
 cl::opt<bool> CFLProbeBlobFormation(
   "cfl-probe-blob-formation",
   cl::desc("MEASUREMENT-ONLY probe (task #31): log merge events while "

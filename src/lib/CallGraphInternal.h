@@ -79,17 +79,6 @@ struct SctPending {
   std::string structName; // canonical (suffix-stripped) struct name
   unsigned fieldIdx;
 };
-// task #32: stratum classification of an inttoptr's int computation —
-// shared by the census and the --cfl-probe-stratum-ablate probe.
-enum StrataBucket {
-  STRATA_DIRECTMAP,
-  STRATA_VMEMMAP,
-  STRATA_KERNELMAP,
-  STRATA_MMFN,
-  STRATA_TRACE,
-  STRATA_OTHER,
-  STRATA_NBUCK
-};
 
 extern uint64_t printfSinkCallsites, printfSinkArgsSkipped;
 extern uint64_t printfNonConstFmt, printfNonBenignFmt;
@@ -120,7 +109,6 @@ extern size_t g_sinkSitesConfirmed, g_sinkSitesEscaped, g_sinkSitesViolated;
 extern bool g_sinkContractChecked;
 bool isSinkPayloadAccessor(StringRef n);
 extern size_t g_sinkArenaSites;
-StrataBucket strataClassify(const Value *V0, const Function *F);
 extern std::vector<std::pair<NodeIndex, std::string>> g_userCertObjs;
 extern size_t g_userCertCopySites, g_userCertGetSites;
 extern size_t g_tagRoundTrips;

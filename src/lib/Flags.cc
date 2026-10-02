@@ -484,13 +484,6 @@ cl::opt<bool> CFLIdentityChannels(
            "small"),
   cl::init(false));
 
-cl::opt<bool> CFLProbeIdentityJoinAblate(
-  "cfl-probe-identity-join-ablate",
-  cl::desc("MEASUREMENT-ONLY, UNSOUND: skip cluster joins keyed by "
-           "identity/synthetic origins (unwitnessed-content roots). "
-           "Quantifies the identity-web weld's share of the answer"),
-  cl::init(false));
-
 cl::opt<std::string> CFLProbeWildcardAblate(
   "cfl-probe-wildcard-ablate",
   cl::desc("MEASUREMENT-ONLY, UNSOUND: skip field-wildcard mints whose "

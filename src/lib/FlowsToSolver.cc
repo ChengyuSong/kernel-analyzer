@@ -3111,9 +3111,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // that sizes the delta-precision fix and names summarization targets.
   size_t mergesFromJoin = 0, mergesFromSCC = 0, redundantJoins = 0;
   size_t nullKeyJoinsSkipped = 0; // null-cell join hygiene LEDGER
-  size_t g_idJoinsAblated = 0;    // identity-join ablation probe LEDGER
   size_t g_transJoinsRefused = 0; // --cfl-probe-no-trans-join LEDGER
-  std::vector<int8_t> g_idJoinClass; // rid -> 1 = identity/synthetic
   // --cfl-root-relevance: (root, keeper class) per join-triggered merge —
   // joins are the only consumer of individual root bits besides the final
   // icall answer read, so these witnesses + function roots form a
@@ -3640,28 +3638,6 @@ bool CallGraphPass::runFlowsToResolution() {
         if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode()) {
           nullKeyJoinsSkipped++;
           return;
-        }
-        // MEASUREMENT-ONLY UNSOUND probe: skip joins keyed by
-        // identity/synthetic origins (unwitnessed-content roots — the
-        // nm-new weld glue). Quantifies the prize of an object-indexed
-        // cell model / witness-gated identity joins.
-        if (CFLProbeIdentityJoinAblate) {
-          if (rid0 >= g_idJoinClass.size())
-            g_idJoinClass.resize(rid0 + 1, -1);
-          int8_t &cls = g_idJoinClass[rid0];
-          if (cls < 0) {
-            const llvm::Value *OV = NF.getValueForNode(on0);
-            cls = (!OV || llvm::isa<llvm::Instruction>(OV)) ? 1 : 0;
-            if (VerboseLevel >= 2 && cls == 1)
-              errs() << "IdJoinAblate: rid " << rid0 << " "
-                     << (!OV ? (NF.isObjectNode(on0) ? "valueless-object" : "valueless-value")
-                             : (llvm::isa<llvm::CallBase>(OV) ? "call-inst" : "other-inst"))
-                     << " " << protBlameName(rootClassOf[rid0]).substr(0, 70) << "\n";
-          }
-          if (cls == 1) {
-            g_idJoinsAblated++;
-            return;
-          }
         }
       }
     }
@@ -8090,7 +8066,6 @@ bool CallGraphPass::runFlowsToResolution() {
            << " scc=" << mergesFromSCC
            << ", redundant join lookups " << redundantJoins
            << ", null-key joins skipped " << nullKeyJoinsSkipped
-           << ", identity-joins ABLATED " << g_idJoinsAblated
            << ", transitive joins REFUSED " << g_transJoinsRefused
            << (CFLChannelCells
                    ? (", CHANNELS " + std::to_string(chanNodes) + " nodes " +

@@ -63,9 +63,6 @@ Removed options are errors that name their replacement; the list is in
 - **`--ir-census-strict`** (default `false`): Closed-world enforcement: run the census and ABORT if any construct kind in the corpus lacks a disposition. With --ir-census: audit-and-exit (exit 1 on violation). Alone: gate — census summary runs before the analysis and a violation kills the run instead of silently dropping edges
 - **`--ir-census-out`** (default `""`): Write the full census as JSON to this path: dispositions, intrinsics, constexprs, ALL external callees, the classified inline-asm table, and the unsoundness ledger (implies running the census)
 - **`--cfl-clone-per-caller`** (default `""`): Comma-separated function names to expand per call site at load time (each direct call site gets its own clone; names are processed in order, so a later name is cloned per the clones of an earlier one). The load-time equivalent of a per-call-site summary for a small generic helper such as linked_list_append: its allocation sites and formals become per site. Experiment instrument; the original is erased when no use remains
-- **`--dump-bid-mapping`** (default `""`): Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum
-- **`--dump-func-info`** (default `""`): Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum
-- **`--dump-annotated-ir`** (default `""`): Dump annotated IR
 
 ## Solver and graph build
 

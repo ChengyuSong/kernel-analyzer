@@ -19,8 +19,7 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 GROUPS = [
     ('Inputs, outputs, driver', '''bc-list verbose log-timestamps mem-limit mem-limit-mode
         callgraph-json cfl-dump-icalls cfl-dump-icalls-json ir-sidecar-dir ir-census
-        ir-census-strict ir-census-out cfl-clone-per-caller dump-bid-mapping dump-func-info
-        dump-annotated-ir'''),
+        ir-census-strict ir-census-out cfl-clone-per-caller'''),
     ('Solver and graph build', '''cfl-global-dedup cfl-local-alloca-summary
         cfl-ext-globals-own-identity cfl-linker-arrays cfl-static-call cfl-printf-vararg-sink
         cfl-tracepoint-keys cfl-static-ops-tables cfl-presolve-cone cfl-presolve-exact

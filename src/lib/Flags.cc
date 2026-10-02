@@ -39,15 +39,6 @@ cl::opt<bool> CFLLocalAllocaSummary(
   cl::desc("Enable non-escaping local alloca store/load summarization in CFL edge construction"),
   cl::init(true));
 
-cl::opt<std::string> DumpBidMapping(
-  "dump-bid-mapping", cl::desc("Dump basic block ID mapping, format: bid,fun_GUID,filepath:linenum"), cl::init(""));
-
-cl::opt<std::string> DumpFuncInfo(
-  "dump-func-info", cl::desc("Dump function info, format: fun_GUID,fun_name,filepath,start_linenum,end_linenum"), cl::init(""));
-
-cl::opt<std::string> DumpAnnotatedIR(
-  "dump-annotated-ir", cl::desc("Dump annotated IR"), cl::init(""));
-
 cl::opt<bool> CFLPreSolveOnce(
   "cfl-presolve-once",
   cl::desc("Run the pre-solve copy/field merge only on the INITIAL graph "

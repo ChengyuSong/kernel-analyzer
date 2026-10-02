@@ -179,9 +179,10 @@ PART B (decide there): `--cfl-field-buckets`,
 `--cfl-lazy-cap`, `--cfl-lazy-trace-object`, `--cfl-lazy-typed-access`,
 `--cfl-lazy-type-identity`.
 
-OPEN (asked of the user): `--dump-bid-mapping`, `--dump-func-info`,
-`--dump-annotated-ir` are accepted but do nothing — their code was
-removed in 3d84c19 (2026-02-12) when `--callgraph-json` replaced it.
+REMOVED — dead options (user decision 2026-10-02): `--dump-bid-mapping`,
+`--dump-func-info`, `--dump-annotated-ir` were accepted but did nothing
+since 3d84c19 (2026-02-12), when `--callgraph-json` replaced their
+code. Older revisions keep them.
 
 KABASELINE ONLY: `--cfl-compositional`, `--cfl-compressed-output`,
 `--cfl-compressed-input`, `--cfl-presolve-merge`, `--cfl-fptr-slice`,

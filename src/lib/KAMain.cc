@@ -102,6 +102,12 @@ static const RemovedFlag RemovedFlags[] = {
    "retired one-off census (sized the adopted --cfl-tracepoint-keys); result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
   {"cfl-census-icall-shape",
    "retired one-off census; result in docs/cfl-graph-explosion-and-scaling.md (docs/release-trim.md)"},
+  {"dump-bid-mapping",
+   "did nothing since 3d84c19 (code removed when --callgraph-json replaced it); use --callgraph-json"},
+  {"dump-func-info",
+   "did nothing since 3d84c19 (code removed when --callgraph-json replaced it); use --callgraph-json"},
+  {"dump-annotated-ir",
+   "did nothing since 3d84c19 (code removed when --callgraph-json replaced it); use --callgraph-json"},
 };
 
 int main(int argc, char **argv) {

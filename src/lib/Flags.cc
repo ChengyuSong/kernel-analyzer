@@ -495,16 +495,6 @@ cl::opt<bool> CFLFilterLedger(
            "Answer-run instrument; output scales with removed pairs"),
   cl::init(false));
 
-cl::opt<bool> CFLProbeUserCopyAblate(
-  "cfl-probe-usercopy-ablate",
-  cl::desc("MEASUREMENT-ONLY UNSOUND probe (task #32): sever the memory "
-           "edges introduced by the from-user copy primitives "
-           "(_copy_from_user et al.) — the uaccess `~{memory}`-clobber "
-           "asm raw-ptr closure that carries user bytes into the "
-           "destination buffer. Tests whether user-copied memory affects "
-           "the indirect-call graph (expect -0/+0). NEVER a shipped config"),
-  cl::init(false));
-
 cl::opt<bool> CFLCertUserCopy(
   "cfl-cert-usercopy",
   cl::desc("MEASUREMENT-ONLY certificate (task #32): tag the from-user "

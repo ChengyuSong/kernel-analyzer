@@ -6998,12 +6998,6 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
   }
-  if (CFLProbeUserCopyAblate)
-    errs() << "UserCopyAblate: " << g_userCopyAsmSevered
-           << " copy-body + " << g_userGetAsmSevered
-           << " get_user asm memory closures severed ("
-           << g_userCopyDerefsSevered
-           << " raw-ptr derefs) [MEASUREMENT-ONLY UNSOUND]\n";
   if (NB > 0 && g_tagRoundTrips)
     CG_LOG("TagRoundTrip: " << g_tagRoundTrips
            << " ptrtoint wildcards suppressed (tag-bit-only closures)\n");

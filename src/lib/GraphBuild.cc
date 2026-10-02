@@ -1610,8 +1610,8 @@ StrataBucket strataClassify(const Value *V0, const Function *F) {
   return STRATA_OTHER;
 }
 
-// --cfl-probe-usercopy-ablate (task #32): user ingress reaches kernel
-// memory through two uaccess shapes, both severed here.
+// User ingress (task #32): user bytes reach kernel memory through two
+// uaccess shapes, which --cfl-cert-usercopy tags.
 //   (1) bulk copies (_copy_from_user et al.): the body's rep-movsb
 //       `~{memory}`-clobber asm is the SOLE source of pointer-memory
 //       edges (task #23 raw-ptr closure aliases *dest<->*src and stores
@@ -1628,12 +1628,9 @@ static bool isUserCopyFromFn(llvm::StringRef n) {
          n == "__copy_from_user" || n == "__copy_from_user_inatomic" ||
          n == "copy_from_user_nofault" || n == "strncpy_from_user";
 }
-size_t g_userCopyAsmSevered = 0;   // from-user copy-body asm sites cut
-size_t g_userGetAsmSevered = 0;    // caller-side get_user asm sites cut
-size_t g_userCopyDerefsSevered = 0; // raw-ptr memory derefs suppressed
 
 // --cfl-cert-usercopy (task #32): the positive-direction check. At the
-// SAME two ingress shapes the ablation severs, mint a synthetic origin
+// two ingress shapes above, mint a synthetic origin
 // object U and assign it into the asm's raw-ptr memory cells — "user
 // bytes" become a trackable root. After solve, any icall fptr class
 // whose fact planes carry a U root is a stratum crossing to inventory
@@ -1901,25 +1898,6 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
       if (pNode == AndersNodeFactory::InvalidIndex)
         continue;
       rawPtrDerefs.push_back(getRepDerefNode(pNode));
-    }
-    // MEASUREMENT-ONLY UNSOUND (task #32 usercopy ablation): if this asm
-    // is a from-user uaccess memory access — a bulk-copy body (rep movsb)
-    // or a caller-side `call __get_user_N` scalar read — drop its entire
-    // raw-ptr memory closure: the load/store/alias edges that carry user
-    // bytes into (and around) the destination. The separation test then
-    // checks the indirect-call graph is unchanged.
-    if (CFLProbeUserCopyAblate && !rawPtrDerefs.empty()) {
-      const bool copyBody =
-          CS.getFunction() && isUserCopyFromFn(CS.getFunction()->getName());
-      const bool getUser = StringRef(IA->getAsmString()).contains("__get_user");
-      if (copyBody || getUser) {
-        if (copyBody)
-          g_userCopyAsmSevered++;
-        else
-          g_userGetAsmSevered++;
-        g_userCopyDerefsSevered += rawPtrDerefs.size();
-        rawPtrDerefs.clear();
-      }
     }
     // MEASUREMENT-ONLY (task #32 usercopy certificate): tag the same
     // two ingress shapes with a synthetic origin object flowing into

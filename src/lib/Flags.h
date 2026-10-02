@@ -61,7 +61,6 @@ extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<bool> CFLCertUserCopy;
 extern cl::opt<bool> CFLConfirmSinks;
 extern cl::opt<bool> CFLSinkInstr;
-extern cl::opt<bool> CFLCensusPtrToInt;
 extern cl::opt<bool> CFLCensusTypeRej;
 extern cl::opt<std::string> CFLGTTypeCensus;
 extern cl::opt<bool> CFLFieldBucketsAuto;

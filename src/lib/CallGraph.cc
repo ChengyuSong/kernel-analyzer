@@ -665,9 +665,6 @@ bool CallGraphPass::doModulePass(Module *M) {
       M == Ctx->Modules.front().first)
     runSinkConfirmer(); // contract gate BEFORE any sealing can happen
 
-  if (CFLCensusPtrToInt && iteration == 0 && M == Ctx->Modules.front().first)
-    runPtrToIntCensus(); // measurement-only, adds no edges
-
   if (CFLCensusTracepoint && iteration == 0 &&
       M == Ctx->Modules.front().first)
     runTracepointCensus(); // measurement-only, adds no edges

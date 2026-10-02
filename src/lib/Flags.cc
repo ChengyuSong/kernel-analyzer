@@ -474,16 +474,6 @@ cl::opt<bool> CFLSinkInstr(
            "ESCAPE sites are inventoried for the documented review"),
   cl::init(false));
 
-cl::opt<bool> CFLCensusPtrToInt(
-  "cfl-census-ptrtoint",
-  cl::desc("MEASUREMENT-ONLY census (task #33): classify every ptrtoint "
-           "by its forward use-chains (escape > other > variable-arith > "
-           "mask > const-add-chain-to-inttoptr > compare-only) — sizes "
-           "the int-provenance residue design: const chains are GEPs in "
-           "disguise (residue-encodable, wildcard-suppressible), "
-           "cmp-only sites need no wildcard at all. Adds no edges"),
-  cl::init(false));
-
 cl::opt<bool> CFLCensusTypeRej(
   "cfl-census-type-rej",
   cl::desc("MEASUREMENT-ONLY reverse census of the type filter: per "

@@ -104,7 +104,7 @@ int main(int argc, char **argv) {
 
     std::vector<std::string> flowsToOnly;
     for (cl::opt<bool> *O :
-         {&CFLLazyMint, &CFLFlowsToSlice, &CFLResidueCopies, &CFLConflationReport, &CFLRootRelevance, &CFLProbeBlobFormation, &CFLCertUserCopy, &CFLConfirmSinks, &CFLSinkInstr, &CFLCensusPtrToInt, &CFLCensusTracepoint, &CFLCensusTypeRej, &CFLCensusExternBound, &CFLTracepointKeys, &CFLStaticOpsTables, &CFLCensusIcallShape, &CFLPreSolveExact, &CFLPreSolveCone, &CFLCensusCouplers, &CFLCensusNexus, &CFLReachable, &CFLLazyAddress})
+         {&CFLLazyMint, &CFLFlowsToSlice, &CFLResidueCopies, &CFLConflationReport, &CFLRootRelevance, &CFLProbeBlobFormation, &CFLCertUserCopy, &CFLConfirmSinks, &CFLSinkInstr, &CFLCensusTracepoint, &CFLCensusTypeRej, &CFLCensusExternBound, &CFLTracepointKeys, &CFLStaticOpsTables, &CFLCensusIcallShape, &CFLPreSolveExact, &CFLPreSolveCone, &CFLCensusCouplers, &CFLCensusNexus, &CFLReachable, &CFLLazyAddress})
       if (*O)
         flowsToOnly.push_back(O->ArgStr.str());
     for (const cl::Option *O : std::initializer_list<const cl::Option *>{

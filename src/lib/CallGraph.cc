@@ -24620,6 +24620,28 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     return;
   }
 
+  // Deterministic order (the maps below are keyed by pointers): every
+  // function and call instruction gets its ordinal in module order.
+  DenseMap<const Function *, uint64_t> FuncOrd;
+  DenseMap<const CallBase *, uint64_t> CallOrd;
+  for (auto &[M, Name] : Ctx->Modules)
+    for (Function &F : *M) {
+      FuncOrd.try_emplace(&F, FuncOrd.size());
+      for (Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          CallOrd.try_emplace(CB, CallOrd.size());
+    }
+  auto funcOrd = [&](const Function *F) {
+    auto It = FuncOrd.find(F);
+    assert(It != FuncOrd.end() && "call graph names a function of no module");
+    return It->second;
+  };
+  auto callOrd = [&](const CallBase *CB) {
+    auto It = CallOrd.find(CB);
+    assert(It != CallOrd.end() && "call graph names a call of no module");
+    return It->second;
+  };
+
   // Collect all functions that appear in Callees or Callers.
   // Group by getFuncId to merge multiple Function* for the same symbol
   // (e.g., external declarations appear in each module).
@@ -24637,27 +24659,44 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     if (F && !(F->isIntrinsic() && !isImportantIntrinsic(F)))
       AllFuncs.insert(F);
   }
+  // One entry per function ID. Its file, line range and linkage come
+  // from the first definition in module order (a declaration only when
+  // no definition exists); its callees are those of every definition
+  // carrying the ID (a header's static inline function is one ID with a
+  // body per translation unit, each resolving its own indirect calls).
+  std::map<std::string, std::vector<const Function *>> ByID;
+  for (const Function *F : AllFuncs)
+    ByID[getFuncId(F)].push_back(F);
+  for (auto &[ID, Fs] : ByID)
+    std::sort(Fs.begin(), Fs.end(), [&](const Function *A, const Function *B) {
+      if (A->isDeclaration() != B->isDeclaration())
+        return !A->isDeclaration();
+      return funcOrd(A) < funcOrd(B);
+    });
 
   // Build merged Callers map keyed by getFuncId string, since external
   // declarations have separate Function* per module.
-  StringMap<CallInstSet> MergedCallers;
+  StringMap<std::vector<const CallBase *>> MergedCallers;
   for (auto &[F, CIS] : Ctx->Callers) {
     if (!F || (F->isIntrinsic() && !isImportantIntrinsic(F)))
       continue;
     auto &merged = MergedCallers[getFuncId(F)];
-    merged.insert(CIS.begin(), CIS.end());
+    merged.insert(merged.end(), CIS.begin(), CIS.end());
+  }
+  for (auto &E : MergedCallers) {
+    auto &V = E.second;
+    std::sort(V.begin(), V.end(), [&](const CallBase *A, const CallBase *B) {
+      return callOrd(A) < callOrd(B);
+    });
+    V.erase(std::unique(V.begin(), V.end()), V.end());
   }
 
   json::Object Functions;
   size_t totalEdges = 0, directEdges = 0, indirectEdges = 0;
 
-  for (const Function *F : AllFuncs) {
+  for (auto &[FuncID, Fs] : ByID) {
+    const Function *F = Fs.front();
     if (F->isIntrinsic() && !isImportantIntrinsic(F))
-      continue;
-
-    std::string FuncID = getFuncId(F);
-    // Skip if already emitted (multiple Function* for the same symbol).
-    if (Functions.find(FuncID) != Functions.end())
       continue;
 
     std::string SrcFile = getFuncSourceFile(F);
@@ -24671,10 +24710,14 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
       FuncObj["line_end"] = static_cast<int64_t>(LineEnd);
     FuncObj["linkage"] = F->hasExternalLinkage() ? "external" : "internal";
 
-    // Build callees array by iterating call instructions in this function
+    // Build callees array by iterating call instructions of each body;
+    // a later body's edge already listed by an earlier body is skipped.
     json::Array CalleesArr;
-    if (!F->isDeclaration()) {
-      for (auto &BB : *F) {
+    std::set<std::tuple<std::string, bool, unsigned>> earlierBodies, thisBody;
+    for (const Function *Body : Fs) {
+      if (Body->isDeclaration())
+        break; // definitions sort first
+      for (auto &BB : *Body) {
         for (auto &I : BB) {
           const CallBase *CI = dyn_cast<CallBase>(&I);
           if (!CI || CI->isInlineAsm())
@@ -24687,11 +24730,23 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
           bool isDirect = (CI->getCalledFunction() != nullptr);
           unsigned line = getCallLine(CI);
 
-          for (const Function *Callee : it->second) {
-            if (Callee->isIntrinsic() && !isImportantIntrinsic(Callee))
+          std::vector<std::pair<std::string, const Function *>> Targets;
+          for (const Function *Callee : it->second)
+            if (!(Callee->isIntrinsic() && !isImportantIntrinsic(Callee)))
+              Targets.emplace_back(getFuncId(Callee), Callee);
+          std::sort(Targets.begin(), Targets.end(),
+                    [&](const auto &A, const auto &B) {
+                      if (A.first != B.first)
+                        return A.first < B.first;
+                      return funcOrd(A.second) < funcOrd(B.second);
+                    });
+          for (auto &[CalleeID, Callee] : Targets) {
+            auto Key = std::make_tuple(CalleeID, isDirect, line);
+            if (earlierBodies.count(Key))
               continue;
+            thisBody.insert(Key);
             json::Object Edge;
-            Edge["callee"] = getFuncId(Callee);
+            Edge["callee"] = CalleeID;
             Edge["call_type"] = isDirect ? "direct" : "indirect";
             if (line > 0)
               Edge["line"] = static_cast<int64_t>(line);
@@ -24702,6 +24757,8 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
           }
         }
       }
+      earlierBodies.insert(thisBody.begin(), thisBody.end());
+      thisBody.clear();
     }
     FuncObj["callees"] = std::move(CalleesArr);
 

@@ -3980,7 +3980,6 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     }
     // ptr = &globalvar: add assignment edges globalvar_val -> ptr
     Graph.addCopy(valNode, ptrNode);
-    if (inConstInit) constInitCells.insert(ptrNode);
     CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (isa<Function>(init)) {
     auto *storedFunc = cast<Function>(init);
@@ -3991,7 +3990,6 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     }
     // ptr = &function: add assignment edges function_val -> ptr
     Graph.addCopy(valNode, ptrNode);
-    if (inConstInit) constInitCells.insert(ptrNode);
     // Record direct function store into struct field. A store WITHOUT a
     // derivable key (literal-struct initializer like sysctl tables, plain
     // global, top-level array) must mark the function evidence-incomplete:

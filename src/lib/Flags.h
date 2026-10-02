@@ -58,8 +58,6 @@ extern cl::opt<bool> CFLRegFieldAudit;
 extern cl::opt<bool> CFLRegFieldObj;
 extern cl::opt<std::string> CFLRegFieldWatch;
 extern cl::opt<bool> CFLChannelCells;
-extern cl::opt<bool> CFLKeyChannels;
-extern cl::opt<bool> CFLIdentityChannels;
 extern cl::opt<bool> CFLFilterLedger;
 extern cl::opt<bool> CFLCertUserCopy;
 extern cl::opt<bool> CFLConfirmSinks;

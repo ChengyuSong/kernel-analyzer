@@ -727,11 +727,9 @@ bool CallGraphPass::doModulePass(Module *M) {
         Graph.addDeref(valNode, deref);
         CG_DEBUG("Processing initializer for GV " << GV.getName() << "\n");
         auto init = GV.getInitializer();
-        inConstInit = GV.isConstant();
         processInitializer(deref, init, "", -1,
                            Graph.fieldSensitive() ? valNode
                                                : AndersNodeFactory::InvalidIndex);
-        inConstInit = false;
       }
     }
 

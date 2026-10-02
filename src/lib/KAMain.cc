@@ -86,6 +86,10 @@ static const RemovedFlag RemovedFlags[] = {
    "retired measurement probe; finding in docs/release-trim.md (flag census)"},
   {"cfl-probe-block-hub-formals",
    "retired measurement probe; finding in docs/release-trim.md (flag census)"},
+  {"cfl-key-channels",
+   "retired: constant-global channels measured answer-neutral (docs/channel-cells-design.md; docs/release-trim.md)"},
+  {"cfl-identity-channels",
+   "retired: identity-root channels did not fit (docs/channel-cells-design.md; docs/release-trim.md)"},
 };
 
 int main(int argc, char **argv) {
@@ -148,29 +152,6 @@ int main(int argc, char **argv) {
                   "serial)\n";
         exit(1);
       }
-    }
-    if (CFLKeyChannels && !CFLChannelCells) {
-      const bool mono = CFLBatchRoots == 0 && CFLSolverThreads <= 1 &&
-                        !CFLVerifyClosure;
-      if (!mono) {
-        if (CFLKeyChannels.getNumOccurrences() > 0) {
-          errs() << "ERROR: --cfl-key-channels needs the sequential mono "
-                    "solve (no batch roots, one solver thread, no "
-                    "--cfl-verify-closure): the pend flush and node growth "
-                    "are barrier-serial\n";
-          exit(1);
-        }
-        CFLKeyChannels = false;
-        errs() << "KeyChannels: OFF (batch/parallel/verify-closure solve; "
-                  "constant-global keys merge as clusters)\n";
-      }
-    }
-    if (CFLIdentityChannels && !CFLKeyChannels) {
-      if (CFLKeyChannels.getNumOccurrences() > 0) {
-        errs() << "ERROR: --cfl-identity-channels needs --cfl-key-channels\n";
-        exit(1);
-      }
-      CFLKeyChannels = true;
     }
     if (!CFLNexusFields.empty() && CFLFieldBuckets == 0) {
       if (CFLFieldBuckets.getNumOccurrences() == 0) {

@@ -98,7 +98,6 @@ extern cl::opt<unsigned> CFLBatchWorkers;
 extern cl::opt<std::string> CFLBatchSpill;
 extern cl::opt<bool> CFLCensusStrata;
 extern cl::opt<bool> CFLProbeBlobFormation;
-extern cl::opt<bool> CFLProbeOriginSplit;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConfirmFresh;
 extern cl::opt<std::string> CFLAblateMints;

@@ -432,13 +432,6 @@ cl::opt<std::string> CFLRegFieldWatch(
            "that drops a watched fn — GT-loss attribution forensics"),
   cl::init(""));
 
-cl::opt<bool> CFLProbeNoIntStores(
-  "cfl-probe-no-int-stores",
-  cl::desc("MEASUREMENT-ONLY, UNSOUND: do not model ptr-width integer "
-           "stores as potential pointer stores — sizes the integer-"
-           "laundering share of pooling (shape-only mayBecomePointer)"),
-  cl::init(false));
-
 cl::opt<bool> CFLChannelCells(
   "cfl-channel-cells",
   cl::desc("Pairwise-witnessed M (docs/channel-cells-design.md): route "

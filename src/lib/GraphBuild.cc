@@ -3008,10 +3008,6 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
             if (srcN != AndersNodeFactory::InvalidIndex)
               CGP.addAssignmentEdge(srcN, valNode);
           }
-        if (CFLProbeNoIntStores) {
-          g_intStoreUnmodeled++; // MEASUREMENT-ONLY UNSOUND: laundering share
-          return;
-        }
         Value *sp = I.getOperand(1);
         NodeIndex slotRep;
         if (CGP.resolveSummarizedAllocaSlot(sp, slotRep)) {

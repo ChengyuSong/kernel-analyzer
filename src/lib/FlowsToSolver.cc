@@ -55,8 +55,6 @@ static void cflDumpClassHist(const char *label,
 
 } // namespace
 
-static size_t g_icallWiringSkipped = 0; // --cfl-probe-no-icall-wiring ledger
-
 // task #38 rung 2: canonical nodes of the presolve fptr backward cone,
 // persisted for the in-solve join-cone experiment (--cfl-join-cone).
 
@@ -6967,10 +6965,6 @@ bool CallGraphPass::runFlowsToResolution() {
       if (!Ctx->Callees[CS].insert(F).second)
         continue; // wired in an earlier iteration
       newPairs++;
-      if (CFLProbeNoIcallWiring) {
-        g_icallWiringSkipped++; // MEASUREMENT-ONLY UNSOUND: feedback share
-        continue;
-      }
       // Wire the callee's flows exactly as the saturation fixpoint does;
       // the new edges enter the NEXT iteration's solve.
       Function *CF = const_cast<Function *>(F);
@@ -7004,9 +6998,6 @@ bool CallGraphPass::runFlowsToResolution() {
   if (g_sinkAblatedJoins)
     errs() << "SinkAblate: " << g_sinkAblatedJoins
            << " cluster joins skipped [MEASUREMENT-ONLY UNSOUND]\n";
-  if (g_icallWiringSkipped)
-    errs() << "NoIcallWiring: " << g_icallWiringSkipped
-           << " resolved callees left unwired [MEASUREMENT-ONLY UNSOUND]\n";
   if (CFLSinkInstr) {
     assert(g_sinkContractChecked &&
            "sink arena ran without the read-back contract check");

@@ -57,7 +57,6 @@ extern cl::opt<bool> CFLIterCapOk;
 extern cl::opt<bool> CFLRegFieldAudit;
 extern cl::opt<bool> CFLRegFieldObj;
 extern cl::opt<std::string> CFLRegFieldWatch;
-extern cl::opt<bool> CFLProbeNoIcallWiring;
 extern cl::opt<bool> CFLProbeNoIntStores;
 extern cl::opt<bool> CFLChannelCells;
 extern cl::opt<bool> CFLKeyChannels;

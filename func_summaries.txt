@@ -37,6 +37,20 @@ _ZnajRKSt9nothrow_t FRESH
 _Znam FRESH
 _ZnamRKSt9nothrow_t FRESH
 realloc FRESH CPY(ret<-arg0)
+# Aligned allocators. posix_memalign returns its object through *arg0:
+# unmodeled, that pointer has no origin, and a wrapper that retries by
+# calling itself (ffmpeg av_malloc: ptr = av_malloc(1)) gives the value
+# an incoming edge from its own return, so no lazy root is minted either.
+# Every av_malloc object then lacked identity: AVBufferPool's alloc
+# field, stored through a byte offset after av_mallocz, never met its
+# typed load and pool_alloc_buffer's pool->alloc call (buffer.c:313)
+# resolved to nothing in every configuration, missing fuzz-observed
+# av_buffer_alloc/av_buffer_allocz (2026-10-01).
+posix_memalign FRESHSUB(*arg0)
+aligned_alloc FRESH
+memalign FRESH
+valloc FRESH
+pvalloc FRESH
 # strdup/strndup copy CHARACTERS: a C string holds no pointer, so the
 # residue-complete CPY only relays content that reached the source
 # string through an unknown-offset fold (cflow: a wordsplit field store

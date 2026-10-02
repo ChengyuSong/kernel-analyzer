@@ -463,20 +463,29 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     if (F && !(F->isIntrinsic() && !isImportantIntrinsic(F)))
       AllFuncs.insert(F);
   }
-  // One entry per function ID. Its file, line range and linkage come
-  // from the first definition in module order (a declaration only when
-  // no definition exists); its callees are those of every definition
-  // carrying the ID (a header's static inline function is one ID with a
-  // body per translation unit, each resolving its own indirect calls).
+  // One entry per function ID. An external symbol (a bare-name ID) is
+  // the definition the analysis linked it to (getFuncDef; its
+  // declarations otherwise). Every other ID is keyed by its file and can
+  // have several bodies — a header's static inline function has one per
+  // translation unit, each resolving its own indirect calls — and lists
+  // the callees of all of them. File, line range and linkage come from
+  // the first definition in module order (a declaration only when no
+  // definition exists).
   std::map<std::string, std::vector<const Function *>> ByID;
-  for (const Function *F : AllFuncs)
-    ByID[getFuncId(F)].push_back(F);
-  for (auto &[ID, Fs] : ByID)
+  for (const Function *F : AllFuncs) {
+    const Function *G = F->hasExternalLinkage()
+                            ? getFuncDef(const_cast<Function *>(F))
+                            : F;
+    ByID[getFuncId(F)].push_back(G);
+  }
+  for (auto &[ID, Fs] : ByID) {
     std::sort(Fs.begin(), Fs.end(), [&](const Function *A, const Function *B) {
       if (A->isDeclaration() != B->isDeclaration())
         return !A->isDeclaration();
       return funcOrd(A) < funcOrd(B);
     });
+    Fs.erase(std::unique(Fs.begin(), Fs.end()), Fs.end());
+  }
 
   // Build merged Callers map keyed by getFuncId string, since external
   // declarations have separate Function* per module.

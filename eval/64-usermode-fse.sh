@@ -78,17 +78,14 @@ bclist_for() {
   esac
 }
 
-CHANNELS=(--cfl-propose-chain-summaries --cfl-regfield-apply
-          --cfl-regfield-obj --cfl-propose-solved-summaries
-          --cfl-adopt-proposed-summaries)
 FSSTACK=(--cfl-bidi-prune --cfl-nexus-fields=all+ids --cfl-presolve-once)
 
 arm_flags() { # arm -> per-arm flags; batch tier appended by run_arm
   case "$1" in
-    full)   echo "${CHANNELS[@]} --func-summaries=$SUM" ;;
-    base)   echo "--func-summaries=$SUM" ;;
-    fsfull) echo "${FSSTACK[@]} ${CHANNELS[@]} --func-summaries=$SUM" ;;
-    fsbase) echo "${FSSTACK[@]} --func-summaries=$SUM" ;;
+    full)   echo "$(ka_config "$SUM" $KA_MECHANISMS)" ;;
+    base)   echo "$(ka_config "$SUM")" ;;
+    fsfull) echo "${FSSTACK[@]} $(ka_config "$SUM" $KA_MECHANISMS)" ;;
+    fsbase) echo "${FSSTACK[@]} $(ka_config "$SUM")" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }
@@ -128,7 +125,7 @@ run_arm() {
   echo "== $corpus/$arm: running ($(date -Is))"
   # shellcheck disable=SC2086
   /usr/bin/time -v "${PIN[@]}" "$KA_BIN" \
-      --verbose=2 --cfl-compositional=false --cfl-flows-to \
+      --verbose=2 \
       --cfl-dump-icalls --log-timestamps "${cert[@]}" \
       --mem-limit="$KA_UM_MEMPCT" "${batch[@]}" $flags \
       @"$bcl" > "$log" 2>&1
@@ -157,7 +154,7 @@ timed_run() { # quiet second pass: no dump/cert/logging in the wall
   echo "== $corpus/$arm: timed run ($(date -Is))"
   # shellcheck disable=SC2086
   /usr/bin/time -v -o "$tlog" "${PIN[@]}" "$KA_BIN" \
-      --verbose=0 --cfl-compositional=false --cfl-flows-to \
+      --verbose=0 \
       --mem-limit="$KA_UM_MEMPCT" $flags \
       @"$bcl" > /dev/null 2>&1
   local rc=$?

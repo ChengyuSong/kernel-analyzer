@@ -16,6 +16,23 @@ Requirements: LLVM/clang >= 18 with lld and llvm-ar (Ubuntu:
 expat headers (`libexpat1-dev`), pcre2 (`libpcre2-dev`). ~15 GB disk
 in `KA_WORK`; RAM per the table below.
 
+## The two binaries
+
+`eval/00-build-kanalyzer.sh` builds both from one tree:
+
+- `release/lib/KAMain` (`KA_BIN`) — the analysis: the rooted flows-to
+  solver, its only mode. With no options it runs the reported
+  configuration (the five channel/adoption mechanisms on, the
+  repository's `func_summaries.txt` loaded); other configurations are
+  spelled with `ka_config` from `env.sh`, which states the summaries
+  file and every mechanism explicitly.
+- `release/baseline/KABaseline` (`KA_BASELINE_BIN`) — the
+  CFL-reachability baseline: the same IR front end and constraint
+  graph, saturated by GraCFL with the points-to grammar, monolithic
+  (`--cfl-compositional=false`) or per translation unit with
+  composition (the default). It refuses the options only the flows-to
+  solver honors.
+
 ## Configuration (env vars, see `env.sh`)
 
 | var | default | meaning |
@@ -25,7 +42,7 @@ in `KA_WORK`; RAM per the table below.
 | `KA_LLVM_SUFFIX` | `-18` | toolchain suffix (`""` for unsuffixed) |
 | `KA_MEM_LIMIT_GB` | `0` (=80% RAM watchdog) | analyzer memory cap |
 | `KA_SAT_TIMEOUT` | `14400` | saturation wall cap (s) |
-| `KA_EXTRA_FLAGS` | — | appended to flows-to runs |
+| `KA_EXTRA_FLAGS` | — | appended to the 30-run/35-ablate flows-to runs; a `--func-summaries=` in it is the summaries file of those runs (none otherwise) |
 | `KA_USER_BCLIST`/`KA_USER_NAME` | — | analyze an existing bclist too (e.g. a kernel) |
 
 Big-machine note: the interesting saturation question is whether the
@@ -38,13 +55,15 @@ or higher-water OOMs. Flows-to runs need far less.
 Per corpus (httpd 2.4.68+apr static-all-modules; postgresql 18.4
 backend objects only; optionally your bclist):
 
-- **ft** — flows-to (the system config): `--cfl-compositional=false
-  --cfl-flows-to --cfl-dump-icalls`. Produces the per-icall answer
+- **ft** — flows-to without the channel mechanisms:
+  `$(ka_config <summaries from KA_EXTRA_FLAGS>) --cfl-dump-icalls`
+  on `KA_BIN`. Produces the per-icall answer
   set; the sorted dump + sha256 is the portable pin — answers are
   deterministic, so hashes must match across machines for the same
   binary+corpus.
-- **sat** — saturation baseline (GraCFL engine, same IR graph): no
-  `--cfl-flows-to`. Expected outcome at library/app scale under
+- **sat** — saturation baseline (GraCFL engine, same IR graph):
+  `KA_BASELINE_BIN --cfl-compositional=false`. Expected outcome at
+  library/app scale under
   ~50 GB caps: OOM (that is the measured result, not a harness
   failure).
 - **ftc** (opt-in: `KA_MODES="ft ftc sat"`) — ft + auto-certified

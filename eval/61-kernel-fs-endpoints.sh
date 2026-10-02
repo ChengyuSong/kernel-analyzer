@@ -45,20 +45,16 @@ case "$(df --output=fstype "$KA_SPILL_ROOT" 2>/dev/null | tail -1)" in
   tmpfs|ramfs) echo "!! KA_SPILL_ROOT is on tmpfs — refuse" >&2; exit 1 ;;
 esac
 
-COMMON=(--verbose=2 --cfl-compositional=false --cfl-flows-to
+COMMON=(--verbose=2
         --cfl-dump-icalls --log-timestamps
         --cfl-bidi-prune --cfl-nexus-fields=all+ids
         --mem-limit-mode=rss --mem-limit="$KA_FS_MEMPCT"
         --cfl-batch-roots=4000 --cfl-batch-workers="$KA_FS_WORKERS"
         --cfl-presolve-once)
-CHANNELS=(--cfl-propose-chain-summaries --cfl-regfield-apply
-          --cfl-regfield-obj --cfl-propose-solved-summaries
-          --cfl-adopt-proposed-summaries)
-
 arm_flags() {
   case "$1" in
-    fsfull) echo "${CHANNELS[@]} --func-summaries=$SUM" ;;
-    fsbase) echo "--func-summaries=$SUM" ;;
+    fsfull) echo "$(ka_config "$SUM" $KA_MECHANISMS)" ;;
+    fsbase) echo "$(ka_config "$SUM")" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }

@@ -9,6 +9,30 @@ export KA_RESULTS="${KA_RESULTS:-$KA_WORK/results}"
 # Repo root = parent of this script's directory (scripts live in-repo).
 export KA_REPO="${KA_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export KA_BIN="${KA_BIN:-$KA_REPO/release/lib/KAMain}"
+# The CFL-reachability baseline (GraCFL saturation, monolithic or
+# compositional) is its own binary since 2026-10-02.
+export KA_BASELINE_BIN="${KA_BASELINE_BIN:-$KA_REPO/release/baseline/KABaseline}"
+
+# KAMain's default IS the reported configuration: the five channel and
+# adoption mechanisms below on, and the repository's func_summaries.txt
+# loaded. Any other configuration states all of them (an option given
+# twice is an error, so arms cannot "reset then re-enable"):
+#   ka_config <summaries-file or ""> [mechanism ...]
+# prints --func-summaries=<file> and --cfl-<m> / --cfl-<m>=false for
+# each of KA_MECHANISMS.
+export KA_MECHANISMS="propose-chain-summaries regfield-apply regfield-obj propose-solved-summaries adopt-proposed-summaries"
+ka_config() {
+  local sum="$1"; shift
+  local on=" $* " out="--func-summaries=$sum" m
+  for m in $KA_MECHANISMS; do
+    if [[ "$on" == *" $m "* ]]; then out+=" --cfl-$m"; else out+=" --cfl-$m=false"; fi
+  done
+  echo "$out"
+}
+# KA_EXTRA_FLAGS may carry --func-summaries=<file>; these split it out
+# so ka_config can state it once.
+ka_extra_summaries() { sed -n 's/.*--func-summaries=\([^ ]*\).*/\1/p' <<< "$KA_EXTRA_FLAGS"; }
+ka_extra_rest() { sed 's/--func-summaries=[^ ]*//' <<< "$KA_EXTRA_FLAGS"; }
 
 # Toolchain. LLVM >= 18 with lld and llvm-ar. On systems with
 # unsuffixed binaries set KA_LLVM_SUFFIX= (empty).
@@ -53,7 +77,8 @@ export PG_VER="${PG_VER:-18.4}"
 export KA_MEM_LIMIT_GB="${KA_MEM_LIMIT_GB:-0}"
 export KA_SAT_TIMEOUT="${KA_SAT_TIMEOUT:-14400}"
 export KA_FT_TIMEOUT="${KA_FT_TIMEOUT:-14400}"
-# Extra flags appended to every flows-to run (e.g. --func-summaries=...).
+# Extra flags appended to every flows-to run of 30-run/35-ablate (e.g.
+# --func-summaries=...; without one, those runs use no summary file).
 export KA_EXTRA_FLAGS="${KA_EXTRA_FLAGS:-}"
 # Field-sensitive mode (KA_MODES+=" ftfs"): canonical fs config as of
 # 2026-08-17 — P=41 residues + presolve-once (byte-identical to the

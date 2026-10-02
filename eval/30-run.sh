@@ -8,29 +8,30 @@
 # Usage: 30-run.sh [corpus ...]   (default: httpd pg [+KA_USER_NAME])
 set -euo pipefail
 source "$(dirname "$0")/env.sh"
-ka_require "$KA_BIN" /usr/bin/time timeout
+ka_require "$KA_BIN" "$KA_BASELINE_BIN" /usr/bin/time timeout
 mkdir -p "$KA_RESULTS"
 
 run_one() { # run_one <name> <bclist> <mode: ft|sat>
   local name=$1 bclist=$2 mode=$3
   local log="$KA_RESULTS/$name-$mode.log"
-  local flags timeo
+  local flags timeo bin=$KA_BIN
+  local sum; sum=$(ka_extra_summaries)
   case $mode in
-    ft)  flags="--cfl-flows-to --cfl-dump-icalls $KA_EXTRA_FLAGS"
+    ft)  flags="$(ka_config "$sum") --cfl-dump-icalls $(ka_extra_rest)"
          timeo=$KA_FT_TIMEOUT ;;
-    ftfs) flags="--cfl-flows-to --cfl-dump-icalls $KA_FS_FLAGS \
-$KA_EXTRA_FLAGS"
+    ftfs) flags="$(ka_config "$sum") --cfl-dump-icalls $KA_FS_FLAGS \
+$(ka_extra_rest)"
          timeo=$KA_FT_TIMEOUT ;;
-    ftc) flags="--cfl-flows-to --cfl-dump-icalls --cfl-regfield-apply \
---cfl-regfield-audit $KA_EXTRA_FLAGS"
+    ftc) flags="$(ka_config "$sum" regfield-apply) --cfl-dump-icalls \
+--cfl-regfield-audit $(ka_extra_rest)"
          timeo=$KA_FT_TIMEOUT ;;
-    sat) flags=""
+    sat) flags="--cfl-compositional=false" bin=$KA_BASELINE_BIN
          timeo=$KA_SAT_TIMEOUT ;;
   esac
   echo "== $name/$mode -> $log"
   set +e
   timeout "$timeo" /usr/bin/time -v \
-    "$KA_BIN" --verbose=2 --cfl-compositional=false $flags $(ka_memflag) \
+    "$bin" --verbose=2 $flags $(ka_memflag) \
       --bc-list="$bclist" > "$log" 2>&1
   local rc=$?
   set -e

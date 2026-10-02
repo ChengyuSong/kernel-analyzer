@@ -61,10 +61,13 @@ one_sided() { # channels may only ADD pairs when ablated
 run_abl() { # run_abl <corpus> <bclist> <ablation>
   local name=$1 bclist=$2 abl=$3
   local extra; extra=$(abl_flags "$abl") || { echo "-- $name/$abl: n/a, skipped"; return 0; }
-  local base_flags="$KA_EXTRA_FLAGS"
+  # the default ft pin's configuration (30-run.sh ft), summaries from
+  # KA_EXTRA_FLAGS
+  local sum; sum=$(ka_extra_summaries)
   if [ "$extra" = "__STRIP_SUMMARIES__" ]; then
-    base_flags=$(echo "$KA_EXTRA_FLAGS" | sed 's/--func-summaries=[^ ]*//'); extra=""
+    sum=""; extra=""
   fi
+  local base_flags; base_flags="$(ka_config "$sum") $(ka_extra_rest)"
   local log="$KA_RESULTS/$name-abl-$abl.log"
   local pin="$KA_RESULTS/$name-abl-$abl-icalls.sort"
   local base_pin="$KA_RESULTS/$name-ft-icalls.sort"
@@ -72,7 +75,7 @@ run_abl() { # run_abl <corpus> <bclist> <ablation>
   echo "== $name/$abl -> $log"
   set +e
   timeout "$KA_FT_TIMEOUT" /usr/bin/time -v \
-    "$KA_BIN" --verbose=2 --cfl-compositional=false --cfl-flows-to \
+    "$KA_BIN" --verbose=2 \
       --cfl-dump-icalls $extra $base_flags $(ka_memflag) \
       --bc-list="$bclist" > "$log" 2>&1
   local rc=$?

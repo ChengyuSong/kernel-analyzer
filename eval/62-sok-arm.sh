@@ -30,14 +30,10 @@ export MALLOC_ARENA_MAX=2
 PIN=()
 [[ -n "${KA_CPUSET:-}" ]] && PIN=(taskset -c "$KA_CPUSET")
 
-CHANNELS=(--cfl-propose-chain-summaries --cfl-regfield-apply
-          --cfl-regfield-obj --cfl-propose-solved-summaries
-          --cfl-adopt-proposed-summaries)
-
 cfg_flags() {
   case "$1" in
-    full) echo "${CHANNELS[@]}" ;;
-    base) echo "" ;;
+    full) echo "$(ka_config "$SUM" $KA_MECHANISMS)" ;;
+    base) echo "$(ka_config "$SUM")" ;;
     *) return 1 ;;
   esac
 }
@@ -63,9 +59,9 @@ for cfg in full base; do
       echo "== $cfg/$tag/$prog"
       # shellcheck disable=SC2086
       timeout "$TIMEOUT" /usr/bin/time -v -o "$log.time" \
-        "${PIN[@]}" "$KA_BIN" --verbose=0 --cfl-compositional=false \
-        --cfl-flows-to --cfl-dump-icalls-json="$json" \
-        --func-summaries="$SUM" $flags "$bc" > "$log" 2>&1
+        "${PIN[@]}" "$KA_BIN" --verbose=0 \
+        --cfl-dump-icalls-json="$json" \
+        $flags "$bc" > "$log" 2>&1
       rc=$?
       if [[ $rc -eq 124 ]]; then
         echo "!! $prog: TIMEOUT (${TIMEOUT}s) — no JSON emitted" >&2

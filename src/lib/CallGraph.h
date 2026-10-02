@@ -14,12 +14,18 @@
 #include <unordered_set>
 
 #include "Global.h"
-#include "CompressedGraph.h"
-#include "gracfl/include/utils/Reachability.hpp"
-#include "gracfl/include/solvers/SolverFWGramParallel.hpp"
+#include "ConstraintGraph.h"
 
+// IR predicates the graph build and the baseline's export share.
+bool shouldSkipValue(const llvm::Value *V); // compiler-introduced values
+bool containsPointerType(llvm::Type *T);   // T is or holds a pointer
+
+// Builds the constraint graph from IR and resolves indirect calls with
+// the rooted flows-to solver. The CFL-reachability baseline
+// (src/baseline/CFLCGPass) derives from it to reuse the graph build and
+// overrides the solve and the hooks marked "baseline".
 class CallGraphPass : public IterativeModulePass {
-private:
+protected:
   class InstHandler : public llvm::InstVisitor<InstHandler> {
   private:
     CallGraphPass &CGP;
@@ -58,7 +64,6 @@ private:
 
   friend class InstHandler;
 
-  using cfl_result_t = gracfl::ReachabilityMatrix;
   // Field-store tracking for struct-field-aware indirect call filtering
   using FieldStoreKey = std::pair<std::string, unsigned>;
   struct FieldStoreKeyHash {
@@ -134,23 +139,21 @@ private:
   void addFieldWildcardLoop(NodeIndex n, const char *why);
   std::map<std::string, size_t> wildcardReasons; // fallback category tally
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
-  void sliceEdgesToFptrComponents(std::vector<size_t> &idx);
   bool runFlowsToResolution();
   // --cfl-dump-agraph: raw (pre-presolve) constraint graph + icall
   // site / function tables for offline reference solvers.
   void dumpRawGraph(const std::string &prefix);
   void runGTTypeCensus(const std::string &path);
   void dumpFnPtrOffsets();
-  std::unordered_set<NodeIndex> fptrSliceKept;
   void emitFieldwiseCopyEdges(NodeIndex srcAddr, NodeIndex dstAddr,
                               llvm::Type *Ty, unsigned depth);
 
-  // Pre-solve copy/field merge (--cfl-presolve-merge): solve the memory-free
-  // sublanguage (a/-a/f* edges only; M rules cannot fire without d edges),
-  // then collapse mutual-V' classes into canonicalNodeMap before the full
-  // solve, so the d/-d interaction runs on class representatives.
-  void preSolveCopyFieldMerge(const std::vector<gracfl::Edge> &edges,
-                              const std::vector<size_t> *idx);
+  // Pre-solve copy/field merge: quotient the memory-free sublanguage
+  // (copy and field edges; no deref edges, so no M) by its V-components
+  // (or, with --cfl-presolve-exact, its mutual-flow SCCs) into
+  // canonicalNodeMap before the solve. idx: the edges of Graph to use
+  // (all when null).
+  void preSolveCopyFieldMerge(const std::vector<size_t> *idx);
   void mergeCanonicalClasses(NodeIndex a, NodeIndex b);
 
   static bool getGEPStructField(const llvm::GEPOperator *GEP,
@@ -219,22 +222,6 @@ private:
                            const llvm::Value *DataV, bool fromWalker);
   void bindTracepointMediatorPairs();
   void handleInlineAsm(llvm::CallBase &CS);
-  bool findCustomAllocators(const cfl_result_t &outputCFLGraph,
-                            bool rewriteEdges = true);
-  bool findCustomAllocatorsComposed(
-      const cfl_result_t &composedGraph,
-      const std::unordered_map<std::string, uint32_t> &symbolToDense);
-  bool lookupRetDense(const llvm::Function *F,
-                      const std::unordered_map<std::string, uint32_t> &symMap,
-                      uint32_t graphSize, uint32_t &retDense) const;
-  bool lookupArgDense(const llvm::Function *F, unsigned argNo,
-                      const std::unordered_map<std::string, uint32_t> &symMap,
-                      uint32_t graphSize, uint32_t &argDense) const;
-  bool lookupVarargDense(const llvm::Function *F,
-                         const std::unordered_map<std::string, uint32_t> &symMap,
-                         uint32_t graphSize, uint32_t &varargDense) const;
-  bool handleIndirectCall(const cfl_result_t &outputCFLGraph,
-                          const CallInstSet &indirectCalls);
   void collectLocalAllocaSummaries(const llvm::Function *F);
   bool isSummarizableAlloca(const llvm::AllocaInst *AI) const;
   bool resolveSummarizedAllocaSlot(const llvm::Value *Ptr, NodeIndex &slotRep);
@@ -258,39 +245,11 @@ private:
   bool globalUnion(NodeIndex a, NodeIndex b);
   void globalDedupFinalize();
 
-  // Dense ID mapping (after global dedup)
-  std::vector<uint32_t> origToDense;
-  std::vector<NodeIndex> denseToOrig;
-  uint32_t numDenseNodes = 0;
-  std::vector<gracfl::Edge> denseEdges;
-  void buildDenseMapping();
-  uint32_t getDenseID(NodeIndex origNode) const;
-
-  // V-SCC computation and constraint graph compression
-  void computeVSCC(const cfl_result_t &outputCFLGraph, unsigned labelV,
-                   std::vector<uint32_t> &nodeToSCC, uint32_t &numSCCs);
-  void compressConstraintGraph(const cfl_result_t &outputCFLGraph,
-                               const std::vector<uint32_t> &nodeToSCC,
-                               uint32_t numSCCs,
-                               CompressedGraphData &out);
-
-  // Per-TU compositional solving
-  std::vector<CompressedGraphData> perTUGraphs;
-  void solveAndCompressPerTU(llvm::Module *M, size_t edgeStart, size_t edgeEnd);
-  std::unordered_map<llvm::Module *, std::pair<size_t, size_t>> moduleEdgeRanges;
+  // Indirect calls per module (the baseline's per-TU solve reads them).
   llvm::DenseMap<const llvm::Module *, CallInstSet> moduleIndirectCallInsts;
 
-  // Compositional solve results (for V-snapshot export)
-  std::unique_ptr<gracfl::SolverFWGramParallel> composedSolver;
-  std::unordered_map<std::string, uint32_t> composedSymbolToDense;
-  uint32_t composedNumDense = 0;
-
   AndersNodeFactory &NF;
-  CFLEdgeBuilder &EB;
-  unsigned cflThreads;
-  std::unique_ptr<gracfl::SolverFWGramParallel> cflSolver;
-  size_t cflSolvedInputEdgeCount;
-  bool cflForceRebuild;
+  ConstraintGraph &Graph;
   std::unordered_map<NodeIndex, NodeIndex> canonicalNodeMap;
   std::unordered_map<NodeIndex, std::unordered_set<NodeIndex>> canonicalClassMembers;
   std::unordered_set<NodeIndex> localSummarizedAllocaSlots;
@@ -352,22 +311,30 @@ private:
                      std::unordered_set<FieldStoreKey, FieldStoreKeyHash>,
                      FieldStoreKeyHash> fieldAliasMap;
 
+  // Runs after the last module's graph build on every iteration;
+  // returns true to request another iteration.
+  virtual bool solve();
+  void logHighDegreeNodes(size_t threshold, size_t topN);
+
+  // Hooks (baseline): the flows-to binary never overrides them.
+  // Called after each module's edges [edgeStart, edgeEnd) of Graph are
+  // built, before linker arrays and chain pairs are wired.
+  virtual void moduleBuilt(llvm::Module *, size_t edgeStart, size_t edgeEnd) {}
+  // Graph-build choices that depend on the solver consuming the graph.
+  virtual bool flowsTo() const { return true; }
+  virtual bool compositional() const { return false; }
+  virtual bool perTUSolve() const { return false; }
+  virtual bool exportsCallBoundaries() const { return false; }
+
 public:
   CallGraphPass(GlobalContext *Ctx_);
+  virtual ~CallGraphPass() = default;
   virtual bool doInitialization(llvm::Module *);
   virtual bool doFinalization(llvm::Module *);
   virtual bool doModulePass(llvm::Module *);
 
-  // debug
-  void dumpFuncPtrs(llvm::raw_ostream &OS);
-  void dumpGlobals(llvm::raw_ostream &OS);
-
   // export
   void dumpCallGraphJSON(llvm::StringRef Path);
-  void dumpVSnapshot(llvm::StringRef Path);
-  void dumpComposedVSnapshot(llvm::StringRef Path);
-  void exportCompressedGraph(llvm::StringRef Path);
-  bool runCompositionalSolve();
 };
 
 #endif

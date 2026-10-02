@@ -19,7 +19,9 @@ echo "bitcode objects: $(wc -l < "$LIST")"
 export MALLOC_ARENA_MAX=2
 release/lib/KAMain --verbose=2 --mem-limit=40 --mem-limit-mode=as \
   --cfl-field-buckets=13 --cfl-presolve-exact --cfl-presolve-cone=false \
-  --cfl-compositional=false --cfl-flows-to --func-summaries=func_summaries.txt \
+  --func-summaries=func_summaries.txt --cfl-propose-chain-summaries=false \
+  --cfl-regfield-apply=false --cfl-regfield-obj=false \
+  --cfl-adopt-proposed-summaries=false \
   --cfl-confirm-fresh --cfl-propose-noop-summaries --cfl-propose-atom-summaries \
   --cfl-propose-solved-summaries --cfl-trace-func=zzz_none \
   $(cat "$LIST") > "$OUT" 2>&1

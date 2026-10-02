@@ -125,14 +125,12 @@ PIN=()
 # from the harness when the incremental divergence shipped —
 # never again. Answer runs carry it; quiet timed runs do not (it
 # adds a scan to the measured wall).
-COMMON=(--verbose=2 --cfl-compositional=false --cfl-flows-to
+COMMON=(--verbose=2
         --cfl-dump-icalls --cfl-verify-closure --log-timestamps
         --mem-limit="$KA_MEMLIMIT")
-FULLPREC=(--cfl-propose-chain-summaries --cfl-regfield-apply
-          --cfl-regfield-obj --cfl-propose-solved-summaries
-          --cfl-adopt-proposed-summaries)
-NOADOPT=(--cfl-propose-chain-summaries --cfl-regfield-apply
-         --cfl-regfield-obj)
+FULLPREC=(propose-chain-summaries regfield-apply regfield-obj
+          propose-solved-summaries adopt-proposed-summaries)
+NOADOPT=(propose-chain-summaries regfield-apply regfield-obj)
 
 # INVOKE-filtered summaries (generated fresh each invocation).
 NOINV="$OUT/func_summaries.noinvoke.txt"
@@ -140,23 +138,23 @@ grep -v 'INVOKE(' "$SUM" > "$NOINV"
 
 arm_flags() {
   case "$1" in
-    full)        echo "${FULLPREC[@]} --func-summaries=$SUM" ;;
-    base)        echo "--func-summaries=$SUM" ;;
-    noadopt)     echo "${NOADOPT[@]} --func-summaries=$SUM" ;;
-    noregf)      echo "--cfl-propose-chain-summaries --cfl-propose-solved-summaries --cfl-adopt-proposed-summaries --func-summaries=$SUM" ;;
-    nochain)     echo "--cfl-regfield-apply --cfl-regfield-obj --cfl-propose-solved-summaries --cfl-adopt-proposed-summaries --func-summaries=$SUM" ;;
-    notpkeys)    echo "${FULLPREC[@]} --cfl-tracepoint-keys=false --func-summaries=$SUM" ;;
-    noopstables) echo "${FULLPREC[@]} --cfl-static-ops-tables=false --func-summaries=$SUM" ;;
-    noinvoke)    echo "${FULLPREC[@]} --func-summaries=$NOINV" ;;
+    full)        echo "$(ka_config "$SUM" "${FULLPREC[@]}")" ;;
+    base)        echo "$(ka_config "$SUM")" ;;
+    noadopt)     echo "$(ka_config "$SUM" "${NOADOPT[@]}")" ;;
+    noregf)      echo "$(ka_config "$SUM" propose-chain-summaries propose-solved-summaries adopt-proposed-summaries)" ;;
+    nochain)     echo "$(ka_config "$SUM" regfield-apply regfield-obj propose-solved-summaries adopt-proposed-summaries)" ;;
+    notpkeys)    echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-tracepoint-keys=false" ;;
+    noopstables) echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-static-ops-tables=false" ;;
+    noinvoke)    echo "$(ka_config "$NOINV" "${FULLPREC[@]}")" ;;
     # adoption requires the summaries-file infrastructure (asserted
     # in runSummaryProvers), so the soundness row drops both; the
     # adoption delta is isolated by the noadopt arm.
-    nosummaries) echo "${NOADOPT[@]}" ;;
-    noshare)     echo "${FULLPREC[@]} --cfl-intern-planes=false --func-summaries=$SUM" ;;
-    nofastjoin)  echo "${FULLPREC[@]} --cfl-join-fastpath=false --func-summaries=$SUM" ;;
-    lazymint)    echo "${FULLPREC[@]} --cfl-lazy-mint --func-summaries=$SUM" ;;
-    bidi)        echo "${FULLPREC[@]} --cfl-bidi-prune --func-summaries=$SUM" ;;
-    lazybidi)    echo "${FULLPREC[@]} --cfl-lazy-mint --cfl-bidi-prune --func-summaries=$SUM" ;;
+    nosummaries) echo "$(ka_config "" "${NOADOPT[@]}")" ;;
+    noshare)     echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-intern-planes=false" ;;
+    nofastjoin)  echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-join-fastpath=false" ;;
+    lazymint)    echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-lazy-mint" ;;
+    bidi)        echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-bidi-prune" ;;
+    lazybidi)    echo "$(ka_config "$SUM" "${FULLPREC[@]}") --cfl-lazy-mint --cfl-bidi-prune" ;;
     *) echo "unknown arm: $1" >&2; return 1 ;;
   esac
 }
@@ -197,7 +195,7 @@ gt_aux() {
   local log="$OUT/gtaux.log"
   [[ -s "$aux" && "${KA_FORCE:-0}" != 1 ]] && return 0
   echo "== gtaux: dumping direct/trampoline edges"
-  "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" --cfl-dump-gt-aux --func-summaries="$SUM" \
+  "${PIN[@]}" "$KA_BIN" "${COMMON[@]}" --cfl-dump-gt-aux $(ka_config "$SUM") \
       @"$KA_KERNEL_BCLIST" > "$log" 2>&1
   local rc=$?
   grep -E '^DCALL |^SCTCALL ' "$log" > "$aux" || true
@@ -285,7 +283,7 @@ timed_run() { # quiet second pass for reportable timing
   echo "== $arm: timed run ($(date -Is))"
   # shellcheck disable=SC2086
   /usr/bin/time -v -o "$tlog" "${PIN[@]}" "$KA_BIN" \
-      --verbose=0 --cfl-compositional=false --cfl-flows-to \
+      --verbose=0 \
       --mem-limit="$KA_MEMLIMIT" $flags \
       @"$KA_KERNEL_BCLIST" > /dev/null 2>&1
   local rc=$?

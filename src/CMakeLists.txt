@@ -35,5 +35,30 @@ include_directories(.)
 
 enable_testing()
 
+# jemalloc is the allocator of both binaries (GraCFL also links it).
+include(ExternalProject)
+find_library(JEMALLOC_LIB jemalloc)
+if(NOT JEMALLOC_LIB)
+    message(STATUS "jemalloc not found, downloading and building it...")
+    ExternalProject_Add(
+        jemalloc
+        GIT_REPOSITORY https://github.com/jemalloc/jemalloc.git
+        GIT_TAG 5.3.0
+        CONFIGURE_COMMAND ./autogen.sh --prefix=${CMAKE_BINARY_DIR}/jemalloc_install --libdir=${CMAKE_BINARY_DIR}/jemalloc_install/lib --with-private-libpthread
+        BUILD_COMMAND make
+        INSTALL_COMMAND make install
+        BUILD_IN_SOURCE 1
+        PREFIX ${CMAKE_BINARY_DIR}/_deps/jemalloc
+    )
+    set(JEMALLOC_LIB "${CMAKE_BINARY_DIR}/jemalloc_install/lib/libjemalloc.a")
+    set(JEMALLOC_LIBS ${JEMALLOC_LIB} pthread dl)
+    add_custom_target(libjemalloc)
+    add_dependencies(libjemalloc jemalloc)
+else()
+    set(JEMALLOC_LIBS ${JEMALLOC_LIB})
+endif()
+
 add_subdirectory(lib)
+# GraCFL and the CFL-reachability baseline (KABaseline) that uses it.
 add_subdirectory(gracfl)
+add_subdirectory(baseline)

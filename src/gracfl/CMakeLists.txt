@@ -30,7 +30,8 @@ find_package(OpenMP REQUIRED)
 # External project support
 include(ExternalProject)
 
-# External jemalloc setup
+# External jemalloc setup (KANALYZER's top level provides JEMALLOC_LIBS)
+if(NOT DEFINED JEMALLOC_LIBS)
 find_library(JEMALLOC_LIB jemalloc)
 
 if(NOT JEMALLOC_LIB)
@@ -57,6 +58,7 @@ if(NOT JEMALLOC_LIB)
     add_dependencies(libjemalloc jemalloc)
 else()
     set(JEMALLOC_LIBS ${JEMALLOC_LIB})
+endif()
 endif()
 
 # External TBB setup

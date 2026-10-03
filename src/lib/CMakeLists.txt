@@ -15,6 +15,7 @@ set (KACoreSource
   Presolve.cc
   FlowsToSolver.cc
   Names.cc
+  NamedCells.cc
   Summaries.cc
   Census.cc
   Dump.cc

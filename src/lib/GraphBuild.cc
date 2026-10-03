@@ -1201,11 +1201,176 @@ void CallGraphPass::addAssignmentEdge(NodeIndex src, NodeIndex dst) {
     return;
   NodeIndex s = getCanonicalNode(src);
   NodeIndex d = getCanonicalNode(dst);
+  // Before the s == d shortcut: a presolve class may hold both the value
+  // and the cell, but the cell's unnamed shadow is outside every class.
+  fileUnnamedWrite(s, src, dst);
   if (s == d) return;
   if (s == NF.getUniversalPtrNode() || d == NF.getUniversalPtrNode() ||
       s == NF.getUniversalObjNode() || d == NF.getUniversalObjNode())
     g_uniEdgeTouches++;
   Graph.addCopy(s, d);
+}
+
+// ---- Named cells (--cfl-named-planes) ----
+// Realization of NamedCells.lean's planes by separate nodes: the cell
+// itself keeps every write (unnamed loads read it, exactly as without
+// names); a shadow per (cell, name) holds the writes filed under that
+// name, and the Unnamed shadow every other write into the cell. A
+// shadow has no Deref edge: the solver keeps it as a satellite of its
+// cell's class and merges the satellites of one name whenever two
+// classes merge, so a merged class keeps its content by name. Shadows
+// stay out of presolve classes and SCC collapse, never mint an identity
+// of their own, and receive the cell's identity in the Unnamed shadow
+// instead (FlowsToSolver.cc).
+
+bool CallGraphPass::namedPlanes() const { return CFLNamedPlanes && flowsTo(); }
+
+NodeIndex CallGraphPass::cellParent(NodeIndex cell) {
+  if (NF.isDereferenceNode(cell)) {
+    if (shadowInfo.count(cell))
+      return AndersNodeFactory::InvalidIndex; // a shadow is no cell
+    return NF.getDerefParent(cell);
+  }
+  if (!NF.isObjectNode(cell))
+    return AndersNodeFactory::InvalidIndex;
+  // Object nodes are cells when a Deref edge reaches them (allocation
+  // contents): index the Deref edges added since the last look.
+  if (Graph.removalCount() != objCellRemovals) {
+    objCellRemovals = Graph.removalCount();
+    objCellScan = 0;
+  }
+  const auto &E = Graph.edges();
+  for (; objCellScan < E.size(); objCellScan++)
+    if (E[objCellScan].kind == EdgeKind::Deref &&
+        NF.isObjectNode(E[objCellScan].to))
+      objCellParent.emplace(E[objCellScan].to, E[objCellScan].from);
+  auto it = objCellParent.find(cell);
+  return it == objCellParent.end() ? AndersNodeFactory::InvalidIndex
+                                   : it->second;
+}
+
+std::pair<NodeIndex, uint32_t> CallGraphPass::shadowInfoOf(NodeIndex n) const {
+  auto it = shadowInfo.find(n);
+  if (it == shadowInfo.end())
+    return {AndersNodeFactory::InvalidIndex, ka::AccessNames::Original};
+  return it->second;
+}
+
+NodeIndex CallGraphPass::namedShadow(NodeIndex cell, uint32_t name) {
+  assert(name != ka::AccessNames::Original && "the original is the cell");
+  assert(!isShadowCell(cell) && "shadows have no shadows");
+  const uint64_t key = (uint64_t)cell << 32 | name;
+  auto it = shadowOf.find(key);
+  if (it != shadowOf.end())
+    return it->second;
+  assert(cellParent(cell) != AndersNodeFactory::InvalidIndex &&
+         "only a cell has shadows");
+  const NodeIndex sh = NF.createDereferenceNode(AndersNodeFactory::InvalidIndex);
+  shadowOf.emplace(key, sh);
+  shadowInfo.emplace(sh, std::make_pair(cell, name));
+  namedStats.shadows++;
+  return sh;
+}
+
+bool CallGraphPass::isCellNode(NodeIndex n) {
+  if (isShadowCell(n))
+    return false;
+  const bool deref = NF.isDereferenceNode(n);
+  if (!deref && !NF.isObjectNode(n))
+    return false;
+  if (cellParent(n) == AndersNodeFactory::InvalidIndex) {
+    // An object no Deref edge reaches is not memory in this graph (it is
+    // read only as a value); every dereference node has its pointer.
+    assert(!deref && "dereference node without a pointer");
+    return false;
+  }
+  return true;
+}
+
+void CallGraphPass::fileUnnamedWrite(NodeIndex s, NodeIndex src,
+                                     NodeIndex dst) {
+  if (namedFiling || !namedPlanes() || !isCellNode(dst))
+    return;
+  if (isCellNode(src)) {
+    // A copy from cell to cell (memcpy, CPY/MOVE summaries, asm, field-
+    // wise copies) moves bytes to the same offsets, so content keeps the
+    // name it was stored under: unnamed to unnamed here, each name's
+    // shadow to the same name's once the solve shows which names the
+    // source holds (wireCopyNames).
+    Graph.addCopy(namedShadow(src, ka::AccessNames::Unnamed),
+                  namedShadow(dst, ka::AccessNames::Unnamed));
+    if (cellCopySeen.insert(((uint64_t)src << 32) | dst).second)
+      cellCopies.emplace_back(src, dst);
+    namedStats.cellCopies++;
+    return;
+  }
+  Graph.addCopy(s, namedShadow(dst, ka::AccessNames::Unnamed));
+  namedStats.unnamedWrites++;
+}
+
+void CallGraphPass::wireNamedStore(NodeIndex val, NodeIndex cell,
+                                   uint32_t name) {
+  if (!namedPlanes() || name == ka::AccessNames::Unnamed) {
+    addAssignmentEdge(val, cell);
+    namedStats.unnamedStores++;
+    return;
+  }
+  namedFiling++;
+  addAssignmentEdge(val, cell);
+  addAssignmentEdge(val, namedShadow(cell, name));
+  namedFiling--;
+  namedStats.namedStores++;
+}
+
+void CallGraphPass::wireNamedLoad(NodeIndex cell, NodeIndex val,
+                                  uint32_t name) {
+  if (!namedPlanes() || name == ka::AccessNames::Unnamed) {
+    addAssignmentEdge(cell, val);
+    namedStats.unnamedLoads++;
+    return;
+  }
+  addAssignmentEdge(namedShadow(cell, name), val);
+  addAssignmentEdge(namedShadow(cell, ka::AccessNames::Unnamed), val);
+  namedLoadCells[val] = cell;
+  namedStats.namedLoads++;
+}
+
+void CallGraphPass::ensureUnnamedShadows() {
+  if (!namedPlanes())
+    return;
+  // Every cell gets an Unnamed shadow before the solve, written or not:
+  // a root the solver mints on a cell's class (the identity of content
+  // nobody wrote) is unnamed content, and named loads of aliasing cells
+  // must see it through their own Unnamed shadows.
+  std::vector<NodeIndex> cells;
+  for (const GraphEdge &E : Graph.edges())
+    if (E.kind == EdgeKind::Deref && !isShadowCell(E.to) &&
+        !shadowOf.count((uint64_t)E.to << 32 | ka::AccessNames::Unnamed))
+      cells.push_back(E.to);
+  std::sort(cells.begin(), cells.end());
+  cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
+  for (NodeIndex c : cells) // adds Deref edges: not while iterating them
+    namedShadow(c, ka::AccessNames::Unnamed);
+}
+
+void CallGraphPass::logNamedCells() const {
+  if (!namedPlanes())
+    return;
+  CG_LOG("NamedCells: " << accessNames->size() - 2 << " names; "
+         << namedStats.namedStores << " named / "
+         << namedStats.unnamedStores << " unnamed stores, "
+         << namedStats.namedLoads << " named / " << namedStats.unnamedLoads
+         << " unnamed loads, " << namedStats.namedSlots << " named / "
+         << namedStats.unnamedSlots << " unnamed initializer slots, "
+         << namedStats.unnamedWrites << " other cell writes, "
+         << namedStats.cellCopies << " cell-to-cell copies; "
+         << namedStats.shadows << " shadow cells\n");
+  std::string why;
+  for (unsigned w = 0; w < ka::AccessNames::NumWhy; w++)
+    why += std::string(" ") +
+           ka::AccessNames::whyName((ka::AccessNames::Why)w) + "=" +
+           std::to_string(accessNames->unnamedBy[w]);
+  CG_LOG("NamedCells: unnamed accesses by reason:" << why << "\n");
 }
 
 // ---- Field-sensitive memory modeling helpers (--cfl-field-buckets > 0) ----
@@ -2918,7 +3083,11 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
 
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
-  CGP.addAssignmentEdge(derefNode, valNode);
+  uint32_t name = ka::AccessNames::Unnamed;
+  if (CGP.namedPlanes() && I.getType()->isPointerTy())
+    name = CGP.accessNames->ofAccess(
+        ptr, CGP.curDL->getTypeStoreSize(I.getType()), *CGP.curDL);
+  CGP.wireNamedLoad(derefNode, valNode, name);
 }
 
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
@@ -3006,7 +3175,11 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
 
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
-  CGP.addAssignmentEdge(valNode, derefNode);
+  uint32_t name = ka::AccessNames::Unnamed;
+  if (CGP.namedPlanes() && val->getType()->isPointerTy())
+    name = CGP.accessNames->ofAccess(
+        ptr, CGP.curDL->getTypeStoreSize(val->getType()), *CGP.curDL);
+  CGP.wireNamedStore(valNode, derefNode, name);
 }
 
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
@@ -3892,6 +4065,22 @@ void CallGraphPass::InstHandler::visitShuffleVectorInst(ShuffleVectorInst &I) {
   }
 }
 
+// A pointer-carrying initializer constant `val` written into `cell`: with
+// named cells it is also filed under the slot's name (initNamedS,
+// initOff), or in the cell's unnamed shadow when the slot has none.
+void CallGraphPass::initSlotWrite(NodeIndex val, NodeIndex cell) {
+  Graph.addCopy(val, cell);
+  if (!namedPlanes())
+    return;
+  uint32_t name = ka::AccessNames::Unnamed;
+  if (initNamedS && !initUnion)
+    name = accessNames->ofSlot(initNamedS, initOff,
+                               curDL->getPointerSize(), *curDL);
+  Graph.addCopy(val, namedShadow(cell, name));
+  (name == ka::AccessNames::Unnamed ? namedStats.unnamedSlots
+                                    : namedStats.namedSlots)++;
+}
+
 // Process global variable initializer. Field-insensitive by default: every
 // pointer in the initializer assigns into `ptrNode` (the global's deref cell).
 // In field mode (`addrNode` valid), struct elements are routed into per-field
@@ -3932,7 +4121,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
       valNode = NF.createValueNode(init);
     }
     // ptr = &globalvar: add assignment edges globalvar_val -> ptr
-    Graph.addCopy(valNode, ptrNode);
+    initSlotWrite(valNode, ptrNode);
     CG_DEBUG("add CFL assignment edges for global variable " << cast<GlobalVariable>(init)->getName() << " -> " << ptrNode << "\n");
   } else if (isa<Function>(init)) {
     auto *storedFunc = cast<Function>(init);
@@ -3942,7 +4131,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
       valNode = NF.createValueNode(init);
     }
     // ptr = &function: add assignment edges function_val -> ptr
-    Graph.addCopy(valNode, ptrNode);
+    initSlotWrite(valNode, ptrNode);
     // Record direct function store into struct field. A store WITHOUT a
     // derivable key (literal-struct initializer like sysctl tables, plain
     // global, top-level array) must mark the function evidence-incomplete:
@@ -3967,6 +4156,13 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     StructType *STy = CS->getType();
     const bool isUnion = STy && STy->hasName() &&
                          LLVM_STRING_STARTS_WITH(STy->getStructName(), "union");
+    // Named-cell slot position of each element (initSlotWrite).
+    StructType *const savedS = initNamedS;
+    const uint64_t savedOff = initOff;
+    const bool savedUnion = initUnion;
+    const StructLayout *NL =
+        (namedPlanes() && !isUnion) ? curDL->getStructLayout(STy) : nullptr;
+    const bool namedTy = !STy->isLiteral() && STy->hasName();
     const bool fieldMode = Graph.fieldSensitive() &&
                            addrNode != AndersNodeFactory::InvalidIndex &&
                            curDL && STy;
@@ -3996,8 +4192,17 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         }
         childCell = getRepDerefNode(childAddr);
       }
+      if (isUnion) {
+        initUnion = true;
+      } else if (NL && (namedTy || savedS)) {
+        initNamedS = namedTy ? STy : savedS;
+        initOff = (namedTy ? 0 : savedOff) + NL->getElementOffset(i);
+      }
       processInitializer(childCell, CS->getOperand(i), curStruct, curField,
                          childAddr);
+      initNamedS = savedS;
+      initOff = savedOff;
+      initUnion = savedUnion;
     }
   } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
     Type *Ty = CAZ->getType();
@@ -4025,7 +4230,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         if (Graph.fieldSensitive()) {
           NodeIndex ceNode = getRepNodeForValue(CE);
           if (ceNode != AndersNodeFactory::InvalidIndex) {
-            Graph.addCopy(ceNode, ptrNode);
+            initSlotWrite(ceNode, ptrNode);
             break;
           }
         }
@@ -4037,7 +4242,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
           baseNode = NF.createValueNode(basePtr);
         }
         // ptr = base_ptr: add assignment edges base_ptr -> ptr
-        Graph.addCopy(baseNode, ptrNode);
+        initSlotWrite(baseNode, ptrNode);
         break;
       }
       case Instruction::BitCast: {

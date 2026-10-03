@@ -205,6 +205,12 @@ int main(int argc, char **argv) {
                             "labels)");
       CFLBidiPrune = false; // cone is residue-based; not ported
     }
+    if (CFLNamedPlanes && (CFLChannelCells || CFLBatchRoots > 0 ||
+                           CFLLazyMint || CFLFlowsToSlice))
+      cliErrors.push_back("--cfl-named-planes is not ported to channel "
+                          "cells, lazy addresses, batched roots, lazy "
+                          "minting or slicing (their relevance oracles and "
+                          "seeding do not see a cell's name planes)");
     if (CFLChannelCells && CFLKeyIdentity.getNumOccurrences() == 0) {
       // Channel cells carry the identity of never-written content on
       // the channel key (docs/channel-cells-design.md, "Identity of

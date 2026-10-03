@@ -395,6 +395,19 @@ cl::opt<bool> CFLRegFieldObj(
            "Requires --cfl-regfield-apply machinery (same walk). Default on (the reported configuration); =false to opt out"),
   cl::init(true));
 
+cl::opt<bool> CFLNamedPlanes(
+  "cfl-named-planes",
+  cl::desc("Named cells (docs/named-cells-design.md): a store through a "
+           "named struct field also files its value in a shadow cell for "
+           "that field name, every other write into a cell also lands in "
+           "the cell's unnamed shadow, and a load through a field name "
+           "reads only those two shadows instead of the whole cell. "
+           "Merged cells keep their content by name. Removal-only "
+           "against the default (Lean NamedCells.named_sound_fderiv); "
+           "soundness against the exact semantics assumes no type "
+           "punning between named accesses (named_read_sound3)"),
+  cl::init(false));
+
 cl::opt<std::string> CFLRegFieldWatch(
   "cfl-regfield-watch",
   cl::desc("With --cfl-regfield-apply: comma-separated fn names; log "

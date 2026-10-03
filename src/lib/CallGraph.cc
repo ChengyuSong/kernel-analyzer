@@ -692,6 +692,11 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     const size_t edgeStart = Graph.size();
+    if (namedPlanes()) {
+      if (!accessNames)
+        accessNames = std::make_unique<ka::AccessNames>();
+      accessNames->scanBases(*M);
+    }
     moduleDerefEdgeRoots.clear();
     moduleFieldWildcardRoots.clear();
     moduleConstGEPFieldDone.clear();
@@ -711,6 +716,9 @@ bool CallGraphPass::doModulePass(Module *M) {
         Graph.addDeref(valNode, deref);
         CG_DEBUG("Processing initializer for GV " << GV.getName() << "\n");
         auto init = GV.getInitializer();
+        initNamedS = nullptr; // slot names start at the first named struct
+        initOff = 0;
+        initUnion = false;
         processInitializer(deref, init, "", -1,
                            Graph.fieldSensitive() ? valNode
                                                : AndersNodeFactory::InvalidIndex);
@@ -782,6 +790,8 @@ bool CallGraphPass::solve() {
   logHighDegreeNodes(1000, 20);
   if (!CFLDumpAGraph.empty() && iteration == 0)
     dumpRawGraph(CFLDumpAGraph); // before presolve: raw value nodes
+  ensureUnnamedShadows();
+  logNamedCells();
   if (!CFLPreSolveOnce || iteration == 0)
     preSolveCopyFieldMerge(nullptr);
   // Answer-anchored resolution. Outer fixpoint: re-solve while

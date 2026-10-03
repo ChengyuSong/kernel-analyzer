@@ -127,6 +127,8 @@ private:
 
     // derefMap - This map caches the deref-relations across value nodes.
     boost::unordered_flat_map<const NodeIndex, NodeIndex> derefMap;
+    // derefParentMap - the inverse: a dereference node's pointer.
+    boost::unordered_flat_map<NodeIndex, NodeIndex> derefParentMap;
 
     // gepMap - This map maintains the gep-relations across value nodes.
     // The mappings are of the form <base-ptr, offset> -> gep-ptr,
@@ -174,6 +176,12 @@ public:
     NodeIndex getReturnNodeFor(const llvm::Function* f);
     NodeIndex getVarargNodeFor(const llvm::Function* f);
     NodeIndex getDereferenceNodeFor(const NodeIndex ptr);
+    // The pointer a dereference node was created for (InvalidIndex for
+    // one created without a pointer).
+    NodeIndex getDerefParent(NodeIndex deref) const {
+        auto it = derefParentMap.find(deref);
+        return it == derefParentMap.end() ? InvalidIndex : it->second;
+    }
     const boost::unordered_flat_map<const NodeIndex, NodeIndex> &
     getDerefMap() const { return derefMap; }
 

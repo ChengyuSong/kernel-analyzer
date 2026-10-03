@@ -23,6 +23,10 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
   auto isBarrierNode = [&](NodeIndex canon) {
     if (NF.isSpecialNode(canon))
       return true;
+    // Named-cell shadows hold one name's content: merging one into any
+    // class would pour it into every name.
+    if (isShadowCell(canon))
+      return true;
     const Value *v = NF.getValueForNode(canon);
     if (!v)
       return false;

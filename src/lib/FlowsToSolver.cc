@@ -584,6 +584,17 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   }
   const uint32_t N = toOrig.size();
+  // Named cells: the name id of each shadow cell (0 for every other
+  // node). Shadows are presolve barriers, so each is its own class.
+  std::vector<uint32_t> cellNameOf;
+  if (namedPlanes()) {
+    cellNameOf.assign(N, ka::AccessNames::Original);
+    for (uint32_t n = 0; n < N; n++)
+      cellNameOf[n] = shadowInfoOf(toOrig[n]).second;
+  }
+  auto nameOfCell = [&](uint32_t c) -> uint32_t {
+    return c < cellNameOf.size() ? cellNameOf[c] : ka::AccessNames::Original;
+  };
   std::vector<std::vector<uint32_t>> outA(N);
   for (auto [s, t] : aEdges) outA[s].push_back(t);
   // f-edges as shift transformers: (target, residue).
@@ -1102,6 +1113,14 @@ bool CallGraphPass::runFlowsToResolution() {
       omap[y].clear();
     };
     for (auto [s2, t2] : aEdges) bunite(s2, t2);
+    // Named cells: a shadow is a plane of its cell's class (satellite),
+    // so it belongs to its cell's partition.
+    for (uint32_t u = 0; u < (uint32_t)cellNameOf.size(); u++)
+      if (cellNameOf[u] != ka::AccessNames::Original) {
+        auto d = toDense.find(getCanonicalNode(shadowInfoOf(toOrig[u]).first));
+        assert(d != toDense.end() && "a shadow's cell is in the graph");
+        bunite(u, d->second);
+      }
     for (auto [p2, c2] : dEdges) addLbl(p2, 0, c2);
     for (auto &[b2, r2, bk2] : fEdges) addLbl(b2, 1 + bk2, r2);
     while (!pend.empty()) {
@@ -1361,6 +1380,9 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
+    // A shadow holds only content filed under its name; content nobody
+    // wrote is the identity of the cell it shadows (seeded below).
+    if (nameOfCell(n) != ka::AccessNames::Original) continue;
     auto fit = funcOfCanon.find(toOrig[n]);
     const bool isFunc = fit != funcOfCanon.end();
     const bool isCert = !certCls.empty() && certCls.count(n);
@@ -2641,6 +2663,13 @@ bool CallGraphPass::runFlowsToResolution() {
     cellJoined[i].resize(NSHIFT);
   }
   std::vector<std::vector<uint32_t>> bridgesOf(N); // VX partners (class ids)
+  // Named cells: the shadows of a class's cells, one class per name
+  // (name, a member of that name's shadow class). Merging two classes
+  // merges their shadows name by name (attachShadow), so a merged class
+  // keeps its content by name: NamedCells.lean's planes.
+  std::vector<llvm::SmallVector<std::pair<uint32_t, uint32_t>, 2>> satOf(
+      cellNameOf.empty() ? 0 : N);
+  std::function<uint32_t(uint32_t, uint32_t)> mergeFn;
   std::vector<char> wflag(N, 0);
   for (uint32_t w : wildcardNodes) wflag[w] = 1;
   // ---- Task #46: dense-plane intern sweep (hash-consing) ----
@@ -3330,8 +3359,23 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     clsSize[a] += clsSize[b];
     push(a, ctx0);
+    if (b < satOf.size() && !satOf[b].empty()) {
+      auto moved = std::move(satOf[b]);
+      satOf[b].clear();
+      for (auto [nm, u] : moved) {
+        bool found = false;
+        for (auto &[nm2, v] : satOf[a])
+          if (nm2 == nm) {
+            found = true;
+            if (find(u) != find(v)) mergeFn(v, u); // shadows have no satellites
+            break;
+          }
+        if (!found) satOf[a].emplace_back(nm, u);
+      }
+    }
     return a;
   };
+  mergeFn = merge;
   // Merged classes accumulate stale/duplicate edge and cell entries;
   // compact when a list has grown well past its last compacted size.
   std::vector<uint32_t> compactMark(N, 64);
@@ -3520,6 +3564,7 @@ bool CallGraphPass::runFlowsToResolution() {
     joined.emplace_back(NSHIFT);
     cellJoined.emplace_back(NSHIFT);
     bridgesOf.emplace_back();
+    if (!satOf.empty()) satOf.emplace_back();
     wflag.push_back(0);
     cellsOf.emplace_back();
     outA.emplace_back();
@@ -4430,6 +4475,9 @@ bool CallGraphPass::runFlowsToResolution() {
     // the pointer may reach (cflow: yyin's FILE* cell with a list head's
     // free_data). Only value-to-value cycles collapse.
     auto isMemoryNode = [&](uint32_t v) -> bool {
+      // A named shadow collapsed with values would take their content
+      // under its name, and pour its own into every name.
+      if (nameOfCell(v) != ka::AccessNames::Original) return true;
       if (!CFLChannelCells) return false;
       if (v >= N) return true; // channel / read half
       return NF.isDereferenceNode(toOrig[v]);
@@ -4522,7 +4570,48 @@ bool CallGraphPass::runFlowsToResolution() {
     mergeWhy = "other";
     return collapsed;
   };
+  // Named cells: hang every shadow on its cell's class; shadows of one
+  // name on one class merge now (they are one plane of that class).
+  if (!cellNameOf.empty()) {
+    tHow = "named-satellite";
+    for (uint32_t u = 0; u < N; u++) {
+      const auto [cell, nm] = shadowInfoOf(toOrig[u]);
+      if (nm == ka::AccessNames::Original) continue;
+      auto d = toDense.find(getCanonicalNode(cell));
+      assert(d != toDense.end() && "a shadow's cell is in the graph");
+      const uint32_t c = find(d->second);
+      bool found = false;
+      for (auto &[nm2, v] : satOf[c])
+        if (nm2 == nm) {
+          found = true;
+          if (find(v) != find(u)) merge(v, u);
+          break;
+        }
+      if (!found) satOf[c].emplace_back(nm, u);
+    }
+  }
   tHow = "seed"; tFrom = UINT32_MAX;
+  // Named cells: a root minted on a class is content of each cell in
+  // the class that no store wrote, so it is filed under no name: the
+  // cells' Unnamed shadows get it too (NamedCells.lean, graph fidelity:
+  // identities are unnamed writes).
+  std::vector<std::pair<uint32_t, uint32_t>> unnamedSeeds; // (shadow, rid)
+  if (!cellNameOf.empty()) {
+    std::vector<NodeIndex> members;
+    for (auto [n, rid] : seeds) {
+      collectCanonicalMembers(toOrig[n], members);
+      for (NodeIndex m : members) {
+        auto it = shadowOf.find((uint64_t)m << 32 | ka::AccessNames::Unnamed);
+        if (it == shadowOf.end()) continue;
+        assert(getCanonicalNode(it->second) == it->second &&
+               "shadows are presolve barriers");
+        auto d = toDense.find(it->second);
+        if (d != toDense.end()) unnamedSeeds.emplace_back(d->second, rid);
+      }
+    }
+    CG_LOG("NamedCells: " << unnamedSeeds.size()
+           << " roots seeded into unnamed shadows\n");
+  }
   if (CFLBatchRoots == 0) {
     size_t exactMint = 0, wildMint = 0;
     for (auto [n, rid] : seeds) {
@@ -4531,6 +4620,9 @@ bool CallGraphPass::runFlowsToResolution() {
       else addFact(find(n), exact ? 0 : SHIFT_X, rid, ctx0);
       (exact ? exactMint : wildMint)++;
     }
+    for (auto [u, rid] : unnamedSeeds)
+      addFact(find(u), (!nexusGate || rootNexus[rid]) ? 0 : SHIFT_X, rid,
+              ctx0);
     if (nexusGate)
       CG_LOG("NexusFields: " << exactMint << " exact-minted roots (fn + "
              "nexus origins), " << wildMint << " wildcard-minted (FI)\n");
@@ -4571,6 +4663,7 @@ bool CallGraphPass::runFlowsToResolution() {
     return false;
   };
   auto mintRoot = [&](uint32_t cls) {
+    assert(cellNameOf.empty() && "named cells refuse lazy minting");
     uint32_t rep = find(cls);
     if (isRoot[rep]) return;
     // Channel nodes / read halves (ids past the dense graph) are solver
@@ -5675,6 +5768,13 @@ bool CallGraphPass::runFlowsToResolution() {
       if (!R[rep][s0].test(rid) && !RB[rep][s0].test(rid))
         report("C6-seed", rep, s0, rid);
     }
+    for (auto [u, rid] : unnamedSeeds) {
+      const uint32_t rep = find(u);
+      const uint32_t s0 =
+          (nexusGate && !rootNexus[rid]) ? (uint32_t)SHIFT_X : 0u;
+      if (!R[rep][s0].test(rid) && !RB[rep][s0].test(rid))
+        report("C6-unnamed-seed", rep, s0, rid);
+    }
     // C7: mint coverage — every class satisfying the origin criterion
     // at the FINAL quotient is minted, or is an intentionally pruned
     // bidi-irrelevant origin (tracked in bidiPrunedCls) or a still-
@@ -5691,6 +5791,9 @@ bool CallGraphPass::runFlowsToResolution() {
       for (uint32_t n : lazyDeferred) report("C7-lazy", find(n), 0, n);
       for (uint32_t n = 0; n < N; n++) {
         if (find(n) != n || isRoot[n]) continue;
+        // Named shadows never mint: their cell's roots are seeded into
+        // them (C6-unnamed-seed).
+        if (nameOfCell(n) != ka::AccessNames::Original) continue;
         if ((originBearing(toOrig[n]) || !hasIn[n]) && !pruned.count(n))
           report("C7-mint", n, 0, n);
       }
@@ -6841,7 +6944,30 @@ bool CallGraphPass::runFlowsToResolution() {
              << *CS2 << "\n";
     }
   }
-  if (newPairs == 0) {
+  // Named cells: copies relay name by name (fileUnnamedWrite). A copy's
+  // source holds name n when its cell's class has a shadow of name n;
+  // wire shadow(src, n) -> shadow(dst, n) for each such name not yet
+  // wired. The edges enter the next iteration's solve, like new callee
+  // pairs; names only grow, so the outer fixpoint is reached when none
+  // is new.
+  size_t newCopyNames = 0;
+  if (!cellNameOf.empty()) {
+    for (size_t ci = 0; ci < cellCopies.size(); ci++) {
+      const auto [src, dst] = cellCopies[ci];
+      auto d = toDense.find(getCanonicalNode(src));
+      if (d == toDense.end()) continue; // cell not in this graph
+      for (auto [nm, u] : satOf[find(d->second)])
+        if (nm != ka::AccessNames::Unnamed &&
+            cellCopyNamed.insert(((uint64_t)ci << 32) | nm).second) {
+          Graph.addCopy(namedShadow(src, nm), namedShadow(dst, nm));
+          newCopyNames++;
+        }
+    }
+    if (newCopyNames)
+      CG_LOG("NamedCells: " << newCopyNames
+             << " new name relays across cell-to-cell copies\n");
+  }
+  if (newPairs == 0 && newCopyNames == 0) {
     // Lazy-mint catch-up: the A-loop cannot admit CYCLIC witness
     // dependences — e.g. circular list_head chains, where each node's
     // join needs the neighbor's merge for its consequence path to
@@ -6869,6 +6995,63 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     wideningReport();
     verifyClosure(); // certificate over the answer-producing fixpoint
+    // Named cells, measurement only: at an icall whose callee is loaded
+    // through a name, the functions its name's plane holds and those
+    // only the unnamed plane adds — what assuming that no unnamed write
+    // reaches a named field (the field tables' blind spot) would remove.
+    if (!cellNameOf.empty() && VerboseLevel >= 2) {
+      size_t sites = 0, namedFns = 0, unnamedOnly = 0;
+      std::vector<std::tuple<size_t, size_t, const CallBase *>> top;
+      auto fnsOf = [&](NodeIndex sh, FactSet &out) {
+        auto d = toDense.find(sh);
+        if (d == toDense.end()) return;
+        const uint32_t c = find(d->second);
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          out.unionWith(R[c][s2]);
+          out.unionWith(RB[c][s2]);
+        }
+      };
+      for (const CallBase *CS2 : Ctx->IndirectCallInsts) {
+        const auto *LI = dyn_cast<LoadInst>(
+            CS2->getCalledOperand()->stripPointerCasts());
+        if (!LI) continue;
+        NodeIndex v = getRepNodeForValue(LI);
+        auto it = namedLoadCells.find(v);
+        if (it == namedLoadCells.end()) continue;
+        const NodeIndex cell = it->second;
+        const uint32_t nm = accessNames->ofAccess(
+            LI->getPointerOperand(),
+            LI->getModule()->getDataLayout().getTypeStoreSize(LI->getType()),
+            LI->getModule()->getDataLayout());
+        if (!shadowOf.count((uint64_t)cell << 32 | nm)) continue;
+        FactSet named, unnamed;
+        fnsOf(shadowOf.at((uint64_t)cell << 32 | nm), named);
+        fnsOf(shadowOf.at((uint64_t)cell << 32 | ka::AccessNames::Unnamed), unnamed);
+        size_t nf = 0, uf = 0;
+        for (auto &[rid2, F2] : funcRootOf) {
+          if (named.test(rid2)) nf++;
+          else if (unnamed.test(rid2)) uf++;
+        }
+        sites++; namedFns += nf; unnamedOnly += uf;
+        top.emplace_back(uf, nf, CS2);
+      }
+      std::sort(top.begin(), top.end(), [](auto &a, auto &b) {
+        return std::get<0>(a) > std::get<0>(b);
+      });
+      CG_LOG("NamedCells: " << sites << " icalls load their callee through "
+             "a name: " << namedFns << " targets in the name's plane, "
+             << unnamedOnly << " more only through the unnamed plane\n");
+      for (size_t i = 0; i < top.size() && i < 10; i++) {
+        const CallBase *CS2 = std::get<2>(top[i]);
+        std::string loc = "?";
+        if (const DILocation *DL2 = CS2->getDebugLoc())
+          loc = (DL2->getFilename() + ":" + Twine(DL2->getLine())).str();
+        CG_LOG("NamedCells:   " << loc << " in "
+               << CS2->getFunction()->getName() << ": name "
+               << std::get<1>(top[i]) << ", unnamed-only "
+               << std::get<0>(top[i]) << "\n");
+      }
+    }
     break; // converged: no callee flows were added
   }
   if (iteration + fpIter + 1 >= (int)CFLFlowsToMaxIters) {
@@ -6879,7 +7062,8 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!CFLIterCapOk) {
       errs() << "ERROR: FlowsTo fixpoint hit iteration cap ("
              << CFLFlowsToMaxIters.getValue() << ") with " << newPairs
-             << " newly wired pairs unprocessed — result would be "
+             << " newly wired pairs and " << newCopyNames
+             << " name relays unprocessed — result would be "
              << "unsound. Raise --cfl-flows-to-max-iters, or pass "
              << "--cfl-iter-cap-ok to accept UNSOUND capped output.\n";
       exit(1);

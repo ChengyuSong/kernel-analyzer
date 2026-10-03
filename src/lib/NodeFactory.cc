@@ -188,6 +188,7 @@ NodeIndex AndersNodeFactory::createDereferenceNode(const NodeIndex ptr) {
         if (derefMap.count(ptr))
             return derefMap[ptr];
         derefMap[ptr] = nextIdx;
+        derefParentMap[nextIdx] = ptr;
     }
     return nextIdx;
 }

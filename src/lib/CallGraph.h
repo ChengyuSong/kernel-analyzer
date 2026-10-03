@@ -15,6 +15,7 @@
 
 #include "Global.h"
 #include "ConstraintGraph.h"
+#include "NamedCells.h"
 
 // IR predicates the graph build and the baseline's export share.
 bool shouldSkipValue(const llvm::Value *V); // compiler-introduced values
@@ -226,6 +227,58 @@ protected:
   void collectCanonicalMembers(NodeIndex n, std::vector<NodeIndex> &out) const;
   NodeIndex getRepDerefNode(NodeIndex ptrNode);
   void addAssignmentEdge(NodeIndex src, NodeIndex dst);
+
+  // ---- Named cells (--cfl-named-planes; docs/named-cells-design.md) ----
+  // A cell is the target of a Deref edge. Its shadow for name id n is a
+  // cell reached by the same pointer that holds only the content filed
+  // under n; AccessNames::Unnamed is the shadow of writes with no name.
+  bool namedPlanes() const;
+  NodeIndex namedShadow(NodeIndex cell, uint32_t name);
+  // The pointer whose Deref edge reaches `cell`; InvalidIndex if none.
+  NodeIndex cellParent(NodeIndex cell);
+  bool isShadowCell(NodeIndex n) const { return shadowInfo.count(n) != 0; }
+  // (cell, name) of a shadow; name 0 (Original) for any other node.
+  std::pair<NodeIndex, uint32_t> shadowInfoOf(NodeIndex n) const;
+  // A Deref target that is not a shadow.
+  bool isCellNode(NodeIndex n);
+  // A write from raw `src` (canonical `s`) into raw node `dst` that is
+  // not filed by name: when dst is a cell, also write dst's unnamed
+  // shadow; a copy from another cell relays shadows name by name.
+  void fileUnnamedWrite(NodeIndex s, NodeIndex src, NodeIndex dst);
+  // A load of value node `val` from `cell`: through name `name` it reads
+  // the cell's shadows for that name and for unnamed writes; with no
+  // name it reads the cell.
+  void wireNamedLoad(NodeIndex cell, NodeIndex val, uint32_t name);
+  // A store of `val` into `cell` through name `name` (Unnamed: no name).
+  void wireNamedStore(NodeIndex val, NodeIndex cell, uint32_t name);
+  void logNamedCells() const;
+  // Before each solve: give every cell its Unnamed shadow.
+  void ensureUnnamedShadows();
+  void initSlotWrite(NodeIndex val, NodeIndex cell);
+  std::unique_ptr<ka::AccessNames> accessNames;
+  boost::unordered_flat_map<uint64_t, NodeIndex> shadowOf; // cell<<32|name
+  boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, uint32_t>>
+      shadowInfo;
+  boost::unordered_flat_map<NodeIndex, NodeIndex> objCellParent;
+  size_t objCellScan = 0;
+  uint64_t objCellRemovals = 0;
+  unsigned namedFiling = 0; // >0: the cell write being added is filed
+  // Cell-to-cell copies (raw cells) and the names already relayed.
+  std::vector<std::pair<NodeIndex, NodeIndex>> cellCopies;
+  boost::unordered_flat_set<uint64_t> cellCopySeen;
+  boost::unordered_flat_set<uint64_t> cellCopyNamed; // copy index<<32|name
+  // Value node of each named load -> the cell it reads (measurement).
+  boost::unordered_flat_map<NodeIndex, NodeIndex> namedLoadCells;
+  struct NamedCellStats {
+    uint64_t shadows = 0, namedStores = 0, unnamedStores = 0,
+             namedLoads = 0, unnamedLoads = 0, namedSlots = 0,
+             unnamedSlots = 0, unnamedWrites = 0, cellCopies = 0;
+  } namedStats;
+  // processInitializer's slot position: innermost named struct and the
+  // byte offset in it (array elements folded), or none / in a union.
+  llvm::StructType *initNamedS = nullptr;
+  uint64_t initOff = 0;
+  bool initUnion = false;
 
   // Global union-find dedup
   std::vector<NodeIndex> globalUFParent;

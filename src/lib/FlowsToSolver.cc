@@ -5650,6 +5650,10 @@ bool CallGraphPass::runFlowsToResolution() {
               if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode())
                 return;
             }
+            // Constant data-only globals key no joins either (they hold
+            // no pointer and cannot be stored into) — mirror it.
+            if (o < rootConstData.size() && rootConstData[o])
+              return;
             const uint32_t cr = clusterFind((uint64_t)o * NSHIFT + s);
             if (cr == UINT32_MAX) { report("C4-key", n, s, o); return; }
             uint32_t rep = find(cr);

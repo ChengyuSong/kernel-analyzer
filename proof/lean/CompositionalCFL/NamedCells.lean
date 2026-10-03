@@ -649,4 +649,272 @@ theorem nbatched_exact (M : ShiftMonoid) {N Nm : Type} {P : NamePolicy Nm}
   · rintro ⟨i, _, d⟩
     exact nwderiv_sound M (hsub i) hsound d
 
+/-! ## The shadow-cell realization (what `--cfl-named-planes` runs)
+
+The solver keeps no name-indexed planes inside a class. Each cell `x`
+gets one shadow node `sh x m` per name `m : Option Nm` (`none`: the
+unnamed shadow). A shadow has no Deref edge of its own: the solver keeps
+it as a SATELLITE of its cell's class and merges the shadows of one name
+whenever two cell classes merge. So the realized graph `G'` is an
+ordinary flows-to graph, and its semantics `KDeriv` is `FDeriv` plus two
+rules: aliased cells have aliased shadows of every name (`mal_sat`), and
+a root minted on a cell (content no program store wrote) is also seeded
+into the cell's unnamed shadow (`flow_seed`). Names are canonical leaf
+names (the innermost named struct and the leaf's offset), so layout
+aliasing is equality.
+
+A named load reads its name's shadow AND the unnamed shadow; there is
+no certificate census. The hazards the census would count (bulk copies,
+escapes, atomics, untyped stores, summaries) are writes with no name:
+they land in the unnamed shadow of the cells they reach, wherever the
+solve says that is. What remains is one hypothesis about the program,
+`PunFree`: a named store and a named load of one concrete cell use the
+same name.
+
+The reference `RDeriv` is the exact semantics `CDeriv` plus identities:
+an origin cell `x` is content, filed under no name, of every concrete
+cell its pointer reaches. -/
+
+/-- Flows-to with satellite shadows: aliased cells alias their shadows
+name by name; `seedU z u`: root `z` is also seeded at `u`. -/
+inductive KDeriv (M : ShiftMonoid) {N Nm : Type} (origin : N → Prop)
+    (sh : N → Option Nm → N) (seedU : N → N → Prop) (G : FGraph N M.S) :
+    FJudg N M.S → Prop where
+  | flow_refl (z : N) (hz : origin z) :
+      KDeriv M origin sh seedU G (.flow z (some M.zero) z)
+  | flow_seed {z u : N} (hz : origin z) (hu : seedU z u) :
+      KDeriv M origin sh seedU G (.flow z (some M.zero) u)
+  | flow_a {z : N} {c : Shift M} {x y : N} :
+      KDeriv M origin sh seedU G (.flow z c x) →
+      ({ src := x, lbl := .a, dst := y } : FEdge N M.S) ∈ G →
+      KDeriv M origin sh seedU G (.flow z c y)
+  | flow_f {z : N} {c : Shift M} {x y : N} {r : M.S} :
+      KDeriv M origin sh seedU G (.flow z c x) →
+      ({ src := x, lbl := .f r, dst := y } : FEdge N M.S) ∈ G →
+      KDeriv M origin sh seedU G (.flow z (shiftComp M c (some r)) y)
+  | flow_fx {z : N} {c : Shift M} {x y : N} :
+      KDeriv M origin sh seedU G (.flow z c x) →
+      ({ src := x, lbl := .fx, dst := y } : FEdge N M.S) ∈ G →
+      KDeriv M origin sh seedU G (.flow z none y)
+  | flow_m {z : N} {c : Shift M} {x y : N} :
+      KDeriv M origin sh seedU G (.flow z c x) →
+      KDeriv M origin sh seedU G (.mal x y) →
+      KDeriv M origin sh seedU G (.flow z c y)
+  | mal_join {p q cx cy z : N} {c : Shift M} :
+      ({ src := p, lbl := .d, dst := cx } : FEdge N M.S) ∈ G →
+      ({ src := q, lbl := .d, dst := cy } : FEdge N M.S) ∈ G →
+      KDeriv M origin sh seedU G (.flow z c p) →
+      KDeriv M origin sh seedU G (.flow z c q) →
+      KDeriv M origin sh seedU G (.mal cx cy)
+  | mal_joinXL {p q cx cy z : N} {c : Shift M} :
+      ({ src := p, lbl := .d, dst := cx } : FEdge N M.S) ∈ G →
+      ({ src := q, lbl := .d, dst := cy } : FEdge N M.S) ∈ G →
+      KDeriv M origin sh seedU G (.flow z none p) →
+      KDeriv M origin sh seedU G (.flow z c q) →
+      KDeriv M origin sh seedU G (.mal cx cy)
+  | mal_joinXR {p q cx cy z : N} {c : Shift M} :
+      ({ src := p, lbl := .d, dst := cx } : FEdge N M.S) ∈ G →
+      ({ src := q, lbl := .d, dst := cy } : FEdge N M.S) ∈ G →
+      KDeriv M origin sh seedU G (.flow z c p) →
+      KDeriv M origin sh seedU G (.flow z none q) →
+      KDeriv M origin sh seedU G (.mal cx cy)
+  /-- Merging two classes merges their shadows name by name. -/
+  | mal_sat {x y : N} (m : Option Nm) :
+      KDeriv M origin sh seedU G (.mal x y) →
+      KDeriv M origin sh seedU G (.mal (sh x m) (sh y m))
+
+/-- The exact reference with identities: `CDeriv` plus `cid`. -/
+inductive RDeriv (M : ShiftMonoid) {N Nm : Type} (origin : N → Prop)
+    (G : NGraph N M.S Nm) : CJudg N M.S Nm → Prop where
+  | crefl (z : N) (hz : origin z) : RDeriv M origin G (.cflow z M.zero z)
+  | ca {z x y : N} {s : M.S} :
+      RDeriv M origin G (.cflow z s x) →
+      ({ src := x, lbl := .a, dst := y } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z s y)
+  | cf {z x y : N} {s r : M.S} :
+      RDeriv M origin G (.cflow z s x) →
+      ({ src := x, lbl := .f r, dst := y } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z (M.add s r) y)
+  | cfx {z x y : N} {s : M.S} (s' : M.S) :
+      RDeriv M origin G (.cflow z s x) →
+      ({ src := x, lbl := .fx, dst := y } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z s' y)
+  | cstore {z v x p z0 : N} {s s0 : M.S} {n : Option Nm} :
+      RDeriv M origin G (.cflow z s v) →
+      ({ src := v, lbl := .st n, dst := x } : NEdge N M.S Nm) ∈ G →
+      ({ src := p, lbl := .d, dst := x } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z0 s0 p) →
+      RDeriv M origin G (.ccell z s z0 s0 n)
+  | cload {z q y r z0 : N} {s s0 : M.S} {n k : Option Nm} :
+      RDeriv M origin G (.ccell z s z0 s0 n) →
+      ({ src := q, lbl := .d, dst := y } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z0 s0 q) →
+      ({ src := y, lbl := .ld k, dst := r } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z s r)
+  | cval {z q y z0 : N} {s s0 : M.S} {n : Option Nm} :
+      RDeriv M origin G (.ccell z s z0 s0 n) →
+      ({ src := q, lbl := .d, dst := y } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z0 s0 q) →
+      RDeriv M origin G (.cflow z s y)
+  /-- An origin cell holds itself, unnamed, at every concrete cell its
+  pointer reaches: content from outside the program. -/
+  | cid {x p z0 : N} {s0 : M.S} (hx : origin x) :
+      ({ src := p, lbl := .d, dst := x } : NEdge N M.S Nm) ∈ G →
+      RDeriv M origin G (.cflow z0 s0 p) →
+      RDeriv M origin G (.ccell x M.zero z0 s0 none)
+
+/-- No punning: a named store and a named load of one concrete cell use
+the same name. A hypothesis about the program; the solver does not check
+it (plan 3.4: type data, exposed as an assumption). -/
+def PunFree (M : ShiftMonoid) {N Nm : Type} (origin : N → Prop)
+    (G : NGraph N M.S Nm) : Prop :=
+  ∀ {z q y r z0 : N} {s s0 : M.S} {n k : Nm},
+    RDeriv M origin G (.ccell z s z0 s0 (some n)) →
+    ({ src := q, lbl := .d, dst := y } : NEdge N M.S Nm) ∈ G →
+    RDeriv M origin G (.cflow z0 s0 q) →
+    ({ src := y, lbl := .ld (some k), dst := r } : NEdge N M.S Nm) ∈ G →
+    n = k
+
+/-- How the solver's graph realizes a named graph: every edge kept, a
+store writes its cell and the shadow of its name (the unnamed shadow for
+an unnamed write), a named load reads its name's shadow and the unnamed
+shadow, an unnamed load reads the cell. -/
+structure Realizes {N S Nm : Type} (G : NGraph N S Nm) (G' : FGraph N S)
+    (sh : N → Option Nm → N) : Prop where
+  a : ∀ {x y : N}, ({ src := x, lbl := .a, dst := y } : NEdge N S Nm) ∈ G →
+    ({ src := x, lbl := .a, dst := y } : FEdge N S) ∈ G'
+  f : ∀ {x y : N} {r : S}, ({ src := x, lbl := .f r, dst := y } : NEdge N S Nm) ∈ G →
+    ({ src := x, lbl := .f r, dst := y } : FEdge N S) ∈ G'
+  fx : ∀ {x y : N}, ({ src := x, lbl := .fx, dst := y } : NEdge N S Nm) ∈ G →
+    ({ src := x, lbl := .fx, dst := y } : FEdge N S) ∈ G'
+  d : ∀ {p x : N}, ({ src := p, lbl := .d, dst := x } : NEdge N S Nm) ∈ G →
+    ({ src := p, lbl := .d, dst := x } : FEdge N S) ∈ G'
+  st : ∀ {v x : N} {n : Option Nm},
+    ({ src := v, lbl := .st n, dst := x } : NEdge N S Nm) ∈ G →
+    ({ src := v, lbl := .a, dst := x } : FEdge N S) ∈ G'
+  st_sh : ∀ {v x : N} {n : Option Nm},
+    ({ src := v, lbl := .st n, dst := x } : NEdge N S Nm) ∈ G →
+    ({ src := v, lbl := .a, dst := sh x n } : FEdge N S) ∈ G'
+  ld_none : ∀ {y r : N}, ({ src := y, lbl := .ld none, dst := r } : NEdge N S Nm) ∈ G →
+    ({ src := y, lbl := .a, dst := r } : FEdge N S) ∈ G'
+  ld_name : ∀ {y r : N} {k : Nm},
+    ({ src := y, lbl := .ld (some k), dst := r } : NEdge N S Nm) ∈ G →
+    ({ src := sh y (some k), lbl := .a, dst := r } : FEdge N S) ∈ G'
+  ld_unnamed : ∀ {y r : N} {k : Nm},
+    ({ src := y, lbl := .ld (some k), dst := r } : NEdge N S Nm) ∈ G →
+    ({ src := sh y none, lbl := .a, dst := r } : FEdge N S) ∈ G'
+
+/-- What a concrete judgment guarantees of the realized solve: a value
+flow at its node; a stored value at a cell AND at the cell's shadow for
+the store's name. -/
+def KCovered (M : ShiftMonoid) {N Nm : Type} (origin : N → Prop)
+    (sh : N → Option Nm → N) (G : NGraph N M.S Nm) (G' : FGraph N M.S) :
+    CJudg N M.S Nm → Prop
+  | .cflow z s x =>
+      ∃ a, covers a s ∧
+        KDeriv M origin sh (fun z u => u = sh z none) G' (.flow z a x)
+  | .ccell z s z0 s0 n =>
+      ∃ x p a a0,
+        ({ src := p, lbl := .d, dst := x } : NEdge N M.S Nm) ∈ G ∧
+        covers a s ∧
+        KDeriv M origin sh (fun z u => u = sh z none) G' (.flow z a x) ∧
+        KDeriv M origin sh (fun z u => u = sh z none) G' (.flow z a (sh x n)) ∧
+        covers a0 s0 ∧
+        KDeriv M origin sh (fun z u => u = sh z none) G' (.flow z0 a0 p)
+
+theorem kmal_of_covers (M : ShiftMonoid) {N Nm : Type} {origin : N → Prop}
+    {sh : N → Option Nm → N} {seedU : N → N → Prop} {G : FGraph N M.S}
+    {p q x y z0 : N} {a0 b0 : Shift M} {s0 : M.S}
+    (hp : ({ src := p, lbl := .d, dst := x } : FEdge N M.S) ∈ G)
+    (hq : ({ src := q, lbl := .d, dst := y } : FEdge N M.S) ∈ G)
+    (ha : covers a0 s0) (dp : KDeriv M origin sh seedU G (.flow z0 a0 p))
+    (hb : covers b0 s0) (dq : KDeriv M origin sh seedU G (.flow z0 b0 q)) :
+    KDeriv M origin sh seedU G (.mal x y) := by
+  rcases ha with ha | ha
+  · subst ha; exact .mal_joinXL hp hq dp dq
+  · rcases hb with hb | hb
+    · subst hb; exact .mal_joinXR hp hq dp dq
+    · subst ha; subst hb; exact .mal_join hp hq dp dq
+
+/-- THE REALIZATION IS SOUND: every concrete value flow of the exact
+semantics with identities is a flow of the solver's satellite-shadow
+graph, provided the program does not pun. -/
+theorem realize_sound (M : ShiftMonoid) {N Nm : Type} {origin : N → Prop}
+    {G : NGraph N M.S Nm} {G' : FGraph N M.S} {sh : N → Option Nm → N}
+    (R : Realizes G G' sh) (hpun : PunFree M origin G) :
+    ∀ {j : CJudg N M.S Nm}, RDeriv M origin G j → KCovered M origin sh G G' j := by
+  intro j d
+  induction d with
+  | crefl z hz => exact ⟨_, Or.inr rfl, .flow_refl z hz⟩
+  | ca _ hE ih =>
+      obtain ⟨a, ha, da⟩ := ih
+      exact ⟨a, ha, .flow_a da (R.a hE)⟩
+  | cf _ hE ih =>
+      obtain ⟨a, ha, da⟩ := ih
+      exact ⟨_, covers_comp _ ha, .flow_f da (R.f hE)⟩
+  | cfx s' _ hE ih =>
+      obtain ⟨a, _, da⟩ := ih
+      exact ⟨none, Or.inl rfl, .flow_fx da (R.fx hE)⟩
+  | cstore _ hE hD _ ihv ihp =>
+      obtain ⟨a, ha, da⟩ := ihv
+      obtain ⟨a0, ha0, dp⟩ := ihp
+      exact ⟨_, _, a, a0, hD, ha, .flow_a da (R.st hE), .flow_a da (R.st_sh hE),
+        ha0, dp⟩
+  | cload dc hq dq hL ihc ihq =>
+      obtain ⟨x, p, a, a0, hp, ha, dx, dsx, ha0, dp⟩ := ihc
+      obtain ⟨b0, hb0, dq'⟩ := ihq
+      have hm := kmal_of_covers M (R.d hp) (R.d hq) ha0 dp hb0 dq'
+      rename_i n k
+      cases k with
+      | none => exact ⟨a, ha, .flow_a (.flow_m dx hm) (R.ld_none hL)⟩
+      | some k =>
+          cases n with
+          | none =>
+              exact ⟨a, ha, .flow_a (.flow_m dsx (.mal_sat none hm)) (R.ld_unnamed hL)⟩
+          | some n =>
+              have hnk : n = k := hpun dc hq dq hL
+              subst hnk
+              exact ⟨a, ha, .flow_a (.flow_m dsx (.mal_sat (some n) hm)) (R.ld_name hL)⟩
+  | cval _ hq _ ihc ihq =>
+      obtain ⟨x, p, a, a0, hp, ha, dx, _, ha0, dp⟩ := ihc
+      obtain ⟨b0, hb0, dq'⟩ := ihq
+      exact ⟨a, ha, .flow_m dx (kmal_of_covers M (R.d hp) (R.d hq) ha0 dp hb0 dq')⟩
+  | cid hx hD _ ihp =>
+      obtain ⟨a0, ha0, dp⟩ := ihp
+      exact ⟨_, _, _, a0, hD, Or.inr rfl, .flow_refl _ hx, .flow_seed hx rfl, ha0, dp⟩
+
+/-- THE REALIZATION ONLY REMOVES ANSWERS: projecting every shadow onto
+its cell maps each solver derivation onto a derivation of today's
+flows-to grammar on the erased graph (stores and loads as `a`), provided
+the realized graph has no other edges (`hHom`). -/
+theorem realize_removal_only (M : ShiftMonoid) {N Nm : Type}
+    {origin : N → Prop} {sh : N → Option Nm → N} {seedU : N → N → Prop}
+    {G : NGraph N M.S Nm} {G' : FGraph N M.S} (π : N → N)
+    (hHom : FGraphHom π G' (eraseGraph G))
+    (horig : ∀ z, origin z → origin (π z))
+    (hseed : ∀ z u, seedU z u → π u = π z)
+    (hsh : ∀ x m, π (sh x m) = π x) :
+    ∀ {j : FJudg N M.S}, KDeriv M origin sh seedU G' j →
+      FDeriv M origin (eraseGraph G) (mapFJudg π j) := by
+  intro j d
+  induction d with
+  | flow_refl z hz => exact .flow_refl (π z) (horig z hz)
+  | flow_seed hz hu =>
+      rename_i z u
+      show FDeriv M origin (eraseGraph G) (.flow (π z) (some M.zero) (π u))
+      rw [hseed z u hu]
+      exact .flow_refl (π z) (horig z hz)
+  | flow_a _ hE ih => exact .flow_a ih (hHom _ hE)
+  | flow_f _ hE ih => exact .flow_f ih (hHom _ hE)
+  | flow_fx _ hE ih => exact .flow_fx ih (hHom _ hE)
+  | flow_m _ _ ih₁ ih₂ => exact .flow_m ih₁ ih₂
+  | mal_join hp hq _ _ ihp ihq => exact .mal_join (hHom _ hp) (hHom _ hq) ihp ihq
+  | mal_joinXL hp hq _ _ ihp ihq => exact .mal_joinXL (hHom _ hp) (hHom _ hq) ihp ihq
+  | mal_joinXR hp hq _ _ ihp ihq => exact .mal_joinXR (hHom _ hp) (hHom _ hq) ihp ihq
+  | mal_sat m hd ih =>
+      rename_i x y
+      show FDeriv M origin (eraseGraph G) (.mal (π (sh x m)) (π (sh y m)))
+      rw [hsh x m, hsh y m]
+      exact ih
+
 end NamedCells

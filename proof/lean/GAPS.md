@@ -458,3 +458,45 @@ Implementation obligations left open:
 5. Spill/restore (`wderiv_restore`) and staged minting
    (`sderiv_catchup`) are not restated for named planes; their proofs
    do not inspect cell contents and should transfer, unchecked.
+
+### The shadow-cell realization (`--cfl-named-planes`, WIP 2026-10-02)
+
+What the solver runs is not the certified-name policy above but a
+realization with no certificate census: every write that is not a
+single-leaf named store goes to the cell's unnamed shadow, and a named
+load reads its name's shadow and the unnamed shadow
+(docs/named-cells-design.md). Statements (checked, `propext` only):
+- `realize_sound`: against `RDeriv` (`CDeriv` plus identities: an
+  origin cell is unnamed content of every concrete cell its pointer
+  reaches), every concrete flow is a `KDeriv` flow of the realized graph
+  — `FDeriv` plus `mal_sat` (aliased cells alias their shadows of each
+  name: the solver keeps shadows as satellites of their cell's class and
+  merges them name by name when classes merge) and the identity seeded
+  into the unnamed shadow — given `Realizes` (the graph construction)
+  and `PunFree` (a named store and a named load of one concrete cell use
+  the same name).
+- `realize_removal_only`: projecting shadows onto their cells maps
+  every `KDeriv` derivation onto today's `FDeriv` on the erased graph,
+  given that the realized graph has no other edges.
+
+Obligations left open:
+6. `Realizes` is checked by construction: every write into a raw cell
+   passes `addAssignmentEdge` (or `initSlotWrite`) and is filed or
+   mirrored there; every cell gets an unnamed shadow before each solve
+   (`ensureUnnamedShadows`); a root minted on a class is seeded into
+   the unnamed shadows of the class's raw cells. That the solver's
+   satellite merges realize `mal_sat` (every class merge, cluster join
+   or a-SCC collapse, merges the satellites of each name) and that the
+   relevance oracles see a shadow as part of its cell (`--cfl-bidi-prune`
+   unites them; slicing and lazy minting are refused) is not mechanized.
+7. `PunFree` is a program assumption (type data in the answer path).
+   Exposed partially: chains that cast a position to a struct the
+   layout lacks, bases indexed as two unrelated structs, and unions are
+   unnamed; casts across functions (`void *`) are not detected.
+8. Name-preserving copies (cell-to-cell copies relay each name's
+   shadow to the same name's) extend `PunFree` to copied content; the
+   relayed names are discovered from the solution and wired in further
+   outer iterations (monotone), not mechanized.
+9. Names are canonical leaf names, so `lalias` is equality; struct
+   names are unified across modules by stripping numeric suffixes (two
+   different layouts with one tag share names: coarser, still sound).

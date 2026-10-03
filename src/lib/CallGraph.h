@@ -180,7 +180,8 @@ protected:
   void runSummaryProvers(llvm::Module *M);
   bool applySummaryAtoms(const llvm::CallBase *CS,
                          const GlobalContext::FuncSummary &S,
-                         bool *retBound = nullptr);
+                         bool *retBound = nullptr,
+                         const llvm::Function *SF = nullptr);
   // Keyed pair-channels (CHAINREG/CHAINCALL): registrations and
   // dispatch sites collected during edge construction, wired per key
   // (cross product) after the last module. Keys are chain-head
@@ -248,13 +249,81 @@ protected:
   // A load of value node `val` from `cell`: through name `name` it reads
   // the cell's shadows for that name and for unnamed writes; with no
   // name it reads the cell.
-  void wireNamedLoad(NodeIndex cell, NodeIndex val, uint32_t name);
+  void wireNamedLoad(NodeIndex cell, NodeIndex val,
+                     llvm::ArrayRef<uint32_t> names);
   // A store of `val` into `cell` through name `name` (Unnamed: no name).
-  void wireNamedStore(NodeIndex val, NodeIndex cell, uint32_t name);
+  void wireNamedStore(NodeIndex val, NodeIndex cell,
+                      llvm::ArrayRef<uint32_t> names);
   void logNamedCells() const;
-  // Before each solve: give every cell its Unnamed shadow.
+  // Before each solve: give every cell its Unnamed shadow, and let the
+  // named loads of names opened since the last solve read it.
   void ensureUnnamedShadows();
+  // Certificate (plan 3.7): a name is open once a typed write that names
+  // no single leaf (variable offset, union, pun, several leaves, unknown
+  // extent) may land on it; loads of names never opened skip the
+  // unnamed shadow. Untyped writes (no struct position) open nothing
+  // under --cfl-named-untyped=count and are counted (the blind spot).
+  void openName(uint32_t name, llvm::StringRef culprit);
+  void openStruct(llvm::StructType *S, llvm::StringRef culprit);
+  // Struct position of the pointer through which a cell is written.
+  ka::AccessNames::Position writerPosition(NodeIndex cell, std::string &where);
+  bool namedCertifies() const;
+  boost::unordered_flat_set<uint32_t> openNames;
+  boost::unordered_flat_map<uint32_t, std::string> openWhy;
+  uint64_t namedOpenEpoch = 0;
+  // Named loads still reading only their name's shadow: (cell, value, name).
+  std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> certifiedReads;
+  // Untyped writes into cells (the counted blind spot), by writer.
+  uint64_t blindWrites = 0;
+  std::map<std::string, uint64_t> blindBy;
+  // Shape of the cell write being added: byte size of the value stored
+  // (0: unknown), an offset from the cell's pointer the cell itself does
+  // not carry (field-insensitive summary cells), and whether a write
+  // from another cell moves one value rather than copying bytes in place
+  // (a copy keeps names; a moved value is filed by its destination).
+  uint64_t cellWriteSize = 0;
+  int64_t cellWriteExtraOff = 0;
+  bool cellWriteIsValue = false;
+  struct CellWriteSize {
+    CallGraphPass &P;
+    uint64_t OldSz;
+    int64_t OldOff;
+    bool OldVal;
+    CellWriteSize(CallGraphPass &P_, uint64_t Sz, int64_t ExtraOff = 0,
+                  bool IsValue = false)
+        : P(P_), OldSz(P_.cellWriteSize), OldOff(P_.cellWriteExtraOff),
+          OldVal(P_.cellWriteIsValue) {
+      P.cellWriteSize = Sz;
+      P.cellWriteExtraOff = ExtraOff;
+      P.cellWriteIsValue = IsValue;
+    }
+    ~CellWriteSize() {
+      P.cellWriteSize = OldSz;
+      P.cellWriteExtraOff = OldOff;
+      P.cellWriteIsValue = OldVal;
+    }
+  };
+  // Synthetic field pointers: node -> (base, byte offset).
+  boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, int64_t>>
+      fieldPtrOrigin;
+  // Initializer slot: absolute byte offset in the global, and the global.
+  uint64_t initAbsOff = 0;
+  const llvm::GlobalVariable *initGV = nullptr;
+  boost::unordered_flat_map<const llvm::GlobalVariable *, llvm::StructType *>
+      initUseType;
   void initSlotWrite(NodeIndex val, NodeIndex cell);
+  llvm::StructType *initUseTypeOf(const llvm::GlobalVariable *GV);
+  uint64_t summaryWriteSize(int byteOff) const;
+  // The named struct a function's formal points to (debug info, else the
+  // one struct its body indexes it as); nullptr when unknown.
+  llvm::StructType *formalStruct(const llvm::Function *F, unsigned ArgNo);
+  boost::unordered_flat_map<uint64_t, llvm::StructType *> formalStructCache;
+  // An explicit position for the cell write being added (summary atoms
+  // write through a formal whose type the call site does not show).
+  bool cellWriteHasPos = false;
+  ka::AccessNames::Position cellWritePos;
+  std::string cellWriteWhere;
+  int64_t summaryCellOffset(int byteOff) const;
   std::unique_ptr<ka::AccessNames> accessNames;
   boost::unordered_flat_map<uint64_t, NodeIndex> shadowOf; // cell<<32|name
   boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, uint32_t>>
@@ -272,7 +341,8 @@ protected:
   struct NamedCellStats {
     uint64_t shadows = 0, namedStores = 0, unnamedStores = 0,
              namedLoads = 0, unnamedLoads = 0, namedSlots = 0,
-             unnamedSlots = 0, unnamedWrites = 0, cellCopies = 0;
+             unnamedSlots = 0, unnamedWrites = 0, cellCopies = 0,
+             typedWrites = 0;
   } namedStats;
   // processInitializer's slot position: innermost named struct and the
   // byte offset in it (array elements folded), or none / in a union.

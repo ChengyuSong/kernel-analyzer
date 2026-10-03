@@ -14,6 +14,8 @@
 
 #include "CallGraphInternal.h"
 
+#include <llvm/BinaryFormat/Dwarf.h>
+
 namespace {
 
 static bool isZeroOffsetGEP(const Value *V) {
@@ -779,7 +781,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
          (sit->second->atoms.empty() && !sit->second->fresh &&
           !sit->second->none));
     if (sit != Ctx->FuncSummaries.end() && (directSite || transferFree)) {
-      if (!applySummaryAtoms(CS, *sit->second, &retBound))
+      if (!applySummaryAtoms(CS, *sit->second, &retBound, sit->first))
         return false;
       // Invoke atom with dynamic fn at this callsite: fall through to
       // the pooled arg/ret wiring (sound, LEDGERed). retBound=true
@@ -1291,7 +1293,7 @@ void CallGraphPass::fileUnnamedWrite(NodeIndex s, NodeIndex src,
                                      NodeIndex dst) {
   if (namedFiling || !namedPlanes() || !isCellNode(dst))
     return;
-  if (isCellNode(src)) {
+  if (isCellNode(src) && !cellWriteIsValue) {
     // A copy from cell to cell (memcpy, CPY/MOVE summaries, asm, field-
     // wise copies) moves bytes to the same offsets, so content keeps the
     // name it was stored under: unnamed to unnamed here, each name's
@@ -1299,38 +1301,139 @@ void CallGraphPass::fileUnnamedWrite(NodeIndex s, NodeIndex src,
     // source holds (wireCopyNames).
     Graph.addCopy(namedShadow(src, ka::AccessNames::Unnamed),
                   namedShadow(dst, ka::AccessNames::Unnamed));
+    Graph.addCopy(namedShadow(src, ka::AccessNames::Identity),
+                  namedShadow(dst, ka::AccessNames::Identity));
     if (cellCopySeen.insert(((uint64_t)src << 32) | dst).second)
       cellCopies.emplace_back(src, dst);
     namedStats.cellCopies++;
     return;
   }
+  // Not a copy: where does the writer point? A typed single leaf is a
+  // named write (the store's own address had no name, e.g. a summary
+  // atom or int-provenance store through a field address); any other
+  // typed position opens the names it may cover; no struct at all is
+  // the counted blind spot.
+  std::string where;
+  const DataLayout *DLw = curDL;
+  const ka::AccessNames::Position pos = writerPosition(dst, where);
+  if ((pos.S || pos.DIS) && DLw) {
+    const uint32_t n = cellWriteSize
+                           ? accessNames->ofPosition(pos, cellWriteSize, *DLw)
+                           : ka::AccessNames::Unnamed;
+    if (n != ka::AccessNames::Unnamed) {
+      Graph.addCopy(s, namedShadow(dst, n));
+      namedStats.typedWrites++;
+      return;
+    }
+    if (pos.S) {
+      openStruct(pos.S, where);
+    } else { // a debug-info-only struct we cannot enumerate: counted
+      blindWrites++;
+      blindBy[where]++;
+    }
+  } else if (pos.tainted && !pos.open.empty()) {
+    for (llvm::StructType *S : pos.open)
+      openStruct(S, where);
+  } else {
+    blindWrites++;
+    blindBy[where]++;
+  }
   Graph.addCopy(s, namedShadow(dst, ka::AccessNames::Unnamed));
   namedStats.unnamedWrites++;
 }
 
+bool CallGraphPass::namedCertifies() const {
+  return namedPlanes() && CFLNamedUntyped == "count";
+}
+
+void CallGraphPass::openName(uint32_t name, StringRef culprit) {
+  if (!openNames.insert(name).second)
+    return;
+  openWhy.emplace(name, culprit.str());
+  namedOpenEpoch++;
+}
+
+void CallGraphPass::openStruct(llvm::StructType *S, StringRef culprit) {
+  for (uint32_t n : accessNames->leavesOf(S, *curDL))
+    openName(n, culprit);
+}
+
+ka::AccessNames::Position CallGraphPass::writerPosition(NodeIndex cell,
+                                                        std::string &where) {
+  if (cellWriteHasPos) {
+    where = cellWriteWhere;
+    return cellWritePos;
+  }
+  NodeIndex p = cellParent(cell);
+  // byte offset accumulated over synthetic field pointers, plus what the
+  // write declares the cell itself does not carry
+  int64_t acc = cellWriteExtraOff;
+  while (p != AndersNodeFactory::InvalidIndex) {
+    if (const Value *V = NF.getValueForNode(p)) {
+      if (const auto *I = dyn_cast<Instruction>(V))
+        where = (I->getFunction()->getName() + "::" + I->getOpcodeName()).str();
+      else if (const auto *A = dyn_cast<Argument>(V))
+        where = (A->getParent()->getName() + "::arg" + Twine(A->getArgNo())).str();
+      else
+        where = V->hasName() ? V->getName().str() : std::string("<const>");
+      ka::AccessNames::Position pos = accessNames->position(V, *curDL);
+      if (pos.S && acc && !pos.tainted) {
+        pos.off += acc;
+        if (pos.off < 0 ||
+            (uint64_t)pos.off >=
+                curDL->getStructLayout(pos.S)->getSizeInBytes()) {
+          pos.S = nullptr; // a field pointer past the struct: untyped
+          pos.why = ka::AccessNames::OutOfRange;
+        }
+      }
+      return pos;
+    }
+    auto it = fieldPtrOrigin.find(p);
+    if (it == fieldPtrOrigin.end())
+      break;
+    acc += it->second.second;
+    p = it->second.first;
+  }
+  where = "<synthetic>";
+  return ka::AccessNames::Position();
+}
+
+// A store through several names (the lanes of a pointer vector) files
+// the whole value under each: a superset of each lane's content.
 void CallGraphPass::wireNamedStore(NodeIndex val, NodeIndex cell,
-                                   uint32_t name) {
-  if (!namedPlanes() || name == ka::AccessNames::Unnamed) {
+                                   ArrayRef<uint32_t> names) {
+  if (!namedPlanes() || names.empty() ||
+      names[0] == ka::AccessNames::Unnamed) {
     addAssignmentEdge(val, cell);
     namedStats.unnamedStores++;
     return;
   }
   namedFiling++;
   addAssignmentEdge(val, cell);
-  addAssignmentEdge(val, namedShadow(cell, name));
+  for (uint32_t name : names)
+    addAssignmentEdge(val, namedShadow(cell, name));
   namedFiling--;
   namedStats.namedStores++;
 }
 
 void CallGraphPass::wireNamedLoad(NodeIndex cell, NodeIndex val,
-                                  uint32_t name) {
-  if (!namedPlanes() || name == ka::AccessNames::Unnamed) {
+                                  ArrayRef<uint32_t> names) {
+  if (!namedPlanes() || names.empty() ||
+      names[0] == ka::AccessNames::Unnamed) {
     addAssignmentEdge(cell, val);
     namedStats.unnamedLoads++;
     return;
   }
-  addAssignmentEdge(namedShadow(cell, name), val);
-  addAssignmentEdge(namedShadow(cell, ka::AccessNames::Unnamed), val);
+  addAssignmentEdge(namedShadow(cell, ka::AccessNames::Identity), val);
+  for (uint32_t name : names) {
+    addAssignmentEdge(namedShadow(cell, name), val);
+    // A certified name skips the unnamed shadow until it is opened
+    // (ensureUnnamedShadows adds the read then).
+    if (namedCertifies() && !openNames.count(name))
+      certifiedReads.emplace_back(cell, val, name);
+    else
+      addAssignmentEdge(namedShadow(cell, ka::AccessNames::Unnamed), val);
+  }
   namedLoadCells[val] = cell;
   namedStats.namedLoads++;
 }
@@ -1338,25 +1441,41 @@ void CallGraphPass::wireNamedLoad(NodeIndex cell, NodeIndex val,
 void CallGraphPass::ensureUnnamedShadows() {
   if (!namedPlanes())
     return;
-  // Every cell gets an Unnamed shadow before the solve, written or not:
-  // a root the solver mints on a cell's class (the identity of content
-  // nobody wrote) is unnamed content, and named loads of aliasing cells
-  // must see it through their own Unnamed shadows.
+  // Every cell gets an Unnamed and an Identity shadow before the solve,
+  // written or not: unnamed writes may reach any cell, and a root the
+  // solver mints on a cell's class (content nobody in the program wrote)
+  // goes to the Identity shadow, which every named load of an aliasing
+  // cell reads through its own (the satellites merge).
   std::vector<NodeIndex> cells;
   for (const GraphEdge &E : Graph.edges())
     if (E.kind == EdgeKind::Deref && !isShadowCell(E.to) &&
-        !shadowOf.count((uint64_t)E.to << 32 | ka::AccessNames::Unnamed))
+        (!shadowOf.count((uint64_t)E.to << 32 | ka::AccessNames::Unnamed) ||
+         !shadowOf.count((uint64_t)E.to << 32 | ka::AccessNames::Identity)))
       cells.push_back(E.to);
   std::sort(cells.begin(), cells.end());
   cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-  for (NodeIndex c : cells) // adds Deref edges: not while iterating them
+  for (NodeIndex c : cells) {
     namedShadow(c, ka::AccessNames::Unnamed);
+    namedShadow(c, ka::AccessNames::Identity);
+  }
+  // Loads of names opened since they were wired now read the unnamed
+  // shadow too (monotone: a name never closes again).
+  size_t kept = 0;
+  for (auto &r : certifiedReads) {
+    const auto [cell, val, name] = r;
+    if (openNames.count(name))
+      addAssignmentEdge(namedShadow(cell, ka::AccessNames::Unnamed), val);
+    else
+      certifiedReads[kept++] = r;
+  }
+  certifiedReads.resize(kept);
 }
 
 void CallGraphPass::logNamedCells() const {
   if (!namedPlanes())
     return;
-  CG_LOG("NamedCells: " << accessNames->size() - 2 << " names; "
+  CG_LOG("NamedCells: " << accessNames->size() - ka::AccessNames::FirstName
+         << " names; "
          << namedStats.namedStores << " named / "
          << namedStats.unnamedStores << " unnamed stores, "
          << namedStats.namedLoads << " named / " << namedStats.unnamedLoads
@@ -1370,7 +1489,27 @@ void CallGraphPass::logNamedCells() const {
     why += std::string(" ") +
            ka::AccessNames::whyName((ka::AccessNames::Why)w) + "=" +
            std::to_string(accessNames->unnamedBy[w]);
-  CG_LOG("NamedCells: unnamed accesses by reason:" << why << "\n");
+  CG_LOG("NamedCells: unnamed accesses by reason:" << why << "; "
+         << accessNames->namedByTBAA << " named by their TBAA tag\n");
+  CG_LOG("NamedCells: " << namedStats.typedWrites
+         << " unnamed writes filed by their writer's field; certificate ("
+         << CFLNamedUntyped << "): " << openNames.size() << "/"
+         << accessNames->size() - ka::AccessNames::FirstName
+         << " names open, "
+         << certifiedReads.size()
+         << " loads skip the unnamed plane; blind spot: " << blindWrites
+         << " untyped writes into cells\n");
+  if (VerboseLevel >= 3) // who opened each name (first culprit)
+    for (auto &[n, why] : openWhy)
+      CG_LOG("NamedCells:   open " << accessNames->str(n) << " by " << why
+             << "\n");
+  std::vector<std::pair<uint64_t, std::string>> top;
+  for (auto &[w, c] : blindBy)
+    top.emplace_back(c, w);
+  std::sort(top.rbegin(), top.rend());
+  for (size_t i = 0; i < top.size() && i < 10; i++)
+    CG_LOG("NamedCells:   blind " << top[i].first << " " << top[i].second
+           << "\n");
 }
 
 // ---- Field-sensitive memory modeling helpers (--cfl-field-buckets > 0) ----
@@ -1424,6 +1563,7 @@ NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
     return it->second;
   NodeIndex n = NF.createValueNode();
   fieldPtrNodes.emplace(key, n);
+  fieldPtrOrigin.emplace(n, std::make_pair(parentCanon, off));
   {
     const Value *pv = NF.getValueForNode(parentCanon);
     std::string pn = "#" + std::to_string(parentCanon);
@@ -1780,6 +1920,9 @@ void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
 static bool mayBecomePointer(const llvm::Value *V, unsigned depth,
                              bool &declined);
 void CallGraphPass::handleInlineAsm(CallBase &CS) {
+  // Named cells: asm writes of unknown extent; a cell-to-cell flow here
+  // moves values, not bytes in place.
+  CellWriteSize asmWrite(*this, 0, 0, /*IsValue=*/true);
   auto *IA = cast<InlineAsm>(CS.getCalledOperand());
   auto Constraints = InlineAsm::ParseConstraints(IA->getConstraintString());
   CG_DEBUG("InlineAsm: processing \"" << IA->getAsmString()
@@ -2421,7 +2564,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
         // cross-caller conflation channel (~470 witnessed joins at km)
         // — suppress it, then apply the remaining atoms (CPY for the
         // dup family restores the copy the skipped body drops).
-        if (CGP.applySummaryAtoms(&CS, *sit->second))
+        if (CGP.applySummaryAtoms(&CS, *sit->second, nullptr, sit->first))
           CGP.wireCallArgs(&CS, RCF); // dynamic-fn INVOKE: feed the body pool
       } else if (CF->getReturnType()->isPointerTy()) {
         NodeIndex retNode = CGP.NF.getReturnNodeFor(RCF);
@@ -3083,11 +3226,19 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
 
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
-  uint32_t name = ka::AccessNames::Unnamed;
-  if (CGP.namedPlanes() && I.getType()->isPointerTy())
-    name = CGP.accessNames->ofAccess(
-        ptr, CGP.curDL->getTypeStoreSize(I.getType()), *CGP.curDL);
-  CGP.wireNamedLoad(derefNode, valNode, name);
+  SmallVector<uint32_t, 4> names{ka::AccessNames::Unnamed};
+  if (CGP.namedPlanes()) {
+    if (I.getType()->isPointerTy())
+      names[0] = CGP.accessNames->ofMemAccess(
+          I, ptr, CGP.curDL->getTypeStoreSize(I.getType()), *CGP.curDL);
+    else if (auto *VT = dyn_cast<VectorType>(I.getType()))
+      if (VT->getElementType()->isPointerTy()) {
+        auto lanes = CGP.accessNames->ofLanes(ptr, VT, *CGP.curDL);
+        if (!lanes.empty())
+          names = lanes;
+      }
+  }
+  CGP.wireNamedLoad(derefNode, valNode, names);
 }
 
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
@@ -3114,6 +3265,7 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
           CGP.localAllocaStoreVals[slotRep].push_back(valNode);
         } else {
           NodeIndex pN = CGP.getRepNodeForValue(sp);
+          CellWriteSize ws(CGP, CGP.curDL->getTypeStoreSize(val->getType()));
           if (pN != AndersNodeFactory::InvalidIndex)
             CGP.addAssignmentEdge(valNode, CGP.getRepDerefNode(pN));
         }
@@ -3175,11 +3327,20 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
 
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
 
-  uint32_t name = ka::AccessNames::Unnamed;
-  if (CGP.namedPlanes() && val->getType()->isPointerTy())
-    name = CGP.accessNames->ofAccess(
-        ptr, CGP.curDL->getTypeStoreSize(val->getType()), *CGP.curDL);
-  CGP.wireNamedStore(valNode, derefNode, name);
+  SmallVector<uint32_t, 4> names{ka::AccessNames::Unnamed};
+  if (CGP.namedPlanes()) {
+    if (val->getType()->isPointerTy())
+      names[0] = CGP.accessNames->ofMemAccess(
+          I, ptr, CGP.curDL->getTypeStoreSize(val->getType()), *CGP.curDL);
+    else if (auto *VT = dyn_cast<VectorType>(val->getType()))
+      if (VT->getElementType()->isPointerTy()) {
+        auto lanes = CGP.accessNames->ofLanes(ptr, VT, *CGP.curDL);
+        if (!lanes.empty())
+          names = lanes;
+      }
+  }
+  CellWriteSize ws(CGP, CGP.curDL->getTypeStoreSize(val->getType()));
+  CGP.wireNamedStore(valNode, derefNode, names);
 }
 
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
@@ -3296,7 +3457,10 @@ void CallGraphPass::InstHandler::visitAtomicRMWInst(AtomicRMWInst &I) {
   assert(ptrNode != AndersNodeFactory::InvalidIndex &&
          "Failed to find atomicrmw ptr node");
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
-  CGP.addAssignmentEdge(valNode, derefNode);
+  {
+    CellWriteSize ws(CGP, CGP.curDL ? CGP.curDL->getTypeStoreSize(I.getType()) : 0);
+    CGP.addAssignmentEdge(valNode, derefNode);
+  }
   CGP.addAssignmentEdge(derefNode, resNode);
   // Segment-local field claim for the loaded-old-value side.
   if (!containsPointerType(I.getType()) && CGP.Graph.fieldSensitive() &&
@@ -3342,7 +3506,10 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   assert(ptrNode != AndersNodeFactory::InvalidIndex &&
          "Failed to find cmpxchg ptr node");
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
-  CGP.addAssignmentEdge(valNode, derefNode);
+  {
+    CellWriteSize ws(CGP, CGP.curDL ? CGP.curDL->getTypeStoreSize(I.getNewValOperand()->getType()) : 0);
+    CGP.addAssignmentEdge(valNode, derefNode);
+  }
   CGP.addAssignmentEdge(derefNode, resNode);
   // Segment-local field claim for the loaded-old-value projection.
   if (!containsPointerType(I.getNewValOperand()->getType()) &&
@@ -4065,6 +4232,119 @@ void CallGraphPass::InstHandler::visitShuffleVectorInst(ShuffleVectorInst &I) {
   }
 }
 
+// The named struct a literal-typed global is read as: the one struct its
+// GEPs index it as (element type for an array of structs), else the
+// struct its debug info declares; nullptr when neither names exactly
+// one struct. Several unrelated GEP types are a pun: they are opened.
+llvm::StructType *CallGraphPass::initUseTypeOf(const GlobalVariable *GV) {
+  auto it = initUseType.find(GV);
+  if (it != initUseType.end())
+    return it->second;
+  llvm::SmallVector<llvm::StructType *, 2> types;
+  for (const User *U : GV->users()) {
+    const auto *G = dyn_cast<GEPOperator>(U);
+    if (!G || G->getPointerOperand()->stripPointerCasts() != GV)
+      continue;
+    Type *T = G->getSourceElementType();
+    while (T->isArrayTy())
+      T = T->getArrayElementType();
+    auto *ST = dyn_cast<llvm::StructType>(T);
+    if (!ST || ST->isLiteral() || !ST->hasName() ||
+        LLVM_STRING_STARTS_WITH(ST->getName(), "union"))
+      continue;
+    if (std::find(types.begin(), types.end(), ST) == types.end())
+      types.push_back(ST);
+  }
+  llvm::StructType *S = nullptr;
+  if (types.size() == 1) {
+    S = types[0];
+  } else if (types.size() > 1) {
+    for (llvm::StructType *T : types)
+      openStruct(T, "init-pun:" + GV->getName().str());
+  } else {
+    llvm::SmallVector<DIGlobalVariableExpression *, 1> DIs;
+    GV->getDebugInfo(DIs);
+    for (auto *E : DIs) {
+      const DIType *T = E->getVariable()->getType();
+      while (const auto *D = dyn_cast_or_null<DIDerivedType>(T)) {
+        if (D->getTag() != dwarf::DW_TAG_typedef &&
+            D->getTag() != dwarf::DW_TAG_const_type &&
+            D->getTag() != dwarf::DW_TAG_volatile_type)
+          break;
+        T = D->getBaseType();
+      }
+      while (const auto *C = dyn_cast_or_null<DICompositeType>(T)) {
+        if (C->getTag() != dwarf::DW_TAG_array_type)
+          break;
+        T = C->getBaseType();
+        while (const auto *D = dyn_cast_or_null<DIDerivedType>(T)) {
+          if (D->getTag() != dwarf::DW_TAG_typedef &&
+              D->getTag() != dwarf::DW_TAG_const_type)
+            break;
+          T = D->getBaseType();
+        }
+      }
+      const auto *C = dyn_cast_or_null<DICompositeType>(T);
+      if (!C || C->getTag() != dwarf::DW_TAG_structure_type ||
+          C->getName().empty())
+        continue;
+      const std::string want = ("struct." + C->getName()).str();
+      for (llvm::StructType *ST : GV->getParent()->getIdentifiedStructTypes())
+        if (ST->hasName() && stripStructNameSuffix(ST->getName()) == want) {
+          S = ST;
+          break;
+        }
+      if (S)
+        break;
+    }
+  }
+  initUseType.emplace(GV, S);
+  return S;
+}
+
+llvm::StructType *CallGraphPass::formalStruct(const Function *F,
+                                              unsigned ArgNo) {
+  const uint64_t key = ((uint64_t)(uintptr_t)F << 8) ^ ArgNo;
+  auto it = formalStructCache.find(key);
+  if (it != formalStructCache.end())
+    return it->second;
+  llvm::StructType *S = nullptr;
+  if (const DISubprogram *SP = F->getSubprogram())
+    if (const DISubroutineType *ST = SP->getType()) {
+      auto Types = ST->getTypeArray();
+      if (ArgNo + 1 < Types.size())
+        S = accessNames->structByTag(F->getParent(),
+                                     ka::diStructName(Types[ArgNo + 1], true));
+    }
+  if (!S && ArgNo < F->arg_size()) {
+    // The one struct the body indexes the formal as (directly, or through
+    // the stack slot it is spilled to at -O0).
+    llvm::SmallVector<llvm::StructType *, 2> types;
+    llvm::SmallVector<const Value *, 4> ptrs{F->getArg(ArgNo)};
+    for (const User *U : F->getArg(ArgNo)->users())
+      if (const auto *SI = dyn_cast<StoreInst>(U))
+        if (SI->getValueOperand() == F->getArg(ArgNo))
+          if (const auto *AI = dyn_cast<AllocaInst>(
+                  SI->getPointerOperand()->stripPointerCasts()))
+            for (const User *U2 : AI->users())
+              if (const auto *LI = dyn_cast<LoadInst>(U2))
+                ptrs.push_back(LI);
+    for (const Value *Pv : ptrs)
+      for (const User *U : Pv->users())
+        if (const auto *G = dyn_cast<GEPOperator>(U))
+          if (G->getPointerOperand()->stripPointerCasts() == Pv)
+            if (auto *St = dyn_cast<llvm::StructType>(G->getSourceElementType()))
+              if (!St->isLiteral() && St->hasName() &&
+                  !LLVM_STRING_STARTS_WITH(St->getName(), "union") &&
+                  std::find(types.begin(), types.end(), St) == types.end())
+                types.push_back(St);
+    if (types.size() == 1)
+      S = types[0];
+  }
+  formalStructCache.emplace(key, S);
+  return S;
+}
+
 // A pointer-carrying initializer constant `val` written into `cell`: with
 // named cells it is also filed under the slot's name (initNamedS,
 // initOff), or in the cell's unnamed shadow when the slot has none.
@@ -4073,9 +4353,30 @@ void CallGraphPass::initSlotWrite(NodeIndex val, NodeIndex cell) {
   if (!namedPlanes())
     return;
   uint32_t name = ka::AccessNames::Unnamed;
-  if (initNamedS && !initUnion)
-    name = accessNames->ofSlot(initNamedS, initOff,
-                               curDL->getPointerSize(), *curDL);
+  const uint64_t psz = curDL->getPointerSize();
+  const std::string gvName =
+      "init:" + (initGV ? initGV->getName().str() : std::string("?"));
+  if (initNamedS && !initUnion) {
+    name = accessNames->ofSlot(initNamedS, initOff, psz, *curDL);
+    if (name == ka::AccessNames::Unnamed)
+      openStruct(initNamedS, gvName);
+  } else if (initNamedS) { // a union member: read elsewhere as its type
+    openStruct(initNamedS, gvName);
+  } else if (initGV) {
+    // A literal-typed global (designated initializers, unions, bit-
+    // fields): its slots are named by the struct the program reads it
+    // as (initUseTypeOf); without one they are the counted blind spot.
+    if (llvm::StructType *S = initUseTypeOf(initGV)) {
+      const uint64_t sz = curDL->getTypeAllocSize(S);
+      name = accessNames->ofSlot(S, sz ? initAbsOff % sz : initAbsOff, psz,
+                                 *curDL);
+      if (name == ka::AccessNames::Unnamed)
+        openStruct(S, gvName);
+    } else {
+      blindWrites++;
+      blindBy[gvName]++;
+    }
+  }
   Graph.addCopy(val, namedShadow(cell, name));
   (name == ka::AccessNames::Unnamed ? namedStats.unnamedSlots
                                     : namedStats.namedSlots)++;
@@ -4148,10 +4449,15 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
              << " -> " << ptrNode << "\n");
   } else if (ConstantArray *CA = dyn_cast<ConstantArray>(init)) {
     // Arrays are collapsed: all elements share the array's cell.
+    const uint64_t savedAbs = initAbsOff;
+    const uint64_t esz =
+        curDL ? curDL->getTypeAllocSize(CA->getType()->getElementType()) : 0;
     for (unsigned i = 0; i != CA->getNumOperands(); ++i) {
+      initAbsOff = savedAbs + i * esz;
       processInitializer(ptrNode, CA->getOperand(i), enclosingStruct,
                          enclosingFieldIdx, addrNode);
     }
+    initAbsOff = savedAbs;
   } else if (ConstantStruct *CS = dyn_cast<ConstantStruct>(init)) {
     StructType *STy = CS->getType();
     const bool isUnion = STy && STy->hasName() &&
@@ -4162,6 +4468,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     const bool savedUnion = initUnion;
     const StructLayout *NL =
         (namedPlanes() && !isUnion) ? curDL->getStructLayout(STy) : nullptr;
+    const uint64_t savedAbs = initAbsOff;
     const bool namedTy = !STy->isLiteral() && STy->hasName();
     const bool fieldMode = Graph.fieldSensitive() &&
                            addrNode != AndersNodeFactory::InvalidIndex &&
@@ -4198,11 +4505,14 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
         initNamedS = namedTy ? STy : savedS;
         initOff = (namedTy ? 0 : savedOff) + NL->getElementOffset(i);
       }
+      if (NL)
+        initAbsOff = savedAbs + NL->getElementOffset(i);
       processInitializer(childCell, CS->getOperand(i), curStruct, curField,
                          childAddr);
       initNamedS = savedS;
       initOff = savedOff;
       initUnion = savedUnion;
+      initAbsOff = savedAbs;
     }
   } else if (ConstantAggregateZero *CAZ = dyn_cast<ConstantAggregateZero>(init)) {
     Type *Ty = CAZ->getType();

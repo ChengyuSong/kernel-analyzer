@@ -592,6 +592,7 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t n = 0; n < N; n++)
       cellNameOf[n] = shadowInfoOf(toOrig[n]).second;
   }
+  const uint64_t namedOpenEpoch0 = namedOpenEpoch;
   auto nameOfCell = [&](uint32_t c) -> uint32_t {
     return c < cellNameOf.size() ? cellNameOf[c] : ka::AccessNames::Original;
   };
@@ -4592,16 +4593,16 @@ bool CallGraphPass::runFlowsToResolution() {
   }
   tHow = "seed"; tFrom = UINT32_MAX;
   // Named cells: a root minted on a class is content of each cell in
-  // the class that no store wrote, so it is filed under no name: the
-  // cells' Unnamed shadows get it too (NamedCells.lean, graph fidelity:
-  // identities are unnamed writes).
+  // the class that no program store wrote — content from outside, read
+  // under whatever name: it goes to those cells' Identity shadows, which
+  // every named load reads (NamedCells.lean: RDeriv.cid).
   std::vector<std::pair<uint32_t, uint32_t>> unnamedSeeds; // (shadow, rid)
   if (!cellNameOf.empty()) {
     std::vector<NodeIndex> members;
     for (auto [n, rid] : seeds) {
       collectCanonicalMembers(toOrig[n], members);
       for (NodeIndex m : members) {
-        auto it = shadowOf.find((uint64_t)m << 32 | ka::AccessNames::Unnamed);
+        auto it = shadowOf.find((uint64_t)m << 32 | ka::AccessNames::Identity);
         if (it == shadowOf.end()) continue;
         assert(getCanonicalNode(it->second) == it->second &&
                "shadows are presolve barriers");
@@ -4610,7 +4611,7 @@ bool CallGraphPass::runFlowsToResolution() {
       }
     }
     CG_LOG("NamedCells: " << unnamedSeeds.size()
-           << " roots seeded into unnamed shadows\n");
+           << " roots seeded into identity shadows\n");
   }
   if (CFLBatchRoots == 0) {
     size_t exactMint = 0, wildMint = 0;
@@ -6587,7 +6588,7 @@ bool CallGraphPass::runFlowsToResolution() {
         Graph.addDeref(callNode, heapObj);
         auto sit = Ctx->FuncSummaries.find(CF);
         if (sit != Ctx->FuncSummaries.end() &&
-            applySummaryAtoms(CS, *sit->second))
+            applySummaryAtoms(CS, *sit->second, nullptr, sit->first))
           wireCallArgs(CS, CF); // dynamic-fn INVOKE: feed the body pool
       } else if (Ctx->ContainerFuncs.count(CF)) {
         handleContainerCall(CS, CF);
@@ -6950,22 +6951,36 @@ bool CallGraphPass::runFlowsToResolution() {
   // wired. The edges enter the next iteration's solve, like new callee
   // pairs; names only grow, so the outer fixpoint is reached when none
   // is new.
-  size_t newCopyNames = 0;
+  size_t newCopyNames = 0, copiesInClass = 0;
+  if (!cellNameOf.empty() && namedOpenEpoch != namedOpenEpoch0) {
+    // Resolution wiring opened names: their loads read the unnamed
+    // shadow from the next solve on.
+    CG_LOG("NamedCells: " << (namedOpenEpoch - namedOpenEpoch0)
+           << " names opened by resolution wiring\n");
+    newCopyNames++;
+  }
   if (!cellNameOf.empty()) {
     for (size_t ci = 0; ci < cellCopies.size(); ci++) {
       const auto [src, dst] = cellCopies[ci];
       auto d = toDense.find(getCanonicalNode(src));
       if (d == toDense.end()) continue; // cell not in this graph
+      // A copy inside one class moves each plane onto itself: nothing to
+      // relay. Classes only merge as iterations add edges, so it stays so.
+      auto dd = toDense.find(getCanonicalNode(dst));
+      if (dd != toDense.end() && find(dd->second) == find(d->second)) {
+        copiesInClass++;
+        continue;
+      }
       for (auto [nm, u] : satOf[find(d->second)])
-        if (nm != ka::AccessNames::Unnamed &&
+        if (nm >= ka::AccessNames::FirstName &&
             cellCopyNamed.insert(((uint64_t)ci << 32) | nm).second) {
           Graph.addCopy(namedShadow(src, nm), namedShadow(dst, nm));
           newCopyNames++;
         }
     }
-    if (newCopyNames)
-      CG_LOG("NamedCells: " << newCopyNames
-             << " new name relays across cell-to-cell copies\n");
+    CG_LOG("NamedCells: " << newCopyNames
+           << " new name relays across cell-to-cell copies ("
+           << copiesInClass << " copies inside one class)\n");
   }
   if (newPairs == 0 && newCopyNames == 0) {
     // Lazy-mint catch-up: the A-loop cannot admit CYCLIC witness
@@ -7019,8 +7034,8 @@ bool CallGraphPass::runFlowsToResolution() {
         auto it = namedLoadCells.find(v);
         if (it == namedLoadCells.end()) continue;
         const NodeIndex cell = it->second;
-        const uint32_t nm = accessNames->ofAccess(
-            LI->getPointerOperand(),
+        const uint32_t nm = accessNames->ofMemAccess(
+            *LI, LI->getPointerOperand(),
             LI->getModule()->getDataLayout().getTypeStoreSize(LI->getType()),
             LI->getModule()->getDataLayout());
         if (!shadowOf.count((uint64_t)cell << 32 | nm)) continue;

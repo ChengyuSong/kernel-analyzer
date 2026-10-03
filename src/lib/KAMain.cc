@@ -211,6 +211,8 @@ int main(int argc, char **argv) {
                           "cells, lazy addresses, batched roots, lazy "
                           "minting or slicing (their relevance oracles and "
                           "seeding do not see a cell's name planes)");
+    if (CFLNamedUntyped != "count" && CFLNamedUntyped != "open")
+      cliErrors.push_back("--cfl-named-untyped must be 'count' or 'open'");
     if (CFLChannelCells && CFLKeyIdentity.getNumOccurrences() == 0) {
       // Channel cells carry the identity of never-written content on
       // the channel key (docs/channel-cells-design.md, "Identity of

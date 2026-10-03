@@ -1321,6 +1321,20 @@ const GlobalValue *CallGraphPass::canonChainKey(const GlobalValue *G) {
 // Deref cell at a byte offset within *base — mirrors runtime
 // store/load field handling under fs (field-ptr node + matched
 // f-edges); at FI (or offset 0) the plain top cell.
+// Named cells: the shape of a summary atom's write into
+// summaryDerefCell(base, byteOff) — one pointer, or unknown extent at a
+// wildcard offset — and the part of the offset that cell does not carry
+// (field-insensitive cells are the base's own).
+uint64_t CallGraphPass::summaryWriteSize(int byteOff) const {
+  return byteOff < 0 ? 0
+                     : Ctx->Modules.front().first->getDataLayout()
+                           .getPointerSize();
+}
+
+int64_t CallGraphPass::summaryCellOffset(int byteOff) const {
+  return (byteOff > 0 && !Graph.fieldSensitive()) ? byteOff : 0;
+}
+
 NodeIndex CallGraphPass::summaryDerefCell(NodeIndex base, int byteOff) {
   NodeIndex canon = getCanonicalNode(base);
   if (byteOff < 0 && Graph.fieldSensitive()) {
@@ -1396,7 +1410,7 @@ static const GlobalValue *resolveChainKeySym(GlobalContext *Ctx,
 
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S,
-                                      bool *retBound) {
+                                      bool *retBound, const Function *SF) {
   if (S.noop)
     return false; // NOOP owns the callsite: nothing transfers
   bool needPooled = false;
@@ -1426,6 +1440,38 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       n = getCanonicalNode(NF.createValueNode(v));
     if (n == AndersNodeFactory::InvalidIndex) g_sumSkipped++;
     return n;
+  };
+  // Named cells: an atom writing through formal `ref` (or global `g`)
+  // at byte `off` writes field `off` of the struct that formal points
+  // to, which the call site's untyped actual does not show.
+  struct WritePos {
+    CallGraphPass &P;
+    bool Old;
+    WritePos(CallGraphPass &P_, const Function *F, int ref,
+             const GlobalValue *g, int off)
+        : P(P_), Old(P_.cellWriteHasPos) {
+      if (!P.namedPlanes() || off < 0)
+        return;
+      llvm::StructType *St = nullptr;
+      if (g) {
+        if (const auto *GV = dyn_cast<GlobalVariable>(g)) {
+          Type *T = GV->getValueType();
+          while (T->isArrayTy()) T = T->getArrayElementType();
+          St = dyn_cast<llvm::StructType>(T);
+          if (St && (St->isLiteral() || !St->hasName())) St = nullptr;
+        }
+      } else if (F && ref >= 0) {
+        St = P.formalStruct(F, (unsigned)ref);
+      }
+      if (!St || (uint64_t)off >= P.curDL->getTypeAllocSize(St))
+        return;
+      P.cellWritePos = ka::AccessNames::Position();
+      P.cellWritePos.S = St;
+      P.cellWritePos.off = off;
+      P.cellWriteWhere = "summary:" + (F ? F->getName().str() : std::string("?"));
+      P.cellWriteHasPos = true;
+    }
+    ~WritePos() { P.cellWriteHasPos = Old; }
   };
   for (const auto &A : S.atoms) {
     switch (A.kind) {
@@ -1492,6 +1538,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (c == AndersNodeFactory::InvalidIndex ||
           v == AndersNodeFactory::InvalidIndex)
         break;
+      CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff),
+                       summaryCellOffset(A.dstByteOff));
+      WritePos wp(*this, SF, A.dst, A.gdst, A.dstByteOff);
       addAssignmentEdge(A.gsrc ? getCanonicalNode(v)
                                : summaryFieldPtr(v, A.srcByteOff),
                         summaryDerefCell(c, A.dstByteOff));
@@ -1504,6 +1553,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
+      CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff),
+                       summaryCellOffset(A.dstByteOff), /*IsValue=*/true);
+      WritePos wp(*this, SF, A.dst, A.gdst, A.dstByteOff);
       addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
                         summaryDerefCell(d, A.dstByteOff));
       g_sumSt++;
@@ -1667,7 +1719,12 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       }
       Graph.addDeref(subVal, subObj);
       AllocSites.insert(subVal); // origin identity for the mint loop
-      addAssignmentEdge(subVal, getRepDerefNode(getCanonicalNode(d)));
+      {
+        CellWriteSize ws(*this, Ctx->Modules.front().first->getDataLayout()
+                                    .getPointerSize());
+        WritePos wp(*this, SF, A.dst, nullptr, 0);
+        addAssignmentEdge(subVal, getRepDerefNode(getCanonicalNode(d)));
+      }
       g_sumFreshSub++;
       break;
     }
@@ -1691,6 +1748,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         break;
       // File ST2: the pointer in *c@0, then field dstByteOff of what it
       // points to (exact); generated Store2 keeps its wildcard level 2.
+      CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff));
       addAssignmentEdge(summaryFieldPtr(v, A.srcByteOff),
                         A.exact2 ? summaryDerefCell(summaryDerefCell(c, 0),
                                                     A.dstByteOff)
@@ -1745,6 +1803,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
+      CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff), 0,
+                       /*IsValue=*/true);
       addAssignmentEdge(summaryDerefCell(c, A.srcByteOff),
                         summaryDeref2Cell(d, A.dstByteOff));
       g_sumSt++;
@@ -1783,6 +1843,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       addAssignmentEdge(summaryDerefCell(c, A.srcByteOff), v);
       if (Graph.fieldSensitive())
         addFieldWildcardLoop(v, "summary-mvx");
+      CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff),
+                       summaryCellOffset(A.dstByteOff));
+      WritePos wp(*this, SF, A.dst, A.gdst, A.dstByteOff);
       addAssignmentEdge(v, summaryDerefCell(d, A.dstByteOff));
       g_sumSt++;
       break;

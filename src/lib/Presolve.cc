@@ -144,29 +144,68 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
   // increase (|cone|).
   std::vector<char> inCone;
   if (CFLPreSolveCone && !CFLChannelCells) {
+    // Named cells: a load through name n reads what every store under n
+    // wrote, wherever the solve puts the cells — shadows are barriers, so
+    // the cone crosses names explicitly: a named load's value in the cone
+    // brings every value stored under its name. Such values (and icall
+    // operands read only through shadows) need not touch the sublanguage:
+    // give them local ids so the cone can hold them.
+    std::unordered_map<uint32_t, std::vector<uint32_t>> loadNames; // local -> names
+    std::unordered_map<uint32_t, std::vector<uint32_t>> storedUnder; // name -> locals
+    if (namedPlanes())
+      for (const GraphEdge &E : edges) {
+        if (E.kind != EdgeKind::Copy)
+          continue;
+        const NodeIndex f = getCanonicalNode(E.from), t = getCanonicalNode(E.to);
+        const uint32_t fn = shadowInfoOf(f).second, tn = shadowInfoOf(t).second;
+        if (fn >= ka::AccessNames::FirstName && !isBarrierNode(t))
+          loadNames[localId(t)].push_back(fn);
+        if (tn >= ka::AccessNames::FirstName && !isBarrierNode(f))
+          storedUnder[tn].push_back(localId(f));
+      }
+    std::vector<uint32_t> seeds;
+    for (const CallBase *CS2 : Ctx->IndirectCallInsts) {
+      NodeIndex n2 = NF.getValueNodeFor(
+          CS2->getCalledOperand()->stripPointerCastsAndAliases());
+      if (n2 == AndersNodeFactory::InvalidIndex)
+        continue;
+      const NodeIndex c2 = getCanonicalNode(n2);
+      if (namedPlanes() && !isBarrierNode(c2))
+        seeds.push_back(localId(c2));
+      else if (auto lit = toLocal.find(c2); lit != toLocal.end())
+        seeds.push_back(lit->second);
+    }
     const uint32_t Mc = (uint32_t)toCanon.size();
     inCone.assign(Mc, 0);
     std::vector<std::vector<uint32_t>> radjC(Mc);
     for (auto &E : subEdges)
       radjC[E.to].push_back(E.from);
     std::vector<uint32_t> bfs;
-    for (const CallBase *CS2 : Ctx->IndirectCallInsts) {
-      NodeIndex n2 = NF.getValueNodeFor(
-          CS2->getCalledOperand()->stripPointerCastsAndAliases());
-      if (n2 == AndersNodeFactory::InvalidIndex)
-        continue;
-      auto lit = toLocal.find(getCanonicalNode(n2));
-      if (lit == toLocal.end() || inCone[lit->second])
-        continue;
-      inCone[lit->second] = 1;
-      bfs.push_back(lit->second);
-    }
-    for (size_t qi = 0; qi < bfs.size(); qi++)
+    for (uint32_t l : seeds)
+      if (!inCone[l]) {
+        inCone[l] = 1;
+        bfs.push_back(l);
+      }
+    std::unordered_set<uint32_t> namesInCone;
+    for (size_t qi = 0; qi < bfs.size(); qi++) {
       for (uint32_t w : radjC[bfs[qi]])
         if (!inCone[w]) {
           inCone[w] = 1;
           bfs.push_back(w);
         }
+      auto ln = loadNames.find(bfs[qi]);
+      if (ln == loadNames.end())
+        continue;
+      for (uint32_t nm : ln->second) {
+        if (!namesInCone.insert(nm).second)
+          continue;
+        for (uint32_t w : storedUnder[nm])
+          if (!inCone[w]) {
+            inCone[w] = 1;
+            bfs.push_back(w);
+          }
+      }
+    }
     CG_LOG("Pre-solve merge (CONE): " << bfs.size() << "/" << Mc
            << " nodes in the fptr backward cone kept exact\n");
   }

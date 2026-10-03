@@ -719,6 +719,8 @@ bool CallGraphPass::doModulePass(Module *M) {
         initNamedS = nullptr; // slot names start at the first named struct
         initOff = 0;
         initUnion = false;
+        initAbsOff = 0;
+        initGV = &GV;
         processInitializer(deref, init, "", -1,
                            Graph.fieldSensitive() ? valNode
                                                : AndersNodeFactory::InvalidIndex);

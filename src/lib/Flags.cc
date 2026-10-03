@@ -408,6 +408,17 @@ cl::opt<bool> CFLNamedPlanes(
            "punning between named accesses (named_read_sound3)"),
   cl::init(false));
 
+cl::opt<std::string> CFLNamedUntyped(
+  "cfl-named-untyped",
+  cl::desc("With --cfl-named-planes: what a write into a cell through an "
+           "untyped pointer (no struct position: void *, char *, an "
+           "unknown container) does to the field-name certificate. "
+           "'count' (default): it opens no name; such writes are the "
+           "counted blind spot, reported per run, the assumption the "
+           "field tables make. 'open': it opens every name, so no load "
+           "skips the unnamed plane (sound, plan decision 7)"),
+  cl::init("count"));
+
 cl::opt<std::string> CFLRegFieldWatch(
   "cfl-regfield-watch",
   cl::desc("With --cfl-regfield-apply: comma-separated fn names; log "

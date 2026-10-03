@@ -461,20 +461,21 @@ Implementation obligations left open:
 
 ### The shadow-cell realization (`--cfl-named-planes`, WIP 2026-10-02)
 
-What the solver runs is not the certified-name policy above but a
-realization with no certificate census: every write that is not a
-single-leaf named store goes to the cell's unnamed shadow, and a named
-load reads its name's shadow and the unnamed shadow
-(docs/named-cells-design.md). Statements (checked, `propext` only):
+What the solver runs (docs/named-cells-design.md): every write that is
+not filed under a name goes to the cell's unnamed shadow; a named load
+reads its name's shadow and, unless its name is certified, the unnamed
+shadow. Statements (checked, `propext` only):
 - `realize_sound`: against `RDeriv` (`CDeriv` plus identities: an
   origin cell is unnamed content of every concrete cell its pointer
   reaches), every concrete flow is a `KDeriv` flow of the realized graph
   — `FDeriv` plus `mal_sat` (aliased cells alias their shadows of each
   name: the solver keeps shadows as satellites of their cell's class and
   merges them name by name when classes merge) and the identity seeded
-  into the unnamed shadow — given `Realizes` (the graph construction)
-  and `PunFree` (a named store and a named load of one concrete cell use
-  the same name).
+  into the shadows — given `Realizes` (the graph construction),
+  `PunFree` (a named store and a named load of one concrete cell use
+  the same name) and `CertNamed` (content filed under no name never
+  reaches a load of a certified name). Identities (`RDeriv.cid`) are
+  content under every name, matching their seeding into every shadow.
 - `realize_removal_only`: projecting shadows onto their cells maps
   every `KDeriv` derivation onto today's `FDeriv` on the erased graph,
   given that the realized graph has no other edges.
@@ -493,10 +494,30 @@ Obligations left open:
    Exposed partially: chains that cast a position to a struct the
    layout lacks, bases indexed as two unrelated structs, and unions are
    unnamed; casts across functions (`void *`) are not detected.
+10. `CertNamed` is discharged for typed writers by construction (a
+   write whose pointer has a struct position is filed under its leaf,
+   or opens every leaf of the structs it may lie in) and ASSUMED for
+   untyped writers (no struct position): under
+   `--cfl-named-untyped=count` they are counted per run ("blind spot",
+   with the writing functions); `open` certifies nothing. Summary atoms
+   are positioned by the summarized function's formal (debug-info type,
+   else the one struct its body indexes it as); a wrong formal type is
+   a `PunFree` violation. A write into a union field opens only the
+   structs the chain enters inside the union (a union has no names of
+   its own); a union write with none inside is counted as untyped.
+   Precision-only (no obligation): the presolve cone crosses names, so
+   values stored under a name read at an icall stay out of V-merges.
 8. Name-preserving copies (cell-to-cell copies relay each name's
    shadow to the same name's) extend `PunFree` to copied content; the
    relayed names are discovered from the solution and wired in further
    outer iterations (monotone), not mechanized.
+9a. Name sources: GEP chains, declared types of globals and stack
+   slots, struct-path TBAA tags, debug-info types of formals and
+   dbg.value-described pointers (through casts; anonymous structs by
+   typedef; structs only debug info describes, by their members). All
+   are the program's declaration of what the memory is; `PunFree` is
+   that they hold at run time. A pointer vector access is filed under /
+   reads every lane's name.
 9. Names are canonical leaf names, so `lalias` is equality; struct
    names are unified across modules by stripping numeric suffixes (two
    different layouts with one tag share names: coarser, still sound).

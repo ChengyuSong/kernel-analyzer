@@ -521,3 +521,33 @@ Obligations left open:
 9. Names are canonical leaf names, so `lalias` is equality; struct
    names are unified across modules by stripping numeric suffixes (two
    different layouts with one tag share names: coarser, still sound).
+
+## Type labels (TypeLabels.lean, 2026-10-03, plan-named-cells 3.9)
+
+Statements (checked, `propext` only):
+- `label_sound`: against `RDeriv`, the exact semantics over concrete
+  instances `(site, label)`, every concrete flow is covered by
+  `LDeriv` through the instance's plain origin or its own label, and
+  every concrete cell alias is an `LDeriv` alias. `LDeriv` relabels a
+  plain origin at a labeling point, passes labeled facts unchanged, and
+  joins cells whose pointers' facts `meets` (the same labeled origin, or
+  a plain origin against any label of its site: the wildcard bridge).
+- `label_removal_only`: erasing labels maps every `LDeriv` derivation
+  onto today's `FDeriv` (labels only remove answers).
+
+Obligations left open:
+1. FAITHFULNESS (built into `RDeriv.clab`): only instances initialized
+   as `t` pass a `lab t` edge. A labeling point must be an instance's
+   first typed write; an instance passing it already initialized
+   otherwise is memory reused for another type, observable only through
+   a stale pointer (use after reuse). Not checked statically; the rule
+   check (plan 3.9, L4) reports a labeled fact arriving at an
+   incompatible labeling point or access.
+2. Realization: the solver keys cell clusters by labeled roots and
+   realizes `meets` between a plain and a labeled origin as a pairwise
+   bridge (as VX realizes the wildcard shift), not a merge. That the
+   bridge realizes `mal_join` with `meets` is argued as for VX, not
+   restated.
+3. Composition with named cells (labels × names in one solve) is not
+   stated; both refine cell keys independently, and each theorem is
+   about one dimension.

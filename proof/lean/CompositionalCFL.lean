@@ -5,3 +5,4 @@ import CompositionalCFL.Channels
 import CompositionalCFL.ChannelCells
 import CompositionalCFL.Staging
 import CompositionalCFL.NamedCells
+import CompositionalCFL.TypeLabels

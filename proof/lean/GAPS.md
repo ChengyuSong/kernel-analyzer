@@ -410,3 +410,51 @@ FI/P=13/all+ids, cflow O3 FI/P=13/all+ids, km FI full; answers
 byte-identical on the consumer gate (test/consumer-gate.sh).
 BACKLOG: mechanize as `valley_components_exact` next to
 fderiv_quotient.
+
+## Named cells (NamedCells.lean, 2026-10-02, plan-named-cells B.3)
+
+Statements (checked, standard axioms only):
+- `named_sound_fderiv`: every named derivation, for any admissibility,
+  is an FDeriv derivation on the erased graph (named planes are
+  removal-only against the current specification; gate G2).
+- `named_sub`, `nderiv_adm_mono`, `uncertified_read_eq_today`: a
+  stricter policy derives less; with no certified name, named = today.
+- `named_read_sound`: against the exact-offset reference semantics
+  (`CDeriv`: a store and a load meet iff their pointers carry the same
+  object and offset; `fx` moves to an arbitrary offset), named
+  derivations cover every concrete value flow, given `CertConsistent`.
+- `merge_keeps_names`, `read_merge`, `read_noleak`
+  (merge_lossless_named): planes merge name by name; a certified read
+  of a merged class never returns content filed under a non-alias name.
+- `nbatched_exact` (batched_named_eq): `batched_exact` with
+  name-indexed cell planes.
+
+Semantics fixed by the model (and a correction to the plan): only a
+load through a CERTIFIED name filters; it reads the planes of the
+layout aliases of its name and NOT the unnamed plane. An uncertified
+named load reads every plane, as today (plan 3.2 item 4 would have let
+it skip other names' planes, unsound under type punning).
+
+Implementation obligations left open:
+1. Fidelity of the graph: the implementation's store name is the
+   access name (deepKey) of the store's address expression; every
+   other write into a cell (memcpy cell-to-cell copies, summary atoms,
+   initializers, asm closures, channel wiring) is a store with name
+   `none`; every other read of a cell (cell content used as a pointer,
+   copies out of cells) is an unnamed load. Checked by construction in
+   code review, not mechanized.
+2. `CertConsistent` is a hypothesis about the program. The certificate
+   census (plan 3.4: no escaped field address, no bulk copy from a
+   non-constant source, no atomic with a non-constant value, no
+   variable offset reaching the field, no copy-in from an open name,
+   bare-pointer stores open every name they could cover) is its
+   intended syntactic discharge; the census's completeness against
+   `CertConsistent` is argued in docs, not mechanized.
+3. `lalias` completeness: the layout-alias table (nested structs at
+   the same offset, unions; a name inside a union is open) must
+   contain every pair of names that can denote the same concrete cell.
+4. The reference semantics' soundness for machine executions (the
+   standard inclusion-based argument) is assumed, as for FDeriv.
+5. Spill/restore (`wderiv_restore`) and staged minting
+   (`sderiv_catchup`) are not restated for named planes; their proofs
+   do not inspect cell contents and should transfer, unchecked.

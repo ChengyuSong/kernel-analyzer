@@ -33,25 +33,39 @@ V=5.18
 URL="https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-$V.tar.xz"
 SHA=51f3f1684a896e797182a0907299cc1f0ff5e5b51dd9a55478ae63a409855cee
 TAR="$KA_WORK/linux-$V.tar.xz"
-TREE="$KA_WORK/linux-$V"
-LIST="$KA_WORK/linux-$V.bclist"
+# KA_KERNEL_LLVM selects the compiler: 18 (default; the evaluated corpus)
+# or 14 (the corpus KallGraph can read, eval/70). Same source, same
+# patch, same config; only the tree/list/image names differ.
+LLVMV="${KA_KERNEL_LLVM:-18}"
+case "$LLVMV" in
+  18) TREE="$KA_WORK/linux-$V"; LIST="$KA_WORK/linux-$V.bclist"
+      IMG=kernel-toolchain; DF="$HERE/kernel-toolchain.Dockerfile" ;;
+  14) TREE="$KA_WORK/linux-$V-clang14"; LIST="$KA_WORK/linux-$V-clang14.bclist"
+      IMG=kernel-toolchain-14; DF="$HERE/kernel-toolchain-14.Dockerfile" ;;
+  *)  echo "!! KA_KERNEL_LLVM must be 18 or 14 (got $LLVMV)" >&2; exit 1 ;;
+esac
 
 fetch_url "$URL" "$TAR" "$SHA"
 if [[ ! -f "$TREE/Makefile" ]]; then
   echo "== extracting $TAR"
-  tar -xf "$TAR" -C "$KA_WORK"
+  if [[ "$TREE" != "$KA_WORK/linux-$V" ]]; then
+    mkdir -p "$TREE" && tar -xf "$TAR" -C "$TREE" --strip-components=1
+  else
+    tar -xf "$TAR" -C "$KA_WORK"
+  fi
   patch -d "$TREE" -p1 --forward -s < "$HERE/kernel/linux-5.18-clang18.patch" \
     || { echo "!! kernel source patch failed" >&2; exit 1; }
 fi
 grep -q "struct balance_callback" "$TREE/kernel/sched/sched.h" \
   || { echo "!! $TREE lacks eval/kernel/linux-5.18-clang18.patch" >&2; exit 1; }
 
-docker image inspect kernel-toolchain >/dev/null 2>&1 || \
-  docker build -f "$HERE/kernel-toolchain.Dockerfile" -t kernel-toolchain "$HERE"
+docker image inspect "$IMG" >/dev/null 2>&1 || \
+  docker build -f "$DF" -t "$IMG" "$HERE"
 
-echo "== building linux-$V (defconfig + ThinLTO, clang 18) in $TREE"
+echo "== building linux-$V (defconfig + ThinLTO, clang $LLVMV) in $TREE"
 docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp \
-  -v "$TREE":"$TREE" -w "$TREE" kernel-toolchain bash -c '
+  ${KA_CPUSET:+--cpuset-cpus "$KA_CPUSET"} \
+  -v "$TREE":"$TREE" -w "$TREE" "$IMG" bash -c '
     set -e
     make -s LLVM=1 defconfig
     scripts/config --disable LTO_NONE --enable LTO_CLANG_THIN

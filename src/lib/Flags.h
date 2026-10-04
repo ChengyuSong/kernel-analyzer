@@ -54,6 +54,8 @@ extern cl::opt<bool> CFLRegFieldObj;
 extern cl::opt<bool> CFLNamedPlanes;
 extern cl::opt<std::string> CFLNamedUntyped;
 extern cl::opt<bool> CFLCensusTypeLabels;
+extern cl::opt<bool> CFLAllocOrigins;
+extern cl::opt<unsigned> CFLEnvDepth;
 extern cl::opt<std::string> CFLRegFieldWatch;
 extern cl::opt<bool> CFLChannelCells;
 extern cl::opt<bool> CFLFilterLedger;

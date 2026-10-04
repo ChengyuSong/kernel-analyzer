@@ -419,6 +419,28 @@ cl::opt<std::string> CFLNamedUntyped(
            "skips the unnamed plane (sound, plan decision 7)"),
   cl::init("count"));
 
+cl::opt<bool> CFLAllocOrigins(
+  "cfl-alloc-origins",
+  cl::desc("Origins only from allocation (stack slots, globals, heap "
+           "sites), functions and the environment (formals no call "
+           "reaches, results of calls without a body or summary, extern "
+           "globals): no identity root for the content of a cell nothing "
+           "wrote, nor for a value with no incoming edge. An environment "
+           "object's content is one content root per site, whose own "
+           "content is itself. Sound under rule (a), no pointer made from "
+           "external data (Lean Keys.keys_sound; plan 3.11)"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLEnvDepth(
+  "cfl-env-depth",
+  cl::desc("With --cfl-alloc-origins: how many levels of environment "
+           "memory get their own content roots. The content at key (e, s) "
+           "of an environment root e is a new root one level deeper; at "
+           "this depth a root's content is itself. Any depth is sound; "
+           "deeper keeps more environment objects apart (km: depth 1 "
+           "welds +1,471 pairs, 2 and 3 agree)"),
+  cl::init(2));
+
 cl::opt<bool> CFLCensusTypeLabels(
   "cfl-census-type-labels",
   cl::desc("With --cfl-named-planes, after the fixpoint: label every "

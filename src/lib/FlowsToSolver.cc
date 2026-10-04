@@ -1392,6 +1392,59 @@ bool CallGraphPass::runFlowsToResolution() {
       auto dIt = toDense.find(getCanonicalNode(p.first));
       if (dIt != toDense.end()) certCls.insert(dIt->second);
     }
+  // Identity roots by what they stand for: content of a cell nothing in
+  // the program wrote, a formal no call reaches, the result of a call
+  // without a body, a loaded or computed value with no incoming edge.
+  // Plan 3.11: only formals, bodiless call results and the varargs of an
+  // uncalled function are environment objects; the rest are no objects.
+  enum IdKind { IdSpecial, IdFormal, IdCallResult, IdCell, IdLoad,
+                IdIntValue, IdVararg, IdOther };
+  static const char *idKindName[] = {"special", "formal", "call-result",
+                                     "cell", "load", "int-value", "vararg",
+                                     "other"};
+  auto identityKindOf = [&](uint32_t n) -> IdKind {
+    std::vector<NodeIndex> members;
+    collectCanonicalMembers(toOrig[n], members);
+    if (members.empty()) members.push_back(toOrig[n]);
+    int best = IdOther;
+    for (NodeIndex m : members) {
+      int k = IdOther;
+      const Value *V = NF.getValueForNode(m);
+      if (NF.isSpecialNode(m)) k = IdSpecial;
+      else if (NF.isVarargNode(m)) k = IdVararg;
+      else if (NF.isDereferenceNode(m)) k = IdCell;
+      else if (V && isa<Argument>(V)) k = IdFormal;
+      else if (V && isa<CallBase>(V)) k = IdCallResult;
+      else if (V && isa<LoadInst>(V))
+        k = V->getType()->isPointerTy() ? IdLoad : IdIntValue;
+      else if (V && !V->getType()->isPointerTy()) k = IdIntValue;
+      best = std::min(best, k);
+    }
+    return (IdKind)best;
+  };
+  auto isEnvKind = [](IdKind k) {
+    return k == IdSpecial || k == IdFormal || k == IdCallResult ||
+           k == IdVararg;
+  };
+  auto isExternGlobalClass = [&](uint32_t n) {
+    auto ext = [&](NodeIndex m) {
+      const auto *G = dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(m));
+      return G && G->isDeclaration();
+    };
+    if (ext(toOrig[n])) return true;
+    auto mit = canonicalClassMembers.find(toOrig[n]);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m : mit->second)
+        if (ext(m)) return true;
+    return false;
+  };
+  std::map<std::string, size_t> identityKinds, identityNotMinted;
+  // --cfl-alloc-origins: environment roots (rid-indexed), their depth
+  // (0 = an environment site; d = content d levels below one), and the
+  // content root of each cluster key an environment root anchors.
+  std::vector<char> envRoot;
+  std::vector<uint8_t> envDepth;
+  boost::unordered_flat_map<uint64_t, uint32_t> envContentOfKey;
   for (uint32_t n = 0; n < N; n++) {
     if (!inSlice.empty() && !inSlice[n]) continue;
     // A shadow holds only content filed under its name; content nobody
@@ -1488,7 +1541,23 @@ bool CallGraphPass::runFlowsToResolution() {
           continue;
         }
       }
+      bool env = false;
+      if (!isFunc && !hasOrigin[n] && !isCert) {
+        const IdKind ik = identityKindOf(n);
+        if (VerboseLevel >= 2) identityKinds[idKindName[ik]]++;
+        if (CFLAllocOrigins && !isEnvKind(ik)) {
+          identityNotMinted[idKindName[ik]]++;
+          continue; // not an object: a read of it is empty (rule a)
+        }
+        env = true;
+      } else if (CFLAllocOrigins && !isFunc && isExternGlobalClass(n)) {
+        env = true;
+      }
       uint32_t rid = nextRoot++;
+      if (CFLAllocOrigins) {
+        envRoot.resize(nextRoot, 0);
+        envRoot[rid] = env;
+      }
       seeds.emplace_back(n, rid);
       rootClassOf.push_back(n); // rid-indexed
       if (isFunc) funcRootOf[rid] = fit->second;
@@ -1510,6 +1579,11 @@ bool CallGraphPass::runFlowsToResolution() {
       if (nexusGate)
         rootNexus.push_back(nexusCls[n] && (nexusIds || hasOrigin[n]));
     }
+  }
+
+  if (CFLAllocOrigins) {
+    envRoot.resize(nextRoot, 0);
+    envDepth.assign(nextRoot, 0);
   }
 
   // --cfl-probe-blob-formation (task #31): formation-time causality
@@ -2242,6 +2316,21 @@ bool CallGraphPass::runFlowsToResolution() {
   CG_LOG("FlowsTo: minted " << nextRoot << " roots ("
          << funcRootOf.size() << " function), " << wildcardNodes.size()
          << " wildcard nodes, " << NSHIFT << " shift planes\n");
+  if (!identityKinds.empty()) {
+    std::string line;
+    for (auto &[k, c] : identityKinds)
+      line += " " + k + " " + std::to_string(c);
+    CG_LOG("FlowsTo: identity candidates by kind:" << line << "\n");
+  }
+  if (CFLAllocOrigins) {
+    std::string line;
+    for (auto &[k, c] : identityNotMinted)
+      line += " " + k + " " + std::to_string(c);
+    size_t nEnvRoots = 0;
+    for (char e : envRoot) nEnvRoots += e;
+    CG_LOG("AllocOrigins: " << nEnvRoots << " environment roots; not "
+           << "minted:" << line << "\n");
+  }
   if (!lazyA.empty())
     CG_LOG("LazyMint: deferred " << lazyDeferred.size()
            << " candidate roots outside initial A ("
@@ -3500,6 +3589,43 @@ bool CallGraphPass::runFlowsToResolution() {
   boost::unordered_flat_map<uint32_t, uint32_t> chanReadHalf;
   size_t chanNodes = 0, chanEdges = 0, chanSplits = 0, chanConeSkipped = 0,
          chanConstSkipped = 0;
+  // --cfl-alloc-origins: a cluster keyed by an environment root holds that
+  // root's content root (environment data), seeded when the key is first
+  // inserted. Named planes: into the class's identity shadow, or pending
+  // until one joins (as the seeds of minted roots are).
+  size_t envContentSeeded = 0, envContentMinted = 0;
+  // The content root at key (o, s) of environment root o: a new root one
+  // level deeper, or o itself at the depth bound (environment memory is
+  // then summarized; any depth is sound, Keys.EnvInit).
+  auto envContentFor = [&](uint32_t o, uint32_t cell) -> uint32_t {
+    if (envDepth[o] >= CFLEnvDepth) return o;
+    const uint32_t rid = nextRoot++;
+    FactSet::Universe = nextRoot; // widen BEFORE the first set
+    rootClassOf.push_back(find(cell)); // named after the cell it fills
+    rootConstData.push_back(0);
+    rootParkable.push_back(0);
+    if (nexusGate) rootNexus.push_back(0);
+    envRoot.push_back(1);
+    envDepth.push_back(envDepth[o] + 1);
+    envContentMinted++;
+    return rid;
+  };
+  auto seedEnvContent = [&](uint32_t c, uint32_t rid) {
+    const uint32_t pl =
+        (nexusGate && !rootNexus[rid]) ? (uint32_t)SHIFT_X : 0u;
+    envContentSeeded++;
+    if (cellNameOf.empty()) {
+      addFact(find(c), pl, rid, ctx0);
+      return;
+    }
+    c = find(c);
+    for (auto &[nm, u] : satOf[c])
+      if (nm == ka::AccessNames::Identity) {
+        addFact(find(u), pl, rid, ctx0);
+        return;
+      }
+    pendingId[c].emplace_back(rid, pl);
+  };
   auto joinCluster = [&](uint32_t cell, uint32_t o, uint32_t s) {
     // Null-cell join hygiene (2026-08-25): joins keyed by the NULL
     // pseudo-object's cells model store-through-null — UB, no real
@@ -3563,6 +3689,12 @@ bool CallGraphPass::runFlowsToResolution() {
     keyCount[find(cell)].fetch_add(1, std::memory_order_relaxed);
     if (!CFLDumpMerges.empty())
       keyLog.push_back({mergeLog.size(), find(cell), o, s, tPtr, cell});
+    if (o < envRoot.size() && envRoot[o]) {
+      tHow = "env-content"; tFrom = UINT32_MAX;
+      const uint32_t c = envContentFor(o, cell);
+      envContentOfKey[key] = c;
+      seedEnvContent(cell, c);
+    }
     if (g_batchRecord)
       g_batchEvts.push_back({0, cell, o, s}); // first insert of this key
     if (NB == 0) return;
@@ -5815,12 +5947,27 @@ bool CallGraphPass::runFlowsToResolution() {
     // THIS run (proof-review finding #4: C0-C5 checked rule closure
     // only — an empty relation is closed).
     for (uint32_t rid = 0; rid < nextRoot; rid++) {
+      // Environment content roots have no seed of their own: they are
+      // seeded into the clusters their site keys (C6-env below).
+      if (rid < envDepth.size() && envDepth[rid] > 0) continue;
       const uint32_t rep = find(rootClassOf[rid]);
       const uint32_t s0 =
           (nexusGate && !rootNexus[rid]) ? (uint32_t)SHIFT_X : 0u;
       if (!R[rep][s0].test(rid) && !RB[rep][s0].test(rid))
         report("C6-seed", rep, s0, rid);
     }
+    // C6-env (--cfl-alloc-origins): every cluster keyed by an environment
+    // root holds that root's content root. Checked where content lives
+    // in the cluster class (named planes put it in the identity shadow).
+    if (CFLAllocOrigins && cellNameOf.empty())
+      for (auto &[key, cr] : clusterRep) {
+        auto eit = envContentOfKey.find(key);
+        if (eit == envContentOfKey.end()) continue;
+        const uint32_t c = eit->second, rep = find(cr);
+        const uint32_t pl = (nexusGate && !rootNexus[c]) ? (uint32_t)SHIFT_X : 0u;
+        if (!R[rep][pl].test(c) && !RB[rep][pl].test(c))
+          report("C6-env", rep, pl, c);
+      }
     for (auto [u, rid] : unnamedSeeds) {
       const uint32_t rep = find(u);
       const uint32_t s0 =
@@ -5847,6 +5994,10 @@ bool CallGraphPass::runFlowsToResolution() {
         // Named shadows never mint: their cell's roots are seeded into
         // them (C6-unnamed-seed).
         if (nameOfCell(n) != ka::AccessNames::Original) continue;
+        // --cfl-alloc-origins mints no identity for what is no object.
+        if (CFLAllocOrigins && !originBearing(toOrig[n]) &&
+            !isEnvKind(identityKindOf(n)))
+          continue;
         if ((originBearing(toOrig[n]) || !hasIn[n]) && !pruned.count(n))
           report("C7-mint", n, 0, n);
       }
@@ -7060,6 +7211,43 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     wideningReport();
     verifyClosure(); // certificate over the answer-producing fixpoint
+    if (CFLAllocOrigins) {
+      // Reads that found nothing at convergence: a pointer load whose
+      // class holds no fact. Under rule (a) each is unreachable, behind
+      // a pointer that never resolved, or of a field never written.
+      size_t emptyLoads = 0, loads = 0;
+      std::map<std::string, size_t> byFn;
+      std::vector<NodeIndex> members;
+      for (uint32_t n = 0; n < N; n++) {
+        const uint32_t c = find(n);
+        bool any = false;
+        for (uint32_t s2 = 0; s2 < NSHIFT && !any; s2++)
+          any = R[c][s2].any() || RB[c][s2].any();
+        collectCanonicalMembers(toOrig[n], members);
+        if (members.empty()) members.push_back(toOrig[n]);
+        for (NodeIndex m : members) {
+          const auto *LI = dyn_cast_or_null<LoadInst>(NF.getValueForNode(m));
+          if (!LI || !LI->getType()->isPointerTy() || NF.isDereferenceNode(m))
+            continue;
+          loads++;
+          if (any) continue;
+          emptyLoads++;
+          byFn[LI->getFunction()->getName().str()]++;
+        }
+      }
+      std::vector<std::pair<size_t, std::string>> top;
+      for (auto &[f, k] : byFn) top.emplace_back(k, f);
+      std::sort(top.rbegin(), top.rend());
+      std::string line;
+      for (size_t i = 0; i < top.size() && i < 8; i++)
+        line += " " + top[i].second + " " + std::to_string(top[i].first);
+      CG_LOG("AllocOrigins: " << emptyLoads << " of " << loads
+             << " pointer loads read nothing at convergence; "
+             << envContentSeeded << " environment-content seeds, "
+             << envContentMinted << " content roots (depth "
+             << CFLEnvDepth << "); top:"
+             << line << "\n");
+    }
     if (CFLCensusTypeLabels && !cellNameOf.empty())
       runTypeLabelCensus(
           [&](NodeIndex canon, std::vector<uint32_t> &out) {

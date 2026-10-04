@@ -211,6 +211,11 @@ int main(int argc, char **argv) {
                           "cells, lazy addresses, batched roots, lazy "
                           "minting or slicing (their relevance oracles and "
                           "seeding do not see a cell's name planes)");
+    if (CFLAllocOrigins && (CFLChannelCells || CFLBatchRoots > 0 ||
+                            CFLLazyMint || CFLLazyAddress))
+      cliErrors.push_back("--cfl-alloc-origins is not ported to channel "
+                          "cells, batched roots, lazy minting or lazy "
+                          "addresses (each mints roots on its own path)");
     if (CFLCensusTypeLabels && !CFLNamedPlanes)
       cliErrors.push_back("--cfl-census-type-labels requires --cfl-named-planes");
     if (CFLNamedUntyped != "count" && CFLNamedUntyped != "open")

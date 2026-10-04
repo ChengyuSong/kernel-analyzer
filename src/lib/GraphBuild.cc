@@ -262,6 +262,46 @@ static bool derivesFromLoweredVAList(const Value *V) {
   return derivesFromLoweredVAListImpl(V, Seen, 0);
 }
 
+// The va_list object an access reads through: a va_list stack slot, or
+// the base of a GEP that indexes a va_list (a va_list received as a
+// parameter is an untyped pointer; its GEPs carry the type). Walks the
+// lowered va_arg sequence: load of overflow_arg_area / reg_save_area,
+// byte offsets, phis and selects of them. nullptr if none.
+static const Value *vaListBaseImpl(const Value *V,
+                                   SmallPtrSetImpl<const Value *> &Seen) {
+  if (!V || Seen.size() > 64)
+    return nullptr;
+  V = V->stripPointerCasts();
+  if (!Seen.insert(V).second)
+    return nullptr;
+  if (const auto *AI = dyn_cast<AllocaInst>(V))
+    return isLoweredVAListType(AI->getAllocatedType()) ? AI : nullptr;
+  if (const auto *GEP = dyn_cast<GEPOperator>(V)) {
+    if (isLoweredVAListType(GEP->getSourceElementType()))
+      return GEP->getPointerOperand()->stripPointerCasts();
+    return vaListBaseImpl(GEP->getPointerOperand(), Seen);
+  }
+  if (const auto *LI = dyn_cast<LoadInst>(V))
+    return vaListBaseImpl(LI->getPointerOperand(), Seen);
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    for (const Value *In : PN->incoming_values())
+      if (const Value *B = vaListBaseImpl(In, Seen))
+        return B;
+    return nullptr;
+  }
+  if (const auto *SI = dyn_cast<SelectInst>(V)) {
+    if (const Value *B = vaListBaseImpl(SI->getTrueValue(), Seen))
+      return B;
+    return vaListBaseImpl(SI->getFalseValue(), Seen);
+  }
+  return nullptr;
+}
+
+static const Value *vaListBase(const Value *V) {
+  SmallPtrSet<const Value *, 16> Seen;
+  return vaListBaseImpl(V, Seen);
+}
+
 bool shouldSkipFunction(const Function *F) {
   if (!F)
     return false;
@@ -3206,6 +3246,14 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
                << " -> val node " << valNode << " for " << I << "\n");
     }
   }
+  // A va_list received from another function: what va_start put into
+  // the va_list object (the creator's variadic arguments) is what this
+  // lowered va_arg reads.
+  if (const Value *Base = vaListBase(ptr)) {
+    NodeIndex baseNode = CGP.getRepNodeForValue(Base);
+    if (baseNode != AndersNodeFactory::InvalidIndex)
+      CGP.addAssignmentEdge(CGP.getRepDerefNode(baseNode), valNode);
+  }
 
   NodeIndex slotRep;
   if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
@@ -4189,16 +4237,46 @@ void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
     return;
   }
 
+  // The va_list object's content (va_start wrote it, possibly in the
+  // caller that passed this va_list down).
+  if (NodeIndex lp = CGP.getRepNodeForValue(I.getPointerOperand());
+      lp != AndersNodeFactory::InvalidIndex)
+    CGP.addAssignmentEdge(CGP.getRepDerefNode(lp), valNode);
   Function *F = I.getParent()->getParent();
   NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
-  if (varargNode == AndersNodeFactory::InvalidIndex) {
-    WARNING("VAArg: vararg node not found for function: " << F->getName() << "\n");
-    return;
-  }
+  if (varargNode == AndersNodeFactory::InvalidIndex)
+    return; // a va_list received as a parameter: read through it above
 
   CG_DEBUG("VAArg: " << F->getName() << ": vararg node " << varargNode
            << " -> val node " << valNode << " for " << I << "\n");
   CGP.addAssignmentEdge(varargNode, valNode);
+}
+
+// va_start writes the function's variadic arguments into the va_list
+// object; va_copy copies that object. va_arg (and its lowered loads)
+// read it, so a va_list passed to another function carries its
+// arguments as an ordinary pointer to the same object.
+void CallGraphPass::InstHandler::visitVAStartInst(VAStartInst &I) {
+  Function *F = I.getFunction();
+  NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
+  if (varargNode == AndersNodeFactory::InvalidIndex)
+    varargNode = CGP.NF.createVarargNode(F);
+  NodeIndex listNode = CGP.getRepNodeForValue(I.getArgList());
+  if (listNode == AndersNodeFactory::InvalidIndex)
+    return;
+  CellWriteSize ws(CGP, 0);
+  CGP.addAssignmentEdge(CGP.getCanonicalNode(varargNode),
+                        CGP.getRepDerefNode(listNode));
+}
+
+void CallGraphPass::InstHandler::visitVACopyInst(VACopyInst &I) {
+  NodeIndex dst = CGP.getRepNodeForValue(I.getDest());
+  NodeIndex src = CGP.getRepNodeForValue(I.getSrc());
+  if (dst == AndersNodeFactory::InvalidIndex ||
+      src == AndersNodeFactory::InvalidIndex)
+    return;
+  CellWriteSize ws(CGP, 0);
+  CGP.addAssignmentEdge(CGP.getRepDerefNode(src), CGP.getRepDerefNode(dst));
 }
 
 void CallGraphPass::InstHandler::visitMemTransferInst(MemTransferInst &I) {

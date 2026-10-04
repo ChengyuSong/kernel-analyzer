@@ -54,6 +54,8 @@ protected:
     void visitPtrToIntInst(llvm::PtrToIntInst &I);
     void visitBinaryOperator(llvm::BinaryOperator &I);
     void visitVAArgInst(llvm::VAArgInst &I);
+    void visitVAStartInst(llvm::VAStartInst &I);
+    void visitVACopyInst(llvm::VACopyInst &I);
     void visitFreezeInst(llvm::FreezeInst &I);
     void visitAddrSpaceCastInst(llvm::AddrSpaceCastInst &I);
     void visitAtomicRMWInst(llvm::AtomicRMWInst &I);

@@ -23,10 +23,6 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
   auto isBarrierNode = [&](NodeIndex canon) {
     if (NF.isSpecialNode(canon))
       return true;
-    // Named-cell shadows hold one name's content: merging one into any
-    // class would pour it into every name.
-    if (isShadowCell(canon))
-      return true;
     const Value *v = NF.getValueForNode(canon);
     if (!v)
       return false;
@@ -101,6 +97,8 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
     uint32_t biggest = 0;
     std::vector<uint32_t> csz(nComp, 0);
     for (uint32_t ln = 0; ln < M2; ln++) {
+      if (isShadowCell(toCanon[ln]))
+        continue; // see the component loop below
       csz[comp[ln]]++;
       if (repX[comp[ln]] == AndersNodeFactory::InvalidIndex)
         repX[comp[ln]] = toCanon[ln];
@@ -158,9 +156,11 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
           continue;
         const NodeIndex f = getCanonicalNode(E.from), t = getCanonicalNode(E.to);
         const uint32_t fn = shadowInfoOf(f).second, tn = shadowInfoOf(t).second;
-        if (fn >= ka::AccessNames::FirstName && !isBarrierNode(t))
+        if (fn >= ka::AccessNames::FirstName && !isBarrierNode(t) &&
+            !isBarrierNode(f))
           loadNames[localId(t)].push_back(fn);
-        if (tn >= ka::AccessNames::FirstName && !isBarrierNode(f))
+        if (tn >= ka::AccessNames::FirstName && !isBarrierNode(f) &&
+            !isBarrierNode(t))
           storedUnder[tn].push_back(localId(f));
       }
     std::vector<uint32_t> seeds;
@@ -220,6 +220,11 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
       coneSkipped++;
       continue; // answer-relevant: no component quotient for this node
     }
+    // Named-cell shadows join the components (their readers and writers
+    // collapse as they do through a cell) but are never merged: one in a
+    // class would pour its name's content into every name.
+    if (isShadowCell(toCanon[ln]))
+      continue;
     if (sccRep[scc] == AndersNodeFactory::InvalidIndex) {
       sccRep[scc] = toCanon[ln];
     } else {

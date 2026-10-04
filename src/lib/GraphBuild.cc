@@ -1321,7 +1321,7 @@ void CallGraphPass::fileUnnamedWrite(NodeIndex s, NodeIndex src,
                            ? accessNames->ofPosition(pos, cellWriteSize, *DLw)
                            : ka::AccessNames::Unnamed;
     if (n != ka::AccessNames::Unnamed) {
-      Graph.addCopy(s, namedShadow(dst, n));
+      fileNamedWrite(s, dst, n);
       namedStats.typedWrites++;
       return;
     }
@@ -1410,9 +1410,9 @@ void CallGraphPass::wireNamedStore(NodeIndex val, NodeIndex cell,
   }
   namedFiling++;
   addAssignmentEdge(val, cell);
-  for (uint32_t name : names)
-    addAssignmentEdge(val, namedShadow(cell, name));
   namedFiling--;
+  for (uint32_t name : names)
+    fileNamedWrite(getCanonicalNode(val), cell, name);
   namedStats.namedStores++;
 }
 
@@ -1426,6 +1426,7 @@ void CallGraphPass::wireNamedLoad(NodeIndex cell, NodeIndex val,
   }
   addAssignmentEdge(namedShadow(cell, ka::AccessNames::Identity), val);
   for (uint32_t name : names) {
+    readNames.insert(name);
     addAssignmentEdge(namedShadow(cell, name), val);
     // A certified name skips the unnamed shadow until it is opened
     // (ensureUnnamedShadows adds the read then).
@@ -1438,26 +1439,32 @@ void CallGraphPass::wireNamedLoad(NodeIndex cell, NodeIndex val,
   namedStats.namedLoads++;
 }
 
+// Planes are created on demand (plan 3.7 item 1): a name's shadow only
+// once some load reads that name — until then its writes wait here; the
+// unnamed shadow only where an unnamed write lands or an uncertified
+// load reads; the identity shadow only at named loads (roots minted on
+// other cells reach it through their class, FlowsToSolver.cc).
+void CallGraphPass::fileNamedWrite(NodeIndex s, NodeIndex cell,
+                                   uint32_t name) {
+  if (readNames.count(name))
+    Graph.addCopy(s, namedShadow(cell, name));
+  else
+    pendingNamedWrites.emplace_back(s, cell, name);
+}
+
 void CallGraphPass::ensureUnnamedShadows() {
   if (!namedPlanes())
     return;
-  // Every cell gets an Unnamed and an Identity shadow before the solve,
-  // written or not: unnamed writes may reach any cell, and a root the
-  // solver mints on a cell's class (content nobody in the program wrote)
-  // goes to the Identity shadow, which every named load of an aliasing
-  // cell reads through its own (the satellites merge).
-  std::vector<NodeIndex> cells;
-  for (const GraphEdge &E : Graph.edges())
-    if (E.kind == EdgeKind::Deref && !isShadowCell(E.to) &&
-        (!shadowOf.count((uint64_t)E.to << 32 | ka::AccessNames::Unnamed) ||
-         !shadowOf.count((uint64_t)E.to << 32 | ka::AccessNames::Identity)))
-      cells.push_back(E.to);
-  std::sort(cells.begin(), cells.end());
-  cells.erase(std::unique(cells.begin(), cells.end()), cells.end());
-  for (NodeIndex c : cells) {
-    namedShadow(c, ka::AccessNames::Unnamed);
-    namedShadow(c, ka::AccessNames::Identity);
+  // Writes under names a load now reads get their shadows.
+  size_t keptW = 0;
+  for (auto &w : pendingNamedWrites) {
+    const auto [s, cell, name] = w;
+    if (readNames.count(name))
+      Graph.addCopy(s, namedShadow(cell, name));
+    else
+      pendingNamedWrites[keptW++] = w;
   }
+  pendingNamedWrites.resize(keptW);
   // Loads of names opened since they were wired now read the unnamed
   // shadow too (monotone: a name never closes again).
   size_t kept = 0;
@@ -4377,7 +4384,10 @@ void CallGraphPass::initSlotWrite(NodeIndex val, NodeIndex cell) {
       blindBy[gvName]++;
     }
   }
-  Graph.addCopy(val, namedShadow(cell, name));
+  if (name == ka::AccessNames::Unnamed)
+    Graph.addCopy(val, namedShadow(cell, name));
+  else
+    fileNamedWrite(val, cell, name);
   (name == ka::AccessNames::Unnamed ? namedStats.unnamedSlots
                                     : namedStats.namedSlots)++;
 }

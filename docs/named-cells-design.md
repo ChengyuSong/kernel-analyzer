@@ -55,9 +55,15 @@ The solver keeps no name-indexed planes inside a class. Instead:
   name. So a merged class keeps its content by name, the Lean `NDeriv` planes, and the cluster
   registry is unchanged (no name in the key). The relevance oracle `--cfl-bidi-prune` counts a
   shadow as part of its cell's partition.
-- Shadows are presolve barriers and are never collapsed with values (a-SCC). They never mint an
-  identity. A root minted on a class (content nobody in the program wrote, i.e. from outside) is
-  seeded into every shadow of the class's raw cells, so a certified load still sees it.
+- Shadows are created on demand. A name's shadow exists once some load reads that name; until
+  then the writes filed under it wait (`fileNamedWrite`). The unnamed shadow exists where an
+  unnamed write lands or an uncertified load reads; the identity shadow only at named loads.
+- Shadows join presolve's components, so the values written into a shadow and read out of it
+  collapse as they do through a cell, but a shadow itself is never merged, in presolve or by the
+  solver's a-SCC collapse. They never mint an identity. A root minted on a class (content nobody
+  in the program wrote, i.e. from outside) goes to the class's identity shadow, which every named
+  load of an aliasing cell reads. If the class has none yet, the root waits on the class and
+  enters when a class with one merges in.
 - Literal-typed globals (designated initializers, unions, bitfields) have their slots named by
   the struct the program reads them as: the one struct their GEPs index them as, else their
   debug-info type.
@@ -192,14 +198,40 @@ Solve time per iteration and dense classes, sqlite3 fuzzershell O0 base:
 | final (cone and union corrections) | — | 3.9 s |
 
 All 334 sqlite3 copies are inside one class at the fixpoint, where relaying a plane onto itself
-is a no-op. The remaining 5× is the eager shadows: every cell has an unnamed and an identity
-shadow, and every named access a name shadow. Plan 3.7 item 1 (planes created lazily, when a
-class sees a second name) is the next step.
+is a no-op.
+
+**Laziness did not change the cost, and the shadows are not what costs.** Creating planes on
+demand (section 2) gave the same answers on every program and the same solve time. A histogram
+of facts by class shows where they are (sqlite3, last iteration):
+
+| | classes holding 4,096+ facts | facts in them | all facts |
+|---|---|---|---|
+| off | 1,325 (4–8 k each) | 8.94 M | 8.96 M |
+| named | 4,749 (most 8–16 k each) | 42.0 M | 42.0 M |
+
+Both runs have a "soup": about 125,000 values whose points-to sets are the same few thousand
+heap and identity roots (about a third more of them named: 23,720 roots vs 21,282). Off, about
+120,000 of the values sit in one class, so the soup is stored once. That class is presolve's work. Its component quotient merges a store's value with
+the cell it writes and a load's value with the cell it reads. The solver then joins the cells
+of one object, so every value stored into or loaded from that object ends up in one class.
+Named, the stores and loads go through shadows, which are never merged. 15,752 of those values
+(8,790 loads, 5,721 field addresses) fall out of the big class into 2,994 classes, each
+holding its own copy of the soup.
+
+Letting shadows outside the answer cone merge like cells brings the cost down (16 M facts,
+2.6 s per iteration) and the answer back to the base answer exactly: 19,106 pairs, from 2,037.
+That merge is the smear the names remove. The extra facts are the price of the precision, not
+of the shadows. Things that did not help: identity-plane reads (37.6 M facts without them),
+identity roots on unread cells (no change), name crossing in the cone (35.6 M without it, but
+answers twice as wide), and running the exact a-SCC collapse every 4,096 pops (27 M facts, the
+same time).
+
+End to end the flag costs 1.6× on sqlite3 (11.4 s → 18.1 s for the whole pass) and is faster on
+nm-new, where fewer callees are wired.
 
 ## 7. Open items
 
-1. Laziness (plan 3.7.1).
-2. Decision 7 (plan section 6): `count` (the blind spot, counted) or `open` as the default for
+1. Decision 7 (plan section 6): `count` (the blind spot, counted) or `open` as the default for
    untyped writes.
-3. Remove the field tables (`--cfl-regfield-apply`, `--cfl-regfield-obj`; rule 1) once named
+2. Remove the field tables (`--cfl-regfield-apply`, `--cfl-regfield-obj`; rule 1) once named
    planes are the default: G3 holds per site on the six programs measured.

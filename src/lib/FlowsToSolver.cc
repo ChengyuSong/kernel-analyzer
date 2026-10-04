@@ -2670,6 +2670,12 @@ bool CallGraphPass::runFlowsToResolution() {
   // keeps its content by name: NamedCells.lean's planes.
   std::vector<llvm::SmallVector<std::pair<uint32_t, uint32_t>, 2>> satOf(
       cellNameOf.empty() ? 0 : N);
+  // Roots minted on a class that has no identity shadow yet: they enter
+  // its identity plane when one joins (an identity shadow exists only at
+  // named loads). (rid, plane)
+  std::vector<llvm::SmallVector<std::pair<uint32_t, uint32_t>, 1>> pendingId(
+      cellNameOf.empty() ? 0 : N);
+  std::function<void(uint32_t, uint32_t, uint32_t)> addFactFn;
   std::function<uint32_t(uint32_t, uint32_t)> mergeFn;
   std::vector<char> wflag(N, 0);
   for (uint32_t w : wildcardNodes) wflag[w] = 1;
@@ -3374,6 +3380,19 @@ bool CallGraphPass::runFlowsToResolution() {
         if (!found) satOf[a].emplace_back(nm, u);
       }
     }
+    if (b < pendingId.size() && !pendingId[b].empty()) {
+      pendingId[a].append(pendingId[b].begin(), pendingId[b].end());
+      pendingId[b].clear();
+    }
+    if (a < pendingId.size() && !pendingId[a].empty())
+      for (auto &[nm, u] : satOf[a])
+        if (nm == ka::AccessNames::Identity) {
+          auto moved = std::move(pendingId[a]);
+          pendingId[a].clear();
+          for (auto [rid, pl] : moved)
+            addFactFn(find(u), pl, rid);
+          break;
+        }
     return a;
   };
   mergeFn = merge;
@@ -3566,6 +3585,7 @@ bool CallGraphPass::runFlowsToResolution() {
     cellJoined.emplace_back(NSHIFT);
     bridgesOf.emplace_back();
     if (!satOf.empty()) satOf.emplace_back();
+    if (!pendingId.empty()) pendingId.emplace_back();
     wflag.push_back(0);
     cellsOf.emplace_back();
     outA.emplace_back();
@@ -4597,21 +4617,34 @@ bool CallGraphPass::runFlowsToResolution() {
   // under whatever name: it goes to those cells' Identity shadows, which
   // every named load reads (NamedCells.lean: RDeriv.cid).
   std::vector<std::pair<uint32_t, uint32_t>> unnamedSeeds; // (shadow, rid)
+  size_t pendingSeeds = 0;
   if (!cellNameOf.empty()) {
+    addFactFn = [&](uint32_t n2, uint32_t pl, uint32_t rid) {
+      addFact(n2, pl, rid, ctx0);
+    };
     std::vector<NodeIndex> members;
     for (auto [n, rid] : seeds) {
+      const uint32_t c = find(n);
+      bool seeded = false;
+      for (auto &[nm, u] : satOf[c])
+        if (nm == ka::AccessNames::Identity) {
+          unnamedSeeds.emplace_back(u, rid);
+          seeded = true;
+          break;
+        }
+      if (seeded) continue;
       collectCanonicalMembers(toOrig[n], members);
-      for (NodeIndex m : members) {
-        auto it = shadowOf.find((uint64_t)m << 32 | ka::AccessNames::Identity);
-        if (it == shadowOf.end()) continue;
-        assert(getCanonicalNode(it->second) == it->second &&
-               "shadows are presolve barriers");
-        auto d = toDense.find(it->second);
-        if (d != toDense.end()) unnamedSeeds.emplace_back(d->second, rid);
-      }
+      for (NodeIndex m : members)
+        if (isCellNode(m)) { // cell content from outside: wait for a reader
+          pendingId[c].emplace_back(
+              rid, (!nexusGate || rootNexus[rid]) ? 0u : (uint32_t)SHIFT_X);
+          pendingSeeds++;
+          break;
+        }
     }
     CG_LOG("NamedCells: " << unnamedSeeds.size()
-           << " roots seeded into identity shadows\n");
+           << " roots seeded into identity shadows, " << pendingSeeds
+           << " pending a reader\n");
   }
   if (CFLBatchRoots == 0) {
     size_t exactMint = 0, wildMint = 0;
@@ -7014,7 +7047,44 @@ bool CallGraphPass::runFlowsToResolution() {
     // through a name, the functions its name's plane holds and those
     // only the unnamed plane adds — what assuming that no unnamed write
     // reaches a named field (the field tables' blind spot) would remove.
+    if (VerboseLevel >= 2) {
+      // Fact mass by class size (log2 buckets of a class's fact count):
+      // where a solve's facts live.
+      uint64_t bn[64] = {0}, bm[64] = {0};
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n) continue;
+        uint64_t f = 0;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+          f += R[n][s2].count() + RB[n][s2].count();
+        if (!f) continue;
+        const unsigned b = 63 - __builtin_clzll(f);
+        bn[b]++;
+        bm[b] += f;
+      }
+      for (unsigned b = 0; b < 64; b++)
+        if (bn[b])
+          CG_LOG("FactHist: facts 2^" << b << ": " << bn[b] << " classes, "
+                 << bm[b] << " facts\n");
+    }
     if (!cellNameOf.empty() && VerboseLevel >= 2) {
+      // Where the facts are: shadow classes (by plane kind) vs the rest.
+      uint64_t fShadowName = 0, fShadowU = 0, fShadowId = 0, fOther = 0;
+      size_t cShadow = 0, cOther = 0;
+      for (uint32_t n = 0; n < N; n++) {
+        if (find(n) != n) continue;
+        uint64_t f = 0;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+          f += R[n][s2].count() + RB[n][s2].count();
+        const uint32_t nm = nameOfCell(n);
+        if (nm == ka::AccessNames::Original) { fOther += f; cOther++; continue; }
+        cShadow++;
+        (nm == ka::AccessNames::Unnamed ? fShadowU
+         : nm == ka::AccessNames::Identity ? fShadowId : fShadowName) += f;
+      }
+      CG_LOG("NamedCells: facts in " << cShadow << " shadow classes: names "
+             << fShadowName << ", unnamed " << fShadowU << ", identity "
+             << fShadowId << "; in " << cOther << " other classes: " << fOther
+             << "\n");
       size_t sites = 0, namedFns = 0, unnamedOnly = 0;
       std::vector<std::tuple<size_t, size_t, const CallBase *>> top;
       auto fnsOf = [&](NodeIndex sh, FactSet &out) {
@@ -7041,7 +7111,9 @@ bool CallGraphPass::runFlowsToResolution() {
         if (!shadowOf.count((uint64_t)cell << 32 | nm)) continue;
         FactSet named, unnamed;
         fnsOf(shadowOf.at((uint64_t)cell << 32 | nm), named);
-        fnsOf(shadowOf.at((uint64_t)cell << 32 | ka::AccessNames::Unnamed), unnamed);
+        if (auto uit = shadowOf.find((uint64_t)cell << 32 | ka::AccessNames::Unnamed);
+            uit != shadowOf.end())
+          fnsOf(uit->second, unnamed);
         size_t nf = 0, uf = 0;
         for (auto &[rid2, F2] : funcRootOf) {
           if (named.test(rid2)) nf++;

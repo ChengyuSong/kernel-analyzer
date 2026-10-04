@@ -255,9 +255,15 @@ protected:
   void wireNamedStore(NodeIndex val, NodeIndex cell,
                       llvm::ArrayRef<uint32_t> names);
   void logNamedCells() const;
-  // Before each solve: give every cell its Unnamed shadow, and let the
-  // named loads of names opened since the last solve read it.
+  // Before each solve: give pending writes of names now read their
+  // shadows, and let the loads of names opened since the last solve read
+  // the unnamed shadow.
   void ensureUnnamedShadows();
+  // A write filed under `name`: into its shadow once some load reads the
+  // name, pending until then.
+  void fileNamedWrite(NodeIndex s, NodeIndex cell, uint32_t name);
+  boost::unordered_flat_set<uint32_t> readNames;
+  std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> pendingNamedWrites;
   // Certificate (plan 3.7): a name is open once a typed write that names
   // no single leaf (variable offset, union, pun, several leaves, unknown
   // extent) may land on it; loads of names never opened skip the

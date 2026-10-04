@@ -988,9 +988,11 @@ bool CallGraphPass::runFlowsToResolution() {
   // carries one cell per access site — keep them all; the join rule must
   // see the store-side and load-side cells of the same class.
   std::vector<std::vector<uint32_t>> cellsOf(N);
+  std::vector<uint32_t> cellOwner(N, UINT32_MAX); // cell -> its pointer
   for (auto [p, c] : dEdges) {
     auto &cs = cellsOf[p];
     if (std::find(cs.begin(), cs.end(), c) == cs.end()) cs.push_back(c);
+    cellOwner[c] = p;
   }
   // Channel cells (docs/channel-cells-design.md): no access role is
   // inferred here any more — the flush splits every cell into its
@@ -3821,10 +3823,17 @@ bool CallGraphPass::runFlowsToResolution() {
   // and its read half (out-edges, owned dereferences) is fed by them.
   // Nothing merges: content crosses from a store to a load only through a
   // key both pointers carry (or a wildcard key bridged pairwise).
-  boost::unordered_flat_map<uint64_t, uint32_t> keyNodeOf;
+  // Keyed by (o * NSHIFT + s, name): one key cell per plane. Raw
+  // dereferences use name Original (every write), shadows their name.
+  boost::unordered_flat_map<std::pair<uint64_t, uint32_t>, uint32_t,
+                            boost::hash<std::pair<uint64_t, uint32_t>>>
+      keyNodeOf;
   boost::unordered_flat_map<uint32_t, uint32_t> keyReadHalf; // cell -> rh
-  std::unordered_map<uint32_t, std::vector<uint32_t>> keyExactOf; // o -> K
-  std::unordered_map<uint32_t, uint32_t> keyXOf;                  // o -> K
+  // (o << 32 | name) -> exact-shift key cells / the wildcard key cell
+  std::unordered_map<uint64_t, std::vector<uint32_t>> keyExactOf;
+  std::unordered_map<uint64_t, uint32_t> keyXOf;
+  // (o * NSHIFT + s) -> the names that have a key cell there
+  std::unordered_map<uint64_t, std::vector<uint32_t>> keyNamesOf;
   boost::unordered_flat_set<uint64_t> keyWired; // (write half << 32) | K
   boost::unordered_flat_set<uint64_t> keyReads; // (K << 32) | read half
   size_t keyNodes = 0, keySplits = 0;
@@ -3836,32 +3845,44 @@ bool CallGraphPass::runFlowsToResolution() {
     for (const KeyPend &P : pends) {
       const uint32_t cell = find(P.cell);
       const uint64_t key = (uint64_t)P.o * NSHIFT + P.s;
-      auto [kit, kNew] = keyNodeOf.try_emplace(key, UINT32_MAX);
+      const uint32_t nm = nameOfCell(cell);
+      auto [kit, kNew] = keyNodeOf.try_emplace(std::make_pair(key, nm), UINT32_MAX);
       if (kNew) {
         const uint32_t K = newSolverNode();
         kit->second = K;
         keyNodes++;
+        keyNamesOf[key].push_back(nm);
         chanNodeName[K] =
             "key(" +
             (P.o < rootClassOf.size() ? protBlameName(rootClassOf[P.o]).substr(0, 40)
                                       : std::string("?")) +
-            ",s" + std::to_string(P.s) + ")";
-        if (P.o < envRoot.size() && envRoot[P.o]) {
+            ",s" + std::to_string(P.s) +
+            (nm == ka::AccessNames::Original ? std::string()
+                                             : "," + accessNames->str(nm)) +
+            ")";
+        // Environment content: what every read of the key sees whatever
+        // its name (the raw plane, and the identity plane named loads read).
+        if (P.o < envRoot.size() && envRoot[P.o] &&
+            (nm == ka::AccessNames::Original ||
+             nm == ka::AccessNames::Identity)) {
           tHow = "env-content"; tFrom = UINT32_MAX;
-          const uint32_t c = envContentFor(P.o, cell);
-          envContentOfKey[key] = c;
+          auto eit = envContentOfKey.find(key);
+          const uint32_t c = eit != envContentOfKey.end()
+                                 ? eit->second
+                                 : (envContentOfKey[key] = envContentFor(P.o, cell));
           envContentSeeded++;
           addFact(K, (nexusGate && !rootNexus[c]) ? (uint32_t)SHIFT_X : 0u, c,
                   ctx0);
         }
         if (NB > 0) { // the wildcard key exchanges with every exact key
           tHow = "bridge-init"; tKeyO = P.o; tKeyS = P.s;
+          const uint64_t on = ((uint64_t)P.o << 32) | nm;
           if (P.s == SHIFT_X) {
-            keyXOf[P.o] = K;
-            for (uint32_t K2 : keyExactOf[P.o]) addBridge(K, K2);
+            keyXOf[on] = K;
+            for (uint32_t K2 : keyExactOf[on]) addBridge(K, K2);
           } else {
-            keyExactOf[P.o].push_back(K);
-            auto xi = keyXOf.find(P.o);
+            keyExactOf[on].push_back(K);
+            auto xi = keyXOf.find(on);
             if (xi != keyXOf.end()) addBridge(K, xi->second);
           }
         }
@@ -4904,7 +4925,18 @@ bool CallGraphPass::runFlowsToResolution() {
   // name on one class merge now (they are one plane of that class).
   if (!cellNameOf.empty()) {
     tHow = "named-satellite";
-    for (uint32_t u = 0; u < N; u++) {
+    // Key cells: a shadow is a dereference of its cell's pointer under
+    // its name; it joins that pointer's key cells in its name's plane.
+    if (CFLKeyCells)
+      for (uint32_t u = 0; u < N; u++) {
+        const auto [cell, nm] = shadowInfoOf(toOrig[u]);
+        if (nm == ka::AccessNames::Original) continue;
+        auto d = toDense.find(getCanonicalNode(cell));
+        assert(d != toDense.end() && "a shadow's cell is in the graph");
+        const uint32_t p = cellOwner[d->second];
+        if (p != UINT32_MAX) cellsOf[p].push_back(u);
+      }
+    for (uint32_t u = 0; u < N && !CFLKeyCells; u++) {
       const auto [cell, nm] = shadowInfoOf(toOrig[u]);
       if (nm == ka::AccessNames::Original) continue;
       auto d = toDense.find(getCanonicalNode(cell));
@@ -4927,7 +4959,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // every named load reads (NamedCells.lean: RDeriv.cid).
   std::vector<std::pair<uint32_t, uint32_t>> unnamedSeeds; // (shadow, rid)
   size_t pendingSeeds = 0;
-  if (!cellNameOf.empty()) {
+  if (!cellNameOf.empty() && !CFLKeyCells) {
     addFactFn = [&](uint32_t n2, uint32_t pl, uint32_t rid) {
       addFact(n2, pl, rid, ctx0);
     };
@@ -7331,7 +7363,31 @@ bool CallGraphPass::runFlowsToResolution() {
         copiesInClass++;
         continue;
       }
-      for (auto [nm, u] : satOf[find(d->second)])
+      std::vector<uint32_t> srcNames;
+      if (CFLKeyCells) {
+        // The names the source's key cells hold content under.
+        const uint32_t p = cellOwner[d->second];
+        if (p != UINT32_MAX) {
+          const uint32_t pc = find(p);
+          for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+            R[pc][s2].forEach([&](uint32_t o) {
+              auto kn = keyNamesOf.find((uint64_t)o * NSHIFT + s2);
+              if (kn == keyNamesOf.end()) return;
+              for (uint32_t nm : kn->second) {
+                auto kit = keyNodeOf.find(
+                    std::make_pair((uint64_t)o * NSHIFT + s2, nm));
+                const uint32_t K = find(kit->second);
+                bool any = false;
+                for (uint32_t s3 = 0; s3 < NSHIFT && !any; s3++)
+                  any = R[K][s3].any() || RB[K][s3].any();
+                if (any) srcNames.push_back(nm);
+              }
+            });
+        }
+      } else {
+        for (auto [nm, u] : satOf[find(d->second)]) srcNames.push_back(nm);
+      }
+      for (uint32_t nm : srcNames)
         if (nm >= ka::AccessNames::FirstName &&
             cellCopyNamed.insert(((uint64_t)ci << 32) | nm).second) {
           Graph.addCopy(namedShadow(src, nm), namedShadow(dst, nm));
@@ -7374,18 +7430,22 @@ bool CallGraphPass::runFlowsToResolution() {
       // fixpoint every dereference is wired to the key cell of every
       // native fact of its pointer (bridged facts are images of native
       // ones; the key cells' bridges carry them).
-      size_t checked = 0, missing = 0, planes = 0;
+      size_t checked = 0, missing = 0, planes = 0, ptrClasses = 0,
+             classKeys = 0;
       for (uint32_t n = 0; n < (uint32_t)ufp.size(); n++) {
         if (find(n) != n || cellsOf[n].empty()) continue;
+        ptrClasses++;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) classKeys += R[n][s2].count();
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
           R[n][s2].forEach([&](uint32_t o) {
             const NodeIndex on0 = rootOrig(o);
             if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode())
               return; // joins on null keys are skipped (UB)
             if (o < rootConstData.size() && rootConstData[o]) return;
-            auto kit = keyNodeOf.find((uint64_t)o * NSHIFT + s2);
             for (uint32_t c : cellsOf[n]) {
               checked++;
+              auto kit = keyNodeOf.find(std::make_pair(
+                  (uint64_t)o * NSHIFT + s2, nameOfCell(find(c))));
               if (kit == keyNodeOf.end() ||
                   !keyWired.count(((uint64_t)find(c) << 32) | find(kit->second))) {
                 if (++missing <= 5)
@@ -7396,16 +7456,32 @@ bool CallGraphPass::runFlowsToResolution() {
             }
           });
       }
+      // Names present per key (plan 3.14 (3)): named planes holding content.
+      std::unordered_map<uint64_t, uint32_t> namesAt;
       for (auto &[k, K] : keyNodeOf) {
         bool any = false;
         for (uint32_t s2 = 0; s2 < NSHIFT && !any; s2++)
           any = R[find(K)][s2].any() || RB[find(K)][s2].any();
         planes += any;
+        if (any && k.second >= ka::AccessNames::FirstName) namesAt[k.first]++;
       }
+      uint32_t namesMax = 0;
+      size_t namesSum = 0;
+      for (auto &[k, c] : namesAt) {
+        namesSum += c;
+        namesMax = std::max(namesMax, c);
+      }
+      if (!cellNameOf.empty())
+        CG_LOG("KeyCells: names present: " << namesSum << " over "
+               << namesAt.size() << " keys (mean "
+               << (namesAt.empty() ? 0.0 : (double)namesSum / namesAt.size())
+               << ", max " << namesMax << ")\n");
       CG_LOG("KeyCells: " << keyNodes << " key cells (" << planes
              << " holding content), " << keyWired.size()
              << " write edges + " << keyReads.size() << " read edges, "
-             << keySplits << " read halves; certificate: " << checked
+             << keySplits << " read halves; " << ptrClasses
+             << " pointer classes own dereferences, sum of their facts "
+             << classKeys << "; certificate: " << checked
              << " (dereference, fact) pairs, " << missing << " unwired\n");
       if (missing)
         report_fatal_error("--cfl-key-cells: " + Twine(missing) +

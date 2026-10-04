@@ -220,11 +220,11 @@ int main(int argc, char **argv) {
       cliErrors.push_back("--cfl-key-cells requires --cfl-alloc-origins "
                           "(identity roots would key cells by invented "
                           "origins)");
-    if (CFLKeyCells && (CFLNamedPlanes || CFLChannelCells ||
+    if (CFLKeyCells && (CFLChannelCells ||
                         CFLBatchRoots > 0 || CFLLazyMint || CFLLazyAddress ||
                         CFLFlowsToSlice || CFLBidiPrune || CFLPreSolveOnce ||
                         CFLVerifyClosure))
-      cliErrors.push_back("--cfl-key-cells (stage 1) refuses names, channel "
+      cliErrors.push_back("--cfl-key-cells refuses channel "
                           "cells, batched roots, lazy minting, lazy "
                           "addresses, slicing, bidi-prune, presolve-once and "
                           "--cfl-verify-closure (its own wiring certificate "

@@ -3103,14 +3103,19 @@ bool CallGraphPass::runFlowsToResolution() {
   };
   // --cfl-dump-merges: every union with its cause, replayed offline to
   // answer "which union first put X and Y in one class, and why".
-  struct MergeEv { uint32_t a, b, keyO, keyS, ptr; const char *why; };
+  struct MergeEv { uint32_t a, b, keyO, keyS, ptr; const char *why; uint32_t cell; };
   std::vector<MergeEv> mergeLog;
+  // --cfl-dump-merges: first inserts of cluster keys (a class anchors
+  // its first origin without any union), placed in the union order by
+  // the number of unions logged before them.
+  struct KeyEv { size_t seq; uint32_t cls, o, s, ptr, cell; };
+  std::vector<KeyEv> keyLog;
   const char *mergeWhy = "other";
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
     if (a == b) return a;
     if (!CFLDumpMerges.empty())
-      mergeLog.push_back({a, b, tKeyO, tKeyS, tPtr, mergeWhy});
+      mergeLog.push_back({a, b, tKeyO, tKeyS, tPtr, mergeWhy, tCell});
     struct MergeTimer {
       uint64_t &acc, t0;
       MergeTimer(uint64_t &a_) : acc(a_), t0(__builtin_ia32_rdtsc()) {}
@@ -3544,6 +3549,8 @@ bool CallGraphPass::runFlowsToResolution() {
       return;
     }
     keyCount[find(cell)].fetch_add(1, std::memory_order_relaxed);
+    if (!CFLDumpMerges.empty())
+      keyLog.push_back({mergeLog.size(), find(cell), o, s, tPtr, cell});
     if (g_batchRecord)
       g_batchEvts.push_back({0, cell, o, s}); // first insert of this key
     if (NB == 0) return;
@@ -7379,15 +7386,100 @@ bool CallGraphPass::runFlowsToResolution() {
           if (!ty.empty()) OS << "T\t" << d << "\t" << ty << "\n";
         }
       }
-      for (const MergeEv &e : mergeLog) {
-        OS << "M\t" << e.a << "\t" << e.b << "\t" << e.why << "\t";
-        if (e.why == StringRef("join") && e.keyO != UINT32_MAX &&
-            e.keyO < rootClassOf.size())
-          OS << e.keyO << "\t" << protBlameName(rootClassOf[e.keyO]).substr(0, 50)
-             << "\t" << e.keyS << "\t" << e.ptr;
-        else
-          OS << "-\t-\t-\t-";
-        OS << "\n";
+      // R lines: every origin with its kind and label, what the program
+      // made it as: a function; a global or stack slot by its declared
+      // type; a heap allocation by its site; an identity root (content
+      // from outside) by the static type of the cell it was minted on,
+      // or of the value. K lines: first key inserts.
+      {
+        boost::unordered_flat_map<NodeIndex, NodeIndex> ownerOf;
+        for (auto &[ptr, cell] : NF.getDerefMap()) ownerOf[cell] = ptr;
+        auto tyName = [&](Type *T) -> std::string {
+          std::string s2; raw_string_ostream os(s2); T->print(os); return os.str();
+        };
+        auto cellTy = [&](NodeIndex canon) -> std::string {
+          auto oit = ownerOf.find(canon);
+          if (oit == ownerOf.end()) return "?";
+          const Value *V = NF.getValueForNode(oit->second);
+          if (!V) return "?";
+          if (const auto *G = dyn_cast<GEPOperator>(V)) {
+            std::string ty = tyName(G->getSourceElementType());
+            if (G->getNumIndices() >= 2)
+              if (const auto *CI = dyn_cast<ConstantInt>(G->getOperand(2)))
+                ty += " field " + std::to_string(CI->getZExtValue());
+            return ty;
+          }
+          if (const auto *A = dyn_cast<AllocaInst>(V))
+            return tyName(A->getAllocatedType());
+          if (const auto *GV = dyn_cast<GlobalVariable>(V))
+            return tyName(GV->getValueType());
+          if (const auto *LI = dyn_cast<LoadInst>(V))
+            return "loaded " + tyName(LI->getType());
+          return std::string("via ") +
+                 (isa<Instruction>(V) ? cast<Instruction>(V)->getOpcodeName()
+                  : isa<Argument>(V)  ? "arg"
+                                      : "const");
+        };
+        for (uint32_t rid = 0; rid < nextRoot; rid++) {
+          const uint32_t rc = rid < rootClassOf.size() ? rootClassOf[rid] : UINT32_MAX;
+          if (rc >= toOrig.size()) continue;
+          const NodeIndex canon = toOrig[rc];
+          const Value *V = NF.getValueForNode(canon);
+          std::string kind, label;
+          if (funcRootOf.count(rid)) {
+            kind = "fn";
+            label = "fn";
+          } else if (NF.isDereferenceNode(canon)) {
+            kind = "cell-id";
+            label = cellTy(canon);
+          } else if (!V) {
+            kind = "special";
+            label = "?";
+          } else if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+            kind = "global";
+            label = tyName(GV->getValueType());
+          } else if (const auto *A = dyn_cast<AllocaInst>(V)) {
+            kind = "alloca";
+            label = tyName(A->getAllocatedType());
+          } else if (const auto *CB = dyn_cast<CallBase>(V);
+                     CB && Ctx->AllocSites.count(const_cast<CallBase *>(CB))) {
+            kind = "heap";
+            label = "heap";
+          } else {
+            kind = "val-id";
+            label = tyName(V->getType());
+            if (const auto *I = dyn_cast<Instruction>(V))
+              label += std::string(" ") + I->getOpcodeName();
+            else if (isa<Argument>(V))
+              label += " arg";
+          }
+          if (addrIsObj.size() > rid && addrIsObj[rid] && addrObj[rid] != rid)
+            kind += "+addr";
+          OS << "R\t" << rid << "\t" << kind << "\t" << label << "\t"
+             << protBlameName(rc).substr(0, 90) << "\n";
+        }
+      }
+      {
+        size_t ki = 0;
+        auto flushKeys = [&](size_t upto) {
+          for (; ki < keyLog.size() && keyLog[ki].seq <= upto; ki++)
+            OS << "K\t" << keyLog[ki].cls << "\t" << keyLog[ki].o << "\t"
+               << keyLog[ki].s << "\t" << keyLog[ki].ptr << "\t"
+               << keyLog[ki].cell << "\n";
+        };
+        for (size_t mi = 0; mi < mergeLog.size(); mi++) {
+          flushKeys(mi);
+          const MergeEv &e = mergeLog[mi];
+          OS << "M\t" << e.a << "\t" << e.b << "\t" << e.why << "\t";
+          if (e.why == StringRef("join") && e.keyO != UINT32_MAX &&
+              e.keyO < rootClassOf.size())
+            OS << e.keyO << "\t" << protBlameName(rootClassOf[e.keyO]).substr(0, 50)
+               << "\t" << e.keyS << "\t" << e.ptr << "\t" << e.cell;
+          else
+            OS << "-\t-\t-\t-\t-";
+          OS << "\n";
+        }
+        flushKeys(SIZE_MAX);
       }
       CG_LOG("DumpMerges: " << mergeLog.size() << " unions -> " << CFLDumpMerges
              << "\n");

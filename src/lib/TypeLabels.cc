@@ -28,6 +28,8 @@
 
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Operator.h>
+#include <llvm/IR/InstIterator.h>
+#include <set>
 
 namespace {
 
@@ -45,7 +47,12 @@ bool namedStruct(const llvm::StructType *ST) {
 void CallGraphPass::runTypeLabelCensus(
     const std::function<void(NodeIndex, std::vector<uint32_t> &)> &originsOf,
     const std::function<void(uint32_t, std::vector<const Value *> &)>
-        &originValues) {
+        &originValues,
+    const std::function<bool(NodeIndex)> &anyFact,
+    const std::function<std::string(NodeIndex, uint32_t, std::string &)>
+        &explain,
+    const std::string &emptyReadLine) {
+  const bool report = !CFLRuleReport.empty();
   // ---- 1. Allocation calls: direct allocators and their wrappers ----
   // A wrapper returns only allocation results (through casts, phis of
   // them, or null).
@@ -436,6 +443,9 @@ void CallGraphPass::runTypeLabelCensus(
   // ---- 4. Untyped writes, retyped by the labels they reach ----
   size_t uHarmless = 0, uTyped = 0, uUnknown = 0, uNoFacts = 0;
   std::map<std::string, size_t> uUnknownBy;
+  // Rule (c) candidates: an untyped write that reaches a struct object.
+  struct UntypedHit { std::string where, labels; };
+  std::vector<UntypedHit> ruleC;
   for (auto &[cell, where] : blindWriteLog) {
     NodeIndex p = cellParent(cell);
     if (p == AndersNodeFactory::InvalidIndex) {
@@ -448,13 +458,20 @@ void CallGraphPass::runTypeLabelCensus(
       continue;
     }
     bool unknown = false, typed = false;
+    std::string labels;
     for (uint32_t r : rids) {
       const OriginLabel &L = labelOf(r);
       if (L.kind == Unknown || (L.kind == Heap && L.types.empty()))
         unknown = true;
-      else if (!L.types.empty())
+      else if (!L.types.empty()) {
         typed = true;
+        for (const std::string &T : L.types)
+          if (labels.size() < 200 && labels.find(T) == std::string::npos)
+            labels += (labels.empty() ? "" : "|") + T;
+      }
     }
+    if (typed && report && ruleC.size() < 5000)
+      ruleC.push_back({where, labels});
     if (unknown) {
       uUnknown++;
       uUnknownBy[where]++;
@@ -479,6 +496,17 @@ void CallGraphPass::runTypeLabelCensus(
   };
   std::vector<Mis> mismatches;
   std::vector<std::pair<const Instruction *, std::string>> onlyBad;
+  // Rule (b) violations: (access, name, the pointer, the origin, its
+  // label, whether the pointer reaches no compatible object at all).
+  struct TypeHit {
+    const Instruction *I;
+    uint32_t name;
+    NodeIndex ptr;
+    uint32_t rid;
+    std::string label;
+    bool only;
+  };
+  std::vector<TypeHit> ruleB;
   for (auto &[cell, name, I] : namedAccessLog) {
     NodeIndex p = cellParent(cell);
     if (p == AndersNodeFactory::InvalidIndex)
@@ -513,6 +541,12 @@ void CallGraphPass::runTypeLabelCensus(
       if (!fits) {
         mis = true;
         (L.kind == Heap ? misHeap : misDecl) = true;
+        if (report && ruleB.size() < 20000) {
+          std::string lb;
+          for (const std::string &T : L.types)
+            lb += (lb.empty() ? "" : "|") + T;
+          ruleB.push_back({I, name, getCanonicalNode(p), r, lb, false});
+        }
         if (badLabel.empty())
           for (const std::string &T : L.types)
             badLabel += (badLabel.empty() ? "" : "|") + T;
@@ -526,6 +560,9 @@ void CallGraphPass::runTypeLabelCensus(
     Tally &T2 = isIcall ? icall : all;
     if (mis) {
       T2.mismatch++;
+      if (!good && report)
+        for (auto it = ruleB.rbegin(); it != ruleB.rend() && it->I == I; ++it)
+          it->only = true;
       if (!good) {
         T2.allBad++;
         std::string why = accessNames->str(name) + " reaches only:";
@@ -647,4 +684,214 @@ void CallGraphPass::runTypeLabelCensus(
            << std::get<1>(mtop[i]) << " on " << std::get<2>(mtop[i]) << " ("
            << loc << ")\n";
   }
+
+  if (!report)
+    return;
+  // ---- The rule report (plan 3.11 item 1) ----
+  std::error_code EC;
+  raw_fd_ostream RO(CFLRuleReport, EC, sys::fs::OF_Text);
+  if (EC) {
+    errs() << "FATAL: cannot write " << CFLRuleReport << ": " << EC.message()
+           << "\n";
+    exit(1);
+  }
+  auto locOf = [&](const Instruction *I2) {
+    std::string loc = I2->getFunction()->getName().str();
+    if (const DILocation *DL2 = I2->getDebugLoc())
+      loc += " " + DL2->getFilename().str() + ":" + std::to_string(DL2->getLine());
+    return loc;
+  };
+  auto originName = [&](uint32_t r) {
+    originValues(r, vals);
+    for (const Value *V : vals) {
+      if (const auto *I3 = dyn_cast<Instruction>(V)) {
+        std::string n3 = (I3->getFunction()->getName() + "::" +
+                          I3->getOpcodeName()).str();
+        if (const DILocation *DL3 = I3->getDebugLoc())
+          n3 += "@" + std::to_string(DL3->getLine());
+        return n3;
+      }
+      if (V->hasName())
+        return V->getName().str();
+    }
+    return std::string("?");
+  };
+
+  // Rule (a): an inttoptr used as a pointer whose integer carries no
+  // origin. Its integer sources say what the bytes were: data (a
+  // violation), a constant address, or a pointer lost before the cast
+  // (an unknown: the pointer that was cast carried nothing).
+  struct ForgeHit { const Instruction *I; std::string kind, sources; };
+  std::vector<ForgeHit> ruleA;
+  size_t aData = 0, aConst = 0, aLost = 0;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F)) {
+        auto *IP = dyn_cast<IntToPtrInst>(&I);
+        if (!IP)
+          continue;
+        bool usedAsPtr = false;
+        for (const User *U : IP->users()) {
+          if (const auto *LI = dyn_cast<LoadInst>(U))
+            usedAsPtr |= LI->getPointerOperand() == IP;
+          else if (const auto *SI = dyn_cast<StoreInst>(U))
+            usedAsPtr |= SI->getPointerOperand() == IP;
+          else if (const auto *CB = dyn_cast<CallBase>(U))
+            usedAsPtr |= CB->getCalledOperand() == IP;
+          else if (const auto *G = dyn_cast<GetElementPtrInst>(U))
+            usedAsPtr |= G->getPointerOperand() == IP;
+        }
+        if (!usedAsPtr)
+          continue;
+        const NodeIndex n = getRepNodeForValue(IP->getOperand(0));
+        if (n != AndersNodeFactory::InvalidIndex &&
+            anyFact(getCanonicalNode(n)))
+          continue;
+        SmallVector<const Value *, 16> work{IP->getOperand(0)};
+        SmallPtrSet<const Value *, 16> seen;
+        std::string srcs;
+        bool lost = false, allConst = true;
+        while (!work.empty() && seen.size() < 24) {
+          const Value *V = work.pop_back_val();
+          if (!seen.insert(V).second)
+            continue;
+          std::string leaf;
+          if (const auto *CI = dyn_cast<ConstantInt>(V)) {
+            leaf = "const";
+            (void)CI;
+          } else if (isa<PtrToIntInst>(V) ||
+                     (isa<ConstantExpr>(V) &&
+                      cast<ConstantExpr>(V)->getOpcode() == Instruction::PtrToInt)) {
+            leaf = "ptrtoint";
+            lost = true;
+          } else if (const auto *BO = dyn_cast<BinaryOperator>(V)) {
+            work.push_back(BO->getOperand(0));
+            work.push_back(BO->getOperand(1));
+            continue;
+          } else if (const auto *CA = dyn_cast<CastInst>(V)) {
+            work.push_back(CA->getOperand(0));
+            continue;
+          } else if (const auto *PN = dyn_cast<PHINode>(V)) {
+            for (const Value *In : PN->incoming_values())
+              work.push_back(In);
+            continue;
+          } else if (const auto *SE = dyn_cast<SelectInst>(V)) {
+            work.push_back(SE->getTrueValue());
+            work.push_back(SE->getFalseValue());
+            continue;
+          } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
+            leaf = "load " + locOf(LI);
+          } else if (const auto *A = dyn_cast<Argument>(V)) {
+            leaf = "arg " + A->getParent()->getName().str() + "#" +
+                   std::to_string(A->getArgNo());
+          } else if (const auto *CB = dyn_cast<CallBase>(V)) {
+            const Function *CF = CB->getCalledFunction();
+            leaf = "call " + (CF ? CF->getName().str() : std::string("<icall>"));
+          } else if (const auto *I4 = dyn_cast<Instruction>(V)) {
+            leaf = I4->getOpcodeName();
+          } else {
+            leaf = "other";
+          }
+          if (leaf != "const")
+            allConst = false;
+          if (srcs.size() < 300)
+            srcs += (srcs.empty() ? "" : "; ") + leaf;
+        }
+        const char *kind = lost ? "unknown" : allConst ? "constant" : "data";
+        (lost ? aLost : allConst ? aConst : aData)++;
+        if (ruleA.size() < 5000)
+          ruleA.push_back({&I, kind, srcs});
+      }
+
+  // Rule (b): grouped by access; derivations for the first entries.
+  std::stable_sort(ruleB.begin(), ruleB.end(),
+                   [](const TypeHit &a, const TypeHit &b) {
+                     return a.only > b.only;
+                   });
+  std::set<const Instruction *> bAcc, bOnly;
+  for (auto &h : ruleB) {
+    bAcc.insert(h.I);
+    if (h.only)
+      bOnly.insert(h.I);
+  }
+  std::map<std::pair<std::string, std::string>, size_t> cAgg;
+  for (auto &h : ruleC)
+    cAgg[{h.where, h.labels}]++;
+  size_t heapAll = 0, heapUnl = 0;
+  for (auto &[r, L] : originLabel)
+    if (L.kind == Heap) {
+      heapAll++;
+      heapUnl += L.types.empty();
+    }
+  const std::string prog = Ctx->Modules.empty()
+                               ? std::string("?")
+                               : Ctx->Modules.front().first->getName().str();
+
+  RO << "# Rule report (plan 3.11). Input: " << prog << "\n"
+     << "# The call graph holds for executions that obey three rules:\n"
+     << "#  (a) no pointer is made from bytes that never were a pointer;\n"
+     << "#  (b) an object initialized as T is accessed only as T or as a "
+        "struct embedded in T;\n"
+     << "#  (c) a certified field receives no untyped write.\n"
+     << "# Each violation below is a place the program (or the model) "
+        "breaks one.\n";
+  RO << "SUMMARY a " << aData << " pointers from data, " << aConst
+     << " constant addresses; unknown " << aLost
+     << " (a pointer lost before the cast)\n";
+  RO << "SUMMARY b " << bAcc.size() << " named accesses reach an object "
+     << "initialized as an incompatible struct (" << bOnly.size()
+     << " reach only such objects), of "
+     << all.legit + all.mismatch + all.unknown + icall.legit +
+            icall.mismatch + icall.unknown
+     << " named accesses\n";
+  RO << "SUMMARY c " << ruleC.size() << " untyped writes reach a struct "
+     << "object, of " << blindWriteLog.size() << " untyped writes\n";
+  RO << "UNKNOWN named accesses reaching an unlabeled object: "
+     << all.unknown + icall.unknown << "\n";
+  RO << "UNKNOWN untyped writes reaching an unlabeled object: " << uUnknown
+     << "\n";
+  RO << "UNKNOWN heap objects with no typed write: " << heapUnl << " of "
+     << heapAll << "\n";
+  if (!emptyReadLine.empty())
+    RO << "UNKNOWN " << emptyReadLine << "\n";
+
+  RO << "\n== (a) pointers made from bytes that never were a pointer\n";
+  for (auto &h : ruleA)
+    RO << "A " << h.kind << " " << locOf(h.I) << " from: " << h.sources
+       << "\n";
+
+  RO << "\n== (b) accesses reaching an object initialized as an "
+        "incompatible struct\n";
+  size_t explained = 0;
+  for (auto &h : ruleB) {
+    bool isIcall = false;
+    if (isa<LoadInst>(h.I))
+      for (const User *U : h.I->users())
+        if (const auto *CB = dyn_cast<CallBase>(U))
+          isIcall |= CB->getCalledOperand() == h.I;
+    RO << "B " << (h.only ? "only " : "mixed ") << locOf(h.I)
+       << " access=" << accessNames->str(h.name) << (isIcall ? " icall" : "")
+       << " origin=" << originName(h.rid) << " label=" << h.label << "\n";
+    if (explained < 500) {
+      explained++;
+      std::string merge;
+      const std::string der = explain(h.ptr, h.rid, merge);
+      RO << "   derivation: " << der << "\n";
+      RO << "   first merge: " << (merge.empty() ? "none (value flow only)" : merge)
+         << "\n";
+    }
+  }
+
+  RO << "\n== (c) untyped writes reaching a struct object\n";
+  std::vector<std::tuple<size_t, std::string, std::string>> ctop;
+  for (auto &[k, c] : cAgg)
+    ctop.emplace_back(c, k.first, k.second);
+  std::sort(ctop.begin(), ctop.end(),
+            [](auto &a, auto &b) { return std::get<0>(a) > std::get<0>(b); });
+  for (auto &[c, w, l] : ctop)
+    RO << "C x" << c << " " << w << " reaches: " << l << "\n";
+  errs() << "RuleReport: a " << aData << "+" << aConst << " const (+" << aLost
+         << " unknown), b " << bAcc.size() << " accesses (" << bOnly.size()
+         << " only-incompatible), c " << ruleC.size() << " -> "
+         << CFLRuleReport << "\n";
 }

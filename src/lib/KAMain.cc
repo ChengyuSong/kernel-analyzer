@@ -216,6 +216,10 @@ int main(int argc, char **argv) {
       cliErrors.push_back("--cfl-alloc-origins is not ported to channel "
                           "cells, batched roots, lazy minting or lazy "
                           "addresses (each mints roots on its own path)");
+    if (!CFLRuleReport.empty() && !(CFLNamedPlanes && CFLAllocOrigins))
+      cliErrors.push_back("--cfl-rule-report requires --cfl-named-planes "
+                          "(access names) and --cfl-alloc-origins (an "
+                          "origin-free value is data)");
     if (CFLCensusTypeLabels && !CFLNamedPlanes)
       cliErrors.push_back("--cfl-census-type-labels requires --cfl-named-planes");
     if (CFLNamedUntyped != "count" && CFLNamedUntyped != "open")

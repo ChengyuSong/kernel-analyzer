@@ -261,7 +261,11 @@ protected:
   void runTypeLabelCensus(
       const std::function<void(NodeIndex, std::vector<uint32_t> &)> &originsOf,
       const std::function<void(uint32_t, std::vector<const llvm::Value *> &)>
-          &originValues);
+          &originValues,
+      const std::function<bool(NodeIndex)> &anyFact,
+      const std::function<std::string(NodeIndex, uint32_t, std::string &)>
+          &explain,
+      const std::string &emptyReadLine);
   std::vector<std::pair<NodeIndex, std::string>> blindWriteLog;
   std::vector<std::tuple<NodeIndex, uint32_t, const llvm::Instruction *>>
       namedAccessLog;

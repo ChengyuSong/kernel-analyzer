@@ -431,6 +431,18 @@ cl::opt<bool> CFLAllocOrigins(
            "external data (Lean Keys.keys_sound; plan 3.11)"),
   cl::init(false));
 
+cl::opt<std::string> CFLRuleReport(
+  "cfl-rule-report",
+  cl::desc("Write the rule report to this file (plan 3.11 item 1): every "
+           "place the program breaks the analysis's rules, (a) a pointer "
+           "made from bytes that never were a pointer, (b) a named access "
+           "reaching an object initialized as an incompatible struct, (c) "
+           "an untyped write reaching a struct object, each with how the "
+           "offending origin got there; and the unknowns, counted. "
+           "Requires --cfl-named-planes and --cfl-alloc-origins; records "
+           "every first arrival (single-threaded solve)"),
+  cl::init(""));
+
 cl::opt<unsigned> CFLEnvDepth(
   "cfl-env-depth",
   cl::desc("With --cfl-alloc-origins: how many levels of environment "

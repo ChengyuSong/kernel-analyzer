@@ -2603,8 +2603,19 @@ bool CallGraphPass::runFlowsToResolution() {
       errs() << "\n";
     }
   };
-  const bool traceAny = traceRoot >= 0 || meetRid[0] >= 0;
+  // --cfl-rule-report: the first arrival of every origin at every class
+  // (how, from which class, under which join key and pointer), so a rule
+  // violation can say how the offending origin got there.
+  const bool ruleReport = !CFLRuleReport.empty() && !cellNameOf.empty();
+  struct Arrival { uint32_t from; const char *how; uint32_t keyO, ptr; };
+  boost::unordered_flat_map<uint64_t, Arrival> arrivals;
+  const bool traceAny = traceRoot >= 0 || meetRid[0] >= 0 || ruleReport;
+  auto recordArrival = [&](uint32_t n, uint32_t r) {
+    arrivals.try_emplace(((uint64_t)n << 32) | r,
+                         Arrival{tFrom, tHow, tKeyO, tPtr});
+  };
   auto traceCheck = [&](uint32_t n, uint32_t s, bool br, const FactSet &bits) {
+    if (ruleReport) bits.forEach([&](uint32_t r) { recordArrival(n, r); });
     for (uint32_t r : traceRoots)
       if (bits.test(r)) traceHit(n, s, br, r);
     if (meetRid[0] >= 0) {
@@ -2613,6 +2624,7 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   };
   auto traceCheckOne = [&](uint32_t n, uint32_t s, uint32_t o) {
+    if (ruleReport) recordArrival(n, o);
     if (o < traceMark.size() && traceMark[o]) traceHit(n, s, false, o);
     if (meetRid[0] >= 0) {
       if (o == (uint32_t)meetRid[0]) meetHit(n, s, 0);
@@ -7211,6 +7223,7 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     wideningReport();
     verifyClosure(); // certificate over the answer-producing fixpoint
+    std::string emptyReadLine;
     if (CFLAllocOrigins) {
       // Reads that found nothing at convergence: a pointer load whose
       // class holds no fact. Under rule (a) each is unreachable, behind
@@ -7241,6 +7254,9 @@ bool CallGraphPass::runFlowsToResolution() {
       std::string line;
       for (size_t i = 0; i < top.size() && i < 8; i++)
         line += " " + top[i].second + " " + std::to_string(top[i].first);
+      emptyReadLine = std::to_string(emptyLoads) + " of " +
+                      std::to_string(loads) +
+                      " pointer loads read nothing at convergence; top:" + line;
       CG_LOG("AllocOrigins: " << emptyLoads << " of " << loads
              << " pointer loads read nothing at convergence; "
              << envContentSeeded << " environment-content seeds, "
@@ -7248,7 +7264,64 @@ bool CallGraphPass::runFlowsToResolution() {
              << CFLEnvDepth << "); top:"
              << line << "\n");
     }
-    if (CFLCensusTypeLabels && !cellNameOf.empty())
+    // How origin `rid` reached the class of pointer `canonPtr`: the first
+    // arrivals walked back to the origin's seed, oldest first, with the
+    // first union or bridge on the way (where the analysis, not a copy
+    // in the program, put the origin there).
+    std::unordered_map<uint32_t, std::vector<uint32_t>> arrByRid;
+    auto explainArrival = [&](NodeIndex canonPtr, uint32_t rid,
+                              std::string &mergePoint) -> std::string {
+      mergePoint.clear();
+      auto d = toDense.find(canonPtr);
+      if (d == toDense.end()) return "";
+      if (arrByRid.empty())
+        for (auto &[k, a] : arrivals)
+          arrByRid[(uint32_t)k].push_back((uint32_t)(k >> 32));
+      const uint32_t c = find(d->second);
+      uint32_t x = UINT32_MAX;
+      auto ait = arrByRid.find(rid);
+      if (ait != arrByRid.end())
+        for (uint32_t y : ait->second)
+          if (find(y) == c && (x == UINT32_MAX || y == c)) x = y;
+      if (x == UINT32_MAX) return "(no arrival recorded)";
+      std::vector<std::string> steps;
+      boost::unordered_flat_set<uint32_t> seen;
+      for (int depth = 0; depth < 48 && x != UINT32_MAX; depth++) {
+        auto it = arrivals.find(((uint64_t)x << 32) | rid);
+        if (it == arrivals.end() || !seen.insert(x).second) break;
+        const Arrival &a = it->second;
+        std::string st = std::string(a.how) + "[" +
+                         (a.from == UINT32_MAX ? std::string("-")
+                                               : nodeKind(a.from)) +
+                         ">" + nodeKind(x) + "] " +
+                         protBlameName(x).substr(0, 60);
+        bool merged = StringRef(a.how).starts_with("merge") ||
+                      StringRef(a.how).starts_with("bridge");
+        if (merged && a.keyO != UINT32_MAX && a.keyO < rootClassOf.size())
+          st += " key=" + protBlameName(rootClassOf[a.keyO]).substr(0, 50);
+        if (merged && a.ptr != UINT32_MAX && a.ptr < toOrig.size())
+          st += " by=" + protBlameName(a.ptr).substr(0, 50);
+        // A class presolve formed (its component quotient merges values
+        // that share a source, outside the answer cone) is itself a
+        // merge: the origin reaches every member through it.
+        {
+          std::vector<NodeIndex> mem;
+          collectCanonicalMembers(toOrig[x], mem);
+          if (mem.size() > 1) {
+            st += " [presolve class of " + std::to_string(mem.size()) + "]";
+            merged = true;
+          }
+        }
+        if (merged) mergePoint = st; // walking back: the oldest wins
+        steps.push_back(st);
+        x = a.from;
+      }
+      std::string out;
+      for (auto i = steps.rbegin(); i != steps.rend(); ++i)
+        out += (out.empty() ? "" : " -> ") + *i;
+      return out;
+    };
+    if ((CFLCensusTypeLabels || ruleReport) && !cellNameOf.empty())
       runTypeLabelCensus(
           [&](NodeIndex canon, std::vector<uint32_t> &out) {
             out.clear();
@@ -7273,7 +7346,16 @@ bool CallGraphPass::runFlowsToResolution() {
             collectCanonicalMembers(rn, members);
             for (NodeIndex m : members)
               if (const Value *V = NF.getValueForNode(m)) out.push_back(V);
-          });
+          },
+          [&](NodeIndex canon) -> bool {
+            auto d = toDense.find(canon);
+            if (d == toDense.end()) return false;
+            const uint32_t c = find(d->second);
+            for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+              if (R[c][s2].any() || RB[c][s2].any()) return true;
+            return false;
+          },
+          explainArrival, emptyReadLine);
     // Named cells, measurement only: at an icall whose callee is loaded
     // through a name, the functions its name's plane holds and those
     // only the unnamed plane adds — what assuming that no unnamed write

@@ -551,3 +551,68 @@ Obligations left open:
 3. Composition with named cells (labels × names in one solve) is not
    stated; both refine cell keys independently, and each theorem is
    about one dimension.
+
+## Keys (Keys.lean, 2026-10-03, plan-named-cells 3.10/3.11)
+
+The first statement against a CONCRETE semantics. A program is a set of
+statements (alloc, fnaddr, copy, field, lab, i2p, load, store, icall,
+icallRet, and the correlated call `dcall` for `p->fn(p->data)`), any of
+which may run at any time; values are pointers to locations, functions
+or data; memory starts as data plus pointers among environment objects.
+An `i2p` on data forges an arbitrary pointer. A key denotes locations
+(`γ`); a load reads every cell whose key `meets` its own.
+
+Statements (checked):
+- `keys_sound` (`propext`): under the three rules and the key
+  obligations, every reachable state is covered by EVERY solution closed
+  under the rules (not only the least). No identity roots: a cell nothing
+  wrote holds data, and by rule (a) data never becomes a pointer.
+- `icall_sound` (`propext`): every function an indirect call actually
+  calls is in its answer.
+- `coarsen_sound` (no axioms): any larger `meets` is sound; union-find
+  clusters (transitive `meets`), presolve and SCC merges are coarsenings
+  with a precision cost, never a soundness one. Since `keys_sound` holds
+  for every closed solution, a realization that merges variables or
+  cells is covered as long as what it computes is closed.
+- `ProductKey` with `product_meetSound`, `product_meetKSound`,
+  `product_fieldCover`, `product_faithful` (no axioms): keys as
+  (site, position, instance), meet componentwise; each obligation reduces
+  to its own dimension (site by construction, position by `PunFree` and
+  address arithmetic, instance by faithfulness).
+
+Hypotheses (the rules; each is what L4 reports when it fails):
+- `NoForge` (rule a): no reachable `i2p` reads data. ptrtoint/inttoptr of
+  a value that was a pointer is a copy, not a violation.
+- `AccessAgree` (rules b, c): every load and store touches a location in
+  its access key. For a named access this is `PunFree`; for an untyped
+  write whose key excludes certified fields it is rule (c).
+- `FieldCover`: field steps (GEPs, the two reads of `dcall`) cover the
+  concrete address arithmetic.
+- `Faithful`: an object passing a labeling point is one the label
+  denotes (no use after reuse).
+- `AllocCover`: an allocation's result lies in its site key.
+- `MeetSound`, `MeetKSound`: key-domain properties.
+- `EnvInit`: environment memory holds no code pointers, and its pointers
+  are described by `envCnt`.
+
+Obligations left open:
+1. Graph fidelity: the statement set encodes the IR (every pointer-moving
+   instruction, summary atom and special case is a statement or a sound
+   over-approximation of one). The 3.10 special-case table is the
+   inventory; not mechanized (cf. F9).
+2. Environment model: which objects are environment sites (argv/envp,
+   the fuzzer buffer, one per extern global, one per bodiless callee
+   without a summary, one per formal of a never-called function) and the
+   enumerated runtime code-pointer sources (dlsym; kallsyms, module
+   symbol resolution, firmware tables) as `fnaddr` statements with a
+   ledger line. Stated in the plan, not in Lean.
+3. Calls are modeled through indirect calls; direct calls and returns are
+   copies (context-insensitive). Concurrency is interleaving of the same
+   statements (flow insensitivity covers it).
+4. Undefined behavior: a load or store through a non-pointer does not
+   step; executions that do it are outside the theorem.
+5. The existing results (`solver_complete`, named cells, labels,
+   channels) are not yet restated as instances or realizations of this
+   model.
+6. The rules are checked by the solver's own facts (L4), not proved:
+   the report is the deliverable for programs that break them.

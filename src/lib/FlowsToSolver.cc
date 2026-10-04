@@ -1438,6 +1438,33 @@ bool CallGraphPass::runFlowsToResolution() {
         if (ext(m)) return true;
     return false;
   };
+  // A partial corpus (--cfl-alloc-origins without --cfl-whole-program):
+  // code outside it may write any externally visible global and call any
+  // externally visible function, so those globals and formals are
+  // environment sites too.
+  const bool partialEnv = CFLAllocOrigins && !CFLWholeProgram;
+  auto classHas = [&](uint32_t n, auto pred) {
+    if (pred(toOrig[n])) return true;
+    auto mit = canonicalClassMembers.find(toOrig[n]);
+    if (mit != canonicalClassMembers.end())
+      for (NodeIndex m : mit->second)
+        if (pred(m)) return true;
+    return false;
+  };
+  auto isVisibleGlobalClass = [&](uint32_t n) {
+    return classHas(n, [&](NodeIndex m) {
+      const auto *G = dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(m));
+      return G && !G->isDeclaration() && !G->hasLocalLinkage();
+    });
+  };
+  auto isExportedFormalClass = [&](uint32_t n) {
+    return classHas(n, [&](NodeIndex m) {
+      const auto *A = dyn_cast_or_null<Argument>(NF.getValueForNode(m));
+      return A && !A->getParent()->hasLocalLinkage() &&
+             !A->getParent()->isDeclaration();
+    });
+  };
+  size_t partialEnvRoots = 0;
   std::map<std::string, size_t> identityKinds, identityNotMinted;
   // --cfl-alloc-origins: environment roots (rid-indexed), their depth
   // (0 = an environment site; d = content d levels below one), and the
@@ -1483,7 +1510,8 @@ bool CallGraphPass::runFlowsToResolution() {
         continue;
       }
     }
-    if (!hasIn[n] || isFunc || hasOrigin[n] || isCert) {
+    const bool exportedFormal = partialEnv && isExportedFormalClass(n);
+    if (!hasIn[n] || isFunc || hasOrigin[n] || isCert || exportedFormal) {
       if (!bidiMarked.empty() && !isFunc && !isCert && !bidiMarked[n]) {
         // Outside the fptr cone: this origin's facts can key joins only
         // at cells inside its partition's d/f closure, which never
@@ -1542,7 +1570,10 @@ bool CallGraphPass::runFlowsToResolution() {
         }
       }
       bool env = false;
-      if (!isFunc && !hasOrigin[n] && !isCert) {
+      if (exportedFormal && !isFunc && !hasOrigin[n] && !isCert) {
+        env = true; // a formal code outside the corpus may call
+        partialEnvRoots++;
+      } else if (!isFunc && !hasOrigin[n] && !isCert) {
         const IdKind ik = identityKindOf(n);
         if (VerboseLevel >= 2) identityKinds[idKindName[ik]]++;
         if (CFLAllocOrigins && !isEnvKind(ik)) {
@@ -1552,6 +1583,9 @@ bool CallGraphPass::runFlowsToResolution() {
         env = true;
       } else if (CFLAllocOrigins && !isFunc && isExternGlobalClass(n)) {
         env = true;
+      } else if (partialEnv && !isFunc && isVisibleGlobalClass(n)) {
+        env = true; // a global code outside the corpus may write
+        partialEnvRoots++;
       }
       uint32_t rid = nextRoot++;
       if (CFLAllocOrigins) {
@@ -2328,8 +2362,9 @@ bool CallGraphPass::runFlowsToResolution() {
       line += " " + k + " " + std::to_string(c);
     size_t nEnvRoots = 0;
     for (char e : envRoot) nEnvRoots += e;
-    CG_LOG("AllocOrigins: " << nEnvRoots << " environment roots; not "
-           << "minted:" << line << "\n");
+    CG_LOG("AllocOrigins: " << nEnvRoots << " environment roots ("
+           << partialEnvRoots << " for a partial corpus: visible globals "
+           << "and exported formals); not minted:" << line << "\n");
   }
   if (!lazyA.empty())
     CG_LOG("LazyMint: deferred " << lazyDeferred.size()
@@ -2676,7 +2711,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // (no live references across the flush).
   // Headroom bound: realized keys ≤ origins × NSHIFT; origins ≤ N.
   const uint32_t NCap =
-      CFLChannelCells ? N + std::max<uint32_t>(3 * N, 1u << 20) : N;
+      (CFLChannelCells || CFLKeyCells) ? N + std::max<uint32_t>(3 * N, 1u << 20)
+                                       : N;
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
       new std::atomic<uint8_t>[NCap]);
   for (uint32_t i = 0; i < NCap; i++)
@@ -3228,7 +3264,7 @@ bool CallGraphPass::runFlowsToResolution() {
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
     if (a == b) return a;
-    if (!CFLDumpMerges.empty())
+    if (!CFLDumpMerges.empty() || ruleReport)
       mergeLog.push_back({a, b, tKeyO, tKeyS, tPtr, mergeWhy, tCell});
     struct MergeTimer {
       uint64_t &acc, t0;
@@ -3606,6 +3642,12 @@ bool CallGraphPass::runFlowsToResolution() {
   // inserted. Named planes: into the class's identity shadow, or pending
   // until one joins (as the seeds of minted roots are).
   size_t envContentSeeded = 0, envContentMinted = 0;
+  // --cfl-key-cells: joins pend here and are wired at the drain barrier.
+  struct KeyPend { uint32_t cell, o, s; };
+  std::vector<KeyPend> keyPend;
+  boost::unordered_flat_set<std::pair<uint64_t, uint32_t>,
+                            boost::hash<std::pair<uint64_t, uint32_t>>>
+      keyPendSeen;
   // The content root at key (o, s) of environment root o: a new root one
   // level deeper, or o itself at the depth bound (environment memory is
   // then summarized; any depth is sound, Keys.EnvInit).
@@ -3665,6 +3707,11 @@ bool CallGraphPass::runFlowsToResolution() {
     // modes; channel mode adopted this rule first (2026-09-15).
     if (o < rootConstData.size() && rootConstData[o]) {
       chanConstSkipped++;
+      return;
+    }
+    if (CFLKeyCells) {
+      if (keyPendSeen.emplace((uint64_t)o * NSHIFT + s, cell).second)
+        keyPend.push_back({cell, o, s});
       return;
     }
     if (CFLChannelCells) {
@@ -3768,6 +3815,101 @@ bool CallGraphPass::runFlowsToResolution() {
     if (!wireCone.empty()) wireCone.push_back(1); // made from an in-cone cell
     chanNodes++;
     return id;
+  };
+  // --cfl-key-cells barrier flush (plan 3.13): a key cell per key (o, s);
+  // a dereference's write half feeds the key cells of its pointer's facts
+  // and its read half (out-edges, owned dereferences) is fed by them.
+  // Nothing merges: content crosses from a store to a load only through a
+  // key both pointers carry (or a wildcard key bridged pairwise).
+  boost::unordered_flat_map<uint64_t, uint32_t> keyNodeOf;
+  boost::unordered_flat_map<uint32_t, uint32_t> keyReadHalf; // cell -> rh
+  std::unordered_map<uint32_t, std::vector<uint32_t>> keyExactOf; // o -> K
+  std::unordered_map<uint32_t, uint32_t> keyXOf;                  // o -> K
+  boost::unordered_flat_set<uint64_t> keyWired; // (write half << 32) | K
+  boost::unordered_flat_set<uint64_t> keyReads; // (K << 32) | read half
+  size_t keyNodes = 0, keySplits = 0;
+  auto flushKeyPends = [&]() -> size_t {
+    if (!CFLKeyCells || keyPend.empty()) return 0;
+    size_t work = 0;
+    std::vector<KeyPend> pends;
+    pends.swap(keyPend);
+    for (const KeyPend &P : pends) {
+      const uint32_t cell = find(P.cell);
+      const uint64_t key = (uint64_t)P.o * NSHIFT + P.s;
+      auto [kit, kNew] = keyNodeOf.try_emplace(key, UINT32_MAX);
+      if (kNew) {
+        const uint32_t K = newSolverNode();
+        kit->second = K;
+        keyNodes++;
+        chanNodeName[K] =
+            "key(" +
+            (P.o < rootClassOf.size() ? protBlameName(rootClassOf[P.o]).substr(0, 40)
+                                      : std::string("?")) +
+            ",s" + std::to_string(P.s) + ")";
+        if (P.o < envRoot.size() && envRoot[P.o]) {
+          tHow = "env-content"; tFrom = UINT32_MAX;
+          const uint32_t c = envContentFor(P.o, cell);
+          envContentOfKey[key] = c;
+          envContentSeeded++;
+          addFact(K, (nexusGate && !rootNexus[c]) ? (uint32_t)SHIFT_X : 0u, c,
+                  ctx0);
+        }
+        if (NB > 0) { // the wildcard key exchanges with every exact key
+          tHow = "bridge-init"; tKeyO = P.o; tKeyS = P.s;
+          if (P.s == SHIFT_X) {
+            keyXOf[P.o] = K;
+            for (uint32_t K2 : keyExactOf[P.o]) addBridge(K, K2);
+          } else {
+            keyExactOf[P.o].push_back(K);
+            auto xi = keyXOf.find(P.o);
+            if (xi != keyXOf.end()) addBridge(K, xi->second);
+          }
+        }
+        work++;
+      }
+      const uint32_t K = find(kit->second);
+      auto [rit, rNew] = keyReadHalf.try_emplace(cell, UINT32_MAX);
+      if (rNew && (!outA[cell].empty() || !outF[cell].empty() ||
+                   !cellsOf[cell].empty())) {
+        const uint32_t rh = newSolverNode();
+        rit->second = rh;
+        keySplits++;
+        chanNodeName[rh] = "rh(" + protBlameName(cell).substr(0, 50) + ")";
+        outA[rh].swap(outA[cell]);
+        outF[rh].swap(outF[cell]);
+        cellsOf[rh].swap(cellsOf[cell]);
+        wflag[rh] = wflag[cell];
+        // What the cell held so far (its own writes) is what its reads
+        // already saw: hand it to the read half once.
+        tHow = "key-carry"; tFrom = cell; tKeyO = UINT32_MAX;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          if (R[cell][s2].any()) addBits(rh, s2, R[cell][s2], ctx0);
+          if (RB[cell][s2].any()) addBits(rh, s2, RB[cell][s2], ctx0);
+        }
+        work++;
+      }
+      if (keyWired.insert(((uint64_t)cell << 32) | K).second) {
+        outA[cell].push_back(K);
+        tHow = "key-in"; tFrom = cell; tKeyO = P.o; tKeyS = P.s; tCell = cell;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          if (R[cell][s2].any()) addBits(K, s2, R[cell][s2], ctx0);
+          if (RB[cell][s2].any()) addBits(K, s2, RB[cell][s2], ctx0);
+        }
+        work++;
+      }
+      const uint32_t rh = rit->second;
+      if (rh != UINT32_MAX && keyReads.insert(((uint64_t)K << 32) | rh).second) {
+        outA[K].push_back(rh);
+        tHow = "key-out"; tFrom = K; tKeyO = P.o; tKeyS = P.s; tCell = cell;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          if (R[K][s2].any()) addBits(rh, s2, R[K][s2], ctx0);
+          if (RB[K][s2].any()) addBits(rh, s2, RB[K][s2], ctx0);
+        }
+        work++;
+      }
+    }
+    flushCtx(ctx0);
+    return work;
   };
   // Barrier flush: materialize channels for pended (cell, o, s) joins
   // and wire directional edges. Store cell -> channel(o,s); channel ->
@@ -4662,6 +4804,10 @@ bool CallGraphPass::runFlowsToResolution() {
       // A named shadow collapsed with values would take their content
       // under its name, and pour its own into every name.
       if (nameOfCell(v) != ka::AccessNames::Original) return true;
+      // Key cells: dereference nodes (write halves), read halves and key
+      // cells never collapse with values (plan 3.14 (1)).
+      if (CFLKeyCells)
+        return v >= N || NF.isDereferenceNode(toOrig[v]);
       if (!CFLChannelCells) return false;
       if (v >= N) return true; // channel / read half
       return NF.isDereferenceNode(toOrig[v]);
@@ -5018,7 +5164,7 @@ bool CallGraphPass::runFlowsToResolution() {
       // cell to every residue's channel would repeat, per cell, what the
       // channel-level bridges already do (P-fold pend fan-out). Join on
       // native facts only.
-      if (CFLChannelCells) todo.intersectWith(R[n][s]);
+      if (CFLChannelCells || CFLKeyCells) todo.intersectWith(R[n][s]);
       if (cellsOf[n].empty()) { ctx.cyJoin += rd() - tp0; continue; }
       // Dedup stale cell entries to live union-find reps: after the
       // FIRST fact of a shift joins the cells they all share one rep,
@@ -5444,7 +5590,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // identity bits; stable A + empty backlog = restricted fixpoint.
   // Channel mode: also materialize pended channels/edges — new edges
   // seed facts, so drain again until neither expands.
-  } while (lazyExpand() > 0 || flushChannelPends() > 0);
+  } while (lazyExpand() > 0 || flushChannelPends() > 0 ||
+           flushKeyPends() > 0);
   } else {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
@@ -7222,6 +7369,49 @@ bool CallGraphPass::runFlowsToResolution() {
       continue; // re-drain with the full root set, then re-resolve
     }
     wideningReport();
+    if (CFLKeyCells) {
+      // Plan 3.14 (2): the wiring is dynamic, so check it per run: at the
+      // fixpoint every dereference is wired to the key cell of every
+      // native fact of its pointer (bridged facts are images of native
+      // ones; the key cells' bridges carry them).
+      size_t checked = 0, missing = 0, planes = 0;
+      for (uint32_t n = 0; n < (uint32_t)ufp.size(); n++) {
+        if (find(n) != n || cellsOf[n].empty()) continue;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+          R[n][s2].forEach([&](uint32_t o) {
+            const NodeIndex on0 = rootOrig(o);
+            if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode())
+              return; // joins on null keys are skipped (UB)
+            if (o < rootConstData.size() && rootConstData[o]) return;
+            auto kit = keyNodeOf.find((uint64_t)o * NSHIFT + s2);
+            for (uint32_t c : cellsOf[n]) {
+              checked++;
+              if (kit == keyNodeOf.end() ||
+                  !keyWired.count(((uint64_t)find(c) << 32) | find(kit->second))) {
+                if (++missing <= 5)
+                  errs() << "KeyCells: UNWIRED dereference "
+                         << protBlameName(find(c)).substr(0, 60) << " key (r" << o
+                         << ",s" << s2 << ")\n";
+              }
+            }
+          });
+      }
+      for (auto &[k, K] : keyNodeOf) {
+        bool any = false;
+        for (uint32_t s2 = 0; s2 < NSHIFT && !any; s2++)
+          any = R[find(K)][s2].any() || RB[find(K)][s2].any();
+        planes += any;
+      }
+      CG_LOG("KeyCells: " << keyNodes << " key cells (" << planes
+             << " holding content), " << keyWired.size()
+             << " write edges + " << keyReads.size() << " read edges, "
+             << keySplits << " read halves; certificate: " << checked
+             << " (dereference, fact) pairs, " << missing << " unwired\n");
+      if (missing)
+        report_fatal_error("--cfl-key-cells: " + Twine(missing) +
+                           " dereferences not wired to a key cell of their "
+                           "pointer's facts (plan 3.14 (2))");
+    }
     verifyClosure(); // certificate over the answer-producing fixpoint
     std::string emptyReadLine;
     if (CFLAllocOrigins) {
@@ -7269,6 +7459,9 @@ bool CallGraphPass::runFlowsToResolution() {
     // first union or bridge on the way (where the analysis, not a copy
     // in the program, put the origin there).
     std::unordered_map<uint32_t, std::vector<uint32_t>> arrByRid;
+    // Dereference nodes per class (a cell class holding several is a
+    // cluster the joins merged: a step through it crosses that merge).
+    std::vector<uint32_t> derefsIn;
     auto explainArrival = [&](NodeIndex canonPtr, uint32_t rid,
                               std::string &mergePoint) -> std::string {
       mergePoint.clear();
@@ -7301,10 +7494,21 @@ bool CallGraphPass::runFlowsToResolution() {
           st += " key=" + protBlameName(rootClassOf[a.keyO]).substr(0, 50);
         if (merged && a.ptr != UINT32_MAX && a.ptr < toOrig.size())
           st += " by=" + protBlameName(a.ptr).substr(0, 50);
-        // A class presolve formed (its component quotient merges values
-        // that share a source, outside the answer cone) is itself a
-        // merge: the origin reaches every member through it.
-        {
+        // A class the component presolve formed (it merges values that
+        // share a source, outside the answer cone) is itself a merge: the
+        // origin reaches every member through it. Exact presolve merges
+        // only mutual-flow cycles, which lose nothing.
+        if (derefsIn.empty()) {
+          derefsIn.assign(N, 0);
+          for (uint32_t u = 0; u < N; u++)
+            if (NF.isDereferenceNode(toOrig[u])) derefsIn[find(u)]++;
+        }
+        if (find(x) < derefsIn.size() && derefsIn[find(x)] > 1) {
+          st += " [cell cluster of " + std::to_string(derefsIn[find(x)]) +
+                " dereferences]";
+          merged = true;
+        }
+        if (!CFLPreSolveExact && !CFLChannelCells) {
           std::vector<NodeIndex> mem;
           collectCanonicalMembers(toOrig[x], mem);
           if (mem.size() > 1) {
@@ -7319,6 +7523,38 @@ bool CallGraphPass::runFlowsToResolution() {
       std::string out;
       for (auto i = steps.rbegin(); i != steps.rend(); ++i)
         out += (out.empty() ? "" : " -> ") + *i;
+      // The origin reached a class the pointer's own node was merged
+      // into later: the union that first joined them is the merge point.
+      uint32_t start = UINT32_MAX;
+      for (uint32_t y : arrByRid[rid])
+        if (find(y) == c && (start == UINT32_MAX || y == c)) start = y;
+      if (start != UINT32_MAX && start != d->second && !mergeLog.empty()) {
+        std::unordered_map<uint32_t, uint32_t> par;
+        auto f = [&](uint32_t u) {
+          while (true) {
+            auto it = par.find(u);
+            if (it == par.end() || it->second == u) return u;
+            u = it->second;
+          }
+        };
+        for (const MergeEv &e : mergeLog) {
+          const uint32_t ra = f(e.a), rb = f(e.b);
+          if (ra == rb) continue;
+          par[rb] = ra;
+          if (f(d->second) == f(start)) {
+            std::string m = std::string("class merge (") + e.why + ") of " +
+                            protBlameName(e.a).substr(0, 50) + " and " +
+                            protBlameName(e.b).substr(0, 50);
+            if (e.keyO != UINT32_MAX && e.keyO < rootClassOf.size())
+              m += " key=" + protBlameName(rootClassOf[e.keyO]).substr(0, 50);
+            if (e.ptr != UINT32_MAX && e.ptr < toOrig.size())
+              m += " by=" + protBlameName(e.ptr).substr(0, 50);
+            out += " => pointer's class joined it by " + m;
+            mergePoint = m;
+            break;
+          }
+        }
+      }
       return out;
     };
     if ((CFLCensusTypeLabels || ruleReport) && !cellNameOf.empty())

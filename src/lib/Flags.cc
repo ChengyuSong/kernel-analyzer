@@ -443,6 +443,28 @@ cl::opt<std::string> CFLRuleReport(
            "every first arrival (single-threaded solve)"),
   cl::init(""));
 
+cl::opt<bool> CFLKeyCells(
+  "cfl-key-cells",
+  cl::desc("Memory as key cells (plan 3.13): one cell per key (origin, "
+           "shift); a dereference writes into and reads from the key cells "
+           "of its pointer's facts through directed edges (each cell split "
+           "into a write half and a read half) and never merges with them; "
+           "key cells never merge. Dereference nodes stay out of every "
+           "merge (exact presolve, a-SCC collapse). Requires "
+           "--cfl-alloc-origins. Checked per run: every dereference is "
+           "wired to every key cell of its pointer's facts"),
+  cl::init(false));
+
+cl::opt<bool> CFLWholeProgram(
+  "cfl-whole-program",
+  cl::desc("With --cfl-alloc-origins: the input is a whole program (an "
+           "LTO link, the full kernel), so code outside it cannot write "
+           "its globals or call its functions. Off (default): every "
+           "externally visible global and every formal of an externally "
+           "visible function is also an environment site, whose content "
+           "is environment data (a partial corpus such as the km subset)"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLEnvDepth(
   "cfl-env-depth",
   cl::desc("With --cfl-alloc-origins: how many levels of environment "

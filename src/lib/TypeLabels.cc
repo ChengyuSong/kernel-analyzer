@@ -863,6 +863,7 @@ void CallGraphPass::runTypeLabelCensus(
   RO << "\n== (b) accesses reaching an object initialized as an "
         "incompatible struct\n";
   size_t explained = 0;
+  std::map<const Instruction *, unsigned> explainedAt;
   for (auto &h : ruleB) {
     bool isIcall = false;
     if (isa<LoadInst>(h.I))
@@ -872,7 +873,9 @@ void CallGraphPass::runTypeLabelCensus(
     RO << "B " << (h.only ? "only " : "mixed ") << locOf(h.I)
        << " access=" << accessNames->str(h.name) << (isIcall ? " icall" : "")
        << " origin=" << originName(h.rid) << " label=" << h.label << "\n";
-    if (explained < 500) {
+    // Up to three origins per access, 3000 in all: every access gets a
+    // derivation before any gets many.
+    if (explained < 3000 && explainedAt[h.I]++ < 3) {
       explained++;
       std::string merge;
       const std::string der = explain(h.ptr, h.rid, merge);

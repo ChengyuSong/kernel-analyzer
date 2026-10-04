@@ -56,6 +56,8 @@ extern cl::opt<std::string> CFLNamedUntyped;
 extern cl::opt<bool> CFLCensusTypeLabels;
 extern cl::opt<bool> CFLAllocOrigins;
 extern cl::opt<unsigned> CFLEnvDepth;
+extern cl::opt<bool> CFLWholeProgram;
+extern cl::opt<bool> CFLKeyCells;
 extern cl::opt<std::string> CFLRuleReport;
 extern cl::opt<std::string> CFLRegFieldWatch;
 extern cl::opt<bool> CFLChannelCells;

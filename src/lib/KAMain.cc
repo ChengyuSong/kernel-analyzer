@@ -216,6 +216,19 @@ int main(int argc, char **argv) {
       cliErrors.push_back("--cfl-alloc-origins is not ported to channel "
                           "cells, batched roots, lazy minting or lazy "
                           "addresses (each mints roots on its own path)");
+    if (CFLKeyCells && !CFLAllocOrigins)
+      cliErrors.push_back("--cfl-key-cells requires --cfl-alloc-origins "
+                          "(identity roots would key cells by invented "
+                          "origins)");
+    if (CFLKeyCells && (CFLNamedPlanes || CFLChannelCells ||
+                        CFLBatchRoots > 0 || CFLLazyMint || CFLLazyAddress ||
+                        CFLFlowsToSlice || CFLBidiPrune || CFLPreSolveOnce ||
+                        CFLVerifyClosure))
+      cliErrors.push_back("--cfl-key-cells (stage 1) refuses names, channel "
+                          "cells, batched roots, lazy minting, lazy "
+                          "addresses, slicing, bidi-prune, presolve-once and "
+                          "--cfl-verify-closure (its own wiring certificate "
+                          "runs instead)");
     if (!CFLRuleReport.empty() && !(CFLNamedPlanes && CFLAllocOrigins))
       cliErrors.push_back("--cfl-rule-report requires --cfl-named-planes "
                           "(access names) and --cfl-alloc-origins (an "

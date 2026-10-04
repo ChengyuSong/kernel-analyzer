@@ -616,3 +616,11 @@ Obligations left open:
    model.
 6. The rules are checked by the solver's own facts (L4), not proved:
    the report is the deliverable for programs that break them.
+7. Partial corpora (`--cfl-alloc-origins` without `--cfl-whole-program`):
+   externally visible globals and exported functions' formals are
+   environment sites whose content holds no code. Not covered: code
+   outside the corpus storing an in-corpus function's address into an
+   exported global (the content model would miss that function).
+8. `va_list` is modeled as memory (va_start writes the variadic
+   arguments into the va_list object, va_arg reads it); the lowered
+   va_arg sequence is recognized from GEPs that index `__va_list_tag`.

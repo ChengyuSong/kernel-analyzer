@@ -76,7 +76,7 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
   // Channel cells require the exact quotient: the V-component merge is
   // itself a symmetric (Steensgaard-style) unification, the class of
   // merge the pairwise cell model exists to remove.
-  if (CFLPreSolveExact || CFLChannelCells) {
+  if (CFLPreSolveExact || CFLChannelCells || CFLKeyCells) {
     const uint32_t M2 = (uint32_t)toCanon.size();
     std::vector<std::vector<uint32_t>> adjX(M2);
     for (auto &E : subEdges)
@@ -99,6 +99,10 @@ void CallGraphPass::preSolveCopyFieldMerge(const std::vector<size_t> *idx) {
     for (uint32_t ln = 0; ln < M2; ln++) {
       if (isShadowCell(toCanon[ln]))
         continue; // see the component loop below
+      // Key cells: a dereference node never merges (a read-modify-write
+      // cycle would fuse a cell with the values it feeds; plan 3.14 (1)).
+      if (CFLKeyCells && NF.isDereferenceNode(toCanon[ln]))
+        continue;
       csz[comp[ln]]++;
       if (repX[comp[ln]] == AndersNodeFactory::InvalidIndex)
         repX[comp[ln]] = toCanon[ln];

@@ -53,34 +53,55 @@ indirect call resolution, so these gaps mainly affect the type-based fallback.
 
 ## 4. Inline assembly
 
-**Status**: Not handled (known issue, to be addressed separately).
+**Status**: Handled (`handleInlineAsm`, `GraphBuild.cc`), with stated
+over-approximations.
 
-`visitCallBase` (`CallGraph.cc:490`) skips inline assembly calls entirely.
-This causes two categories of missing edges:
+- **Operands.** Tied outputs become copy edges. Indirect memory operands
+  (`=*m`, `*m`) on pointer or pointer-width integer slots become a store
+  to or a load from the slot's cell; this covers `this_cpu_read/write`
+  and `xchg`/`cmpxchg` on `i64`. Raw `"p"`/`"r"` pointer inputs flow into
+  the result, and, when the asm has a `"memory"` clobber or an indirect
+  output, also into every written cell. `"i"` immediates are skipped
+  unless the text reads `%gs:`/`%fs:` (the `current` idiom).
+- **Calls inside the asm text.** `call foo` is resolved by name
+  (`handleCall`), trying the size-suffixed variants of `__put_user_${N}`
+  style placeholders.
+- **Addresses taken in module-level asm.** Entries such as
+  `.long fn - .` in linker-gathered sections (initcalls, `pci_fixup`,
+  tracepoint pointers) mark `fn` as address-taken and make it a member of
+  the section array read through `__start_X`/`__stop_X`
+  (`--cfl-linker-arrays`, `wireLinkerSectionArrays`). Members of
+  sections with incomplete membership keep the universal node and are
+  ledgered; excluded families (ksymtab/kcrctab, static_call, jump_table,
+  ex_table, orc, mcount, ...) are ledgered in `CallGraph.cc`.
 
-- **Calls inside inline asm**: Functions called from inline assembly blocks
-  are invisible to LLVM's use-def chains.
-- **Address-taken via inline asm**: The Linux kernel extensively uses inline
-  asm to place function pointers into special sections (e.g., `__initcall`,
-  syscall tables, exception tables). These references are not visible as
-  LLVM IR uses of the function, so `hasAddressTaken()` returns `false` and
-  the CFL graph has no edges for them.
+**Remaining limitations**: asm effects are summarized from constraints,
+not from the instruction text; an indirect call written in the asm text
+(`call *%reg`) is not resolved, and a direct `call` the name match cannot
+resolve is missed; per-cpu `inttoptr(ptrtoint @pcpu + off)` rebasing is modeled
+only for globals in a `percpu` section (other rebasing is a counted
+residual).
 
 ## 5. `inttoptr` / integer-cast function pointers
 
-**Status**: Partially handled.
+**Status**: Handled, with provenance witnesses.
 
-`visitPtrToIntInst` creates assignment edges from the pointer operand to
-the integer result, and `visitIntToPtrInst` creates assignment edges from
-the integer operand to the pointer result. `visitBinaryOperator`
-propagates pointer identity through `ptr op const` patterns (integer
-binary ops where one operand is pointer-derived and the other is a
-constant).
+`visitPtrToIntInst` and `visitIntToPtrInst` add assignment edges through
+the integer. `visitBinaryOperator` adds an edge from EVERY
+pointer-derived operand to the result, so `ptr - ptr`, `ptr + var` and
+the kernel's `offset_to_ptr` / PREL32 consumer
+(`add(ptrtoint base, sext(*entry))`) all carry the pointer.
+Pointer-width integer loads, stores, phis, selects, returns, arguments
+and varargs are wired when a provenance witness (`mayCarryPtrProvenance`
+/ `mayBecomePointer`, depth 8) says the integer may hold a pointer.
+In field-sensitive mode a `ptrtoint` adds a wildcard (unknown offset) on
+its source unless every use is a tag round trip (low-bit or/xor/and,
+compare, `inttoptr`; `ptrToIntTagRoundTripOnly`); reasons are tallied in
+the wildcard census.
 
-**Remaining limitation**: Binary operations where both operands are
-non-constant (e.g., `ptr - ptr`, `ptr + var`) are not handled and
-produce a warning. Distinguishing these cases soundly requires pointer
-provenance tracking.
+**Remaining limitation**: the witnesses are syntactic and bounded
+(depth 8); an integer that carries a pointer past that depth, or through
+a path they do not follow, loses the flow.
 
 ## 6. `va_arg` extraction
 

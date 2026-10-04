@@ -1365,6 +1365,19 @@ bool CallGraphPass::runFlowsToResolution() {
   }
   std::unordered_map<uint32_t, const Function *> funcRootOf;
   std::vector<uint32_t> rootClassOf; // rid -> minted class
+  // The graph node a root was minted on. Key-identity roots
+  // (--cfl-key-identity) are minted on channel nodes, which lie past the
+  // dense graph and have no graph node: InvalidIndex.
+  auto rootOrig = [&](uint32_t rid) -> NodeIndex {
+    if (rid >= rootClassOf.size() || rootClassOf[rid] >= toOrig.size())
+      return AndersNodeFactory::InvalidIndex;
+    return toOrig[rootClassOf[rid]];
+  };
+  auto rootValue = [&](uint32_t rid) -> const Value * {
+    const NodeIndex n = rootOrig(rid);
+    return n == AndersNodeFactory::InvalidIndex ? nullptr
+                                                : NF.getValueForNode(n);
+  };
   std::vector<char> rootParkable;    // rid -> pure no-in identity
   std::vector<std::pair<uint32_t, uint32_t>> seeds; // (class, root id)
   uint32_t nextRoot = 0;
@@ -1733,7 +1746,7 @@ bool CallGraphPass::runFlowsToResolution() {
     for (uint32_t rid = 0; rid < nextRoot; rid++) {
       if (funcRootOf.count(rid))
         continue; // fn identities excluded: data-object plane only
-      const Value *ov = NF.getValueForNode(toOrig[rootClassOf[rid]]);
+      const Value *ov = rootValue(rid);
       const llvm::Module *om = nullptr;
       if (ov) {
         if (const auto *oi = dyn_cast<Instruction>(ov))
@@ -2424,7 +2437,7 @@ bool CallGraphPass::runFlowsToResolution() {
         bool hit = StringRef(nm).contains(want[w]);
         if (!hit) {
           // The rep may be another member of a merged class: scan them.
-          auto mit = canonicalClassMembers.find(toOrig[rootClassOf[rid]]);
+          auto mit = canonicalClassMembers.find(rootOrig(rid));
           if (mit != canonicalClassMembers.end())
             for (NodeIndex m3 : mit->second) {
               std::string mn = nodeNameOf(m3);
@@ -3298,8 +3311,7 @@ bool CallGraphPass::runFlowsToResolution() {
         std::string who = "ctx:" + std::string(blobCtx);
         const uint32_t bOrig = blobCtxOrigin;
         if (bOrig != UINT32_MAX && bOrig < rootClassOf.size()) {
-          const Value *wv =
-              NF.getValueForNode(toOrig[rootClassOf[bOrig]]);
+          const Value *wv = rootValue(bOrig);
           if (wv && wv->hasName())
             who = wv->getName().str();
           else if (wv) {
@@ -3312,7 +3324,7 @@ bool CallGraphPass::runFlowsToResolution() {
               who = (wa->getParent()->getName() + "::arg" +
                      Twine(wa->getArgNo())).str();
           } else {
-            const NodeIndex bn = toOrig[rootClassOf[bOrig]];
+            const NodeIndex bn = rootOrig(bOrig);
             auto pit = g_opaqueProvenance.find(bn);
             if (pit != g_opaqueProvenance.end()) {
               who = pit->second;
@@ -3500,7 +3512,7 @@ bool CallGraphPass::runFlowsToResolution() {
     {
       const uint32_t rid0 = o;
       if (rid0 != UINT32_MAX && rid0 < rootClassOf.size()) {
-        const NodeIndex on0 = toOrig[rootClassOf[rid0]];
+        const NodeIndex on0 = rootOrig(rid0);
         if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode()) {
           nullKeyJoinsSkipped++;
           return;
@@ -5780,7 +5792,7 @@ bool CallGraphPass::runFlowsToResolution() {
             // for NULL-rooted facts (store-through-null is UB, and the
             // null constant is a universal rendezvous) — mirror it.
             if (o < rootClassOf.size()) {
-              const NodeIndex on0 = toOrig[rootClassOf[o]];
+              const NodeIndex on0 = rootOrig(o);
               if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode())
                 return;
             }
@@ -6192,7 +6204,7 @@ bool CallGraphPass::runFlowsToResolution() {
           }
         errs() << " ]\n";
         // Members of the origin class: what merged into this orphan?
-        NodeIndex ocanon = toOrig[rootClassOf[o2]];
+        NodeIndex ocanon = rootOrig(o2);
         auto mIt = canonicalClassMembers.find(ocanon);
         if (mIt != canonicalClassMembers.end()) {
           size_t mShown = 0;
@@ -6676,13 +6688,12 @@ bool CallGraphPass::runFlowsToResolution() {
           for (uint32_t rid3 = 0; rid3 < nextRoot && shown3 < 14; rid3++) {
             if (funcRootOf.count(rid3)) continue;
             if (find(rootClassOf[rid3]) != wrep) continue;
-            const Value *ov3 =
-                NF.getValueForNode(toOrig[rootClassOf[rid3]]);
+            const Value *ov3 = rootValue(rid3);
             const llvm::Module *om3 = nullptr;
             std::string on3 = "<synthetic>";
             if (!ov3) {
               auto pit3 =
-                  g_opaqueProvenance.find(toOrig[rootClassOf[rid3]]);
+                  g_opaqueProvenance.find(rootOrig(rid3));
               if (pit3 != g_opaqueProvenance.end()) on3 = pit3->second;
             }
             if (ov3) {
@@ -6719,8 +6730,7 @@ bool CallGraphPass::runFlowsToResolution() {
       auto accum = [&](const FactSet &pl) {
         pl.forEach([&](uint32_t o3) {
           if (funcRootOf.count(o3)) return;
-          const Value *ov3 = o3 < rootClassOf.size()
-              ? NF.getValueForNode(toOrig[rootClassOf[o3]]) : nullptr;
+          const Value *ov3 = rootValue(o3);
           const llvm::Module *om3 = nullptr;
           if (ov3) {
             if (const auto *oi3 = dyn_cast<Instruction>(ov3))
@@ -7070,7 +7080,9 @@ bool CallGraphPass::runFlowsToResolution() {
           [&](uint32_t rid, std::vector<const Value *> &out) {
             out.clear();
             std::vector<NodeIndex> members;
-            collectCanonicalMembers(toOrig[rootClassOf[rid]], members);
+            const NodeIndex rn = rootOrig(rid);
+            if (rn == AndersNodeFactory::InvalidIndex) return;
+            collectCanonicalMembers(rn, members);
             for (NodeIndex m : members)
               if (const Value *V = NF.getValueForNode(m)) out.push_back(V);
           });

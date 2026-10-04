@@ -255,6 +255,16 @@ protected:
   void wireNamedStore(NodeIndex val, NodeIndex cell,
                       llvm::ArrayRef<uint32_t> names);
   void logNamedCells() const;
+  // --cfl-census-type-labels (TypeLabels.cc): object labels from their
+  // initializing writes, untyped writes retyped by them, named accesses
+  // checked against them. Measurement only.
+  void runTypeLabelCensus(
+      const std::function<void(NodeIndex, std::vector<uint32_t> &)> &originsOf,
+      const std::function<void(uint32_t, std::vector<const llvm::Value *> &)>
+          &originValues);
+  std::vector<std::pair<NodeIndex, std::string>> blindWriteLog;
+  std::vector<std::tuple<NodeIndex, uint32_t, const llvm::Instruction *>>
+      namedAccessLog;
   // Before each solve: give pending writes of names now read their
   // shadows, and let the loads of names opened since the last solve read
   // the unnamed shadow.

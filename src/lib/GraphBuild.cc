@@ -1337,6 +1337,8 @@ void CallGraphPass::fileUnnamedWrite(NodeIndex s, NodeIndex src,
   } else {
     blindWrites++;
     blindBy[where]++;
+    if (CFLCensusTypeLabels)
+      blindWriteLog.emplace_back(dst, where);
   }
   Graph.addCopy(s, namedShadow(dst, ka::AccessNames::Unnamed));
   namedStats.unnamedWrites++;
@@ -3245,6 +3247,8 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
           names = lanes;
       }
   }
+  if (CFLCensusTypeLabels && names[0] != ka::AccessNames::Unnamed)
+    CGP.namedAccessLog.emplace_back(derefNode, names[0], &I);
   CGP.wireNamedLoad(derefNode, valNode, names);
 }
 
@@ -3346,6 +3350,8 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
           names = lanes;
       }
   }
+  if (CFLCensusTypeLabels && names[0] != ka::AccessNames::Unnamed)
+    CGP.namedAccessLog.emplace_back(derefNode, names[0], &I);
   CellWriteSize ws(CGP, CGP.curDL->getTypeStoreSize(val->getType()));
   CGP.wireNamedStore(valNode, derefNode, names);
 }
@@ -4382,6 +4388,8 @@ void CallGraphPass::initSlotWrite(NodeIndex val, NodeIndex cell) {
     } else {
       blindWrites++;
       blindBy[gvName]++;
+      if (CFLCensusTypeLabels)
+        blindWriteLog.emplace_back(cell, gvName);
     }
   }
   if (name == ka::AccessNames::Unnamed)

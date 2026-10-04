@@ -211,6 +211,8 @@ int main(int argc, char **argv) {
                           "cells, lazy addresses, batched roots, lazy "
                           "minting or slicing (their relevance oracles and "
                           "seeding do not see a cell's name planes)");
+    if (CFLCensusTypeLabels && !CFLNamedPlanes)
+      cliErrors.push_back("--cfl-census-type-labels requires --cfl-named-planes");
     if (CFLNamedUntyped != "count" && CFLNamedUntyped != "open")
       cliErrors.push_back("--cfl-named-untyped must be 'count' or 'open'");
     if (CFLChannelCells && CFLKeyIdentity.getNumOccurrences() == 0) {

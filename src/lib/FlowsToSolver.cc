@@ -7043,6 +7043,30 @@ bool CallGraphPass::runFlowsToResolution() {
     }
     wideningReport();
     verifyClosure(); // certificate over the answer-producing fixpoint
+    if (CFLCensusTypeLabels && !cellNameOf.empty())
+      runTypeLabelCensus(
+          [&](NodeIndex canon, std::vector<uint32_t> &out) {
+            out.clear();
+            auto d = toDense.find(canon);
+            if (d == toDense.end()) return;
+            const uint32_t c = find(d->second);
+            for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+              auto add = [&](uint32_t r) {
+                if (!funcRootOf.count(r)) out.push_back(r);
+              };
+              R[c][s2].forEach(add);
+              RB[c][s2].forEach(add);
+            }
+            std::sort(out.begin(), out.end());
+            out.erase(std::unique(out.begin(), out.end()), out.end());
+          },
+          [&](uint32_t rid, std::vector<const Value *> &out) {
+            out.clear();
+            std::vector<NodeIndex> members;
+            collectCanonicalMembers(toOrig[rootClassOf[rid]], members);
+            for (NodeIndex m : members)
+              if (const Value *V = NF.getValueForNode(m)) out.push_back(V);
+          });
     // Named cells, measurement only: at an icall whose callee is loaded
     // through a name, the functions its name's plane holds and those
     // only the unnamed plane adds — what assuming that no unnamed write

@@ -1,0 +1,650 @@
+/*
+ * Call graph construction
+ *
+ * Copyright (C) 2024 - 2026 Chengyu Song
+ *
+ * For licensing details see LICENSE
+ */
+
+// TypeLabels.cc: type labels of memory objects, recovered from their
+// initialization (--cfl-census-type-labels; measurement only).
+//
+// Most heap allocation sites carry no type: malloc returns bytes, and a
+// wrapper (_TIFFmalloc, xmalloc) returns the same bytes to every caller.
+// The type appears when the caller initializes the object: the first
+// typed writes through the call's result (a struct GEP, a struct-path
+// TBAA tag) name the struct the object is. That struct is the object's
+// LABEL; the flows-to solution carries it from the allocation to every
+// use. With labels:
+//   - an untyped write (no struct position of its own) is typed by the
+//     labels of the objects its pointer reaches, or is harmless when
+//     those objects hold no struct at all;
+//   - a named access is checked against the labels of the objects it
+//     reaches: consistent ("the type shortcut is legit here") or not
+//     (a pun, or a merge of the analysis).
+// Globals and stack slots are labeled by their declared types.
+
+#include "CallGraphInternal.h"
+
+#include <llvm/IR/Dominators.h>
+#include <llvm/IR/Operator.h>
+
+namespace {
+
+std::string structKey(const llvm::StructType *ST) {
+  return stripStructNameSuffix(ST->getName()).str();
+}
+
+bool namedStruct(const llvm::StructType *ST) {
+  return ST && !ST->isLiteral() && ST->hasName() &&
+         !ST->getName().starts_with("union");
+}
+
+} // namespace
+
+void CallGraphPass::runTypeLabelCensus(
+    const std::function<void(NodeIndex, std::vector<uint32_t> &)> &originsOf,
+    const std::function<void(uint32_t, std::vector<const Value *> &)>
+        &originValues) {
+  // ---- 1. Allocation calls: direct allocators and their wrappers ----
+  // A wrapper returns only allocation results (through casts, phis of
+  // them, or null).
+  std::unordered_map<const Function *, int> wrapState; // 0 visiting, 1 yes, 2 no
+  std::function<bool(const Function *)> isAllocWrapper =
+      [&](const Function *F) -> bool {
+    if (!F || F->isDeclaration())
+      return false;
+    if (Ctx->AllocFuncs.count(const_cast<Function *>(F)))
+      return true;
+    auto [it, ins] = wrapState.try_emplace(F, 0);
+    if (!ins)
+      return it->second == 1;
+    bool any = false, all = true;
+    std::function<bool(const Value *, int)> allocResult =
+        [&](const Value *V, int depth) -> bool {
+      V = V->stripPointerCasts();
+      if (isa<ConstantPointerNull>(V))
+        return true;
+      if (const auto *PN = dyn_cast<PHINode>(V)) {
+        if (depth > 8)
+          return false;
+        for (const Value *In : PN->incoming_values())
+          if (!allocResult(In, depth + 1))
+            return false;
+        return true;
+      }
+      if (const auto *CB = dyn_cast<CallBase>(V)) {
+        if (Ctx->AllocSites.count(const_cast<CallBase *>(CB)))
+          return true;
+        return isAllocWrapper(CB->getCalledFunction());
+      }
+      return false;
+    };
+    for (const BasicBlock &BB : *F)
+      if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+        if (const Value *RV = RI->getReturnValue()) {
+          any = true;
+          if (!allocResult(RV, 0))
+            all = false;
+        }
+    const bool yes = any && all;
+    wrapState[F] = yes ? 1 : 2;
+    return yes;
+  };
+
+  // ---- 2. Labels of each allocation call from its typed writes ----
+  // Aliases of the result in the calling function: casts, constant GEPs
+  // (with their byte offset), and at -O0 the stack slot it is stored to
+  // when that slot is stored exactly once.
+  struct SiteLabel {
+    std::set<std::string> types; // outermost struct of typed writes at offset 0
+    std::string declared;        // the struct its debug-info variable declares
+    bool scalarUse = false;      // accessed as scalars/arrays (a buffer)
+  };
+  std::unordered_map<const CallBase *, SiteLabel> siteLabel;
+  size_t allocCalls = 0, wrapperCalls = 0;
+  // Address expressions within a function: the same base value (a
+  // stack slot stored once reads as what was stored) and the same
+  // constant GEP path denote the same memory. A slot stored once in a
+  // function and reloaded there reads the stored value back
+  // (store->load forwarding; the -O0 idiom `tif->tif_data = malloc(..);
+  // sp = (JPEGState *)tif->tif_data;`).
+  std::function<std::string(const Value *, int)> addrKey =
+      [&](const Value *P, int depth) -> std::string {
+    P = P->stripPointerCasts();
+    if (depth < 8) {
+      if (const auto *G = dyn_cast<GEPOperator>(P)) {
+        std::string k = addrKey(G->getPointerOperand(), depth + 1) + "/";
+        raw_string_ostream os(k);
+        G->getSourceElementType()->print(os);
+        for (const Use &Ix : G->indices()) {
+          const auto *CI = dyn_cast<ConstantInt>(Ix.get());
+          if (!CI)
+            return "v:" + std::to_string((uintptr_t)P);
+          os << ":" << CI->getSExtValue();
+        }
+        return os.str();
+      }
+      if (const auto *LI = dyn_cast<LoadInst>(P))
+        if (const auto *AI =
+                dyn_cast<AllocaInst>(LI->getPointerOperand()->stripPointerCasts())) {
+          const StoreInst *only = nullptr;
+          size_t n = 0;
+          for (const User *U : AI->users())
+            if (const auto *SI = dyn_cast<StoreInst>(U))
+              if (SI->getPointerOperand()->stripPointerCasts() == AI) {
+                n++;
+                only = SI;
+              }
+          if (n == 1)
+            return addrKey(only->getValueOperand(), depth + 1);
+        }
+    }
+    return "v:" + std::to_string((uintptr_t)P);
+  };
+  struct FnAddrs {
+    std::map<std::string, std::vector<const StoreInst *>> stores;
+    std::map<std::string, std::vector<const LoadInst *>> loads;
+  };
+  std::unordered_map<const Function *, FnAddrs> fnAddrs;
+  auto addrsOf = [&](const Function *F) -> const FnAddrs & {
+    auto [it, ins] = fnAddrs.try_emplace(F);
+    if (ins)
+      for (const Instruction &I : instructions(*F)) {
+        if (const auto *SI = dyn_cast<StoreInst>(&I))
+          it->second.stores[addrKey(SI->getPointerOperand(), 0)].push_back(SI);
+        else if (const auto *LI = dyn_cast<LoadInst>(&I))
+          if (LI->getType()->isPointerTy())
+            it->second.loads[addrKey(LI->getPointerOperand(), 0)].push_back(LI);
+      }
+    return it->second;
+  };
+  auto labelSite = [&](const CallBase *C) {
+    SiteLabel L;
+    const DataLayout &DL = C->getModule()->getDataLayout();
+    std::vector<std::pair<const Value *, int64_t>> work{{C, 0}};
+    std::set<const Value *> seen{C};
+    auto push = [&](const Value *V, int64_t off) {
+      if (seen.insert(V).second)
+        work.emplace_back(V, off);
+    };
+    for (size_t i = 0; i < work.size(); i++) {
+      const auto [V, off] = work[i];
+      if (L.declared.empty())
+        if (llvm::StructType *S = accessNames->baseStruct(V).S)
+          L.declared = structKey(S);
+      for (const User *U : V->users()) {
+        if (const auto *CI = dyn_cast<CastInst>(U)) {
+          if (CI->getType()->isPointerTy())
+            push(CI, off);
+        } else if (const auto *LI = dyn_cast<LoadInst>(U)) {
+          if (!LI->getType()->isPointerTy() && !LI->getType()->isAggregateType())
+            L.scalarUse = true;
+        } else if (const auto *G = dyn_cast<GEPOperator>(U)) {
+          if (G->getPointerOperand() != V)
+            continue;
+          if (!isa<llvm::StructType>(G->getSourceElementType()))
+            for (const User *GU : G->users())
+              if ((isa<LoadInst>(GU) && !GU->getType()->isPointerTy()) ||
+                  (isa<StoreInst>(GU) &&
+                   !cast<StoreInst>(GU)->getValueOperand()->getType()->isPointerTy()))
+                L.scalarUse = true;
+          // A struct GEP at the object's start names its type.
+          auto *ST = dyn_cast<llvm::StructType>(G->getSourceElementType());
+          if (off == 0 && namedStruct(ST)) {
+            bool written = false;
+            for (const User *GU : G->users())
+              if (const auto *SI = dyn_cast<StoreInst>(GU))
+                written |= SI->getPointerOperand() == G;
+              else
+                written |= isa<GEPOperator>(GU) || isa<CastInst>(GU);
+            if (written)
+              L.types.insert(structKey(ST));
+          }
+          APInt A(64, 0);
+          if (G->accumulateConstantOffset(DL, A))
+            push(G, off + A.getSExtValue());
+        } else if (const auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == V) {
+            if (!SI->getValueOperand()->getType()->isPointerTy() &&
+                !SI->getValueOperand()->getType()->isAggregateType())
+              L.scalarUse = true;
+            // A store at the object through a struct-path TBAA tag.
+            if (const MDNode *Tag = SI->getMetadata(LLVMContext::MD_tbaa))
+              if (Tag->getNumOperands() >= 3 &&
+                  Tag->getOperand(0) != Tag->getOperand(1))
+                if (const auto *B = dyn_cast<MDNode>(Tag->getOperand(0)))
+                  if (B->getNumOperands() >= 3)
+                    if (const auto *N = dyn_cast<MDString>(B->getOperand(0)))
+                      if (llvm::StructType *S = accessNames->structByTag(
+                              SI->getModule(), N->getString()))
+                        L.types.insert(structKey(S));
+          } else if (SI->getValueOperand() == V && off == 0) {
+            // The result stored to an address the function writes only
+            // here: its reloads in the function are the object.
+            const FnAddrs &FA = addrsOf(SI->getFunction());
+            const std::string K = addrKey(SI->getPointerOperand(), 0);
+            auto st = FA.stores.find(K);
+            if (st != FA.stores.end() && st->second.size() == 1) {
+              auto ld = FA.loads.find(K);
+              if (ld != FA.loads.end())
+                for (const LoadInst *LI : ld->second)
+                  push(LI, 0);
+            }
+          }
+        }
+      }
+    }
+    siteLabel[C] = std::move(L);
+  };
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I)) {
+          if (Ctx->AllocSites.count(const_cast<CallBase *>(CB))) {
+            allocCalls++;
+            labelSite(CB);
+          } else if (isAllocWrapper(CB->getCalledFunction())) {
+            wrapperCalls++;
+            labelSite(CB);
+          }
+        }
+
+  // ---- 3. Labels of each origin ----
+  // An origin's label set: for a heap origin, the labels of every
+  // allocation call whose result reaches it (a wrapper's single malloc
+  // collects all its callers' types); for a global or stack slot, its
+  // declared struct, or "nonstruct" when it holds no struct.
+  enum Kind { Heap, Declared, NonStruct, Unknown };
+  struct OriginLabel {
+    Kind kind = Unknown;
+    std::set<std::string> types;
+    bool buffer = false;
+  };
+  std::unordered_map<uint32_t, OriginLabel> originLabel;
+  auto declOf = [&](const Value *V, OriginLabel &L) {
+    Type *T = nullptr;
+    if (const auto *GV = dyn_cast<GlobalVariable>(V))
+      T = GV->getValueType();
+    else if (const auto *AI = dyn_cast<AllocaInst>(V))
+      T = AI->getAllocatedType();
+    if (!T)
+      return false;
+    while (T->isArrayTy())
+      T = T->getArrayElementType();
+    if (auto *ST = dyn_cast<llvm::StructType>(T)) {
+      if (namedStruct(ST)) {
+        L.kind = Declared;
+        L.types.insert(structKey(ST));
+      } else if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+        if (llvm::StructType *U = initUseTypeOf(GV)) {
+          L.kind = Declared;
+          L.types.insert(structKey(U));
+        }
+      }
+      return true;
+    }
+    if (L.kind == Unknown)
+      L.kind = NonStruct;
+    return true;
+  };
+  // The objects each labeling call creates: itself when it is an
+  // allocation (an allocator, or a wrapper --cfl-confirm-fresh promoted),
+  // else the allocations its wrapper returns (shared by all callers: such
+  // an object collects every caller's type). A call labels only these —
+  // never the other objects its result may point to.
+  std::function<void(const Function *, std::set<const CallBase *> &, int)>
+      innerAllocs = [&](const Function *F, std::set<const CallBase *> &out,
+                        int depth) {
+        if (!F || F->isDeclaration() || depth > 8)
+          return;
+        for (const BasicBlock &BB : *F)
+          if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            if (const Value *RV = RI->getReturnValue()) {
+              SmallVector<const Value *, 4> vs{RV->stripPointerCasts()};
+              while (!vs.empty()) {
+                const Value *V = vs.pop_back_val();
+                if (const auto *PN = dyn_cast<PHINode>(V)) {
+                  for (const Value *In : PN->incoming_values())
+                    vs.push_back(In->stripPointerCasts());
+                } else if (const auto *CB = dyn_cast<CallBase>(V)) {
+                  if (Ctx->AllocSites.count(const_cast<CallBase *>(CB)))
+                    out.insert(CB);
+                  else
+                    innerAllocs(CB->getCalledFunction(), out, depth + 1);
+                }
+              }
+            }
+      };
+  std::vector<uint32_t> rids;
+  std::vector<const Value *> vals;
+  std::unordered_map<const CallBase *, std::vector<uint32_t>> ridsOfAlloc;
+  auto originsCreatedBy = [&](const CallBase *A) -> const std::vector<uint32_t> & {
+    auto [it, ins] = ridsOfAlloc.try_emplace(A);
+    if (!ins)
+      return it->second;
+    NodeIndex n = getRepNodeForValue(A);
+    if (n == AndersNodeFactory::InvalidIndex)
+      return it->second;
+    std::vector<uint32_t> cand;
+    originsOf(getCanonicalNode(n), cand);
+    for (uint32_t r : cand) {
+      originValues(r, vals);
+      if (std::find(vals.begin(), vals.end(), A) != vals.end())
+        it->second.push_back(r);
+    }
+    return it->second;
+  };
+  for (auto &[C, SL] : siteLabel) {
+    std::set<const CallBase *> allocs;
+    if (Ctx->AllocSites.count(const_cast<CallBase *>(C)))
+      allocs.insert(C);
+    else
+      innerAllocs(C->getCalledFunction(), allocs, 0);
+    for (const CallBase *A : allocs)
+      for (uint32_t r : originsCreatedBy(A)) {
+        OriginLabel &L = originLabel[r];
+        L.kind = Heap;
+        L.types.insert(SL.types.begin(), SL.types.end());
+        if (SL.types.empty() && !SL.declared.empty())
+          L.types.insert(SL.declared); // typed only by its variable
+        if (SL.types.empty() && SL.declared.empty() && SL.scalarUse)
+          L.buffer = true;
+      }
+  }
+  // A heap object every creating call uses only as scalars is a buffer.
+  for (auto &[r, L] : originLabel)
+    if (L.kind == Heap && L.types.empty() && L.buffer)
+      L.kind = NonStruct;
+  auto labelOf = [&](uint32_t r) -> OriginLabel & {
+    auto [it, ins] = originLabel.try_emplace(r);
+    if (ins) {
+      originValues(r, vals);
+      for (const Value *V : vals)
+        declOf(V, it->second);
+    }
+    return it->second;
+  };
+
+  // Embedding: the struct names laid out inside a struct (itself included).
+  std::unordered_map<std::string, std::set<std::string>> emb;
+  std::unordered_map<std::string, llvm::StructType *> byName;
+  for (auto &[M, _] : Ctx->Modules)
+    for (llvm::StructType *ST : M->getIdentifiedStructTypes())
+      if (namedStruct(ST))
+        byName.try_emplace(structKey(ST), ST);
+  std::function<const std::set<std::string> &(const std::string &)> embOf =
+      [&](const std::string &K) -> const std::set<std::string> & {
+    auto [it, ins] = emb.try_emplace(K);
+    if (!ins)
+      return it->second;
+    std::set<std::string> out{K};
+    auto bit = byName.find(K);
+    if (bit != byName.end()) {
+      std::function<void(Type *)> walk = [&](Type *T) {
+        while (T->isArrayTy())
+          T = T->getArrayElementType();
+        if (auto *ST = dyn_cast<llvm::StructType>(T)) {
+          if (namedStruct(ST) && structKey(ST) != K) {
+            const auto &inner = embOf(structKey(ST));
+            out.insert(inner.begin(), inner.end());
+            return;
+          }
+          if (!ST->isOpaque())
+            for (Type *E : ST->elements())
+              walk(E);
+        }
+      };
+      if (!bit->second->isOpaque())
+        for (Type *E : bit->second->elements())
+          walk(E);
+    }
+    emb[K] = out;
+    return emb[K];
+  };
+  auto nameStruct = [&](uint32_t name) {
+    const std::string &s = accessNames->str(name);
+    return s.substr(0, s.rfind('+'));
+  };
+  // Labels one struct embeds at offset 0 of another are one type (the
+  // outer, e.g. LZWCodecState begins with an LZWBaseState).
+  auto atZero = [&](const std::string &U) {
+    std::set<std::string> out;
+    auto it = byName.find(U);
+    llvm::StructType *ST = it == byName.end() ? nullptr : it->second;
+    while (ST && !ST->isOpaque() && ST->getNumElements()) {
+      Type *E = ST->getElementType(0);
+      while (E->isArrayTy())
+        E = E->getArrayElementType();
+      ST = dyn_cast<llvm::StructType>(E);
+      if (ST && namedStruct(ST))
+        out.insert(structKey(ST));
+    }
+    return out;
+  };
+  for (auto &[r, L] : originLabel) {
+    if (L.types.size() < 2)
+      continue;
+    std::set<std::string> inner;
+    for (const std::string &U : L.types)
+      for (const std::string &T : atZero(U))
+        inner.insert(T);
+    for (const std::string &T : inner)
+      L.types.erase(T);
+  }
+
+  // ---- 4. Untyped writes, retyped by the labels they reach ----
+  size_t uHarmless = 0, uTyped = 0, uUnknown = 0, uNoFacts = 0;
+  std::map<std::string, size_t> uUnknownBy;
+  for (auto &[cell, where] : blindWriteLog) {
+    NodeIndex p = cellParent(cell);
+    if (p == AndersNodeFactory::InvalidIndex) {
+      uNoFacts++;
+      continue;
+    }
+    originsOf(getCanonicalNode(p), rids);
+    if (rids.empty()) {
+      uNoFacts++;
+      continue;
+    }
+    bool unknown = false, typed = false;
+    for (uint32_t r : rids) {
+      const OriginLabel &L = labelOf(r);
+      if (L.kind == Unknown || (L.kind == Heap && L.types.empty()))
+        unknown = true;
+      else if (!L.types.empty())
+        typed = true;
+    }
+    if (unknown) {
+      uUnknown++;
+      uUnknownBy[where]++;
+    } else if (typed) {
+      uTyped++;
+    } else {
+      uHarmless++;
+    }
+  }
+
+  // ---- 5. Named accesses against the labels they reach ----
+  struct Tally {
+    size_t legit = 0, mismatch = 0, unknown = 0;
+    size_t allBad = 0; // every labeled object reached is incompatible
+    // what the incompatible objects are
+    size_t byHeap = 0, byDecl = 0, byBuffer = 0;
+  };
+  Tally all, icall;
+  struct Mis {
+    const Instruction *I;
+    std::string name, label;
+  };
+  std::vector<Mis> mismatches;
+  std::vector<std::pair<const Instruction *, std::string>> onlyBad;
+  for (auto &[cell, name, I] : namedAccessLog) {
+    NodeIndex p = cellParent(cell);
+    if (p == AndersNodeFactory::InvalidIndex)
+      continue;
+    originsOf(getCanonicalNode(p), rids);
+    const std::string S = nameStruct(name);
+    bool mis = false, unk = rids.empty();
+    bool misHeap = false, misDecl = false, misBuf = false;
+    size_t good = 0;
+    std::string badLabel;
+    for (uint32_t r : rids) {
+      const OriginLabel &L = labelOf(r);
+      if (L.kind == Unknown || (L.kind == Heap && L.types.empty())) {
+        unk = true;
+        continue;
+      }
+      if (L.kind == NonStruct) {
+        mis = misBuf = true;
+        if (badLabel.empty())
+          badLabel = "<nonstruct>";
+        continue;
+      }
+      // Some type the object is initialized as must hold S.
+      bool fits = false;
+      for (const std::string &T : L.types)
+        if (embOf(T).count(S)) {
+          fits = true;
+          break;
+        }
+      if (fits)
+        good++;
+      if (!fits) {
+        mis = true;
+        (L.kind == Heap ? misHeap : misDecl) = true;
+        if (badLabel.empty())
+          for (const std::string &T : L.types)
+            badLabel += (badLabel.empty() ? "" : "|") + T;
+      }
+    }
+    bool isIcall = false;
+    if (isa<LoadInst>(I))
+      for (const User *U : I->users())
+        if (const auto *CB = dyn_cast<CallBase>(U))
+          isIcall |= CB->getCalledOperand() == I;
+    Tally &T2 = isIcall ? icall : all;
+    if (mis) {
+      T2.mismatch++;
+      if (!good) {
+        T2.allBad++;
+        std::string why = accessNames->str(name) + " reaches only:";
+        for (uint32_t r : rids) {
+          const OriginLabel &L = labelOf(r);
+          originValues(r, vals);
+          std::string ov = "?";
+          for (const Value *V : vals) {
+            if (const auto *I3 = dyn_cast<Instruction>(V))
+              ov = (I3->getFunction()->getName() + "::" + I3->getOpcodeName()).str();
+            else if (V->hasName())
+              ov = V->getName().str();
+            break;
+          }
+          why += " [" + ov + " = ";
+          if (L.kind == NonStruct)
+            why += "non-struct";
+          else
+            for (const std::string &T : L.types)
+              why += T + " ";
+          why += "]";
+          if (why.size() > 400)
+            break;
+        }
+        onlyBad.emplace_back(I, why);
+      }
+      T2.byHeap += misHeap;
+      T2.byDecl += misDecl;
+      T2.byBuffer += misBuf;
+      if (mismatches.size() < 4000)
+        mismatches.push_back({I, accessNames->str(name), badLabel});
+    } else if (unk) {
+      T2.unknown++;
+    } else {
+      T2.legit++;
+    }
+  }
+
+  // ---- Report ----
+  size_t heap = 0, heapOne = 0, heapMany = 0, heapNone = 0;
+  for (auto &[r, L] : originLabel)
+    if (L.kind == Heap) {
+      heap++;
+      if (L.types.empty())
+        heapNone++;
+      else if (L.types.size() == 1)
+        heapOne++;
+      else
+        heapMany++;
+    }
+  errs() << "TypeLabels: " << allocCalls << " allocator calls, "
+         << wrapperCalls << " wrapper calls labeled from their typed writes\n";
+  errs() << "TypeLabels: heap origins " << heap << ": " << heapOne
+         << " one type, " << heapMany << " several types (a shared wrapper "
+         << "or reuse), " << heapNone << " no typed write\n";
+  size_t shown = 0;
+  for (auto &[r, L] : originLabel)
+    if (L.kind == Heap && L.types.size() > 1 && shown++ < 12) {
+      originValues(r, vals);
+      std::string where = "?";
+      for (const Value *V : vals)
+        if (const auto *I2 = dyn_cast<Instruction>(V))
+          where = I2->getFunction()->getName().str();
+      errs() << "TypeLabels:   heap @" << where << " typed as " << L.types.size()
+             << " structs:";
+      size_t k = 0;
+      for (const std::string &T : L.types)
+        if (k++ < 8)
+          errs() << " " << T;
+      errs() << "\n";
+    }
+  errs() << "TypeLabels: untyped writes " << blindWriteLog.size() << ": "
+         << uHarmless << " reach only non-struct objects (harmless), " << uTyped
+         << " reach only labeled objects (typed by label), " << uUnknown
+         << " reach an unlabeled object, " << uNoFacts << " reach nothing\n";
+  {
+    std::vector<std::pair<size_t, std::string>> top;
+    for (auto &[w, c] : uUnknownBy)
+      top.emplace_back(c, w);
+    std::sort(top.rbegin(), top.rend());
+    for (size_t i = 0; i < top.size() && i < 10; i++)
+      errs() << "TypeLabels:   still untyped " << top[i].first << " "
+             << top[i].second << "\n";
+  }
+  auto line = [&](const char *what, const Tally &T) {
+    errs() << "TypeLabels: " << what << " " << T.legit + T.mismatch + T.unknown
+           << ": " << T.legit << " consistent with every label they reach, "
+           << T.mismatch << " reach an object labeled otherwise (" << T.allBad
+           << " only such objects; incompatible: heap-initialized "
+           << T.byHeap << ", declared " << T.byDecl << ", non-struct "
+           << T.byBuffer << "), " << T.unknown
+           << " reach an unlabeled object\n";
+  };
+  line("named accesses", all);
+  for (auto &[I3, why] : onlyBad) {
+    std::string loc = I3->getFunction()->getName().str();
+    if (const DILocation *DL3 = I3->getDebugLoc())
+      loc += " " + DL3->getFilename().str() + ":" + std::to_string(DL3->getLine());
+    errs() << "TypeLabels:   only-incompatible " << loc << ": " << why << "\n";
+  }
+  line("named icall-callee loads", icall);
+  std::map<std::pair<std::string, std::string>, std::pair<size_t, const Instruction *>> mk;
+  for (auto &m : mismatches) {
+    auto &e = mk[{m.name, m.label}];
+    if (!e.first++)
+      e.second = m.I;
+  }
+  std::vector<std::tuple<size_t, std::string, std::string, const Instruction *>> mtop;
+  for (auto &[k, v] : mk)
+    mtop.emplace_back(v.first, k.first, k.second, v.second);
+  std::sort(mtop.begin(), mtop.end(),
+            [](auto &a, auto &b) { return std::get<0>(a) > std::get<0>(b); });
+  for (size_t i = 0; i < mtop.size() && i < 15; i++) {
+    const Instruction *I2 = std::get<3>(mtop[i]);
+    std::string loc = I2->getFunction()->getName().str();
+    if (const DILocation *L = I2->getDebugLoc())
+      loc += " " + L->getFilename().str() + ":" + std::to_string(L->getLine());
+    errs() << "TypeLabels:   mismatch x" << std::get<0>(mtop[i]) << " "
+           << std::get<1>(mtop[i]) << " on " << std::get<2>(mtop[i]) << " ("
+           << loc << ")\n";
+  }
+}

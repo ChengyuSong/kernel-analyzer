@@ -16,6 +16,7 @@ set (KACoreSource
   FlowsToSolver.cc
   Names.cc
   NamedCells.cc
+  TypeLabels.cc
   Summaries.cc
   Census.cc
   Dump.cc

@@ -419,6 +419,18 @@ cl::opt<std::string> CFLNamedUntyped(
            "skips the unnamed plane (sound, plan decision 7)"),
   cl::init("count"));
 
+cl::opt<bool> CFLCensusTypeLabels(
+  "cfl-census-type-labels",
+  cl::desc("With --cfl-named-planes, after the fixpoint: label every "
+           "object by the struct its initializing writes name (heap "
+           "allocations through allocator and wrapper calls; globals and "
+           "stack slots by declaration), then report how many untyped "
+           "writes the labels type, and how many named accesses reach "
+           "only objects consistent with their struct (where the type "
+           "shortcut holds) versus objects labeled otherwise. "
+           "Measurement only (docs/named-cells-design.md)"),
+  cl::init(false));
+
 cl::opt<std::string> CFLRegFieldWatch(
   "cfl-regfield-watch",
   cl::desc("With --cfl-regfield-apply: comma-separated fn names; log "

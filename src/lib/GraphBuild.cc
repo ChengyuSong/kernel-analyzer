@@ -3340,10 +3340,46 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
 
   SmallVector<uint32_t, 4> names{ka::AccessNames::Unnamed};
   if (CGP.namedPlanes()) {
-    if (val->getType()->isPointerTy())
-      names[0] = CGP.accessNames->ofMemAccess(
-          I, ptr, CGP.curDL->getTypeStoreSize(val->getType()), *CGP.curDL);
-    else if (auto *VT = dyn_cast<VectorType>(val->getType()))
+    if (val->getType()->isPointerTy()) {
+      const uint64_t sz = CGP.curDL->getTypeStoreSize(val->getType());
+      names[0] = CGP.accessNames->ofMemAccess(I, ptr, sz, *CGP.curDL);
+      // A store through a phi or select of addresses (-O3 sinks the
+      // stores of two branches into one, e.g. a hash bucket and a
+      // chain link) lands on one of them: file it under every incoming
+      // name, as lanes are. If any incoming address has no name, the
+      // store stays unnamed (an untyped write).
+      if (names[0] == ka::AccessNames::Unnamed) {
+        SmallVector<const Value *, 8> work{ptr->stripPointerCasts()}, leaves;
+        SmallPtrSet<const Value *, 8> seen;
+        bool merged = false, allNamed = true;
+        while (!work.empty() && allNamed) {
+          const Value *P = work.pop_back_val();
+          if (!seen.insert(P).second) continue;
+          if (seen.size() > 16) { allNamed = false; break; }
+          if (const auto *PN = dyn_cast<PHINode>(P)) {
+            merged = true;
+            for (const Value *In : PN->incoming_values())
+              work.push_back(In->stripPointerCasts());
+          } else if (const auto *SI = dyn_cast<SelectInst>(P)) {
+            merged = true;
+            work.push_back(SI->getTrueValue()->stripPointerCasts());
+            work.push_back(SI->getFalseValue()->stripPointerCasts());
+          } else {
+            leaves.push_back(P);
+          }
+        }
+        if (merged && allNamed && !leaves.empty()) {
+          SmallVector<uint32_t, 4> incoming;
+          for (const Value *P : leaves) {
+            const uint32_t n = CGP.accessNames->ofMemAccess(I, P, sz, *CGP.curDL);
+            if (n == ka::AccessNames::Unnamed) { incoming.clear(); break; }
+            if (std::find(incoming.begin(), incoming.end(), n) == incoming.end())
+              incoming.push_back(n);
+          }
+          if (!incoming.empty()) names = incoming;
+        }
+      }
+    } else if (auto *VT = dyn_cast<VectorType>(val->getType()))
       if (VT->getElementType()->isPointerTy()) {
         auto lanes = CGP.accessNames->ofLanes(ptr, VT, *CGP.curDL);
         if (!lanes.empty())

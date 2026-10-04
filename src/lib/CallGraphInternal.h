@@ -123,7 +123,7 @@ bool linkerExcludedFamily(StringRef K);
 const AllocaInst *spillSlotOf(const Value *v);
 void reachingSlotStoresOf(const LoadInst *L, const AllocaInst *AI, SmallVectorImpl<const StoreInst *> &out);
 void loadFuncSummaries(GlobalContext *Ctx, const std::string &path);
-const GlobalContext::FuncSummary * summaryForName(GlobalContext *Ctx, StringRef name);
+const GlobalContext::FuncSummary * summaryForName(GlobalContext *Ctx, StringRef name, bool hasBody = false);
 void walkInitFnOffsets(const Constant *C, uint64_t base, const DataLayout &DL, std::set<int64_t> &out);
 void walkInitFnSlots(const Constant *C, uint64_t base, const DataLayout &DL, std::map<uint64_t, const Function *> &out);
 void checkFileSummaries(GlobalContext *Ctx);

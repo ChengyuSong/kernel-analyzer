@@ -201,7 +201,7 @@ bool CallGraphPass::doInitialization(Module *M) {
     // it, legacy behavior is unchanged.
     if (!Ctx->SummarySpecs.empty()) {
       g_sumAuthoritative = true; // file owns skip lists too (NOOP)
-      if (const auto *S = summaryForName(Ctx, F.getName())) {
+      if (const auto *S = summaryForName(Ctx, F.getName(), !F.isDeclaration())) {
         // FRESH on a void-returning function is a glob overreach
         // ("vmalloc*" caught void vmalloc_init): treating it as an
         // allocator SKIPS ITS BODY, silently severing every registration

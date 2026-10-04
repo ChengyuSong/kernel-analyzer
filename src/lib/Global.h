@@ -196,6 +196,13 @@ public:
                         // (free/printk/lock entry points — replaces the
                         // hardcoded isFreeFn/isKernelUtilityFn lists
                         // when the file is loaded; task #44 follow-up)
+    bool externOnly = false; // '@scope extern' block: applies only to
+                        // functions WITHOUT a body in the corpus. A
+                        // libc-derived entry must never replace a
+                        // same-named in-corpus definition (5.18: 'sort
+                        // NOOP' cut the comparator flow of lib/sort.c,
+                        // 'sem_init NOOP' erased ipc/sem.c's registration
+                        // of sysvipc_sem_proc_show; 10 GT misses).
   };
   // Ordered specs (first match wins; trailing '*' = prefix match) and
   // the per-Function resolution filled during doInitialization.

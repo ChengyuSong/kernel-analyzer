@@ -863,13 +863,29 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
          nNone = 0, nInv = 0, nChR = 0, nChC = 0, nNoop = 0, nChGated = 0;
+  // '@scope extern' / '@scope all': entries that follow apply only to
+  // functions without a body / to every function (default). Derived
+  // libc blocks are extern-only: a program that defines a same-named
+  // function (the kernel's sort, sem_init, strlcpy; tcpdump's strlcpy)
+  // gets its body analyzed, not the libc model.
+  bool scopeExtern = false;
   while (std::getline(in, line)) {
     lineNo++;
     StringRef L = StringRef(line).trim();
     if (L.empty() || L.starts_with("#")) continue;
+    if (L.starts_with("@")) {
+      StringRef d = L.drop_front(1).trim();
+      if (d == "scope extern") { scopeExtern = true; continue; }
+      if (d == "scope all") { scopeExtern = false; continue; }
+      errs() << "FuncSummary: " << path << ":" << lineNo
+             << ": unknown directive '" << L << "'\n";
+      assert(false && "unknown func_summaries directive");
+      continue;
+    }
     SmallVector<StringRef, 6> toks;
     L.split(toks, ' ', -1, false);
     GlobalContext::FuncSummary S;
+    S.externOnly = scopeExtern;
     bool hasChainAtom = false;
     bool bad = toks.size() < 2;
     for (size_t i = 1; i < toks.size() && !bad; i++) {
@@ -1128,8 +1144,18 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
 
 // First-match-wins spec lookup ('*' suffix = prefix).
 const GlobalContext::FuncSummary *
-summaryForName(GlobalContext *Ctx, StringRef name) {
+summaryForName(GlobalContext *Ctx, StringRef name, bool hasBody) {
   for (const auto &sp : Ctx->SummarySpecs) {
+    // An extern-only spec does not match a function that has a body;
+    // matching continues (a later '@scope all' rule may still apply).
+    if (hasBody && sp.second.externOnly) {
+      StringRef p0(sp.first);
+      bool h0 = p0.consume_back("*") ? name.starts_with(p0) : name == sp.first;
+      if (h0)
+        CG_LOG("FuncSummary: extern-only spec '" << sp.first
+               << "' skipped for defined function " << name << "\n");
+      continue;
+    }
     StringRef pat(sp.first);
     bool glob = StringRef(sp.first).ends_with("*");
     bool hit = pat.consume_back("*") ? name.starts_with(pat) : name == pat;

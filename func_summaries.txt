@@ -104,6 +104,10 @@ linked_list_iterate DISPATCH(arg1:f0<-**arg0@24) DISPATCH(arg1:f1<-arg2)
 linked_list_destroy DISPATCH(**arg0@0:f0<-**arg0@24)
 linked_list_unlink DISPATCH(*arg0@0:f0<-*arg1@24)
 
+# The two libc blocks below apply ONLY to functions the corpus does not
+# define (@scope extern): a same-named in-corpus function keeps its body
+# (kernel lib/sort.c sort, ipc/sem.c sem_init, tcpdump's strlcpy).
+@scope extern
 # ---- libc callback interfaces (2026-09-16, from the man pages) ----
 # The registration pairs of userspace: the callback's data-carrying
 # formals are bound at the registration site (INVOKE), which also
@@ -836,6 +840,7 @@ ldexp NOOP
 fmodf NOOP
 casemap NOOP
 
+@scope all
 # ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
 # apr_palloc carves from shared allocator blocks; FRESH on the leaf
 # dup/create family severs per-callsite object identity from the pool

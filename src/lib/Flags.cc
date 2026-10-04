@@ -455,6 +455,17 @@ cl::opt<bool> CFLKeyCells(
            "wired to every key cell of its pointer's facts"),
   cl::init(false));
 
+cl::opt<bool> CFLKeyHubs(
+  "cfl-key-hubs",
+  cl::desc("With --cfl-key-cells: wire through shared hubs. Memory nodes "
+           "whose pointers have the same native fact set and the same name "
+           "share one hub (a write half feeding the key cells of the set, "
+           "a read half they feed), so the wiring costs the sum over "
+           "distinct (set, name) of |set| instead of the sum over memory "
+           "nodes. Exact: a node keeps its earlier hubs, whose sets are "
+           "subsets of its current one"),
+  cl::init(false));
+
 cl::opt<bool> CFLWholeProgram(
   "cfl-whole-program",
   cl::desc("With --cfl-alloc-origins: the input is a whole program (an "

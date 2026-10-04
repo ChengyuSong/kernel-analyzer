@@ -3647,6 +3647,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // --cfl-key-cells: joins pend here and are wired at the drain barrier.
   struct KeyPend { uint32_t cell, o, s; };
   std::vector<KeyPend> keyPend;
+  std::vector<uint32_t> hubDirty; // --cfl-key-hubs: classes with new facts
   boost::unordered_flat_set<std::pair<uint64_t, uint32_t>,
                             boost::hash<std::pair<uint64_t, uint32_t>>>
       keyPendSeen;
@@ -3927,6 +3928,145 @@ bool CallGraphPass::runFlowsToResolution() {
           if (RB[K][s2].any()) addBits(rh, s2, RB[K][s2], ctx0);
         }
         work++;
+      }
+    }
+    flushCtx(ctx0);
+    return work;
+  };
+  // --cfl-key-hubs: hubs per (native fact set, name).
+  struct KeyHub { std::vector<uint64_t> set; uint32_t nm, w, r; };
+  std::vector<KeyHub> hubs;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> hubsByHash;
+  boost::unordered_flat_set<uint64_t> hubIn, hubOut; // (node << 32) | hub w/r
+  size_t hubKeyEdges = 0, hubRounds = 0;
+  // The key cell (o, s, nm), created as the plain flush creates it.
+  auto keyCellFor = [&](uint32_t o, uint32_t sft, uint32_t nm,
+                        uint32_t cell) -> uint32_t {
+    const uint64_t key = (uint64_t)o * NSHIFT + sft;
+    auto [kit, kNew] = keyNodeOf.try_emplace(std::make_pair(key, nm), UINT32_MAX);
+    if (!kNew) return find(kit->second);
+    const uint32_t K = newSolverNode();
+    kit->second = K;
+    keyNodes++;
+    keyNamesOf[key].push_back(nm);
+    chanNodeName[K] = "key(" + (o < rootClassOf.size()
+                                    ? protBlameName(rootClassOf[o]).substr(0, 40)
+                                    : std::string("?")) +
+                      ",s" + std::to_string(sft) + ")";
+    if (o < envRoot.size() && envRoot[o] &&
+        (nm == ka::AccessNames::Original || nm == ka::AccessNames::Identity)) {
+      tHow = "env-content"; tFrom = UINT32_MAX;
+      auto eit = envContentOfKey.find(key);
+      const uint32_t c = eit != envContentOfKey.end()
+                             ? eit->second
+                             : (envContentOfKey[key] = envContentFor(o, cell));
+      envContentSeeded++;
+      addFact(K, (nexusGate && !rootNexus[c]) ? (uint32_t)SHIFT_X : 0u, c, ctx0);
+    }
+    if (NB > 0) {
+      tHow = "bridge-init"; tKeyO = o; tKeyS = sft;
+      const uint64_t on = ((uint64_t)o << 32) | nm;
+      if (sft == SHIFT_X) {
+        keyXOf[on] = K;
+        for (uint32_t K2 : keyExactOf[on]) addBridge(K, K2);
+      } else {
+        keyExactOf[on].push_back(K);
+        auto xi = keyXOf.find(on);
+        if (xi != keyXOf.end()) addBridge(K, xi->second);
+      }
+    }
+    return K;
+  };
+  auto pushPlanes = [&](uint32_t from, uint32_t to) {
+    for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+      if (R[from][s2].any()) addBits(to, s2, R[from][s2], ctx0);
+      if (RB[from][s2].any()) addBits(to, s2, RB[from][s2], ctx0);
+    }
+  };
+  auto nativeKeySet = [&](uint32_t p, std::vector<uint64_t> &set) {
+    set.clear();
+    for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+      R[p][s2].forEach([&](uint32_t o) {
+        const NodeIndex on0 = rootOrig(o);
+        if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode())
+          return; // joins on null keys are skipped (UB)
+        if (o < rootConstData.size() && rootConstData[o]) return;
+        set.push_back(((uint64_t)o << 8) | s2);
+      });
+    std::sort(set.begin(), set.end());
+  };
+  auto hubFor = [&](const std::vector<uint64_t> &set, uint32_t nm,
+                    uint32_t cell) -> uint32_t {
+    uint64_t h = 1469598103934665603ULL ^ nm;
+    for (uint64_t k : set) h = (h ^ k) * 1099511628211ULL;
+    auto &cands = hubsByHash[h];
+    for (uint32_t hi : cands)
+      if (hubs[hi].nm == nm && hubs[hi].set == set) return hi;
+    KeyHub H{set, nm, newSolverNode(), newSolverNode()};
+    chanNodeName[H.w] = "hubw(" + std::to_string(set.size()) + ")";
+    chanNodeName[H.r] = "hubr(" + std::to_string(set.size()) + ")";
+    for (uint64_t k : set) {
+      const uint32_t o = (uint32_t)(k >> 8), sft = (uint32_t)(k & 0xff);
+      const uint32_t K = keyCellFor(o, sft, nm, cell);
+      tHow = "key-in"; tFrom = H.w; tKeyO = o; tKeyS = sft;
+      outA[H.w].push_back(K);
+      outA[K].push_back(H.r);
+      tHow = "key-out"; tFrom = K;
+      pushPlanes(K, H.r);
+      hubKeyEdges += 2;
+    }
+    hubs.push_back(std::move(H));
+    cands.push_back((uint32_t)hubs.size() - 1);
+    return (uint32_t)hubs.size() - 1;
+  };
+  auto flushHubs = [&]() -> size_t {
+    if (!CFLKeyHubs || hubDirty.empty()) return 0;
+    hubRounds++;
+    size_t work = 0;
+    std::vector<uint32_t> dirty;
+    dirty.swap(hubDirty);
+    for (auto &d : dirty) d = find(d);
+    std::sort(dirty.begin(), dirty.end());
+    dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
+    std::vector<uint64_t> set;
+    for (uint32_t p : dirty) {
+      if (find(p) != p || cellsOf[p].empty()) continue;
+      nativeKeySet(p, set);
+      if (set.empty()) continue;
+      for (uint32_t cRaw : cellsOf[p]) {
+        const uint32_t m = find(cRaw);
+        const uint32_t hi = hubFor(set, nameOfCell(m), m);
+        const uint32_t hw = hubs[hi].w, hr = hubs[hi].r;
+        // read half of the memory node, as the plain flush splits it
+        auto [rit, rNew] = keyReadHalf.try_emplace(m, UINT32_MAX);
+        if (rNew && (!outA[m].empty() || !outF[m].empty() ||
+                     !cellsOf[m].empty())) {
+          const uint32_t rh = newSolverNode();
+          rit->second = rh;
+          keySplits++;
+          chanNodeName[rh] = "rh(" + protBlameName(m).substr(0, 50) + ")";
+          outA[rh].swap(outA[m]);
+          outF[rh].swap(outF[m]);
+          cellsOf[rh].swap(cellsOf[m]);
+          wflag[rh] = wflag[m];
+          tHow = "key-carry"; tFrom = m; tKeyO = UINT32_MAX;
+          pushPlanes(m, rh);
+          hubDirty.push_back(rh); // it now owns m's dereferences
+          work++;
+        }
+        if (hubIn.insert(((uint64_t)m << 32) | hw).second) {
+          outA[m].push_back(hw);
+          tHow = "hub-in"; tFrom = m;
+          pushPlanes(m, hw);
+          work++;
+        }
+        const uint32_t rh = rit->second;
+        if (rh != UINT32_MAX && hubOut.insert(((uint64_t)hr << 32) | rh).second) {
+          outA[hr].push_back(rh);
+          tHow = "hub-out"; tFrom = hr;
+          pushPlanes(hr, rh);
+          work++;
+        }
       }
     }
     flushCtx(ctx0);
@@ -5214,6 +5354,12 @@ bool CallGraphPass::runFlowsToResolution() {
       todo.subtract(joined[n][s]);
       const uint64_t todoCnt = todo.count();
       if (todoCnt == 0) { ctx.cyJoin += rd() - tp0; continue; }
+      if (CFLKeyHubs) { // the barrier re-hubs the class on its new set
+        joined[n][s].unionWith(todo);
+        hubDirty.push_back(n);
+        ctx.cyJoin += rd() - tp0;
+        continue;
+      }
       if (prof) ctx.sweepKept += todoCnt;
       // Fast path eligibility: the measurement flags reroute joins and
       // the prot path bypasses the registry — both must stay slow-path.
@@ -5623,7 +5769,7 @@ bool CallGraphPass::runFlowsToResolution() {
   // Channel mode: also materialize pended channels/edges — new edges
   // seed facts, so drain again until neither expands.
   } while (lazyExpand() > 0 || flushChannelPends() > 0 ||
-           flushKeyPends() > 0);
+           flushKeyPends() > 0 || flushHubs() > 0);
   } else {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
@@ -7431,11 +7577,30 @@ bool CallGraphPass::runFlowsToResolution() {
       // native fact of its pointer (bridged facts are images of native
       // ones; the key cells' bridges carry them).
       size_t checked = 0, missing = 0, planes = 0, ptrClasses = 0,
-             classKeys = 0;
+             classKeys = 0, hubEdges = 0, hubMembers = 0;
+      std::map<std::pair<uint64_t, uint32_t>, std::pair<size_t, int>> hubSets;
       for (uint32_t n = 0; n < (uint32_t)ufp.size(); n++) {
         if (find(n) != n || cellsOf[n].empty()) continue;
         ptrClasses++;
-        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) classKeys += R[n][s2].count();
+        // Option (b) estimate: memory nodes whose pointers have equal
+        // native fact sets could share one wiring hub per name.
+        uint64_t h = 1469598103934665603ULL;
+        size_t sz = 0;
+        for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+          classKeys += R[n][s2].count();
+          R[n][s2].forEach([&](uint32_t o) {
+            h = (h ^ (((uint64_t)s2 << 32) | o)) * 1099511628211ULL;
+            sz++;
+          });
+        }
+        std::map<uint32_t, uint32_t> namesHere; // name -> memory nodes
+        for (uint32_t c : cellsOf[n]) namesHere[nameOfCell(find(c))]++;
+        for (auto &[nm, cnt] : namesHere) {
+          auto &e = hubSets[{h, nm}];
+          if (!e.first++) hubEdges += 2 * sz; // hub -> keys, keys -> hub
+          hubMembers += 2 * cnt;              // node -> hub, hub -> node
+          (void)e;
+        }
         for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
           R[n][s2].forEach([&](uint32_t o) {
             const NodeIndex on0 = rootOrig(o);
@@ -7444,6 +7609,7 @@ bool CallGraphPass::runFlowsToResolution() {
             if (o < rootConstData.size() && rootConstData[o]) return;
             for (uint32_t c : cellsOf[n]) {
               checked++;
+              if (CFLKeyHubs) continue; // checked per hub below
               auto kit = keyNodeOf.find(std::make_pair(
                   (uint64_t)o * NSHIFT + s2, nameOfCell(find(c))));
               if (kit == keyNodeOf.end() ||
@@ -7455,6 +7621,34 @@ bool CallGraphPass::runFlowsToResolution() {
               }
             }
           });
+      }
+      if (CFLKeyHubs) {
+        // Every memory node is attached to the hub of its pointer's final
+        // native set (the hub is wired to every key of the set when made).
+        std::vector<uint64_t> set;
+        for (uint32_t n = 0; n < (uint32_t)ufp.size(); n++) {
+          if (find(n) != n || cellsOf[n].empty()) continue;
+          nativeKeySet(n, set);
+          if (set.empty()) continue;
+          for (uint32_t c : cellsOf[n]) {
+            const uint32_t m = find(c), nm = nameOfCell(m);
+            uint64_t h = 1469598103934665603ULL ^ nm;
+            for (uint64_t k : set) h = (h ^ k) * 1099511628211ULL;
+            bool ok = false;
+            auto hit = hubsByHash.find(h);
+            if (hit != hubsByHash.end())
+              for (uint32_t hi : hit->second)
+                if (hubs[hi].nm == nm && hubs[hi].set == set &&
+                    hubIn.count(((uint64_t)m << 32) | hubs[hi].w))
+                  ok = true;
+            if (!ok && ++missing <= 5)
+              errs() << "KeyCells: UNHUBBED memory node "
+                     << protBlameName(m).substr(0, 60) << "\n";
+          }
+        }
+        CG_LOG("KeyCells: " << hubs.size() << " hubs, " << hubKeyEdges
+               << " hub-key edges, " << hubIn.size() << " + " << hubOut.size()
+               << " member edges, " << hubRounds << " rounds\n");
       }
       // Names present per key (plan 3.14 (3)): named planes holding content.
       std::unordered_map<uint64_t, uint32_t> namesAt;
@@ -7481,7 +7675,9 @@ bool CallGraphPass::runFlowsToResolution() {
              << " write edges + " << keyReads.size() << " read edges, "
              << keySplits << " read halves; " << ptrClasses
              << " pointer classes own dereferences, sum of their facts "
-             << classKeys << "; certificate: " << checked
+             << classKeys << "; equal-set hubs would be " << hubSets.size()
+             << " hubs, " << hubEdges << " key edges + " << hubMembers
+             << " member edges; certificate: " << checked
              << " (dereference, fact) pairs, " << missing << " unwired\n");
       if (missing)
         report_fatal_error("--cfl-key-cells: " + Twine(missing) +

@@ -2707,12 +2707,11 @@ bool CallGraphPass::runFlowsToResolution() {
     CG_LOG("FlowsTo: plane interning inactive (requires a sequential "
            "unbatched solve: T=1, no batch roots/workers)\n");
   bool parallelPhase = false; // true only inside a parallel wave phase
-  // Channel-cells headroom: channel nodes are appended at barrier
-  // flushes; the fixed atomic arrays (classLk/inWL/keyCount) cannot
-  // grow, so they get capacity up front. Vectors grow at the barrier
-  // (no live references across the flush).
-  // Headroom bound: realized keys ≤ origins × NSHIFT; origins ≤ N.
-  const uint32_t NCap =
+  // Channel-cells headroom: channel and key nodes are appended at barrier
+  // flushes. The atomic arrays (classLk/inWL/keyCount) start with this
+  // capacity and are regrown by newSolverNode, which runs only at the
+  // serial barrier (no live references); the vectors grow there too.
+  uint32_t NCap =
       (CFLChannelCells || CFLKeyCells) ? N + std::max<uint32_t>(3 * N, 1u << 20)
                                        : N;
   std::unique_ptr<std::atomic<uint8_t>[]> classLk(
@@ -3784,9 +3783,28 @@ bool CallGraphPass::runFlowsToResolution() {
   // below always passes the cell as the keeper side.
   auto newSolverNode = [&]() -> uint32_t {
     const uint32_t id = (uint32_t)ufp.size();
-    if (id >= NCap)
-      report_fatal_error("channel-cells: node capacity exhausted "
-                         "(raise the NCap headroom)");
+    if (id >= NCap) {
+      assert(!parallelPhase && "solver nodes are appended only at the barrier");
+      const uint64_t want = std::min<uint64_t>((uint64_t)NCap * 2, UINT32_MAX);
+      if (want <= id)
+        report_fatal_error("channel-cells: more than 2^32 solver nodes");
+      const uint32_t cap2 = (uint32_t)want;
+      auto grow8 = [&](std::unique_ptr<std::atomic<uint8_t>[]> &a) {
+        std::unique_ptr<std::atomic<uint8_t>[]> b(new std::atomic<uint8_t>[cap2]);
+        for (uint32_t i = 0; i < cap2; i++)
+          b[i].store(i < NCap ? a[i].load(std::memory_order_relaxed) : 0,
+                     std::memory_order_relaxed);
+        a.swap(b);
+      };
+      grow8(classLk);
+      grow8(inWL);
+      std::unique_ptr<std::atomic<uint32_t>[]> kc(new std::atomic<uint32_t>[cap2]);
+      for (uint32_t i = 0; i < cap2; i++)
+        kc[i].store(i < NCap ? keyCount[i].load(std::memory_order_relaxed) : 0,
+                    std::memory_order_relaxed);
+      keyCount.swap(kc);
+      NCap = cap2;
+    }
     ufp.push_back(id);
     ufrank.push_back(0);
     R.emplace_back(NSHIFT);

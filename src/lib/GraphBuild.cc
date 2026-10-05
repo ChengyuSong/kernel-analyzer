@@ -1388,6 +1388,30 @@ bool CallGraphPass::namedCertifies() const {
   return namedPlanes() && CFLNamedUntyped == "count";
 }
 
+// --cfl-union-keys: a union access the inference keyed is filed under its
+// key names instead of Unnamed (plan 3.17). Key names are opened at once:
+// writes whose key is unknown, aggregate copies, initializer slots and
+// untyped writes all land in the unnamed plane, which a keyed read must
+// therefore read.
+void CallGraphPass::applyUnionKeys(const llvm::Instruction &I,
+                                   SmallVectorImpl<uint32_t> &names) {
+  auto it = unionKeyNames.find(&I);
+  if (it == unionKeyNames.end())
+    return;
+  // Only pointer accesses carry names (an integer member is no channel).
+  const Type *VT = isa<StoreInst>(I) ? I.getOperand(0)->getType() : I.getType();
+  if (!VT->isPointerTy())
+    return;
+  assert(names.size() == 1 && names[0] == ka::AccessNames::Unnamed &&
+         "a union access has no access name");
+  names.clear();
+  for (const std::string &k : it->second) {
+    const uint32_t n = accessNames->keyName(k);
+    openName(n, "union-key");
+    names.push_back(n);
+  }
+}
+
 void CallGraphPass::openName(uint32_t name, StringRef culprit) {
   if (!openNames.insert(name).second)
     return;
@@ -3294,6 +3318,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
         if (!lanes.empty())
           names = lanes;
       }
+    CGP.applyUnionKeys(I, names);
   }
   if ((CFLCensusTypeLabels || !CFLRuleReport.empty()) && names[0] != ka::AccessNames::Unnamed)
     CGP.namedAccessLog.emplace_back(derefNode, names[0], &I);
@@ -3433,6 +3458,7 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
         if (!lanes.empty())
           names = lanes;
       }
+    CGP.applyUnionKeys(I, names);
   }
   if ((CFLCensusTypeLabels || !CFLRuleReport.empty()) && names[0] != ka::AccessNames::Unnamed)
     CGP.namedAccessLog.emplace_back(derefNode, names[0], &I);

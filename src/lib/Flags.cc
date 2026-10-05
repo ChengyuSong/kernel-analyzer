@@ -705,6 +705,17 @@ cl::opt<bool> CFLCensusUnions(
            "establish on stable fields. Adds no edges"),
   cl::init(false));
 
+cl::opt<std::string> CFLUnionKeys(
+  "cfl-union-keys",
+  cl::desc("With --cfl-named-planes: give union accesses discriminator "
+           "keys (plan 3.17): a union field gets one plane per key value, "
+           "an access whose key is known reads/writes that plane, one whose "
+           "key is unknown keeps today's wiring (every plane). 'off' (default), "
+           "'callback' (keys inferred from co-written callbacks with "
+           "correlated dispatch), 'single' (every union access the same key: "
+           "a plumbing test)"),
+  cl::init("off"));
+
 cl::opt<std::string> CFLCensusUnionsDetail(
   "cfl-census-unions-detail",
   cl::desc("With --cfl-census-unions: for the union STRUCT.FIELD (or every "

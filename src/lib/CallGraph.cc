@@ -666,8 +666,9 @@ bool CallGraphPass::doModulePass(Module *M) {
       M == Ctx->Modules.front().first)
     bindTracepointMediatorPairs(); // before any callsite is visited
 
-  if (CFLCensusUnions && iteration == 0 && M == Ctx->Modules.front().first)
-    runUnionCensus(); // measurement-only, adds no edges
+  if ((CFLCensusUnions || CFLUnionKeys != "off") && iteration == 0 &&
+      M == Ctx->Modules.front().first)
+    runUnionCensus(); // census, and the union keys graph build applies
 
   if (CFLCensusNexus && iteration == 0 && M == Ctx->Modules.front().first)
     runNexusCensus(); // measurement-only, adds no edges

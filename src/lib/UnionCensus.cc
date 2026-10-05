@@ -514,11 +514,31 @@ void CallGraphPass::runUnionCensus() {
   // stores of a constant / function / global / flag bit into a field.
   using ObjKey = std::tuple<const Function *, const Value *, uint64_t, std::string>;
   std::map<ObjKey, CoSet> coWrites;
+  // Loads of each (struct, field): where callback fields are read.
+  std::map<std::pair<std::string, uint64_t>, std::vector<const LoadInst *>> loadsAt;
   size_t accesses = 0;
   for (auto &[M, _] : Ctx->Modules) {
     const DataLayout &DL = M->getDataLayout();
     for (Function &F : *M)
       for (Instruction &I : instructions(F)) {
+        // A zeroing memset of a struct writes 0 to every field it covers
+        // (`memset(&w, 0, sizeof(w))` before a walker sets its callbacks).
+        if (const auto *MS = dyn_cast<MemSetInst>(&I)) {
+          const auto *Z = dyn_cast<ConstantInt>(MS->getValue());
+          const auto *Len = dyn_cast<ConstantInt>(MS->getLength());
+          const auto *A = dyn_cast<AllocaInst>(MS->getDest()->stripPointerCasts());
+          if (Z && Z->isZero() && Len && A)
+            if (const auto *ST = dyn_cast<StructType>(A->getAllocatedType()))
+              if (ST->hasName()) {
+                const std::string S = stripSuffix(ST->getName());
+                auto fit = fieldsOf.find(S);
+                if (fit != fieldsOf.end())
+                  for (auto &[o, sz] : fit->second)
+                    if (o + sz <= Len->getZExtValue())
+                      coWrites[{&F, A, 0, S}][o].insert("int:0");
+              }
+          continue;
+        }
         const Value *P = nullptr;
         if (const auto *LI = dyn_cast<LoadInst>(&I))
           P = LI->getPointerOperand();
@@ -529,6 +549,11 @@ void CallGraphPass::runUnionCensus() {
         const Pos Q = position(P, DL);
         if (!Q.ok)
           continue;
+        if (const auto *LI = dyn_cast<LoadInst>(&I)) {
+          const int64_t lf = fieldAt(Q.S, Q.off);
+          if (lf >= 0)
+            loadsAt[{Q.S, (uint64_t)lf}].push_back(LI);
+        }
         if (const auto *SI = dyn_cast<StoreInst>(&I)) {
           const int64_t f = fieldAt(Q.S, Q.off);
           // The stored value (`w.xSelectCallback = cond ? 0 : resolveSelectStep`,
@@ -1212,6 +1237,284 @@ void CallGraphPass::runUnionCensus() {
     }
   };
 
+  // ---- The union-key engine (--cfl-union-keys) ----
+  // Definitions by name (callbacks are known by name in the co-write sets).
+  std::map<std::string, const Function *> defByName;
+  for (auto &[M, _] : Ctx->Modules)
+    for (const Function &F : *M)
+      if (!F.isDeclaration())
+        defByName.emplace(F.getName().str(), &F);
+  // The argument of a call that is the object `base` (+ embed) itself.
+  auto objArg = [&](const CallBase *CB, const Value *base, uint64_t embed) -> int {
+    const DataLayout &DL = CB->getModule()->getDataLayout();
+    for (unsigned j = 0; j < CB->arg_size(); j++) {
+      const Value *A = CB->getArgOperand(j)->stripPointerCasts();
+      int64_t off = 0;
+      bool ok = true;
+      while (const auto *G = dyn_cast<GEPOperator>(A)) {
+        APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
+        if (!G->accumulateConstantOffset(DL, O)) { ok = false; break; }
+        off += O.getSExtValue();
+        A = G->getPointerOperand()->stripPointerCasts();
+      }
+      if (ok && off == (int64_t)embed && resolveBase(A) == base)
+        return (int)j;
+    }
+    return -1;
+  };
+  // Correlated dispatch: every load of a callback field is called with
+  // the object it was loaded from, at one argument position (returned),
+  // compared, or stored into a callback field (a copy, seen there as an
+  // unknown value). Anything else lets the callback escape: -1.
+  auto dispatchArg = [&](const std::string &S, const std::set<uint64_t> &cbFields,
+                         std::string &why) -> int {
+    int k = -1;
+    for (uint64_t f : cbFields)
+      for (const LoadInst *L : loadsAt[{S, f}]) {
+        const Pos Q = position(L->getPointerOperand(), L->getModule()->getDataLayout());
+        for (const User *Us : L->users()) {
+          if (const auto *CB = dyn_cast<CallBase>(Us)) {
+            if (CB->getCalledOperand()->stripPointerCasts() != L) {
+              why = "callback passed as an argument in " + L->getFunction()->getName().str();
+              return -1;
+            }
+            const int j = objArg(CB, Q.base, Q.embed);
+            if (j < 0 || (k >= 0 && j != k)) {
+              why = "dispatch without its object in " + L->getFunction()->getName().str();
+              return -1;
+            }
+            k = j;
+          } else if (isa<ICmpInst>(Us)) {
+          } else if (const auto *SI = dyn_cast<StoreInst>(Us)) {
+            const Pos T = position(SI->getPointerOperand(), SI->getModule()->getDataLayout());
+            if (SI->getValueOperand() != L || !T.ok || T.S != S ||
+                !cbFields.count((uint64_t)fieldAt(T.S, T.off))) {
+              why = "callback stored elsewhere in " + L->getFunction()->getName().str();
+              return -1;
+            }
+          } else {
+            why = "callback value escapes in " + L->getFunction()->getName().str();
+            return -1;
+          }
+        }
+      }
+    if (k < 0)
+      why = "no dispatch site";
+    return k;
+  };
+  // A callback runs only through dispatch: its address is only stored
+  // into callback fields of S (through selects and phis) or compared;
+  // never passed or put in an initializer. Its direct calls are returned
+  // in `direct`: each must hand on the dispatched object (keyUnion).
+  auto onlyDispatched = [&](const std::string &c, const std::string &S,
+                            const std::set<uint64_t> &cbFields,
+                            std::vector<const CallBase *> &direct) {
+    bool any = false;
+    for (auto &[M, _] : Ctx->Modules) {
+      const Function *Fn = M->getFunction(c);
+      if (!Fn)
+        continue;
+      any = true;
+      SmallVector<const Value *, 8> work{Fn};
+      SmallPtrSet<const Value *, 16> seen;
+      while (!work.empty()) {
+        const Value *V = work.pop_back_val();
+        if (!seen.insert(V).second)
+          continue;
+        for (const User *Us : V->users()) {
+          if (const auto *CE = dyn_cast<ConstantExpr>(Us)) {
+            if (CE->isCast()) { work.push_back(CE); continue; }
+            return false;
+          }
+          if (isa<SelectInst>(Us) || isa<PHINode>(Us) || isa<CastInst>(Us)) {
+            work.push_back(Us);
+            continue;
+          }
+          if (isa<ICmpInst>(Us))
+            continue;
+          if (const auto *CB = dyn_cast<CallBase>(Us))
+            if (CB->getCalledOperand() == V && V == Fn) {
+              direct.push_back(CB);
+              continue;
+            }
+          if (const auto *SI = dyn_cast<StoreInst>(Us)) {
+            if (SI->getValueOperand() != V)
+              return false;
+            const Pos T = position(SI->getPointerOperand(), SI->getModule()->getDataLayout());
+            if (!T.ok || T.S != S || !cbFields.count((uint64_t)fieldAt(T.S, T.off)))
+              return false;
+            continue;
+          }
+          return false; // a direct call, an argument, an initializer, ...
+        }
+      }
+    }
+    return any;
+  };
+  // Keys of one union: writes by the callbacks co-written with them,
+  // reads by the callbacks they run under. Unknown stays unkeyed (the
+  // read takes every plane, the write lands where every read sees it).
+  auto keyUnion = [&](const UnionField *U, const std::vector<Site> &W,
+                      const std::vector<Site> &Rd, const std::set<uint64_t> &cbFields,
+                      const std::set<std::string> &governed, bool governsAll,
+                      size_t &keyedW, size_t &keyedR, std::string &note) {
+    auto keyName = [&](const std::string &v) {
+      return "struct." + U->structName + "+" + std::to_string(U->off) + "#" + v;
+    };
+    if (CFLUnionKeys == "single") {
+      for (auto &w : W)
+        if (w.I) { unionKeyNames[w.I] = {keyName("all")}; keyedW++; }
+      for (auto &r : Rd) { unionKeyNames[r.I] = {keyName("all")}; keyedR++; }
+      return;
+    }
+    if (cbFields.empty()) { note = "no callback field"; return; }
+    if (governsAll) { note = "a callback field takes an unknown value"; return; }
+    const int kS = dispatchArg(U->structName, cbFields, note);
+    if (kS < 0)
+      return;
+    // Writes: every callback field's value known in the write's context.
+    auto fnsOf = [&](const std::string &v, std::set<std::string> &out) {
+      if (v.rfind("fn:", 0) == 0) { out.insert(v.substr(3)); return true; }
+      if (v.rfind("gv:", 0) == 0) {
+        auto git = fnsInGV.find(v.substr(3));
+        if (git != fnsInGV.end()) { out.insert(git->second.begin(), git->second.end()); return true; }
+        return false;
+      }
+      return v == "null" || v == "int:0";
+    };
+    std::set<std::string> stored; // every callback ever stored into the fields
+    for (uint64_t f : cbFields) {
+      auto wit = writersOf.find({U->structName, f});
+      if (wit != writersOf.end())
+        for (const ObjKey &K : wit->second)
+          for (auto &v : coWrites[K][f]) fnsOf(v, stored);
+    }
+    size_t partial = 0;
+    for (auto &w : W) {
+      if (!w.I) continue;
+      std::set<std::string> F;
+      bool known = true;
+      for (uint64_t f : cbFields) {
+        auto it = w.co.find(f);
+        if (it == w.co.end()) {
+          known = false;
+          partial++;
+          if (detailed(U))
+            errs() << "UnionCensus:   unkeyed write " << w.member << " at " << locOf(w.I)
+                   << ": callback field @" << f << " not written in its context\n";
+          break;
+        }
+        for (auto &v : it->second) known &= fnsOf(v, F);
+      }
+      if (!known || F.empty()) continue;
+      auto &names = unionKeyNames[w.I];
+      for (auto &fn : F) names.push_back(keyName(fn));
+      keyedW++;
+    }
+    // Reads: the function runs only under good callbacks, on the object
+    // the dispatch passed (the callback's parameter kS, handed down to
+    // helpers whose every caller passes it).
+    std::map<std::string, std::set<std::string>> closureOf;
+    std::map<std::string, std::vector<const CallBase *>> directOf;
+    std::set<std::string> dispatchedOnly, good;
+    for (auto &c : stored) {
+      std::set<std::string> cl{c};
+      calleeClosure(cl);
+      closureOf[c] = std::move(cl);
+      if (onlyDispatched(c, U->structName, cbFields, directOf[c]))
+        dispatchedOnly.insert(c);
+    }
+    std::map<std::string, int> wpar; // function -> its parameter holding the object
+    // A direct call of a callback hands on the dispatched object when its
+    // caller runs on that object and passes it at the callback's slot
+    // (exprNodeIsConstantOrGroupBy calling exprNodeIsConstant).
+    auto handsOn = [&](const CallBase *CB) {
+      const Function *G = CB->getFunction();
+      auto pit = wpar.find(G->getName().str());
+      return pit != wpar.end() && (unsigned)kS < CB->arg_size() &&
+             resolveBase(CB->getArgOperand(kS)) == paramBase(G, (unsigned)pit->second);
+    };
+    std::set<std::string> helpers;
+    for (auto &[c, cl] : closureOf) helpers.insert(cl.begin(), cl.end());
+    // Greatest fixpoint: assume every dispatched-only callback runs on the
+    // dispatched object, derive the helpers, and drop a callback whose
+    // direct calls do not hand the object on; repeat until stable. Sound
+    // because every chain of direct calls into a callback starts at a
+    // dispatch (recursion like resolveExprStep's included).
+    good = dispatchedOnly;
+    for (bool changed = true; changed;) {
+      wpar.clear();
+      for (auto &c : good) wpar[c] = kS;
+      for (int round = 0; round < 3; round++)
+        for (auto &h : helpers) {
+          if (wpar.count(h) || stored.count(h)) continue;
+          auto dit = defByName.find(h);
+          if (dit == defByName.end() || dit->second->hasAddressTaken()) continue;
+          auto &callers = callersOf[dit->second];
+          if (callers.empty()) continue;
+          int j = -1;
+          bool ok = true;
+          for (const CallBase *CB : callers) {
+            const Function *G = CB->getFunction();
+            auto pit = wpar.find(G->getName().str());
+            if (pit == wpar.end()) { ok = false; break; }
+            const Value *wb = paramBase(G, (unsigned)pit->second);
+            int jj = -1;
+            for (unsigned a = 0; a < CB->arg_size(); a++)
+              if (resolveBase(CB->getArgOperand(a)) == wb) { jj = (int)a; break; }
+            if (jj < 0 || (j >= 0 && jj != j)) { ok = false; break; }
+            j = jj;
+          }
+          if (ok) wpar[h] = j;
+        }
+      changed = false;
+      for (auto it = good.begin(); it != good.end();)
+        if (!std::all_of(directOf[*it].begin(), directOf[*it].end(), handsOn)) {
+          it = good.erase(it);
+          changed = true;
+        } else
+          ++it;
+    }
+    size_t badCb = 0;
+    for (auto &c : stored) {
+      badCb += !good.count(c);
+      if (!good.count(c) && detailed(U))
+        errs() << "UnionCensus:   callback " << c << " runs outside dispatch\n";
+    }
+    for (auto &r : Rd) {
+      const Function *RF = r.I->getFunction();
+      const std::string rn = RF->getName().str();
+      if (governed.count(rn) || r.embed != 0) continue;
+      auto pit = wpar.find(rn);
+      if (pit == wpar.end() || r.base != paramBase(RF, (unsigned)pit->second)) {
+        if (detailed(U))
+          errs() << "UnionCensus:   unkeyed read " << r.member << " at " << locOf(r.I)
+                 << ": not on the dispatched object\n";
+        continue;
+      }
+      std::set<std::string> K;
+      bool ok = true;
+      for (auto &[c, cl] : closureOf)
+        if (cl.count(rn)) {
+          if (!good.count(c)) ok = false;
+          K.insert(c);
+        }
+      if (!ok || K.empty()) {
+        if (detailed(U))
+          errs() << "UnionCensus:   unkeyed read " << r.member << " at " << locOf(r.I)
+                 << (ok ? ": under no callback" : ": under a callback that runs outside dispatch")
+                 << "\n";
+        continue;
+      }
+      auto &names = unionKeyNames[r.I];
+      for (auto &c : K) names.push_back(keyName(c));
+      keyedR++;
+    }
+    note = "dispatch arg " + std::to_string(kS) + ", " + std::to_string(stored.size()) +
+           " callbacks (" + std::to_string(badCb) + " not only dispatched), " +
+           std::to_string(partial) + " writes with a callback field unset in context";
+  };
+
   size_t nUnions = 0, nTag = 0, nTagVer = 0, nCallback = 0, nNone = 0, nSingle = 0,
          nLowBit = 0;
   struct Line { size_t accesses; std::string text; };
@@ -1351,6 +1654,63 @@ void CallGraphPass::runUnionCensus() {
     for (auto &[m, fs] : cbOf) calleeClosure(fs);
     std::set<std::string> allCb;
     for (auto &[m, fs] : cbOf) allCb.insert(fs.begin(), fs.end());
+    // The other half of the pairing (review of 3.17): a callback field
+    // written where the union is not installs a callback that runs on
+    // whatever member the object holds. Such a write governs the union
+    // reads inside the callback it installs (and its callees); an unknown
+    // value governs every read. Governed reads lose the callback key; a
+    // write installing null, or a callback that reads no union, is harmless.
+    std::set<uint64_t> cbFields;
+    for (auto &s : W)
+      for (auto &[f, vs] : s.co) {
+        if (f >= U->off && f < U->off + U->size)
+          continue;
+        for (auto &v : vs)
+          if (v.rfind("fn:", 0) == 0 ||
+              (v.rfind("gv:", 0) == 0 && fnsInGV.count(v.substr(3))))
+            cbFields.insert(f);
+      }
+    size_t unpairedCb = 0, unpairedGov = 0;
+    bool governsAll = false;
+    std::set<std::string> governed; // reader functions that lose the key
+    for (uint64_t f : cbFields) {
+      auto wit = writersOf.find({U->structName, f});
+      if (wit == writersOf.end())
+        continue;
+      for (const ObjKey &K : wit->second) {
+        if (unionCtx[U].count(K))
+          continue;
+        unpairedCb++;
+        std::set<std::string> fns;
+        bool unknown = false;
+        for (auto &v : coWrites[K][f]) {
+          if (v.rfind("fn:", 0) == 0)
+            fns.insert(v.substr(3));
+          else if (v.rfind("gv:", 0) == 0) {
+            auto git = fnsInGV.find(v.substr(3));
+            if (git != fnsInGV.end()) fns.insert(git->second.begin(), git->second.end());
+          } else if (v != "null" && v != "int:0")
+            unknown = true;
+        }
+        calleeClosure(fns);
+        bool gov = unknown;
+        for (auto &fn : fns)
+          if (readers.count(fn)) {
+            governed.insert(fn);
+            gov = true;
+          }
+        if (unknown) governsAll = true;
+        unpairedGov += gov;
+        if (detailed(U)) {
+          errs() << "UnionCensus:   unpaired callback write @" << f << " in "
+                 << std::get<0>(K)->getName() << ":";
+          for (auto &v : coWrites[K][f]) errs() << " " << v;
+          errs() << (gov ? "  (governs reads)" : "") << "\n";
+        }
+      }
+    }
+    if (governsAll)
+      governed = readers;
     if (detailed(U) && best >= 0)
       for (auto &s : W)
         if (!s.co.count((uint64_t)best) &&
@@ -1384,8 +1744,9 @@ void CallGraphPass::runUnionCensus() {
       }
       lowBit += lowBitTagged(s.I);
       const std::string rn = s.I->getFunction()->getName().str();
-      const bool cb = real(s.member) ? (cbOf.count(s.member) && cbOf[s.member].count(rn))
-                                     : allCb.count(rn) != 0;
+      const bool cb = !governed.count(rn) &&
+                      (real(s.member) ? (cbOf.count(s.member) && cbOf[s.member].count(rn))
+                                      : allCb.count(rn) != 0);
       bool g = false;
       if (best >= 0) {
         g = guardedHere(s.I, U->structName, (uint64_t)best, s.base, s.embed);
@@ -1400,6 +1761,11 @@ void CallGraphPass::runUnionCensus() {
         errs() << "UnionCensus:   untested read " << s.member << " at " << locOf(s.I) << "\n";
       if (!g && !cb && unguarded.size() < 3) unguarded.push_back(s.I);
     }
+    // ---- Keys for the solver (--cfl-union-keys, plan 3.17/3.18) ----
+    size_t keyedW = 0, keyedR = 0;
+    std::string keyNote;
+    if (CFLUnionKeys != "off" && realMembers.size() > 1)
+      keyUnion(U, W, Rd, cbFields, governed, governsAll, keyedW, keyedR, keyNote);
     std::string verdict;
     const bool allW = best >= 0 && bestCov == W.size() && bestFD;
     if (realMembers.size() <= 1) {
@@ -1453,15 +1819,36 @@ void CallGraphPass::runUnionCensus() {
     t += "stable fields {" + st + "}; reads keyed by facts " + std::to_string(nVer) + "/" +
          std::to_string(Rd.size()) +
          " (" + std::to_string(nContra) + " contradicted); ";
+    // Tag writes elsewhere: contexts writing the best tag field without
+    // writing the union.
+    size_t unpairedTag = 0;
+    if (best >= 0) {
+      auto wit = writersOf.find({U->structName, (uint64_t)best});
+      if (wit != writersOf.end())
+        for (const ObjKey &K : wit->second) unpairedTag += !unionCtx[U].count(K);
+    }
+    if (best >= 0)
+      t += "tag writes without the union " + std::to_string(unpairedTag) + "; ";
     t += "callbacks: writes paired " + std::to_string(writesWithCb) + "/" +
-         std::to_string(W.size()) + (cbFD ? ", fn->member OK" : ", fn->member BROKEN") +
+         std::to_string(W.size()) + ", unpaired callback writes " +
+         std::to_string(unpairedCb) + " (" + std::to_string(unpairedGov) +
+         " govern reads)" + (cbFD ? ", fn->member OK" : ", fn->member BROKEN") +
          ", reads in a paired callback " + std::to_string(inCallback) + "/" +
          std::to_string(Rd.size()) + "; " + verdict;
+    if (CFLUnionKeys != "off")
+      t += "; keys: writes " + std::to_string(keyedW) + "/" + std::to_string(W.size()) +
+           ", reads " + std::to_string(keyedR) + "/" + std::to_string(Rd.size()) +
+           (keyNote.empty() ? "" : " (" + keyNote + ")");
     for (const Instruction *I : unguarded)
       t += "\n    unguarded read: " + locOf(I);
     for (const Instruction *I : contra)
       t += "\n    contradicted read: " + locOf(I);
     lines.push_back({W.size() + Rd.size(), t});
+  }
+  if (!CFLCensusUnions) {
+    errs() << "UnionKeys: " << unionKeyNames.size() << " union accesses keyed ("
+           << CFLUnionKeys << ")\n";
+    return;
   }
   std::sort(lines.begin(), lines.end(),
             [](const Line &a, const Line &b) { return a.accesses > b.accesses; });

@@ -235,6 +235,12 @@ int main(int argc, char **argv) {
       cliErrors.push_back("--cfl-rule-report requires --cfl-named-planes "
                           "(access names) and --cfl-alloc-origins (an "
                           "origin-free value is data)");
+    if (CFLUnionKeys != "off" && CFLUnionKeys != "callback" &&
+        CFLUnionKeys != "single")
+      cliErrors.push_back("--cfl-union-keys takes off, callback or single");
+    else if (CFLUnionKeys != "off" && !CFLNamedPlanes)
+      cliErrors.push_back("--cfl-union-keys requires --cfl-named-planes "
+                          "(a key is a name plane)");
     if (CFLCensusTypeLabels && !CFLNamedPlanes)
       cliErrors.push_back("--cfl-census-type-labels requires --cfl-named-planes");
     if (CFLNamedUntyped != "count" && CFLNamedUntyped != "open")

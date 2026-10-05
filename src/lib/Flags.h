@@ -60,6 +60,7 @@ extern cl::opt<bool> CFLWholeProgram;
 extern cl::opt<bool> CFLKeyCells;
 extern cl::opt<bool> CFLCensusUnions;
 extern cl::opt<std::string> CFLCensusUnionsDetail;
+extern cl::opt<std::string> CFLUnionKeys;
 extern cl::opt<bool> CFLKeyHubs;
 extern cl::opt<std::string> CFLRuleReport;
 extern cl::opt<std::string> CFLRegFieldWatch;

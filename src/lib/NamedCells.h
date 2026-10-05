@@ -139,6 +139,9 @@ public:
                   const llvm::DataLayout &DL);
 
   const std::string &str(uint32_t Id) const { return Names[Id]; }
+  // The id of a name built outside the descent (a union key,
+  // "struct.S+off#v"; --cfl-union-keys).
+  uint32_t keyName(const std::string &S) { return intern(S); }
   uint32_t size() const { return (uint32_t)Names.size(); }
   // Unnamed results by reason (counted per query).
   uint64_t unnamedBy[NumWhy] = {};

@@ -214,6 +214,10 @@ protected:
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
   void runNexusCensus();      // task #38: nexus-struct discovery
   void runUnionCensus();      // --cfl-census-unions (UnionCensus.cc)
+  // --cfl-union-keys: the key names of each keyed union access, filled by
+  // runUnionCensus's inference before graph build, applied by the
+  // load/store visitors (plan 3.17).
+  std::map<const llvm::Instruction *, std::vector<std::string>> unionKeyNames;
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>
   tracepointJunctions(const llvm::GlobalVariable *KeyGV);
@@ -287,6 +291,8 @@ protected:
   // unnamed shadow. Untyped writes (no struct position) open nothing
   // under --cfl-named-untyped=count and are counted (the blind spot).
   void openName(uint32_t name, llvm::StringRef culprit);
+  void applyUnionKeys(const llvm::Instruction &I,
+                      llvm::SmallVectorImpl<uint32_t> &names);
   void openStruct(llvm::StructType *S, llvm::StringRef culprit);
   // Struct position of the pointer through which a cell is written.
   ka::AccessNames::Position writerPosition(NodeIndex cell, std::string &where);

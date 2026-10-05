@@ -17,6 +17,7 @@ set (KACoreSource
   Names.cc
   NamedCells.cc
   TypeLabels.cc
+  UnionCensus.cc
   Summaries.cc
   Census.cc
   Dump.cc

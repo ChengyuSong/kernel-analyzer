@@ -695,6 +695,23 @@ cl::opt<bool> CFLCensusCouplers(
            "naturally compartmentalized"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusUnions(
+  "cfl-census-unions",
+  cl::desc("MEASUREMENT ONLY: for every union field of a struct (from "
+           "debug info), its member accesses and whether a discriminator "
+           "exists: a tag field (constant or flag bit) or a callback "
+           "co-written with the union, one or two calls away; reads tested "
+           "on the tag, and reads keyed by the facts their branches "
+           "establish on stable fields. Adds no edges"),
+  cl::init(false));
+
+cl::opt<std::string> CFLCensusUnionsDetail(
+  "cfl-census-unions-detail",
+  cl::desc("With --cfl-census-unions: for the union STRUCT.FIELD (or every "
+           "union of STRUCT with STRUCT.), print each write's tag knowledge, "
+           "each read's facts and verdict, uncovered writes and unkeyed reads"),
+  cl::init(""));
+
 cl::opt<bool> CFLCensusNexus(
   "cfl-census-nexus",
   cl::desc("MEASUREMENT-ONLY census (task #38): discover nexus structs "

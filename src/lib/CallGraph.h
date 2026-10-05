@@ -213,6 +213,7 @@ protected:
   void confirmInvokeSummaries();
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
   void runNexusCensus();      // task #38: nexus-struct discovery
+  void runUnionCensus();      // --cfl-census-unions (UnionCensus.cc)
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>
   tracepointJunctions(const llvm::GlobalVariable *KeyGV);

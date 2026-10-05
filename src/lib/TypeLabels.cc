@@ -26,6 +26,8 @@
 
 #include "CallGraphInternal.h"
 
+#include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/InstIterator.h>
@@ -44,15 +46,11 @@ bool namedStruct(const llvm::StructType *ST) {
 
 } // namespace
 
-void CallGraphPass::runTypeLabelCensus(
-    const std::function<void(NodeIndex, std::vector<uint32_t> &)> &originsOf,
-    const std::function<void(uint32_t, std::vector<const Value *> &)>
-        &originValues,
-    const std::function<bool(NodeIndex)> &anyFact,
-    const std::function<std::string(NodeIndex, uint32_t, std::string &)>
-        &explain,
-    const std::string &emptyReadLine) {
-  const bool report = !CFLRuleReport.empty();
+// Allocation calls (allocators and their wrappers) labeled by the typed
+// writes through their results. IR only: usable before the solve.
+void CallGraphPass::labelAllocationSites(
+    std::unordered_map<const CallBase *, AllocSiteLabel> &siteLabel,
+    size_t &allocCalls, size_t &wrapperCalls) {
   // ---- 1. Allocation calls: direct allocators and their wrappers ----
   // A wrapper returns only allocation results (through casts, phis of
   // them, or null).
@@ -103,13 +101,6 @@ void CallGraphPass::runTypeLabelCensus(
   // Aliases of the result in the calling function: casts, constant GEPs
   // (with their byte offset), and at -O0 the stack slot it is stored to
   // when that slot is stored exactly once.
-  struct SiteLabel {
-    std::set<std::string> types; // outermost struct of typed writes at offset 0
-    std::string declared;        // the struct its debug-info variable declares
-    bool scalarUse = false;      // accessed as scalars/arrays (a buffer)
-  };
-  std::unordered_map<const CallBase *, SiteLabel> siteLabel;
-  size_t allocCalls = 0, wrapperCalls = 0;
   // Address expressions within a function: the same base value (a
   // stack slot stored once reads as what was stored) and the same
   // constant GEP path denote the same memory. A slot stored once in a
@@ -167,7 +158,7 @@ void CallGraphPass::runTypeLabelCensus(
     return it->second;
   };
   auto labelSite = [&](const CallBase *C) {
-    SiteLabel L;
+    AllocSiteLabel L;
     const DataLayout &DL = C->getModule()->getDataLayout();
     std::vector<std::pair<const Value *, int64_t>> work{{C, 0}};
     std::set<const Value *> seen{C};
@@ -257,6 +248,124 @@ void CallGraphPass::runTypeLabelCensus(
           }
         }
 
+}
+
+// The allocations a labeling call creates: itself when it is an
+// allocation, else the allocations its wrapper returns (shared by all
+// callers: such an object collects every caller's type).
+void CallGraphPass::allocationsOfCall(const CallBase *C,
+                                      std::set<const CallBase *> &out) {
+  std::function<void(const Function *, int)> inner = [&](const Function *F,
+                                                         int depth) {
+    if (!F || F->isDeclaration() || depth > 8)
+      return;
+    for (const BasicBlock &BB : *F)
+      if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+        if (const Value *RV = RI->getReturnValue()) {
+          SmallVector<const Value *, 4> vs{RV->stripPointerCasts()};
+          while (!vs.empty()) {
+            const Value *V = vs.pop_back_val();
+            if (const auto *PN = dyn_cast<PHINode>(V)) {
+              for (const Value *In : PN->incoming_values())
+                vs.push_back(In->stripPointerCasts());
+            } else if (const auto *CB = dyn_cast<CallBase>(V)) {
+              if (Ctx->AllocSites.count(const_cast<CallBase *>(CB)))
+                out.insert(CB);
+              else
+                inner(CB->getCalledFunction(), depth + 1);
+            }
+          }
+        }
+  };
+  if (Ctx->AllocSites.count(const_cast<CallBase *>(C)))
+    out.insert(C);
+  else
+    inner(C->getCalledFunction(), 0);
+}
+
+// Labels by value, before any solve: a global or stack slot by its
+// declared struct, a heap allocation by the typed writes of every call
+// that creates it (--cfl-weld-watch).
+void CallGraphPass::staticLabels(
+    std::unordered_map<const Value *, std::set<std::string>> &out) {
+  std::unordered_map<const CallBase *, AllocSiteLabel> siteLabel;
+  size_t allocCalls = 0, wrapperCalls = 0;
+  labelAllocationSites(siteLabel, allocCalls, wrapperCalls);
+  for (auto &[C, SL] : siteLabel) {
+    std::set<const CallBase *> allocs;
+    allocationsOfCall(C, allocs);
+    for (const CallBase *A : allocs) {
+      auto &L = out[A];
+      L.insert(SL.types.begin(), SL.types.end());
+      if (SL.types.empty() && !SL.declared.empty())
+        L.insert(SL.declared);
+    }
+  }
+  // A declared object by its debug-info type: linking unifies structurally
+  // identical IR types under one name (an fts3 local reads as
+  // struct.WindowUpdate), the variable's declared type does not. The IR
+  // type only when there is no debug info.
+  auto diLabel = [&](const DIType *T) -> std::string {
+    for (int i = 0; i < 8 && T; i++) {
+      if (const auto *C = dyn_cast<DICompositeType>(T))
+        if (C->getTag() == dwarf::DW_TAG_array_type) {
+          T = C->getBaseType();
+          continue;
+        }
+      if (const auto *D = dyn_cast<DIDerivedType>(T))
+        if (D->getTag() == dwarf::DW_TAG_typedef ||
+            D->getTag() == dwarf::DW_TAG_const_type ||
+            D->getTag() == dwarf::DW_TAG_volatile_type) {
+          T = D->getBaseType();
+          continue;
+        }
+      break;
+    }
+    const StringRef N = ka::diStructName(T, false);
+    return N.empty() ? std::string() : "struct." + N.str();
+  };
+  for (auto &[M, _] : Ctx->Modules) {
+    auto decl = [&](const Value *V, Type *T, const DIType *DT) {
+      if (DT) {
+        const std::string L = diLabel(DT);
+        if (!L.empty()) out[V].insert(L);
+        return;
+      }
+      while (T->isArrayTy())
+        T = T->getArrayElementType();
+      if (auto *ST = dyn_cast<llvm::StructType>(T))
+        if (namedStruct(ST))
+          out[V].insert(structKey(ST));
+    };
+    for (GlobalVariable &GV : M->globals()) {
+      SmallVector<DIGlobalVariableExpression *, 1> GVEs;
+      GV.getDebugInfo(GVEs);
+      decl(&GV, GV.getValueType(), GVEs.empty() ? nullptr : GVEs[0]->getVariable()->getType());
+    }
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F))
+        if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+          const DIType *DT = nullptr;
+          for (auto *DDI : findDbgDeclares(AI))
+            if (auto *Var = DDI->getVariable()) { DT = Var->getType(); break; }
+          decl(AI, AI->getAllocatedType(), DT);
+        }
+  }
+}
+
+void CallGraphPass::runTypeLabelCensus(
+    const std::function<void(NodeIndex, std::vector<uint32_t> &)> &originsOf,
+    const std::function<void(uint32_t, std::vector<const Value *> &)>
+        &originValues,
+    const std::function<bool(NodeIndex)> &anyFact,
+    const std::function<std::string(NodeIndex, uint32_t, std::string &)>
+        &explain,
+    const std::string &emptyReadLine) {
+  const bool report = !CFLRuleReport.empty();
+  std::unordered_map<const CallBase *, AllocSiteLabel> siteLabel;
+  size_t allocCalls = 0, wrapperCalls = 0;
+  labelAllocationSites(siteLabel, allocCalls, wrapperCalls);
+
   // ---- 3. Labels of each origin ----
   // An origin's label set: for a heap origin, the labels of every
   // allocation call whose result reaches it (a wrapper's single malloc
@@ -295,34 +404,6 @@ void CallGraphPass::runTypeLabelCensus(
       L.kind = NonStruct;
     return true;
   };
-  // The objects each labeling call creates: itself when it is an
-  // allocation (an allocator, or a wrapper --cfl-confirm-fresh promoted),
-  // else the allocations its wrapper returns (shared by all callers: such
-  // an object collects every caller's type). A call labels only these —
-  // never the other objects its result may point to.
-  std::function<void(const Function *, std::set<const CallBase *> &, int)>
-      innerAllocs = [&](const Function *F, std::set<const CallBase *> &out,
-                        int depth) {
-        if (!F || F->isDeclaration() || depth > 8)
-          return;
-        for (const BasicBlock &BB : *F)
-          if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
-            if (const Value *RV = RI->getReturnValue()) {
-              SmallVector<const Value *, 4> vs{RV->stripPointerCasts()};
-              while (!vs.empty()) {
-                const Value *V = vs.pop_back_val();
-                if (const auto *PN = dyn_cast<PHINode>(V)) {
-                  for (const Value *In : PN->incoming_values())
-                    vs.push_back(In->stripPointerCasts());
-                } else if (const auto *CB = dyn_cast<CallBase>(V)) {
-                  if (Ctx->AllocSites.count(const_cast<CallBase *>(CB)))
-                    out.insert(CB);
-                  else
-                    innerAllocs(CB->getCalledFunction(), out, depth + 1);
-                }
-              }
-            }
-      };
   std::vector<uint32_t> rids;
   std::vector<const Value *> vals;
   std::unordered_map<const CallBase *, std::vector<uint32_t>> ridsOfAlloc;
@@ -344,10 +425,7 @@ void CallGraphPass::runTypeLabelCensus(
   };
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;
-    if (Ctx->AllocSites.count(const_cast<CallBase *>(C)))
-      allocs.insert(C);
-    else
-      innerAllocs(C->getCalledFunction(), allocs, 0);
+    allocationsOfCall(C, allocs);
     for (const CallBase *A : allocs)
       for (uint32_t r : originsCreatedBy(A)) {
         OriginLabel &L = originLabel[r];

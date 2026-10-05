@@ -216,6 +216,8 @@ int main(int argc, char **argv) {
       cliErrors.push_back("--cfl-alloc-origins is not ported to channel "
                           "cells, batched roots, lazy minting or lazy "
                           "addresses (each mints roots on its own path)");
+    if (CFLKeyPartition && !CFLKeyCells)
+      cliErrors.push_back("--cfl-key-partition requires --cfl-key-cells");
     if (CFLKeyHubs && !CFLKeyCells)
       cliErrors.push_back("--cfl-key-hubs requires --cfl-key-cells");
     if (CFLKeyCells && !CFLAllocOrigins)

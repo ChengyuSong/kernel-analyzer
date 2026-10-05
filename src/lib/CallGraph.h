@@ -8,6 +8,7 @@
 #include <memory>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <functional>
 #include <vector>
 #include <unordered_map>
@@ -214,6 +215,21 @@ protected:
   void runSinkConfirmer(); // task #32: trace-payload read-back contract
   void runNexusCensus();      // task #38: nexus-struct discovery
   void runUnionCensus();      // --cfl-census-unions (UnionCensus.cc)
+  // TypeLabels.cc: allocation calls labeled by their typed writes (IR
+  // only), the allocations a call creates, and labels by value before
+  // the solve (--cfl-weld-watch).
+  struct AllocSiteLabel {
+    std::set<std::string> types; // outermost struct of typed writes at offset 0
+    std::string declared;        // the struct its debug-info variable declares
+    bool scalarUse = false;      // accessed as scalars/arrays (a buffer)
+  };
+  void labelAllocationSites(
+      std::unordered_map<const llvm::CallBase *, AllocSiteLabel> &siteLabel,
+      size_t &allocCalls, size_t &wrapperCalls);
+  void allocationsOfCall(const llvm::CallBase *C,
+                         std::set<const llvm::CallBase *> &out);
+  void staticLabels(
+      std::unordered_map<const llvm::Value *, std::set<std::string>> &out);
   // --cfl-union-keys: the key names of each keyed union access, filled by
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).

@@ -2646,13 +2646,16 @@ bool CallGraphPass::runFlowsToResolution() {
   const bool ruleReport = !CFLRuleReport.empty() && !cellNameOf.empty();
   struct Arrival { uint32_t from; const char *how; uint32_t keyO, ptr; };
   boost::unordered_flat_map<uint64_t, Arrival> arrivals;
-  const bool traceAny = traceRoot >= 0 || meetRid[0] >= 0 || ruleReport;
+  // --cfl-weld-watch explains its events with the same arrivals (cheap:
+  // the run stops at the first welds).
+  const bool recordArrivals = ruleReport || CFLWeldWatch > 0;
+  const bool traceAny = traceRoot >= 0 || meetRid[0] >= 0 || recordArrivals;
   auto recordArrival = [&](uint32_t n, uint32_t r) {
     arrivals.try_emplace(((uint64_t)n << 32) | r,
                          Arrival{tFrom, tHow, tKeyO, tPtr});
   };
   auto traceCheck = [&](uint32_t n, uint32_t s, bool br, const FactSet &bits) {
-    if (ruleReport) bits.forEach([&](uint32_t r) { recordArrival(n, r); });
+    if (recordArrivals) bits.forEach([&](uint32_t r) { recordArrival(n, r); });
     for (uint32_t r : traceRoots)
       if (bits.test(r)) traceHit(n, s, br, r);
     if (meetRid[0] >= 0) {
@@ -2661,7 +2664,7 @@ bool CallGraphPass::runFlowsToResolution() {
     }
   };
   auto traceCheckOne = [&](uint32_t n, uint32_t s, uint32_t o) {
-    if (ruleReport) recordArrival(n, o);
+    if (recordArrivals) recordArrival(n, o);
     if (o < traceMark.size() && traceMark[o]) traceHit(n, s, false, o);
     if (meetRid[0] >= 0) {
       if (o == (uint32_t)meetRid[0]) meetHit(n, s, 0);
@@ -3262,10 +3265,252 @@ bool CallGraphPass::runFlowsToResolution() {
   struct KeyEv { size_t seq; uint32_t cls, o, s, ptr, cell; };
   std::vector<KeyEv> keyLog;
   const char *mergeWhy = "other";
+  // ---- --cfl-weld-watch: incompatible objects welded into one cell ----
+  // Labels are interned struct names; a root's labels come from its IR
+  // values (staticLabels). A class's labels are those of the keys it
+  // anchors; two label sets are incompatible when no label of one is, or
+  // is embedded in, a label of the other.
+  const bool weldWatch = CFLWeldWatch > 0;
+  std::unordered_map<const Value *, std::set<std::string>> valueLabels;
+  std::vector<std::string> labelName;
+  std::unordered_map<std::string, uint32_t> labelId;
+  std::vector<std::vector<uint32_t>> rootLabels; // root -> sorted labels
+  std::vector<char> rootLabeled;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> clsLabels; // class -> sorted labels
+  // class -> label -> the first (origin, pointer, cell) that anchored it there
+  struct Witness { uint32_t o, ptr, cell; };
+  std::unordered_map<uint32_t, std::map<uint32_t, Witness>> clsWitness;
+  size_t watchEvents = 0;
+  std::map<std::string, llvm::StructType *> structByKey;
+  if (weldWatch || CFLKeyPartition) {
+    staticLabels(valueLabels);
+    for (auto &[M, _] : Ctx->Modules)
+      for (llvm::StructType *ST : M->getIdentifiedStructTypes())
+        if (!ST->isLiteral() && ST->hasName() && !ST->getName().starts_with("union"))
+          structByKey.emplace(stripStructNameSuffix(ST->getName()).str(), ST);
+    CG_LOG("Labels: " << valueLabels.size() << " labeled values\n");
+  }
+  // Every struct laid out inside a struct (itself included), at any
+  // offset: with one shift plane a pointer to an embedded field is the
+  // object (&pFix->w is the DbFixer), so embedding is compatibility.
+  std::map<std::string, std::set<std::string>> embAll;
+  std::function<const std::set<std::string> &(const std::string &)> embedsOf =
+      [&](const std::string &K) -> const std::set<std::string> & {
+    auto it = embAll.find(K);
+    if (it != embAll.end()) return it->second;
+    embAll[K] = {K}; // cycle guard
+    std::set<std::string> out{K};
+    auto sit = structByKey.find(K);
+    if (sit != structByKey.end() && !sit->second->isOpaque()) {
+      std::function<void(Type *)> walk = [&](Type *T) {
+        while (T->isArrayTy()) T = T->getArrayElementType();
+        auto *ST = dyn_cast<llvm::StructType>(T);
+        if (!ST || ST->isOpaque()) return;
+        if (ST->hasName() && !ST->isLiteral() && !ST->getName().starts_with("union")) {
+          const auto &in = embedsOf(stripStructNameSuffix(ST->getName()).str());
+          out.insert(in.begin(), in.end());
+          return;
+        }
+        for (Type *E : ST->elements()) walk(E);
+      };
+      for (Type *E : sit->second->elements()) walk(E);
+    }
+    embAll[K] = out;
+    return embAll[K];
+  };
+  auto internLabel = [&](const std::string &n) -> uint32_t {
+    auto [it, ins] = labelId.try_emplace(n, (uint32_t)labelName.size());
+    if (ins)
+      labelName.push_back(n);
+    return it->second;
+  };
+  auto labelsOfRoot = [&](uint32_t r) -> const std::vector<uint32_t> & {
+    if (r >= rootLabels.size()) {
+      rootLabels.resize(r + 1);
+      rootLabeled.resize(r + 1, 0);
+    }
+    if (!rootLabeled[r]) {
+      rootLabeled[r] = 1;
+      std::vector<NodeIndex> members;
+      const NodeIndex rn = rootOrig(r);
+      if (rn != AndersNodeFactory::InvalidIndex && !funcRootOf.count(r)) {
+        collectCanonicalMembers(rn, members);
+        std::set<uint32_t> ls;
+        for (NodeIndex m : members)
+          if (const Value *V = NF.getValueForNode(m)) {
+            auto it = valueLabels.find(V);
+            if (it != valueLabels.end())
+              for (auto &n : it->second) ls.insert(internLabel(n));
+          }
+        rootLabels[r].assign(ls.begin(), ls.end());
+      }
+    }
+    return rootLabels[r];
+  };
+  auto compatible = [&](const std::vector<uint32_t> &A, const std::vector<uint32_t> &B) {
+    for (uint32_t a : A)
+      for (uint32_t b : B)
+        if (a == b || embedsOf(labelName[a]).count(labelName[b]) ||
+            embedsOf(labelName[b]).count(labelName[a]))
+          return true;
+    return false;
+  };
+  auto labelText = [&](const std::vector<uint32_t> &L) {
+    std::string t;
+    for (size_t i = 0; i < L.size() && i < 6; i++)
+      t += (t.empty() ? "" : "|") + labelName[L[i]];
+    if (L.size() > 6) t += "|+" + std::to_string(L.size() - 6);
+    return "{" + t + "}";
+  };
+  auto weldEvent = [&](const char *kind, const std::vector<uint32_t> &A,
+                       const std::vector<uint32_t> &B, uint32_t clsA, uint32_t clsB) {
+    watchEvents++;
+    errs() << "WELD #" << watchEvents << " " << kind << ": " << labelText(A)
+           << " with " << labelText(B);
+    if (tKeyO != UINT32_MAX && tKeyO < rootClassOf.size())
+      errs() << " key=(" << protBlameName(rootClassOf[tKeyO]).substr(0, 60) << ",s"
+             << tKeyS << ")";
+    if (tPtr != UINT32_MAX && tPtr < toOrig.size())
+      errs() << " by=" << protBlameName(tPtr).substr(0, 80);
+    if (tCell != UINT32_MAX && tCell < toOrig.size())
+      errs() << " cell=" << protBlameName(tCell).substr(0, 80);
+    errs() << " after " << mergeCount << " merges\n";
+    // Why the triggering pointer holds each side: the arrival chain of
+    // the key's origin, and of one origin it holds with an incompatible
+    // label (newest step first).
+    auto chainOf = [&](uint32_t cls, uint32_t rid) {
+      const uint32_t c = find(cls);
+      uint32_t x = UINT32_MAX;
+      for (auto &[k, a] : arrivals)
+        if ((uint32_t)k == rid && find((uint32_t)(k >> 32)) == c) {
+          x = (uint32_t)(k >> 32);
+          if (x == c) break;
+        }
+      std::string out;
+      boost::unordered_flat_set<uint32_t> seen;
+      for (int d = 0; d < 24 && x != UINT32_MAX; d++) {
+        auto it = arrivals.find(((uint64_t)x << 32) | rid);
+        if (it == arrivals.end() || !seen.insert(x).second) break;
+        const Arrival &a = it->second;
+        out += "\n      " + std::string(a.how) + " " + protBlameName(x).substr(0, 70);
+        if (a.keyO != UINT32_MAX && a.keyO < rootClassOf.size() &&
+            (StringRef(a.how).starts_with("merge") || StringRef(a.how).starts_with("bridge")))
+          out += " key=" + protBlameName(rootClassOf[a.keyO]).substr(0, 40);
+        if (a.ptr != UINT32_MAX && a.ptr < toOrig.size() &&
+            (StringRef(a.how).starts_with("merge") || StringRef(a.how).starts_with("bridge")))
+          out += " by=" + protBlameName(a.ptr).substr(0, 40);
+        x = a.from;
+      }
+      return out.empty() ? std::string(" (no arrival recorded)") : out;
+    };
+    if (tPtr != UINT32_MAX && tPtr < toOrig.size() && tKeyO != UINT32_MAX) {
+      errs() << "    pointer holds " << protBlameName(rootClassOf[tKeyO]).substr(0, 60)
+             << ":" << chainOf(tPtr, tKeyO) << "\n";
+      const auto &LK = labelsOfRoot(tKeyO);
+      uint32_t other = UINT32_MAX;
+      const uint32_t cp = find(tPtr);
+      for (uint32_t s2 = 0; s2 < NSHIFT && other == UINT32_MAX; s2++)
+        R[cp][s2].forEach([&](uint32_t r) {
+          if (other != UINT32_MAX || r == tKeyO) return;
+          const auto &Lr = labelsOfRoot(r);
+          if (!Lr.empty() && !LK.empty() && !compatible(Lr, LK)) other = r;
+        });
+      if (other != UINT32_MAX)
+        errs() << "    pointer holds " << protBlameName(rootClassOf[other]).substr(0, 60)
+               << " " << labelText(labelsOfRoot(other)) << ":" << chainOf(tPtr, other)
+               << "\n";
+    }
+    // Each class's side: the key that first gave it a label, and why the
+    // pointer that anchored that key held its origin.
+    for (uint32_t cls : {clsA, clsB}) {
+      if (cls == UINT32_MAX) continue;
+      auto wit = clsWitness.find(cls);
+      if (wit == clsWitness.end() || wit->second.empty()) continue;
+      const auto &[lab, w] = *wit->second.begin();
+      errs() << "    class c" << cls << " " << labelName[lab] << " from key "
+             << protBlameName(rootClassOf[w.o]).substr(0, 60);
+      if (w.ptr != UINT32_MAX && w.ptr < toOrig.size())
+        errs() << " anchored by " << protBlameName(w.ptr).substr(0, 60) << ":"
+               << chainOf(w.ptr, w.o);
+      errs() << "\n";
+      // How the triggering cell came into this class: replay the merges
+      // until it and the key's anchoring cell are one; that merge, and
+      // why its pointer held its key, is the first link.
+      if (tCell == UINT32_MAX || w.cell == UINT32_MAX) continue;
+      std::unordered_map<uint32_t, uint32_t> par;
+      auto f = [&](uint32_t u) {
+        while (true) {
+          auto it = par.find(u);
+          if (it == par.end() || it->second == u) return u;
+          u = it->second;
+        }
+      };
+      if (find(tCell) != cls) continue; // the witness is the other side's
+      std::vector<NodeIndex> mem;
+      if (tCell == w.cell || (tCell < toOrig.size() && w.cell < toOrig.size() &&
+                              toOrig[tCell] == toOrig[w.cell])) {
+        errs() << "      the cell is the key's own cell\n";
+        continue;
+      }
+      bool linked = false;
+      for (const MergeEv &e : mergeLog) {
+        const uint32_t ra = f(e.a), rb = f(e.b);
+        if (ra == rb) continue;
+        par[rb] = ra;
+        if (f(tCell) != f(w.cell)) continue;
+        errs() << "      the cell joined it by merge (" << e.why << ") of "
+               << protBlameName(e.a).substr(0, 50) << " and "
+               << protBlameName(e.b).substr(0, 50);
+        if (e.keyO != UINT32_MAX && e.keyO < rootClassOf.size())
+          errs() << " key=" << protBlameName(rootClassOf[e.keyO]).substr(0, 50);
+        if (e.ptr != UINT32_MAX && e.ptr < toOrig.size()) {
+          errs() << " by=" << protBlameName(e.ptr).substr(0, 50);
+          if (e.keyO != UINT32_MAX)
+            errs() << "; that pointer holds the key's origin:" << chainOf(e.ptr, e.keyO);
+        }
+        errs() << "\n";
+        linked = true;
+        break;
+      }
+      if (!linked)
+        errs() << "      the cell was in this class before any logged merge "
+                  "(one node from presolve or an SCC collapse)\n";
+    }
+    if (watchEvents >= CFLWeldWatch) {
+      errs() << "WeldWatch: stopping the run after " << watchEvents
+             << " incompatible welds (--cfl-weld-watch)\n";
+      errs().flush();
+      std::exit(0);
+    }
+  };
+  auto mergeLabels = [&](uint32_t keeper, uint32_t loser) {
+    auto it = clsLabels.find(loser);
+    if (it == clsLabels.end()) return;
+    auto &K = clsLabels[keeper];
+    std::vector<uint32_t> u;
+    std::set_union(K.begin(), K.end(), it->second.begin(), it->second.end(),
+                   std::back_inserter(u));
+    K.swap(u);
+    clsLabels.erase(loser);
+    auto wl = clsWitness.find(loser);
+    if (wl != clsWitness.end()) {
+      auto &Wk = clsWitness[keeper];
+      for (auto &[l, op] : wl->second) Wk.try_emplace(l, op);
+      clsWitness.erase(loser);
+    }
+  };
   auto merge = [&](uint32_t a, uint32_t b) -> uint32_t {
     a = find(a); b = find(b);
     if (a == b) return a;
-    if (!CFLDumpMerges.empty() || ruleReport)
+    if (weldWatch) {
+      auto ia = clsLabels.find(a), ib = clsLabels.find(b);
+      if (ia != clsLabels.end() && ib != clsLabels.end() && !ia->second.empty() &&
+          !ib->second.empty() && !compatible(ia->second, ib->second)) {
+        const std::string kind = std::string("merge/") + mergeWhy;
+        weldEvent(kind.c_str(), ia->second, ib->second, a, b);
+      }
+    }
+    if (!CFLDumpMerges.empty() || ruleReport || CFLWeldWatch > 0)
       mergeLog.push_back({a, b, tKeyO, tKeyS, tPtr, mergeWhy, tCell});
     struct MergeTimer {
       uint64_t &acc, t0;
@@ -3283,6 +3528,8 @@ bool CallGraphPass::runFlowsToResolution() {
     if (ufrank[a] < ufrank[b]) std::swap(a, b);
     if (ufrank[a] == ufrank[b]) ufrank[a]++;
     ufp[b] = a;
+    if (weldWatch)
+      mergeLabels(a, b);
     if (g_batchRecord)
       g_batchEvts.push_back({1, a, b, 0});
     if (g_touchTrack) {
@@ -3748,6 +3995,21 @@ bool CallGraphPass::runFlowsToResolution() {
       return;
     }
     keyCount[find(cell)].fetch_add(1, std::memory_order_relaxed);
+    if (weldWatch) {
+      const auto &L = labelsOfRoot(o);
+      if (!L.empty()) {
+        auto &C = clsLabels[find(cell)];
+        if (!C.empty() && !compatible(C, L)) {
+          tKeyO = o; tKeyS = s; tCell = cell;
+          weldEvent("anchor", C, L, find(cell), UINT32_MAX);
+        }
+        std::vector<uint32_t> u;
+        std::set_union(C.begin(), C.end(), L.begin(), L.end(), std::back_inserter(u));
+        C.swap(u);
+        auto &Wm = clsWitness[find(cell)];
+        for (uint32_t l : L) Wm.try_emplace(l, Witness{o, tPtr, cell});
+      }
+    }
     if (!CFLDumpMerges.empty())
       keyLog.push_back({mergeLog.size(), find(cell), o, s, tPtr, cell});
     if (o < envRoot.size() && envRoot[o]) {
@@ -3856,6 +4118,33 @@ bool CallGraphPass::runFlowsToResolution() {
   boost::unordered_flat_set<uint64_t> keyWired; // (write half << 32) | K
   boost::unordered_flat_set<uint64_t> keyReads; // (K << 32) | read half
   size_t keyNodes = 0, keySplits = 0;
+  // --cfl-key-partition: the key cells one dereference reaches, as
+  // (key cell, origin); a new one merges with the first whose labels are
+  // compatible (unlabeled with unlabeled), never across labels.
+  std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> cellKeyCells;
+  size_t partitionMerges = 0, partitionRefusals = 0;
+  auto sameGroup = [&](uint32_t o1, uint32_t o2) {
+    const auto &L1 = labelsOfRoot(o1), &L2 = labelsOfRoot(o2);
+    if (L1.empty() || L2.empty()) return L1.empty() && L2.empty();
+    return compatible(L1, L2);
+  };
+  auto partitionJoin = [&](std::vector<std::pair<uint32_t, uint32_t>> &seen,
+                           uint32_t K, uint32_t o) {
+    bool refused = false;
+    for (auto &[K2, o2] : seen) {
+      if (find(K2) == find(K)) return;
+      if (sameGroup(o, o2)) {
+        mergeWhy = "key-partition";
+        tKeyO = o;
+        merge(K2, K);
+        partitionMerges++;
+        return;
+      }
+      refused = true;
+    }
+    partitionRefusals += refused;
+    seen.emplace_back(K, o);
+  };
   auto flushKeyPends = [&]() -> size_t {
     if (!CFLKeyCells || keyPend.empty()) return 0;
     size_t work = 0;
@@ -3908,6 +4197,8 @@ bool CallGraphPass::runFlowsToResolution() {
         work++;
       }
       const uint32_t K = find(kit->second);
+      if (CFLKeyPartition)
+        partitionJoin(cellKeyCells[cell], K, P.o);
       auto [rit, rNew] = keyReadHalf.try_emplace(cell, UINT32_MAX);
       if (rNew && (!outA[cell].empty() || !outF[cell].empty() ||
                    !cellsOf[cell].empty())) {
@@ -4032,6 +4323,13 @@ bool CallGraphPass::runFlowsToResolution() {
       tHow = "key-out"; tFrom = K;
       pushPlanes(K, H.r);
       hubKeyEdges += 2;
+    }
+    if (CFLKeyPartition) {
+      std::vector<std::pair<uint32_t, uint32_t>> seen;
+      for (uint64_t k : set) {
+        const uint32_t o = (uint32_t)(k >> 8), sft = (uint32_t)(k & 0xff);
+        partitionJoin(seen, keyCellFor(o, sft, nm, cell), o);
+      }
     }
     hubs.push_back(std::move(H));
     cands.push_back((uint32_t)hubs.size() - 1);
@@ -7596,6 +7894,38 @@ bool CallGraphPass::runFlowsToResolution() {
       // ones; the key cells' bridges carry them).
       size_t checked = 0, missing = 0, planes = 0, ptrClasses = 0,
              classKeys = 0, hubEdges = 0, hubMembers = 0;
+      // Wiring by class: --cfl-key-partition merges key cells after they
+      // are wired, so raw ids no longer name them.
+      boost::unordered_flat_set<uint64_t> wiredNow;
+      for (uint64_t e : keyWired)
+        wiredNow.insert(((uint64_t)find((uint32_t)(e >> 32)) << 32) |
+                        find((uint32_t)e));
+      // --cfl-key-partition: how many key classes each dereference reaches
+      // (1 = it could share its group's node as in cluster mode).
+      if (CFLKeyPartition) {
+        std::map<size_t, size_t> hist;
+        std::unordered_map<uint32_t, std::set<uint32_t>> classesOf;
+        for (auto &[c, ks] : cellKeyCells)
+          for (auto &[K, o] : ks) classesOf[find(c)].insert(find(K));
+        for (auto &[c, ks] : classesOf) hist[std::min<size_t>(ks.size(), 5)]++;
+        // hub path: a hub's key set is one pointer's; weigh it by the
+        // memory nodes attached to it
+        std::unordered_map<uint32_t, size_t> membersOfHub;
+        for (uint64_t e : hubIn) membersOfHub[(uint32_t)e]++;
+        for (const auto &H : hubs) {
+          std::set<uint32_t> cls;
+          for (uint64_t k : H.set) {
+            auto kit = keyNodeOf.find(std::make_pair(
+                (uint64_t)(uint32_t)(k >> 8) * NSHIFT + (k & 0xff), H.nm));
+            if (kit != keyNodeOf.end()) cls.insert(find(kit->second));
+          }
+          hist[std::min<size_t>(cls.size(), 5)] += membersOfHub[H.w];
+        }
+        std::string h;
+        for (auto &[n, cnt] : hist)
+          h += " " + std::to_string(n) + (n == 5 ? "+" : "") + ":" + std::to_string(cnt);
+        CG_LOG("KeyCells: dereferences by key classes reached (after partition):" << h << "\n");
+      }
       std::map<std::pair<uint64_t, uint32_t>, std::pair<size_t, int>> hubSets;
       for (uint32_t n = 0; n < (uint32_t)ufp.size(); n++) {
         if (find(n) != n || cellsOf[n].empty()) continue;
@@ -7631,7 +7961,7 @@ bool CallGraphPass::runFlowsToResolution() {
               auto kit = keyNodeOf.find(std::make_pair(
                   (uint64_t)o * NSHIFT + s2, nameOfCell(find(c))));
               if (kit == keyNodeOf.end() ||
-                  !keyWired.count(((uint64_t)find(c) << 32) | find(kit->second))) {
+                  !wiredNow.count(((uint64_t)find(c) << 32) | find(kit->second))) {
                 if (++missing <= 5)
                   errs() << "KeyCells: UNWIRED dereference "
                          << protBlameName(find(c)).substr(0, 60) << " key (r" << o
@@ -7696,7 +8026,13 @@ bool CallGraphPass::runFlowsToResolution() {
              << classKeys << "; equal-set hubs would be " << hubSets.size()
              << " hubs, " << hubEdges << " key edges + " << hubMembers
              << " member edges; certificate: " << checked
-             << " (dereference, fact) pairs, " << missing << " unwired\n");
+             << " (dereference, fact) pairs, " << missing << " unwired"
+             << (CFLKeyPartition ? "; partition: " + std::to_string(partitionMerges) +
+                                      " key-cell merges, " +
+                                      std::to_string(partitionRefusals) +
+                                      " refused across labels"
+                                 : std::string())
+             << "\n");
       if (missing)
         report_fatal_error("--cfl-key-cells: " + Twine(missing) +
                            " dereferences not wired to a key cell of their "

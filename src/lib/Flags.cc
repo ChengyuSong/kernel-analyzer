@@ -705,6 +705,28 @@ cl::opt<bool> CFLCensusUnions(
            "establish on stable fields. Adds no edges"),
   cl::init(false));
 
+cl::opt<bool> CFLKeyPartition(
+  "cfl-key-partition",
+  cl::desc("With --cfl-key-cells: key cells that one dereference reaches "
+           "merge (as cluster mode merges cells) when their objects' labels "
+           "are compatible, and stay apart when they are not; unlabeled "
+           "objects form one group of their own. Labels as --cfl-weld-watch "
+           "computes them. A coarsening of key cells, so sound; the cost "
+           "should approach cluster mode"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLWeldWatch(
+  "cfl-weld-watch",
+  cl::desc("Cluster mode: watch cell classes for welds of incompatible "
+           "objects while solving. Objects are labeled before the solve (a "
+           "global or stack slot by its declared struct, a heap allocation by "
+           "the typed writes of the calls creating it); a class collects the "
+           "labels of the keys it anchors. An event is a key anchored into, "
+           "or a merge with, a class whose labels share no struct (offset-0 "
+           "embedding counts as shared). Prints each event with its trigger "
+           "and stops the run after N events (0 = off)"),
+  cl::init(0));
+
 cl::opt<std::string> CFLUnionKeys(
   "cfl-union-keys",
   cl::desc("With --cfl-named-planes: give union accesses discriminator "

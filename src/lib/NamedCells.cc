@@ -306,6 +306,15 @@ uint32_t AccessNames::intern(std::string S) {
 }
 
 void AccessNames::scanBases(const Module &M) {
+  {
+    DebugInfoFinder DIF;
+    DIF.processModule(M);
+    for (const DIType *T : DIF.types())
+      if (const auto *CT = dyn_cast<DICompositeType>(T))
+        if (CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() &&
+            !CT->isForwardDecl())
+          DIStruct.try_emplace(CT->getName().str(), CT);
+  }
   // Struct types each base pointer is indexed as, by its first GEP index
   // (the type the GEP claims the pointed-to object has).
   boost::unordered_flat_map<const Value *, SmallVector<StructType *, 2>> Seen;
@@ -348,6 +357,74 @@ void AccessNames::scanBases(const Module &M) {
   }
 }
 
+uint32_t AccessNames::unionSlot(StructType *S, uint64_t Base, uint64_t Rel,
+                                uint64_t Size) {
+  StringRef Tag = stripStructNameSuffix(S->getName());
+  Tag.consume_front("struct.");
+  auto It = DIStruct.find(Tag.str());
+  if (It == DIStruct.end())
+    return miss(Union);
+  // Down the debug-info layout of S to the union starting at Base.
+  const DICompositeType *C = It->second;
+  uint64_t At = 0;
+  for (int Depth = 0; Depth < 8 && C; Depth++) {
+    const DIDerivedType *Mem = nullptr;
+    for (const DINode *E : C->getElements())
+      if (const auto *D = dyn_cast<DIDerivedType>(E))
+        if (D->getTag() == dwarf::DW_TAG_member && !D->isStaticMember()) {
+          const uint64_t MO = At + D->getOffsetInBits() / 8,
+                         MS = (D->getSizeInBits() + 7) / 8;
+          if (Base >= MO && Base < MO + std::max<uint64_t>(MS, 1)) {
+            Mem = D;
+            At = MO;
+            break;
+          }
+        }
+    if (!Mem)
+      return miss(Union);
+    StringRef T2;
+    const DICompositeType *MC = diComposite(Mem->getBaseType(), false, T2);
+    if (!MC)
+      return miss(Union);
+    if (MC->getTag() == dwarf::DW_TAG_union_type) {
+      if (At != Base)
+        return miss(Union);
+      // Any struct-typed (or nested union) member over the bytes taints.
+      for (const DINode *E : MC->getElements()) {
+        const auto *D = dyn_cast<DIDerivedType>(E);
+        if (!D || D->getTag() != dwarf::DW_TAG_member)
+          continue;
+        const uint64_t MO = D->getOffsetInBits() / 8,
+                       MS = (D->getSizeInBits() + 7) / 8;
+        if (Rel + Size <= MO || Rel >= MO + MS)
+          continue;
+        const DIType *MT = D->getBaseType();
+        while (const auto *DD = dyn_cast_or_null<DIDerivedType>(MT)) {
+          const unsigned DT = DD->getTag();
+          if (DT != dwarf::DW_TAG_typedef && DT != dwarf::DW_TAG_const_type &&
+              DT != dwarf::DW_TAG_volatile_type)
+            break;
+          MT = DD->getBaseType();
+        }
+        while (const auto *AC = dyn_cast_or_null<DICompositeType>(MT)) {
+          if (AC->getTag() != dwarf::DW_TAG_array_type)
+            break;
+          MT = AC->getBaseType();
+        }
+        if (isa_and_nonnull<DICompositeType>(MT))
+          return miss(Union);
+      }
+      return intern((stripStructNameSuffix(S->getName()) + "+" +
+                     std::to_string(Base + Rel))
+                        .str());
+    }
+    if (MC->getTag() != dwarf::DW_TAG_structure_type)
+      return miss(Union);
+    C = MC; // an unnamed (or IR-transparent) struct between S and the union
+  }
+  return miss(Union);
+}
+
 uint32_t AccessNames::ofSlot(StructType *S, uint64_t Off, uint64_t Size,
                              const DataLayout &DL) {
   assert(S && isNamed(S) && "ofSlot: S must be a named struct");
@@ -360,7 +437,7 @@ uint32_t AccessNames::ofSlot(StructType *S, uint64_t Off, uint64_t Size,
   while (true) {
     if (auto *ST = dyn_cast<StructType>(T)) {
       if (isUnion(ST))
-        return miss(Union);
+        return Named ? unionSlot(Named, Base, Rel, Size) : miss(Union);
       if (isNamed(ST)) {
         Named = ST;
         Base = 0;
@@ -445,11 +522,16 @@ AccessNames::Position AccessNames::position(const Value *Ptr,
   int64_t &Off = R.off;
   Why Lost = NoStruct;
   bool VarLost = false; // a variable step left the last known struct
+  bool InUnion = false; // inside a union of S: S and the offset stay
   auto enter = [&](Type *Ty) -> bool {
     if (auto *ST = dyn_cast<StructType>(Ty)) {
-      if (isUnion(ST))
-        return false;
-      if (isNamed(ST)) {
+      if (isUnion(ST)) {
+        if (!S)
+          return false; // a union outside any named struct
+        InUnion = true;
+        return true;
+      }
+      if (isNamed(ST) && !InUnion) {
         S = ST;
         Off = 0;
         VarLost = false;
@@ -619,8 +701,20 @@ const SmallVector<uint32_t, 8> &AccessNames::leavesOf(StructType *S,
   std::function<void(Type *, StructType *, uint64_t)> walk =
       [&](Type *T, StructType *Named, uint64_t Base) {
         if (auto *ST = dyn_cast<StructType>(T)) {
+          if (isUnion(ST) && Named) {
+            // the union's pointer-sized slots that have a name (unionSlot)
+            const uint64_t Z = DL.getTypeAllocSize(ST);
+            const uint64_t Saved = unnamedBy[Union]; // probing, not naming
+            for (uint64_t K = 0; K + 8 <= Z; K += 8) {
+              const uint32_t N = unionSlot(Named, Base, K, 8);
+              if (N != Unnamed)
+                Out.push_back(N);
+            }
+            unnamedBy[Union] = Saved;
+            return;
+          }
           if (isUnion(ST) || ST->isOpaque())
-            return; // no names inside a union
+            return; // no names inside a union outside a named struct
           if (isNamed(ST)) {
             Named = ST;
             Base = 0;

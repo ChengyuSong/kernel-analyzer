@@ -1388,28 +1388,49 @@ bool CallGraphPass::namedCertifies() const {
   return namedPlanes() && CFLNamedUntyped == "count";
 }
 
-// --cfl-union-keys: a union access the inference keyed is filed under its
-// key names instead of Unnamed (plan 3.17). Key names are opened at once:
-// writes whose key is unknown, aggregate copies, initializer slots and
-// untyped writes all land in the unnamed plane, which a keyed read must
-// therefore read.
+// --cfl-union-keys: union accesses by key (plan 3.17). With a union slot
+// name (NamedCells: the union's bytes named by its struct and offset):
+//   keyed write  -> its key planes and the slot;
+//   unknown-key write -> the slot and the union's "#?" plane;
+//   keyed read   -> its key planes and "#?" (never the slot: other keys);
+//   unknown-key read -> the slot (every write).
+// Without one (a struct member over the bytes) the union access is
+// Unnamed and keys are its only names: keyed accesses use their key
+// planes, unknown ones stay Unnamed. Key names are opened at once, so
+// keyed reads also read the unnamed plane.
 void CallGraphPass::applyUnionKeys(const llvm::Instruction &I,
                                    SmallVectorImpl<uint32_t> &names) {
   auto it = unionKeyNames.find(&I);
-  if (it == unionKeyNames.end())
+  auto ut = unionUnknownOf.find(&I);
+  if (it == unionKeyNames.end() && ut == unionUnknownOf.end())
     return;
   // Only pointer accesses carry names (an integer member is no channel).
   const Type *VT = isa<StoreInst>(I) ? I.getOperand(0)->getType() : I.getType();
   if (!VT->isPointerTy())
     return;
-  assert(names.size() == 1 && names[0] == ka::AccessNames::Unnamed &&
-         "a union access has no access name");
-  names.clear();
-  for (const std::string &k : it->second) {
+  const bool isStore = isa<StoreInst>(I);
+  const bool slotted = !names.empty() && names[0] != ka::AccessNames::Unnamed;
+  auto open = [&](const std::string &k) {
     const uint32_t n = accessNames->keyName(k);
     openName(n, "union-key");
-    names.push_back(n);
+    return n;
+  };
+  if (it == unionKeyNames.end()) { // unknown key
+    if (slotted && isStore)
+      names.push_back(open(ut->second + "#?"));
+    return;
   }
+  const std::string prefix = it->second[0].substr(0, it->second[0].rfind('#'));
+  SmallVector<uint32_t, 4> out;
+  for (const std::string &k : it->second)
+    out.push_back(open(k));
+  if (slotted) {
+    if (isStore)
+      out.append(names.begin(), names.end());
+    else
+      out.push_back(open(prefix + "#?"));
+  }
+  names.assign(out.begin(), out.end());
 }
 
 void CallGraphPass::openName(uint32_t name, StringRef culprit) {

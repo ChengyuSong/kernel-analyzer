@@ -523,18 +523,30 @@ void CallGraphPass::runUnionCensus() {
       for (Instruction &I : instructions(F)) {
         // A zeroing memset of a struct writes 0 to every field it covers
         // (`memset(&w, 0, sizeof(w))` before a walker sets its callbacks).
+        // At -O3 dead-store elimination trims it to the fields not stored
+        // afterwards: a constant offset into the stack struct.
         if (const auto *MS = dyn_cast<MemSetInst>(&I)) {
           const auto *Z = dyn_cast<ConstantInt>(MS->getValue());
           const auto *Len = dyn_cast<ConstantInt>(MS->getLength());
-          const auto *A = dyn_cast<AllocaInst>(MS->getDest()->stripPointerCasts());
-          if (Z && Z->isZero() && Len && A)
+          const Value *Dst = MS->getDest()->stripPointerCasts();
+          int64_t at = 0;
+          bool constOff = true;
+          while (const auto *G = dyn_cast<GEPOperator>(Dst)) {
+            APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
+            if (!G->accumulateConstantOffset(DL, O)) { constOff = false; break; }
+            at += O.getSExtValue();
+            Dst = G->getPointerOperand()->stripPointerCasts();
+          }
+          const auto *A = dyn_cast<AllocaInst>(Dst);
+          if (Z && Z->isZero() && Len && A && constOff && at >= 0)
             if (const auto *ST = dyn_cast<StructType>(A->getAllocatedType()))
               if (ST->hasName()) {
                 const std::string S = stripSuffix(ST->getName());
+                const uint64_t lo = (uint64_t)at, hi = lo + Len->getZExtValue();
                 auto fit = fieldsOf.find(S);
                 if (fit != fieldsOf.end())
                   for (auto &[o, sz] : fit->second)
-                    if (o + sz <= Len->getZExtValue())
+                    if (o >= lo && o + sz <= hi)
                       coWrites[{&F, A, 0, S}][o].insert("int:0");
               }
           continue;
@@ -1509,6 +1521,15 @@ void CallGraphPass::runUnionCensus() {
       auto &names = unionKeyNames[r.I];
       for (auto &c : K) names.push_back(keyName(c));
       keyedR++;
+    }
+    // The rest of this union's accesses keep an unknown key.
+    if (keyedW + keyedR > 0) {
+      const std::string prefix =
+          "struct." + U->structName + "+" + std::to_string(U->off);
+      for (auto &w : W)
+        if (w.I && !unionKeyNames.count(w.I)) unionUnknownOf[w.I] = prefix;
+      for (auto &r : Rd)
+        if (!unionKeyNames.count(r.I)) unionUnknownOf[r.I] = prefix;
     }
     note = "dispatch arg " + std::to_string(kS) + ", " + std::to_string(stored.size()) +
            " callbacks (" + std::to_string(badCb) + " not only dispatched), " +

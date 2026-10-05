@@ -14,9 +14,16 @@
 // a load of the same field get the same name by whichever path they
 // reached it.
 //
+// A union inside a named struct is one slot of that struct: an access in
+// it is named by the struct and its byte offset (every member at those
+// bytes shares the plane), unless a struct-typed member of the union
+// overlaps the access (a `struct T *` into the union names its accesses
+// T+off, which would then miss the slot's).
+//
 // An access gets no name (`Unnamed`) when its address expression has no
 // struct type, an offset leaves the struct it indexes, a leaf is crossed
-// or padding is hit, a union lies on the path, or the chain casts the
+// or padding is hit, a union with a struct member over the bytes (or a
+// union outside any named struct) lies on the path, or the chain casts the
 // position to a struct type the enclosing layout does not have there
 // (punning between unrelated structs).
 
@@ -152,6 +159,13 @@ private:
     return Unnamed;
   }
   uint32_t intern(std::string S);
+  // The union slot name for bytes [Rel, Rel+Size) of the union at byte
+  // Base of named struct S, or Unnamed when a struct-typed member of the
+  // union (debug info: the IR keeps only its largest member) overlaps them.
+  uint32_t unionSlot(llvm::StructType *S, uint64_t Base, uint64_t Rel,
+                     uint64_t Size);
+  // Debug-info composites of named structs, by C tag (scanBases).
+  boost::unordered_flat_map<std::string, const llvm::DICompositeType *> DIStruct;
   std::vector<std::string> Names;
   boost::unordered_flat_map<std::string, uint32_t> Ids;
   boost::unordered_flat_set<const llvm::Value *> PunnedBases;

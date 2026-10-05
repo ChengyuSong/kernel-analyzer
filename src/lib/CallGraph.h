@@ -234,6 +234,9 @@ protected:
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).
   std::map<const llvm::Instruction *, std::vector<std::string>> unionKeyNames;
+  // ... and the accesses of a keyed union whose key is unknown, with the
+  // union's name prefix "struct.S+off".
+  std::map<const llvm::Instruction *, std::string> unionUnknownOf;
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>
   tracepointJunctions(const llvm::GlobalVariable *KeyGV);

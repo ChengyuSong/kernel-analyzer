@@ -251,6 +251,11 @@ run() {
         if [[ -n "${KA_DF_PROGS:-}" && " $KA_DF_PROGS " != *" $prog "* ]]; then
           continue
         fi
+        # KA_DF_ROWS: space-separated "<set>/<prog>" rows to run (eval/72
+        # reruns of timed-out / out-of-memory rows); others are skipped.
+        if [[ -n "${KA_DF_ROWS:-}" && " $KA_DF_ROWS " != *" $set/$prog "* ]]; then
+          continue
+        fi
         run_one "$appr" "$set" "$bc"
       done < <(find "$BC/$dir" -name '*.bc' | sort)
     done <<< "$sets"

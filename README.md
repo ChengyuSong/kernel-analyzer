@@ -1,82 +1,80 @@
-# Linux Kernel Analyzer
+# KAnalyzer
 
-This is a static kernel analyzer forked from [KINT](https://github.com/CRYPTOlab/kint).
+A whole-program call-graph analysis for C/C++ in LLVM IR, built for the
+Linux kernel and large user-space programs. It began as a fork of
+[KINT](https://github.com/CRYPTOlab/kint).
 
-## Compositional CFL Analysis
+Indirect calls are resolved by a rooted flows-to analysis: the origins
+that matter for a call graph (functions, globals, allocation sites) are
+propagated through a constraint graph built from the IR, and memory
+cells are named by what the program declares and tests (struct fields,
+union members, discriminators, tags). The assumptions that make those
+names sound are stated, checked, and reported per run rather than
+assumed.
 
-The `--cfl-compositional` flag enables per-TU CFL solving with V-SCC
-compression and whole-program composition. This avoids building a single
-monolithic constraint graph and allows caching per-library results.
+## Build
 
-### Quick start
+Requirements: LLVM 18 with clang, CMake 3.16+, a C++17 compiler,
+jemalloc (built automatically if absent).
 
 ```bash
-# All-in-one: per-TU solve + compose (no intermediate files)
-kanalyzer tu1.o tu2.o tu3.o --cfl-compositional --callgraph-json cg.json
-
-# Two-phase with cached compressed graphs:
-kanalyzer lib_tu1.o lib_tu2.o --cfl-compressed-output lib.cflcg
-kanalyzer app.o               --cfl-compressed-output app.cflcg
-
-kanalyzer lib_tu1.o lib_tu2.o app.o \
-  --cfl-compositional \
-  --cfl-compressed-input lib.cflcg \
-  --cfl-compressed-input app.cflcg \
-  --callgraph-json cg.json
+make BUILD_DIR=release LLVM_BUILD=/usr/lib/llvm-18      # clean build
+cmake --build release                                   # incremental
 ```
 
-### Flags
+Two binaries are produced:
 
-| Flag | Description |
-|------|-------------|
-| `--cfl-compositional` | Enable per-TU CFL solving and whole-program composition |
-| `--cfl-compressed-output <path>` | Export compressed constraint graph to a `.cflcg` file |
-| `--cfl-compressed-input <path>` | Load a pre-built `.cflcg` file (repeatable) |
-| `--cfl-cache-strict=<true\|false>` | Strict cache validation for `.cflcg` inputs (default: `true`) |
-| `--cfl-cache-repair` | Recompute missing/stale/incompatible modules from current IR, then compose |
-| `--cfl-cache-allow-duplicate-coverage` | Allow multiple input `.cflcg` files to claim the same covered module |
+- `release/lib/KAMain`: the analyzer.
+- `release/baseline/KABaseline`: the CFL-reachability saturation
+  baseline (GraCFL), kept for the scaling measurements. It carries the
+  compositional per-translation-unit mode and the compressed-graph
+  cache (`--cfl-compositional`, `--cfl-compressed-output/-input`,
+  `--cfl-cache-*`); see `docs/compositional-cfl-analysis.md`.
 
-### Cache validation policy
+## Quick start
 
-Compositional mode now validates `.cflcg` cache inputs against current bitcode
-inputs in strict mode (`--cfl-cache-strict=true`, default).
+```bash
+# Analyze bitcode (files or a list); the default configuration is the
+# one reported in the paper.
+release/lib/KAMain tu1.bc tu2.bc --callgraph-json cg.json
+release/lib/KAMain --bc-list files.txt --cfl-dump-icalls-json icalls.json
 
-Strict mode checks:
+# Report the rules the call graph assumes and where the program breaks them
+# (a whole program: code outside the bitcode is assumed to do nothing)
+release/lib/KAMain --bc-list files.txt --cfl-whole-program \
+  --cfl-named-planes --cfl-alloc-origins --cfl-rule-report=rules.txt
+```
 
-- coverage: union of `covered_modules` equals current input module set
-- freshness: per-module SHA256 in `module_hashes` matches current bitcode
-- compatibility: `analysis_key` (grammar/labels/flags/schema) matches current run
-- duplicates: same module cannot be covered by multiple `.cflcg` inputs unless
-  `--cfl-cache-allow-duplicate-coverage` is set
-- boundary sanity: required boundary classes
-  (`func/arg/ret/vararg/glob/icall`) are present when expected from current IR
+Outputs: `--callgraph-json` (functions with callers and callees),
+`--cfl-dump-icalls-json` (per-callsite answers keyed by debug location),
+`--ir-sidecar-dir` (per-module IR facts). Options removed from the
+analyzer are rejected with a message naming the replacement.
 
-On mismatch, diagnostics list `missing`, `stale`, `duplicate`, and
-`incompatible` entries, and the run fails closed.
+The full option list with descriptions is in `docs/cli-reference.md`.
 
-Use `--cfl-cache-repair` to rebuild invalid/missing modules from current IR and
-continue composition automatically.
+## Evaluation
 
-For legacy or handcrafted `.cflcg` fixtures without metadata, use
-`--cfl-cache-strict=false`.
-
-See `docs/compositional-cfl-analysis.md` for the full design.
+`eval/` rebuilds every corpus and baseline from pinned sources and runs
+the comparison; see `eval/README.md`. Gates for changes:
+`test/cfl-smoke.sh` (pinned answers), `test/consumer-gate.sh` with
+`test/consumer-diff.sh` (every consumer output, old binary against new).
 
 ## Documentation
 
-- CFL-reachability architecture, optimizations, and VSnapshot serialization:
+- Design of named cells and the rule report: `docs/named-cells-design.md`
+- Transfer summaries (`func_summaries.txt`) and their scopes: header of
+  that file
+- Lean models and open obligations: `proof/lean/README.md`,
+  `proof/lean/GAPS.md`
+- Compositional CFL baseline: `docs/compositional-cfl-analysis.md`,
   `docs/cfl-reachability-vsnapshot.md`
-- Compositional CFL analysis design:
-  `docs/compositional-cfl-analysis.md`
-- Lean proof scaffold for compositional soundness:
-  `proof/lean/README.md`
-  (gap tracker: `proof/lean/GAPS.md`)
-- Known call graph limitations:
-  `docs/call-graph-limitations.md`
+- Known limitations: `docs/call-graph-limitations.md`
+- Command-line reference: `docs/cli-reference.md`
 
-### Referece
+## Reference
 
-If you like our code, please kindly acknowledge the usage of our tool by citing the following paper:
+If you use this code, please cite:
+
 ```
 Enforcing Kernel Security Invariants with Data Flow Integrity
 Chengyu Song, Byoungyoung Lee, Kangjie Lu, William R. Harris, Taesoo Kim, and Wenke Lee
@@ -92,7 +90,7 @@ NDSS 2016
 }
 ```
 
-### Papers/Tools use this tool/framework
+## Papers and tools that use this framework
 
 ```
 Principled Unearthing of TCP Side Channel Vulnerabilities

@@ -689,7 +689,7 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
       const unsigned P = Graph.numFieldBuckets();
       NodeIndex sParent = getCanonicalNode(srcNode);
       NodeIndex dParent = getCanonicalNode(dstNode);
-      if (CFLLazyAddress) {
+      if (exactFieldLabels()) {
         // Exact addresses have no finite residue set to copy over: an
         // unknown-layout copy is the range wildcard on both sides.
         addFieldWildcardLoop(sParent, "memcpy-unknown-layout");
@@ -1687,7 +1687,7 @@ void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
                                        int64_t off, uint32_t stride, bool arith,
                                        const StructType *ty, uint32_t extent) {
   Graph.addField(src, dst, fieldBucket(off));
-  if (!CFLLazyAddress) return;
+  if (!exactFieldLabels()) return;
   // Recorded per edge (not per endpoint pair): canonical merging can
   // fold two field nodes into one destination, and each edge keeps its
   // own exact label.
@@ -1757,7 +1757,7 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
         levels.push_back(off);
         if (types) types->push_back(STy);
       }
-    } else if (CFLLazyAddress) {
+    } else if (exactFieldLabels()) {
       // Exact addresses: a constant array index is an exact element
       // offset (element k is distinct from element 0); one variable index
       // over an element of size > 1 is a strided step; byte arithmetic

@@ -7678,36 +7678,9 @@ bool CallGraphPass::runFlowsToResolution() {
                         filtCandidates - ctrSiteC0, targets.size()});
     }
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
-    for (const Function *F : targets) {
-      if (!Ctx->Callees[CS].insert(F).second)
-        continue; // wired in an earlier iteration
-      newPairs++;
-      // Wire the callee's flows exactly as the saturation fixpoint does;
-      // the new edges enter the NEXT iteration's solve.
-      Function *CF = const_cast<Function *>(F);
-      reachFunction(CF); // --cfl-reachable: body (and its callees) first
-      if (Ctx->AllocFuncs.count(CF)) {
-        Ctx->AllocSites.insert(CS);
-        NodeIndex callNode = getRepNodeForValue(CS);
-        if (callNode == AndersNodeFactory::InvalidIndex) {
-          // Allocator resolved at a callsite with no value node (result
-          // unused or non-pointer-typed, e.g. type-compat match on a
-          // void callsite): create on demand, as handleCall does.
-          callNode = getCanonicalNode(NF.createValueNode(CS));
-        }
-        AllocSites.insert(callNode);
-        NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
-        Graph.addDeref(callNode, heapObj);
-        auto sit = Ctx->FuncSummaries.find(CF);
-        if (sit != Ctx->FuncSummaries.end() &&
-            applySummaryAtoms(CS, *sit->second, nullptr, sit->first))
-          wireCallArgs(CS, CF); // dynamic-fn INVOKE: feed the body pool
-      } else if (Ctx->ContainerFuncs.count(CF)) {
-        handleContainerCall(CS, CF);
-      } else {
-        handleCall(CS, CF);
-      }
-    }
+    for (const Function *F : targets)
+      if (wireResolvedCallee(CS, F))
+        newPairs++;
   }
   if (NB > 0 && g_tagRoundTrips)
     CG_LOG("TagRoundTrip: " << g_tagRoundTrips
@@ -9874,4 +9847,36 @@ uniqueAllocSource(const Value *v,
     return nullptr;
   }
   return found;
+}
+
+// A resolved pair (CS, F): record it and wire the callee's flows exactly
+// as the saturation fixpoint does; the new edges enter the NEXT
+// iteration's solve. False if the pair was wired in an earlier iteration.
+bool CallGraphPass::wireResolvedCallee(const CallBase *CS, const Function *F) {
+  if (!Ctx->Callees[CS].insert(F).second)
+    return false;
+  Function *CF = const_cast<Function *>(F);
+  reachFunction(CF); // --cfl-reachable: body (and its callees) first
+  if (Ctx->AllocFuncs.count(CF)) {
+    Ctx->AllocSites.insert(CS);
+    NodeIndex callNode = getRepNodeForValue(CS);
+    if (callNode == AndersNodeFactory::InvalidIndex) {
+      // Allocator resolved at a callsite with no value node (result
+      // unused or non-pointer-typed, e.g. type-compat match on a
+      // void callsite): create on demand, as handleCall does.
+      callNode = getCanonicalNode(NF.createValueNode(CS));
+    }
+    AllocSites.insert(callNode);
+    NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
+    Graph.addDeref(callNode, heapObj);
+    auto sit = Ctx->FuncSummaries.find(CF);
+    if (sit != Ctx->FuncSummaries.end() &&
+        applySummaryAtoms(CS, *sit->second, nullptr, sit->first))
+      wireCallArgs(CS, CF); // dynamic-fn INVOKE: feed the body pool
+  } else if (Ctx->ContainerFuncs.count(CF)) {
+    handleContainerCall(CS, CF);
+  } else {
+    handleCall(CS, CF);
+  }
+  return true;
 }

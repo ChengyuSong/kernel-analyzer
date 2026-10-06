@@ -696,7 +696,7 @@ bool CallGraphPass::doModulePass(Module *M) {
     }
 
     const size_t edgeStart = Graph.size();
-    if (namedPlanes()) {
+    if (namedPlanes() || CFLCells) { // cells: the labels read the bases
       if (!accessNames)
         accessNames = std::make_unique<ka::AccessNames>();
       accessNames->scanBases(*M);
@@ -796,6 +796,11 @@ bool CallGraphPass::solve() {
   logHighDegreeNodes(1000, 20);
   if (!CFLDumpAGraph.empty() && iteration == 0)
     dumpRawGraph(CFLDumpAGraph); // before presolve: raw value nodes
+  if (CFLCells) { // no presolve: cells are never unified
+    bool again = runCellResolution();
+    iteration++;
+    return again;
+  }
   ensureUnnamedShadows();
   logNamedCells();
   if (!CFLPreSolveOnce || iteration == 0)

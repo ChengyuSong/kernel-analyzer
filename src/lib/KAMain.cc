@@ -205,6 +205,37 @@ int main(int argc, char **argv) {
                             "labels)");
       CFLBidiPrune = false; // cone is residue-based; not ported
     }
+    if (CFLCells) {
+      // Field edges must exist for their exact labels; the residue count
+      // is unused by the cell solver.
+      if (CFLFieldBuckets == 0) CFLFieldBuckets = 13;
+      if (!CFLAllocOrigins || !CFLWholeProgram || CFLOutside != "pure")
+        cliErrors.push_back("--cfl-cells requires --cfl-alloc-origins, "
+                            "--cfl-whole-program and --cfl-outside=pure "
+                            "(its origins are objects and functions only)");
+      if (CFLNamedPlanes || CFLChannelCells || CFLLazyAddress ||
+          CFLKeyCells || CFLBatchRoots > 0 || CFLLazyMint ||
+          CFLFlowsToSlice || CFLBidiPrune || CFLPreSolveOnce ||
+          CFLVerifyClosure || !CFLRuleReport.empty() ||
+          CFLUnionKeys != "off" || CFLNameByTarget ||
+          !CFLNexusFields.empty() || CFLResidueCopies)
+        cliErrors.push_back("--cfl-cells replaces named planes, channel "
+                            "cells, lazy addresses, key cells, batching, "
+                            "lazy minting, slicing, bidi-prune, presolve, "
+                            "nexus fields, union keys, residue copies and "
+                            "the rule report of the cluster solver: refuse "
+                            "them");
+      // Mechanisms that read or extend the cluster solver's state.
+      for (cl::opt<bool> *o :
+           {&CFLProposeChainSummaries, &CFLRegFieldApply, &CFLRegFieldObj,
+            &CFLProposeSolvedSummaries, &CFLAdoptProposedSummaries}) {
+        if (o->getNumOccurrences() && *o)
+          cliErrors.push_back("--cfl-cells refuses --" +
+                              o->ArgStr.str() +
+                              " (it reads the cluster solver's state)");
+        *o = false;
+      }
+    }
     if (CFLNamedPlanes && (CFLChannelCells || CFLBatchRoots > 0 ||
                            CFLLazyMint || CFLFlowsToSlice))
       cliErrors.push_back("--cfl-named-planes is not ported to channel "

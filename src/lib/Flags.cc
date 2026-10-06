@@ -1107,6 +1107,22 @@ cl::opt<bool> CFLLazyAddress(
            "batch, bidi-prune and the closure verifier"),
   cl::init(false));
 
+cl::opt<bool> CFLCells(
+  "cfl-cells",
+  cl::desc("Cell solver (plan 3.26): facts are cells (origin, name), a "
+           "name being the object's label and a byte offset folded by its "
+           "layout (array elements onto element 0); loads and stores go "
+           "through per-pointer hubs, never unify cells. Whole programs "
+           "with --cfl-alloc-origins only"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLCellCap(
+  "cfl-cell-cap",
+  cl::desc("--cfl-cells: offset cells of an UNLABELED object before its "
+           "further offsets become its any-offset cell (counted); a labeled "
+           "object's cells are bounded by its layout"),
+  cl::init(32));
+
 cl::opt<unsigned> CFLLazyCap(
   "cfl-lazy-cap",
   cl::desc("--cfl-lazy-address: exact addresses minted per writable object "

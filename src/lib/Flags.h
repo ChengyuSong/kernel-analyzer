@@ -121,6 +121,11 @@ extern cl::opt<std::string> CFLDumpIcallsJson;
 extern cl::opt<std::string> CFLDumpTypeJson;
 extern cl::opt<std::string> CFLDumpMerges;
 extern cl::opt<bool> CFLLazyAddress;
+extern cl::opt<bool> CFLCells;
+extern cl::opt<unsigned> CFLCellCap;
+// Field edges carry exact byte-offset labels (lazyFEdges) instead of
+// residue relays: the lazy-address solver and the cell solver.
+inline bool exactFieldLabels() { return CFLLazyAddress || CFLCells; }
 extern cl::opt<unsigned> CFLLazyCap;
 extern cl::opt<std::string> CFLLazyTraceObject;
 extern cl::opt<bool> CFLLazyTypedAccess;

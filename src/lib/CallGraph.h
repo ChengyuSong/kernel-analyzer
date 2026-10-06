@@ -144,6 +144,10 @@ protected:
   std::map<std::string, size_t> wildcardReasons; // fallback category tally
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
   bool runFlowsToResolution();
+  // --cfl-cells (CellSolver.cc, plan 3.26): inclusion over (object,
+  // name) cells, no dereference-node unification.
+  bool runCellResolution();
+  bool wireResolvedCallee(const llvm::CallBase *CS, const llvm::Function *F);
   // --cfl-dump-agraph: raw (pre-presolve) constraint graph + icall
   // site / function tables for offline reference solvers.
   void dumpRawGraph(const std::string &prefix);

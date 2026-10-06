@@ -237,6 +237,11 @@ protected:
   // ... and the accesses of a keyed union whose key is unknown, with the
   // union's name prefix "struct.S+off".
   std::map<const llvm::Instruction *, std::string> unionUnknownOf;
+  // --cfl-name-by-target: untyped writes whose unnamed-plane edge waits for
+  // the solve to show a target other than a pointer variable:
+  // (value, cell, the cell's unnamed shadow).
+  std::vector<std::tuple<NodeIndex, NodeIndex, NodeIndex>> deferredUnnamed;
+  bool isPointerVariable(const llvm::Value *V);
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>
   tracepointJunctions(const llvm::GlobalVariable *KeyGV);
@@ -390,7 +395,7 @@ protected:
     uint64_t shadows = 0, namedStores = 0, unnamedStores = 0,
              namedLoads = 0, unnamedLoads = 0, namedSlots = 0,
              unnamedSlots = 0, unnamedWrites = 0, cellCopies = 0,
-             typedWrites = 0;
+             typedWrites = 0, pointerVarWrites = 0;
   } namedStats;
   // processInitializer's slot position: innermost named struct and the
   // byte offset in it (array elements folded), or none / in a union.

@@ -1379,9 +1379,49 @@ void CallGraphPass::fileUnnamedWrite(NodeIndex s, NodeIndex src,
     blindBy[where]++;
     if ((CFLCensusTypeLabels || !CFLRuleReport.empty()))
       blindWriteLog.emplace_back(dst, where);
+    // --cfl-name-by-target: no position at all; the solve decides by the
+    // objects the pointer reaches (FlowsToSolver.cc, flushDeferredUnnamed).
+    if (CFLNameByTarget && NF.isDereferenceNode(dst)) {
+      deferredUnnamed.emplace_back(s, dst, namedShadow(dst, ka::AccessNames::Unnamed));
+      namedStats.unnamedWrites++;
+      return;
+    }
+    // ... and a write straight into an object is filed by that object now.
+    if (CFLNameByTarget && NF.isObjectNode(dst) &&
+        isPointerVariable(NF.getValueForNode(dst))) {
+      namedStats.pointerVarWrites++;
+      return; // raw cell only
+    }
   }
   Graph.addCopy(s, namedShadow(dst, ka::AccessNames::Unnamed));
   namedStats.unnamedWrites++;
+}
+
+// A stack or global object whose declared type (debug info) is a pointer
+// or an array of pointers: no struct field lives in it.
+bool CallGraphPass::isPointerVariable(const Value *V) {
+  const DIType *T = nullptr;
+  if (const auto *AI = dyn_cast_or_null<AllocaInst>(V)) {
+    for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+      if (auto *Var = DDI->getVariable()) { T = Var->getType(); break; }
+  } else if (const auto *GV = dyn_cast_or_null<GlobalVariable>(V)) {
+    SmallVector<DIGlobalVariableExpression *, 1> GVEs;
+    GV->getDebugInfo(GVEs);
+    if (!GVEs.empty()) T = GVEs[0]->getVariable()->getType();
+  }
+  for (int i = 0; i < 8 && T; i++) {
+    if (const auto *D = dyn_cast<DIDerivedType>(T)) {
+      const unsigned Tg = D->getTag();
+      if (Tg == dwarf::DW_TAG_pointer_type) return true;
+      if (Tg == dwarf::DW_TAG_typedef || Tg == dwarf::DW_TAG_const_type ||
+          Tg == dwarf::DW_TAG_volatile_type) { T = D->getBaseType(); continue; }
+      return false;
+    }
+    if (const auto *C = dyn_cast<DICompositeType>(T))
+      if (C->getTag() == dwarf::DW_TAG_array_type) { T = C->getBaseType(); continue; }
+    return false;
+  }
+  return false;
 }
 
 bool CallGraphPass::namedCertifies() const {
@@ -1575,7 +1615,9 @@ void CallGraphPass::logNamedCells() const {
          << namedStats.namedLoads << " named / " << namedStats.unnamedLoads
          << " unnamed loads, " << namedStats.namedSlots << " named / "
          << namedStats.unnamedSlots << " unnamed initializer slots, "
-         << namedStats.unnamedWrites << " other cell writes, "
+         << namedStats.unnamedWrites << " other cell writes ("
+         << namedStats.pointerVarWrites << " into pointer variables kept out of "
+         << "the unnamed plane), "
          << namedStats.cellCopies << " cell-to-cell copies; "
          << namedStats.shadows << " shadow cells\n");
   std::string why;

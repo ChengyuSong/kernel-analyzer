@@ -705,6 +705,17 @@ cl::opt<bool> CFLCensusUnions(
            "establish on stable fields. Adds no edges"),
   cl::init(false));
 
+cl::opt<bool> CFLNameByTarget(
+  "cfl-name-by-target",
+  cl::desc("With --cfl-named-planes: an untyped write (no struct position "
+           "on its address) is filed by what its pointer reaches, at solve "
+           "time. While the pointer reaches only pointer variables (a stack "
+           "or global object whose declared type is a pointer or an array of "
+           "pointers), the write stays in the raw cell (unnamed reads see "
+           "it) and out of the unnamed plane every named read also reads; "
+           "it joins that plane as soon as the pointer reaches anything else"),
+  cl::init(false));
+
 cl::opt<bool> CFLKeyPartition(
   "cfl-key-partition",
   cl::desc("With --cfl-key-cells: key cells that one dereference reaches "

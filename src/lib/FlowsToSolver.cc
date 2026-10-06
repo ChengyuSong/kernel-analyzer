@@ -13,6 +13,8 @@
 // Part of CallGraphPass; shared declarations in CallGraphInternal.h.
 
 #include "CallGraphInternal.h"
+#include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/IR/DebugInfo.h>
 
 static const llvm::CallBase *
 uniqueAllocSource(const llvm::Value *v,
@@ -4145,6 +4147,136 @@ bool CallGraphPass::runFlowsToResolution() {
     partitionRefusals += refused;
     seen.emplace_back(K, o);
   };
+  // --cfl-name-by-target: an untyped write joins its cell's unnamed plane
+  // once its pointer reaches an object that is not a pointer variable (a
+  // stack or global object whose declared type is a pointer or an array of
+  // pointers: no struct field lives there for a named read to miss it).
+  // Code and null/constant-data roots take no write and decide nothing.
+  std::vector<int8_t> slotRoot; // -1 unknown, 0 no, 1 pointer variable
+  auto isPointerType = [](const DIType *T) {
+    for (int i = 0; i < 8 && T; i++) {
+      if (const auto *D = dyn_cast<DIDerivedType>(T)) {
+        const unsigned Tg = D->getTag();
+        if (Tg == dwarf::DW_TAG_pointer_type) return true;
+        if (Tg == dwarf::DW_TAG_typedef || Tg == dwarf::DW_TAG_const_type ||
+            Tg == dwarf::DW_TAG_volatile_type) { T = D->getBaseType(); continue; }
+        return false;
+      }
+      if (const auto *C = dyn_cast<DICompositeType>(T))
+        if (C->getTag() == dwarf::DW_TAG_array_type) { T = C->getBaseType(); continue; }
+      return false;
+    }
+    return false;
+  };
+  auto pointerVariable = [&](uint32_t o) -> int {
+    if (o >= slotRoot.size()) slotRoot.resize(o + 1, -1);
+    if (slotRoot[o] >= 0) return slotRoot[o];
+    int v = 1;
+    const NodeIndex rn = rootOrig(o);
+    if (rn == AndersNodeFactory::InvalidIndex) v = 0;
+    std::vector<NodeIndex> mem;
+    if (v) collectCanonicalMembers(rn, mem);
+    bool any = false;
+    for (NodeIndex m : mem) {
+      const Value *V = NF.getValueForNode(m);
+      if (!V) continue;
+      const DIType *T = nullptr;
+      if (const auto *AI = dyn_cast<AllocaInst>(V)) {
+        for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+          if (auto *Var = DDI->getVariable()) { T = Var->getType(); break; }
+      } else if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
+        SmallVector<DIGlobalVariableExpression *, 1> GVEs;
+        GV->getDebugInfo(GVEs);
+        if (!GVEs.empty()) T = GVEs[0]->getVariable()->getType();
+      } else {
+        continue; // other members (casts of the object) say nothing
+      }
+      any = true;
+      if (!isPointerType(T)) { v = 0; break; }
+    }
+    if (!any) v = 0;
+    slotRoot[o] = (int8_t)v;
+    return v;
+  };
+  struct DeferredW { uint32_t val, cell, shadow; bool other, wired; };
+  std::vector<DeferredW> deferredW;
+  size_t deferredWired = 0;
+  // A cell can belong to several pointers (dedup and presolve merge
+  // cells): every owner's facts count.
+  std::unordered_map<uint32_t, std::vector<uint32_t>> ownersOf;
+  size_t deferredMissing[8] = {};
+  if (CFLNameByTarget) {
+    boost::unordered_flat_set<uint32_t> want;
+    for (auto &[sv, dc, sh] : deferredUnnamed) {
+      auto b = toDense.find(getCanonicalNode(dc));
+      if (b != toDense.end()) want.insert(b->second);
+    }
+    for (uint32_t p = 0; p < N; p++)
+      for (uint32_t c : cellsOf[p])
+        if (want.count(c)) ownersOf[c].push_back(p);
+  }
+  if (CFLNameByTarget)
+    for (auto &[sv, dc, sh] : deferredUnnamed) {
+      auto a = toDense.find(getCanonicalNode(sv)), b = toDense.find(getCanonicalNode(dc)),
+           c = toDense.find(getCanonicalNode(sh));
+      // A value or cell outside the graph holds or takes nothing. A shadow
+      // with no edge of its own is no satellite: the write goes to the
+      // unnamed satellite its cell's class has (or gets) instead.
+      if (a == toDense.end() || b == toDense.end()) {
+        deferredMissing[(a == toDense.end() ? 1 : 0) | (b == toDense.end() ? 2 : 0)]++;
+        continue;
+      }
+      if (c == toDense.end()) deferredMissing[4]++;
+      deferredW.push_back({a->second, b->second,
+                           c == toDense.end() ? UINT32_MAX : c->second, false, false});
+    }
+  auto flushDeferredUnnamed = [&]() -> size_t {
+    size_t work = 0;
+    for (DeferredW &D : deferredW) {
+      if (D.wired) continue;
+      auto oit = ownersOf.find(D.cell);
+      bool other = D.other || oit == ownersOf.end(); // no pointer known: decide now
+      if (!other)
+      for (uint32_t owner : oit->second) {
+        if (other) break;
+        const uint32_t p = find(owner);
+        for (uint32_t s2 = 0; s2 < NSHIFT && !other; s2++)
+          for (const FactSet *F : {&R[p][s2], &RB[p][s2]})
+            F->forEach([&](uint32_t o) {
+              if (other || funcRootOf.count(o)) return;
+              const NodeIndex on0 = rootOrig(o);
+              if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode()) return;
+              if (o < rootConstData.size() && rootConstData[o]) return;
+              if (!pointerVariable(o)) other = true;
+            });
+      }
+      if (!other) continue;
+      D.other = true;
+      uint32_t to = UINT32_MAX;
+      if (D.shadow != UINT32_MAX) {
+        to = find(D.shadow);
+      } else {
+        const uint32_t c = find(D.cell);
+        if (c < satOf.size())
+          for (auto &[nm, u] : satOf[c])
+            if (nm == ka::AccessNames::Unnamed) { to = find(u); break; }
+        if (to == UINT32_MAX) continue; // no unnamed plane in the class yet
+      }
+      D.wired = true;
+      deferredWired++;
+      const uint32_t from = find(D.val);
+      if (from == to) continue;
+      outA[from].push_back(to);
+      tHow = "untyped-in"; tFrom = from;
+      for (uint32_t s2 = 0; s2 < NSHIFT; s2++) {
+        if (R[from][s2].any()) addBits(to, s2, R[from][s2], ctx0);
+        if (RB[from][s2].any()) addBits(to, s2, RB[from][s2], ctx0);
+      }
+      work++;
+    }
+    if (work) flushCtx(ctx0);
+    return work;
+  };
   auto flushKeyPends = [&]() -> size_t {
     if (!CFLKeyCells || keyPend.empty()) return 0;
     size_t work = 0;
@@ -6085,7 +6217,8 @@ bool CallGraphPass::runFlowsToResolution() {
   // Channel mode: also materialize pended channels/edges — new edges
   // seed facts, so drain again until neither expands.
   } while (lazyExpand() > 0 || flushChannelPends() > 0 ||
-           flushKeyPends() > 0 || flushHubs() > 0);
+           flushKeyPends() > 0 || flushHubs() > 0 ||
+           flushDeferredUnnamed() > 0);
   } else {
     const uint32_t K = CFLBatchRoots;
     const unsigned P = std::max(1u, (unsigned)CFLBatchWorkers);
@@ -6495,6 +6628,16 @@ bool CallGraphPass::runFlowsToResolution() {
         break; // retained witness state stable: harvest is valid
     }
   }
+  if (CFLNameByTarget)
+    CG_LOG("NameByTarget: " << deferredUnnamed.size() << " deferred at build, "
+           << deferredW.size() << " in this solve's graph (missing value/cell/shadow:"
+           << " v" << deferredMissing[1] << " c" << deferredMissing[2] << " s" << deferredMissing[4]
+           << " vc" << deferredMissing[3] << " vs" << deferredMissing[5] << " cs" << deferredMissing[6]
+           << " vcs" << deferredMissing[7] << "); "
+           << deferredW.size() << " untyped writes, "
+           << deferredWired << " joined the unnamed plane (their pointer "
+           << "reaches more than pointer variables), "
+           << deferredW.size() - deferredWired << " kept out\n");
   // --cfl-verify-closure: certify the fixpoint. One full non-delta scan of
   // every rule; any rule that would still fire is a violation. This checks
   // the closure property the delta/backlog machinery must maintain — the

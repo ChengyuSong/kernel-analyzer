@@ -216,6 +216,14 @@ int main(int argc, char **argv) {
       cliErrors.push_back("--cfl-alloc-origins is not ported to channel "
                           "cells, batched roots, lazy minting or lazy "
                           "addresses (each mints roots on its own path)");
+    if (CFLOutside != "pure" && CFLOutside != "roots")
+      cliErrors.push_back("--cfl-outside takes pure or roots");
+    else if (CFLAllocOrigins && !CFLWholeProgram && CFLOutside == "pure")
+      cliErrors.push_back("--cfl-outside=pure is for whole programs "
+                          "(--cfl-whole-program): in a partial corpus, code "
+                          "outside it calls exported functions and writes "
+                          "visible globals; choose an environment model "
+                          "explicitly (--cfl-outside=roots)");
     if (CFLNameByTarget && !CFLNamedPlanes)
       cliErrors.push_back("--cfl-name-by-target requires --cfl-named-planes");
     if (CFLKeyPartition && !CFLKeyCells)

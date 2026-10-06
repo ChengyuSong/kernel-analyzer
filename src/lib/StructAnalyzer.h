@@ -196,6 +196,14 @@ public:
 
 	void run(llvm::Module* M, const llvm::DataLayout* layout);
 
+	// Every (embedded struct, its module, containing struct, byte offset).
+	template <class Fn> void forEachContainer(Fn fn) const {
+		for (auto &[st, info] : structInfoMap)
+			for (auto &[ct, offs] : info.containers)
+				for (unsigned off : offs)
+					fn(st, info.getModule(), ct, off);
+	}
+
 	void printStructInfo() const;
 	void printStructInfo(const StructInfo &info) const;
 };

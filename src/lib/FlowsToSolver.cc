@@ -1447,6 +1447,9 @@ bool CallGraphPass::runFlowsToResolution() {
   // externally visible function, so those globals and formals are
   // environment sites too.
   const bool partialEnv = CFLAllocOrigins && !CFLWholeProgram;
+  // --cfl-outside=pure: code without IR or summary writes nothing, calls
+  // nothing, keeps nothing (UNSOUND for such code; Flags.cc).
+  const bool pureOutside = CFLAllocOrigins && CFLOutside == "pure";
   auto classHas = [&](uint32_t n, auto pred) {
     if (pred(toOrig[n])) return true;
     auto mit = canonicalClassMembers.find(toOrig[n]);
@@ -1575,6 +1578,10 @@ bool CallGraphPass::runFlowsToResolution() {
       }
       bool env = false;
       if (exportedFormal && !isFunc && !hasOrigin[n] && !isCert) {
+        if (pureOutside) { // outside code calls nothing
+          identityNotMinted["exported-formal"]++;
+          continue;
+        }
         env = true; // a formal code outside the corpus may call
         partialEnvRoots++;
       } else if (!isFunc && !hasOrigin[n] && !isCert) {
@@ -1584,10 +1591,16 @@ bool CallGraphPass::runFlowsToResolution() {
           identityNotMinted[idKindName[ik]]++;
           continue; // not an object: a read of it is empty (rule a)
         }
-        env = true;
+        // --cfl-outside=pure: a formal no call reaches (yet), the result of
+        // a bodiless call and a vararg of an uncalled function hold nothing.
+        if (pureOutside && ik != IdSpecial) {
+          identityNotMinted[idKindName[ik]]++;
+          continue;
+        }
+        env = !pureOutside;
       } else if (CFLAllocOrigins && !isFunc && isExternGlobalClass(n)) {
-        env = true;
-      } else if (partialEnv && !isFunc && isVisibleGlobalClass(n)) {
+        env = !pureOutside; // pure: holds only what the program writes
+      } else if (partialEnv && !pureOutside && !isFunc && isVisibleGlobalClass(n)) {
         env = true; // a global code outside the corpus may write
         partialEnvRoots++;
       }
@@ -3284,7 +3297,7 @@ bool CallGraphPass::runFlowsToResolution() {
   std::unordered_map<uint32_t, std::map<uint32_t, Witness>> clsWitness;
   size_t watchEvents = 0;
   std::map<std::string, llvm::StructType *> structByKey;
-  if (weldWatch || CFLKeyPartition) {
+  if (weldWatch || CFLKeyPartition || CFLCensusNames) {
     staticLabels(valueLabels);
     for (auto &[M, _] : Ctx->Modules)
       for (llvm::StructType *ST : M->getIdentifiedStructTypes())
@@ -6627,6 +6640,116 @@ bool CallGraphPass::runFlowsToResolution() {
       if (dm == 0 && nextRoot == nR && dk == 0)
         break; // retained witness state stable: harvest is valid
     }
+  }
+  // --cfl-census-names (measurement only).
+  if (CFLCensusNames && iteration == 0) {
+    auto pct = [](std::vector<size_t> v, double q) -> size_t {
+      if (v.empty()) return 0;
+      std::sort(v.begin(), v.end());
+      return v[std::min(v.size() - 1, (size_t)(q * (v.size() - 1)))];
+    };
+    // Distinct labels (plus unlabeled objects, each its own name) a class holds.
+    auto widthOf = [&](uint32_t c, size_t &unl) {
+      std::set<uint32_t> labs;
+      unl = 0;
+      for (uint32_t s2 = 0; s2 < NSHIFT; s2++)
+        for (const FactSet *F2 : {&R[c][s2], &RB[c][s2]})
+          F2->forEach([&](uint32_t o) {
+            if (funcRootOf.count(o)) return;
+            const NodeIndex on0 = rootOrig(o);
+            if (on0 == NF.getNullPtrNode() || on0 == NF.getNullObjectNode()) return;
+            if (o < rootConstData.size() && rootConstData[o]) return;
+            const auto &L = labelsOfRoot(o);
+            if (L.empty()) unl++;
+            else labs.insert(L.begin(), L.end());
+          });
+      return labs.size();
+    };
+    std::vector<size_t> wAddr, uAddr;
+    std::vector<std::pair<size_t, uint32_t>> topAddr;
+    for (uint32_t p = 0; p < N; p++) {
+      if (find(p) != p || cellsOf[p].empty()) continue;
+      size_t unl = 0;
+      const size_t w = widthOf(p, unl);
+      wAddr.push_back(w);
+      uAddr.push_back(unl);
+      topAddr.emplace_back(w, p);
+    }
+    std::sort(topAddr.rbegin(), topAddr.rend());
+    errs() << "NameCensus: address pointers " << wAddr.size()
+           << "; labels reached p50 " << pct(wAddr, .5) << " p90 " << pct(wAddr, .9)
+           << " p99 " << pct(wAddr, .99) << " max " << pct(wAddr, 1)
+           << "; unlabeled objects reached p50 " << pct(uAddr, .5) << " p90 "
+           << pct(uAddr, .9) << " max " << pct(uAddr, 1) << "\n";
+    for (size_t i = 0; i < topAddr.size() && i < 5; i++)
+      errs() << "NameCensus:   widest " << topAddr[i].first << " labels: "
+             << protBlameName(topAddr[i].second).substr(0, 80) << "\n";
+    // void* / char* formals
+    std::vector<size_t> wGen;
+    for (auto &[M2, _] : Ctx->Modules)
+      for (const Function &Fn : *M2) {
+        const DISubprogram *SP = Fn.getSubprogram();
+        if (Fn.isDeclaration() || !SP || !SP->getType()) continue;
+        auto TA = SP->getType()->getTypeArray();
+        for (const Argument &A : Fn.args()) {
+          if (A.getArgNo() + 1 >= TA.size()) break;
+          const auto *PT = dyn_cast_or_null<DIDerivedType>(TA[A.getArgNo() + 1]);
+          if (!PT || PT->getTag() != dwarf::DW_TAG_pointer_type) continue;
+          const DIType *B = PT->getBaseType();
+          while (const auto *D = dyn_cast_or_null<DIDerivedType>(B)) {
+            if (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_const_type) break;
+            B = D->getBaseType();
+          }
+          const auto *BT = dyn_cast_or_null<DIBasicType>(B);
+          const bool generic = !B || (BT && BT->getSizeInBits() == 8);
+          if (!generic) continue;
+          auto d = toDense.find(getCanonicalNode(getRepNodeForValue(&A)));
+          if (d == toDense.end()) continue;
+          size_t unl = 0;
+          wGen.push_back(widthOf(find(d->second), unl) + unl);
+        }
+      }
+    errs() << "NameCensus: void*/char* formals " << wGen.size() << "; names reached p50 "
+           << pct(wGen, .5) << " p90 " << pct(wGen, .9) << " p99 " << pct(wGen, .99)
+           << " max " << pct(wGen, 1) << "\n";
+    // Unnamed accesses by target kind
+    size_t kNone[2] = {}, kLab[2] = {}, kMix[2] = {}, kUnl[2] = {}, kOut[2] = {};
+    for (auto &[cell, isStore] : unnamedAccessLog) {
+      auto d = toDense.find(getCanonicalNode(cell));
+      if (d == toDense.end()) { kOut[isStore]++; continue; }
+      const uint32_t owner = cellOwner[d->second];
+      if (owner == UINT32_MAX) { kOut[isStore]++; continue; }
+      size_t unl = 0;
+      const size_t w = widthOf(find(owner), unl);
+      if (!w && !unl) kNone[isStore]++;
+      else if (w && !unl) kLab[isStore]++;
+      else if (w && unl) kMix[isStore]++;
+      else kUnl[isStore]++;
+    }
+    for (int st = 0; st < 2; st++)
+      errs() << "NameCensus: unnamed " << (st ? "stores " : "loads ") << ": reach nothing "
+             << kNone[st] << ", only labeled " << kLab[st] << ", mixed " << kMix[st]
+             << ", only unlabeled " << kUnl[st] << ", outside the graph " << kOut[st] << "\n";
+    // container_of fan-out
+    std::map<std::pair<std::string, unsigned>, std::set<std::string>> outers;
+    Ctx->structAnalyzer.forEachContainer([&](const llvm::StructType *St, const Module *SM,
+                                             const llvm::StructType *Ct, unsigned off) {
+      if (St->isLiteral() || Ct->isLiteral() || St == Ct) return;
+      outers[{getScopeName(St, SM), off}].insert(getScopeName(Ct, SM));
+    });
+    std::vector<size_t> fan;
+    std::vector<std::pair<size_t, std::string>> topFan;
+    for (auto &[k, v] : outers) {
+      fan.push_back(v.size());
+      topFan.emplace_back(v.size(), k.first + "@" + std::to_string(k.second));
+    }
+    std::sort(topFan.rbegin(), topFan.rend());
+    errs() << "NameCensus: container_of (embedded struct, offset) pairs " << fan.size()
+           << "; outer types p50 " << pct(fan, .5) << " p90 " << pct(fan, .9) << " p99 "
+           << pct(fan, .99) << " max " << pct(fan, 1) << "; top:";
+    for (size_t i = 0; i < topFan.size() && i < 8; i++)
+      errs() << " " << topFan[i].second << "=" << topFan[i].first;
+    errs() << "\n";
   }
   if (CFLNameByTarget)
     CG_LOG("NameByTarget: " << deferredUnnamed.size() << " deferred at build, "

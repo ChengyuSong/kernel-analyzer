@@ -191,6 +191,7 @@ public:
   struct FuncSummary {
     std::vector<SummaryAtom> atoms;
     bool fresh = false; // has a Fresh atom
+    bool body = false;  // BODY: the body is analyzed too (its own calls)
     bool none = false;  // explicit NONE: no summary, stop matching
     bool noop = false;  // NOOP: call transfers nothing, body skipped
                         // (free/printk/lock entry points — replaces the

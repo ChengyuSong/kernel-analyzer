@@ -64,6 +64,8 @@ extern cl::opt<std::string> CFLUnionKeys;
 extern cl::opt<unsigned> CFLWeldWatch;
 extern cl::opt<bool> CFLKeyPartition;
 extern cl::opt<bool> CFLNameByTarget;
+extern cl::opt<std::string> CFLOutside;
+extern cl::opt<bool> CFLCensusNames;
 extern cl::opt<bool> CFLKeyHubs;
 extern cl::opt<std::string> CFLRuleReport;
 extern cl::opt<std::string> CFLRegFieldWatch;

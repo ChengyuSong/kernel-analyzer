@@ -1533,6 +1533,7 @@ void CallGraphPass::wireNamedStore(NodeIndex val, NodeIndex cell,
       names[0] == ka::AccessNames::Unnamed) {
     addAssignmentEdge(val, cell);
     namedStats.unnamedStores++;
+    if (CFLCensusNames) unnamedAccessLog.emplace_back(cell, true);
     return;
   }
   namedFiling++;
@@ -1549,6 +1550,7 @@ void CallGraphPass::wireNamedLoad(NodeIndex cell, NodeIndex val,
       names[0] == ka::AccessNames::Unnamed) {
     addAssignmentEdge(cell, val);
     namedStats.unnamedLoads++;
+    if (CFLCensusNames) unnamedAccessLog.emplace_back(cell, false);
     return;
   }
   addAssignmentEdge(namedShadow(cell, ka::AccessNames::Identity), val);
@@ -5303,7 +5305,7 @@ void CallGraphPass::buildFieldStoreMapFromIR(Module *M) {
   // falls back to always-accept for it.
   auto scannedFn = [&](const Function *PF) {
     return PF && !PF->isDeclaration() && !PF->isIntrinsic() && !PF->empty() &&
-           (!Ctx->AllocFuncs.count(PF) || summaryInvokeKeepsBody(Ctx, PF)) &&
+           (!Ctx->AllocFuncs.count(PF) || summaryKeepsBody(Ctx, PF)) &&
            !Ctx->ContainerFuncs.count(PF) && !shouldSkipFunction(PF);
   };
   size_t incompleteMarked = 0;
@@ -5839,7 +5841,7 @@ void CallGraphPass::reachFunction(Function *F0) {
     Function *F = g_reachWork.back();
     g_reachWork.pop_back();
     if (F->isIntrinsic() || F->empty()) continue;
-    if ((Ctx->AllocFuncs.count(F) && !summaryInvokeKeepsBody(Ctx, F)) ||
+    if ((Ctx->AllocFuncs.count(F) && !summaryKeepsBody(Ctx, F)) ||
         Ctx->ContainerFuncs.count(F) || shouldSkipFunction(F)) {
       g_reachSkippedFilter++;
       continue; // summarized: no body, same as the eager loop

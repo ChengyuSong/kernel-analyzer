@@ -705,6 +705,31 @@ cl::opt<bool> CFLCensusUnions(
            "establish on stable fields. Adds no edges"),
   cl::init(false));
 
+cl::opt<bool> CFLCensusNames(
+  "cfl-census-names",
+  cl::desc("MEASUREMENT ONLY (plan 3.23 item 6): with --cfl-named-planes, "
+           "after the solve: (1) name-set width, the distinct labels of the "
+           "objects each address pointer (and each void*/char* formal) "
+           "reaches; (2) unnamed loads and stores by what their pointers "
+           "reach (nothing / only labeled / mixed / only unlabeled objects); "
+           "(3) container_of fan-out, the outer struct types per (embedded "
+           "struct, offset) of the embedding table. Adds no edges"),
+  cl::init(false));
+
+cl::opt<std::string> CFLOutside(
+  "cfl-outside",
+  cl::desc("With --cfl-alloc-origins: what code the analysis has neither IR "
+           "nor a summary for does. 'pure' (default, UNSOUND for such code): "
+           "it writes nothing, calls nothing and keeps nothing it is given; a "
+           "call to it returns no object, an uncalled function's formals "
+           "take nothing from outside, extern globals hold only what the "
+           "program writes. Whole programs only (--cfl-whole-program); a "
+           "partial corpus refuses it. 'roots': each "
+           "formal no call reaches, bodiless call result and vararg is an "
+           "environment object with environment content (and, in a partial "
+           "corpus, exported formals and visible globals)"),
+  cl::init("pure"));
+
 cl::opt<bool> CFLNameByTarget(
   "cfl-name-by-target",
   cl::desc("With --cfl-named-planes: an untyped write (no struct position "

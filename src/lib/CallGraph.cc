@@ -738,7 +738,7 @@ bool CallGraphPass::doModulePass(Module *M) {
     } else
     for (Function &F : *M) {
       if (F.isDeclaration() || F.isIntrinsic() || F.empty() ||
-          (Ctx->AllocFuncs.count(&F) && !summaryInvokeKeepsBody(Ctx, &F)) ||
+          (Ctx->AllocFuncs.count(&F) && !summaryKeepsBody(Ctx, &F)) ||
           Ctx->ContainerFuncs.count(&F))
         continue;
       if (shouldSkipFunction(&F))

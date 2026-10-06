@@ -242,6 +242,8 @@ protected:
   // (value, cell, the cell's unnamed shadow).
   std::vector<std::tuple<NodeIndex, NodeIndex, NodeIndex>> deferredUnnamed;
   bool isPointerVariable(const llvm::Value *V);
+  // --cfl-census-names: unnamed pointer loads and stores (cell, is store).
+  std::vector<std::pair<NodeIndex, bool>> unnamedAccessLog;
   // task #35 keyed-channel model (--cfl-tracepoint-keys)
   std::pair<NodeIndex, NodeIndex>
   tracepointJunctions(const llvm::GlobalVariable *KeyGV);

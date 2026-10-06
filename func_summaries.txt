@@ -10,6 +10,8 @@
 #   NONE             explicitly no summary (body analyzed)
 #   NOOP             no transfer at the callsite AND body skipped
 #                    (standalone; replaces hardcoded free/utility lists)
+#   BODY             the function body is analyzed too (a FRESH
+#                    wrapper keeps its own calls in the graph)
 #
 # Provenance: migrated 2026-07-24 from the hardcoded isAllocFn table
 # (src/lib/Annotation.cc) — task #26 — plus the dup family with copy
@@ -76,6 +78,49 @@ x2nrealloc FRESH CPY(ret<-arg0)
 xstrdup FRESH
 xstrndup FRESH
 xmemdup FRESH CPY(ret<-arg0)
+
+# ---- custom allocators: per-callsite objects (2026-10-05) ----
+# A program's own allocation API returns memory from ONE malloc site (or
+# a pool carved from it), so every heap object of the program shares one
+# origin: sqlite3 allocates everything through sqlite3MemMalloc's malloc,
+# reached through the sqlite3GlobalConfig.m.xMalloc pointer, plus the
+# lookaside pool; binutils through bfd_alloc/objalloc chunks. With one
+# origin, any untyped write reaches every heap object and every field
+# read reads them all. FRESH gives each callsite its own object, the
+# allocator model (as for malloc). ASSUMPTION (recorded): a slot the
+# pool hands out again (lookaside, objalloc after a release) is a new
+# object; content written before its reuse is not read through the new
+# owner. BODY keeps the wrapper's body analyzed: its own calls (the
+# xMalloc / xRealloc dispatch, observed by fuzzing) stay in the graph.
+# Reallocation copies the old object's content (CPY), as realloc does.
+# Drafted from the sources (sqlite 3.38.5, binutils 5279478); neither
+# allocation path can be inferred fresh from the IR (dispatch through a
+# function pointer; pool slots loaded from a free list).
+sqlite3_malloc FRESH BODY
+sqlite3_malloc64 FRESH BODY
+sqlite3Malloc FRESH BODY
+sqlite3MallocZero FRESH BODY
+sqlite3DbMallocZero FRESH BODY
+sqlite3DbMallocRaw FRESH BODY
+sqlite3DbMallocRawNN FRESH BODY
+dbMallocRawFinish FRESH BODY
+sqlite3_realloc FRESH CPY(ret<-arg0) BODY
+sqlite3_realloc64 FRESH CPY(ret<-arg0) BODY
+sqlite3Realloc FRESH CPY(ret<-arg0) BODY
+sqlite3DbRealloc FRESH CPY(ret<-arg1) BODY
+sqlite3DbReallocOrFree FRESH CPY(ret<-arg1) BODY
+dbReallocFinish FRESH CPY(ret<-arg1) BODY
+bfd_alloc FRESH BODY
+bfd_zalloc FRESH BODY
+bfd_alloc2 FRESH BODY
+bfd_zalloc2 FRESH BODY
+bfd_malloc FRESH BODY
+bfd_zmalloc FRESH BODY
+bfd_malloc2 FRESH BODY
+bfd_realloc FRESH CPY(ret<-arg0) BODY
+bfd_realloc_or_free FRESH CPY(ret<-arg0) BODY
+bfd_hash_allocate FRESH BODY
+_objalloc_alloc FRESH BODY
 
 # ---- gnulib hash / cflow linked list: instance channels (2026-09-16) ----
 # Container APIs summarized so their bodies (unknown-index bucket walks,

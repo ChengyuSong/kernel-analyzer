@@ -900,6 +900,9 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         S.none = true;
         nNone++;
         continue;
+      } else if (t == "BODY") {
+        S.body = true; // keep analyzing the body (a FRESH wrapper's own calls)
+        continue;
       } else if (t == "NOOP") {
         S.noop = true;
         nNoop++;
@@ -4754,10 +4757,11 @@ void CallGraphPass::runSummaryProvers(Module *M) {
 // through the allocator body-skip and dynamic registrations are silently
 // severed (caught by the kernel smpboot_thread_fn zero-target diff;
 // micro: t_pairs2.c).
-bool summaryInvokeKeepsBody(GlobalContext *Ctx,
+bool summaryKeepsBody(GlobalContext *Ctx,
                                    const llvm::Function *F) {
   auto it = Ctx->FuncSummaries.find(F);
   if (it == Ctx->FuncSummaries.end()) return false;
+  if (it->second->body) return true; // BODY
   for (const auto &A : it->second->atoms)
     if (A.kind == GlobalContext::SummaryAtom::Invoke) return true;
   return false;

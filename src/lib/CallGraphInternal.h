@@ -129,6 +129,6 @@ void walkInitFnSlots(const Constant *C, uint64_t base, const DataLayout &DL, std
 void checkFileSummaries(GlobalContext *Ctx);
 extern size_t g_sumInvokeRet;
 extern size_t g_sumCpy, g_sumAlias, g_sumSt, g_sumLd, g_sumSkipped, g_sumFreshSub, g_sumInvoke, g_sumInvokeDyn, g_chainReg, g_chainRegDyn, g_chainCall, g_chainCallDyn, g_chainLate;
-bool summaryInvokeKeepsBody(GlobalContext *Ctx, const llvm::Function *F);
+bool summaryKeepsBody(GlobalContext *Ctx, const llvm::Function *F);
 
 #endif

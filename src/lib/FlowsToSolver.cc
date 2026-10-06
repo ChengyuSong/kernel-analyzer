@@ -3728,16 +3728,6 @@ bool CallGraphPass::runFlowsToResolution() {
             auto pit = g_opaqueProvenance.find(bn);
             if (pit != g_opaqueProvenance.end()) {
               who = pit->second;
-            } else if (bn < NF.getNumNodes() && NF.isObjectNode(bn) &&
-                       NF.getObjectOffset(bn) > 0) {
-              // struct-object FIELD node: no Value of its own — name
-              // via the base object
-              const NodeIndex base = bn - NF.getObjectOffset(bn);
-              const Value *bv = NF.getValueForNode(base);
-              who = (bv && bv->hasName() ? bv->getName().str()
-                     : bv ? std::string("<anon-obj>")
-                          : std::string("<synthetic-base>")) +
-                    "+f" + std::to_string(NF.getObjectOffset(bn));
             } else if (bn == NF.getUniversalPtrNode() ||
                        bn == NF.getUniversalObjNode()) {
               // extern-boundary class: joins keyed here are the

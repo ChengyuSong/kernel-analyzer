@@ -41,7 +41,6 @@
 
 #include "Reachable.h"
 #include "Annotation.h"
-#include "PointTo.h"
 
 
 #if defined(LLVM34)

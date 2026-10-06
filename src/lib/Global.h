@@ -48,8 +48,6 @@ typedef llvm::DenseMap<const llvm::Function*, CallInstSet> CallerMap;
 typedef llvm::DenseMap<const llvm::CallBase*, FuncSet> CalleeMap;
 typedef llvm::DenseMap<const llvm::Function*, const llvm::ReturnInst*> RetSiteMap;
 
-typedef boost::unordered_flat_map<std::size_t, AndersPtsSet> PtsGraph;
-typedef boost::unordered_flat_map<llvm::Instruction*, PtsGraph> NodeToPtsGraph;
 
 class GlobalContext {
 private:
@@ -232,7 +230,6 @@ public:
   AndersNodeFactory nodeFactory;
 
   // Global init point-to graph
-  PtsGraph GlobalInitPtsGraph;
 
   // Constraint graph built from IR (src/lib/ConstraintGraph.h)
   ConstraintGraph constraintGraph;

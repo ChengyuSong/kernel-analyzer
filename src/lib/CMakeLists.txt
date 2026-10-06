@@ -6,7 +6,6 @@ set (KACoreSource
   Annotation.cc
   StructAnalyzer.cc
   NodeFactory.cc
-  PointTo.cc
   LLMClient.cc
   LLMAnalysis.cc
   ConstraintGraph.cc

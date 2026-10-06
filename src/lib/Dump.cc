@@ -73,8 +73,8 @@ void CallGraphPass::dumpRawGraph(const std::string &prefix) {
     // Object nodes carry their allocation's Value (call, alloca, global,
     // function): classify them as objects before looking at the Value.
     if (NF.isObjectNode(m))
-      return std::string("obj") + (NF.isHeapObject(m) ? ":heap" : ":static") +
-             (NF.getObjectOffset(m) ? ":field" : "");
+      return std::string("obj") + (NF.isHeapObject(m) ? ":heap" : ":static");
+    if (NF.isCellNode(m)) return "cell";
     const Value *V = NF.getValueForNode(m);
     if (!V) return "syn";
     if (isa<Argument>(V)) return "arg";

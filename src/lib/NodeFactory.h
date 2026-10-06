@@ -10,7 +10,6 @@
 #include <llvm/Analysis/ValueTracking.h>
 
 #include "StructAnalyzer.h"
-#include "PtsSet.h"
 
 #include <map>
 #include <unordered_set>
@@ -36,36 +35,32 @@ public:
     enum AndersNodeType {
         VALUE_NODE,
         OBJ_NODE,
-        DEREF_NODE
+        DEREF_NODE,
+        // A memory cell (plan 3.26): one location of an object, keyed by a
+        // name (a field as label+byte offset, a union slot, a key value, a
+        // byte offset of an unlabeled object). Its content is (origin, name):
+        // the origin is the object node of the allocation, global, stack slot
+        // or function; the name is an id of the factory's cell-name table.
+        CELL_NODE
     };
 private:
     AndersNodeType type;
-    NodeIndex idx, mergeTarget;
+    NodeIndex idx;
     const llvm::Value* value;
-    const llvm::Type* allocationType;
-    const NodeIndex offset;
-    const bool isUnionObj;
-    const bool isHeapNode;
-    const bool isOpaqueObj;
-    int storeFlag;
+    bool isHeapNode;
+    bool isOpaqueObj;
+    NodeIndex cellOrigin = ~0u; // CELL_NODE: the object node it is a cell of
+    uint32_t cellName = ~0u;    // CELL_NODE: id in the cell-name table
 
-    AndersNode(AndersNodeType t, unsigned i, const llvm::Value* v = NULL, const llvm::Type* ty = NULL,
-               const unsigned off = 0, const bool uniono = false, const bool heap = false,
-               const bool opaque = false, int _storeFlag = 0)
-            : type(t), idx(i), mergeTarget(i), value(v),
-              allocationType(ty == NULL ? (v == NULL ? NULL : v->getType()) : ty),
-              offset(off), isUnionObj(uniono), isHeapNode(heap), isOpaqueObj(opaque),
-              storeFlag(_storeFlag) {}
+    AndersNode(AndersNodeType t, unsigned i, const llvm::Value* v = nullptr,
+               bool heap = false, bool opaque = false)
+            : type(t), idx(i), value(v), isHeapNode(heap), isOpaqueObj(opaque) {}
 
 public:
     NodeIndex getIndex() const { return idx; }
     const llvm::Value* getValue() const { return value; }
-    const NodeIndex getOffset() const { return offset; }
-    const bool isUnion() const { return isUnionObj; }
-    const bool isHeap() const { return isHeapNode; }
-    const bool isOpaque() const { return isOpaqueObj; }
-    const int getStoreFlag() const { return storeFlag; }
-    const llvm::Type* getAllocationType() const { return allocationType; }
+    bool isHeap() const { return isHeapNode; }
+    bool isOpaque() const { return isOpaqueObj; }
 
     friend class AndersNodeFactory;
 };
@@ -78,7 +73,6 @@ public:
 // This is ugly, but it is efficient.
 class AndersNodeFactory {
 public:
-    typedef llvm::DenseMap<std::pair<NodeIndex, unsigned>, NodeIndex> GepMap;
 
     // The largest unsigned int is reserved for invalid index
     static const unsigned InvalidIndex;
@@ -97,7 +91,6 @@ private:
 
     // The set of nodes
     std::vector<AndersNode> nodes;
-    std::set<NodeIndex> taintedNodes;
 
     // Some special indices
     std::unordered_set<uint64_t> extGobjOverrides;
@@ -125,19 +118,21 @@ private:
     // take variable arguments.
     boost::unordered_flat_map<const llvm::Function*, NodeIndex> varargMap;
 
+    // Cells (plan 3.26): (origin object node, name id) -> cell node, minted
+    // lazily; names are interned key strings.
+    boost::unordered_flat_map<uint64_t, NodeIndex> cellMap;
+    std::vector<std::string> cellNames;
+    boost::unordered_flat_map<std::string, uint32_t> cellNameIds;
+
     // derefMap - This map caches the deref-relations across value nodes.
     boost::unordered_flat_map<const NodeIndex, NodeIndex> derefMap;
     // derefParentMap - the inverse: a dereference node's pointer.
     boost::unordered_flat_map<NodeIndex, NodeIndex> derefParentMap;
 
-    // gepMap - This map maintains the gep-relations across value nodes.
-    // The mappings are of the form <base-ptr, offset> -> gep-ptr,
-    // where base-ptr is the ValueNodeIndex for nodes that created out of llvm SSA variables
-    // while gep-ptr is the ValueNodeIndex for nodes that are created out of GEP instructions
-    GepMap gepMap;
-    llvm::DenseMap<NodeIndex, std::pair<NodeIndex, unsigned> > gepNodeMap;
-
-    unsigned constGEPtoFieldNum(const llvm::ConstantExpr* expr) const;
+    // gepMap - constant GEP expressions: (base value node, byte offset) ->
+    // the value node of the address, so equal addresses share one node.
+    boost::unordered_flat_map<std::pair<NodeIndex, int64_t>, NodeIndex,
+                              boost::hash<std::pair<NodeIndex, int64_t>>> gepMap;
     const llvm::GlobalVariable* canonicalizeGlobal(const llvm::GlobalVariable* gv) const;
     bool percpuPtiBase(const llvm::Constant* base) const;
     const llvm::Function* canonicalizeFunction(const llvm::Function* f) const;
@@ -157,22 +152,35 @@ public:
 
     // Factory methods
     NodeIndex createValueNode(const llvm::Value* val = NULL);
-    NodeIndex createObjectNode(const llvm::Value* val = NULL,
-        const llvm::Type* ty = NULL,
-        const bool uniono = false, const bool heap = false);
-    NodeIndex createObjectNode(const NodeIndex base, const unsigned offset,
-        const bool uniono = false, const bool heap = false);
     NodeIndex createOpaqueObjectNode(const llvm::Value* val = NULL,
         const bool heap = false);
     NodeIndex createReturnNode(const llvm::Function* f);
     NodeIndex createVarargNode(const llvm::Function* f);
     NodeIndex createDereferenceNode(const NodeIndex ptr);
 
+    // Cells (plan 3.26). A name is any key the program fixes for a location:
+    // "struct.T+off" (a field: the object's label and a byte offset),
+    // "+k" (byte k of an unlabeled object), "...#v" (refined by a key).
+    uint32_t internCellName(const std::string &name);
+    const std::string &cellNameString(uint32_t name) const { return cellNames.at(name); }
+    // The cell of `origin` named `name`, created on first use.
+    NodeIndex getCellNode(NodeIndex origin, uint32_t name);
+    bool isCellNode(NodeIndex i) const {
+        return nodes.at(i).type == AndersNode::CELL_NODE;
+    }
+    NodeIndex getCellOrigin(NodeIndex cell) const {
+        assert(isCellNode(cell) && "not a cell");
+        return nodes.at(cell).cellOrigin;
+    }
+    uint32_t getCellName(NodeIndex cell) const {
+        assert(isCellNode(cell) && "not a cell");
+        return nodes.at(cell).cellName;
+    }
+    size_t numCells() const { return cellMap.size(); }
+
     // Map lookup interfaces (return NULL if value not found)
     NodeIndex getValueNodeFor(const llvm::Value* val);
     NodeIndex getValueNodeForConstant(const llvm::Constant* c);
-    NodeIndex getObjectNodeFor(const llvm::Value* val);
-    NodeIndex getObjectNodeForConstant(const llvm::Constant* c);
     NodeIndex getReturnNodeFor(const llvm::Function* f);
     NodeIndex getVarargNodeFor(const llvm::Function* f);
     NodeIndex getDereferenceNodeFor(const NodeIndex ptr);
@@ -204,11 +212,6 @@ public:
         return it != varargMap.end() && it->second == i;
     }
 
-    // Node merge interfaces
-    void mergeNode(NodeIndex n0, NodeIndex n1);	// Merge n1 into n0
-    NodeIndex getMergeTarget(NodeIndex n);
-    NodeIndex getMergeTarget(NodeIndex n) const;
-
     // Pointer arithmetic
     const bool isObjectNode(NodeIndex i) const {
         return (nodes.at(i).type == AndersNode::OBJ_NODE);
@@ -219,59 +222,11 @@ public:
     const bool isDereferenceNode(NodeIndex i) const {
         return (nodes.at(i).type == AndersNode::DEREF_NODE);
     }
-    const bool isUnionObject(NodeIndex i) const {
-        return nodes.at(i).isUnion();
-    }
     const bool isHeapObject (NodeIndex i) const {
         return nodes.at(i).isHeap();
     }
     const bool isOpaqueObject(NodeIndex i) const {
         return nodes.at(i).isOpaque();
-    }
-    const llvm::Type* getObjectType(NodeIndex i) const {
-        return nodes.at(i).getAllocationType();
-    }
-    int getStored (NodeIndex i) const {
-        return nodes.at(i).storeFlag;
-    }
-
-    NodeIndex getOffsetObjectNode(NodeIndex n, int offset) const {
-        if (!isObjectNode(n)) {
-            llvm::errs() << "n :" << n << "\n";
-            llvm::errs() << "offset :" << offset << "\n";
-            for (int i = n; i <= n + offset; i++)
-                dumpNode(i);
-            assert(false && "Base is a non-object node!");
-        }
-        if (isUnionObject(n))
-            return n;
-        if (!isObjectNode(n + offset)) {
-            llvm::errs() << "n :" << n << "\n";
-            llvm::errs() << "offset :" << offset << "\n";
-            for (int i = n; i <= n + offset; i++)
-                dumpNode(i);
-            assert(false && "Offsetting an object node goes out of bound!");
-        }
-        assert((nodes.at(n).getOffset() + offset) == nodes.at(n + offset).getOffset());
-        return n + offset;
-    }
-
-    unsigned getObjectSize(NodeIndex i) const {
-        assert(isObjectNode(i));
-        unsigned offset = nodes.at(i).getOffset();
-        
-        while ((i + 1) < nodes.size() &&
-               nodes.at(i + 1).type == AndersNode::OBJ_NODE &&
-               nodes.at(i + 1).getOffset() == (offset + 1)) {
-            ++i;
-            ++offset;
-        }
-        return offset + 1; // offset starts from 0
-    }
-
-    unsigned getObjectOffset(NodeIndex i) const {
-        assert(isObjectNode(i));
-        return nodes.at(i).getOffset();
     }
 
     // Special node getters
@@ -299,69 +254,18 @@ public:
     }
 
     // Value getters
+    // The IR value a node stands for; a dereference or a cell has none
+    // (its pointer: getDerefParent; its object: getCellOrigin).
     const llvm::Value* getValueForNode(NodeIndex i) const {
-        const AndersNode& n = nodes.at(i);
-        if (n.getValue() != nullptr)
-            return n.getValue();
-        else if (n.type == AndersNode::OBJ_NODE)
-            return nodes.at(i - n.getOffset()).getValue();
-        else if (n.type == AndersNode::DEREF_NODE) {
-            auto itr = derefMap.find(i);
-            if (itr != derefMap.end()) {
-                NodeIndex ptrNode = itr->second;
-                return getValueForNode(ptrNode);
-            }
-        }
-        return nullptr;
-    }
-
-    // Value remover
-    void removeNodeForValue(const llvm::Value* val) {
-        valueNodeMap.erase(val);
-    }
-
-    void removeNodeForObject(const llvm::Value* val) {
-        objNodeMap.erase(val);
-    }
-
-    void updateNodeForObject(const llvm::Value* val, NodeIndex idx) {
-        assert(isObjectNode(idx));
-        objNodeMap[val] = idx;
+        return nodes.at(i).getValue();
     }
 
     // Size getters
     unsigned getNumNodes() const { return nodes.size(); }
 
-    // GepMap interfaces
-    GepMap::const_iterator gepmap_begin() const { return gepMap.begin(); }
-    GepMap::const_iterator gepmap_end() const { return gepMap.end(); }
-    void clearGepMap() { gepMap.clear(); }
-
-    NodeIndex getObjNodeForGEPExpr(NodeIndex i) const {
-        auto itr = gepNodeMap.find(i);
-        if (itr == gepNodeMap.end()) {
-            return InvalidIndex;
-        } else {
-            // base + offset
-            return itr->second.first + itr->second.second;
-        }
-    }
-
-    NodeIndex getObjectBound(NodeIndex i) const {
-        NodeIndex offset = getObjectOffset(i);
-        NodeIndex objSize = getObjectSize(i);
-        return i - offset + objSize;
-    }
-
-    // Taint setter
-    void setNodeAsTainted(NodeIndex i);
 
     // For debugging purpose
     void dumpNode(NodeIndex) const;
-    void dumpNode(NodeIndex, std::map<NodeIndex, AndersPtsSet>&, std::set<NodeIndex>&, bool) const;
-    void dumpNodeInfo(std::map<NodeIndex, AndersPtsSet>&, std::set<const llvm::Value*>* = nullptr) const;
-    void dumpRepInfo() const;
-    void dumpNodePtrSetInfo(NodeIndex index, std::map<NodeIndex, AndersPtsSet>&, std::set<NodeIndex>&, bool) const;
 };
 
 #endif

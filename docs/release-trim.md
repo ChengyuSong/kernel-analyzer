@@ -250,4 +250,12 @@ REMOVED — one-off censuses whose results are recorded:
 (task #37); all in docs/cfl-graph-explosion-and-scaling.md unless
 noted.
 
+REMOVED — the old Andersen components (2026-10-05, plan 3.26):
+`PointTo.{cc,h}` and `PtsSet.h` (an unused points-to solver),
+`cg-select.cc` (never built), and NodeFactory's per-field-number object
+nodes (createObjectNode, getObjectNodeFor, field merging, object
+offsets/sizes, taint). Fields are byte offsets; a memory location is a
+cell node (origin, name). Constant-GEP value nodes are deduplicated by
+byte offset. Consumer gate: 44 runs byte-identical.
+
 Every removed option is an error in KAMain naming this ledger.

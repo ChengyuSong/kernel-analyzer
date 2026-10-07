@@ -9,7 +9,8 @@
 # paper's table uses, most important first).
 #
 #   eval/72-rerun-baselines.sh <capped-root> <new-root> [approach...]
-# env: KA_SOK_ROOT, KA_RERUN_TIMEOUT (default 86400 s), KA_RERUN_MEM
+# env: KA_SOK_ROOT, KA_RERUN_STATUS (default 'timeout killed-oom-or-signal'),
+#      KA_RERUN_TIMEOUT (default 86400 s), KA_RERUN_MEM
 #      (default 700g), KA_RERUN_PAR (default 2 concurrent), KA_RERUN_CPUS
 #      (first cpu to pin from, default 12), KA_LOTUS_BCSET (default
 #      llvm15down, as eval/69 runs the Lotus rows).
@@ -28,7 +29,13 @@ export KA_LOTUS_BCSET="${KA_LOTUS_BCSET:-llvm15down}"
 echo "== rerun: cap $TIMEOUT s, mem $MEM, $PAR concurrent; rows from $CAPPED/summary.tsv -> $NEW/baselines"
 n=0
 for appr in "${APPRS[@]}"; do
-  rows=$(awk -F'\t' -v a="$appr" '$1==a && ($4=="timeout" || $4=="killed-oom-or-signal") {print $2"/"$3}' \
+  # KA_RERUN_STATUS: which capped statuses to rerun (default both);
+  # 'timeout' rows are not memory-bound and can run several at a time
+  # at a smaller KA_RERUN_MEM, 'killed-oom-or-signal' rows need the big
+  # slots.
+  rows=$(awk -F'\t' -v a="$appr" -v st="${KA_RERUN_STATUS:-timeout killed-oom-or-signal}" \
+         'BEGIN{n=split(st,S," "); for(i=1;i<=n;i++) want[S[i]]=1}
+          $1==a && ($4 in want) {print $2"/"$3}' \
          "$CAPPED/summary.tsv" | sort -u | tr '\n' ' ')
   [[ -z "$rows" ]] && { echo "== $appr: nothing to rerun"; continue; }
   while (( $(jobs -rp | wc -l) >= PAR )); do wait -n || true; done

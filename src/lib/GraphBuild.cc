@@ -641,6 +641,15 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
   NodeIndex derefDst = getRepDerefNode(dstNode);
   NodeIndex derefSrc = getRepDerefNode(srcNode);
   addAssignmentEdge(derefSrc, derefDst);
+  if (CFLCells) {
+    // The cell solver copies cell by cell (arrays as one element).
+    const auto *lenC = CS->arg_size() > 2
+                           ? dyn_cast<ConstantInt>(CS->getArgOperand(2))
+                           : nullptr;
+    byteCopies.emplace_back(getCanonicalNode(srcNode), getCanonicalNode(dstNode),
+                            lenC ? (int64_t)lenC->getZExtValue() : (int64_t)-1, CS);
+    return false;
+  }
 
   // Field mode: the deref-to-deref edge only links the offset-0 cells, but an
   // aggregate copy moves every field. When both operands agree on the copied
@@ -675,8 +684,21 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
                             ? dyn_cast<ConstantInt>(CS->getArgOperand(2))
                             : nullptr;
     const bool smallCopy = lenCI && lenCI->getZExtValue() <= 512;
-    if (dstTy && dstTy == srcTy && isa<StructType>(dstTy) && curDL) {
-      emitFieldwiseCopyEdges(srcNode, dstNode, dstTy, 0);
+    // The copied struct: both sides agree, or one side is a struct and
+    // the copy fits it (a byte copy keeps offsets, so either side's
+    // layout names the fields; `dummy = *png_ptr` copies from a loaded
+    // pointer with no static type).
+    Type *copyTy = nullptr;
+    if (dstTy && dstTy == srcTy && isa<StructType>(dstTy)) {
+      copyTy = dstTy;
+    } else if (!dstTy != !srcTy && curDL) {
+      Type *one = dstTy ? dstTy : srcTy;
+      if (isa<StructType>(one) && cast<StructType>(one)->isSized() && lenCI &&
+          lenCI->getZExtValue() <= curDL->getTypeAllocSize(one))
+        copyTy = one;
+    }
+    if (copyTy && curDL) {
+      emitFieldwiseCopyEdges(srcNode, dstNode, copyTy, 0);
     } else if (CFLResidueCopies && flowsTo() && smallCopy) {
       // Layout-free residue copy: a byte copy preserves offsets, so under
       // the mod-P encoding "for every residue r: *(dst+r) = *(src+r)" is
@@ -1767,14 +1789,20 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       if (const auto *CI = dyn_cast<ConstantInt>(idx)) {
         int64_t off = CI->getSExtValue() * (int64_t)esz;
         if (off > 0 && off < ((int64_t)1 << 40)) {
-          levels.push_back(off | kArithLevelTag); // element step: walk candidate
+          // element step: walk candidate; the element size rides in bits
+          // 40..59 (the cell solver: an index stays in its array)
+          const int64_t eszBits = esz < (1u << 20) ? (int64_t)esz << 40 : 0;
+          levels.push_back(off | kArithLevelTag | eszBits);
           if (types) types->push_back(nullptr);
         } else if (off != 0) {
           levels.push_back(off);
           if (types) types->push_back(nullptr);
         }
       } else {
-        if (esz <= 1 || esz > 0x3fffffffULL)
+        if (esz == 0) { first = false; continue; } // no offset
+        // A byte index is a stride-1 step for the cell solver (it stays in
+        // its array); the lazy-address solver keeps the range wildcard.
+        if ((esz == 1 && !CFLCells) || esz > 0x3fffffffULL)
           return false; // wildcard fallback
         // Low 32 bits: element count of the array being indexed (0 =
         // unbounded: pointer-level index, scalable vector, unknown).
@@ -1825,8 +1853,11 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
       const uint32_t count = (uint32_t)(levels[k] & 0xffffffff);
       addFieldEdgesExact(cur, next, 0, stride, false, nullptr, count * stride);
     }
-    else if (levels[k] > 0 && (levels[k] & kArithLevelTag))
-      addFieldEdgesExact(cur, next, levels[k] & ~kArithLevelTag, 0, true);
+    else if (levels[k] > 0 && (levels[k] & kArithLevelTag)) {
+      const int64_t lv = levels[k] & ~kArithLevelTag;
+      addFieldEdgesExact(cur, next, lv & (((int64_t)1 << 40) - 1), 0, true,
+                         nullptr, (uint32_t)((lv >> 40) & 0xFFFFF)); // extent: element size
+    }
     else
       addFieldEdgesExact(cur, next, levels[k], 0, false,
                          k < types.size() ? types[k] : nullptr);
@@ -1980,6 +2011,8 @@ bool isSinkPayloadAccessor(StringRef n) {
   return n == "ring_buffer_event_data" || n == "perf_trace_buf_alloc";
 }
 size_t g_sinkArenaSites = 0;
+size_t g_innerAllocSites = 0;
+size_t g_p2iNumberOnly = 0;
 static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
                                       AndersNodeFactory::InvalidIndex};
 
@@ -2599,7 +2632,11 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
     if (const CallBase *CB = dyn_cast<CallBase>(I)) {
       if (const Function *CF = CB->getCalledFunction()) {
-        if (Ctx->AllocFuncs.count(CF))
+        // An allocator whose body is kept (BODY) calling itself: inside
+        // its own body the result is its own memory, not a fresh object.
+        const bool selfInBody = summaryKeepsBody(Ctx, CF) &&
+                                CF->getGUID() == F->getGUID();
+        if (Ctx->AllocFuncs.count(CF) && !selfInBody)
           Ctx->AllocSites.insert(CB);
       }
     }
@@ -2683,9 +2720,23 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       valNode = CGP.NF.createValueNode(&CS);
       valNode = CGP.getCanonicalNode(valNode);
     }
-    CGP.AllocSites.insert(valNode);
-    NodeIndex heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
-    CGP.Graph.addDeref(valNode, heapObj);
+    // --cfl-cells: an allocator called inside a kept allocator body
+    // (sqlite3_realloc64 -> sqlite3Realloc) allocates the outer call's
+    // object, which the outer FRESH already stands for; its result only
+    // reaches the outer's cut return. It gets no object of its own (a
+    // stand-in nothing outside reads), and its atoms into the result
+    // have nothing to write.
+    const Function *PF = CS.getFunction();
+    const bool innerAlloc = CFLCells && CGP.Ctx->AllocFuncs.count(PF) &&
+                            summaryKeepsBody(CGP.Ctx, PF);
+    NodeIndex heapObj = AndersNodeFactory::InvalidIndex;
+    if (!innerAlloc) {
+      CGP.AllocSites.insert(valNode);
+      heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
+      CGP.Graph.addDeref(valNode, heapObj);
+    } else {
+      g_innerAllocSites++;
+    }
     // Keep allocator return-node flow active for compositional promotion:
     // known allocator return symbols must stay reachable even when alloc
     // callsites are short-circuited as explicit AllocSites.
@@ -2702,8 +2753,14 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
         // cross-caller conflation channel (~470 witnessed joins at km)
         // — suppress it, then apply the remaining atoms (CPY for the
         // dup family restores the copy the skipped body drops).
-        if (CGP.applySummaryAtoms(&CS, *sit->second, nullptr, sit->first))
-          CGP.wireCallArgs(&CS, RCF); // dynamic-fn INVOKE: feed the body pool
+        // A kept body (BODY) sees its arguments: its own calls may read
+        // them (png_malloc_base calls png_ptr->malloc_fn). Its return is
+        // replaced by the callsite's FRESH object. Callers' objects meeting
+        // at its void* formals is call-context confluence (clone per site).
+        const bool invokeWired =
+            CGP.applySummaryAtoms(&CS, *sit->second, nullptr, sit->first);
+        if (invokeWired || (summaryKeepsBody(CGP.Ctx, RCF) && !RCF->empty()))
+          CGP.wireCallArgs(&CS, RCF);
       } else if (CF->getReturnType()->isPointerTy()) {
         NodeIndex retNode = CGP.NF.getReturnNodeFor(RCF);
         if (retNode == AndersNodeFactory::InvalidIndex)
@@ -3267,6 +3324,21 @@ bool isPtrWidthInt(const Type *T, const DataLayout &DL) {
          T->getIntegerBitWidth() >= DL.getPointerSizeInBits();
 }
 
+// --cfl-union-keys=tag: a dereference node of `ptr` for one key, so the
+// cell solver links it to that key's cell of the union slot.
+NodeIndex CallGraphPass::keyedDeref(NodeIndex ptr, const std::string &key) {
+  ptr = getCanonicalNode(ptr);
+  const uint32_t k = NF.internCellName(key);
+  auto [it, ins] = keyedDerefOf.try_emplace({ptr, k}, AndersNodeFactory::InvalidIndex);
+  if (ins) {
+    // A fresh node (not the pointer's shared dereference node).
+    it->second = NF.createDereferenceNode(AndersNodeFactory::InvalidIndex);
+    Graph.addDeref(ptr, it->second);
+    cellHubKey[it->second] = k;
+  }
+  return it->second;
+}
+
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // Tracepoint keyed dispatch (task #35): inside __traceiter_X, the
   // funcs-head load reads cells that the kernel-scale giant absorbs —
@@ -3370,7 +3442,16 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
     }
   }
 
-  NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
+  // A keyed union access reads its key's cell (--cfl-cells), through
+  // its own hub only: the pointer's shared hub would read every member.
+  NodeIndex derefNode = AndersNodeFactory::InvalidIndex;
+  if (CFLCells) {
+    auto kit = CGP.unionKeyNames.find(&I);
+    if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
+      derefNode = CGP.keyedDeref(ptrNode, kit->second[0]);
+  }
+  if (derefNode == AndersNodeFactory::InvalidIndex)
+    derefNode = CGP.getRepDerefNode(ptrNode);
 
   SmallVector<uint32_t, 4> names{ka::AccessNames::Unnamed};
   if (CGP.namedPlanes()) {
@@ -3474,7 +3555,16 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     }
   }
 
-  NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
+  // A keyed union access writes its key's cell (--cfl-cells), through
+  // its own hub only: the pointer's shared hub would read every member.
+  NodeIndex derefNode = AndersNodeFactory::InvalidIndex;
+  if (CFLCells) {
+    auto kit = CGP.unionKeyNames.find(&I);
+    if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
+      derefNode = CGP.keyedDeref(ptrNode, kit->second[0]);
+  }
+  if (derefNode == AndersNodeFactory::InvalidIndex)
+    derefNode = CGP.getRepDerefNode(ptrNode);
 
   SmallVector<uint32_t, 4> names{ka::AccessNames::Unnamed};
   if (CGP.namedPlanes()) {
@@ -4266,6 +4356,35 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
   return true;
 }
 
+// --cfl-cells: could the integer V (derived from a ptrtoint) become a
+// pointer again? As mayBecomePointer, except that an integer narrower than
+// a pointer carries none: a narrowing cast or a narrow store ends the path
+// (pNode - aNode truncated to an int index is a number, not an address).
+static bool intMayRebase(const Value *V, unsigned depth, const DataLayout &DL) {
+  if (depth == 0) return true;
+  for (const User *U : V->users()) {
+    if (isa<IntToPtrInst>(U)) return true;
+    if (const auto *SI = dyn_cast<StoreInst>(U)) {
+      if (SI->getValueOperand() == V && isPtrWidthInt(V->getType(), DL))
+        return true; // a pointer-width integer flows onward via memory
+      continue;
+    }
+    if (isa<ReturnInst>(U)) return true;
+    if (const auto *CB = dyn_cast<CallBase>(U)) {
+      if (CB->getCalledOperand() != V) return true;
+      continue;
+    }
+    if (const auto *CI = dyn_cast<CastInst>(U))
+      if (CI->getType()->isIntegerTy() && !isPtrWidthInt(CI->getType(), DL))
+        continue; // narrowed below a pointer: no address survives
+    if (isa<BinaryOperator>(U) || isa<CastInst>(U) || isa<PHINode>(U) ||
+        isa<SelectInst>(U) || isa<FreezeInst>(U) || isa<ExtractValueInst>(U))
+      if (intMayRebase(U, depth - 1, DL))
+        return true;
+  }
+  return false;
+}
+
 void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   NodeIndex srcNode = CGP.getRepNodeForValue(I.getOperand(0));
   if (srcNode == AndersNodeFactory::InvalidIndex) {
@@ -4284,6 +4403,9 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
   if (CGP.Graph.fieldSensitive()) {
     if (ptrToIntTagRoundTripOnly(&I)) {
       g_tagRoundTrips++;
+    } else if (CFLCells && CGP.curDL && !intMayRebase(&I, 8, *CGP.curDL)) {
+      g_p2iNumberOnly++; // the address is used as a number only: the
+      return;            // integer holds no pointer, so no facts
     } else {
       p2iEscapeCensus(&I, "inst");
       CGP.addFieldWildcardLoop(srcNode, tagWalkTag("ptrtoint-escape").c_str());
@@ -4295,6 +4417,18 @@ void CallGraphPass::InstHandler::visitPtrToIntInst(PtrToIntInst &I) {
 void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
   if (!I.getType()->isIntegerTy())
     return;
+  // --cfl-cells: p - q (ptrtoint p - ptrtoint q), C's pointer difference,
+  // defined only within one object; the solver checks the pair.
+  if (CFLCells && I.getOpcode() == Instruction::Sub) {
+    auto ptrOf = [&](Value *V) -> NodeIndex {
+      Value *P = nullptr;
+      if (auto *PI = dyn_cast<PtrToIntOperator>(V)) P = PI->getPointerOperand();
+      return P ? CGP.getRepNodeForValue(P) : AndersNodeFactory::InvalidIndex;
+    };
+    const NodeIndex p = ptrOf(I.getOperand(0)), q = ptrOf(I.getOperand(1));
+    if (p != AndersNodeFactory::InvalidIndex && q != AndersNodeFactory::InvalidIndex)
+      CGP.ptrDiffs.emplace_back(CGP.getCanonicalNode(p), CGP.getCanonicalNode(q), &I);
+  }
 
   // Emit a-edges from EVERY pointer-derived operand to the result, per
   // the encoding spec (operand_i -> result). The previous "other

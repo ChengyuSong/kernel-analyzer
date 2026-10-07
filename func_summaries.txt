@@ -38,7 +38,8 @@ _Znaj FRESH
 _ZnajRKSt9nothrow_t FRESH
 _Znam FRESH
 _ZnamRKSt9nothrow_t FRESH
-realloc FRESH CPY(ret<-arg0)
+# realloc continues the old object (ALIAS); FRESH covers realloc(NULL, n).
+realloc FRESH ALIAS(ret=arg0)
 # Aligned allocators. posix_memalign returns its object through *arg0:
 # unmodeled, that pointer has no origin, and a wrapper that retries by
 # calling itself (ffmpeg av_malloc: ptr = av_malloc(1)) gives the value
@@ -70,11 +71,11 @@ xzalloc FRESH
 xcalloc FRESH
 xcharalloc FRESH
 xnmalloc FRESH
-xrealloc FRESH CPY(ret<-arg0)
-xreallocarray FRESH CPY(ret<-arg0)
-xnrealloc FRESH CPY(ret<-arg0)
-x2realloc FRESH CPY(ret<-arg0)
-x2nrealloc FRESH CPY(ret<-arg0)
+xrealloc FRESH ALIAS(ret=arg0)
+xreallocarray FRESH ALIAS(ret=arg0)
+xnrealloc FRESH ALIAS(ret=arg0)
+x2realloc FRESH ALIAS(ret=arg0)
+x2nrealloc FRESH ALIAS(ret=arg0)
 xstrdup FRESH
 xstrndup FRESH
 xmemdup FRESH CPY(ret<-arg0)
@@ -92,10 +93,13 @@ xmemdup FRESH CPY(ret<-arg0)
 # object; content written before its reuse is not read through the new
 # owner. BODY keeps the wrapper's body analyzed: its own calls (the
 # xMalloc / xRealloc dispatch, observed by fuzzing) stay in the graph.
-# Reallocation copies the old object's content (CPY), as realloc does.
-# Drafted from the sources (sqlite 3.38.5, binutils 5279478); neither
-# allocation path can be inferred fresh from the IR (dispatch through a
-# function pointer; pool slots loaded from a free list).
+# Reallocation continues the old object (ALIAS, plan 3.30): its names and
+# content are the old ones; FRESH covers realloc(NULL, n). A use of the
+# old pointer after the call is undefined behavior (reported, not modeled).
+# Drafted from the sources (sqlite 3.38.5, binutils 5279478, libpng
+# 1.6); none of these allocation paths can be inferred fresh from the IR
+# (dispatch through a function pointer: xMalloc, png_ptr->malloc_fn;
+# pool slots loaded from a free list).
 sqlite3_malloc FRESH BODY
 sqlite3_malloc64 FRESH BODY
 sqlite3Malloc FRESH BODY
@@ -104,12 +108,12 @@ sqlite3DbMallocZero FRESH BODY
 sqlite3DbMallocRaw FRESH BODY
 sqlite3DbMallocRawNN FRESH BODY
 dbMallocRawFinish FRESH BODY
-sqlite3_realloc FRESH CPY(ret<-arg0) BODY
-sqlite3_realloc64 FRESH CPY(ret<-arg0) BODY
-sqlite3Realloc FRESH CPY(ret<-arg0) BODY
-sqlite3DbRealloc FRESH CPY(ret<-arg1) BODY
-sqlite3DbReallocOrFree FRESH CPY(ret<-arg1) BODY
-dbReallocFinish FRESH CPY(ret<-arg1) BODY
+sqlite3_realloc FRESH ALIAS(ret=arg0) BODY
+sqlite3_realloc64 FRESH ALIAS(ret=arg0) BODY
+sqlite3Realloc FRESH ALIAS(ret=arg0) BODY
+sqlite3DbRealloc FRESH ALIAS(ret=arg1) BODY
+sqlite3DbReallocOrFree FRESH ALIAS(ret=arg1) BODY
+dbReallocFinish FRESH ALIAS(ret=arg1) BODY
 bfd_alloc FRESH BODY
 bfd_zalloc FRESH BODY
 bfd_alloc2 FRESH BODY
@@ -117,10 +121,17 @@ bfd_zalloc2 FRESH BODY
 bfd_malloc FRESH BODY
 bfd_zmalloc FRESH BODY
 bfd_malloc2 FRESH BODY
-bfd_realloc FRESH CPY(ret<-arg0) BODY
-bfd_realloc_or_free FRESH CPY(ret<-arg0) BODY
+bfd_realloc FRESH ALIAS(ret=arg0) BODY
+bfd_realloc_or_free FRESH ALIAS(ret=arg0) BODY
 bfd_hash_allocate FRESH BODY
 _objalloc_alloc FRESH BODY
+png_malloc_base FRESH BODY
+png_malloc FRESH BODY
+png_calloc FRESH BODY
+png_malloc_warn FRESH BODY
+png_malloc_array FRESH BODY
+png_malloc_array_checked FRESH BODY
+png_realloc_array FRESH ALIAS(ret=arg1) BODY
 
 # ---- gnulib hash / cflow linked list: instance channels (2026-09-16) ----
 # Container APIs summarized so their bodies (unknown-index bucket walks,
@@ -1043,11 +1054,11 @@ kstrdup FRESH CPY(ret<-arg0)
 kstrdup_const FRESH CPY(ret<-arg0)
 kstrndup FRESH CPY(ret<-arg0)
 kvmemdup FRESH CPY(ret<-arg0)
-krealloc FRESH CPY(ret<-arg0)
-__krealloc FRESH CPY(ret<-arg0)
-kvrealloc FRESH CPY(ret<-arg0)
+krealloc FRESH ALIAS(ret=arg0)
+__krealloc FRESH ALIAS(ret=arg0)
+kvrealloc FRESH ALIAS(ret=arg0)
 devm_kmemdup FRESH CPY(ret<-arg1)
-devm_krealloc FRESH CPY(ret<-arg1)
+devm_krealloc FRESH ALIAS(ret=arg1)
 # user-memory sources: no CPY by the uaccess assumption
 memdup_user FRESH
 vmemdup_user FRESH
@@ -1069,10 +1080,10 @@ kstrdup_noprof FRESH CPY(ret<-arg0)
 kstrdup_const_noprof FRESH CPY(ret<-arg0)
 kstrndup_noprof FRESH CPY(ret<-arg0)
 kvmemdup_noprof FRESH CPY(ret<-arg0)
-krealloc_noprof FRESH CPY(ret<-arg0)
-kvrealloc_noprof FRESH CPY(ret<-arg0)
+krealloc_noprof FRESH ALIAS(ret=arg0)
+kvrealloc_noprof FRESH ALIAS(ret=arg0)
 devm_kmemdup_noprof FRESH CPY(ret<-arg1)
-devm_krealloc_noprof FRESH CPY(ret<-arg1)
+devm_krealloc_noprof FRESH ALIAS(ret=arg1)
 memdup_user_noprof FRESH
 vmemdup_user_noprof FRESH
 __kvmalloc* FRESH

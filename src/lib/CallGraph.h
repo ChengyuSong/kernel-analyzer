@@ -119,10 +119,19 @@ protected:
   // `[4 x ptr]` steps 8 bytes over 32; without the bound the strided
   // address overlapped every later slot of the object (bfd_target: 75 of
   // 107 slots read for `_bfd_check_format[fmt]`).
+  // extent: a strided step's covered length; an arith (constant index)
+  // step's element size.
   struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; uint32_t extent; };
   std::vector<LazyLabel> lazyLabels;
   std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *, uint32_t>, uint32_t> lazyLabelIdx;
   std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
+  // --cfl-cells: byte copies (memcpy, CPY summaries) as copy constraints
+  // the cell solver resolves per cell pair: src, dst, length (-1 unknown).
+  std::vector<std::tuple<NodeIndex, NodeIndex, int64_t, const llvm::Instruction *>>
+      byteCopies; // (src, dst, length or -1, the copying call)
+  // --cfl-cells: pointer subtractions (p, q, the sub): C defines p - q only
+  // within one object; the solver reports pairs that are not.
+  std::vector<std::tuple<NodeIndex, NodeIndex, const llvm::Instruction *>> ptrDiffs;
   uint32_t lazyLabelFor(int64_t off, uint32_t stride, bool arith = false,
                         const llvm::StructType *ty = nullptr, uint32_t extent = 0);
   void addFieldEdgesExact(NodeIndex src, NodeIndex dst, int64_t off,
@@ -241,6 +250,13 @@ protected:
   // ... and the accesses of a keyed union whose key is unknown, with the
   // union's name prefix "struct.S+off".
   std::map<const llvm::Instruction *, std::string> unionUnknownOf;
+  // --cfl-union-keys=tag (cell solver): the keyed union slots (struct,
+  // byte offset, size), and the dereference node of each keyed access with
+  // its key (an interned cell name).
+  std::set<std::tuple<std::string, uint64_t, uint64_t>> cellUnionSlots;
+  boost::unordered_flat_map<NodeIndex, uint32_t> cellHubKey;
+  std::map<std::pair<NodeIndex, uint32_t>, NodeIndex> keyedDerefOf;
+  NodeIndex keyedDeref(NodeIndex ptr, const std::string &key);
   // --cfl-name-by-target: untyped writes whose unnamed-plane edge waits for
   // the solve to show a target other than a pointer variable:
   // (value, cell, the cell's unnamed shadow).

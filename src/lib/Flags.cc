@@ -763,6 +763,15 @@ cl::opt<unsigned> CFLWeldWatch(
            "and stops the run after N events (0 = off)"),
   cl::init(0));
 
+cl::opt<bool> CFLUnionPathStable(
+  "cfl-union-path-stable",
+  cl::desc("With --cfl-union-keys=tag: a tag test keys a read when no path "
+           "from the test to the read writes the tested tag bits or the "
+           "union slot (plan 3.30 P2; else only program-wide stable tags), "
+           "and a test on an earlier load of the same slot counts when the "
+           "slot is not written in between (the reload clause)"),
+  cl::init(true));
+
 cl::opt<std::string> CFLUnionKeys(
   "cfl-union-keys",
   cl::desc("With --cfl-named-planes: give union accesses discriminator "
@@ -771,7 +780,9 @@ cl::opt<std::string> CFLUnionKeys(
            "key is unknown keeps today's wiring (every plane). 'off' (default), "
            "'callback' (keys inferred from co-written callbacks with "
            "correlated dispatch), 'single' (every union access the same key: "
-           "a plumbing test)"),
+           "a plumbing test), 'tag' (with --cfl-cells: a write keyed by "
+           "the member it writes, a read by its member when its dominating "
+           "tag tests rule out every other member's write)"),
   cl::init("off"));
 
 cl::opt<std::string> CFLCensusUnionsDetail(
@@ -1115,6 +1126,55 @@ cl::opt<bool> CFLCells(
            "through per-pointer hubs, never unify cells. Whole programs "
            "with --cfl-alloc-origins only"),
   cl::init(false));
+
+cl::opt<bool> CFLCellUnify(
+  "cfl-cell-unify",
+  cl::desc("--cfl-cells: unification by name. Two cells of one name that "
+           "one node holds become one cell; different names never merge. "
+           "false: every (object, offset) stays its own cell"),
+  cl::init(false));
+
+cl::opt<bool> CFLCellMergePtrs(
+  "cfl-cell-merge-ptrs",
+  cl::desc("--cfl-cells: pointer nodes with equal sets (no function among "
+           "them) become one node, at each periodic cycle collapse"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLCellCensusAt(
+  "cfl-cell-census-at",
+  cl::desc("MEASUREMENT ONLY: --cfl-cells stops propagating after this "
+           "many pops (0: never), prints the confluence census (functions "
+           "by formal/return width x direct call sites: clone candidates) "
+           "and exits without answers"),
+  cl::init(0));
+
+cl::opt<std::string> CFLCellCensusFormal(
+  "cfl-cell-census-formal",
+  cl::desc("With --cfl-cell-census-at: FUNCTION:ARGNO whose held objects "
+           "and names are listed"),
+  cl::init(""));
+
+cl::opt<std::string> CFLCellTraceObj(
+  "cfl-cell-trace-obj",
+  cl::desc("With --cfl-cell-census-formal: a backward path from the formal "
+           "to the origin of an object whose description contains this"),
+  cl::init(""));
+
+cl::opt<bool> CFLCellOneLabel(
+  "cfl-cell-one-label",
+  cl::desc("MEASUREMENT ONLY: --cfl-cells with one cell per pointer: an "
+           "arriving cell of the same name merges into the pointer's cell; "
+           "the first cell of another name stops the solve and reports both "
+           "cells and how each arrived"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLCellOneLabelMax(
+  "cfl-cell-one-label-max",
+  cl::desc("--cfl-cell-one-label: collect this many name conflicts (each "
+           "with the point where the two labels' paths meet) before "
+           "stopping, keeping both labels at a conflict; prints the clone "
+           "candidates (functions whose formal is a meet point)"),
+  cl::init(1));
 
 cl::opt<unsigned> CFLCellCap(
   "cfl-cell-cap",

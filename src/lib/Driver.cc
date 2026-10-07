@@ -120,8 +120,32 @@ void IterativeModulePass::run(ModuleList &modules) {
 // --cfl-clone-per-caller: expand listed functions per direct call site.
 static void clonePerCaller(Module *M) {
   if (CFLClonePerCaller.empty()) return;
+  SmallVector<StringRef, 8> given;
+  StringRef(CFLClonePerCaller).split(given, ',', -1, false);
+  // Callers before callees: a caller's clones then each get their own
+  // clones of the callee (cloning the callee first would leave every
+  // caller clone sharing the callee clone of its one call site).
   SmallVector<StringRef, 8> names;
-  StringRef(CFLClonePerCaller).split(names, ',', -1, false);
+  {
+    std::vector<StringRef> rest(given.begin(), given.end());
+    auto calledByRest = [&](StringRef b) {
+      Function *FB = M->getFunction(b.trim());
+      if (!FB) return false;
+      for (User *U : FB->users())
+        if (auto *CB = dyn_cast<CallBase>(U))
+          for (StringRef a : rest)
+            if (a != b && CB->getFunction()->getName() == a.trim())
+              return true;
+      return false;
+    };
+    while (!rest.empty()) {
+      size_t pick = 0;
+      for (size_t i = 0; i < rest.size(); i++)
+        if (!calledByRest(rest[i])) { pick = i; break; }
+      names.push_back(rest[pick]);
+      rest.erase(rest.begin() + pick);
+    }
+  }
   for (StringRef nm : names) {
     Function *F = M->getFunction(nm.trim());
     if (!F || F->isDeclaration()) continue;

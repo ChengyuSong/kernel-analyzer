@@ -34,13 +34,17 @@
 // of the value written or read. Plan docs/plan-named-cells.md.
 
 #include "CallGraphInternal.h"
+#include <llvm/Analysis/CaptureTracking.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/Support/KnownBits.h>
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Operator.h>
 #include <map>
+#include <optional>
 #include <set>
 
 using namespace llvm;
@@ -62,6 +66,42 @@ const DIType *stripDI(const DIType *T) {
 
 // A name for what a value of this type is: "ptr:Pointee", "fnptr", or the
 // base type's name. Typedef names of the pointee count as the pointee.
+// Known bits of an integer value (LLVM's analysis), and for the result of
+// a direct call to a defined function, the bits known in every value it
+// returns (`flags |= sqlite3IsTrueOrFalse(z)`), two calls deep.
+KnownBits knownBitsThroughCalls(const Value *V, const DataLayout &DL, int depth = 2) {
+  KnownBits K = computeKnownBits(V, DL);
+  const auto *CB = dyn_cast<CallBase>(V->stripPointerCasts());
+  const Function *F = CB ? CB->getCalledFunction() : nullptr;
+  if (!F || depth == 0 || F->isDeclaration()) return K; // (this module's bodies)
+  std::optional<KnownBits> R;
+  for (const BasicBlock &B : *F)
+    if (const auto *RI = dyn_cast<ReturnInst>(B.getTerminator())) {
+      const Value *RV = RI->getReturnValue();
+      if (!RV || RV->getType() != V->getType()) return K;
+      const KnownBits KR = knownBitsThroughCalls(RV, DL, depth - 1);
+      R = R ? R->intersectWith(KR) : KR;
+    }
+  if (R) K = K.unionWith(*R);
+  return K;
+}
+
+// The bits of an integer value known zero and known one, as "kb:Z:O";
+// empty when nothing is known. Written for tag writes whose exact value is
+// not known (`flags = x & M`, `flags |= y`).
+std::string knownBitsKey(const Value *V) {
+  if (!V->getType()->isIntegerTy() || V->getType()->getIntegerBitWidth() > 64)
+    return "";
+  const Module *M = nullptr;
+  if (const auto *I = dyn_cast<Instruction>(V)) M = I->getModule();
+  else if (const auto *A = dyn_cast<Argument>(V)) M = A->getParent()->getParent();
+  if (!M) return "";
+  const KnownBits K = knownBitsThroughCalls(V, M->getDataLayout());
+  const uint64_t Z = K.Zero.getZExtValue(), O = K.One.getZExtValue();
+  if (!Z && !O) return "";
+  return "kb:" + std::to_string(Z) + ":" + std::to_string(O);
+}
+
 std::string typeKey(const DIType *T) {
   T = stripDI(T);
   if (!T)
@@ -87,7 +127,48 @@ struct UnionField {
   std::string structName, fieldName;
   uint64_t off = 0, size = 0; // bytes
   std::vector<std::pair<std::string, std::string>> members; // name, typeKey
+  // The members whose typed-pointer LLVM type is the union's storage type
+  // (clang lowers a union to its first member of largest alignment, then
+  // size); every other member is reached through a bitcast.
+  std::set<std::string> storageMembers;
 };
+
+// The typed-pointer LLVM type a member lowers to, as a class: pointers to
+// char-like or void are one type (i8*), pointers to a named struct are
+// that struct's pointer, integers by width.
+std::string loweredClass(const DIType *T) {
+  T = stripDI(T);
+  if (!T) return "?";
+  if (const auto *D = dyn_cast<DIDerivedType>(T))
+    if (D->getTag() == dwarf::DW_TAG_pointer_type) {
+      const DIType *P = stripDI(D->getBaseType());
+      if (!P) return "i8*";
+      if (const auto *B = dyn_cast<DIBasicType>(P))
+        if (B->getSizeInBits() == 8) return "i8*";
+      if (isa<DISubroutineType>(P)) return "fn*:" + std::to_string((uintptr_t)P);
+      return P->getName().empty() ? "anon*" : P->getName().str() + "*";
+    }
+  if (const auto *B = dyn_cast<DIBasicType>(T))
+    return (B->getEncoding() == dwarf::DW_ATE_float ? "f" : "i") +
+           std::to_string(B->getSizeInBits());
+  return T->getName().str();
+}
+
+// Alignment of a member type in bits (natural for scalars and pointers).
+uint64_t diAlign(const DIType *T, int depth = 0) {
+  T = stripDI(T);
+  if (!T || depth > 8) return 8;
+  if (T->getAlignInBits()) return T->getAlignInBits();
+  if (const auto *C = dyn_cast<DICompositeType>(T)) {
+    if (C->getTag() == dwarf::DW_TAG_array_type) return diAlign(C->getBaseType(), depth + 1);
+    uint64_t a = 8;
+    for (const DINode *E : C->getElements())
+      if (const auto *M = dyn_cast<DIDerivedType>(E))
+        a = std::max(a, diAlign(M->getBaseType(), depth + 1));
+    return a;
+  }
+  return std::max<uint64_t>(T->getSizeInBits(), 8);
+}
 
 SmallVector<DbgValueInst *, 2> dbgValuesOf(const Value *V) {
   SmallVector<DbgValueInst *, 2> out;
@@ -143,9 +224,22 @@ void CallGraphPass::runUnionCensus() {
         U.fieldName = Mem->getName().empty() ? "<anon>" : Mem->getName().str();
         U.off = off;
         U.size = Mem->getSizeInBits() / 8;
+        const DIType *storage = nullptr;
         for (const DINode *UE : UT->getElements())
-          if (const auto *UM = dyn_cast<DIDerivedType>(UE))
+          if (const auto *UM = dyn_cast<DIDerivedType>(UE)) {
             U.members.emplace_back(UM->getName().str(), typeKey(UM->getBaseType()));
+            const DIType *MT = UM->getBaseType();
+            if (!storage || diAlign(MT) > diAlign(storage) ||
+                (diAlign(MT) == diAlign(storage) &&
+                 stripDI(MT) && stripDI(storage) &&
+                 stripDI(MT)->getSizeInBits() > stripDI(storage)->getSizeInBits()))
+              storage = MT;
+          }
+        if (storage)
+          for (const DINode *UE : UT->getElements())
+            if (const auto *UM = dyn_cast<DIDerivedType>(UE))
+              if (loweredClass(UM->getBaseType()) == loweredClass(storage))
+                U.storageMembers.insert(UM->getName().str());
       }
     }
   }
@@ -229,6 +323,8 @@ void CallGraphPass::runUnionCensus() {
       if (!moved) break;
     }
   };
+  // The debug type of a value (valueKey, defined below).
+  std::function<std::string(const Value *, int)> valueKeyFwd;
   auto position = [&](const Value *P, const DataLayout &DL) {
     Pos R;
     std::vector<const GEPOperator *> chain;
@@ -237,17 +333,51 @@ void CallGraphPass::runUnionCensus() {
       chain.push_back(G);
       P = G->getPointerOperand()->stripPointerCasts();
     }
-    if (chain.empty())
+    const auto *ST = chain.empty() ? nullptr
+                                   : dyn_cast<StructType>(chain.back()->getSourceElementType());
+    if (!ST || !ST->hasName()) {
+      // -O3 on a raw pointer (an allocator's result): no GEP (offset 0) or
+      // constant byte offsets. Typed by the pointer's debug type
+      // (`Expr *pNew`), when it names a struct we know.
+      int64_t total = 0;
+      for (const GEPOperator *G : chain) {
+        APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
+        if (!G->accumulateConstantOffset(DL, O)) return R;
+        total += O.getSExtValue();
+      }
+      if (total < 0 || !valueKeyFwd) return R;
+      const std::string k = valueKeyFwd(P, 0);
+      if (k.rfind("ptr:", 0) != 0 || !fieldsOf.count(k.substr(4))) return R;
+      R.S = k.substr(4);
+      R.off = (uint64_t)total;
+      R.base = resolveBase(P);
+      R.ok = true;
+      descend(R);
       return R;
-    const auto *ST = dyn_cast<StructType>(chain.back()->getSourceElementType());
-    if (!ST || !ST->hasName())
-      return R;
+    }
+    // Arrays are one element: an index over whole elements (the pointer
+    // level of &a[i], or an array inside the struct) keeps the position;
+    // struct members add their offsets; a byte index must be constant.
     int64_t total = 0;
-    for (const GEPOperator *G : chain) {
-      APInt O(DL.getIndexTypeSizeInBits(G->getType()), 0);
-      if (!G->accumulateConstantOffset(DL, O))
-        return R; // a variable index: not a fixed position
-      total += O.getSExtValue();
+    for (auto cit = chain.rbegin(); cit != chain.rend(); ++cit) {
+      bool first = true;
+      for (auto GTI = gep_type_begin(*cit), E = gep_type_end(*cit); GTI != E; ++GTI) {
+        const Value *Idx = GTI.getOperand();
+        if (StructType *STy = GTI.getStructTypeOrNull()) {
+          const auto *CI = dyn_cast<ConstantInt>(Idx);
+          if (!CI) return R;
+          total += (int64_t)DL.getStructLayout(STy)->getElementOffset(CI->getZExtValue());
+        } else {
+          const uint64_t esz = DL.getTypeAllocSize(GTI.getIndexedType());
+          if (esz == 1 && first) { // byte arithmetic on the pointer
+            const auto *CI = dyn_cast<ConstantInt>(Idx);
+            if (!CI) return R;
+            total += CI->getSExtValue();
+          }
+          // otherwise: whole elements of an array, one element
+        }
+        first = false;
+      }
     }
     if (total < 0)
       return R;
@@ -295,6 +425,13 @@ void CallGraphPass::runUnionCensus() {
     for (auto *DVI : dbgValuesOf(V))
       if (auto *Var = DVI->getVariable())
         return typeKey(Var->getType());
+    // The variable may be recorded on a no-op cast of the value (typed
+    // IR upgraded to opaque pointers: `%36 = bitcast ptr %35 to ptr`).
+    for (const User *U : V->users())
+      if (isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U))
+        for (auto *DVI : dbgValuesOf(U))
+          if (auto *Var = DVI->getVariable())
+            return typeKey(Var->getType());
     if (const auto *AI = dyn_cast<AllocaInst>(V)) {
       for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
         if (auto *Var = DDI->getVariable())
@@ -319,6 +456,28 @@ void CallGraphPass::runUnionCensus() {
       for (auto *E : GVEs)
         return "ptr:" + stripDI(E->getVariable()->getType())->getName().str();
     }
+    // At -O3 a value keeps no variable: a pointer to struct T made by a
+    // GEP (&a[i], a struct-typed index), through phis and selects.
+    if (const auto *G = dyn_cast<GEPOperator>(V))
+      if (const auto *ST = dyn_cast<StructType>(G->getResultElementType()))
+        if (ST->hasName() && G->getNumIndices() == 1)
+          return "ptr:" + stripSuffix(ST->getName());
+    if (const auto *PN = dyn_cast<PHINode>(V)) {
+      std::string k;
+      for (const Value *In : PN->incoming_values()) {
+        if (isa<ConstantPointerNull>(In)) continue;
+        const std::string ki = valueKey(In, depth + 1);
+        if (ki == "?" || (!k.empty() && ki != k)) return "?";
+        k = ki;
+      }
+      if (!k.empty()) return k;
+    }
+    if (const auto *SL = dyn_cast<SelectInst>(V)) {
+      const std::string a = valueKey(SL->getTrueValue(), depth + 1),
+                        b = valueKey(SL->getFalseValue(), depth + 1);
+      if (a == b || b == "null") return a;
+      if (a == "null") return b;
+    }
     // A call's result: the callee's declared return type.
     if (const auto *CB = dyn_cast<CallBase>(V))
       if (const Function *T = CB->getCalledFunction())
@@ -337,6 +496,7 @@ void CallGraphPass::runUnionCensus() {
     }
     return "?";
   };
+  valueKeyFwd = valueKey;
   // What a read is used as: the variable it is stored into, or its
   // debug value, or the struct its GEP users index it as.
   auto readKey = [&](const LoadInst *LI) -> std::string {
@@ -431,6 +591,39 @@ void CallGraphPass::runUnionCensus() {
       }
     return nullptr;
   };
+  // Is a pointer null (1), non-null (0) or either (-1)? A constant null; a
+  // nonnull argument, address or allocation; through the callers of a
+  // parameter (all must agree).
+  std::function<int(const Value *, int)> ptrNullness = [&](const Value *V,
+                                                           int depth) -> int {
+    V = V->stripPointerCasts();
+    if (isa<ConstantPointerNull>(V)) return 1;
+    if (isa<GlobalValue>(V) || isa<AllocaInst>(V)) return 0;
+    if (const auto *A = dyn_cast<Argument>(V)) {
+      if (A->hasNonNullAttr()) return 0;
+      const Function *F = A->getParent();
+      auto &callers = callersOf[F];
+      if (depth <= 0 || F->hasAddressTaken() || callers.empty() ||
+          callers.size() > kCallers)
+        return -1;
+      int r = -2;
+      for (const CallBase *CB : callers) {
+        if (CB->paramHasAttr(A->getArgNo(), Attribute::NonNull)) {
+          if (r == 1) return -1;
+          r = 0;
+          continue;
+        }
+        const int c = ptrNullness(CB->getArgOperand(A->getArgNo()),
+                                  callers.size() == 1 ? depth : depth - 1);
+        if (c < 0 || (r >= 0 && c != r)) return -1;
+        r = c;
+      }
+      return r < 0 ? -1 : r;
+    }
+    if (const auto *G = dyn_cast<GEPOperator>(V))
+      if (G->isInBounds() && depth > 0) return ptrNullness(G->getPointerOperand(), depth - 1) == 0 ? 0 : -1;
+    return -1;
+  };
   // The tag values a scalar may hold: constants, through selects, phis,
   // casts, masks (`op & 0xff`) and parameters (the constants every direct
   // caller passes). "?" is a value not known.
@@ -471,24 +664,64 @@ void CallGraphPass::runUnionCensus() {
         if (const auto *M = dyn_cast<ConstantInt>(BO->getOperand(1))) {
           std::set<std::string> in;
           scalarValues(BO->getOperand(0), depth, in);
-          for (auto &v : in)
-            out.insert(v.rfind("int:", 0) == 0
-                           ? "int:" + std::to_string(std::stoll(v.substr(4)) &
-                                                     (int64_t)M->getZExtValue())
-                           : v);
+          const uint64_t Mk = M->getZExtValue();
+          for (auto &v : in) {
+            if (v.rfind("int:", 0) == 0) {
+              out.insert("int:" + std::to_string(std::stoll(v.substr(4)) & (int64_t)Mk));
+            } else if (v.rfind("kb:", 0) == 0) {
+              // x & M: bits outside M become known zero; known ones stay
+              // only inside M.
+              const size_t c = v.find(':', 3);
+              const uint64_t Z = std::stoull(v.substr(3, c - 3)), O = std::stoull(v.substr(c + 1));
+              out.insert("kb:" + std::to_string(Z | ~Mk) + ":" + std::to_string(O & Mk));
+            } else if (v == "?") {
+              out.insert("kb:" + std::to_string(~Mk) + ":0");
+            } else {
+              out.insert(v);
+            }
+          }
           return;
         }
+    // A comparison is 0 or 1; a null test of a pointer whose nullness is
+    // known (a constant null, a nonnull argument or address, through the
+    // single caller of a per-call-site clone) is exactly one of them.
+    if (const auto *IC = dyn_cast<ICmpInst>(V)) {
+      int nul = -1; // 1: null, 0: non-null, -1: either
+      if (IC->isEquality()) {
+        const Value *X = IC->getOperand(0), *Y = IC->getOperand(1);
+        if (isa<ConstantPointerNull>(X)) std::swap(X, Y);
+        if (isa<ConstantPointerNull>(Y)) nul = ptrNullness(X, 4);
+      }
+      if (nul >= 0) {
+        const bool isNull = nul == 1;
+        const bool eq = IC->getPredicate() == ICmpInst::ICMP_EQ;
+        out.insert(isNull == eq ? "int:1" : "int:0");
+      } else {
+        out.insert("int:0");
+        out.insert("int:1");
+      }
+      return;
+    }
+    if (V->getType()->isIntegerTy(1)) {
+      out.insert("int:0");
+      out.insert("int:1");
+      return;
+    }
     if (const Argument *A = scalarParam(V)) {
       const Function *F = A->getParent();
       auto &callers = callersOf[F];
       if (depth > 0 && !F->hasAddressTaken() && !callers.empty() &&
           callers.size() <= kCallers) {
+        // A single caller (a per-call-site clone) costs no depth: the
+        // chain of clones ends at the call that fixes the value.
+        const int d2 = callers.size() == 1 ? depth : depth - 1;
         for (const CallBase *CB : callers)
-          scalarValues(CB->getArgOperand(A->getArgNo()), depth - 1, out);
+          scalarValues(CB->getArgOperand(A->getArgNo()), d2, out);
         return;
       }
     }
-    out.insert("?");
+    const std::string kb = knownBitsKey(V);
+    out.insert(kb.empty() ? "?" : kb);
   };
   auto scalarValues = [&](const Value *V, int depth, std::set<std::string> &out) {
     SmallPtrSet<const Value *, 16> seen;
@@ -498,7 +731,9 @@ void CallGraphPass::runUnionCensus() {
   // "set:C" (`f |= C`), "clr:C" (`f &= ~C`), "?" (a value not known).
   using CoSet = std::map<uint64_t, std::set<std::string>>;
   auto known = [](const std::string &v) {
-    return v != "?" && v != "or:?" && v != "and:?" && v.rfind("clr:", 0) != 0;
+    return v != "?" && v != "or:?" && v != "and:?" && v.rfind("clr:", 0) != 0 &&
+           v.rfind("or0:", 0) != 0 && v.rfind("and1:", 0) != 0 && v.rfind("kb:", 0) != 0 &&
+           v.rfind("rel:", 0) != 0;
   };
   struct Site {
     const Instruction *I = nullptr;      // or a global initializer:
@@ -516,11 +751,14 @@ void CallGraphPass::runUnionCensus() {
   std::map<ObjKey, CoSet> coWrites;
   // Loads of each (struct, field): where callback fields are read.
   std::map<std::pair<std::string, uint64_t>, std::vector<const LoadInst *>> loadsAt;
-  size_t accesses = 0;
+  size_t accesses = 0, membersByShape = 0;
   for (auto &[M, _] : Ctx->Modules) {
     const DataLayout &DL = M->getDataLayout();
     for (Function &F : *M)
       for (Instruction &I : instructions(F)) {
+        // A function nothing calls or refers to (an original replaced by
+        // its per-call-site clones) writes and reads nothing.
+        if (F.use_empty() && F.hasLocalLinkage()) break;
         // A zeroing memset of a struct writes 0 to every field it covers
         // (`memset(&w, 0, sizeof(w))` before a walker sets its callbacks).
         // At -O3 dead-store elimination trims it to the fields not stored
@@ -538,17 +776,29 @@ void CallGraphPass::runUnionCensus() {
             Dst = G->getPointerOperand()->stripPointerCasts();
           }
           const auto *A = dyn_cast<AllocaInst>(Dst);
-          if (Z && Z->isZero() && Len && A && constOff && at >= 0)
+          // The struct zeroed: a stack slot's type, else (a heap object,
+          // `memset(pNew, 0, sizeof(Expr))` after allocation) the debug
+          // type of the pointer.
+          std::string S;
+          const Value *B = A;
+          if (A) {
             if (const auto *ST = dyn_cast<StructType>(A->getAllocatedType()))
-              if (ST->hasName()) {
-                const std::string S = stripSuffix(ST->getName());
-                const uint64_t lo = (uint64_t)at, hi = lo + Len->getZExtValue();
-                auto fit = fieldsOf.find(S);
-                if (fit != fieldsOf.end())
-                  for (auto &[o, sz] : fit->second)
-                    if (o >= lo && o + sz <= hi)
-                      coWrites[{&F, A, 0, S}][o].insert("int:0");
-              }
+              if (ST->hasName()) S = stripSuffix(ST->getName());
+          } else {
+            const std::string k = valueKey(Dst, 0);
+            if (k.rfind("ptr:", 0) == 0 && fieldsOf.count(k.substr(4))) {
+              S = k.substr(4);
+              B = resolveBase(Dst);
+            }
+          }
+          if (Z && Z->isZero() && Len && !S.empty() && B && constOff && at >= 0) {
+            const uint64_t lo = (uint64_t)at, hi = lo + Len->getZExtValue();
+            auto fit = fieldsOf.find(S);
+            if (fit != fieldsOf.end())
+              for (auto &[o, sz] : fit->second)
+                if (o >= lo && o + sz <= hi)
+                  coWrites[{&F, B, 0, S}][o].insert("int:0");
+          }
           continue;
         }
         const Value *P = nullptr;
@@ -566,6 +816,25 @@ void CallGraphPass::runUnionCensus() {
           if (lf >= 0)
             loadsAt[{Q.S, (uint64_t)lf}].push_back(LI);
         }
+        // A constant vector store (-O3 merges `t.flags = C; t.u.iValue = 0`
+        // into one): each element is a constant write of the field it
+        // starts.
+        if (const auto *SI = dyn_cast<StoreInst>(&I))
+          if (const auto *CV = dyn_cast<Constant>(SI->getValueOperand()))
+            if (auto *VT = dyn_cast<FixedVectorType>(CV->getType()))
+              if (VT->getElementType()->isIntegerTy()) {
+                const uint64_t esz = DL.getTypeStoreSize(VT->getElementType());
+                for (unsigned k = 0; k < VT->getNumElements(); k++) {
+                  const auto *E = dyn_cast_or_null<ConstantInt>(CV->getAggregateElement(k));
+                  const uint64_t off = Q.off + k * esz;
+                  const int64_t fk = fieldAt(Q.S, off);
+                  if (fk < 0) continue;
+                  auto &vals = coWrites[{&F, Q.base, Q.embed, Q.S}][(uint64_t)fk];
+                  vals.insert(E && (uint64_t)fk == off ? "int:" + std::to_string(E->getSExtValue())
+                                                       : std::string("?"));
+                }
+                continue;
+              }
         if (const auto *SI = dyn_cast<StoreInst>(&I)) {
           const int64_t f = fieldAt(Q.S, Q.off);
           // The stored value (`w.xSelectCallback = cond ? 0 : resolveSelectStep`,
@@ -598,10 +867,79 @@ void CallGraphPass::runUnionCensus() {
                         BO->getOpcode() == Instruction::And) &&
                        (isFieldLoad(BO->getOperand(0), Q.S, (uint64_t)f, Q.base, Q.embed) ||
                         isFieldLoad(BO->getOperand(1), Q.S, (uint64_t)f, Q.base, Q.embed))) {
-              // `f |= x`: may set any bit, clears none; `f &= x` the reverse.
-              vals.insert(BO->getOpcode() == Instruction::Or ? "or:?" : "and:?");
-            } else if (V->getType()->isIntegerTy()) {
-              scalarValues(V, 2, vals);
+              // `f |= x`: may set any bit x may have, clears none; `f &= x`
+              // may clear any bit x may lack. Known bits of x bound them.
+              const Value *X = isFieldLoad(BO->getOperand(0), Q.S, (uint64_t)f, Q.base, Q.embed)
+                                   ? BO->getOperand(1) : BO->getOperand(0);
+              const KnownBits K = knownBitsThroughCalls(X, DL);
+              const unsigned bw = K.getBitWidth();
+              if (BO->getOpcode() == Instruction::Or) {
+                const uint64_t Z = bw <= 64 ? K.Zero.getZExtValue() : 0;
+                vals.insert(Z ? "or0:" + std::to_string(Z) : std::string("or:?"));
+              } else {
+                const uint64_t O = bw <= 64 ? K.One.getZExtValue() : 0;
+                vals.insert(O ? "and1:" + std::to_string(O) : std::string("and:?"));
+              }
+            } else if (V->getType()->isIntegerTy() && V->getType()->getIntegerBitWidth() <= 64) {
+              // Relative to the field's current value (-O3 keeps the flags
+              // in a register: `flags = phi(load, flags & ~A) & ~B`): the bits
+              // the write may newly set and newly clear. "rel:S:C" when some
+              // leaf is a load of this field of this object.
+              bool fromField = false;
+              std::function<std::pair<uint64_t, uint64_t>(const Value *, int)> rel =
+                  [&](const Value *X, int d) -> std::pair<uint64_t, uint64_t> {
+                X = peel(X);
+                if (isFieldLoad(X, Q.S, (uint64_t)f, Q.base, Q.embed)) {
+                  fromField = true;
+                  return {0, 0};
+                }
+                auto absolute = [&]() -> std::pair<uint64_t, uint64_t> {
+                  const KnownBits K = knownBitsThroughCalls(X, DL);
+                  if (K.getBitWidth() > 64) return {~0ULL, ~0ULL};
+                  return {~K.Zero.getZExtValue(), ~K.One.getZExtValue()};
+                };
+                if (d == 0) return absolute();
+                if (const auto *PN = dyn_cast<PHINode>(X)) {
+                  if (PN->getNumIncomingValues() > 8) return absolute();
+                  std::pair<uint64_t, uint64_t> r{0, 0};
+                  for (const Value *In : PN->incoming_values()) {
+                    if (In == PN) continue;
+                    auto [s, c] = rel(In, d - 1);
+                    r.first |= s;
+                    r.second |= c;
+                  }
+                  return r;
+                }
+                if (const auto *SE = dyn_cast<SelectInst>(X)) {
+                  auto a = rel(SE->getTrueValue(), d - 1), b = rel(SE->getFalseValue(), d - 1);
+                  return {a.first | b.first, a.second | b.second};
+                }
+                if (const auto *B = dyn_cast<BinaryOperator>(X)) {
+                  const Value *A0 = B->getOperand(0), *A1 = B->getOperand(1);
+                  auto kz = [&](const Value *Y) { return knownBitsThroughCalls(Y, DL).Zero.getZExtValue(); };
+                  auto ko = [&](const Value *Y) { return knownBitsThroughCalls(Y, DL).One.getZExtValue(); };
+                  if (B->getOpcode() == Instruction::And) {
+                    // and only clears: new ones come from the field side.
+                    auto [s, c] = rel(A0, d - 1);
+                    return {s & ~kz(A1), c | ~ko(A1)};
+                  }
+                  if (B->getOpcode() == Instruction::Or) {
+                    auto [s, c] = rel(A0, d - 1);
+                    return {s | ~kz(A1), c};
+                  }
+                  if (B->getOpcode() == Instruction::Xor) {
+                    auto [s, c] = rel(A0, d - 1);
+                    const uint64_t t = ~kz(A1);
+                    return {s | t, c | t};
+                  }
+                }
+                return absolute();
+              };
+              const auto [maySet, mayClear] = rel(V, 6);
+              if (fromField)
+                vals.insert("rel:" + std::to_string(maySet) + ":" + std::to_string(mayClear));
+              else
+                scalarValues(V, 2, vals);
             } else {
               const std::string k = constKey(V);
               if (!k.empty())
@@ -636,13 +974,44 @@ void CallGraphPass::runUnionCensus() {
         s.I = &I;
         s.base = Q.base;
         s.embed = Q.embed;
-        if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (const auto *SI = dyn_cast<StoreInst>(&I))
           s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0));
-          writes[U].push_back(s);
-        } else {
+        else
           s.member = memberOf(*U, readKey(cast<LoadInst>(&I)));
-          reads[U].push_back(s);
+        if (s.member == "?" || s.member == "ambiguous") {
+          // Typed-pointer IR (upgraded): an access of the storage type is a
+          // GEP into the union struct; any other member keeps a no-op
+          // bitcast of the union's address. Narrow by that, then by the
+          // access's kind (pointer or integer).
+          const Value *Ptr = getLoadStorePointerOperand(&I);
+          int shape = 0; // 1: storage type, -1: another type
+          if (const auto *BC = dyn_cast<BitCastOperator>(Ptr)) {
+            if (BC->getSrcTy() == BC->getDestTy()) shape = -1;
+          } else if (const auto *G = dyn_cast<GEPOperator>(Ptr)) {
+            StructType *last = nullptr;
+            for (auto GTI = gep_type_begin(G), E = gep_type_end(G); GTI != E; ++GTI)
+              last = GTI.getStructTypeOrNull();
+            if (last && last->hasName() && last->getName().starts_with("union."))
+              shape = 1;
+          }
+          if (shape != 0) {
+            const Type *AT = getLoadStoreType(const_cast<Instruction *>(&I));
+            std::vector<std::string> cand;
+            for (auto &[nm, tk] : U->members) {
+              const bool inStorage = U->storageMembers.count(nm) != 0;
+              if ((shape == 1) != inStorage) continue;
+              const bool ptrMember = tk.rfind("ptr:", 0) == 0 || tk == "fnptr";
+              if (AT->isPointerTy() != ptrMember) continue;
+              cand.push_back(nm);
+            }
+            if (cand.size() == 1) {
+              s.member = cand[0];
+              membersByShape++;
+            }
+          }
         }
+        if (isa<StoreInst>(&I)) writes[U].push_back(s);
+        else reads[U].push_back(s);
       }
   }
 
@@ -914,8 +1283,26 @@ void CallGraphPass::runUnionCensus() {
   // ---- Facts a read's dominating branches establish on its object ----
   // `f == C` / `f != C` (comparisons, switch cases, null tests), some bit
   // of M set / every bit of M clear (`(f & M) != 0`).
-  enum class FK { EQ, NE, BSET, BCLR };
-  struct Fact { uint64_t f; FK k; uint64_t c; };
+  // ULT c: the value is below c (unsigned); UGE c: at least c (plan 3.30
+  // P3: `icmp ult eU, 2` is `eU == 0 || eU == 1`).
+  // FN c: a callback field holds function fnIds[c] (dispatch is the check:
+  // inside a callback reached only by `p->f(p, ...)`, p->f is that callback).
+  enum class FK { EQ, NE, BSET, BCLR, ULT, UGE, FN };
+  std::vector<std::string> fnIds;
+  std::map<std::string, uint64_t> fnIdOf;
+  auto fnId = [&](const std::string &n) {
+    auto [it, ins] = fnIdOf.try_emplace(n, fnIds.size());
+    if (ins) fnIds.push_back(n);
+    return it->second;
+  };
+  struct Fact {
+    uint64_t f; FK k; uint64_t c;
+    // Where the test's true path starts (the first instruction of the
+    // edge's successor), and whether the fact still holds at the read the
+    // search started from (plan 3.30 P2: path stability).
+    const Instruction *from = nullptr;
+    bool usable = false;
+  };
   // The field f a value loads from the same object, and the bit shift of
   // the loaded piece inside f.
   auto fieldLoad = [&](const Value *V, const std::string &S, const Value *base,
@@ -948,7 +1335,36 @@ void CallGraphPass::runUnionCensus() {
       return;
     }
     const auto *IC = dyn_cast<ICmpInst>(C);
-    if (!IC || !IC->isEquality())
+    if (!IC)
+      return;
+    if (IC->isUnsigned() && IC->isRelational()) {
+      // X <u c, X <=u c, X >u c, X >=u c (constant on either side).
+      ICmpInst::Predicate P = IC->getPredicate();
+      const Value *X = IC->getOperand(0);
+      const auto *CI = dyn_cast<ConstantInt>(IC->getOperand(1));
+      if (!CI) {
+        CI = dyn_cast<ConstantInt>(IC->getOperand(0));
+        X = IC->getOperand(1);
+        P = ICmpInst::getSwappedPredicate(P);
+      }
+      if (!CI || CI->getBitWidth() > 64) return;
+      if (!truth) P = ICmpInst::getInversePredicate(P);
+      uint64_t c = CI->getZExtValue();
+      FK k;
+      switch (P) {
+      case ICmpInst::ICMP_ULT: k = FK::ULT; break;
+      case ICmpInst::ICMP_ULE: if (c == ~0ULL) return; k = FK::ULT; c += 1; break;
+      case ICmpInst::ICMP_UGE: k = FK::UGE; break;
+      case ICmpInst::ICMP_UGT: if (c == ~0ULL) return; k = FK::UGE; c += 1; break;
+      default: return;
+      }
+      uint64_t f;
+      unsigned sh;
+      if (fieldLoad(peel(X), S, base, embed, f, sh) && sh == 0)
+        out.push_back({f, k, c});
+      return;
+    }
+    if (!IC->isEquality())
       return;
     const Value *X = IC->getOperand(0), *Y = IC->getOperand(1);
     if (isa<Constant>(X))
@@ -989,8 +1405,12 @@ void CallGraphPass::runUnionCensus() {
         if (!BI->isConditional() || BI->getSuccessor(0) == BI->getSuccessor(1))
           continue;
         for (unsigned k = 0; k < 2; k++)
-          if (DT.dominates(BasicBlockEdge(NB, BI->getSuccessor(k)), BB))
+          if (DT.dominates(BasicBlockEdge(NB, BI->getSuccessor(k)), BB)) {
+            const size_t n0 = out.size();
             condFacts(BI->getCondition(), k == 0, S, base, embed, out);
+            for (size_t i = n0; i < out.size(); i++)
+              out[i].from = &*BI->getSuccessor(k)->begin();
+          }
       } else if (const auto *SW = dyn_cast<SwitchInst>(T)) {
         uint64_t f;
         unsigned sh;
@@ -1000,8 +1420,10 @@ void CallGraphPass::runUnionCensus() {
           const BasicBlock *Succ = Case.getCaseSuccessor();
           if (Succ == SW->getDefaultDest())
             continue;
-          if (DT.dominates(BasicBlockEdge(NB, Succ), BB))
+          if (DT.dominates(BasicBlockEdge(NB, Succ), BB)) {
             out.push_back({f, FK::EQ, Case.getCaseValue()->getZExtValue()});
+            out.back().from = &*Succ->begin();
+          }
         }
       }
     }
@@ -1009,17 +1431,30 @@ void CallGraphPass::runUnionCensus() {
   };
   // Does a write's tag knowledge satisfy, violate, or leave open a fact?
   enum class Res { SAT, VIOL, UNK };
-  auto evalFact = [](const CoSet &co, const Fact &g) -> Res {
+  auto evalFact = [&](const CoSet &co, const Fact &g) -> Res {
     auto it = co.find(g.f);
     if (it == co.end())
       return Res::UNK;
-    bool unk = false, nz = false, orUnk = false, andUnk = false;
+    bool unk = false, nz = false;
     std::vector<uint64_t> exact;
-    uint64_t sets = 0, clrs = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> kbs; // known zero, known one
+    // Bits an unknown `|=` may set / an unknown `&=` may clear.
+    uint64_t sets = 0, clrs = 0, orMay = 0, andMay = 0;
     for (auto &v : it->second) {
       if (v == "?") unk = true;
-      else if (v == "or:?") orUnk = true;
-      else if (v == "and:?") andUnk = true;
+      else if (v == "or:?") orMay = ~0ULL;
+      else if (v == "and:?") andMay = ~0ULL;
+      else if (v.rfind("or0:", 0) == 0) orMay |= ~std::stoull(v.substr(4));
+      else if (v.rfind("and1:", 0) == 0) andMay |= ~std::stoull(v.substr(5));
+      else if (v.rfind("rel:", 0) == 0) {
+        const size_t c = v.find(':', 4);
+        orMay |= std::stoull(v.substr(4, c - 4));
+        andMay |= std::stoull(v.substr(c + 1));
+      }
+      else if (v.rfind("kb:", 0) == 0) {
+        const size_t c = v.find(':', 3);
+        kbs.push_back({std::stoull(v.substr(3, c - 3)), std::stoull(v.substr(c + 1))});
+      }
       else if (v == "null") exact.push_back(0);
       else if (v.rfind("int:", 0) == 0) exact.push_back((uint64_t)std::stoll(v.substr(4)));
       else if (v.rfind("set:", 0) == 0) sets |= std::stoull(v.substr(4));
@@ -1033,9 +1468,10 @@ void CallGraphPass::runUnionCensus() {
     };
     auto inv = [](Res r) { return r == Res::SAT ? Res::VIOL : r == Res::VIOL ? Res::SAT : Res::UNK; };
     auto eqRes = [&](uint64_t c) {
-      if (unk || sets || clrs || orUnk || andUnk) return Res::UNK;
+      if (unk || sets || clrs || orMay || andMay) return Res::UNK;
       std::vector<Res> rs;
       for (uint64_t n : exact) rs.push_back(n == c ? Res::SAT : Res::VIOL);
+      for (auto [Z, O] : kbs) rs.push_back((c & Z) || (~c & O) ? Res::VIOL : Res::UNK);
       if (nz) rs.push_back(c == 0 ? Res::VIOL : Res::UNK);
       return all(rs);
     };
@@ -1044,25 +1480,49 @@ void CallGraphPass::runUnionCensus() {
     // An unknown `|=` can only add bits (never undoes SAT); an unknown
     // `&=` can only remove them (never undoes VIOL).
     auto bsetRes = [&](uint64_t m) {
-      if ((sets & m) && !(clrs & m) && !andUnk) return Res::SAT;
+      if ((sets & m) && !(clrs & m) && !(andMay & m)) return Res::SAT;
       if (unk || nz) return Res::UNK;
       Res r = Res::UNK;
-      if (!exact.empty()) {
+      if (!exact.empty() || !kbs.empty()) {
         std::vector<Res> rs;
         for (uint64_t n : exact) rs.push_back((n & m) ? Res::SAT : Res::VIOL);
+        for (auto [Z, O] : kbs)
+          rs.push_back((O & m) ? Res::SAT : (m & ~Z) == 0 ? Res::VIOL : Res::UNK);
         r = all(rs);
-        if (r == Res::VIOL && ((sets & m) || orUnk)) return Res::UNK;
-        if (r == Res::SAT && ((clrs & m) || andUnk)) return Res::UNK;
+        if (r == Res::VIOL && ((sets & m) || (orMay & m))) return Res::UNK;
+        if (r == Res::SAT && ((clrs & m) || (andMay & m))) return Res::UNK;
         return r;
       }
-      if ((clrs & m) == m && !(sets & m) && !orUnk) return Res::VIOL;
+      if ((clrs & m) == m && !(sets & m) && !(orMay & m)) return Res::VIOL;
       return r;
+    };
+    auto ultRes = [&](uint64_t c) {
+      if (unk || nz || sets || clrs || orMay || andMay) return Res::UNK;
+      std::vector<Res> rs;
+      for (uint64_t n : exact) rs.push_back(n < c ? Res::SAT : Res::VIOL);
+      for (auto [Z, O] : kbs)
+        // At least the known ones; at most everything not known zero.
+        rs.push_back(O >= c ? Res::VIOL : (~Z) < c ? Res::SAT : Res::UNK);
+      return all(rs);
+    };
+    auto fnRes = [&]() {
+      // The field holds fnIds[g.c]: another function or null violates it.
+      std::vector<Res> rs;
+      for (auto &v : it->second) {
+        if (v.rfind("fn:", 0) == 0) rs.push_back(v.substr(3) == fnIds[g.c] ? Res::SAT : Res::VIOL);
+        else if (v == "null" || v == "int:0") rs.push_back(Res::VIOL);
+        else rs.push_back(Res::UNK);
+      }
+      return all(rs);
     };
     switch (g.k) {
     case FK::EQ: return eqRes(g.c);
     case FK::NE: return inv(eqRes(g.c));
     case FK::BSET: return bsetRes(g.c);
     case FK::BCLR: return inv(bsetRes(g.c));
+    case FK::ULT: return ultRes(g.c);
+    case FK::UGE: return inv(ultRes(g.c));
+    case FK::FN: return fnRes();
     }
     return Res::UNK;
   };
@@ -1085,8 +1545,6 @@ void CallGraphPass::runUnionCensus() {
   auto factStable = [&](const Fact &g) {
     if (stable.count(g.f))
       return true;
-    if (g.k != FK::BSET && g.k != FK::BCLR)
-      return false;
     if (!outsideDone.count(g.f)) {
       outsideDone.insert(g.f);
       auto wit = writersOf.find({stableU->structName, g.f});
@@ -1097,6 +1555,8 @@ void CallGraphPass::runUnionCensus() {
             outsideVals[g.f].insert(vs.begin(), vs.end());
           }
     }
+    if (g.k != FK::BSET && g.k != FK::BCLR)
+      return false;
     for (const std::string &v : outsideVals[g.f]) {
       if (v.rfind("set:", 0) != 0 && v.rfind("clr:", 0) != 0)
         return false;
@@ -1104,6 +1564,67 @@ void CallGraphPass::runUnionCensus() {
         return false;
     }
     return true;
+  };
+  // (A) write -> check (plan 3.31): the tag value written with the union
+  // still holds at the test when no write outside the union's write
+  // contexts can make the fact TRUE. Outside writes that make it false, or
+  // touch only other bits, are harmless (the fact then fails until a union
+  // write sets the tag again). Generalizes factStable; bulk copies and
+  // zeroing are taken to carry tag and content together (ASSUMPTION).
+  // Outside writes that broke a fact: (struct, field, fact) -> value -> functions.
+  std::map<std::string, std::map<std::string, std::set<std::string>>> breakers;
+  auto factPreserved = [&](const Fact &g) {
+    if (factStable(g))
+      return true;
+    auto harmless = [&](const std::string &v) {
+      CoSet one;
+      one[g.f] = {v};
+      if (evalFact(one, g) == Res::VIOL) return true;
+      if (g.k != FK::BSET && g.k != FK::BCLR) return false;
+      // Read-modify-writes that leave the tested bits as they were.
+      if (v.rfind("set:", 0) == 0 || v.rfind("clr:", 0) == 0)
+        return !(std::stoull(v.substr(4)) & g.c);
+      if (v.rfind("or0:", 0) == 0) return (~std::stoull(v.substr(4)) & g.c) == 0;
+      if (v.rfind("and1:", 0) == 0) return (~std::stoull(v.substr(5)) & g.c) == 0;
+      if (v.rfind("rel:", 0) == 0) {
+        // Can it make the fact true? bits-set m: only by newly setting a bit
+        // of m; bits-clear m: only by newly clearing one.
+        const size_t c = v.find(':', 4);
+        const uint64_t s = std::stoull(v.substr(4, c - 4)), k = std::stoull(v.substr(c + 1));
+        return g.k == FK::BSET ? (s & g.c) == 0 : (k & g.c) == 0;
+      }
+      return false;
+    };
+    bool ok = true;
+    for (const std::string &v : outsideVals[g.f])
+      if (!harmless(v)) { ok = false; break; }
+    if (!ok) {
+      const char *kn[] = {"==", "!=", "bits-set", "bits-clear", "<u", ">=u", "== fn#"};
+      const std::string key = stableU->structName + "@" + std::to_string(g.f) + " " +
+                              kn[(int)g.k] + " " + std::to_string(g.c);
+      auto &B = breakers[key];
+      if (B.empty()) {
+        auto wit = writersOf.find({stableU->structName, g.f});
+        if (wit != writersOf.end())
+          for (const ObjKey &K : wit->second)
+            if (!unionCtx[stableU].count(K))
+              for (const std::string &v : coWrites[K][g.f])
+                if (!harmless(v) && B[v].size() < 4)
+                  B[v].insert(std::get<0>(K)->getName().str());
+      }
+    }
+    return ok;
+  };
+  auto pointerless = [&](const Site &w) {
+    const auto *SI = dyn_cast_or_null<StoreInst>(w.I);
+    if (!SI) return false;
+    const Value *SV = SI->getValueOperand();
+    if (isa<ConstantInt>(SV) || isa<ConstantPointerNull>(SV) || isa<UndefValue>(SV))
+      return true; // a constant (zeroing the union) carries no pointer
+    Type *T = SV->getType();
+    if (T->isFloatingPointTy()) return true;
+    const DataLayout &DLw = SI->getModule()->getDataLayout();
+    return T->isIntegerTy() && T->getIntegerBitWidth() < DLw.getPointerSizeInBits();
   };
   auto judge = [&](const std::vector<Fact> &facts, const std::string &member,
                    const std::vector<Site> &W) {
@@ -1119,6 +1640,9 @@ void CallGraphPass::runUnionCensus() {
       const bool typed = w.member != "?" && w.member != "ambiguous";
       if (typed && w.member == member) ownWrite = true;
       if (excluded(w)) continue;
+      // Tag keys key pointer content: a write that cannot hold a pointer
+      // (a narrow integer, a float) feeds no pointer read.
+      if (CFLUnionKeys == "tag" && pointerless(w)) continue;
       if (typed) admitted.insert(w.member);
       else untypedAdmitted = true;
     }
@@ -1141,7 +1665,7 @@ void CallGraphPass::runUnionCensus() {
     for (const Fact &g : factsHere(I, S, base, embed)) facts.push_back(g);
     const RV r = judge(facts, member, W);
     if (detailU && depth == 2) {
-        const char *kn[] = {"==", "!=", "bits-set", "bits-clear"};
+        const char *kn[] = {"==", "!=", "bits-set", "bits-clear", "<u", ">=u", "== fn#"};
         errs() << "UnionCensus:   read " << member << " at " << locOf(I) << " depth " << depth
                << " ->" << (r == RV::VER ? " VER" : r == RV::CONTRA ? " CONTRA" : " UNK") << "\n";
         for (const Fact &g : facts)
@@ -1537,13 +2061,742 @@ void CallGraphPass::runUnionCensus() {
   };
 
   size_t nUnions = 0, nTag = 0, nTagVer = 0, nCallback = 0, nNone = 0, nSingle = 0,
-         nLowBit = 0;
+         nLowBit = 0, readContra = 0, pointerlessReads = 0;
+  // Untested reads by where the search stopped (plan 3.30 P1).
+  std::map<std::string, size_t> untestedBy;
+  std::map<std::string, size_t> uncheckedBy; // reads keyed by their own member, by why
+  std::map<std::string, size_t> blockingWrites; // write of unknown tag -> reads it blocks
+  std::map<std::string, std::map<std::string, size_t>> untestedByUnion;
+  // --cfl-union-keys=tag: per union, the accesses left unkeyed (the gap:
+  // an unkeyed read sees every member). Pointerless writes carry nothing.
+  struct Unkeyed {
+    size_t writes = 0;                    // pointer writes of unknown member
+    std::map<std::string, size_t> readsBy; // unkeyed reads by failed input
+    std::vector<std::string> at;
+  };
+  std::map<std::string, Unkeyed> unkeyedOf;
   struct Line { size_t accesses; std::string text; };
   std::vector<Line> lines;
   std::set<const UnionField *> touched;
   for (auto &[U, _] : writes) touched.insert(U);
   for (auto &[U, _] : reads) touched.insert(U);
   auto real = [](const std::string &m) { return m != "?" && m != "ambiguous"; };
+  // ---- Tag keys: one rule (plan 3.17) ----
+  // A tagged union is a sum type and its tag the program's own RTTI: a
+  // dominating tag test is a dynamic type check. A read's key is the set
+  // of members of the writes its tag facts admit; it is keyed when that
+  // set has at most one member. The inputs, each derived on its own:
+  //   (1) the member a write writes (unknown: the write lands on the
+  //       unkeyed side, which every key sees, so it never blocks a key);
+  //   (2) the tag value written with it (co-writes; unknown: admitted);
+  //   (3) the tag facts at the read (here, else at every call site).
+  // A write that carries no pointer feeds no pointer read. The read's own
+  // static type is not an input (it only names a contradiction).
+  // ---- Path stability (plan 3.30 P2) ----
+  // A test at C justifies a read at L when no path C -> L writes the tested
+  // bits of the tag or the union slot: kind not modified between check and
+  // use (C++: isa<> then use). A write is a store to the field (`f |= K`
+  // with K outside the tested bits does not count), a memset/memcpy or a
+  // struct store that may cover the struct, or a call whose transitive mod
+  // set has the field. Sound only when the field's address is used for
+  // nothing but loads and stores (else other pointers write it unseen).
+  // ASSUMPTION: a function without a body writes no program struct.
+  auto embedsStruct = [&](std::string outer, const std::string &S) {
+    std::vector<std::string> work{outer};
+    std::set<std::string> seen;
+    while (!work.empty()) {
+      const std::string X = work.back();
+      work.pop_back();
+      if (X == S) return true;
+      if (!seen.insert(X).second) continue;
+      for (auto &[k, v] : embeddedAt)
+        if (k.first == X) work.push_back(v.first);
+    }
+    return false;
+  };
+  // A bulk write (memset, memcpy, a struct store) that may cover struct S.
+  auto bulkMayWrite = [&](const Value *Dst, const DataLayout &DL, const std::string &S) {
+    const Pos Q = position(Dst, DL);
+    if (Q.ok) return embedsStruct(Q.S, S);
+    const Value *U = getUnderlyingObject(Dst);
+    if (const auto *A = dyn_cast<AllocaInst>(U)) {
+      const auto *ST = dyn_cast<StructType>(A->getAllocatedType());
+      if (!ST) return !A->getAllocatedType()->isIntegerTy() &&
+                      !A->getAllocatedType()->isArrayTy();
+      return !ST->hasName() || embedsStruct(stripSuffix(ST->getName()), S);
+    }
+    return true; // unknown destination
+  };
+  auto fieldSize = [&](const std::string &S, uint64_t f) -> uint64_t {
+    auto fit = fieldsOf.find(S);
+    if (fit != fieldsOf.end())
+      for (auto &[o, sz] : fit->second)
+        if (o == f) return std::max<uint64_t>(sz, 1);
+    return 1;
+  };
+  // A store through a pointer with no GEP (offset 0 of whatever it points
+  // to, e.g. `p->op = x` at -O3): it may write S unless the pointer's
+  // debug type names a struct that does not embed S.
+  auto untypedMayWrite = [&](const Value *Ptr, const std::string &S) {
+    const std::string k = valueKey(Ptr, 0);
+    if (k.rfind("ptr:", 0) != 0) return true;
+    const std::string X = k.substr(4);
+    if (X.empty() || X == "void" || X.find("char") != std::string::npos ||
+        X == "u8" || X == "i8")
+      return true; // a char lvalue may write any object
+    if (!fieldsOf.count(X)) return true; // not a struct we know
+    return embedsStruct(X, S);
+  };
+  // The struct positions an address may be: itself, or every incoming
+  // address of a phi/select (-O3 joins `&a->f` and `&b->f`). False when
+  // some incoming address is not a struct position.
+  std::function<bool(const Value *, const DataLayout &, std::vector<Pos> &, int)>
+      addrPositions = [&](const Value *V, const DataLayout &DL, std::vector<Pos> &out,
+                          int depth) -> bool {
+    V = V->stripPointerCasts();
+    const Pos Q = position(V, DL);
+    if (Q.ok) { out.push_back(Q); return true; }
+    if (depth == 0) return false;
+    if (const auto *PN = dyn_cast<PHINode>(V)) {
+      for (const Value *X : PN->incoming_values())
+        if (X != PN && !addrPositions(X, DL, out, depth - 1)) return false;
+      return true;
+    }
+    if (const auto *SE = dyn_cast<SelectInst>(V))
+      return addrPositions(SE->getTrueValue(), DL, out, depth - 1) &&
+             addrPositions(SE->getFalseValue(), DL, out, depth - 1);
+    return false;
+  };
+  // Does instruction I (directly) write bits `bits` of field f of S? A
+  // store writes every field its bytes overlap (-O3 merges adjacent
+  // stores into one wider store).
+  auto directWrite = [&](const Instruction &I, const std::string &S, uint64_t f,
+                         uint64_t bits) -> bool {
+    const DataLayout &DL = I.getModule()->getDataLayout();
+    if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+      const Type *T = SI->getValueOperand()->getType();
+      if (T->isStructTy() || T->isArrayTy())
+        return bulkMayWrite(SI->getPointerOperand(), DL, S);
+      std::vector<Pos> qs;
+      if (!position(SI->getPointerOperand(), DL).ok &&
+          addrPositions(SI->getPointerOperand(), DL, qs, 4)) {
+        const uint64_t sz = DL.getTypeStoreSize(const_cast<Type *>(T));
+        const uint64_t fsz = fieldSize(S, f);
+        for (const Pos &P : qs)
+          if (P.S == S && !(P.off + sz <= f || f + fsz <= P.off)) return true;
+        return false;
+      }
+      const Pos Q = position(SI->getPointerOperand(), DL);
+      if (!Q.ok) {
+        // Not a struct-field address (no GEP, a byte GEP, an array of
+        // scalars): judged by the object it lands in, offsets ignored.
+        const Value *U = getUnderlyingObject(SI->getPointerOperand());
+        auto declared = [&](Type *T) {
+          while (auto *AT = dyn_cast<ArrayType>(T)) T = AT->getElementType();
+          const auto *ST = dyn_cast<StructType>(T);
+          return ST && (!ST->hasName() || embedsStruct(stripSuffix(ST->getName()), S));
+        };
+        if (const auto *A = dyn_cast<AllocaInst>(U)) return declared(A->getAllocatedType());
+        if (const auto *G = dyn_cast<GlobalVariable>(U)) return declared(G->getValueType());
+        return untypedMayWrite(U, S);
+      }
+      if (Q.S != S) return false;
+      const uint64_t sz = DL.getTypeStoreSize(const_cast<Type *>(T));
+      const uint64_t fsz = fieldSize(S, f);
+      if (Q.off + sz <= f || f + fsz <= Q.off) return false; // no overlap
+      if (Q.off != f || sz != fsz) return true; // part of a wider store
+      const Value *V = peel(SI->getValueOperand());
+      if (const auto *BO = dyn_cast<BinaryOperator>(V))
+        if (BO->getOpcode() == Instruction::Or || BO->getOpcode() == Instruction::And)
+          for (unsigned k = 0; k < 2; k++)
+            if (const auto *C = dyn_cast<ConstantInt>(BO->getOperand(k)))
+              if (isFieldLoad(BO->getOperand(1 - k), Q.S, f, Q.base, Q.embed)) {
+                const unsigned bw = C->getType()->getIntegerBitWidth();
+                const uint64_t mask = bw >= 64 ? ~0ULL : ((1ULL << bw) - 1);
+                const uint64_t touched = BO->getOpcode() == Instruction::Or
+                                             ? C->getZExtValue()
+                                             : (~C->getZExtValue() & mask);
+                return (touched & bits) != 0;
+              }
+      return true;
+    }
+    if (const auto *MI = dyn_cast<MemIntrinsic>(&I))
+      return bulkMayWrite(MI->getDest(), DL, S);
+    if (const auto *CB = dyn_cast<CallBase>(&I)) {
+      if (isa<DbgInfoIntrinsic>(I) || CB->isLifetimeStartOrEnd()) return false;
+      for (unsigned a = 0; a < CB->arg_size(); a++) {
+        const Value *A = CB->getArgOperand(a);
+        if (!A->getType()->isPointerTy() || CB->onlyReadsMemory(a)) continue;
+        std::vector<Pos> qs;
+        if (!addrPositions(A, DL, qs, 4)) continue;
+        for (const Pos &P : qs)
+          if (P.S == S && fieldAt(S, P.off) == (int64_t)f)
+            return true; // the callee may write through the address
+      }
+    }
+    return false;
+  };
+  // Functions that may write bits of (S, f): directly, or through a call
+  // (direct callers; every function with an indirect call once an
+  // address-taken writer exists).
+  std::vector<const Function *> allFns, indirectCallers;
+  for (auto &[M, _] : Ctx->Modules)
+    for (const Function &F : *M) {
+      if (F.isDeclaration()) continue;
+      allFns.push_back(&F);
+      for (const Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (!CB->getCalledFunction() && !CB->isInlineAsm()) {
+            indirectCallers.push_back(&F);
+            break;
+          }
+    }
+  std::map<std::tuple<std::string, uint64_t, uint64_t>, std::set<const Function *>> modMemo;
+  // Why a function is in a mod set: the direct write, or the call into a
+  // member (verbose report).
+  std::map<std::tuple<std::string, uint64_t, uint64_t>,
+           std::map<const Function *, const Instruction *>> modWhy;
+  auto modFns = [&](const std::string &S, uint64_t f, uint64_t bits)
+      -> const std::set<const Function *> & {
+    auto [it, ins] = modMemo.try_emplace({S, f, bits});
+    std::set<const Function *> &M = it->second;
+    if (!ins) return M;
+    auto &why = modWhy[{S, f, bits}];
+    std::vector<const Function *> work;
+    for (const Function *F : allFns)
+      for (const Instruction &I : instructions(*F))
+        if (directWrite(I, S, f, bits) ||
+            (isa<CallBase>(I) && cast<CallBase>(I).isInlineAsm())) {
+          if (M.insert(F).second) { work.push_back(F); why[F] = &I; }
+          break;
+        }
+    bool indirectDone = false;
+    while (!work.empty()) {
+      const Function *F = work.back();
+      work.pop_back();
+      for (const CallBase *CB : callersOf[F])
+        if (M.insert(CB->getFunction()).second) {
+          work.push_back(CB->getFunction());
+          why[CB->getFunction()] = CB;
+        }
+      if (F->hasAddressTaken() && !indirectDone) {
+        indirectDone = true;
+        for (const Function *G : indirectCallers)
+          if (M.insert(G).second) { work.push_back(G); why[G] = nullptr; }
+      }
+    }
+    return M;
+  };
+  // Does the address of field f of S escape: stored as a value, turned
+  // into an integer, returned? Loads, stores through it, compares, and
+  // calls taking it (a call is a write of the field, see directWrite) do
+  // not; phis, selects, GEPs and casts of it are followed.
+  std::map<std::pair<std::string, uint64_t>, bool> escapeMemo;
+  auto fieldEscapes = [&](const std::string &S, uint64_t f) {
+    auto [it, ins] = escapeMemo.try_emplace({S, f}, false);
+    if (!ins) return it->second;
+    std::set<const Value *> seen;
+    for (const Function *F : allFns) {
+      const DataLayout &DL = F->getParent()->getDataLayout();
+      for (const Instruction &I : instructions(*F)) {
+        const Value *V = &I;
+        if (!isa<GEPOperator>(V)) continue;
+        const Pos Q = position(V, DL);
+        if (!Q.ok || Q.S != S || fieldAt(Q.S, Q.off) != (int64_t)f) continue;
+        std::vector<const Value *> work{V};
+        while (!work.empty()) {
+          const Value *X = work.back();
+          work.pop_back();
+          if (!seen.insert(X).second) continue;
+          for (const User *U : X->users()) {
+            if (isa<LoadInst>(U) || isa<ICmpInst>(U) || isa<DbgInfoIntrinsic>(U))
+              continue;
+            if (const auto *SI = dyn_cast<StoreInst>(U)) {
+              if (SI->getValueOperand() != X) continue;
+            } else if (isa<CallBase>(U)) {
+              continue;
+            } else if (isa<PHINode>(U) || isa<SelectInst>(U) || isa<GEPOperator>(U) ||
+                       isa<BitCastOperator>(U) || isa<AddrSpaceCastInst>(U)) {
+              work.push_back(U);
+              continue;
+            }
+            it->second = true;
+            std::string is;
+            raw_string_ostream os(is);
+            cast<Instruction>(U)->print(os);
+            errs() << "UnionKeys: address of " << S << "+" << f << " escapes in "
+                   << cast<Instruction>(U)->getFunction()->getName() << ": "
+                   << os.str().substr(0, 160) << "\n";
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+  // ---- Capture (for object-sensitive slot checks) ----
+  // Which parameters a body may capture (store as a value, turn into an
+  // integer, return, or pass to a capturing parameter), inferred from the
+  // bodies as LLVM's function-attrs does: the least fixpoint from "none".
+  // A call to a function without a body, or an indirect call, captures
+  // unless the argument is marked nocapture.
+  std::map<std::pair<const Function *, unsigned>, bool> paramCap;
+  bool capDone = false;
+  std::function<bool(const Value *)> valueCaptured = [&](const Value *V) -> bool {
+    SmallVector<const Value *, 16> work{V};
+    SmallPtrSet<const Value *, 32> seen;
+    while (!work.empty()) {
+      const Value *X = work.pop_back_val();
+      if (!seen.insert(X).second) continue;
+      for (const Use &U : X->uses()) {
+        const User *Us = U.getUser();
+        if (isa<LoadInst>(Us) || isa<ICmpInst>(Us) || isa<DbgInfoIntrinsic>(Us)) continue;
+        if (const auto *SI = dyn_cast<StoreInst>(Us)) {
+          if (SI->getValueOperand() == X) return true;
+          continue;
+        }
+        if (isa<GetElementPtrInst>(Us) || isa<BitCastInst>(Us) || isa<PHINode>(Us) ||
+            isa<SelectInst>(Us) || isa<AddrSpaceCastInst>(Us)) {
+          work.push_back(Us);
+          continue;
+        }
+        if (const auto *CB = dyn_cast<CallBase>(Us)) {
+          if (CB->isLifetimeStartOrEnd() || isa<MemIntrinsic>(CB)) continue;
+          if (!CB->isArgOperand(&U)) return true; // called through
+          const unsigned a = CB->getArgOperandNo(&U);
+          if (CB->doesNotCapture(a)) continue;
+          const Function *T = CB->getCalledFunction();
+          if (!T || T->isDeclaration() || a >= T->arg_size() || T->isVarArg()) return true;
+          if (paramCap[{T, a}]) return true;
+          continue;
+        }
+        return true; // ptrtoint, return, insertvalue, ...
+      }
+    }
+    return false;
+  };
+  auto computeCaptures = [&]() {
+    if (capDone) return;
+    capDone = true;
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (const Function *F : allFns)
+        for (const Argument &A : F->args())
+          if (A.getType()->isPointerTy() && !paramCap[{F, A.getArgNo()}] &&
+              valueCaptured(&A)) {
+            paramCap[{F, A.getArgNo()}] = true;
+            changed = true;
+          }
+    }
+  };
+  // Does some path from `start` (inclusive) to `to` (exclusive) execute an
+  // instruction for which `writes` holds?
+  auto pathWrites = [&](const Instruction *start, const Instruction *to,
+                        const std::function<bool(const Instruction &)> &writes) {
+    const BasicBlock *SB = start->getParent(), *TB = to->getParent();
+    if (SB == TB) {
+      // Start before `to` in one block: every path reaches `to` first.
+      bool before = false;
+      for (const Instruction &I : *SB) {
+        if (&I == start) { before = true; break; }
+        if (&I == to) break;
+      }
+      if (before) {
+        for (const Instruction *I = start; I && I != to; I = I->getNextNode())
+          if (writes(*I)) return true;
+        return false;
+      }
+    }
+    std::set<const BasicBlock *> fwd, bwd;
+    std::vector<const BasicBlock *> work{SB};
+    while (!work.empty()) {
+      const BasicBlock *B = work.back();
+      work.pop_back();
+      if (!fwd.insert(B).second) continue;
+      if (B == TB && B != SB) continue; // reached the read
+      for (const BasicBlock *X : successors(B)) work.push_back(X);
+    }
+    work = {TB};
+    while (!work.empty()) {
+      const BasicBlock *B = work.back();
+      work.pop_back();
+      if (!bwd.insert(B).second) continue;
+      if (B == SB && B != TB) continue;
+      for (const BasicBlock *X : predecessors(B)) work.push_back(X);
+    }
+    // A block on a cycle inside the region is on a path whole.
+    auto onCycle = [&](const BasicBlock *B) {
+      std::set<const BasicBlock *> seen;
+      std::vector<const BasicBlock *> w(succ_begin(B), succ_end(B));
+      while (!w.empty()) {
+        const BasicBlock *X = w.back();
+        w.pop_back();
+        if (X == B) return true;
+        if (!fwd.count(X) || !bwd.count(X) || !seen.insert(X).second) continue;
+        for (const BasicBlock *Y : successors(X)) w.push_back(Y);
+      }
+      return false;
+    };
+    for (const BasicBlock *B : fwd) {
+      if (!bwd.count(B)) continue;
+      const bool whole = onCycle(B);
+      bool on = whole || B != SB;
+      for (const Instruction &I : *B) {
+        if (&I == start) on = true;
+        if (!whole && B == TB && &I == to) break;
+        if (on && writes(I)) return true;
+      }
+    }
+    return false;
+  };
+  // A writer predicate for (S, f, bits): direct writes and calls into mod.
+  auto writerOf = [&](const std::string &S, uint64_t f, uint64_t bits) {
+    const std::set<const Function *> *M = &modFns(S, f, bits);
+    bool anyAddrTaken = false;
+    for (const Function *F : *M) anyAddrTaken |= F->hasAddressTaken();
+    return [=, &directWrite](const Instruction &I) -> bool {
+      if (directWrite(I, S, f, bits)) return true;
+      const auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || isa<DbgInfoIntrinsic>(I)) return false;
+      if (CB->isInlineAsm()) return true;
+      if (const Function *T = CB->getCalledFunction()) {
+        if (T->isIntrinsic()) return false;
+        const Function *D = getFuncDef(const_cast<Function *>(T));
+        return M->count(D) != 0;
+      }
+      return anyAddrTaken; // an indirect call reaches address-taken code
+    };
+  };
+  auto bitsOf = [](const Fact &g) {
+    return g.k == FK::BSET || g.k == FK::BCLR ? g.c : ~0ULL;
+  };
+  // Is fact g (found at a test whose path reaches I) intact at I, and at
+  // every lower frame's read point from that frame's entry (`below`)?
+  // Why the last path check failed (verbose report: which condition).
+  std::map<std::string, std::pair<size_t, std::string>> pathFails;
+  auto failAt = [&](const std::string &why, const Instruction *X) {
+    auto &e = pathFails[why];
+    if (e.first++ == 0 && X) {
+      std::string d = X->getFunction()->getName().str();
+      if (const DILocation *L = X->getDebugLoc())
+        d += ":" + std::to_string(L->getLine());
+      std::string is;
+      raw_string_ostream os(is);
+      X->print(os);
+      e.second = d + " " + os.str().substr(0, 120);
+    }
+  };
+  // A usable fact (plan 3.31): (A) write -> check, factPreserved; (B)
+  // check -> read: no path from the test to the read (and from each lower
+  // frame's entry to its read point) writes the union slot with a write
+  // the fact excludes. A write the fact admits is seen by the key anyway;
+  // a call that may write the slot, or a write not matched to a union
+  // write site, counts.
+  auto factUsable = [&](const Fact &g, const Instruction *I, const std::string &S,
+                        uint64_t uoff, const std::vector<const Instruction *> &below,
+                        const std::vector<Site> &W) {
+    if (!factPreserved(g)) { failAt(S + " tag set outside the union's writes", nullptr); return false; }
+    if (!g.from) { failAt("no test position", nullptr); return false; }
+    if (fieldEscapes(S, uoff)) { failAt(S + " union address escapes", nullptr); return false; }
+    auto slot = writerOf(S, uoff, ~0ULL);
+    const Instruction *hit = nullptr;
+    auto harmful = [&](const Instruction &X) {
+      if (!slot(X)) return false;
+      if (isa<StoreInst>(X))
+        for (const Site &w : W)
+          if (w.I == &X) {
+            if (evalFact(w.co, g) != Res::VIOL) return false; // admitted
+            break;
+          }
+      hit = &X;
+      return true;
+    };
+    auto what = [&](const Instruction *X) {
+      const auto *CB = dyn_cast<CallBase>(X);
+      return S + " union written between test and read by " +
+             (CB ? (CB->getCalledFunction() ? "a call" : "an indirect call")
+                 : isa<MemIntrinsic>(X) ? "a mem intrinsic" : "an excluded write");
+    };
+    if (pathWrites(g.from, I, harmful)) { failAt(what(hit), hit); return false; }
+    for (const Instruction *J : below)
+      if (pathWrites(&*J->getFunction()->getEntryBlock().begin(), J, harmful)) {
+        failAt(what(hit) + " (a frame below)", hit);
+        return false;
+      }
+    return true;
+  };
+  size_t factsPathStable = 0, factsReload = 0, writesByTest = 0, dispatchFacts = 0;
+  std::set<uint64_t> curCbFields; // the union's callback fields (per union)
+  // Do a fact h (holding at a write) and a fact g (at a read), both on the
+  // same field, contradict?
+  auto contradict = [&](const Fact &h, const Fact &g) {
+    if (h.f != g.f) return false;
+    if (h.k == FK::FN || g.k == FK::FN)
+      return h.k == FK::FN && g.k == FK::FN && h.c != g.c;
+    auto eqVs = [](uint64_t c, const Fact &x) { // fact x on value c
+      switch (x.k) {
+      case FK::EQ: return c == x.c;
+      case FK::NE: return c != x.c;
+      case FK::BSET: return (c & x.c) != 0;
+      case FK::BCLR: return (c & x.c) == 0;
+      case FK::ULT: return c < x.c;
+      case FK::UGE: return c >= x.c;
+      case FK::FN: return true;
+      }
+      return true;
+    };
+    if (h.k == FK::EQ) return !eqVs(h.c, g);
+    if (g.k == FK::EQ) return !eqVs(g.c, h);
+    if (h.k == FK::ULT && g.k == FK::UGE) return h.c <= g.c;
+    if (h.k == FK::UGE && g.k == FK::ULT) return g.c <= h.c;
+    if (g.k == FK::BSET && h.k == FK::BCLR) return (g.c & ~h.c) == 0;
+    if (g.k == FK::BCLR && h.k == FK::BSET) return (h.c & ~g.c) == 0;
+    return false;
+  };
+  // A write excluded by a test that dominates it (`if (!ExprUseXSelect(p))
+  // p->x.pList = l`): the write's context writes no value of the field,
+  // and no path from the test to the write writes the tested bits.
+  auto excludedByTest = [&](const Site &w, const Fact &g, const std::string &S) {
+    if (!w.I || w.co.count(g.f)) return false;
+    for (const Fact &h : factsHere(w.I, S, w.base, w.embed)) {
+      if (!h.from || !contradict(h, g)) continue;
+      if (fieldEscapes(S, h.f)) continue;
+      auto tag = writerOf(S, h.f, bitsOf(h));
+      if (pathWrites(h.from, w.I, tag)) continue;
+      return true;
+    }
+    return false;
+  };
+  struct Admit {
+    std::set<std::string> members;             // of the admitted writes
+    bool facts = false;                        // a usable tag fact applied
+    bool unstable = false;                     // a test of a field not stable
+    std::set<const Instruction *> tagUnknown;  // admitted: tag value unknown
+    // Where the backward search for facts stopped while several members
+    // were still admitted (one per context; plan 3.30 P1).
+    std::set<std::string> stops;
+  };
+  // A test on another load of the same slot that dominates I (the
+  // object reloaded between the test and the read).
+  auto reloadTested = [&](const Instruction *I, const Value *base,
+                          const std::string &S, uint64_t embed) {
+    const auto *L = dyn_cast<LoadInst>(base);
+    if (!L) return false;
+    const Value *slot = L->getPointerOperand()->stripPointerCasts();
+    for (const User *U : slot->users()) {
+      const auto *L2 = dyn_cast<LoadInst>(U);
+      if (!L2 || L2 == L || L2->getFunction() != I->getFunction()) continue;
+      if (!factsHere(I, S, L2, embed).empty()) return true;
+    }
+    return false;
+  };
+  // uoff: the union's offset in S. below: the read points of the frames
+  // under this one (the read itself, then each call site walked up).
+  std::function<Admit(const Instruction *, const Value *, uint64_t,
+                      const std::string &, uint64_t, const std::vector<Site> &,
+                      std::vector<Fact>, std::vector<const Instruction *>, int)>
+      admittedFor = [&](const Instruction *I, const Value *base, uint64_t embed,
+                        const std::string &S, uint64_t uoff, const std::vector<Site> &W,
+                        std::vector<Fact> facts, std::vector<const Instruction *> below,
+                        int depth) -> Admit {
+    auto keep = [&](Fact g) {
+      if (CFLUnionPathStable) {
+        g.usable = factUsable(g, I, S, uoff, below, W);
+        if (g.usable && !factStable(g)) factsPathStable++;
+      } else {
+        g.usable = factStable(g);
+      }
+      facts.push_back(g);
+    };
+    for (const Fact &g : factsHere(I, S, base, embed)) keep(g);
+    // Reload (C++: dyn_cast on a reloaded pointer): a test on another load
+    // L2 of the same slot that dominates this load L, with no write of the
+    // slot between L2 and L.
+    if (const auto *L = dyn_cast<LoadInst>(base); L && CFLUnionPathStable) {
+      const Value *slot = L->getPointerOperand()->stripPointerCasts();
+      const DataLayout &DL = L->getModule()->getDataLayout();
+      const Pos SQ = position(slot, DL);
+      const auto *SA = dyn_cast<AllocaInst>(slot);
+      bool slotVisible = false;
+      std::function<bool(const Instruction &)> slotWrite;
+      // The slot inside a stack object whose address is never captured
+      // (stored, returned): only pointers derived from it reach it, so
+      // only an instruction given such a pointer can write the slot.
+      const auto *SObj = dyn_cast<AllocaInst>(getUnderlyingObject(slot));
+      if (SObj) computeCaptures();
+      if (SObj && !valueCaptured(SObj)) {
+        slotVisible = true;
+        slotWrite = [SObj](const Instruction &X) {
+          auto fromObj = [&](const Value *P) { return getUnderlyingObject(P) == SObj; };
+          if (const auto *SI = dyn_cast<StoreInst>(&X)) return fromObj(SI->getPointerOperand());
+          if (const auto *MI = dyn_cast<MemIntrinsic>(&X)) return fromObj(MI->getDest());
+          if (const auto *CB = dyn_cast<CallBase>(&X)) {
+            if (isa<DbgInfoIntrinsic>(X) || CB->isLifetimeStartOrEnd()) return false;
+            for (unsigned a = 0; a < CB->arg_size(); a++)
+              if (CB->getArgOperand(a)->getType()->isPointerTy() &&
+                  !CB->onlyReadsMemory(a) && fromObj(CB->getArgOperand(a)))
+                return true;
+            return false;
+          }
+          return X.mayWriteToMemory() && !isa<FenceInst>(X) &&
+                 !isa<LoadInst>(X); // atomics and the like: conservative
+        };
+      } else if (SQ.ok && !fieldEscapes(SQ.S, (uint64_t)std::max<int64_t>(fieldAt(SQ.S, SQ.off), 0)) &&
+          fieldAt(SQ.S, SQ.off) >= 0) {
+        slotVisible = true;
+        slotWrite = writerOf(SQ.S, (uint64_t)fieldAt(SQ.S, SQ.off), ~0ULL);
+      } else if (SA && llvm::all_of(SA->users(), [&](const User *U) {
+                   if (isa<LoadInst>(U)) return true;
+                   const auto *SI = dyn_cast<StoreInst>(U);
+                   return SI && SI->getPointerOperand() == SA;
+                 })) {
+        slotVisible = true; // a stack slot only loaded and stored
+        slotWrite = [SA](const Instruction &X) {
+          const auto *SI = dyn_cast<StoreInst>(&X);
+          return SI && SI->getPointerOperand()->stripPointerCasts() == SA;
+        };
+      }
+      DominatorTree &DT = domTree(L->getFunction());
+      if (slotVisible)
+        for (const User *U : slot->users()) {
+          const auto *L2 = dyn_cast<LoadInst>(U);
+          if (!L2 || L2 == L || L2->getFunction() != L->getFunction() ||
+              !DT.dominates(L2, L))
+            continue;
+          if (pathWrites(L2->getNextNode(), L, slotWrite)) continue;
+          for (Fact g : factsHere(I, S, L2, embed)) {
+            if (!factUsable(g, I, S, uoff, below, W)) continue;
+            g.usable = true;
+            facts.push_back(g);
+            factsReload++;
+          }
+        }
+    }
+    auto admitUnder = [&](const std::vector<Fact> &fs) {
+      Admit A;
+      for (const Fact &g : fs) {
+        A.facts |= g.usable;
+        A.unstable |= !g.usable;
+      }
+      for (const Site &w : W) {
+        if (!real(w.member)) continue;         // (1) unknown: unkeyed side
+        if (pointerless(w)) continue;          // no pointer to feed a read
+        bool excluded = false, unknownTag = false;
+        for (const Fact &g : fs) {
+          if (!g.usable) continue;
+          const Res e = evalFact(w.co, g);     // (2) against (3)
+          if (e == Res::VIOL) { excluded = true; break; }
+          if (e == Res::UNK && excludedByTest(w, g, S)) {
+            excluded = true;
+            writesByTest++;
+            break;
+          }
+          unknownTag |= e == Res::UNK;
+        }
+        if (excluded) continue;
+        A.members.insert(w.member);
+        if (unknownTag && w.I) A.tagUnknown.insert(w.I);
+      }
+      return A;
+    };
+    Admit A = admitUnder(facts);
+    if (A.members.size() <= 1) return A;
+    // The object a parameter: what each call site's facts admit.
+    const Function *F = I->getFunction();
+    const int pi = paramIndex(F, base);
+    auto &callers = callersOf[F];
+    const char *stop = nullptr;
+    std::string otherKind;
+    if (pi < 0 && !isa<LoadInst>(base) && !isa<CallBase>(base) &&
+        !isa<GlobalVariable>(base) && !isa<AllocaInst>(base)) {
+      if (const auto *BI = dyn_cast<Instruction>(base))
+        otherKind = std::string("object from a ") + BI->getOpcodeName();
+      else if (isa<Argument>(base))
+        otherKind = "object from an argument (not tracked)";
+      else
+        otherKind = "object from a constant";
+    }
+    if (!otherKind.empty()) {
+      A.stops.insert(otherKind);
+      return A;
+    }
+    if (pi < 0) {
+      stop = reloadTested(I, base, S, embed)  ? "reload of a tested slot"
+             : isa<LoadInst>(base)            ? "object loaded from memory"
+             : isa<CallBase>(base)            ? "object returned by a call"
+             : isa<GlobalVariable>(base)      ? "global object"
+             : isa<AllocaInst>(base)          ? "stack object"
+                                              : "other object";
+    } else if (depth == 0) {
+      stop = "caller depth";
+    } else if (F->hasAddressTaken()) {
+      // Dispatch is the check (plan 3.30): F runs only through
+      // `p->f(p, ...)` with p at argument pi, its address stored only in
+      // callback field f of S: inside F, p->f == F (C++: `this` in D::f is
+      // a D). Direct calls of F add their callers' facts.
+      std::vector<const CallBase *> direct;
+      std::string why;
+      std::set<uint64_t> heldIn;
+      if (!curCbFields.empty() &&
+          onlyDispatched(F->getName().str(), S, curCbFields, direct) &&
+          dispatchArg(S, curCbFields, why) == pi) {
+        for (const User *Us : F->users())
+          if (const auto *SI = dyn_cast<StoreInst>(Us)) {
+            const Pos T = position(SI->getPointerOperand(), SI->getModule()->getDataLayout());
+            if (T.ok) heldIn.insert((uint64_t)fieldAt(T.S, T.off));
+          }
+      }
+      if (heldIn.size() == 1) {
+        Fact g{*heldIn.begin(), FK::FN, fnId(F->getName().str())};
+        g.from = &*F->getEntryBlock().begin();
+        g.usable = factUsable(g, I, S, uoff, below, W);
+        if (g.usable) {
+          std::vector<Fact> fs = facts;
+          fs.push_back(g);
+          Admit D = admitUnder(fs);
+          dispatchFacts++;
+          if (direct.empty()) return D;
+          // Other ways in: the direct callers' facts, unioned in.
+          below.push_back(I);
+          for (const CallBase *CB : direct) {
+            if (depth == 0 || pi >= (int)CB->arg_size()) {
+              // A way in we cannot follow: the dispatch fact alone would
+              // be unsound; fall back to what holds without it.
+              A.stops.insert("direct call of a callback");
+              return A;
+            }
+            const Admit c = admittedFor(CB, resolveBase(CB->getArgOperand(pi)), embed, S,
+                                        uoff, W, facts, below, depth - 1);
+            D.members.insert(c.members.begin(), c.members.end());
+            D.tagUnknown.insert(c.tagUnknown.begin(), c.tagUnknown.end());
+            D.stops.insert(c.stops.begin(), c.stops.end());
+          }
+          return D;
+        }
+      }
+      stop = "indirect call (address taken)";
+    } else if (callers.empty()) {
+      stop = "no caller";
+    } else if (callers.size() > kCallers) {
+      stop = "caller fan-out";
+    }
+    if (stop) {
+      A.stops.insert(stop);
+      return A;
+    }
+    Admit R;
+    below.push_back(I);
+    for (const CallBase *CB : callers) {
+      const Admit c = admittedFor(CB, resolveBase(CB->getArgOperand(pi)), embed, S,
+                                  uoff, W, facts, below, depth - 1);
+      R.members.insert(c.members.begin(), c.members.end());
+      R.facts |= c.facts;
+      R.unstable |= c.unstable;
+      R.tagUnknown.insert(c.tagUnknown.begin(), c.tagUnknown.end());
+      R.stops.insert(c.stops.begin(), c.stops.end());
+    }
+    return R;
+  };
   for (const UnionField *U : touched) {
     nUnions++;
     auto &W = writes[U];
@@ -1691,6 +2944,7 @@ void CallGraphPass::runUnionCensus() {
               (v.rfind("gv:", 0) == 0 && fnsInGV.count(v.substr(3))))
             cbFields.insert(f);
       }
+    curCbFields = cbFields;
     size_t unpairedCb = 0, unpairedGov = 0;
     bool governsAll = false;
     std::set<std::string> governed; // reader functions that lose the key
@@ -1785,7 +3039,133 @@ void CallGraphPass::runUnionCensus() {
     // ---- Keys for the solver (--cfl-union-keys, plan 3.17/3.18) ----
     size_t keyedW = 0, keyedR = 0;
     std::string keyNote;
-    if (CFLUnionKeys != "off" && realMembers.size() > 1)
+    if (CFLUnionKeys == "tag" && realMembers.size() > 1) {
+      // Tag keys (cell solver): a write is keyed by the member it writes
+      // (input 1); a read by the rule (admittedFor). An unkeyed read sees
+      // every member; an unkeyed write lands where every read sees it.
+      const std::string prefix =
+          "struct." + U->structName + "+" + std::to_string(U->off);
+      for (auto &w : W) {
+        if (!w.I) continue; // initializers write the unkeyed side
+        if (real(w.member)) { unionKeyNames[w.I] = {prefix + "#" + w.member}; keyedW++; }
+        else {
+          unionUnknownOf[w.I] = prefix;
+          if (!pointerless(w)) {
+            Unkeyed &K = unkeyedOf[prefix];
+            K.writes++;
+            if (K.at.size() < 6) {
+              std::string d = "write " + locOf(w.I) + " (member unknown";
+              auto cit = best >= 0 ? w.co.find((uint64_t)best) : w.co.end();
+              if (cit != w.co.end()) {
+                d += "; tag @" + std::to_string(best) + " =";
+                for (const std::string &v : cit->second) d += " " + v;
+              }
+              K.at.push_back(d + ")");
+            }
+          }
+        }
+      }
+      for (auto &r : Rd) {
+        // A read that cannot carry a pointer (a narrow integer, a float)
+        // needs no key: no pointer flows through it.
+        if (const auto *LI = dyn_cast_or_null<LoadInst>(r.I)) {
+          Type *T = LI->getType();
+          if (T->isFloatingPointTy() ||
+              (T->isIntegerTy() && T->getIntegerBitWidth() <
+                                       LI->getModule()->getDataLayout().getPointerSizeInBits())) {
+            pointerlessReads++;
+            continue;
+          }
+        }
+        const Admit A = admittedFor(r.I, r.base, r.embed, U->structName, U->off, W,
+                                    {}, {}, 2);
+        if (A.members.size() <= 1) {
+          // One member (or none: only unkeyed writes reach it).
+          const std::string k = A.members.empty() ? "-" : *A.members.begin();
+          unionKeyNames[r.I] = {prefix + "#" + k};
+          keyedR++;
+          // A contradiction: the read's member has typed writes and the
+          // facts exclude every one (writes of unknown member are in U).
+          const bool ownTyped = real(r.member) &&
+              std::any_of(W.begin(), W.end(), [&](const Site &w) {
+                return w.member == r.member && !pointerless(w);
+              });
+          if (ownTyped && k != r.member) {
+            readContra++; // reads a member its facts rule out
+            errs() << "UnionKeys: read of " << r.member << " at " << locOf(r.I)
+                   << ": its facts admit only " << k << "\n";
+            // Explain: the usable facts, and each own-member write's verdict.
+            std::vector<Fact> fs;
+            for (const Fact &g : factsHere(r.I, U->structName, r.base, r.embed)) fs.push_back(g);
+            const char *kn[] = {"==", "!=", "bits-set", "bits-clear", "<u", ">=u", "== fn#"};
+            for (const Fact &g : fs)
+              errs() << "UnionKeys:     fact @" << g.f << " " << kn[(int)g.k] << " " << g.c
+                     << (factStable(g) ? " (stable)" : "")
+                     << (factUsable(g, r.I, U->structName, U->off, {}, W) ? " (usable)" : "")
+                     << "\n";
+            for (const Site &w : W) {
+              if (w.member != r.member || pointerless(w)) continue;
+              errs() << "UnionKeys:     write " << w.member << " at "
+                     << (w.I ? locOf(w.I) : "init") << ":";
+              for (const Fact &g : fs) {
+                const Res e = evalFact(w.co, g);
+                errs() << " @" << g.f << "=" << (e == Res::SAT ? "SAT" : e == Res::VIOL ? "VIOL" : "UNK");
+                auto it = w.co.find(g.f);
+                if (it != w.co.end()) {
+                  errs() << "{";
+                  for (auto &v : it->second) errs() << v << ",";
+                  errs() << "}";
+                }
+              }
+              errs() << "\n";
+            }
+          }
+          continue;
+        }
+        // Which input failed: no facts (3); writes of unknown tag (2); or
+        // the facts admit several members.
+        const char *why = !A.facts ? (A.unstable ? "tests of an unstable field"
+                                                 : "no tag test")
+                          : !A.tagUnknown.empty() ? "writes of unknown tag"
+                                                  : "facts admit several members";
+        // The access states the developer's expectation (user, 2026-10-07):
+        // a read of a known member with no check that settles it is keyed by
+        // that member, taken as correct, and warned for review of the
+        // source; another member reaching it would be a potential bug.
+        if (real(r.member)) {
+          unionKeyNames[r.I] = {prefix + "#" + r.member};
+          keyedR++;
+          uncheckedBy[why]++;
+          std::string others;
+          for (const std::string &m : A.members)
+            if (m != r.member) others += (others.empty() ? "" : " ") + m;
+          errs() << "UnionKeys: UNCHECKED read of " << r.member << " at " << locOf(r.I)
+                 << " (" << why << "); other members it would admit: {" << others << "}"
+                 << (A.members.count(r.member) ? "" : " (none of its own member's writes admitted)")
+                 << "\n";
+          continue;
+        }
+        unionUnknownOf[r.I] = prefix;
+        Unkeyed &K = unkeyedOf[prefix];
+        K.readsBy[why]++;
+        if (A.facts && !A.tagUnknown.empty())
+          for (const Instruction *X : A.tagUnknown) blockingWrites[prefix + " " + locOf(X)]++;
+        if (!A.facts && !A.unstable) {
+          std::string st;
+          for (const std::string &x : A.stops) st += (st.empty() ? "" : " + ") + x;
+          untestedBy[st.empty() ? "?" : st]++;
+          untestedByUnion[prefix][st.empty() ? "?" : st]++;
+        }
+        if (K.at.size() < 6) {
+          std::string d = std::string("read ") + locOf(r.I) + " (" + why;
+          if (!A.tagUnknown.empty()) d += ": " + locOf(*A.tagUnknown.begin());
+          d += "; {";
+          for (const std::string &m : A.members) d += m + " ";
+          K.at.push_back(d.substr(0, d.size() - 1) + "})");
+        }
+      }
+      cellUnionSlots.insert({U->structName, U->off, U->size});
+    } else if (CFLUnionKeys != "off" && realMembers.size() > 1)
       keyUnion(U, W, Rd, cbFields, governed, governsAll, keyedW, keyedR, keyNote);
     std::string verdict;
     const bool allW = best >= 0 && bestCov == W.size() && bestFD;
@@ -1867,8 +3247,78 @@ void CallGraphPass::runUnionCensus() {
     lines.push_back({W.size() + Rd.size(), t});
   }
   if (!CFLCensusUnions) {
+    errs() << "UnionKeys: " << membersByShape
+           << " accesses named by their address shape (storage-type GEP / no-op bitcast)\n";
     errs() << "UnionKeys: " << unionKeyNames.size() << " union accesses keyed ("
-           << CFLUnionKeys << ")\n";
+           << CFLUnionKeys << "); " << pointerlessReads
+           << " reads carry no pointer (no key); facts usable beyond program-wide stability "
+           << factsPathStable << ", by a reload " << factsReload
+           << "; writes excluded by a test at the write " << writesByTest
+           << "; dispatch facts " << dispatchFacts << "; " << readContra
+           << " reads of a member their facts rule out\n";
+    {
+      size_t n = 0;
+      std::string t;
+      for (auto &[w, c] : uncheckedBy) { n += c; t += ", " + w + " " + std::to_string(c); }
+      errs() << "UnionKeys: " << n << " reads keyed by their own member without a settling "
+             << "check (warned, see UNCHECKED lines)" << t << "\n";
+    }
+    size_t uw = 0, ur = 0;
+    std::map<std::string, size_t> byWhy;
+    std::vector<std::pair<size_t, std::string>> top;
+    for (auto &[u, K] : unkeyedOf) {
+      size_t r = 0;
+      for (auto &[why, c] : K.readsBy) { r += c; byWhy[why] += c; }
+      uw += K.writes;
+      ur += r;
+      top.push_back({K.writes + r, u});
+    }
+    std::sort(top.rbegin(), top.rend());
+    std::string bw;
+    for (auto &[why, c] : byWhy) bw += ", " + why + " " + std::to_string(c);
+    errs() << "UnionKeys: unkeyed (the gap): " << uw
+           << " pointer writes of unknown member; " << ur << " reads" << bw
+           << "; in " << unkeyedOf.size() << " unions\n";
+    errs() << "UnionKeys: path checks that failed, by condition:\n";
+    std::vector<std::pair<size_t, std::string>> pf;
+    for (auto &[w, e] : pathFails) pf.push_back({e.first, w});
+    std::sort(pf.rbegin(), pf.rend());
+    for (size_t i = 0; i < pf.size() && i < 20; i++)
+      errs() << "UnionKeys:   " << pf[i].first << "  " << pf[i].second << "  e.g. "
+             << pathFails[pf[i].second].second << "\n";
+    errs() << "UnionKeys: facts broken by tag writes outside the union's writes:\n";
+    for (auto &[k, B] : breakers) {
+      std::string t;
+      for (auto &[v, fs] : B) {
+        t += "  " + v + " in";
+        for (const std::string &f : fs) t += " " + f;
+        t += ";";
+      }
+      errs() << "UnionKeys:   " << k << ":" << t.substr(0, 400) << "\n";
+    }
+    {
+      std::vector<std::pair<size_t, std::string>> bw2;
+      for (auto &[w, c] : blockingWrites) bw2.push_back({c, w});
+      std::sort(bw2.rbegin(), bw2.rend());
+      errs() << "UnionKeys: union writes of unknown tag, by reads they keep unkeyed:\n";
+      for (size_t i = 0; i < bw2.size() && i < 25; i++)
+        errs() << "UnionKeys:   " << bw2[i].first << "  " << bw2[i].second << "\n";
+    }
+    errs() << "UnionKeys: untested reads by where the search stopped:\n";
+    for (auto &[st, c] : untestedBy) errs() << "UnionKeys:   " << c << "  " << st << "\n";
+    for (auto &[u, m] : untestedByUnion) {
+      std::string t;
+      for (auto &[st, c] : m) t += "; " + st + " " + std::to_string(c);
+      errs() << "UnionKeys:   " << u << t << "\n";
+    }
+    for (size_t i = 0; i < top.size() && i < 12; i++) {
+      const Unkeyed &K = unkeyedOf[top[i].second];
+      std::string rb;
+      for (auto &[why, c] : K.readsBy) rb += ", " + why + " " + std::to_string(c);
+      errs() << "UnionKeys:   " << top[i].second << ": " << K.writes
+             << " writes of unknown member" << rb << "\n";
+      for (const std::string &a : K.at) errs() << "UnionKeys:     " << a << "\n";
+    }
     return;
   }
   std::sort(lines.begin(), lines.end(),

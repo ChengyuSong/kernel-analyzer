@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
           CFLKeyCells || CFLBatchRoots > 0 || CFLLazyMint ||
           CFLFlowsToSlice || CFLBidiPrune || CFLPreSolveOnce ||
           CFLVerifyClosure || !CFLRuleReport.empty() ||
-          CFLUnionKeys != "off" || CFLNameByTarget ||
+          (CFLUnionKeys != "off" && CFLUnionKeys != "tag") || CFLNameByTarget ||
           !CFLNexusFields.empty() || CFLResidueCopies)
         cliErrors.push_back("--cfl-cells replaces named planes, channel "
                             "cells, lazy addresses, key cells, batching, "
@@ -279,9 +279,12 @@ int main(int argc, char **argv) {
                           "(access names) and --cfl-alloc-origins (an "
                           "origin-free value is data)");
     if (CFLUnionKeys != "off" && CFLUnionKeys != "callback" &&
-        CFLUnionKeys != "single")
-      cliErrors.push_back("--cfl-union-keys takes off, callback or single");
-    else if (CFLUnionKeys != "off" && !CFLNamedPlanes)
+        CFLUnionKeys != "single" && CFLUnionKeys != "tag")
+      cliErrors.push_back("--cfl-union-keys takes off, callback, single or tag");
+    else if (CFLUnionKeys == "tag" && !CFLCells)
+      cliErrors.push_back("--cfl-union-keys=tag is for --cfl-cells (keyed "
+                          "union cells)");
+    else if (CFLUnionKeys != "off" && CFLUnionKeys != "tag" && !CFLNamedPlanes)
       cliErrors.push_back("--cfl-union-keys requires --cfl-named-planes "
                           "(a key is a name plane)");
     if (CFLCensusTypeLabels && !CFLNamedPlanes)

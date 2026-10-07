@@ -108,6 +108,10 @@ extern size_t g_sinkSitesConfirmed, g_sinkSitesEscaped, g_sinkSitesViolated;
 extern bool g_sinkContractChecked;
 bool isSinkPayloadAccessor(StringRef n);
 extern size_t g_sinkArenaSites;
+// --cfl-cells: allocator calls inside kept allocator bodies (no object).
+extern size_t g_innerAllocSites;
+// --cfl-cells: ptrtoints whose integer never becomes a pointer (no wildcard).
+extern size_t g_p2iNumberOnly;
 extern std::vector<std::pair<NodeIndex, std::string>> g_userCertObjs;
 extern size_t g_userCertCopySites, g_userCertGetSites;
 extern size_t g_tagRoundTrips;

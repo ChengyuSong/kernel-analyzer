@@ -201,7 +201,15 @@ bool CallGraphPass::doInitialization(Module *M) {
     // it, legacy behavior is unchanged.
     if (!Ctx->SummarySpecs.empty()) {
       g_sumAuthoritative = true; // file owns skip lists too (NOOP)
-      if (const auto *S = summaryForName(Ctx, F.getName(), !F.isDeclaration())) {
+      // A per-call-site clone (--cfl-clone-per-caller: "f.site3") is
+      // still f: it takes f's summary.
+      StringRef sumName = F.getName();
+      for (size_t at = sumName.rfind(".site"); at != StringRef::npos &&
+                                               at + 5 < sumName.size() &&
+                                               llvm::all_of(sumName.substr(at + 5), isDigit);
+           at = sumName.rfind(".site"))
+        sumName = sumName.substr(0, at);
+      if (const auto *S = summaryForName(Ctx, sumName, !F.isDeclaration())) {
         // FRESH on a void-returning function is a glob overreach
         // ("vmalloc*" caught void vmalloc_init): treating it as an
         // allocator SKIPS ITS BODY, silently severing every registration

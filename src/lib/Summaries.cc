@@ -1525,7 +1525,11 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       // 104 ≡ 0 (mod 13) by residue accident (found via the 5.18 GT
       // target_absent shift 2026-08-18; invisible to t_kmemdup, whose
       // source fields are runtime stores).
-      if (flowsTo() && Graph.fieldSensitive() && exactFieldLabels()) {
+      if (CFLCells) {
+        // The cell solver copies cell by cell (arrays as one element).
+        byteCopies.emplace_back(getCanonicalNode(s), getCanonicalNode(d),
+                                (int64_t)-1, CS);
+      } else if (flowsTo() && Graph.fieldSensitive() && exactFieldLabels()) {
         // Exact addresses: no residue set to relay; a byte copy of
         // unknown extent is the range wildcard on both sides.
         addFieldWildcardLoop(getCanonicalNode(s), "cpy-unknown-extent");

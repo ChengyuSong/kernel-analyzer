@@ -61,6 +61,7 @@ extern cl::opt<bool> CFLKeyCells;
 extern cl::opt<bool> CFLCensusUnions;
 extern cl::opt<std::string> CFLCensusUnionsDetail;
 extern cl::opt<std::string> CFLUnionKeys;
+extern cl::opt<bool> CFLUnionPathStable;
 extern cl::opt<unsigned> CFLWeldWatch;
 extern cl::opt<bool> CFLKeyPartition;
 extern cl::opt<bool> CFLNameByTarget;
@@ -123,6 +124,13 @@ extern cl::opt<std::string> CFLDumpMerges;
 extern cl::opt<bool> CFLLazyAddress;
 extern cl::opt<bool> CFLCells;
 extern cl::opt<unsigned> CFLCellCap;
+extern cl::opt<bool> CFLCellUnify;
+extern cl::opt<bool> CFLCellMergePtrs;
+extern cl::opt<bool> CFLCellOneLabel;
+extern cl::opt<unsigned> CFLCellOneLabelMax;
+extern cl::opt<unsigned> CFLCellCensusAt;
+extern cl::opt<std::string> CFLCellCensusFormal;
+extern cl::opt<std::string> CFLCellTraceObj;
 // Field edges carry exact byte-offset labels (lazyFEdges) instead of
 // residue relays: the lazy-address solver and the cell solver.
 inline bool exactFieldLabels() { return CFLLazyAddress || CFLCells; }

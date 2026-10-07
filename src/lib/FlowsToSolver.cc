@@ -9858,7 +9858,12 @@ bool CallGraphPass::wireResolvedCallee(const CallBase *CS, const Function *F) {
   Function *CF = const_cast<Function *>(F);
   reachFunction(CF); // --cfl-reachable: body (and its callees) first
   if (Ctx->AllocFuncs.count(CF)) {
-    Ctx->AllocSites.insert(CS);
+    // --cfl-cells (plan 3.30): an allocator resolved at an icall inside a
+    // kept allocator body (sqlite3Realloc's xRealloc) allocates the outer
+    // call's object, which the outer FRESH stands for: no object here.
+    const Function *PF = CS->getFunction();
+    const bool innerAlloc = CFLCells && Ctx->AllocFuncs.count(PF) &&
+                            summaryKeepsBody(Ctx, PF);
     NodeIndex callNode = getRepNodeForValue(CS);
     if (callNode == AndersNodeFactory::InvalidIndex) {
       // Allocator resolved at a callsite with no value node (result
@@ -9866,13 +9871,22 @@ bool CallGraphPass::wireResolvedCallee(const CallBase *CS, const Function *F) {
       // void callsite): create on demand, as handleCall does.
       callNode = getCanonicalNode(NF.createValueNode(CS));
     }
-    AllocSites.insert(callNode);
-    NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
-    Graph.addDeref(callNode, heapObj);
+    if (innerAlloc) {
+      g_innerAllocSites++;
+    } else {
+      Ctx->AllocSites.insert(CS);
+      AllocSites.insert(callNode);
+      NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
+      Graph.addDeref(callNode, heapObj);
+    }
     auto sit = Ctx->FuncSummaries.find(CF);
-    if (sit != Ctx->FuncSummaries.end() &&
-        applySummaryAtoms(CS, *sit->second, nullptr, sit->first))
-      wireCallArgs(CS, CF); // dynamic-fn INVOKE: feed the body pool
+    const bool invokeWired =
+        sit != Ctx->FuncSummaries.end() &&
+        applySummaryAtoms(CS, *sit->second, nullptr, sit->first);
+    // A kept body (BODY) sees its arguments (its own calls may read
+    // them); its return is replaced by the callsite's FRESH object.
+    if (invokeWired || (summaryKeepsBody(Ctx, CF) && !CF->empty()))
+      wireCallArgs(CS, CF);
   } else if (Ctx->ContainerFuncs.count(CF)) {
     handleContainerCall(CS, CF);
   } else {

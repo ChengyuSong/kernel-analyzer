@@ -76,6 +76,14 @@ public:
 // Offsets one folded offset or one strided step may stand for before the
 // step yields the object's any-offset cell (counted).
 constexpr size_t kExpandCap = 1 << 16;
+// A field edge out of a node: its target, label, and for an edge on a
+// cycle (a pointer walk) the gcd of the steps around the cycle.
+struct FieldEdge {
+  uint32_t dst, li;
+  int64_t walk; // 0: not on a cycle
+};
+// A member of a (possibly unified) cell: an object and its offset there.
+using Member = std::pair<uint32_t, int64_t>;
 
 enum class CellKind : uint8_t { Func, Off, Any, Out };
 
@@ -83,22 +91,60 @@ struct Cell {
   uint32_t obj;
   CellKind kind;
   int64_t off;     // Off: the folded offset
+  uint32_t name;   // Off: interned "label+off" ("+off" unlabeled)
   uint32_t store;  // solver node a store writes (Off, Any)
   uint32_t load;   // solver node a load reads (Off, Any)
   NodeIndex node;  // the factory's cell node
+  // Off: an address made by a variable index (some element of the arrays
+  // its offset lies in, the offset being element 0's), not an exact one.
+  bool folded = false;
 };
+
+// A member's offset carries the folded flag in a high bit.
+constexpr int64_t kFoldedBit = (int64_t)1 << 62;
+inline int64_t encOff(int64_t off, bool folded) {
+  return folded ? (off | kFoldedBit) : off;
+}
+inline int64_t decOff(int64_t e) { return e & ~kFoldedBit; }
+
 
 struct Obj {
   NodeIndex origin;
   const Function *fn = nullptr;
   Type *layout = nullptr; // null: unlabeled
   bool repeats = false;   // an array of `layout` of unknown length
+  // A heap block allocated as sizeof(T) + extra: T followed by trailing
+  // bytes (one i8[] cell from offset `size` on), not an array of T.
+  bool tail = false;
   int64_t size = 0;       // layout's allocation size
   std::string label;
+  // Address facts by (offset << 1 | folded), and the content cells (one
+  // solver node per folded offset: arrays are one element) they share.
   boost::unordered_flat_map<int64_t, uint32_t> offCells;
-  boost::unordered_flat_map<int64_t, uint32_t> atRaw; // raw offset -> cell
-  std::vector<uint32_t> loadNodes; // of the Off cells
-  uint32_t any = UINT32_MAX, out = UINT32_MAX, func = UINT32_MAX;
+  // A content cell is a (write side, read side) pair of solver nodes: one
+  // node, except in a keyed union slot (--cfl-union-keys=tag), where the
+  // unkeyed writes land in U, a key's reads see U and its own writes (K),
+  // and an unkeyed read sees everything (P).
+  boost::unordered_flat_map<int64_t, std::pair<uint32_t, uint32_t>> content;
+  boost::unordered_flat_map<uint64_t, uint32_t> keyed; // (c, key) -> K
+  // Copies out of a keyed union slot (src c -> dst object, dst c): a key
+  // made here later is copied to the same key there.
+  std::vector<std::tuple<int64_t, uint32_t, int64_t>> copyOut;
+  // Learned during the solve: a layout from the first typed access at
+  // offset 0 of an unlabeled object.
+  bool learnedLayout = false;
+  // An unlabeled object is unknown (its cells named ?#o, compatible only
+  // with itself) until its first typed use: a struct step gives a layout,
+  // byte arithmetic (a variable i8 index, a byte walk) makes it bytes.
+  bool bytes = false;
+  // An unlabeled object is an array of unknown element: a variable index
+  // of stride s says its element is s bytes (content folds modulo it).
+  int64_t period = 0;
+  uint32_t func = UINT32_MAX;
+  // Its content nodes (by folded offset, for the any and residue cells),
+  // its any-offset cell (reads and writes exactly those) and outside cell.
+  std::vector<std::tuple<int64_t, uint32_t, uint32_t>> loadNodes; // c, U, P
+  uint32_t any = UINT32_MAX, out = UINT32_MAX;
 };
 
 // The folded offset of byte `off` inside one instance of T: every array
@@ -130,43 +176,39 @@ int64_t foldIn(Type *T, int64_t off, const DataLayout &DL) {
   return off;
 }
 
-// Every offset the folded offset `c` stands for inside one instance of T
-// (one per element of each array it lies in). False when there are more
-// than `cap`.
-bool expandIn(Type *T, int64_t c, int64_t base, const DataLayout &DL,
-              size_t cap, std::vector<int64_t> &out) {
-  if (c >= 0) {
+// "function file:line" of an instruction (reports).
+std::string instLoc(const Instruction *I) {
+  if (!I) return "?";
+  std::string s = I->getFunction()->getName().str();
+  if (const DILocation *L = I->getDebugLoc())
+    s += " " + L->getFilename().str() + ":" + std::to_string(L->getLine());
+  return s;
+}
+
+// The outermost struct that starts at offset `off` of T (through nested
+// members and array elements), or null.
+StructType *structAt(Type *T, int64_t off, const DataLayout &DL) {
+  for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
     if (auto *ST = dyn_cast<StructType>(T)) {
-      if (!ST->isOpaque()) {
-        const StructLayout *SL = DL.getStructLayout(ST);
-        if ((uint64_t)c < SL->getSizeInBytes()) {
-          unsigned i = SL->getElementContainingOffset(c);
-          int64_t eo = (int64_t)SL->getElementOffset(i);
-          Type *E = ST->getElementType(i);
-          if (c - eo < (int64_t)DL.getTypeAllocSize(E))
-            return expandIn(E, c - eo, base + eo, DL, cap, out);
-        }
-      }
-    } else {
-      Type *E = nullptr;
-      uint64_t n = 0;
-      if (auto *AT = dyn_cast<ArrayType>(T)) {
-        E = AT->getElementType(); n = AT->getNumElements();
-      } else if (auto *VT = dyn_cast<FixedVectorType>(T)) {
-        E = VT->getElementType(); n = VT->getNumElements();
-      }
-      const int64_t e = E ? (int64_t)DL.getTypeAllocSize(E) : 0;
-      if (E && e > 0 && c < e) {
-        for (uint64_t j = 0; j < n; j++)
-          if (!expandIn(E, c, base + (int64_t)j * e, DL, cap, out))
-            return false;
-        return true;
-      }
+      if (ST->isOpaque()) return nullptr;
+      if (off == 0) return ST;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) return nullptr;
+      unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      continue;
     }
+    Type *E = nullptr;
+    if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+    else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType();
+    if (!E) return nullptr;
+    const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+    if (e == 0) return nullptr;
+    off %= e;
+    T = E;
   }
-  if (out.size() >= cap) return false;
-  out.push_back(base + c);
-  return true;
+  return nullptr;
 }
 
 // Does a struct named like S start at offset `off` of T (through nested
@@ -192,6 +234,173 @@ bool structStartsAt(Type *T, int64_t off, StringRef S, const DataLayout &DL) {
     if (e == 0) return false;
     off %= e;
     T = E;
+  }
+  return false;
+}
+
+// Is `off` (folded) the first byte of a scalar member of T?
+bool leafStart(Type *T, int64_t off, const DataLayout &DL) {
+  for (int depth = 0; depth < 64; depth++) {
+    if (off < 0) return false;
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) return off == 0;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+      unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      if (off >= (int64_t)DL.getTypeAllocSize(T)) return false; // padding
+      continue;
+    }
+    Type *E = nullptr;
+    if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+    else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType();
+    if (!E) return off == 0;
+    const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+    if (e == 0) return off == 0;
+    off %= e;
+    T = E;
+  }
+  return false;
+}
+
+// Does offset `off` of T lie inside an array of i8 (a char buffer, at any
+// nesting)? Its cell is then the byte array i8[], like an untyped buffer.
+bool inByteArray(Type *T, int64_t off, const DataLayout &DL) {
+  for (int depth = 0; depth < 64 && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) return false;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+      unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      continue;
+    }
+    Type *E = nullptr;
+    if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+    else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType();
+    if (!E) return false;
+    if (E->isIntegerTy(8)) return true;
+    const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+    if (e == 0) return false;
+    off %= e;
+    T = E;
+  }
+  return false;
+}
+
+// Every struct enclosing offset `off` of T, with the offset inside it,
+// outermost first: the views a pointer to that address has (a field of an
+// embedded struct is that struct's field; offset 0 of a struct is the
+// struct itself, and its first member).
+void structChain(Type *T, int64_t off, const DataLayout &DL,
+                 std::vector<std::string> &out) {
+  out.clear();
+  for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->hasName())
+        out.push_back(stripStructNameSuffix(ST->getName()).str() + "+" +
+                      std::to_string(off));
+      if (ST->isOpaque()) return;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) return;
+      unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      continue;
+    }
+    Type *E = nullptr;
+    if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+    else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType();
+    if (!E) return;
+    const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+    if (e == 0) return;
+    off %= e;
+    T = E;
+  }
+}
+
+// The element of the innermost array holding offset `off` of T: its start
+// (absolute) and size. False when `off` lies in no array.
+bool innermostArray(Type *T, int64_t off, const DataLayout &DL, int64_t &b,
+                    int64_t &e) {
+  bool found = false;
+  int64_t base = 0;
+  for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) break;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) break;
+      unsigned i = SL->getElementContainingOffset(off);
+      const int64_t eo = (int64_t)SL->getElementOffset(i);
+      base += eo;
+      off -= eo;
+      T = ST->getElementType(i);
+      continue;
+    }
+    Type *E = nullptr;
+    if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+    else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType();
+    if (!E) break;
+    const int64_t esz = (int64_t)DL.getTypeAllocSize(E);
+    if (esz == 0) break;
+    found = true;
+    b = base + (off / esz) * esz;
+    e = esz;
+    base = b;
+    off %= esz;
+    T = E;
+  }
+  return found;
+}
+
+// The value an O0 stack slot or a cast chain holds: through casts, and
+// through a load of an alloca with a single store.
+const Value *lookThrough(const Value *V) {
+  for (int i = 0; i < 16 && V; i++) {
+    if (const auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
+    if (const auto *LI = dyn_cast<LoadInst>(V))
+      if (const auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand()->stripPointerCasts())) {
+        const StoreInst *only = nullptr;
+        for (const User *U : AI->users())
+          if (const auto *SI = dyn_cast<StoreInst>(U)) {
+            if (SI->getPointerOperand()->stripPointerCasts() != AI) continue;
+            if (only) return V;
+            only = SI;
+          }
+        if (!only) return V;
+        V = only->getValueOperand();
+        continue;
+      }
+    break;
+  }
+  return V;
+}
+
+// Does an allocation call's size argument say "a T followed by trailing
+// data" (sizeof(T) + x, or a constant larger than T and not a multiple)?
+bool headerPlusTail(const CallBase *C, uint64_t sz) {
+  for (const Use &A : C->args()) {
+    const Value *V = lookThrough(A.get());
+    if (!V->getType()->isIntegerTy()) continue;
+    if (const auto *K = dyn_cast<ConstantInt>(V)) {
+      const uint64_t k = K->getZExtValue();
+      if (k > sz && k % sz != 0) return true;
+      continue;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(V))
+      if (BO->getOpcode() == Instruction::Add)
+        for (const Value *Op : BO->operands()) {
+          const Value *X = lookThrough(Op);
+          if (const auto *K = dyn_cast<ConstantInt>(X))
+            if (K->getZExtValue() >= sz) return true;
+          if (const auto *B2 = dyn_cast<BinaryOperator>(X))
+            if (B2->getOpcode() == Instruction::Add)
+              for (const Value *Op2 : B2->operands())
+                if (const auto *K2 = dyn_cast<ConstantInt>(lookThrough(Op2)))
+                  if (K2->getZExtValue() >= sz) return true;
+        }
   }
   return false;
 }
@@ -234,14 +443,24 @@ bool CallGraphPass::runCellResolution() {
   // representative inherits every constraint of its members.
   std::vector<uint32_t> repOf;
   std::vector<std::vector<uint32_t>> hubsOf; // pointer -> its hubs
-  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> fieldOut;
+  std::vector<std::vector<FieldEdge>> fieldOut;
   std::vector<char> anyLoop;
+  // Per node: the fact it holds under each name (unification by name).
+  std::vector<boost::unordered_flat_map<uint32_t, uint32_t>> byName;
+  // --cfl-cell-one-label: the one (merged) cell a node points to.
+  std::vector<uint32_t> oneCell;
+  std::vector<std::vector<uint32_t>> copiesAt; // byte copies a node is in
+  std::vector<char> unionView; // a union slot's U or P: holds every member
   auto grow = [&](uint32_t n) {
     if (n <= pts.size()) return;
     size_t cap = std::max<size_t>(n, pts.size() * 3 / 2);
     const size_t old = repOf.size();
     pts.resize(cap); pend.resize(cap); succ.resize(cap); inWL.resize(cap, 0);
     hubsOf.resize(cap); fieldOut.resize(cap); anyLoop.resize(cap, 0);
+    byName.resize(cap);
+    oneCell.resize(cap, UINT32_MAX);
+    copiesAt.resize(cap);
+    unionView.resize(cap, 0);
     repOf.resize(cap);
     for (size_t i = old; i < cap; i++) repOf[i] = i;
   };
@@ -255,8 +474,10 @@ bool CallGraphPass::runCellResolution() {
   auto push = [&](uint32_t n) {
     if (!inWL[n]) { inWL[n] = 1; worklist.push_back(n); }
   };
+  std::function<uint32_t(uint32_t)> canonFact; // the fact union-find
   auto add = [&](uint32_t n, uint32_t f) {
     n = find(n);
+    if (canonFact) f = canonFact(f);
     if (pts[n].set(f)) {
       pend[n].push_back(f);
       push(n);
@@ -319,19 +540,71 @@ bool CallGraphPass::runCellResolution() {
   }
   assert(graphFieldEdges == lazyFEdges.size() &&
          "every field edge carries an exact label");
+  struct ByteCopy { uint32_t src, dst; int64_t len; const Instruction *at; };
+  std::vector<ByteCopy> copies;
+  for (auto &[sN, dN, len, at] : byteCopies) {
+    const uint32_t a = canon(sN), b = canon(dN);
+    inGraph[a] = inGraph[b] = 1;
+    copiesAt[a].push_back(copies.size());
+    if (b != a) copiesAt[b].push_back(copies.size());
+    copies.push_back({a, b, len, at});
+  }
   for (auto &[f, t, li] : lazyFEdges) {
     const uint32_t a = canon(f), b = canon(t);
     inGraph[a] = inGraph[b] = 1;
     assert(!isHub[b] && "a field address is never a dereference");
     if (a != b || lazyLabels[li].off != 0 || lazyLabels[li].stride != 0)
-      fieldOut[a].push_back({b, li});
+      fieldOut[a].push_back({b, li, 0});
   }
+
+  // Merging solver nodes: the representative inherits every constraint
+  // and re-propagates every fact (members brought facts the others'
+  // successors and constraints have not seen).
+  auto absorb = [&](uint32_t r, uint32_t m) {
+    repOf[m] = r;
+    pts[m].forEach([&](uint32_t f) { pts[r].set(f); });
+    pts[m] = Facts();
+    pend[m].clear();
+    succ[r].insert(succ[r].end(), succ[m].begin(), succ[m].end());
+    succ[m].clear();
+    hubsOf[r].insert(hubsOf[r].end(), hubsOf[m].begin(), hubsOf[m].end());
+    hubsOf[m].clear();
+    fieldOut[r].insert(fieldOut[r].end(), fieldOut[m].begin(),
+                       fieldOut[m].end());
+    fieldOut[m].clear();
+    anyLoop[r] |= anyLoop[m];
+    byName[m] = {}; // the rep re-runs every fact (finalize)
+    copiesAt[r].insert(copiesAt[r].end(), copiesAt[m].begin(), copiesAt[m].end());
+    copiesAt[m].clear();
+    oneCell[m] = UINT32_MAX;
+  };
+  size_t finalizes = 0, refacts = 0;
+  auto finalize = [&](uint32_t r) {
+    finalizes++;
+    refacts += pts[r].count();
+    std::vector<uint32_t> &S = succ[r];
+    for (uint32_t &v : S) v = find(v);
+    std::sort(S.begin(), S.end());
+    S.erase(std::unique(S.begin(), S.end()), S.end());
+    S.erase(std::remove(S.begin(), S.end(), r), S.end());
+    for (uint32_t v : S) edgeSet.insert((uint64_t)r << 32 | v);
+    pend[r].clear();
+    pts[r].forEach([&](uint32_t f) { pend[r].push_back(f); });
+    if (!pend[r].empty()) push(r);
+  };
+  auto mergeNodes = [&](uint32_t a, uint32_t b) {
+    a = find(a);
+    b = find(b);
+    if (a == b) return;
+    if (b < a) std::swap(a, b);
+    absorb(a, b);
+    finalize(a);
+  };
 
   // Collapse the copy cycles of the current graph (static edges and the
   // hub edges added so far).
-  size_t collapses = 0, collapsedNodes = 0;
+  size_t collapses = 0, collapsedNodes = 0, walkEdges = 0;
   double collapseSecs = 0;
-  std::vector<uint32_t> fs2;
   auto collapseCycles = [&]() {
     const auto tc = Clock::now();
     collapses++;
@@ -348,37 +621,73 @@ bool CallGraphPass::runCellResolution() {
         });
     for (auto &M : sccs) {
       const uint32_t r = *std::min_element(M.begin(), M.end());
-      for (uint32_t m : M) {
-        if (m == r) continue;
-        repOf[m] = r;
-        collapsedNodes++;
-        pts[m].forEach([&](uint32_t f) { pts[r].set(f); });
-        pts[m] = Facts();
-        pend[m].clear();
-        succ[r].insert(succ[r].end(), succ[m].begin(), succ[m].end());
-        succ[m].clear();
-        hubsOf[r].insert(hubsOf[r].end(), hubsOf[m].begin(), hubsOf[m].end());
-        hubsOf[m].clear();
-        fieldOut[r].insert(fieldOut[r].end(), fieldOut[m].begin(),
-                           fieldOut[m].end());
-        fieldOut[m].clear();
-        anyLoop[r] |= anyLoop[m];
-      }
+      for (uint32_t m : M)
+        if (m != r && find(m) == m) {
+          absorb(find(r), m);
+          collapsedNodes++;
+        }
     }
-    // Representatives: successor lists through the union-find, and every
-    // fact re-propagated (members brought facts the others' successors
-    // and constraints have not seen).
-    for (auto &M : sccs) {
-      const uint32_t r = find(M[0]);
-      std::vector<uint32_t> &S = succ[r];
-      for (uint32_t &v : S) v = find(v);
-      std::sort(S.begin(), S.end());
-      S.erase(std::unique(S.begin(), S.end()), S.end());
-      S.erase(std::remove(S.begin(), S.end(), r), S.end());
-      for (uint32_t v : S) edgeSet.insert((uint64_t)r << 32 | v);
-      pend[r].clear();
-      pts[r].forEach([&](uint32_t f) { pend[r].push_back(f); });
-      if (!pend[r].empty()) push(r);
+    for (auto &M : sccs) finalize(find(M[0]));
+    {
+      // Field edges on a cycle (copy and field edges together) are
+      // pointer walks: a step along one yields the object's any-offset
+      // cell (the walk reaches every offset) instead of one address per
+      // turn. Flagged in the label's top bit.
+      std::vector<uint32_t> comp(numNodes, UINT32_MAX);
+      uint32_t nc = 0;
+      ka::tarjanSCC(
+          numNodes, [&](uint32_t u) { return find(u) != u; },
+          [&](uint32_t u) { return succ[u].size() + fieldOut[u].size(); },
+          [&](uint32_t u, size_t i) -> uint32_t {
+            const uint32_t v = i < succ[u].size()
+                                   ? find(succ[u][i])
+                                   : find(fieldOut[u][i - succ[u].size()].dst);
+            return v == u ? ka::kNoNode : v;
+          },
+          [&](const std::vector<uint32_t> &members) {
+            for (uint32_t w : members) comp[w] = nc;
+            nc++;
+          });
+      std::map<std::string, size_t> walk;
+      size_t onCycle = 0, selfLoops = 0;
+      // The steps around a cycle reach offsets congruent modulo the gcd
+      // of all of them.
+      std::vector<int64_t> compGcd(nc, 0);
+      auto stepOf = [&](const LazyLabel &L) -> int64_t {
+        const int64_t o = L.off < 0 ? -L.off : L.off;
+        return L.stride ? std::gcd((int64_t)L.stride, o) : o;
+      };
+      for (uint32_t u = 0; u < numNodes; u++) {
+        if (find(u) != u) continue;
+        for (FieldEdge &e : fieldOut[u]) {
+          const uint32_t v = find(e.dst);
+          if (v != u && comp[v] != comp[u]) continue;
+          compGcd[comp[u]] = std::gcd(compGcd[comp[u]], stepOf(lazyLabels[e.li]));
+        }
+      }
+      for (uint32_t u = 0; u < numNodes; u++) {
+        if (find(u) != u) continue;
+        for (FieldEdge &e : fieldOut[u]) {
+          const uint32_t v = find(e.dst);
+          if (v != u && comp[v] != comp[u]) continue;
+          const int64_t g = compGcd[comp[u]];
+          if (g == 0) continue; // offset-free cycle
+          e.walk = g;
+          onCycle++;
+          selfLoops += v == u;
+          walk["step " + std::to_string(g)]++;
+        }
+      }
+      std::vector<std::pair<size_t, std::string>> top;
+      for (auto &[k, c] : walk) top.push_back({c, k});
+      std::sort(top.rbegin(), top.rend());
+      std::string line;
+      for (size_t i = 0; i < top.size() && i < 12; i++)
+        line += " " + top[i].second + "=" + std::to_string(top[i].first);
+      walkEdges = onCycle;
+      if (VerboseLevel >= 2)
+      CG_LOG("Cells: field edges on cycles " << onCycle << " (" << selfLoops
+             << " self-loops):" << line << "\n");
     }
     collapseSecs += std::chrono::duration<double>(Clock::now() - tc).count();
   };
@@ -387,70 +696,364 @@ bool CallGraphPass::runCellResolution() {
   // ---- Objects and cells ----
   std::vector<Obj> objs;
   std::vector<Cell> cells;
+  std::vector<uint32_t> factRep; // cells unified by name
+  // A unified cell's member objects (all at its offset); the steps
+  // (target node, label) and walks (target node) applied to it, replayed
+  // for a member that joins later.
+  std::vector<std::vector<Member>> memb;
+  std::vector<std::vector<uint32_t>> anyDst; // field-any loops: any cells
+  std::vector<std::vector<FieldEdge>> walkDst;
+  std::vector<std::vector<uint64_t>> stepDst;
   size_t cappedMints = 0, outMints = 0;
   auto internName = [&](const std::string &s) { return NF.internCellName(s); };
-  std::function<uint32_t(uint32_t)> anyOf; // mints link to it, it to them
-  auto mintOff = [&](uint32_t o, int64_t off) -> uint32_t {
+  auto findFact = [&](uint32_t f) {
+    while (factRep[f] != f) f = factRep[f] = factRep[factRep[f]];
+    return f;
+  };
+  canonFact = findFact;
+  auto newCell = [&](Cell C) {
+    cells.push_back(C);
+    factRep.push_back(cells.size() - 1);
+    memb.push_back({{C.obj, encOff(C.off, C.folded)}});
+    anyDst.emplace_back();
+    walkDst.emplace_back();
+    stepDst.emplace_back();
+    return (uint32_t)cells.size() - 1;
+  };
+  // The any-offset cell writes every content cell and reads them all.
+  auto linkAny = [&](uint32_t a, uint32_t storeNode, uint32_t loadNode) {
+    addEdge(cells[a].store, storeNode);
+    addEdge(loadNode, cells[a].load);
+  };
+  // Why an any-offset cell was made (verbose, --cfl-cell-trace-obj).
+  std::string anyCause = "?";
+  uint32_t anyCauseNode = UINT32_MAX;
+  std::function<void(uint32_t)> noteAnyCause;
+  auto anyOf = [&](uint32_t o) -> uint32_t {
+    if (objs[o].any != UINT32_MAX) return objs[o].any;
+    if (noteAnyCause) noteAnyCause(o);
+    const uint32_t w = newNode(), r = newNode();
+    const uint32_t f = newCell({o, CellKind::Any, 0, UINT32_MAX, w, r,
+                                NF.getCellNode(objs[o].origin, internName("*"))});
+    objs[o].any = f;
+    addEdge(w, r);
+    for (auto &[c, u, pn] : objs[o].loadNodes) linkAny(f, u, pn);
+    return f;
+  };
+  // Interior cells (a labeled object's offset inside a scalar member),
+  // by the step that minted them (verbose census).
+  std::map<std::string, size_t> interiorBy;
+  std::string mintCause = "seed";
+  size_t interiorCells = 0, beyondLabel = 0, leftObject = 0;
+  // The content cell of folded offset c of object o, made on first use.
+  // The content cell an offset of object o lands in: folded through its
+  // layout (arrays are one element), or, unlabeled, one cell for bytes,
+  // the offset modulo the learned element size, else the raw offset.
+  auto contentKey = [&](const Obj &O, int64_t off) -> int64_t {
+    if (!O.layout)
+      return O.bytes ? 0 : O.period ? ((off % O.period) + O.period) % O.period : off;
+    if (O.tail && off >= O.size) return O.size; // the trailing bytes
+    off = ((off % O.size) + O.size) % O.size; // an array of one or more
+    return foldIn(O.layout, off, DL);
+  };
+  // Keyed union slots by struct ("struct.S" -> offset, size).
+  std::map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> slotsOf;
+  for (auto &[S, off, size] : cellUnionSlots) slotsOf["struct." + S].push_back({off, size});
+  std::vector<std::string> slotChain;
+  auto inUnionSlot = [&](const Obj &O, int64_t c) {
+    if (slotsOf.empty() || !O.layout) return false;
+    structChain(O.layout, c, DL, slotChain);
+    for (const std::string &e : slotChain) {
+      const size_t plus = e.rfind('+');
+      auto it = slotsOf.find(e.substr(0, plus));
+      if (it == slotsOf.end()) continue;
+      const uint64_t rel = std::stoull(e.substr(plus + 1));
+      for (auto [off, size] : it->second)
+        if (rel >= off && rel < off + size) return true;
+    }
+    return false;
+  };
+  size_t splitCells = 0, keyedCells = 0;
+  auto contentOf = [&](uint32_t o, int64_t c) -> std::pair<uint32_t, uint32_t> {
+    auto it = objs[o].content.find(c);
+    if (it != objs[o].content.end()) return it->second;
+    const uint32_t u = newNode();
+    uint32_t pn = u;
+    if (inUnionSlot(objs[o], c)) { // write side U, read side P = U + keys
+      pn = newNode();
+      addEdge(u, pn);
+      unionView[u] = unionView[pn] = 1;
+      splitCells++;
+    }
+    objs[o].content.emplace(c, std::make_pair(u, pn));
+    objs[o].loadNodes.push_back({c, u, pn});
+    if (objs[o].any != UINT32_MAX) linkAny(objs[o].any, u, pn);
+    if (objs[o].layout && !leafStart(objs[o].layout, c, DL)) {
+      interiorCells++;
+      interiorBy[mintCause]++;
+    }
+    return std::make_pair(u, pn);
+  };
+  // The cell of key k in content (o, c): its unkeyed writes and its own.
+  std::function<uint32_t(uint32_t, int64_t, uint32_t)> keyedOf;
+  keyedOf = [&](uint32_t o, int64_t c, uint32_t k) -> uint32_t {
+    const auto [u, pn] = contentOf(o, c);
+    if (u == pn) return u; // not a keyed slot: the key adds nothing
+    const uint64_t kk = ((uint64_t)(uint32_t)c << 32) | k;
+    auto it = objs[o].keyed.find(kk);
+    if (it != objs[o].keyed.end()) return it->second;
+    const uint32_t n = newNode();
+    addEdge(u, n);
+    addEdge(n, pn);
+    objs[o].keyed.emplace(kk, n);
+    keyedCells++;
+    // Copies out of this slot carry the key along.
+    for (size_t i = 0; i < objs[o].copyOut.size(); i++) {
+      const auto [sc, od, dc] = objs[o].copyOut[i];
+      if (sc == c) addEdge(n, keyedOf(od, dc, k));
+    }
+    return n;
+  };
+  auto cellName = [&](uint32_t o, int64_t c) -> std::string {
+    const Obj &O = objs[o];
+    if (!O.layout)
+      return O.bytes ? std::string("i8[]") : "?#" + std::to_string(o);
+    if (O.label == "i8" || inByteArray(O.layout, c, DL) || (O.tail && c >= O.size))
+      return "i8[]";
+    return O.label + "+" + std::to_string(c);
+  };
+  // The address fact (o, off): exact, or folded (off is element 0's).
+  auto mintOff = [&](uint32_t o, int64_t off, bool folded) -> uint32_t {
     Obj &O = objs[o];
-    auto it = O.offCells.find(off);
-    if (it != O.offCells.end()) return it->second;
-    if (!O.layout && O.offCells.size() >= CFLCellCap) {
+    const int64_t key = off * 2 + (folded ? 1 : 0);
+    auto it = O.offCells.find(key);
+    if (it != O.offCells.end()) return findFact(it->second);
+    if (!O.layout && O.content.size() >= CFLCellCap &&
+        !O.content.count(off)) {
+      anyCause = "cap";
       cappedMints++;
       return anyOf(o);
     }
-    const uint32_t f = cells.size();
-    const uint32_t n = newNode();
-    Obj &O2 = O;
-    const std::string nm = (O2.layout ? O2.label : std::string()) + "+" +
-                           std::to_string(off);
-    cells.push_back({o, CellKind::Off, off, n, n,
-                     NF.getCellNode(O2.origin, internName(nm))});
-    O2.offCells.emplace(off, f);
-    O2.loadNodes.push_back(n);
-    if (O2.any != UINT32_MAX) {
-      const Cell &A = cells[O2.any];
-      addEdge(A.store, n);
-      addEdge(n, A.load);
-    }
-    return f;
-  };
-  anyOf = [&](uint32_t o) -> uint32_t {
-    if (objs[o].any != UINT32_MAX) return objs[o].any;
-    const uint32_t f = cells.size();
-    const uint32_t w = newNode(), r = newNode();
-    cells.push_back({o, CellKind::Any, 0, w, r,
-                     NF.getCellNode(objs[o].origin, internName("*"))});
-    objs[o].any = f;
-    addEdge(w, r);
-    for (uint32_t c : objs[o].loadNodes) {
-      addEdge(w, c);
-      addEdge(c, r);
-    }
+    const int64_t c = contentKey(O, off);
+    const uint32_t nm = internName(cellName(o, c));
+    const auto [cu, cp] = contentOf(o, c);
+    Cell C{o, CellKind::Off, off, nm, cu, cp, NF.getCellNode(objs[o].origin, nm)};
+    C.folded = folded;
+    const uint32_t f = newCell(C);
+    objs[o].offCells.emplace(key, f);
     return f;
   };
   auto outOf = [&](uint32_t o) -> uint32_t {
     if (objs[o].out != UINT32_MAX) return objs[o].out;
-    const uint32_t f = cells.size();
-    cells.push_back({o, CellKind::Out, 0, UINT32_MAX, UINT32_MAX,
-                     NF.getCellNode(objs[o].origin, internName("out"))});
+    const uint32_t f = newCell({o, CellKind::Out, 0, UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                                NF.getCellNode(objs[o].origin, internName("out"))});
     objs[o].out = f;
     outMints++;
     return f;
   };
-  // The cell of byte `off` of object o.
+  // The cells one step of object o's offset `off` along label li reaches.
+  std::function<const std::vector<uint32_t> &(uint32_t, int64_t, uint32_t)>
+      stepOne;
+  std::function<void(uint32_t, int64_t, uint32_t, int64_t, uint32_t)> walkOne;
+  // The fact applyStep is stepping, and its node (one-label reports).
+  uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX;
+  std::map<std::string, size_t> cloneCandidates, otherMeets; // one-label
+  std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenConflict;
+  size_t conflicts = 0;
+  std::function<void(uint32_t, uint32_t, const StructType *, const char *)>
+      reportTypedStep;
+  // Two cells of one name a node holds become one cell: their content
+  // nodes merge, and each side's steps and walks are replayed for the
+  // other side's member objects.
+  size_t factMerges = 0;
+  auto mergeFacts = [&](uint32_t a, uint32_t b) {
+    a = findFact(a);
+    b = findFact(b);
+    if (a == b) return a;
+    assert(cells[a].kind == CellKind::Off && cells[b].kind == CellKind::Off &&
+           "only offset cells merge");
+    factRep[b] = a;
+    factMerges++;
+    mergeNodes(cells[a].store, cells[b].store);
+    // stepOne, walkOne and anyOf may mint (growing these vectors): copies.
+    const std::vector<Member> ma = memb[a], mb = memb[b];
+    const std::vector<uint32_t> xa = anyDst[a], xb = anyDst[b];
+    const std::vector<FieldEdge> wa = walkDst[a], wb = walkDst[b];
+    const std::vector<uint64_t> sa = stepDst[a], sb = stepDst[b];
+    auto replay = [&](const std::vector<uint64_t> &S,
+                      const std::vector<FieldEdge> &W,
+                      const std::vector<uint32_t> &X,
+                      const std::vector<Member> &M) {
+      for (uint64_t dl : S)
+        for (auto [o, off] : M) {
+          const std::vector<uint32_t> R = stepOne(o, off, (uint32_t)dl);
+          for (uint32_t f2 : R) add((uint32_t)(dl >> 32), f2);
+        }
+      for (const FieldEdge &e : W)
+        for (auto [o, off] : M) walkOne(o, off, e.li, e.walk, e.dst);
+      for (uint32_t d : X) {
+        anyCause = "merge with a fact in the field-any loop";
+        anyCauseNode = d;
+        for (auto [o, off] : M) add(d, anyOf(o));
+      }
+    };
+    replay(sa, wa, xa, mb);
+    replay(sb, wb, xb, ma);
+    memb[a].insert(memb[a].end(), mb.begin(), mb.end());
+    anyDst[a].insert(anyDst[a].end(), xb.begin(), xb.end());
+    walkDst[a].insert(walkDst[a].end(), wb.begin(), wb.end());
+    stepDst[a].insert(stepDst[a].end(), sb.begin(), sb.end());
+    memb[b] = {};
+    anyDst[b] = {};
+    walkDst[b] = {};
+    stepDst[b] = {};
+    return a;
+  };
+  // The exact address of byte `off` of object o (a heap array is one
+  // element: offsets reduce modulo its size).
   auto cellAt = [&](uint32_t o, int64_t off) -> uint32_t {
     Obj &O = objs[o];
-    if (!O.layout)
-      return off < 0 ? outOf(o) : mintOff(o, off);
-    if (O.repeats)
+    if (!O.layout) {
+      // An unlabeled array of learned element size: the address reduces
+      // modulo the element (bytes: to 0), as a heap object modulo its
+      // struct.
+      if (O.bytes) return mintOff(o, 0, false);
+      if (O.period) return mintOff(o, ((off % O.period) + O.period) % O.period, false);
+      return off < 0 ? outOf(o) : mintOff(o, off, false);
+    }
+    // Every object is an array (a single object an array of one), arrays
+    // are one element and a step never leaves its array: offsets reduce
+    // modulo the object, and inside it fold to element 0 (&a[4] is &a[0]).
+    // Leaving a non-array object (one past the end of a single struct) is
+    // undefined behavior if dereferenced: counted.
+    if (O.tail && off >= O.size) return mintOff(o, O.size, false); // trailing bytes
+    if (off >= O.size || off < 0) {
+      // An array of T (heap) wraps; a byte offset past a single object is
+      // outside it (one past the end, never dereferenced legally). Index
+      // steps (p[k], p++) never get here: they stay in their array.
+      if (!O.repeats) { leftObject++; return outOf(o); }
+      beyondLabel++;
       off = ((off % O.size) + O.size) % O.size;
-    else if (off < 0 || off >= O.size)
-      return outOf(o);
-    auto it = O.atRaw.find(off);
-    if (it != O.atRaw.end()) return it->second;
-    const uint32_t f = mintOff(o, foldIn(O.layout, off, DL));
-    objs[o].atRaw.emplace(off, f);
-    return f;
+    }
+    return mintOff(o, foldIn(O.layout, off, DL), false);
+  };
+  // Some element at byte `off`: the folded address.
+  auto cellAtFolded = [&](uint32_t o, int64_t off) -> uint32_t {
+    return cellAt(o, off);
+  };
+
+  // Learned folding: a typed access at offset 0 of an unlabeled object
+  // gives it a layout. Existing cells re-fold (merge) at the next safe
+  // point; folding only merges, so the cells minted before it stay sound.
+  std::vector<uint32_t> refoldQueue;
+  // --cfl-cell-one-label: nodes an object's facts passed while unknown.
+  boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> passedBy;
+  size_t layoutsLearned = 0, refoldMerges = 0, periodsLearned = 0,
+         tailObjects = 0;
+  size_t bytesLearned = 0;
+  auto requestPeriod = [&](uint32_t o, int64_t s) {
+    Obj &O = objs[o];
+    if (O.layout || O.bytes || O.fn || s <= 0) return;
+    const int64_t p = O.period ? std::gcd(O.period, s) : s;
+    if (p == O.period) return;
+    if (!O.period) periodsLearned++;
+    O.period = p;
+    refoldQueue.push_back(o);
+  };
+  auto requestBytes = [&](uint32_t o) {
+    Obj &O = objs[o];
+    if (O.layout || O.bytes || O.fn) return;
+    O.bytes = true;
+    bytesLearned++;
+    refoldQueue.push_back(o); // renames its cells i8[]
+  };
+  auto requestLayout = [&](uint32_t o, StructType *S) {
+    Obj &O = objs[o];
+    if (O.layout || O.bytes || !S || S->isOpaque() || !S->isSized()) return;
+    const int64_t sz = (int64_t)DL.getTypeAllocSize(S);
+    if (sz <= 0) return;
+    O.layout = S;
+    O.repeats = true;
+    O.size = sz;
+    O.label = typeLabel(S);
+    O.learnedLayout = true;
+    if (const auto *C = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin)))
+      if (headerPlusTail(C, (uint64_t)sz)) { O.tail = true; tailObjects++; }
+    layoutsLearned++;
+    refoldQueue.push_back(o);
+  };
+  auto canonOff = contentKey;
+  auto refold = [&](uint32_t o) {
+    // Content cells merge by their new folded offset.
+    std::map<int64_t, std::vector<std::pair<uint32_t, uint32_t>>> byC;
+    for (auto &[c, u, pn] : objs[o].loadNodes)
+      byC[canonOff(objs[o], c)].push_back({u, pn});
+    objs[o].content.clear();
+    objs[o].loadNodes.clear();
+    for (auto &[c, ns] : byC) {
+      for (size_t i = 1; i < ns.size(); i++) {
+        mergeNodes(ns[0].first, ns[i].first);
+        mergeNodes(ns[0].second, ns[i].second);
+      }
+      objs[o].content.emplace(c, ns[0]);
+      objs[o].loadNodes.push_back({c, ns[0].first, ns[0].second});
+    }
+    // Exact addresses reduce modulo the element; equal ones become one.
+    std::map<int64_t, std::vector<uint32_t>> byOff;
+    for (auto &[key, f] : objs[o].offCells) {
+      int64_t off = key >> 1;
+      const Obj &O = objs[o];
+      if (O.tail && off >= O.size) off = O.size; // the trailing bytes
+      else if (O.repeats) off = ((off % O.size) + O.size) % O.size;
+      else if (!O.layout && O.bytes) off = 0;
+      else if (!O.layout && O.period) off = ((off % O.period) + O.period) % O.period;
+      byOff[off].push_back(findFact(f));
+    }
+    objs[o].offCells.clear();
+    for (auto &[off, G2] : byOff) {
+      std::vector<uint32_t> fs = G2;
+      std::sort(fs.begin(), fs.end());
+      fs.erase(std::unique(fs.begin(), fs.end()), fs.end());
+      const int64_t c = canonOff(objs[o], off);
+      const uint32_t nm = internName(cellName(o, c));
+      for (uint32_t f : fs) {
+        for (Member &mb : memb[f])
+          if (mb.first == o) mb.second = encOff(off, false);
+        if (cells[f].obj == o) {
+          cells[f].off = off;
+          cells[f].name = nm;
+        }
+      }
+      uint32_t surv = fs[0];
+      for (size_t i = 1; i < fs.size(); i++) {
+        surv = mergeFacts(surv, fs[i]);
+        refoldMerges++;
+      }
+      objs[o].offCells[off * 2] = surv;
+    }
+  };
+  auto drainRefolds = [&]() {
+    while (!refoldQueue.empty()) {
+      const uint32_t o = refoldQueue.back();
+      refoldQueue.pop_back();
+      refold(o);
+      // Typed now: its facts at the nodes it passed while unknown get the
+      // one-label check (re-presented as pending; propagation is a no-op).
+      auto pit = passedBy.find(o);
+      if (pit == passedBy.end() || (!objs[o].layout && !objs[o].bytes)) continue;
+      std::vector<uint32_t> nodes = std::move(pit->second);
+      passedBy.erase(pit);
+      std::sort(nodes.begin(), nodes.end());
+      nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+      for (uint32_t m : nodes) {
+        const uint32_t r = find(m);
+        pts[r].forEach([&](uint32_t x) {
+          for (auto [o2, e] : memb[findFact(x)])
+            if (o2 == o) { pend[r].push_back(x); break; }
+        });
+        if (!pend[r].empty()) push(r);
+      }
+    }
   };
 
   // Labels: globals and stack slots by their IR types, heap objects by the
@@ -486,6 +1089,9 @@ bool CallGraphPass::runCellResolution() {
       O.size = (int64_t)DL.getTypeAllocSize(O.layout);
     if (O.size <= 0) O.layout = nullptr; // opaque or empty: unlabeled
     else O.label = typeLabel(O.layout);
+    if (O.layout && O.repeats)
+      if (const auto *C = dyn_cast_or_null<CallBase>(V))
+        if (headerPlusTail(C, (uint64_t)O.size)) { O.tail = true; tailObjects++; }
     objs.push_back(std::move(O));
     return objs.size() - 1;
   };
@@ -505,10 +1111,9 @@ bool CallGraphPass::runCellResolution() {
       O.origin = vn;
       O.fn = FD;
       objs.push_back(std::move(O));
-      const uint32_t f = cells.size();
-      cells.push_back({(uint32_t)objs.size() - 1, CellKind::Func, 0,
-                       UINT32_MAX, UINT32_MAX,
-                       NF.getCellNode(vn, internName("fn"))});
+      const uint32_t f = newCell({(uint32_t)objs.size() - 1, CellKind::Func, 0,
+                                  UINT32_MAX, UINT32_MAX, UINT32_MAX,
+                                  NF.getCellNode(vn, internName("fn"))});
       objs.back().func = f;
       it->second = f;
     }
@@ -537,34 +1142,87 @@ bool CallGraphPass::runCellResolution() {
     }
   }
 
+  // A variable index (stride s) from byte x of object o stays in the
+  // innermost array holding x, arrays being one element: the same cell
+  // when s is a multiple of the element, else the element's positions
+  // congruent to x modulo gcd(s, element). An unlabeled object is an array
+  // of s-byte elements (stride 1: bytes). An index from an address in no
+  // array is undefined behavior: counted, the address stays.
+  size_t indexOutsideArray = 0;
+  auto strideCells = [&](uint32_t o, int64_t x, int64_t s,
+                         std::vector<uint32_t> &out) {
+    Obj &O = objs[o];
+    if (!O.layout) {
+      if (s == 1) requestBytes(o);
+      else requestPeriod(o, s);
+      out.push_back(cellAt(o, x));
+      return;
+    }
+    if (O.tail && x >= O.size) { out.push_back(cellAt(o, x)); return; }
+    const int64_t pos = ((x % O.size) + O.size) % O.size;
+    int64_t b = 0, e = 0;
+    if (!innermostArray(O.layout, pos, DL, b, e)) {
+      // No array holds the address: what it points to is a single object
+      // (the object itself, or one embedded in it), an array of one: the
+      // index stays.
+      indexOutsideArray++;
+      out.push_back(cellAt(o, pos));
+      return;
+    }
+    if (s % e == 0) { out.push_back(cellAtFolded(o, pos)); return; }
+    const int64_t g = std::gcd(s, e), r0 = (((pos - b) % g) + g) % g;
+    for (int64_t j = r0; j < e; j += g) out.push_back(cellAtFolded(o, b + j));
+  };
+
   // ---- Steps: a field edge maps each cell to the cell(s) at the new
   // offset, through every element its folded offset stands for. ----
-  boost::unordered_flat_map<uint64_t, std::vector<uint32_t>> stepMemo;
+  boost::unordered_flat_map<std::tuple<uint32_t, int64_t, uint32_t>,
+                            std::vector<uint32_t>,
+                            boost::hash<std::tuple<uint32_t, int64_t, uint32_t>>>
+      stepMemo;
   size_t stridedUnlabeled = 0, expandCapped = 0, ruleB = 0, stepCalls = 0,
          stepOffsets = 0;
   std::map<std::pair<std::string, std::string>, size_t> ruleBPairs;
   std::vector<int64_t> actual;
-  auto step = [&](uint32_t f, uint32_t li) -> const std::vector<uint32_t> & {
-    auto [it, ins] = stepMemo.try_emplace((uint64_t)f << 32 | li);
+  stepOne = [&](uint32_t o, int64_t eoff,
+                uint32_t li) -> const std::vector<uint32_t> & {
+    const auto key = std::make_tuple(o, eoff, li);
+    const int64_t off = decOff(eoff);
+    auto [it, ins] = stepMemo.try_emplace(key);
     if (!ins) return it->second;
     std::vector<uint32_t> res;
     stepCalls++;
-    const Cell C = cells[f];
+    // The member's own cell at `off` (an Off cell of object o).
+    const Cell C{o, CellKind::Off, off, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0};
     const LazyLabel &L = lazyLabels[li];
+    if (VerboseLevel >= 2)
+      mintCause = (L.stride ? "stride " + std::to_string(L.stride)
+                            : (L.arith ? "arith +" : "member +") +
+                                  std::to_string(L.off)) +
+                  (objs[C.obj].repeats ? " (heap)" : "");
     switch (C.kind) {
     case CellKind::Func:
     case CellKind::Any:
-      res.push_back(f);
-      break;
     case CellKind::Out:
-      res.push_back(anyOf(C.obj));
-      break;
+      llvm_unreachable("stepOne steps offset cells only");
     case CellKind::Off: {
       const Obj &O = objs[C.obj];
+      if (!O.layout && L.ty && !L.stride && !L.arith && C.off == 0) {
+        // One label per pointer: a cell merged from several objects as
+        // bytes, now accessed as struct L.ty, is the conflict itself.
+        if (CFLCellOneLabel && curStepFact != UINT32_MAX &&
+            memb[curStepFact].size() > 1) {
+          if (CFLCellOneLabelMax <= 1)
+            reportTypedStep(curStepNode, curStepFact, L.ty,
+                            "merged from several objects as bytes");
+          otherMeets["bytes-then-struct"]++;
+        }
+        requestLayout(C.obj, const_cast<StructType *>(L.ty));
+      }
       if (!O.layout) {
         if (L.stride) {
           stridedUnlabeled++;
-          res.push_back(anyOf(C.obj));
+          strideCells(C.obj, C.off + L.off, (int64_t)L.stride, res);
         } else {
           res.push_back(cellAt(C.obj, C.off + L.off));
         }
@@ -574,64 +1232,41 @@ bool CallGraphPass::runCellResolution() {
           !structStartsAt(O.layout, C.off, stripStructNameSuffix(L.ty->getName()), DL)) {
         ruleB++;
         ruleBPairs[{O.label, stripStructNameSuffix(L.ty->getName()).str()}]++;
+        // One label per pointer: a pointer used as L.ty holding an object
+        // of another struct is the conflict itself.
+        if (CFLCellOneLabel && curStepFact != UINT32_MAX) {
+          if (CFLCellOneLabelMax <= 1)
+            reportTypedStep(curStepNode, curStepFact, L.ty,
+                            "of another struct");
+          otherMeets["struct-mismatch"]++;
+        }
       }
+      // A step stays in its array (arrays are one element), so a folded
+      // address steps from element 0 like any other: no expansion over the
+      // elements it stands for. Leaving the array is undefined behavior.
       actual.clear();
-      if (!expandIn(O.layout, C.off, 0, DL, kExpandCap, actual)) {
-        expandCapped++;
-        res.push_back(anyOf(C.obj));
-        break;
-      }
+      actual.push_back(C.off);
       stepOffsets += actual.size();
       if (!L.stride) {
-        for (int64_t a : actual) res.push_back(cellAt(C.obj, a + L.off));
+        // A constant index on a pointer (p + k, p[k], element > 1 byte) is
+        // array indexing: it stays in the array, which is one element, so
+        // the address is the same. Byte offsets (gep i8, O3's field
+        // access) and member steps move.
+        const bool index = L.arith && L.extent > 1 && L.off % L.extent == 0 &&
+                           !O.tail; // &p[1] of a header block: its trailing data
+        for (int64_t a : actual)
+          res.push_back(index ? cellAt(C.obj, a) : cellAt(C.obj, a + L.off));
         break;
       }
-      // Strided: from each start a + off, every a + off + m*stride the
-      // extent (or the object) allows. Starts are merged per residue
-      // class first, so an array's elements are walked once, not once
-      // per element.
-      struct Run { int64_t step, res, lo, hi; }; // lo, lo+step, ... < hi
-      std::vector<Run> runs;
-      for (int64_t a : actual) {
-        const int64_t st = (int64_t)L.stride, start = a + L.off;
-        if (O.repeats && !L.extent) {
-          const int64_t g = std::gcd(st, O.size);
-          const int64_t r = ((start % g) + g) % g;
-          runs.push_back({g, r, r, O.size});
-        } else {
-          int64_t hi = L.extent ? start + (int64_t)L.extent
-                                : (O.repeats ? start + O.size : O.size);
-          if (hi <= start) hi = start + 1; // the base element itself
-          runs.push_back({st, ((start % st) + st) % st, start, hi});
-        }
-      }
-      std::sort(runs.begin(), runs.end(), [](const Run &x, const Run &y) {
-        return std::tie(x.step, x.res, x.lo) < std::tie(y.step, y.res, y.lo);
-      });
-      size_t walked = 0;
-      bool capped = false;
-      for (size_t i = 0; i < runs.size() && !capped;) {
-        Run R = runs[i++];
-        while (i < runs.size() && runs[i].step == R.step &&
-               runs[i].res == R.res && runs[i].lo <= R.hi) {
-          R.hi = std::max(R.hi, runs[i].hi); // overlapping or adjacent
-          i++;
-        }
-        walked += (size_t)((R.hi - R.lo + R.step - 1) / R.step);
-        if (walked > kExpandCap) { capped = true; break; }
-        for (int64_t x = R.lo; x < R.hi; x += R.step)
-          res.push_back(cellAt(C.obj, x));
-      }
-      if (capped) {
-        expandCapped++;
-        res.assign(1, anyOf(C.obj));
-      }
+      // Strided: a variable index stays in its array.
+      for (int64_t a : actual)
+        strideCells(C.obj, a + L.off, (int64_t)L.stride, res);
       break;
     }
     }
     std::sort(res.begin(), res.end());
     res.erase(std::unique(res.begin(), res.end()), res.end());
-    auto &slot = stepMemo[(uint64_t)f << 32 | li]; // cellAt may rehash
+    auto &slot = stepMemo[key]; // cellAt may rehash
     slot = std::move(res);
     return slot;
   };
@@ -680,7 +1315,7 @@ bool CallGraphPass::runCellResolution() {
   };
   auto massByObject = [&](size_t k) {
     std::vector<uint64_t> mass(objs.size(), 0), holders(objs.size(), 0);
-    uint64_t byKind[4] = {0, 0, 0, 0};
+    uint64_t byKind[5] = {0, 0, 0, 0, 0};
     std::vector<uint32_t> seen(objs.size(), UINT32_MAX);
     for (uint32_t m = 0; m < numNodes; m++)
       pts[m].forEach([&](uint32_t f) {
@@ -691,7 +1326,7 @@ bool CallGraphPass::runCellResolution() {
       });
     CG_LOG("Cells: mass by kind: function " << byKind[0] << ", offset "
            << byKind[1] << ", any " << byKind[2] << ", outside "
-           << byKind[3] << "\n");
+           << byKind[3] << ", residue " << byKind[4] << "\n");
     std::vector<std::pair<uint64_t, uint32_t>> top;
     for (uint32_t o = 0; o < objs.size(); o++) top.push_back({mass[o], o});
     std::sort(top.rbegin(), top.rend());
@@ -746,27 +1381,770 @@ bool CallGraphPass::runCellResolution() {
       fl += " " + fns[i].second + "(" + std::to_string(fns[i].first) + ")";
     CG_LOG("Cells:   ... by function (" << fns.size() << "):" << fl << "\n");
   };
+  auto interiorReport = [&]() {
+    std::vector<std::pair<size_t, std::string>> top;
+    for (auto &[k, c] : interiorBy) top.push_back({c, k});
+    std::sort(top.rbegin(), top.rend());
+    std::string line;
+    for (size_t i = 0; i < top.size() && i < 12; i++)
+      line += " [" + top[i].second + "] " + std::to_string(top[i].first);
+    CG_LOG("Cells: " << interiorCells << " interior cells (inside a scalar "
+           << "member), " << beyondLabel << " heap offsets past the label "
+           << "folded back; minted by:" << line << "\n");
+  };
   // ---- Propagation (difference propagation over a worklist) ----
   const auto tSolve = Clock::now();
-  uint64_t pops = 0;
+  uint64_t pops = 0, walkSteps = 0;
   size_t hubLinks = 0, funcDerefs = 0, outDerefs = 0;
   auto linkHub = [&](uint32_t h, uint32_t f) {
-    const Cell &C = cells[f];
+    const Cell &C = cells[findFact(f)];
     if (C.kind == CellKind::Func) { funcDerefs++; return; }
     if (C.kind == CellKind::Out) { outDerefs++; return; }
     hubLinks++;
-    const uint32_t ld = C.load, st = C.store;
+    uint32_t ld = C.load, st = C.store;
+    auto kit = cellHubKey.find(h);
+    if (kit != cellHubKey.end() && C.kind == CellKind::Off) {
+      // A keyed union access: its key's cell, for every member object.
+      for (auto [o, e] : memb[findFact(f)]) {
+        const uint32_t K = keyedOf(o, contentKey(objs[o], decOff(e)), kit->second);
+        addEdge(K, h);
+        if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], K);
+      }
+      return;
+    }
     addEdge(ld, h);
     if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], st);
+  };
+  // The any-offset cells of every object a cell stands for, into dst.
+  auto toAny = [&](uint32_t f, uint32_t dst) {
+    anyCause = "field-any loop";
+    anyCauseNode = dst;
+    if (cells[f].kind == CellKind::Out) return; // outside stays outside
+    for (auto [o, e] : memb[f])
+      if (!objs[o].layout) requestBytes(o); // a variable i8 index into it
+    std::vector<uint32_t> &W = anyDst[f];
+    if (std::find(W.begin(), W.end(), dst) != W.end()) return;
+    W.push_back(dst);
+    for (size_t i = 0; i < memb[f].size(); i++)
+      add(dst, anyOf(memb[f][i].first));
+  };
+  // A step of cell f along label li into dst: every member object steps
+  // (recorded, so members that join f later are stepped too).
+  auto applyStep = [&](uint32_t f, uint32_t li, uint32_t dst) {
+    const Cell &C = cells[f];
+
+    if (C.kind == CellKind::Func || C.kind == CellKind::Any) {
+      add(dst, f);
+      return;
+    }
+    if (C.kind == CellKind::Out) { // outside the object stays outside
+      add(dst, f);
+      return;
+    }
+    anyCause = "step";
+    stepDst[f].push_back((uint64_t)find(dst) << 32 | li);
+    curStepFact = f;
+    for (size_t i = 0; i < memb[f].size(); i++) {
+      const Member mb = memb[f][i];
+      const std::vector<uint32_t> &R = stepOne(mb.first, mb.second, li);
+      for (size_t j = 0; j < R.size(); j++) add(dst, R[j]);
+    }
+  };
+  // A walk (a field edge on a cycle whose steps have gcd g): the walking
+  // pointer reaches the object's offsets congruent modulo g, so g becomes
+  // the object's period and the walk lands on the start's residue cell.
+  // A walk (a field edge on a cycle) is an index stepping by the gcd of
+  // the cycle's steps: it stays in its array like any variable index.
+  std::vector<uint32_t> walkOut;
+  walkOne = [&](uint32_t o, int64_t c, uint32_t li, int64_t g, uint32_t dst) {
+    walkOut.clear();
+    // An index walk (p++) stays where it is; a member-step walk moves by
+    // its member offset first.
+    const LazyLabel &L = lazyLabels[li];
+    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut);
+    for (uint32_t f2 : walkOut) add(dst, f2);
+  };
+  auto applyWalk = [&](uint32_t f, const FieldEdge &e) {
+    const Cell &C = cells[f];
+    if (C.kind == CellKind::Func || C.kind == CellKind::Any) {
+      add(e.dst, f);
+      return;
+    }
+    if (C.kind == CellKind::Out) {
+      add(e.dst, f);
+      return;
+    }
+    walkSteps++;
+    std::vector<FieldEdge> &W = walkDst[f];
+    for (const FieldEdge &w : W)
+      if (w.dst == e.dst && w.li == e.li && w.walk == e.walk) return;
+    W.push_back(e);
+    for (size_t i = 0; i < memb[f].size(); i++) {
+      const Member mb = memb[f][i];
+      walkOne(mb.first, mb.second, e.li, e.walk, e.dst);
+    }
+  };
+  // Pointer nodes with equal sets (no function among them: answers stay
+  // as computed) merge into one node.
+  size_t ptrMerges = 0;
+  auto mergeEqualSets = [&]() {
+    std::vector<uint32_t> buf;
+    auto canonSet = [&](uint32_t u, bool &hasFn) {
+      buf.clear();
+      hasFn = false;
+      pts[u].forEach([&](uint32_t f) {
+        f = findFact(f);
+        hasFn |= cells[f].kind == CellKind::Func;
+        buf.push_back(f);
+      });
+      std::sort(buf.begin(), buf.end());
+      buf.erase(std::unique(buf.begin(), buf.end()), buf.end());
+    };
+    boost::unordered_flat_map<uint64_t, std::vector<uint32_t>> groups;
+    for (uint32_t u = 0; u < G; u++) {
+      if (find(u) != u || isHub[u] || pts[u].count() == 0) continue;
+      bool hasFn;
+      canonSet(u, hasFn);
+      if (hasFn) continue;
+      uint64_t h = buf.size();
+      for (uint32_t f : buf) h = (h ^ f) * 0x9E3779B97F4A7C15ull;
+      groups[h].push_back(u);
+    }
+    std::vector<uint32_t> first, touched;
+    for (auto &[h, U] : groups) {
+      if (U.size() < 2) continue;
+      bool hasFn;
+      canonSet(U[0], hasFn);
+      first = buf;
+      for (size_t i = 1; i < U.size(); i++) {
+        canonSet(U[i], hasFn);
+        if (buf != first) continue; // hash collision
+        absorb(find(U[0]), U[i]);
+        ptrMerges++;
+        touched.push_back(find(U[0]));
+      }
+    }
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    for (uint32_t r : touched) finalize(r);
+  };
+  // Sets still holding ids that unification retired: rewrite them to the
+  // survivors (equivalent content, smaller sets). Pending deltas are
+  // mapped when popped.
+  size_t retiredDropped = 0;
+  auto canonicalizeSets = [&]() {
+    std::vector<uint32_t> buf;
+    for (uint32_t u = 0; u < numNodes; u++) {
+      if (find(u) != u || pts[u].count() == 0) continue;
+      bool stale = false;
+      pts[u].forEach([&](uint32_t f) { stale |= findFact(f) != f; });
+      if (!stale) continue;
+      buf.clear();
+      pts[u].forEach([&](uint32_t f) { buf.push_back(findFact(f)); });
+      const size_t before = pts[u].count();
+      pts[u] = Facts();
+      for (uint32_t f : buf) pts[u].set(f);
+      retiredDropped += before - pts[u].count();
+    }
+  };
+  // Backward path from `target` to the origin of an object whose
+  // description contains `want`, through nodes holding one of its cells
+  // (copy and hub edges, field steps).
+  auto factDescP = [&](uint32_t f) -> std::string {
+    const Cell &C = cells[f];
+    std::string k = C.kind == CellKind::Off ? NF.cellNameString(C.name)
+                    : C.kind == CellKind::Func ? "fn " + objs[C.obj].fn->getName().str()
+                    : C.kind == CellKind::Any ? "*" : "out";
+    return k + " @" + std::to_string(C.off) + " of " + describe(objs[C.obj]);
+  };
+  auto nodeDesc = [&](uint32_t m) -> std::string {
+    if (m >= G) {
+      for (uint32_t f = 0; f < cells.size(); f++) {
+        const Cell &C = cells[f];
+        if (C.store != m && C.load != m) continue;
+        std::string k = C.kind == CellKind::Any ? "*" :
+                        C.kind == CellKind::Off ? NF.cellNameString(C.name) : "?";
+        return "cell " + k + (C.kind == CellKind::Any
+                                  ? (C.store == m ? " (write)" : " (read)")
+                                  : "") +
+               " of " + describe(objs[C.obj]);
+      }
+      // A content cell's view: U (unkeyed writes), P (every member), or
+      // a key's cell K.
+      for (uint32_t o = 0; o < objs.size(); o++) {
+        for (auto &[c, up] : objs[o].content)
+          if (up.first == m || up.second == m)
+            return "content " + cellName(o, c) +
+                   (up.first == up.second ? ""
+                    : up.first == m      ? " (U)"
+                                         : " (P)") +
+                   " #" + std::to_string(m) + " of " + describe(objs[o]);
+        for (auto &[kk, kn] : objs[o].keyed)
+          if (kn == m)
+            return "content " + cellName(o, (int64_t)(uint32_t)(kk >> 32)) +
+                   " (K " + NF.cellNameString((uint32_t)kk) + ") #" +
+                   std::to_string(m) + " of " + describe(objs[o]);
+      }
+      for (uint32_t h = 0; h < G; h++)
+        if (storeHub[h] == m)
+          return "<stores through hub #" + std::to_string(h) + " #" +
+                 std::to_string(m) + ">";
+      return "<store collector #" + std::to_string(m) + ">";
+    }
+    const Value *V = NF.getValueForNode(m);
+    std::string k;
+    if (const auto *I = dyn_cast_or_null<Instruction>(V)) {
+      std::string is;
+      raw_string_ostream os(is);
+      I->print(os);
+      k = (I->getFunction()->getName() + ": " ).str() + os.str().substr(0, 140);
+    } else if (const auto *A = dyn_cast_or_null<Argument>(V)) {
+      k = (A->getParent()->getName() + " arg" + Twine(A->getArgNo())).str();
+    } else if (NF.isDereferenceNode(m) || NF.isObjectNode(m)) {
+      k = "hub of #" + std::to_string(NF.getDerefParent(m));
+      const NodeIndex par = NF.getDerefParent(m);
+      if (par != AndersNodeFactory::InvalidIndex)
+        if (const auto *I = dyn_cast_or_null<Instruction>(NF.getValueForNode(par)))
+          k += " (" + I->getFunction()->getName().str() + ")";
+    } else if (NF.isReturnNode(m)) {
+      k = "return of " + cast<Function>(V)->getName().str();
+    } else if (NF.isVarargNode(m)) {
+      k = "vararg of " + cast<Function>(V)->getName().str();
+    } else if (V) {
+      k = V->getName().str();
+    } else {
+      k = "<node #" + std::to_string(m) + ">";
+    }
+    return k;
+  };
+  std::function<void(uint32_t, const std::string &, int)> tracePathD;
+  auto tracePath = [&](uint32_t target, const std::string &want) {
+    tracePathD(target, want, 0);
+  };
+  tracePathD = [&](uint32_t target, const std::string &want, int depth) {
+    const std::string ind(depth * 2, ' ');
+    std::vector<char> objWant(objs.size(), 0);
+    for (uint32_t o = 0; o < objs.size(); o++)
+      objWant[o] = describe(objs[o]).find(want) != std::string::npos;
+    auto holds = [&](uint32_t m) {
+      bool h = false;
+      pts[m].forEach([&](uint32_t f) {
+        for (auto [o, off] : memb[findFact(f)]) h |= objWant[o];
+      });
+      return h;
+    };
+    std::vector<std::vector<uint32_t>> rev(numNodes);
+    for (uint32_t u = 0; u < numNodes; u++) {
+      if (find(u) != u) continue;
+      for (uint32_t v : succ[u]) rev[find(v)].push_back(u);
+      for (const FieldEdge &e : fieldOut[u]) rev[find(e.dst)].push_back(u);
+    }
+    std::vector<uint32_t> parent(numNodes, UINT32_MAX);
+    std::vector<uint32_t> q{target};
+    parent[target] = target;
+    for (size_t i = 0; i < q.size(); i++)
+      for (uint32_t p : rev[q[i]])
+        if (parent[p] == UINT32_MAX && holds(p)) {
+          parent[p] = q[i];
+          q.push_back(p);
+        }
+    // The seed: the node an object of the wanted kind was minted at.
+    uint32_t origin = UINT32_MAX;
+    for (uint32_t o = 0; o < objs.size() && origin == UINT32_MAX; o++) {
+      if (!objWant[o]) continue;
+      const uint32_t sn = find(getCanonicalNode(objs[o].origin));
+      if (sn < numNodes && parent[sn] != UINT32_MAX) origin = sn;
+    }
+    if (origin == UINT32_MAX) {
+      CG_LOG("Cells: " << ind << "no path from the object's seed (" << q.size()
+             << " holders reached backward)\n");
+      return;
+    }
+    CG_LOG("Cells: " << ind << "path of '" << want << "' into "
+           << nodeDesc(target) << " (origin first):\n");
+    std::vector<std::pair<uint32_t, uint32_t>> hubsOnPath; // hub, its cell node
+    uint32_t prev = UINT32_MAX;
+    for (uint32_t u = origin, k = 0; k < 200; k++) {
+      CG_LOG("Cells: " << ind << "  " << nodeDesc(u) << "\n");
+      if (u < G && (NF.isDereferenceNode(u) || NF.isObjectNode(u)) &&
+          prev != UINT32_MAX && prev >= G)
+        hubsOnPath.push_back({u, prev});
+      if (u == target || parent[u] == UINT32_MAX) break;
+      prev = u;
+      u = parent[u];
+    }
+    // Why does each load's pointer hold the cell it read?
+    if (depth >= 4) return;
+    for (auto [h, cellNode] : hubsOnPath) {
+      const NodeIndex par = NF.getDerefParent(h);
+      if (par == AndersNodeFactory::InvalidIndex) continue;
+      uint32_t obj = UINT32_MAX;
+      for (uint32_t f = 0; f < cells.size() && obj == UINT32_MAX; f++)
+        if (cells[f].load == cellNode || cells[f].store == cellNode)
+          obj = cells[f].obj;
+      if (obj == UINT32_MAX) continue;
+      const std::string w = describe(objs[obj]);
+      CG_LOG("Cells: " << ind << "  why does the pointer of that load hold "
+             << w << "?\n");
+      tracePathD(find(getCanonicalNode(par)), w.substr(0, w.find(" [")), depth + 1);
+    }
+  };
+  // Confluence census: per function, the width of its pointer formals
+  // and return (distinct names / objects held) and its direct call
+  // sites. Width x sites ranks clone candidates.
+  auto confluenceCensus = [&]() {
+    struct Row { double score; size_t names, objects, sites, holders; std::string what; };
+    std::vector<Row> rows;
+    std::vector<char> seenObj(objs.size(), 0);
+    auto width = [&](uint32_t u, size_t &nn, size_t &no) {
+      boost::unordered_flat_set<uint32_t> names;
+      std::vector<uint32_t> os;
+      pts[find(u)].forEach([&](uint32_t f) {
+        f = findFact(f);
+        const Cell &C = cells[f];
+        names.insert(C.kind == CellKind::Off ? C.name : (uint32_t)C.kind + (1u << 31));
+        for (auto [o, off] : memb[f])
+          if (!seenObj[o]) { seenObj[o] = 1; os.push_back(o); }
+      });
+      for (uint32_t o : os) seenObj[o] = 0;
+      nn = names.size();
+      no = os.size();
+    };
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (F.isDeclaration()) continue;
+        size_t sites = 0;
+        for (const User *U : F.users())
+          if (const auto *CB = dyn_cast<CallBase>(U))
+            if (CB->getCalledOperand() == &F) sites++;
+        size_t bestN = 0, bestO = 0;
+        std::string what;
+        for (Argument &A : F.args()) {
+          if (!A.getType()->isPointerTy()) continue;
+          const NodeIndex vn = NF.getValueNodeFor(&A);
+          if (vn == AndersNodeFactory::InvalidIndex) continue;
+          const uint32_t c = getCanonicalNode(vn);
+          if (c >= G) continue;
+          size_t nn, no;
+          width(c, nn, no);
+          if (nn > bestN) { bestN = nn; bestO = no; what = "arg" + std::to_string(A.getArgNo()); }
+        }
+        const NodeIndex rn = NF.getReturnNodeFor(&F);
+        if (rn != AndersNodeFactory::InvalidIndex && getCanonicalNode(rn) < G) {
+          size_t nn, no;
+          width(getCanonicalNode(rn), nn, no);
+          if (nn > bestN) { bestN = nn; bestO = no; what = "ret"; }
+        }
+        if (bestN < 2) continue;
+        rows.push_back({(double)bestN * std::max<size_t>(sites, 1), bestN, bestO,
+                        sites, 0, F.getName().str() + " " + what +
+                                   (F.hasAddressTaken() ? " (address taken)" : "")});
+      }
+    std::sort(rows.begin(), rows.end(),
+              [](const Row &a, const Row &b) { return a.score > b.score; });
+    CG_LOG("Cells: confluence census at " << pops << " pops (" << rows.size()
+           << " functions with a formal/return of 2+ names)\n");
+    for (size_t i = 0; i < rows.size() && i < 40; i++)
+      CG_LOG("Cells:   " << rows[i].what << ": " << rows[i].names
+             << " names, " << rows[i].objects << " objects, " << rows[i].sites
+             << " direct call sites\n");
+    // What a named formal holds: its objects (by label) and names.
+    unsigned instId = UINT32_MAX;
+    if (StringRef(CFLCellCensusFormal).contains(":%")) {
+      // FUNCTION:%N names an instruction by its printed operand.
+      auto [fn2, inst2] = StringRef(CFLCellCensusFormal).split(':');
+      for (auto &[M, _] : Ctx->Modules)
+        if (Function *F2 = M->getFunction(fn2))
+          for (Instruction &I : instructions(*F2)) {
+            std::string op;
+            raw_string_ostream os(op);
+            I.printAsOperand(os, false);
+            if (os.str() == inst2) instId = NF.getValueNodeFor(&I);
+          }
+      if (instId != UINT32_MAX && instId != AndersNodeFactory::InvalidIndex) {
+        std::vector<NodeIndex> mem;
+        collectCanonicalMembers(getCanonicalNode(instId), mem);
+        CG_LOG("Cells: " << CFLCellCensusFormal << " = node " << instId
+               << ", canonical " << getCanonicalNode(instId) << ", solver rep "
+               << find(getCanonicalNode(instId)) << "; class members:\n");
+        for (NodeIndex m : mem) CG_LOG("Cells:   member " << nodeDesc(m) << "\n");
+        const uint32_t t = find(getCanonicalNode(instId));
+        for (uint32_t u = 0; u < numNodes; u++) {
+          if (find(u) != u) continue;
+          for (const FieldEdge &e : fieldOut[u])
+            if (find(e.dst) == t) {
+              const LazyLabel &L = lazyLabels[e.li];
+              CG_LOG("Cells:   field edge in from " << nodeDesc(u) << ": +" << L.off
+                     << " stride " << L.stride << (L.arith ? " arith" : "")
+                     << (e.walk ? " WALK" : "") << "\n");
+            }
+          for (uint32_t v : succ[u])
+            if (find(v) == t)
+              CG_LOG("Cells:   copy in from " << nodeDesc(u) << "\n");
+        }
+        std::string fl;
+        pts[t].forEach([&](uint32_t f) { fl += " [" + factDescP(findFact(f)) + "]"; });
+        CG_LOG("Cells:   holds:" << fl.substr(0, 3000) << "\n");
+      }
+    } else if (StringRef(CFLCellCensusFormal).starts_with("#")) {
+      unsigned id = 0;
+      StringRef(CFLCellCensusFormal).drop_front(1).getAsInteger(10, id);
+      const uint32_t t = find(getCanonicalNode(id));
+      CG_LOG("Cells: node #" << id << " = " << nodeDesc(t) << ", "
+             << pts[t].count() << " facts\n");
+      if (!CFLCellTraceObj.empty()) tracePath(t, CFLCellTraceObj);
+    } else if (!CFLCellCensusFormal.empty()) {
+      StringRef spec(CFLCellCensusFormal);
+      auto [fname, argno] = spec.split(':');
+      unsigned ai = 0;
+      argno.getAsInteger(10, ai);
+      for (auto &[M, _] : Ctx->Modules) {
+        Function *F = M->getFunction(fname);
+        if (!F || F->isDeclaration() || ai >= F->arg_size()) continue;
+        const NodeIndex vn = NF.getValueNodeFor(F->getArg(ai));
+        if (vn == AndersNodeFactory::InvalidIndex) continue;
+        std::map<std::string, size_t> byLabel;
+        std::map<std::string, size_t> nameCount;
+        pts[find(getCanonicalNode(vn))].forEach([&](uint32_t f) {
+          f = findFact(f);
+          const Cell &C = cells[f];
+          for (auto [o, off] : memb[f]) byLabel[describe(objs[o])]++;
+          nameCount[C.kind == CellKind::Off ? NF.cellNameString(C.name)
+                    : C.kind == CellKind::Func ? "fn"
+                    : C.kind == CellKind::Any ? "*" : "out"]++;
+        });
+        CG_LOG("Cells: " << fname << " arg" << ai << " holds "
+               << byLabel.size() << " objects:\n");
+        if (!CFLCellTraceObj.empty())
+          tracePath(find(getCanonicalNode(vn)), CFLCellTraceObj);
+        for (auto &[d, c] : byLabel) CG_LOG("Cells:   obj " << d << "\n");
+        std::string nl;
+        for (auto &[n2, c] : nameCount) nl += " " + n2;
+        CG_LOG("Cells:   names:" << nl.substr(0, 4000) << "\n");
+      }
+    }
+  };
+  // Two cells' names are compatible when one may be viewed as the other:
+  // equal names, or a struct starting at both addresses (a base embedded
+  // at offset 0 of a derived struct, a list_head in two containers).
+  size_t compatMerges = 0;
+  std::vector<std::string> chainA, chainB;
+  auto namesCompatible = [&](uint32_t a, uint32_t f) {
+    if (cells[a].name == cells[f].name) return true;
+    const Obj &OA = objs[cells[a].obj], &OB = objs[cells[f].obj];
+    if (!OA.layout || !OB.layout) return false; // bytes meet only bytes
+    structChain(OA.layout, foldIn(OA.layout, cells[a].off, DL), DL, chainA);
+    structChain(OB.layout, foldIn(OB.layout, cells[f].off, DL), DL, chainB);
+    for (const std::string &x : chainA)
+      for (const std::string &y : chainB)
+        if (x == y) return true;
+    return false;
+  };
+  auto factDesc = [&](uint32_t f) {
+    const Cell &C = cells[f];
+    std::string d = NF.cellNameString(C.name) + " @" + std::to_string(C.off) + " of {";
+    for (size_t i = 0; i < memb[f].size() && i < 6; i++)
+      d += (i ? "; " : "") + describe(objs[memb[f][i].first]);
+    if (memb[f].size() > 6) d += "; ... " + std::to_string(memb[f].size()) + " members";
+    return d + "}";
+  };
+  // Collect mode (--cfl-cell-one-label-max > 1): where the two labels'
+  // paths into n meet. A meet at a formal is call-context confluence: the
+  // function is a clone candidate; elsewhere (a load, a phi) it is not.
+  auto meetPoints = [&](uint32_t n, uint32_t a, uint32_t f) {
+    // Different objects: hold by object (a field step changes the cell,
+    // not the object). Fields of one object: hold by cell identity.
+    const uint32_t ra = findFact(a), rf = findFact(f);
+    std::set<uint32_t> oa, ob;
+    for (auto [o, e] : memb[ra]) oa.insert(o);
+    for (auto [o, e] : memb[rf]) ob.insert(o);
+    bool disjoint = true;
+    for (uint32_t o : oa) disjoint &= !ob.count(o);
+    auto holdsCell = [&](uint32_t u, uint32_t want) {
+      const std::set<uint32_t> &os = want == ra ? oa : ob;
+      bool h = false;
+      pts[u].forEach([&](uint32_t x) {
+        if (h) return;
+        x = findFact(x);
+        if (!disjoint) { h = x == want; return; }
+        for (auto [o, e] : memb[x])
+          if (os.count(o)) { h = true; break; }
+      });
+      return h;
+    };
+    std::vector<std::vector<uint32_t>> rev(numNodes);
+    for (uint32_t u = 0; u < numNodes; u++) {
+      if (find(u) != u) continue;
+      for (uint32_t v : succ[u]) rev[find(v)].push_back(u);
+      for (const FieldEdge &e : fieldOut[u]) rev[find(e.dst)].push_back(u);
+    }
+    std::vector<char> seen(numNodes, 0);
+    std::vector<uint32_t> q{n};
+    seen[n] = 1;
+    std::vector<uint32_t> meets;
+    for (size_t i = 0; i < q.size() && i < 200000; i++) {
+      const uint32_t u = q[i];
+      bool pA = false, pB = false;
+      for (uint32_t p : rev[u]) {
+        const bool ha = holdsCell(p, ra), hb = holdsCell(p, rf);
+        if (ha && !hb) pA = true;
+        if (hb && !ha) pB = true;
+        if ((ha || hb) && !seen[p]) { seen[p] = 1; q.push_back(p); }
+      }
+      if (pA && pB) meets.push_back(u);
+    }
+    for (uint32_t u : meets) {
+      const Value *V = u < G ? NF.getValueForNode(u) : nullptr;
+      std::string d = nodeDesc(u);
+      if (const auto *A = dyn_cast_or_null<Argument>(V)) {
+        cloneCandidates[A->getParent()->getName().str()]++;
+        CG_LOG("Cells:   meet at a formal: " << d << " -> clone "
+               << A->getParent()->getName() << "\n");
+      } else {
+        std::string kind = u >= G ? "cell" : NF.isDereferenceNode(u) || NF.isObjectNode(u) ? "load"
+                           : V && isa<PHINode>(V) ? "phi" : V && isa<SelectInst>(V) ? "select"
+                           : NF.isReturnNode(u) ? "return" : "value";
+        otherMeets[kind]++;
+        CG_LOG("Cells:   meet at a " << kind << ": " << d << "\n");
+      }
+    }
+    if (meets.empty()) CG_LOG("Cells:   no meet point found\n");
+  };
+  // Program defects the solver reports and does not model (C undefined
+  // behavior, copies between unrelated structs). In stop mode the counts
+  // are the ones seen so far.
+  std::vector<std::string> copyMismatchAt;
+  size_t copyMismatches = 0;
+  auto reportDefects = [&]() {
+    CG_LOG("Cells: " << copyMismatches
+           << " copies between unrelated structs (copied byte by byte, "
+              "reported)\n");
+    for (const std::string &d : copyMismatchAt) CG_LOG("Cells:   " << d << "\n");
+    size_t disjoint = 0, partial = 0, same = 0, empty = 0;
+    std::vector<std::string> ex;
+    for (auto &[pN, qN, at] : ptrDiffs) {
+      std::set<uint32_t> po, qo;
+      pts[find(canon(pN))].forEach([&](uint32_t f) {
+        for (auto [o, e] : memb[findFact(f)]) po.insert(o);
+      });
+      pts[find(canon(qN))].forEach([&](uint32_t f) {
+        for (auto [o, e] : memb[findFact(f)]) qo.insert(o);
+      });
+      if (po.empty() || qo.empty()) { empty++; continue; }
+      bool any = false;
+      for (uint32_t o : po) any |= qo.count(o) != 0;
+      if (po == qo) { same++; continue; }
+      (any ? partial : disjoint)++;
+      if (ex.size() < 8)
+        ex.push_back(std::string(any ? "may" : "always") +
+                     " two objects: " + instLoc(at) + " (" +
+                     std::to_string(po.size()) + " vs " +
+                     std::to_string(qo.size()) + " objects)");
+    }
+    CG_LOG("Cells: pointer subtractions (C: one object only): "
+           << ptrDiffs.size() << ", same objects " << same
+           << ", undefined behavior: always " << disjoint << ", may "
+           << partial << " (no facts: " << empty << ")\n");
+    for (const std::string &d : ex) CG_LOG("Cells:   " << d << "\n");
+  };
+  auto finishCollect = [&]() {
+    reportDefects();
+    std::string c;
+    for (auto &[fn, k] : cloneCandidates) c += (c.empty() ? "" : ",") + fn;
+    std::string o;
+    for (auto &[k, v] : otherMeets) o += " " + k + "=" + std::to_string(v);
+    errs() << "Cells: " << conflicts << " name conflicts; meets elsewhere:" << o
+           << "\nCLONE-CANDIDATES: " << c << "\n";
+    exit(0);
+  };
+  reportTypedStep = [&](uint32_t n, uint32_t f, const StructType *S,
+                        const char *why) {
+    CG_LOG("Cells: NAME CONFLICT at pop " << pops << ": " << nodeDesc(n)
+           << " holds a cell (" << memb[f].size() << " objects) " << why
+           << ", now stepped as "
+           << (S->hasName() ? S->getName().str() : std::string("<struct>"))
+           << "\n");
+    CG_LOG("Cells:   cell = " << factDesc(f) << "\n");
+    std::set<std::string> seen;
+    for (auto [o, eo] : memb[f]) {
+      const std::string w = describe(objs[o]);
+      if (!seen.insert(w).second || seen.size() > 3) continue;
+      tracePathD(n, w.substr(0, w.find(" [")), 3);
+    }
+    reportDefects();
+    errs() << "Cells: --cfl-cell-one-label stopped at the first name "
+           << "conflict (measurement only, no answers)\n";
+    exit(0);
+  };
+  auto reportConflict = [&](uint32_t n, uint32_t a, uint32_t f) {
+    CG_LOG("Cells: NAME CONFLICT at pop " << pops << ": " << nodeDesc(n)
+           << " points to\n");
+    CG_LOG("Cells:   A = " << factDesc(a) << "\n");
+    CG_LOG("Cells:   B = " << factDesc(f) << "\n");
+    for (uint32_t x : {a, f}) {
+      const std::string w = describe(objs[memb[x][0].first]);
+      tracePathD(n, w.substr(0, w.find(" [")), 3); // depth 3: one level of why
+    }
+  };
+  noteAnyCause = [&](uint32_t o) {
+    if (CFLCellTraceObj.empty() ||
+        describe(objs[o]).find(CFLCellTraceObj) == std::string::npos)
+      return;
+    CG_LOG("Cells: ANY CELL of " << describe(objs[o]) << " made by "
+           << anyCause << " at "
+           << (anyCauseNode == UINT32_MAX ? std::string("?") : nodeDesc(anyCauseNode))
+           << "\n");
+  };
+  // Byte copies: each (source cell, destination cell) pair copies content
+  // position by position, through the folding (arrays are one element):
+  // the copy's length, or (unknown) the rest of the innermost array
+  // element or of the object. An unknown object a variable-length copy
+  // touches is bytes.
+  auto regionLen = [&](uint32_t o, int64_t a) -> int64_t {
+    Obj &O = objs[o];
+    if (!O.layout) {
+      if (!O.bytes && !O.period) requestBytes(o);
+      if (O.bytes) return 1;
+      return O.period - (((a % O.period) + O.period) % O.period);
+    }
+    int64_t pos = a;
+    if (O.repeats) pos = ((pos % O.size) + O.size) % O.size;
+    int64_t b = 0, e = 0;
+    if (innermostArray(O.layout, pos, DL, b, e)) return e - (pos - b);
+    return O.size - pos;
+  };
+  boost::unordered_flat_set<std::tuple<uint32_t, uint32_t, uint32_t>,
+                            boost::hash<std::tuple<uint32_t, uint32_t, uint32_t>>>
+      copyPairsDone;
+  size_t copyPairs = 0, copyEdges = 0, effectiveTyped = 0;
+  auto copyRegion = [&](uint32_t os, int64_t a, uint32_t od, int64_t b,
+                        int64_t len, const Instruction *at) {
+    // Effective type (C11 6.5p6): a copy into an object with no declared
+    // type gives it the source's type. An unknown destination copied into
+    // from its start learns the struct the source region starts with.
+    if (!objs[od].layout && !objs[od].bytes && b == 0 && objs[os].layout) {
+      const Obj &Os = objs[os];
+      const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
+      if (StructType *S = structAt(Os.layout, fa, DL)) {
+        requestLayout(od, S);
+        if (objs[od].layout) effectiveTyped++;
+      }
+    }
+    // A copy between two structs is compatible when one starts where the
+    // other is (equal, or embedded: base and derived). Otherwise the
+    // program copies one struct over an unrelated one: report it (in
+    // one-label stop mode, stop); the bytes are still copied.
+    if (objs[os].layout && objs[od].layout) {
+      const Obj &Os = objs[os], &Od = objs[od];
+      const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
+      const int64_t fb = Od.repeats ? ((b % Od.size) + Od.size) % Od.size : b;
+      StructType *Ss = structAt(Os.layout, fa, DL), *Sd = structAt(Od.layout, fb, DL);
+      auto startsIn = [&](StructType *S, Type *T, int64_t off) {
+        return S->hasName() &&
+               structStartsAt(T, off, stripStructNameSuffix(S->getName()), DL);
+      };
+      if (Ss && Sd && Ss != Sd && !startsIn(Ss, Od.layout, fb) &&
+          !startsIn(Sd, Os.layout, fa)) {
+        copyMismatches++;
+        const std::string d =
+            instLoc(at) + ": " + describe(Os) + " +" + std::to_string(fa) +
+            " (" + typeLabel(Ss) + ") into " + describe(Od) + " +" +
+            std::to_string(fb) + " (" + typeLabel(Sd) + ")";
+        if (copyMismatchAt.size() < 8) copyMismatchAt.push_back(d);
+        if (CFLCellOneLabel && CFLCellOneLabelMax <= 1) {
+          CG_LOG("Cells: NAME CONFLICT at pop " << pops
+                 << ": a copy between unrelated structs: " << d << "\n");
+          reportDefects();
+          errs() << "Cells: --cfl-cell-one-label stopped at the first name "
+                 << "conflict (measurement only, no answers)\n";
+          exit(0);
+        }
+        if (CFLCellOneLabel) otherMeets["copy-mismatch"]++;
+      }
+    }
+    const int64_t L = std::min<int64_t>(len >= 0 ? len : regionLen(os, a),
+                                        (int64_t)kExpandCap);
+    std::set<std::pair<int64_t, int64_t>> seen;
+    for (int64_t k = 0; k < L; k++) {
+      const Obj &Os = objs[os], &Od = objs[od];
+      if (Os.layout && !Os.repeats && (a + k < 0 || a + k >= Os.size)) break;
+      if (Od.layout && !Od.repeats && (b + k < 0 || b + k >= Od.size)) break;
+      const int64_t sk = contentKey(Os, a + k), dk = contentKey(Od, b + k);
+      if (!seen.insert({sk, dk}).second) continue;
+      if (!Os.layout && !Os.bytes && Os.content.size() >= CFLCellCap &&
+          !Os.content.count(sk))
+        continue; // capped: its any-offset cell already reads everything
+      const auto [su, sp] = contentOf(os, sk);
+      const auto [du, dp] = contentOf(od, dk);
+      if (su != sp && du != dp) {
+        // Keyed union slot to keyed union slot: unkeyed to unkeyed, each
+        // key to the same key (a realloc of a node array keeps its keys).
+        addEdge(su, du);
+        objs[os].copyOut.push_back({sk, od, dk});
+        std::vector<std::pair<uint32_t, uint32_t>> ks; // key, node
+        for (auto &[kk, kn] : objs[os].keyed)
+          if ((int64_t)(uint32_t)(kk >> 32) == (int64_t)(uint32_t)sk)
+            ks.push_back({(uint32_t)kk, kn});
+        for (auto [k, kn] : ks) addEdge(kn, keyedOf(od, dk, k));
+      } else {
+        addEdge(sp, du);
+      }
+      copyEdges++;
+    }
+  };
+  auto copyPair = [&](uint32_t ci, uint32_t fs, uint32_t fd) {
+    fs = findFact(fs);
+    fd = findFact(fd);
+    if (!copyPairsDone.insert(std::make_tuple(ci, fs, fd)).second) return;
+    const Cell &S = cells[fs], &D = cells[fd];
+    if (S.kind == CellKind::Func || D.kind == CellKind::Func ||
+        S.kind == CellKind::Out || D.kind == CellKind::Out)
+      return;
+    copyPairs++;
+    if (S.kind == CellKind::Any || D.kind == CellKind::Any) {
+      addEdge(S.load, D.store); // any offset: everything to everything
+      return;
+    }
+    const std::vector<Member> ms = memb[fs], md = memb[fd];
+    for (auto [os, ea] : ms)
+      for (auto [od, eb] : md)
+        copyRegion(os, decOff(ea), od, decOff(eb), copies[ci].len, copies[ci].at);
+  };
+  std::vector<uint32_t> copyOther;
+  auto applyCopies = [&](uint32_t n, const std::vector<uint32_t> &dlt) {
+    for (size_t i = 0; i < copiesAt[n].size(); i++) {
+      const uint32_t ci = copiesAt[n][i];
+      const uint32_t sN = find(copies[ci].src), dN = find(copies[ci].dst);
+      if (n == sN) {
+        copyOther.clear();
+        pts[dN].forEach([&](uint32_t g) { copyOther.push_back(g); });
+        for (uint32_t f : dlt)
+          for (uint32_t g : copyOther) copyPair(ci, f, g);
+      }
+      if (n == dN) {
+        copyOther.clear();
+        pts[sN].forEach([&](uint32_t g) { copyOther.push_back(g); });
+        for (uint32_t g : dlt)
+          for (uint32_t f : copyOther) copyPair(ci, f, g);
+      }
+    }
   };
   std::vector<uint32_t> delta;
   uint64_t lastCollapsePops = 0;
   size_t edgesAtCollapse = edgeSet.size();
-  while (!worklist.empty()) {
+  while (true) {
+    if (!refoldQueue.empty()) drainRefolds();
+    if (worklist.empty()) break;
     const uint32_t n = worklist.back();
     worklist.pop_back();
     inWL[n] = 0;
     if (find(n) != n) continue; // merged: its facts moved to the rep
+    if (CFLCellCensusAt && pops >= CFLCellCensusAt) {
+      confluenceCensus();
+      errs() << "Cells: --cfl-cell-census-at stopped the solve (measurement "
+             << "only, no answers)\n";
+      exit(0);
+    }
     delta.clear();
     delta.swap(pend[n]);
     if (delta.empty()) continue;
@@ -780,30 +2158,96 @@ bool CallGraphPass::runCellResolution() {
              << std::chrono::duration<double>(Clock::now() - tSolve).count()
              << " s\n");
       topObjects(4);
+      interiorReport();
       if (pops % (1u << 22) == 0) massByObject(12);
+    }
+    for (uint32_t &f : delta) f = findFact(f);
+    // One label per pointer: an arriving cell of the anchor's name merges
+    // into it; a cell of another name is the anomaly: stop and report.
+    if (CFLCellOneLabel && !unionView[n]) { // a union's views hold every member
+      for (uint32_t &f : delta) {
+        if (cells[f].kind != CellKind::Off) continue;
+        // An unknown object (not yet used as anything) passes by: no
+        // label, no conflict, no merge. Re-examined here once typed.
+        bool unknown = true;
+        for (auto [o, e] : memb[f])
+          unknown &= !objs[o].layout && !objs[o].bytes;
+        if (unknown) {
+          for (auto [o, e] : memb[f]) passedBy[o].push_back(n);
+          continue;
+        }
+        if (oneCell[n] == UINT32_MAX) { oneCell[n] = f; continue; }
+        const uint32_t a = findFact(oneCell[n]);
+        if (a == f) continue;
+        if (namesCompatible(a, f)) {
+          oneCell[n] = f = mergeFacts(a, f);
+          compatMerges += cells[a].name != cells[f].name;
+          continue;
+        }
+        if (!seenConflict.insert(std::make_tuple(n, cells[a].name, cells[f].name)).second)
+          continue;
+        conflicts++;
+        if (CFLCellOneLabelMax <= 1) {
+          reportConflict(n, a, f);
+          reportDefects();
+          errs() << "Cells: --cfl-cell-one-label stopped at the first name "
+                 << "conflict (measurement only, no answers)\n";
+          exit(0);
+        }
+        CG_LOG("Cells: NAME CONFLICT #" << conflicts << " at pop " << pops << ": "
+               << nodeDesc(n) << ": A = " << factDesc(a).substr(0, 160)
+               << " | B = " << factDesc(f).substr(0, 160) << "\n");
+        meetPoints(n, a, f);
+        if (conflicts >= CFLCellOneLabelMax) finishCollect();
+        // keep both labels at n and go on
+      }
+      if (find(n) != n) continue;
+    }
+    // Unification by name: a node holds one cell per name.
+    if (CFLCellUnify) {
+      for (uint32_t &f : delta) {
+        if (cells[f].kind != CellKind::Off) continue;
+        auto [it, ins] = byName[n].try_emplace(cells[f].name, f);
+        if (!ins) f = it->second = mergeFacts(it->second, f);
+      }
+      if (find(n) != n) continue; // absorbed by a merge: the rep re-runs
     }
     {
       for (uint32_t h : hubsOf[n])
         for (uint32_t f : delta) linkHub(h, f);
-      for (auto [dst, li] : fieldOut[n])
-        for (uint32_t f : delta)
-          for (uint32_t f2 : step(f, li)) add(dst, f2);
+      curStepNode = n;
+      anyCauseNode = n;
+      for (size_t ei = 0; ei < fieldOut[n].size(); ei++) {
+        const FieldEdge e = fieldOut[n][ei];
+        for (uint32_t f : delta) {
+          if (e.walk) applyWalk(f, e);
+          else applyStep(f, e.li, e.dst);
+        }
+      }
       if (anyLoop[n])
         for (uint32_t f : delta) {
           const CellKind k = cells[f].kind;
           if (k == CellKind::Off || k == CellKind::Out)
-            add(n, anyOf(cells[f].obj));
+            toAny(f, n);
         }
     }
+    if (!copiesAt[n].empty()) applyCopies(n, delta);
     for (uint32_t m : succ[n])
       for (uint32_t f : delta) add(m, f);
+    if (VerboseLevel >= 2 && pops % (1u << 16) == 0)
+      CG_LOG("Cells: at " << pops << " pops: " << finalizes << " finalizes re-ran "
+             << refacts << " facts; " << factMerges << " fact merges, "
+             << ptrMerges << " ptr merges, " << hubLinks << " hub links\n");
     if (pops - lastCollapsePops >= (1u << 18) &&
         edgeSet.size() > edgesAtCollapse + edgesAtCollapse / 8) {
       collapseCycles();
+      if (CFLCellMergePtrs) mergeEqualSets();
+      if (CFLCellUnify) canonicalizeSets();
       lastCollapsePops = pops;
       edgesAtCollapse = edgeSet.size();
     }
   }
+  if (CFLCellOneLabel && CFLCellOneLabelMax > 1) finishCollect();
   dynEdges = edgeSet.size() - staticCopies - stores;
   const double solveSecs =
       std::chrono::duration<double>(Clock::now() - tSolve).count();
@@ -836,6 +2280,32 @@ bool CallGraphPass::runCellResolution() {
   // ---- Report ----
   size_t factMass = 0, offCells = 0, anyCells = 0;
   for (uint32_t n = 0; n < numNodes; n++) factMass += pts[n].count();
+
+  CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
+         << walkSteps << " walk steps, " << indexOutsideArray
+         << " variable indexes on a single object (array of one); "
+         << "learned " << layoutsLearned << " layouts, " << periodsLearned
+         << " element sizes, " << bytesLearned << " byte arrays ("
+         << refoldMerges << " cells merged by re-folding)\n");
+  if (CFLCellUnify) canonicalizeSets();
+  CG_LOG("Cells: " << leftObject << " byte offsets leaving a single "
+         << "object (outside: one past the end, never dereferenced), "
+         << compatMerges << " merges of compatible (not equal) names\n");
+  CG_LOG("Cells: " << cellHubKey.size() << " keyed union accesses, "
+         << splitCells << " union-slot cells, " << keyedCells
+         << " keyed cells\n");
+  CG_LOG("Cells: " << copies.size() << " byte copies, " << copyPairs
+         << " cell pairs copied, " << copyEdges << " content edges, "
+         << effectiveTyped << " unknown destinations typed by the source\n");
+  reportDefects();
+  CG_LOG("Cells: " << g_innerAllocSites
+         << " allocator calls inside kept allocator bodies (no object: the "
+            "outer FRESH stands for it); "
+         << g_p2iNumberOnly
+         << " ptrtoints used as numbers only (no field-any loop)\n");
+  CG_LOG("Cells: " << factMerges << " cells unified by name ("
+         << retiredDropped << " retired ids dropped from sets), "
+         << ptrMerges << " pointer nodes merged by equal sets\n");
   CG_LOG("Cells: " << collapses << " cycle collapses merged "
          << collapsedNodes << " solver nodes (" << collapseSecs << " s)\n");
   for (const Cell &C : cells) {
@@ -846,7 +2316,8 @@ bool CallGraphPass::runCellResolution() {
       std::chrono::duration<double>(Clock::now() - t0).count();
   CG_LOG("Cells: iteration " << iteration << ": " << objs.size()
          << " origins (" << funcSeeds << " function seeds, " << objSeeds
-         << " objects; heap " << heapLabeled << " labeled, " << heapUnlabeled
+         << " objects; heap " << heapLabeled << " labeled (" << tailObjects
+         << " header + trailing data), " << heapUnlabeled
          << " unlabeled, " << heapConflict << " with conflicting labels), "
          << cells.size() << " cells (" << offCells << " named offsets, "
          << anyCells << " any-offset, " << outMints << " outside)\n");
@@ -862,11 +2333,13 @@ bool CallGraphPass::runCellResolution() {
          << " steps over " << stepOffsets << " offsets); dereferences of a "
          << "function " << funcDerefs << ", of an outside address "
          << outDerefs << "\n");
+  interiorReport();
   CG_LOG("Cells: rule (b) member steps whose struct is not at the "
          << "address's offset: " << ruleB << " (" << ruleBPairs.size()
          << " object label / struct pairs)\n");
   if (VerboseLevel >= 2) {
     topObjects(12);
+    massByObject(10);
     std::vector<std::pair<size_t, std::pair<std::string, std::string>>> top;
     for (auto &[k, c] : ruleBPairs) top.push_back({c, k});
     std::sort(top.rbegin(), top.rend());

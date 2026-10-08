@@ -2624,13 +2624,61 @@ bool CallGraphPass::runCellResolution() {
     coneSize = 0;
     for (uint32_t u = 0; u < numNodes; u++) coneSize += inCone[u];
   };
-  size_t coneReported = 0;
+  // Objects that carry function pointers: their content holds a function,
+  // or a pointer to such an object (fixpoint). A conflict can add a wrong
+  // icall target only through such objects.
+  std::vector<char> fptrObj;
+  auto computeFptrObjs = [&]() {
+    fptrObj.assign(objs.size(), 0);
+    auto nodesOf = [&](uint32_t o, auto &&fn) {
+      for (auto &[c, up] : objs[o].content) { fn(find(up.first)); fn(find(up.second)); }
+      for (auto &[kk, kn] : objs[o].keyed) fn(find(kn));
+    };
+    for (int round = 0; round < 16; round++) {
+      bool changed = false;
+      for (uint32_t o = 0; o < objs.size(); o++) {
+        if (fptrObj[o] || objs[o].fn) continue;
+        bool hit = false;
+        nodesOf(o, [&](uint32_t m) {
+          if (hit || m >= pts.size()) return;
+          pts[m].forEach([&](uint32_t x) {
+            if (hit) return;
+            const Cell &C = cells[findFact(x)];
+            if (C.kind == CellKind::Func) { hit = true; return; }
+            for (auto [o2, e] : memb[findFact(x)])
+              if (o2 < fptrObj.size() && fptrObj[o2]) { hit = true; break; }
+          });
+        });
+        if (hit) { fptrObj[o] = 1; changed = true; }
+      }
+      if (!changed) break;
+    }
+  };
+  auto factCarriesFptrs = [&](uint32_t f) {
+    for (auto [o, e] : memb[findFact(f)])
+      if (o < fptrObj.size() && fptrObj[o]) return true;
+    return false;
+  };
+  size_t coneReported = 0, coneHarmless = 0;
   auto flushPending = [&](bool final) {
     if (pendingConf.empty() && !final) return;
     computeCone();
+    computeFptrObjs();
     std::vector<PendingConflict> keep;
     for (PendingConflict &P : pendingConf) {
       if (!inCone[find(P.n)]) { keep.push_back(P); continue; }
+      // Fact level: only objects carrying function pointers can change a
+      // target set (both sides for two names; the stepped or copied object
+      // otherwise). Harmless ones wait: the fixpoint may still change.
+      const bool matters =
+          P.kind == 0 ? factCarriesFptrs(P.a) && factCarriesFptrs(P.f)
+          : P.kind == 1 ? factCarriesFptrs(P.f)
+                        : true;
+      if (!matters) {
+        if (final) coneHarmless++;
+        else keep.push_back(P);
+        continue;
+      }
       if (CFLCellOneLabelMax <= 1) {
         CG_LOG("Cells: (inside the icall cone: " << coneSize << " nodes from "
                << icallOps.size() << " icall operands; the conflict arose at pop "
@@ -2658,7 +2706,9 @@ bool CallGraphPass::runCellResolution() {
     if (final)
       CG_LOG("Cells: icall cone " << coneSize << " nodes from " << icallOps.size()
              << " icall operands; " << pendingConf.size() + pendingDup
-             << " conflicts outside it (unreported), " << coneReported << " inside\n");
+             << " conflicts outside it (unreported), " << coneHarmless
+             << " inside but without function-pointer objects on both sides, "
+             << coneReported << " inside\n");
   };
   std::vector<uint32_t> delta;
   uint64_t lastCollapsePops = 0;
@@ -2838,7 +2888,8 @@ bool CallGraphPass::runCellResolution() {
             "outer FRESH stands for it); "
          << g_p2iNumberOnly
          << " ptrtoints used as numbers only (no field-any loop); " << g_carves
-         << " carved regions (one past an array, used as another type; see CARVE lines)\n");
+         << " carved regions (one past an array, used as another type; see CARVE lines); "
+         << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   CG_LOG("Cells: " << factMerges << " cells unified by name ("
          << retiredDropped << " retired ids dropped from sets), "
          << ptrMerges << " pointer nodes merged by equal sets\n");

@@ -850,7 +850,12 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
         (sit->second->noop ||
          (sit->second->atoms.empty() && !sit->second->fresh &&
           !sit->second->none));
-    if (sit != Ctx->FuncSummaries.end() && (directSite || transferFree)) {
+    // FREE only (no transfer atoms): the call is wired as usual; FREE acts
+    // inside the deallocator's body (visitStoreInst).
+    const bool freeOnly = sit != Ctx->FuncSummaries.end() &&
+                          sit->second->freeArg >= 0 && sit->second->atoms.empty() &&
+                          !sit->second->fresh && !sit->second->noop && !sit->second->none;
+    if (sit != Ctx->FuncSummaries.end() && !freeOnly && (directSite || transferFree)) {
       if (!applySummaryAtoms(CS, *sit->second, &retBound, sit->first))
         return false;
       // Invoke atom with dynamic fn at this callsite: fall through to
@@ -2040,6 +2045,7 @@ size_t g_sinkArenaSites = 0;
 size_t g_innerAllocSites = 0;
 size_t g_p2iNumberOnly = 0;
 size_t g_carves = 0;
+size_t g_freeDropped = 0;
 static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
                                       AndersNodeFactory::InvalidIndex};
 
@@ -3498,8 +3504,57 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   CGP.wireNamedLoad(derefNode, valNode, names);
 }
 
+// Does V hold the formal A (through casts, constant and variable GEPs,
+// phis and selects all of whose inputs do, and at -O0 a stack slot stored
+// once with it)?
+static bool holdsFormal(const Value *V, const Argument *A, int depth = 8) {
+  if (depth == 0) return false;
+  V = V->stripPointerCasts();
+  if (V == A) return true;
+  if (const auto *G = dyn_cast<GEPOperator>(V))
+    return holdsFormal(G->getPointerOperand(), A, depth - 1);
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    if (PN->getNumIncomingValues() == 0) return false;
+    for (const Value *In : PN->incoming_values())
+      if (In != PN && !holdsFormal(In, A, depth - 1)) return false;
+    return true;
+  }
+  if (const auto *SE = dyn_cast<SelectInst>(V))
+    return holdsFormal(SE->getTrueValue(), A, depth - 1) &&
+           holdsFormal(SE->getFalseValue(), A, depth - 1);
+  if (const auto *LI = dyn_cast<LoadInst>(V))
+    if (const auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand()->stripPointerCasts())) {
+      const StoreInst *only = nullptr;
+      for (const User *U : AI->users())
+        if (const auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand()->stripPointerCasts() != AI) continue;
+          if (only) return false;
+          only = SI;
+        } else if (!isa<LoadInst>(U) && !isa<DbgInfoIntrinsic>(U)) {
+          return false; // the slot's address escapes
+        }
+      return only && holdsFormal(only->getValueOperand(), A, depth - 1);
+    }
+  return false;
+}
+
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   Value *val = I.getOperand(0);
+  // --cfl-cells, FREE(argN): inside a deallocator, a store through the
+  // freed block (pBuf->pNext = ...) or of it (db->lookaside.pFree = pBuf)
+  // touches a dead object: invisible (func_summaries FREE).
+  if (CFLCells) {
+    const Function *F = I.getFunction();
+    auto sit = CGP.Ctx->FuncSummaries.find(F);
+    if (sit != CGP.Ctx->FuncSummaries.end() && sit->second->freeArg >= 0 &&
+        sit->second->freeArg < (int)F->arg_size()) {
+      const Argument *A = F->getArg(sit->second->freeArg);
+      if (holdsFormal(I.getPointerOperand(), A) || holdsFormal(val, A)) {
+        g_freeDropped++;
+        return;
+      }
+    }
+  }
   if (!containsPointerType(val->getType())) {
     // Integer-laundered provenance: a pointer-width int store with a
     // def-side witness (ptrtoint upstream) still moves a pointer.

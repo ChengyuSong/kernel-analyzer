@@ -18,6 +18,8 @@
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Analysis/ConstantFolding.h>
+#include <llvm/Transforms/Utils/Local.h>
 
 #include <chrono>
 #include <cstring>
@@ -158,7 +160,7 @@ static void clonePerCaller(Module *M) {
       if (auto *CB = dyn_cast<CallBase>(U))
         if (CB->getCalledOperand() == F && CB->getFunction() != F) sites.push_back(CB);
     if (sites.size() < 2) continue;
-    unsigned k = 0;
+    unsigned k = 0, specialized = 0;
     for (CallBase *CB : sites) {
       ValueToValueMapTy VMap;
       Function *C = CloneFunction(F, VMap);
@@ -167,6 +169,43 @@ static void clonePerCaller(Module *M) {
       for (Instruction &I : instructions(*C))
         if (auto *SC = dyn_cast<CallBase>(&I))
           if (SC->getCalledOperand() == F) SC->setCalledFunction(C);
+      // Specialized to its one call site: an integer argument that is a
+      // constant there is that constant in the clone, and the branches it
+      // decides fold (sqlite3_db_config(db, SQLITE_DBCONFIG_LOOKASIDE, ...)
+      // keeps only its own case of the op switch, and its own va_arg
+      // reads). Not for a recursive clone (its own calls pass other values).
+      bool recursive = false;
+      for (User *U : C->users())
+        recursive |= isa<CallBase>(U) && cast<CallBase>(U)->getFunction() == C;
+      if (!recursive) {
+        bool changed = false;
+        for (unsigned a = 0; a < CB->arg_size() && a < C->arg_size(); a++)
+          if (auto *K = dyn_cast<ConstantInt>(CB->getArgOperand(a)))
+            if (C->getArg(a)->getType() == K->getType() && !C->getArg(a)->use_empty()) {
+              C->getArg(a)->replaceAllUsesWith(K);
+              changed = true;
+            }
+        if (changed) {
+          const DataLayout &DL = C->getParent()->getDataLayout();
+          for (int round = 0; round < 4; round++) {
+            bool folded = false;
+            // Conditions computed from the constant (icmp, and, select).
+            for (BasicBlock &BB : *C)
+              for (Instruction &I : make_early_inc_range(BB))
+                if (!I.isTerminator() && !I.mayHaveSideEffects() && !isa<PHINode>(I))
+                  if (Constant *K = ConstantFoldInstruction(&I, DL)) {
+                    I.replaceAllUsesWith(K);
+                    I.eraseFromParent();
+                    folded = true;
+                  }
+            for (BasicBlock &BB : *C)
+              folded |= ConstantFoldTerminator(&BB, /*DeleteDeadConditions=*/true);
+            folded |= removeUnreachableBlocks(*C);
+            if (!folded) break;
+          }
+          specialized++;
+        }
+      }
       CB->setCalledFunction(C);
     }
     // The original stays (uncalled): later phases hold raw Function*
@@ -174,7 +213,8 @@ static void clonePerCaller(Module *M) {
     bool calledOutside = false;
     for (User *U : F->users())
       calledOutside |= !isa<CallBase>(U) || cast<CallBase>(U)->getFunction() != F;
-    errs() << "ClonePerCaller: " << nm << " -> " << k << " clones"
+    errs() << "ClonePerCaller: " << nm << " -> " << k << " clones (" << specialized
+           << " specialized to constant arguments)"
            << (!calledOutside ? " (original now uncalled)"
                               : " (original kept: address taken)")
            << "\n";

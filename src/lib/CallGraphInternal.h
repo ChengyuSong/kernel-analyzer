@@ -114,6 +114,8 @@ extern size_t g_innerAllocSites;
 extern size_t g_p2iNumberOnly;
 // --cfl-cells: GEPs that carve a new object out of an allocation.
 extern size_t g_carves;
+// --cfl-cells: deallocator stores into or of the freed block (FREE).
+extern size_t g_freeDropped;
 extern std::vector<std::pair<NodeIndex, std::string>> g_userCertObjs;
 extern size_t g_userCertCopySites, g_userCertGetSites;
 extern size_t g_tagRoundTrips;

@@ -195,6 +195,13 @@ public:
                         // (free/printk/lock entry points — replaces the
                         // hardcoded isFreeFn/isKernelUtilityFn lists
                         // when the file is loaded; task #44 follow-up)
+    // FREE(argN): a deallocator of argN. Its body's stores through the
+    // freed pointer, and of it (a pool's free list), are invisible: the
+    // object is dead after the call (a read is undefined behavior), and a
+    // reuse of the block is a new object (FRESH). Premise: the block stays
+    // in the program's own pool, not released to the underlying allocator.
+    // Not a transfer atom: call sites wire the body as usual.
+    int freeArg = -1;
     bool externOnly = false; // '@scope extern' block: applies only to
                         // functions WITHOUT a body in the corpus. A
                         // libc-derived entry must never replace a

@@ -903,6 +903,11 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       } else if (t == "BODY") {
         S.body = true; // keep analyzing the body (a FRESH wrapper's own calls)
         continue;
+      } else if (t.consume_front("FREE(arg") && t.consume_back(")")) {
+        int n = -1;
+        if (t.getAsInteger(10, n) || n < 0) { bad = true; continue; }
+        S.freeArg = n;
+        continue;
       } else if (t == "NOOP") {
         S.noop = true;
         nNoop++;

@@ -168,7 +168,9 @@ void CallGraphPass::labelAllocationSites(
     };
     for (size_t i = 0; i < work.size(); i++) {
       const auto [V, off] = work[i];
-      if (L.declared.empty())
+      // A variable's declared struct names the object only at its start
+      // (`Fts3Table *t = (Fts3Table *)&p[1]` is not p's type).
+      if (L.declared.empty() && off == 0)
         if (llvm::StructType *S = accessNames->baseStruct(V).S)
           L.declared = structKey(S);
       for (const User *U : V->users()) {
@@ -207,16 +209,21 @@ void CallGraphPass::labelAllocationSites(
             if (!SI->getValueOperand()->getType()->isPointerTy() &&
                 !SI->getValueOperand()->getType()->isAggregateType())
               L.scalarUse = true;
-            // A store at the object through a struct-path TBAA tag.
+            // A store at the object through a struct-path TBAA tag: the
+            // tag's struct starts where the access offset is the tag's own
+            // offset in it (an access at 24 + offsetof(Fts3Table, db) is a
+            // Fts3Table at 24, not this object's type).
             if (const MDNode *Tag = SI->getMetadata(LLVMContext::MD_tbaa))
               if (Tag->getNumOperands() >= 3 &&
                   Tag->getOperand(0) != Tag->getOperand(1))
                 if (const auto *B = dyn_cast<MDNode>(Tag->getOperand(0)))
                   if (B->getNumOperands() >= 3)
                     if (const auto *N = dyn_cast<MDString>(B->getOperand(0)))
-                      if (llvm::StructType *S = accessNames->structByTag(
-                              SI->getModule(), N->getString()))
-                        L.types.insert(structKey(S));
+                      if (const auto *TO = mdconst::dyn_extract<ConstantInt>(Tag->getOperand(2)))
+                        if (off == TO->getSExtValue())
+                          if (llvm::StructType *S = accessNames->structByTag(
+                                  SI->getModule(), N->getString()))
+                            L.types.insert(structKey(S));
           } else if (SI->getValueOperand() == V && off == 0) {
             // The result stored to an address the function writes only
             // here: its reloads in the function are the object.

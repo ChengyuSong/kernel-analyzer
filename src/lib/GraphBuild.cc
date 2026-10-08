@@ -93,8 +93,16 @@ static bool formatVarargsBenign(StringRef fmt) {
     if (fmt[i] == '%')
       continue;
     while (i < fmt.size() &&
-           (isDigit(fmt[i]) || StringRef("-+ #0'.*").contains(fmt[i])))
+           (isDigit(fmt[i]) || StringRef("-+ #0'.*!,").contains(fmt[i])))
       i++;
+    // sqlite3_str_vappendf's own conversions, read-only renderer inputs:
+    // %q %Q %w (escaped strings), %z (a string, freed after), %T (a Token
+    // *), %r (an ordinal). %q and %z only when they end the specifier (else
+    // they are the length modifiers of C's %qd, %zu).
+    if (i < fmt.size() && StringRef("qQwzTr").contains(fmt[i]) &&
+        (i + 1 >= fmt.size() ||
+         !StringRef("diouxXcCsSeEfgGaAnp").contains(fmt[i + 1])))
+      continue;
     while (i < fmt.size() && StringRef("hlLzjtq").contains(fmt[i]))
       i++;
     if (i >= fmt.size())
@@ -1760,6 +1768,24 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
                                        SmallVectorImpl<const StructType *> *types) const {
   levels.clear();
   if (types) types->clear();
+  // --cfl-cells: a GEP with a nonzero constant first index and constant
+  // indices is one byte offset. -O3 writes a field of the struct a pointer
+  // is cast to as an index over the pointer's own type (`gep sqlite3_vtab,
+  // %p, i64 3, i32 2` for a field of Fts3Table): neither the index nor the
+  // member step's type is the program's. A real `p[3].f` loses nothing:
+  // arrays fold to element 0.
+  if (CFLCells && GEP->getNumIndices() >= 1)
+    if (const auto *F0 = dyn_cast<ConstantInt>(GEP->idx_begin()->get());
+        F0 && !F0->isZero() && GEP->hasAllConstantIndices()) {
+      APInt O(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+      if (GEP->accumulateConstantOffset(DL, O)) {
+        if (O.getSExtValue() != 0) { // an untyped offset: it moves
+          levels.push_back(O.getSExtValue());
+          if (types) types->push_back(nullptr);
+        }
+        return true;
+      }
+    }
   bool first = true;
   // The aggregate the current index steps inside (null at the pointer
   // level): a variable index over an array of known length is bounded
@@ -2013,6 +2039,7 @@ bool isSinkPayloadAccessor(StringRef n) {
 size_t g_sinkArenaSites = 0;
 size_t g_innerAllocSites = 0;
 size_t g_p2iNumberOnly = 0;
+size_t g_carves = 0;
 static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
                                       AndersNodeFactory::InvalidIndex};
 
@@ -3621,6 +3648,157 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   CGP.wireNamedStore(valNode, derefNode, names);
 }
 
+// --cfl-cells: carving. One allocation cut into regions of run-time size
+// (fts3InitVtab: `aIndex = (Fts3Index *)&azColumn[nCol]; zCsr = (char
+// *)&aIndex[nIndex]`): a variable index over an array of T whose result is
+// used as another type is one past that array, the start of the next
+// region. Such a GEP starts an object of its own (unknown until typed).
+// Sound when the program never indexes from one region into the next (out
+// of bounds: undefined behavior); each carve is warned for review at the
+// source. Byte arithmetic (gep i8) is not carving.
+namespace {
+std::string elemClass(Type *T) {
+  if (!T) return "?";
+  if (T->isPointerTy()) return "ptr";
+  if (T->isIntegerTy()) return "i" + std::to_string(T->getIntegerBitWidth());
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    if (!ST->hasName()) return "{}";
+    StringRef N = stripStructNameSuffix(ST->getName());
+    N.consume_front("struct.");
+    N.consume_front("union.");
+    return N.str();
+  }
+  if (T->isFloatingPointTy()) return "f";
+  if (auto *AT = dyn_cast<ArrayType>(T)) return elemClass(AT->getElementType());
+  return "?";
+}
+// The element class a debug type names for what a pointer points to.
+std::string diPointeeClass(const DIType *T) {
+  for (int i = 0; i < 8 && T; i++) {
+    const auto *D = dyn_cast<DIDerivedType>(T);
+    if (!D) break;
+    if (D->getTag() == dwarf::DW_TAG_typedef || D->getTag() == dwarf::DW_TAG_const_type ||
+        D->getTag() == dwarf::DW_TAG_volatile_type) {
+      T = D->getBaseType();
+      continue;
+    }
+    if (D->getTag() != dwarf::DW_TAG_pointer_type) return "?";
+    const DIType *P = D->getBaseType();
+    for (int j = 0; j < 8 && P; j++) {
+      const auto *Q = dyn_cast<DIDerivedType>(P);
+      if (!Q || (Q->getTag() != dwarf::DW_TAG_typedef && Q->getTag() != dwarf::DW_TAG_const_type &&
+                 Q->getTag() != dwarf::DW_TAG_volatile_type))
+        break;
+      P = Q->getBaseType();
+    }
+    if (!P) return "i8"; // void *
+    if (const auto *Q = dyn_cast<DIDerivedType>(P))
+      if (Q->getTag() == dwarf::DW_TAG_pointer_type) return "ptr";
+    if (const auto *B = dyn_cast<DIBasicType>(P)) return "i" + std::to_string(B->getSizeInBits());
+    if (const auto *C = dyn_cast<DICompositeType>(P))
+      return C->getName().empty() ? "{}" : C->getName().str();
+    return "?";
+  }
+  return "?";
+}
+} // namespace
+
+// Is the IR struct T the debug type a pointer variable points to? Linking
+// names structurally identical types once (TermOffset reads as
+// struct.ReusableSpace): same size and member offsets are the same type.
+static bool sameStructAsPointee(Type *T, const DIType *PT, const DataLayout &DL) {
+  auto *ST = dyn_cast_or_null<StructType>(T);
+  if (!ST || ST->isOpaque()) return false;
+  for (int i = 0; i < 8 && PT; i++) {
+    const auto *D = dyn_cast<DIDerivedType>(PT);
+    if (!D) break;
+    PT = D->getBaseType();
+    if (D->getTag() == dwarf::DW_TAG_pointer_type) break;
+  }
+  for (int i = 0; i < 8 && PT; i++) {
+    const auto *D = dyn_cast<DIDerivedType>(PT);
+    if (!D || (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_const_type))
+      break;
+    PT = D->getBaseType();
+  }
+  const auto *C = dyn_cast_or_null<DICompositeType>(PT);
+  if (!C || C->getTag() != dwarf::DW_TAG_structure_type) return false;
+  const StructLayout *SL = DL.getStructLayout(ST);
+  if (C->getSizeInBits() / 8 != SL->getSizeInBytes()) return false;
+  std::vector<uint64_t> di, ir;
+  for (const DINode *N : C->getElements())
+    if (const auto *M = dyn_cast<DIDerivedType>(N))
+      if (M->getTag() == dwarf::DW_TAG_member) di.push_back(M->getOffsetInBits() / 8);
+  for (unsigned k = 0; k < ST->getNumElements(); k++) ir.push_back(SL->getElementOffset(k));
+  return di == ir;
+}
+
+// Is GEP a carve? `why` gets the other type it is used as.
+static bool carvingGEP(const GetElementPtrInst &GEP, std::string &why) {
+  // A variable last index over an array of T: the pointer level (`&a[n]`)
+  // or an array member (`&p->aToken[nToken]`, past a flexible array).
+  if (GEP.getNumIndices() == 0 || isa<ConstantInt>((GEP.idx_end() - 1)->get()))
+    return false;
+  const std::string T = elemClass(GEP.getResultElementType());
+  if (T == "i8" || T == "?") return false;
+  // A pointer stepping itself (`dp32 += skip`: loaded from a slot, stored
+  // back to it; or, -O3, a phi it feeds back into) iterates over one
+  // buffer, possibly read as another type afterwards (`dp = (png_bytep)
+  // dp32`): not a region boundary.
+  const Value *Base = GEP.getPointerOperand()->stripPointerCasts();
+  if (const auto *LI = dyn_cast<LoadInst>(Base)) {
+    const Value *Slot = LI->getPointerOperand()->stripPointerCasts();
+    for (const User *U : GEP.users())
+      if (const auto *SI = dyn_cast<StoreInst>(U))
+        if (SI->getValueOperand() == &GEP &&
+            SI->getPointerOperand()->stripPointerCasts() == Slot)
+          return false;
+  }
+  if (const auto *PN = dyn_cast<PHINode>(Base))
+    for (const Value *In : PN->incoming_values())
+      if (In->stripPointerCasts() == &GEP) return false;
+  SmallVector<const Value *, 4> work{&GEP};
+  SmallPtrSet<const Value *, 8> seen;
+  while (!work.empty()) {
+    const Value *V = work.pop_back_val();
+    if (!seen.insert(V).second) continue;
+    SmallVector<DbgValueInst *, 2> dvs;
+    findDbgValues(dvs, const_cast<Value *>(V));
+    for (DbgValueInst *DV : dvs)
+      if (DV->getExpression()->getNumElements() == 0) {
+        const std::string U = diPointeeClass(DV->getVariable()->getType());
+        if (U != "?" && U != T &&
+            !sameStructAsPointee(GEP.getResultElementType(), DV->getVariable()->getType(),
+                                 GEP.getModule()->getDataLayout())) {
+          why = T + " -> " + U + " (variable)";
+          return true;
+        }
+      }
+    for (const User *Us : V->users()) {
+      if (isa<BitCastInst>(Us)) { work.push_back(Us); continue; }
+      // Stored (`p->aIndex = &azColumn[nCol]`): its reloads from the same
+      // address in the function are the same pointer.
+      if (const auto *SI = dyn_cast<StoreInst>(Us))
+        if (SI->getValueOperand() == V) {
+          const Value *A = SI->getPointerOperand()->stripPointerCasts();
+          for (const User *AU : A->users())
+            for (const User *X : (isa<BitCastInst>(AU) ? AU->users() : A->users()))
+              if (const auto *LI = dyn_cast<LoadInst>(X))
+                if (LI->getFunction() == GEP.getFunction() &&
+                    LI->getPointerOperand()->stripPointerCasts() == A)
+                  work.push_back(LI);
+          continue;
+        }
+      if (const auto *G = dyn_cast<GEPOperator>(Us))
+        if (G->getPointerOperand() == V) {
+          const std::string U = elemClass(G->getSourceElementType());
+          if (U != "?" && U != T) { why = T + " -> " + U + " (indexed)"; return true; }
+        }
+    }
+  }
+  return false;
+}
+
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   Value *ptr = GEP.getPointerOperand();
 
@@ -3638,6 +3816,20 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   if (valNode == AndersNodeFactory::InvalidIndex) {
     valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&GEP));
     CG_DEBUG("Create value node " << valNode << " for GEP result " << GEP << "\n");
+  }
+
+  if (CFLCells) {
+    std::string why;
+    if (carvingGEP(GEP, why)) {
+      CGP.AllocSites.insert(valNode);
+      CGP.Graph.addDeref(valNode, CGP.NF.createOpaqueObjectNode(&GEP, true));
+      g_carves++;
+      std::string loc = GEP.getFunction()->getName().str();
+      if (const DILocation *L = GEP.getDebugLoc())
+        loc += " " + L->getFilename().str() + ":" + std::to_string(L->getLine());
+      errs() << "Cells: CARVE (review at the source) " << loc << ": " << why << "\n";
+      return;
+    }
   }
 
   if (CGP.Graph.fieldSensitive()) {

@@ -112,6 +112,8 @@ extern size_t g_sinkArenaSites;
 extern size_t g_innerAllocSites;
 // --cfl-cells: ptrtoints whose integer never becomes a pointer (no wildcard).
 extern size_t g_p2iNumberOnly;
+// --cfl-cells: GEPs that carve a new object out of an allocation.
+extern size_t g_carves;
 extern std::vector<std::pair<NodeIndex, std::string>> g_userCertObjs;
 extern size_t g_userCertCopySites, g_userCertGetSites;
 extern size_t g_tagRoundTrips;

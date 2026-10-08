@@ -114,6 +114,25 @@ sqlite3Realloc FRESH ALIAS(ret=arg0) BODY
 sqlite3DbRealloc FRESH ALIAS(ret=arg1) BODY
 sqlite3DbReallocOrFree FRESH ALIAS(ret=arg1) BODY
 dbReallocFinish FRESH ALIAS(ret=arg1) BODY
+# The default xMalloc/xRealloc (sqlite3MemMalloc/Realloc: malloc with an
+# 8-byte size header, the user pointer past it), and allocation wrappers
+# that only allocate (fts3HashMalloc zeroes; contextMalloc reports
+# SQLITE_TOOBIG; pcache1Alloc takes a pool slot or calls sqlite3Malloc).
+sqlite3MemMalloc FRESH BODY
+sqlite3MemRealloc FRESH ALIAS(ret=arg0) BODY
+fts3HashMalloc FRESH BODY
+contextMalloc FRESH BODY
+pcache1Alloc FRESH BODY
+sqlite3PageMalloc FRESH BODY
+sqlite3Fts3MallocZero FRESH BODY
+rowSetEntryAlloc FRESH BODY
+# Reallocating wrappers: the old block continues (ALIAS); fts3ReallocOrFree
+# frees it on failure; sqlite3ArrayAllocate grows pArray by one slot.
+fts3ReallocOrFree FRESH ALIAS(ret=arg0) BODY
+sqlite3ArrayAllocate FRESH ALIAS(ret=arg1) BODY
+# The fuzz harness's xMalloc/xRealloc (fuzzershell OOM injection).
+oomMalloc FRESH BODY
+oomRealloc FRESH ALIAS(ret=arg0) BODY
 bfd_alloc FRESH BODY
 bfd_zalloc FRESH BODY
 bfd_alloc2 FRESH BODY

@@ -11,6 +11,7 @@
  * For licensing details see LICENSE
  */
 
+#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IRReader/IRReader.h>
@@ -149,10 +150,13 @@ static void clonePerCaller(Module *M) {
   for (StringRef nm : names) {
     Function *F = M->getFunction(nm.trim());
     if (!F || F->isDeclaration()) continue;
+    // External call sites only: a recursive function's clone keeps its
+    // recursion inside itself (the whole recursion runs in that caller's
+    // context: fts3ExprIterate2 carries one caller's callback and context).
     SmallVector<CallBase *, 16> sites;
     for (User *U : F->users())
       if (auto *CB = dyn_cast<CallBase>(U))
-        if (CB->getCalledOperand() == F) sites.push_back(CB);
+        if (CB->getCalledOperand() == F && CB->getFunction() != F) sites.push_back(CB);
     if (sites.size() < 2) continue;
     unsigned k = 0;
     for (CallBase *CB : sites) {
@@ -160,12 +164,18 @@ static void clonePerCaller(Module *M) {
       Function *C = CloneFunction(F, VMap);
       C->setName(F->getName() + ".site" + Twine(k++));
       C->setLinkage(GlobalValue::InternalLinkage);
+      for (Instruction &I : instructions(*C))
+        if (auto *SC = dyn_cast<CallBase>(&I))
+          if (SC->getCalledOperand() == F) SC->setCalledFunction(C);
       CB->setCalledFunction(C);
     }
     // The original stays (uncalled): later phases hold raw Function*
     // observers, and erasing it left them dangling (teardown crash).
+    bool calledOutside = false;
+    for (User *U : F->users())
+      calledOutside |= !isa<CallBase>(U) || cast<CallBase>(U)->getFunction() != F;
     errs() << "ClonePerCaller: " << nm << " -> " << k << " clones"
-           << (F->use_empty() ? " (original now uncalled)"
+           << (!calledOutside ? " (original now uncalled)"
                               : " (original kept: address taken)")
            << "\n";
   }

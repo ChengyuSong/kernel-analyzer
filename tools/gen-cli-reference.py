@@ -45,9 +45,9 @@ GROUPS = [
     ('Named cells and the cell solver (plan 3.9-3.31)', '''cfl-alloc-origins cfl-whole-program
         cfl-outside cfl-env-depth cfl-named-planes cfl-named-untyped cfl-name-by-target
         cfl-key-cells cfl-key-hubs cfl-key-partition cfl-union-keys cfl-union-path-stable
-        cfl-rule-report cfl-cells cfl-cell-cap cfl-cell-unify cfl-cell-merge-ptrs
+        cfl-rule-report cfl-cells cfl-cell-cap cfl-cell-unify cfl-cell-merge-ptrs cfl-cell-receivers
         cfl-cell-one-label cfl-cell-one-label-max cfl-cell-census-at cfl-cell-census-formal
-        cfl-cell-trace-obj cfl-census-names cfl-census-type-labels cfl-census-unions
+        cfl-cell-trace-obj cfl-cell-why cfl-census-names cfl-census-type-labels cfl-census-unions
         cfl-census-unions-detail cfl-weld-watch'''),
     ('Measurement instruments', '''cfl-probe-blob-formation cfl-census-couplers
         cfl-census-nexus cfl-census-type-rej cfl-gt-type-census cfl-dump-gt-aux

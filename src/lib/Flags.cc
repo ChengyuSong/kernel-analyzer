@@ -1160,6 +1160,27 @@ cl::opt<std::string> CFLCellTraceObj(
            "to the origin of an object whose description contains this"),
   cl::init(""));
 
+cl::opt<bool> CFLCellReceivers(
+  "cfl-cell-receivers",
+  cl::desc("--cfl-cells: method calls as the program's own dispatch. A call "
+           "whose callee is loaded through a path of field steps and loads "
+           "from an argument p (p->f(p), p->ops->f(p), C++ p->vptr[k](p)) "
+           "passes each object o at p only to the methods o's own path "
+           "leads to; a method reached only through calls of one path "
+           "shape reloads the holder from its receiver only as holders "
+           "whose slot holds it (premise: the path is not rewritten in "
+           "between). p is one value: one SSA value, or two loads of a "
+           "non-escaping slot with no store between them"),
+  cl::init(true));
+
+cl::opt<std::string> CFLCellWhy(
+  "cfl-cell-why",
+  cl::desc("--cfl-cells instrument: record the first cause of every fact "
+           "arrival (edge, hub link, step, walk, any-offset, byte copy); at "
+           "the heaviest byte copy, explain how its source pointer came to "
+           "hold a cell of the object whose description contains this"),
+  cl::init(""));
+
 cl::opt<bool> CFLCellOneLabel(
   "cfl-cell-one-label",
   cl::desc("MEASUREMENT ONLY: --cfl-cells with one cell per pointer: an "

@@ -90,6 +90,15 @@ protected:
   bool isCompatibleType(const llvm::Type *T1, const llvm::Type *T2);
   bool isStructLayoutCompatible(const llvm::StructType *ST1, const llvm::StructType *ST2);
   bool isCompatible(const llvm::CallBase*, const llvm::Function*);
+  // A method call (*(p.path.slot))(.., p, ..): the method is loaded
+  // through a path of constant field steps and loads from an argument p
+  // (C: p->f(p), p->ops->f(p); C++: p->vptr[k](p)). Returns the argument
+  // index of p (-1 if none). levels[i] = (the pointer stepped at level i,
+  // the address loaded at level i): level 0 starts at p, the last level's
+  // load is the callee.
+  int dispatchReceiver(
+      const llvm::CallBase *CS,
+      std::vector<std::pair<const llvm::Value *, const llvm::Value *>> *levels = nullptr);
   bool findCalleesByType(const llvm::CallBase*, FuncSet&);
   void processInitializer(NodeIndex obj, llvm::Constant *init,
                           const std::string &enclosingStruct = "",

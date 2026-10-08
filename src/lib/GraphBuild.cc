@@ -570,6 +570,57 @@ bool CallGraphPass::isCompatibleType(const Type *T1, const Type *T2) {
   }
 }
 
+// The same pointer value: one SSA value, or two loads of one stack slot
+// that never escapes (used only as a load or store address) with no store
+// to it between them in their block.
+static bool samePointerValue(const Value *A, const Value *B) {
+  A = A->stripPointerCasts();
+  B = B->stripPointerCasts();
+  if (A == B) return true;
+  const auto *LA = dyn_cast<LoadInst>(A), *LB = dyn_cast<LoadInst>(B);
+  if (!LA || !LB || LA->getParent() != LB->getParent()) return false;
+  const auto *S = dyn_cast<AllocaInst>(LA->getPointerOperand()->stripPointerCasts());
+  if (!S || S != LB->getPointerOperand()->stripPointerCasts()) return false;
+  for (const User *U : S->users()) {
+    if (isa<LoadInst>(U)) continue;
+    if (const auto *SI = dyn_cast<StoreInst>(U))
+      if (SI->getPointerOperand() == S && SI->getValueOperand() != S) continue;
+    return false; // escapes (cast, call argument, stored as a value)
+  }
+  if (LB->comesBefore(LA)) std::swap(LA, LB);
+  for (const Instruction *I = LA->getNextNode(); I && I != LB; I = I->getNextNode())
+    if (const auto *SI = dyn_cast<StoreInst>(I))
+      if (SI->getPointerOperand()->stripPointerCasts() == S) return false;
+  return true;
+}
+
+int CallGraphPass::dispatchReceiver(
+    const CallBase *CS, std::vector<std::pair<const Value *, const Value *>> *levels) {
+  if (CS->isInlineAsm() || CS->getCalledFunction()) return -1;
+  const auto *LI = dyn_cast<LoadInst>(CS->getCalledOperand()->stripPointerCasts());
+  // From the callee back to an argument: each level is a load from a
+  // constant GEP of a pointer, or from the pointer itself (offset 0;
+  // stripPointerCasts also strips an all-zero GEP).
+  std::vector<std::pair<const Value *, const Value *>> path;
+  for (int depth = 0; LI && depth < 4; depth++) {
+    const Value *Slot = LI->getPointerOperand();
+    const Value *P = Slot->stripPointerCasts();
+    if (const auto *G = dyn_cast<GEPOperator>(P)) {
+      if (!G->hasAllConstantIndices()) return -1;
+      P = G->getPointerOperand()->stripPointerCasts();
+    }
+    path.insert(path.begin(), {P, Slot});
+    for (unsigned k = 0; k < CS->arg_size(); k++) {
+      const Value *A = CS->getArgOperand(k);
+      if (!A->getType()->isPointerTy() || !samePointerValue(A, P)) continue;
+      if (levels) *levels = path;
+      return (int)k;
+    }
+    LI = dyn_cast<LoadInst>(P);
+  }
+  return -1;
+}
+
 bool CallGraphPass::isCompatible(const CallBase *CS, const Function *F) {
   if (F->isIntrinsic())
     return false;

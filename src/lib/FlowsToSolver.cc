@@ -9890,7 +9890,9 @@ bool CallGraphPass::wireResolvedCallee(const CallBase *CS, const Function *F) {
   } else if (Ctx->ContainerFuncs.count(CF)) {
     handleContainerCall(CS, CF);
   } else {
-    handleCall(CS, CF);
+    // --cfl-cell-receivers: the receiver of a method call reaches the
+    // method per object (the cell solver's dispatch), not by this edge.
+    handleCall(CS, CF, CFLCells && CFLCellReceivers ? dispatchReceiver(CS) : -1);
   }
   return true;
 }

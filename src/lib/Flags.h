@@ -131,6 +131,8 @@ extern cl::opt<unsigned> CFLCellOneLabelMax;
 extern cl::opt<unsigned> CFLCellCensusAt;
 extern cl::opt<std::string> CFLCellCensusFormal;
 extern cl::opt<std::string> CFLCellTraceObj;
+extern cl::opt<std::string> CFLCellWhy;
+extern cl::opt<bool> CFLCellReceivers;
 // Field edges carry exact byte-offset labels (lazyFEdges) instead of
 // residue relays: the lazy-address solver and the cell solver.
 inline bool exactFieldLabels() { return CFLLazyAddress || CFLCells; }

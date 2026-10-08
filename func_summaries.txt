@@ -164,6 +164,19 @@ png_malloc_warn FRESH BODY
 png_malloc_array FRESH BODY
 png_malloc_array_checked FRESH BODY
 png_realloc_array FRESH ALIAS(ret=arg1) BODY
+# libjpeg-turbo jmemmgr.c: alloc_small / alloc_large hand out chunks of a
+# pool (jpeg_get_small / jpeg_get_large blocks, kept on small_list /
+# large_list): data_ptr = (char *)(hdr_ptr + 1) + bytes_used. Reached only
+# through cinfo->mem->alloc_small/alloc_large (the sarray/barray
+# allocators call them directly). Without FRESH every method struct and
+# sample buffer is the one pool object.
+alloc_small FRESH BODY
+alloc_large FRESH BODY
+# jmemnobs.c: return malloc(sizeofobject). One malloc site for the memory
+# manager itself (jinit_memory_mgr: its method pointers) and every pool
+# block (alloc_small reads pool headers from it).
+jpeg_get_small FRESH
+jpeg_get_large FRESH
 
 # ---- gnulib hash / cflow linked list: instance channels (2026-09-16) ----
 # Container APIs summarized so their bodies (unknown-index bucket walks,

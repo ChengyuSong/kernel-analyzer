@@ -625,10 +625,36 @@ bool CallGraphPass::runCellResolution() {
     if (!inWL[n]) { inWL[n] = 1; worklist.push_back(n); }
   };
   std::function<uint32_t(uint32_t)> canonFact; // the fact union-find
+  // --cfl-cell-why: the first cause of each (node, fact) arrival and of
+  // each dynamic edge. node/fact: where the fact came from (EDGE: the
+  // edge's source; STEP/WALK/ANY/HUB: the pointer and its fact); COPY:
+  // node = the byte copy, fact = its source cell, extra = its destination
+  // cell.
+  enum WhyKind : uint8_t { W_OTHER, W_EDGE, W_STEP, W_WALK, W_ANY, W_HUB, W_COPY, W_DISPATCH };
+  struct Why { uint32_t node = UINT32_MAX, fact = UINT32_MAX, extra = UINT32_MAX;
+               WhyKind kind = W_OTHER; uint32_t t = 0; };
+  uint32_t whyClock = 0; // pops, for the order of first arrivals
+  const bool recordWhy = !CFLCellWhy.empty();
+  Why curWhy;
+  boost::unordered_flat_map<uint64_t, Why> factWhy, edgeWhy;
+  // --cfl-cell-receivers holder guards: a guarded node's facts are held
+  // until admitted (guardHold); guardIdx[n] = the guard, UINT32_MAX none.
+  std::vector<uint32_t> guardIdx;
+  bool admitting = false;
+  std::function<void(uint32_t, uint32_t, uint32_t)> guardHold;
   auto add = [&](uint32_t n, uint32_t f) {
     n = find(n);
     if (canonFact) f = canonFact(f);
+    if (n < guardIdx.size() && guardIdx[n] != UINT32_MAX && !admitting) {
+      guardHold(guardIdx[n], n, f);
+      return;
+    }
     if (pts[n].set(f)) {
+      if (recordWhy) {
+        Why w = curWhy;
+        w.t = whyClock;
+        factWhy.try_emplace((uint64_t)n << 32 | f, w);
+      }
       pend[n].push_back(f);
       push(n);
     }
@@ -640,7 +666,17 @@ bool CallGraphPass::runCellResolution() {
     b = find(b);
     if (a == b || !edgeSet.insert((uint64_t)a << 32 | b).second) return;
     succ[a].push_back(b);
-    pts[a].forEach([&](uint32_t f) { add(b, f); });
+    if (!recordWhy) {
+      pts[a].forEach([&](uint32_t f) { add(b, f); });
+      return;
+    }
+    edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy);
+    const Why saved = curWhy;
+    pts[a].forEach([&](uint32_t f) {
+      curWhy = {a, f, UINT32_MAX, W_EDGE};
+      add(b, f);
+    });
+    curWhy = saved;
   };
 
   // ---- Static constraints ----
@@ -1060,7 +1096,16 @@ bool CallGraphPass::runCellResolution() {
     }
     pendingConf.push_back(std::move(P));
   };
-  uint32_t curCopyDst = UINT32_MAX;
+  uint32_t curCopyDst = UINT32_MAX, curCopySrcFact = UINT32_MAX;
+  // Per byte copy: cell pairs, content edges, source and destination
+  // objects met (the copy report).
+  struct CopyStat {
+    size_t pairs = 0, edges = 0;
+    boost::unordered_flat_set<uint32_t> srcObjs, dstObjs;
+  };
+  std::vector<CopyStat> copyStat;
+  uint32_t curCopy = UINT32_MAX;
+  struct { uint32_t ci = UINT32_MAX, fs, os, od; } firstMismatch;
   uint64_t pops = 0; // worklist pops (the solve's clock)
   // Two cells of one name a node holds become one cell: their content
   // nodes merge, and each side's steps and walks are replayed for the
@@ -1372,6 +1417,24 @@ bool CallGraphPass::runCellResolution() {
       O.repeats = AI->isArrayAllocation();
     } else if (const auto *C = dyn_cast_or_null<CallBase>(V)) {
       auto lit = labels.find(C);
+      // Labels of one object at its start, one embedding the other at
+      // offset 0 (my_memory_mgr and its first member jpeg_memory_mgr:
+      // `mem->pub.f = ..`): the container is the object's type.
+      if (lit != labels.end() && lit->second.size() > 1) {
+        std::set<std::string> outer;
+        for (const std::string &a : lit->second) {
+          bool embedded = false;
+          for (const std::string &b : lit->second) {
+            if (a == b) continue;
+            StructType *SB = StructType::getTypeByName(C->getContext(), b);
+            if (SB && !SB->isOpaque() &&
+                structStartsAt(SB, 0, stripStructNameSuffix(a), DL))
+              embedded = true;
+          }
+          if (!embedded) outer.insert(a);
+        }
+        if (outer.size() == 1) lit->second = std::move(outer);
+      }
       if (lit != labels.end() && lit->second.size() == 1) {
         O.layout = StructType::getTypeByName(C->getContext(),
                                              *lit->second.begin());
@@ -1484,6 +1547,8 @@ bool CallGraphPass::runCellResolution() {
   size_t stridedUnlabeled = 0, expandCapped = 0, ruleB = 0, stepCalls = 0,
          stepOffsets = 0;
   std::map<std::pair<std::string, std::string>, size_t> ruleBPairs;
+  // --cfl-cell-why: the first rule (b) step (pointer node, object, struct).
+  struct { uint32_t node = UINT32_MAX, obj; const StructType *ty; } firstRuleB;
   std::vector<int64_t> actual;
   stepOne = [&](uint32_t o, int64_t eoff,
                 uint32_t li) -> const std::vector<uint32_t> & {
@@ -1531,6 +1596,8 @@ bool CallGraphPass::runCellResolution() {
       }
       if (L.ty && L.stride == 0 &&
           !structStartsAt(O.layout, C.off, stripStructNameSuffix(L.ty->getName()), DL, L.ty)) {
+        if (!ruleB && curStepFact != UINT32_MAX)
+          firstRuleB = {curStepNode, C.obj, L.ty};
         ruleB++;
         ruleBPairs[{O.label, stripStructNameSuffix(L.ty->getName()).str()}]++;
         // One label per pointer: a pointer used as L.ty holding an object
@@ -1705,6 +1772,283 @@ bool CallGraphPass::runCellResolution() {
            << "member), " << beyondLabel << " heap offsets past the label "
            << "folded back; minted by:" << line << "\n");
   };
+  // ---- Method dispatch (--cfl-cell-receivers) ----
+  // A method call (*(p.path.slot))(.., p, ..) (dispatchReceiver; the graph
+  // does not wire the receiver argument): each object o at p reaches the
+  // receiver formal only of the methods its own path leads to (C:
+  // p->f(p), p->ops->f(p); C++: p->vptr[k](p)). Level nodes per (site,
+  // receiver cell, level) collect the content loaded at that level: a
+  // holder arriving at a level steps to the next level's slot; a function
+  // arriving at the last level gets the receiver. A site whose step at
+  // some level is not a field step of the graph passes every receiver to
+  // every method (the plain wiring, counted).
+  // The byte offset an address adds to its base pointer (0: the pointer
+  // itself), INT64_MIN when not constant.
+  auto slotOffset = [&](const Value *Slot) -> int64_t {
+    const auto *G = dyn_cast<GEPOperator>(Slot->stripPointerCasts());
+    if (!G) return 0;
+    APInt A(64, 0);
+    return G->accumulateConstantOffset(DL, A) ? A.getSExtValue() : INT64_MIN;
+  };
+  struct RecvSite {
+    const CallBase *cs;
+    unsigned k;
+    uint32_t base, callee;
+    std::vector<uint32_t> lis; // per level: the field step (UINT32_MAX: none)
+    bool all = false;          // every receiver to every method
+    std::string sig;           // the path's shape (types and constant indices)
+    const Value *slot0;        // the address loaded at level 0
+  };
+  // guard: UINT32_MAX for a call's dispatch, else the holder guard whose
+  // admission this level chain decides.
+  struct LevelKey { uint32_t si, f, level, guard = UINT32_MAX; };
+  std::vector<RecvSite> recvSites;
+  boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> recvAt; // base -> sites
+  boost::unordered_flat_map<uint64_t, uint32_t> recvLevel; // (site, receiver, level) -> node
+  // level node -> site, receiver cell (UINT32_MAX: every receiver), level
+  boost::unordered_flat_map<uint32_t, LevelKey> dispatchOf;
+  size_t recvUnstepped = 0, recvNoNode = 0, recvBound = 0, recvLevels = 0;
+  if (CFLCellReceivers) {
+    std::vector<std::pair<const Value *, const Value *>> path;
+    for (const CallBase *CS : Ctx->IndirectCallInsts) {
+      const int k = dispatchReceiver(CS, &path);
+      if (k < 0) continue;
+      const NodeIndex bn = NF.getValueNodeFor(path[0].first),
+                      cn = NF.getValueNodeFor(CS->getCalledOperand());
+      if (bn == AndersNodeFactory::InvalidIndex || cn == AndersNodeFactory::InvalidIndex) {
+        recvNoNode++; // no facts at p or at the callee: nothing to pass
+        continue;
+      }
+      RecvSite R{CS, (unsigned)k, find(canon(bn)), find(canon(cn)), {}};
+      R.slot0 = path[0].second;
+      R.sig = std::to_string(k);
+      for (auto [V, Slot] : path) {
+        // The shape by byte offsets: linking renames a struct per unit.
+        R.sig += "|" + std::to_string(slotOffset(Slot));
+        const NodeIndex vn = NF.getValueNodeFor(V), sn = NF.getValueNodeFor(Slot);
+        uint32_t li = UINT32_MAX;
+        bool stepped = vn != AndersNodeFactory::InvalidIndex &&
+                       (sn == AndersNodeFactory::InvalidIndex ||
+                        find(canon(sn)) == find(canon(vn)));
+        if (!stepped && vn != AndersNodeFactory::InvalidIndex)
+          for (const FieldEdge &e : fieldOut[find(canon(vn))])
+            if (!e.walk && find(e.dst) == find(canon(sn))) {
+              li = e.li;
+              stepped = true;
+              break;
+            }
+        R.all |= !stepped;
+        R.lis.push_back(li);
+      }
+      const uint32_t si = recvSites.size();
+      recvSites.push_back(R);
+      recvLevels += R.lis.size();
+      if (R.all) {
+        // Every receiver to every method: the callee's content, all of p.
+        recvUnstepped++;
+        const uint32_t P = newNode();
+        dispatchOf[P] = {si, UINT32_MAX, (uint32_t)R.lis.size() - 1};
+        addEdge(R.callee, P);
+        continue;
+      }
+      recvAt[R.base].push_back(si);
+    }
+  }
+  // Holder g at level L of site si for receiver f: g's slot content into
+  // the level node.
+  boost::unordered_flat_map<uint64_t, uint32_t> guardLevel; // (guard, holder, level) -> node
+  auto linkLevel = [&](uint32_t si, uint32_t f, uint32_t level, uint32_t g,
+                       uint32_t guard = UINT32_MAX) {
+    const RecvSite &R = recvSites[si];
+    const Cell &C = cells[g];
+    if (C.kind == CellKind::Func || C.kind == CellKind::Out) return; // no slot
+    std::vector<uint32_t> slots;
+    if (R.lis[level] == UINT32_MAX || C.kind == CellKind::Any) slots.push_back(g);
+    else
+      for (size_t i = 0; i < memb[g].size(); i++) {
+        const Member mb = memb[g][i];
+        const std::vector<uint32_t> &S = stepOne(mb.first, mb.second, R.lis[level]);
+        slots.insert(slots.end(), S.begin(), S.end());
+      }
+    auto &M = guard == UINT32_MAX ? recvLevel : guardLevel;
+    const uint64_t key =
+        ((uint64_t)(guard == UINT32_MAX ? si : guard) << 40) ^ ((uint64_t)level << 32) ^ f;
+    auto [it, ins] = M.try_emplace(key, 0);
+    if (ins) {
+      it->second = newNode();
+      dispatchOf[it->second] = {si, f, level, guard};
+      if (level == 0 && guard == UINT32_MAX) recvBound++;
+    }
+    const uint32_t P = it->second;
+    for (uint32_t r : slots) {
+      r = findFact(r);
+      const CellKind k = cells[r].kind;
+      if (k == CellKind::Off || k == CellKind::Any) addEdge(cells[r].load, P);
+    }
+  };
+  auto bindReceiver = [&](uint32_t si, uint32_t f) { linkLevel(si, f, 0, f); };
+  // After a cycle collapse: a site whose p merged into another node is
+  // keyed by the representative, and that node's facts are dispatched.
+  auto rekeyReceivers = [&]() {
+    if (recvAt.empty()) return;
+    recvAt.clear();
+    for (uint32_t si = 0; si < recvSites.size(); si++) {
+      RecvSite &R = recvSites[si];
+      if (R.all) continue; // plain edges: merges keep them
+      const uint32_t b = find(R.base);
+      const bool moved = b != R.base;
+      R.base = b;
+      recvAt[b].push_back(si);
+      if (moved) {
+        std::vector<uint32_t> fs;
+        pts[b].forEach([&](uint32_t f) { fs.push_back(findFact(f)); });
+        for (uint32_t f : fs) bindReceiver(si, f);
+      }
+    }
+  };
+  std::function<void(uint32_t, uint32_t, uint32_t)> guardAdmit; // guard, holder, function
+  auto dispatch = [&](uint32_t P, const std::vector<uint32_t> &dlt) {
+    const LevelKey K = dispatchOf[P];
+    const RecvSite &R = recvSites[K.si];
+    if (K.level + 1 < R.lis.size()) { // holders: on to the next level
+      for (uint32_t g : dlt) linkLevel(K.si, K.f, K.level + 1, g, K.guard);
+      return;
+    }
+    if (K.guard != UINT32_MAX) {
+      for (uint32_t F : dlt)
+        if (cells[F].kind == CellKind::Func) guardAdmit(K.guard, K.f, F);
+      return;
+    }
+    for (uint32_t F : dlt) {
+      if (cells[F].kind != CellKind::Func) continue;
+      const Function *Fn = objs[cells[F].obj].fn;
+      if (!Fn || Fn->isDeclaration() || R.k >= Fn->arg_size()) continue;
+      if (!isCompatible(R.cs, Fn)) continue; // not a target (the answers' rule)
+      const NodeIndex fv = NF.getValueNodeFor(Fn->getArg(R.k));
+      if (fv == AndersNodeFactory::InvalidIndex) continue;
+      const uint32_t formal = find(canon(fv));
+      if (recordWhy) curWhy = {R.base, K.f, F, W_DISPATCH};
+      if (K.f == UINT32_MAX) addEdge(R.base, formal);
+      else add(formal, K.f);
+    }
+  };
+  // Holder guards: a method F reached only through dispatch sites of one
+  // path shape reloads the level-1 holder from its receiver formal
+  // (`entropy = (phuff_entropy_ptr) cinfo->entropy` in a method fetched
+  // from cinfo->entropy->start_pass): that load yields only holders whose
+  // own path leads to F. A holder is held at the load until F arrives at
+  // its slot. Premise (recorded): the path is not rewritten between the
+  // method's fetch and its reload in F.
+  struct Guard { const Function *F; uint32_t si, node; std::vector<uint32_t> held; bool dropped = false; };
+  std::vector<Guard> guards;
+  boost::unordered_flat_set<uint64_t> guardAdmitted, guardSeen; // (guard, holder)
+  size_t guardHeldFacts = 0, guardDropped = 0;
+  // Is V the receiver formal A of its function: A itself, or a reload of
+  // a non-escaping stack slot whose only store stores A.
+  auto isFormalValue = [](const Value *V, const Argument *A) {
+    V = V->stripPointerCasts();
+    if (V == A) return true;
+    const auto *L = dyn_cast<LoadInst>(V);
+    if (!L) return false;
+    const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+    if (!S) return false;
+    const StoreInst *only = nullptr;
+    for (const User *U : S->users()) {
+      if (isa<LoadInst>(U)) continue;
+      const auto *SI = dyn_cast<StoreInst>(U);
+      if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S) return false;
+      if (only) return false;
+      only = SI;
+    }
+    return only && only->getValueOperand()->stripPointerCasts() == A;
+  };
+  auto sameSlotShape = [&](const Value *X, const Value *Y) {
+    const int64_t a = slotOffset(X);
+    return a != INT64_MIN && a == slotOffset(Y);
+  };
+  if (CFLCellReceivers && !recvSites.empty()) {
+    // Callers of each function (the previous iterations' call graph).
+    boost::unordered_flat_map<const Function *, std::vector<const CallBase *>> callers;
+    for (auto &[CS, FS] : Ctx->Callees)
+      for (const Function *F : FS) callers[F].push_back(CS);
+    boost::unordered_flat_map<const CallBase *, uint32_t> siteOf;
+    for (uint32_t si = 0; si < recvSites.size(); si++) siteOf[recvSites[si].cs] = si;
+    boost::unordered_flat_set<const Function *> done;
+    guardIdx.assign(numNodes, UINT32_MAX);
+    for (uint32_t si = 0; si < recvSites.size(); si++) {
+      const RecvSite &R = recvSites[si];
+      if (R.all || R.lis.size() < 2) continue;
+      auto cit = Ctx->Callees.find(R.cs);
+      if (cit == Ctx->Callees.end()) continue;
+      for (const Function *F : cit->second) {
+        if (!done.insert(F).second || F->isDeclaration() || R.k >= F->arg_size()) continue;
+        bool uniform = true; // every call of F: a dispatch site of this shape
+        for (const CallBase *C : callers[F]) {
+          auto sit = siteOf.find(C);
+          uniform &= sit != siteOf.end() && !recvSites[sit->second].all &&
+                     recvSites[sit->second].sig == R.sig;
+        }
+        if (!uniform) continue;
+        const Argument *A = F->getArg(R.k);
+        for (const Instruction &I : instructions(*F)) {
+          const auto *L = dyn_cast<LoadInst>(&I);
+          if (!L || !L->getType()->isPointerTy() || !sameSlotShape(L->getPointerOperand(), R.slot0))
+            continue;
+          const Value *B = L->getPointerOperand()->stripPointerCasts();
+          if (const auto *G = dyn_cast<GEPOperator>(B)) B = G->getPointerOperand();
+          if (!isFormalValue(B, A)) continue;
+          const NodeIndex ln = NF.getValueNodeFor(L);
+          if (ln == AndersNodeFactory::InvalidIndex) continue;
+          const uint32_t n = find(canon(ln));
+          if (guardIdx[n] != UINT32_MAX) continue;
+          guardIdx[n] = guards.size();
+          guards.push_back({F, si, n, {}});
+        }
+      }
+    }
+  }
+  guardHold = [&](uint32_t gi, uint32_t n, uint32_t f) {
+    Guard &Gd = guards[gi];
+    if (!guardSeen.insert((uint64_t)gi << 32 | f).second && !Gd.dropped &&
+        !guardAdmitted.count((uint64_t)gi << 32 | f))
+      return; // already held
+    if (Gd.dropped || guardAdmitted.count((uint64_t)gi << 32 | f)) {
+      admitting = true;
+      add(n, f);
+      admitting = false;
+      return;
+    }
+    if (cells[f].kind == CellKind::Func || cells[f].kind == CellKind::Out) {
+      Gd.held.push_back(f); // no slot: never admitted (counted)
+      guardHeldFacts++;
+      return;
+    }
+    Gd.held.push_back(f);
+    guardHeldFacts++;
+    linkLevel(Gd.si, f, 1, f, gi);
+  };
+  // A guarded node merged into another (a cycle): the guard is dropped and
+  // its held facts are released (more facts, sound).
+  auto dropMergedGuards = [&]() {
+    for (uint32_t gi = 0; gi < guards.size(); gi++) {
+      Guard &Gd = guards[gi];
+      if (Gd.dropped || find(Gd.node) == Gd.node) continue;
+      Gd.dropped = true;
+      guardDropped++;
+      admitting = true;
+      for (uint32_t f : Gd.held) add(Gd.node, f);
+      admitting = false;
+    }
+  };
+  guardAdmit = [&](uint32_t gi, uint32_t f, uint32_t F) {
+    Guard &Gd = guards[gi];
+    if (objs[cells[F].obj].fn != Gd.F) return;
+    if (!guardAdmitted.insert((uint64_t)gi << 32 | f).second) return;
+    admitting = true;
+    add(Gd.node, f);
+    admitting = false;
+  };
+
   // ---- Propagation (difference propagation over a worklist) ----
   const auto tSolve = Clock::now();
   uint64_t walkSteps = 0;
@@ -2479,6 +2823,8 @@ bool CallGraphPass::runCellResolution() {
       };
       if (Ss && Sd && Ss != Sd && !startsIn(Ss, Od.layout, fb) &&
           !startsIn(Sd, Os.layout, fa)) {
+        if (!copyMismatches && curCopy != UINT32_MAX)
+          firstMismatch = {curCopy, curCopySrcFact, os, od};
         copyMismatches++;
         const std::string d =
             instLoc(at) + ": " + describe(Os) + " +" + std::to_string(fa) +
@@ -2486,7 +2832,7 @@ bool CallGraphPass::runCellResolution() {
             std::to_string(fb) + " (" + typeLabel(Sd) + ")";
         if (copyMismatchAt.size() < 8) copyMismatchAt.push_back(d);
         if (CFLCellOneLabel && CFLCellOneLabelMax <= 1 && curCopyDst != UINT32_MAX)
-          pend1({2, curCopyDst, 0, 0, nullptr, d, pops});
+          pend1({2, curCopyDst, 0, curCopySrcFact, nullptr, d, pops});
         if (CFLCellOneLabel) otherMeets["copy-mismatch"]++;
       }
     }
@@ -2522,6 +2868,7 @@ bool CallGraphPass::runCellResolution() {
         addEdge(sp, du);
       }
       copyEdges++;
+      copyStat[curCopy].edges++;
     }
   };
   auto copyPair = [&](uint32_t ci, uint32_t fs, uint32_t fd) {
@@ -2533,12 +2880,19 @@ bool CallGraphPass::runCellResolution() {
         S.kind == CellKind::Out || D.kind == CellKind::Out)
       return;
     copyPairs++;
+    if (copyStat.size() < copies.size()) copyStat.resize(copies.size());
+    curCopy = ci;
+    copyStat[ci].pairs++;
+    for (auto [o, e] : memb[fs]) copyStat[ci].srcObjs.insert(o);
+    for (auto [o, e] : memb[fd]) copyStat[ci].dstObjs.insert(o);
     if (S.kind == CellKind::Any || D.kind == CellKind::Any) {
       addEdge(S.load, D.store); // any offset: everything to everything
       return;
     }
     const std::vector<Member> ms = memb[fs], md = memb[fd];
     curCopyDst = find(copies[ci].dst);
+    curCopySrcFact = fs;
+    if (recordWhy) curWhy = {ci, fs, fd, W_COPY};
     for (auto [os, ea] : ms)
       for (auto [od, eb] : md)
         copyRegion(os, decOff(ea), od, decOff(eb), copies[ci].len, copies[ci].at);
@@ -2672,8 +3026,7 @@ bool CallGraphPass::runCellResolution() {
       // otherwise). Harmless ones wait: the fixpoint may still change.
       const bool matters =
           P.kind == 0 ? factCarriesFptrs(P.a) && factCarriesFptrs(P.f)
-          : P.kind == 1 ? factCarriesFptrs(P.f)
-                        : true;
+          : factCarriesFptrs(P.f); // the stepped / copied-from object
       if (!matters) {
         if (final) coneHarmless++;
         else keep.push_back(P);
@@ -2732,6 +3085,7 @@ bool CallGraphPass::runCellResolution() {
     delta.clear();
     delta.swap(pend[n]);
     if (delta.empty()) continue;
+    whyClock = pops;
     if (CFLCellOneLabel && (pops & 0x1fff) == 0 && !pendingConf.empty())
       flushPending(false);
     if (++pops % (1u << 20) == 0) {
@@ -2748,6 +3102,19 @@ bool CallGraphPass::runCellResolution() {
       if (pops % (1u << 22) == 0) massByObject(12);
     }
     for (uint32_t &f : delta) f = findFact(f);
+    if (!dispatchOf.empty() && dispatchOf.count(n)) {
+      dispatch(n, delta);
+      continue;
+    }
+    if (!recvAt.empty()) {
+      auto rit = recvAt.find(n);
+      if (rit != recvAt.end())
+        for (uint32_t si : std::vector<uint32_t>(rit->second))
+          for (uint32_t f : delta) {
+            if (recordWhy) curWhy = {n, f, UINT32_MAX, W_DISPATCH};
+            bindReceiver(si, f);
+          }
+    }
     // One label per pointer: an arriving cell of the anchor's name merges
     // into it; a cell of another name is the anomaly: stop and report.
     if (CFLCellOneLabel && !unionView[n]) { // a union's views hold every member
@@ -2798,12 +3165,16 @@ bool CallGraphPass::runCellResolution() {
     }
     {
       for (uint32_t h : hubsOf[n])
-        for (uint32_t f : delta) linkHub(h, f);
+        for (uint32_t f : delta) {
+          if (recordWhy) curWhy = {n, f, UINT32_MAX, W_HUB};
+          linkHub(h, f);
+        }
       curStepNode = n;
       anyCauseNode = n;
       for (size_t ei = 0; ei < fieldOut[n].size(); ei++) {
         const FieldEdge e = fieldOut[n][ei];
         for (uint32_t f : delta) {
+          if (recordWhy) curWhy = {n, f, UINT32_MAX, e.walk ? W_WALK : W_STEP};
           if (e.walk) applyWalk(f, e);
           else applyStep(f, e.li, e.dst);
         }
@@ -2811,13 +3182,18 @@ bool CallGraphPass::runCellResolution() {
       if (anyLoop[n])
         for (uint32_t f : delta) {
           const CellKind k = cells[f].kind;
+          if (recordWhy) curWhy = {n, f, UINT32_MAX, W_ANY};
           if (k == CellKind::Off || k == CellKind::Out)
             toAny(f, n);
         }
     }
     if (!copiesAt[n].empty()) applyCopies(n, delta);
     for (uint32_t m : succ[n])
-      for (uint32_t f : delta) add(m, f);
+      for (uint32_t f : delta) {
+        if (recordWhy) curWhy = {n, f, UINT32_MAX, W_EDGE};
+        add(m, f);
+      }
+    curWhy = Why();
     if (VerboseLevel >= 2 && pops % (1u << 16) == 0)
       CG_LOG("Cells: at " << pops << " pops: " << finalizes << " finalizes re-ran "
              << refacts << " facts; " << factMerges << " fact merges, "
@@ -2825,6 +3201,8 @@ bool CallGraphPass::runCellResolution() {
     if (pops - lastCollapsePops >= (1u << 18) &&
         edgeSet.size() > edgesAtCollapse + edgesAtCollapse / 8) {
       collapseCycles();
+      rekeyReceivers();
+      dropMergedGuards();
       if (CFLCellMergePtrs) mergeEqualSets();
       if (CFLCellUnify) canonicalizeSets();
       lastCollapsePops = pops;
@@ -2879,6 +3257,194 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: " << cellHubKey.size() << " keyed union accesses, "
          << splitCells << " union-slot cells, " << keyedCells
          << " keyed cells\n");
+  // --cfl-cell-why: the chain of first causes that brought a cell of
+  // `want` into `target`, latest first; the pointers whose hub links or
+  // steps the chain used are explained in turn (two levels).
+  // factDesc names offset cells only.
+  auto whyDesc = [&](uint32_t f) {
+    f = findFact(f);
+    return cells[f].kind == CellKind::Off ? factDesc(f) : factDescP(f);
+  };
+  std::function<void(uint32_t, const std::string &, int)> explainWhy2;
+  auto explainWhy = [&](uint32_t target, const std::string &want) {
+    explainWhy2(target, want, 0);
+  };
+  explainWhy2 = [&](uint32_t target, const std::string &want, int depth) {
+    const std::string ind(2 + depth * 4, ' ');
+    auto matches = [&](uint32_t f) {
+      f = findFact(f);
+      if (describe(objs[cells[f].obj]).find(want) != std::string::npos) return true;
+      for (auto [o, e] : memb[f])
+        if (describe(objs[o]).find(want) != std::string::npos) return true;
+      return false;
+    };
+    uint32_t f0 = UINT32_MAX;
+    pts[target].forEach([&](uint32_t f) {
+      if (f0 == UINT32_MAX && matches(f)) f0 = f;
+    });
+    if (f0 == UINT32_MAX) {
+      CG_LOG("Cells:" << ind << nodeDesc(target) << " holds no cell of '" << want << "'\n");
+      return;
+    }
+    CG_LOG("Cells:" << ind << "why does " << nodeDesc(target) << " hold "
+           << whyDesc(f0) << "? (latest cause first)\n");
+    std::vector<std::pair<uint32_t, uint32_t>> pointers; // pointer, its fact
+    boost::unordered_flat_set<uint64_t> seen;
+    uint32_t n = target, f = f0;
+    for (int k = 0; k < 400; k++) {
+      const uint64_t key = (uint64_t)n << 32 | f;
+      if (!seen.insert(key).second) { CG_LOG("Cells:" << ind << "  (cycle)\n"); break; }
+      auto it = factWhy.find(key);
+      if (it == factWhy.end()) {
+        CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << ": " << whyDesc(f)
+               << " (seed, or arrived before a merge)\n");
+        break;
+      }
+      const Why w = it->second;
+      std::string how;
+      switch (w.kind) {
+      case W_EDGE: {
+        auto eit = edgeWhy.find((uint64_t)w.node << 32 | n);
+        const Why e = eit == edgeWhy.end() ? Why() : eit->second;
+        if (e.kind == W_HUB) {
+          how = "edge made by a load/store through " + nodeDesc(e.node) +
+                " holding " + whyDesc(e.fact);
+          pointers.push_back({find(e.node), e.fact});
+        } else if (e.kind == W_COPY) {
+          how = "byte copy " + instLoc(copies[e.node].at) + " (" +
+                whyDesc(e.fact) + " into " + whyDesc(e.extra) + ")";
+          pointers.push_back({find(copies[e.node].src), e.fact});
+        } else if (e.kind == W_OTHER && eit != edgeWhy.end()) {
+          how = "edge (made outside the propagation loop)";
+        } else if (eit == edgeWhy.end()) {
+          how = "static copy edge";
+        } else {
+          static const char *kn[] = {"other", "edge", "step", "walk", "any-offset", "hub", "copy", "dispatch"};
+          how = std::string("edge made during a ") + kn[e.kind] + " at " +
+                (e.node < numNodes ? nodeDesc(e.node) : std::string("?")) +
+                " holding " + (e.fact < cells.size() ? whyDesc(e.fact) : std::string("?"));
+          if (e.node < numNodes && e.fact < cells.size())
+            pointers.push_back({find(e.node), e.fact});
+        }
+        break;
+      }
+      case W_STEP: how = "step"; break;
+      case W_WALK: how = "walk"; break;
+      case W_ANY: how = "any-offset (field-any loop)"; break;
+      case W_DISPATCH:
+        how = "method dispatch of " +
+              (w.extra < cells.size() ? whyDesc(w.extra) : std::string("?")) +
+              " to the receiver";
+        break;
+      default: how = "other (seed, refold, finalize, merge replay)"; break;
+      }
+      if (w.kind == W_STEP || w.kind == W_WALK || w.kind == W_ANY ||
+          w.kind == W_DISPATCH) {
+        how += " of " + whyDesc(w.fact);
+        CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << " <- " << how << "\n");
+        if (w.node == UINT32_MAX) break;
+        n = find(w.node);
+        f = findFact(w.fact);
+        continue;
+      }
+      CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << " <- " << how << "\n");
+      if (w.kind != W_EDGE || w.node == UINT32_MAX) break;
+      n = find(w.node);
+      f = findFact(w.fact);
+    }
+    if (depth >= 2) return;
+    // The first pointers the chain loaded or copied through.
+    for (size_t i = 0; i < pointers.size() && i < 2; i++) {
+      const uint32_t fo = findFact(pointers[i].second);
+      const std::string w = describe(objs[cells[fo].obj]);
+      explainWhy2(pointers[i].first, w.substr(0, w.find(" [")), depth + 1);
+    }
+  };
+  {
+    std::vector<uint32_t> order;
+    for (uint32_t ci = 0; ci < copyStat.size(); ci++)
+      if (copyStat[ci].pairs) order.push_back(ci);
+    std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+      return copyStat[x].edges > copyStat[y].edges;
+    });
+    for (size_t i = 0; i < order.size() && i < 12; i++) {
+      const uint32_t ci = order[i];
+      const CopyStat &C = copyStat[ci];
+      CG_LOG("Cells:   copy " << instLoc(copies[ci].at) << " len "
+             << copies[ci].len << ": " << C.pairs << " cell pairs, "
+             << C.edges << " content edges, " << C.srcObjs.size()
+             << " source objects (" << pts[find(copies[ci].src)].count()
+             << " facts at the source pointer), " << C.dstObjs.size()
+             << " destination objects (" << pts[find(copies[ci].dst)].count()
+             << " facts)\n");
+      if (i > 0) continue;
+      // The heaviest copy: its source pointer's facts by object.
+      std::map<uint32_t, size_t> perObj;
+      pts[find(copies[ci].src)].forEach([&](uint32_t f) {
+        for (auto [o, e] : memb[f]) perObj[o]++;
+      });
+      for (auto [o, k] : perObj)
+        CG_LOG("Cells:     source " << describe(objs[o]) << ": " << k << " facts\n");
+      if (recordWhy) explainWhy(find(copies[ci].src), CFLCellWhy);
+    }
+    // --cfl-cell-why=any:OBJ: where OBJ's any-offset cell first arrived.
+    if (recordWhy && StringRef(CFLCellWhy).starts_with("any:")) {
+      const std::string want = CFLCellWhy.substr(4);
+      uint64_t bestKey = 0;
+      uint32_t bestT = UINT32_MAX;
+      for (auto &[key, w] : factWhy) {
+        const uint32_t f = (uint32_t)key;
+        if (f >= cells.size() || cells[f].kind != CellKind::Any) continue;
+        if (describe(objs[cells[f].obj]).find(want) == std::string::npos) continue;
+        if (w.t < bestT) { bestT = w.t; bestKey = key; }
+      }
+      if (bestT == UINT32_MAX) {
+        CG_LOG("Cells: no any-offset cell of '" << want << "' arrived\n");
+      } else {
+        const uint32_t n0 = (uint32_t)(bestKey >> 32), f0 = (uint32_t)bestKey;
+        const Why w = factWhy[bestKey];
+        CG_LOG("Cells: first any-offset cell " << whyDesc(f0) << " arrived at pop "
+               << bestT << " at " << nodeDesc(n0) << " (cause kind " << (int)w.kind
+               << ") from " << (w.node < numNodes ? nodeDesc(w.node) : std::string("?"))
+               << " holding " << (w.fact < cells.size() ? whyDesc(w.fact) : std::string("?"))
+               << "\n");
+        if (w.node < numNodes && w.fact < cells.size()) {
+          const std::string d = describe(objs[cells[findFact(w.fact)].obj]);
+          explainWhy(find(w.node), d.substr(0, d.find(" [")));
+        }
+      }
+    }
+    if (recordWhy && firstRuleB.node != UINT32_MAX) {
+      const std::string w = describe(objs[firstRuleB.obj]);
+      CG_LOG("Cells: first rule (b) step: " << nodeDesc(firstRuleB.node) << " steps "
+             << firstRuleB.ty->getName() << " on " << w << "\n");
+      explainWhy(find(firstRuleB.node), w.substr(0, w.find(" [")));
+    }
+    // The first copy between unrelated structs: how its two pointers came
+    // to hold the two objects.
+    if (recordWhy && firstMismatch.ci != UINT32_MAX) {
+      const ByteCopy &C = copies[firstMismatch.ci];
+      CG_LOG("Cells: first copy between unrelated structs: " << instLoc(C.at)
+             << ": " << describe(objs[firstMismatch.os]) << " into "
+             << describe(objs[firstMismatch.od]) << "\n");
+      const std::string ws = describe(objs[firstMismatch.os]),
+                        wd = describe(objs[firstMismatch.od]);
+      explainWhy(find(C.src), ws.substr(0, ws.find(" [")));
+      explainWhy(find(C.dst), wd.substr(0, wd.find(" [")));
+    }
+  }
+  if (CFLCellReceivers)
+    CG_LOG("Cells: method calls p->f(.., p, ..): " << recvSites.size()
+           << " sites, " << recvLevels << " levels (" << recvUnstepped << " slot not a field step of p: every "
+           << "receiver to every method; " << recvNoNode << " without facts), "
+           << recvBound << " receiver cells dispatched; " << guards.size()
+           << " holder reloads guarded in methods (" << guardHeldFacts
+           << " holder arrivals checked, " << guardAdmitted.size() << " admitted, "
+           << guardDropped << " guards dropped by a merge)\n");
+  if (recordWhy)
+    for (const RecvSite &R : recvSites)
+      CG_LOG("Cells:   method call " << instLoc(R.cs) << " receiver arg" << R.k
+             << (R.all ? " (every receiver)" : "") << "\n");
   CG_LOG("Cells: " << copies.size() << " byte copies, " << copyPairs
          << " cell pairs copied, " << copyEdges << " content edges, "
          << effectiveTyped << " unknown destinations typed by the source\n");

@@ -1673,7 +1673,8 @@ bool CallGraphPass::runCellResolution() {
   // of s-byte elements (stride 1: bytes). An index from an address in no
   // array is undefined behavior: counted, the address stays.
   size_t indexOutsideArray = 0, indexAsOffset = 0, indexStays = 0, leafMerges = 0, byteStepUB = 0,
-         byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0;
+         byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0,
+         byteWalkStays = 0, byteWalkStructRel = 0;
   // Sampled undefined-behavior exits: (pointer node, object, position, k).
   std::vector<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> byteStepUBAt;
   // arr: the result is an element address of its byte array (provenance).
@@ -2817,10 +2818,30 @@ bool CallGraphPass::runCellResolution() {
   walkOne = [&](uint32_t o, int64_t c, uint32_t li, int64_t g, uint32_t dst) {
     walkOut.clear();
     // An index walk (p++) stays where it is; a member-step walk moves by
-    // its member offset first.
+    // its member offset first. An untyped offset walking from inside a
+    // byte array (bufpt[-1] in a loop) is an index of the array: it stays
+    // in it (plan 3.43); a byte address of the object also moves
+    // struct-relative, an address of the array as such does not.
     const LazyLabel &L = lazyLabels[li];
-    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut,
-                (c & kFoldedBit) != 0);
+    const bool arr = (c & kFoldedBit) != 0;
+    if (!L.ty && !L.arith && !L.stride && L.off != 0) {
+      const auto [lo2, at] = locate(o, decOff(c));
+      const Obj &O = objs[lo2];
+      int64_t lo = 0, hi = 0, esz = 0;
+      const int64_t pos = O.layout && O.repeats ? ((at % O.size) + O.size) % O.size : at;
+      if (O.layout && !O.tail && pos >= 0 && pos < O.size &&
+          innermostArraySpan(O.layout, pos, DL, lo, hi, esz) && esz == 1 && hi - lo > 1) {
+        strideCells(o, decOff(c), g, walkOut, arr);
+        if (arr) byteWalkStays++;
+        else {
+          byteWalkStructRel++;
+          strideCells(o, decOff(c) + L.off, g, walkOut, false);
+        }
+        for (uint32_t f2 : walkOut) add(dst, f2);
+        return;
+      }
+    }
+    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut, arr);
     for (uint32_t f2 : walkOut) add(dst, f2);
   };
   auto applyWalk = [&](uint32_t f, const FieldEdge &e) {
@@ -4075,7 +4096,8 @@ bool CallGraphPass::runCellResolution() {
          << "byte offsets from inside a byte array: " << byteStepStays << " stay in it, "
          << byteStepContainer << " leave it for a struct start (container_of), " << byteStepUB
          << " leave it otherwise (undefined behavior: not followed), " << byteStepStructRel
-         << " from a byte address (struct-relative), "
+         << " from a byte address (struct-relative); walks from inside a byte array: "
+         << byteWalkStays << " stay in it, " << byteWalkStructRel << " also struct-relative, "
          << leafMerges << " same-leaf coexistences (unmerged); "
          << "learned " << layoutsLearned << " layouts, " << periodsLearned
          << " element sizes, " << bytesLearned << " byte arrays ("

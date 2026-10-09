@@ -485,10 +485,30 @@ bool innermostArray(Type *T, int64_t off, const DataLayout &DL, int64_t &b,
 // at least sizeof(T) and some other term that is not a multiple of it
 // (`n*sizeof(T) + sizeof(T)` is an array of n+1)?
 bool headerPlusTail(const CallBase *C, uint64_t sz) {
-  // Casts only: a size term is never forwarded through memory (a slot
-  // stored once may still be written through its address by a call).
+  // Casts, and at -O0 a local slot that never escapes (its only users are
+  // direct loads and exactly one store: no call can write it through its
+  // address) forwards the stored value (sqlite3: nByte = sizeof(Fts3SegReader)
+  // + (nElem+1)*sizeof(Fts3HashElem *); malloc(nByte)).
   auto lookThrough = [](const Value *V) {
-    while (const auto *CI = dyn_cast<CastInst>(V)) V = CI->getOperand(0);
+    for (int d = 0; d < 8; d++) {
+      if (const auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
+      if (const auto *L = dyn_cast<LoadInst>(V))
+        if (const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+          const StoreInst *only = nullptr;
+          bool ok = true;
+          for (const User *U : S->users()) {
+            if (isa<LoadInst>(U)) continue;
+            const auto *SI = dyn_cast<StoreInst>(U);
+            if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S || only) {
+              ok = false;
+              break;
+            }
+            only = SI;
+          }
+          if (ok && only) { V = only->getValueOperand(); continue; }
+        }
+      break;
+    }
     return V;
   };
   auto multipleOf = [&](const Value *X) {
@@ -1265,11 +1285,50 @@ bool CallGraphPass::runCellResolution() {
     if (noteBytesCause) noteBytesCause(o);
     refoldQueue.push_back(o); // renames its cells i8[]
   };
+  // An allocation whose constant size k is larger than struct S (and not a
+  // multiple): the structs of exactly k bytes that start with S. Then S is
+  // the first member of a container (C inheritance: code that writes only
+  // `pub`), not a header before trailing data. *n = how many there are.
+  size_t heapContainerRelabeled = 0, heapContainerAmbiguous = 0;
+  auto containerOfSize = [&](const CallBase *C, const StructType *S, int64_t sz,
+                             size_t &n) -> StructType * {
+    n = 0;
+    uint64_t k = 0;
+    for (const Use &A : C->args())
+      if (const auto *K = dyn_cast<ConstantInt>(A.get()))
+        if (K->getZExtValue() > (uint64_t)sz && K->getZExtValue() % sz) k = K->getZExtValue();
+    if (!k) return nullptr;
+    const StructInfo *SI =
+        Ctx->structAnalyzer.getStructInfo(S, const_cast<Module *>(C->getModule()));
+    if (!SI) return nullptr;
+    StructType *one = nullptr;
+    for (auto &[ct, offs] : SI->getContainers())
+      if (offs.count(0) && ct->isSized() && DL.getTypeAllocSize(const_cast<StructType *>(ct)) == k) {
+        n++;
+        one = const_cast<StructType *>(ct);
+      }
+    return n == 1 ? one : nullptr;
+  };
   auto requestLayout = [&](uint32_t o, StructType *S) {
     Obj &O = objs[o];
     if (O.layout || O.bytes || !S || S->isOpaque() || !S->isSized()) return;
-    const int64_t sz = (int64_t)DL.getTypeAllocSize(S);
+    int64_t sz = (int64_t)DL.getTypeAllocSize(S);
     if (sz <= 0) return;
+    // The first member of a container its allocation size names: learn the
+    // container; with several such containers, learn nothing yet (a later
+    // step names the type).
+    if (!O.tail && O.base == 0)
+      if (const auto *C = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin))) {
+        size_t n = 0;
+        if (StructType *CT = containerOfSize(C, S, sz, n)) {
+          S = CT;
+          sz = (int64_t)DL.getTypeAllocSize(S);
+          heapContainerRelabeled++;
+        } else if (n > 1) {
+          heapContainerAmbiguous++;
+          return;
+        }
+      }
     if (O.tail) {
       // An unknown header before trailing bytes at O.size: the struct fills
       // it (sz == size) or leaves an unknown gap before them (sz < size).
@@ -1467,6 +1526,29 @@ bool CallGraphPass::runCellResolution() {
       O.size = (int64_t)DL.getTypeAllocSize(O.layout);
     if (O.size <= 0) O.layout = nullptr; // opaque or empty: unlabeled
     else O.label = typeLabel(O.layout);
+    // A constant size larger than the label where some struct of exactly
+    // that size starts with the label: the label is the first member of a
+    // container (C inheritance: the allocating code writes only `pub`),
+    // not a header before trailing data. One such container: its type;
+    // several (cjpeg -O3: huff and phuff encoders are both 200 bytes):
+    // unlabeled, learned from the first struct step.
+    if (O.layout && O.repeats)
+      if (const auto *C = dyn_cast_or_null<CallBase>(V))
+        if (const auto *ST = dyn_cast<StructType>(O.layout)) {
+          size_t n = 0;
+          if (StructType *CT = containerOfSize(C, ST, O.size, n)) {
+            O.layout = CT;
+            O.size = (int64_t)DL.getTypeAllocSize(CT);
+            O.label = typeLabel(O.layout);
+            O.repeats = false;
+            heapContainerRelabeled++;
+          } else if (n > 1) {
+            O.layout = nullptr;
+            O.size = 0;
+            O.label.clear();
+            heapContainerAmbiguous++;
+          }
+        }
     if (O.layout && O.repeats)
       if (const auto *C = dyn_cast_or_null<CallBase>(V)) {
         if (headerPlusTail(C, (uint64_t)O.size)) { O.tail = true; tailObjects++; }
@@ -1940,6 +2022,9 @@ bool CallGraphPass::runCellResolution() {
     }
   };
   std::function<void(uint32_t, uint32_t, uint32_t)> guardAdmit; // guard, holder, function
+  // A method first delivered by a dispatch site during the solve: its
+  // holder guards are installed then (set below), not one iteration late.
+  std::function<void(uint32_t, const Function *)> onDispatchTarget;
   auto dispatch = [&](uint32_t P, const std::vector<uint32_t> &dlt) {
     const LevelKey K = dispatchOf[P];
     const RecvSite &R = recvSites[K.si];
@@ -1960,6 +2045,7 @@ bool CallGraphPass::runCellResolution() {
       const NodeIndex fv = NF.getValueNodeFor(Fn->getArg(R.k));
       if (fv == AndersNodeFactory::InvalidIndex) continue;
       const uint32_t formal = find(canon(fv));
+      if (onDispatchTarget) onDispatchTarget(K.si, Fn);
       if (trackWhy) curWhy = {R.base, K.f, F, W_DISPATCH};
       if (K.f == UINT32_MAX) addEdge(R.base, formal);
       else add(formal, K.f);
@@ -2181,72 +2267,95 @@ bool CallGraphPass::runCellResolution() {
     }
     return true;
   };
+  // Callers of each function (the previous iterations' call graph).
+  boost::unordered_flat_map<const Function *, std::vector<const CallBase *>> callers;
+  boost::unordered_flat_map<const CallBase *, uint32_t> siteOf;
+  boost::unordered_flat_set<const Function *> done; // guard decided for F
+  // Holder guards for method F delivered by dispatch site si: every call of
+  // F is a dispatch site of si's path shape (no direct call), F's writes
+  // do not include the path's level-0 slot (the receivers premise,
+  // checked), and each reload of that slot from the receiver formal is
+  // its own node. live: during the solve (the method was just delivered);
+  // the reload's node must still be empty, and a later dispatch of F with
+  // another shape drops the guards (held facts released).
+  boost::unordered_flat_map<const Function *, std::string> guardSig;
+  size_t guardsLive = 0, guardsLiveDropped = 0;
+  auto hasDirectCaller = [](const Function *F) {
+    for (const User *U : F->users())
+      if (const auto *CB = dyn_cast<CallBase>(U))
+        if (CB->getCalledOperand()->stripPointerCasts() == F) return true;
+    return false;
+  };
+  std::function<void(uint32_t, const Function *, bool)> tryHolderGuards =
+      [&](uint32_t si, const Function *F, bool live) {
+    const RecvSite &R = recvSites[si];
+    if (R.all || !R.cs || R.lis.size() < 2) return;
+    if (!done.insert(F).second || F->isDeclaration() || R.k >= F->arg_size()) return;
+    bool uniform = !hasDirectCaller(F); // every call of F: a dispatch site of this shape
+    const CallBase *breaker = nullptr;
+    for (const CallBase *C : callers[F]) {
+      auto sit = siteOf.find(C);
+      const bool ok = sit != siteOf.end() && !recvSites[sit->second].all &&
+                      recvSites[sit->second].sig == R.sig;
+      if (!ok && !breaker) breaker = C;
+      uniform &= ok;
+    }
+    if (uniform) {
+      // The premise: F (and its callees) never rewrite the path's level-0
+      // slot, so a reload inside F sees the holder the method came from.
+      buildMod();
+      std::pair<std::string, int64_t> slot0;
+      if (!slotKey(R.slot0, slot0) || mayWrite(F, slot0)) {
+        guardModFallback++;
+        if (guardRefusedAt.size() < 400)
+          guardRefusedAt.push_back(F->getName().str() + ": may write the dispatch path's slot " +
+                                   slot0.first + "+" + std::to_string(slot0.second) +
+                                   " (receiver premise fails; no guard)");
+        return;
+      }
+    }
+    if (!uniform) {
+      guardRefused++;
+      if (guardRefusedAt.size() < 400) {
+        auto sit = breaker ? siteOf.find(breaker) : siteOf.end();
+        guardRefusedAt.push_back(F->getName().str() + " (shape " + R.sig + "): called at " +
+                                 (breaker ? instLoc(breaker) : std::string("a direct call")) +
+                                 (sit == siteOf.end() ? " (not a method call)"
+                                                      : " (shape " + recvSites[sit->second].sig + ")"));
+      }
+      return;
+    }
+    guardSig[F] = R.sig;
+    const Argument *A = F->getArg(R.k);
+    for (const Instruction &I : instructions(*F)) {
+      const auto *L = dyn_cast<LoadInst>(&I);
+      if (!L || !L->getType()->isPointerTy() || !sameSlotShape(L->getPointerOperand(), R.slot0))
+        continue;
+      const Value *B = L->getPointerOperand()->stripPointerCasts();
+      if (const auto *G = dyn_cast<GEPOperator>(B)) B = G->getPointerOperand();
+      if (!isFormalValue(B, A)) continue;
+      const NodeIndex ln = NF.getValueNodeFor(L);
+      if (ln == AndersNodeFactory::InvalidIndex) continue;
+      const uint32_t n = find(canon(ln));
+      if (n >= guardIdx.size() || guardIdx[n] != UINT32_MAX || !classOnly(ln, L)) continue;
+      if (live && pts[n].count()) continue; // facts arrived before the method did
+      guardIdx[n] = guards.size();
+      guards.push_back({F, si, n, {}});
+      guardsLive += live;
+    }
+  };
   if (CFLCellReceivers && !recvSites.empty()) {
-    // Callers of each function (the previous iterations' call graph).
-    boost::unordered_flat_map<const Function *, std::vector<const CallBase *>> callers;
     for (auto &[CS, FS] : Ctx->Callees)
       for (const Function *F : FS) callers[F].push_back(CS);
-    boost::unordered_flat_map<const CallBase *, uint32_t> siteOf;
-    for (uint32_t si = 0; si < recvSites.size(); si++) siteOf[recvSites[si].cs] = si;
-    boost::unordered_flat_set<const Function *> done;
+    for (uint32_t si = 0; si < recvSites.size(); si++)
+      if (recvSites[si].cs) siteOf[recvSites[si].cs] = si;
     guardIdx.assign(numNodes, UINT32_MAX);
     for (uint32_t si = 0; si < recvSites.size(); si++) {
       const RecvSite &R = recvSites[si];
       if (R.all || R.lis.size() < 2) continue;
       auto cit = Ctx->Callees.find(R.cs);
       if (cit == Ctx->Callees.end()) continue;
-      for (const Function *F : cit->second) {
-        if (!done.insert(F).second || F->isDeclaration() || R.k >= F->arg_size()) continue;
-        bool uniform = true; // every call of F: a dispatch site of this shape
-        const CallBase *breaker = nullptr;
-        for (const CallBase *C : callers[F]) {
-          auto sit = siteOf.find(C);
-          const bool ok = sit != siteOf.end() && !recvSites[sit->second].all &&
-                          recvSites[sit->second].sig == R.sig;
-          if (!ok && !breaker) breaker = C;
-          uniform &= ok;
-        }
-        if (uniform) {
-          // The premise: F (and its callees) never rewrite the path's level-0
-          // slot, so a reload inside F sees the holder the method came from.
-          buildMod();
-          std::pair<std::string, int64_t> slot0;
-          if (!slotKey(R.slot0, slot0) || mayWrite(F, slot0)) {
-            guardModFallback++;
-            if (guardRefusedAt.size() < 12)
-              guardRefusedAt.push_back(F->getName().str() + ": may write the dispatch path's slot " +
-                                       slot0.first + "+" + std::to_string(slot0.second) +
-                                       " (receiver premise fails; no guard)");
-            continue;
-          }
-        }
-        if (!uniform) {
-          guardRefused++;
-          if (guardRefusedAt.size() < 12) {
-            auto sit = siteOf.find(breaker);
-            guardRefusedAt.push_back(F->getName().str() + " (shape " + R.sig + "): called at " +
-                                     instLoc(breaker) +
-                                     (sit == siteOf.end() ? " (not a method call)"
-                                                          : " (shape " + recvSites[sit->second].sig + ")"));
-          }
-          continue;
-        }
-        const Argument *A = F->getArg(R.k);
-        for (const Instruction &I : instructions(*F)) {
-          const auto *L = dyn_cast<LoadInst>(&I);
-          if (!L || !L->getType()->isPointerTy() || !sameSlotShape(L->getPointerOperand(), R.slot0))
-            continue;
-          const Value *B = L->getPointerOperand()->stripPointerCasts();
-          if (const auto *G = dyn_cast<GEPOperator>(B)) B = G->getPointerOperand();
-          if (!isFormalValue(B, A)) continue;
-          const NodeIndex ln = NF.getValueNodeFor(L);
-          if (ln == AndersNodeFactory::InvalidIndex) continue;
-          const uint32_t n = find(canon(ln));
-          if (guardIdx[n] != UINT32_MAX || !classOnly(ln, L)) continue;
-          guardIdx[n] = guards.size();
-          guards.push_back({F, si, n, {}});
-        }
-      }
+      for (const Function *F : cit->second) tryHolderGuards(si, F, false);
     }
     CG_LOG("Cells: holder guards: " << guards.size() << " reloads guarded; "
            << guardModFallback << " methods that may rewrite the path (premise checked: no guard); "
@@ -2255,6 +2364,26 @@ bool CallGraphPass::runCellResolution() {
            << guardClassShared << " reloads not guarded (node shared by dedup); "
            << guardRefused << " methods refused (a call of another shape):\n");
     for (const std::string &d : guardRefusedAt) CG_LOG("Cells:   refused " << d << "\n");
+    onDispatchTarget = [&](uint32_t si, const Function *F) {
+      const RecvSite &R = recvSites[si];
+      if (R.all || !R.cs || R.lis.size() < 2) return;
+      auto git = guardSig.find(F);
+      if (git != guardSig.end()) {
+        if (git->second.empty() || git->second == R.sig) return;
+        // Another shape delivers F: its guards are void; release what they held.
+        git->second.clear();
+        for (Guard &Gd : guards) {
+          if (Gd.F != F || Gd.dropped) continue;
+          Gd.dropped = true;
+          guardsLiveDropped++;
+          admitting = true;
+          for (uint32_t f : Gd.held) add(Gd.node, f);
+          admitting = false;
+        }
+        return;
+      }
+      if (!done.count(F)) tryHolderGuards(si, F, true);
+    };
   }
   // Method-identity checks (the program's own RTTI with a method pointer
   // as the tag): `if (h->slot != Fn) <never returns>` where h = B->path
@@ -3940,9 +4069,16 @@ bool CallGraphPass::runCellResolution() {
     }
   };
   if (CFLCellSoupProfile) {
+    // Node descriptions, memoized (nodeDesc scans the cells of a cell node).
+    boost::unordered_flat_map<uint32_t, std::string> descMemo;
+    auto descOf = [&](uint32_t n) -> const std::string & {
+      auto [it, ins] = descMemo.try_emplace(n);
+      if (ins) it->second = nodeDesc(n);
+      return it->second;
+    };
     // Construct class of a join node, from its description.
     auto classOf = [&](uint32_t n) -> std::string {
-      const std::string d = nodeDesc(n);
+      const std::string d = descOf(n);
       if (d.rfind("return of ", 0) == 0) return "return of a function";
       if (d.rfind("cell ", 0) == 0) return "struct field / object cell";
       if (d.rfind("hub of", 0) == 0) return "load/store through a pointer (hub)";
@@ -3976,7 +4112,7 @@ bool CallGraphPass::runCellResolution() {
     // The construct by its owner: the function the join is in (hub, load,
     // phi, formal, return) or the allocation site of the cell's object.
     auto ownerOf = [&](uint32_t n) -> std::string {
-      const std::string d = nodeDesc(n);
+      const std::string d = descOf(n);
       size_t p;
       if (d.rfind("cell ", 0) == 0 && (p = d.find(" of ")) != std::string::npos) {
         const std::string o = d.substr(p + 4);
@@ -4114,7 +4250,8 @@ bool CallGraphPass::runCellResolution() {
            << " sites, " << recvLevels << " levels (" << recvUnstepped << " slot not a field step of p: every "
            << "receiver to every method; " << recvNoNode << " without facts), "
            << recvBound << " receiver cells dispatched; " << guards.size()
-           << " holder reloads guarded in methods (" << guardHeldFacts
+           << " holder reloads guarded in methods (" << guardsLive << " installed during the solve, "
+           << guardsLiveDropped << " dropped by a later shape; " << guardHeldFacts
            << " holder arrivals checked, " << guardAdmitted.size() << " admitted, "
            << guardDropped << " guards dropped by a merge)\n");
   if (recordWhy)
@@ -4148,7 +4285,9 @@ bool CallGraphPass::runCellResolution() {
          << " objects (" << tailMinted << " trailing, " << tailMoved
          << " cells moved to them); heap " << heapLabeled << " labeled (" << tailObjects
          << " header + trailing data), " << heapUnlabeled
-         << " unlabeled, " << heapConflict << " with conflicting labels), "
+         << " unlabeled, " << heapConflict << " with conflicting labels, "
+         << heapContainerRelabeled << " relabeled to the container their size names, "
+         << heapContainerAmbiguous << " left unlabeled (several containers of that size)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
          << anyCells << " any-offset, " << outMints << " outside)\n");
   CG_LOG("Cells: " << numNodes << " solver nodes, " << staticCopies

@@ -555,9 +555,11 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
                     });
           for (auto &[CalleeID, Callee] : Targets) {
             auto Key = std::make_tuple(CalleeID, isDirect, line);
-            if (earlierBodies.count(Key))
-              continue;
-            thisBody.insert(Key);
+            // One edge per (callee, kind, line) across bodies, and across
+            // the clones of one call (ka.sunk: Driver's sinkCallsIntoBranches
+            // keeps the debug location).
+            if (earlierBodies.count(Key)) continue;
+            if (!thisBody.insert(Key).second && CI->getMetadata("ka.sunk")) continue;
             json::Object Edge;
             Edge["callee"] = CalleeID;
             Edge["call_type"] = isDirect ? "direct" : "indirect";
@@ -579,12 +581,16 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     json::Array CallersArr;
     auto callerIt = MergedCallers.find(FuncID);
     if (callerIt != MergedCallers.end()) {
+      std::set<std::tuple<std::string, bool, unsigned>> seenCallers; // clones of one call
       for (const CallBase *CI : callerIt->second) {
         const Function *CallerF = CI->getFunction();
         if (!CallerF || (CallerF->isIntrinsic() && !isImportantIntrinsic(CallerF)))
           continue;
         bool isDirect = (CI->getCalledFunction() != nullptr);
         unsigned line = getCallLine(CI);
+        if (CI->getMetadata("ka.sunk") &&
+            !seenCallers.insert({getFuncId(CallerF), isDirect, line}).second)
+          continue;
 
         json::Object Edge;
         Edge["caller"] = getFuncId(CallerF);

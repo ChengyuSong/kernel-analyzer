@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <new>
 #include <set>
@@ -34,6 +35,7 @@
 #include <unistd.h>
 
 #include "Driver.h"
+#include "CallGraphInternal.h"
 #include "IRCensus.h"
 
 using namespace llvm;
@@ -188,6 +190,263 @@ static void splitIdentityTests(Module *M) {
   }
   if (copies)
     WARNING("IdentityTests: " << copies << " holder copies at method-identity tests in "
+            << M->getModuleIdentifier() << "\n");
+}
+
+// --cfl-cells: undo the hoisting of a call above a branch when its result
+// is used only on the branch's sides (-O3 cjpeg: both entropy encoders
+// allocate 200 bytes, so alloc_small is called once before `if
+// (progressive_mode)` and the object takes either encoder's methods). The
+// call and what follows it up to the branch (no-op casts, constant GEPs,
+// stores; the branch condition computed before the call) run at the start
+// of each successor instead: once per path, in the same order, so the
+// program is unchanged; each side becomes its own allocation site.
+// Functions the summary file declares FRESH allocators (the pre-pass runs
+// before the summaries are attached to functions).
+static const std::set<std::string> &freshAllocatorNames() {
+  static std::set<std::string> names;
+  static bool loaded = false;
+  if (loaded) return names;
+  loaded = true;
+  std::ifstream in(FuncSummaryFile);
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#' || line[0] == '@') continue;
+    std::istringstream ls(line);
+    std::string name, tok;
+    ls >> name;
+    while (ls >> tok)
+      if (tok == "FRESH") names.insert(name);
+  }
+  return names;
+}
+
+// Does struct type T hold a struct named S at byte offset off (itself, or
+// through first-member / field embedding)?
+static bool embedsAt(Type *T, int64_t off, StringRef S, const DataLayout &DL) {
+  for (int depth = 0; depth < 32 && T && off >= 0; depth++) {
+    auto *ST = dyn_cast<StructType>(T);
+    if (!ST || ST->isOpaque()) return false;
+    if (off == 0 && ST->hasName() && stripStructNameSuffix(ST->getName()) == S) return true;
+    const StructLayout *SL = DL.getStructLayout(ST);
+    if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+    unsigned i = SL->getElementContainingOffset(off);
+    off -= (int64_t)SL->getElementOffset(i);
+    T = ST->getElementType(i);
+  }
+  return false;
+}
+
+// The callee of C is a FRESH allocator: directly, or (an indirect call
+// through a method slot) every function the program stores into that slot
+// is one, the slot is written by nothing else, and no static initializer
+// fills it.
+// The struct GEP an address is (bitcasts only: stripPointerCasts would also
+// strip an all-zero GEP, the method at offset 0 of its struct).
+static const GEPOperator *structGEP(const Value *A) {
+  while (const auto *BC = dyn_cast<BitCastOperator>(A)) A = BC->getOperand(0);
+  return dyn_cast<GEPOperator>(A);
+}
+
+// The (struct, byte offset) an access names: its struct GEP, else its
+// struct-path TBAA tag (-O3 drops all-zero GEPs; the tag keeps the base
+// struct and the offset).
+static bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
+                       StructType *&S, int64_t &off) {
+  if (const GEPOperator *G = structGEP(Addr)) {
+    S = dyn_cast<StructType>(G->getSourceElementType());
+    APInt Ap(64, 0);
+    if (S && S->hasName() && G->accumulateConstantOffset(DL, Ap)) {
+      off = Ap.getSExtValue();
+      return true;
+    }
+  }
+  const MDNode *Tag = I->getMetadata(LLVMContext::MD_tbaa);
+  if (!Tag || Tag->getNumOperands() < 3 || Tag->getOperand(0) == Tag->getOperand(1)) return false;
+  const auto *B = dyn_cast<MDNode>(Tag->getOperand(0));
+  const auto *N = B && B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
+  const auto *TO = mdconst::dyn_extract<ConstantInt>(Tag->getOperand(2));
+  if (!N || !TO) return false;
+  S = StructType::getTypeByName(I->getContext(), ("struct." + N->getString()).str());
+  if (!S) return false;
+  // The tag's offset is relative to the base struct; the address must be
+  // the struct's start plus that offset, which the tag asserts.
+  off = TO->getSExtValue();
+  return true;
+}
+
+// Does an access's struct-path TBAA tag reach struct SN (IR name,
+// "struct.T") at byte offset o: walking from the tag's base type into the
+// member that contains the access offset (an anonymous typedef'd struct
+// whose first member is SN: cjpeg's my_memory_mgr { jpeg_memory_mgr pub; }).
+static bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o) {
+  const MDNode *Tag = I->getMetadata(LLVMContext::MD_tbaa);
+  if (!Tag || Tag->getNumOperands() < 3 || Tag->getOperand(0) == Tag->getOperand(1)) return false;
+  const auto *TO = mdconst::dyn_extract<ConstantInt>(Tag->getOperand(2));
+  const auto *B = dyn_cast<MDNode>(Tag->getOperand(0));
+  if (!TO || !B) return false;
+  int64_t off = TO->getSExtValue();
+  for (int depth = 0; depth < 16 && B; depth++) {
+    const auto *N = B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
+    if (N && !N->getString().empty() && ("struct." + N->getString()).str() == SN && off == o)
+      return true;
+    // Members: (type, offset) pairs after the name.
+    const MDNode *next = nullptr;
+    int64_t best = -1;
+    for (unsigned k = 1; k + 1 < B->getNumOperands(); k += 2) {
+      const auto *MO = mdconst::dyn_extract<ConstantInt>(B->getOperand(k + 1));
+      if (MO && MO->getSExtValue() <= off && MO->getSExtValue() > best) {
+        best = MO->getSExtValue();
+        next = dyn_cast<MDNode>(B->getOperand(k));
+      }
+    }
+    if (!next || best < 0) return false;
+    off -= best;
+    B = next;
+  }
+  return false;
+}
+
+static bool calleeIsFreshAllocator(const CallInst *C, std::string &why) {
+  const auto &fresh = freshAllocatorNames();
+  if (const Function *F = C->getCalledFunction()) {
+    why = "direct " + F->getName().str();
+    return fresh.count(F->getName().str()) > 0;
+  }
+  const Module *M = C->getModule();
+  const DataLayout &DL = M->getDataLayout();
+  const auto *LM = dyn_cast<LoadInst>(C->getCalledOperand()->stripPointerCasts());
+  if (!LM) { why = "callee not a load"; return false; }
+  StructType *S = nullptr;
+  int64_t o = 0;
+  if (!accessSlot(LM, LM->getPointerOperand(), DL, S, o)) { why = "untyped slot"; return false; }
+  const std::string SN = stripStructNameSuffix(S->getName()).str();
+  std::set<std::string> stored;
+  for (const GlobalVariable &GV : M->globals())
+    if (GV.hasInitializer() && !GV.getInitializer()->isNullValue() &&
+        embedsAt(GV.getValueType(), 0, SN, DL)) {
+      why = "static initializer " + GV.getName().str();
+      return false; // a static initializer may fill the slot
+    }
+  for (const Function &F : *M)
+    for (const Instruction &I : instructions(F)) {
+      const auto *SI = dyn_cast<StoreInst>(&I);
+      if (!SI) continue;
+      StructType *SS = nullptr;
+      int64_t so = 0;
+      bool hits = false;
+      if (accessSlot(SI, SI->getPointerOperand(), DL, SS, so)) {
+        const int64_t d = so - o; // where an S would start in SS
+        hits = d >= 0 && embedsAt(SS, d, SN, DL);
+      }
+      hits = hits || tbaaReaches(SI, SN, o);
+      if (!hits) continue; // another slot, or untyped (premise)
+      const Value *V = SI->getValueOperand()->stripPointerCasts();
+      if (isa<ConstantPointerNull>(V)) continue;
+      const auto *Fn = dyn_cast<Function>(V);
+      if (!Fn || !fresh.count(Fn->getName().str())) {
+        why = "slot " + SN + "+" + std::to_string(o) + " also holds " +
+              (Fn ? Fn->getName().str() : std::string("a computed value"));
+        return false;
+      }
+      stored.insert(Fn->getName().str());
+    }
+  if (stored.empty()) { why = "no store into slot " + SN + "+" + std::to_string(o) + " seen"; return false; }
+  why = "slot " + SN + "+" + std::to_string(o) + " holds only";
+  for (const std::string &n : stored) why += " " + n;
+  return true;
+}
+
+static void sinkCallsIntoBranches(Module *M) {
+  if (!CFLCells) return;
+  unsigned sunk = 0;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    // Candidates: a pointer-returning call whose block continues with only
+    // no-op casts, constant GEPs and stores up to a conditional branch whose
+    // condition is computed before the call (cjpeg -O3: alloc_small, then
+    // cinfo->entropy = it, then if (progressive_mode)).
+    std::vector<CallInst *> cands;
+    for (BasicBlock &BB : F) {
+      auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+      if (!Br || !Br->isConditional() || Br->getSuccessor(0) == Br->getSuccessor(1)) continue;
+      CallInst *C = nullptr;
+      for (Instruction *I = Br->getPrevNode(); I; I = I->getPrevNode()) {
+        if (isa<DbgInfoIntrinsic>(I) || isa<StoreInst>(I)) continue;
+        if (auto *CI = dyn_cast<CastInst>(I))
+          if (CI->isNoopCast(M->getDataLayout())) continue;
+        if (auto *G = dyn_cast<GetElementPtrInst>(I))
+          if (G->hasAllConstantIndices()) continue;
+        C = dyn_cast<CallInst>(I);
+        break;
+      }
+      if (!C || !C->getType()->isPointerTy() || isa<IntrinsicInst>(C) || C->isInlineAsm()) continue;
+      // The condition is computed before the call: it reads none of what the
+      // moved block writes (the premise that makes the move meaning-preserving).
+      const auto *Cond = dyn_cast<Instruction>(Br->getCondition());
+      if (Cond && Cond->getParent() == &BB && !Cond->comesBefore(C)) continue;
+      std::string why;
+      if (!calleeIsFreshAllocator(C, why)) continue;
+      cands.push_back(C);
+      std::string loc = F.getName().str();
+      if (const DILocation *L = C->getDebugLoc())
+        loc += " " + L->getFilename().str() + ":" + std::to_string(L->getLine());
+      WARNING("SinkCalls: " << loc << ": an allocation (" << why
+              << ") run on each side of the branch after it\n");
+    }
+    for (CallInst *C : cands) {
+      auto *Br = cast<BranchInst>(C->getParent()->getTerminator());
+      BasicBlock *From = C->getParent();
+      std::vector<Instruction *> run; // C and what follows it, up to the branch
+      for (Instruction *I = C; I != Br; I = I->getNextNode()) run.push_back(I);
+      BasicBlock *S[2] = {Br->getSuccessor(0), Br->getSuccessor(1)};
+      for (BasicBlock *&X : S)
+        if (!X->getSinglePredecessor()) X = SplitEdge(From, X);
+      DominatorTree DT(F);
+      auto side = [&](const Use &U) -> int {
+        const auto *UI = dyn_cast<Instruction>(U.getUser());
+        if (!UI) return -1;
+        const BasicBlock *UB = UI->getParent();
+        if (const auto *Ph = dyn_cast<PHINode>(UI)) UB = Ph->getIncomingBlock(U);
+        for (int k = 0; k < 2; k++)
+          if (DT.dominates(S[k], UB)) return k;
+        return -1;
+      };
+      // Every use of a run value outside the run lies under one side.
+      std::set<const Instruction *> inRun(run.begin(), run.end());
+      bool ok = true;
+      for (Instruction *I : run)
+        for (const Use &U : I->uses()) {
+          const auto *UI = dyn_cast<Instruction>(U.getUser());
+          if (UI && (inRun.count(UI) || isa<DbgInfoIntrinsic>(UI))) continue;
+          if (side(U) < 0) ok = false;
+        }
+      if (!ok) continue;
+      for (int k = 0; k < 2; k++) {
+        ValueToValueMapTy VM;
+        Instruction *at = &*S[k]->getFirstInsertionPt();
+        for (Instruction *I : run) {
+          if (isa<DbgInfoIntrinsic>(I)) continue;
+          Instruction *NI = I->clone();
+          RemapInstruction(NI, VM, RF_IgnoreMissingLocals | RF_NoModuleLevelChanges);
+          if (isa<CallBase>(NI)) // a clone of one call: consumers merge it by location
+            NI->setMetadata("ka.sunk", MDNode::get(M->getContext(), {}));
+          NI->insertBefore(at);
+          if (I->hasName()) NI->setName(I->getName() + ".side" + Twine(k));
+          VM[I] = NI;
+        }
+        for (Instruction *I : run)
+          if (Value *NV = VM.lookup(I))
+            I->replaceUsesWithIf(NV, [&](Use &U) { return side(U) == k; });
+      }
+      // Before any analysis: nothing observes the originals yet.
+      for (auto it = run.rbegin(); it != run.rend(); ++it)
+        if ((*it)->use_empty() || isa<DbgInfoIntrinsic>(*it)) (*it)->eraseFromParent();
+      sunk++;
+    }
+  }
+  if (sunk)
+    WARNING("SinkCalls: " << sunk << " calls executed on each side of the branch after them in "
             << M->getModuleIdentifier() << "\n");
 }
 
@@ -519,6 +778,7 @@ int kaLoadModules(const char *argv0) {
     GlobalCtx.ModuleMaps[Module] = InputFilenames[i];
 
     clonePerCaller(Module);
+    sinkCallsIntoBranches(Module);
     splitIdentityTests(Module);
     doBasicInitialization(Module);
   }

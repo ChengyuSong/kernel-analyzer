@@ -161,6 +161,12 @@ public:
 		return nullptr;
 	}
 
+	// Every struct containing this one, with the offsets it sits at.
+	const std::unordered_map<const llvm::StructType*, std::set<unsigned>> &getContainers() const
+	{
+		return containers;
+	}
+
 	static unsigned getMaxStructSize() { return maxStructSize; }
 
 	friend class StructAnalyzer;

@@ -6203,6 +6203,42 @@ static bool splitConstAddr(const Value *A, const DataLayout &DL, const Value *&b
 void CallGraphPass::computeGuardCandidates() {
   dedupKeep.clear();
   if (!CFLCells || !CFLCellReceivers) return;
+  // Methods delivered during a solve (holder guards installed live): every
+  // address-taken function's reloads, from its formal k, of a level-0 slot
+  // offset o0 that some dispatch site of two or more levels uses with
+  // receiver k.
+  std::set<std::pair<unsigned, int64_t>> shapes;
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F))
+        if (const auto *CS = dyn_cast<CallBase>(&I)) {
+          std::vector<std::pair<const Value *, const Value *>> path;
+          const int k = dispatchReceiver(CS, &path);
+          const Value *b0;
+          int64_t o0;
+          if (k >= 0 && path.size() >= 2 && splitConstAddr(path[0].second, DL, b0, o0))
+            shapes.insert({(unsigned)k, o0});
+        }
+  }
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &G : *M) {
+      if (G.isDeclaration() || !G.hasAddressTaken()) continue;
+      for (const Instruction &J : instructions(G))
+        if (const auto *L = dyn_cast<LoadInst>(&J)) {
+          const Value *b;
+          int64_t o;
+          if (!L->getType()->isPointerTy() || !splitConstAddr(L->getPointerOperand(), DL, b, o))
+            continue;
+          for (const auto &[k, o0] : shapes)
+            if (o == o0 && k < G.arg_size() && isFormalReloadOf(b, G.getArg(k))) {
+              dedupKeep.insert(L);
+              break;
+            }
+        }
+    }
+  }
   for (auto &[M, _] : Ctx->Modules) {
     const DataLayout &DL = M->getDataLayout();
     for (Function &F : *M)

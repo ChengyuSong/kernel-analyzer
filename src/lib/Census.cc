@@ -13,6 +13,7 @@
 // Part of CallGraphPass; shared declarations in CallGraphInternal.h.
 
 #include "CallGraphInternal.h"
+#include <llvm/BinaryFormat/Dwarf.h>
 
 static std::map<std::string, size_t> g_sinkEscapeSinks; // sink -> sites
                                    // (tag-bit-only local closures)
@@ -518,4 +519,242 @@ void CallGraphPass::runInvokeCensus() {
   if (withEvidence > printed)
     errs() << "InvokeCensus: ... +" << (withEvidence - printed)
            << " more with evidence (raise the cap to see them)\n";
+}
+
+// --cfl-construct-census (plan 3.34 instrument 2): the constructs every
+// soup traced so far came from, counted before the solve. Syntactic, so
+// the counts are candidates: each kind's examples name the function or
+// site to model (a summary, a clone, a key).
+void CallGraphPass::runConstructCensus() {
+  struct Kind {
+    const char *name;
+    size_t n = 0, covered = 0;
+    std::vector<std::string> ex;
+    void add(const std::string &e, bool cov) {
+      n++;
+      covered += cov;
+      if (!cov && ex.size() < 10) ex.push_back(e);
+    }
+  };
+  Kind wrappers{"allocator wrapper (returns an allocator's result)"},
+      pools{"pool allocator (returns a variable offset into a loaded or allocated block)"},
+      containers{"generic container (void* parameter stored into a field of another parameter)"},
+      method1{"method call p->f(p) (one level)"}, methodN{"method call p->x->f(p) (two or more levels)"},
+      fptrCalls{"other indirect call"}, idTests{"method-identity test (h->slot ==/!= function)"},
+      unions{"union type with a pointer member"}, varargs{"varargs function with a body"},
+      byteCopies{"struct copy through a byte buffer (memcpy between a struct and a non-struct)"};
+  auto loc = [](const Instruction *I) {
+    std::string s = I->getFunction()->getName().str();
+    if (const DILocation *L = I->getDebugLoc())
+      s += " " + L->getFilename().str() + ":" + std::to_string(L->getLine());
+    return s;
+  };
+  auto summarized = [&](const Function *F) { return Ctx->FuncSummaries.count(F) > 0; };
+  // A value that is an allocator result (through casts and phis/selects):
+  // a call of an allocator, or of a wrapper found so far.
+  std::set<const Function *> wrapperSet;
+  std::function<bool(const Value *, int)> fromAlloc = [&](const Value *V, int d) -> bool {
+    V = V->stripPointerCasts();
+    if (const auto *CB = dyn_cast<CallBase>(V))
+      if (const Function *C = CB->getCalledFunction())
+        return Ctx->AllocFuncs.count(const_cast<Function *>(C)) > 0 || wrapperSet.count(C) > 0;
+    if (d > 4) return false;
+    if (const auto *P = dyn_cast<PHINode>(V)) {
+      bool any = false;
+      for (const Value *In : P->incoming_values())
+        if (!isa<ConstantPointerNull>(In)) { if (!fromAlloc(In, d + 1)) return false; any = true; }
+      return any;
+    }
+    return false;
+  };
+  // The values a value can be: through casts, phis, constant GEPs (for a
+  // base) and, at -O0, loads of a non-escaping local slot (its stores).
+  std::function<void(const Value *, int, std::vector<const Value *> &)> defs =
+      [&](const Value *V, int d, std::vector<const Value *> &out) {
+        V = V->stripPointerCasts();
+        if (d > 6) { out.push_back(V); return; }
+        if (const auto *P = dyn_cast<PHINode>(V)) {
+          for (const Value *In : P->incoming_values()) defs(In, d + 1, out);
+          return;
+        }
+        if (const auto *L = dyn_cast<LoadInst>(V))
+          if (const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+            std::vector<const Value *> stored;
+            bool ok = true;
+            for (const User *U : S->users()) {
+              if (isa<LoadInst>(U)) continue;
+              const auto *SI = dyn_cast<StoreInst>(U);
+              if (!SI || SI->getPointerOperand() != S) { ok = false; break; }
+              stored.push_back(SI->getValueOperand());
+            }
+            if (ok) {
+              for (const Value *X : stored) defs(X, d + 1, out);
+              return;
+            }
+          }
+        out.push_back(V);
+      };
+  // A block base: an allocator result, a load (a free list or a header
+  // field), through constant GEPs (past a header).
+  auto blockBase = [&](const Value *B) {
+    std::vector<const Value *> ds;
+    defs(B, 0, ds);
+    for (const Value *X : ds) {
+      while (const auto *G = dyn_cast<GEPOperator>(X)) {
+        if (!G->hasAllConstantIndices()) break;
+        X = G->getPointerOperand()->stripPointerCasts();
+      }
+      std::vector<const Value *> d2;
+      defs(X, 0, d2);
+      for (const Value *Y : d2)
+        if (isa<LoadInst>(Y) || fromAlloc(Y, 0)) return true;
+    }
+    return false;
+  };
+  auto isVoidPtrDI = [](const DIType *T) {
+    const auto *D = dyn_cast_or_null<DIDerivedType>(T);
+    return D && D->getTag() == dwarf::DW_TAG_pointer_type && !D->getBaseType();
+  };
+  // Wrappers to a fixpoint: every non-null return is an allocation result,
+  // or a constant offset past one (a header before the payload).
+  for (bool grew = true; grew;) {
+    grew = false;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (F.isDeclaration() || !F.getReturnType()->isPointerTy() || wrapperSet.count(&F) ||
+            Ctx->AllocFuncs.count(&F))
+          continue;
+        bool anyRet = false, all = true;
+        for (const BasicBlock &BB : F)
+          if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            if (const Value *RV = RI->getReturnValue()) {
+              std::vector<const Value *> ds;
+              defs(RV, 0, ds);
+              for (const Value *X : ds) {
+                if (isa<ConstantPointerNull>(X)) continue;
+                anyRet = true;
+                while (const auto *G = dyn_cast<GEPOperator>(X)) {
+                  if (!G->hasAllConstantIndices()) break;
+                  X = G->getPointerOperand()->stripPointerCasts();
+                }
+                std::vector<const Value *> d2;
+                defs(X, 0, d2);
+                for (const Value *Y : d2) all &= fromAlloc(Y, 0);
+              }
+            }
+        if (anyRet && all) { wrapperSet.insert(&F); grew = true; }
+      }
+  }
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M) {
+      if (F.isDeclaration()) continue;
+      if (F.isVarArg()) varargs.add(F.getName().str(), summarized(&F));
+      if (wrapperSet.count(&F)) wrappers.add(F.getName().str(), summarized(&F));
+      // Wrappers and pools: by what F returns.
+      if (F.getReturnType()->isPointerTy()) {
+        bool anyRet = false, allAlloc = true, interior = false;
+        for (const BasicBlock &BB : F)
+          if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+            if (const Value *RV = RI->getReturnValue()) {
+              std::vector<const Value *> ds;
+              defs(RV, 0, ds);
+              for (const Value *X : ds) {
+                if (isa<ConstantPointerNull>(X)) continue;
+                anyRet = true;
+                allAlloc &= fromAlloc(X, 0);
+                if (const auto *G = dyn_cast<GEPOperator>(X))
+                  if (!G->hasAllConstantIndices() && blockBase(G->getPointerOperand()))
+                    interior = true;
+              }
+            }
+        const bool alloc = Ctx->AllocFuncs.count(&F) > 0;
+        (void)allAlloc;
+        if (anyRet && interior) pools.add(F.getName().str(), summarized(&F) || alloc);
+      }
+      // Generic containers: a void* formal stored into a field reached
+      // from another formal.
+      if (const DISubprogram *SP = F.getSubprogram())
+        if (const DISubroutineType *ST = SP->getType()) {
+          auto types = ST->getTypeArray();
+          for (Instruction &I : instructions(F)) {
+            const auto *SI = dyn_cast<StoreInst>(&I);
+            if (!SI) continue;
+            const auto *A = dyn_cast<Argument>(SI->getValueOperand()->stripPointerCasts());
+            if (!A || A->getArgNo() + 1 >= types.size() || !isVoidPtrDI(types[A->getArgNo() + 1]))
+              continue;
+            const Value *P = SI->getPointerOperand()->stripPointerCasts();
+            if (const auto *G = dyn_cast<GEPOperator>(P)) P = G->getPointerOperand()->stripPointerCasts();
+            if (const auto *L = dyn_cast<LoadInst>(P)) P = L->getPointerOperand()->stripPointerCasts();
+            if (isa<Argument>(P) || isa<LoadInst>(P)) {
+              containers.add(F.getName().str() + " arg" + std::to_string(A->getArgNo()), summarized(&F));
+              break;
+            }
+          }
+        }
+      for (Instruction &I : instructions(F)) {
+        if (const auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB->isInlineAsm()) continue;
+          if (!CB->getCalledFunction() &&
+              !isa<Function>(CB->getCalledOperand()->stripPointerCasts())) {
+            std::vector<std::pair<const Value *, const Value *>> path;
+            const int k = dispatchReceiver(CB, &path);
+            if (k < 0) fptrCalls.add(loc(&I), false);
+            else if (path.size() == 1) method1.add(loc(&I), true);
+            else methodN.add(loc(&I), true);
+            continue;
+          }
+          if (const Function *C = CB->getCalledFunction())
+            if ((C->getName().starts_with("llvm.memcpy") || C->getName().starts_with("llvm.memmove") ||
+                 C->getName() == "memcpy" || C->getName() == "memmove") && CB->arg_size() >= 2) {
+              auto structy = [&](const Value *V) {
+                V = V->stripPointerCasts();
+                if (const auto *AI = dyn_cast<AllocaInst>(V)) return AI->getAllocatedType()->isStructTy();
+                if (const auto *G = dyn_cast<GEPOperator>(V)) return G->getResultElementType()->isStructTy() ||
+                                                                   G->getSourceElementType()->isStructTy();
+                if (const auto *GV = dyn_cast<GlobalVariable>(V)) return GV->getValueType()->isStructTy();
+                return false;
+              };
+              if (structy(CB->getArgOperand(0)) != structy(CB->getArgOperand(1)))
+                byteCopies.add(loc(&I), false);
+            }
+        }
+        if (const auto *C = dyn_cast<ICmpInst>(&I))
+          if (C->isEquality())
+            for (unsigned i = 0; i < 2; i++)
+              if (isa<Function>(C->getOperand(i)->stripPointerCasts()) &&
+                  isa<LoadInst>(C->getOperand(1 - i)->stripPointerCasts())) {
+                idTests.add(loc(&I), true);
+                break;
+              }
+      }
+    }
+    // Unions with a pointer member (debug info).
+    DebugInfoFinder DIF;
+    DIF.processModule(*M);
+    std::set<std::string> seenU;
+    for (const DIType *T : DIF.types()) {
+      const auto *CT = dyn_cast<DICompositeType>(T);
+      if (!CT || CT->getTag() != dwarf::DW_TAG_union_type) continue;
+      unsigned ptrs = 0;
+      for (const DINode *E : CT->getElements())
+        if (const auto *Mb = dyn_cast<DIDerivedType>(E))
+          if (const auto *B = dyn_cast_or_null<DIDerivedType>(Mb->getBaseType()))
+            ptrs += B->getTag() == dwarf::DW_TAG_pointer_type;
+      if (!ptrs) continue;
+      const std::string nm = CT->getName().empty()
+                                 ? ("anonymous at " + CT->getFilename().str() + ":" + std::to_string(CT->getLine()))
+                                 : CT->getName().str();
+      if (seenU.insert(nm).second) unions.add(nm + " (" + std::to_string(ptrs) + " pointer members)", false);
+    }
+    (void)DL;
+  }
+  errs() << "CONSTRUCT CENSUS (counts before the solve; 'covered' = a summary or the engine handles it)\n";
+  for (Kind *K : {&wrappers, &pools, &containers, &method1, &methodN, &fptrCalls, &idTests, &unions,
+                  &varargs, &byteCopies}) {
+    errs() << "  " << K->name << ": " << K->n << " (" << K->covered << " covered)\n";
+    for (const std::string &e : K->ex) errs() << "      " << e << "\n";
+  }
+  errs() << "  carves (one past an array, used as another type): counted per solve as "
+            "'carved regions' in the cell report\n";
 }

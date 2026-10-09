@@ -635,6 +635,11 @@ bool CallGraphPass::runCellResolution() {
                WhyKind kind = W_OTHER; uint32_t t = 0; };
   uint32_t whyClock = 0; // pops, for the order of first arrivals
   const bool recordWhy = !CFLCellWhy.empty();
+  // Causes are tracked (curWhy) for --cfl-cell-why and the soup profiler;
+  // only --cfl-cell-why records them per fact.
+  const bool trackWhy = recordWhy || CFLCellSoupProfile;
+  std::function<void(uint32_t, uint32_t)> soupArrive; // set once cells exist
+  bool soupStop = false;
   const bool whyStopAtAny = StringRef(CFLCellWhy).starts_with("any:");
   bool whyAnyArrived = false;
   std::function<bool(uint32_t)> whyIsAny = [](uint32_t) { return false; }; // set once cells exist
@@ -656,6 +661,7 @@ bool CallGraphPass::runCellResolution() {
       return;
     }
     if (pts[n].set(f)) {
+      if (soupArrive) soupArrive(n, f);
       if (recordWhy && whyWanted(f)) {
         Why w = curWhy;
         w.t = whyClock;
@@ -674,13 +680,13 @@ bool CallGraphPass::runCellResolution() {
     b = find(b);
     if (a == b || !edgeSet.insert((uint64_t)a << 32 | b).second) return;
     succ[a].push_back(b);
-    if (!recordWhy) {
+    if (!trackWhy) {
       pts[a].forEach([&](uint32_t f) { add(b, f); });
       return;
     }
     // A byte copy's content edges are not recorded (a copy makes millions
     // of edges); the chain names them "static copy or byte copy".
-    if (curWhy.kind != W_COPY) edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy);
+    if (recordWhy && curWhy.kind != W_COPY) edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy);
     const Why saved = curWhy;
     pts[a].forEach([&](uint32_t f) {
       curWhy = {a, f, UINT32_MAX, W_EDGE};
@@ -1954,7 +1960,7 @@ bool CallGraphPass::runCellResolution() {
       const NodeIndex fv = NF.getValueNodeFor(Fn->getArg(R.k));
       if (fv == AndersNodeFactory::InvalidIndex) continue;
       const uint32_t formal = find(canon(fv));
-      if (recordWhy) curWhy = {R.base, K.f, F, W_DISPATCH};
+      if (trackWhy) curWhy = {R.base, K.f, F, W_DISPATCH};
       if (K.f == UINT32_MAX) addEdge(R.base, formal);
       else add(formal, K.f);
     }
@@ -3152,7 +3158,7 @@ bool CallGraphPass::runCellResolution() {
     const std::vector<Member> ms = memb[fs], md = memb[fd];
     curCopyDst = find(copies[ci].dst);
     curCopySrcFact = fs;
-    if (recordWhy) curWhy = {ci, fs, fd, W_COPY};
+    if (trackWhy) curWhy = {ci, fs, fd, W_COPY};
     for (auto [os, ea] : ms)
       for (auto [od, eb] : md)
         copyRegion(os, decOff(ea), od, decOff(eb), copies[ci].len, copies[ci].at);
@@ -3177,6 +3183,69 @@ bool CallGraphPass::runCellResolution() {
       }
     }
   };
+  // ---- The soup profiler (--cfl-cell-soup-profile, plan 3.34) ----
+  // A fact landing on a node where its name is incompatible with the
+  // node's first (labeled) name is FOREIGN there. It inherits the entry of
+  // the fact it came from (the cause the solver is propagating: an edge's
+  // source, a step's base, a dispatch's receiver) when that was foreign
+  // already; otherwise this node is the join where the incompatible name
+  // entered, and becomes the entry. Mass = foreign facts per entry.
+  struct SoupEntry {
+    uint32_t node;
+    size_t born = 0, mass = 0;
+    std::vector<std::pair<uint32_t, size_t>> srcs; // entering source node, count
+  };
+  std::vector<SoupEntry> soupEntries;
+  boost::unordered_flat_map<uint32_t, uint32_t> soupEntryAt;  // join node -> entry
+  boost::unordered_flat_map<uint64_t, uint32_t> soupForeign;  // (node, fact) -> entry
+  std::vector<uint32_t> soupAnchor;
+  if (CFLCellSoupProfile)
+    soupArrive = [&](uint32_t n, uint32_t f) {
+      if (soupStop) return;
+      f = findFact(f);
+      const Cell &C = cells[f];
+      if (C.kind != CellKind::Off) return;
+      bool unknown = true;
+      for (auto [o, e] : memb[f]) unknown &= !objs[o].layout && !objs[o].bytes;
+      if (unknown) return; // no name yet
+      if (n >= soupAnchor.size()) soupAnchor.resize(numNodes + 1024, UINT32_MAX);
+      if (soupAnchor[n] == UINT32_MAX) { soupAnchor[n] = f; return; }
+      const uint32_t a = findFact(soupAnchor[n]);
+      if (a == f) return;
+      int compat;
+      {
+        const uint64_t key = (uint64_t)a << 32 | f;
+        auto cit = compatMemo.find(key);
+        if (cit != compatMemo.end()) compat = cit->second;
+        else compatMemo.emplace(key, compat = namesCompatible(a, f));
+      }
+      if (compat != 0) return;
+      uint32_t entry = UINT32_MAX;
+      const Why w = curWhy;
+      const bool hasSrc = w.node < numNodes && w.fact < cells.size() &&
+                          (w.kind == W_EDGE || w.kind == W_STEP || w.kind == W_WALK ||
+                           w.kind == W_ANY || w.kind == W_DISPATCH);
+      if (hasSrc) {
+        auto it = soupForeign.find((uint64_t)find(w.node) << 32 | findFact(w.fact));
+        if (it != soupForeign.end()) entry = it->second;
+      }
+      if (entry == UINT32_MAX) {
+        auto [it, ins] = soupEntryAt.try_emplace(n, (uint32_t)soupEntries.size());
+        if (ins) soupEntries.push_back({n});
+        entry = it->second;
+        SoupEntry &E = soupEntries[entry];
+        E.born++;
+        const uint32_t src = hasSrc ? find(w.node) : UINT32_MAX;
+        bool found = false;
+        for (auto &[sn, c] : E.srcs)
+          if (sn == src) { c++; found = true; break; }
+        if (!found && E.srcs.size() < 16) E.srcs.push_back({src, 1});
+      }
+      soupForeign.emplace((uint64_t)n << 32 | f, entry);
+      soupEntries[entry].mass++;
+      if (soupForeign.size() >= CFLCellSoupCap) soupStop = true;
+    };
+
   // ---- The icall cone (--cfl-cell-one-label) ----
   // Nodes whose facts can reach an indirect call's callee operand, on the
   // current graph: backward over copy edges, field steps (the base
@@ -3337,6 +3406,17 @@ bool CallGraphPass::runCellResolution() {
     worklist.pop_back();
     inWL[n] = 0;
     if (find(n) != n) continue; // merged: its facts moved to the rep
+    if (CFLCellSoupProfile && CFLCellSoupTime && (pops & 0xfff) == 0 &&
+        std::chrono::duration<double>(Clock::now() - tSolve).count() > CFLCellSoupTime) {
+      errs() << "Cells: --cfl-cell-soup-time reached; ";
+      soupStop = true;
+    }
+    if (soupStop) {
+      errs() << "Cells: --cfl-cell-soup-profile stopping at " << soupForeign.size()
+             << " foreign facts (measurement only, no answers)\n";
+      stoppedAt = pops;
+      break;
+    }
     if (whyAnyArrived) {
       errs() << "Cells: --cfl-cell-why any: the queried any-offset cell arrived; "
              << "stopping (measurement only, no answers)\n";
@@ -3395,7 +3475,7 @@ bool CallGraphPass::runCellResolution() {
       if (rit != recvAt.end())
         for (uint32_t si : std::vector<uint32_t>(rit->second))
           for (uint32_t f : delta) {
-            if (recordWhy) curWhy = {n, f, UINT32_MAX, W_DISPATCH};
+            if (trackWhy) curWhy = {n, f, UINT32_MAX, W_DISPATCH};
             bindReceiver(si, f);
           }
     }
@@ -3450,7 +3530,7 @@ bool CallGraphPass::runCellResolution() {
     {
       for (uint32_t h : hubsOf[n])
         for (uint32_t f : delta) {
-          if (recordWhy) curWhy = {n, f, UINT32_MAX, W_HUB};
+          if (trackWhy) curWhy = {n, f, UINT32_MAX, W_HUB};
           linkHub(h, f);
         }
       curStepNode = n;
@@ -3458,7 +3538,7 @@ bool CallGraphPass::runCellResolution() {
       for (size_t ei = 0; ei < fieldOut[n].size(); ei++) {
         const FieldEdge e = fieldOut[n][ei];
         for (uint32_t f : delta) {
-          if (recordWhy) curWhy = {n, f, UINT32_MAX, e.walk ? W_WALK : W_STEP};
+          if (trackWhy) curWhy = {n, f, UINT32_MAX, e.walk ? W_WALK : W_STEP};
           if (e.walk) applyWalk(f, e);
           else applyStep(f, e.li, e.dst);
         }
@@ -3466,7 +3546,7 @@ bool CallGraphPass::runCellResolution() {
       if (anyLoop[n])
         for (uint32_t f : delta) {
           const CellKind k = cells[f].kind;
-          if (recordWhy) curWhy = {n, f, UINT32_MAX, W_ANY};
+          if (trackWhy) curWhy = {n, f, UINT32_MAX, W_ANY};
           if (k == CellKind::Off || k == CellKind::Out)
             toAny(f, n);
         }
@@ -3474,7 +3554,7 @@ bool CallGraphPass::runCellResolution() {
     if (!copiesAt[n].empty()) applyCopies(n, delta);
     for (uint32_t m : succ[n])
       for (uint32_t f : delta) {
-        if (recordWhy) curWhy = {n, f, UINT32_MAX, W_EDGE};
+        if (trackWhy) curWhy = {n, f, UINT32_MAX, W_EDGE};
         add(m, f);
       }
     curWhy = Why();
@@ -3645,6 +3725,102 @@ bool CallGraphPass::runCellResolution() {
       explainWhy2(pointers[i].first, w.substr(0, w.find(" [")), depth + 1);
     }
   };
+  if (CFLCellSoupProfile) {
+    // Construct class of a join node, from its description.
+    auto classOf = [&](uint32_t n) -> std::string {
+      const std::string d = nodeDesc(n);
+      if (d.rfind("return of ", 0) == 0) return "return of a function";
+      if (d.rfind("cell ", 0) == 0) return "struct field / object cell";
+      if (d.rfind("hub of", 0) == 0) return "load/store through a pointer (hub)";
+      if (d.rfind("<stores through", 0) == 0) return "store collector";
+      if (d.find(" arg") != std::string::npos && d.find(':') == std::string::npos)
+        return "formal of a function";
+      if (d.find("= phi") != std::string::npos || d.find("= select") != std::string::npos)
+        return "join (phi/select)";
+      if (d.find("= load") != std::string::npos) return "load";
+      if (d.find("call ") != std::string::npos) return "call result";
+      if (d.find("getelementptr") != std::string::npos) return "address step (GEP)";
+      return "other";
+    };
+    size_t total = 0;
+    for (const SoupEntry &E : soupEntries) total += E.mass;
+    CG_LOG("Cells: SOUP PROFILE: " << total << " foreign facts, " << soupEntries.size()
+           << " entries (joins where an incompatible name entered)"
+           << (soupStop ? " [stopped at the cap]" : "") << "\n");
+    std::map<std::string, std::pair<size_t, size_t>> byClass; // mass, entries
+    for (const SoupEntry &E : soupEntries) {
+      auto &c = byClass[classOf(E.node)];
+      c.first += E.mass;
+      c.second++;
+    }
+    std::vector<std::pair<size_t, std::string>> cls;
+    for (auto &[k, v] : byClass) cls.push_back({v.first, k + " (" + std::to_string(v.second) + " entries)"});
+    std::sort(cls.rbegin(), cls.rend());
+    for (auto &[m, k] : cls)
+      CG_LOG("Cells:   SOUP class " << k << ": " << m << " ("
+             << (total ? 100.0 * m / total : 0.0) << "%)\n");
+    // The construct by its owner: the function the join is in (hub, load,
+    // phi, formal, return) or the allocation site of the cell's object.
+    auto ownerOf = [&](uint32_t n) -> std::string {
+      const std::string d = nodeDesc(n);
+      size_t p;
+      if (d.rfind("cell ", 0) == 0 && (p = d.find(" of ")) != std::string::npos) {
+        const std::string o = d.substr(p + 4);
+        return "object " + o.substr(0, o.find(" ["));
+      }
+      if (d.rfind("hub of", 0) == 0 && (p = d.rfind('(')) != std::string::npos)
+        return "function " + d.substr(p + 1, d.size() - p - 2);
+      if (d.rfind("return of ", 0) == 0) return "function " + d.substr(10);
+      if ((p = d.find(':')) != std::string::npos) return "function " + d.substr(0, p);
+      if ((p = d.find(" arg")) != std::string::npos) return "function " + d.substr(0, p);
+      return d.substr(0, 60);
+    };
+    std::map<std::string, size_t> byOwner;
+    for (const SoupEntry &E : soupEntries) byOwner[ownerOf(E.node)] += E.mass;
+    std::vector<std::pair<size_t, std::string>> own;
+    for (auto &[k, m] : byOwner) own.push_back({m, k});
+    std::sort(own.rbegin(), own.rend());
+    for (size_t i = 0; i < own.size() && i < 20; i++)
+      CG_LOG("Cells:   SOUP construct " << own[i].second << ": " << own[i].first << " ("
+             << (total ? 100.0 * own[i].first / total : 0.0) << "%)\n");
+    std::vector<uint32_t> order(soupEntries.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+      return soupEntries[x].mass > soupEntries[y].mass;
+    });
+    for (size_t i = 0; i < order.size() && i < 40; i++) {
+      const SoupEntry &E = soupEntries[order[i]];
+      CG_LOG("Cells:   SOUP #" << i + 1 << " mass " << E.mass << " ("
+             << (total ? 100.0 * E.mass / total : 0.0) << "%), born " << E.born << ", "
+             << classOf(E.node) << ": " << nodeDesc(E.node) << "\n");
+      std::vector<std::pair<uint32_t, size_t>> sr = E.srcs;
+      std::sort(sr.begin(), sr.end(), [](auto &x, auto &y) { return x.second > y.second; });
+      for (size_t j = 0; j < sr.size() && j < 3; j++)
+        CG_LOG("Cells:       entered from " << (sr[j].first < numNodes ? nodeDesc(sr[j].first) : std::string("(no source)"))
+               << " x" << sr[j].second << "\n");
+    }
+    // Width per formal and per struct field (distinct names held).
+    std::vector<std::pair<size_t, uint32_t>> formals, fields;
+    for (uint32_t n = 0; n < numNodes; n++) {
+      if (find(n) != n || pts[n].count() < 2) continue;
+      boost::unordered_flat_set<uint32_t> names;
+      pts[n].forEach([&](uint32_t f) {
+        f = findFact(f);
+        if (cells[f].kind == CellKind::Off) names.insert(cells[f].name);
+      });
+      if (names.size() < 2) continue;
+      const std::string d = nodeDesc(n);
+      if (d.rfind("cell ", 0) == 0) fields.push_back({names.size(), n});
+      else if (d.find(" arg") != std::string::npos && d.find(':') == std::string::npos)
+        formals.push_back({names.size(), n});
+    }
+    std::sort(formals.rbegin(), formals.rend());
+    std::sort(fields.rbegin(), fields.rend());
+    for (size_t i = 0; i < formals.size() && i < 25; i++)
+      CG_LOG("Cells:   WIDTH formal " << formals[i].first << " names: " << nodeDesc(formals[i].second) << "\n");
+    for (size_t i = 0; i < fields.size() && i < 25; i++)
+      CG_LOG("Cells:   WIDTH field " << fields[i].first << " names: " << nodeDesc(fields[i].second) << "\n");
+  }
   {
     std::vector<uint32_t> order;
     for (uint32_t ci = 0; ci < copyStat.size(); ci++)

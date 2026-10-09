@@ -133,6 +133,10 @@ extern cl::opt<std::string> CFLCellCensusFormal;
 extern cl::opt<std::string> CFLCellTraceObj;
 extern cl::opt<std::string> CFLCellWhy;
 extern cl::opt<bool> CFLCellReceivers;
+extern cl::opt<bool> CFLCellSoupProfile;
+extern cl::opt<bool> CFLConstructCensus;
+extern cl::opt<unsigned> CFLCellSoupCap;
+extern cl::opt<unsigned> CFLCellSoupTime;
 // Field edges carry exact byte-offset labels (lazyFEdges) instead of
 // residue relays: the lazy-address solver and the cell solver.
 inline bool exactFieldLabels() { return CFLLazyAddress || CFLCells; }

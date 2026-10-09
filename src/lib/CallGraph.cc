@@ -805,6 +805,7 @@ bool CallGraphPass::solve() {
   if (!CFLDumpAGraph.empty() && iteration == 0)
     dumpRawGraph(CFLDumpAGraph); // before presolve: raw value nodes
   if (CFLCells) { // no presolve: cells are never unified
+    if (CFLConstructCensus && iteration == 0) runConstructCensus();
     bool again = runCellResolution();
     iteration++;
     return again;

@@ -1174,6 +1174,41 @@ cl::opt<bool> CFLCellReceivers(
            "non-escaping slot with no store between them"),
   cl::init(true));
 
+cl::opt<bool> CFLConstructCensus(
+  "cfl-construct-census",
+  cl::desc("MEASUREMENT ONLY (plan 3.34 instrument 2): before the first "
+           "solve, count the constructs that made soups so far, with "
+           "examples and whether a summary covers them: allocator wrappers "
+           "and pool allocators without a summary, generic containers "
+           "(void* parameter stored into a field), method calls by path "
+           "length, method-identity tests, unions with pointer members, "
+           "varargs functions, struct copies through byte buffers"),
+  cl::init(false));
+
+cl::opt<bool> CFLCellSoupProfile(
+  "cfl-cell-soup-profile",
+  cl::desc("--cfl-cells instrument (plan 3.34): never stops; every fact "
+           "landing on a node where its name is incompatible with the "
+           "node's first name is foreign, and inherits the ENTRY of the "
+           "fact it came from or, at the first such join, makes this node "
+           "its entry. Reports entries and construct classes ranked by "
+           "the foreign facts they explain, the hubs, and width per formal "
+           "and per struct field"),
+  cl::init(false));
+
+cl::opt<unsigned> CFLCellSoupCap(
+  "cfl-cell-soup-cap",
+  cl::desc("--cfl-cell-soup-profile: stop (report, no answers) after this "
+           "many foreign facts"),
+  cl::init(20000000));
+
+cl::opt<unsigned> CFLCellSoupTime(
+  "cfl-cell-soup-time",
+  cl::desc("--cfl-cell-soup-profile: stop (report, no answers) after this "
+           "many seconds of propagation in one iteration (0: no limit); the "
+           "report then includes the byte-copy cost table"),
+  cl::init(0));
+
 cl::opt<std::string> CFLCellWhy(
   "cfl-cell-why",
   cl::desc("--cfl-cells instrument: record the first cause of every fact "

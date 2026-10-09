@@ -4440,6 +4440,11 @@ bool CallGraphPass::runCellResolution() {
          << " GEPs of data pointers (character traffic: no edges, no cells); " << g_carves
          << " carved regions (one past an array, used as another type; see CARVE lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
+  if (!varargAllKeys.empty())
+    CG_LOG("Cells: varargs keyed by format specifier (plan 3.47): " << varargKeyedSites
+           << " call sites with a constant format, " << varargPoolSites
+           << " with a non-constant format (unkeyed: every key), " << varargUnparsed
+           << " whose specifiers do not match their arguments (unkeyed)\n");
   CG_LOG("Cells: " << factMerges << " cells unified by name ("
          << retiredDropped << " retired ids dropped from sets), "
          << ptrMerges << " pointer nodes merged by equal sets\n");

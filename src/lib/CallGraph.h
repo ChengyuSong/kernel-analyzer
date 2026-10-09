@@ -461,6 +461,20 @@ protected:
   std::unordered_set<const llvm::Function *> varargSinkRenderers, varargSinkWrappers;
   std::unordered_set<const llvm::Value *> varargSinkReads; // data-only va_arg reads
   void computeVarargSinks();
+  // Varargs keyed by format specifier (plan 3.47): a printf-style list is
+  // a tagged sequence whose tag is the specifier. The format parameter of
+  // each function whose format reaches a mapped renderer; the keys a
+  // renderer's va_arg read reads ("va#c": the specifiers whose cases
+  // dominate it); all keys of the mapped renderers.
+  std::map<const llvm::Function *, unsigned> varargFmtParam;
+  std::map<const llvm::Value *, std::vector<std::string>> varargReadKeys;
+  std::set<std::string> varargAllKeys;
+  std::map<std::pair<const llvm::Function *, std::string>, NodeIndex> varargKeyNodes;
+  NodeIndex varargKeyNode(const llvm::Function *F, const std::string &key);
+  bool varargKeysAt(const llvm::CallBase *CS, const llvm::Function *CF,
+                    std::vector<std::string> &keys);
+  size_t varargKeyedSites = 0, varargPoolSites = 0, varargUnparsed = 0;
+  void computeVarargKeys();
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

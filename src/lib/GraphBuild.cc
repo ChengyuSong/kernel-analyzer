@@ -15,6 +15,7 @@
 #include "CallGraphInternal.h"
 
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/IR/Dominators.h>
 
 namespace {
 
@@ -1064,12 +1065,16 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
       printfSinkCallsites++;
       printfSinkArgsSkipped += numArgs - numFormals;
     } else {
-      NodeIndex varargNode = NF.getVarargNodeFor(CF);
-      if (varargNode == AndersNodeFactory::InvalidIndex)
-        varargNode = NF.createVarargNode(CF);
-      varargNode = getCanonicalNode(varargNode);
+      NodeIndex poolNode = NF.getVarargNodeFor(CF);
+      if (poolNode == AndersNodeFactory::InvalidIndex)
+        poolNode = NF.createVarargNode(CF);
+      poolNode = getCanonicalNode(poolNode);
+      // A constant format keys each argument by its specifier (plan 3.47).
+      std::vector<std::string> keys;
+      const bool keyed = varargKeysAt(CS, CF, keys);
       for (unsigned i = numFormals; i < numArgs; i++) {
         Value *arg = CS->getArgOperand(i);
+        const NodeIndex varargNode = keyed ? varargKeyNode(CF, keys[i - numFormals]) : poolNode;
         if (!containsPointerType(arg->getType())) {
           // Laundered ints ride varargs too (non-benign-fmt callsites
           // only; printf sinks are intercepted above). Same witness
@@ -1203,10 +1208,13 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
   // Remove variadic-tail edges
   if (CF->isVarArg() && !varargSinkWrappers.count(CF) && !varargSinkRenderers.count(CF) &&
       !(CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF))) {
-    NodeIndex varargNode = getCanonicalNode(NF.getVarargNodeFor(CF));
-    assert(varargNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
+    const NodeIndex poolNode = getCanonicalNode(NF.getVarargNodeFor(CF));
+    assert(poolNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
+    std::vector<std::string> keys;
+    const bool keyed = varargKeysAt(CS, CF, keys);
     for (unsigned i = numFormals; i < numArgs; i++) {
       Value *arg = CS->getArgOperand(i);
+      const NodeIndex varargNode = keyed ? varargKeyNode(CF, keys[i - numFormals]) : poolNode;
       if (!containsPointerType(arg->getType())) {
         bool declined = false;
         if (curDL && isPtrWidthInt(arg->getType(), *curDL) && !CF->empty() &&
@@ -3497,11 +3505,17 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   const bool vaSink = CGP.varargSinkReads.count(&I) > 0;
   // Frontends often lower va_arg to __va_list_tag memory accesses (no VAArgInst).
   // Connect such pointer loads to the function's vararg summary node.
+  // A read the renderer's dispatch keys (plan 3.47) reads its keys only.
+  const auto vk = vaSink ? CGP.varargReadKeys.end() : CGP.varargReadKeys.find(&I);
+  const bool vaKeyed = vk != CGP.varargReadKeys.end();
   if (Function *F = I.getFunction(); F && !vaSink) {
     NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
     if (varargNode != AndersNodeFactory::InvalidIndex &&
         derivesFromLoweredVAList(ptr)) {
-      CGP.addAssignmentEdge(varargNode, valNode);
+      CGP.addAssignmentEdge(varargNode, valNode); // the unkeyed arguments
+      if (vaKeyed)
+        for (const std::string &k : vk->second)
+          CGP.addAssignmentEdge(CGP.varargKeyNode(F, k), valNode);
       CG_DEBUG("LoweredVAArg: " << F->getName() << ": vararg node " << varargNode
                << " -> val node " << valNode << " for " << I << "\n");
     }
@@ -3511,8 +3525,13 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // lowered va_arg reads.
   if (const Value *Base = vaSink ? nullptr : vaListBase(ptr)) {
     NodeIndex baseNode = CGP.getRepNodeForValue(Base);
-    if (baseNode != AndersNodeFactory::InvalidIndex)
-      CGP.addAssignmentEdge(CGP.getRepDerefNode(baseNode), valNode);
+    if (baseNode != AndersNodeFactory::InvalidIndex) {
+      if (vaKeyed)
+        for (const std::string &k : vk->second)
+          CGP.addAssignmentEdge(CGP.keyedDeref(baseNode, k), valNode);
+      else
+        CGP.addAssignmentEdge(CGP.getRepDerefNode(baseNode), valNode);
+    }
   }
 
   NodeIndex slotRep;
@@ -4901,6 +4920,10 @@ void CallGraphPass::InstHandler::visitVAStartInst(VAStartInst &I) {
   CellWriteSize ws(CGP, 0);
   CGP.addAssignmentEdge(CGP.getCanonicalNode(varargNode),
                         CGP.getRepDerefNode(listNode));
+  // Keyed arguments go to their keys of the va_list object (plan 3.47).
+  if (CGP.varargFmtParam.count(F))
+    for (const std::string &k : CGP.varargAllKeys)
+      CGP.addAssignmentEdge(CGP.varargKeyNode(F, k), CGP.keyedDeref(listNode, k));
 }
 
 void CallGraphPass::InstHandler::visitVACopyInst(VACopyInst &I) {
@@ -4910,6 +4933,13 @@ void CallGraphPass::InstHandler::visitVACopyInst(VACopyInst &I) {
       src == AndersNodeFactory::InvalidIndex)
     return;
   CellWriteSize ws(CGP, 0);
+  if (!CGP.varargAllKeys.empty()) {
+    // Key by key (plan 3.47): a plain copy would read every key and
+    // write them all unkeyed.
+    for (const std::string &k : CGP.varargAllKeys)
+      CGP.addAssignmentEdge(CGP.keyedDeref(src, k), CGP.keyedDeref(dst, k));
+    return;
+  }
   CGP.addAssignmentEdge(CGP.getRepDerefNode(src), CGP.getRepDerefNode(dst));
 }
 
@@ -6216,7 +6246,7 @@ void CallGraphPass::globalDedupScanCallEdges(
       if (formalNode != AndersNodeFactory::InvalidIndex)
         globalUnion(argNode, formalNode);
     }
-    if (CF->isVarArg() &&
+    if (CF->isVarArg() && !(varargFmtParam.count(CF) && !varargAllKeys.empty()) &&
         !(CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF))) {
       NodeIndex varargNode = NF.getVarargNodeFor(CF);
       if (varargNode == AndersNodeFactory::InvalidIndex)
@@ -6866,3 +6896,387 @@ void CallGraphPass::computeVarargSinks() {
          << varargSinkWrappers.size() << " wrappers cut; " << familyArgs
          << " va pointers passed to the allocator family (sized or freed: premise)\n");
 }
+
+// ---- Varargs keyed by format specifier (plan 3.47) ----
+// A printf-style argument list is a tagged sequence: the constant format
+// at a call site constructs it (position -> specifier), and the
+// renderer's va_arg read under the case for specifier c checks the tag.
+// A call site with a constant format stores each vararg under key "va#c";
+// va_start relays the keys into the va_list object (a keyed slot, as a
+// union's); a read dominated by the cases of specifiers C reads keys C
+// (which include the unkeyed writes: non-constant formats). A read under
+// no case reads every key (the plain dereference).
+
+// The parameters of F that V may come from, through casts, GEPs, phis,
+// selects and O0 local slots (a value stored back from itself, the format
+// walk's ++fmt, adds nothing).
+static void paramsOf(const Function &F, const Value *V, std::set<unsigned> &out,
+                     std::set<const Value *> &seen, bool &other) {
+  V = V->stripPointerCasts();
+  if (!seen.insert(V).second) return;
+  if (const auto *A = dyn_cast<Argument>(V)) {
+    if (A->getParent() == &F) out.insert(A->getArgNo());
+    else other = true;
+    return;
+  }
+  if (const auto *G = dyn_cast<GEPOperator>(V)) return paramsOf(F, G->getPointerOperand(), out, seen, other);
+  if (const auto *PN = dyn_cast<PHINode>(V)) {
+    for (const Value *In : PN->incoming_values()) paramsOf(F, In, out, seen, other);
+    return;
+  }
+  if (const auto *SI = dyn_cast<SelectInst>(V)) {
+    paramsOf(F, SI->getTrueValue(), out, seen, other);
+    paramsOf(F, SI->getFalseValue(), out, seen, other);
+    return;
+  }
+  if (const auto *L = dyn_cast<LoadInst>(V))
+    if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+      for (const User *U : AI->users())
+        if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == AI)
+          paramsOf(F, S->getValueOperand(), out, seen, other);
+      return;
+    }
+  other = true;
+}
+static int paramOf(const Function &F, const Value *V) {
+  std::set<unsigned> out;
+  std::set<const Value *> seen;
+  bool other = false;
+  paramsOf(F, V, out, seen, other);
+  return !other && out.size() == 1 ? (int)*out.begin() : -1;
+}
+// The stores into a non-escaping O0 slot that reach load L: the nearest
+// store on each path back from L (no call can write the slot).
+static void reachingStores(const LoadInst *L, const AllocaInst *AI,
+                           std::vector<const StoreInst *> &out) {
+  std::vector<const BasicBlock *> work;
+  std::set<const BasicBlock *> seen;
+  auto scan = [&](const BasicBlock *BB, BasicBlock::const_reverse_iterator from) {
+    for (auto it = from; it != BB->rend(); ++it)
+      if (const auto *S = dyn_cast<StoreInst>(&*it); S && S->getPointerOperand() == AI) {
+        out.push_back(S);
+        return;
+      }
+    for (const BasicBlock *P : predecessors(BB))
+      if (seen.insert(P).second) work.push_back(P);
+  };
+  scan(L->getParent(), BasicBlock::const_reverse_iterator(L->getIterator()));
+  while (!work.empty()) {
+    const BasicBlock *BB = work.back();
+    work.pop_back();
+    scan(BB, BB->rbegin());
+  }
+}
+// A character read from the format: the parameter it is loaded through
+// (through extensions and O0 slots), or -1.
+static int charParam(const Function &F, const Value *V, int depth = 0) {
+  if (depth > 8) return -1;
+  while (const auto *C = dyn_cast<CastInst>(V)) V = C->getOperand(0);
+  const auto *L = dyn_cast<LoadInst>(V);
+  if (!L) return -1;
+  if (L->getType()->isIntegerTy(8)) return paramOf(F, L->getPointerOperand());
+  if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+    std::vector<const StoreInst *> rs;
+    reachingStores(L, AI, rs);
+    int p = -1;
+    for (const StoreInst *S : rs) {
+      const int q = charParam(F, S->getValueOperand(), depth + 1);
+      if (q < 0 || (p >= 0 && p != q)) return -1;
+      p = q;
+    }
+    return p;
+  }
+  return -1;
+}
+// The constant table field a value is loaded from: the table's rows and
+// the field index (gep @T, 0, idx, f / gep (row), 0, f), or null.
+static const ConstantArray *tableField(const Value *V, unsigned &field) {
+  while (const auto *C = dyn_cast<CastInst>(V)) V = C->getOperand(0);
+  const auto *L = dyn_cast<LoadInst>(V);
+  if (!L) return nullptr;
+  const auto *G = dyn_cast<GEPOperator>(L->getPointerOperand());
+  if (!G || !isa<StructType>(G->getSourceElementType()) || G->getNumIndices() != 2) return nullptr;
+  const auto *FI = dyn_cast<ConstantInt>(G->getOperand(2));
+  if (!FI) return nullptr;
+  field = (unsigned)FI->getZExtValue();
+  // The row pointer: an element of the table, through O0 slots.
+  std::function<const GlobalVariable *(const Value *, int)> tableOf =
+      [&](const Value *P, int d) -> const GlobalVariable * {
+    if (d > 6) return nullptr;
+    P = P->stripPointerCasts();
+    if (const auto *GV = dyn_cast<GlobalVariable>(P)) return GV;
+    if (const auto *G2 = dyn_cast<GEPOperator>(P)) return tableOf(G2->getPointerOperand(), d + 1);
+    if (const auto *L2 = dyn_cast<LoadInst>(P))
+      if (const auto *AI = dyn_cast<AllocaInst>(L2->getPointerOperand()->stripPointerCasts())) {
+        const GlobalVariable *T = nullptr;
+        for (const User *U : AI->users())
+          if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == AI) {
+            const GlobalVariable *T2 = tableOf(S->getValueOperand(), d + 1);
+            if (!T2 || (T && T != T2)) return nullptr;
+            T = T2;
+          }
+        return T;
+      }
+    return nullptr;
+  };
+  const GlobalVariable *T = tableOf(G->getPointerOperand(), 0);
+  if (!T || !T->isConstant() || !T->hasInitializer()) return nullptr;
+  return dyn_cast<ConstantArray>(T->getInitializer());
+}
+static int64_t rowField(const ConstantArray *T, unsigned row, unsigned field, bool &ok) {
+  const auto *R = dyn_cast<ConstantStruct>(T->getOperand(row));
+  const auto *V = R && field < R->getNumOperands() ? dyn_cast<ConstantInt>(R->getOperand(field)) : nullptr;
+  ok = V != nullptr;
+  return V ? V->getSExtValue() : 0;
+}
+static std::string vaKey(int64_t c) {
+  if (c > 32 && c < 127) return std::string("va#") + (char)c;
+  return "va#" + std::to_string(c);
+}
+
+void CallGraphPass::computeVarargKeys() {
+  varargFmtParam.clear();
+  varargReadKeys.clear();
+  varargAllKeys.clear();
+  if (!CFLCells || CFLUnionKeys != "tag") return;
+  size_t mapped = 0, keyedReads = 0, unkeyedReads = 0;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M) {
+      if (F.isDeclaration()) continue;
+      std::vector<const LoadInst *> reads;
+      for (Instruction &I : instructions(F))
+        if (const auto *L = dyn_cast<LoadInst>(&I)) {
+          const Value *A = L->getPointerOperand()->stripPointerCasts();
+          const auto *G = dyn_cast<GEPOperator>(A);
+          const bool machinery =
+              (G && isLoweredVAListType(G->getSourceElementType())) ||
+              (isa<AllocaInst>(A) && isLoweredVAListType(cast<AllocaInst>(A)->getAllocatedType()));
+          if (!machinery && L->getType()->isPointerTy() && !varargSinkReads.count(L) &&
+              (derivesFromLoweredVAList(L->getPointerOperand()) || vaListBase(L->getPointerOperand())))
+            reads.push_back(L);
+        }
+      if (reads.empty()) continue;
+      // The dispatch: a switch on the format character (direct), or on a
+      // field of a constant table row selected by comparing the character
+      // with another field (sqlite3's fmtinfo[].type by fmttype).
+      struct Dispatch {
+        const SwitchInst *SW;
+        bool direct;
+        std::map<int64_t, int64_t> charToCase; // empty with direct: identity
+      };
+      std::vector<Dispatch> dispatches;
+      int fmtParam = -1;
+      std::string why = "no switch on the format character";
+      for (Instruction &I : instructions(F)) {
+        const auto *S = dyn_cast<SwitchInst>(&I);
+        if (!S) continue;
+        int64_t dflt = INT64_MIN;
+        if (const int p = charParam(F, S->getCondition()); p >= 0) {
+          if (fmtParam >= 0 && fmtParam != p) continue;
+          fmtParam = p;
+          dispatches.push_back({S, true, {}});
+          continue;
+        }
+        // Table form: the switched value's sources (through an O0 slot or
+        // a phi) are constants (the default) and one table field.
+        const Value *C = S->getCondition();
+        while (const auto *CI = dyn_cast<CastInst>(C)) C = CI->getOperand(0);
+        std::vector<const Value *> srcs;
+        if (const auto *L = dyn_cast<LoadInst>(C)) {
+          if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+            std::vector<const StoreInst *> rs;
+            reachingStores(L, AI, rs);
+            for (const StoreInst *St : rs) srcs.push_back(St->getValueOperand());
+          }
+        } else if (const auto *PN = dyn_cast<PHINode>(C)) {
+          for (const Value *In : PN->incoming_values()) srcs.push_back(In);
+        }
+        const ConstantArray *T = nullptr;
+        unsigned ft = 0;
+        bool ok = !srcs.empty();
+        for (const Value *X : srcs) {
+          const Value *Y = X;
+          while (const auto *CI = dyn_cast<CastInst>(Y)) Y = CI->getOperand(0);
+          if (const auto *K = dyn_cast<ConstantInt>(Y)) {
+            if (dflt != INT64_MIN && dflt != K->getSExtValue()) ok = false;
+            dflt = K->getSExtValue(); // the value for characters not in the table
+            continue;
+          }
+          unsigned f2 = 0;
+          const ConstantArray *T2 = tableField(Y, f2);
+          if (!T2 || (T && (T != T2 || f2 != ft))) { ok = false; break; }
+          T = T2, ft = f2;
+        }
+        if (!ok || !T) continue;
+        // The key field: a table field compared for equality with a
+        // character of the format.
+        int fk = -1;
+        for (Instruction &J : instructions(F)) {
+          const auto *IC = dyn_cast<ICmpInst>(&J);
+          if (!IC || IC->getPredicate() != ICmpInst::ICMP_EQ) continue;
+          for (int side = 0; side < 2 && fk < 0; side++) {
+            unsigned f3 = 0;
+            const ConstantArray *T3 = tableField(IC->getOperand(side), f3);
+            if (T3 != T || f3 == ft) continue;
+            if (const int p = charParam(F, IC->getOperand(1 - side));
+                p >= 0 && (fmtParam < 0 || fmtParam == p)) {
+              fk = (int)f3;
+              fmtParam = p;
+            }
+          }
+          if (fk >= 0) break;
+        }
+        if (fk < 0) { why = "table switch without a key comparison"; continue; }
+        Dispatch D{S, false, {}};
+        for (unsigned r = 0; r < T->getNumOperands(); r++) {
+          bool ok1 = false, ok2 = false;
+          const int64_t key = rowField(T, r, (unsigned)fk, ok1), cs = rowField(T, r, ft, ok2);
+          if (ok1 && ok2) D.charToCase.emplace(key, cs); // the first row wins (the lookup breaks)
+        }
+        dispatches.push_back(std::move(D));
+      }
+      if (dispatches.empty() || fmtParam < 0) {
+        CG_LOG("VarargKeys: UNMAPPED " << F.getName() << " (" << reads.size()
+               << " va_arg pointer reads): " << why << "\n");
+        unkeyedReads += reads.size();
+        continue;
+      }
+      DominatorTree DT(F);
+      size_t k0 = 0;
+      size_t viaTable = 0;
+      // Per dispatch: the blocks each case reaches before the switch runs
+      // again, and the blocks its default reaches. A read under the
+      // switch (dominated by it) has the cases that reach it, unless the
+      // default reaches it too (then it is unkeyed).
+      struct Reach { std::map<const BasicBlock *, std::set<int64_t>> byCase; std::set<const BasicBlock *> dflt; };
+      std::vector<Reach> reach(dispatches.size());
+      for (size_t d = 0; d < dispatches.size(); d++) {
+        const SwitchInst *S = dispatches[d].SW;
+        auto bfs = [&](const BasicBlock *From, auto &&mark) {
+          std::vector<const BasicBlock *> work{From};
+          std::set<const BasicBlock *> seen{From};
+          while (!work.empty()) {
+            const BasicBlock *B = work.back();
+            work.pop_back();
+            mark(B);
+            for (const BasicBlock *N : successors(B))
+              if (N != S->getParent() && seen.insert(N).second) work.push_back(N);
+          }
+        };
+        for (auto C : S->cases()) {
+          const int64_t v = C.getCaseValue()->getSExtValue();
+          bfs(C.getCaseSuccessor(), [&](const BasicBlock *B) { reach[d].byCase[B].insert(v); });
+        }
+        bfs(S->getDefaultDest(), [&](const BasicBlock *B) { reach[d].dflt.insert(B); });
+      }
+      for (const LoadInst *L : reads) {
+        std::set<int64_t> cases;
+        const Dispatch *D = nullptr;
+        for (size_t d = 0; d < dispatches.size() && !D; d++) {
+          const BasicBlock *B = L->getParent();
+          if (!DT.dominates(dispatches[d].SW->getParent(), B) || reach[d].dflt.count(B)) continue;
+          auto it = reach[d].byCase.find(B);
+          if (it == reach[d].byCase.end()) continue;
+          cases = it->second;
+          D = &dispatches[d];
+        }
+        if (!D) {
+          unkeyedReads++;
+          std::string where2 = F.getName().str(), r = "under no dispatch switch";
+          if (const DILocation *DL2 = L->getDebugLoc()) where2 += ":" + std::to_string(DL2->getLine());
+          for (size_t d = 0; d < dispatches.size(); d++)
+            if (DT.dominates(dispatches[d].SW->getParent(), L->getParent()))
+              r = reach[d].dflt.count(L->getParent()) ? "the default reaches it" : "no case reaches it";
+          CG_LOG("VarargKeys: UNKEYED read " << where2 << " (" << r << ")\n");
+          continue;
+        }
+        std::vector<std::string> keys;
+        if (D->direct) {
+          for (int64_t c : cases) keys.push_back(vaKey(c));
+        } else {
+          viaTable++;
+          for (auto [ch, cs] : D->charToCase)
+            if (cases.count(cs)) keys.push_back(vaKey(ch));
+        }
+        if (keys.empty()) { unkeyedReads++; continue; }
+        for (const std::string &k : keys) varargAllKeys.insert(k);
+        varargReadKeys[L] = std::move(keys);
+        keyedReads++;
+        k0++;
+      }
+      varargFmtParam[&F] = (unsigned)fmtParam;
+      mapped++;
+      CG_LOG("VarargKeys: MAPPED " << F.getName() << " (format arg" << fmtParam << ", "
+             << dispatches.size() << " dispatch switches): " << k0 << " of " << reads.size()
+             << " va_arg pointer reads keyed, " << viaTable << " through a constant table\n");
+    }
+  // Wrappers: a function passing its parameter q as a mapped function's
+  // format has format q (sqlite3_mprintf -> sqlite3VMPrintf -> vappendf).
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (F.isDeclaration() || varargFmtParam.count(&F)) continue;
+        for (Instruction &I : instructions(F)) {
+          const auto *CB = dyn_cast<CallBase>(&I);
+          const Function *C = CB ? CB->getCalledFunction() : nullptr;
+          auto it = C ? varargFmtParam.find(C) : varargFmtParam.end();
+          if (it == varargFmtParam.end() || it->second >= CB->arg_size()) continue;
+          const int q = paramOf(F, CB->getArgOperand(it->second));
+          if (q < 0) continue;
+          varargFmtParam[&F] = (unsigned)q;
+          changed = true;
+          break;
+        }
+      }
+  }
+  if (!varargAllKeys.empty())
+    cellUnionSlots.insert({"__va_list_tag", 0, 24}); // the va_list content is a keyed slot
+  CG_LOG("VarargKeys: " << mapped << " renderers mapped, " << keyedReads << " va_arg reads keyed, "
+         << unkeyedReads << " left unkeyed (read every key); " << varargFmtParam.size()
+         << " functions with a format parameter, " << varargAllKeys.size() << " keys\n");
+}
+
+NodeIndex CallGraphPass::varargKeyNode(const Function *F, const std::string &key) {
+  auto [it, ins] = varargKeyNodes.try_emplace({F, key}, AndersNodeFactory::InvalidIndex);
+  if (ins) it->second = getCanonicalNode(NF.createValueNode());
+  return getCanonicalNode(it->second);
+}
+
+// The keys of a call's variadic arguments from its constant format
+// (printf syntax: flags, width and precision with '*' consuming an int,
+// length modifiers, the conversion character); false when the format is
+// not a constant string or its specifiers do not match the arguments.
+bool CallGraphPass::varargKeysAt(const CallBase *CS, const Function *CF,
+                                 std::vector<std::string> &keys) {
+  keys.clear();
+  auto it = varargFmtParam.find(CF);
+  if (it == varargFmtParam.end() || varargAllKeys.empty()) return false;
+  if (it->second >= CS->arg_size()) return false;
+  const auto *GV = dyn_cast<GlobalVariable>(CS->getArgOperand(it->second)->stripPointerCasts());
+  const auto *CDA = GV && GV->isConstant() && GV->hasInitializer()
+                        ? dyn_cast<ConstantDataSequential>(GV->getInitializer()) : nullptr;
+  if (!CDA || !CDA->isCString()) { varargPoolSites++; return false; }
+  const StringRef fmt = CDA->getAsCString();
+  for (size_t i = 0; i < fmt.size(); i++) {
+    if (fmt[i] != '%') continue;
+    if (++i >= fmt.size()) break;
+    if (fmt[i] == '%') continue;
+    while (i < fmt.size() && StringRef("-+ #!0,").contains(fmt[i])) i++;
+    if (i < fmt.size() && fmt[i] == '*') { keys.push_back("va#*"); i++; }
+    while (i < fmt.size() && isdigit((unsigned char)fmt[i])) i++;
+    if (i < fmt.size() && fmt[i] == '.') {
+      i++;
+      if (i < fmt.size() && fmt[i] == '*') { keys.push_back("va#*"); i++; }
+      while (i < fmt.size() && isdigit((unsigned char)fmt[i])) i++;
+    }
+    while (i < fmt.size() && StringRef("lhLqjzt").contains(fmt[i])) i++;
+    if (i >= fmt.size()) { varargUnparsed++; return false; }
+    keys.push_back(vaKey((unsigned char)fmt[i]));
+  }
+  const unsigned nva = CS->arg_size() - CF->arg_size();
+  if (keys.size() != nva) { varargUnparsed++; keys.clear(); return false; }
+  varargKeyedSites++;
+  return true;
+}
+

@@ -215,7 +215,9 @@ public:
     // would otherwise drop. At a call site the object(s) at argN + K
     // take a typed step of T, as the body's GEP would: first typed write
     // labels them, an incompatible label is a rule (b) report.
-    struct LabelAtom { int arg; int off; const llvm::StructType *ty; };
+    // A drafted entry names T (tyName, matched without the per-unit
+    // suffix); a proved one carries the type itself.
+    struct LabelAtom { int arg; int off; const llvm::StructType *ty; std::string tyName = ""; };
     std::vector<LabelAtom> labels;
     bool externOnly = false; // '@scope extern' block: applies only to
                         // functions WITHOUT a body in the corpus. A

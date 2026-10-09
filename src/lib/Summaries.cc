@@ -905,6 +905,33 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       StringRef t = toks[i].trim();
       if (t.empty()) continue;
       GlobalContext::SummaryAtom A{};
+      // AS(argN@K:T): a label atom (plan 3.46). On ST/LD, ":T" after the
+      // container ref says argN points to a T (the access is at K inside
+      // it): the atom plus AS(argN@0:T).
+      if (t.consume_front("AS(") && t.consume_back(")")) {
+        auto [r, ty] = t.split(':');
+        int arg = -1, off = 0;
+        bad = ty.empty() || !parseDerefRef(r, arg, off) || arg < 0 || off < 0;
+        if (!bad) S.labels.push_back({arg, off, nullptr, ty.str()});
+        continue;
+      }
+      std::string typedTok;
+      if ((t.starts_with("ST(*") || t.starts_with("LD(")) && t.contains(':')) {
+        const bool st = t.starts_with("ST(*");
+        auto [lhs, rhs] = t.split("<-");
+        StringRef cont = st ? lhs : rhs;
+        auto [ref, ty] = cont.split(':');
+        if (ty.empty() || ty.contains(')') == st) { bad = true; continue; }
+        const StringRef tyName = st ? ty : ty.drop_back(1);
+        StringRef base = ref;
+        if (st) base.consume_front("ST(*");
+        else base.consume_front("*");
+        int arg = -1, off0 = 0;
+        if (!parseDerefRef(base, arg, off0) || arg < 0) { bad = true; continue; }
+        S.labels.push_back({arg, 0, nullptr, tyName.str()});
+        typedTok = st ? (ref + "<-" + rhs).str() : (lhs + "<-" + ref + ")").str();
+        t = typedTok;
+      }
       if (t == "FRESH") {
         A.kind = GlobalContext::SummaryAtom::Fresh;
         S.fresh = true;
@@ -1471,11 +1498,30 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
   // of its own; nothing transfers.
   for (const auto &LA : S.labels) {
     if (LA.arg < 0 || (unsigned)LA.arg >= CS->arg_size()) continue;
+    const llvm::StructType *Ty = LA.ty;
+    if (!Ty) {
+      static std::map<std::string, const llvm::StructType *> byName;
+      auto [it, ins] = byName.try_emplace(LA.tyName, nullptr);
+      if (ins) {
+        for (auto &[Mod, MName] : Ctx->Modules)
+          for (llvm::StructType *ST : Mod->getIdentifiedStructTypes())
+            if (ST->hasName() && !ST->isOpaque() &&
+                stripStructNameSuffix(ST->getName()) == LA.tyName) {
+              it->second = ST;
+              break;
+            }
+        if (!it->second)
+          errs() << "FuncSummary: label type " << LA.tyName
+                 << " names no struct of the corpus (AS atom ignored)\n";
+      }
+      Ty = it->second;
+      if (!Ty) continue;
+    }
     NodeIndex a = getRepNodeForValue(CS->getArgOperand(LA.arg));
     if (a == AndersNodeFactory::InvalidIndex) continue;
     NodeIndex base = summaryFieldPtr(a, LA.off);
     NodeIndex sink = getCanonicalNode(NF.createValueNode());
-    addFieldEdgesExact(getCanonicalNode(base), sink, 0, 0, false, LA.ty);
+    addFieldEdgesExact(getCanonicalNode(base), sink, 0, 0, false, Ty);
     g_sumLabels++;
   }
   if (S.noop)
@@ -2526,6 +2572,39 @@ static bool labelsCover(const Function &F, std::string &why) {
 
 void CallGraphPass::runSummaryProvers(Module *M) {
   curDL = &M->getDataLayout();
+  // Engine check of drafted label atoms (plan 3.46): a file entry that
+  // replaces a body defined here must carry the body's naming evidence.
+  // MISSING: a typed step of the body the entry does not state; EXTRA: a
+  // stated label the body does not show; UNCOVERED: evidence no label
+  // can state (the entry loses it under --cfl-cells).
+  if (CFLCells) {
+    size_t nOk = 0, nBad = 0;
+    for (auto &[F, Sp] : Ctx->FuncSummaries) {
+      const GlobalContext::FuncSummary &S = *Sp;
+      if (F->isDeclaration() || S.none || S.body || S.fresh) continue;
+      if (!S.noop && S.atoms.empty()) continue;
+      std::set<std::tuple<int, int, std::string>> body, drafted;
+      for (const auto &LA : bodyLabels(*F, *curDL))
+        body.insert({LA.arg, LA.off, stripStructNameSuffix(LA.ty->getName()).str()});
+      for (const auto &LA : S.labels)
+        drafted.insert({LA.arg, LA.off,
+                        LA.ty ? stripStructNameSuffix(LA.ty->getName()).str() : LA.tyName});
+      std::string why, line;
+      const bool cover = labelsCover(*F, why);
+      for (const auto &[a, o, t] : body)
+        if (!drafted.count({a, o, t}))
+          line += " MISSING AS(arg" + std::to_string(a) + "@" + std::to_string(o) + ":" + t + ")";
+      for (const auto &[a, o, t] : drafted)
+        if (!body.count({a, o, t}))
+          line += " EXTRA AS(arg" + std::to_string(a) + "@" + std::to_string(o) + ":" + t + ")";
+      if (!cover) line += " UNCOVERED [" + why + "]";
+      if (line.empty()) { nOk++; continue; }
+      nBad++;
+      CG_LOG("LabelCheck: " << F->getName() << line << "\n");
+    }
+    CG_LOG("LabelCheck: " << nOk << " body-replacing file entries carry their bodies' "
+           << "naming evidence, " << nBad << " do not (see above)\n");
+  }
   struct PAtom { // 0=ST 1=MV 2=LD(ret) 3=ALIAS(ret) 4=CPY
     int kind; int a1; int a2; int64_t o1; int64_t o2;
     const GlobalValue *g1 = nullptr; // dst/container-side global

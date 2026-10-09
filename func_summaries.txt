@@ -7,6 +7,13 @@
 #   ALIAS(ret=argN)  result aliases the argument value
 #   ST(*argC<-argV)  store value argV into *argC
 #   LD(ret<-*argC)   result loaded from *argC
+#   AS(argN@K:T)     label only (plan 3.46): the body accesses argN + K
+#                    as struct T (no transfer; under --cfl-cells the
+#                    object takes T as the body's typed step would).
+#                    On ST/LD, ":T" after the container ref
+#                    (ST(*argN@K:T<-v), LD(ret<-*argN@K:T)) says argN
+#                    points to a T and adds AS(argN@0:T). Checked
+#                    against bodies in the corpus (LabelCheck lines).
 #   NONE             explicitly no summary (body analyzed)
 #   NOOP             no transfer at the callsite AND body skipped
 #                    (standalone; replaces hardcoded free/utility lists)

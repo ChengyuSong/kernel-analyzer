@@ -871,6 +871,11 @@ bool CallGraphPass::runCellResolution() {
   size_t collapses = 0, collapsedNodes = 0, walkEdges = 0;
   double collapseSecs = 0;
   std::vector<std::vector<uint32_t>> bigCycles; // the largest per collapse (report)
+  // Cycles with offset (plan 3.49; Pearce's positive-weight cycles): the
+  // copy+field SCCs whose steps have a nonzero gcd (pointer walks).
+  struct PwcComp { size_t size = 0, typed = 0, untyped = 0; bool cls = false; int64_t g = 0; uint32_t rep = 0; };
+  std::vector<PwcComp> pwcComps;
+  std::vector<uint8_t> inPwc;
   auto collapseCycles = [&]() {
     const auto tc = Clock::now();
     collapses++;
@@ -905,7 +910,7 @@ bool CallGraphPass::runCellResolution() {
       // pointer walks: a step along one yields the object's any-offset
       // cell (the walk reaches every offset) instead of one address per
       // turn. Flagged in the label's top bit.
-      std::vector<uint32_t> comp(numNodes, UINT32_MAX);
+      std::vector<uint32_t> comp(numNodes, UINT32_MAX), compSize;
       uint32_t nc = 0;
       ka::tarjanSCC(
           numNodes, [&](uint32_t u) { return find(u) != u; },
@@ -918,6 +923,7 @@ bool CallGraphPass::runCellResolution() {
           },
           [&](const std::vector<uint32_t> &members) {
             for (uint32_t w : members) comp[w] = nc;
+            compSize.push_back(members.size());
             nc++;
           });
       std::map<std::string, size_t> walk;
@@ -937,6 +943,7 @@ bool CallGraphPass::runCellResolution() {
           compGcd[comp[u]] = std::gcd(compGcd[comp[u]], stepOf(lazyLabels[e.li]));
         }
       }
+      std::map<uint32_t, PwcComp> pwcBy;
       for (uint32_t u = 0; u < numNodes; u++) {
         if (find(u) != u) continue;
         for (FieldEdge &e : fieldOut[u]) {
@@ -948,7 +955,28 @@ bool CallGraphPass::runCellResolution() {
           onCycle++;
           selfLoops += v == u;
           walk["step " + std::to_string(g)]++;
+          PwcComp &P = pwcBy[comp[u]];
+          P.size = compSize[comp[u]];
+          P.g = g;
+          P.rep = u;
+          const LazyLabel &L = lazyLabels[e.li];
+          (L.ty ? P.typed : P.untyped)++;
+          if (L.ty && L.ty->hasName() && L.ty->getName().starts_with("class.")) P.cls = true;
         }
+      }
+      pwcComps.clear();
+      inPwc.assign(numNodes, 0);
+      for (auto &[c, P] : pwcBy) pwcComps.push_back(P);
+      for (uint32_t u = 0; u < numNodes; u++)
+        if (find(u) == u && comp[u] != UINT32_MAX && pwcBy.count(comp[u])) inPwc[u] = 1;
+      if (VerboseLevel >= 2 && !pwcComps.empty()) {
+        size_t t = 0, un = 0, mx = 0, cl = 0;
+        for (const PwcComp &P : pwcComps) {
+          (P.typed && P.untyped ? mx : P.typed ? t : un)++;
+          cl += P.cls;
+        }
+        CG_LOG("Cells: pwc: " << pwcComps.size() << " (typed " << t << ", untyped " << un
+               << ", mixed " << mx << "; through a C++ class step " << cl << ")\n");
       }
       std::vector<std::pair<size_t, std::string>> top;
       for (auto &[k, c] : walk) top.push_back({c, k});
@@ -4241,6 +4269,7 @@ bool CallGraphPass::runCellResolution() {
     };
     // Construct class of a join node, from its description.
     auto classOf = [&](uint32_t n) -> std::string {
+      if (n < inPwc.size() && inPwc[find(n)]) return "offset cycle (pwc)";
       const std::string d = descOf(n);
       if (d.rfind("return of ", 0) == 0) return "return of a function";
       if (d.rfind("cell ", 0) == 0) return "struct field / object cell";
@@ -4804,6 +4833,37 @@ bool CallGraphPass::runCellResolution() {
          << " depend on an outside boundary (--cfl-outside=" << CFLOutside.getValue()
          << ")" << k << "\n";
     }
+    {
+      size_t t = 0, un = 0, mx = 0, cl = 0;
+      for (const PwcComp &P : pwcComps) {
+        (P.typed && P.untyped ? mx : P.typed ? t : un)++;
+        cl += P.cls;
+      }
+      // Indirect-call width downstream of a cycle with offset.
+      std::vector<uint8_t> down(numNodes, 0);
+      std::vector<uint32_t> work;
+      for (uint32_t u = 0; u < numNodes && u < inPwc.size(); u++)
+        if (inPwc[u]) { down[u] = 1; work.push_back(u); }
+      while (!work.empty()) {
+        const uint32_t u = work.back();
+        work.pop_back();
+        auto visit = [&](uint32_t v) { v = find(v); if (v < numNodes && !down[v]) { down[v] = 1; work.push_back(v); } };
+        for (uint32_t v : succ[u]) visit(v);
+        for (const FieldEdge &e : fieldOut[u]) visit(e.dst);
+      }
+      size_t wAll = 0, wDown = 0;
+      for (const CallBase *CS : Ctx->IndirectCallInsts) {
+        auto cit = Ctx->Callees.find(CS);
+        const size_t w = cit == Ctx->Callees.end() ? 0 : cit->second.size();
+        wAll += w;
+        const NodeIndex n = NF.getValueNodeFor(CS->getCalledOperand());
+        if (n != AndersNodeFactory::InvalidIndex && getCanonicalNode(n) < G && down[find(canon(n))])
+          wDown += w;
+      }
+      RO << "SUMMARY pwc " << pwcComps.size() << " cycles with offset (typed " << t << ", untyped "
+         << un << ", mixed " << mx << "; through a C++ class step " << cl << "); indirect-call width "
+         << "downstream: " << wDown << " of " << wAll << " targets\n";
+    }
     RO << "SUMMARY varargs " << varargMapped << " renderers mapped, " << varargKeyedReads
        << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "
        << varargKeyedSites << " constant format, " << varargPoolSites << " non-constant, "
@@ -4819,6 +4879,15 @@ bool CallGraphPass::runCellResolution() {
       RO << "UB byte-exit " << (n < numNodes ? nodeDesc(n) : std::string("?")) << " steps " << k
          << " from " << describe(objs[o]) << " +" << pos << "\n";
     for (const std::string &d : rrPtrAt) RO << "UB ptr-sub " << d << "\n";
+    RO << "\n== cycles with offset, the ten largest (plan 3.49)\n";
+    {
+      std::vector<PwcComp> top = pwcComps;
+      std::sort(top.begin(), top.end(), [](const PwcComp &a, const PwcComp &b) { return a.size > b.size; });
+      for (size_t i = 0; i < top.size() && i < 10; i++)
+        RO << "P size " << top[i].size << " step " << top[i].g << " typed " << top[i].typed
+           << " untyped " << top[i].untyped << (top[i].cls ? " C++ class" : "") << " at "
+           << (top[i].rep < numNodes ? nodeDesc(top[i].rep) : std::string("?")) << "\n";
+    }
     RO << "\n== outside dependence per indirect call (plan 3.48)\n";
     {
       std::vector<std::pair<size_t, std::string>> rank;

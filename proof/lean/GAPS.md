@@ -616,11 +616,32 @@ Obligations left open:
    model.
 6. The rules are checked by the solver's own facts (L4), not proved:
    the report is the deliverable for programs that break them.
-7. Partial corpora (`--cfl-alloc-origins` without `--cfl-whole-program`):
-   externally visible globals and exported functions' formals are
-   environment sites whose content holds no code. Not covered: code
-   outside the corpus storing an in-corpus function's address into an
-   exported global (the content model would miss that function).
+7. The environment (`--cfl-alloc-origins`, plan 3.16): what code with
+   neither IR nor a summary does is fixed by `--cfl-outside`.
+   - `pure` (default; whole programs only, a partial corpus refuses it):
+     such code writes nothing, calls nothing and keeps nothing it is
+     given; a call to it returns no object, an uncalled function's
+     formals take nothing, extern globals hold only what the program
+     writes. A premise, UNSOUND for code that does otherwise; the rule
+     report's outside rows (plan 3.48) say per indirect call where it is
+     load-bearing.
+   - `roots`: each formal no call reaches, each bodiless call result and
+     each vararg is an environment object with environment content (in a
+     partial corpus also exported formals and visible globals): one
+     object, ENV, whose memory is the closure of what escaped; outside
+     code reads and writes what it holds and may call any function whose
+     address it holds. In `Keys.lean` terms ENV is one site key with the
+     wildcard position and `EnvInit` becomes "the initial memory and
+     every outside step are covered by ENV's cell"; the outside steps are
+     not stated as statements yet.
+   - Both modes (plan 3.48): outside code honors the type of what it is
+     handed. It reads and writes only within the subobject it received
+     (per content cell: the struct at the offset, else the array holding
+     it, else the cell; an unlabeled object whole) and what that
+     subobject points to, never stepping past it. Under `pure` this is
+     part of "writes nothing"; under `roots` it is the whole claim of the
+     per-cell exposure. Not mechanized; printed with the rule report's
+     assumptions.
 8. `va_list` is modeled as memory (va_start writes the variadic
    arguments into the va_list object, va_arg reads it); the lowered
    va_arg sequence is recognized from GEPs that index `__va_list_tag`.

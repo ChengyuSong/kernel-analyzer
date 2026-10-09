@@ -165,6 +165,7 @@ protected:
                           const char *why);
   void addFieldWildcardLoop(NodeIndex n, const char *why);
   std::map<std::string, size_t> wildcardReasons; // fallback category tally
+  std::map<NodeIndex, std::string> wildcardWhy;   // per node (cells cycle report)
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
   bool runFlowsToResolution();
   // --cfl-cells (CellSolver.cc, plan 3.26): inclusion over (object,

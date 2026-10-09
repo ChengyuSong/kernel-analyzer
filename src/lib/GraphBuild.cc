@@ -1972,6 +1972,7 @@ void CallGraphPass::addFieldWildcardLoop(NodeIndex n, const char *why) {
   if (moduleFieldWildcardRoots.insert(canon).second) {
     Graph.addFieldAnyLoop(canon);
     wildcardReasons[why]++;
+    wildcardWhy[canon] = why;
   }
 }
 

@@ -871,6 +871,8 @@ bool CallGraphPass::runCellResolution() {
   size_t collapses = 0, collapsedNodes = 0, walkEdges = 0;
   double collapseSecs = 0;
   std::vector<std::vector<uint32_t>> bigCycles; // the largest per collapse (report)
+  // Edges inside each big cycle, recorded before the merge erases them.
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> bigCycleEdges;
   // Cycles with offset (plan 3.49; Pearce's positive-weight cycles): the
   // copy+field SCCs whose steps have a nonzero gcd (pointer walks).
   struct PwcComp { size_t size = 0, typed = 0, untyped = 0; bool cls = false; int64_t g = 0; uint32_t rep = 0; };
@@ -894,7 +896,15 @@ bool CallGraphPass::runCellResolution() {
       auto big = std::max_element(sccs.begin(), sccs.end(), [](auto &a, auto &b) {
         return a.size() < b.size();
       });
-      if (big->size() >= 50) bigCycles.push_back(*big);
+      if (big->size() >= 50) {
+        bigCycles.push_back(*big);
+        std::set<uint32_t> in(big->begin(), big->end());
+        std::vector<std::pair<uint32_t, uint32_t>> es;
+        for (uint32_t m : *big)
+          for (uint32_t v : succ[m])
+            if (in.count(find(v)) && find(v) != m) es.push_back({m, find(v)});
+        bigCycleEdges.push_back(std::move(es));
+      }
     }
     for (auto &M : sccs) {
       const uint32_t r = *std::min_element(M.begin(), M.end());
@@ -4490,7 +4500,8 @@ bool CallGraphPass::runCellResolution() {
          << collapsedNodes << " solver nodes (" << collapseSecs << " s)\n");
   // The largest cycles: members by function, and the memory cells in them
   // (a cycle through a cell is a store and a load of one name).
-  for (const auto &M : bigCycles) {
+  for (size_t ci = 0; ci < bigCycles.size(); ci++) {
+    const auto &M = bigCycles[ci];
     std::map<std::string, size_t> byFn;
     std::vector<std::string> cellsIn;
     for (uint32_t m : M) {
@@ -4510,6 +4521,82 @@ bool CallGraphPass::runCellResolution() {
       fl += " " + top[i].second + "(" + std::to_string(top[i].first) + ")";
     CG_LOG("Cells:   cycle of " << M.size() << " nodes:" << fl << "\n");
     for (const std::string &c : cellsIn) CG_LOG("Cells:     " << c << "\n");
+    // Its cells by object label, and the members carrying a field-any loop.
+    std::map<std::string, size_t> byLabel;
+    std::set<uint32_t> typed, buffer;
+    for (uint32_t m : M) {
+      const std::string d = nodeDesc(m);
+      if (d.rfind("cell ", 0) != 0) continue;
+      const size_t lb = d.rfind(" ["), rb = d.rfind(']');
+      const std::string label = lb != std::string::npos && rb > lb ? d.substr(lb + 2, rb - lb - 2) : "?";
+      byLabel[label]++;
+      const bool buf = d.find("cell i8[]") == 0 || label == "unlabeled" || label == "i8";
+      (buf ? buffer : typed).insert(m);
+    }
+    std::vector<std::pair<size_t, std::string>> lt;
+    for (auto &[l, c] : byLabel) lt.push_back({c, l});
+    std::sort(lt.rbegin(), lt.rend());
+    std::string ll;
+    for (size_t i = 0; i < lt.size() && i < 3; i++)
+      ll += " [" + lt[i].second + "] " + std::to_string(lt[i].first);
+    CG_LOG("Cells:     cells by object label: " << byLabel.size() << " labels; largest:" << ll
+           << " (" << typed.size() << " typed cells, " << buffer.size() << " byte-buffer cells)\n");
+    for (auto &[n, why] : wildcardWhy) {
+      const uint32_t s2 = getCanonicalNode(n) < G ? canon(n) : UINT32_MAX;
+      if (s2 != UINT32_MAX && std::find(M.begin(), M.end(), s2) != M.end())
+        CG_LOG("Cells:     field-any loop at " << nodeDesc(s2) << " [" << why << "]\n");
+    }
+    // The byte copies relaying between objects of the cycle: content
+    // edges from a copy are what joins two cells directly.
+    {
+      const uint32_t rep = find(M[0]);
+      std::set<uint32_t> cyc;
+      for (uint32_t o = 0; o < objs.size(); o++)
+        for (auto &[c, up] : objs[o].content)
+          if (find(up.first) == rep || find(up.second) == rep) { cyc.insert(o); break; }
+      std::vector<std::tuple<size_t, size_t, size_t, uint32_t>> cs;
+      for (uint32_t ci2 = 0; ci2 < copyStat.size() && ci2 < copies.size(); ci2++) {
+        size_t s3 = 0, d3 = 0;
+        for (uint32_t o : copyStat[ci2].srcObjs) s3 += cyc.count(o);
+        for (uint32_t o : copyStat[ci2].dstObjs) d3 += cyc.count(o);
+        if (s3 && d3) cs.push_back({s3 * d3, s3, d3, ci2});
+      }
+      std::sort(cs.rbegin(), cs.rend());
+      CG_LOG("Cells:     " << cyc.size() << " objects in the cycle; " << cs.size()
+             << " byte copies relay between them; the largest:\n");
+      for (size_t i = 0; i < cs.size() && i < 8; i++) {
+        const auto [sc, s3, d3, ci2] = cs[i];
+        CG_LOG("Cells:       copy " << instLoc(copies[ci2].at) << " len " << copies[ci2].len
+               << ": " << s3 << " source x " << d3 << " destination objects of the cycle\n");
+      }
+    }
+    // The weld: a shortest path inside the cycle from a typed cell to a
+    // byte-buffer cell, and one back.
+    if (ci < bigCycleEdges.size() && !typed.empty() && !buffer.empty()) {
+      std::map<uint32_t, std::vector<uint32_t>> adj;
+      for (auto [a, b] : bigCycleEdges[ci]) adj[a].push_back(b);
+      auto path = [&](const std::set<uint32_t> &from, const std::set<uint32_t> &to, const char *what) {
+        std::map<uint32_t, uint32_t> prev;
+        std::vector<uint32_t> q(from.begin(), from.end());
+        for (uint32_t f : from) prev[f] = f;
+        for (size_t qi = 0; qi < q.size(); qi++) {
+          const uint32_t u = q[qi];
+          if (to.count(u) && !from.count(u)) {
+            std::vector<uint32_t> p{u};
+            while (prev[p.back()] != p.back()) p.push_back(prev[p.back()]);
+            std::reverse(p.begin(), p.end());
+            CG_LOG("Cells:     weld " << what << " (" << p.size() << " nodes):\n");
+            for (uint32_t x : p) CG_LOG("Cells:       " << nodeDesc(x) << "\n");
+            return;
+          }
+          for (uint32_t v : adj[u])
+            if (!prev.count(v)) { prev[v] = u; q.push_back(v); }
+        }
+        CG_LOG("Cells:     weld " << what << ": no path in the recorded edges\n");
+      };
+      path(typed, buffer, "typed -> byte buffer");
+      path(buffer, typed, "byte buffer -> typed");
+    }
   }
   for (const Cell &C : cells) {
     offCells += C.kind == CellKind::Off;

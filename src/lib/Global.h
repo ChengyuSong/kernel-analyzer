@@ -184,6 +184,9 @@ public:
     bool exact2 = false; // Store2/Load2 from the file: level-2 offset is
                          // exact (field of the pointed-to object), not
                          // the generated wildcard
+    int innerOff = 0;    // exact Store2/Load2: the first dereference's field
+                         // (**argN@inner@outer: the table/array pointer in
+                         // field `inner`, then element/field `outer`)
     std::string siteFn; // Dispatch: function holding the icall site(s)
   };
   struct FuncSummary {
@@ -202,6 +205,11 @@ public:
     // in the program's own pool, not released to the underlying allocator.
     // Not a transfer atom: call sites wire the body as usual.
     int freeArg = -1;
+    // POOL: a member of an allocator family that is not itself an
+    // allocator (pool setup, introspection, range tests): no transfer
+    // meaning, the call is wired as usual; its accesses count as the
+    // family's in the pool-closure check (plan 3.38).
+    bool pool = false;
     bool externOnly = false; // '@scope extern' block: applies only to
                         // functions WITHOUT a body in the corpus. A
                         // libc-derived entry must never replace a

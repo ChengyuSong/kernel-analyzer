@@ -901,10 +901,12 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
         (sit->second->noop ||
          (sit->second->atoms.empty() && !sit->second->fresh &&
           !sit->second->none));
-    // FREE only (no transfer atoms): the call is wired as usual; FREE acts
-    // inside the deallocator's body (visitStoreInst).
+    // FREE or POOL only (no transfer atoms): the call is wired as usual;
+    // FREE acts inside the deallocator's body (visitStoreInst), POOL only
+    // in the pool-closure check.
     const bool freeOnly = sit != Ctx->FuncSummaries.end() &&
-                          sit->second->freeArg >= 0 && sit->second->atoms.empty() &&
+                          (sit->second->freeArg >= 0 || sit->second->pool) &&
+                          sit->second->atoms.empty() &&
                           !sit->second->fresh && !sit->second->noop && !sit->second->none;
     if (sit != Ctx->FuncSummaries.end() && !freeOnly && (directSite || transferFree)) {
       if (!applySummaryAtoms(CS, *sit->second, &retBound, sit->first))
@@ -3424,6 +3426,7 @@ NodeIndex CallGraphPass::keyedDeref(NodeIndex ptr, const std::string &key) {
 }
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
+  if (!CGP.poolDrop.empty() && CGP.poolDrop.count(&I)) return; // pool state (closure checked)
   // Tracepoint keyed dispatch (task #35): inside __traceiter_X, the
   // funcs-head load reads cells that the kernel-scale giant absorbs —
   // the keyed channel replaces this read entirely (sound: the census
@@ -3590,6 +3593,7 @@ static bool holdsFormal(const Value *V, const Argument *A, int depth = 8) {
 }
 
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
+  if (!CGP.poolDrop.empty() && CGP.poolDrop.count(&I)) return; // pool state (closure checked)
   Value *val = I.getOperand(0);
   // --cfl-cells, FREE(argN): inside a deallocator, a store through the
   // freed block (pBuf->pNext = ...) or of it (db->lookaside.pFree = pBuf)

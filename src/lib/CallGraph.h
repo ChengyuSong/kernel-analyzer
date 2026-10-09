@@ -445,6 +445,10 @@ protected:
   // node would filter every value of the class.
   std::unordered_set<const llvm::Value *> dedupKeep;
   void computeGuardCandidates();
+  // Pool closure (plan 3.38): loads and stores of an allocator family's
+  // pool fields that no other function touches; not modeled.
+  std::unordered_set<const llvm::Instruction *> poolDrop;
+  void checkPoolClosure();
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

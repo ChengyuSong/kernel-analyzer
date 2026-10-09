@@ -86,6 +86,12 @@ extern boost::unordered_flat_set<const Function *> g_noopBodies;
 extern bool g_sumAuthoritative;
 bool shouldSkipFunction(const Function *F);
 StringRef stripStructNameSuffix(StringRef Name);
+// Slots.cc: an access's (struct, byte offset), across embedding and -O3.
+bool embedsAt(Type *T, int64_t off, StringRef S, const DataLayout &DL);
+const GEPOperator *structGEP(const Value *A);
+bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
+                StructType *&S, int64_t &off);
+bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o);
 extern size_t g_intStoreUnmodeled;
 extern size_t g_intArgUnmodeled;
 extern size_t g_initCEDeclined;

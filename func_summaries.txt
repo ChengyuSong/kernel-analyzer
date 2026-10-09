@@ -146,6 +146,20 @@ sqlite3MemFree FREE(arg0)
 pcache1Free FREE(arg0)
 sqlite3PageFree FREE(arg0)
 fts3HashFree FREE(arg0)
+# Members of the lookaside and page-cache pool families that are not
+# allocators (plan 3.38 pool closure): setup builds the free lists,
+# introspection counts slots, range tests compare a pointer against the
+# pool's bounds. POOL: no transfer meaning; their accesses count as the
+# family's when the closure check decides which fields are pool state.
+setupLookaside POOL
+isLookaside POOL
+lookasideMallocSize POOL
+sqlite3DbMallocSize POOL
+countLookasideSlots POOL
+sqlite3LookasideUsed POOL
+sqlite3_db_status POOL
+sqlite3LeaveMutexAndCloseZombie POOL
+sqlite3PCacheBufferSetup POOL
 bfd_alloc FRESH BODY
 bfd_zalloc FRESH BODY
 bfd_alloc2 FRESH BODY

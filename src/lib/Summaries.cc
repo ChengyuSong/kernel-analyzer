@@ -860,6 +860,19 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
     }
     return parseRef(base, out);
   };
+  // **argN@outer (inner 0) or **argN@inner@outer; outer may be X.
+  auto parse2Ref = [&](StringRef tok, int &out, int &inner, int &outer) -> bool {
+    inner = 0;
+    auto [base, offs] = tok.split('@');
+    auto [first, second] = offs.split('@');
+    if (!second.empty()) {
+      unsigned v;
+      if (first.getAsInteger(10, v)) return false;
+      inner = (int)v;
+      return parseDerefRef((base + "@" + second).str(), out, outer);
+    }
+    return parseDerefRef(tok, out, outer);
+  };
   std::string line;
   size_t lineNo = 0, nFresh = 0, nCpy = 0, nAlias = 0, nSt = 0, nLd = 0,
          nNone = 0, nInv = 0, nChR = 0, nChC = 0, nNoop = 0, nChGated = 0;
@@ -902,6 +915,9 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         continue;
       } else if (t == "BODY") {
         S.body = true; // keep analyzing the body (a FRESH wrapper's own calls)
+        continue;
+      } else if (t == "POOL") {
+        S.pool = true;
         continue;
       } else if (t.consume_front("FREE(arg") && t.consume_back(")")) {
         int n = -1;
@@ -965,17 +981,22 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       } else if (t.consume_front("ST2(**") && t.consume_back(")")) {
         // ST2(**argN@off<-argV[@K]): value into field off of the object
         // the pointer in *argN@0 points to (exact, no wildcard).
+        // ST2(**argN@inner@outer<-argV): the pointer in *argN@inner, then
+        // field or element `outer` of what it points to (X: any element;
+        // GList::append's data[length]).
         auto [c, v] = t.split("<-");
         A.kind = GlobalContext::SummaryAtom::Store2;
         A.exact2 = true;
-        bad = !parseDerefRef(c, A.dst, A.dstByteOff) ||
+        bad = !parse2Ref(c, A.dst, A.innerOff, A.dstByteOff) ||
               !parseDerefRef(v, A.src, A.srcByteOff) || A.dst < 0 || A.src < 0;
         nSt++;
       } else if (t.consume_front("LD2(ret<-**") && t.consume_back(")")) {
+        // LD2(ret<-**argN@off) and LD2(ret<-**argN@inner@outer)
+        // (GList::get: data[i] = LD2(ret<-**arg0@data@X)).
         A.kind = GlobalContext::SummaryAtom::Load2;
         A.exact2 = true;
         A.dst = -1;
-        bad = !parseDerefRef(t, A.src, A.srcByteOff) || A.src < 0;
+        bad = !parse2Ref(t, A.src, A.innerOff, A.srcByteOff) || A.src < 0;
         nLd++;
       } else if (t.consume_front("DISPATCH(") && t.consume_back(")")) {
         // DISPATCH(fnref:fK<-valref[@siteFn]); ref = argN | *argN@off |
@@ -1788,7 +1809,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       // points to (exact); generated Store2 keeps its wildcard level 2.
       CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff));
       addAssignmentEdge(summaryFieldPtr(v, A.srcByteOff),
-                        A.exact2 ? summaryDerefCell(summaryDerefCell(c, 0),
+                        A.exact2 ? summaryDerefCell(summaryDerefCell(c, A.innerOff),
                                                     A.dstByteOff)
                                  : summaryDeref2Cell(c, A.dstByteOff));
       g_sumSt++;
@@ -1854,7 +1875,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       if (d == AndersNodeFactory::InvalidIndex ||
           c == AndersNodeFactory::InvalidIndex)
         break;
-      addAssignmentEdge(A.exact2 ? summaryDerefCell(summaryDerefCell(c, 0),
+      addAssignmentEdge(A.exact2 ? summaryDerefCell(summaryDerefCell(c, A.innerOff),
                                                     A.srcByteOff)
                                  : summaryDeref2Cell(c, A.srcByteOff),
                         getCanonicalNode(d));
@@ -4774,4 +4795,106 @@ bool summaryKeepsBody(GlobalContext *Ctx,
   for (const auto &A : it->second->atoms)
     if (A.kind == GlobalContext::SummaryAtom::Invoke) return true;
   return false;
+}
+
+// --cfl-cells, plan 3.38: POOL CLOSURE. An allocator family (the functions
+// whose summary is FRESH or FREE) keeps its pool in pointer fields (free-
+// list heads, slot links). Premise: those fields are allocator-internal:
+// the returned block is FRESH and a freed block dead, so their content is
+// no program data. Checked, not assumed: a field is pool state only when
+// no function outside the family loads or stores it (by struct slot,
+// across embedding and -O3 TBAA). Then the family's accesses to it are not
+// modeled; otherwise they are, and the outside accessors are reported (a
+// real escape, or a family member missing its summary).
+void CallGraphPass::checkPoolClosure() {
+  poolDrop.clear();
+  auto inFamily = [&](const Function *F) {
+    auto it = Ctx->FuncSummaries.find(F);
+    return it != Ctx->FuncSummaries.end() &&
+           (it->second->fresh || it->second->freeArg >= 0 || it->second->pool);
+  };
+  struct Key { StructType *S; int64_t off; };
+  auto keyOf = [&](const Instruction &I, Key &k) {
+    const Value *Addr = nullptr;
+    if (const auto *L = dyn_cast<LoadInst>(&I)) {
+      if (!L->getType()->isPointerTy()) return false;
+      Addr = L->getPointerOperand();
+    } else if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (!SI->getValueOperand()->getType()->isPointerTy()) return false;
+      Addr = SI->getPointerOperand();
+    } else {
+      return false;
+    }
+    if (isa<AllocaInst>(Addr->stripPointerCasts())) return false;
+    return accessSlot(&I, Addr, I.getModule()->getDataLayout(), k.S, k.off);
+  };
+  auto sameSlot = [&](const Key &a, const Key &b, const DataLayout &DL) {
+    if (a.S == b.S) return a.off == b.off;
+    const StringRef an = stripStructNameSuffix(a.S->getName()), bn = stripStructNameSuffix(b.S->getName());
+    if (an == bn) return a.off == b.off;
+    if (a.off >= b.off && embedsAt(a.S, a.off - b.off, bn, DL)) return true;
+    return b.off >= a.off && embedsAt(b.S, b.off - a.off, an, DL);
+  };
+  // The family's pool fields and its accesses to them.
+  std::vector<Key> fields;
+  std::vector<std::vector<const Instruction *>> famAccess;
+  std::vector<std::set<std::string>> famNames, outside;
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M) {
+      if (F.isDeclaration() || !inFamily(&F)) continue;
+      for (const Instruction &I : instructions(F)) {
+        Key k;
+        if (!keyOf(I, k)) continue;
+        size_t fi = 0;
+        for (; fi < fields.size(); fi++)
+          if (sameSlot(fields[fi], k, DL)) break;
+        if (fi == fields.size()) {
+          fields.push_back(k);
+          famAccess.emplace_back();
+          famNames.emplace_back();
+          outside.emplace_back();
+        }
+        famAccess[fi].push_back(&I);
+        famNames[fi].insert(F.getName().str());
+      }
+    }
+  }
+  if (fields.empty()) return;
+  // Every other function's accesses.
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M) {
+      if (F.isDeclaration() || inFamily(&F)) continue;
+      for (const Instruction &I : instructions(F)) {
+        Key k;
+        if (!keyOf(I, k)) continue;
+        for (size_t fi = 0; fi < fields.size(); fi++)
+          if (sameSlot(fields[fi], k, DL)) outside[fi].insert(F.getName().str());
+      }
+    }
+  }
+  size_t certified = 0, kept = 0;
+  for (size_t fi = 0; fi < fields.size(); fi++) {
+    const std::string fname = stripStructNameSuffix(fields[fi].S->getName()).str() + "+" +
+                              std::to_string(fields[fi].off);
+    std::string fam;
+    for (const std::string &n : famNames[fi]) fam += " " + n;
+    if (outside[fi].empty()) {
+      certified++;
+      poolDrop.insert(famAccess[fi].begin(), famAccess[fi].end());
+      CG_LOG("PoolClosure: CERTIFIED " << fname << " (pool state of" << fam << "; "
+             << famAccess[fi].size() << " accesses not modeled)\n");
+    } else {
+      kept++;
+      std::string who;
+      size_t n = 0;
+      for (const std::string &o : outside[fi])
+        if (n++ < 6) who += " " + o;
+      CG_LOG("PoolClosure: KEPT " << fname << " (family" << fam << "; also accessed by"
+             << who << (outside[fi].size() > 6 ? " ..." : "") << ")\n");
+    }
+  }
+  CG_LOG("PoolClosure: " << certified << " fields certified as pool state, " << kept
+         << " kept (accessed outside the allocator family)\n");
 }

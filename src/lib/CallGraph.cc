@@ -334,6 +334,8 @@ bool CallGraphPass::doInitialization(Module *M) {
     }
     runSummaryProvers(M);
   }
+  if (CFLCells && iteration == 0 && M == Ctx->Modules.back().first)
+    checkPoolClosure();
 
   return false;
 }

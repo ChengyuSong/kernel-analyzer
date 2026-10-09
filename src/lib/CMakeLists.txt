@@ -20,6 +20,7 @@ set (KACoreSource
   UnionCensus.cc
   Summaries.cc
   Census.cc
+  Slots.cc
   Dump.cc
   IRSidecar.cc
   IRCensus.cc

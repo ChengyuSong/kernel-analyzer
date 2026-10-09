@@ -54,6 +54,19 @@ for f in icalls.json callgraph.json sidecar/$BC.facts.json; do
   fi
 done
 
+# The cell solver (--cfl-cells): its rule report is pinned (row meanings,
+# plans 3.47-3.49); a changed row is a reviewed re-pin.
+CELLS=(--func-summaries=../../func_summaries.txt --cfl-cells --cfl-union-keys=tag
+       --cfl-alloc-origins --cfl-whole-program)
+if "$BIN" --verbose=0 "${CELLS[@]}" --cfl-rule-report="$OUT/rules.txt" "$BC" >/dev/null 2>&1 &&
+   diff -q ../baselines/libpng-cells-rule-report.txt "$OUT/rules.txt" >/dev/null; then
+  echo "PASS[cells rule report]"
+else
+  echo "FAIL[cells rule report]:"
+  diff ../baselines/libpng-cells-rule-report.txt "$OUT/rules.txt" 2>&1 | head -5
+  fail=1
+fi
+
 # KABaseline (GraCFL saturation on the same graph).
 run sat-mono-base       "$EXPECT" "$BASE" --cfl-compositional=false
 run sat-comp-base       "$EXPECT" "$BASE"

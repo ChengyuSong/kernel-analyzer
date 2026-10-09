@@ -4868,6 +4868,18 @@ bool CallGraphPass::runCellResolution() {
        << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "
        << varargKeyedSites << " constant format, " << varargPoolSites << " non-constant, "
        << varargUnparsed << " unparsed\n";
+    RO << "\n== assumptions the rows rest on\n"
+       << "ASSUME outside code honors the type of what it is handed: it writes only within the "
+          "subobject it received and what that subobject points to, never stepping past it "
+          "(under --cfl-outside=pure this is part of \"writes nothing\"; under roots it is the "
+          "whole claim of the outside rows)\n"
+       << "ASSUME setjmp/longjmp: bodiless calls (the jmp_buf they receive is exposed); longjmp "
+          "does not return (noreturn), and its non-local return to the setjmp carries no "
+          "pointer value the flow-insensitive solve does not already hold\n"
+       << "ASSUME untyped writes and calls of bodiless functions write no struct slot "
+          "(receivers premise; counted in SUMMARY c)\n"
+       << "ASSUME a va_arg read under the case of specifier c reads only arguments passed under "
+          "c or under a non-constant format (plan 3.47)\n";
     RO << "\n== (a) pointers made from bytes that never were a pointer\n";
     for (const AHit &h : ruleA) RO << "A " << h.kind << " " << instLoc(h.I) << " from: " << h.srcs << "\n";
     RO << "\n== (b) member steps of a struct the object is not at that offset\n";
@@ -4882,7 +4894,9 @@ bool CallGraphPass::runCellResolution() {
     RO << "\n== cycles with offset, the ten largest (plan 3.49)\n";
     {
       std::vector<PwcComp> top = pwcComps;
-      std::sort(top.begin(), top.end(), [](const PwcComp &a, const PwcComp &b) { return a.size > b.size; });
+      std::sort(top.begin(), top.end(), [](const PwcComp &a, const PwcComp &b) {
+        return a.size != b.size ? a.size > b.size : a.rep < b.rep;
+      });
       for (size_t i = 0; i < top.size() && i < 10; i++)
         RO << "P size " << top[i].size << " step " << top[i].g << " typed " << top[i].typed
            << " untyped " << top[i].untyped << (top[i].cls ? " C++ class" : "") << " at "
@@ -4894,6 +4908,7 @@ bool CallGraphPass::runCellResolution() {
       for (auto &[f, c] : byBodiless) rank.push_back({c, f});
       std::sort(rank.rbegin(), rank.rend());
       for (auto &[c, f] : rank) RO << "O bodiless " << f << ": " << c << " indirect calls depend on it\n";
+      std::sort(depRows.begin(), depRows.end()); // the call set is pointer-ordered
       for (const std::string &d : depRows) RO << d << "\n";
     }
     RO << "\n== varargs keyed by format specifier (plan 3.47)\n";

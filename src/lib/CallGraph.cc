@@ -426,7 +426,8 @@ bool CallGraphPass::doFinalization(Module *M) {
     if (!Ctx->SummarySpecs.empty())
       CG_LOG("FuncSummary LEDGER: " << Ctx->FuncSummaries.size()
              << " functions summarized; applied " << g_sumCpy << " CPY, "
-             << g_sumAlias << " ALIAS, " << g_sumSt << " ST, " << g_sumLd
+             << g_sumAlias << " ALIAS, " << g_sumSt << " ST, " << g_sumLabels
+             << " AS (label), " << g_sumLd
              << " LD, " << g_sumFreshSub << " FRESHSUB, " << g_sumInvoke
              << " INVOKE (" << g_sumInvokeDyn
              << " dynamic-fn pooled fallbacks, " << g_sumInvokeRet

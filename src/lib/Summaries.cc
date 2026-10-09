@@ -1358,7 +1358,8 @@ static size_t g_sumDispatch = 0;
 size_t g_sumCpy = 0, g_sumAlias = 0, g_sumSt = 0, g_sumLd = 0,
               g_sumSkipped = 0, g_sumFreshSub = 0, g_sumInvoke = 0,
               g_sumInvokeDyn = 0, g_chainReg = 0, g_chainRegDyn = 0,
-              g_chainCall = 0, g_chainCallDyn = 0, g_chainLate = 0;
+              g_chainCall = 0, g_chainCallDyn = 0, g_chainLate = 0,
+              g_sumLabels = 0;
 // Returns true when an Invoke atom's fn operand is not a constant
 // function at this callsite — the caller must fall back to the pooled
 // arg/ret wiring for soundness (LEDGERed).
@@ -1466,6 +1467,17 @@ static const GlobalValue *resolveChainKeySym(GlobalContext *Ctx,
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S,
                                       bool *retBound, const Function *SF) {
+  // Label atoms (plan 3.46): a typed step of T from argN + K into a node
+  // of its own; nothing transfers.
+  for (const auto &LA : S.labels) {
+    if (LA.arg < 0 || (unsigned)LA.arg >= CS->arg_size()) continue;
+    NodeIndex a = getRepNodeForValue(CS->getArgOperand(LA.arg));
+    if (a == AndersNodeFactory::InvalidIndex) continue;
+    NodeIndex base = summaryFieldPtr(a, LA.off);
+    NodeIndex sink = getCanonicalNode(NF.createValueNode());
+    addFieldEdgesExact(getCanonicalNode(base), sink, 0, 0, false, LA.ty);
+    g_sumLabels++;
+  }
   if (S.noop)
     return false; // NOOP owns the callsite: nothing transfers
   bool needPooled = false;
@@ -2339,6 +2351,179 @@ void CallGraphPass::finalizeChainPairs() {
 // specific: a 5.18-proven ST(*arg0@4096<-arg0) is wrong on 6.x — the
 // shared func_summaries.txt stays layout-free/hand-audited; adoption
 // is per-run, re-proven on the corpus being analyzed).
+// The typed-access evidence of a body (plan 3.46): for each struct GEP
+// whose base is argN + K, the struct whose member step the cell solver
+// would take from the object's start (the first struct level with a
+// nonzero member offset; a field-0 level adds no edge, and a nonzero
+// first index is an untyped byte offset under --cfl-cells). The base
+// resolves through casts, constant GEPs and non-escaping O0 slots that
+// hold one value.
+static std::vector<GlobalContext::FuncSummary::LabelAtom>
+bodyLabels(const Function &F, const DataLayout &DL) {
+  boost::unordered_flat_map<const Value *, int> argIdx;
+  int ai = 0;
+  for (const Argument &A : F.args()) argIdx[&A] = ai++;
+  std::function<bool(const Value *, int, int &, int64_t &)> argOf =
+      [&](const Value *V, int depth, int &arg, int64_t &off) -> bool {
+    if (depth == 0) return false;
+    V = V->stripPointerCasts();
+    if (auto it = argIdx.find(V); it != argIdx.end()) {
+      arg = it->second;
+      off = 0;
+      return true;
+    }
+    if (const auto *G = dyn_cast<GEPOperator>(V)) {
+      APInt O(64, 0);
+      if (!G->accumulateConstantOffset(DL, O)) return false;
+      if (!argOf(G->getPointerOperand(), depth - 1, arg, off)) return false;
+      off += O.getSExtValue();
+      return true;
+    }
+    if (const auto *L = dyn_cast<LoadInst>(V)) {
+      const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+      if (!AI) return false;
+      const Value *only = nullptr;
+      for (const User *U : AI->users()) {
+        if (const auto *L2 = dyn_cast<LoadInst>(U)) {
+          if (L2->getPointerOperand() == AI) continue;
+          return false;
+        }
+        if (const auto *S2 = dyn_cast<StoreInst>(U)) {
+          if (S2->getPointerOperand() != AI || S2->getValueOperand() == AI) return false;
+          if (only && only != S2->getValueOperand()) return false;
+          only = S2->getValueOperand();
+          continue;
+        }
+        if (const auto *II = dyn_cast<IntrinsicInst>(U))
+          if (II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II)) continue;
+        return false;
+      }
+      return only && argOf(only, depth - 1, arg, off);
+    }
+    return false;
+  };
+  std::vector<GlobalContext::FuncSummary::LabelAtom> out;
+  std::set<std::tuple<int, int64_t, const StructType *>> seen;
+  for (const auto &BB : F)
+    for (const auto &I : BB) {
+      const auto *G = dyn_cast<GetElementPtrInst>(&I);
+      if (!G || G->getNumIndices() < 2) continue;
+      const auto *F0 = dyn_cast<ConstantInt>(G->idx_begin()->get());
+      if (!F0 || !F0->isZero()) continue;
+      int64_t acc = 0;
+      const StructType *T = nullptr;
+      bool first = true;
+      for (auto GTI = gep_type_begin(G), E = gep_type_end(G); GTI != E; ++GTI) {
+        if (first) { first = false; continue; } // the pointer level (0)
+        const auto *CI = dyn_cast<ConstantInt>(GTI.getOperand());
+        if (!CI) break;
+        if (StructType *ST = GTI.getStructTypeOrNull()) {
+          const int64_t eo = (int64_t)DL.getStructLayout(ST)->getElementOffset(CI->getZExtValue());
+          if (eo != 0) {
+            if (ST->hasName() && !ST->isLiteral()) T = ST;
+            break;
+          }
+        } else {
+          acc += CI->getSExtValue() * (int64_t)DL.getTypeAllocSize(GTI.getIndexedType());
+        }
+      }
+      if (!T) continue;
+      int arg = -1;
+      int64_t off = 0;
+      if (!argOf(G->getPointerOperand(), 8, arg, off) || off + acc < 0) continue;
+      if (seen.insert({arg, off + acc, T}).second)
+        out.push_back({arg, (int)(off + acc), T});
+    }
+  return out;
+}
+
+// Do a body's label atoms carry all the naming evidence it gives the
+// objects its arguments reach (plan 3.46)? Not when it steps through a
+// pointer loaded from argument memory (a second level: AS cannot name
+// it), indexes an argument pointer by a variable (a walk or stride:
+// element sizes), copies or sets argument memory (effective type), or
+// passes an argument pointer to a function with a body (whose evidence
+// a skipped body would also skip). *why names the first such access.
+static bool labelsCover(const Function &F, std::string &why) {
+  boost::unordered_flat_set<const Value *> arg1, deep; // argN + K / loaded from it
+  for (const Argument &A : F.args())
+    if (A.getType()->isPointerTy()) arg1.insert(&A);
+  auto isSlot = [](const Value *P) -> const AllocaInst * {
+    const auto *AI = dyn_cast<AllocaInst>(P->stripPointerCasts());
+    if (!AI) return nullptr;
+    for (const User *U : AI->users()) {
+      if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == AI) continue;
+      if (const auto *S = dyn_cast<StoreInst>(U);
+          S && S->getPointerOperand() == AI && S->getValueOperand() != AI)
+        continue;
+      if (const auto *II = dyn_cast<IntrinsicInst>(U);
+          II && (II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II)))
+        continue;
+      return nullptr;
+    }
+    return AI;
+  };
+  boost::unordered_flat_set<const AllocaInst *> slot1, slotDeep;
+  for (bool changed = true; changed;) {
+    changed = false;
+    auto mark = [&](boost::unordered_flat_set<const Value *> &S, const Value *V) {
+      changed |= S.insert(V).second;
+    };
+    for (const auto &BB : F)
+      for (const auto &I : BB) {
+        auto in1 = [&](const Value *V) { return arg1.count(V->stripPointerCasts()) > 0; };
+        auto inD = [&](const Value *V) { return deep.count(V->stripPointerCasts()) > 0; };
+        if (const auto *S = dyn_cast<StoreInst>(&I)) {
+          if (const AllocaInst *AI = isSlot(S->getPointerOperand())) {
+            if (in1(S->getValueOperand())) changed |= slot1.insert(AI).second;
+            if (inD(S->getValueOperand())) changed |= slotDeep.insert(AI).second;
+          }
+        } else if (const auto *L = dyn_cast<LoadInst>(&I)) {
+          if (const AllocaInst *AI = isSlot(L->getPointerOperand())) {
+            if (slot1.count(AI)) mark(arg1, L);
+            if (slotDeep.count(AI)) mark(deep, L);
+          } else if (L->getType()->isPointerTy() &&
+                     (in1(L->getPointerOperand()) || inD(L->getPointerOperand()))) {
+            mark(deep, L);
+          }
+        } else if (isa<GetElementPtrInst>(I) || isa<CastInst>(I) || isa<PHINode>(I) ||
+                   isa<SelectInst>(I) || isa<FreezeInst>(I)) {
+          for (const Value *Op : I.operands()) {
+            if (in1(Op)) mark(arg1, &I);
+            if (inD(Op)) mark(deep, &I);
+          }
+        }
+      }
+  }
+  auto any = [&](const Value *V) {
+    V = V->stripPointerCasts();
+    return arg1.count(V) || deep.count(V);
+  };
+  for (const auto &BB : F)
+    for (const auto &I : BB) {
+      if (const auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+        const Value *B = G->getPointerOperand()->stripPointerCasts();
+        if (deep.count(B)) { why = "step through a loaded pointer"; return false; }
+        if (arg1.count(B) && !G->hasAllConstantIndices()) {
+          why = "variable index on an argument pointer";
+          return false;
+        }
+      } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+        if (isa<DbgInfoIntrinsic>(CB)) continue;
+        bool passes = false;
+        for (const Value *A : CB->args()) passes |= any(A);
+        if (!passes) continue;
+        if (isa<MemIntrinsic>(CB)) { why = "memory intrinsic on argument memory"; return false; }
+        const Function *CF = CB->getCalledFunction();
+        if (!CF || !CF->isDeclaration()) {
+          why = "argument pointer passed to " + (CF ? CF->getName().str() : std::string("an icall"));
+          return false;
+        }
+      }
+    }
+  return true;
+}
+
 void CallGraphPass::runSummaryProvers(Module *M) {
   curDL = &M->getDataLayout();
   struct PAtom { // 0=ST 1=MV 2=LD(ret) 3=ALIAS(ret) 4=CPY
@@ -4522,27 +4707,43 @@ void CallGraphPass::runSummaryProvers(Module *M) {
     // Solved-class zero-atom fns: EMPTY-ATOM summaries — callsite
     // wiring cut, body KEPT (never g_noopBodies: their proofs allow
     // formal-independent icalls/asm which body-skip would erase).
+    size_t nLabels = 0, nUncovered = 0;
     for (const Function *F : okEmpty) {
       if (adoptSkip(F)) continue;
       GlobalContext::FuncSummary S;
+      if (CFLCells) {
+        std::string why;
+        if (!labelsCover(*F, why)) {
+          CG_LOG("SummaryAdopt: KEPT " << F->getName() << " [evidence beyond labels: " << why << "]\n");
+          nUncovered++;
+          continue;
+        }
+        S.labels = bodyLabels(*F, *curDL);
+        nLabels += S.labels.size();
+      }
       Ctx->OwnedSummaries.push_back(std::move(S));
       Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
       nEmptyAd++;
     }
-    size_t nNoopKept = 0;
     for (const Function *F : ok) {
       if (adoptSkip(F)) continue;
-      // Under --cfl-cells a NOOP body still names the objects it touches:
-      // its typed accesses give them labels (djpeg O3: skipping
-      // gray_rgb565_convert left the row buffers unlabeled i8[], 1,026
-      // cells unified by name instead of 74, 4x the time). A NOOP saves
-      // time only, so under cells the body stays walked.
-      if (CFLCells) {
-        nNoopKept++;
-        continue;
-      }
       GlobalContext::FuncSummary S;
       S.noop = true;
+      // Under --cfl-cells a skipped body still names the objects it
+      // touches: its typed accesses label them (djpeg O3: without them
+      // gray_rgb565_convert's row buffers stayed unlabeled i8[], 1,026
+      // cells unified by name instead of 74). Label atoms carry them;
+      // a body with evidence they cannot carry stays walked.
+      if (CFLCells) {
+        std::string why;
+        if (!labelsCover(*F, why)) {
+          CG_LOG("SummaryAdopt: KEPT " << F->getName() << " [evidence beyond labels: " << why << "]\n");
+          nUncovered++;
+          continue;
+        }
+        S.labels = bodyLabels(*F, *curDL);
+        nLabels += S.labels.size();
+      }
       Ctx->OwnedSummaries.push_back(std::move(S));
       Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
       g_noopBodies.insert(F);
@@ -4580,6 +4781,16 @@ void CallGraphPass::runSummaryProvers(Module *M) {
         }
       }
       GlobalContext::FuncSummary S;
+      if (CFLCells) {
+        std::string why;
+        if (!labelsCover(*F, why)) {
+          CG_LOG("SummaryAdopt: KEPT " << F->getName() << " [evidence beyond labels: " << why << "]\n");
+          nUncovered++;
+          continue;
+        }
+        S.labels = bodyLabels(*F, *curDL);
+        nLabels += S.labels.size();
+      }
       for (const PAtom &A : pas) {
         GlobalContext::SummaryAtom SA{};
         switch (A.kind) {
@@ -4628,8 +4839,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
     CG_LOG("SummaryAdopt: " << nNoop << " noop + " << nAtom
            << " atom + " << nEmptyAd
            << " empty summaries adopted (per-corpus proofs); " << nInexact
-           << " refused as inexact under cells, " << nNoopKept
-           << " NOOP bodies kept under cells (their accesses label objects)\n");
+           << " refused as inexact under cells; " << nLabels
+           << " label atoms (typed accesses of replaced bodies), " << nUncovered
+           << " bodies kept (naming evidence beyond labels)\n");
   }
 
   // --cfl-propose-chain-summaries (docs/kernel-id-keys.md §7): derive

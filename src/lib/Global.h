@@ -210,6 +210,13 @@ public:
     // meaning, the call is wired as usual; its accesses count as the
     // family's in the pool-closure check (plan 3.38).
     bool pool = false;
+    // AS(argN@K:T): the body accessed argN + K as struct T (plan 3.46).
+    // No transfer: the typed-access evidence a body-replacing summary
+    // would otherwise drop. At a call site the object(s) at argN + K
+    // take a typed step of T, as the body's GEP would: first typed write
+    // labels them, an incompatible label is a rule (b) report.
+    struct LabelAtom { int arg; int off; const llvm::StructType *ty; };
+    std::vector<LabelAtom> labels;
     bool externOnly = false; // '@scope extern' block: applies only to
                         // functions WITHOUT a body in the corpus. A
                         // libc-derived entry must never replace a

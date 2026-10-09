@@ -4603,6 +4603,179 @@ bool CallGraphPass::runCellResolution() {
           (lost ? aLost : allConst ? aConst : aData)++;
           if (ruleA.size() < 5000) ruleA.push_back({&I, kind, srcs});
         }
+    // ---- Outside dependence per indirect call (plan 3.48; DSA's
+    // completeness flag). An object the outside can reach (a pointer
+    // passed to a bodiless call without a summary, an undefined global,
+    // an asm operand), and every object reachable from its cells, is
+    // exposed; an indirect call whose callee is loaded from an exposed
+    // object, or comes from an uncalled function's formal, a bodiless
+    // call's result or an asm result, depends on those boundaries. ----
+    std::vector<std::pair<std::string, std::string>> bnd; // (kind, id)
+    std::map<std::pair<std::string, std::string>, uint32_t> bndIdx;
+    auto bid = [&](const std::string &kind, const std::string &id) {
+      auto [it, ins] = bndIdx.try_emplace({kind, id}, (uint32_t)bnd.size());
+      if (ins) bnd.push_back({kind, id});
+      return it->second;
+    };
+    // Exposure is per content cell: a pointer to (o, off) hands the outside
+    // the subobject there (the struct starting at off, else the byte or
+    // element array holding it, else the cell; an unlabeled object whole),
+    // and what its cells point to.
+    std::map<std::pair<uint32_t, int64_t>, std::set<uint32_t>> exposedBy;
+    std::vector<std::pair<uint32_t, int64_t>> exWork;
+    auto exposeAt = [&](uint32_t o, int64_t off, const std::set<uint32_t> &B, bool whole = false) {
+      const Obj &O = objs[o];
+      int64_t lo = INT64_MIN, hi = INT64_MAX;
+      if (O.layout && !whole) {
+        const int64_t pos = O.repeats ? ((off % O.size) + O.size) % O.size : off;
+        int64_t alo = 0, ahi = 0, esz = 0;
+        if (StructType *S = structAt(O.layout, pos, DL)) {
+          lo = pos;
+          hi = pos + (int64_t)DL.getTypeAllocSize(S);
+        } else if (innermostArraySpan(O.layout, pos, DL, alo, ahi, esz)) {
+          lo = alo;
+          hi = ahi;
+        } else {
+          lo = pos;
+          hi = pos + 1;
+        }
+      }
+      for (auto &[c, up] : O.content) {
+        if (c < lo || c >= hi) continue;
+        std::set<uint32_t> &E = exposedBy[{o, c}];
+        const size_t before = E.size();
+        for (uint32_t b : B) if (E.size() < 5) E.insert(b); // capped: "several"
+        if (E.size() != before) exWork.push_back({o, c});
+      }
+    };
+    auto factsAt = [&](const Value *V, std::vector<std::pair<uint32_t, int64_t>> &out) {
+      const NodeIndex n = NF.getValueNodeFor(V);
+      if (n == AndersNodeFactory::InvalidIndex || getCanonicalNode(n) >= G) return;
+      pts[find(canon(n))].forEach([&](uint32_t f) {
+        for (auto [o, e] : memb[findFact(f)]) out.push_back({o, decOff(e)});
+      });
+    };
+    auto summarized = [&](const Function *F) {
+      auto it = Ctx->FuncSummaries.find(F);
+      return it != Ctx->FuncSummaries.end() && !it->second->none;
+    };
+    std::set<const Function *> calledFns;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F))
+          if (const auto *CB = dyn_cast<CallBase>(&I)) {
+            if (const Function *CF = CB->getCalledFunction()) {
+              calledFns.insert(CF);
+              calledFns.insert(getFuncDef(const_cast<Function *>(CF)));
+            }
+            if (auto cit = Ctx->Callees.find(CB); cit != Ctx->Callees.end())
+              for (const Function *T : cit->second) calledFns.insert(T);
+          }
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F)) {
+          const auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || isa<IntrinsicInst>(CB)) continue;
+          std::set<uint32_t> B;
+          if (CB->isInlineAsm()) {
+            B.insert(bid("asm", instLoc(CB)));
+          } else if (const Function *CF = CB->getCalledFunction()) {
+            const Function *D = getFuncDef(const_cast<Function *>(CF));
+            if (!D->isDeclaration() || summarized(D) || summarized(CF)) continue;
+            B.insert(bid("bodiless call", D->getName().str()));
+          } else {
+            continue;
+          }
+          for (const Value *A : CB->args()) {
+            if (!A->getType()->isPointerTy()) continue;
+            std::vector<std::pair<uint32_t, int64_t>> fs;
+            factsAt(A, fs);
+            for (auto [o, off] : fs) exposeAt(o, off, B);
+          }
+        }
+    for (uint32_t o = 0; o < objs.size(); o++) {
+      const auto *GV = dyn_cast_or_null<GlobalVariable>(NF.getValueForNode(objs[o].origin));
+      if (!GV) continue;
+      if (GV->isDeclaration())
+        exposeAt(o, 0, {bid("undefined global", GV->getName().str())}, true);
+      else if (!CFLWholeProgram && !GV->hasLocalLinkage())
+        exposeAt(o, 0, {bid("exported global", GV->getName().str())}, true);
+    }
+    while (!exWork.empty()) { // what an exposed cell points to
+      const auto [o, c] = exWork.back();
+      exWork.pop_back();
+      const std::set<uint32_t> B = exposedBy[{o, c}];
+      auto cit = objs[o].content.find(c);
+      if (cit == objs[o].content.end()) continue;
+      pts[find(cit->second.second)].forEach([&](uint32_t f) {
+        for (auto [o2, e] : memb[findFact(f)]) exposeAt(o2, decOff(e), B);
+      });
+    }
+    // The boundaries an indirect call's callee depends on.
+    std::function<void(const Value *, std::set<uint32_t> &, std::set<const Value *> &)> calleeDeps =
+        [&](const Value *V, std::set<uint32_t> &out, std::set<const Value *> &seen) {
+      V = V->stripPointerCasts();
+      if (!seen.insert(V).second || seen.size() > 64) return;
+      if (const auto *A = dyn_cast<Argument>(V)) {
+        if (!calledFns.count(A->getParent()))
+          out.insert(bid("uncalled formal", A->getParent()->getName().str() + "#" +
+                                                std::to_string(A->getArgNo())));
+        return;
+      }
+      if (const auto *L = dyn_cast<LoadInst>(V)) {
+        std::vector<std::pair<uint32_t, int64_t>> fs;
+        factsAt(L->getPointerOperand(), fs);
+        for (auto [o, off] : fs) {
+          auto it = exposedBy.find({o, contentKey(objs[o], off)});
+          if (it != exposedBy.end()) out.insert(it->second.begin(), it->second.end());
+        }
+        return;
+      }
+      if (const auto *CB = dyn_cast<CallBase>(V)) {
+        if (CB->isInlineAsm()) { out.insert(bid("asm", instLoc(CB))); return; }
+        if (const Function *CF = CB->getCalledFunction()) {
+          const Function *D = getFuncDef(const_cast<Function *>(CF));
+          if (D->isDeclaration() && !summarized(D) && !summarized(CF))
+            out.insert(bid("bodiless call", D->getName().str()));
+        }
+        return;
+      }
+      if (const auto *PN = dyn_cast<PHINode>(V)) {
+        for (const Value *In : PN->incoming_values()) calleeDeps(In, out, seen);
+        return;
+      }
+      if (const auto *SI = dyn_cast<SelectInst>(V)) {
+        calleeDeps(SI->getTrueValue(), out, seen);
+        calleeDeps(SI->getFalseValue(), out, seen);
+        return;
+      }
+      if (const auto *GEP = dyn_cast<GEPOperator>(V)) calleeDeps(GEP->getPointerOperand(), out, seen);
+    };
+    std::vector<std::string> depRows;
+    size_t nComplete = 0, nDepend = 0;
+    std::map<std::string, size_t> byKind, byBodiless;
+    for (const CallBase *CS : Ctx->IndirectCallInsts) {
+      std::set<uint32_t> out;
+      std::set<const Value *> seen;
+      calleeDeps(CS->getCalledOperand(), out, seen);
+      if (out.empty()) {
+        nComplete++;
+        depRows.push_back("R complete " + instLoc(CS));
+        continue;
+      }
+      nDepend++;
+      std::string l = "R depends " + instLoc(CS) + ":";
+      std::set<std::string> kinds;
+      size_t shown = 0;
+      for (uint32_t b : out) {
+        kinds.insert(bnd[b].first);
+        if (bnd[b].first == "bodiless call") byBodiless[bnd[b].second]++;
+        if (shown++ < 4) l += " [" + bnd[b].first + " " + bnd[b].second + "]";
+      }
+      if (out.size() > 4) l += " (several: " + std::to_string(out.size()) + ")";
+      for (const std::string &k : kinds) byKind[k]++;
+      depRows.push_back(l);
+    }
     const std::string prog = Ctx->Modules.empty() ? std::string("?")
                                                   : Ctx->Modules.front().first->getName().str();
     std::vector<std::pair<size_t, std::pair<std::string, std::string>>> bTop;
@@ -4624,6 +4797,13 @@ bool CallGraphPass::runCellResolution() {
        << leftObject << " offsets past a single object, " << indexOutsideArray
        << " variable indexes on a single object, pointer subtractions across objects: always "
        << rrPtrAlways << ", may " << rrPtrMay << "\n";
+    {
+      std::string k;
+      for (auto &[n, c] : byKind) k += ", " + n + " " + std::to_string(c);
+      RO << "SUMMARY outside " << nComplete << " indirect calls complete, " << nDepend
+         << " depend on an outside boundary (--cfl-outside=" << CFLOutside.getValue()
+         << ")" << k << "\n";
+    }
     RO << "SUMMARY varargs " << varargMapped << " renderers mapped, " << varargKeyedReads
        << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "
        << varargKeyedSites << " constant format, " << varargPoolSites << " non-constant, "
@@ -4639,6 +4819,14 @@ bool CallGraphPass::runCellResolution() {
       RO << "UB byte-exit " << (n < numNodes ? nodeDesc(n) : std::string("?")) << " steps " << k
          << " from " << describe(objs[o]) << " +" << pos << "\n";
     for (const std::string &d : rrPtrAt) RO << "UB ptr-sub " << d << "\n";
+    RO << "\n== outside dependence per indirect call (plan 3.48)\n";
+    {
+      std::vector<std::pair<size_t, std::string>> rank;
+      for (auto &[f, c] : byBodiless) rank.push_back({c, f});
+      std::sort(rank.rbegin(), rank.rend());
+      for (auto &[c, f] : rank) RO << "O bodiless " << f << ": " << c << " indirect calls depend on it\n";
+      for (const std::string &d : depRows) RO << d << "\n";
+    }
     RO << "\n== varargs keyed by format specifier (plan 3.47)\n";
     for (const std::string &d : varargReport) RO << "V " << d << "\n";
     CG_LOG("Cells: rule report written to " << CFLRuleReport << "\n");

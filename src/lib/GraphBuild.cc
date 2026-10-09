@@ -3470,6 +3470,15 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
     // can become a pointer again (inttoptr downstream, or stored onward)
     // must read the cell.
     bool declined = false;
+    // Under --cfl-cells a load from an integer name is data: no facts, no
+    // step, no loop (decided by the name's accesses program-wide).
+    bool counter = false;
+    if (CFLCells && CGP.curDL && isPtrWidthInt(I.getType(), *CGP.curDL) &&
+        CGP.isIntegerName(&I, I.getPointerOperand(), counter)) {
+      g_intNameLoads++;
+      g_counterRetired += counter;
+      return;
+    }
     if (CGP.curDL && isPtrWidthInt(I.getType(), *CGP.curDL)) {
       if (mayBecomePointer(&I, 8, declined)) {
         NodeIndex valNode = CGP.getRepNodeForValue(&I);
@@ -3488,9 +3497,15 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
         // Segment-local field claim: facts arrive with the residues
         // the producer proved; this segment (load -> ... -> inttoptr)
         // must be tag-clean or the residue claim is wrong here.
-        if (CGP.Graph.fieldSensitive() && !ptrToIntTagRoundTripOnly(&I))
+        if (CGP.Graph.fieldSensitive() && !ptrToIntTagRoundTripOnly(&I)) {
           CGP.addFieldWildcardLoop(
               valNode, tagWalkTag("int-load-dirty-segment").c_str());
+          if (CFLCells) {
+            bool c2 = false;
+            CGP.isIntegerName(&I, I.getPointerOperand(), c2); // a counter on a non-integer name
+            g_counterKept += c2;
+          }
+        }
       } else if (declined) {
         g_intLoadUnmodeled++; // ledger
       }
@@ -7286,5 +7301,82 @@ bool CallGraphPass::varargKeysAt(const CallBase *CS, const Function *CF,
   if (keys.size() != nva) { varargUnparsed++; keys.clear(); return false; }
   varargKeyedSites++;
   return true;
+}
+
+// ---- Integer names (plan 3.50 ruling) ----
+size_t g_intNameLoads = 0, g_counterRetired = 0, g_counterKept = 0;
+
+// Does an integer load's value reach an inttoptr through SSA (casts,
+// arithmetic, phis, selects)?
+static bool reachesIntToPtr(const Value *V) {
+  std::vector<const Value *> work{V};
+  std::set<const Value *> seen{V};
+  while (!work.empty()) {
+    const Value *X = work.back();
+    work.pop_back();
+    for (const User *U : X->users()) {
+      if (isa<IntToPtrInst>(U)) return true;
+      if ((isa<CastInst>(U) || isa<BinaryOperator>(U) || isa<PHINode>(U) || isa<SelectInst>(U) ||
+           isa<FreezeInst>(U)) && seen.insert(U).second && seen.size() < 256)
+        work.push_back(U);
+    }
+  }
+  return false;
+}
+
+void CallGraphPass::buildIntegerNames() {
+  intNamesBuilt = true;
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F)) {
+        const Value *Addr = nullptr;
+        Type *T = nullptr;
+        if (const auto *L = dyn_cast<LoadInst>(&I)) Addr = L->getPointerOperand(), T = L->getType();
+        else if (const auto *S = dyn_cast<StoreInst>(&I))
+          Addr = S->getPointerOperand(), T = S->getValueOperand()->getType();
+        else continue;
+        StructType *ST = nullptr;
+        int64_t off = 0;
+        if (!accessSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) continue;
+        uint8_t &f = intNameFlags[{stripStructNameSuffix(ST->getName()).str(), off}];
+        if (containsPointerType(T)) f |= 1;
+        else if (!T->isIntegerTy()) f |= 4;
+        if (isa<LoadInst>(&I) && T->isIntegerTy() && reachesIntToPtr(&I)) f |= 2;
+      }
+  }
+}
+
+// Is the load's name an integer name? counter: its value, after
+// arithmetic, is stored back into the same name (a typed cycle with
+// offset, plan 3.49 "counter").
+bool CallGraphPass::isIntegerName(const Instruction *I, const Value *Addr, bool &counter) {
+  counter = false;
+  if (!intNamesBuilt) buildIntegerNames();
+  const DataLayout &DL = I->getModule()->getDataLayout();
+  StructType *ST = nullptr;
+  int64_t off = 0;
+  if (!accessSlot(I, Addr, DL, ST, off) || !ST || !ST->hasName()) return false;
+  const std::pair<std::string, int64_t> key{stripStructNameSuffix(ST->getName()).str(), off};
+  auto it = intNameFlags.find(key);
+  // A counter: load -> arithmetic -> store into the same name.
+  std::vector<const Value *> work{I};
+  std::set<const Value *> seen{I};
+  while (!work.empty() && !counter) {
+    const Value *X = work.back();
+    work.pop_back();
+    for (const User *U : X->users()) {
+      if (const auto *S = dyn_cast<StoreInst>(U)) {
+        StructType *S2 = nullptr;
+        int64_t o2 = 0;
+        if (S->getValueOperand() == X && accessSlot(S, S->getPointerOperand(), DL, S2, o2) && S2 &&
+            S2->hasName() && stripStructNameSuffix(S2->getName()) == key.first && o2 == off)
+          counter = true;
+        continue;
+      }
+      if ((isa<CastInst>(U) || isa<BinaryOperator>(U)) && seen.insert(U).second) work.push_back(U);
+    }
+  }
+  return it != intNameFlags.end() && it->second == 0;
 }
 

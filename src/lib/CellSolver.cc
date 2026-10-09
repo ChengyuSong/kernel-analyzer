@@ -3590,7 +3590,8 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_set<std::tuple<uint32_t, uint32_t, uint32_t>,
                             boost::hash<std::tuple<uint32_t, uint32_t, uint32_t>>>
       copyPairsDone;
-  size_t copyPairs = 0, copyEdges = 0, effectiveTyped = 0;
+  size_t copyPairs = 0, copyEdges = 0, effectiveTyped = 0, intNameToBytes = 0;
+  std::set<std::string> intNameToBytesAt;
   auto copyRegion = [&](uint32_t os, int64_t a, uint32_t od, int64_t b,
                         int64_t len, const Instruction *at) {
     // Effective type (C11 6.5p6): a copy into an object with no declared
@@ -3645,6 +3646,16 @@ bool CallGraphPass::runCellResolution() {
       if (Od.layout && !Od.repeats && (db < 0 || db >= Od.size)) break;
       const int64_t sk = contentKey(Os, sa), dk = contentKey(Od, db);
       if (!seenAt.insert({so, sk, dob, dk}).second) continue;
+      // An integer name copied into bytes (the route by which an integer
+      // could be read back as a pointer, plan 3.50 ruling): counted.
+      if (!Od.layout && Os.layout && !Os.label.empty()) {
+        auto it = intNameFlags.find({Os.label, sk});
+        if (it != intNameFlags.end() && it->second == 0) {
+          intNameToBytes++;
+          if (intNameToBytesAt.size() < 8 && at)
+            intNameToBytesAt.insert(instLoc(at) + " (" + Os.label + "+" + std::to_string(sk) + ")");
+        }
+      }
       if (!Os.layout && !Os.bytes && Os.content.size() >= CFLCellCap &&
           !Os.content.count(sk))
         continue; // capped: its any-offset cell already reads everything
@@ -4482,7 +4493,8 @@ bool CallGraphPass::runCellResolution() {
             "outer FRESH stands for it); "
          << g_p2iNumberOnly
          << " ptrtoints used as numbers only (no field-any loop); " << g_dataOnlyGeps
-         << " GEPs of data pointers (character traffic: no edges, no cells); " << g_carves
+         << " GEPs of data pointers (character traffic: no edges, no cells); " << g_intNameLoads
+         << " loads of integer names (no facts; " << g_counterRetired << " counters); " << g_carves
          << " carved regions (one past an array, used as another type; see CARVE lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   if (!varargAllKeys.empty())
@@ -4947,9 +4959,12 @@ bool CallGraphPass::runCellResolution() {
         if (n != AndersNodeFactory::InvalidIndex && getCanonicalNode(n) < G && down[find(canon(n))])
           wDown += w;
       }
-      RO << "SUMMARY pwc " << pwcComps.size() << " cycles with offset (typed " << t << ", untyped "
-         << un << ", mixed " << mx << "; through a C++ class step " << cl << "); indirect-call width "
-         << "downstream: " << wDown << " of " << wAll << " targets\n";
+      RO << "SUMMARY pwc " << pwcComps.size() + g_counterRetired + g_counterKept
+         << " cycles with offset (typed " << t + g_counterRetired + g_counterKept << ": walks " << t
+         << ", counters " << g_counterRetired << " retired by the integer-name test and "
+         << g_counterKept << " kept on the int-launder fallback; untyped " << un << ", mixed " << mx
+         << "; through a C++ class step " << cl << "); indirect-call width downstream of the walks: "
+         << wDown << " of " << wAll << " targets\n";
     }
     RO << "SUMMARY varargs " << varargMapped << " renderers mapped, " << varargKeyedReads
        << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "
@@ -4973,6 +4988,8 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[c, k] : bTop) RO << "B x" << c << " object " << k.first << " stepped as " << k.second << "\n";
     RO << "\n== (c) premises and copies between unrelated structs\n";
     for (const std::string &d : copyMismatchAt) RO << "C copy " << d << "\n";
+    RO << "C integer name copied into bytes: " << intNameToBytes << " positions\n";
+    for (const std::string &d : intNameToBytesAt) RO << "C int-to-bytes " << d << "\n";
     RO << "\n== UB undefined behavior (counted, not followed)\n";
     for (auto [n, o, pos, k] : byteStepUBAt)
       RO << "UB byte-exit " << (n < numNodes ? nodeDesc(n) : std::string("?")) << " steps " << k

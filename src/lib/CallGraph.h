@@ -166,6 +166,13 @@ protected:
   void addFieldWildcardLoop(NodeIndex n, const char *why);
   std::map<std::string, size_t> wildcardReasons; // fallback category tally
   std::map<NodeIndex, std::string> wildcardWhy;   // per node (cells cycle report)
+  // Integer names (plan 3.50 ruling): a struct field every access of
+  // which, program-wide, is integer-typed, and no load of which reaches an
+  // inttoptr. Loads from it carry no facts under --cfl-cells.
+  std::map<std::pair<std::string, int64_t>, uint8_t> intNameFlags; // 1 ptr, 2 inttoptr, 4 non-int
+  bool intNamesBuilt = false;
+  void buildIntegerNames();
+  bool isIntegerName(const llvm::Instruction *I, const llvm::Value *Addr, bool &counter);
   void ensureConstGEPFieldEdges(const llvm::ConstantExpr *CE);
   bool runFlowsToResolution();
   // --cfl-cells (CellSolver.cc, plan 3.26): inclusion over (object,

@@ -3591,6 +3591,12 @@ bool CallGraphPass::runCellResolution() {
                             boost::hash<std::tuple<uint32_t, uint32_t, uint32_t>>>
       copyPairsDone;
   size_t copyPairs = 0, copyEdges = 0, effectiveTyped = 0, intNameToBytes = 0;
+  // Byte-array relays (measurement, soup profiler): per byte-array object
+  // B, the typed regions copied in (source object, B offset, length) and
+  // copied out (destination object, B offset, length).
+  struct RelayEnd { uint32_t obj; int64_t at, len, cells; const Instruction *I; };
+  boost::unordered_flat_map<uint32_t, std::vector<RelayEnd>> relayIn, relayOut;
+  std::set<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> relaySeen;
   std::set<std::string> intNameToBytesAt;
   auto copyRegion = [&](uint32_t os, int64_t a, uint32_t od, int64_t b,
                         int64_t len, const Instruction *at) {
@@ -3636,6 +3642,23 @@ bool CallGraphPass::runCellResolution() {
     const auto [ro, ra] = locate(os, a);
     const int64_t L = std::min<int64_t>(len >= 0 ? len : regionLen(ro, ra),
                                         (int64_t)kExpandCap);
+    if (CFLCellSoupProfile && L > 0) {
+      // Typed -> byte array (in) and byte array -> typed (out).
+      auto cellsOf = [&](uint32_t o, int64_t from, int64_t n) {
+        std::set<int64_t> ks;
+        for (int64_t k = 0; k < n && k < 4096; k++) {
+          const auto [o2, x] = locate(o, from + k);
+          if (o2 == o) ks.insert(contentKey(objs[o2], x));
+        }
+        return (int64_t)ks.size();
+      };
+      const bool srcTyped = objs[os].layout && objs[os].label != "i8";
+      const bool dstTyped = objs[od].layout && objs[od].label != "i8";
+      if (srcTyped && !dstTyped && relaySeen.insert({od, os, b, a}).second)
+        relayIn[od].push_back({os, b, L, cellsOf(os, a, L), at});
+      else if (!srcTyped && dstTyped && relaySeen.insert({os, od, a, b}).second)
+        relayOut[os].push_back({od, a, L, cellsOf(od, b, L), at});
+    }
     std::set<std::tuple<uint32_t, int64_t, uint32_t, int64_t>> seenAt;
     for (int64_t k = 0; k < L; k++) {
       // Past a header: the trailing object (located per position).
@@ -4659,6 +4682,47 @@ bool CallGraphPass::runCellResolution() {
   // ---- The rule report (plan 3.11, cells writer): the rules the call
   // graph assumes and where the program breaks them, from the cell
   // solver's state. Rewritten each iteration; the last one stands. ----
+  // Byte-array relays (measurement): typed -> B -> typed paths, the cell
+  // pairs they join today (B is one cell: every source cell to every
+  // destination cell) and with offset preservation (a copy into B keeps
+  // the source offset as +k, a copy out maps +k back: only overlapping
+  // positions join, one to one).
+  if (CFLCellSoupProfile && !relayIn.empty()) {
+    size_t paths = 0, broken = 0;
+    double now = 0, kept = 0;
+    std::vector<std::tuple<double, uint32_t, size_t, size_t>> big; // pairs now, B, ins, outs
+    for (auto &[B, ins] : relayIn) {
+      auto oit = relayOut.find(B);
+      if (oit == relayOut.end()) continue;
+      double bn = 0;
+      for (const RelayEnd &i : ins)
+        for (const RelayEnd &o : oit->second) {
+          if (i.obj == o.obj) continue;
+          paths++;
+          const double pn = (double)i.cells * (double)o.cells;
+          const int64_t lo = std::max(i.at, o.at), hi = std::min(i.at + i.len, o.at + o.len);
+          const double pk = hi > lo ? (double)std::min<int64_t>(hi - lo, std::min(i.cells, o.cells)) : 0;
+          broken += pk == 0;
+          now += pn;
+          kept += pk;
+          bn += pn;
+        }
+      big.push_back({bn, B, ins.size(), oit->second.size()});
+    }
+    std::sort(big.rbegin(), big.rend());
+    CG_LOG("Cells: byte-array relays: " << big.size() << " arrays relay typed->typed, " << paths
+           << " object paths (" << broken << " with no overlapping offsets); cell pairs joined "
+           << (size_t)now << " today, " << (size_t)kept << " with offset preservation\n");
+    for (size_t i = 0; i < big.size() && i < 3; i++) {
+      const auto [bn, B, ni, no] = big[i];
+      CG_LOG("Cells:   relay " << describe(objs[B]) << ": " << ni << " typed regions in, " << no
+             << " out, " << (size_t)bn << " cell pairs today\n");
+      std::set<std::string> where;
+      for (const RelayEnd &e : relayIn[B]) if (e.I && where.size() < 3) where.insert("in " + instLoc(e.I) + " from " + describe(objs[e.obj]));
+      for (const RelayEnd &e : relayOut[B]) if (e.I && where.size() < 6) where.insert("out " + instLoc(e.I) + " to " + describe(objs[e.obj]));
+      for (const std::string &w : where) CG_LOG("Cells:     " << w << "\n");
+    }
+  }
   if (!CFLRuleReport.empty()) {
     std::error_code EC;
     raw_fd_ostream RO(CFLRuleReport, EC, sys::fs::OF_Text);

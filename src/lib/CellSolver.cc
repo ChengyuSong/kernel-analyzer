@@ -3380,10 +3380,15 @@ bool CallGraphPass::runCellResolution() {
   // element or of the object. An unknown object a variable-length copy
   // touches is bytes.
   auto regionLen = [&](uint32_t o, int64_t a) -> int64_t {
-    Obj &O = objs[o];
+    if (objs[o].fn) return 0; // a function holds no cells
+    if (!objs[o].layout && !objs[o].bytes && !objs[o].period) {
+      requestBytes(o, a); // may split o at a (bytes in a new trailing object)
+      std::tie(o, a) = locate(o, a);
+    }
+    const Obj &O = objs[o];
     if (!O.layout) {
-      if (!O.bytes && !O.period) requestBytes(o, a);
       if (O.bytes) return 1;
+      assert(O.period && "copy from an unknown object that requestBytes left unknown");
       return O.period - (((a % O.period) + O.period) % O.period);
     }
     int64_t pos = a;
@@ -4244,6 +4249,14 @@ bool CallGraphPass::runCellResolution() {
       explainWhy(find(C.src), ws.substr(0, ws.find(" [")));
       explainWhy(find(C.dst), wd.substr(0, wd.find(" [")));
     }
+    // --cfl-cell-why-at=NODE: why the nodes NODE describes hold the object.
+    if (recordWhy && !CFLCellWhyAt.empty()) {
+      std::set<uint32_t> asked;
+      for (uint32_t m = 0; m < numNodes; m++)
+        if (nodeDesc(m).find(CFLCellWhyAt) != std::string::npos && asked.insert(find(m)).second)
+          explainWhy(find(m), CFLCellWhy);
+      if (asked.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
+    }
   }
   if (CFLCellReceivers)
     CG_LOG("Cells: method calls p->f(.., p, ..): " << recvSites.size()
@@ -4266,7 +4279,8 @@ bool CallGraphPass::runCellResolution() {
          << " allocator calls inside kept allocator bodies (no object: the "
             "outer FRESH stands for it); "
          << g_p2iNumberOnly
-         << " ptrtoints used as numbers only (no field-any loop); " << g_carves
+         << " ptrtoints used as numbers only (no field-any loop); " << g_dataOnlyGeps
+         << " GEPs of data pointers (character traffic: no edges, no cells); " << g_carves
          << " carved regions (one past an array, used as another type; see CARVE lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   CG_LOG("Cells: " << factMerges << " cells unified by name ("

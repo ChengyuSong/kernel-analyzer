@@ -1216,6 +1216,11 @@ cl::opt<std::string> CFLCellWhy(
            "the heaviest byte copy, explain how its source pointer came to "
            "hold a cell of the object whose description contains this"),
   cl::init(""));
+cl::opt<std::string> CFLCellWhyAt(
+  "cfl-cell-why-at",
+  cl::desc("--cfl-cell-why instrument: also explain why each node whose "
+           "description contains this holds the --cfl-cell-why object"),
+  cl::init(""));
 
 cl::opt<bool> CFLCellOneLabel(
   "cfl-cell-one-label",

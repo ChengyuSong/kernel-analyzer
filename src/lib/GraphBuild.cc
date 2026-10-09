@@ -1053,7 +1053,12 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
     addAssignmentEdge(argNode, formalNode);
   }
   if (CF->isVarArg()) {
-    if (CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF, true)) {
+    if (varargSinkWrappers.count(CF) || varargSinkRenderers.count(CF)) {
+      // A certified vararg sink (computeVarargSinks): its va_arg reads
+      // carry no facts, so the call's variadic arguments go nowhere.
+      printfSinkCallsites++;
+      printfSinkArgsSkipped += numArgs - numFormals;
+    } else if (CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF, true)) {
       // Benign printf-style callsite: varargs are read-only renderer
       // inputs; skip the vararg-summary wiring entirely.
       printfSinkCallsites++;
@@ -1196,7 +1201,7 @@ bool CallGraphPass::removeCallEdges(const CallBase *CS, const Function *CF) {
     Graph.removeCopy(getCanonicalNode(argNode), getCanonicalNode(formalNode));
   }
   // Remove variadic-tail edges
-  if (CF->isVarArg() &&
+  if (CF->isVarArg() && !varargSinkWrappers.count(CF) && !varargSinkRenderers.count(CF) &&
       !(CFLPrintfVarargSink && printfVarargSinkCallsite(CS, CF))) {
     NodeIndex varargNode = getCanonicalNode(NF.getVarargNodeFor(CF));
     assert(varargNode != AndersNodeFactory::InvalidIndex && "Vararg node not found!");
@@ -2098,6 +2103,7 @@ size_t g_sinkArenaSites = 0;
 size_t g_innerAllocSites = 0;
 size_t g_p2iNumberOnly = 0;
 size_t g_carves = 0;
+size_t g_dataOnlyGeps = 0;
 size_t g_freeDropped = 0;
 static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
                                       AndersNodeFactory::InvalidIndex};
@@ -3483,9 +3489,12 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   assert(valNode != AndersNodeFactory::InvalidIndex && "Failed to find load value node");
 
   Value *ptr = I.getOperand(0);
+  // A certified vararg sink: its va_arg reads carry no facts (the two
+  // va_arg edges below are skipped; the load itself is modeled as usual).
+  const bool vaSink = CGP.varargSinkReads.count(&I) > 0;
   // Frontends often lower va_arg to __va_list_tag memory accesses (no VAArgInst).
   // Connect such pointer loads to the function's vararg summary node.
-  if (Function *F = I.getFunction()) {
+  if (Function *F = I.getFunction(); F && !vaSink) {
     NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
     if (varargNode != AndersNodeFactory::InvalidIndex &&
         derivesFromLoweredVAList(ptr)) {
@@ -3497,7 +3506,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // A va_list received from another function: what va_start put into
   // the va_list object (the creator's variadic arguments) is what this
   // lowered va_arg reads.
-  if (const Value *Base = vaListBase(ptr)) {
+  if (const Value *Base = vaSink ? nullptr : vaListBase(ptr)) {
     NodeIndex baseNode = CGP.getRepNodeForValue(Base);
     if (baseNode != AndersNodeFactory::InvalidIndex)
       CGP.addAssignmentEdge(CGP.getRepDerefNode(baseNode), valNode);
@@ -3909,6 +3918,82 @@ static bool carvingGEP(const GetElementPtrInst &GEP, std::string &why) {
   return false;
 }
 
+// --cfl-cells, plan 3.42: a pointer used only for DATA. Every use, through
+// GEPs, casts, phis, selects and non-escaping local slots (the -O0
+// `bufpt++` walk), is a load or store of a value narrower than a pointer
+// (or a pointer-width integer that is never rebased into a pointer), a
+// comparison, an integer used as a number, or an argument of a NOOP entry
+// (strlen). No pointer fact can be read or written through it, so its
+// facts and the cells its steps would mint are never needed: the GEP gets
+// no edges. Pointer-typed accesses and memcpy/memmove/memset keep theirs.
+static bool intMayRebase(const Value *V, unsigned depth, const DataLayout &DL);
+static bool dataOnlyPointer(const Value *V, GlobalContext *Ctx, const DataLayout &DL) {
+  std::vector<const Value *> work{V};
+  std::set<const Value *> seen{V};
+  auto push = [&](const Value *X) { if (seen.insert(X).second) work.push_back(X); };
+  const unsigned ptrBits = DL.getPointerSizeInBits();
+  auto narrow = [&](Type *T) {
+    return T->isIntegerTy() ? T->getIntegerBitWidth() < ptrBits : T->isFloatingPointTy();
+  };
+  while (!work.empty()) {
+    if (seen.size() > 256) return false; // not worth proving
+    const Value *X = work.back();
+    work.pop_back();
+    for (const User *U : X->users()) {
+      const auto *I = dyn_cast<Instruction>(U);
+      if (!I) return false;
+      if (const auto *L = dyn_cast<LoadInst>(I)) {
+        if (narrow(L->getType())) continue;
+        if (L->getType()->isIntegerTy(ptrBits) && !intMayRebase(L, 8, DL)) continue;
+        return false; // a pointer read through it
+      }
+      if (const auto *SI = dyn_cast<StoreInst>(I)) {
+        if (SI->getPointerOperand() == X && SI->getValueOperand() != X) {
+          Type *VT = SI->getValueOperand()->getType();
+          if (narrow(VT)) continue;
+          bool declined = false;
+          if (VT->isIntegerTy(ptrBits) && !mayCarryPtrProvenance(SI->getValueOperand(), 8, declined))
+            continue;
+          return false;
+        }
+        // Stored as a value: into a non-escaping local slot whose loads are
+        // checked in turn (the walk's increment going back to its slot).
+        const auto *S = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts());
+        if (!S) return false;
+        for (const User *SU : S->users()) {
+          if (const auto *SL = dyn_cast<LoadInst>(SU)) { push(SL); continue; }
+          if (const auto *SS = dyn_cast<StoreInst>(SU))
+            if (SS->getPointerOperand() == S && SS->getValueOperand() != S) continue;
+          if (isa<DbgInfoIntrinsic>(SU)) continue;
+          return false;
+        }
+        continue;
+      }
+      if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) || isa<AddrSpaceCastInst>(I) ||
+          isa<PHINode>(I) || isa<SelectInst>(I) || isa<FreezeInst>(I)) {
+        push(I);
+        continue;
+      }
+      if (isa<ICmpInst>(I) || isa<DbgInfoIntrinsic>(I)) continue;
+      if (const auto *P2I = dyn_cast<PtrToIntInst>(I)) {
+        if (!intMayRebase(P2I, 8, DL)) continue;
+        return false;
+      }
+      if (const auto *CB = dyn_cast<CallBase>(I)) {
+        if (isa<MemIntrinsic>(CB)) return false; // relays cells
+        if (const Function *C = CB->getCalledFunction()) {
+          auto sit = Ctx->FuncSummaries.find(C);
+          if (sit != Ctx->FuncSummaries.end() && sit->second->noop && CB->getCalledOperand() != X)
+            continue;
+        }
+        return false;
+      }
+      return false; // returned, or another use
+    }
+  }
+  return true;
+}
+
 void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   Value *ptr = GEP.getPointerOperand();
 
@@ -3928,6 +4013,10 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
     CG_DEBUG("Create value node " << valNode << " for GEP result " << GEP << "\n");
   }
 
+  if (CFLCells && CGP.curDL && dataOnlyPointer(&GEP, CGP.Ctx, *CGP.curDL)) {
+    g_dataOnlyGeps++; // a data pointer: no edges, no facts, no minted cells
+    return;
+  }
   if (CFLCells) {
     std::string why;
     if (carvingGEP(GEP, why)) {
@@ -4768,6 +4857,7 @@ void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
 void CallGraphPass::InstHandler::visitVAArgInst(VAArgInst &I) {
   if (!I.getType()->isPointerTy())
     return;
+  if (CGP.varargSinkReads.count(&I)) return; // a data-only va_arg read
 
   NodeIndex valNode = CGP.NF.getValueNodeFor(&I);
   if (valNode == AndersNodeFactory::InvalidIndex) {
@@ -6553,4 +6643,220 @@ void CallGraphPass::reachLedger() {
          << "missing entry if any should run)\n");
   if (VerboseLevel >= 2)
     for (StringRef n : sample) errs() << "Reach:   unreached " << n << "\n";
+}
+
+// --cfl-cells, plan 3.41: callee-side vararg sinks. A function that reads
+// a va_list (lowered va_arg loads, or VAArgInst) is a SINK when every
+// pointer it reads that way is consumed as data only: loaded as numbers or
+// as pointers that are themselves data only, compared, used as a number,
+// written through only with non-pointers, copied byte-wise into untyped
+// memory (the accumulator), passed only to callees that are sinks for that
+// parameter (or NOOP / FREE entries); never stored as a pointer (except to
+// a non-escaping local slot, whose loads are then checked), returned, or
+// called. Then those reads carry no facts, and a variadic function whose
+// va_lists reach only sinks gets no vararg wiring at its call sites.
+void CallGraphPass::computeVarargSinks() {
+  varargSinkRenderers.clear();
+  varargSinkWrappers.clear();
+  varargSinkReads.clear();
+  if (!CFLCells) return;
+  // Per (callee, param): 1 sink, 2 sink except that a value derived from it
+  // is returned (the caller checks the call's result), 0 not, -1 open.
+  std::map<std::pair<const Function *, unsigned>, int> paramMemo;
+  size_t familyArgs = 0; // va pointers passed to the allocator family (premise)
+  std::string why;
+  auto where = [](const Instruction *I) {
+    std::string w = I->getFunction()->getName().str();
+    if (const DILocation *L = I->getDebugLoc()) w += ":" + std::to_string(L->getLine());
+    return w;
+  };
+  // dataOnly(V, depth, returned): returned != nullptr for a callee's
+  // parameter, where a return of a derived value is noted, not a failure.
+  std::function<bool(const Value *, int, bool *)> dataOnly;
+  auto paramIsSink = [&](const Function *C, unsigned idx, int depth) -> int {
+    auto sit = Ctx->FuncSummaries.find(C);
+    if (sit != Ctx->FuncSummaries.end()) {
+      const auto &S = *sit->second;
+      if (S.noop || (S.freeArg >= 0 && (unsigned)S.freeArg == idx)) return 1;
+      // The allocator family (FRESH / FREE / POOL) takes a block to size or
+      // free it: pool state, not program data (the pool-closure premise).
+      if (S.fresh || S.freeArg >= 0 || S.pool) { familyArgs++; return 1; }
+    }
+    if (C->isDeclaration() || idx >= C->arg_size()) {
+      why = "passed to " + C->getName().str();
+      return 0;
+    }
+    auto [it, ins] = paramMemo.try_emplace({C, idx}, -1);
+    if (!ins) return it->second < 0 ? 1 : it->second; // recursion: the rest of the walk decides
+    bool returned = false;
+    const int r = dataOnly(C->getArg(idx), depth + 1, &returned) ? (returned ? 2 : 1) : 0;
+    paramMemo[{C, idx}] = r;
+    return r;
+  };
+  dataOnly = [&](const Value *V, int depth, bool *returned) -> bool {
+    if (depth > 24) { why = "too deep"; return false; }
+    std::vector<const Value *> work{V};
+    std::set<const Value *> seen{V};
+    auto push = [&](const Value *X) { if (seen.insert(X).second) work.push_back(X); };
+    while (!work.empty()) {
+      const Value *X = work.back();
+      work.pop_back();
+      for (const User *U : X->users()) {
+        const auto *I = dyn_cast<Instruction>(U);
+        if (!I) { why = "constant use"; return false; }
+        if (const auto *L = dyn_cast<LoadInst>(I)) {
+          if (L->getType()->isPointerTy()) push(L); // a pointer read through it: data too
+          continue;
+        }
+        if (const auto *SI = dyn_cast<StoreInst>(I)) {
+          if (SI->getPointerOperand() == X && SI->getValueOperand() != X) {
+            if (SI->getValueOperand()->getType()->isPointerTy()) { why = "pointer stored through it in " + where(I); return false; }
+            continue;
+          }
+          // Stored as a value: only into a non-escaping local slot.
+          const auto *S = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts());
+          if (!S) { why = "stored in " + where(I); return false; }
+          for (const User *SU : S->users()) {
+            if (const auto *SL = dyn_cast<LoadInst>(SU)) { push(SL); continue; }
+            if (const auto *SS = dyn_cast<StoreInst>(SU))
+              if (SS->getPointerOperand() == S && SS->getValueOperand() != S) continue;
+            if (isa<DbgInfoIntrinsic>(SU)) continue;
+            if (const auto *CI = dyn_cast<CastInst>(SU)) { push(CI); continue; }
+            why = "local slot escapes in " + I->getFunction()->getName().str();
+            return false;
+          }
+          continue;
+        }
+        if (isa<GetElementPtrInst>(I) || isa<CastInst>(I) || isa<PHINode>(I) || isa<SelectInst>(I) ||
+            isa<FreezeInst>(I)) {
+          if (const auto *P2I = dyn_cast<PtrToIntInst>(I)) {
+            if (intMayRebase(P2I, 8, I->getModule()->getDataLayout())) { why = "address used as a pointer-sized integer"; return false; }
+            continue;
+          }
+          if (I->getType()->isPointerTy()) push(I);
+          continue;
+        }
+        if (isa<ICmpInst>(I) || isa<DbgInfoIntrinsic>(I)) continue;
+        if (const auto *CB = dyn_cast<CallBase>(I)) {
+          if (CB->getCalledOperand() == X) { why = "called in " + where(I); return false; }
+          if (const auto *MT = dyn_cast<MemTransferInst>(CB)) {
+            // A source copied byte-wise into untyped memory (the accumulator).
+            StructType *S = nullptr;
+            int64_t off = 0;
+            if (MT->getRawSource() == X && MT->getRawDest() != X &&
+                !accessSlot(MT, MT->getRawDest(), MT->getModule()->getDataLayout(), S, off))
+              continue;
+            why = "memcpy into a struct in " + where(I);
+            return false;
+          }
+          if (isa<MemSetInst>(CB) || isa<IntrinsicInst>(CB)) continue;
+          const Function *C = CB->getCalledFunction();
+          if (!C) { why = "passed to an indirect call in " + where(I); return false; }
+          for (unsigned a = 0; a < CB->arg_size(); a++) {
+            if (CB->getArgOperand(a) != X) continue;
+            const int r = paramIsSink(C, a, depth);
+            if (r == 0) return false;
+            if (r == 2 && CB->getType()->isPointerTy()) push(CB); // its result: data too
+          }
+          continue;
+        }
+        if (isa<ReturnInst>(I)) {
+          if (returned) { *returned = true; continue; } // the caller checks the result
+          why = "returned in " + where(I);
+          return false;
+        }
+        why = std::string("used by ") + I->getOpcodeName() + " in " + where(I);
+        return false;
+      }
+    }
+    return true;
+  };
+  // Renderers: functions with va_arg pointer reads.
+  size_t certified = 0, refused = 0;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M) {
+      if (F.isDeclaration()) continue;
+      std::vector<const Value *> reads;
+      for (Instruction &I : instructions(F)) {
+        if (const auto *VA = dyn_cast<VAArgInst>(&I)) {
+          if (VA->getType()->isPointerTy()) reads.push_back(VA);
+        } else if (const auto *L = dyn_cast<LoadInst>(&I)) {
+          // A va_arg value read, not the va_list's own bookkeeping
+          // (overflow_arg_area / reg_save_area are fields of the va_list).
+          const Value *A = L->getPointerOperand()->stripPointerCasts();
+          const auto *G = dyn_cast<GEPOperator>(A);
+          const bool machinery =
+              (G && isLoweredVAListType(G->getSourceElementType())) ||
+              (isa<AllocaInst>(A) && isLoweredVAListType(cast<AllocaInst>(A)->getAllocatedType()));
+          if (!machinery && L->getType()->isPointerTy() &&
+              (derivesFromLoweredVAList(L->getPointerOperand()) || vaListBase(L->getPointerOperand())))
+            reads.push_back(L);
+        }
+      }
+      if (reads.empty()) continue;
+      // Per read: a data-only read carries no facts; a function whose reads
+      // all are is a certified renderer (its call sites lose the wiring too).
+      size_t cut = 0;
+      std::string firstWhy;
+      for (const Value *R : reads) {
+        why.clear();
+        if (dataOnly(R, 0, nullptr)) {
+          varargSinkReads.insert(R);
+          cut++;
+        } else if (firstWhy.empty()) {
+          firstWhy = why;
+        }
+      }
+      if (cut == reads.size()) {
+        varargSinkRenderers.insert(&F);
+        certified++;
+        CG_LOG("VarargSink: CERTIFIED " << F.getName() << " (" << reads.size()
+               << " va_arg pointer reads are data only)\n");
+      } else {
+        refused++;
+        CG_LOG("VarargSink: PARTIAL " << F.getName() << ": " << cut << " of " << reads.size()
+               << " va_arg pointer reads data only; first kept: " << firstWhy << "\n");
+      }
+    }
+  // Wrappers: variadic functions whose va_lists reach only renderers.
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M) {
+      if (F.isDeclaration() || !F.isVarArg()) continue;
+      bool ok = true, any = false;
+      for (Instruction &I : instructions(F)) {
+        const auto *VS = dyn_cast<VAStartInst>(&I);
+        if (!VS) continue;
+        any = true;
+        const auto *AP = dyn_cast<AllocaInst>(VS->getArgList()->stripPointerCasts());
+        if (!AP) { ok = false; break; }
+        std::vector<const Value *> work{AP};
+        std::set<const Value *> seen{AP};
+        while (!work.empty() && ok) {
+          const Value *X = work.back();
+          work.pop_back();
+          for (const User *U : X->users()) {
+            if (isa<VAStartInst>(U) || isa<VAEndInst>(U) || isa<DbgInfoIntrinsic>(U)) continue;
+            if (const auto *G = dyn_cast<GetElementPtrInst>(U)) { if (seen.insert(G).second) work.push_back(G); continue; }
+            if (const auto *CI = dyn_cast<CastInst>(U)) { if (seen.insert(CI).second) work.push_back(CI); continue; }
+            if (const auto *CB = dyn_cast<CallBase>(U)) {
+              const Function *C = CB->getCalledFunction();
+              if (C && (varargSinkRenderers.count(C) || C->isIntrinsic())) continue;
+            }
+            if (const auto *L = dyn_cast<LoadInst>(U))
+              if (!L->getType()->isPointerTy()) continue; // gp_offset / fp_offset
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) break;
+      }
+      if (any && ok) {
+        varargSinkWrappers.insert(&F);
+        CG_LOG("VarargSink: WRAPPER " << F.getName() << " (its va_lists reach only renderers; "
+               << "call-site vararg wiring cut)\n");
+      }
+    }
+  CG_LOG("VarargSink: " << certified << " renderers certified, " << refused << " keep full wiring, "
+         << varargSinkWrappers.size() << " wrappers cut; " << familyArgs
+         << " va pointers passed to the allocator family (sized or freed: premise)\n");
 }

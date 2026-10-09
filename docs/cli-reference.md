@@ -1,6 +1,6 @@
 # KAMain and KABaseline command-line reference
 
-Generated 2026-10-08 by `tools/gen-cli-reference.py` from the
+Generated 2026-10-09 by `tools/gen-cli-reference.py` from the
 `cl::opt` definitions (`src/lib/Flags.cc` for options both binaries share,
 `src/baseline/BaselineMain.cc` for the baseline's own). The descriptions in
 the code are the source of truth; the grouping is the flag census of
@@ -175,6 +175,7 @@ Removed options are errors that name their replacement; the list is in
 - **`--cfl-cell-census-formal`** (default `""`): With --cfl-cell-census-at: FUNCTION:ARGNO whose held objects and names are listed
 - **`--cfl-cell-trace-obj`** (default `""`): With --cfl-cell-census-formal: a backward path from the formal to the origin of an object whose description contains this
 - **`--cfl-cell-why`** (default `""`): --cfl-cells instrument: record the first cause of every fact arrival (edge, hub link, step, walk, any-offset, byte copy); at the heaviest byte copy, explain how its source pointer came to hold a cell of the object whose description contains this
+- **`--cfl-cell-why-at`** (default `""`): --cfl-cell-why instrument: also explain why each node whose description contains this holds the --cfl-cell-why object
 - **`--cfl-cell-soup-profile`** (default `false`): --cfl-cells instrument (plan 3.34): never stops; every fact landing on a node where its name is incompatible with the node's first name is foreign, and inherits the ENTRY of the fact it came from or, at the first such join, makes this node its entry. Reports entries and construct classes ranked by the foreign facts they explain, the hubs, and width per formal and per struct field
 - **`--cfl-cell-soup-cap`** (default `20000000`): --cfl-cell-soup-profile: stop (report, no answers) after this many foreign facts
 - **`--cfl-cell-soup-time`** (default `0`): --cfl-cell-soup-profile: stop (report, no answers) after this many seconds of propagation in one iteration (0: no limit); the report then includes the byte-copy cost table

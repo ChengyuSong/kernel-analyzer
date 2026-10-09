@@ -120,6 +120,7 @@ extern size_t g_innerAllocSites;
 extern size_t g_p2iNumberOnly;
 // --cfl-cells: GEPs that carve a new object out of an allocation.
 extern size_t g_carves;
+extern size_t g_dataOnlyGeps; // GEPs whose result is a data pointer (plan 3.42)
 // --cfl-cells: deallocator stores into or of the freed block (FREE).
 extern size_t g_freeDropped;
 extern std::vector<std::pair<NodeIndex, std::string>> g_userCertObjs;

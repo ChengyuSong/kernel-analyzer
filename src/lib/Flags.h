@@ -132,6 +132,7 @@ extern cl::opt<unsigned> CFLCellCensusAt;
 extern cl::opt<std::string> CFLCellCensusFormal;
 extern cl::opt<std::string> CFLCellTraceObj;
 extern cl::opt<std::string> CFLCellWhy;
+extern cl::opt<std::string> CFLCellWhyAt;
 extern cl::opt<bool> CFLCellReceivers;
 extern cl::opt<bool> CFLCellSoupProfile;
 extern cl::opt<bool> CFLConstructCensus;

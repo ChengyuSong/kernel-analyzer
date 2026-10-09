@@ -2937,6 +2937,7 @@ bool CallGraphPass::runCellResolution() {
                     : C.kind == CellKind::Any ? "*" : "out";
     return k + " @" + std::to_string(C.off) + " of " + describe(objs[C.obj]);
   };
+  boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, uint32_t>> keyedPtrOf;
   auto nodeDesc = [&](uint32_t m) -> std::string {
     if (m >= G) {
       for (uint32_t f = 0; f < cells.size(); f++) {
@@ -2991,11 +2992,24 @@ bool CallGraphPass::runCellResolution() {
       else
         k += "#" + std::to_string(m);
     } else if (NF.isDereferenceNode(m) || NF.isObjectNode(m)) {
-      k = "hub of #" + std::to_string(NF.getDerefParent(m));
-      const NodeIndex par = NF.getDerefParent(m);
-      if (par != AndersNodeFactory::InvalidIndex)
-        if (const auto *I = dyn_cast_or_null<Instruction>(NF.getValueForNode(par)))
-          k += " (" + I->getFunction()->getName().str() + ")";
+      // A keyed union access (--cfl-union-keys=tag) has a dereference
+      // node of its own, without a parent in the factory: its pointer and
+      // key come from keyedDerefOf.
+      if (keyedPtrOf.empty())
+        for (const auto &[pk, d] : keyedDerefOf) keyedPtrOf.emplace(d, pk);
+      NodeIndex par = NF.getDerefParent(m);
+      std::string key;
+      if (par == AndersNodeFactory::InvalidIndex)
+        if (auto it = keyedPtrOf.find(m); it != keyedPtrOf.end()) {
+          par = it->second.first;
+          key = " key " + NF.cellNameString(it->second.second);
+        }
+      assert(par != AndersNodeFactory::InvalidIndex && "a hub without a pointer");
+      k = "hub of #" + std::to_string(par) + key;
+      if (const auto *I = dyn_cast_or_null<Instruction>(NF.getValueForNode(par)))
+        k += " (" + I->getFunction()->getName().str() + ")";
+      else if (const auto *A = dyn_cast_or_null<Argument>(NF.getValueForNode(par)))
+        k += " (" + A->getParent()->getName().str() + " arg" + std::to_string(A->getArgNo()) + ")";
     } else if (NF.isReturnNode(m)) {
       k = "return of " + cast<Function>(V)->getName().str();
     } else if (NF.isVarargNode(m)) {

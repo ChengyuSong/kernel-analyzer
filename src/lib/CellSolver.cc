@@ -479,6 +479,39 @@ bool innermostArray(Type *T, int64_t off, const DataLayout &DL, int64_t &b,
   return found;
 }
 
+// The innermost array holding offset `off` of T: its span [lo, hi)
+// (absolute) and element size. False when `off` lies in no array.
+bool innermostArraySpan(Type *T, int64_t off, const DataLayout &DL, int64_t &lo,
+                        int64_t &hi, int64_t &esz) {
+  bool found = false;
+  int64_t base = 0;
+  for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) break;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) break;
+      unsigned i = SL->getElementContainingOffset(off);
+      const int64_t eo = (int64_t)SL->getElementOffset(i);
+      base += eo;
+      off -= eo;
+      T = ST->getElementType(i);
+      continue;
+    }
+    auto *AT = dyn_cast<ArrayType>(T);
+    if (!AT) break;
+    const int64_t e = (int64_t)DL.getTypeAllocSize(AT->getElementType());
+    if (e == 0) break;
+    found = true;
+    lo = base;
+    hi = base + (int64_t)AT->getNumElements() * e;
+    esz = e;
+    base += (off / e) * e;
+    off %= e;
+    T = AT->getElementType();
+  }
+  return found;
+}
+
 // Does an allocation call's size argument say "a T followed by trailing
 // data": a constant larger than T and not a multiple of it, or a sum (any
 // depth: -O3 chains `sizeof(T) + 8*n + 40*m + k`) with a constant term of
@@ -495,17 +528,27 @@ bool headerPlusTail(const CallBase *C, uint64_t sz) {
       if (const auto *L = dyn_cast<LoadInst>(V))
         if (const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
           const StoreInst *only = nullptr;
-          bool ok = true;
+          bool ok = true, several = false;
           for (const User *U : S->users()) {
             if (isa<LoadInst>(U)) continue;
             const auto *SI = dyn_cast<StoreInst>(U);
-            if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S || only) {
+            if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S) {
               ok = false;
               break;
             }
+            several |= only != nullptr;
             only = SI;
           }
-          if (ok && only) { V = only->getValueOperand(); continue; }
+          if (ok && only && !several) { V = only->getValueOperand(); continue; }
+          // A slot stored several times (fts3InitVtab reuses nByte): the
+          // store before the load in its block reaches it.
+          if (ok && several) {
+            const StoreInst *last = nullptr;
+            for (const Instruction *I = L->getPrevNode(); I && !last; I = I->getPrevNode())
+              if (const auto *SI = dyn_cast<StoreInst>(I))
+                if (SI->getPointerOperand() == S) last = SI;
+            if (last) { V = last->getValueOperand(); continue; }
+          }
         }
       break;
     }
@@ -827,6 +870,7 @@ bool CallGraphPass::runCellResolution() {
   // hub edges added so far).
   size_t collapses = 0, collapsedNodes = 0, walkEdges = 0;
   double collapseSecs = 0;
+  std::vector<std::vector<uint32_t>> bigCycles; // the largest per collapse (report)
   auto collapseCycles = [&]() {
     const auto tc = Clock::now();
     collapses++;
@@ -841,6 +885,12 @@ bool CallGraphPass::runCellResolution() {
         [&](const std::vector<uint32_t> &members) {
           if (members.size() > 1) sccs.push_back(members);
         });
+    if (VerboseLevel >= 2 && !sccs.empty()) {
+      auto big = std::max_element(sccs.begin(), sccs.end(), [](auto &a, auto &b) {
+        return a.size() < b.size();
+      });
+      if (big->size() >= 50) bigCycles.push_back(*big);
+    }
     for (auto &M : sccs) {
       const uint32_t r = *std::min_element(M.begin(), M.end());
       for (uint32_t m : M)
@@ -1219,9 +1269,19 @@ bool CallGraphPass::runCellResolution() {
     }
     return mintOff(o, foldIn(O.layout, off, DL), false);
   };
-  // Some element at byte `off`: the folded address.
-  auto cellAtFolded = [&](uint32_t o, int64_t off) -> uint32_t {
-    return cellAt(o, off);
+  // The address of byte `off` as an element of the byte array holding it
+  // (provenance, plan 3.43: it cannot leave the array); the exact address
+  // elsewhere. Both share the content cell.
+  auto cellAtArr = [&](uint32_t o, int64_t off) -> uint32_t {
+    std::tie(o, off) = locate(o, off);
+    const Obj &O = objs[o];
+    if (!O.layout || O.tail) return cellAt(o, off);
+    const int64_t pos = O.repeats ? ((off % O.size) + O.size) % O.size : off;
+    int64_t lo = 0, hi = 0, esz = 0;
+    if (pos < 0 || pos >= O.size || !innermostArraySpan(O.layout, pos, DL, lo, hi, esz) ||
+        esz != 1 || hi - lo <= 1)
+      return cellAt(o, off);
+    return mintOff(o, foldIn(O.layout, pos, DL), true);
   };
 
   // Learned folding: a typed access at offset 0 of an unlabeled object
@@ -1385,22 +1445,22 @@ bool CallGraphPass::runCellResolution() {
         mergeNodes(u2, u);
         mergeNodes(p2, pn);
       }
-      std::vector<std::pair<int64_t, uint32_t>> past;
+      std::vector<std::tuple<int64_t, bool, uint32_t>> past;
       for (auto &[key, f] : objs[o].offCells)
-        if ((key >> 1) >= sz) past.push_back({key >> 1, findFact(f)});
-      for (auto &[off, f] : past) {
-        objs[o].offCells.erase(off * 2);
-        objs[o].offCells.erase(off * 2 + 1);
+        if ((key >> 1) >= sz) past.push_back({key >> 1, (key & 1) != 0, findFact(f)});
+      for (auto &[off, bit, f] : past) {
+        objs[o].offCells.erase(off * 2 + (bit ? 1 : 0));
         const auto [t, off2] = locate(o, off);
         for (Member &mb : memb[f])
-          if (mb.first == o && decOff(mb.second) == off) mb = {t, encOff(off2, false)};
+          if (mb.first == o && decOff(mb.second) == off)
+            mb = {t, encOff(off2, (mb.second & kFoldedBit) != 0)};
         if (cells[f].obj == o) {
           cells[f].obj = t;
           cells[f].off = off2;
           cells[f].name = internName(cellName(t, contentKey(objs[t], off2)));
         }
-        auto it = objs[t].offCells.find(off2 * 2);
-        if (it == objs[t].offCells.end()) objs[t].offCells[off2 * 2] = f;
+        auto it = objs[t].offCells.find(off2 * 2 + (bit ? 1 : 0));
+        if (it == objs[t].offCells.end()) objs[t].offCells[off2 * 2 + (bit ? 1 : 0)] = f;
         else it->second = mergeFacts(findFact(it->second), f);
         tailMoved++;
         refoldQueue.push_back(t); // folds them as the trailing object reads
@@ -1421,18 +1481,20 @@ bool CallGraphPass::runCellResolution() {
       objs[o].loadNodes.push_back({c, ns[0].first, ns[0].second});
     }
     // Exact addresses reduce modulo the element; equal ones become one.
-    std::map<int64_t, std::vector<uint32_t>> byOff;
+    std::map<std::pair<int64_t, bool>, std::vector<uint32_t>> byOff;
     for (auto &[key, f] : objs[o].offCells) {
       int64_t off = key >> 1;
+      const bool bit = (key & 1) != 0;
       const Obj &O = objs[o];
       assert(!(O.tail && off >= O.size) && "moved to the trailing object above");
       if (O.repeats) off = ((off % O.size) + O.size) % O.size;
       else if (!O.layout && O.bytes) off = 0;
       else if (!O.layout && O.period) off = ((off % O.period) + O.period) % O.period;
-      byOff[off].push_back(findFact(f));
+      byOff[{off, bit}].push_back(findFact(f));
     }
     objs[o].offCells.clear();
-    for (auto &[off, G2] : byOff) {
+    for (auto &[ob, G2] : byOff) {
+      const auto [off, bit] = ob;
       std::vector<uint32_t> fs = G2;
       std::sort(fs.begin(), fs.end());
       fs.erase(std::unique(fs.begin(), fs.end()), fs.end());
@@ -1440,7 +1502,7 @@ bool CallGraphPass::runCellResolution() {
       const uint32_t nm = internName(cellName(o, c));
       for (uint32_t f : fs) {
         for (Member &mb : memb[f])
-          if (mb.first == o) mb.second = encOff(off, false);
+          if (mb.first == o) mb.second = encOff(off, (mb.second & kFoldedBit) != 0);
         if (cells[f].obj == o) {
           cells[f].off = off;
           cells[f].name = nm;
@@ -1451,7 +1513,7 @@ bool CallGraphPass::runCellResolution() {
         surv = mergeFacts(surv, fs[i]);
         refoldMerges++;
       }
-      objs[o].offCells[off * 2] = surv;
+      objs[o].offCells[off * 2 + (bit ? 1 : 0)] = surv;
     }
   };
   auto drainRefolds = [&]() {
@@ -1610,9 +1672,14 @@ bool CallGraphPass::runCellResolution() {
   // congruent to x modulo gcd(s, element). An unlabeled object is an array
   // of s-byte elements (stride 1: bytes). An index from an address in no
   // array is undefined behavior: counted, the address stays.
-  size_t indexOutsideArray = 0, indexAsOffset = 0, leafMerges = 0;
+  size_t indexOutsideArray = 0, indexAsOffset = 0, leafMerges = 0, byteStepUB = 0,
+         byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0;
+  // Sampled undefined-behavior exits: (pointer node, object, position, k).
+  std::vector<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> byteStepUBAt;
+  // arr: the result is an element address of its byte array (provenance).
   auto strideCells = [&](uint32_t o, int64_t x, int64_t s,
-                         std::vector<uint32_t> &out) {
+                         std::vector<uint32_t> &out, bool arr) {
+    auto folded = [&](uint32_t o2, int64_t at) { return arr ? cellAtArr(o2, at) : cellAt(o2, at); };
     std::tie(o, x) = locate(o, x); // past a header: the trailing object
     Obj &O = objs[o];
     if (!O.layout) {
@@ -1631,9 +1698,9 @@ bool CallGraphPass::runCellResolution() {
       out.push_back(cellAt(o, pos));
       return;
     }
-    if (s % e == 0) { out.push_back(cellAtFolded(o, pos)); return; }
+    if (s % e == 0) { out.push_back(folded(o, pos)); return; }
     const int64_t g = std::gcd(s, e), r0 = (((pos - b) % g) + g) % g;
-    for (int64_t j = r0; j < e; j += g) out.push_back(cellAtFolded(o, b + j));
+    for (int64_t j = r0; j < e; j += g) out.push_back(folded(o, b + j));
   };
 
   // ---- Steps: a field edge maps each cell to the cell(s) at the new
@@ -1686,7 +1753,7 @@ bool CallGraphPass::runCellResolution() {
       if (!O.layout) {
         if (L.stride) {
           stridedUnlabeled++;
-          strideCells(C.obj, C.off + L.off, (int64_t)L.stride, res);
+          strideCells(C.obj, C.off + L.off, (int64_t)L.stride, res, false);
         } else {
           res.push_back(cellAt(C.obj, C.off + L.off));
         }
@@ -1731,13 +1798,55 @@ bool CallGraphPass::runCellResolution() {
         if (L.arith && L.extent > 1 && L.off % L.extent == 0 && !O.tail && !inArray &&
             L.off != 0)
           indexAsOffset++;
+        // An untyped constant offset k from inside an array of bytes (n
+        // elements; folded, the address stands for every element). Where
+        // k moves some element to another (-n < k < n), the address stays
+        // in the array. An address of the array as such (provenance: a
+        // typed step into it, an index; the folded bit) cannot leave it
+        // (C11 6.5.6p8): an exit is followed only to a struct start
+        // (container_of), any other is undefined behavior, counted and not
+        // followed. A byte address of the object (from its start or a
+        // byte offset: -O3 writes fields as byte offsets) may step
+        // anywhere in it: the struct-relative target too (plan 3.43).
+        {
+          int64_t lo = 0, hi = 0, esz = 0;
+          const int64_t pos = O.repeats ? ((C.off % O.size) + O.size) % O.size : C.off;
+          if (!index && !L.ty && L.off != 0 && !O.tail &&
+              innermostArraySpan(O.layout, pos, DL, lo, hi, esz) && esz == 1 &&
+              hi - lo > 1) {
+            const int64_t n = hi - lo, k = L.off;
+            const bool arr = (eoff & kFoldedBit) != 0, stays = k > -n && k < n;
+            if (stays) res.push_back(arr ? cellAtArr(C.obj, C.off) : cellAt(C.obj, C.off));
+            if (!arr) {
+              byteStepStructRel++;
+              res.push_back(cellAt(C.obj, C.off + k));
+            } else if (stays) {
+              byteStepStays++;
+            } else {
+              const int64_t to = pos + k;
+              const int64_t tf = O.repeats ? ((to % O.size) + O.size) % O.size : to;
+              if (tf >= 0 && tf < O.size && structAt(O.layout, tf, DL)) {
+                byteStepContainer++;
+                res.push_back(cellAt(C.obj, C.off + k));
+              } else {
+                byteStepUB++;
+                if (byteStepUBAt.size() < 12) byteStepUBAt.push_back({curStepNode, C.obj, pos, k});
+              }
+            }
+            break;
+          }
+        }
         for (int64_t a : actual)
-          res.push_back(index ? cellAt(C.obj, a) : cellAt(C.obj, a + L.off));
+          res.push_back(index ? cellAt(C.obj, a)
+                        : L.ty && L.written ? cellAtArr(C.obj, a + L.off) // into an array member as such
+                               : cellAt(C.obj, a + L.off));
         break;
       }
-      // Strided: a variable index stays in its array.
+      // Strided: a variable index stays in its array (an element address
+      // of it: as the source was, or by a written index into the array).
       for (int64_t a : actual)
-        strideCells(C.obj, a + L.off, (int64_t)L.stride, res);
+        strideCells(C.obj, a + L.off, (int64_t)L.stride, res,
+                    (eoff & kFoldedBit) || (L.written && L.extent > 0));
       break;
     }
     }
@@ -2709,7 +2818,8 @@ bool CallGraphPass::runCellResolution() {
     // An index walk (p++) stays where it is; a member-step walk moves by
     // its member offset first.
     const LazyLabel &L = lazyLabels[li];
-    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut);
+    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut,
+                (c & kFoldedBit) != 0);
     for (uint32_t f2 : walkOut) add(dst, f2);
   };
   auto applyWalk = [&](uint32_t f, const FieldEdge &e) {
@@ -3960,6 +4070,10 @@ bool CallGraphPass::runCellResolution() {
          << walkSteps << " walk steps, " << indexOutsideArray
          << " variable indexes on a single object (array of one), " << indexAsOffset
          << " constant indexes outside an array of their element (byte offsets), "
+         << "byte offsets from inside a byte array: " << byteStepStays << " stay in it, "
+         << byteStepContainer << " leave it for a struct start (container_of), " << byteStepUB
+         << " leave it otherwise (undefined behavior: not followed), " << byteStepStructRel
+         << " from a byte address (struct-relative), "
          << leafMerges << " same-leaf coexistences (unmerged); "
          << "learned " << layoutsLearned << " layouts, " << periodsLearned
          << " element sizes, " << bytesLearned << " byte arrays ("
@@ -4252,9 +4366,14 @@ bool CallGraphPass::runCellResolution() {
     // --cfl-cell-why-at=NODE: why the nodes NODE describes hold the object.
     if (recordWhy && !CFLCellWhyAt.empty()) {
       std::set<uint32_t> asked;
+      boost::unordered_flat_map<uint32_t, uint32_t> classSize;
+      for (uint32_t m = 0; m < numNodes; m++) classSize[find(m)]++;
       for (uint32_t m = 0; m < numNodes; m++)
-        if (nodeDesc(m).find(CFLCellWhyAt) != std::string::npos && asked.insert(find(m)).second)
+        if (nodeDesc(m).find(CFLCellWhyAt) != std::string::npos && asked.insert(find(m)).second) {
+          CG_LOG("Cells: why-at " << nodeDesc(m) << ": class " << find(m) << " of "
+                 << classSize[find(m)] << " nodes, represented by " << nodeDesc(find(m)) << "\n");
           explainWhy(find(m), CFLCellWhy);
+        }
       if (asked.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
     }
   }
@@ -4286,8 +4405,34 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: " << factMerges << " cells unified by name ("
          << retiredDropped << " retired ids dropped from sets), "
          << ptrMerges << " pointer nodes merged by equal sets\n");
+  for (auto [n, o, pos, k] : byteStepUBAt)
+    CG_LOG("Cells:   byte array exit (UB): " << (n < numNodes ? nodeDesc(n) : std::string("?"))
+           << " steps " << k << " from " << describe(objs[o]) << " +" << pos << "\n");
   CG_LOG("Cells: " << collapses << " cycle collapses merged "
          << collapsedNodes << " solver nodes (" << collapseSecs << " s)\n");
+  // The largest cycles: members by function, and the memory cells in them
+  // (a cycle through a cell is a store and a load of one name).
+  for (const auto &M : bigCycles) {
+    std::map<std::string, size_t> byFn;
+    std::vector<std::string> cellsIn;
+    for (uint32_t m : M) {
+      const std::string d = nodeDesc(m);
+      if (d.rfind("cell ", 0) == 0) {
+        if (cellsIn.size() < 16) cellsIn.push_back(d);
+        byFn["<cells>"]++;
+        continue;
+      }
+      byFn[d.substr(0, d.find(':'))]++;
+    }
+    std::vector<std::pair<size_t, std::string>> top;
+    for (auto &[k, c] : byFn) top.push_back({c, k});
+    std::sort(top.rbegin(), top.rend());
+    std::string fl;
+    for (size_t i = 0; i < top.size() && i < 16; i++)
+      fl += " " + top[i].second + "(" + std::to_string(top[i].first) + ")";
+    CG_LOG("Cells:   cycle of " << M.size() << " nodes:" << fl << "\n");
+    for (const std::string &c : cellsIn) CG_LOG("Cells:     " << c << "\n");
+  }
   for (const Cell &C : cells) {
     offCells += C.kind == CellKind::Off;
     anyCells += C.kind == CellKind::Any;

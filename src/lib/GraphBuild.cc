@@ -1766,13 +1766,14 @@ int CallGraphPass::fieldBucket(int64_t off) const {
 uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith,
                                      const StructType *ty, uint32_t extent) {
   if (lazyLabels.empty()) {
-    lazyLabels.push_back({0, 0, false, nullptr, 0});
-    lazyLabelIdx[{0, 0, false, nullptr, 0}] = 0;
+    lazyLabels.push_back({0, 0, false, nullptr, 0, false});
+    lazyLabelIdx[{0, 0, false, nullptr, 0, false}] = 0;
   }
   if (stride == 0) extent = 0; // an extent only qualifies a strided step
-  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent),
+  const bool written = gepWritten && (ty || stride);
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent, written),
                                         (uint32_t)lazyLabels.size());
-  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent});
+  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent, written});
   return it->second;
 }
 
@@ -4039,8 +4040,11 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
       CGP.applyFieldFallback(ptrNode, valNode, "gep-variable-offset");
     else if (levels.empty())
       CGP.addAssignmentEdge(ptrNode, valNode);
-    else
+    else {
+      CGP.gepWritten = GEP.getFunction()->hasOptNone();
       CGP.addFieldChainEdges(ptrNode, valNode, levels, ltys);
+      CGP.gepWritten = false;
+    }
     return;
   }
 

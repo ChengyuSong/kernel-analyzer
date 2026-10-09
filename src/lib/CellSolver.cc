@@ -1672,7 +1672,7 @@ bool CallGraphPass::runCellResolution() {
   // congruent to x modulo gcd(s, element). An unlabeled object is an array
   // of s-byte elements (stride 1: bytes). An index from an address in no
   // array is undefined behavior: counted, the address stays.
-  size_t indexOutsideArray = 0, indexAsOffset = 0, leafMerges = 0, byteStepUB = 0,
+  size_t indexOutsideArray = 0, indexAsOffset = 0, indexStays = 0, leafMerges = 0, byteStepUB = 0,
          byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0;
   // Sampled undefined-behavior exits: (pointer node, object, position, k).
   std::vector<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> byteStepUBAt;
@@ -1798,6 +1798,7 @@ bool CallGraphPass::runCellResolution() {
         if (L.arith && L.extent > 1 && L.off % L.extent == 0 && !O.tail && !inArray &&
             L.off != 0)
           indexAsOffset++;
+        if (index && L.off != 0) indexStays++;
         // An untyped constant offset k from inside an array of bytes (n
         // elements; folded, the address stands for every element). Where
         // k moves some element to another (-n < k < n), the address stays
@@ -4068,7 +4069,8 @@ bool CallGraphPass::runCellResolution() {
 
   CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
          << walkSteps << " walk steps, " << indexOutsideArray
-         << " variable indexes on a single object (array of one), " << indexAsOffset
+         << " variable indexes on a single object (array of one), " << indexStays
+         << " constant indexes staying in their array, " << indexAsOffset
          << " constant indexes outside an array of their element (byte offsets), "
          << "byte offsets from inside a byte array: " << byteStepStays << " stay in it, "
          << byteStepContainer << " leave it for a struct start (container_of), " << byteStepUB

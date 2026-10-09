@@ -1769,7 +1769,9 @@ uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith,
     lazyLabels.push_back({0, 0, false, nullptr, 0, false});
     lazyLabelIdx[{0, 0, false, nullptr, 0, false}] = 0;
   }
-  if (stride == 0) extent = 0; // an extent only qualifies a strided step
+  // An extent qualifies a strided step (the array's length) and an arith
+  // step (the element size: a constant index stays in its array).
+  if (stride == 0 && !arith) extent = 0;
   const bool written = gepWritten && (ty || stride);
   auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent, written),
                                         (uint32_t)lazyLabels.size());

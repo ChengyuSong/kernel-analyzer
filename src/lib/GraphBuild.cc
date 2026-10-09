@@ -4669,8 +4669,19 @@ static bool intMayRebase(const Value *V, unsigned depth, const DataLayout &DL) {
     }
     if (isa<ReturnInst>(U)) return true;
     if (const auto *CB = dyn_cast<CallBase>(U)) {
-      if (CB->getCalledOperand() != V) return true;
-      continue;
+      if (CB->getCalledOperand() == V) continue;
+      // A length or other integer operand of an intrinsic (llvm.memset's
+      // size, llvm.lifetime's size) and the size of a libc memset/memcpy/
+      // memmove are numbers, never addresses (sqlite3 getNextString:
+      // memset(p, 0, (char*)&p->aToken[0] - (char*)p)).
+      if (isa<IntrinsicInst>(CB)) continue;
+      if (const Function *C = CB->getCalledFunction()) {
+        const StringRef N = C->getName();
+        if ((N == "memset" || N == "memcpy" || N == "memmove") && CB->arg_size() == 3 &&
+            CB->getArgOperand(2) == V && CB->getArgOperand(0) != V && CB->getArgOperand(1) != V)
+          continue;
+      }
+      return true;
     }
     if (const auto *CI = dyn_cast<CastInst>(U))
       if (CI->getType()->isIntegerTy() && !isPtrWidthInt(CI->getType(), DL))

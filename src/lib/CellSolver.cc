@@ -2000,6 +2000,165 @@ bool CallGraphPass::runCellResolution() {
     const int64_t a = slotOffset(X);
     return a != INT64_MIN && a == slotOffset(Y);
   };
+  // Pointer slots a function may write, itself or through its callees
+  // (direct calls and the previous iterations' resolved targets): a slot
+  // is (struct name, byte offset); name "" = an untyped write at that
+  // offset (any struct); allWrites = a memcpy/memset into non-local memory.
+  // Bodiless functions write nothing (premise, counted). Used to check the
+  // guards' premise: no write of the guarded path between the check (the
+  // dispatch or the identity test) and the reload.
+  struct ModSet { std::set<std::pair<std::string, int64_t>> slots; bool all = false; };
+  boost::unordered_flat_map<const Function *, ModSet> modOf;
+  // Premises, counted: writes into untyped memory (a byte or pointer
+  // buffer, a memcpy/memset whose destination has no struct type) do not
+  // hit a struct's pointer slot; bodiless functions write no slot.
+  size_t modBodiless = 0, modUntypedWrites = 0;
+  // The struct slots a write at Addr of Len bytes may hit: (S, off) per
+  // 8-byte word, (S, -1) = some slot of S (a variable index inside S);
+  // false = untyped memory (counted premise).
+  auto writeSlots = [&](const Value *Addr, int64_t Len,
+                        std::vector<std::pair<std::string, int64_t>> &out) {
+    const Value *X = Addr->stripPointerCasts();
+    const auto *G = dyn_cast<GEPOperator>(X);
+    if (!G) return false;
+    const auto *ST = dyn_cast<StructType>(G->getSourceElementType());
+    if (!ST || !ST->hasName()) return false;
+    const std::string S = stripStructNameSuffix(ST->getName()).str();
+    APInt Ap(64, 0);
+    if (!G->accumulateConstantOffset(DL, Ap) || Len < 0) {
+      out.push_back({S, -1});
+      return true;
+    }
+    const int64_t o = Ap.getSExtValue();
+    for (int64_t w = o & ~(int64_t)7; w < o + std::max<int64_t>(Len, 1); w += 8) out.push_back({S, w});
+    return true;
+  };
+  auto slotKey = [&](const Value *Addr, std::pair<std::string, int64_t> &key) {
+    const Value *X = Addr->stripPointerCasts();
+    key = {"", 0};
+    if (const auto *G = dyn_cast<GEPOperator>(X)) {
+      APInt Ap(64, 0);
+      if (!G->accumulateConstantOffset(DL, Ap)) return false;
+      key.second = Ap.getSExtValue();
+      if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
+        if (ST->hasName()) key.first = stripStructNameSuffix(ST->getName()).str();
+    }
+    return true;
+  };
+  auto slotMatches = [](const std::pair<std::string, int64_t> &w,
+                        const std::pair<std::string, int64_t> &slot) {
+    if (w.second == -1 || slot.second == -1) return w.first == slot.first;
+    return w.second == slot.second &&
+           (w.first.empty() || slot.first.empty() || w.first == slot.first);
+  };
+  bool modBuilt = false;
+  auto buildMod = [&]() {
+    if (modBuilt) return;
+    modBuilt = true;
+    boost::unordered_flat_map<const Function *, std::vector<const Function *>> calls;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (F.isDeclaration()) continue;
+        ModSet &MS = modOf[&F];
+        for (Instruction &I : instructions(F)) {
+          if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+            const Type *VT = SI->getValueOperand()->getType();
+            if (!VT->isPointerTy() && !(VT->isIntegerTy(64))) continue;
+            if (isa<AllocaInst>(SI->getPointerOperand()->stripPointerCasts())) continue;
+            std::pair<std::string, int64_t> k;
+            std::vector<std::pair<std::string, int64_t>> ws;
+            if (slotKey(SI->getPointerOperand(), k)) MS.slots.insert(k);
+            else if (writeSlots(SI->getPointerOperand(), -1, ws)) MS.slots.insert(ws.begin(), ws.end());
+            else modUntypedWrites++;
+            continue;
+          }
+          const auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB) continue;
+          if (const Function *C = CB->getCalledFunction()) {
+            const StringRef N = C->getName();
+            if (N.starts_with("llvm.memcpy") || N.starts_with("llvm.memmove") ||
+                N.starts_with("llvm.memset") || N == "memcpy" || N == "memmove" || N == "memset") {
+              const Value *D = CB->getArgOperand(0);
+              if (isa<AllocaInst>(D->stripPointerCasts())) continue;
+              int64_t len = -1;
+              if (CB->arg_size() >= 3)
+                if (const auto *CI = dyn_cast<ConstantInt>(CB->getArgOperand(2))) len = CI->getSExtValue();
+              std::vector<std::pair<std::string, int64_t>> ws;
+              if (writeSlots(D, len, ws)) MS.slots.insert(ws.begin(), ws.end());
+              else modUntypedWrites++;
+              continue;
+            }
+            if (C->isDeclaration()) { modBodiless++; continue; }
+            calls[&F].push_back(C);
+            continue;
+          }
+          auto cit = Ctx->Callees.find(CB);
+          if (cit != Ctx->Callees.end())
+            for (const Function *C : cit->second)
+              if (!C->isDeclaration()) calls[&F].push_back(C);
+        }
+      }
+    for (bool grew = true; grew;) {
+      grew = false;
+      for (auto &[F, cs] : calls) {
+        ModSet &MS = modOf[F];
+        for (const Function *C : cs) {
+          const ModSet &CM = modOf[C];
+          if (CM.all && !MS.all) { MS.all = true; grew = true; }
+          for (const auto &k : CM.slots)
+            if (MS.slots.insert(k).second) grew = true;
+        }
+      }
+    }
+  };
+  auto mayWrite = [&](const Function *F, const std::pair<std::string, int64_t> &slot) {
+    auto it = modOf.find(F);
+    if (it == modOf.end()) return false;
+    if (it->second.all) return true;
+    for (const auto &w : it->second.slots)
+      if (slotMatches(w, slot)) return true;
+    return false;
+  };
+  // Does instruction K (in a function body) possibly write the slot?
+  auto instWrites = [&](const Instruction &K, const std::pair<std::string, int64_t> &slot) {
+    if (const auto *SI = dyn_cast<StoreInst>(&K)) {
+      if (isa<AllocaInst>(SI->getPointerOperand()->stripPointerCasts())) return false;
+      const Type *VT = SI->getValueOperand()->getType();
+      if (!VT->isPointerTy() && !VT->isIntegerTy(64)) return false;
+      std::pair<std::string, int64_t> k;
+      if (slotKey(SI->getPointerOperand(), k)) return slotMatches(k, slot);
+      std::vector<std::pair<std::string, int64_t>> ws;
+      if (!writeSlots(SI->getPointerOperand(), -1, ws)) return false; // untyped (premise)
+      for (const auto &w : ws)
+        if (slotMatches(w, slot)) return true;
+      return false;
+    }
+    const auto *CB = dyn_cast<CallBase>(&K);
+    if (!CB) return false;
+    if (const Function *C = CB->getCalledFunction()) {
+      const StringRef N = C->getName();
+      if (N.starts_with("llvm.memcpy") || N.starts_with("llvm.memmove") ||
+          N.starts_with("llvm.memset") || N == "memcpy" || N == "memmove" || N == "memset") {
+        const Value *D = CB->getArgOperand(0);
+        if (isa<AllocaInst>(D->stripPointerCasts())) return false;
+        int64_t len = -1;
+        if (CB->arg_size() >= 3)
+          if (const auto *CI = dyn_cast<ConstantInt>(CB->getArgOperand(2))) len = CI->getSExtValue();
+        std::vector<std::pair<std::string, int64_t>> ws;
+        if (!writeSlots(D, len, ws)) return false; // untyped (premise)
+        for (const auto &w : ws)
+          if (slotMatches(w, slot)) return true;
+        return false;
+      }
+      return mayWrite(C, slot);
+    }
+    auto cit = Ctx->Callees.find(CB);
+    if (cit == Ctx->Callees.end()) return false;
+    for (const Function *C : cit->second)
+      if (mayWrite(C, slot)) return true;
+    return false;
+  };
+  size_t guardModFallback = 0;
   // A guard needs a node of its own: every value in the node's class is
   // the guarded value R, a no-op cast of it, or a phi of only those (global
   // dedup merges loads of one pointer class and one-input phis; a guard on
@@ -2047,6 +2206,20 @@ bool CallGraphPass::runCellResolution() {
           if (!ok && !breaker) breaker = C;
           uniform &= ok;
         }
+        if (uniform) {
+          // The premise: F (and its callees) never rewrite the path's level-0
+          // slot, so a reload inside F sees the holder the method came from.
+          buildMod();
+          std::pair<std::string, int64_t> slot0;
+          if (!slotKey(R.slot0, slot0) || mayWrite(F, slot0)) {
+            guardModFallback++;
+            if (guardRefusedAt.size() < 12)
+              guardRefusedAt.push_back(F->getName().str() + ": may write the dispatch path's slot " +
+                                       slot0.first + "+" + std::to_string(slot0.second) +
+                                       " (receiver premise fails; no guard)");
+            continue;
+          }
+        }
         if (!uniform) {
           guardRefused++;
           if (guardRefusedAt.size() < 12) {
@@ -2076,6 +2249,9 @@ bool CallGraphPass::runCellResolution() {
       }
     }
     CG_LOG("Cells: holder guards: " << guards.size() << " reloads guarded; "
+           << guardModFallback << " methods that may rewrite the path (premise checked: no guard); "
+           << modBodiless << " calls of bodiless functions and " << modUntypedWrites
+           << " untyped writes assumed to write no struct slot; "
            << guardClassShared << " reloads not guarded (node shared by dedup); "
            << guardRefused << " methods refused (a call of another shape):\n");
     for (const std::string &d : guardRefusedAt) CG_LOG("Cells:   refused " << d << "\n");
@@ -2090,7 +2266,7 @@ bool CallGraphPass::runCellResolution() {
   // noreturn function, or a call whose resolved targets all never return.
   boost::unordered_flat_map<uint32_t, uint32_t> passOf; // pass node -> guard
   size_t idTests = 0, idGuards = 0, idUngated = 0, idShared = 0;
-  std::vector<std::string> idGuardAt;
+  std::vector<std::string> idGuardAt, idTestAt;
   if (CFLCellReceivers && !guardIdx.empty()) {
     auto neverReturns = [&](const Function *F) {
       if (F->doesNotReturn()) return true;
@@ -2171,6 +2347,7 @@ bool CallGraphPass::runCellResolution() {
           const auto *Br = dyn_cast_or_null<BranchInst>(C->getNextNode());
           if (!Br || !Br->isConditional() || Br->getCondition() != C) continue;
           idTests++;
+          size_t tCand = 0, tGuard = 0, tUngated = 0, tShared = 0;
           const BasicBlock *eqSucc =
               Br->getSuccessor(C->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1);
           const Value *path = LH->getPointerOperand();
@@ -2207,32 +2384,42 @@ bool CallGraphPass::runCellResolution() {
                 R = Ph;
             }
             if (!R) continue;
-            // Walk from the entry avoiding gates; reaching R ungated fails.
+            tCand++;
+            // Walk from the entry with a state: gated after the test's equal
+            // edge or a store into the path (its value passes), ungated again
+            // at anything that may write the path (another store, a call whose
+            // writes include the slot). Reaching R ungated fails.
+            buildMod();
+            std::pair<std::string, int64_t> pslot;
+            if (!slotKey(path, pslot)) { idUngated++; tUngated++; continue; }
             bool reached = false;
-            std::vector<const BasicBlock *> work{&F.getEntryBlock()};
-            boost::unordered_flat_set<const BasicBlock *> seen{&F.getEntryBlock()};
+            std::vector<std::pair<const BasicBlock *, bool>> work{{&F.getEntryBlock(), false}};
+            boost::unordered_flat_set<uint64_t> seen;
+            auto key = [](const BasicBlock *B, bool g) { return (uint64_t)(uintptr_t)B * 2 + g; };
+            seen.insert(key(&F.getEntryBlock(), false));
             while (!work.empty() && !reached) {
-              const BasicBlock *X = work.back();
+              auto [X, gated] = work.back();
               work.pop_back();
               bool stop = false;
               for (const Instruction &K : *X) {
-                if (&K == R) { reached = true; break; }
+                if (&K == R) { if (!gated) reached = true; stop = true; break; }
                 if (const auto *SI = dyn_cast<StoreInst>(&K))
                   if (std::find(pathStores.begin(), pathStores.end(), SI) != pathStores.end()) {
-                    stop = true;
-                    break;
+                    gated = true;
+                    continue;
                   }
                 if (deadCall(K)) { stop = true; break; }
+                if (gated && instWrites(K, pslot)) gated = false;
               }
-              if (reached || stop) continue;
+              if (stop) continue;
               const Instruction *T = X->getTerminator();
               for (unsigned k = 0; k < T->getNumSuccessors(); k++) {
                 const BasicBlock *S = T->getSuccessor(k);
-                if (T == Br && S == eqSucc) continue; // gated by the test
-                if (seen.insert(S).second) work.push_back(S);
+                const bool g = gated || (T == Br && S == eqSucc);
+                if (seen.insert(key(S, g)).second) work.push_back({S, g});
               }
             }
-            if (reached) { idUngated++; continue; }
+            if (reached) { idUngated++; tUngated++; continue; }
             const NodeIndex rn = NF.getValueNodeFor(R);
             if (rn == AndersNodeFactory::InvalidIndex) continue;
             const uint32_t n = find(canon(rn));
@@ -2240,12 +2427,15 @@ bool CallGraphPass::runCellResolution() {
             // the tested holder (or another value) would filter them too.
             if (n == find(canon(hn))) {
               idShared++;
+              tShared++;
               continue;
             }
             if (n >= guardIdx.size() || guardIdx[n] != UINT32_MAX || !classOnly(rn, R)) {
               idShared++;
+              tShared++;
               continue;
             }
+            tGuard++;
             // A pseudo site: level 1 steps the holder to the tested slot.
             RecvSite PS{nullptr, 0, n, n, {UINT32_MAX, li}};
             const uint32_t si = recvSites.size();
@@ -2265,6 +2455,11 @@ bool CallGraphPass::runCellResolution() {
               addEdge(find(canon(vn)), P);
             }
           }
+          if (idTestAt.size() < 40)
+            idTestAt.push_back(instLoc(C) + " (== " + Fn->getName().str() + "): " +
+                               std::to_string(tCand) + " reloads, " + std::to_string(tGuard) +
+                               " guarded, " + std::to_string(tUngated) + " reachable around, " +
+                               std::to_string(tShared) + " shared");
         }
       }
     CG_LOG("Cells: method-identity tests: " << idTests << " (h->slot ==/!= function); "
@@ -2272,6 +2467,7 @@ bool CallGraphPass::runCellResolution() {
            << " reloads reachable around the test (not guarded), " << idShared
            << " not guarded (node shared with the holder or another guard)\n");
     for (const std::string &d : idGuardAt) CG_LOG("Cells:   " << d << "\n");
+    for (const std::string &d : idTestAt) CG_LOG("Cells:   identity test " << d << "\n");
   }
   guardHold = [&](uint32_t gi, uint32_t n, uint32_t f) {
     Guard &Gd = guards[gi];
@@ -2523,6 +2719,16 @@ bool CallGraphPass::runCellResolution() {
       k = (I->getFunction()->getName() + ": " ).str() + os.str().substr(0, 140);
     } else if (const auto *A = dyn_cast_or_null<Argument>(V)) {
       k = (A->getParent()->getName() + " arg" + Twine(A->getArgNo())).str();
+    } else if (NF.isObjectNode(m) && NF.getDerefParent(m) == AndersNodeFactory::InvalidIndex) {
+      // An object's own memory node (a global, stack slot or allocation).
+      const Value *OV = NF.getValueForNode(m);
+      k = "memory of ";
+      if (const auto *I = dyn_cast_or_null<Instruction>(OV))
+        k += I->getFunction()->getName().str() + "::" + I->getOpcodeName();
+      else if (OV)
+        k += OV->getName().str();
+      else
+        k += "#" + std::to_string(m);
     } else if (NF.isDereferenceNode(m) || NF.isObjectNode(m)) {
       k = "hub of #" + std::to_string(NF.getDerefParent(m));
       const NodeIndex par = NF.getDerefParent(m);
@@ -3138,6 +3344,7 @@ bool CallGraphPass::runCellResolution() {
     }
   };
   auto copyPair = [&](uint32_t ci, uint32_t fs, uint32_t fd) {
+    if (soupStop) return; // the profiler stopped: no more work
     fs = findFact(fs);
     fd = findFact(fd);
     if (!copyPairsDone.insert(std::make_tuple(ci, fs, fd)).second) return;
@@ -3202,6 +3409,13 @@ bool CallGraphPass::runCellResolution() {
   if (CFLCellSoupProfile)
     soupArrive = [&](uint32_t n, uint32_t f) {
       if (soupStop) return;
+      // The time cap, also inside a long pop (a byte copy's expansion).
+      static uint32_t tick = 0;
+      if (CFLCellSoupTime && (++tick & 0xffff) == 0 &&
+          std::chrono::duration<double>(Clock::now() - t0).count() > CFLCellSoupTime) {
+        soupStop = true;
+        return;
+      }
       f = findFact(f);
       const Cell &C = cells[f];
       if (C.kind != CellKind::Off) return;
@@ -3771,6 +3985,7 @@ bool CallGraphPass::runCellResolution() {
       if (d.rfind("hub of", 0) == 0 && (p = d.rfind('(')) != std::string::npos)
         return "function " + d.substr(p + 1, d.size() - p - 2);
       if (d.rfind("return of ", 0) == 0) return "function " + d.substr(10);
+      if (d.rfind("memory of ", 0) == 0) return "object " + d.substr(10);
       if ((p = d.find(':')) != std::string::npos) return "function " + d.substr(0, p);
       if ((p = d.find(" arg")) != std::string::npos) return "function " + d.substr(0, p);
       return d.substr(0, 60);

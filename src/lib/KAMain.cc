@@ -225,10 +225,12 @@ int main(int argc, char **argv) {
                             "nexus fields, union keys, residue copies and "
                             "the rule report of the cluster solver: refuse "
                             "them");
-      // Mechanisms that read or extend the cluster solver's state.
+      // Mechanisms that read or extend the cluster solver's state. The
+      // summary provers (NOOP, atom, solved) are IR proofs and adoption
+      // installs them as call-site summaries: both run under cells
+      // (plan 3.37 item 2).
       for (cl::opt<bool> *o :
-           {&CFLProposeChainSummaries, &CFLRegFieldApply, &CFLRegFieldObj,
-            &CFLProposeSolvedSummaries, &CFLAdoptProposedSummaries}) {
+           {&CFLProposeChainSummaries, &CFLRegFieldApply, &CFLRegFieldObj}) {
         if (o->getNumOccurrences() && *o)
           cliErrors.push_back("--cfl-cells refuses --" +
                               o->ArgStr.str() +

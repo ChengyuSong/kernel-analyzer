@@ -2957,6 +2957,33 @@ void CallGraphPass::runSummaryProvers(Module *M) {
           boost::unordered_flat_map<const Value *, SmallVector<Src, 4>> memo;
           boost::unordered_flat_set<const Value *> inProg;
           bool blockedOnCallee = false;
+          // An O0 local slot (a spilled parameter or local variable): an
+          // alloca used only by loads from it, stores into it (never of
+          // its own address) and lifetime/debug markers. Its address
+          // never escapes, so a store into it is a frame-local effect
+          // (no atom), and a load from it yields what was stored into it
+          // (all stores: flow-insensitive, as the main model is).
+          boost::unordered_flat_map<const AllocaInst *, bool> slotMemo;
+          auto isSlot = [&](const Value *V) -> const AllocaInst * {
+            const auto *AI = dyn_cast<AllocaInst>(V);
+            if (!AI) return nullptr;
+            auto [it, ins] = slotMemo.try_emplace(AI, true);
+            if (ins)
+              for (const User *U : AI->users()) {
+                if (const auto *L = dyn_cast<LoadInst>(U)) {
+                  if (L->getPointerOperand() == AI) continue;
+                } else if (const auto *S = dyn_cast<StoreInst>(U)) {
+                  if (S->getPointerOperand() == AI && S->getValueOperand() != AI)
+                    continue;
+                } else if (const auto *II = dyn_cast<IntrinsicInst>(U)) {
+                  if (II->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(II))
+                    continue;
+                }
+                it->second = false;
+                break;
+              }
+            return it->second ? AI : nullptr;
+          };
           std::function<bool(const Value *, SmallVectorImpl<Src> &)> rez =
               [&](const Value *V, SmallVectorImpl<Src> &out) -> bool {
             V = V->stripPointerCasts();
@@ -3009,6 +3036,15 @@ void CallGraphPass::runSummaryProvers(Module *M) {
               okr = rez(SI2->getTrueValue(), b) &&
                     rez(SI2->getFalseValue(), b);
               r = b;
+            } else if (const auto *LI = dyn_cast<LoadInst>(V);
+                       LI && isSlot(LI->getPointerOperand())) {
+              okr = true;
+              for (const User *U : LI->getPointerOperand()->users())
+                if (const auto *S = dyn_cast<StoreInst>(U)) {
+                  SmallVector<Src, 4> b;
+                  if (!rez(S->getValueOperand(), b)) { okr = false; break; }
+                  r.append(b.begin(), b.end());
+                }
             } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
               SmallVector<Src, 4> b;
               if (rez(LI->getPointerOperand(), b)) {
@@ -3304,6 +3340,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
               }
               if (const auto *SI3 = dyn_cast<StoreInst>(&I)) {
                 const Value *Val = SI3->getValueOperand();
+                if (isSlot(SI3->getPointerOperand())) continue; // frame-local
                 SmallVector<Src, 4> Ts;
                 if (!rez(SI3->getPointerOperand(), Ts)) {
                   why = blockedOnCallee ? (retryable = true, "compose")
@@ -3469,6 +3506,12 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       // Zero-atom successes -> okEmpty (EMPTY-ATOM summaries: callsite
       // wiring cut, body kept — in-body registrations survive).
       boost::unordered_flat_set<const Function *> okEmpty;
+      // Under --cfl-cells a scalar narrower than a pointer is data: its
+      // loads and stores carry no pointer (plan 3.42), as in the graph.
+      auto narrowData = [&](Type *T) {
+        return (T->isIntegerTy() || T->isFloatingPointTy()) &&
+               curDL->getTypeSizeInBits(T) < curDL->getPointerSizeInBits();
+      };
       if (CFLProposeSolvedSummaries && curDL) {
         // LV kinds: 0 ARGP(a,off) 1 LOADARG(a,off) 2 NULL 3 GLOBALP(g,off)
         //           4 LOADGLOBAL(g,off) 5 LOCAL(id,off) 6 OPAQUE-EXT
@@ -3723,6 +3766,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   LVSet dd;
                   mergeInto(dd, r);
                   setEnv(&I, dd);
+                } else if (const auto *LI = dyn_cast<LoadInst>(&I);
+                           LI && CFLCells && narrowData(LI->getType())) {
+                  setEnv(&I, LVSet()); // data (plan 3.42): no pointer
                 } else if (const auto *LI = dyn_cast<LoadInst>(&I)) {
                   LVSet b = evalV(LI->getPointerOperand()), r;
                   for (const LV &v : b) {
@@ -3759,6 +3805,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   LVSet dd;
                   mergeInto(dd, r);
                   setEnv(&I, dd);
+                } else if (const auto *SI2 = dyn_cast<StoreInst>(&I);
+                           SI2 && CFLCells &&
+                           narrowData(SI2->getValueOperand()->getType())) {
+                  continue; // data (plan 3.42): writes no pointer
                 } else if (const auto *SI2 = dyn_cast<StoreInst>(&I)) {
                   LVSet val = evalV(SI2->getValueOperand());
                   LVSet ptr = evalV(SI2->getPointerOperand());
@@ -4479,8 +4529,18 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
       nEmptyAd++;
     }
+    size_t nNoopKept = 0;
     for (const Function *F : ok) {
       if (adoptSkip(F)) continue;
+      // Under --cfl-cells a NOOP body still names the objects it touches:
+      // its typed accesses give them labels (djpeg O3: skipping
+      // gray_rgb565_convert left the row buffers unlabeled i8[], 1,026
+      // cells unified by name instead of 74, 4x the time). A NOOP saves
+      // time only, so under cells the body stays walked.
+      if (CFLCells) {
+        nNoopKept++;
+        continue;
+      }
       GlobalContext::FuncSummary S;
       S.noop = true;
       Ctx->OwnedSummaries.push_back(std::move(S));
@@ -4488,8 +4548,37 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       g_noopBodies.insert(F);
       nNoop++;
     }
+    size_t nInexact = 0;
     for (auto &[F, pas] : props) {
       if (adoptSkip(F)) continue;
+      // Under --cfl-cells an atom with a wildcard offset (@X), MVX/LDX,
+      // or a two-level atom the prover proposes (no exact inner offset)
+      // applies as a field-any loop: every cell of the object, where the
+      // walked body copies position by position. Refused: the body
+      // stays walked (plan 3.37 item 2).
+      if (CFLCells) {
+        // An interior value pointer (ST/ALIAS of argN@K, K > 0) loses
+        // the provenance the walked body gives it: &p->zSpace (a typed
+        // step into a byte array, plan 3.43) becomes a byte offset, and
+        // a walk from it leaves the array. Refused as well.
+        const PAtom *bad = nullptr;
+        for (const PAtom &A : pas)
+          if (A.o1 < 0 || A.o2 < 0 || A.kind == 5 || A.kind == 6 ||
+              A.kind == 7 || A.kind == 8 || A.kind == 9 ||
+              ((A.kind == 0 || A.kind == 3) && A.o2 > 0)) {
+            bad = &A;
+            break;
+          }
+        if (bad) {
+          CG_LOG("SummaryAdopt: REFUSED " << F->getName()
+                 << " [inexact under cells: atom kind " << bad->kind
+                 << (bad->o1 < 0 || bad->o2 < 0 ? ", wildcard offset"
+                     : bad->o2 > 0 ? ", interior value pointer" : "")
+                 << "]\n");
+          nInexact++;
+          continue;
+        }
+      }
       GlobalContext::FuncSummary S;
       for (const PAtom &A : pas) {
         GlobalContext::SummaryAtom SA{};
@@ -4538,7 +4627,9 @@ void CallGraphPass::runSummaryProvers(Module *M) {
     }
     CG_LOG("SummaryAdopt: " << nNoop << " noop + " << nAtom
            << " atom + " << nEmptyAd
-           << " empty summaries adopted (per-corpus proofs)\n");
+           << " empty summaries adopted (per-corpus proofs); " << nInexact
+           << " refused as inexact under cells, " << nNoopKept
+           << " NOOP bodies kept under cells (their accesses label objects)\n");
   }
 
   // --cfl-propose-chain-summaries (docs/kernel-id-keys.md §7): derive

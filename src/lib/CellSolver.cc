@@ -3432,6 +3432,9 @@ bool CallGraphPass::runCellResolution() {
   // are the ones seen so far.
   std::vector<std::string> copyMismatchAt;
   size_t copyMismatches = 0;
+  // Pointer subtractions across objects (kept for the rule report).
+  size_t rrPtrAlways = 0, rrPtrMay = 0;
+  std::vector<std::string> rrPtrAt;
   auto reportDefects = [&]() {
     CG_LOG("Cells: " << copyMismatches
            << " copies between unrelated structs (copied byte by byte, "
@@ -3458,6 +3461,9 @@ bool CallGraphPass::runCellResolution() {
                      std::to_string(po.size()) + " vs " +
                      std::to_string(qo.size()) + " objects)");
     }
+    rrPtrAlways = disjoint;
+    rrPtrMay = partial;
+    rrPtrAt = ex;
     CG_LOG("Cells: pointer subtractions (C: one object only): "
            << ptrDiffs.size() << ", same objects " << same
            << ", undefined behavior: always " << disjoint << ", may "
@@ -4522,6 +4528,121 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, " << totalTargets
          << " targets (" << newPairs << " new pairs wired, " << typeRej
          << " type-rejected), iteration " << iteration << "\n");
+  // ---- The rule report (plan 3.11, cells writer): the rules the call
+  // graph assumes and where the program breaks them, from the cell
+  // solver's state. Rewritten each iteration; the last one stands. ----
+  if (!CFLRuleReport.empty()) {
+    std::error_code EC;
+    raw_fd_ostream RO(CFLRuleReport, EC, sys::fs::OF_Text);
+    if (EC) {
+      errs() << "FATAL: cannot write " << CFLRuleReport << ": " << EC.message() << "\n";
+      exit(1);
+    }
+    // (a) pointers made from integers that carry no address: an inttoptr
+    // used as a pointer whose value holds no fact; its integer sources
+    // say what the bytes were.
+    struct AHit { const Instruction *I; std::string kind, srcs; };
+    std::vector<AHit> ruleA;
+    size_t aData = 0, aConst = 0, aLost = 0;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F)) {
+          auto *IP = dyn_cast<IntToPtrInst>(&I);
+          if (!IP) continue;
+          bool usedAsPtr = false;
+          for (const User *U : IP->users()) {
+            if (const auto *LI = dyn_cast<LoadInst>(U)) usedAsPtr |= LI->getPointerOperand() == IP;
+            else if (const auto *SI = dyn_cast<StoreInst>(U)) usedAsPtr |= SI->getPointerOperand() == IP;
+            else if (const auto *CB = dyn_cast<CallBase>(U)) usedAsPtr |= CB->getCalledOperand() == IP;
+            else if (const auto *G = dyn_cast<GetElementPtrInst>(U)) usedAsPtr |= G->getPointerOperand() == IP;
+          }
+          if (!usedAsPtr) continue;
+          const NodeIndex n = NF.getValueNodeFor(IP);
+          if (n != AndersNodeFactory::InvalidIndex && getCanonicalNode(n) < G &&
+              pts[find(canon(n))].count())
+            continue;
+          SmallVector<const Value *, 16> work{IP->getOperand(0)};
+          SmallPtrSet<const Value *, 16> seen;
+          std::string srcs;
+          bool lost = false, allConst = true;
+          while (!work.empty() && seen.size() < 24) {
+            const Value *V = work.pop_back_val();
+            if (!seen.insert(V).second) continue;
+            std::string leaf;
+            if (isa<ConstantInt>(V)) leaf = "const";
+            else if (isa<PtrToIntInst>(V) || (isa<ConstantExpr>(V) &&
+                     cast<ConstantExpr>(V)->getOpcode() == Instruction::PtrToInt)) {
+              leaf = "ptrtoint";
+              lost = true;
+            } else if (const auto *BO = dyn_cast<BinaryOperator>(V)) {
+              work.push_back(BO->getOperand(0));
+              work.push_back(BO->getOperand(1));
+              continue;
+            } else if (const auto *CA = dyn_cast<CastInst>(V)) {
+              work.push_back(CA->getOperand(0));
+              continue;
+            } else if (const auto *PN = dyn_cast<PHINode>(V)) {
+              for (const Value *In : PN->incoming_values()) work.push_back(In);
+              continue;
+            } else if (const auto *SE = dyn_cast<SelectInst>(V)) {
+              work.push_back(SE->getTrueValue());
+              work.push_back(SE->getFalseValue());
+              continue;
+            } else if (const auto *LI = dyn_cast<LoadInst>(V)) leaf = "load " + instLoc(LI);
+            else if (const auto *A = dyn_cast<Argument>(V))
+              leaf = "arg " + A->getParent()->getName().str() + "#" + std::to_string(A->getArgNo());
+            else if (const auto *CB = dyn_cast<CallBase>(V)) {
+              const Function *CF = CB->getCalledFunction();
+              leaf = "call " + (CF ? CF->getName().str() : std::string("<icall>"));
+            } else if (const auto *I4 = dyn_cast<Instruction>(V)) leaf = I4->getOpcodeName();
+            else leaf = "other";
+            if (leaf != "const") allConst = false;
+            if (srcs.size() < 300) srcs += (srcs.empty() ? "" : "; ") + leaf;
+          }
+          const char *kind = lost ? "unknown" : allConst ? "constant" : "data";
+          (lost ? aLost : allConst ? aConst : aData)++;
+          if (ruleA.size() < 5000) ruleA.push_back({&I, kind, srcs});
+        }
+    const std::string prog = Ctx->Modules.empty() ? std::string("?")
+                                                  : Ctx->Modules.front().first->getName().str();
+    std::vector<std::pair<size_t, std::pair<std::string, std::string>>> bTop;
+    for (auto &[k, c] : ruleBPairs) bTop.push_back({c, k});
+    std::sort(bTop.rbegin(), bTop.rend());
+    RO << "# Rule report (plan 3.11; cells writer). Input: " << prog << "\n"
+       << "# Rows under --cfl-cells (plan 3.48 note): (b) counts member steps of\n"
+       << "# struct T on an address whose object has another label at that offset;\n"
+       << "# (c) lists the premises the solver assumes (untyped writes and bodiless\n"
+       << "# calls write no struct slot) and struct copies between unrelated types.\n";
+    RO << "SUMMARY a " << aData << " pointers from data, " << aConst
+       << " from constant addresses, " << aLost << " from pointers lost before the cast\n";
+    RO << "SUMMARY b " << ruleB << " member steps whose struct is not at the address's offset ("
+       << ruleBPairs.size() << " object label / struct pairs)\n";
+    RO << "SUMMARY c " << modUntypedWrites << " untyped writes and " << modBodiless
+       << " calls of bodiless functions assumed to write no struct slot; "
+       << copyMismatches << " copies between unrelated structs\n";
+    RO << "SUMMARY UB " << byteStepUB << " byte steps leaving a byte array, "
+       << leftObject << " offsets past a single object, " << indexOutsideArray
+       << " variable indexes on a single object, pointer subtractions across objects: always "
+       << rrPtrAlways << ", may " << rrPtrMay << "\n";
+    RO << "SUMMARY varargs " << varargMapped << " renderers mapped, " << varargKeyedReads
+       << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "
+       << varargKeyedSites << " constant format, " << varargPoolSites << " non-constant, "
+       << varargUnparsed << " unparsed\n";
+    RO << "\n== (a) pointers made from bytes that never were a pointer\n";
+    for (const AHit &h : ruleA) RO << "A " << h.kind << " " << instLoc(h.I) << " from: " << h.srcs << "\n";
+    RO << "\n== (b) member steps of a struct the object is not at that offset\n";
+    for (auto &[c, k] : bTop) RO << "B x" << c << " object " << k.first << " stepped as " << k.second << "\n";
+    RO << "\n== (c) premises and copies between unrelated structs\n";
+    for (const std::string &d : copyMismatchAt) RO << "C copy " << d << "\n";
+    RO << "\n== UB undefined behavior (counted, not followed)\n";
+    for (auto [n, o, pos, k] : byteStepUBAt)
+      RO << "UB byte-exit " << (n < numNodes ? nodeDesc(n) : std::string("?")) << " steps " << k
+         << " from " << describe(objs[o]) << " +" << pos << "\n";
+    for (const std::string &d : rrPtrAt) RO << "UB ptr-sub " << d << "\n";
+    RO << "\n== varargs keyed by format specifier (plan 3.47)\n";
+    for (const std::string &d : varargReport) RO << "V " << d << "\n";
+    CG_LOG("Cells: rule report written to " << CFLRuleReport << "\n");
+  }
   if (stoppedAt) {
     errs() << "Cells: stopped at " << stoppedAt << " pops (--cfl-cell-census-at); "
            << "the reports above describe the partial state\n";

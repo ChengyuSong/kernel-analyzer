@@ -216,15 +216,14 @@ int main(int argc, char **argv) {
       if (CFLNamedPlanes || CFLChannelCells || CFLLazyAddress ||
           CFLKeyCells || CFLBatchRoots > 0 || CFLLazyMint ||
           CFLFlowsToSlice || CFLBidiPrune || CFLPreSolveOnce ||
-          CFLVerifyClosure || !CFLRuleReport.empty() ||
+          CFLVerifyClosure ||
           (CFLUnionKeys != "off" && CFLUnionKeys != "tag") || CFLNameByTarget ||
           !CFLNexusFields.empty() || CFLResidueCopies)
         cliErrors.push_back("--cfl-cells replaces named planes, channel "
                             "cells, lazy addresses, key cells, batching, "
                             "lazy minting, slicing, bidi-prune, presolve, "
-                            "nexus fields, union keys, residue copies and "
-                            "the rule report of the cluster solver: refuse "
-                            "them");
+                            "nexus fields, union keys and residue copies "
+                            "of the cluster solver: refuse them");
       // Mechanisms that read or extend the cluster solver's state. The
       // summary provers (NOOP, atom, solved) are IR proofs and adoption
       // installs them as call-site summaries: both run under cells
@@ -276,10 +275,10 @@ int main(int argc, char **argv) {
                           "addresses, slicing, bidi-prune, presolve-once and "
                           "--cfl-verify-closure (its own wiring certificate "
                           "runs instead)");
-    if (!CFLRuleReport.empty() && !(CFLNamedPlanes && CFLAllocOrigins))
-      cliErrors.push_back("--cfl-rule-report requires --cfl-named-planes "
-                          "(access names) and --cfl-alloc-origins (an "
-                          "origin-free value is data)");
+    if (!CFLRuleReport.empty() && !(CFLAllocOrigins && (CFLCells || CFLNamedPlanes)))
+      cliErrors.push_back("--cfl-rule-report requires --cfl-alloc-origins (an "
+                          "origin-free value is data) and --cfl-cells or "
+                          "--cfl-named-planes (access names)");
     if (CFLUnionKeys != "off" && CFLUnionKeys != "callback" &&
         CFLUnionKeys != "single" && CFLUnionKeys != "tag")
       cliErrors.push_back("--cfl-union-keys takes off, callback, single or tag");

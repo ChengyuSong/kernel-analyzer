@@ -7038,6 +7038,7 @@ void CallGraphPass::computeVarargKeys() {
   varargFmtParam.clear();
   varargReadKeys.clear();
   varargAllKeys.clear();
+  varargReport.clear();
   if (!CFLCells || CFLUnionKeys != "tag") return;
   size_t mapped = 0, keyedReads = 0, unkeyedReads = 0;
   for (auto &[M, _] : Ctx->Modules)
@@ -7138,6 +7139,8 @@ void CallGraphPass::computeVarargKeys() {
       if (dispatches.empty() || fmtParam < 0) {
         CG_LOG("VarargKeys: UNMAPPED " << F.getName() << " (" << reads.size()
                << " va_arg pointer reads): " << why << "\n");
+        varargReport.push_back("UNMAPPED " + F.getName().str() + " (" +
+                               std::to_string(reads.size()) + " va_arg pointer reads): " + why);
         unkeyedReads += reads.size();
         continue;
       }
@@ -7188,6 +7191,7 @@ void CallGraphPass::computeVarargKeys() {
             if (DT.dominates(dispatches[d].SW->getParent(), L->getParent()))
               r = reach[d].dflt.count(L->getParent()) ? "the default reaches it" : "no case reaches it";
           CG_LOG("VarargKeys: UNKEYED read " << where2 << " (" << r << ")\n");
+          varargReport.push_back("UNKEYED read " + where2 + " (" + r + ")");
           continue;
         }
         std::vector<std::string> keys;
@@ -7232,6 +7236,9 @@ void CallGraphPass::computeVarargKeys() {
   }
   if (!varargAllKeys.empty())
     cellUnionSlots.insert({"__va_list_tag", 0, 24}); // the va_list content is a keyed slot
+  varargMapped = mapped;
+  varargKeyedReads = keyedReads;
+  varargUnkeyedReads = unkeyedReads;
   CG_LOG("VarargKeys: " << mapped << " renderers mapped, " << keyedReads << " va_arg reads keyed, "
          << unkeyedReads << " left unkeyed (read every key); " << varargFmtParam.size()
          << " functions with a format parameter, " << varargAllKeys.size() << " keys\n");

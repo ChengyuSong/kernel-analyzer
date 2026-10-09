@@ -439,8 +439,10 @@ cl::opt<std::string> CFLRuleReport(
            "reaching an object initialized as an incompatible struct, (c) "
            "an untyped write reaching a struct object, each with how the "
            "offending origin got there; and the unknowns, counted. "
-           "Requires --cfl-named-planes and --cfl-alloc-origins; records "
-           "every first arrival (single-threaded solve)"),
+           "Requires --cfl-alloc-origins with --cfl-named-planes (records "
+           "every first arrival, single-threaded solve) or --cfl-cells (the "
+           "cell solver's writer: also undefined behavior counted and the "
+           "varargs keyed by format specifier)"),
   cl::init(""));
 
 cl::opt<bool> CFLKeyCells(

@@ -474,6 +474,8 @@ protected:
   bool varargKeysAt(const llvm::CallBase *CS, const llvm::Function *CF,
                     std::vector<std::string> &keys);
   size_t varargKeyedSites = 0, varargPoolSites = 0, varargUnparsed = 0;
+  size_t varargMapped = 0, varargKeyedReads = 0, varargUnkeyedReads = 0;
+  std::vector<std::string> varargReport; // UNMAPPED / UNKEYED lines (rule report)
   void computeVarargKeys();
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();

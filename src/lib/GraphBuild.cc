@@ -5877,8 +5877,8 @@ bool CallGraphPass::globalDedupScanFunction(const Function *F) {
       }
 
       if (const auto *PHI = dyn_cast<PHINode>(&I)) {
-        if (!PHI->getType()->isPointerTy())
-          continue;
+        if (!PHI->getType()->isPointerTy() || PHI->getMetadata("ka.idcopy"))
+          continue; // an identity copy keeps its own node (computeGuardCandidates)
         NodeIndex dstNode = NF.getValueNodeFor(PHI);
         if (dstNode == AndersNodeFactory::InvalidIndex)
           continue;
@@ -5987,7 +5987,7 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
         }
 
         if (const auto *LI = dyn_cast<LoadInst>(&I)) {
-          if (!containsPointerType(LI->getType()))
+          if (!containsPointerType(LI->getType()) || dedupKeep.count(LI))
             continue;
           NodeIndex ptrNode = NF.getValueNodeFor(LI->getPointerOperand());
           NodeIndex valNode = NF.getValueNodeFor(LI);
@@ -6154,7 +6154,109 @@ void CallGraphPass::globalDedupFinalize() {
          << canonicalClassMembers.size() << " equivalence classes\n");
 }
 
+// Is V the formal A of its function: A itself, or a reload of a
+// non-escaping stack slot whose only store stores A.
+static bool isFormalReloadOf(const Value *V, const Argument *A) {
+  V = V->stripPointerCasts();
+  if (V == A) return true;
+  const auto *L = dyn_cast<LoadInst>(V);
+  if (!L) return false;
+  const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+  if (!S) return false;
+  const StoreInst *only = nullptr;
+  for (const User *U : S->users()) {
+    if (isa<LoadInst>(U)) continue;
+    const auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S || only)
+      return false;
+    only = SI;
+  }
+  return only && only->getValueOperand()->stripPointerCasts() == A;
+}
+
+// An address as (base, constant byte offset); false when not constant.
+static bool splitConstAddr(const Value *A, const DataLayout &DL, const Value *&base,
+                           int64_t &off) {
+  const Value *X = A->stripPointerCasts();
+  off = 0;
+  if (const auto *G = dyn_cast<GEPOperator>(X)) {
+    APInt Ap(64, 0);
+    if (!G->accumulateConstantOffset(DL, Ap)) return false;
+    off = Ap.getSExtValue();
+    X = G->getPointerOperand()->stripPointerCasts();
+  }
+  base = X;
+  return true;
+}
+
+void CallGraphPass::computeGuardCandidates() {
+  dedupKeep.clear();
+  if (!CFLCells || !CFLCellReceivers) return;
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F)) {
+        // Method-identity tests: the copy is kept by its metadata; other
+        // loads of the tested holder's path in F are kept too.
+        if (const auto *C = dyn_cast<ICmpInst>(&I)) {
+          if (!C->isEquality()) continue;
+          const LoadInst *LM = nullptr;
+          for (unsigned i = 0; i < 2; i++)
+            if (isa<Function>(C->getOperand(i)->stripPointerCasts()))
+              LM = dyn_cast<LoadInst>(C->getOperand(1 - i)->stripPointerCasts());
+          if (!LM) continue;
+          const Value *Hb;
+          int64_t m;
+          if (!splitConstAddr(LM->getPointerOperand(), DL, Hb, m)) continue;
+          const auto *LH = dyn_cast<LoadInst>(Hb);
+          if (!LH) continue;
+          const Value *b0;
+          int64_t o0;
+          if (!splitConstAddr(LH->getPointerOperand(), DL, b0, o0)) continue;
+          for (Instruction &J : instructions(F))
+            if (const auto *L = dyn_cast<LoadInst>(&J)) {
+              const Value *b;
+              int64_t o;
+              if (L != LH && L->getType()->isPointerTy() &&
+                  splitConstAddr(L->getPointerOperand(), DL, b, o) && o == o0 &&
+                  (b == b0 || (isa<LoadInst>(b) && isa<LoadInst>(b0) &&
+                               cast<LoadInst>(b)->getPointerOperand()->stripPointerCasts() ==
+                                   cast<LoadInst>(b0)->getPointerOperand()->stripPointerCasts())))
+                dedupKeep.insert(L);
+            }
+          continue;
+        }
+        // Method reloads: a callee of a dispatch site with a path of two or
+        // more levels reloads the level-1 holder from its receiver formal.
+        const auto *CS = dyn_cast<CallBase>(&I);
+        if (!CS) continue;
+        std::vector<std::pair<const Value *, const Value *>> path;
+        const int k = dispatchReceiver(CS, &path);
+        if (k < 0 || path.size() < 2) continue;
+        const Value *b0;
+        int64_t o0;
+        if (!splitConstAddr(path[0].second, DL, b0, o0)) continue;
+        auto cit = Ctx->Callees.find(CS);
+        if (cit == Ctx->Callees.end()) continue;
+        for (const Function *G : cit->second) {
+          if (G->isDeclaration() || (unsigned)k >= G->arg_size()) continue;
+          const Argument *A = G->getArg(k);
+          for (const Instruction &J : instructions(*G))
+            if (const auto *L = dyn_cast<LoadInst>(&J)) {
+              const Value *b;
+              int64_t o;
+              if (L->getType()->isPointerTy() &&
+                  splitConstAddr(L->getPointerOperand(), DL, b, o) && o == o0 &&
+                  isFormalReloadOf(b, A))
+                dedupKeep.insert(L);
+            }
+        }
+      }
+  }
+}
+
 void CallGraphPass::runGlobalDedup() {
+  computeGuardCandidates();
   const size_t numNodes = NF.getNumNodes();
   globalUFParent.resize(numNodes);
   std::iota(globalUFParent.begin(), globalUFParent.end(), 0);

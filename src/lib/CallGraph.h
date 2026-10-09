@@ -438,6 +438,12 @@ protected:
   std::vector<NodeIndex> globalUFParent;
   std::vector<uint8_t> globalUFRank;
   void runGlobalDedup();
+  // Values global dedup must keep as their own nodes: the cell solver's
+  // guard candidates (method-identity copies and reloads, method reloads
+  // of a dispatch path from the receiver formal). A guard on a shared
+  // node would filter every value of the class.
+  std::unordered_set<const llvm::Value *> dedupKeep;
+  void computeGuardCandidates();
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

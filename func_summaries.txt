@@ -177,6 +177,15 @@ alloc_large FRESH BODY
 # block (alloc_small reads pool headers from it).
 jpeg_get_small FRESH
 jpeg_get_large FRESH
+# xpdf / poppler gmem (goo/gmem.cc): malloc/realloc with overflow checks
+# and gMemError on failure. One malloc site for every GList array,
+# GString buffer and table: without FRESH every GList holds every
+# element. copyString: gmalloc + strcpy.
+gmalloc FRESH BODY
+gmallocn FRESH BODY
+grealloc FRESH ALIAS(ret=arg0) BODY
+greallocn FRESH ALIAS(ret=arg0) BODY
+copyString FRESH BODY
 
 # ---- gnulib hash / cflow linked list: instance channels (2026-09-16) ----
 # Container APIs summarized so their bodies (unknown-index bucket walks,

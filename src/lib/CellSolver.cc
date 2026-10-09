@@ -635,6 +635,12 @@ bool CallGraphPass::runCellResolution() {
                WhyKind kind = W_OTHER; uint32_t t = 0; };
   uint32_t whyClock = 0; // pops, for the order of first arrivals
   const bool recordWhy = !CFLCellWhy.empty();
+  const bool whyStopAtAny = StringRef(CFLCellWhy).starts_with("any:");
+  bool whyAnyArrived = false;
+  std::function<bool(uint32_t)> whyIsAny = [](uint32_t) { return false; }; // set once cells exist
+  // Only facts of the queried object are recorded (an exploding iteration
+  // has far too many facts to record them all); set once objs exist.
+  std::function<bool(uint32_t)> whyWanted = [](uint32_t) { return true; };
   Why curWhy;
   boost::unordered_flat_map<uint64_t, Why> factWhy, edgeWhy;
   // --cfl-cell-receivers holder guards: a guarded node's facts are held
@@ -650,10 +656,12 @@ bool CallGraphPass::runCellResolution() {
       return;
     }
     if (pts[n].set(f)) {
-      if (recordWhy) {
+      if (recordWhy && whyWanted(f)) {
         Why w = curWhy;
         w.t = whyClock;
         factWhy.try_emplace((uint64_t)n << 32 | f, w);
+        // any:OBJ: stop at the first arrival of OBJ's any-offset cell.
+        if (whyStopAtAny && whyIsAny(f)) whyAnyArrived = true;
       }
       pend[n].push_back(f);
       push(n);
@@ -670,7 +678,9 @@ bool CallGraphPass::runCellResolution() {
       pts[a].forEach([&](uint32_t f) { add(b, f); });
       return;
     }
-    edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy);
+    // A byte copy's content edges are not recorded (a copy makes millions
+    // of edges); the chain names them "static copy or byte copy".
+    if (curWhy.kind != W_COPY) edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy);
     const Why saved = curWhy;
     pts[a].forEach([&](uint32_t f) {
       curWhy = {a, f, UINT32_MAX, W_EDGE};
@@ -1772,6 +1782,23 @@ bool CallGraphPass::runCellResolution() {
            << "member), " << beyondLabel << " heap offsets past the label "
            << "folded back; minted by:" << line << "\n");
   };
+  whyIsAny = [&](uint32_t f) { return f < cells.size() && cells[f].kind == CellKind::Any; };
+  if (recordWhy) {
+    const std::string want = StringRef(CFLCellWhy).starts_with("any:")
+                                 ? CFLCellWhy.substr(4) : std::string(CFLCellWhy);
+    whyWanted = [&, want, cache = std::vector<int8_t>()](uint32_t f) mutable {
+      auto is = [&](uint32_t o) {
+        if (o >= cache.size()) cache.resize(objs.size() + 64, -1);
+        if (cache[o] < 0) cache[o] = describe(objs[o]).find(want) != std::string::npos;
+        return cache[o] == 1;
+      };
+      if (f >= cells.size()) return false;
+      if (is(cells[f].obj)) return true;
+      for (auto [o, e] : memb[f])
+        if (is(o)) return true;
+      return false;
+    };
+  }
   // ---- Method dispatch (--cfl-cell-receivers) ----
   // A method call (*(p.path.slot))(.., p, ..) (dispatchReceiver; the graph
   // does not wire the receiver argument): each object o at p reaches the
@@ -1894,7 +1921,7 @@ bool CallGraphPass::runCellResolution() {
     recvAt.clear();
     for (uint32_t si = 0; si < recvSites.size(); si++) {
       RecvSite &R = recvSites[si];
-      if (R.all) continue; // plain edges: merges keep them
+      if (R.all || !R.cs) continue; // plain edges: merges keep them; guard pseudo sites
       const uint32_t b = find(R.base);
       const bool moved = b != R.base;
       R.base = b;
@@ -1942,7 +1969,8 @@ bool CallGraphPass::runCellResolution() {
   struct Guard { const Function *F; uint32_t si, node; std::vector<uint32_t> held; bool dropped = false; };
   std::vector<Guard> guards;
   boost::unordered_flat_set<uint64_t> guardAdmitted, guardSeen; // (guard, holder)
-  size_t guardHeldFacts = 0, guardDropped = 0;
+  size_t guardHeldFacts = 0, guardDropped = 0, guardRefused = 0;
+  std::vector<std::string> guardRefusedAt;
   // Is V the receiver formal A of its function: A itself, or a reload of
   // a non-escaping stack slot whose only store stores A.
   auto isFormalValue = [](const Value *V, const Argument *A) {
@@ -1966,6 +1994,28 @@ bool CallGraphPass::runCellResolution() {
     const int64_t a = slotOffset(X);
     return a != INT64_MIN && a == slotOffset(Y);
   };
+  // A guard needs a node of its own: every value in the node's class is
+  // the guarded value R, a no-op cast of it, or a phi of only those (global
+  // dedup merges loads of one pointer class and one-input phis; a guard on
+  // a shared node would filter every value of the class).
+  size_t guardClassShared = 0;
+  auto classOnly = [&](NodeIndex rn, const Value *R) {
+    auto mit = canonicalClassMembers.find(getCanonicalNode(rn));
+    if (mit == canonicalClassMembers.end()) return true; // a singleton
+    for (NodeIndex m : mit->second) {
+      const Value *V = NF.getValueForNode(m);
+      if (!V) { guardClassShared++; return false; }
+      if (V->stripPointerCasts() == R) continue;
+      if (const auto *Ph = dyn_cast<PHINode>(V)) {
+        bool all = true;
+        for (const Value *In : Ph->incoming_values()) all &= In->stripPointerCasts() == R;
+        if (all) continue;
+      }
+      guardClassShared++;
+      return false;
+    }
+    return true;
+  };
   if (CFLCellReceivers && !recvSites.empty()) {
     // Callers of each function (the previous iterations' call graph).
     boost::unordered_flat_map<const Function *, std::vector<const CallBase *>> callers;
@@ -1983,12 +2033,25 @@ bool CallGraphPass::runCellResolution() {
       for (const Function *F : cit->second) {
         if (!done.insert(F).second || F->isDeclaration() || R.k >= F->arg_size()) continue;
         bool uniform = true; // every call of F: a dispatch site of this shape
+        const CallBase *breaker = nullptr;
         for (const CallBase *C : callers[F]) {
           auto sit = siteOf.find(C);
-          uniform &= sit != siteOf.end() && !recvSites[sit->second].all &&
-                     recvSites[sit->second].sig == R.sig;
+          const bool ok = sit != siteOf.end() && !recvSites[sit->second].all &&
+                          recvSites[sit->second].sig == R.sig;
+          if (!ok && !breaker) breaker = C;
+          uniform &= ok;
         }
-        if (!uniform) continue;
+        if (!uniform) {
+          guardRefused++;
+          if (guardRefusedAt.size() < 12) {
+            auto sit = siteOf.find(breaker);
+            guardRefusedAt.push_back(F->getName().str() + " (shape " + R.sig + "): called at " +
+                                     instLoc(breaker) +
+                                     (sit == siteOf.end() ? " (not a method call)"
+                                                          : " (shape " + recvSites[sit->second].sig + ")"));
+          }
+          continue;
+        }
         const Argument *A = F->getArg(R.k);
         for (const Instruction &I : instructions(*F)) {
           const auto *L = dyn_cast<LoadInst>(&I);
@@ -2000,12 +2063,209 @@ bool CallGraphPass::runCellResolution() {
           const NodeIndex ln = NF.getValueNodeFor(L);
           if (ln == AndersNodeFactory::InvalidIndex) continue;
           const uint32_t n = find(canon(ln));
-          if (guardIdx[n] != UINT32_MAX) continue;
+          if (guardIdx[n] != UINT32_MAX || !classOnly(ln, L)) continue;
           guardIdx[n] = guards.size();
           guards.push_back({F, si, n, {}});
         }
       }
     }
+    CG_LOG("Cells: holder guards: " << guards.size() << " reloads guarded; "
+           << guardClassShared << " reloads not guarded (node shared by dedup); "
+           << guardRefused << " methods refused (a call of another shape):\n");
+    for (const std::string &d : guardRefusedAt) CG_LOG("Cells:   refused " << d << "\n");
+  }
+  // Method-identity checks (the program's own RTTI with a method pointer
+  // as the tag): `if (h->slot != Fn) <never returns>` where h = B->path
+  // (jdatadst.c: cinfo->dest->init_destination != init_mem_destination ->
+  // ERREXIT). A reload of B->path that every path from the function's
+  // entry reaches only through the test's equal edge or a store into
+  // B->path (in that function) admits only the stored objects and holders
+  // whose slot holds Fn. "Never returns": an unreachable, a call to a
+  // noreturn function, or a call whose resolved targets all never return.
+  boost::unordered_flat_map<uint32_t, uint32_t> passOf; // pass node -> guard
+  size_t idTests = 0, idGuards = 0, idUngated = 0, idShared = 0;
+  std::vector<std::string> idGuardAt;
+  if (CFLCellReceivers && !guardIdx.empty()) {
+    auto neverReturns = [&](const Function *F) {
+      if (F->doesNotReturn()) return true;
+      if (F->isDeclaration()) return false;
+      for (const BasicBlock &BB : *F)
+        if (isa<ReturnInst>(BB.getTerminator())) return false;
+      return true;
+    };
+    auto deadCall = [&](const Instruction &I) {
+      const auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB) return false;
+      if (CB->doesNotReturn()) return true;
+      if (const Function *C = CB->getCalledFunction()) return neverReturns(C);
+      auto cit = Ctx->Callees.find(CB);
+      if (cit == Ctx->Callees.end() || cit->second.empty()) return false;
+      for (const Function *C : cit->second)
+        if (!neverReturns(C)) return false;
+      return true;
+    };
+    // The same base pointer anywhere in a function: one SSA value, or loads
+    // of a non-escaping stack slot stored exactly once.
+    auto sameBase = [](const Value *A, const Value *B) {
+      A = A->stripPointerCasts();
+      B = B->stripPointerCasts();
+      if (A == B) return true;
+      const auto *LA = dyn_cast<LoadInst>(A), *LB = dyn_cast<LoadInst>(B);
+      if (!LA || !LB) return false;
+      const auto *S = dyn_cast<AllocaInst>(LA->getPointerOperand()->stripPointerCasts());
+      if (!S || S != LB->getPointerOperand()->stripPointerCasts()) return false;
+      unsigned stores = 0;
+      for (const User *U : S->users()) {
+        if (isa<LoadInst>(U)) continue;
+        const auto *SI = dyn_cast<StoreInst>(U);
+        if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S) return false;
+        stores++;
+      }
+      return stores == 1;
+    };
+    // An address as (base, constant offset).
+    auto splitAddr = [&](const Value *A, const Value *&base, int64_t &off) {
+      const Value *X = A->stripPointerCasts();
+      off = 0;
+      if (const auto *G = dyn_cast<GEPOperator>(X)) {
+        APInt Ap(64, 0);
+        if (!G->accumulateConstantOffset(DL, Ap)) return false;
+        off = Ap.getSExtValue();
+        X = G->getPointerOperand()->stripPointerCasts();
+      }
+      base = X;
+      return true;
+    };
+    auto samePath = [&](const Value *A1, const Value *A2) {
+      const Value *b1, *b2;
+      int64_t o1, o2;
+      return splitAddr(A1, b1, o1) && splitAddr(A2, b2, o2) && o1 == o2 && sameBase(b1, b2);
+    };
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        for (Instruction &I : instructions(F)) {
+          const auto *C = dyn_cast<ICmpInst>(&I);
+          if (!C || !C->isEquality()) continue;
+          const Function *Fn = nullptr;
+          const LoadInst *LM = nullptr;
+          for (unsigned i = 0; i < 2; i++) {
+            const Value *X = C->getOperand(i)->stripPointerCasts(),
+                        *Y = C->getOperand(1 - i)->stripPointerCasts();
+            if (isa<Function>(X) && isa<LoadInst>(Y)) {
+              Fn = cast<Function>(X);
+              LM = cast<LoadInst>(Y);
+            }
+          }
+          if (!Fn || !LM) continue;
+          const Value *Hb;
+          int64_t m;
+          if (!splitAddr(LM->getPointerOperand(), Hb, m)) continue;
+          const auto *LH = dyn_cast<LoadInst>(Hb); // the holder: B->path
+          if (!LH || !LH->getType()->isPointerTy()) continue;
+          const auto *Br = dyn_cast_or_null<BranchInst>(C->getNextNode());
+          if (!Br || !Br->isConditional() || Br->getCondition() != C) continue;
+          idTests++;
+          const BasicBlock *eqSucc =
+              Br->getSuccessor(C->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1);
+          const Value *path = LH->getPointerOperand();
+          // The slot step from the holder (none at offset 0).
+          const NodeIndex hn = NF.getValueNodeFor(LH),
+                          sn = NF.getValueNodeFor(LM->getPointerOperand());
+          if (hn == AndersNodeFactory::InvalidIndex) continue;
+          uint32_t li = UINT32_MAX;
+          if (m != 0) {
+            if (sn == AndersNodeFactory::InvalidIndex) continue;
+            for (const FieldEdge &e : fieldOut[find(canon(hn))])
+              if (!e.walk && find(e.dst) == find(canon(sn))) { li = e.li; break; }
+            if (li == UINT32_MAX) continue;
+          }
+          // Stores into the path in F: their values pass the guard.
+          std::vector<const StoreInst *> pathStores;
+          for (Instruction &J : instructions(F))
+            if (const auto *SI = dyn_cast<StoreInst>(&J))
+              if (SI->getValueOperand()->getType()->isPointerTy() &&
+                  samePath(SI->getPointerOperand(), path))
+                pathStores.push_back(SI);
+          // Every reload of the path gated by the test or a path store.
+          for (Instruction &J : instructions(F)) {
+            // A reload of the path, or the holder's SSA copy at the test's
+            // equal successor (Driver: splitIdentityTests).
+            const Instruction *R = nullptr;
+            if (const auto *Ld = dyn_cast<LoadInst>(&J)) {
+              if (Ld != LH && Ld->getType()->isPointerTy() &&
+                  samePath(Ld->getPointerOperand(), path))
+                R = Ld;
+            } else if (const auto *Ph = dyn_cast<PHINode>(&J)) {
+              if (Ph->getMetadata("ka.idcopy") && Ph->getNumIncomingValues() == 1 &&
+                  Ph->getIncomingValue(0) == LH)
+                R = Ph;
+            }
+            if (!R) continue;
+            // Walk from the entry avoiding gates; reaching R ungated fails.
+            bool reached = false;
+            std::vector<const BasicBlock *> work{&F.getEntryBlock()};
+            boost::unordered_flat_set<const BasicBlock *> seen{&F.getEntryBlock()};
+            while (!work.empty() && !reached) {
+              const BasicBlock *X = work.back();
+              work.pop_back();
+              bool stop = false;
+              for (const Instruction &K : *X) {
+                if (&K == R) { reached = true; break; }
+                if (const auto *SI = dyn_cast<StoreInst>(&K))
+                  if (std::find(pathStores.begin(), pathStores.end(), SI) != pathStores.end()) {
+                    stop = true;
+                    break;
+                  }
+                if (deadCall(K)) { stop = true; break; }
+              }
+              if (reached || stop) continue;
+              const Instruction *T = X->getTerminator();
+              for (unsigned k = 0; k < T->getNumSuccessors(); k++) {
+                const BasicBlock *S = T->getSuccessor(k);
+                if (T == Br && S == eqSucc) continue; // gated by the test
+                if (seen.insert(S).second) work.push_back(S);
+              }
+            }
+            if (reached) { idUngated++; continue; }
+            const NodeIndex rn = NF.getValueNodeFor(R);
+            if (rn == AndersNodeFactory::InvalidIndex) continue;
+            const uint32_t n = find(canon(rn));
+            // The guarded value must be its own node: a node shared with
+            // the tested holder (or another value) would filter them too.
+            if (n == find(canon(hn))) {
+              idShared++;
+              continue;
+            }
+            if (n >= guardIdx.size() || guardIdx[n] != UINT32_MAX || !classOnly(rn, R)) {
+              idShared++;
+              continue;
+            }
+            // A pseudo site: level 1 steps the holder to the tested slot.
+            RecvSite PS{nullptr, 0, n, n, {UINT32_MAX, li}};
+            const uint32_t si = recvSites.size();
+            recvSites.push_back(PS);
+            const uint32_t gi = guards.size();
+            guardIdx[n] = gi;
+            guards.push_back({Fn, si, n, {}});
+            idGuards++;
+            if (idGuardAt.size() < 12)
+              idGuardAt.push_back(instLoc(R) + " admits holders whose slot +" +
+                                  std::to_string(m) + " holds " + Fn->getName().str());
+            for (const StoreInst *SI : pathStores) {
+              const NodeIndex vn = NF.getValueNodeFor(SI->getValueOperand());
+              if (vn == AndersNodeFactory::InvalidIndex) continue;
+              const uint32_t P = newNode();
+              passOf[P] = gi;
+              addEdge(find(canon(vn)), P);
+            }
+          }
+        }
+      }
+    CG_LOG("Cells: method-identity tests: " << idTests << " (h->slot ==/!= function); "
+           << idGuards << " reloads guarded, " << idUngated
+           << " reloads reachable around the test (not guarded), " << idShared
+           << " not guarded (node shared with the holder or another guard)\n");
+    for (const std::string &d : idGuardAt) CG_LOG("Cells:   " << d << "\n");
   }
   guardHold = [&](uint32_t gi, uint32_t n, uint32_t f) {
     Guard &Gd = guards[gi];
@@ -3066,6 +3326,7 @@ bool CallGraphPass::runCellResolution() {
   std::vector<uint32_t> delta;
   uint64_t lastCollapsePops = 0;
   size_t edgesAtCollapse = edgeSet.size();
+  uint32_t stoppedAt = 0;
   while (true) {
     if (!refoldQueue.empty()) drainRefolds();
     if (worklist.empty()) {
@@ -3076,11 +3337,22 @@ bool CallGraphPass::runCellResolution() {
     worklist.pop_back();
     inWL[n] = 0;
     if (find(n) != n) continue; // merged: its facts moved to the rep
-    if (CFLCellCensusAt && pops >= CFLCellCensusAt) {
-      confluenceCensus();
+    if (whyAnyArrived) {
+      errs() << "Cells: --cfl-cell-why any: the queried any-offset cell arrived; "
+             << "stopping (measurement only, no answers)\n";
+      stoppedAt = pops;
+      break;
+    }
+    // Pops counted over all iterations (the stop lands in the iteration
+    // that explodes, not in an earlier, cheap one).
+    static uint64_t allPops = 0;
+    if (CFLCellCensusAt && ++allPops >= CFLCellCensusAt) {
+      if (!recordWhy) confluenceCensus();
       errs() << "Cells: --cfl-cell-census-at stopped the solve (measurement "
              << "only, no answers)\n";
-      exit(0);
+      if (!recordWhy) exit(0);
+      stoppedAt = pops; // the --cfl-cell-why reports run on the partial state
+      break;
     }
     delta.clear();
     delta.swap(pend[n]);
@@ -3102,6 +3374,18 @@ bool CallGraphPass::runCellResolution() {
       if (pops % (1u << 22) == 0) massByObject(12);
     }
     for (uint32_t &f : delta) f = findFact(f);
+    if (!passOf.empty()) {
+      auto pit = passOf.find(n);
+      if (pit != passOf.end()) { // a path store's value: admitted
+        for (uint32_t f : delta) {
+          guardAdmitted.insert((uint64_t)pit->second << 32 | f);
+          admitting = true;
+          add(guards[pit->second].node, f);
+          admitting = false;
+        }
+        continue;
+      }
+    }
     if (!dispatchOf.empty() && dispatchOf.count(n)) {
       dispatch(n, delta);
       continue;
@@ -3209,7 +3493,8 @@ bool CallGraphPass::runCellResolution() {
       edgesAtCollapse = edgeSet.size();
     }
   }
-  if (CFLCellOneLabel && CFLCellOneLabelMax > 1) finishCollect();
+  // Collect mode runs on through the iterations (a soup often forms only
+  // after calls resolve); it ends at the cap or at the last iteration.
   dynEdges = edgeSet.size() - staticCopies - stores;
   const double solveSecs =
       std::chrono::duration<double>(Clock::now() - tSolve).count();
@@ -3317,7 +3602,7 @@ bool CallGraphPass::runCellResolution() {
         } else if (e.kind == W_OTHER && eit != edgeWhy.end()) {
           how = "edge (made outside the propagation loop)";
         } else if (eit == edgeWhy.end()) {
-          how = "static copy edge";
+          how = "static copy edge or byte-copy content edge (unrecorded)";
         } else {
           static const char *kn[] = {"other", "edge", "step", "walk", "any-offset", "hub", "copy", "dispatch"};
           how = std::string("edge made during a ") + kn[e.kind] + " at " +
@@ -3505,7 +3790,13 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("FlowsTo: resolved " << resolved << " icalls, " << totalTargets
          << " targets (" << newPairs << " new pairs wired, " << typeRej
          << " type-rejected), iteration " << iteration << "\n");
+  if (stoppedAt) {
+    errs() << "Cells: stopped at " << stoppedAt << " pops (--cfl-cell-census-at); "
+           << "the reports above describe the partial state\n";
+    exit(0);
+  }
 
+  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0) finishCollect();
   if (newPairs == 0) return false;
   if (iteration + 1 >= (int)CFLFlowsToMaxIters) {
     if (!CFLIterCapOk) {

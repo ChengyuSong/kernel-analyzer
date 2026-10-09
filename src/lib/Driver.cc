@@ -20,6 +20,8 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Transforms/Utils/Local.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
+#include <llvm/IR/Dominators.h>
 
 #include <chrono>
 #include <cstring>
@@ -121,6 +123,74 @@ void IterativeModulePass::run(ModuleList &modules) {
 }
 
 // --cfl-clone-per-caller: expand listed functions per direct call site.
+// --cfl-cells --cfl-cell-receivers: a method-identity test `h->slot ==/!=
+// Fn` (h a loaded holder) gets an SSA copy of h at the test's equal
+// successor (a one-entry phi marked ka.idcopy, the edge split when the
+// successor has other predecessors); uses of h that the equal edge
+// dominates read the copy. Renaming only: the program is unchanged. The
+// cell solver guards the copy (holders whose slot holds Fn).
+static void splitIdentityTests(Module *M) {
+  if (!CFLCells || !CFLCellReceivers) return;
+  unsigned copies = 0;
+  for (Function &F : *M) {
+    if (F.isDeclaration()) continue;
+    struct Test { LoadInst *LH; BranchInst *Br; unsigned eqIdx; };
+    std::vector<Test> tests;
+    for (Instruction &I : instructions(F)) {
+      auto *C = dyn_cast<ICmpInst>(&I);
+      if (!C || !C->isEquality()) continue;
+      LoadInst *LM = nullptr;
+      bool fn = false;
+      for (unsigned i = 0; i < 2; i++)
+        if (isa<Function>(C->getOperand(i)->stripPointerCasts()))
+          if (auto *L = dyn_cast<LoadInst>(C->getOperand(1 - i)->stripPointerCasts())) {
+            LM = L;
+            fn = true;
+          }
+      if (!fn) continue;
+      Value *A = LM->getPointerOperand()->stripPointerCasts();
+      if (auto *G = dyn_cast<GEPOperator>(A)) {
+        if (!G->hasAllConstantIndices()) continue;
+        A = G->getPointerOperand()->stripPointerCasts();
+      }
+      auto *LH = dyn_cast<LoadInst>(A);
+      auto *Br = dyn_cast_or_null<BranchInst>(C->getNextNode());
+      if (!LH || !LH->getType()->isPointerTy() || !Br || !Br->isConditional() ||
+          Br->getCondition() != C)
+        continue;
+      tests.push_back({LH, Br, C->getPredicate() == ICmpInst::ICMP_EQ ? 0u : 1u});
+    }
+    for (const Test &T : tests) {
+      BasicBlock *From = T.Br->getParent(), *Eq = T.Br->getSuccessor(T.eqIdx);
+      if (Eq == T.Br->getSuccessor(1 - T.eqIdx)) continue; // both edges alike
+      if (!Eq->getSinglePredecessor()) Eq = SplitEdge(From, Eq);
+      PHINode *P = PHINode::Create(T.LH->getType(), 1, "ka.idcopy", &Eq->front());
+      P->addIncoming(T.LH, From);
+      P->setMetadata("ka.idcopy", MDNode::get(M->getContext(), {}));
+      DominatorTree DT(F);
+      // The holder and its no-op casts (a phi may take the cast).
+      std::vector<Value *> aliases{T.LH};
+      for (size_t i = 0; i < aliases.size(); i++)
+        for (User *U : aliases[i]->users())
+          if (auto *CI = dyn_cast<CastInst>(U))
+            if (CI->isNoopCast(M->getDataLayout()) && CI->getType()->isPointerTy())
+              aliases.push_back(CI);
+      for (Value *A : aliases)
+        A->replaceUsesWithIf(P, [&](Use &U) {
+          auto *UI = dyn_cast<Instruction>(U.getUser());
+          if (!UI || UI == P) return false;
+          const BasicBlock *UB = UI->getParent();
+          if (auto *Ph = dyn_cast<PHINode>(UI)) UB = Ph->getIncomingBlock(U);
+          return DT.dominates(Eq, UB);
+        });
+      copies++;
+    }
+  }
+  if (copies)
+    WARNING("IdentityTests: " << copies << " holder copies at method-identity tests in "
+            << M->getModuleIdentifier() << "\n");
+}
+
 static void clonePerCaller(Module *M) {
   if (CFLClonePerCaller.empty()) return;
   SmallVector<StringRef, 8> given;
@@ -449,6 +519,7 @@ int kaLoadModules(const char *argv0) {
     GlobalCtx.ModuleMaps[Module] = InputFilenames[i];
 
     clonePerCaller(Module);
+    splitIdentityTests(Module);
     doBasicInitialization(Module);
   }
 

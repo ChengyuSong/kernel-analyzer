@@ -1143,9 +1143,10 @@ cl::opt<bool> CFLCellMergePtrs(
 cl::opt<unsigned> CFLCellCensusAt(
   "cfl-cell-census-at",
   cl::desc("MEASUREMENT ONLY: --cfl-cells stops propagating after this "
-           "many pops (0: never), prints the confluence census (functions "
-           "by formal/return width x direct call sites: clone candidates) "
-           "and exits without answers"),
+           "many pops over all iterations (0: never) and exits without "
+           "answers; prints the confluence census (functions by "
+           "formal/return width x direct call sites: clone candidates), or "
+           "with --cfl-cell-why the why reports on the partial state"),
   cl::init(0));
 
 cl::opt<std::string> CFLCellCensusFormal(

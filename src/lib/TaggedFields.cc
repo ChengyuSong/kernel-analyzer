@@ -149,6 +149,18 @@ struct ObjIds {
     }
     return SI;
   }
+  // A store into a named field of a struct (a struct GEP or struct-path
+  // TBAA naming it), with A a pointer-typed slot: by rule (b) the store's
+  // object is labeled as the struct and the slot as a pointer, so it
+  // cannot write the slot (a label disagreement there is a (b) row).
+  static bool fieldStoreOnly(const Instruction *I, const AllocaInst *A) {
+    const auto *St = dyn_cast<StoreInst>(I);
+    if (!St || St->isVolatile() || !A->getAllocatedType()->isPointerTy()) return false;
+    StructType *S = nullptr;
+    int64_t off = 0;
+    return accessSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), S, off) && S && S->hasName() &&
+           St->getPointerOperand()->stripPointerCasts() != A;
+  }
   // objSize: the accessed struct's size (a -O3 byte offset inside it is a
   // field of the base; past it, another element).
   const Value *of(const Value *Addr, int64_t objSize = 0, int depth = 0) {
@@ -173,6 +185,8 @@ struct ObjIds {
             if (const auto *L2 = dyn_cast<LoadInst>(I);
                 L2 && L2->getPointerOperand()->stripPointerCasts() == A && !L2->isVolatile())
               head = L2;
+            else if (fieldStoreOnly(I, A))
+              continue; // a store into a named struct field does not write a pointer slot (rule (b))
             else if (I->mayWriteToMemory())
               break;
           }
@@ -331,6 +345,11 @@ void CallGraphPass::computeTaggedFields() {
     char src;
     int64_t a, f, m;
     const Value *who = nullptr; // evaluation only: the object a symbolic term's tag was read from
+    // The load the symbolic tag was read at (rule iii: it is the tag that
+    // held there, the current one only if nothing writes it in between);
+    // ldMany: read at several loads.
+    const Instruction *ld = nullptr;
+    bool ldMany = false;
   };
   // Function-pointer tags (plan 3.51 ruling a): a pointer-valued tag holds
   // NULL (0), the special constant -1 (sqlite's SQLITE_TRANSIENT), a small
@@ -576,7 +595,7 @@ void CallGraphPass::computeTaggedFields() {
         const unsigned sb = C->getOperand(0)->getType()->getIntegerBitWidth(), db = C->getType()->getIntegerBitWidth();
         if (isa<TruncInst>(C) || isa<ZExtInst>(C)) {
           const int64_t m = mask(isa<TruncInst>(C) ? db : sb);
-          for (Term t : in) out.push_back({t.src, t.a & m, t.f & m, t.m & m, t.who});
+          for (Term t : in) out.push_back({t.src, t.a & m, t.f & m, t.m & m, t.who, t.ld, t.ldMany});
           return true;
         }
         if (isa<SExtInst>(C)) {
@@ -622,6 +641,8 @@ void CallGraphPass::computeTaggedFields() {
             }
             r.src = r.a ? src : 'c';
             r.who = p.a ? p.who : q.who;
+            r.ld = p.a ? p.ld : q.ld;
+            r.ldMany = p.ldMany || q.ldMany || (p.a && q.a && p.ld != q.ld);
             return r;
           };
           const std::set<char> sx = srcs(x), sy = srcs(y);
@@ -722,7 +743,7 @@ void CallGraphPass::computeTaggedFields() {
             accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, off2) && S2 &&
             S2->hasName() && stripStructNameSuffix(S2->getName()) == D.first && off2 == D.second) {
           const Value *who = objKey(L, L->getPointerOperand(), S2);
-          out.push_back({sameObj(who, obj, L) ? 's' : 'x', -1, 0, 0, who});
+          out.push_back({sameObj(who, obj, L) ? 's' : 'x', -1, 0, 0, who, L});
           return true;
         }
         return false;
@@ -769,8 +790,11 @@ void CallGraphPass::computeTaggedFields() {
     for (const Term &t : ts) {
       const bool c = t.src == 'c' || (t.a & m) == 0;
       const int64_t f = t.f & m;
-      const Term n{c ? 'c' : t.src, c ? 0 : t.a & m & ~f, f, t.m & m & ~f};
+      const Term n{c ? 'c' : t.src, c ? 0 : t.a & m & ~f, f, t.m & m & ~f, t.who, t.ld, t.ldMany};
       if (seen.insert({n.src, n.a, n.f, n.m}).second) T.terms.push_back(n);
+      else if (n.src == 's') // the same map read at another load: both must hold
+        for (Term &e : T.terms)
+          if (e.src == 's' && e.a == n.a && e.f == n.f && e.m == n.m && e.ld != n.ld) e.ldMany = true;
     }
   };
   // ---- scan ----
@@ -2442,6 +2466,68 @@ void CallGraphPass::computeTaggedFields() {
     as.insert(it->second.as.begin(), it->second.as.end());
     if (Ef) Ef->insert(Ef->end(), it->second.Es.begin(), it->second.Es.end());
   };
+  // Rule (iii): an 's' term is the tag that held at its load L. It is the
+  // current tag at the store only when the load is in the store's function
+  // and no write of D to the object, no call that may write D, and no
+  // redefinition of the identity can come between them. Otherwise it is
+  // the set that held at L: the last D writes before L when those are
+  // closed and constant, else any tag of the field (an 'x' image).
+  size_t sTermsKept = 0, sTermsAtLoad = 0;
+  for (auto &[Dx, ts] : dStores) {
+    const FieldCtx &Dc = ctxOf(Dx, true);
+    for (TagStore &t : ts) {
+      std::vector<Term> nt;
+      bool changed = false;
+      for (const Term &tm : t.terms) {
+        if (tm.src != 's' || !tm.ld) { nt.push_back(tm); continue; }
+        bool cur = !tm.ldMany && tm.ld->getFunction() == t.I->getFunction();
+        if (cur) { // backward from the store to the load on every path
+          const Defs &idDefs = defsOf(t.obj);
+          std::set<const BasicBlock *> seen;
+          std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{t.I->getParent(), t.I->getPrevNode()}};
+          while (!work.empty() && cur) {
+            auto [B, I] = work.back();
+            work.pop_back();
+            bool reached = false;
+            for (; I && cur; I = I->getPrevNode()) {
+              if (I == tm.ld) { reached = true; break; }
+              if (idDefs.insts.count(I)) cur = false;
+              else if (auto sit = Dc.stores.find(I); sit != Dc.stores.end() && sameObj(sit->second, t.obj, I)) cur = false;
+              else if (const auto *CB = dyn_cast<CallBase>(I); CB && !isa<IntrinsicInst>(CB) && !CB->isInlineAsm()) {
+                const Function *H = CB->getCalledFunction();
+                if (H ? (H->isDeclaration() ? outsideRoots : Dc.mw.fns.count(H) != 0) : Dc.mw.viaIndirect) cur = false;
+              }
+            }
+            if (reached || !cur) continue;
+            if (idDefs.blocks.count(B) || B == &B->getParent()->getEntryBlock()) { cur = false; break; }
+            for (const BasicBlock *P : predecessors(B))
+              if (seen.insert(P).second) work.push_back({P, &P->back()});
+          }
+        }
+        if (cur) { nt.push_back(tm); sTermsKept++; continue; }
+        changed = true;
+        sTermsAtLoad++;
+        // The set at L: the last D writes of the identity read at L.
+        const Walk LD = walkBack(Dc, tm.ld->getFunction(), tm.who, tm.ld);
+        bool constant = !LD.open && !LD.entry && !LD.W.empty();
+        std::vector<int64_t> vals;
+        for (const Instruction *d : LD.W) {
+          auto it = tagStoreAt.find(d);
+          if (it == tagStoreAt.end() || it->second->unknown) { constant = false; break; }
+          std::set<int64_t> cs;
+          for (const Term &u : it->second->terms)
+            if (u.src != 'c' || !concretize({u}, cs)) { constant = false; break; }
+          if (!constant) break;
+          vals.insert(vals.end(), cs.begin(), cs.end());
+        }
+        if (constant)
+          for (int64_t v : vals) nt.push_back({'c', 0, (v & tm.a) | tm.f, tm.m & ~((v & tm.a) | tm.f)});
+        else
+          nt.push_back({'x', tm.a, tm.f, tm.m});
+      }
+      if (changed) t.terms = std::move(nt);
+    }
+  }
   for (auto &[Ff, fs] : fStores) {
     const std::string &S = Ff.first;
     // Candidate discriminators: integer fields of S stored in a function
@@ -3504,7 +3590,8 @@ void CallGraphPass::computeTaggedFields() {
          << " tests dropped: D may be written before the access), " << readsAll
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
          << pairsUncertified << " by an uncertified tag; " << unionFields
-         << " union members read as one pointer field; " << outParamWrites << " out-parameter F writes\n");
+         << " union members read as one pointer field; " << outParamWrites << " out-parameter F writes; "
+         << sTermsKept << " own-tag terms current at their store, " << sTermsAtLoad << " taken at their load (rule iii)\n");
   if (VerboseLevel >= 2) {
     for (const std::string &l : taggedReport) CG_LOG("TaggedFields:   " << l << "\n");
     CG_LOG("TaggedFields: predicate tests " << predClosed << " closed, " << predOpen << " open\n");

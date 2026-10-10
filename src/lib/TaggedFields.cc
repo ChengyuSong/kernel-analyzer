@@ -2148,9 +2148,12 @@ void CallGraphPass::computeTaggedFields() {
     return sums[key];
   };
   // Can W's content be read before its object's D or F is rewritten?
+  // 1: W's content can be read under the tag it found; 2: only mapped
+  // from it (every path reaching a use of the found tag reaches a tag
+  // write computed from it first; those writes in mapAt); 0: neither.
   auto observed = [&](const FieldCtx &Fc, const FieldCtx &Dc, const MayWrite &mrF,
                       const std::map<const Instruction *, const Value *> &reads, const Value *id,
-                      const Instruction *W, std::set<uint32_t> &as) {
+                      const Instruction *W, std::set<uint32_t> &as, std::vector<const Instruction *> &mapAt) -> int {
     walksFwd++;
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{W->getParent(), W->getNextNode()}};
@@ -2159,18 +2162,18 @@ void CallGraphPass::computeTaggedFields() {
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
-      if (idDefs.blocks.count(B) && I == &B->front()) return true; // the name becomes another object
+      if (idDefs.blocks.count(B) && I == &B->front()) return 1; // the name becomes another object
       bool stopped = false;
       for (; I && !stopped; I = I->getNextNode()) {
-        if (isa<ReturnInst>(I) || idDefs.insts.count(I)) return true;
+        if (isa<ReturnInst>(I) || idDefs.insts.count(I)) return 1;
         if (auto rit = reads.find(I); rit != reads.end()) {
-          if (sameObj(rit->second, id, I)) return true;
+          if (sameObj(rit->second, id, I)) return 1;
           as.insert(assume(id, Fc.X, accessSet(Fc.X, '1', I), I)); // a read of another identity
           continue;
         }
         if (isa<UnreachableInst>(I)) { stopped = true; break; }
         if (auto dit = Dc.stores.find(I); dit != Dc.stores.end() && sameObj(dit->second, id, I)) {
-          if (mapsOld(I)) return true; // the new tag is computed from the found one
+          if (mapsOld(I)) mapAt.push_back(I); // the new tag is computed from the found one
           stopped = true;
           break;
         }
@@ -2183,18 +2186,18 @@ void CallGraphPass::computeTaggedFields() {
           continue;
         }
         if (H->isDeclaration()) {
-          if (outsideRoots) return true;
+          if (outsideRoots) return 1;
           continue;
         }
         bool mapped = false;
         for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size(); k++)
           if (CB->getArgOperand(k)->getType()->isPointerTy() && argId(CB->getArgOperand(k)) == id) {
             mapped = true;
-            if (mrF.fns.count(H)) return true; // it may read it through the parameter
+            if (mrF.fns.count(H)) return 1; // it may read it through the parameter
             const Walk &Sm = sumOf(Dc, H, k);
             if (!Sm.entry) {
               for (const Instruction *d : Sm.W)
-                if (mapsOld(d)) return true; // its last write may compute from the found tag
+                if (mapsOld(d)) mapAt.push_back(d); // its last write may compute from the found tag
               stopped = true; // the callee must-write D of it
               as.insert(Sm.assumes.begin(), Sm.assumes.end());
             }
@@ -2204,11 +2207,11 @@ void CallGraphPass::computeTaggedFields() {
       if (stopped) continue;
       for (const BasicBlock *N : successors(B)) {
         if (!seen.insert(N).second) continue;
-        if (++blocks > kWalkBlocks) return true;
+        if (++blocks > kWalkBlocks) return 1;
         work.push_back({N, &N->front()});
       }
     }
-    return false;
+    return mapAt.empty() ? 0 : 2;
   };
   // A function whose every caller is a direct call (whole program, address
   // not taken): an effect on its parameter's object is accounted at its
@@ -2314,6 +2317,7 @@ void CallGraphPass::computeTaggedFields() {
         std::vector<Term> ownMaps;   // maps of its own tag (a later tag store)
         std::vector<std::vector<Test>> ownGuards; // per own map: the tests it runs under (none: always)
         std::vector<std::string> ownLab;          // per own map: where it comes from (reports)
+        std::vector<Term> topMaps;  // maps of an unknown found tag (mapped, never read, from an open tag)
         bool unknown = false;
         std::string why; // why unknown (reports)
       };
@@ -2341,13 +2345,15 @@ void CallGraphPass::computeTaggedFields() {
       }
       MayWrite mrF;
       closureOf(testedV, mrF);
-      std::map<std::pair<const Instruction *, const Value *>, std::pair<bool, std::set<uint32_t>>> obsMemo;
-      auto obsM = [&](const Value *id, const Instruction *W, std::set<uint32_t> &as) {
+      struct Obs { int r = 0; std::set<uint32_t> as; std::vector<const Instruction *> mapAt; };
+      std::map<std::pair<const Instruction *, const Value *>, Obs> obsMemo;
+      auto obsFull = [&](const Value *id, const Instruction *W, std::set<uint32_t> &as) -> const Obs & {
         auto [it, ins] = obsMemo.try_emplace({W, id});
-        if (ins) it->second.first = observed(Fc, Dc, mrF, tested, id, W, it->second.second);
-        as.insert(it->second.second.begin(), it->second.second.end());
-        return it->second.first;
+        if (ins) it->second.r = observed(Fc, Dc, mrF, tested, id, W, it->second.as, it->second.mapAt);
+        as.insert(it->second.as.begin(), it->second.as.end());
+        return it->second;
       };
+      auto obsM = [&](const Value *id, const Instruction *W, std::set<uint32_t> &as) { return obsFull(id, W, as).r != 0; };
       std::set<std::string> via;
       auto give = [&](Writer &W, const TagStore &t, bool prior) {
         if (t.unknown && !W.unknown) W.why = "unevaluable tag write at " + locOf(t.I);
@@ -2361,7 +2367,7 @@ void CallGraphPass::computeTaggedFields() {
       };
       std::vector<const TagStore *> retags;
       bool nonConstRetag = false;
-      size_t closedStores = 0, openStores = 0, observedWriters = 0, openPrior = 0;
+      size_t closedStores = 0, openStores = 0, observedWriters = 0, openPrior = 0, mappedFromOpen = 0;
       std::string openAt;
       std::map<const TagStore *, std::string> openWhyOf;
       size_t unseenStores = 0, absorbedStores = 0;
@@ -2571,10 +2577,28 @@ void CallGraphPass::computeTaggedFields() {
       nonConstRetag |= effUnknownRetag;
       for (size_t i = 0; i < writers.size(); i++) {
         const FAccess &w = fs[i];
-        if (!obsM(w.obj, w.I, pas)) continue;
+        const Obs &ob = obsFull(w.obj, w.I, pas);
+        if (!ob.r) continue;
         observedWriters++;
         const Walk LD = walkBackM(Dc, w.I->getFunction(), w.obj, w.I);
         pas.insert(LD.assumes.begin(), LD.assumes.end());
+        if ((LD.open || LD.entry) && ob.r == 2) {
+          // Only mapped from an open tag: the content is read under the
+          // mapping writes' images of an unknown tag.
+          for (const Instruction *d : ob.mapAt) {
+            const TagStore *t = tagStoreAt.at(d);
+            if (t->unknown) {
+              if (!writers[i].unknown) writers[i].why = "mapped by an unevaluable tag write at " + locOf(d);
+              writers[i].unknown = true;
+            }
+            for (const Term &tm : t->terms)
+              if (tm.src == 'c') { if (!concretize({tm}, writers[i].tags)) writers[i].unknown = true; }
+              else if (tm.src == 's') writers[i].topMaps.push_back(tm);
+              else writers[i].fromAny.push_back(tm);
+          }
+          mappedFromOpen++;
+          continue;
+        }
         if (LD.open || LD.entry) {
           if (!writers[i].unknown) writers[i].why = "read under the tag it found, which is open (" +
                                                     (LD.open ? LD.why : std::string("the entry")) + ")";
@@ -2965,6 +2989,8 @@ void CallGraphPass::computeTaggedFields() {
         }
         closure(U, allMaps, &allGuards);
         TagSet base = sets2; // what retags may set on any object
+        TagSet top;          // every tag
+        top.wide = true;
         for (const Term &t : ai) addImages(base, U, t);
         Tags &T = it->second;
         T.w.resize(writers.size());
@@ -2975,6 +3001,7 @@ void CallGraphPass::computeTaggedFields() {
           if (base.wide) { from.why = "the retag base widened (" + base.why + ")"; widen(from); joinKB(from, base.kb); }
           else for (int64_t v : base.vals) add(from, v);
           for (const Term &t : writers[i].fromAny) addImages(from, U, pt(t));
+          for (const Term &t : writers[i].topMaps) addImages(from, top, pt(t));
           std::vector<Term> maps = xf;
           for (const Term &t : writers[i].ownMaps) maps.push_back(pt(t));
           std::vector<std::vector<Test>> gs = xformGuard;
@@ -3076,7 +3103,8 @@ void CallGraphPass::computeTaggedFields() {
                           " never read under, " + std::to_string(closedStores) +
                           " closed, " + std::to_string(openStores) + " open (retags" +
                           (openAt.empty() ? std::string() : ", e.g. " + openAt) + "); " +
-                          std::to_string(observedWriters) + " writers read under their prior tag (" +
+                          std::to_string(observedWriters) + " writers read under their prior tag (" + std::to_string(mappedFromOpen) +
+                          " only mapped from an open one; " +
                           std::to_string(openPrior) + " of any tag); transforms " + std::to_string(guarded) +
                           " guarded, " + std::to_string(unguarded) + " unguarded";
           for (const std::string &x : xformAt) d += "; retag " + x;

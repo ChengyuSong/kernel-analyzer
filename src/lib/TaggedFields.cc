@@ -24,6 +24,7 @@
 #include <llvm/Support/KnownBits.h>
 #include <chrono>
 #include <deque>
+#include <unordered_map>
 
 using namespace llvm;
 
@@ -1350,7 +1351,8 @@ void CallGraphPass::computeTaggedFields() {
     return effs[key];
   };
   size_t effClosed = 0, effOpen = 0, ceRounds = 0, ceUnsettled = 0;
-  double ceSecs = 0;
+  double ceSecs = 0, tagsSecs = 0, readSecs = 0, scanSecs = 0, pairSecs = 0;
+  size_t tagsComputes = 0;
   std::vector<std::string> effOpenAt;
   // Can D be written between the test (its load dl, its branch into Succ)
   // and the access at `at`? The last passage: blocks reachable from Succ
@@ -2426,8 +2428,29 @@ void CallGraphPass::computeTaggedFields() {
       // its guard.
       std::map<int64_t, std::pair<int64_t, std::string>> *prov = nullptr; // reports: how each tag arose
       const std::vector<std::string> *provLab = nullptr;
+      // Guard results, cached by (guard content, tag, projection): the same
+      // guards meet the same tags in every closure.
+      struct PairHash {
+        size_t operator()(const std::tuple<uint64_t, int64_t, int64_t> &k) const {
+          return std::hash<uint64_t>()(std::get<0>(k) * 1000003u ^ (uint64_t)std::get<1>(k) * 7919u ^
+                                       (uint64_t)std::get<2>(k));
+        }
+      };
+      std::unordered_map<std::tuple<uint64_t, int64_t, int64_t>, bool, PairHash> guardCache;
+      auto guardSig = [](const std::vector<Test> &g) {
+        uint64_t h = 1469598103934665603ull;
+        for (const Test &t : g) h = (h ^ (uint64_t)(uintptr_t)t.cond ^ (t.onTrue ? 0x9e3779b97f4a7c15ull : 0)) * 1099511628211ull;
+        return h;
+      };
       auto closure = [&](TagSet &T, const std::vector<Term> &maps, const std::vector<std::vector<Test>> *guards) {
         auto guarded = [&](size_t mi) { return guards && mi < guards->size() && !(*guards)[mi].empty(); };
+        std::vector<uint64_t> gsig(maps.size(), 0);
+        for (size_t mi = 0; mi < maps.size(); mi++) if (guarded(mi)) gsig[mi] = guardSig((*guards)[mi]);
+        auto admits = [&](size_t mi, int64_t v) {
+          auto [it, ins] = guardCache.try_emplace({gsig[mi], v, curR}, false);
+          if (ins) it->second = holdsP((*guards)[mi], v);
+          return it->second;
+        };
         if (!T.wide) {
           std::vector<int64_t> work(T.vals.begin(), T.vals.end());
           while (!work.empty() && !T.wide) {
@@ -2435,7 +2458,7 @@ void CallGraphPass::computeTaggedFields() {
             work.pop_back();
             for (size_t mi = 0; mi < maps.size() && !T.wide; mi++) {
               const Term &t = maps[mi];
-              if (guarded(mi) && !holdsP((*guards)[mi], v)) continue;
+              if (guarded(mi) && !admits(mi, v)) continue;
               if (llvm::popcount((uint64_t)t.m) > 12) {
                 T.why = "a map with " + std::to_string(llvm::popcount((uint64_t)t.m)) + " free bits: " + termStr(t);
                 widen(T);
@@ -2478,6 +2501,9 @@ void CallGraphPass::computeTaggedFields() {
       auto computeTags = [&](int64_t R) -> const Tags & {
         auto [it, ins] = tagsByR.try_emplace(R);
         if (!ins) return it->second;
+        tagsComputes++;
+        const auto t0c = std::chrono::steady_clock::now();
+        struct Timer { double &acc; std::chrono::steady_clock::time_point t; ~Timer() { acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); } } tm{tagsSecs, t0c};
         curR = R;
         anyWide = false;
         auto pv = [&](int64_t v) { return v & R; };
@@ -2713,6 +2739,8 @@ void CallGraphPass::computeTaggedFields() {
       for (const Instruction *I : eqMergeSites) if (sites.size() < 300) sites += " " + locOf(I);
       CG_LOG("TaggedFields: pointer-equality identity merges: " << eqMergeSites.size() << " (" << sites << " )\n");
     }
+    CG_LOG("TaggedFields: time: tag sets " << tagsSecs << " s (" << tagsComputes << " computations), content effects "
+           << ceSecs << " s\n");
     CG_LOG("TaggedFields: callee D-effects composed: " << effClosed << " closed, " << effOpen << " open ("
            << effComputes << " effect computations; content effects " << ceRounds << " rounds, " << ceUnsettled
            << " pairs unsettled, " << ceSecs << " s)\n");

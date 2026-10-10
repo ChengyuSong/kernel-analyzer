@@ -833,7 +833,7 @@ bool CallGraphPass::runCellResolution() {
   // Alias assumptions (plan 3.51): an entry on a node is the identity side
   // of assumption idx (off: the field) or an access of access set idx
   // (off: its constant offset, var: unknown).
-  struct AsmEntry { uint32_t idx; bool idSide; int64_t off; bool var; };
+  struct AsmEntry { uint32_t idx; bool idSide; int64_t off; bool var; uint32_t acc = UINT32_MAX; };
   boost::unordered_flat_map<uint32_t, std::vector<AsmEntry>> asmAt;
   std::function<void(const AsmEntry &, uint32_t)> asmCheck;
   // Merging solver nodes: the representative inherits every constraint
@@ -2924,6 +2924,7 @@ bool CallGraphPass::runCellResolution() {
   std::vector<std::vector<uint32_t>> asmPairs(taggedAssumes.size()), setAssumes(taggedAccessSets.size());
   size_t asmUsed = 0, asmFailed = 0, asmNoNode = 0;
   std::vector<char> asmFailedAt(taggedAssumes.size(), 0);
+  std::vector<boost::unordered_flat_map<uint32_t, uint32_t>> asmAccFirst(taggedAccessSets.size()); // obj -> access
   std::vector<std::string> asmFailSites;
   if (!taggedPairs.empty()) {
     std::set<uint32_t> used, sets;
@@ -2958,7 +2959,8 @@ bool CallGraphPass::runCellResolution() {
                                                            ": an access with no node");
           continue;
         }
-        asmAt[find(canon(bn))].push_back({si, false, A.k, A.var});
+        asmAt[find(canon(bn))].push_back({si, false, A.k, A.var,
+                                          (uint32_t)(&A - &taggedAccessSets[si][0])});
       }
     for (auto &[n, es] : asmAt)
       pts[n].forEach([&](uint32_t f) { pend[n].push_back(f); push(n); });
@@ -2979,15 +2981,37 @@ bool CallGraphPass::runCellResolution() {
         return false;
       };
       auto fail = [&](uint32_t a) {
+        std::string detail;
         if (!asmFailedAt[a]) {
           asmFailedAt[a] = 1;
           asmFailed++;
-          if (asmFailSites.size() < 20)
-            asmFailSites.push_back(taggedAssumes[a].site + " (" + objs[o].label + ")");
+          {
+            const TaggedAssume &TA = taggedAssumes[a];
+            std::string acc = "?";
+            if (auto it = asmAccFirst[TA.accSet].find(o); it != asmAccFirst[TA.accSet].end()) {
+              const TaggedAccess &X = taggedAccessSets[TA.accSet][it->second];
+              std::string v;
+              raw_string_ostream os(v);
+              X.base->printAsOperand(os, false);
+              const auto *BI = dyn_cast<Instruction>(X.base);
+              acc = os.str() + (BI ? " in " + BI->getFunction()->getName().str() : std::string()) + " +" +
+                    std::to_string(X.k);
+            }
+            std::string idv;
+            raw_string_ostream os2(idv);
+            TA.id->printAsOperand(os2, false);
+            const auto *II = dyn_cast<Instruction>(TA.id);
+            const auto *IA = dyn_cast<Argument>(TA.id);
+            detail = TA.site + ": object " + describe(objs[o]) + " reaches the walked pointer " + os2.str() +
+                     (II ? " (" + II->getFunction()->getName().str() + ")"
+                         : IA ? " (arg of " + IA->getParent()->getName().str() + ")" : std::string()) +
+                     " and an access " + acc + " of the field at +" + std::to_string(TA.field);
+            if (asmFailSites.size() < 40) asmFailSites.push_back(detail);
+          }
         }
         for (uint32_t pi : asmPairs[a])
           if (!taggedFlipped.count({taggedPairs[pi].S, taggedPairs[pi].F}))
-            flipPair(pi, "alias assumption at " + taggedAssumes[a].site + " failed");
+            flipPair(pi, "alias assumption failed at " + (detail.empty() ? taggedAssumes[a].site : detail));
       };
       if (E.idSide) {
         if (asmFailedAt[E.idx]) continue;
@@ -3000,6 +3024,7 @@ bool CallGraphPass::runCellResolution() {
         auto &mine = asmAccKeys[E.idx][o];
         if (std::find(mine.begin(), mine.end(), key) != mine.end()) continue;
         mine.push_back(key);
+        asmAccFirst[E.idx].try_emplace(o, E.acc);
         for (uint32_t a : setAssumes[E.idx]) {
           if (asmFailedAt[a]) continue;
           auto it = asmIdKeys[a].find(o);
@@ -4259,6 +4284,7 @@ bool CallGraphPass::runCellResolution() {
                << taggedFlipped.size() << " flipped; alias assumptions " << asmFailed << " of " << asmUsed
                << " failed\n";
       for (const std::string &d : taggedFlipAt) errs() << "Cells:   unkeyed during solve: " << d << "\n";
+      for (const std::string &d : asmFailSites) errs() << "Cells:   alias assumption failed at " << d << "\n";
       stoppedAt = pops;
       break;
     }

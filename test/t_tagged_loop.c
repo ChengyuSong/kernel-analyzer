@@ -4,8 +4,11 @@
 // is another object; the tag write retags the content p's object holds
 // now (fptr, from wptr) before use() reads it under STR. The STR read must
 // keep fptr.
-// NOKEY: the open STR retag applies to every writer; before the barrier the
-// walk closed on the previous iteration and the pair keyed without fptr.
+// NOKEY: the open STR retag applies to every writer, so the read admits all.
+// A regression case for the loop shape, not a reproducer of the a50aa34
+// barrier: with definition-based names, a pointer defined in a loop has no
+// same-name store on the loop-entry path, so a backward walk that crosses
+// the definition also reaches the entry and is open either way.
 #include <stdlib.h>
 #define STR 1
 #define PTR 4

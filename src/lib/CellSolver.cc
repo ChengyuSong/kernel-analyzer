@@ -830,11 +830,24 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> watchPending;
   boost::unordered_flat_set<uint64_t> watchSeen;
   std::function<void(uint32_t, uint32_t)> watchCheck;
+  // Alias assumptions (plan 3.51): an entry on a node is the identity side
+  // of assumption idx (off: the field) or an access of access set idx
+  // (off: its constant offset, var: unknown).
+  struct AsmEntry { uint32_t idx; bool idSide; int64_t off; bool var; };
+  boost::unordered_flat_map<uint32_t, std::vector<AsmEntry>> asmAt;
+  std::function<void(const AsmEntry &, uint32_t)> asmCheck;
   // Merging solver nodes: the representative inherits every constraint
   // and re-propagates every fact (members brought facts the others'
   // successors and constraints have not seen).
   auto absorb = [&](uint32_t r, uint32_t m) {
     repOf[m] = r;
+    if (!asmAt.empty())
+      if (auto ait = asmAt.find(m); ait != asmAt.end()) {
+        std::vector<AsmEntry> es = std::move(ait->second);
+        asmAt.erase(ait);
+        auto &ra = asmAt[r];
+        ra.insert(ra.end(), es.begin(), es.end());
+      }
     if (!watchAt.empty())
       if (auto wit = watchAt.find(m); wit != watchAt.end()) {
         std::vector<uint32_t> ws = std::move(wit->second);
@@ -2904,6 +2917,97 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[n, ws] : watchAt)
       pts[n].forEach([&](uint32_t f) { pend[n].push_back(f); push(n); });
   }
+  // Alias assumptions: per assumption and per access set, the content
+  // keys of each object seen on its side (-1: any position).
+  std::vector<boost::unordered_flat_map<uint32_t, std::vector<int64_t>>> asmIdKeys(taggedAssumes.size()),
+      asmAccKeys(taggedAccessSets.size());
+  std::vector<std::vector<uint32_t>> asmPairs(taggedAssumes.size()), setAssumes(taggedAccessSets.size());
+  size_t asmUsed = 0, asmFailed = 0, asmNoNode = 0;
+  std::vector<char> asmFailedAt(taggedAssumes.size(), 0);
+  std::vector<std::string> asmFailSites;
+  if (!taggedPairs.empty()) {
+    std::set<uint32_t> used, sets;
+    for (uint32_t pi = 0; pi < taggedPairAssumes.size(); pi++)
+      for (uint32_t a : taggedPairAssumes[pi]) {
+        asmPairs[a].push_back(pi);
+        if (used.insert(a).second) {
+          setAssumes[taggedAssumes[a].accSet].push_back(a);
+          sets.insert(taggedAssumes[a].accSet);
+        }
+      }
+    asmUsed = used.size();
+    auto failAll = [&](uint32_t a, const std::string &why) {
+      if (!asmFailedAt[a]) { asmFailedAt[a] = 1; asmFailed++; }
+      for (uint32_t pi : asmPairs[a]) flipPair(pi, why);
+    };
+    for (uint32_t a : used) {
+      const NodeIndex vn = NF.getValueNodeFor(taggedAssumes[a].id);
+      if (vn == AndersNodeFactory::InvalidIndex) {
+        asmNoNode++;
+        failAll(a, "alias assumption at " + taggedAssumes[a].site + ": its object has no node");
+        continue;
+      }
+      asmAt[find(canon(vn))].push_back({a, true, taggedAssumes[a].field, false});
+    }
+    for (uint32_t si : sets)
+      for (const TaggedAccess &A : taggedAccessSets[si]) {
+        const NodeIndex bn = NF.getValueNodeFor(A.base);
+        if (bn == AndersNodeFactory::InvalidIndex) {
+          asmNoNode++;
+          for (uint32_t a : setAssumes[si]) failAll(a, "alias assumption at " + taggedAssumes[a].site +
+                                                           ": an access with no node");
+          continue;
+        }
+        asmAt[find(canon(bn))].push_back({si, false, A.k, A.var});
+      }
+    for (auto &[n, es] : asmAt)
+      pts[n].forEach([&](uint32_t f) { pend[n].push_back(f); push(n); });
+  }
+  asmCheck = [&](const AsmEntry &E, uint32_t f) {
+    const Cell &C = cells[f];
+    if (C.kind == CellKind::Func || C.kind == CellKind::Out) return;
+    for (const Member &mb : memb[f]) {
+      const uint32_t o = mb.first;
+      int64_t key = -1;
+      if (C.kind != CellKind::Any && !E.var && objs[o].layout) {
+        const int64_t pos = decOff(mb.second) + E.off;
+        if (!(objs[o].tail && (pos >= objs[o].size || pos < 0))) key = contentKey(objs[o], pos);
+      }
+      auto meets = [&](const std::vector<int64_t> &ks) {
+        for (int64_t k : ks)
+          if (k == key || k == -1 || key == -1) return true;
+        return false;
+      };
+      auto fail = [&](uint32_t a) {
+        if (!asmFailedAt[a]) {
+          asmFailedAt[a] = 1;
+          asmFailed++;
+          if (asmFailSites.size() < 20)
+            asmFailSites.push_back(taggedAssumes[a].site + " (" + objs[o].label + ")");
+        }
+        for (uint32_t pi : asmPairs[a])
+          if (!taggedFlipped.count({taggedPairs[pi].S, taggedPairs[pi].F}))
+            flipPair(pi, "alias assumption at " + taggedAssumes[a].site + " failed");
+      };
+      if (E.idSide) {
+        if (asmFailedAt[E.idx]) continue;
+        auto &mine = asmIdKeys[E.idx][o];
+        if (std::find(mine.begin(), mine.end(), key) != mine.end()) continue;
+        mine.push_back(key);
+        auto it = asmAccKeys[taggedAssumes[E.idx].accSet].find(o);
+        if (it != asmAccKeys[taggedAssumes[E.idx].accSet].end() && meets(it->second)) fail(E.idx);
+      } else {
+        auto &mine = asmAccKeys[E.idx][o];
+        if (std::find(mine.begin(), mine.end(), key) != mine.end()) continue;
+        mine.push_back(key);
+        for (uint32_t a : setAssumes[E.idx]) {
+          if (asmFailedAt[a]) continue;
+          auto it = asmIdKeys[a].find(o);
+          if (it != asmIdKeys[a].end() && meets(it->second)) fail(a);
+        }
+      }
+    }
+  };
   watchCheck = [&](uint32_t wi, uint32_t f) {
     const TaggedWatch &W = taggedWatches[wi];
     const Cell &C = cells[f];
@@ -4195,6 +4299,10 @@ bool CallGraphPass::runCellResolution() {
         for (uint32_t wi : std::vector<uint32_t>(wit->second))
           for (uint32_t f : delta)
             if (watchSeen.insert((uint64_t)wi << 32 | f).second) watchCheck(wi, f);
+    if (!asmAt.empty())
+      if (auto ait = asmAt.find(n); ait != asmAt.end())
+        for (const AsmEntry &E : std::vector<AsmEntry>(ait->second))
+          for (uint32_t f : delta) asmCheck(E, f);
     if (!passOf.empty()) {
       auto pit = passOf.find(n);
       if (pit != passOf.end()) { // a path store's value: admitted
@@ -4697,7 +4805,12 @@ bool CallGraphPass::runCellResolution() {
            << "store wrote the tag); " << taggedWatches.size() << " watched store roots ("
            << watchAt.size() << " nodes, " << watchNoNode << " with no node), "
            << watchPending.size() << " objects never typed with watched writes pending\n");
-  for (const std::string &d : taggedFlipAt) CG_LOG("Cells:   unkeyed during solve: unnamed write to tag " << d << "\n");
+  if (!taggedPairs.empty()) {
+    CG_LOG("Cells: alias assumptions (plan 3.51): " << asmUsed - asmFailed << " held, " << asmFailed
+           << " failed (" << asmNoNode << " for want of a node)\n");
+    for (const std::string &d : asmFailSites) CG_LOG("Cells:   alias assumption failed at " << d << "\n");
+  }
+  for (const std::string &d : taggedFlipAt) CG_LOG("Cells:   unkeyed during solve: " << d << "\n");
   if (!varargAllKeys.empty())
     CG_LOG("Cells: varargs keyed by format specifier (plan 3.47): " << varargKeyedSites
            << " call sites with a constant format, " << varargPoolSites

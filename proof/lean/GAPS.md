@@ -672,6 +672,22 @@ Obligations left open:
    - The certificate (every write to D's bytes named, a char/scalar data
      store, or watched in the solve) and the in-solve flips (byte copies,
      watched stores) make unnamed writes checked, not assumed.
+   - Alias assumptions. Where a walk would give up because a call, a
+     store or a read of another identity might touch the walked object's
+     field through an alias, it records the assumption that the object the
+     identity points to is not one those accesses reach at that field.
+     The access set is computed before the solve over every function the
+     call's possible targets may run. The solver marks the objects arriving
+     at the identity's pointer and at each access's base pointer; one
+     object at both, at the same field position (or at an unknown
+     position), fails the assumption and flips the pair. Flips only add
+     edges (keyed cells feed the unkeyed side), so the solve stays
+     monotone: its fixpoint is the least solution of the constraints plus
+     the flips the facts force. Facts that would have failed an assumption
+     still arrive, because nothing removes a fact. That is why a checked
+     assumption is sound.
+   - Tag sets past 4096 values widen to their known bits (agreeing bits
+     known, the rest free); tests over a widened set evaluate as may-hold.
    Not mechanized. Premises: bodiless calls write and read no slot under
    `pure` (item 7); writes the analysis has no statement for are out of
    scope (item 1).

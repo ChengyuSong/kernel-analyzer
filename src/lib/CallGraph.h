@@ -505,6 +505,14 @@ protected:
   // root + [lo, hi] (unb: anywhere in the object).
   struct TaggedWatch { const llvm::Value *root; int64_t lo, hi; bool unb; unsigned w; const llvm::Instruction *at; };
   std::vector<TaggedWatch> taggedWatches;
+  // Alias assumptions (plan 3.51): the object `id` points to (its field at
+  // offset `field`) is not one the accesses of access set `accSet` reach.
+  // An access is a base pointer plus a constant offset (var: unknown).
+  struct TaggedAccess { const llvm::Value *base; int64_t k; bool var; };
+  struct TaggedAssume { const llvm::Value *id; int64_t field; uint32_t accSet; std::string site; };
+  std::vector<std::vector<TaggedAccess>> taggedAccessSets;
+  std::vector<TaggedAssume> taggedAssumes;
+  std::vector<std::vector<uint32_t>> taggedPairAssumes; // per taggedPairs entry
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

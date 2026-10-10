@@ -92,6 +92,10 @@ const GEPOperator *structGEP(const Value *A);
 bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
                 StructType *&S, int64_t &off);
 bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o);
+// The named structs bytes [lo, hi) of T lie in (T itself, members,
+// array elements folded to element 0), each with the interval inside it.
+void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
+                 const std::function<void(StructType *, int64_t, int64_t)> &visit);
 extern size_t g_intStoreUnmodeled;
 extern size_t g_intArgUnmodeled;
 extern size_t g_initCEDeclined;

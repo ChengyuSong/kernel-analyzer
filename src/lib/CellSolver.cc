@@ -822,11 +822,26 @@ bool CallGraphPass::runCellResolution() {
       fieldOut[a].push_back({b, li, 0});
   }
 
+  // Watched stores (plan 3.51 ruling B): by the solver node of the store's
+  // root pointer; a fact landing there is checked against the keyed tags
+  // its write covers (watchCheck, set once objects exist). Facts on an
+  // object not yet typed wait for its layout (watchPending).
+  boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> watchAt;
+  boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> watchPending;
+  boost::unordered_flat_set<uint64_t> watchSeen;
+  std::function<void(uint32_t, uint32_t)> watchCheck;
   // Merging solver nodes: the representative inherits every constraint
   // and re-propagates every fact (members brought facts the others'
   // successors and constraints have not seen).
   auto absorb = [&](uint32_t r, uint32_t m) {
     repOf[m] = r;
+    if (!watchAt.empty())
+      if (auto wit = watchAt.find(m); wit != watchAt.end()) {
+        std::vector<uint32_t> ws = std::move(wit->second);
+        watchAt.erase(wit);
+        auto &rw = watchAt[r];
+        rw.insert(rw.end(), ws.begin(), ws.end());
+      }
     pts[m].forEach([&](uint32_t f) { pts[r].set(f); });
     pts[m] = Facts();
     pend[m].clear();
@@ -1111,6 +1126,68 @@ bool CallGraphPass::runCellResolution() {
   // every read of the slot sees every write.
   std::set<std::pair<std::string, int64_t>> taggedFlipped;
   std::vector<std::string> taggedFlipAt;
+  std::map<std::string, std::vector<size_t>> tagPairsOf; // struct -> pairs
+  for (size_t i = 0; i < taggedPairs.size(); i++) tagPairsOf[taggedPairs[i].S].push_back(i);
+  std::vector<std::string> tagChain;
+  // Is content c of object o a flipped slot (in any struct nested there)?
+  auto flippedAt = [&](uint32_t o, int64_t c) {
+    if (taggedFlipped.empty() || !objs[o].layout) return false;
+    structChain(objs[o].layout, c, DL, tagChain);
+    for (const std::string &e : tagChain) {
+      const size_t plus = e.rfind('+');
+      if (taggedFlipped.count({e.substr(0, plus), std::stoll(e.substr(plus + 1))})) return true;
+    }
+    return false;
+  };
+  // A write the census did not name reached pair pi's tag: every keyed
+  // cell of its slot (in every object it is nested in) feeds the slot's
+  // unkeyed side, so every read sees every write (monotone).
+  auto flipPair = [&](size_t pi, const std::string &why) {
+    const TaggedPair &tp = taggedPairs[pi];
+    if (!taggedFlipped.insert({tp.S, tp.F}).second) return;
+    if (taggedFlipAt.size() < 20)
+      taggedFlipAt.push_back(tp.S + "+" + std::to_string(tp.F) + " by +" + std::to_string(tp.D) + ": " + why);
+    for (uint32_t o2 = 0; o2 < objs.size(); o2++) {
+      if (!objs[o2].layout || objs[o2].keyed.empty()) continue;
+      for (auto &[kk, n] : objs[o2].keyed) {
+        const int64_t c = (int64_t)(uint32_t)(kk >> 32);
+        if (flippedAt(o2, c)) addEdge(n, contentOf(o2, c).first);
+      }
+    }
+  };
+  // The tagged pairs whose tag bytes positions [lo, hi) of object o cover
+  // (all: anywhere in o); each is flipped.
+  std::map<Type *, bool> tagNests;
+  auto tagNestsIn = [&](Type *L) { // does a keyed pair's struct lie in L?
+    auto [nit, ins] = tagNests.try_emplace(L, false);
+    if (ins && L->isSized())
+      structCover(L, 0, (int64_t)DL.getTypeAllocSize(L), DL, [&](StructType *ST, int64_t, int64_t) {
+        nit->second |= tagPairsOf.count(stripStructNameSuffix(ST->getName()).str()) != 0;
+      });
+    return nit->second;
+  };
+  // (Positions past a header are the trailing object's: the caller's.)
+  auto flipCovered = [&](uint32_t o, int64_t lo, int64_t hi, bool all, const Instruction *at) {
+    const Obj &O = objs[o];
+    if (!O.layout || O.size <= 0 || !tagNestsIn(O.layout)) return;
+    const int64_t sz = O.size;
+    int64_t a = 0, b = sz;
+    if (!all && hi - lo < sz) {
+      a = O.repeats ? ((lo % sz) + sz) % sz : std::max<int64_t>(lo, 0);
+      b = a + (hi - lo);
+    }
+    auto visit = [&](StructType *ST, int64_t l, int64_t h) {
+      auto it = tagPairsOf.find(stripStructNameSuffix(ST->getName()).str());
+      if (it == tagPairsOf.end()) return;
+      for (size_t pi : it->second) {
+        const TaggedPair &tp = taggedPairs[pi];
+        if (l < tp.D + tp.Dsize && tp.D < h && !taggedFlipped.count({tp.S, tp.F}))
+          flipPair(pi, "watched store at " + instLoc(at) + " (" + objs[o].label + ")");
+      }
+    };
+    structCover(O.layout, a, std::min(b, sz), DL, visit);
+    if (b > sz && O.repeats) structCover(O.layout, 0, b - sz, DL, visit);
+  };
   // The cell of key k in content (o, c): its unkeyed writes and its own.
   std::function<uint32_t(uint32_t, int64_t, uint32_t)> keyedOf;
   keyedOf = [&](uint32_t o, int64_t c, uint32_t k) -> uint32_t {
@@ -1122,7 +1199,7 @@ bool CallGraphPass::runCellResolution() {
     const uint32_t n = newNode();
     addEdge(u, n);
     addEdge(n, pn);
-    if (objs[o].layout && taggedFlipped.count({objs[o].label, c})) addEdge(n, u);
+    if (flippedAt(o, c)) addEdge(n, u);
     objs[o].keyed.emplace(kk, n);
     keyedCells++;
     // Copies out of this slot carry the key along.
@@ -1565,6 +1642,12 @@ bool CallGraphPass::runCellResolution() {
       const uint32_t o = refoldQueue.back();
       refoldQueue.pop_back();
       refold(o);
+      if (!watchPending.empty() && (objs[o].layout || objs[o].bytes))
+        if (auto wit = watchPending.find(o); wit != watchPending.end()) {
+          std::vector<std::pair<uint32_t, uint32_t>> ws = std::move(wit->second);
+          watchPending.erase(wit);
+          for (auto [wi, f] : ws) watchCheck(wi, findFact(f));
+        }
       // Typed now: its facts at the nodes it passed while unknown get the
       // one-label check (re-presented as pending; propagation is a no-op).
       auto pit = passedBy.find(o);
@@ -2802,6 +2885,50 @@ bool CallGraphPass::runCellResolution() {
     admitting = false;
   };
 
+  // Watched stores: each root's node; a root with no node is refused
+  // (no facts can tell which objects its stores write).
+  size_t watchNoNode = 0;
+  std::string watchNoNodeAt;
+  if (!taggedPairs.empty()) {
+    for (uint32_t wi = 0; wi < taggedWatches.size(); wi++) {
+      const NodeIndex vn = NF.getValueNodeFor(taggedWatches[wi].root);
+      if (vn == AndersNodeFactory::InvalidIndex) {
+        if (!watchNoNode++) watchNoNodeAt = instLoc(taggedWatches[wi].at);
+        continue;
+      }
+      watchAt[find(canon(vn))].push_back(wi);
+    }
+    if (watchNoNode)
+      for (size_t pi = 0; pi < taggedPairs.size(); pi++)
+        flipPair(pi, "a watched store whose root has no node, e.g. " + watchNoNodeAt);
+    for (auto &[n, ws] : watchAt)
+      pts[n].forEach([&](uint32_t f) { pend[n].push_back(f); push(n); });
+  }
+  watchCheck = [&](uint32_t wi, uint32_t f) {
+    const TaggedWatch &W = taggedWatches[wi];
+    const Cell &C = cells[f];
+    if (C.kind == CellKind::Func || C.kind == CellKind::Out) return;
+    for (const Member &mb : std::vector<Member>(memb[f])) {
+      uint32_t o = mb.first;
+      int64_t lo = decOff(mb.second) + W.lo, hi = decOff(mb.second) + W.hi + W.w;
+      const bool all = W.unb || C.kind == CellKind::Any ||
+                       ((mb.second & kFoldedBit) && (W.lo || W.hi));
+      // Through the header into trailing objects.
+      for (int d = 0; d < 16; d++) {
+        if (!objs[o].layout && !objs[o].bytes) {
+          watchPending[o].push_back({wi, f});
+          break;
+        }
+        flipCovered(o, lo, hi, all, W.at);
+        if (!objs[o].tail || (!all && hi <= objs[o].size)) break;
+        const int64_t sz = objs[o].size;
+        o = tailOf(o);
+        lo = std::max<int64_t>(lo - sz, 0);
+        hi -= sz;
+      }
+    }
+  };
+
   // ---- Propagation (difference propagation over a worklist) ----
   const auto tSolve = Clock::now();
   uint64_t walkSteps = 0;
@@ -3685,22 +3812,27 @@ bool CallGraphPass::runCellResolution() {
       // A byte copy writing a tagged field's tag other than as a co-move
       // (the same struct at the same offset) is a write the census did not
       // name: the pair flips to unkeyed (plan 3.51).
-      if (!taggedPairs.empty() && Od.layout)
-        for (const TaggedPair &tp : taggedPairs)
-          if (Od.label == tp.S && dk >= tp.D && dk < tp.D + tp.Dsize &&
-              !(Os.layout && Os.label == tp.S && sk == dk) &&
-              taggedFlipped.insert({tp.S, tp.F}).second) {
-            if (taggedFlipAt.size() < 20)
-              taggedFlipAt.push_back(tp.S + "+" + std::to_string(tp.F) + " by +" + std::to_string(tp.D) +
-                                     ": " + (at ? instLoc(at) : std::string("?")));
-            for (uint32_t o2 = 0; o2 < objs.size(); o2++) {
-              if (!objs[o2].layout || objs[o2].label != tp.S) continue;
-              auto cit = objs[o2].content.find(tp.F);
-              if (cit == objs[o2].content.end()) continue;
-              for (auto &[kk, n] : objs[o2].keyed)
-                if ((int64_t)(uint32_t)(kk >> 32) == tp.F) addEdge(n, cit->second.first);
-            }
+      if (!taggedPairs.empty() && Od.layout && tagNestsIn(Od.layout)) {
+        auto coMove = [&](const std::string &e) {
+          if (!Os.layout) return false;
+          std::vector<std::string> chS;
+          structChain(Os.layout, sk, DL, chS);
+          return std::find(chS.begin(), chS.end(), e) != chS.end();
+        };
+        std::vector<std::string> chD;
+        structChain(Od.layout, dk, DL, chD);
+        for (const std::string &e : chD) {
+          const size_t plus = e.rfind('+');
+          auto it = tagPairsOf.find(e.substr(0, plus));
+          if (it == tagPairsOf.end()) continue;
+          const int64_t rel = std::stoll(e.substr(plus + 1));
+          for (size_t pi : it->second) {
+            const TaggedPair &tp = taggedPairs[pi];
+            if (rel >= tp.D && rel < tp.D + tp.Dsize && !taggedFlipped.count({tp.S, tp.F}) && !coMove(e))
+              flipPair(pi, "byte copy at " + (at ? instLoc(at) : std::string("?")));
           }
+        }
+      }
       // An integer name copied into bytes (the route by which an integer
       // could be read back as a pointer, plan 3.50 ruling): counted.
       if (!Od.layout && Os.layout && !Os.label.empty()) {
@@ -4058,6 +4190,11 @@ bool CallGraphPass::runCellResolution() {
       if (pops % (1u << 22) == 0) massByObject(12);
     }
     for (uint32_t &f : delta) f = findFact(f);
+    if (!watchAt.empty())
+      if (auto wit = watchAt.find(n); wit != watchAt.end())
+        for (uint32_t wi : std::vector<uint32_t>(wit->second))
+          for (uint32_t f : delta)
+            if (watchSeen.insert((uint64_t)wi << 32 | f).second) watchCheck(wi, f);
     if (!passOf.empty()) {
       auto pit = passOf.find(n);
       if (pit != passOf.end()) { // a path store's value: admitted
@@ -4556,7 +4693,10 @@ bool CallGraphPass::runCellResolution() {
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   if (!taggedPairs.empty())
     CG_LOG("Cells: tagged fields (plan 3.51): " << taggedPairs.size() << " keyed pairs, "
-           << taggedFlipped.size() << " flipped to unkeyed during the solve (a byte copy wrote the tag)\n");
+           << taggedFlipped.size() << " flipped to unkeyed during the solve (a byte copy or a watched "
+           << "store wrote the tag); " << taggedWatches.size() << " watched store roots ("
+           << watchAt.size() << " nodes, " << watchNoNode << " with no node), "
+           << watchPending.size() << " objects never typed with watched writes pending\n");
   for (const std::string &d : taggedFlipAt) CG_LOG("Cells:   unkeyed during solve: unnamed write to tag " << d << "\n");
   if (!varargAllKeys.empty())
     CG_LOG("Cells: varargs keyed by format specifier (plan 3.47): " << varargKeyedSites

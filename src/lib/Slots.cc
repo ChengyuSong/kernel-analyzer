@@ -96,3 +96,50 @@ bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o) {
   return false;
 }
 
+
+// The named structs bytes [lo, hi) of T lie in, outermost first, each with
+// the interval inside it (array elements fold to element 0: an interval
+// spanning an element boundary wraps).
+static void structCoverRec(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
+                           const std::function<void(StructType *, int64_t, int64_t)> &visit,
+                           int depth) {
+  if (depth > 64 || lo >= hi) return;
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    if (ST->isOpaque()) {
+      if (ST->hasName()) visit(ST, lo, hi);
+      return;
+    }
+    const StructLayout *SL = DL.getStructLayout(ST);
+    const int64_t sz = (int64_t)SL->getSizeInBytes();
+    lo = std::max<int64_t>(lo, 0);
+    hi = std::min(hi, sz);
+    if (lo >= hi) return;
+    if (ST->hasName()) visit(ST, lo, hi);
+    for (unsigned i = 0; i < ST->getNumElements(); i++) {
+      Type *E = ST->getElementType(i);
+      const int64_t eo = (int64_t)SL->getElementOffset(i), es = (int64_t)DL.getTypeAllocSize(E);
+      if (eo + es <= lo || eo >= hi) continue;
+      structCoverRec(E, std::max(lo, eo) - eo, std::min(hi, eo + es) - eo, DL, visit, depth + 1);
+    }
+    return;
+  }
+  Type *E = nullptr;
+  uint64_t n = 0;
+  if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType(), n = AT->getNumElements();
+  else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType(), n = VT->getNumElements();
+  if (!E || !(E->isStructTy() || E->isArrayTy())) return;
+  const int64_t es = (int64_t)DL.getTypeAllocSize(E);
+  if (es == 0) return;
+  lo = std::max<int64_t>(lo, 0);
+  if (n) hi = std::min(hi, es * (int64_t)n);
+  if (lo >= hi) return;
+  if (hi - lo >= es) return structCoverRec(E, 0, es, DL, visit, depth + 1);
+  const int64_t a = lo % es, b = a + (hi - lo);
+  if (b <= es) return structCoverRec(E, a, b, DL, visit, depth + 1);
+  structCoverRec(E, a, es, DL, visit, depth + 1);
+  structCoverRec(E, 0, b - es, DL, visit, depth + 1);
+}
+void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
+                 const std::function<void(StructType *, int64_t, int64_t)> &visit) {
+  structCoverRec(T, lo, hi, DL, visit, 0);
+}

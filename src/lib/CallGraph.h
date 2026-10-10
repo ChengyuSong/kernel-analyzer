@@ -494,7 +494,14 @@ protected:
   // flips a pair to unkeyed when a byte copy writes its tag other than as a
   // co-move (plan 3.51, the in-solve certificate check).
   struct TaggedPair { std::string S; int64_t F, D, Dsize; };
-  std::vector<TaggedPair> taggedPairs; // pairs, tagged/untagged writers, reads keyed/no test/all, non-const
+  std::vector<TaggedPair> taggedPairs;
+  // Stores whose pointer's provenance is not decidable locally (a
+  // parameter, a loaded or returned pointer): the solver watches the root
+  // value; a fact (S object, position covering a keyed tag) landing there
+  // flips the pair (plan 3.51 ruling A/B). The store writes w bytes at
+  // root + [lo, hi] (unb: anywhere in the object).
+  struct TaggedWatch { const llvm::Value *root; int64_t lo, hi; bool unb; unsigned w; const llvm::Instruction *at; };
+  std::vector<TaggedWatch> taggedWatches;
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

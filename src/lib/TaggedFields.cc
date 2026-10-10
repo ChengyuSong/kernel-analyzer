@@ -39,6 +39,7 @@ struct ObjIds {
   struct SlotInfo {
     bool escapes = false;
     std::map<const LoadInst *, const Value *> id;
+    std::map<const LoadInst *, const StoreInst *> def; // the one store a reload reads
   };
   std::map<const AllocaInst *, SlotInfo> slots;
   std::map<const Value *, const BasicBlock *> phiBlock; // a merge's name -> the block it is at
@@ -137,7 +138,7 @@ struct ObjIds {
         }
         const auto *L = dyn_cast<LoadInst>(&I);
         if (!L || L->getPointerOperand() != A) continue;
-        if (cur >= 0 && cur < n) SI.id[L] = stores[cur]->getValueOperand();
+        if (cur >= 0 && cur < n) SI.id[L] = stores[cur]->getValueOperand(), SI.def[L] = stores[cur];
         else if (cur >= n) {
           auto [pit, pins] = phiRep.try_emplace(cur, L);
           SI.id[L] = pit->second;
@@ -165,7 +166,17 @@ struct ObjIds {
     if (const auto *L = dyn_cast<LoadInst>(B))
       if (const auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
         const SlotInfo &SI = slot(A);
-        if (SI.escapes) return L; // a slot written elsewhere: this reload only
+        if (SI.escapes) { // a slot written elsewhere: the reloads since the last write that may reach it
+          const LoadInst *head = L;
+          for (const Instruction *I = L->getPrevNode(); I; I = I->getPrevNode()) {
+            if (const auto *L2 = dyn_cast<LoadInst>(I);
+                L2 && L2->getPointerOperand()->stripPointerCasts() == A && !L2->isVolatile())
+              head = L2;
+            else if (I->mayWriteToMemory())
+              break;
+          }
+          return head;
+        }
         auto it = SI.id.find(L);
         assert(it != SI.id.end() && "every reload of a non-escaping slot has an identity");
         if (isa<LoadInst>(it->second) && it->second->getType()->isPointerTy() &&
@@ -173,8 +184,45 @@ struct ObjIds {
           return it->second; // a run of reloads
         return of(it->second, 0, depth + 1);
       }
+    // An element address (a variable index): the same base object and the
+    // same index values name one element, whichever GEP computes it.
+    if (const auto *G = dyn_cast<GEPOperator>(B)) {
+      std::vector<std::pair<int, int64_t>> key;
+      std::vector<const Value *> parts{of(G->getPointerOperand(), 0, depth + 1)};
+      for (auto It = G->idx_begin(); It != G->idx_end(); ++It) {
+        if (const auto *C = dyn_cast<ConstantInt>(*It)) key.push_back({0, C->getSExtValue()});
+        else {
+          const Value *iv = intId(*It, depth + 1);
+          key.push_back({1, (int64_t)(intptr_t)iv});
+          parts.push_back(iv);
+        }
+      }
+      auto [it, ins] = gepRep.try_emplace({G->getSourceElementType(), parts[0], key}, B);
+      if (ins) gepParts[B] = parts;
+      return it->second;
+    }
     return B;
   }
+  // The identity of an integer value (an index): through casts and -O0
+  // slots by their definitions.
+  const Value *intId(const Value *V, int depth) {
+    while (const auto *C = dyn_cast<CastInst>(V)) {
+      if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) break;
+      V = C->getOperand(0);
+    }
+    if (const auto *L = dyn_cast<LoadInst>(V))
+      if (const auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+        const SlotInfo &SI = slot(A);
+        if (SI.escapes) return L;
+        auto it = SI.id.find(L);
+        if (it == SI.id.end()) return L;
+        if (isa<LoadInst>(it->second) && cast<LoadInst>(it->second)->getPointerOperand() == A) return it->second;
+        return depth < 8 ? intId(it->second, depth + 1) : it->second;
+      }
+    return V;
+  }
+  std::map<std::tuple<Type *, const Value *, std::vector<std::pair<int, int64_t>>>, const Value *> gepRep;
+  std::map<const Value *, std::vector<const Value *>> gepParts; // an element's base and index identities
 };
 std::string locOf(const Instruction *I) {
   if (!I) return "?";
@@ -189,17 +237,74 @@ void CallGraphPass::computeTaggedFields() {
   // Where an identity's value is defined: an instruction (each execution
   // names another object), or a merge block (a phi). A walk that crosses
   // it meets another object under the same name: a barrier.
-  auto defInstOf = [&](const Value *id) -> const Instruction * {
-    if (ids.phiBlock.count(id)) return nullptr;
-    return dyn_cast<Instruction>(id);
-  };
-  auto defBlockOf = [&](const Value *id) -> const BasicBlock * {
-    auto it = ids.phiBlock.find(id);
-    return it == ids.phiBlock.end() ? nullptr : it->second;
+  // An element identity (a GEP over a base and indices) is defined where
+  // any of its parts is.
+  struct Defs { std::set<const Instruction *> insts; std::set<const BasicBlock *> blocks; };
+  std::map<const Value *, Defs> defsMemo;
+  std::function<const Defs &(const Value *)> defsOf = [&](const Value *id) -> const Defs & {
+    auto [it, ins] = defsMemo.try_emplace(id);
+    if (!ins) return it->second;
+    Defs D;
+    if (auto pit = ids.gepParts.find(id); pit != ids.gepParts.end()) {
+      for (const Value *pv : pit->second)
+        if (pv != id) {
+          const Defs &P = defsOf(pv);
+          D.insts.insert(P.insts.begin(), P.insts.end());
+          D.blocks.insert(P.blocks.begin(), P.blocks.end());
+        }
+    } else if (auto bit = ids.phiBlock.find(id); bit != ids.phiBlock.end()) D.blocks.insert(bit->second);
+    else if (const auto *I = dyn_cast<Instruction>(id)) D.insts.insert(I);
+    return defsMemo[id] = std::move(D);
   };
   auto objKey = [&](const Instruction *I, const Value *Addr, StructType *S) {
     const DataLayout &DL = I->getModule()->getDataLayout();
     return ids.of(Addr, S && S->isSized() ? (int64_t)DL.getTypeAllocSize(S) : 0);
+  };
+  // Pointer-equality identity merges (plan 3.51): inside the blocks
+  // dominated by the equal edge of a test `X == Y` (the true successor of
+  // icmp eq, the false one of icmp ne, entered only from the test), the two
+  // identities name one object. Operands must be identity pointers (by
+  // reaching definitions), not derived ones (a GEP).
+  struct EqRegion { const Value *X, *Y; const BasicBlock *succ; const Instruction *site; };
+  std::map<const Function *, std::vector<EqRegion>> eqRegionsMemo;
+  std::map<const Function *, std::unique_ptr<DominatorTree>> eqDoms;
+  std::set<const Instruction *> eqMergeSites;
+  auto eqRegionsOf = [&](const Function *Fn) -> const std::vector<EqRegion> & {
+    auto [it, ins] = eqRegionsMemo.try_emplace(Fn);
+    if (!ins) return it->second;
+    auto idOfPtr = [&](const Value *V) -> const Value * {
+      V = V->stripPointerCasts();
+      if (isa<GEPOperator>(V) || isa<Constant>(V)) return nullptr;
+      return ids.of(V, 0);
+    };
+    for (const BasicBlock &BB : *Fn) {
+      const auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+      if (!Br || !Br->isConditional()) continue;
+      const auto *IC = dyn_cast<ICmpInst>(Br->getCondition());
+      if (!IC || !IC->getOperand(0)->getType()->isPointerTy() || !IC->isEquality()) continue;
+      const Value *X = idOfPtr(IC->getOperand(0)), *Y = idOfPtr(IC->getOperand(1));
+      if (!X || !Y || X == Y) continue;
+      const BasicBlock *Succ = Br->getSuccessor(IC->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1);
+      if (Succ->getSinglePredecessor() != &BB) continue;
+      it->second.push_back({X, Y, Succ, Br});
+    }
+    return it->second;
+  };
+  // Do a and b name one object at I?
+  auto sameObj = [&](const Value *a, const Value *b, const Instruction *I) {
+    if (a == b) return true;
+    if (!a || !b || !I) return false;
+    const Function *Fn = I->getFunction();
+    for (const EqRegion &R : eqRegionsOf(Fn))
+      if ((R.X == a && R.Y == b) || (R.X == b && R.Y == a)) {
+        auto &DT = eqDoms[Fn];
+        if (!DT) DT = std::make_unique<DominatorTree>(const_cast<Function &>(*Fn));
+        if (DT->dominates(R.succ, I->getParent())) {
+          eqMergeSites.insert(R.site);
+          return true;
+        }
+      }
+    return false;
   };
   taggedReport.clear();
   taggedPairs.clear();
@@ -218,7 +323,11 @@ void CallGraphPass::computeTaggedFields() {
   // `f |= (f & MEM_Blob) >> 3` is s|{0,2}), and, under
   // --cfl-whole-program, a parameter of a function whose address is not
   // taken, by the arguments at its call sites (each bound reported).
-  struct Term { char src; int64_t a, f, m; };
+  struct Term {
+    char src;
+    int64_t a, f, m;
+    const Value *who = nullptr; // evaluation only: the object a symbolic term's tag was read from
+  };
   struct TagStore {
     const StoreInst *I;
     const Value *obj;
@@ -356,7 +465,7 @@ void CallGraphPass::computeTaggedFields() {
         const unsigned sb = C->getOperand(0)->getType()->getIntegerBitWidth(), db = C->getType()->getIntegerBitWidth();
         if (isa<TruncInst>(C) || isa<ZExtInst>(C)) {
           const int64_t m = mask(isa<TruncInst>(C) ? db : sb);
-          for (Term t : in) out.push_back({t.src, t.a & m, t.f & m, t.m & m});
+          for (Term t : in) out.push_back({t.src, t.a & m, t.f & m, t.m & m, t.who});
           return true;
         }
         if (isa<SExtInst>(C)) {
@@ -401,6 +510,7 @@ void CallGraphPass::computeTaggedFields() {
               r.m = (((p.a | p.f | p.m) & q.m) | ((q.a | q.f | q.m) & p.m)) & ~r.f & ~r.a;
             }
             r.src = r.a ? src : 'c';
+            r.who = p.a ? p.who : q.who;
             return r;
           };
           const std::set<char> sx = srcs(x), sy = srcs(y);
@@ -455,14 +565,31 @@ void CallGraphPass::computeTaggedFields() {
         if (const AllocaInst *A = slotOf(L)) {
           // The one store reaching this reload, when there is one.
           const ObjIds::SlotInfo &SI = ids.slot(A);
+          // A value stored inside a pointer-equality region carries the merge
+          // out of it: a tag read from one of the two names is the other's.
+          auto relabel = [&](std::vector<Term> &ts, size_t from, const Instruction *St) {
+            for (size_t q = from; q < ts.size(); q++)
+              if (ts[q].src == 'x' && ts[q].who && sameObj(ts[q].who, obj, St)) ts[q].src = 's';
+          };
+          if (auto dit = SI.def.find(L); dit != SI.def.end()) {
+            const size_t mark = out.size();
+            if (!ev(dit->second->getValueOperand(), depth + 1, out)) return false;
+            relabel(out, mark, dit->second);
+            return true;
+          }
           if (auto it = SI.id.find(L); it != SI.id.end() &&
               !(isa<LoadInst>(it->second) && cast<LoadInst>(it->second)->getPointerOperand() == A))
             return ev(it->second, depth + 1, out);
           const auto *vals = ids.storedInto(A);
           if (vals->empty()) return false;
           return fixpoint(A, [&](std::vector<Term> &acc) {
-            for (const Value *X : *vals)
-              if (!ev(X, depth + 1, acc)) return false;
+            for (const User *U : A->users())
+              if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == A &&
+                                                          St->getValueOperand() != A) {
+                const size_t mark = acc.size();
+                if (!ev(St->getValueOperand(), depth + 1, acc)) return false;
+                relabel(acc, mark, St);
+              }
             return true;
           }, out);
         }
@@ -471,7 +598,8 @@ void CallGraphPass::computeTaggedFields() {
         if (L->getType()->isIntegerTy() &&
             accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, off2) && S2 &&
             S2->hasName() && stripStructNameSuffix(S2->getName()) == D.first && off2 == D.second) {
-          out.push_back({objKey(L, L->getPointerOperand(), S2) == obj ? 's' : 'x', -1, 0});
+          const Value *who = objKey(L, L->getPointerOperand(), S2);
+          out.push_back({sameObj(who, obj, L) ? 's' : 'x', -1, 0, 0, who});
           return true;
         }
         return false;
@@ -1093,20 +1221,19 @@ void CallGraphPass::computeTaggedFields() {
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{at->getParent(), at->getPrevNode()}};
     size_t blocks = 0;
-    const Instruction *idDef = defInstOf(id);
-    const BasicBlock *idPhi = defBlockOf(id);
+    const Defs &idDefs = defsOf(id);
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
       bool stopped = false;
       for (; I && !stopped; I = I->getPrevNode()) {
-        if (I == idDef) {
+        if (idDefs.insts.count(I)) {
           openWhy("the object's pointer is defined at " + locOf(I));
           stopped = true;
           continue;
         }
         if (auto sit = Dc.stores.find(I); sit != Dc.stores.end()) {
-          if (sit->second != id) {
+          if (!sameObj(sit->second, id, I)) {
             R.assumes.insert(assume(id, Dc.X, accessSet(Dc.X, '1', I), I));
             continue;
           }
@@ -1154,7 +1281,7 @@ void CallGraphPass::computeTaggedFields() {
         R.maps.push_back(idTerm);
         continue;
       }
-      if (B == idPhi) {
+      if (idDefs.blocks.count(B)) {
         openWhy("the object's pointer merges at " + B->getParent()->getName().str());
         continue;
       }
@@ -1244,7 +1371,7 @@ void CallGraphPass::computeTaggedFields() {
     auto writes = [&](const Instruction &I) {
       if (&I == at) return false;
       if (auto sit = C.stores.find(&I); sit != C.stores.end()) {
-        if (sit->second == obj) return true;
+        if (sameObj(sit->second, obj, &I)) return true;
         as.insert(assume(obj, X, accessSet(X, '1', &I), &I)); // another identity
         return false;
       }
@@ -1293,8 +1420,7 @@ void CallGraphPass::computeTaggedFields() {
       for (const BasicBlock *P : predecessors(B))
         if (P != TB && fwd.count(P) && bwd.insert(P).second) work.push_back(P);
     }
-    const Instruction *idDef = defInstOf(obj);
-    const BasicBlock *idPhi = defBlockOf(obj);
+    const Defs &idDefs = defsOf(obj);
     // Is `at`'s block on a cycle inside the region (so the code after `at`
     // in it can come between)?
     bool atCycle = false;
@@ -1311,9 +1437,9 @@ void CallGraphPass::computeTaggedFields() {
     }
     for (const BasicBlock *B : bwd)
       if (fwd.count(B)) {
-        if (B == idPhi && (B != at->getParent() || atCycle)) { unstableWhy = "the object's pointer merges between"; return false; }
+        if (idDefs.blocks.count(B) && (B != at->getParent() || atCycle)) { unstableWhy = "the object's pointer merges between"; return false; }
         for (const Instruction &I : *B) {
-          if (&I == idDef && !(B == at->getParent() && at->comesBefore(&I) && !atCycle)) {
+          if (idDefs.insts.count(&I) && !(B == at->getParent() && at->comesBefore(&I) && !atCycle)) {
             unstableWhy = "the object's pointer is defined between";
             return false;
           }
@@ -1529,20 +1655,19 @@ void CallGraphPass::computeTaggedFields() {
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{at->getParent(), at->getPrevNode()}};
     size_t blocks = 0;
-    const Instruction *idDef = defInstOf(id);
-    const BasicBlock *idPhi = defBlockOf(id);
+    const Defs &idDefs = defsOf(id);
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
       bool stopped = false;
       for (; I && !stopped; I = I->getPrevNode()) {
-        if (I == idDef) { // before this, the name was another object
+        if (idDefs.insts.count(I)) { // before this, the name was another object
           openWhy("the object's pointer is defined at " + locOf(I));
           stopped = true;
           continue;
         }
         if (auto sit = C.stores.find(I); sit != C.stores.end()) {
-          if (sit->second == id) { R.W.insert(I); stopped = true; }
+          if (sameObj(sit->second, id, I)) { R.W.insert(I); stopped = true; }
           else R.assumes.insert(assume(id, C.X, accessSet(C.X, '1', I), I));
           continue;
         }
@@ -1571,7 +1696,7 @@ void CallGraphPass::computeTaggedFields() {
         stopped = must;
       }
       if (stopped) continue;
-      if (B == idPhi) { // the merge that names the object
+      if (idDefs.blocks.count(B)) { // the merge that names the object
         openWhy("the object's pointer merges at " + B->getParent()->getName().str());
         continue;
       }
@@ -1653,23 +1778,22 @@ void CallGraphPass::computeTaggedFields() {
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{W->getParent(), W->getNextNode()}};
     size_t blocks = 0;
-    const Instruction *idDef = defInstOf(id);
-    const BasicBlock *idPhi = defBlockOf(id);
+    const Defs &idDefs = defsOf(id);
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
-      if (B == idPhi && I == &B->front()) return true; // the name becomes another object
+      if (idDefs.blocks.count(B) && I == &B->front()) return true; // the name becomes another object
       bool stopped = false;
       for (; I && !stopped; I = I->getNextNode()) {
-        if (isa<ReturnInst>(I) || I == idDef) return true;
+        if (isa<ReturnInst>(I) || idDefs.insts.count(I)) return true;
         if (auto rit = reads.find(I); rit != reads.end()) {
-          if (rit->second == id) return true;
+          if (sameObj(rit->second, id, I)) return true;
           as.insert(assume(id, Fc.X, accessSet(Fc.X, '1', I), I)); // a read of another identity
           continue;
         }
         if (isa<UnreachableInst>(I)) { stopped = true; break; }
-        if (auto dit = Dc.stores.find(I); dit != Dc.stores.end() && dit->second == id) { stopped = true; break; }
-        if (auto fit = Fc.stores.find(I); fit != Fc.stores.end() && fit->second == id) { stopped = true; break; }
+        if (auto dit = Dc.stores.find(I); dit != Dc.stores.end() && sameObj(dit->second, id, I)) { stopped = true; break; }
+        if (auto fit = Fc.stores.find(I); fit != Fc.stores.end() && sameObj(fit->second, id, I)) { stopped = true; break; }
         const auto *CB = dyn_cast<CallBase>(I);
         if (!CB || isa<IntrinsicInst>(CB) || CB->isInlineAsm()) continue;
         const Function *H = CB->getCalledFunction();
@@ -2584,6 +2708,11 @@ void CallGraphPass::computeTaggedFields() {
   {
     const Function *top = nullptr;
     for (auto &[F, n] : walkBlocksBy) if (!top || n > walkBlocksBy[top]) top = F;
+    {
+      std::string sites;
+      for (const Instruction *I : eqMergeSites) if (sites.size() < 300) sites += " " + locOf(I);
+      CG_LOG("TaggedFields: pointer-equality identity merges: " << eqMergeSites.size() << " (" << sites << " )\n");
+    }
     CG_LOG("TaggedFields: callee D-effects composed: " << effClosed << " closed, " << effOpen << " open ("
            << effComputes << " effect computations; content effects " << ceRounds << " rounds, " << ceUnsettled
            << " pairs unsettled, " << ceSecs << " s)\n");

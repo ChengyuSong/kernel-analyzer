@@ -16,7 +16,9 @@ for c in t_tagged_*.c; do
   "$CLANG" -O0 -g -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
   "$BIN" --verbose=2 --func-summaries=../func_summaries.txt --cfl-cells --cfl-union-keys=tag --cfl-alloc-origins \
     --cfl-whole-program --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" > "$OUT/$n.log" 2>&1
-  if ! grep -q "TaggedFields:   KEYED struct.S+8 by +0" "$OUT/$n.log"; then
+  # A case marked NOKEY: expects every writer admitted (a soundness case
+  # whose answer is the full set); the others must be keyed to test anything.
+  if ! grep -q "NOKEY:" "$c" && ! grep -q "TaggedFields:   KEYED struct.S+8 by +0" "$OUT/$n.log"; then
     echo "FAIL[$n]: pair struct.S+8 by +0 not keyed"; fail=1; continue
   fi
   line=$(grep -n "// CHECK:" "$c" | cut -d: -f1)

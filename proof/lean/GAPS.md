@@ -704,6 +704,15 @@ Obligations left open:
      returns only through its returns: longjmp is not modeled.
    - Reads are stable against F writes only. A D write between a test and
      a read leaves the content the test spoke for in place.
+   - Inside a region dominated by a pointer-equality edge (the true
+     successor of `==`, the false one of `!=`, entered only from the test),
+     the two pointers name one object, for the evaluator and every walk.
+     Outside it they are two objects. A redefinition of either pointer
+     ends it, since the merged names are definitions.
+   - Identities are definitions: mem2reg's for -O0 slots; an element
+     address by its base and index definitions; reloads of an escaping slot
+     in one block with no memory write between. A walk that crosses a
+     definition of its identity's parts stops there (another object).
    Not mechanized. Premises: bodiless calls write and read no slot under
    `pure` (item 7); writes the analysis has no statement for are out of
    scope (item 1).

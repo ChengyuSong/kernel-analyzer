@@ -6157,10 +6157,14 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
           if (ptrNode == AndersNodeFactory::InvalidIndex ||
               valNode == AndersNodeFactory::InvalidIndex)
             continue;
+          // A read's key, union or vararg (3.47), is part of its identity.
           std::string lk;
-          if (CFLCells)
+          if (CFLCells) {
             if (auto kit = unionKeyNames.find(LI); kit != unionKeyNames.end())
               for (const std::string &k : kit->second) lk += k + ";";
+            if (auto vk = varargReadKeys.find(LI); vk != varargReadKeys.end())
+              for (const std::string &k : vk->second) lk += k + ";";
+          }
           if (!lk.empty() || (CFLCells && unionUnknownOf.count(LI))) {
             if (lk.empty()) lk = "?";
             auto [it, inserted] = keyedLoadReps.emplace(std::make_pair(globalFind(ptrNode), lk), valNode);

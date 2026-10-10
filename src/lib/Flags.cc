@@ -1131,14 +1131,14 @@ cl::opt<bool> CFLCells(
 
 cl::opt<bool> CFLCellUnify(
   "cfl-cell-unify",
-  cl::desc("--cfl-cells: unification by name. Two cells of one name that "
+  cl::desc("MEASUREMENT SWITCH, not a configuration of the reported analysis: --cfl-cells: unification by name. Two cells of one name that "
            "one node holds become one cell; different names never merge. "
            "false: every (object, offset) stays its own cell"),
   cl::init(false));
 
 cl::opt<bool> CFLCellMergePtrs(
   "cfl-cell-merge-ptrs",
-  cl::desc("--cfl-cells: pointer nodes with equal sets (no function among "
+  cl::desc("MEASUREMENT SWITCH, not a configuration of the reported analysis: --cfl-cells: pointer nodes with equal sets (no function among "
            "them) become one node, at each periodic cycle collapse"),
   cl::init(false));
 

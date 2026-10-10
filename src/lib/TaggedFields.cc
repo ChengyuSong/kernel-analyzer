@@ -503,9 +503,11 @@ void CallGraphPass::computeTaggedFields() {
   std::string unwatchableAt;
   using Field0 = std::pair<std::string, int64_t>;
   std::map<Field0, std::string> escapedAt; // fields whose address escapes
-  std::set<int64_t> memsetFills;
-  bool memsetUnknown = false;
-  std::string memsetUnknownAt;
+  // memset fills, by the struct bytes they may cover (classified like
+  // stores: typed objects and struct GEPs cover, char data is ignored,
+  // other roots are watched in the solve); fill -1: not a constant.
+  struct Fill { int64_t lo, hi; int fill; const Instruction *I; };
+  std::map<std::string, std::vector<Fill>> fillsOf;
   std::function<bool(Type *)> nestsStruct = [&](Type *T) {
     if (auto *ST = dyn_cast<StructType>(T)) return ST->hasName() || !ST->isOpaque();
     if (auto *AT = dyn_cast<ArrayType>(T)) return nestsStruct(AT->getElementType());
@@ -689,8 +691,33 @@ void CallGraphPass::computeTaggedFields() {
     for (Function &F : *M)
       for (Instruction &I : instructions(F)) {
         if (const auto *MS = dyn_cast<MemSetInst>(&I)) {
-          if (const auto *K = dyn_cast<ConstantInt>(MS->getValue())) memsetFills.insert(K->getZExtValue() & 0xff);
-          else if (!memsetUnknown) { memsetUnknown = true; memsetUnknownAt = locOf(&I); }
+          const auto *K = dyn_cast<ConstantInt>(MS->getValue());
+          const int fill = K ? (int)(K->getZExtValue() & 0xff) : -1;
+          const auto *LN = dyn_cast<ConstantInt>(MS->getLength());
+          const int64_t len = LN ? (int64_t)LN->getZExtValue() : -1;
+          std::vector<Leaf> leaves;
+          walk({{MS->getDest(), {0, 0, false}}}, DL, leaves);
+          bool unwatch = false;
+          for (const Leaf &l : leaves) {
+            if (l.kind == 'u') { unwatch = true; continue; }
+            if (l.kind == 'w') {
+              watchCand.push_back({l.V, l.P.lo, l.P.hi, l.P.unb || len < 0, (unsigned)std::max<int64_t>(len, 1), &I});
+              continue;
+            }
+            const int64_t sz = l.L->isSized() ? (int64_t)DL.getTypeAllocSize(l.L) : 0;
+            if (sz == 0) continue;
+            int64_t a = 0, b = sz;
+            if (!l.P.unb && len >= 0 && l.P.hi + len - l.P.lo < sz) {
+              a = ((l.P.lo % sz) + sz) % sz;
+              b = a + (l.P.hi - l.P.lo) + len;
+            }
+            auto visit = [&](StructType *ST, int64_t lo, int64_t hi) {
+              fillsOf[stripStructNameSuffix(ST->getName()).str()].push_back({lo, hi, fill, &I});
+            };
+            structCover(l.L, a, std::min(b, sz), DL, visit);
+            if (b > sz) structCover(l.L, 0, b - sz, DL, visit);
+          }
+          if (unwatch && !storesUnwatchable++) unwatchableAt = locOf(&I);
           continue;
         }
         if (const auto *SI = dyn_cast<StoreInst>(&I))
@@ -1160,7 +1187,8 @@ void CallGraphPass::computeTaggedFields() {
     }
     return effs[key];
   };
-  size_t effClosed = 0, effOpen = 0;
+  size_t effClosed = 0, effOpen = 0, ceRounds = 0, ceUnsettled = 0;
+  double ceSecs = 0;
   std::vector<std::string> effOpenAt;
   // Can D be written between the test (its load dl, its branch into Succ)
   // and the access at `at`? The last passage: blocks reachable from Succ
@@ -1172,10 +1200,11 @@ void CallGraphPass::computeTaggedFields() {
   // composed, E = the maps from the test to the access; unstable when that
   // effect is open. The last passage: from Succ to `at` without
   // re-entering the test's block.
+  std::string unstableWhy; // why the last test was dropped (reports)
   auto stableBetween = [&](const LoadInst *dl, const BranchInst *Br, const BasicBlock *Succ, const Instruction *at,
                            const Field &X, bool isD, const Value *obj, std::set<uint32_t> &as,
                            std::vector<Term> *E) {
-    if (dl->getParent() != Br->getParent()) return false;
+    if (dl->getParent() != Br->getParent()) { unstableWhy = "the test's load is in another block"; return false; }
     const FieldCtx &C = ctxOf(X, isD);
     auto writes = [&](const Instruction &I) {
       if (&I == at) return false;
@@ -1200,13 +1229,13 @@ void CallGraphPass::computeTaggedFields() {
       return false;
     };
     for (const Instruction *I = dl->getNextNode(); I && I != Br; I = I->getNextNode())
-      if (writes(*I)) return false;
+      if (writes(*I)) { unstableWhy = "a write at " + locOf(I) + " between the test's load and its branch"; return false; }
     if (isD) {
       EffMemo memo;
       std::set<const Instruction *> cyc;
       Eff e = effectBefore(C, at->getFunction(), obj, at, Succ, memo, cyc);
       as.insert(e.assumes.begin(), e.assumes.end());
-      if (e.open) return false;
+      if (e.open) { unstableWhy = "an open D effect: " + e.why; return false; }
       if (E) *E = std::move(e.maps);
       return true;
     }
@@ -1232,7 +1261,7 @@ void CallGraphPass::computeTaggedFields() {
     for (const BasicBlock *B : bwd)
       if (fwd.count(B))
         for (const Instruction &I : *B)
-          if (writes(I)) return false;
+          if (writes(I)) { unstableWhy = "a write at " + locOf(&I); return false; }
     return true;
   };
   // A test of D on the access's object dominating it, stable up to it.
@@ -1240,9 +1269,11 @@ void CallGraphPass::computeTaggedFields() {
   size_t testsUnstable = 0;
   // Reads (Ef null): stable against F writes. Retags (Ef set): each
   // test's composed D effect up to the access, parallel to tests.
+  std::string lastTestsWhy; // the last testsAt's reason for dropping tests
   auto testsAt = [&](const Instruction *at, const Value *obj, const Field &Df, const Field &Ff,
                      std::vector<Test> &tests, std::set<uint32_t> &as,
                      std::vector<std::vector<Term>> *Ef = nullptr) {
+    lastTestsWhy = "no dominating test of the tag on this object";
     const Function *Fn = at->getFunction();
     DominatorTree &DT = domOf(Fn);
     for (const FnTest &ft : fnTestsOf(Fn)) {
@@ -1254,6 +1285,7 @@ void CallGraphPass::computeTaggedFields() {
         std::vector<Term> E;
         if (!stableBetween(ft.dl, ft.Br, Succ, at, Ef ? Df : Ff, Ef != nullptr, obj, a2, &E)) {
           testsUnstable++;
+          lastTestsWhy = "test at " + locOf(ft.Br) + " dropped: " + unstableWhy;
           continue;
         }
         as.insert(a2.begin(), a2.end());
@@ -1347,6 +1379,40 @@ void CallGraphPass::computeTaggedFields() {
       return KnownBits::makeConstant(APInt(1, *r ? 1 : 0));
     }
     return std::nullopt;
+  };
+  // The bits of the tag a test can observe (tests read masks of it; an
+  // expression this does not follow observes every bit).
+  std::function<bool(const Value *, const LoadInst *, uint64_t, uint64_t &)> demand =
+      [&](const Value *X, const LoadInst *dl, uint64_t want, uint64_t &acc) -> bool {
+    if (X == dl) { acc |= want; return true; }
+    if (isa<ConstantInt>(X)) return true;
+    auto maskOf = [](unsigned w) { return w >= 64 ? ~uint64_t(0) : ((uint64_t(1) << w) - 1); };
+    if (const auto *C = dyn_cast<CastInst>(X)) {
+      if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return false;
+      const unsigned sb = C->getOperand(0)->getType()->getIntegerBitWidth();
+      if (isa<TruncInst>(C)) return demand(C->getOperand(0), dl, want, acc);
+      if (isa<ZExtInst>(C)) return demand(C->getOperand(0), dl, want & maskOf(sb), acc);
+      if (isa<SExtInst>(C))
+        return demand(C->getOperand(0), dl,
+                      (want & maskOf(sb)) | ((want & ~maskOf(sb)) ? (uint64_t(1) << (sb - 1)) : 0), acc);
+      return false;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(X)) {
+      const Value *A = BO->getOperand(0), *B = BO->getOperand(1);
+      if (BO->getOpcode() == Instruction::And) {
+        if (const auto *K = dyn_cast<ConstantInt>(B)) return demand(A, dl, want & K->getZExtValue(), acc);
+        if (const auto *K = dyn_cast<ConstantInt>(A)) return demand(B, dl, want & K->getZExtValue(), acc);
+        return demand(A, dl, want, acc) && demand(B, dl, want, acc);
+      }
+      if (BO->getOpcode() == Instruction::Or || BO->getOpcode() == Instruction::Xor)
+        return demand(A, dl, want, acc) && demand(B, dl, want, acc);
+      return false;
+    }
+    if (const auto *IC = dyn_cast<ICmpInst>(X)) {
+      const uint64_t all = maskOf(IC->getOperand(0)->getType()->getIntegerBitWidth());
+      return demand(IC->getOperand(0), dl, all, acc) && demand(IC->getOperand(1), dl, all, acc);
+    }
+    return false;
   };
   auto mayHold = [&](const std::vector<Test> &tests, const KnownBits &kb) {
     for (const Test &t : tests) {
@@ -1586,14 +1652,18 @@ void CallGraphPass::computeTaggedFields() {
     walkMemo[key] = w;
     return w;
   };
-  struct TestsAt { std::vector<Test> tests; std::set<uint32_t> as; std::vector<std::vector<Term>> Es; };
+  struct TestsAt { std::vector<Test> tests; std::set<uint32_t> as; std::vector<std::vector<Term>> Es; std::string why; };
   std::map<std::tuple<const Instruction *, const Value *, std::string, int64_t, int64_t, bool>, TestsAt> testsMemo;
   auto testsAtM = [&](const Instruction *at, const Value *obj, const Field &Df, const Field &Ff,
                       std::vector<Test> &tests, std::set<uint32_t> &as,
                       std::vector<std::vector<Term>> *Ef = nullptr) {
     const auto key = std::make_tuple(at, obj, Df.first, Df.second, Ff.second, Ef != nullptr);
     auto [it, ins] = testsMemo.try_emplace(key);
-    if (ins) testsAt(at, obj, Df, Ff, it->second.tests, it->second.as, Ef ? &it->second.Es : nullptr);
+    if (ins) {
+      testsAt(at, obj, Df, Ff, it->second.tests, it->second.as, Ef ? &it->second.Es : nullptr);
+      it->second.why = lastTestsWhy;
+    }
+    lastTestsWhy = it->second.why;
     tests.insert(tests.end(), it->second.tests.begin(), it->second.tests.end());
     as.insert(it->second.as.begin(), it->second.as.end());
     if (Ef) Ef->insert(Ef->end(), it->second.Es.begin(), it->second.Es.end());
@@ -1619,6 +1689,7 @@ void CallGraphPass::computeTaggedFields() {
         std::vector<Term> ownMaps;   // maps of its own tag (a later tag store)
         std::vector<std::vector<Test>> ownGuards; // per own map: the tests it runs under (none: always)
         bool unknown = false;
+        std::string why; // why unknown (reports)
       };
       std::vector<Writer> writers;
       std::map<const Instruction *, size_t> wIdx;
@@ -1637,6 +1708,10 @@ void CallGraphPass::computeTaggedFields() {
         testsAtM(r.I, r.obj, Df, Ff, tt, pas);
         if (!tt.empty()) tested[r.I] = r.obj, testedV.push_back(r.I);
       }
+      if (tested.empty()) { // no read with a stable test: no read can be keyed
+        readsNoTest += fLoads[Ff].size();
+        continue;
+      }
       MayWrite mrF;
       closureOf(testedV, mrF);
       std::map<std::pair<const Instruction *, const Value *>, std::pair<bool, std::set<uint32_t>>> obsMemo;
@@ -1648,6 +1723,7 @@ void CallGraphPass::computeTaggedFields() {
       };
       std::set<std::string> via;
       auto give = [&](Writer &W, const TagStore &t, bool prior) {
+        if (t.unknown && !W.unknown) W.why = "unevaluable tag write at " + locOf(t.I);
         if (t.unknown) W.unknown = true;
         via.insert(t.via.begin(), t.via.end());
         for (const Term &tm : t.terms)
@@ -1751,7 +1827,7 @@ void CallGraphPass::computeTaggedFields() {
           for (const Term &q : t.terms)
             for (const Term &p : pre) {
               R.maps.push_back(q.src == 's' ? composeT(p, q) : q);
-              R.guards.push_back(q.src == 's' ? g : std::vector<Test>{});
+              R.guards.push_back(q.src == 'x' ? std::vector<Test>{} : g);
             }
         }
         for (const CallBase *CB : callsOf[G]) {
@@ -1800,7 +1876,9 @@ void CallGraphPass::computeTaggedFields() {
             return false;
         return true;
       };
+      const auto tce = std::chrono::steady_clock::now();
       for (int round = 0; round < 12; round++) {
+        ceRounds++;
         ceCycle = false;
         cePrev = std::move(ceMemo);
         ceMemo.clear();
@@ -1812,9 +1890,12 @@ void CallGraphPass::computeTaggedFields() {
           same = pit != cePrev.end() && sameCE(it->second, pit->second);
         }
         if (same) break;
-        if (round == 11)
+        if (round == 11) {
+          ceUnsettled++;
           for (auto &[key, ce] : ceMemo) ce.open = true; // did not settle: unknown
+        }
       }
+      ceSecs += std::chrono::duration<double>(std::chrono::steady_clock::now() - tce).count();
       for (auto [G, k] : carriers) {
         for (const User *U : G->users()) {
           const auto *CB = dyn_cast<CallBase>(U);
@@ -1831,10 +1912,13 @@ void CallGraphPass::computeTaggedFields() {
             for (const Instruction *w : L.W)
               if (auto it = wIdx.find(w); it != wIdx.end()) {
                 Writer &W = writers[it->second];
+                if (E.open && !W.unknown) W.why = "open call-site effect at " + locOf(CB);
                 if (E.open) W.unknown = true;
                 for (size_t q = 0; q < E.maps.size(); q++) {
                   const Term &tm = E.maps[q];
-                  if (tm.src == 'c') { if (!concretize({tm}, W.tags)) W.unknown = true; }
+                  if (tm.src == 'c' && !E.guards[q].empty())
+                    W.ownMaps.push_back(Term{'s', 0, tm.f, tm.m}), W.ownGuards.push_back(E.guards[q]);
+                  else if (tm.src == 'c') { if (!concretize({tm}, W.tags)) W.unknown = true; }
                   else if (tm.src == 's') W.ownMaps.push_back(tm), W.ownGuards.push_back(E.guards[q]);
                   else W.fromAny.push_back(tm);
                 }
@@ -1858,6 +1942,8 @@ void CallGraphPass::computeTaggedFields() {
         const Walk LD = walkBackM(Dc, w.I->getFunction(), w.obj, w.I);
         pas.insert(LD.assumes.begin(), LD.assumes.end());
         if (LD.open || LD.entry) {
+          if (!writers[i].unknown) writers[i].why = "read under the tag it found, which is open (" +
+                                                    (LD.open ? LD.why : std::string("the entry")) + ")";
           writers[i].unknown = true;
           openPrior++;
           continue;
@@ -1890,8 +1976,21 @@ void CallGraphPass::computeTaggedFields() {
                                               : "a store with no watchable pointer, e.g. " + unwatchableAt) + ")");
         continue;
       }
-      if (memsetUnknown) {
+      // memset fills that may cover the tag: constant retags, or (a
+      // non-constant fill) an unevaluable one.
+      std::set<int64_t> pairFills;
+      const Instruction *fillUnknownAt = nullptr;
+      if (auto fit = fillsOf.find(S); fit != fillsOf.end())
+        for (const Fill &f : fit->second)
+          if (f.lo < dOff + dBytes && dOff < f.hi) {
+            if (f.fill < 0) { if (!fillUnknownAt) fillUnknownAt = f.I; }
+            else pairFills.insert(f.fill);
+          }
+      if (fillUnknownAt) {
         pairsNonConst++;
+        if (fs.size() >= 10)
+          taggedReport.push_back("UNKEYED " + S + "+" + std::to_string(Ff.second) + " by +" + std::to_string(dOff) +
+                                 ": a non-constant memset may cover the tag at " + locOf(fillUnknownAt));
         continue;
       }
       if (nonConstRetag) {
@@ -1925,6 +2024,7 @@ void CallGraphPass::computeTaggedFields() {
       std::vector<Term> xforms, anyImgs;
       std::vector<std::vector<Test>> xformGuard; // per xform: the stable tests it runs under
       size_t guarded = 0, unguarded = 0;
+      std::vector<std::string> unguardedAt, allRetagAt;
       std::vector<std::string> xformAt;
       bool setsAll = false;
       auto termStr = [](const Term &tm) {
@@ -1954,11 +2054,14 @@ void CallGraphPass::computeTaggedFields() {
           if (!plain.empty()) for (size_t q : plain) g.push_back(all[q]);
           else if (!all.empty()) g.push_back(all.back()), pre = Es.back();
           (g.empty() ? unguarded : guarded)++;
+          if (g.empty() && unguardedAt.size() < 40) unguardedAt.push_back(locOf(t->I) + ": " + lastTestsWhy);
           for (const Term &tm : t->terms)
             if (tm.src == 's')
               for (const Term &e : pre) {
                 const Term c = composeT(e, tm);
                 if (c.src == 's') xforms.push_back(c), xformGuard.push_back(g);
+                else if (c.src == 'c' && !g.empty()) // a constant under a guard: a map with no input bits
+                  xforms.push_back(Term{'s', 0, c.f, c.m}), xformGuard.push_back(g);
                 else if (c.src == 'c') setsAll |= !concretize({c}, sets);
                 else anyImgs.push_back(c);
               }
@@ -1968,6 +2071,11 @@ void CallGraphPass::computeTaggedFields() {
           else if (tm.src == 's') sym = true;
           else anyImgs.push_back(tm), sym = true;
         }
+        if (sym && VerboseLevel >= 2) {
+          std::string d = locOf(t->I) + " {";
+          for (const Term &tm : t->terms) d += std::string(d.back() == '{' ? "" : ", ") + termStr(tm);
+          allRetagAt.push_back(d + "}");
+        }
         if (sym && xformAt.size() < 4) {
           std::string d = locOf(t->I) + " {";
           for (const Term &tm : t->terms) d += std::string(d.back() == '{' ? "" : ", ") + termStr(tm);
@@ -1976,15 +2084,63 @@ void CallGraphPass::computeTaggedFields() {
       }
       for (size_t q = 0; q < effMaps.size(); q++) { // call-site effects that act as retags
         const Term &tm = effMaps[q];
-        if (tm.src == 'c') setsAll |= !concretize({tm}, sets);
+        if (tm.src == 'c' && !effGuards[q].empty()) // a constant under a guard
+          xforms.push_back(Term{'s', 0, tm.f, tm.m}), xformGuard.push_back(effGuards[q]);
+        else if (tm.src == 'c') setsAll |= !concretize({tm}, sets);
         else if (tm.src == 's') xforms.push_back(tm), xformGuard.push_back(effGuards[q]);
         else anyImgs.push_back(tm);
       }
-      for (int64_t b : memsetFills) { // the fill byte repeated over the tag
+      for (int64_t b : pairFills) { // the fill byte repeated over the tag
         int64_t v = 0;
         for (unsigned k = 0; k < dWidth / 8; k++) v = (v << 8) | b;
         sets.insert(v);
       }
+      // Projection (precision only): tag sets may be computed on the bits a
+      // read's tests observe, R; tests and guards are then judged with the
+      // other bits unknown (may hold), which is sound for any R, and every
+      // map is bitwise, so it commutes with the projection. Used when the
+      // full-width sets widen: each read gets the sets for its own R.
+      std::vector<std::string> wideTests, witnessLines;
+      const int64_t wmask = dWidth >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << dWidth) - 1);
+      auto observedBits = [&](const std::vector<Test> &g) -> int64_t {
+        int64_t r = 0;
+        for (const Test &t : g) {
+          uint64_t acc = 0;
+          const bool ok = demand(t.cond, t.d, 1, acc);
+          if (ok && llvm::popcount(acc) <= 12) r |= (int64_t)acc;
+          else { // an equality or an unfollowed test: the bits of its constants
+            std::vector<const Value *> work{t.cond};
+            std::set<const Value *> seen;
+            while (!work.empty()) {
+              const Value *X = work.back();
+              work.pop_back();
+              if (!seen.insert(X).second || X == t.d) continue;
+              if (const auto *K = dyn_cast<ConstantInt>(X)) r |= (int64_t)K->getZExtValue();
+              else if (const auto *U = dyn_cast<User>(X); U && isa<Instruction>(X))
+                for (const Value *Op : U->operands()) work.push_back(Op);
+            }
+            if (VerboseLevel >= 2 && fs.size() >= 20 && wideTests.size() < 12) {
+              std::string v;
+              raw_string_ostream os(v);
+              t.cond->print(os);
+              wideTests.push_back((ok ? "" : "(unfollowed) ") + locOf(t.d) + ": " + os.str().substr(0, 100));
+            }
+          }
+        }
+        return r & wmask;
+      };
+      int64_t guardBits = 0;
+      for (const auto &g : xformGuard) guardBits |= observedBits(g);
+      for (const Writer &W : writers) for (const auto &g : W.ownGuards) guardBits |= observedBits(g);
+      int64_t curR = wmask; // the projection in force
+      auto holdsP = [&](const std::vector<Test> &tests, int64_t v) {
+        if (curR == wmask) return holds(tests, v);
+        KnownBits kb(64);
+        kb.One = APInt(64, (uint64_t)(v & curR));
+        kb.Zero = APInt(64, (uint64_t)(~v & curR));
+        return mayHold(tests, kb);
+      };
+      int64_t projR = wmask; // reported: the widest projection used
       // Tag sets: explicit up to 4096 values; past that (or a map with
       // more than 12 free bits), widened to the known bits that agree
       // across the set, the rest free (ruling gamma: a sound superset).
@@ -1992,6 +2148,7 @@ void CallGraphPass::computeTaggedFields() {
         std::set<int64_t> vals;
         bool wide = false;
         KnownBits kb{64};
+        std::string why; // what widened it (reports)
       };
       bool anyWide = false;
       auto kbOf = [](int64_t v) { return KnownBits::makeConstant(APInt(64, (uint64_t)v)); };
@@ -2037,7 +2194,18 @@ void CallGraphPass::computeTaggedFields() {
         else { widen(T); joinKB(T, termKB(t)); }
       };
       auto addImages = [&](TagSet &T, const TagSet &From, const Term &t) {
+        // From widened: the images lie among (sub of a) | f | (sub of m),
+        // enumerable when a and m have few bits (a superset, kept exact).
+        if (From.wide && llvm::popcount((uint64_t)(t.a | t.m)) <= 12) {
+          const uint64_t fr = (uint64_t)(t.a | t.m) & ~(uint64_t)t.f;
+          for (uint64_t sub = fr;; sub = (sub - 1) & fr) {
+            add(T, (int64_t)sub | t.f);
+            if (!sub) break;
+          }
+          return;
+        }
         if (From.wide || llvm::popcount((uint64_t)t.m) > 12) {
+          if (!T.wide) T.why = "an image " + termStr(t) + (From.wide ? " of a widened set" : "");
           widen(T);
           if (From.wide) joinKB(T, applyKB(From.kb, t));
           else for (int64_t v : From.vals) joinKB(T, applyKB(kbOf(v), t));
@@ -2060,13 +2228,17 @@ void CallGraphPass::computeTaggedFields() {
             work.pop_back();
             for (size_t mi = 0; mi < maps.size() && !T.wide; mi++) {
               const Term &t = maps[mi];
-              if (guarded(mi) && !holds((*guards)[mi], v)) continue;
-              if (llvm::popcount((uint64_t)t.m) > 12) { widen(T); break; }
+              if (guarded(mi) && !holdsP((*guards)[mi], v)) continue;
+              if (llvm::popcount((uint64_t)t.m) > 12) {
+                T.why = "a map with " + std::to_string(llvm::popcount((uint64_t)t.m)) + " free bits: " + termStr(t);
+                widen(T);
+                break;
+              }
               for (uint64_t fr = (uint64_t)t.m, sub = fr;; sub = (sub - 1) & fr) {
                 const int64_t w = (v & t.a) | t.f | (int64_t)sub;
                 if (!T.vals.count(w)) {
                   add(T, w);
-                  if (T.wide) break;
+                  if (T.wide) { T.why = "more than 4096 tags (last map " + termStr(t) + ")"; break; }
                   work.push_back(w);
                 }
                 if (!sub) break;
@@ -2085,47 +2257,79 @@ void CallGraphPass::computeTaggedFields() {
           }
         }
       };
-      TagSet sets2;
-      for (int64_t v : sets) add(sets2, v);
-      if (setsAll)
-        for (const TagStore *t : retags)
-          for (const Term &tm : t->terms)
-            if (tm.src == 'c') addTerm(sets2, tm);
-      TagSet U = sets2;
-      std::vector<Term> allMaps = xforms;
-      std::vector<std::vector<Test>> allGuards = xformGuard;
-      allMaps.insert(allMaps.end(), anyImgs.begin(), anyImgs.end());
-      allGuards.resize(allMaps.size());
-      for (const Writer &W : writers) {
-        for (int64_t v : W.tags) add(U, v);
-        allMaps.insert(allMaps.end(), W.fromAny.begin(), W.fromAny.end());
-        allGuards.resize(allMaps.size());
-        allMaps.insert(allMaps.end(), W.ownMaps.begin(), W.ownMaps.end());
-        allGuards.insert(allGuards.end(), W.ownGuards.begin(), W.ownGuards.end());
-      }
-      closure(U, allMaps, &allGuards);
-      TagSet base = sets2; // what retags may set on any object
-      for (const Term &t : anyImgs) addImages(base, U, t);
-      std::vector<TagSet> wTags(writers.size());
+      struct Tags { std::vector<TagSet> w; bool wide = false; bool uWide = false; size_t uSize = 0; };
+      std::map<int64_t, Tags> tagsByR;
       std::vector<bool> wAll(writers.size(), false);
-      for (size_t i = 0; i < writers.size(); i++) {
-        if (writers[i].unknown) {
-          wAll[i] = true;
-          continue;
+      for (size_t i = 0; i < writers.size(); i++) wAll[i] = writers[i].unknown;
+      auto computeTags = [&](int64_t R) -> const Tags & {
+        auto [it, ins] = tagsByR.try_emplace(R);
+        if (!ins) return it->second;
+        curR = R;
+        anyWide = false;
+        auto pv = [&](int64_t v) { return v & R; };
+        auto pt = [&](Term t) { t.a &= R; t.f &= R; t.m &= R; return t; };
+        auto pts = [&](const std::vector<Term> &ts) {
+          std::vector<Term> r;
+          for (const Term &t : ts) r.push_back(pt(t));
+          return r;
+        };
+        const std::vector<Term> xf = pts(xforms), ai = pts(anyImgs);
+        TagSet sets2;
+        for (int64_t v : sets) add(sets2, pv(v));
+        if (setsAll)
+          for (const TagStore *t : retags)
+            for (const Term &tm : t->terms)
+              if (tm.src == 'c') addTerm(sets2, pt(tm));
+        TagSet U = sets2;
+        std::vector<Term> allMaps = xf;
+        std::vector<std::vector<Test>> allGuards = xformGuard;
+        allMaps.insert(allMaps.end(), ai.begin(), ai.end());
+        allGuards.resize(allMaps.size());
+        for (const Writer &W : writers) {
+          for (int64_t v : W.tags) add(U, pv(v));
+          for (const Term &t : W.fromAny) allMaps.push_back(pt(t));
+          allGuards.resize(allMaps.size());
+          for (const Term &t : W.ownMaps) allMaps.push_back(pt(t));
+          allGuards.insert(allGuards.end(), W.ownGuards.begin(), W.ownGuards.end());
         }
-        TagSet from;
-        for (int64_t v : writers[i].tags) add(from, v);
-        if (base.wide) { widen(from); joinKB(from, base.kb); }
-        else for (int64_t v : base.vals) add(from, v);
-        for (const Term &t : writers[i].fromAny) addImages(from, U, t);
-        std::vector<Term> maps = xforms;
-        maps.insert(maps.end(), writers[i].ownMaps.begin(), writers[i].ownMaps.end());
-        std::vector<std::vector<Test>> gs = xformGuard;
-        gs.insert(gs.end(), writers[i].ownGuards.begin(), writers[i].ownGuards.end());
-        closure(from, maps, &gs);
-        wTags[i] = std::move(from);
-      }
-      const bool uAll = U.wide;
+        closure(U, allMaps, &allGuards);
+        TagSet base = sets2; // what retags may set on any object
+        for (const Term &t : ai) addImages(base, U, t);
+        Tags &T = it->second;
+        T.w.resize(writers.size());
+        for (size_t i = 0; i < writers.size(); i++) {
+          if (wAll[i]) continue;
+          TagSet from;
+          for (int64_t v : writers[i].tags) add(from, pv(v));
+          if (base.wide) { from.why = "the retag base widened (" + base.why + ")"; widen(from); joinKB(from, base.kb); }
+          else for (int64_t v : base.vals) add(from, v);
+          for (const Term &t : writers[i].fromAny) addImages(from, U, pt(t));
+          std::vector<Term> maps = xf;
+          for (const Term &t : writers[i].ownMaps) maps.push_back(pt(t));
+          std::vector<std::vector<Test>> gs = xformGuard;
+          gs.insert(gs.end(), writers[i].ownGuards.begin(), writers[i].ownGuards.end());
+          closure(from, maps, &gs);
+          T.wide |= from.wide;
+          T.w[i] = std::move(from);
+        }
+        T.uWide = U.wide;
+        T.uSize = U.vals.size();
+        curR = wmask;
+        return T;
+      };
+      const Tags &full = computeTags(wmask);
+      const bool uAll = full.uWide;
+      const std::vector<TagSet> &wTags = full.w;
+      // The sets a read is judged on: full width, unless they widened; then
+      // its own projection (its tests' bits, the guards' too if they fit).
+      auto tagsFor = [&](const std::vector<Test> &tests) -> std::pair<const Tags *, int64_t> {
+        if (!full.wide) return {&full, wmask};
+        int64_t R = observedBits(tests);
+        if (llvm::popcount((uint64_t)(R | guardBits)) <= 12) R |= guardBits;
+        if (llvm::popcount((uint64_t)R) > 12) return {&full, wmask};
+        if (projR == wmask || llvm::popcount((uint64_t)R) > llvm::popcount((uint64_t)projR)) projR = R;
+        return {&computeTags(R), R};
+      };
       // Reads: the stable tests of D (same object) dominating them.
       std::vector<std::pair<const Instruction *, std::vector<size_t>>> keyed;
       size_t pairReadsKeyed = 0;
@@ -2134,15 +2338,26 @@ void CallGraphPass::computeTaggedFields() {
         testsAtM(r.I, r.obj, Df, Ff, tests, pas);
         if (tests.empty()) { readsNoTest++; continue; }
         std::vector<size_t> adm;
+        const auto [TT, R] = tagsFor(tests);
+        curR = R;
         for (size_t i = 0; i < writers.size(); i++) {
           if (wAll[i]) { adm.push_back(i); continue; }
-          if (wTags[i].wide) {
-            if (!wTags[i].kb.hasConflict() && mayHold(tests, wTags[i].kb)) adm.push_back(i);
+          const TagSet &ws = TT->w[i];
+          if (ws.wide) {
+            if (!ws.kb.hasConflict() && mayHold(tests, ws.kb)) adm.push_back(i);
             continue;
           }
-          for (int64_t v : wTags[i].vals)
-            if (holds(tests, v)) { adm.push_back(i); break; }
+          for (int64_t v : ws.vals)
+            if (holdsP(tests, v)) {
+              adm.push_back(i);
+              if (VerboseLevel >= 2 && fs.size() >= 20 && witnessLines.size() < 60)
+                witnessLines.push_back("    read " + locOf(r.I) + " (R 0x" + utohexstr((uint64_t)R) + ", " +
+                                       std::to_string(ws.vals.size()) + " tags) admits " + locOf(writers[i].I) +
+                                       " by tag 0x" + utohexstr((uint64_t)v));
+              break;
+            }
         }
+        curR = wmask;
         if (adm.size() == writers.size()) { readsAll++; continue; }
         keyed.push_back({r.I, adm});
         pairReadsKeyed++;
@@ -2152,8 +2367,9 @@ void CallGraphPass::computeTaggedFields() {
           size_t nAll = std::count(wAll.begin(), wAll.end(), true);
           std::string d = "PLAIN " + S + "+" + std::to_string(Ff.second) + " by +" + std::to_string(dOff) + " (" +
                           std::to_string(fs.size()) + " writes): every tested read admits every writer; " +
-                          (uAll ? std::string("widened") : std::to_string(U.vals.size())) + " tags, " +
-                          std::to_string(nAll) + " writers with any tag; call-site effects " + std::to_string(effSites) +
+                          (uAll ? std::string("widened") : std::to_string(full.uSize)) + " tags, " +
+                          std::to_string(nAll) + " writers with any tag; bits observed " +
+                          std::to_string(llvm::popcount((uint64_t)projR)) + "; call-site effects " + std::to_string(effSites) +
                           " (" + std::to_string(effAbsorbed) + " absorbed by callers); tag stores " +
                           std::to_string(absorbedStores) + " accounted at call sites, " + std::to_string(unseenStores) +
                           " never read under, " + std::to_string(closedStores) +
@@ -2164,6 +2380,47 @@ void CallGraphPass::computeTaggedFields() {
                           " guarded, " + std::to_string(unguarded) + " unguarded";
           for (const std::string &x : xformAt) d += "; retag " + x;
           taggedReport.push_back(d);
+          if (VerboseLevel >= 2) {
+            for (const std::string &u : unguardedAt) taggedReport.push_back("    unguarded transform " + u);
+            for (const std::string &u : allRetagAt) taggedReport.push_back("    open retag " + u);
+            for (const std::string &u : wideTests) taggedReport.push_back("    test observing many bits " + u);
+            for (const std::string &u : witnessLines) taggedReport.push_back(u);
+            {
+              std::string d = "    retag constants:";
+              for (int64_t v : sets) d += " " + std::to_string(v);
+              d += "; U " + std::string(full.uWide ? "widened" : std::to_string(full.uSize));
+              d += "; anyImgs " + std::to_string(anyImgs.size()) + ":";
+              for (const Term &t : anyImgs) d += " " + termStr(t);
+              taggedReport.push_back(d);
+              for (const TagStore *t : retags) {
+                bool c = false;
+                for (const Term &tm : t->terms) c |= tm.src == 'c';
+                if (!c) continue;
+                std::string e = "    constant retag " + locOf(t->I) + " {";
+                for (const Term &tm : t->terms) e += std::string(e.back() == '{' ? "" : ", ") + termStr(tm);
+                taggedReport.push_back(e + "}");
+              }
+            }
+            for (size_t q = 0; q < writers.size(); q++) {
+              std::string d = "    writer " + locOf(writers[q].I) + ": ";
+              if (wAll[q]) d += "any tag (" + writers[q].why + ")";
+              else if (wTags[q].wide) {
+                SmallString<80> z, o;
+                wTags[q].kb.Zero.toStringUnsigned(z, 16);
+                wTags[q].kb.One.toStringUnsigned(o, 16);
+                d += "widened, known zero 0x" + std::string(z) + ", known one 0x" + std::string(o) + " (" +
+                     wTags[q].why + ")";
+              } else {
+                d += std::to_string(wTags[q].vals.size()) + " tags:";
+                size_t c = 0;
+                for (int64_t v : wTags[q].vals) { if (c++ == 8) { d += " ..."; break; } d += " " + std::to_string(v); }
+              }
+              taggedReport.push_back(d);
+            }
+            for (size_t q = 0; q < effMaps.size(); q++)
+              taggedReport.push_back("    call-site retag map " + termStr(effMaps[q]) +
+                                     (effGuards[q].empty() ? " (unguarded)" : " (guarded)"));
+          }
         }
         continue;
       }
@@ -2197,11 +2454,11 @@ void CallGraphPass::computeTaggedFields() {
       taggedReport.push_back("KEYED " + S + "+" + std::to_string(Ff.second) + " by +" +
                                std::to_string(dOff) + ": " + std::to_string(writers.size()) + " writers, " +
                                std::to_string(pairReadsKeyed) + " reads keyed, " +
-                               std::to_string(retags.size()) + " retags (" + std::to_string(closedStores) +
+                               std::to_string(retags.size()) + " retags, bits observed " + std::to_string(llvm::popcount((uint64_t)projR)) + " (" + std::to_string(closedStores) +
                                " tag stores closed; " + std::to_string(observedWriters) + " writers read under their prior tag; " +
                                std::to_string(guarded) +
                                " guarded, " + std::to_string(unguarded) + " unguarded transforms), " +
-                               (uAll ? std::string("widened") : std::to_string(U.vals.size())) + " tags" + extra);
+                               (uAll ? std::string("widened") : std::to_string(full.uSize)) + " tags" + extra);
     }
   }
   if (pairsKeyed) {
@@ -2217,7 +2474,8 @@ void CallGraphPass::computeTaggedFields() {
     const Function *top = nullptr;
     for (auto &[F, n] : walkBlocksBy) if (!top || n > walkBlocksBy[top]) top = F;
     CG_LOG("TaggedFields: callee D-effects composed: " << effClosed << " closed, " << effOpen << " open ("
-           << effComputes << " effect computations)\n");
+           << effComputes << " effect computations; content effects " << ceRounds << " rounds, " << ceUnsettled
+           << " pairs unsettled, " << ceSecs << " s)\n");
     if (VerboseLevel >= 2)
       for (const std::string &d : effOpenAt) CG_LOG("TaggedFields:   open D-effect at " << d << "\n");
     CG_LOG("TaggedFields: walks " << walksBack << " backward, " << walksFwd << " forward, " << walkBlocks

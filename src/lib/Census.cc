@@ -14,6 +14,7 @@
 
 #include "CallGraphInternal.h"
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/IR/Dominators.h>
 
 static std::map<std::string, size_t> g_sinkEscapeSinks; // sink -> sites
                                    // (tag-bit-only local closures)
@@ -748,6 +749,146 @@ void CallGraphPass::runConstructCensus() {
       if (seenU.insert(nm).second) unions.add(nm + " (" + std::to_string(ptrs) + " pointer members)", false);
     }
     (void)DL;
+  }
+  // ---- Tagged fields (plan 3.51): field + discriminator pairs. A pointer
+  // field F of struct S whose writer also writes a sibling field D of the
+  // same object with a constant (or bits or'ed in) in the same function,
+  // and a read of F under a test of D loaded from the same object. ----
+  struct PairStat {
+    size_t writers = 0, readers = 0;
+    std::set<int64_t> consts;
+    std::vector<std::string> ex;
+  };
+  std::map<std::tuple<std::string, int64_t, int64_t>, PairStat> pairs; // (S, F, D)
+  auto objKey = [](const Value *Addr) -> const Value * {
+    const Value *B = Addr->stripPointerCasts();
+    if (const GEPOperator *G = structGEP(Addr)) B = G->getPointerOperand()->stripPointerCasts();
+    if (const auto *L = dyn_cast<LoadInst>(B))
+      if (const auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) return A;
+    return B;
+  };
+  // The constant a tag store writes: a constant, or the bits or'ed in.
+  auto tagConst = [](const Value *V, int64_t &c) -> bool {
+    while (const auto *CI = dyn_cast<CastInst>(V)) V = CI->getOperand(0);
+    if (const auto *K = dyn_cast<ConstantInt>(V)) { c = K->getSExtValue(); return true; }
+    if (const auto *BO = dyn_cast<BinaryOperator>(V); BO && BO->getOpcode() == Instruction::Or)
+      for (const Value *Op : BO->operands())
+        if (const auto *K = dyn_cast<ConstantInt>(Op)) { c = K->getSExtValue(); return true; }
+    return false;
+  };
+  for (auto &[M, _] : Ctx->Modules) {
+    const DataLayout &DL = M->getDataLayout();
+    for (Function &F : *M) {
+      if (F.isDeclaration()) continue;
+      struct Acc { StructType *S; int64_t off; const Instruction *I; };
+      std::map<std::pair<const Value *, std::string>, std::vector<Acc>> ptrWrites, tagWrites, ptrReads, tagReads;
+      std::map<const Instruction *, int64_t> tagVal;
+      for (Instruction &I : instructions(F)) {
+        const Value *Addr = nullptr;
+        Type *T = nullptr;
+        const bool st = isa<StoreInst>(&I);
+        if (const auto *L = dyn_cast<LoadInst>(&I)) Addr = L->getPointerOperand(), T = L->getType();
+        else if (const auto *SI = dyn_cast<StoreInst>(&I)) Addr = SI->getPointerOperand(), T = SI->getValueOperand()->getType();
+        else continue;
+        StructType *S = nullptr;
+        int64_t off = 0;
+        if (!accessSlot(&I, Addr, DL, S, off) || !S || !S->hasName()) continue;
+        const auto key = std::make_pair(objKey(Addr), stripStructNameSuffix(S->getName()).str());
+        if (T->isPointerTy()) (st ? ptrWrites : ptrReads)[key].push_back({S, off, &I});
+        if (T->isIntegerTy() || T->isPointerTy()) {
+          if (st) {
+            int64_t c = 0;
+            if (tagConst(cast<StoreInst>(&I)->getValueOperand(), c)) {
+              tagWrites[key].push_back({S, off, &I});
+              tagVal[&I] = c;
+            }
+          } else {
+            tagReads[key].push_back({S, off, &I});
+          }
+        }
+      }
+      if (ptrWrites.empty() && ptrReads.empty()) continue;
+      // Writers: a pointer store into F with a constant store into a sibling
+      // D of the same object in this function.
+      for (auto &[key, ws] : ptrWrites) {
+        auto tit = tagWrites.find(key);
+        if (tit == tagWrites.end()) continue;
+        for (const Acc &w : ws)
+          for (const Acc &t : tit->second) {
+            if (t.off == w.off) continue;
+            PairStat &P = pairs[{key.second, w.off, t.off}];
+            P.writers++;
+            P.consts.insert(tagVal[t.I]);
+            if (P.ex.size() < 2) P.ex.push_back("write " + loc(w.I));
+          }
+      }
+      // Readers: a load of F in a block entered from a branch whose
+      // condition tests D loaded from the same object.
+      DominatorTree DT(F);
+      auto testedTags = [&](const Value *C, std::vector<const LoadInst *> &out) {
+        std::vector<const Value *> work{C};
+        std::set<const Value *> seen;
+        while (!work.empty()) {
+          const Value *X = work.back();
+          work.pop_back();
+          if (!seen.insert(X).second || seen.size() > 16) continue;
+          if (const auto *L = dyn_cast<LoadInst>(X)) { out.push_back(L); continue; }
+          if (isa<ICmpInst>(X) || isa<CastInst>(X) ||
+              (isa<BinaryOperator>(X) && (cast<BinaryOperator>(X)->getOpcode() == Instruction::And ||
+                                          cast<BinaryOperator>(X)->getOpcode() == Instruction::Or)))
+            for (const Value *Op : cast<User>(X)->operands()) work.push_back(Op);
+        }
+      };
+      std::vector<std::pair<const BranchInst *, std::vector<const LoadInst *>>> tests;
+      for (BasicBlock &BB : F)
+        if (const auto *Br = dyn_cast<BranchInst>(BB.getTerminator()); Br && Br->isConditional()) {
+          std::vector<const LoadInst *> ls;
+          testedTags(Br->getCondition(), ls);
+          if (!ls.empty()) tests.push_back({Br, ls});
+        }
+      for (auto &[key, rs] : ptrReads)
+        for (const Acc &r : rs) {
+          std::set<int64_t> ds;
+          for (auto &[Br, ls] : tests) {
+            bool under = false;
+            for (const BasicBlock *Succ : successors(Br->getParent()))
+              if (Succ->getSinglePredecessor() == Br->getParent() && DT.dominates(Succ, r.I->getParent()))
+                under = true;
+            if (!under) continue;
+            for (const LoadInst *L : ls) {
+              StructType *S2 = nullptr;
+              int64_t o2 = 0;
+              if (!accessSlot(L, L->getPointerOperand(), DL, S2, o2) || !S2 || !S2->hasName()) continue;
+              if (objKey(L->getPointerOperand()) != key.first ||
+                  stripStructNameSuffix(S2->getName()) != key.second || o2 == r.off)
+                continue;
+              ds.insert(o2);
+            }
+          }
+          for (int64_t d : ds) {
+            PairStat &P = pairs[{key.second, r.off, d}];
+            P.readers++;
+            if (P.ex.size() < 4) P.ex.push_back("read " + loc(r.I));
+          }
+        }
+    }
+  }
+  {
+    std::vector<std::pair<size_t, std::tuple<std::string, int64_t, int64_t>>> ranked;
+    for (auto &[k, P] : pairs)
+      if (P.writers && P.readers) ranked.push_back({P.writers + P.readers, k});
+    std::sort(ranked.rbegin(), ranked.rend());
+    errs() << "TAGGED FIELDS (plan 3.51): " << ranked.size()
+           << " field + discriminator pairs (a writer co-writes a constant tag, a reader tests it)\n";
+    for (size_t i = 0; i < ranked.size() && i < 25; i++) {
+      const auto &[S, Fo, Do] = ranked[i].second;
+      const PairStat &P = pairs[ranked[i].second];
+      std::string cs;
+      for (int64_t c : P.consts) { if (cs.size() > 60) { cs += " ..."; break; } cs += " " + std::to_string(c); }
+      errs() << "  " << S << " field +" << Fo << " tag +" << Do << ": " << P.writers << " writers (tags"
+             << cs << "), " << P.readers << " tested readers\n";
+      for (const std::string &e : P.ex) errs() << "      " << e << "\n";
+    }
   }
   errs() << "CONSTRUCT CENSUS (counts before the solve; 'covered' = a summary or the engine handles it)\n";
   for (Kind *K : {&wrappers, &pools, &containers, &method1, &methodN, &fptrCalls, &idTests, &unions,

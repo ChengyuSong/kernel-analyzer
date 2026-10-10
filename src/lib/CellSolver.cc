@@ -4517,7 +4517,8 @@ bool CallGraphPass::runCellResolution() {
          << g_p2iNumberOnly
          << " ptrtoints used as numbers only (no field-any loop); " << g_dataOnlyGeps
          << " GEPs of data pointers (character traffic: no edges, no cells); " << g_intNameLoads
-         << " loads of integer names (no facts; " << g_counterRetired << " counters); " << g_carves
+         << " loads of integer names (no facts; " << g_counterRetired << " counters); "
+         << g_vaMachineryLoads << " va_list bookkeeping loads (no vararg edges); " << g_carves
          << " carved regions (one past an array, used as another type; see CARVE lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   if (!varargAllKeys.empty())

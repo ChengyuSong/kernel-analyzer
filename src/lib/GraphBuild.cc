@@ -3524,7 +3524,20 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // A read the renderer's dispatch keys (plan 3.47) reads its keys only.
   const auto vk = vaSink ? CGP.varargReadKeys.end() : CGP.varargReadKeys.find(&I);
   const bool vaKeyed = vk != CGP.varargReadKeys.end();
-  if (Function *F = I.getFunction(); F && !vaSink) {
+  // The va_list's own bookkeeping (gp_offset, overflow_arg_area,
+  // reg_save_area: fields of __va_list_tag) is not a va_arg read. Under
+  // --cfl-cells it gets no vararg edges: given the arguments, the area
+  // pointer made the va_arg load through it read the arguments' pointees
+  // (sqlite3_str_vappendf: every printf argument's pointee in every read).
+  bool vaMachinery = false;
+  if (CFLCells) {
+    const Value *A = ptr->stripPointerCasts();
+    const auto *MG = dyn_cast<GEPOperator>(A);
+    vaMachinery = (MG && isLoweredVAListType(MG->getSourceElementType())) ||
+                  (isa<AllocaInst>(A) && isLoweredVAListType(cast<AllocaInst>(A)->getAllocatedType()));
+    if (vaMachinery) g_vaMachineryLoads++;
+  }
+  if (Function *F = I.getFunction(); F && !vaSink && !vaMachinery) {
     NodeIndex varargNode = CGP.NF.getVarargNodeFor(F);
     if (varargNode != AndersNodeFactory::InvalidIndex &&
         derivesFromLoweredVAList(ptr)) {
@@ -3539,7 +3552,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // A va_list received from another function: what va_start put into
   // the va_list object (the creator's variadic arguments) is what this
   // lowered va_arg reads.
-  if (const Value *Base = vaSink ? nullptr : vaListBase(ptr)) {
+  if (const Value *Base = vaSink || vaMachinery ? nullptr : vaListBase(ptr)) {
     NodeIndex baseNode = CGP.getRepNodeForValue(Base);
     if (baseNode != AndersNodeFactory::InvalidIndex) {
       if (vaKeyed)
@@ -7324,7 +7337,7 @@ bool CallGraphPass::varargKeysAt(const CallBase *CS, const Function *CF,
 }
 
 // ---- Integer names (plan 3.50 ruling) ----
-size_t g_intNameLoads = 0, g_counterRetired = 0, g_counterKept = 0;
+size_t g_intNameLoads = 0, g_counterRetired = 0, g_counterKept = 0, g_vaMachineryLoads = 0;
 
 // Does an integer load's value reach an inttoptr through SSA (casts,
 // arithmetic, phis, selects)?

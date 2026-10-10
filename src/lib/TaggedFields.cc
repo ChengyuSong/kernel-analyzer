@@ -41,6 +41,7 @@ struct ObjIds {
     std::map<const LoadInst *, const Value *> id;
   };
   std::map<const AllocaInst *, SlotInfo> slots;
+  std::map<const Value *, const BasicBlock *> phiBlock; // a merge's name -> the block it is at
   // The values stored into a non-escaping local slot (null: it escapes).
   std::map<const AllocaInst *, std::optional<std::vector<const Value *>>> stored;
   const std::vector<const Value *> *storedInto(const AllocaInst *A) {
@@ -82,54 +83,66 @@ struct ObjIds {
       return SI;
     }
     if (loads.empty()) return SI;
-    // Reaching stores per block (bit k: stores[k]; bit n: the entry value).
+    // The definition each reload reads, as mem2reg would build it: a store,
+    // the entry value, or a merge of different definitions (a phi at the
+    // block where they meet). Reloads reading the same definition read the
+    // same value; a phi is named by its first reload.
     const Function &F = *A->getFunction();
-    const unsigned n = stores.size();
-    std::map<const StoreInst *, unsigned> idx;
-    for (unsigned k = 0; k < n; k++) idx[stores[k]] = k;
+    const int n = (int)stores.size();
+    std::map<const StoreInst *, int> idx;
+    for (int k = 0; k < n; k++) idx[stores[k]] = k;
+    std::map<const BasicBlock *, int> bix;
+    for (const BasicBlock &BB : F) bix[&BB] = (int)bix.size();
     std::map<const BasicBlock *, const StoreInst *> lastIn;
     for (const StoreInst *S : stores) {
       const StoreInst *&L = lastIn[S->getParent()];
       if (!L || L->comesBefore(S)) L = S;
     }
-    std::map<const BasicBlock *, BitVector> in, out;
-    for (const BasicBlock &BB : F) in[&BB] = BitVector(n + 1), out[&BB] = BitVector(n + 1);
-    in[&F.getEntryBlock()].set(n);
+    constexpr int kBot = -2, kEntry = -1; // not reached yet; the entry value
+    std::map<const BasicBlock *, int> in, out;
+    for (const BasicBlock &BB : F) in[&BB] = out[&BB] = kBot;
     for (bool changed = true; changed;) {
       changed = false;
       for (const BasicBlock &BB : F) {
-        BitVector I = in[&BB];
-        for (const BasicBlock *P : predecessors(&BB)) I |= out[P];
-        if (&BB == &F.getEntryBlock()) I.set(n);
-        BitVector O(n + 1);
-        if (auto lit = lastIn.find(&BB); lit != lastIn.end()) O.set(idx[lit->second]);
-        else O = I;
+        int I;
+        if (&BB == &F.getEntryBlock()) I = kEntry;
+        else {
+          const int phi = n + bix[&BB];
+          I = in[&BB] == phi ? phi : kBot;
+          if (I != phi)
+            for (const BasicBlock *P : predecessors(&BB)) {
+              const int d = out[P];
+              if (d == kBot) continue;
+              if (I == kBot) I = d;
+              else if (I != d) { I = phi; break; }
+            }
+        }
+        const int O = lastIn.count(&BB) ? idx[lastIn[&BB]] : I;
         if (I != in[&BB] || O != out[&BB]) {
-          in[&BB] = std::move(I);
-          out[&BB] = std::move(O);
+          in[&BB] = I;
+          out[&BB] = O;
           changed = true;
         }
       }
     }
-    std::set<const BasicBlock *> blocks;
-    for (const LoadInst *L : loads) blocks.insert(L->getParent());
-    for (const BasicBlock *BB : blocks) {
-      BitVector cur = in[BB];
-      const LoadInst *runHead = nullptr; // first reload since the last store
-      for (const Instruction &I : *BB) {
+    std::map<int, const LoadInst *> phiRep;
+    std::vector<const BasicBlock *> blockAt(bix.size());
+    for (auto &[B, k] : bix) blockAt[k] = B;
+    for (const BasicBlock &BB : F) {
+      int cur = in[&BB];
+      for (const Instruction &I : BB) {
         if (const auto *S = dyn_cast<StoreInst>(&I); S && idx.count(S)) {
-          cur.reset();
-          cur.set(idx[S]);
-          runHead = nullptr;
+          cur = idx[S];
           continue;
         }
         const auto *L = dyn_cast<LoadInst>(&I);
         if (!L || L->getPointerOperand() != A) continue;
-        if (cur.count() == 1 && cur.find_first() < (int)n) SI.id[L] = stores[cur.find_first()]->getValueOperand();
-        else {
-          if (!runHead) runHead = L;
-          SI.id[L] = runHead;
-        }
+        if (cur >= 0 && cur < n) SI.id[L] = stores[cur]->getValueOperand();
+        else if (cur >= n) {
+          auto [pit, pins] = phiRep.try_emplace(cur, L);
+          SI.id[L] = pit->second;
+          if (pins) phiBlock[L] = blockAt[cur - n];
+        } else SI.id[L] = L; // the entry value (or unreachable): this reload only
       }
     }
     return SI;
@@ -173,6 +186,17 @@ std::string locOf(const Instruction *I) {
 
 void CallGraphPass::computeTaggedFields() {
   ObjIds ids;
+  // Where an identity's value is defined: an instruction (each execution
+  // names another object), or a merge block (a phi). A walk that crosses
+  // it meets another object under the same name: a barrier.
+  auto defInstOf = [&](const Value *id) -> const Instruction * {
+    if (ids.phiBlock.count(id)) return nullptr;
+    return dyn_cast<Instruction>(id);
+  };
+  auto defBlockOf = [&](const Value *id) -> const BasicBlock * {
+    auto it = ids.phiBlock.find(id);
+    return it == ids.phiBlock.end() ? nullptr : it->second;
+  };
   auto objKey = [&](const Instruction *I, const Value *Addr, StructType *S) {
     const DataLayout &DL = I->getModule()->getDataLayout();
     return ids.of(Addr, S && S->isSized() ? (int64_t)DL.getTypeAllocSize(S) : 0);
@@ -1069,11 +1093,18 @@ void CallGraphPass::computeTaggedFields() {
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{at->getParent(), at->getPrevNode()}};
     size_t blocks = 0;
+    const Instruction *idDef = defInstOf(id);
+    const BasicBlock *idPhi = defBlockOf(id);
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
       bool stopped = false;
       for (; I && !stopped; I = I->getPrevNode()) {
+        if (I == idDef) {
+          openWhy("the object's pointer is defined at " + locOf(I));
+          stopped = true;
+          continue;
+        }
         if (auto sit = Dc.stores.find(I); sit != Dc.stores.end()) {
           if (sit->second != id) {
             R.assumes.insert(assume(id, Dc.X, accessSet(Dc.X, '1', I), I));
@@ -1121,6 +1152,10 @@ void CallGraphPass::computeTaggedFields() {
       if (stopped) continue;
       if (B == stop || B == &B->getParent()->getEntryBlock()) {
         R.maps.push_back(idTerm);
+        continue;
+      }
+      if (B == idPhi) {
+        openWhy("the object's pointer merges at " + B->getParent()->getName().str());
         continue;
       }
       for (const BasicBlock *P : predecessors(B)) {
@@ -1258,10 +1293,33 @@ void CallGraphPass::computeTaggedFields() {
       for (const BasicBlock *P : predecessors(B))
         if (P != TB && fwd.count(P) && bwd.insert(P).second) work.push_back(P);
     }
+    const Instruction *idDef = defInstOf(obj);
+    const BasicBlock *idPhi = defBlockOf(obj);
+    // Is `at`'s block on a cycle inside the region (so the code after `at`
+    // in it can come between)?
+    bool atCycle = false;
+    {
+      std::set<const BasicBlock *> sn;
+      std::vector<const BasicBlock *> w2(succ_begin(at->getParent()), succ_end(at->getParent()));
+      while (!w2.empty() && !atCycle) {
+        const BasicBlock *B = w2.back();
+        w2.pop_back();
+        if (B == TB || !sn.insert(B).second) continue;
+        if (B == at->getParent()) atCycle = true;
+        for (const BasicBlock *N : successors(B)) w2.push_back(N);
+      }
+    }
     for (const BasicBlock *B : bwd)
-      if (fwd.count(B))
-        for (const Instruction &I : *B)
+      if (fwd.count(B)) {
+        if (B == idPhi && (B != at->getParent() || atCycle)) { unstableWhy = "the object's pointer merges between"; return false; }
+        for (const Instruction &I : *B) {
+          if (&I == idDef && !(B == at->getParent() && at->comesBefore(&I) && !atCycle)) {
+            unstableWhy = "the object's pointer is defined between";
+            return false;
+          }
           if (writes(I)) { unstableWhy = "a write at " + locOf(&I); return false; }
+        }
+      }
     return true;
   };
   // A test of D on the access's object dominating it, stable up to it.
@@ -1471,11 +1529,18 @@ void CallGraphPass::computeTaggedFields() {
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{at->getParent(), at->getPrevNode()}};
     size_t blocks = 0;
+    const Instruction *idDef = defInstOf(id);
+    const BasicBlock *idPhi = defBlockOf(id);
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
       bool stopped = false;
       for (; I && !stopped; I = I->getPrevNode()) {
+        if (I == idDef) { // before this, the name was another object
+          openWhy("the object's pointer is defined at " + locOf(I));
+          stopped = true;
+          continue;
+        }
         if (auto sit = C.stores.find(I); sit != C.stores.end()) {
           if (sit->second == id) { R.W.insert(I); stopped = true; }
           else R.assumes.insert(assume(id, C.X, accessSet(C.X, '1', I), I));
@@ -1506,6 +1571,10 @@ void CallGraphPass::computeTaggedFields() {
         stopped = must;
       }
       if (stopped) continue;
+      if (B == idPhi) { // the merge that names the object
+        openWhy("the object's pointer merges at " + B->getParent()->getName().str());
+        continue;
+      }
       if (B == &B->getParent()->getEntryBlock()) { R.entry = true; continue; }
       for (const BasicBlock *P : predecessors(B)) {
         if (!seen.insert(P).second) continue;
@@ -1584,12 +1653,15 @@ void CallGraphPass::computeTaggedFields() {
     std::set<const BasicBlock *> seen;
     std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{W->getParent(), W->getNextNode()}};
     size_t blocks = 0;
+    const Instruction *idDef = defInstOf(id);
+    const BasicBlock *idPhi = defBlockOf(id);
     while (!work.empty()) {
       auto [B, I] = work.back();
       work.pop_back();
+      if (B == idPhi && I == &B->front()) return true; // the name becomes another object
       bool stopped = false;
       for (; I && !stopped; I = I->getNextNode()) {
-        if (isa<ReturnInst>(I)) return true;
+        if (isa<ReturnInst>(I) || I == idDef) return true;
         if (auto rit = reads.find(I); rit != reads.end()) {
           if (rit->second == id) return true;
           as.insert(assume(id, Fc.X, accessSet(Fc.X, '1', I), I)); // a read of another identity
@@ -1688,6 +1760,7 @@ void CallGraphPass::computeTaggedFields() {
         std::vector<Term> fromAny;   // images of every tag: (u & a) | f | sub(m)
         std::vector<Term> ownMaps;   // maps of its own tag (a later tag store)
         std::vector<std::vector<Test>> ownGuards; // per own map: the tests it runs under (none: always)
+        std::vector<std::string> ownLab;          // per own map: where it comes from (reports)
         bool unknown = false;
         std::string why; // why unknown (reports)
       };
@@ -1728,7 +1801,8 @@ void CallGraphPass::computeTaggedFields() {
         via.insert(t.via.begin(), t.via.end());
         for (const Term &tm : t.terms)
           if (tm.src == 'c') { if (!concretize({tm}, W.tags)) W.unknown = true; }
-          else if (tm.src == 's' && !prior) W.ownMaps.push_back(tm), W.ownGuards.push_back({});
+          else if (tm.src == 's' && !prior)
+            W.ownMaps.push_back(tm), W.ownGuards.push_back({}), W.ownLab.push_back("tag write " + locOf(t.I));
           else W.fromAny.push_back(tm);
       };
       std::vector<const TagStore *> retags;
@@ -1864,6 +1938,7 @@ void CallGraphPass::computeTaggedFields() {
       };
       std::vector<Term> effMaps; // effects that act as retags
       std::vector<std::vector<Test>> effGuards;
+      std::vector<std::string> effLab;
       bool effUnknownRetag = false;
       size_t effSites = 0, effAbsorbed = 0;
       // Recursion: rounds from the empty effect, each starting where the
@@ -1917,9 +1992,13 @@ void CallGraphPass::computeTaggedFields() {
                 for (size_t q = 0; q < E.maps.size(); q++) {
                   const Term &tm = E.maps[q];
                   if (tm.src == 'c' && !E.guards[q].empty())
-                    W.ownMaps.push_back(Term{'s', 0, tm.f, tm.m}), W.ownGuards.push_back(E.guards[q]);
+                    W.ownMaps.push_back(Term{'s', 0, tm.f, tm.m}), W.ownGuards.push_back(E.guards[q]),
+                    W.ownLab.push_back("call " + locOf(CB) + " -> " + G->getName().str() + " (guarded constant)");
                   else if (tm.src == 'c') { if (!concretize({tm}, W.tags)) W.unknown = true; }
-                  else if (tm.src == 's') W.ownMaps.push_back(tm), W.ownGuards.push_back(E.guards[q]);
+                  else if (tm.src == 's')
+                    W.ownMaps.push_back(tm), W.ownGuards.push_back(E.guards[q]),
+                    W.ownLab.push_back("call " + locOf(CB) + " -> " + G->getName().str() +
+                                       (E.guards[q].empty() ? "" : " (guarded)"));
                   else W.fromAny.push_back(tm);
                 }
               }
@@ -1931,6 +2010,7 @@ void CallGraphPass::computeTaggedFields() {
             effUnknownRetag |= E.open;
             effMaps.insert(effMaps.end(), E.maps.begin(), E.maps.end());
             effGuards.insert(effGuards.end(), E.guards.begin(), E.guards.end());
+            for (size_t q = 0; q < E.maps.size(); q++) effLab.push_back("call " + locOf(CB) + " -> " + G->getName().str());
           }
         }
       }
@@ -2023,6 +2103,7 @@ void CallGraphPass::computeTaggedFields() {
       std::set<int64_t> sets;
       std::vector<Term> xforms, anyImgs;
       std::vector<std::vector<Test>> xformGuard; // per xform: the stable tests it runs under
+      std::vector<std::string> xformLab;         // per xform: where it comes from (reports)
       size_t guarded = 0, unguarded = 0;
       std::vector<std::string> unguardedAt, allRetagAt;
       std::vector<std::string> xformAt;
@@ -2059,9 +2140,9 @@ void CallGraphPass::computeTaggedFields() {
             if (tm.src == 's')
               for (const Term &e : pre) {
                 const Term c = composeT(e, tm);
-                if (c.src == 's') xforms.push_back(c), xformGuard.push_back(g);
+                if (c.src == 's') xforms.push_back(c), xformGuard.push_back(g), xformLab.push_back(locOf(t->I) + (g.empty() ? " unguarded" : " guarded"));
                 else if (c.src == 'c' && !g.empty()) // a constant under a guard: a map with no input bits
-                  xforms.push_back(Term{'s', 0, c.f, c.m}), xformGuard.push_back(g);
+                  xforms.push_back(Term{'s', 0, c.f, c.m}), xformGuard.push_back(g), xformLab.push_back(locOf(t->I) + " guarded constant");
                 else if (c.src == 'c') setsAll |= !concretize({c}, sets);
                 else anyImgs.push_back(c);
               }
@@ -2085,9 +2166,9 @@ void CallGraphPass::computeTaggedFields() {
       for (size_t q = 0; q < effMaps.size(); q++) { // call-site effects that act as retags
         const Term &tm = effMaps[q];
         if (tm.src == 'c' && !effGuards[q].empty()) // a constant under a guard
-          xforms.push_back(Term{'s', 0, tm.f, tm.m}), xformGuard.push_back(effGuards[q]);
+          xforms.push_back(Term{'s', 0, tm.f, tm.m}), xformGuard.push_back(effGuards[q]), xformLab.push_back(effLab[q] + " guarded constant");
         else if (tm.src == 'c') setsAll |= !concretize({tm}, sets);
-        else if (tm.src == 's') xforms.push_back(tm), xformGuard.push_back(effGuards[q]);
+        else if (tm.src == 's') xforms.push_back(tm), xformGuard.push_back(effGuards[q]), xformLab.push_back(effLab[q] + (effGuards[q].empty() ? " unguarded" : " guarded"));
         else anyImgs.push_back(tm);
       }
       for (int64_t b : pairFills) { // the fill byte repeated over the tag
@@ -2219,6 +2300,8 @@ void CallGraphPass::computeTaggedFields() {
       };
       // Close T under maps; a map applies to v only when v (may) satisfy
       // its guard.
+      std::map<int64_t, std::pair<int64_t, std::string>> *prov = nullptr; // reports: how each tag arose
+      const std::vector<std::string> *provLab = nullptr;
       auto closure = [&](TagSet &T, const std::vector<Term> &maps, const std::vector<std::vector<Test>> *guards) {
         auto guarded = [&](size_t mi) { return guards && mi < guards->size() && !(*guards)[mi].empty(); };
         if (!T.wide) {
@@ -2237,6 +2320,7 @@ void CallGraphPass::computeTaggedFields() {
               for (uint64_t fr = (uint64_t)t.m, sub = fr;; sub = (sub - 1) & fr) {
                 const int64_t w = (v & t.a) | t.f | (int64_t)sub;
                 if (!T.vals.count(w)) {
+                  if (prov && provLab && mi < provLab->size()) (*prov)[w] = {v, (*provLab)[mi]};
                   add(T, w);
                   if (T.wide) { T.why = "more than 4096 tags (last map " + termStr(t) + ")"; break; }
                   work.push_back(w);
@@ -2257,7 +2341,13 @@ void CallGraphPass::computeTaggedFields() {
           }
         }
       };
-      struct Tags { std::vector<TagSet> w; bool wide = false; bool uWide = false; size_t uSize = 0; };
+      struct Tags {
+        std::vector<TagSet> w;
+        bool wide = false, uWide = false;
+        size_t uSize = 0;
+        std::vector<std::map<int64_t, std::pair<int64_t, std::string>>> prov; // reports
+      };
+      const bool provOn = VerboseLevel >= 2 && fs.size() >= 20;
       std::map<int64_t, Tags> tagsByR;
       std::vector<bool> wAll(writers.size(), false);
       for (size_t i = 0; i < writers.size(); i++) wAll[i] = writers[i].unknown;
@@ -2308,7 +2398,16 @@ void CallGraphPass::computeTaggedFields() {
           for (const Term &t : writers[i].ownMaps) maps.push_back(pt(t));
           std::vector<std::vector<Test>> gs = xformGuard;
           gs.insert(gs.end(), writers[i].ownGuards.begin(), writers[i].ownGuards.end());
+          std::vector<std::string> labs = xformLab;
+          labs.insert(labs.end(), writers[i].ownLab.begin(), writers[i].ownLab.end());
+          if (provOn) {
+            T.prov.resize(writers.size());
+            prov = &T.prov[i];
+            provLab = &labs;
+          }
           closure(from, maps, &gs);
+          prov = nullptr;
+          provLab = nullptr;
           T.wide |= from.wide;
           T.w[i] = std::move(from);
         }
@@ -2351,9 +2450,21 @@ void CallGraphPass::computeTaggedFields() {
             if (holdsP(tests, v)) {
               adm.push_back(i);
               if (VerboseLevel >= 2 && fs.size() >= 20 && witnessLines.size() < 60)
+              {
+                std::string chain;
+                if (provOn && i < TT->prov.size()) {
+                  int64_t cur = v;
+                  for (int d = 0; d < 12; d++) {
+                    auto pit = TT->prov[i].find(cur);
+                    if (pit == TT->prov[i].end()) break;
+                    chain += " <- 0x" + utohexstr((uint64_t)pit->second.first) + " by " + pit->second.second;
+                    cur = pit->second.first;
+                  }
+                }
                 witnessLines.push_back("    read " + locOf(r.I) + " (R 0x" + utohexstr((uint64_t)R) + ", " +
                                        std::to_string(ws.vals.size()) + " tags) admits " + locOf(writers[i].I) +
-                                       " by tag 0x" + utohexstr((uint64_t)v));
+                                       " by tag 0x" + utohexstr((uint64_t)v) + chain);
+              }
               break;
             }
         }

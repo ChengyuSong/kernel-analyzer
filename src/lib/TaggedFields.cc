@@ -775,6 +775,246 @@ void CallGraphPass::computeTaggedFields() {
     }
     return it->second;
   };
+  // Path stability (plan 3.51, ruling beta): a test of D speaks for an
+  // access only if no write to D can come between them. May-write-D per
+  // function: a store named (S, D), or a direct call of such a function,
+  // or an indirect call when such a function's address is taken (least
+  // fixpoint). Calls of bodiless functions are assumed to write no struct
+  // slot (the holder-guard premise, reported there); byte copies over D
+  // flip the pair in the solve.
+  std::map<const Function *, std::vector<const CallBase *>> callsOf;
+  std::map<const Function *, std::vector<const Function *>> callersOf;
+  std::vector<const Function *> indirectCallers;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M) {
+      bool ind = false;
+      for (Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I); CB && !isa<IntrinsicInst>(CB)) {
+          callsOf[&F].push_back(CB);
+          if (const Function *C = CB->getCalledFunction()) callersOf[C].push_back(&F);
+          else if (!CB->isInlineAsm()) ind = true;
+        }
+      if (ind) indirectCallers.push_back(&F);
+    }
+  struct MayWrite { std::set<const Function *> fns; bool viaIndirect = false; std::set<const Instruction *> stores; };
+  std::map<Field, MayWrite> mayWriteOf;
+  auto mayWrite = [&](const Field &Df) -> const MayWrite & {
+    auto [it, ins] = mayWriteOf.try_emplace(Df);
+    MayWrite &MW = it->second;
+    if (!ins) return MW;
+    std::vector<const Function *> work;
+    auto add = [&](const Function *F) { if (MW.fns.insert(F).second) work.push_back(F); };
+    for (const TagStore &t : dStores[Df]) {
+      MW.stores.insert(t.I);
+      add(t.I->getFunction());
+    }
+    while (!work.empty()) {
+      const Function *G = work.back();
+      work.pop_back();
+      for (const Function *C : callersOf[G]) add(C);
+      if (G->hasAddressTaken() && !MW.viaIndirect) {
+        MW.viaIndirect = true;
+        for (const Function *C : indirectCallers) add(C);
+      }
+    }
+    return MW;
+  };
+  // Can D be written between the test (its load dl, its branch into Succ)
+  // and the access at `at`? The last passage: blocks reachable from Succ
+  // and reaching `at` without re-entering the test's block.
+  auto stableBetween = [&](const LoadInst *dl, const BranchInst *Br, const BasicBlock *Succ, const Instruction *at,
+                           const Field &Df) {
+    if (dl->getParent() != Br->getParent()) return false;
+    const MayWrite &MW = mayWrite(Df);
+    auto writes = [&](const Instruction &I) {
+      if (&I == at) return false;
+      if (MW.stores.count(&I)) return true;
+      if (const auto *CB = dyn_cast<CallBase>(&I); CB && !isa<IntrinsicInst>(CB)) {
+        if (const Function *C = CB->getCalledFunction()) return MW.fns.count(C) != 0;
+        return !CB->isInlineAsm() && MW.viaIndirect;
+      }
+      return false;
+    };
+    for (const Instruction *I = dl->getNextNode(); I && I != Br; I = I->getNextNode())
+      if (writes(*I)) return false;
+    const BasicBlock *TB = Br->getParent();
+    std::set<const BasicBlock *> fwd, bwd;
+    std::vector<const BasicBlock *> work{Succ};
+    fwd.insert(Succ);
+    while (!work.empty()) {
+      const BasicBlock *B = work.back();
+      work.pop_back();
+      for (const BasicBlock *N : successors(B))
+        if (N != TB && fwd.insert(N).second) work.push_back(N);
+    }
+    work = {at->getParent()};
+    bwd.insert(at->getParent());
+    while (!work.empty()) {
+      const BasicBlock *B = work.back();
+      work.pop_back();
+      if (B == Succ) continue;
+      for (const BasicBlock *P : predecessors(B))
+        if (P != TB && fwd.count(P) && bwd.insert(P).second) work.push_back(P);
+    }
+    for (const BasicBlock *B : bwd)
+      if (fwd.count(B))
+        for (const Instruction &I : *B)
+          if (writes(I)) return false;
+    return true;
+  };
+  // A test of D on the access's object dominating it, stable up to it.
+  struct Test { const Value *cond; const LoadInst *d; bool onTrue; };
+  size_t testsUnstable = 0;
+  auto testsAt = [&](const Instruction *at, const Value *obj, const Field &Df, std::vector<Test> &tests) {
+    const Function *Fn = at->getFunction();
+    DominatorTree &DT = domOf(Fn);
+    for (const FnTest &ft : fnTestsOf(Fn)) {
+      if (ft.S != Df.first || ft.off != Df.second || ft.obj != obj) continue;
+      for (unsigned si = 0; si < 2; si++) {
+        const BasicBlock *Succ = ft.Br->getSuccessor(si);
+        if (Succ->getSinglePredecessor() != ft.Br->getParent() || !DT.dominates(Succ, at->getParent())) continue;
+        if (!stableBetween(ft.dl, ft.Br, Succ, at, Df)) { testsUnstable++; continue; }
+        tests.push_back({ft.Br->getCondition(), ft.dl, si == 0});
+      }
+    }
+  };
+  // Evaluate a test with the tag = v.
+  std::function<std::optional<int64_t>(const Value *, const LoadInst *, int64_t)> eval =
+      [&](const Value *X, const LoadInst *dl, int64_t v) -> std::optional<int64_t> {
+    if (X == dl) return v;
+    if (const auto *K = dyn_cast<ConstantInt>(X)) return K->getSExtValue();
+    if (const auto *C = dyn_cast<CastInst>(X)) {
+      auto a = eval(C->getOperand(0), dl, v);
+      if (!a) return std::nullopt;
+      if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return std::nullopt;
+      const unsigned bw = C->getType()->getIntegerBitWidth(),
+                     sb = C->getOperand(0)->getType()->getIntegerBitWidth();
+      if (isa<TruncInst>(C)) return bw < 64 ? *a & ((int64_t(1) << bw) - 1) : *a;
+      if (isa<ZExtInst>(C)) return sb < 64 ? *a & ((int64_t(1) << sb) - 1) : *a;
+      if (isa<SExtInst>(C)) return APInt(sb, (uint64_t)*a).sext(64).getSExtValue();
+      return std::nullopt;
+    }
+    if (const auto *BO = dyn_cast<BinaryOperator>(X)) {
+      auto a = eval(BO->getOperand(0), dl, v), b = eval(BO->getOperand(1), dl, v);
+      if (!a || !b) return std::nullopt;
+      switch (BO->getOpcode()) {
+      case Instruction::And: return *a & *b;
+      case Instruction::Or: return *a | *b;
+      case Instruction::Xor: return *a ^ *b;
+      default: return std::nullopt;
+      }
+    }
+    if (const auto *IC = dyn_cast<ICmpInst>(X)) {
+      auto a = eval(IC->getOperand(0), dl, v), b = eval(IC->getOperand(1), dl, v);
+      if (!a || !b) return std::nullopt;
+      const unsigned bw = IC->getOperand(0)->getType()->getIntegerBitWidth();
+      const APInt A(bw, (uint64_t)*a, true), B(bw, (uint64_t)*b, true);
+      return (int64_t)ICmpInst::compare(A, B, IC->getPredicate());
+    }
+    return std::nullopt;
+  };
+  auto holds = [&](const std::vector<Test> &tests, int64_t v) {
+    for (const Test &t : tests) {
+      auto r2 = eval(t.cond, t.d, v);
+      if (!r2) continue; // not evaluable: no constraint
+      if ((*r2 != 0) != t.onTrue) return false;
+    }
+    return true;
+  };
+  // Must-write of F (plan 3.51, ruling alpha): a function writes F of the
+  // object passed in parameter j on every path to its normal return,
+  // directly or by a direct callee that must-writes F of the parameter it
+  // receives. Recursion: a function under evaluation counts as "no" (the
+  // bottom), so the answer is a must-write under-approximation.
+  // The identity of a call argument: through casts and zero-offset GEPs;
+  // a field address is its own object.
+  auto argId = [&](const Value *V) -> const Value * {
+    for (int d = 0; d < 8; d++) {
+      V = V->stripPointerCasts();
+      const auto *G = dyn_cast<GEPOperator>(V);
+      if (!G) break;
+      APInt Ap(64, 0);
+      if (!G->accumulateConstantOffset(Ctx->Modules.begin()->first->getDataLayout(), Ap) || !Ap.isZero()) return V;
+      V = G->getPointerOperand();
+    }
+    return ids.of(V, 0);
+  };
+  std::map<std::tuple<Field, const Function *, unsigned>, bool> mustP;
+  std::function<bool(const Field &, const Function *, unsigned)> mustParam;
+  // Does every path from Fn's entry to `at` (or, null, to each normal
+  // return) must-write F of object `id` first?
+  auto mustBefore = [&](const Field &Ff, const Function *Fn, const Value *id, const Instruction *at) {
+    auto isW = [&](const Instruction &I) {
+      if (const auto *St = dyn_cast<StoreInst>(&I)) {
+        StructType *ST = nullptr;
+        int64_t off = 0;
+        return St->getValueOperand()->getType()->isPointerTy() &&
+               accessSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), ST, off) && ST &&
+               ST->hasName() && stripStructNameSuffix(ST->getName()) == Ff.first && off == Ff.second &&
+               objKey(St, St->getPointerOperand(), ST) == id;
+      }
+      if (const auto *CB = dyn_cast<CallBase>(&I))
+        if (const Function *H = CB->getCalledFunction(); H && !H->isDeclaration())
+          for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size(); k++)
+            if (CB->getArgOperand(k)->getType()->isPointerTy() && argId(CB->getArgOperand(k)) == id &&
+                mustParam(Ff, H, k))
+              return true;
+      return false;
+    };
+    std::map<const BasicBlock *, bool> in, out;
+    for (const BasicBlock &B : *Fn) in[&B] = out[&B] = true; // top
+    in[&Fn->getEntryBlock()] = false;
+    std::map<const BasicBlock *, bool> gen;
+    for (const BasicBlock &B : *Fn) {
+      bool g = false;
+      for (const Instruction &I : B) if (isW(I)) { g = true; break; }
+      gen[&B] = g;
+    }
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (const BasicBlock &B : *Fn) {
+        bool i = &B != &Fn->getEntryBlock();
+        for (const BasicBlock *P : predecessors(&B)) i = i && out[P];
+        if (&B == &Fn->getEntryBlock()) i = false;
+        const bool o = i || gen[&B];
+        if (i != in[&B] || o != out[&B]) { in[&B] = i; out[&B] = o; changed = true; }
+      }
+    }
+    auto before = [&](const Instruction *T) {
+      if (in[T->getParent()]) return true;
+      for (const Instruction *I = &T->getParent()->front(); I && I != T; I = I->getNextNode())
+        if (isW(*I)) return true;
+      return false;
+    };
+    if (at) return before(at);
+    for (const BasicBlock &B : *Fn)
+      if (const auto *R = dyn_cast<ReturnInst>(B.getTerminator()); R && !before(R)) return false;
+    return true;
+  };
+  mustParam = [&](const Field &Ff, const Function *G, unsigned j) {
+    const auto key = std::make_tuple(Ff, G, j);
+    if (auto it = mustP.find(key); it != mustP.end()) return it->second;
+    mustP[key] = false; // under evaluation: the bottom
+    const bool r = mustBefore(Ff, G, G->getArg(j), nullptr);
+    mustP[key] = r;
+    return r;
+  };
+  // F stores that may hold F at a point of Fn: Fn's and its direct
+  // callees' (transitively); none if an indirect call is reachable.
+  auto fStoresUnder = [&](const Function *Fn, std::set<const Function *> &fns) {
+    std::vector<const Function *> work{Fn};
+    fns.insert(Fn);
+    while (!work.empty()) {
+      const Function *G = work.back();
+      work.pop_back();
+      for (const CallBase *CB : callsOf[G]) {
+        const Function *C = CB->getCalledFunction();
+        if (!C) { if (!CB->isInlineAsm()) return false; continue; }
+        if (!C->isDeclaration() && fns.insert(C).second) work.push_back(C);
+      }
+    }
+    return true;
+  };
   for (auto &[Ff, fs] : fStores) {
     const std::string &S = Ff.first;
     // Candidate discriminators: integer fields of S stored in a function
@@ -823,6 +1063,36 @@ void CallGraphPass::computeTaggedFields() {
           }
         if (!co) W.unknown = true;
         writers.push_back(std::move(W));
+      }
+      // Ruling alpha: a "retag" whose function must-writes F of the same
+      // object before its D store is a writer of the F it wrote: its tag
+      // goes to every F store that may hold F there (the function's and
+      // its callees'), and it is not a retag of other writers' F.
+      size_t alphaWriters = 0;
+      {
+        std::map<const Instruction *, size_t> wIdx;
+        for (size_t i = 0; i < writers.size(); i++) wIdx[writers[i].I] = i;
+        std::vector<const TagStore *> keep;
+        for (const TagStore *t : retags) {
+          std::set<const Function *> fns;
+          if (!mustBefore(Ff, t->I->getFunction(), t->obj, t->I) || !fStoresUnder(t->I->getFunction(), fns)) {
+            keep.push_back(t);
+            continue;
+          }
+          alphaWriters++;
+          via.insert(t->via.begin(), t->via.end());
+          for (const FAccess &w : fs) {
+            if (!fns.count(w.I->getFunction())) continue;
+            Writer &W = writers[wIdx[w.I]];
+            if (t->unknown) W.unknown = true;
+            for (const Term &tm : t->terms)
+              if (tm.src != 'c') W.fromAny.push_back(tm);
+              else if (!concretize({tm}, W.tags)) W.unknown = true;
+          }
+        }
+        retags = std::move(keep);
+        nonConstRetag = false;
+        for (const TagStore *t : retags) nonConstRetag |= t->unknown;
       }
       // The tag must be certified: every store covering its bytes is one
       // of its own named writes, or watched in the solve.
@@ -880,6 +1150,8 @@ void CallGraphPass::computeTaggedFields() {
       // every transform and image).
       std::set<int64_t> sets;
       std::vector<Term> xforms, anyImgs;
+      std::vector<std::vector<Test>> xformGuard; // per xform: the stable tests it runs under
+      size_t guarded = 0, unguarded = 0;
       std::vector<std::string> xformAt;
       bool setsAll = false;
       auto termStr = [](const Term &tm) {
@@ -891,9 +1163,17 @@ void CallGraphPass::computeTaggedFields() {
       for (const TagStore *t : retags) {
         via.insert(t->via.begin(), t->via.end());
         bool sym = false;
+        std::vector<Test> g;
+        bool hasS = false;
+        for (const Term &tm : t->terms) hasS |= tm.src == 's';
+        if (hasS) {
+          testsAt(t->I, t->obj, Df, g);
+          (g.empty() ? unguarded : guarded)++;
+        }
         for (const Term &tm : t->terms) {
           if (tm.src == 'c') setsAll |= !concretize({tm}, sets);
-          else (tm.src == 's' ? xforms : anyImgs).push_back(tm), sym = true;
+          else if (tm.src == 's') xforms.push_back(tm), xformGuard.push_back(g), sym = true;
+          else anyImgs.push_back(tm), sym = true;
         }
         if (sym && xformAt.size() < 4) {
           std::string d = locOf(t->I) + " {";
@@ -916,12 +1196,16 @@ void CallGraphPass::computeTaggedFields() {
         }
         return true;
       };
-      auto closure = [&](std::set<int64_t> R, const std::vector<Term> &maps, bool &all) {
+      // A map applies to v only when v satisfies its guard (if any).
+      auto closure = [&](std::set<int64_t> R, const std::vector<Term> &maps, bool &all,
+                         const std::vector<std::vector<Test>> *guards = nullptr) {
         std::vector<int64_t> work(R.begin(), R.end()), img;
         while (!work.empty() && !all) {
           const int64_t v = work.back();
           work.pop_back();
-          for (const Term &t : maps) {
+          for (size_t mi = 0; mi < maps.size(); mi++) {
+            const Term &t = maps[mi];
+            if (guards && mi < guards->size() && !(*guards)[mi].empty() && !holds((*guards)[mi], v)) continue;
             img.clear();
             if (!images(v, t, img)) { all = true; break; }
             for (int64_t w : img)
@@ -933,13 +1217,14 @@ void CallGraphPass::computeTaggedFields() {
       };
       std::set<int64_t> U0 = sets;
       std::vector<Term> allMaps = xforms;
+      std::vector<std::vector<Test>> allGuards = xformGuard;
       allMaps.insert(allMaps.end(), anyImgs.begin(), anyImgs.end());
       for (const Writer &W : writers) {
         U0.insert(W.tags.begin(), W.tags.end());
         allMaps.insert(allMaps.end(), W.fromAny.begin(), W.fromAny.end());
       }
       bool uAll = setsAll;
-      const std::set<int64_t> U = closure(U0, allMaps, uAll);
+      const std::set<int64_t> U = closure(U0, allMaps, uAll, &allGuards);
       std::set<int64_t> base = sets; // what retags may set on any object
       {
         std::vector<int64_t> img;
@@ -969,74 +1254,21 @@ void CallGraphPass::computeTaggedFields() {
           }
         if (imgAll) { wAll[i] = true; continue; }
         bool all = false;
-        wTags[i] = closure(from, xforms, all);
+        wTags[i] = closure(from, xforms, all, &xformGuard);
         wAll[i] = all;
       }
-      // Reads: the tests of D (same object) dominating them.
-      struct Test { const Value *cond; const LoadInst *d; bool onTrue; };
+      // Reads: the stable tests of D (same object) dominating them.
       std::vector<std::pair<const Instruction *, std::vector<size_t>>> keyed;
       size_t pairReadsKeyed = 0;
       for (const FAccess &r : fLoads[Ff]) {
-        const Function *Fn = r.I->getFunction();
-        DominatorTree &DT = domOf(Fn);
         std::vector<Test> tests;
-        for (const FnTest &ft : fnTestsOf(Fn)) {
-          if (ft.S != S || ft.off != dOff || ft.obj != r.obj) continue;
-          for (unsigned si = 0; si < 2; si++) {
-            const BasicBlock *Succ = ft.Br->getSuccessor(si);
-            if (Succ->getSinglePredecessor() == ft.Br->getParent() && DT.dominates(Succ, r.I->getParent()))
-              tests.push_back({ft.Br->getCondition(), ft.dl, si == 0});
-          }
-        }
+        testsAt(r.I, r.obj, Df, tests);
         if (tests.empty()) { readsNoTest++; continue; }
-        // Evaluate a test with the tag = v.
-        std::function<std::optional<int64_t>(const Value *, const LoadInst *, int64_t)> eval =
-            [&](const Value *X, const LoadInst *dl, int64_t v) -> std::optional<int64_t> {
-          if (X == dl) return v;
-          if (const auto *K = dyn_cast<ConstantInt>(X)) return K->getSExtValue();
-          if (const auto *C = dyn_cast<CastInst>(X)) {
-            auto a = eval(C->getOperand(0), dl, v);
-            if (!a) return std::nullopt;
-            if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return std::nullopt;
-            const unsigned bw = C->getType()->getIntegerBitWidth(),
-                           sb = C->getOperand(0)->getType()->getIntegerBitWidth();
-            if (isa<TruncInst>(C)) return bw < 64 ? *a & ((int64_t(1) << bw) - 1) : *a;
-            if (isa<ZExtInst>(C)) return sb < 64 ? *a & ((int64_t(1) << sb) - 1) : *a;
-            if (isa<SExtInst>(C)) return APInt(sb, (uint64_t)*a).sext(64).getSExtValue();
-            return std::nullopt;
-          }
-          if (const auto *BO = dyn_cast<BinaryOperator>(X)) {
-            auto a = eval(BO->getOperand(0), dl, v), b = eval(BO->getOperand(1), dl, v);
-            if (!a || !b) return std::nullopt;
-            switch (BO->getOpcode()) {
-            case Instruction::And: return *a & *b;
-            case Instruction::Or: return *a | *b;
-            case Instruction::Xor: return *a ^ *b;
-            default: return std::nullopt;
-            }
-          }
-          if (const auto *IC = dyn_cast<ICmpInst>(X)) {
-            auto a = eval(IC->getOperand(0), dl, v), b = eval(IC->getOperand(1), dl, v);
-            if (!a || !b) return std::nullopt;
-            const unsigned bw = IC->getOperand(0)->getType()->getIntegerBitWidth();
-            const APInt A(bw, (uint64_t)*a, true), B(bw, (uint64_t)*b, true);
-            return (int64_t)ICmpInst::compare(A, B, IC->getPredicate());
-          }
-          return std::nullopt;
-        };
-        auto holds = [&](int64_t v) {
-          for (const Test &t : tests) {
-            auto r2 = eval(t.cond, t.d, v);
-            if (!r2) continue; // not evaluable: no constraint
-            if ((*r2 != 0) != t.onTrue) return false;
-          }
-          return true;
-        };
         std::vector<size_t> adm;
         for (size_t i = 0; i < writers.size(); i++) {
           if (wAll[i]) { adm.push_back(i); continue; }
           for (int64_t v : wTags[i])
-            if (holds(v)) { adm.push_back(i); break; }
+            if (holds(tests, v)) { adm.push_back(i); break; }
         }
         if (adm.size() == writers.size()) { readsAll++; continue; }
         keyed.push_back({r.I, adm});
@@ -1048,7 +1280,9 @@ void CallGraphPass::computeTaggedFields() {
           std::string d = "PLAIN " + S + "+" + std::to_string(Ff.second) + " by +" + std::to_string(dOff) + " (" +
                           std::to_string(fs.size()) + " writes): every tested read admits every writer; " +
                           std::to_string(U.size()) + (uAll ? "+ (capped)" : "") + " tags, " +
-                          std::to_string(nAll) + " writers with any tag";
+                          std::to_string(nAll) + " writers with any tag; " + std::to_string(alphaWriters) +
+                          " retags are writers through a callee; transforms " + std::to_string(guarded) +
+                          " guarded, " + std::to_string(unguarded) + " unguarded";
           for (const std::string &x : xformAt) d += "; retag " + x;
           taggedReport.push_back(d);
         }
@@ -1083,8 +1317,10 @@ void CallGraphPass::computeTaggedFields() {
       taggedReport.push_back("KEYED " + S + "+" + std::to_string(Ff.second) + " by +" +
                                std::to_string(dOff) + ": " + std::to_string(writers.size()) + " writers, " +
                                std::to_string(pairReadsKeyed) + " reads keyed, " +
-                               std::to_string(retags.size()) + " retags, " + std::to_string(U.size()) +
-                               " tags" + extra);
+                               std::to_string(retags.size()) + " retags (" + std::to_string(alphaWriters) +
+                               " more are writers through a callee; " + std::to_string(guarded) +
+                               " guarded, " + std::to_string(unguarded) + " unguarded transforms), " +
+                               std::to_string(U.size()) + " tags" + extra);
     }
   }
   if (pairsKeyed) {
@@ -1099,7 +1335,8 @@ void CallGraphPass::computeTaggedFields() {
   CG_LOG("TaggedFields: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
          << " s; " << pairsKeyed << " pairs keyed (" << writersTagged << " tagged writers, "
          << writersUntagged << " untagged: no co-written tag in the writer's function); reads: "
-         << readsKeyed << " keyed, " << readsNoTest << " with no dominating test, " << readsAll
+         << readsKeyed << " keyed, " << readsNoTest << " with no stable dominating test (" << testsUnstable
+         << " tests dropped: D may be written before the access), " << readsAll
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
          << pairsUncertified << " by an uncertified tag\n");
   if (VerboseLevel >= 2)

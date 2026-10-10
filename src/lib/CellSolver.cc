@@ -1114,6 +1114,7 @@ bool CallGraphPass::runCellResolution() {
     return false;
   };
   size_t splitCells = 0, keyedCells = 0;
+  size_t trailingArrays = 0; // trailing objects of a header taken as arrays of unknown extent
   auto contentOf = [&](uint32_t o, int64_t c) -> std::pair<uint32_t, uint32_t> {
     auto it = objs[o].content.find(c);
     if (it != objs[o].content.end()) return it->second;
@@ -1552,13 +1553,19 @@ bool CallGraphPass::runCellResolution() {
       return;
     }
     O.layout = S;
-    O.repeats = O.parentObj == UINT32_MAX; // a trailing struct is one object
+    // An array of S of unknown extent, then unknown: the trailing data of
+    // a header (sqlite3's VdbeFrame: nMem Mems, then cursor pointers)
+    // indexed by element, offsets reduced modulo S's stride. Only a size
+    // that says otherwise makes it one S: exactly the header and one S, or
+    // one S followed by a constant remainder.
+    O.repeats = true;
     O.size = sz;
     O.label = typeLabel(S);
     O.learnedLayout = true;
     if (const auto *C = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin))) {
-      if (headerPlusTail(C, (uint64_t)(O.base + sz))) { O.tail = true; tailObjects++; }
-      else if (O.base == 0 && exactlyOne(C, (uint64_t)sz)) O.repeats = false;
+      if (headerPlusTail(C, (uint64_t)(O.base + sz))) { O.tail = true; O.repeats = false; tailObjects++; }
+      else if (exactlyOne(C, (uint64_t)(O.base + sz))) O.repeats = false;
+      else if (O.parentObj != UINT32_MAX) trailingArrays++;
     }
     layoutsLearned++;
     refoldQueue.push_back(o);
@@ -5058,7 +5065,7 @@ bool CallGraphPass::runCellResolution() {
       std::chrono::duration<double>(Clock::now() - t0).count();
   CG_LOG("Cells: iteration " << iteration << ": " << objs.size()
          << " origins (" << funcSeeds << " function seeds, " << objSeeds
-         << " objects (" << tailMinted << " trailing, " << tailMoved
+         << " objects (" << tailMinted << " trailing, " << trailingArrays << " of them arrays of unknown extent, " << tailMoved
          << " cells moved to them); heap " << heapLabeled << " labeled (" << tailObjects
          << " header + trailing data), " << heapUnlabeled
          << " unlabeled, " << heapConflict << " with conflicting labels, "

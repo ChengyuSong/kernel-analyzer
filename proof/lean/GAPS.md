@@ -709,6 +709,17 @@ Obligations left open:
      the two pointers name one object, for the evaluator and every walk.
      Outside it they are two objects. A redefinition of either pointer
      ends it, since the merged names are definitions.
+   - Refinement, not yet implemented: the access set of a skipped indirect
+     call could be the solver's resolved targets for that call instead of
+     all address-taken functions. This is admissible by prefix induction.
+     Targets only grow. A real write within any execution prefix is made by
+     a target the solve has already resolved on that prefix. So an
+     assumption that holds against the resolved targets at the fixpoint
+     holds against every real write, and the check stays monotone in the
+     failing direction. Without it, the re-entrant failures (the walked
+     function's own access reached through address-taken reach:
+     sqlite3_str_reset, jsonZero, propagateConstants) fail soundly but
+     needlessly.
    - Identities are definitions: mem2reg's for -O0 slots; an element
      address by its base and index definitions; reloads of an escaping slot
      in one block with no memory write between. A walk that crosses a

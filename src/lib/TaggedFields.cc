@@ -311,6 +311,8 @@ void CallGraphPass::computeTaggedFields() {
   taggedPairs.clear();
   taggedPairAssumes.clear();
   taggedAssumes.clear();
+  taggedOutsideEntries.clear();
+  taggedUntested.clear();
   taggedAccessSets.clear();
   taggedWatches.clear();
   const auto t0 = std::chrono::steady_clock::now();
@@ -329,6 +331,51 @@ void CallGraphPass::computeTaggedFields() {
     int64_t a, f, m;
     const Value *who = nullptr; // evaluation only: the object a symbolic term's tag was read from
   };
+  // Function-pointer tags (plan 3.51 ruling a): a pointer-valued tag holds
+  // NULL (0), the special constant -1 (sqlite's SQLITE_TRANSIENT), a small
+  // integer cast to a pointer, or a function, each a distinct constant.
+  std::map<const Function *, int64_t> fnId;
+  std::vector<const Function *> fnById;
+  constexpr int64_t kFnBase = int64_t(1) << 20, kAllOnes = (int64_t(1) << 31) - 1; // all below 2^31
+  auto ptrConst = [&](const Value *V) -> std::optional<int64_t> {
+    V = V->stripPointerCasts();
+    if (const auto *GA = dyn_cast<GlobalAlias>(V)) V = GA->getAliasee()->stripPointerCasts();
+    if (isa<ConstantPointerNull>(V)) return 0;
+    if (const auto *F = dyn_cast<Function>(V)) {
+      auto [it, ins] = fnId.try_emplace(F, kFnBase + (int64_t)fnById.size());
+      if (ins) fnById.push_back(F);
+      assert(it->second < kAllOnes - 2 && "function-pointer tag encoding exhausted");
+      return it->second;
+    }
+    if (const auto *CE = dyn_cast<ConstantExpr>(V); CE && CE->getOpcode() == Instruction::IntToPtr)
+      if (const auto *K = dyn_cast<ConstantInt>(CE->getOperand(0))) {
+        const int64_t c = K->getSExtValue();
+        if (c == -1) return kAllOnes;
+        if (c >= 0 && c < kFnBase) return c;
+      }
+    return std::nullopt;
+  };
+  auto constOf = [&](const Value *V) -> std::optional<int64_t> {
+    if (const auto *K = dyn_cast<ConstantInt>(V)) return K->getSExtValue();
+    if (V->getType()->isPointerTy() && isa<Constant>(V)) return ptrConst(V);
+    return std::nullopt;
+  };
+  auto widthOf = [](Type *T) -> unsigned { return T->isPointerTy() ? 64u : T->getIntegerBitWidth(); };
+  // The outside domain of a function pointer (ruling a.2, the 3.48
+  // premise applied to function values): code outside the corpus can name
+  // only NULL, -1, its own functions (one value, kOutsideFn), the
+  // corpus's exported functions, and functions whose address reaches it
+  // (the solver checks that none of the others does).
+  const int64_t kOutsideFn = kAllOnes - 2;
+  std::vector<int64_t> outsideDomain;
+  auto outsideDom = [&]() -> const std::vector<int64_t> & {
+    if (!outsideDomain.empty()) return outsideDomain;
+    outsideDomain = {0, kAllOnes, kOutsideFn};
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &G : *M)
+        if (!G.isDeclaration() && !G.hasLocalLinkage()) outsideDomain.push_back(*ptrConst(&G));
+    return outsideDomain;
+  };
   struct TagStore {
     const StoreInst *I;
     const Value *obj;
@@ -340,6 +387,25 @@ void CallGraphPass::computeTaggedFields() {
   using Field = std::pair<std::string, int64_t>; // (struct, offset)
   std::map<Field, std::vector<FAccess>> fStores, fLoads;
   std::map<Field, std::vector<TagStore>> dStores;
+  std::set<Field> fnFields;
+  std::map<Field, std::vector<FAccess>> uStores, uLoads; // union members' non-pointer accesses
+  size_t unionFields = 0;
+  // Is the member at byte off of ST (nested at that offset) a union?
+  auto unionAt = [](StructType *ST, int64_t off, const DataLayout &DL) {
+    Type *T = ST;
+    for (int depth = 0; depth < 16; depth++) {
+      auto *S2 = dyn_cast<StructType>(T);
+      if (!S2 || S2->isOpaque()) return false;
+      if (depth && S2->hasName() && S2->getName().starts_with("union.")) return true;
+      const StructLayout *SL = DL.getStructLayout(S2);
+      if (off < 0 || (uint64_t)off >= SL->getSizeInBytes()) return false;
+      const unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      if (off) return false; // inside a member, not at its start
+      T = S2->getElementType(i);
+    }
+    return false;
+  };
   // Every value a term set may take (a symbolic tag's bits free).
   auto concretize = [](const std::vector<Term> &ts, std::set<int64_t> &out) {
     for (const Term &t : ts) {
@@ -454,12 +520,16 @@ void CallGraphPass::computeTaggedFields() {
     };
     ev1 = [&](const Value *V, int depth, std::vector<Term> &out) -> bool {
       if (depth > 24 || out.size() > kMaxTerms) return false;
-      if (const auto *K = dyn_cast<ConstantInt>(V)) {
-        out.push_back({'c', 0, K->getSExtValue(), 0});
+      if (auto c = constOf(V)) {
+        out.push_back({'c', 0, *c, 0});
         return true;
       }
+      if (isa<Constant>(V) && V->getType()->isPointerTy()) return false; // another pointer constant
       auto mask = [](unsigned bits) { return bits >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << bits) - 1); };
       if (const auto *C = dyn_cast<CastInst>(V)) {
+        if (isa<PtrToIntInst>(C) || isa<IntToPtrInst>(C) ||
+            (C->getType()->isPointerTy() && C->getOperand(0)->getType()->isPointerTy()))
+          return ev(C->getOperand(0), depth + 1, out); // 64-bit values, unchanged
         if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return false;
         std::vector<Term> in;
         if (!ev(C->getOperand(0), depth + 1, in)) return false;
@@ -563,6 +633,18 @@ void CallGraphPass::computeTaggedFields() {
       if (const auto *SI = dyn_cast<SelectInst>(V))
         return ev(SI->getTrueValue(), depth + 1, out) && ev(SI->getFalseValue(), depth + 1, out);
       if (const auto *L = dyn_cast<LoadInst>(V)) {
+        // An element of a constant integer table (sqlite3's
+        // `flags = aFlag[p1 & 1]`): one of its elements.
+        if (const auto *G = dyn_cast<GEPOperator>(L->getPointerOperand()); G && L->getType()->isIntegerTy())
+          if (const auto *GV = dyn_cast<GlobalVariable>(G->getPointerOperand());
+              GV && GV->isConstant() && GV->hasDefinitiveInitializer() && G->getNumIndices() == 2 &&
+              G->getSourceElementType() == GV->getValueType())
+            if (const auto *CD = dyn_cast<ConstantDataSequential>(GV->getInitializer());
+                CD && CD->getElementType() == L->getType() && CD->getNumElements() <= 256) {
+              for (unsigned k = 0; k < CD->getNumElements(); k++)
+                out.push_back({'c', 0, (int64_t)CD->getElementAsInteger(k), 0});
+              return true;
+            }
         if (const AllocaInst *A = slotOf(L)) {
           // The one store reaching this reload, when there is one.
           const ObjIds::SlotInfo &SI = ids.slot(A);
@@ -596,7 +678,7 @@ void CallGraphPass::computeTaggedFields() {
         }
         StructType *S2 = nullptr;
         int64_t off2 = 0;
-        if (L->getType()->isIntegerTy() &&
+        if ((L->getType()->isIntegerTy() || L->getType()->isPointerTy()) &&
             accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, off2) && S2 &&
             S2->hasName() && stripStructNameSuffix(S2->getName()) == D.first && off2 == D.second) {
           const Value *who = objKey(L, L->getPointerOperand(), S2);
@@ -607,21 +689,34 @@ void CallGraphPass::computeTaggedFields() {
       }
       if (const auto *Ar = dyn_cast<Argument>(V)) {
         const Function *F = Ar->getParent();
-        if (!CFLWholeProgram || F->hasAddressTaken()) return false;
+        // An exported function entered from outside (its address taken,
+        // e.g. by an API table, or any caller in a partial corpus): a
+        // function-pointer parameter holds its call sites' arguments or
+        // the outside domain; the solver checks that no indirect call in
+        // the corpus reaches it.
+        const bool fromOutside = !F->hasLocalLinkage() && (!CFLWholeProgram || F->hasAddressTaken()) &&
+                                 Ar->getType()->isPointerTy();
+        if (!fromOutside && (!CFLWholeProgram || F->hasAddressTaken())) return false;
         size_t sites = 0;
         const bool ok = fixpoint(Ar, [&](std::vector<Term> &acc) {
           sites = 0;
           for (const User *U : F->users()) {
             const auto *CB = dyn_cast<CallBase>(U);
-            if (!CB || CB->getCalledOperand() != F) return false;
+            if (!CB || CB->getCalledOperand() != F) {
+              if (fromOutside) continue; // the address taken: the outside's calls
+              return false;
+            }
             sites++;
             if (!ev(CB->getArgOperand(Ar->getArgNo()), depth + 1, acc)) return false;
           }
+          if (fromOutside)
+            for (int64_t v : outsideDom()) acc.push_back({'c', 0, v, 0});
           return true;
         }, out);
-        if (ok && sites)
+        if (ok && fromOutside) taggedOutsideEntries[F].insert(Ar->getArgNo());
+        if (ok && (sites || fromOutside))
           T.via.push_back(F->getName().str() + " arg" + std::to_string(Ar->getArgNo()) + " from " +
-                          std::to_string(sites) + " call sites");
+                          std::to_string(sites) + " call sites" + (fromOutside ? " and the outside domain" : ""));
         return ok;
       }
       return false;
@@ -629,7 +724,7 @@ void CallGraphPass::computeTaggedFields() {
     std::vector<Term> ts;
     if (!ev(S->getValueOperand(), 0, ts)) { T.unknown = true; return; }
     // The store keeps the tag's width.
-    const unsigned w = S->getValueOperand()->getType()->getIntegerBitWidth();
+    const unsigned w = widthOf(S->getValueOperand()->getType());
     const int64_t m = w >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << w) - 1);
     std::set<std::tuple<char, int64_t, int64_t, int64_t>> seen;
     for (const Term &t : ts) {
@@ -904,7 +999,18 @@ void CallGraphPass::computeTaggedFields() {
         if (!accessSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) continue;
         const Field fld{stripStructNameSuffix(ST->getName()).str(), off};
         const Value *obj = objKey(&I, Addr, ST);
-        if (T->isPointerTy()) (isa<StoreInst>(&I) ? fStores : fLoads)[fld].push_back({&I, obj});
+        // A union member (plan 3.51, Mem.u): every access of any width
+        // accesses the one field; kept aside until the scan shows a
+        // pointer store there.
+        if (!T->isPointerTy() && unionAt(ST, off, DL)) {
+          if (isa<StoreInst>(&I)) uStores[fld].push_back({&I, obj});
+          else if (T->isIntegerTy(DL.getPointerSizeInBits())) uLoads[fld].push_back({&I, obj});
+        }
+        if (T->isPointerTy()) {
+          (isa<StoreInst>(&I) ? fStores : fLoads)[fld].push_back({&I, obj});
+          if (const auto *St = dyn_cast<StoreInst>(&I); St && isa<Function>(St->getValueOperand()->stripPointerCasts()))
+            fnFields.insert(fld); // a function-pointer field: also a tag candidate
+        }
         else if (T->isIntegerTy() && isa<StoreInst>(&I)) {
           TagStore TS{cast<StoreInst>(&I), obj};
           analyzeTag(cast<StoreInst>(&I), obj, fld, TS);
@@ -912,6 +1018,27 @@ void CallGraphPass::computeTaggedFields() {
         }
       }
   }
+  // A union member with pointer stores is a pointer field whose writers
+  // are all its stores (an integer or float write holds no pointer) and
+  // whose reads are its pointer and pointer-width integer loads; its
+  // stores are not tags.
+  for (auto &[fld, us] : uStores) {
+    auto fit = fStores.find(fld);
+    if (fit == fStores.end()) continue;
+    fit->second.insert(fit->second.end(), us.begin(), us.end());
+    auto &ls = fLoads[fld];
+    ls.insert(ls.end(), uLoads[fld].begin(), uLoads[fld].end());
+    dStores.erase(fld);
+    unionFields++;
+  }
+  // A function-pointer field's stores are tag stores too (its values are
+  // functions and the special constants).
+  for (const Field &fld : fnFields)
+    for (const FAccess &w : fStores[fld]) {
+      TagStore TS{cast<StoreInst>(w.I), w.obj};
+      analyzeTag(cast<StoreInst>(w.I), w.obj, fld, TS);
+      dStores[fld].push_back(std::move(TS));
+    }
   // ---- per (S, F, D): writers, retags, reads ----
   size_t pairsUncertified = 0;
   size_t pairsKeyed = 0, readsKeyed = 0, readsNoTest = 0, readsAll = 0, pairsNonConst = 0,
@@ -924,15 +1051,181 @@ void CallGraphPass::computeTaggedFields() {
   };
   // Per function, once: conditional branches whose condition's only leaf
   // is one load of a struct field (the candidate tag tests).
-  struct FnTest { const BranchInst *Br; const LoadInst *dl; std::string S; int64_t off; const Value *obj; };
+  // dl: the field load the test reads, or a predicate call (a pure
+  // function of its parameter's tag fields, evaluated by interpretation).
+  struct FnTest { const BranchInst *Br; const Instruction *dl; std::string S; int64_t off; const Value *obj; };
   std::map<const Function *, std::vector<FnTest>> fnTests;
+  // Predicates (plan 3.51 ruling a.3): a function returning an integer that
+  // is a pure function of one pointer parameter's fields of one struct and
+  // constants, with no write but to its own locals and no call.
+  // readsField: it reads a field of its parameter (a failed one is an open
+  // predicate test, not merely a call).
+  struct Pred { bool ok = false, readsField = false; unsigned k = 0; std::string S; std::set<int64_t> offs; std::string why; };
+  std::map<const Function *, Pred> predMemo;
+  size_t predClosed = 0, predOpen = 0;
+  auto predicateOf = [&](const Function *P) -> const Pred & {
+    auto [it, ins] = predMemo.try_emplace(P);
+    Pred &R = it->second;
+    if (!ins) return R;
+    if (P->isDeclaration() || !P->getReturnType()->isIntegerTy()) { R.why = "no body or not an integer"; return R; }
+    int kArg = -1;
+    for (const Instruction &I : instructions(*P)) {
+      if (isa<DbgInfoIntrinsic>(I) || isa<AllocaInst>(I) || isa<GetElementPtrInst>(I) || isa<CastInst>(I) ||
+          isa<BinaryOperator>(I) || isa<ICmpInst>(I) || isa<SelectInst>(I) || isa<PHINode>(I) ||
+          isa<BranchInst>(I) || isa<ReturnInst>(I))
+        continue;
+      if (const auto *St = dyn_cast<StoreInst>(&I)) {
+        if (isa<AllocaInst>(St->getPointerOperand()->stripPointerCasts())) continue;
+        R.why = "a store at " + locOf(&I);
+        return R;
+      }
+      if (const auto *L = dyn_cast<LoadInst>(&I)) {
+        if (isa<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) continue;
+        StructType *S2 = nullptr;
+        int64_t o2 = 0;
+        if (!accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, o2) || !S2 || !S2->hasName()) {
+          R.why = "an unnamed load at " + locOf(&I);
+          return R;
+        }
+        const auto *A = dyn_cast<Argument>(objKey(L, L->getPointerOperand(), S2));
+        const std::string SN = stripStructNameSuffix(S2->getName()).str();
+        if (!A || (kArg >= 0 && (int)A->getArgNo() != kArg) || (!R.S.empty() && R.S != SN)) {
+          R.why = "a load not of the parameter at " + locOf(&I);
+          return R;
+        }
+        kArg = (int)A->getArgNo();
+        R.S = SN;
+        R.offs.insert(o2);
+        R.readsField = true;
+        continue;
+      }
+      R.why = "an instruction it cannot evaluate at " + locOf(&I);
+      return R;
+    }
+    if (kArg < 0) { R.why = "reads no field"; return R; }
+    R.ok = true;
+    R.k = (unsigned)kArg;
+    return R;
+  };
+  // Interpret predicate P with the tested fields at the given values.
+  std::map<std::pair<const Function *, std::vector<std::pair<int64_t, int64_t>>>, std::optional<int64_t>> predCache;
+  auto predEval = [&](const Function *P, const std::map<int64_t, int64_t> &vals) -> std::optional<int64_t> {
+    std::vector<std::pair<int64_t, int64_t>> key(vals.begin(), vals.end());
+    auto [cit, cins] = predCache.try_emplace({P, key});
+    if (!cins) return cit->second;
+    const Pred &PR = predicateOf(P);
+    std::map<const Value *, int64_t> env;
+    std::map<const AllocaInst *, int64_t> slots;
+    auto val = [&](const Value *V) -> std::optional<int64_t> {
+      if (auto c = constOf(V)) return c;
+      if (auto it = env.find(V); it != env.end()) return it->second;
+      return std::nullopt;
+    };
+    const BasicBlock *B = &P->getEntryBlock(), *prev = nullptr;
+    std::optional<int64_t> result;
+    for (int steps = 0; B && steps < 2000;) {
+      const BasicBlock *next = nullptr;
+      bool done = false, fail = false;
+      for (const Instruction &I : *B) {
+        if (++steps > 2000) { fail = true; break; }
+        if (isa<DbgInfoIntrinsic>(I) || isa<AllocaInst>(I) || isa<GetElementPtrInst>(I)) continue;
+        if (const auto *PN = dyn_cast<PHINode>(&I)) {
+          auto v = prev ? val(PN->getIncomingValueForBlock(prev)) : std::nullopt;
+          if (!v) { fail = true; break; }
+          env[&I] = *v;
+          continue;
+        }
+        if (const auto *St = dyn_cast<StoreInst>(&I)) {
+          if (auto v = val(St->getValueOperand()))
+            slots[cast<AllocaInst>(St->getPointerOperand()->stripPointerCasts())] = *v;
+          continue; // a pointer stored to a slot: not tracked
+        }
+        if (const auto *L = dyn_cast<LoadInst>(&I)) {
+          if (const auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+            if (auto it = slots.find(A); it != slots.end()) env[&I] = it->second;
+            continue; // an untracked (pointer) slot: its loads only address fields
+          }
+          StructType *S2 = nullptr;
+          int64_t o2 = 0;
+          accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, o2);
+          auto it = vals.find(o2);
+          if (it == vals.end()) { fail = true; break; }
+          env[&I] = it->second;
+          continue;
+        }
+        if (const auto *C = dyn_cast<CastInst>(&I)) {
+          auto v = val(C->getOperand(0));
+          if (!v) continue; // a pointer cast
+          const unsigned sb = widthOf(C->getOperand(0)->getType()), db = widthOf(C->getType());
+          int64_t r = *v;
+          if (isa<TruncInst>(C)) r = db < 64 ? r & ((int64_t(1) << db) - 1) : r;
+          else if (isa<ZExtInst>(C)) r = sb < 64 ? r & ((int64_t(1) << sb) - 1) : r;
+          else if (isa<SExtInst>(C)) r = APInt(sb, (uint64_t)r).sext(64).getSExtValue();
+          env[&I] = r;
+          continue;
+        }
+        if (const auto *BO = dyn_cast<BinaryOperator>(&I)) {
+          auto a = val(BO->getOperand(0)), b = val(BO->getOperand(1));
+          if (!a || !b) { fail = true; break; }
+          int64_t r;
+          switch (BO->getOpcode()) {
+          case Instruction::And: r = *a & *b; break;
+          case Instruction::Or: r = *a | *b; break;
+          case Instruction::Xor: r = *a ^ *b; break;
+          case Instruction::Add: r = (int64_t)((uint64_t)*a + (uint64_t)*b); break;
+          case Instruction::Sub: r = (int64_t)((uint64_t)*a - (uint64_t)*b); break;
+          default: fail = true; r = 0; break;
+          }
+          if (fail) break;
+          env[&I] = r;
+          continue;
+        }
+        if (const auto *IC = dyn_cast<ICmpInst>(&I)) {
+          auto a = val(IC->getOperand(0)), b = val(IC->getOperand(1));
+          if (!a || !b) { fail = true; break; }
+          const unsigned bw = widthOf(IC->getOperand(0)->getType());
+          env[&I] = ICmpInst::compare(APInt(bw, (uint64_t)*a, true), APInt(bw, (uint64_t)*b, true), IC->getPredicate());
+          continue;
+        }
+        if (const auto *SI = dyn_cast<SelectInst>(&I)) {
+          auto c = val(SI->getCondition());
+          if (!c) { fail = true; break; }
+          auto v = val(*c ? SI->getTrueValue() : SI->getFalseValue());
+          if (!v) { fail = true; break; }
+          env[&I] = *v;
+          continue;
+        }
+        if (const auto *Br = dyn_cast<BranchInst>(&I)) {
+          if (Br->isUnconditional()) next = Br->getSuccessor(0);
+          else {
+            auto c = val(Br->getCondition());
+            if (!c) { fail = true; break; }
+            next = Br->getSuccessor(*c ? 0 : 1);
+          }
+          break;
+        }
+        if (const auto *Ret = dyn_cast<ReturnInst>(&I)) {
+          result = Ret->getReturnValue() ? val(Ret->getReturnValue()) : std::nullopt;
+          done = true;
+          break;
+        }
+        fail = true;
+        break;
+      }
+      if (fail || done) break;
+      prev = B;
+      B = next;
+    }
+    (void)PR;
+    return cit->second = result;
+  };
   auto fnTestsOf = [&](const Function *Fn) -> const std::vector<FnTest> & {
     auto [it, ins] = fnTests.try_emplace(Fn);
     if (!ins) return it->second;
     for (const BasicBlock &BB : *Fn) {
       const auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
       if (!Br || !Br->isConditional()) continue;
-      const LoadInst *dl = nullptr;
+      const Instruction *dl = nullptr;
       bool clean = true;
       std::vector<const Value *> work{Br->getCondition()};
       std::set<const Value *> seen;
@@ -940,10 +1233,17 @@ void CallGraphPass::computeTaggedFields() {
         const Value *X = work.back();
         work.pop_back();
         if (!seen.insert(X).second) continue;
-        if (isa<ConstantInt>(X)) continue;
+        if (isa<ConstantInt>(X) || constOf(X)) continue;
         if (const auto *L = dyn_cast<LoadInst>(X)) {
           if (dl && dl != L) clean = false;
           dl = L;
+          continue;
+        }
+        if (const auto *CB = dyn_cast<CallBase>(X); CB && CB->getCalledFunction() &&
+                                                       !CB->getCalledFunction()->isDeclaration() &&
+                                                       CB->getType()->isIntegerTy()) {
+          if (dl && dl != CB) clean = false;
+          dl = CB;
           continue;
         }
         if (isa<ICmpInst>(X) || isa<CastInst>(X) ||
@@ -956,12 +1256,26 @@ void CallGraphPass::computeTaggedFields() {
         clean = false;
       }
       if (!clean || !dl) continue;
+      if (const auto *CB = dyn_cast<CallBase>(dl)) { // a predicate call
+        const Pred &PR = predicateOf(CB->getCalledFunction());
+        if (!PR.ok) {
+          if (PR.readsField) predOpen++;
+          continue;
+        }
+        predClosed++;
+        if (PR.k >= CB->arg_size()) continue;
+        // One tested field: that field; several: off -1, matched by a product.
+        const int64_t off = PR.offs.size() == 1 ? *PR.offs.begin() : -1;
+        it->second.push_back({Br, dl, PR.S, off, ids.of(CB->getArgOperand(PR.k)->stripPointerCasts(), 0)});
+        continue;
+      }
+      const auto *DL0 = cast<LoadInst>(dl);
       StructType *S2 = nullptr;
       int64_t o2 = 0;
-      if (!accessSlot(dl, dl->getPointerOperand(), dl->getModule()->getDataLayout(), S2, o2) || !S2 ||
+      if (!accessSlot(DL0, DL0->getPointerOperand(), DL0->getModule()->getDataLayout(), S2, o2) || !S2 ||
           !S2->hasName())
         continue;
-      it->second.push_back({Br, dl, stripStructNameSuffix(S2->getName()).str(), o2, objKey(dl, dl->getPointerOperand(), S2)});
+      it->second.push_back({Br, dl, stripStructNameSuffix(S2->getName()).str(), o2, objKey(DL0, DL0->getPointerOperand(), S2)});
     }
     return it->second;
   };
@@ -1006,16 +1320,6 @@ void CallGraphPass::computeTaggedFields() {
         for (const Function *C : indirectCallers) add(C);
       }
     }
-  };
-  std::map<Field, MayWrite> mayWriteOf;
-  auto mayWrite = [&](const Field &Df) -> const MayWrite & {
-    auto [it, ins] = mayWriteOf.try_emplace(Df);
-    if (ins) {
-      std::vector<const Instruction *> seeds;
-      for (const TagStore &t : dStores[Df]) seeds.push_back(t.I);
-      closureOf(seeds, it->second);
-    }
-    return it->second;
   };
   const bool outsideRoots = CFLOutside == "roots";
   // The identity of a call argument: through casts and zero-offset GEPs;
@@ -1111,8 +1415,17 @@ void CallGraphPass::computeTaggedFields() {
     return it->second;
   };
   std::map<const Instruction *, const Value *> dObjOf;
+  std::map<const Instruction *, const TagStore *> tagStoreAt;
   for (auto &[X, ts] : dStores)
-    for (const TagStore &t : ts) dObjOf[t.I] = t.obj;
+    for (const TagStore &t : ts) dObjOf[t.I] = t.obj, tagStoreAt[t.I] = &t;
+  // A tag write whose value may be a function of the tag it overwrites
+  // (an 's' term, or not evaluable): it maps the tag found.
+  auto mapsOld = [&](const Instruction *I) {
+    auto it = tagStoreAt.find(I);
+    if (it == tagStoreAt.end() || it->second->unknown) return true;
+    for (const Term &tm : it->second->terms) if (tm.src == 's') return true;
+    return false;
+  };
   struct FieldCtx {
     Field X;
     std::map<const Instruction *, const Value *> stores; // named stores of X -> object identity
@@ -1351,7 +1664,7 @@ void CallGraphPass::computeTaggedFields() {
     return effs[key];
   };
   size_t effClosed = 0, effOpen = 0, ceRounds = 0, ceUnsettled = 0;
-  double ceSecs = 0, tagsSecs = 0, readSecs = 0, scanSecs = 0, pairSecs = 0;
+  double ceSecs = 0, tagsSecs = 0;
   size_t tagsComputes = 0;
   std::vector<std::string> effOpenAt;
   // Can D be written between the test (its load dl, its branch into Succ)
@@ -1365,7 +1678,7 @@ void CallGraphPass::computeTaggedFields() {
   // effect is open. The last passage: from Succ to `at` without
   // re-entering the test's block.
   std::string unstableWhy; // why the last test was dropped (reports)
-  auto stableBetween = [&](const LoadInst *dl, const BranchInst *Br, const BasicBlock *Succ, const Instruction *at,
+  auto stableBetween = [&](const Instruction *dl, const BranchInst *Br, const BasicBlock *Succ, const Instruction *at,
                            const Field &X, bool isD, const Value *obj, std::set<uint32_t> &as,
                            std::vector<Term> *E) {
     if (dl->getParent() != Br->getParent()) { unstableWhy = "the test's load is in another block"; return false; }
@@ -1451,7 +1764,21 @@ void CallGraphPass::computeTaggedFields() {
     return true;
   };
   // A test of D on the access's object dominating it, stable up to it.
-  struct Test { const Value *cond; const LoadInst *d; bool onTrue; };
+  // A tag value packs field o1 (its low w1 bits) and, for a product,
+  // field o2 above them; off: the field the test's load reads.
+  struct Test {
+    const Value *cond;
+    const Instruction *d;
+    bool onTrue;
+    int64_t off, o1, o2 = INT64_MIN;
+    unsigned w1 = 64;
+  };
+  // Products (plan 3.51 ruling a): a predicate reading an integer tag and
+  // a function-pointer tag of one object is judged on both at once; the
+  // virtual field (S, -1 - index) stands for the pair.
+  struct Prod { int64_t d1, d2; unsigned w1; };
+  std::vector<Prod> prods;
+  std::map<std::tuple<std::string, int64_t, int64_t>, int64_t> prodIdx;
   size_t testsUnstable = 0;
   // Reads (Ef null): stable against F writes. Retags (Ef set): each
   // test's composed D effect up to the access, parallel to tests.
@@ -1462,8 +1789,15 @@ void CallGraphPass::computeTaggedFields() {
     lastTestsWhy = "no dominating test of the tag on this object";
     const Function *Fn = at->getFunction();
     DominatorTree &DT = domOf(Fn);
+    const Prod *pp = Df.second < 0 ? &prods[-1 - Df.second] : nullptr;
     for (const FnTest &ft : fnTestsOf(Fn)) {
-      if (ft.S != Df.first || ft.off != Df.second || ft.obj != obj) continue;
+      if (ft.S != Df.first || ft.obj != obj) continue;
+      if (const auto *CB = dyn_cast<CallBase>(ft.dl)) {
+        // A predicate: of this field (other fields unknown), or, for a
+        // product, of both (one-field tests are the components' own).
+        const Pred &PR = predicateOf(CB->getCalledFunction());
+        if (pp ? !PR.offs.count(pp->d1) || !PR.offs.count(pp->d2) : !PR.offs.count(Df.second)) continue;
+      } else if (pp || ft.off != Df.second) continue;
       for (unsigned si = 0; si < 2; si++) {
         const BasicBlock *Succ = ft.Br->getSuccessor(si);
         if (Succ->getSinglePredecessor() != ft.Br->getParent() || !DT.dominates(Succ, at->getParent())) continue;
@@ -1475,19 +1809,42 @@ void CallGraphPass::computeTaggedFields() {
           continue;
         }
         as.insert(a2.begin(), a2.end());
-        tests.push_back({ft.Br->getCondition(), ft.dl, si == 0});
+        tests.push_back({ft.Br->getCondition(), ft.dl, si == 0, ft.off, pp ? pp->d1 : Df.second,
+                         pp ? pp->d2 : INT64_MIN, pp ? pp->w1 : 64u});
         if (Ef) Ef->push_back(std::move(E));
       }
     }
   };
+  // The test being evaluated (its packing of the tag), and field o's
+  // value in tag v.
+  const Test *curT = nullptr;
+  auto partOf = [&](int64_t v, int64_t o) -> int64_t {
+    if (curT->o2 == INT64_MIN) return v;
+    if (o == curT->o1) return v & (int64_t)((uint64_t(1) << curT->w1) - 1);
+    return (int64_t)((uint64_t)v >> curT->w1);
+  };
   // Evaluate a test with the tag = v.
-  std::function<std::optional<int64_t>(const Value *, const LoadInst *, int64_t)> eval =
-      [&](const Value *X, const LoadInst *dl, int64_t v) -> std::optional<int64_t> {
-    if (X == dl) return v;
-    if (const auto *K = dyn_cast<ConstantInt>(X)) return K->getSExtValue();
+  std::function<std::optional<int64_t>(const Value *, const Instruction *, int64_t)> eval =
+      [&](const Value *X, const Instruction *dl, int64_t v) -> std::optional<int64_t> {
+    if (X == dl) {
+      if (const auto *CB = dyn_cast<CallBase>(dl)) {
+        // The tag's fields; a field it does not hold stays unknown (the
+        // interpretation fails if the predicate reads it).
+        const Pred &PR = predicateOf(CB->getCalledFunction());
+        std::map<int64_t, int64_t> vals;
+        for (int64_t o : PR.offs)
+          if (o == curT->o1 || o == curT->o2) vals[o] = partOf(v, o);
+        return predEval(CB->getCalledFunction(), vals);
+      }
+      return partOf(v, curT->off);
+    }
+    if (auto c = constOf(X)) return c;
     if (const auto *C = dyn_cast<CastInst>(X)) {
       auto a = eval(C->getOperand(0), dl, v);
       if (!a) return std::nullopt;
+      if (isa<PtrToIntInst>(C) || isa<IntToPtrInst>(C) ||
+          (C->getType()->isPointerTy() && C->getOperand(0)->getType()->isPointerTy()))
+        return a;
       if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return std::nullopt;
       const unsigned bw = C->getType()->getIntegerBitWidth(),
                      sb = C->getOperand(0)->getType()->getIntegerBitWidth();
@@ -1509,7 +1866,7 @@ void CallGraphPass::computeTaggedFields() {
     if (const auto *IC = dyn_cast<ICmpInst>(X)) {
       auto a = eval(IC->getOperand(0), dl, v), b = eval(IC->getOperand(1), dl, v);
       if (!a || !b) return std::nullopt;
-      const unsigned bw = IC->getOperand(0)->getType()->getIntegerBitWidth();
+      const unsigned bw = widthOf(IC->getOperand(0)->getType());
       const APInt A(bw, (uint64_t)*a, true), B(bw, (uint64_t)*b, true);
       return (int64_t)ICmpInst::compare(A, B, IC->getPredicate());
     }
@@ -1517,14 +1874,25 @@ void CallGraphPass::computeTaggedFields() {
   };
   // The same tests over a widened tag (plan 3.51, ruling gamma): bits
   // known or free; a test that may hold does not exclude.
-  std::function<std::optional<KnownBits>(const Value *, const LoadInst *, const KnownBits &)> evalKB =
-      [&](const Value *X, const LoadInst *dl, const KnownBits &kb) -> std::optional<KnownBits> {
+  std::function<std::optional<KnownBits>(const Value *, const Instruction *, const KnownBits &)> evalKB =
+      [&](const Value *X, const Instruction *dl, const KnownBits &kb) -> std::optional<KnownBits> {
+    if (X == dl && isa<CallBase>(dl)) return std::nullopt; // a predicate over unknown bits: may hold
     if (X == dl) {
-      const unsigned w = dl->getType()->getIntegerBitWidth();
-      return w == 64 ? kb : kb.trunc(w);
+      const unsigned w = widthOf(dl->getType());
+      KnownBits k = kb;
+      if (curT->o2 != INT64_MIN)
+        k = curT->off == curT->o1 ? kb.trunc(curT->w1).zext(64) : kb.extractBits(64 - curT->w1, curT->w1).zext(64);
+      return w == 64 ? k : k.trunc(w);
     }
     if (const auto *K = dyn_cast<ConstantInt>(X)) return KnownBits::makeConstant(K->getValue());
+    if (auto c = constOf(X)) return KnownBits::makeConstant(APInt(64, (uint64_t)*c));
     if (const auto *C = dyn_cast<CastInst>(X)) {
+      if (isa<PtrToIntInst>(C) || isa<IntToPtrInst>(C) ||
+          (C->getType()->isPointerTy() && C->getOperand(0)->getType()->isPointerTy())) {
+        auto a = evalKB(C->getOperand(0), dl, kb);
+        if (!a || a->getBitWidth() != 64) return std::nullopt;
+        return a;
+      }
       if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return std::nullopt;
       auto a = evalKB(C->getOperand(0), dl, kb);
       if (!a) return std::nullopt;
@@ -1568,10 +1936,15 @@ void CallGraphPass::computeTaggedFields() {
   };
   // The bits of the tag a test can observe (tests read masks of it; an
   // expression this does not follow observes every bit).
-  std::function<bool(const Value *, const LoadInst *, uint64_t, uint64_t &)> demand =
-      [&](const Value *X, const LoadInst *dl, uint64_t want, uint64_t &acc) -> bool {
+  std::function<bool(const Value *, const Instruction *, uint64_t, uint64_t &)> demand =
+      [&](const Value *X, const Instruction *dl, uint64_t want, uint64_t &acc) -> bool {
+    if (X == dl && isa<CallBase>(dl)) return false; // a predicate observes its fields whole
     if (X == dl) { acc |= want; return true; }
-    if (isa<ConstantInt>(X)) return true;
+    if (isa<ConstantInt>(X) || constOf(X)) return true;
+    if (const auto *C = dyn_cast<CastInst>(X);
+        C && (isa<PtrToIntInst>(C) || isa<IntToPtrInst>(C) ||
+              (C->getType()->isPointerTy() && C->getOperand(0)->getType()->isPointerTy())))
+      return demand(C->getOperand(0), dl, want, acc);
     auto maskOf = [](unsigned w) { return w >= 64 ? ~uint64_t(0) : ((uint64_t(1) << w) - 1); };
     if (const auto *C = dyn_cast<CastInst>(X)) {
       if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) return false;
@@ -1595,13 +1968,14 @@ void CallGraphPass::computeTaggedFields() {
       return false;
     }
     if (const auto *IC = dyn_cast<ICmpInst>(X)) {
-      const uint64_t all = maskOf(IC->getOperand(0)->getType()->getIntegerBitWidth());
+      const uint64_t all = maskOf(widthOf(IC->getOperand(0)->getType()));
       return demand(IC->getOperand(0), dl, all, acc) && demand(IC->getOperand(1), dl, all, acc);
     }
     return false;
   };
   auto mayHold = [&](const std::vector<Test> &tests, const KnownBits &kb) {
     for (const Test &t : tests) {
+      curT = &t;
       auto r = evalKB(t.cond, t.d, kb);
       if (!r || !r->isConstant()) continue; // may hold
       if ((!r->getConstant().isZero()) != t.onTrue) return false;
@@ -1610,6 +1984,7 @@ void CallGraphPass::computeTaggedFields() {
   };
   auto holds = [&](const std::vector<Test> &tests, int64_t v) {
     for (const Test &t : tests) {
+      curT = &t;
       auto r2 = eval(t.cond, t.d, v);
       if (!r2) continue; // not evaluable: no constraint
       if ((*r2 != 0) != t.onTrue) return false;
@@ -1794,7 +2169,11 @@ void CallGraphPass::computeTaggedFields() {
           continue;
         }
         if (isa<UnreachableInst>(I)) { stopped = true; break; }
-        if (auto dit = Dc.stores.find(I); dit != Dc.stores.end() && sameObj(dit->second, id, I)) { stopped = true; break; }
+        if (auto dit = Dc.stores.find(I); dit != Dc.stores.end() && sameObj(dit->second, id, I)) {
+          if (mapsOld(I)) return true; // the new tag is computed from the found one
+          stopped = true;
+          break;
+        }
         if (auto fit = Fc.stores.find(I); fit != Fc.stores.end() && sameObj(fit->second, id, I)) { stopped = true; break; }
         const auto *CB = dyn_cast<CallBase>(I);
         if (!CB || isa<IntrinsicInst>(CB) || CB->isInlineAsm()) continue;
@@ -1814,6 +2193,8 @@ void CallGraphPass::computeTaggedFields() {
             if (mrF.fns.count(H)) return true; // it may read it through the parameter
             const Walk &Sm = sumOf(Dc, H, k);
             if (!Sm.entry) {
+              for (const Instruction *d : Sm.W)
+                if (mapsOld(d)) return true; // its last write may compute from the found tag
               stopped = true; // the callee must-write D of it
               as.insert(Sm.assumes.begin(), Sm.assumes.end());
             }
@@ -1876,6 +2257,52 @@ void CallGraphPass::computeTaggedFields() {
         if (Df.first == S && Df.second != Ff.second)
           for (const TagStore &t : ds)
             if (t.I->getFunction() == w.I->getFunction() && t.obj == w.obj) dOffs.insert(Df.second);
+    // Products: an integer tag (at most 32 bits, so a function-pointer
+    // tag's values, below 2^31, fit above it) with a function-pointer tag, where a read
+    // is tested by a predicate of both.
+    struct ProdReads { int64_t virt; std::vector<std::pair<const Instruction *, std::vector<Test>>> reads; std::set<uint32_t> as; };
+    std::vector<ProdReads> fProds;
+    std::set<int64_t> prodNeed;
+    std::set<const Instruction *> prodRead;
+    for (int64_t d1 : dOffs) {
+      const auto &s1 = dStores[{S, d1}];
+      if (fnFields.count({S, d1}) || s1.empty() || widthOf(s1.front().I->getValueOperand()->getType()) > 32) continue;
+      for (int64_t d2 : dOffs) {
+        if (!fnFields.count({S, d2})) continue;
+        auto [pit, pins] = prodIdx.try_emplace({S, d1, d2}, -1 - (int64_t)prods.size());
+        if (pins) prods.push_back({d1, d2, widthOf(s1.front().I->getValueOperand()->getType())});
+        ProdReads PRs{pit->second, {}, {}};
+        for (const FAccess &r : fLoads[Ff]) {
+          std::vector<Test> tt;
+          testsAtM(r.I, r.obj, {S, pit->second}, Ff, tt, PRs.as);
+          if (!tt.empty()) PRs.reads.push_back({r.I, std::move(tt)}), prodRead.insert(r.I);
+        }
+        if (PRs.reads.empty()) continue;
+        prodNeed.insert(d1);
+        prodNeed.insert(d2);
+        fProds.push_back(std::move(PRs));
+      }
+    }
+    // Per tag field (or product) that keys reads: the writers it names
+    // (a known tag) and each read's admitted writers; a read keyed by
+    // several admits their intersection (each a sound superset). Writer
+    // keys do not name the tag, so every read's list refers to the same
+    // cells.
+    struct CompRes { std::vector<bool> any; std::vector<std::set<int64_t>> vals; std::vector<std::optional<KnownBits>> kb; std::set<uint32_t> as; };
+    std::map<int64_t, CompRes> comps; // the components of products
+    std::map<const Instruction *, std::vector<size_t>> readAdm;
+    std::vector<bool> namedW(fs.size(), false);
+    std::vector<TaggedPair> fPairs;
+    std::vector<std::set<uint32_t>> fPairAs;
+    std::vector<std::string> fDims;
+    auto keyRead = [&](const Instruction *I, std::vector<size_t> adm) {
+      auto [it, ins] = readAdm.try_emplace(I, std::move(adm));
+      if (ins) return;
+      std::vector<size_t> both;
+      std::set_intersection(it->second.begin(), it->second.end(), adm.begin(), adm.end(), std::back_inserter(both));
+      it->second = std::move(both);
+    };
+    std::set<const Instruction *> anyTest(prodRead.begin(), prodRead.end()); // reads some tag test guards
     for (int64_t dOff : dOffs) {
       const Field Df{S, dOff};
       const auto &ds = dStores[Df];
@@ -1905,7 +2332,8 @@ void CallGraphPass::computeTaggedFields() {
       for (const FAccess &r : fLoads[Ff]) {
         std::vector<Test> tt;
         testsAtM(r.I, r.obj, Df, Ff, tt, pas);
-        if (!tt.empty()) tested[r.I] = r.obj, testedV.push_back(r.I);
+        if (!tt.empty() || (prodNeed.count(dOff) && prodRead.count(r.I))) tested[r.I] = r.obj, testedV.push_back(r.I);
+        if (!tt.empty()) anyTest.insert(r.I);
       }
       if (tested.empty()) { // no read with a stable test: no read can be keyed
         readsNoTest += fLoads[Ff].size();
@@ -2161,7 +2589,7 @@ void CallGraphPass::computeTaggedFields() {
       // The tag must be certified: every store covering its bytes is one
       // of its own named writes, or watched in the solve.
       unsigned dWidth = 0;
-      for (const TagStore &t : ds) dWidth = t.I->getValueOperand()->getType()->getIntegerBitWidth();
+      for (const TagStore &t : ds) dWidth = widthOf(t.I->getValueOperand()->getType());
       const int64_t dBytes = dWidth / 8;
       std::set<const Instruction *> own;
       for (const TagStore &t : ds) own.insert(t.I);
@@ -2300,6 +2728,9 @@ void CallGraphPass::computeTaggedFields() {
       for (int64_t b : pairFills) { // the fill byte repeated over the tag
         int64_t v = 0;
         for (unsigned k = 0; k < dWidth / 8; k++) v = (v << 8) | b;
+        // A function-pointer tag: NULL, -1, or a pointer equal to no
+        // function and no small constant.
+        if (fnFields.count(Df)) v = b == 0 ? 0 : b == 0xff ? kAllOnes : kAllOnes - 1;
         sets.insert(v);
       }
       // Projection (precision only): tag sets may be computed on the bits a
@@ -2322,7 +2753,7 @@ void CallGraphPass::computeTaggedFields() {
               const Value *X = work.back();
               work.pop_back();
               if (!seen.insert(X).second || X == t.d) continue;
-              if (const auto *K = dyn_cast<ConstantInt>(X)) r |= (int64_t)K->getZExtValue();
+              if (auto c = constOf(X)) r |= *c;
               else if (const auto *U = dyn_cast<User>(X); U && isa<Instruction>(X))
                 for (const Value *Op : U->operands()) work.push_back(Op);
             }
@@ -2567,6 +2998,15 @@ void CallGraphPass::computeTaggedFields() {
         return T;
       };
       const Tags &full = computeTags(wmask);
+      if (prodNeed.count(dOff)) {
+        CompRes &C = comps[dOff];
+        C.as = pas;
+        for (size_t i = 0; i < writers.size(); i++) {
+          C.any.push_back(wAll[i]);
+          C.vals.push_back(full.w[i].wide ? std::set<int64_t>() : full.w[i].vals);
+          C.kb.push_back(full.w[i].wide ? std::optional<KnownBits>(full.w[i].kb) : std::nullopt);
+        }
+      }
       const bool uAll = full.uWide;
       const std::vector<TagSet> &wTags = full.w;
       // The sets a read is judged on: full width, unless they widened; then
@@ -2685,30 +3125,16 @@ void CallGraphPass::computeTaggedFields() {
         }
         continue;
       }
-      // Install: each tagged writer its key; each keyed read the keys of the
-      // writers it admits (untagged writers are plain stores every key reads).
-      const std::string prefix = S + "+" + std::to_string(Ff.second) + "#";
+      // Record: the writers with a known tag are named; each keyed read
+      // its admitted writers (the unknown ones among them: every tag).
       bool any = false;
-      for (size_t i = 0; i < writers.size(); i++) {
-        if (writers[i].unknown || unionKeyNames.count(writers[i].I)) { writersUntagged += writers[i].unknown; continue; }
-        unionKeyNames[writers[i].I] = {prefix + "t" + std::to_string(dOff) + "w" + std::to_string(i)};
-        writersTagged++;
-        any = true;
-      }
-      for (auto &[I, adm] : keyed) {
-        if (unionKeyNames.count(I)) continue;
-        std::vector<std::string> ks;
-        for (size_t i : adm)
-          if (!writers[i].unknown) ks.push_back(prefix + "t" + std::to_string(dOff) + "w" + std::to_string(i));
-        if (ks.empty()) ks.push_back(prefix + "t" + std::to_string(dOff) + "none");
-        unionKeyNames[I] = ks;
-        readsKeyed++;
-      }
+      for (size_t i = 0; i < writers.size(); i++) any |= !writers[i].unknown;
       if (!any) continue;
-      pairsKeyed++;
-      cellUnionSlots.insert({S.substr(S.rfind('.') + 1), Ff.second, 8});
-      taggedPairs.push_back({S, Ff.second, dOff, (int64_t)(dWidth / 8)});
-      taggedPairAssumes.push_back(std::vector<uint32_t>(pas.begin(), pas.end()));
+      for (size_t i = 0; i < writers.size(); i++) if (!writers[i].unknown) namedW[i] = true;
+      for (auto &[I, adm] : keyed) keyRead(I, adm);
+      fPairs.push_back({S, Ff.second, dOff, (int64_t)(dWidth / 8)});
+      fPairAs.push_back(pas);
+      fDims.push_back("+" + std::to_string(dOff));
       std::string extra;
       for (const std::string &d : xformAt) extra += "; retag " + d;
       for (const std::string &v : via) extra += "; bound " + v;
@@ -2721,6 +3147,105 @@ void CallGraphPass::computeTaggedFields() {
                                " guarded, " + std::to_string(unguarded) + " unguarded transforms), " +
                                (uAll ? std::string("widened") : std::to_string(full.uSize)) + " tags" + extra);
     }
+    if (!dOffs.empty())
+      for (const FAccess &r : fLoads[Ff])
+        if (!anyTest.count(r.I)) taggedUntested.push_back({S + "+" + std::to_string(Ff.second), r.I});
+    // Products: writer i admitted iff some (v1, v2) of its component tag
+    // sets satisfies the tests (the cartesian product of the components'
+    // sets: a sound superset of the pairs it can hold; a component any
+    // tag or widened is its known bits).
+    for (const ProdReads &PRs : fProds) {
+      const Prod &P = prods[-1 - PRs.virt];
+      auto c1 = comps.find(P.d1), c2 = comps.find(P.d2);
+      if (c1 == comps.end() || c2 == comps.end()) continue; // a component not certified or not computed
+      auto cands = [](const CompRes &C, size_t i, unsigned w) {
+        std::vector<KnownBits> r;
+        if (C.any[i]) r.push_back(KnownBits(64));
+        else if (C.kb[i]) r.push_back(*C.kb[i]);
+        else for (int64_t v : C.vals[i]) r.push_back(KnownBits::makeConstant(APInt(64, (uint64_t)v)));
+        if (w < 64) for (KnownBits &k : r) k = k.trunc(w).zext(64);
+        return r;
+      };
+      auto joinAll = [](std::vector<KnownBits> &v) {
+        if (v.size() < 2) return;
+        KnownBits j = v[0];
+        for (const KnownBits &k : v) j = j.intersectWith(k);
+        v = {j};
+      };
+      auto pack = [&](const KnownBits &a, const KnownBits &b) {
+        KnownBits r(64);
+        const APInt lo = APInt::getLowBitsSet(64, P.w1);
+        r.One = (a.One & lo) | b.One.shl(P.w1);
+        r.Zero = (a.Zero & lo) | b.Zero.shl(P.w1);
+        return r;
+      };
+      size_t prodKeyed = 0;
+      for (const auto &[I, tt] : PRs.reads) {
+        std::vector<size_t> adm;
+        for (size_t i = 0; i < fs.size(); i++) {
+          std::vector<KnownBits> A = cands(c1->second, i, P.w1), B = cands(c2->second, i, 64);
+          if (A.size() * B.size() > 65536) joinAll(A), joinAll(B);
+          bool ok = false;
+          for (const KnownBits &a : A)
+            for (const KnownBits &b : B) {
+              if (ok) break;
+              const KnownBits k = pack(a, b);
+              ok = k.isConstant() ? holds(tt, (int64_t)k.getConstant().getZExtValue()) : mayHold(tt, k);
+            }
+          if (ok) adm.push_back(i);
+        }
+        if (adm.size() == fs.size()) continue;
+        keyRead(I, adm);
+        prodKeyed++;
+      }
+      if (!prodKeyed) continue;
+      for (size_t i = 0; i < fs.size(); i++) namedW[i] = namedW[i] || !c1->second.any[i] || !c2->second.any[i];
+      std::set<uint32_t> as = PRs.as;
+      for (const auto *C : {&c1->second, &c2->second}) as.insert(C->as.begin(), C->as.end());
+      for (int64_t d : {P.d1, P.d2}) {
+        fPairs.push_back({S, Ff.second, d, d == P.d1 ? (int64_t)(P.w1 / 8) : 8});
+        fPairAs.push_back(as);
+      }
+      fDims.push_back("+" + std::to_string(P.d1) + " x +" + std::to_string(P.d2));
+      taggedReport.push_back("KEYED " + S + "+" + std::to_string(Ff.second) + " by +" + std::to_string(P.d1) +
+                             " x +" + std::to_string(P.d2) + ": " + std::to_string(prodKeyed) +
+                             " reads keyed by predicates of both");
+    }
+    // Install, once per F. Another mechanism's keys on a writer or a read
+    // of F would not meet these: F stays unkeyed then.
+    if (readAdm.empty()) continue;
+    const Instruction *other = nullptr;
+    for (const FAccess &w : fs) if (!other && unionKeyNames.count(w.I)) other = w.I;
+    for (const FAccess &r : fLoads[Ff]) if (!other && unionKeyNames.count(r.I)) other = r.I;
+    if (other) {
+      taggedReport.push_back("UNKEYED " + S + "+" + std::to_string(Ff.second) + ": an access already keyed otherwise at " +
+                             locOf(other));
+      continue;
+    }
+    const std::string prefix = S + "+" + std::to_string(Ff.second) + "#t";
+    for (size_t i = 0; i < fs.size(); i++) {
+      if (!namedW[i]) { writersUntagged++; continue; }
+      unionKeyNames[fs[i].I] = {prefix + "w" + std::to_string(i)};
+      writersTagged++;
+    }
+    for (auto &[I, adm] : readAdm) {
+      std::vector<std::string> ks;
+      for (size_t i : adm)
+        if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i));
+      if (ks.empty()) ks.push_back(prefix + "none");
+      unionKeyNames[I] = ks;
+      readsKeyed++;
+    }
+    pairsKeyed++;
+    cellUnionSlots.insert({S.substr(S.rfind('.') + 1), Ff.second, 8});
+    for (size_t q = 0; q < fPairs.size(); q++) {
+      taggedPairs.push_back(fPairs[q]);
+      taggedPairAssumes.push_back(std::vector<uint32_t>(fPairAs[q].begin(), fPairAs[q].end()));
+    }
+    std::string dims;
+    for (const std::string &d : fDims) dims += (dims.empty() ? "" : ", ") + d;
+    taggedReport.push_back("KEYS " + S + "+" + std::to_string(Ff.second) + " by " + dims + ": " +
+                           std::to_string(readAdm.size()) + " reads keyed");
   }
   if (pairsKeyed) {
     std::set<std::tuple<const Value *, int64_t, int64_t, bool, unsigned>> seenWatch;
@@ -2757,8 +3282,10 @@ void CallGraphPass::computeTaggedFields() {
          << readsKeyed << " keyed, " << readsNoTest << " with no stable dominating test (" << testsUnstable
          << " tests dropped: D may be written before the access), " << readsAll
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
-         << pairsUncertified << " by an uncertified tag\n");
+         << pairsUncertified << " by an uncertified tag; " << unionFields
+         << " union members read as one pointer field\n");
   if (VerboseLevel >= 2)
     for (const std::string &l : taggedReport) CG_LOG("TaggedFields:   " << l << "\n");
-  taggedCounts = {pairsKeyed, writersTagged, writersUntagged, readsKeyed, readsNoTest, readsAll, pairsNonConst};
+  taggedCounts = {pairsKeyed, writersTagged, writersUntagged, readsKeyed, readsNoTest, readsAll, pairsNonConst,
+                  predClosed, predOpen};
 }

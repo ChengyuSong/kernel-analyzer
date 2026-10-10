@@ -492,7 +492,7 @@ protected:
   std::set<const llvm::Function *> adoptedAtomBodies;
   void unadoptKeyedBodies();
   std::vector<std::string> taggedReport;
-  std::array<size_t, 7> taggedCounts{};
+  std::array<size_t, 9> taggedCounts{}; // ..., predicate tests closed, open
   // Keyed tagged-field pairs (struct, F offset, D offset, D size): the solver
   // flips a pair to unkeyed when a byte copy writes its tag other than as a
   // co-move (plan 3.51, the in-solve certificate check).
@@ -512,6 +512,12 @@ protected:
   struct TaggedAssume { const llvm::Value *id; int64_t field; uint32_t accSet; std::string site; };
   std::vector<std::vector<TaggedAccess>> taggedAccessSets;
   std::vector<TaggedAssume> taggedAssumes;
+  // Entries whose function-pointer parameters were evaluated under the
+  // outside-domain premise (plan 3.51 ruling a.2), with the parameter.
+  std::map<const llvm::Function *, std::set<unsigned>> taggedOutsideEntries;
+  // Reads of a field with candidate tags that no tag test guards: they
+  // admit every writer (field, site).
+  std::vector<std::pair<std::string, const llvm::Instruction *>> taggedUntested;
   std::vector<std::vector<uint32_t>> taggedPairAssumes; // per taggedPairs entry
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();

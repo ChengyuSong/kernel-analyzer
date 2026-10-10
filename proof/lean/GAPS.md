@@ -662,7 +662,41 @@ Obligations left open:
    - A writer whose content can be read (a tested read, a call that may
      make one, a return) before its object's D or F is rewritten is
      observed under the tag it found: the values of the last D writers
-     before it, or every tag when that set is open.
+     before it, or every tag when that set is open. A tag write whose
+     value may compute from the tag it overwrites (an own-tag map, or not
+     evaluable), or a callee whose last D writes do, observes the found
+     tag too: it is the map's input (2026-10-10 fix; the walk used to
+     stop at any D write, and a writer whose only later D write was
+     `flags |= x` got an empty set).
+   - Install is per field F, after every candidate D is judged. Writer
+     keys do not name D, and a read keyed by several Ds admits the
+     intersection of their admitted sets, each a sound superset of the
+     writers whose content can reach it. (2026-10-10 fix: per-D key
+     names made a second D's reads list cells no writer writes.)
+   - Products: a predicate reading an integer tag D1 and a
+     function-pointer tag D2 is judged on the pair. Writer i is admitted
+     iff some pair in A_i x B_i passes, where A_i and B_i are its
+     component sets, each sound for its own D. Their product contains
+     every (D1, D2) the writer's content can be read under.
+   - Function values: a function-pointer parameter of an exported entry
+     whose address is taken (or any exported function in a partial
+     corpus) holds its call sites' arguments or the outside domain: NULL,
+     -1, one value for every function outside the corpus, and the
+     exported functions. This premise (the 3.48 "outside honors types"
+     premise applied to function values) is checked after the solve:
+     internal functions reaching exposed cells or bodiless calls, and
+     indirect calls in the corpus resolving to such an entry, are
+     reported as breaks, not repaired.
+   - Unions: a union member with pointer stores is one field F. Every
+     store of any width or type is an F writer, and its pointer and
+     pointer-width integer loads are F reads. This is the same rule with
+     no new premise: a tested read admits writers by tag and takes
+     whatever facts the admitted writers' stored values have (an integer
+     store's facts are its integer-provenance facts). In the solver, a
+     keyed slot's content cell is split into U (unkeyed writes) and
+     P = U + keys. A cell minted before its object was typed is split
+     when the object is typed. P inherits every link U had, so a read
+     linked before the split still sees every write.
    - A test is stable when no D write can come between it and the access
      (the last passage), and a retag's own-tag map applies only to tags
      its stable tests admit.

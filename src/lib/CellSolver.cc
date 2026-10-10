@@ -1113,7 +1113,7 @@ bool CallGraphPass::runCellResolution() {
     }
     return false;
   };
-  size_t splitCells = 0, keyedCells = 0;
+  size_t splitCells = 0, keyedCells = 0, lateSplits = 0;
   size_t trailingArrays = 0; // trailing objects of a header taken as arrays of unknown extent
   auto contentOf = [&](uint32_t o, int64_t c) -> std::pair<uint32_t, uint32_t> {
     auto it = objs[o].content.find(c);
@@ -1655,6 +1655,28 @@ bool CallGraphPass::runCellResolution() {
         refoldMerges++;
       }
       objs[o].offCells[off * 2 + (bit ? 1 : 0)] = surv;
+    }
+    // A content cell minted while the object was unknown and now inside a
+    // keyed slot gets its read side: P reads U and keeps every link U
+    // had (what read the whole cell still does), and the object's cells
+    // there read P, so keys made from now on reach their reads.
+    for (auto &[c, un] : objs[o].content) {
+      auto &[u, pn] = un;
+      if (find(u) != find(pn) || !inUnionSlot(objs[o], c)) continue;
+      const uint32_t p2 = newNode();
+      const std::vector<uint32_t> outs = succ[find(u)];
+      addEdge(u, p2);
+      for (uint32_t x : outs) addEdge(p2, x);
+      unionView[find(u)] = unionView[p2] = 1;
+      for (auto &ln : objs[o].loadNodes)
+        if (std::get<0>(ln) == c) std::get<2>(ln) = p2;
+      for (auto &[key, f] : objs[o].offCells) {
+        Cell &C = cells[findFact(f)];
+        if (C.obj == o && contentKey(objs[o], key >> 1) == c && find(C.load) == find(u)) C.load = p2;
+      }
+      pn = p2;
+      splitCells++;
+      lateSplits++;
     }
   };
   auto drainRefolds = [&]() {
@@ -4516,7 +4538,7 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: " << leftObject << " byte offsets leaving a single "
          << "object (outside: one past the end, never dereferenced)\n");
   CG_LOG("Cells: " << cellHubKey.size() << " keyed union accesses, "
-         << splitCells << " union-slot cells, " << keyedCells
+         << splitCells << " union-slot cells (" << lateSplits << " split when their object was typed), " << keyedCells
          << " keyed cells\n");
   // --cfl-cell-why: the chain of first causes that brought a cell of
   // `want` into `target`, latest first; the pointers whose hub links or
@@ -5290,8 +5312,11 @@ bool CallGraphPass::runCellResolution() {
     // and what its cells point to.
     std::map<std::pair<uint32_t, int64_t>, std::set<uint32_t>> exposedBy;
     std::vector<std::pair<uint32_t, int64_t>> exWork;
+    std::map<const Function *, uint32_t> fnsOutside; // functions whose address reaches the outside (a boundary)
     auto exposeAt = [&](uint32_t o, int64_t off, const std::set<uint32_t> &B, bool whole = false) {
       const Obj &O = objs[o];
+      if (const auto *Fn = dyn_cast_or_null<Function>(NF.getValueForNode(O.origin)); Fn && !B.empty())
+        fnsOutside.try_emplace(Fn, *B.begin());
       int64_t lo = INT64_MIN, hi = INT64_MAX;
       if (O.layout && !whole) {
         const int64_t pos = O.repeats ? ((off % O.size) + O.size) % O.size : off;
@@ -5377,6 +5402,22 @@ bool CallGraphPass::runCellResolution() {
       pts[find(cit->second.second)].forEach([&](uint32_t f) {
         for (auto [o2, e] : memb[findFact(f)]) exposeAt(o2, decOff(e), B);
       });
+    }
+    // The outside-domain premise (plan 3.51 ruling a.2): an internal
+    // function never reaches the outside, and no indirect call in the
+    // corpus reaches an entry whose parameters were read under it.
+    std::vector<std::string> domainBroken;
+    if (!taggedOutsideEntries.empty()) {
+      for (auto &[Fn, b] : fnsOutside)
+        if (Fn->hasLocalLinkage())
+          domainBroken.push_back("internal function " + Fn->getName().str() + " reaches the outside (" +
+                                 bnd[b].first + " " + bnd[b].second + ")");
+      for (auto &[CB, Ts] : Ctx->Callees)
+        if (!CB->getCalledFunction() && !CB->isInlineAsm())
+          for (const Function *T : Ts)
+            if (taggedOutsideEntries.count(T))
+              domainBroken.push_back("indirect call at " + instLoc(CB) + " reaches the outside entry " +
+                                     T->getName().str());
     }
     // The boundaries an indirect call's callee depends on.
     std::function<void(const Value *, std::set<uint32_t> &, std::set<const Value *> &)> calleeDeps =
@@ -5512,7 +5553,15 @@ bool CallGraphPass::runCellResolution() {
     if (!taggedPairs.empty())
       RO << "SUMMARY tagged fields " << taggedPairs.size() << " pairs keyed, " << taggedFlipped.size()
          << " flipped in the solve; alias assumptions " << asmUsed - asmFailed << " held, " << asmFailed
-         << " failed\n";
+         << " failed; predicate tests: " << taggedCounts[7] << " closed, " << taggedCounts[8]
+         << " open; outside-domain entries " << taggedOutsideEntries.size() << ", premise broken at "
+         << domainBroken.size() << "\n";
+    for (const std::string &d : domainBroken) RO << "T outside domain broken: " << d << "\n";
+    if (!taggedUntested.empty()) {
+      RO << "SUMMARY tagged fields untested reads " << taggedUntested.size()
+         << " (reads of a field with candidate tags that no tag test guards: every writer)\n";
+      for (auto &[f, I] : taggedUntested) RO << "U untested read " << instLoc(I) << " of " << f << "\n";
+    }
     RO << "\n== assumptions the rows rest on\n"
        << "ASSUME outside code honors the type of what it is handed: it writes only within the "
           "subobject it received and what that subobject points to, never stepping past it "
@@ -5532,6 +5581,12 @@ bool CallGraphPass::runCellResolution() {
             "declared type and writes none of its fields (the struct is opaque to it), so the "
             "field's content writers are the program's own; a call returns only through its "
             "returns (longjmp not modeled)\n";
+    if (!taggedOutsideEntries.empty())
+      RO << "ASSUME tagged fields, outside domain (plan 3.51 a.2): a function-pointer parameter of an "
+            "exported function entered from outside holds its call sites' arguments, NULL, -1, a "
+            "function of the outside, an exported function, or a function whose address reaches "
+            "the outside; checked: no internal function reaches the outside and no indirect call in "
+            "the corpus reaches such an entry (T rows name each break)\n";
     RO << "\n== (a) pointers made from bytes that never were a pointer\n";
     for (const AHit &h : ruleA) RO << "A " << h.kind << " " << instLoc(h.I) << " from: " << h.srcs << "\n";
     RO << "\n== (b) member steps of a struct the object is not at that offset\n";

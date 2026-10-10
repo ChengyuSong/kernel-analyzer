@@ -18,8 +18,11 @@ for c in t_tagged_*.c; do
     --cfl-whole-program --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" > "$OUT/$n.log" 2>&1
   # A case marked NOKEY: expects every writer admitted (a soundness case
   # whose answer is the full set); the others must be keyed to test anything.
-  if ! grep -q "NOKEY:" "$c" && ! grep -q "TaggedFields:   KEYED struct.S+8 by +0" "$OUT/$n.log"; then
-    echo "FAIL[$n]: pair struct.S+8 by +0 not keyed"; fail=1; continue
+  # The keyed pair: "// PAIR: <text of the KEYED line>" (default struct.S+8 by +0).
+  pair=$(grep -o "// PAIR: .*" "$c" | sed 's|// PAIR: ||')
+  [ -z "$pair" ] && pair="struct.S+8 by +0"
+  if ! grep -q "NOKEY:" "$c" && ! grep -qF "TaggedFields:   KEYED $pair" "$OUT/$n.log"; then
+    echo "FAIL[$n]: pair $pair not keyed"; fail=1; continue
   fi
   line=$(grep -n "// CHECK:" "$c" | cut -d: -f1)
   want=$(grep "// CHECK:" "$c" | sed 's/.*CHECK: //; s/ CHECK-NOT:.*//')

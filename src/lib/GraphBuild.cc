@@ -3490,8 +3490,15 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
           CGP.localAllocaLoadVals[slotRep].push_back(valNode);
         } else {
           NodeIndex pN = CGP.getRepNodeForValue(lp);
-          if (pN != AndersNodeFactory::InvalidIndex)
-            CGP.addAssignmentEdge(CGP.getRepDerefNode(pN), valNode);
+          if (pN != AndersNodeFactory::InvalidIndex) {
+            // A tagged union member's integer read (plan 3.51) reads the
+            // cells of the writers its test admits.
+            auto kit = CFLCells ? CGP.unionKeyNames.find(&I) : CGP.unionKeyNames.end();
+            if (kit != CGP.unionKeyNames.end())
+              for (const std::string &k : kit->second) CGP.addAssignmentEdge(CGP.keyedDeref(pN, k), valNode);
+            else
+              CGP.addAssignmentEdge(CGP.getRepDerefNode(pN), valNode);
+          }
         }
         g_intProvLoads++;
         // Segment-local field claim: facts arrive with the residues
@@ -3705,8 +3712,15 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
         } else {
           NodeIndex pN = CGP.getRepNodeForValue(sp);
           CellWriteSize ws(CGP, CGP.curDL->getTypeStoreSize(val->getType()));
-          if (pN != AndersNodeFactory::InvalidIndex)
-            CGP.addAssignmentEdge(valNode, CGP.getRepDerefNode(pN));
+          if (pN != AndersNodeFactory::InvalidIndex) {
+            // A tagged union member's integer write (plan 3.51) writes
+            // its own key's cell.
+            auto kit = CFLCells ? CGP.unionKeyNames.find(&I) : CGP.unionKeyNames.end();
+            if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
+              CGP.addAssignmentEdge(valNode, CGP.keyedDeref(pN, kit->second[0]));
+            else
+              CGP.addAssignmentEdge(valNode, CGP.getRepDerefNode(pN));
+          }
         }
         g_intProvStores++;
       } else if (declined) {

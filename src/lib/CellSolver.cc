@@ -2024,9 +2024,16 @@ bool CallGraphPass::runCellResolution() {
     const std::string want = StringRef(CFLCellWhy).starts_with("any:")
                                  ? CFLCellWhy.substr(4) : std::string(CFLCellWhy);
     whyWanted = [&, want, cache = std::vector<int8_t>()](uint32_t f) mutable {
+      // Several objects: alternatives separated by '|'.
       auto is = [&](uint32_t o) {
         if (o >= cache.size()) cache.resize(objs.size() + 64, -1);
-        if (cache[o] < 0) cache[o] = describe(objs[o]).find(want) != std::string::npos;
+        if (cache[o] < 0) {
+          const std::string d = describe(objs[o]);
+          bool hit = false;
+          for (StringRef alt : llvm::split(StringRef(want), '|'))
+            hit |= !alt.empty() && d.find(alt.str()) != std::string::npos;
+          cache[o] = hit;
+        }
         return cache[o] == 1;
       };
       if (f >= cells.size()) return false;
@@ -4489,7 +4496,8 @@ bool CallGraphPass::runCellResolution() {
         if (nodeDesc(m).find(CFLCellWhyAt) != std::string::npos && asked.insert(find(m)).second) {
           CG_LOG("Cells: why-at " << nodeDesc(m) << ": class " << find(m) << " of "
                  << classSize[find(m)] << " nodes, represented by " << nodeDesc(find(m)) << "\n");
-          explainWhy(find(m), CFLCellWhy);
+          for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
+            if (!alt.empty()) explainWhy(find(m), alt.str());
         }
       if (asked.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
     }
@@ -4581,6 +4589,98 @@ bool CallGraphPass::runCellResolution() {
       const uint32_t s2 = getCanonicalNode(n) < G ? canon(n) : UINT32_MAX;
       if (s2 != UINT32_MAX && std::find(M.begin(), M.end(), s2) != M.end())
         CG_LOG("Cells:     field-any loop at " << nodeDesc(s2) << " [" << why << "]\n");
+    }
+    // Entry census (the largest cycle only): every edge from outside into
+    // the cycle, the construct of its source, the objects it carries in,
+    // and per object the number of separate entries (one route or many).
+    if (ci == 0 || M.size() == std::max_element(bigCycles.begin(), bigCycles.end(),
+                       [](auto &a, auto &b) { return a.size() < b.size(); })->size()) {
+      const uint32_t rep = find(M[0]);
+      auto kindOf = [&](const std::string &d) -> std::string {
+        if (d.rfind("hub of", 0) == 0) return "load through a pointer (hub)";
+        if (d.rfind("<stores through", 0) == 0) return "store collector";
+        if (d.rfind("cell ", 0) == 0 || d.rfind("content ", 0) == 0) return "memory cell (byte copy / relay)";
+        if (d.rfind("return of", 0) == 0) return "function return";
+        if (d.rfind("vararg of", 0) == 0) return "vararg pool";
+        if (d.find(" arg") != std::string::npos && d.find(':') == std::string::npos) return "formal";
+        if (d.find("= phi") != std::string::npos || d.find("= select") != std::string::npos) return "join";
+        if (d.find("= load") != std::string::npos) return "load";
+        if (d.find("call ") != std::string::npos) return "call result";
+        if (d.find("getelementptr") != std::string::npos) return "address step";
+        return "other";
+      };
+      std::map<std::string, std::pair<size_t, size_t>> byKind; // edges, objects carried
+      std::map<std::string, size_t> byFn;
+      boost::unordered_flat_map<uint32_t, uint32_t> entriesOf; // object -> entry edges
+      std::vector<std::tuple<size_t, std::string>> topSrc;
+      size_t edges = 0;
+      for (uint32_t u = 0; u < numNodes; u++) {
+        if (find(u) != u || u == rep) continue;
+        bool enters = false;
+        for (uint32_t v : succ[u]) if (find(v) == rep) { enters = true; break; }
+        if (!enters) continue;
+        edges++;
+        std::set<uint32_t> os;
+        pts[u].forEach([&](uint32_t f) {
+          for (auto [o, e] : memb[findFact(f)]) os.insert(o);
+        });
+        for (uint32_t o : os) entriesOf[o]++;
+        const std::string d = nodeDesc(u);
+        auto &bk = byKind[kindOf(d)];
+        bk.first++;
+        bk.second += os.size();
+        const size_t colon = d.find(':');
+        if (colon != std::string::npos && d.rfind("cell ", 0) != 0) byFn[d.substr(0, colon)] += os.size();
+        topSrc.push_back({os.size(), d});
+      }
+      size_t one = 0, few = 0, many = 0;
+      for (auto &[o, n] : entriesOf) (n == 1 ? one : n < 10 ? few : many)++;
+      // Which objects: the pool (entering by 10+ edges) by label, and each
+      // single-route object with its one entry.
+      std::map<std::string, size_t> poolLabels;
+      for (auto &[o, n] : entriesOf)
+        if (n >= 10) poolLabels[objs[o].layout ? objs[o].label : std::string("unlabeled/bytes")]++;
+      std::string pl;
+      for (auto &[l, c] : poolLabels) pl += " " + l + " x" + std::to_string(c);
+      CG_LOG("Cells:     entry pool (objects entering by 10+ edges) by label:" << pl << "\n");
+      std::map<uint32_t, std::string> singleFrom;
+      for (uint32_t u = 0; u < numNodes && singleFrom.size() < 200; u++) {
+        if (find(u) != u || u == rep) continue;
+        bool enters = false;
+        for (uint32_t v : succ[u]) if (find(v) == rep) { enters = true; break; }
+        if (!enters) continue;
+        pts[u].forEach([&](uint32_t f) {
+          for (auto [o, e] : memb[findFact(f)])
+            if (entriesOf[o] == 1 && !singleFrom.count(o)) singleFrom[o] = nodeDesc(u);
+        });
+      }
+      std::map<std::string, std::vector<std::string>> byEntry;
+      for (auto &[o, d] : singleFrom) byEntry[d.substr(0, 150)].push_back(describe(objs[o]));
+      std::vector<std::pair<size_t, std::string>> be;
+      for (auto &[d, v] : byEntry) be.push_back({v.size(), d});
+      std::sort(be.rbegin(), be.rend());
+      for (size_t i = 0; i < be.size() && i < 12; i++) {
+        std::string ex;
+        for (size_t j = 0; j < byEntry[be[i].second].size() && j < 3; j++) ex += " | " + byEntry[be[i].second][j].substr(0, 70);
+        CG_LOG("Cells:       single-route " << be[i].first << " objects via " << be[i].second << ":" << ex << "\n");
+      }
+      CG_LOG("Cells:     entry census: " << edges << " edges enter the cycle; " << entriesOf.size()
+             << " objects enter it: " << one << " by one edge, " << few << " by 2-9, " << many
+             << " by 10 or more\n");
+      std::vector<std::pair<size_t, std::string>> kt;
+      for (auto &[k, ec] : byKind) kt.push_back({ec.second, k + " (" + std::to_string(ec.first) + " edges)"});
+      std::sort(kt.rbegin(), kt.rend());
+      for (auto &[c, k] : kt) CG_LOG("Cells:       by construct: " << k << ": " << c << " objects carried\n");
+      std::vector<std::pair<size_t, std::string>> ft;
+      for (auto &[f, c] : byFn) ft.push_back({c, f});
+      std::sort(ft.rbegin(), ft.rend());
+      std::string fl;
+      for (size_t i = 0; i < ft.size() && i < 15; i++) fl += " " + ft[i].second + "(" + std::to_string(ft[i].first) + ")";
+      CG_LOG("Cells:       by function (objects carried):" << fl << "\n");
+      std::sort(topSrc.rbegin(), topSrc.rend());
+      for (size_t i = 0; i < topSrc.size() && i < 15; i++)
+        CG_LOG("Cells:       entry " << std::get<0>(topSrc[i]) << " objects from "
+               << std::get<1>(topSrc[i]).substr(0, 180) << "\n");
     }
     // The byte copies relaying between objects of the cycle: content
     // edges from a copy are what joins two cells directly.

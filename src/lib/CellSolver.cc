@@ -5376,7 +5376,7 @@ bool CallGraphPass::runCellResolution() {
             if (!D->isDeclaration() || summarized(D) || summarized(CF)) continue;
             B.insert(bid("bodiless call", D->getName().str()));
           } else {
-            continue;
+            continue; // indirect calls: below, once their callees' boundaries are known
           }
           for (const Value *A : CB->args()) {
             if (!A->getType()->isPointerTy()) continue;
@@ -5393,37 +5393,24 @@ bool CallGraphPass::runCellResolution() {
       else if (!CFLWholeProgram && !GV->hasLocalLinkage())
         exposeAt(o, 0, {bid("exported global", GV->getName().str())}, true);
     }
-    while (!exWork.empty()) { // what an exposed cell points to
-      const auto [o, c] = exWork.back();
-      exWork.pop_back();
-      const std::set<uint32_t> B = exposedBy[{o, c}];
-      auto cit = objs[o].content.find(c);
-      if (cit == objs[o].content.end()) continue;
-      pts[find(cit->second.second)].forEach([&](uint32_t f) {
-        for (auto [o2, e] : memb[findFact(f)]) exposeAt(o2, decOff(e), B);
-      });
-    }
-    // The outside-domain premise (plan 3.51 ruling a.2): an internal
-    // function never reaches the outside, and no indirect call in the
-    // corpus reaches an entry whose parameters were read under it.
-    std::vector<std::string> domainBroken;
-    if (!taggedOutsideEntries.empty()) {
-      for (auto &[Fn, b] : fnsOutside)
-        if (Fn->hasLocalLinkage())
-          domainBroken.push_back("internal function " + Fn->getName().str() + " reaches the outside (" +
-                                 bnd[b].first + " " + bnd[b].second + ")");
-      for (auto &[CB, Ts] : Ctx->Callees)
-        if (!CB->getCalledFunction() && !CB->isInlineAsm())
-          for (const Function *T : Ts)
-            if (taggedOutsideEntries.count(T))
-              domainBroken.push_back("indirect call at " + instLoc(CB) + " reaches the outside entry " +
-                                     T->getName().str());
-    }
+    auto drainExposure = [&]() {
+      while (!exWork.empty()) { // what an exposed cell points to
+        const auto [o, c] = exWork.back();
+        exWork.pop_back();
+        const std::set<uint32_t> B = exposedBy[{o, c}];
+        auto cit = objs[o].content.find(c);
+        if (cit == objs[o].content.end()) continue;
+        pts[find(cit->second.second)].forEach([&](uint32_t f) {
+          for (auto [o2, e] : memb[findFact(f)]) exposeAt(o2, decOff(e), B);
+        });
+      }
+    };
+    drainExposure();
     // The boundaries an indirect call's callee depends on.
     std::function<void(const Value *, std::set<uint32_t> &, std::set<const Value *> &)> calleeDeps =
         [&](const Value *V, std::set<uint32_t> &out, std::set<const Value *> &seen) {
       V = V->stripPointerCasts();
-      if (!seen.insert(V).second || seen.size() > 64) return;
+      if (!seen.insert(V).second || seen.size() > 512) return;
       if (const auto *A = dyn_cast<Argument>(V)) {
         if (!calledFns.count(A->getParent()))
           out.insert(bid("uncalled formal", A->getParent()->getName().str() + "#" +
@@ -5431,6 +5418,11 @@ bool CallGraphPass::runCellResolution() {
         return;
       }
       if (const auto *L = dyn_cast<LoadInst>(V)) {
+        // A local slot: what is stored into it.
+        if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+          for (const User *U : AI->users())
+            if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand()->stripPointerCasts() == AI)
+              calleeDeps(St->getValueOperand(), out, seen);
         std::vector<std::pair<uint32_t, int64_t>> fs;
         factsAt(L->getPointerOperand(), fs);
         for (auto [o, off] : fs) {
@@ -5441,10 +5433,20 @@ bool CallGraphPass::runCellResolution() {
       }
       if (const auto *CB = dyn_cast<CallBase>(V)) {
         if (CB->isInlineAsm()) { out.insert(bid("asm", instLoc(CB))); return; }
-        if (const Function *CF = CB->getCalledFunction()) {
-          const Function *D = getFuncDef(const_cast<Function *>(CF));
-          if (D->isDeclaration() && !summarized(D) && !summarized(CF))
-            out.insert(bid("bodiless call", D->getName().str()));
+        // A call's result: a bodiless call is a boundary; a body's (or each
+        // resolved target's) returned values are followed.
+        std::vector<const Function *> Ts;
+        if (const Function *CF = CB->getCalledFunction()) Ts.push_back(getFuncDef(const_cast<Function *>(CF)));
+        else if (auto cit = Ctx->Callees.find(CB); cit != Ctx->Callees.end())
+          for (const Function *T : cit->second) Ts.push_back(T);
+        for (const Function *D : Ts) {
+          if (D->isDeclaration()) {
+            if (!summarized(D)) out.insert(bid("bodiless call", D->getName().str()));
+            continue;
+          }
+          for (const BasicBlock &RB : *D)
+            if (const auto *Ret = dyn_cast<ReturnInst>(RB.getTerminator()); Ret && Ret->getReturnValue())
+              calleeDeps(Ret->getReturnValue(), out, seen);
         }
         return;
       }
@@ -5459,6 +5461,46 @@ bool CallGraphPass::runCellResolution() {
       }
       if (const auto *GEP = dyn_cast<GEPOperator>(V)) calleeDeps(GEP->getPointerOperand(), out, seen);
     };
+    // Indirect calls whose callee may come from the outside (plan 3.51 Q1:
+    // a dlsym'd entry point): their arguments reach the outside. Exposure
+    // grows the set of loads that depend on it, so repeat to a fixpoint.
+    std::set<const CallBase *> outTargeted;
+    for (bool grew = true; grew;) {
+      grew = false;
+      for (const CallBase *CS : Ctx->IndirectCallInsts) {
+        if (outTargeted.count(CS) || CS->isInlineAsm()) continue;
+        std::set<uint32_t> deps;
+        std::set<const Value *> seen;
+        calleeDeps(CS->getCalledOperand(), deps, seen);
+        if (deps.empty()) continue;
+        outTargeted.insert(CS);
+        grew = true;
+        const std::set<uint32_t> B{bid("outside indirect call", instLoc(CS))};
+        for (const Value *A : CS->args()) {
+          if (!A->getType()->isPointerTy()) continue;
+          std::vector<std::pair<uint32_t, int64_t>> fs;
+          factsAt(A, fs);
+          for (auto [o, off] : fs) exposeAt(o, off, B);
+        }
+      }
+      drainExposure();
+    }
+    // The outside-domain premise (plan 3.51 a.2, Q1): a function the
+    // pre-solve domain excluded never reaches the outside, and no indirect
+    // call in the corpus reaches an entry whose parameters were read under it.
+    std::vector<std::string> domainBroken;
+    if (!taggedOutsideEntries.empty()) {
+      for (auto &[Fn, b] : fnsOutside)
+        if (!Fn->isDeclaration() && !taggedOutsidePre.count(Fn) && (CFLWholeProgram || Fn->hasLocalLinkage()))
+          domainBroken.push_back("function " + Fn->getName().str() + ", outside the pre-solve domain, reaches the outside (" +
+                                 bnd[b].first + " " + bnd[b].second + ")");
+      for (auto &[CB, Ts] : Ctx->Callees)
+        if (!CB->getCalledFunction() && !CB->isInlineAsm())
+          for (const Function *T : Ts)
+            if (taggedOutsideEntries.count(T))
+              domainBroken.push_back("indirect call at " + instLoc(CB) + " reaches the outside entry " +
+                                     T->getName().str());
+    }
     std::vector<std::string> depRows;
     size_t nComplete = 0, nDepend = 0;
     std::map<std::string, size_t> byKind, byBodiless;
@@ -5557,6 +5599,18 @@ bool CallGraphPass::runCellResolution() {
          << " open; outside-domain entries " << taggedOutsideEntries.size() << ", premise broken at "
          << domainBroken.size() << "\n";
     for (const std::string &d : domainBroken) RO << "T outside domain broken: " << d << "\n";
+    if (!taggedPairs.empty()) {
+      // Which functions the outside can call (their address reaches it),
+      // by the boundary that exposed them: this, not linkage, is "callers
+      // not all visible".
+      std::map<uint32_t, size_t> byB;
+      size_t defined = 0, inPre = 0;
+      for (auto &[Fn, b] : fnsOutside)
+        if (!Fn->isDeclaration()) byB[b]++, defined++, inPre += taggedOutsidePre.count(Fn);
+      RO << "SUMMARY outside callers: " << defined << " defined functions reach the outside after the solve, "
+         << inPre << " of them in the pre-solve domain (" << taggedOutsidePre.size() << " functions)\n";
+      for (auto &[b, n] : byB) RO << "T outside callers: " << n << " via " << bnd[b].first << " " << bnd[b].second << "\n";
+    }
     if (!taggedUntested.empty()) {
       RO << "SUMMARY tagged fields untested reads " << taggedUntested.size()
          << " (reads of a field with candidate tags that no tag test guards: every writer)\n";

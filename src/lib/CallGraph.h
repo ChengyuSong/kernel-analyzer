@@ -515,6 +515,9 @@ protected:
   // Entries whose function-pointer parameters were evaluated under the
   // outside-domain premise (plan 3.51 ruling a.2), with the parameter.
   std::map<const llvm::Function *, std::set<unsigned>> taggedOutsideEntries;
+  // Functions whose address may reach the outside, pre-solve (the
+  // evaluator's outside domain); the solver reports any it missed.
+  std::set<const llvm::Function *> taggedOutsidePre;
   // Reads of a field with candidate tags that no tag test guards: they
   // admit every writer (field, site).
   std::vector<std::pair<std::string, const llvm::Instruction *>> taggedUntested;

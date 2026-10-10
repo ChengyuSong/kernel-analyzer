@@ -687,6 +687,35 @@ Obligations left open:
      internal functions reaching exposed cells or bodiless calls, and
      indirect calls in the corpus resolving to such an entry, are
      reported as breaks, not repaired.
+   - Return identity: a call's result is a fresh identity R. A walk that
+     reaches R's definition (the call) takes the callee's return summary.
+     - The summary is the union over return paths of the last writes
+       before the return to the returned value's identity inside the
+       callee.
+     - At -O0, each store into the %retval slot that only branches to the
+       return block is a path.
+     - A path that reaches the callee's entry with an argument as the
+       returned value continues before the call on that argument.
+     - Any other path reaching the entry, or a recursion through a return
+       in progress, is open.
+     - A summary computed while parameter summaries are still being solved
+       is not memoized.
+   - Outside domain and outside callers, as one exposure question (Q1).
+     - Pre-solve, a function's address may reach the outside unless every
+       use is a direct call, a comparison, or a store into a struct field.
+       The field case rests on the printed premise that the outside
+       performs no field access on what it is handed.
+     - The outside domain of a pointer parameter of such a function is
+       NULL, -1, the outside's own functions (bodiless ones included), and
+       that pre-solve set. Its parameters hold their call sites'
+       arguments or that domain.
+     - After the solve, the 3.48 exposure pass computes the exact set. It
+       also exposes the arguments of indirect calls whose callee depends on
+       an outside boundary: a dlsym'd entry point, followed through local
+       slots and callee returns.
+     - A function in the exact set that the pre-solve set excluded is a
+       break, reported; so is an indirect call in the corpus resolving to
+       an outside-entered entry.
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with

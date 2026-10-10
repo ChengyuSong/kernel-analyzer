@@ -312,6 +312,7 @@ void CallGraphPass::computeTaggedFields() {
   taggedPairAssumes.clear();
   taggedAssumes.clear();
   taggedOutsideEntries.clear();
+  taggedOutsidePre.clear();
   taggedUntested.clear();
   taggedAccessSets.clear();
   taggedWatches.clear();
@@ -361,19 +362,58 @@ void CallGraphPass::computeTaggedFields() {
     return std::nullopt;
   };
   auto widthOf = [](Type *T) -> unsigned { return T->isPointerTy() ? 64u : T->getIntegerBitWidth(); };
-  // The outside domain of a function pointer (ruling a.2, the 3.48
-  // premise applied to function values): code outside the corpus can name
-  // only NULL, -1, its own functions (one value, kOutsideFn), the
-  // corpus's exported functions, and functions whose address reaches it
-  // (the solver checks that none of the others does).
+  // The outside domain of a function pointer (ruling a.2 and Q1, the 3.48
+  // exposure question applied to function values): code outside the
+  // corpus can name only NULL, -1, its own functions (one value,
+  // kOutsideFn, and the corpus's bodiless ones), exported functions in a
+  // partial corpus, and functions whose address reaches it. Pre-solve, an
+  // address reaches the outside unless every use of it is a direct call, a
+  // comparison, or a store into a struct field (the outside performs no
+  // field access on what it is handed: the printed premise); through
+  // casts, phis and selects. The solver computes the exact set and reports
+  // a function in it that this set excluded.
   const int64_t kOutsideFn = kAllOnes - 2;
+  auto addrMayReachOutside = [&](const Function &G) {
+    std::vector<const Value *> work{&G};
+    std::set<const Value *> seen;
+    while (!work.empty()) {
+      const Value *V = work.back();
+      work.pop_back();
+      if (!seen.insert(V).second) continue;
+      for (const User *U : V->users()) {
+        if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == V) continue;
+        if (isa<ICmpInst>(U)) continue;
+        if (const auto *St = dyn_cast<StoreInst>(U); St && St->getValueOperand() == V) {
+          StructType *S2 = nullptr;
+          int64_t o2 = 0;
+          if (accessSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), S2, o2) && S2 &&
+              S2->hasName())
+            continue;
+          return true;
+        }
+        if (isa<PHINode>(U) || isa<SelectInst>(U) || isa<CastInst>(U) ||
+            (isa<ConstantExpr>(U) && cast<ConstantExpr>(U)->isCast())) {
+          work.push_back(U);
+          continue;
+        }
+        if (isa<BlockAddress>(U) || isa<DSOLocalEquivalent>(U)) continue;
+        return true; // an initializer, an argument, a store elsewhere, ...
+      }
+    }
+    return false;
+  };
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &G : *M)
+      if (!G.isDeclaration() && addrMayReachOutside(G)) taggedOutsidePre.insert(&G);
   std::vector<int64_t> outsideDomain;
   auto outsideDom = [&]() -> const std::vector<int64_t> & {
     if (!outsideDomain.empty()) return outsideDomain;
     outsideDomain = {0, kAllOnes, kOutsideFn};
     for (auto &[M, _] : Ctx->Modules)
       for (Function &G : *M)
-        if (!G.isDeclaration() && !G.hasLocalLinkage()) outsideDomain.push_back(*ptrConst(&G));
+        if (G.isDeclaration() ? !G.isIntrinsic() && G.hasAddressTaken()
+                              : taggedOutsidePre.count(&G) || (!CFLWholeProgram && !G.hasLocalLinkage()))
+          outsideDomain.push_back(*ptrConst(&G));
     return outsideDomain;
   };
   struct TagStore {
@@ -689,12 +729,11 @@ void CallGraphPass::computeTaggedFields() {
       }
       if (const auto *Ar = dyn_cast<Argument>(V)) {
         const Function *F = Ar->getParent();
-        // An exported function entered from outside (its address taken,
-        // e.g. by an API table, or any caller in a partial corpus): a
-        // function-pointer parameter holds its call sites' arguments or
-        // the outside domain; the solver checks that no indirect call in
-        // the corpus reaches it.
-        const bool fromOutside = !F->hasLocalLinkage() && (!CFLWholeProgram || F->hasAddressTaken()) &&
+        // A function the outside may call (its address may reach the
+        // outside, or exported in a partial corpus): a pointer parameter
+        // holds its call sites' arguments or the outside domain; the
+        // solver checks that no indirect call in the corpus reaches it.
+        const bool fromOutside = (taggedOutsidePre.count(F) || (!CFLWholeProgram && !F->hasLocalLinkage())) &&
                                  Ar->getType()->isPointerTy();
         if (!fromOutside && (!CFLWholeProgram || F->hasAddressTaken())) return false;
         size_t sites = 0;
@@ -1063,6 +1102,7 @@ void CallGraphPass::computeTaggedFields() {
   struct Pred { bool ok = false, readsField = false; unsigned k = 0; std::string S; std::set<int64_t> offs; std::string why; };
   std::map<const Function *, Pred> predMemo;
   size_t predClosed = 0, predOpen = 0;
+  std::map<std::string, std::pair<size_t, std::string>> predOpenWhy; // reason -> (tests, an example)
   auto predicateOf = [&](const Function *P) -> const Pred & {
     auto [it, ins] = predMemo.try_emplace(P);
     Pred &R = it->second;
@@ -1099,7 +1139,7 @@ void CallGraphPass::computeTaggedFields() {
         R.readsField = true;
         continue;
       }
-      R.why = "an instruction it cannot evaluate at " + locOf(&I);
+      R.why = std::string("an instruction it cannot evaluate (") + I.getOpcodeName() + ") at " + locOf(&I);
       return R;
     }
     if (kArg < 0) { R.why = "reads no field"; return R; }
@@ -1259,7 +1299,12 @@ void CallGraphPass::computeTaggedFields() {
       if (const auto *CB = dyn_cast<CallBase>(dl)) { // a predicate call
         const Pred &PR = predicateOf(CB->getCalledFunction());
         if (!PR.ok) {
-          if (PR.readsField) predOpen++;
+          if (PR.readsField) {
+            predOpen++;
+            const std::string kind = PR.why.substr(0, PR.why.find(" at "));
+            auto &[n, ex] = predOpenWhy[kind];
+            if (!n++) ex = CB->getCalledFunction()->getName().str() + " (" + PR.why + ")";
+          }
           continue;
         }
         predClosed++;
@@ -2019,6 +2064,15 @@ void CallGraphPass::computeTaggedFields() {
   size_t walkBounds = 0;
   constexpr size_t kWalkBlocks = 20000;
   std::function<const Walk &(const FieldCtx &, const Function *, unsigned)> sumOf;
+  // Return identity (plan 3.51, ruling Q2): the last writers of C.X of the
+  // object a call returns, before the return, per return path; a path that
+  // reaches the callee's entry with an argument as the returned pointer
+  // continues before the call on that argument (retArgs). Recursion
+  // through a return in progress is open.
+  struct RetSum { Walk w; std::set<unsigned> retArgs; };
+  std::function<const RetSum &(const FieldCtx &, const Function *)> retSumOf;
+  std::function<Walk(const FieldCtx &, const Function *, const Value *, const Instruction *)> walkBackF;
+  size_t retDefsClosed = 0, retDefsOpen = 0;
   // The last writers of field C.X of object `id` before `at` in Fn.
   size_t walksBack = 0, walksFwd = 0, walkBlocks = 0;
   std::map<const Function *, size_t> walkBlocksBy;
@@ -2039,8 +2093,27 @@ void CallGraphPass::computeTaggedFields() {
       bool stopped = false;
       for (; I && !stopped; I = I->getPrevNode()) {
         if (idDefs.insts.count(I)) { // before this, the name was another object
-          openWhy("the object's pointer is defined at " + locOf(I));
           stopped = true;
+          // The object a direct call returns: the callee's return summary.
+          const auto *RC = dyn_cast<CallBase>(I);
+          const Function *RH = RC && I == id ? RC->getCalledFunction() : nullptr;
+          if (!RH || RH->isDeclaration() || !RH->getReturnType()->isPointerTy()) {
+            openWhy("the object's pointer is defined at " + locOf(I));
+            continue;
+          }
+          const RetSum &RS = retSumOf(C, RH);
+          R.W.insert(RS.w.W.begin(), RS.w.W.end());
+          R.assumes.insert(RS.w.assumes.begin(), RS.w.assumes.end());
+          if (RS.w.open) openWhy(RS.w.why);
+          for (unsigned k : RS.retArgs) {
+            if (k >= RC->arg_size()) { openWhy("a returned argument past the call's at " + locOf(I)); continue; }
+            const Walk w2 = walkBackF(C, Fn, argId(RC->getArgOperand(k)), RC);
+            R.W.insert(w2.W.begin(), w2.W.end());
+            R.assumes.insert(w2.assumes.begin(), w2.assumes.end());
+            if (w2.open) openWhy(w2.why);
+            R.entry |= w2.entry;
+          }
+          (RS.w.open ? retDefsOpen : retDefsClosed)++;
           continue;
         }
         if (auto sit = C.stores.find(I); sit != C.stores.end()) {
@@ -2146,6 +2219,70 @@ void CallGraphPass::computeTaggedFields() {
       sumSolving = false;
     }
     return sums[key];
+  };
+  walkBackF = walkBack;
+  // Settled results are memoized; one computed while summaries are being
+  // solved (they may still grow) is recomputed on each read.
+  std::map<std::tuple<std::string, int64_t, const Function *>, RetSum> retMemo;
+  std::set<std::tuple<std::string, int64_t, const Function *>> retBusy;
+  std::deque<RetSum> retScratch; // unsettled results (stable addresses)
+  retSumOf = [&](const FieldCtx &C, const Function *H) -> const RetSum & {
+    const auto key = std::make_tuple(C.X.first, C.X.second, H);
+    if (auto it = retMemo.find(key); it != retMemo.end()) return it->second;
+    RetSum out;
+    if (!retBusy.insert(key).second) {
+      out.w.open = true;
+      out.w.why = "recursion through the return of " + H->getName().str();
+      retScratch.push_back(std::move(out));
+      return retScratch.back();
+    }
+    const bool settled = !sumSolving;
+    // The return paths: each return, or (-O0's one return of a %retval
+    // slot) each store into the slot followed only by the branch to the
+    // return block, which holds only the reload and the return.
+    std::vector<std::pair<const Value *, const Instruction *>> paths; // (returned value, from)
+    for (const BasicBlock &B : *H)
+      if (const auto *Ret = dyn_cast<ReturnInst>(B.getTerminator())) {
+        const Value *rv = Ret->getReturnValue();
+        const auto *RL = rv ? dyn_cast<LoadInst>(rv) : nullptr;
+        const auto *RA = RL ? dyn_cast<AllocaInst>(RL->getPointerOperand()) : nullptr;
+        bool split = RA && RL->getParent() == &B;
+        for (const Instruction &X : B)
+          if (&X != RL && &X != Ret && !isa<DbgInfoIntrinsic>(X)) split = false;
+        std::vector<const StoreInst *> sts;
+        if (split)
+          for (const User *U : RA->users()) {
+            if (U == RL) continue;
+            const auto *St = dyn_cast<StoreInst>(U);
+            const auto *Br = St ? dyn_cast<BranchInst>(St->getNextNode()) : nullptr;
+            if (!St || St->getPointerOperand() != RA || !Br || Br->isConditional() || Br->getSuccessor(0) != &B) {
+              split = false;
+              break;
+            }
+            sts.push_back(St);
+          }
+        if (split && !sts.empty())
+          for (const StoreInst *St : sts) paths.push_back({St->getValueOperand(), St});
+        else
+          paths.push_back({rv, Ret});
+      }
+    for (auto [rv, from] : paths) {
+      if (!rv || isa<ConstantPointerNull>(rv->stripPointerCasts())) continue; // no object
+      const Value *rid = argId(rv);
+      const Walk w = walkBack(C, H, rid, from);
+      out.w.W.insert(w.W.begin(), w.W.end());
+      out.w.assumes.insert(w.assumes.begin(), w.assumes.end());
+      if (w.open && !out.w.open) out.w.why = w.why;
+      out.w.open |= w.open;
+      if (w.entry) {
+        if (const auto *A = dyn_cast<Argument>(rid)) out.retArgs.insert(A->getArgNo());
+        else if (!out.w.open) { out.w.open = true; out.w.why = "the object " + H->getName().str() + " returns, at its entry"; }
+      }
+    }
+    retBusy.erase(key);
+    if (settled) return retMemo[key] = std::move(out);
+    retScratch.push_back(std::move(out));
+    return retScratch.back();
   };
   // Can W's content be read before its object's D or F is rewritten?
   // 1: W's content can be read under the tag it found; 2: only mapped
@@ -3312,8 +3449,12 @@ void CallGraphPass::computeTaggedFields() {
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
          << pairsUncertified << " by an uncertified tag; " << unionFields
          << " union members read as one pointer field\n");
-  if (VerboseLevel >= 2)
+  if (VerboseLevel >= 2) {
     for (const std::string &l : taggedReport) CG_LOG("TaggedFields:   " << l << "\n");
+    CG_LOG("TaggedFields: predicate tests " << predClosed << " closed, " << predOpen << " open\n");
+    for (auto &[k, ne] : predOpenWhy)
+      CG_LOG("TaggedFields:   open predicate tests: " << ne.first << " by " << k << ", e.g. " << ne.second << "\n");
+  }
   taggedCounts = {pairsKeyed, writersTagged, writersUntagged, readsKeyed, readsNoTest, readsAll, pairsNonConst,
                   predClosed, predOpen};
 }

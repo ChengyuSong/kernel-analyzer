@@ -4254,6 +4254,11 @@ bool CallGraphPass::runCellResolution() {
     if (soupStop) {
       errs() << "Cells: --cfl-cell-soup-profile stopping at " << soupForeign.size()
              << " foreign facts (measurement only, no answers)\n";
+      if (!taggedPairs.empty())
+        errs() << "Cells: at the stop: " << pops << " pops; tagged pairs " << taggedPairs.size() << ", "
+               << taggedFlipped.size() << " flipped; alias assumptions " << asmFailed << " of " << asmUsed
+               << " failed\n";
+      for (const std::string &d : taggedFlipAt) errs() << "Cells:   unkeyed during solve: " << d << "\n";
       stoppedAt = pops;
       break;
     }

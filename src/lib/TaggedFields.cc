@@ -797,16 +797,15 @@ void CallGraphPass::computeTaggedFields() {
       if (ind) indirectCallers.push_back(&F);
     }
   struct MayWrite { std::set<const Function *> fns; bool viaIndirect = false; std::set<const Instruction *> stores; };
-  std::map<Field, MayWrite> mayWriteOf;
-  auto mayWrite = [&](const Field &Df) -> const MayWrite & {
-    auto [it, ins] = mayWriteOf.try_emplace(Df);
-    MayWrite &MW = it->second;
-    if (!ins) return MW;
+  // The functions that may execute one of `seeds` (directly, through
+  // direct callees, or through an indirect call once a function on the way
+  // has its address taken).
+  auto closureOf = [&](const std::vector<const Instruction *> &seeds, MayWrite &MW) {
     std::vector<const Function *> work;
     auto add = [&](const Function *F) { if (MW.fns.insert(F).second) work.push_back(F); };
-    for (const TagStore &t : dStores[Df]) {
-      MW.stores.insert(t.I);
-      add(t.I->getFunction());
+    for (const Instruction *I : seeds) {
+      MW.stores.insert(I);
+      add(I->getFunction());
     }
     while (!work.empty()) {
       const Function *G = work.back();
@@ -817,8 +816,18 @@ void CallGraphPass::computeTaggedFields() {
         for (const Function *C : indirectCallers) add(C);
       }
     }
-    return MW;
   };
+  std::map<Field, MayWrite> mayWriteOf;
+  auto mayWrite = [&](const Field &Df) -> const MayWrite & {
+    auto [it, ins] = mayWriteOf.try_emplace(Df);
+    if (ins) {
+      std::vector<const Instruction *> seeds;
+      for (const TagStore &t : dStores[Df]) seeds.push_back(t.I);
+      closureOf(seeds, it->second);
+    }
+    return it->second;
+  };
+  const bool outsideRoots = CFLOutside == "roots";
   // Can D be written between the test (its load dl, its branch into Succ)
   // and the access at `at`? The last passage: blocks reachable from Succ
   // and reaching `at` without re-entering the test's block.
@@ -830,7 +839,8 @@ void CallGraphPass::computeTaggedFields() {
       if (&I == at) return false;
       if (MW.stores.count(&I)) return true;
       if (const auto *CB = dyn_cast<CallBase>(&I); CB && !isa<IntrinsicInst>(CB)) {
-        if (const Function *C = CB->getCalledFunction()) return MW.fns.count(C) != 0;
+        if (const Function *C = CB->getCalledFunction())
+          return MW.fns.count(C) != 0 || (C->isDeclaration() && outsideRoots);
         return !CB->isInlineAsm() && MW.viaIndirect;
       }
       return false;
@@ -921,11 +931,23 @@ void CallGraphPass::computeTaggedFields() {
     }
     return true;
   };
-  // Must-write of F (plan 3.51, ruling alpha): a function writes F of the
-  // object passed in parameter j on every path to its normal return,
-  // directly or by a direct callee that must-writes F of the parameter it
-  // receives. Recursion: a function under evaluation counts as "no" (the
-  // bottom), so the answer is a must-write under-approximation.
+  // ---- The co-write rule: last writers (plan 3.51) ----
+  // Invariant: a writer W's tag set is the set of D values that can hold
+  // while W's content is in F and F is read; a read under test P admits W
+  // iff some value in that set satisfies P. A D store t gives its values
+  // to the last F writers of its object before it, L(t) (they hold F when
+  // the tag becomes t's). L(t) is a backward walk that stops at F stores of
+  // the object and at direct calls whose summary must-writes F of the
+  // parameter the object is passed in; it is open when it reaches the
+  // entry, an F store of another identity, a call that may write F not
+  // through that mapping (an object reached by a load in the callee is
+  // another identity), an indirect call that may write F, a bodiless call
+  // under --cfl-outside=roots, or the walk bound. An open t is also a
+  // retag: its map applies to every writer. A writer whose content can be
+  // read (a tested read, a call that may make one, a return) before its
+  // object's D or F is rewritten is observed under the tag it found: the
+  // values of the last D writers before it, or every tag when that set is
+  // open. Identity through calls is by direct-call parameter mapping only.
   // The identity of a call argument: through casts and zero-offset GEPs;
   // a field address is its own object.
   auto argId = [&](const Value *V) -> const Value * {
@@ -939,81 +961,138 @@ void CallGraphPass::computeTaggedFields() {
     }
     return ids.of(V, 0);
   };
-  std::map<std::tuple<Field, const Function *, unsigned>, bool> mustP;
-  std::function<bool(const Field &, const Function *, unsigned)> mustParam;
-  // Does every path from Fn's entry to `at` (or, null, to each normal
-  // return) must-write F of object `id` first?
-  auto mustBefore = [&](const Field &Ff, const Function *Fn, const Value *id, const Instruction *at) {
-    auto isW = [&](const Instruction &I) {
-      if (const auto *St = dyn_cast<StoreInst>(&I)) {
-        StructType *ST = nullptr;
-        int64_t off = 0;
-        return St->getValueOperand()->getType()->isPointerTy() &&
-               accessSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), ST, off) && ST &&
-               ST->hasName() && stripStructNameSuffix(ST->getName()) == Ff.first && off == Ff.second &&
-               objKey(St, St->getPointerOperand(), ST) == id;
-      }
-      if (const auto *CB = dyn_cast<CallBase>(&I))
-        if (const Function *H = CB->getCalledFunction(); H && !H->isDeclaration())
-          for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size(); k++)
-            if (CB->getArgOperand(k)->getType()->isPointerTy() && argId(CB->getArgOperand(k)) == id &&
-                mustParam(Ff, H, k))
-              return true;
-      return false;
-    };
-    std::map<const BasicBlock *, bool> in, out;
-    for (const BasicBlock &B : *Fn) in[&B] = out[&B] = true; // top
-    in[&Fn->getEntryBlock()] = false;
-    std::map<const BasicBlock *, bool> gen;
-    for (const BasicBlock &B : *Fn) {
-      bool g = false;
-      for (const Instruction &I : B) if (isW(I)) { g = true; break; }
-      gen[&B] = g;
-    }
-    for (bool changed = true; changed;) {
-      changed = false;
-      for (const BasicBlock &B : *Fn) {
-        bool i = &B != &Fn->getEntryBlock();
-        for (const BasicBlock *P : predecessors(&B)) i = i && out[P];
-        if (&B == &Fn->getEntryBlock()) i = false;
-        const bool o = i || gen[&B];
-        if (i != in[&B] || o != out[&B]) { in[&B] = i; out[&B] = o; changed = true; }
-      }
-    }
-    auto before = [&](const Instruction *T) {
-      if (in[T->getParent()]) return true;
-      for (const Instruction *I = &T->getParent()->front(); I && I != T; I = I->getNextNode())
-        if (isW(*I)) return true;
-      return false;
-    };
-    if (at) return before(at);
-    for (const BasicBlock &B : *Fn)
-      if (const auto *R = dyn_cast<ReturnInst>(B.getTerminator()); R && !before(R)) return false;
-    return true;
+  struct FieldCtx {
+    Field X;
+    std::map<const Instruction *, const Value *> stores; // named stores of X -> object identity
+    MayWrite mw;                                        // functions that may write X
   };
-  mustParam = [&](const Field &Ff, const Function *G, unsigned j) {
-    const auto key = std::make_tuple(Ff, G, j);
-    if (auto it = mustP.find(key); it != mustP.end()) return it->second;
-    mustP[key] = false; // under evaluation: the bottom
-    const bool r = mustBefore(Ff, G, G->getArg(j), nullptr);
-    mustP[key] = r;
-    return r;
-  };
-  // F stores that may hold F at a point of Fn: Fn's and its direct
-  // callees' (transitively); none if an indirect call is reachable.
-  auto fStoresUnder = [&](const Function *Fn, std::set<const Function *> &fns) {
-    std::vector<const Function *> work{Fn};
-    fns.insert(Fn);
+  struct Walk { std::set<const Instruction *> W; bool open = false, entry = false; std::string why; };
+  using SumKey = std::tuple<std::string, int64_t, const Function *, unsigned>;
+  std::map<SumKey, Walk> sums;
+  std::set<SumKey> sumBusy;
+  size_t walkBounds = 0;
+  constexpr size_t kWalkBlocks = 20000;
+  std::function<const Walk &(const FieldCtx &, const Function *, unsigned)> sumOf;
+  // The last writers of field C.X of object `id` before `at` in Fn.
+  auto walkBack = [&](const FieldCtx &C, const Function *Fn, const Value *id, const Instruction *at) {
+    Walk R;
+    auto openWhy = [&](const std::string &w) {
+      if (!R.open) R.why = w;
+      R.open = true;
+    };
+    std::set<const BasicBlock *> seen;
+    std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{at->getParent(), at->getPrevNode()}};
+    size_t blocks = 0;
     while (!work.empty()) {
-      const Function *G = work.back();
+      auto [B, I] = work.back();
       work.pop_back();
-      for (const CallBase *CB : callsOf[G]) {
-        const Function *C = CB->getCalledFunction();
-        if (!C) { if (!CB->isInlineAsm()) return false; continue; }
-        if (!C->isDeclaration() && fns.insert(C).second) work.push_back(C);
+      bool stopped = false;
+      for (; I && !stopped; I = I->getPrevNode()) {
+        if (auto sit = C.stores.find(I); sit != C.stores.end()) {
+          if (sit->second == id) { R.W.insert(I); stopped = true; }
+          else openWhy("a store of another identity at " + locOf(I));
+          continue;
+        }
+        const auto *CB = dyn_cast<CallBase>(I);
+        if (!CB || isa<IntrinsicInst>(CB) || CB->isInlineAsm()) continue;
+        const Function *H = CB->getCalledFunction();
+        if (!H) {
+          if (C.mw.viaIndirect) openWhy("an indirect call at " + locOf(I));
+          continue;
+        }
+        if (H->isDeclaration()) {
+          if (outsideRoots) openWhy("a bodiless call at " + locOf(I));
+          continue;
+        }
+        bool mapped = false, must = false;
+        for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size(); k++)
+          if (CB->getArgOperand(k)->getType()->isPointerTy() && argId(CB->getArgOperand(k)) == id) {
+            mapped = true;
+            const Walk &Sm = sumOf(C, H, k);
+            R.W.insert(Sm.W.begin(), Sm.W.end());
+            if (Sm.open) openWhy(Sm.why);
+            must |= !Sm.entry;
+          }
+        if (!mapped && C.mw.fns.count(H)) openWhy("a call that may write it at " + locOf(I));
+        stopped = must;
+      }
+      if (stopped) continue;
+      if (B == &B->getParent()->getEntryBlock()) { R.entry = true; continue; }
+      for (const BasicBlock *P : predecessors(B)) {
+        if (!seen.insert(P).second) continue;
+        if (++blocks > kWalkBlocks) {
+          if (!R.open) walkBounds++;
+          openWhy("the walk bound in " + Fn->getName().str());
+          work.clear();
+          break;
+        }
+        work.push_back({P, &P->back()});
       }
     }
-    return true;
+    return R;
+  };
+  sumOf = [&](const FieldCtx &C, const Function *H, unsigned k) -> const Walk & {
+    const SumKey key{C.X.first, C.X.second, H, k};
+    if (auto it = sums.find(key); it != sums.end()) return it->second;
+    static const Walk busy = [] {
+      Walk w;
+      w.open = w.entry = true;
+      w.why = "recursion";
+      return w;
+    }();
+    if (!sumBusy.insert(key).second) return busy;
+    Walk R;
+    for (const BasicBlock &B : *H)
+      if (const auto *Ret = dyn_cast<ReturnInst>(B.getTerminator())) {
+        Walk w = walkBack(C, H, H->getArg(k), Ret);
+        R.W.insert(w.W.begin(), w.W.end());
+        if (w.open && !R.open) R.why = w.why;
+        R.open |= w.open;
+        R.entry |= w.entry;
+      }
+    sumBusy.erase(key);
+    return sums[key] = std::move(R);
+  };
+  // Can W's content be read before its object's D or F is rewritten?
+  auto observed = [&](const FieldCtx &Fc, const FieldCtx &Dc, const MayWrite &mrF,
+                      const std::set<const Instruction *> &reads, const Value *id, const Instruction *W) {
+    std::set<const BasicBlock *> seen;
+    std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{W->getParent(), W->getNextNode()}};
+    size_t blocks = 0;
+    while (!work.empty()) {
+      auto [B, I] = work.back();
+      work.pop_back();
+      bool stopped = false;
+      for (; I && !stopped; I = I->getNextNode()) {
+        if (reads.count(I) || isa<ReturnInst>(I)) return true;
+        if (isa<UnreachableInst>(I)) { stopped = true; break; }
+        if (auto dit = Dc.stores.find(I); dit != Dc.stores.end() && dit->second == id) { stopped = true; break; }
+        if (auto fit = Fc.stores.find(I); fit != Fc.stores.end() && fit->second == id) { stopped = true; break; }
+        const auto *CB = dyn_cast<CallBase>(I);
+        if (!CB || isa<IntrinsicInst>(CB) || CB->isInlineAsm()) continue;
+        const Function *H = CB->getCalledFunction();
+        if (!H) {
+          if (mrF.viaIndirect) return true;
+          continue;
+        }
+        if (H->isDeclaration()) {
+          if (outsideRoots) return true;
+          continue;
+        }
+        if (mrF.fns.count(H)) return true;
+        for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size(); k++)
+          if (CB->getArgOperand(k)->getType()->isPointerTy() && argId(CB->getArgOperand(k)) == id &&
+              !sumOf(Dc, H, k).entry)
+            stopped = true; // the callee must-write D of it
+      }
+      if (stopped) continue;
+      for (const BasicBlock *N : successors(B)) {
+        if (!seen.insert(N).second) continue;
+        if (++blocks > kWalkBlocks) return true;
+        work.push_back({N, &N->front()});
+      }
+    }
+    return false;
   };
   for (auto &[Ff, fs] : fStores) {
     const std::string &S = Ff.first;
@@ -1028,71 +1107,79 @@ void CallGraphPass::computeTaggedFields() {
     for (int64_t dOff : dOffs) {
       const Field Df{S, dOff};
       const auto &ds = dStores[Df];
-      // Writers and their tags; retags.
-      std::set<std::pair<const Function *, const Value *>> coWriting;
-      for (const FAccess &w : fs) coWriting.insert({w.I->getFunction(), w.obj});
-      // A writer's tags: its constants, and the images of every reachable
-      // tag under its terms over a tag (its object's previous one, or
-      // another object's).
+      // Writers and their tag sets (the last-writer rule above); retags.
       struct Writer {
         const Instruction *I;
-        std::set<int64_t> tags;
-        std::vector<Term> fromAny; // maps of a tag: (u & a) | f | sub(m)
+        std::set<int64_t> tags;      // constants
+        std::vector<Term> fromAny;   // images of every tag: (u & a) | f | sub(m)
+        std::vector<Term> ownMaps;   // maps of its own tag (a later tag store)
         bool unknown = false;
       };
       std::vector<Writer> writers;
+      std::map<const Instruction *, size_t> wIdx;
+      for (const FAccess &w : fs) {
+        wIdx[w.I] = writers.size();
+        writers.push_back({w.I});
+      }
+      FieldCtx Fc{Ff}, Dc{Df};
+      {
+        std::vector<const Instruction *> seeds;
+        for (const FAccess &w : fs) Fc.stores[w.I] = w.obj, seeds.push_back(w.I);
+        closureOf(seeds, Fc.mw);
+        seeds.clear();
+        for (const TagStore &t : ds) Dc.stores[t.I] = t.obj, seeds.push_back(t.I);
+        closureOf(seeds, Dc.mw);
+      }
+      // The reads that matter: those with a stable test (the others read
+      // every writer).
+      std::set<const Instruction *> tested;
+      std::vector<const Instruction *> testedV;
+      for (const FAccess &r : fLoads[Ff]) {
+        std::vector<Test> tt;
+        testsAt(r.I, r.obj, Df, tt);
+        if (!tt.empty()) tested.insert(r.I), testedV.push_back(r.I);
+      }
+      MayWrite mrF;
+      closureOf(testedV, mrF);
+      std::set<std::string> via;
+      auto give = [&](Writer &W, const TagStore &t, bool prior) {
+        if (t.unknown) W.unknown = true;
+        via.insert(t.via.begin(), t.via.end());
+        for (const Term &tm : t.terms)
+          if (tm.src == 'c') { if (!concretize({tm}, W.tags)) W.unknown = true; }
+          else if (tm.src == 's' && !prior) W.ownMaps.push_back(tm);
+          else W.fromAny.push_back(tm);
+      };
       std::vector<const TagStore *> retags;
       bool nonConstRetag = false;
-      for (const TagStore &t : ds)
-        if (!coWriting.count({t.I->getFunction(), t.obj})) {
+      size_t closedStores = 0, openStores = 0, observedWriters = 0, openPrior = 0;
+      std::string openAt;
+      std::map<const TagStore *, std::string> openWhyOf;
+      for (const TagStore &t : ds) {
+        const Walk L = walkBack(Fc, t.I->getFunction(), t.obj, t.I);
+        for (const Instruction *w : L.W)
+          if (auto it = wIdx.find(w); it != wIdx.end()) give(writers[it->second], t, false);
+        if (L.open || L.entry) {
           retags.push_back(&t);
           nonConstRetag |= t.unknown;
-        }
-      std::set<std::string> via;
-      for (const FAccess &w : fs) {
-        Writer W{w.I};
-        bool co = false;
-        for (const TagStore &t : ds)
-          if (t.I->getFunction() == w.I->getFunction() && t.obj == w.obj) {
-            co = true;
-            if (t.unknown) W.unknown = true;
-            via.insert(t.via.begin(), t.via.end());
-            for (const Term &tm : t.terms)
-              if (tm.src != 'c') W.fromAny.push_back(tm);
-              else if (!concretize({tm}, W.tags)) W.unknown = true;
-          }
-        if (!co) W.unknown = true;
-        writers.push_back(std::move(W));
+          openStores++;
+          openWhyOf[&t] = L.open ? L.why : "the function entry (F from before it)";
+          if (openAt.empty() && L.open) openAt = locOf(t.I) + ": " + L.why;
+        } else closedStores++;
       }
-      // Ruling alpha: a "retag" whose function must-writes F of the same
-      // object before its D store is a writer of the F it wrote: its tag
-      // goes to every F store that may hold F there (the function's and
-      // its callees'), and it is not a retag of other writers' F.
-      size_t alphaWriters = 0;
-      {
-        std::map<const Instruction *, size_t> wIdx;
-        for (size_t i = 0; i < writers.size(); i++) wIdx[writers[i].I] = i;
-        std::vector<const TagStore *> keep;
-        for (const TagStore *t : retags) {
-          std::set<const Function *> fns;
-          if (!mustBefore(Ff, t->I->getFunction(), t->obj, t->I) || !fStoresUnder(t->I->getFunction(), fns)) {
-            keep.push_back(t);
-            continue;
-          }
-          alphaWriters++;
-          via.insert(t->via.begin(), t->via.end());
-          for (const FAccess &w : fs) {
-            if (!fns.count(w.I->getFunction())) continue;
-            Writer &W = writers[wIdx[w.I]];
-            if (t->unknown) W.unknown = true;
-            for (const Term &tm : t->terms)
-              if (tm.src != 'c') W.fromAny.push_back(tm);
-              else if (!concretize({tm}, W.tags)) W.unknown = true;
-          }
+      for (size_t i = 0; i < writers.size(); i++) {
+        const FAccess &w = fs[i];
+        if (!observed(Fc, Dc, mrF, tested, w.obj, w.I)) continue;
+        observedWriters++;
+        const Walk LD = walkBack(Dc, w.I->getFunction(), w.obj, w.I);
+        if (LD.open || LD.entry) {
+          writers[i].unknown = true;
+          openPrior++;
+          continue;
         }
-        retags = std::move(keep);
-        nonConstRetag = false;
-        for (const TagStore *t : retags) nonConstRetag |= t->unknown;
+        for (const Instruction *d : LD.W)
+          for (const TagStore &t : ds)
+            if (t.I == d) give(writers[i], t, true);
       }
       // The tag must be certified: every store covering its bytes is one
       // of its own named writes, or watched in the solve.
@@ -1139,7 +1226,8 @@ void CallGraphPass::computeTaggedFields() {
                 std::string v;
                 raw_string_ostream os(v);
                 t->I->getValueOperand()->print(os);
-                taggedReport.push_back("    non-constant retag " + locOf(t->I) + ": " + os.str().substr(0, 90));
+                taggedReport.push_back("    non-constant retag " + locOf(t->I) + ": " + os.str().substr(0, 90) +
+                                       " [open: " + openWhyOf[t] + "]");
               }
         }
         continue;
@@ -1222,6 +1310,7 @@ void CallGraphPass::computeTaggedFields() {
       for (const Writer &W : writers) {
         U0.insert(W.tags.begin(), W.tags.end());
         allMaps.insert(allMaps.end(), W.fromAny.begin(), W.fromAny.end());
+        allMaps.insert(allMaps.end(), W.ownMaps.begin(), W.ownMaps.end());
       }
       bool uAll = setsAll;
       const std::set<int64_t> U = closure(U0, allMaps, uAll, &allGuards);
@@ -1238,7 +1327,8 @@ void CallGraphPass::computeTaggedFields() {
       std::vector<std::set<int64_t>> wTags(writers.size());
       std::vector<bool> wAll(writers.size(), false);
       for (size_t i = 0; i < writers.size(); i++) {
-        if (writers[i].unknown || setsAll || (uAll && (!writers[i].fromAny.empty() || !anyImgs.empty()))) {
+        if (writers[i].unknown || setsAll ||
+            (uAll && (!writers[i].fromAny.empty() || !writers[i].ownMaps.empty() || !anyImgs.empty()))) {
           wAll[i] = true;
           continue;
         }
@@ -1253,8 +1343,10 @@ void CallGraphPass::computeTaggedFields() {
             from.insert(img.begin(), img.end());
           }
         if (imgAll) { wAll[i] = true; continue; }
+        std::vector<Term> maps = xforms;
+        maps.insert(maps.end(), writers[i].ownMaps.begin(), writers[i].ownMaps.end());
         bool all = false;
-        wTags[i] = closure(from, xforms, all, &xformGuard);
+        wTags[i] = closure(from, maps, all, &xformGuard); // own maps: unguarded
         wAll[i] = all;
       }
       // Reads: the stable tests of D (same object) dominating them.
@@ -1280,8 +1372,11 @@ void CallGraphPass::computeTaggedFields() {
           std::string d = "PLAIN " + S + "+" + std::to_string(Ff.second) + " by +" + std::to_string(dOff) + " (" +
                           std::to_string(fs.size()) + " writes): every tested read admits every writer; " +
                           std::to_string(U.size()) + (uAll ? "+ (capped)" : "") + " tags, " +
-                          std::to_string(nAll) + " writers with any tag; " + std::to_string(alphaWriters) +
-                          " retags are writers through a callee; transforms " + std::to_string(guarded) +
+                          std::to_string(nAll) + " writers with any tag; tag stores " + std::to_string(closedStores) +
+                          " closed, " + std::to_string(openStores) + " open (retags" +
+                          (openAt.empty() ? std::string() : ", e.g. " + openAt) + "); " +
+                          std::to_string(observedWriters) + " writers read under their prior tag (" +
+                          std::to_string(openPrior) + " of any tag); transforms " + std::to_string(guarded) +
                           " guarded, " + std::to_string(unguarded) + " unguarded";
           for (const std::string &x : xformAt) d += "; retag " + x;
           taggedReport.push_back(d);
@@ -1317,8 +1412,9 @@ void CallGraphPass::computeTaggedFields() {
       taggedReport.push_back("KEYED " + S + "+" + std::to_string(Ff.second) + " by +" +
                                std::to_string(dOff) + ": " + std::to_string(writers.size()) + " writers, " +
                                std::to_string(pairReadsKeyed) + " reads keyed, " +
-                               std::to_string(retags.size()) + " retags (" + std::to_string(alphaWriters) +
-                               " more are writers through a callee; " + std::to_string(guarded) +
+                               std::to_string(retags.size()) + " retags (" + std::to_string(closedStores) +
+                               " tag stores closed; " + std::to_string(observedWriters) + " writers read under their prior tag; " +
+                               std::to_string(guarded) +
                                " guarded, " + std::to_string(unguarded) + " unguarded transforms), " +
                                std::to_string(U.size()) + " tags" + extra);
     }

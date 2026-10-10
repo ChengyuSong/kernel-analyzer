@@ -488,6 +488,9 @@ protected:
   // Tagged fields (plan 3.51): union keys for a pointer field tagged by a
   // sibling field of the same object (TaggedFields.cc).
   void computeTaggedFields();
+  // Atom summaries adopted for bodies; withdrawn where keys apply.
+  std::set<const llvm::Function *> adoptedAtomBodies;
+  void unadoptKeyedBodies();
   std::vector<std::string> taggedReport;
   std::array<size_t, 7> taggedCounts{};
   // Keyed tagged-field pairs (struct, F offset, D offset, D size): the solver

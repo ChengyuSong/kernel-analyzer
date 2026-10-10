@@ -67,6 +67,15 @@ else
   fail=1
 fi
 
+# The tagged-field last-writer cases (plan 3.51): each marked read keeps
+# the writers the program can show it.
+if KAMAIN=$(realpath "$BIN") bash ../tagged-gaps.sh > "$OUT/tagged.txt" 2>&1; then
+  echo "PASS[tagged-field last-writer cases]"
+else
+  echo "FAIL[tagged-field last-writer cases]:"; grep FAIL "$OUT/tagged.txt" | head -3
+  fail=1
+fi
+
 # KABaseline (GraCFL saturation on the same graph).
 run sat-mono-base       "$EXPECT" "$BASE" --cfl-compositional=false
 run sat-comp-base       "$EXPECT" "$BASE"

@@ -645,3 +645,33 @@ Obligations left open:
 8. `va_list` is modeled as memory (va_start writes the variadic
    arguments into the va_list object, va_arg reads it); the lowered
    va_arg sequence is recognized from GEPs that index `__va_list_tag`.
+9. Tagged fields (plan 3.51) key a pointer field F by a sibling D the
+   program writes with it and tests before reading it. The invariant the
+   implementation approximates: a writer W's tag set is the set of D
+   values that can hold while W's content is in F and F is read; a read
+   under a stable test P admits W iff some value in that set satisfies P.
+   - Constructors: a tag store t gives its values to the last F writers
+     of its object before it, L(t). L(t) is a backward walk stopping at F
+     stores of the object and at direct calls whose summary must-writes F
+     of the parameter the object is passed in. It is open at the entry,
+     at an F store of another identity, at a call that may write F other
+     than through that mapping, at an indirect call when an address-taken
+     function may write F, at a bodiless call under `roots`, or at the
+     walk bound. An open t is also a retag: its map applies to every
+     writer.
+   - A writer whose content can be read (a tested read, a call that may
+     make one, a return) before its object's D or F is rewritten is
+     observed under the tag it found: the values of the last D writers
+     before it, or every tag when that set is open.
+   - A test is stable when no D write can come between it and the access
+     (the last passage), and a retag's own-tag map applies only to tags
+     its stable tests admit.
+   - Identity: by reaching definitions within a function, and by
+     direct-call parameter mapping across calls. An object reached through
+     a load is another identity.
+   - The certificate (every write to D's bytes named, a char/scalar data
+     store, or watched in the solve) and the in-solve flips (byte copies,
+     watched stores) make unnamed writes checked, not assumed.
+   Not mechanized. Premises: bodiless calls write and read no slot under
+   `pure` (item 7); writes the analysis has no statement for are out of
+   scope (item 1).

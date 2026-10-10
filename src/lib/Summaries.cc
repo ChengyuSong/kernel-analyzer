@@ -4913,6 +4913,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       }
       Ctx->OwnedSummaries.push_back(std::move(S));
       Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
+      adoptedAtomBodies.insert(F);
       nAtom++;
     }
     CG_LOG("SummaryAdopt: " << nNoop << " noop + " << nAtom
@@ -5279,4 +5280,38 @@ void CallGraphPass::checkPoolClosure() {
   }
   CG_LOG("PoolClosure: " << certified << " fields certified as pool state, " << kept
          << " kept (accessed outside the allocator family)\n");
+}
+
+// Union and tagged-field keys (plans 3.18, 3.51) are names the graph build
+// gives a body's accesses; an adopted atom summary replaces the body with
+// unkeyed atoms, so the keys would be lost (every keyed read would see the
+// summarized writes). Keys are computed after adoption: withdraw the
+// adoption of every body with a keyed access, and of every adopted body
+// that calls one (its atoms stand for the callee's writes), to a fixpoint.
+void CallGraphPass::unadoptKeyedBodies() {
+  if (adoptedAtomBodies.empty() || unionKeyNames.empty()) return;
+  std::set<const Function *> keyed;
+  for (const Function *F : adoptedAtomBodies)
+    for (const Instruction &I : instructions(*F))
+      if (unionKeyNames.count(&I)) { keyed.insert(F); break; }
+  for (bool changed = !keyed.empty(); changed;) {
+    changed = false;
+    for (const Function *F : adoptedAtomBodies) {
+      if (keyed.count(F)) continue;
+      for (const Instruction &I : instructions(*F))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (const Function *C = CB->getCalledFunction(); C && keyed.count(C)) {
+            keyed.insert(F);
+            changed = true;
+            break;
+          }
+    }
+  }
+  for (const Function *F : keyed) {
+    Ctx->FuncSummaries.erase(F);
+    adoptedAtomBodies.erase(F);
+    CG_LOG("SummaryAdopt: WITHDRAWN " << F->getName() << " [keyed accesses in the body or a callee]\n");
+  }
+  if (!keyed.empty())
+    CG_LOG("SummaryAdopt: " << keyed.size() << " adopted bodies withdrawn for keyed accesses\n");
 }

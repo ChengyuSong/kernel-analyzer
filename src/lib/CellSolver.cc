@@ -4134,7 +4134,7 @@ bool CallGraphPass::runCellResolution() {
       CG_LOG("Cells: at " << pops << " pops: " << finalizes << " finalizes re-ran "
              << refacts << " facts; " << factMerges << " fact merges, "
              << ptrMerges << " ptr merges, " << hubLinks << " hub links\n");
-    if (pops - lastCollapsePops >= (1u << 18) &&
+    if (CFLCellCollapse && pops - lastCollapsePops >= (1u << 18) &&
         edgeSet.size() > edgesAtCollapse + edgesAtCollapse / 8) {
       collapseCycles();
       rekeyReceivers();
@@ -4710,6 +4710,57 @@ bool CallGraphPass::runCellResolution() {
       big.push_back({bn, B, ins.size(), oit->second.size()});
     }
     std::sort(big.rbegin(), big.rend());
+    // Per relay B: (1) the source types it receives, (3) the destination
+    // types it feeds, (2) whether each source/destination type pair is
+    // compatible (equal, or one embedded at the other's start).
+    auto labelOf = [&](uint32_t o) {
+      return objs[o].layout ? objs[o].label : std::string("unlabeled");
+    };
+    auto compat = [&](uint32_t a, uint32_t c) {
+      const Obj &A = objs[a], &C = objs[c];
+      if (!A.layout || !C.layout) return false;
+      if (A.label == C.label) return true;
+      return (C.layout->isStructTy() && structStartsAt(A.layout, 0, C.label, DL)) ||
+             (A.layout->isStructTy() && structStartsAt(C.layout, 0, A.label, DL));
+    };
+    size_t oneSrc = 0, oneDst = 0, allCompat = 0, pathsCompat = 0, pathsAll = 0;
+    std::vector<std::string> relayLines;
+    for (auto &[bn, B, ni, no] : big) {
+      std::map<std::string, size_t> sl, dl;
+      for (const RelayEnd &e : relayIn[B]) sl[labelOf(e.obj)]++;
+      for (const RelayEnd &e : relayOut[B]) dl[labelOf(e.obj)]++;
+      bool every = true;
+      size_t pc = 0, pa = 0;
+      for (const RelayEnd &i : relayIn[B])
+        for (const RelayEnd &o : relayOut[B]) {
+          if (i.obj == o.obj) continue;
+          pa++;
+          if (compat(i.obj, o.obj)) pc++;
+          else every = false;
+        }
+      oneSrc += sl.size() == 1;
+      oneDst += dl.size() == 1;
+      allCompat += every;
+      pathsCompat += pc;
+      pathsAll += pa;
+      if (relayLines.size() < 6) {
+        auto top = [](const std::map<std::string, size_t> &m) {
+          std::vector<std::pair<size_t, std::string>> v;
+          for (auto &[k, c] : m) v.push_back({c, k});
+          std::sort(v.rbegin(), v.rend());
+          std::string r;
+          for (size_t i = 0; i < v.size() && i < 4; i++) r += " " + v[i].second + " x" + std::to_string(v[i].first);
+          return std::to_string(m.size()) + " types:" + r;
+        };
+        relayLines.push_back(describe(objs[B]) + ": in " + top(sl) + "; out " + top(dl) + "; compatible pairs " +
+                             std::to_string(pc) + " of " + std::to_string(pa));
+      }
+    }
+    CG_LOG("Cells: relay questions: of " << big.size() << " relays, " << oneSrc
+           << " receive one type, " << oneDst << " feed one type, " << allCompat
+           << " have every source/destination pair compatible; paths compatible " << pathsCompat
+           << " of " << pathsAll << "\n");
+    for (const std::string &l : relayLines) CG_LOG("Cells:   relay " << l << "\n");
     CG_LOG("Cells: byte-array relays: " << big.size() << " arrays relay typed->typed, " << paths
            << " object paths (" << broken << " with no overlapping offsets); cell pairs joined "
            << (size_t)now << " today, " << (size_t)kept << " with offset preservation\n");

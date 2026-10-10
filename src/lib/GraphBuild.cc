@@ -6112,6 +6112,12 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
 
   std::unordered_map<GepKey, NodeIndex, GepKeyHash> gepReps;
   std::unordered_map<NodeIndex, NodeIndex> loadReps;
+  // --cfl-cells: a keyed union load reads its key's cell only; merging it
+  // with a load of another key (or an unkeyed one) through the same
+  // pointer would hand it every key's content (jsonReturn: u.pPatch and
+  // u.zJContent loads of one &pNode->u welded JsonNode addresses into
+  // the JSON text). Loads merge only within a key.
+  std::map<std::pair<NodeIndex, std::string>, NodeIndex> keyedLoadReps;
   bool changed = false;
 
   for (auto &[M, _] : Ctx->Modules) {
@@ -6151,6 +6157,16 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
           if (ptrNode == AndersNodeFactory::InvalidIndex ||
               valNode == AndersNodeFactory::InvalidIndex)
             continue;
+          std::string lk;
+          if (CFLCells)
+            if (auto kit = unionKeyNames.find(LI); kit != unionKeyNames.end())
+              for (const std::string &k : kit->second) lk += k + ";";
+          if (!lk.empty() || (CFLCells && unionUnknownOf.count(LI))) {
+            if (lk.empty()) lk = "?";
+            auto [it, inserted] = keyedLoadReps.emplace(std::make_pair(globalFind(ptrNode), lk), valNode);
+            if (!inserted) changed |= globalUnion(it->second, valNode);
+            continue;
+          }
           auto [it, inserted] = loadReps.emplace(globalFind(ptrNode), valNode);
           if (!inserted)
             changed |= globalUnion(it->second, valNode);

@@ -1211,6 +1211,14 @@ cl::opt<unsigned> CFLCellSoupTime(
            "report then includes the byte-copy cost table"),
   cl::init(0));
 
+cl::opt<bool> CFLCellCollapse(
+  "cfl-cell-collapse",
+  cl::desc("--cfl-cells: collapse copy cycles during the solve (the static "
+           "collapse before any fact moves always runs). Off is a measurement "
+           "instrument: nodes keep their own facts, so --cfl-cell-why can "
+           "follow a fact through what would be one merged class (slower)"),
+  cl::init(true));
+
 cl::opt<std::string> CFLCellWhy(
   "cfl-cell-why",
   cl::desc("--cfl-cells instrument: record the first cause of every fact "

@@ -5471,6 +5471,10 @@ bool CallGraphPass::runCellResolution() {
        << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "
        << varargKeyedSites << " constant format, " << varargPoolSites << " non-constant, "
        << varargUnparsed << " unparsed\n";
+    if (!taggedPairs.empty())
+      RO << "SUMMARY tagged fields " << taggedPairs.size() << " pairs keyed, " << taggedFlipped.size()
+         << " flipped in the solve; alias assumptions " << asmUsed - asmFailed << " held, " << asmFailed
+         << " failed\n";
     RO << "\n== assumptions the rows rest on\n"
        << "ASSUME outside code honors the type of what it is handed: it writes only within the "
           "subobject it received and what that subobject points to, never stepping past it "
@@ -5483,6 +5487,13 @@ bool CallGraphPass::runCellResolution() {
           "(receivers premise; counted in SUMMARY c)\n"
        << "ASSUME a va_arg read under the case of specifier c reads only arguments passed under "
           "c or under a non-constant format (plan 3.47)\n";
+    if (!taggedPairs.empty())
+      RO << "ASSUME tagged fields (plan 3.51): a tag write in a function whose callers are not all "
+            "visible (address taken, or exported in a partial corpus) applies, under its guard, to "
+            "every writer of the field; outside code handing such an object back honors its "
+            "declared type and writes none of its fields (the struct is opaque to it), so the "
+            "field's content writers are the program's own; a call returns only through its "
+            "returns (longjmp not modeled)\n";
     RO << "\n== (a) pointers made from bytes that never were a pointer\n";
     for (const AHit &h : ruleA) RO << "A " << h.kind << " " << instLoc(h.I) << " from: " << h.srcs << "\n";
     RO << "\n== (b) member steps of a struct the object is not at that offset\n";

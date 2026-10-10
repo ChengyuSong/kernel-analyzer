@@ -4291,6 +4291,9 @@ bool CallGraphPass::runCellResolution() {
              << " s\n");
       topObjects(4);
       interiorReport();
+      if (!taggedPairs.empty())
+        CG_LOG("Cells: alias assumptions so far: " << asmFailed << " of " << asmUsed << " failed, "
+               << taggedFlipped.size() << " tagged pairs flipped\n");
       if (pops % (1u << 22) == 0) massByObject(12);
     }
     for (uint32_t &f : delta) f = findFact(f);

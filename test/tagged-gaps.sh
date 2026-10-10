@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The plan 3.51 last-writer cases (test/t_tagged_*.c): each read marked
-# "// CHECK: f g ..." must resolve to at least those targets under
+# "// CHECK: f g ..." must resolve to at least those targets (and none
+# listed after CHECK-NOT:, the precision the case is about) under
 # --cfl-cells, and its tagged pair must be keyed (else the case tests
 # nothing). Exits nonzero on any miss. KAMAIN= overrides the binary.
 set -u
@@ -19,7 +20,8 @@ for c in t_tagged_*.c; do
     echo "FAIL[$n]: pair struct.S+8 by +0 not keyed"; fail=1; continue
   fi
   line=$(grep -n "// CHECK:" "$c" | cut -d: -f1)
-  want=$(grep "// CHECK:" "$c" | sed 's/.*CHECK: //')
+  want=$(grep "// CHECK:" "$c" | sed 's/.*CHECK: //; s/ CHECK-NOT:.*//')
+  wantnot=$(grep "CHECK-NOT:" "$c" | sed 's/.*CHECK-NOT: //')
   got=$(python3 - "$OUT/$n.json" "$c" "$line" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -31,6 +33,9 @@ PY
 )
   miss=""
   for f in $want; do grep -qw "$f" <<<"$got" || miss="$miss $f"; done
-  if [ -z "$miss" ]; then echo "PASS[$n] ($got)"; else echo "FAIL[$n]: missing$miss (got: $got)"; fail=1; fi
+  extra=""
+  for f in $wantnot; do grep -qw "$f" <<<"$got" && extra="$extra $f"; done
+  if [ -z "$miss$extra" ]; then echo "PASS[$n] ($got)"
+  else echo "FAIL[$n]: missing$miss, unexpected$extra (got: $got)"; fail=1; fi
 done
 exit $fail

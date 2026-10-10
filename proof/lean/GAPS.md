@@ -688,6 +688,22 @@ Obligations left open:
      assumption is sound.
    - Tag sets past 4096 values widen to their known bits (agreeing bits
      known, the rest free); tests over a widened set evaluate as may-hold.
+   - Composition. A call between a test and a retag is a function from D
+     values to D values: the union over the callee's return paths of the
+     composed D writes on each path (the identity for a path with none).
+     It is applied to the values the test admits, not replaced by
+     "anything". A tag write in a callee that the incoming content can be
+     read under (its last-writer walk reaches the callee's entry) is
+     accounted at the call sites. Its map is guarded by its own stable test
+     and composed after the effect from that test. It goes to the last F
+     writers before each call; when those reach the caller's entry, it
+     becomes the caller's, or a retag if the caller has callers the
+     program does not show (address taken, or a partial corpus).
+     Recursion is solved as rounds from the empty effect. This rests on
+     the premise, printed with the report's assumptions, that a call
+     returns only through its returns: longjmp is not modeled.
+   - Reads are stable against F writes only. A D write between a test and
+     a read leaves the content the test spoke for in place.
    Not mechanized. Premises: bodiless calls write and read no slot under
    `pure` (item 7); writes the analysis has no statement for are out of
    scope (item 1).

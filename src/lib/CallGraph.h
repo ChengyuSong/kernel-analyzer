@@ -485,6 +485,16 @@ protected:
   size_t varargMapped = 0, varargKeyedReads = 0, varargUnkeyedReads = 0;
   std::vector<std::string> varargReport; // UNMAPPED / UNKEYED lines (rule report)
   void computeVarargKeys();
+  // Tagged fields (plan 3.51): union keys for a pointer field tagged by a
+  // sibling field of the same object (TaggedFields.cc).
+  void computeTaggedFields();
+  std::vector<std::string> taggedReport;
+  std::array<size_t, 7> taggedCounts{};
+  // Keyed tagged-field pairs (struct, F offset, D offset, D size): the solver
+  // flips a pair to unkeyed when a byte copy writes its tag other than as a
+  // co-move (plan 3.51, the in-solve certificate check).
+  struct TaggedPair { std::string S; int64_t F, D, Dsize; };
+  std::vector<TaggedPair> taggedPairs; // pairs, tagged/untagged writers, reads keyed/no test/all, non-const
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

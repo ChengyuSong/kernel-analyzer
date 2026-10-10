@@ -3592,11 +3592,23 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // A keyed union access reads its key's cell (--cfl-cells), through
   // its own hub only: the pointer's shared hub would read every member.
   NodeIndex derefNode = AndersNodeFactory::InvalidIndex;
+  // A read admitting several keys (a tagged field, plan 3.51) reads each.
+  bool multiKeyed = false;
   if (CFLCells) {
     auto kit = CGP.unionKeyNames.find(&I);
     if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
       derefNode = CGP.keyedDeref(ptrNode, kit->second[0]);
+    else if (kit != CGP.unionKeyNames.end() && kit->second.size() > 1) {
+      bool tagged = true;
+      for (const std::string &k : kit->second) tagged &= k.find("#t") != std::string::npos;
+      if (tagged) {
+        for (const std::string &k : kit->second)
+          CGP.addAssignmentEdge(CGP.keyedDeref(ptrNode, k), valNode);
+        multiKeyed = true;
+      }
+    }
   }
+  if (multiKeyed) return;
   if (derefNode == AndersNodeFactory::InvalidIndex)
     derefNode = CGP.getRepDerefNode(ptrNode);
 

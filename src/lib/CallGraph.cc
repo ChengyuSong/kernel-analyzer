@@ -683,6 +683,8 @@ bool CallGraphPass::doModulePass(Module *M) {
   if ((CFLCensusUnions || CFLUnionKeys != "off") && iteration == 0 &&
       M == Ctx->Modules.front().first)
     runUnionCensus(); // census, and the union keys graph build applies
+  if (CFLCells && CFLUnionKeys == "tag" && iteration == 0 && M == Ctx->Modules.front().first)
+    computeTaggedFields(); // plan 3.51: keys for fields tagged by a sibling
 
   if (CFLCensusNexus && iteration == 0 && M == Ctx->Modules.front().first)
     runNexusCensus(); // measurement-only, adds no edges

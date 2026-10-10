@@ -1106,6 +1106,11 @@ bool CallGraphPass::runCellResolution() {
     }
     return std::make_pair(u, pn);
   };
+  // Tagged-field slots flipped to unkeyed during the solve (plan 3.51):
+  // (struct label, F offset). Their keyed cells feed the unkeyed side, so
+  // every read of the slot sees every write.
+  std::set<std::pair<std::string, int64_t>> taggedFlipped;
+  std::vector<std::string> taggedFlipAt;
   // The cell of key k in content (o, c): its unkeyed writes and its own.
   std::function<uint32_t(uint32_t, int64_t, uint32_t)> keyedOf;
   keyedOf = [&](uint32_t o, int64_t c, uint32_t k) -> uint32_t {
@@ -1117,6 +1122,7 @@ bool CallGraphPass::runCellResolution() {
     const uint32_t n = newNode();
     addEdge(u, n);
     addEdge(n, pn);
+    if (objs[o].layout && taggedFlipped.count({objs[o].label, c})) addEdge(n, u);
     objs[o].keyed.emplace(kk, n);
     keyedCells++;
     // Copies out of this slot carry the key along.
@@ -3676,6 +3682,25 @@ bool CallGraphPass::runCellResolution() {
       if (Od.layout && !Od.repeats && (db < 0 || db >= Od.size)) break;
       const int64_t sk = contentKey(Os, sa), dk = contentKey(Od, db);
       if (!seenAt.insert({so, sk, dob, dk}).second) continue;
+      // A byte copy writing a tagged field's tag other than as a co-move
+      // (the same struct at the same offset) is a write the census did not
+      // name: the pair flips to unkeyed (plan 3.51).
+      if (!taggedPairs.empty() && Od.layout)
+        for (const TaggedPair &tp : taggedPairs)
+          if (Od.label == tp.S && dk >= tp.D && dk < tp.D + tp.Dsize &&
+              !(Os.layout && Os.label == tp.S && sk == dk) &&
+              taggedFlipped.insert({tp.S, tp.F}).second) {
+            if (taggedFlipAt.size() < 20)
+              taggedFlipAt.push_back(tp.S + "+" + std::to_string(tp.F) + " by +" + std::to_string(tp.D) +
+                                     ": " + (at ? instLoc(at) : std::string("?")));
+            for (uint32_t o2 = 0; o2 < objs.size(); o2++) {
+              if (!objs[o2].layout || objs[o2].label != tp.S) continue;
+              auto cit = objs[o2].content.find(tp.F);
+              if (cit == objs[o2].content.end()) continue;
+              for (auto &[kk, n] : objs[o2].keyed)
+                if ((int64_t)(uint32_t)(kk >> 32) == tp.F) addEdge(n, cit->second.first);
+            }
+          }
       // An integer name copied into bytes (the route by which an integer
       // could be read back as a pointer, plan 3.50 ruling): counted.
       if (!Od.layout && Os.layout && !Os.label.empty()) {
@@ -4529,6 +4554,10 @@ bool CallGraphPass::runCellResolution() {
          << g_vaMachineryLoads << " va_list bookkeeping loads (no vararg edges); " << g_carves
          << " carved regions (one past an array, used as another type; see CARVE lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
+  if (!taggedPairs.empty())
+    CG_LOG("Cells: tagged fields (plan 3.51): " << taggedPairs.size() << " keyed pairs, "
+           << taggedFlipped.size() << " flipped to unkeyed during the solve (a byte copy wrote the tag)\n");
+  for (const std::string &d : taggedFlipAt) CG_LOG("Cells:   unkeyed during solve: unnamed write to tag " << d << "\n");
   if (!varargAllKeys.empty())
     CG_LOG("Cells: varargs keyed by format specifier (plan 3.47): " << varargKeyedSites
            << " call sites with a constant format, " << varargPoolSites

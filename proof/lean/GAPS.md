@@ -716,6 +716,22 @@ Obligations left open:
      - A function in the exact set that the pre-solve set excluded is a
        break, reported; so is an indirect call in the corpus resolving to
        an outside-entered entry.
+   - Tag values read at a load (rule iii). An own-tag term is the
+     current tag at its store only if no write of D, no call that may
+     write D, and no redefinition of the identity can come between the
+     load and the store. Otherwise it is the set that held at the load:
+     the last D writes there when closed and constant, else an image of
+     any tag of the field.
+   - x-masks: bits of a tag value taken from another object's tag of the
+     same field are the projection of U, the values the field holds
+     anywhere in the program. U is the least fixpoint of the field's
+     constants (0, memset fills, constant writes) under every tag write's
+     maps, guards ignored. Sound because another object's tag is some
+     value of the same field, so it lies in U. If U widens, the bits are
+     free.
+   - Out-parameter writes: a direct call handing &identity->F to a callee
+     that writes through that parameter on every return path is an F
+     writer at the call (F walks only).
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with

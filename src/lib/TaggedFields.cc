@@ -328,6 +328,7 @@ void CallGraphPass::computeTaggedFields() {
   taggedOutsideEntries.clear();
   taggedOutsidePre.clear();
   taggedUntested.clear();
+  taggedInPlace.clear();
   taggedAccessSets.clear();
   taggedWatches.clear();
   const auto t0 = std::chrono::steady_clock::now();
@@ -350,6 +351,9 @@ void CallGraphPass::computeTaggedFields() {
     // ldMany: read at several loads.
     const Instruction *ld = nullptr;
     bool ldMany = false;
+    // Bits taken from another object's tag of the same field: they are the
+    // projection of some value the field holds (U), not free (x-mask).
+    int64_t xm = 0;
   };
   // Function-pointer tags (plan 3.51 ruling a): a pointer-valued tag holds
   // NULL (0), the special constant -1 (sqlite's SQLITE_TRANSIENT), a small
@@ -468,7 +472,7 @@ void CallGraphPass::computeTaggedFields() {
   // Every value a term set may take (a symbolic tag's bits free).
   auto concretize = [](const std::vector<Term> &ts, std::set<int64_t> &out) {
     for (const Term &t : ts) {
-      const uint64_t fr = (uint64_t)((t.src == 'c' ? 0 : t.a) | t.m) & ~(uint64_t)t.f;
+      const uint64_t fr = (uint64_t)((t.src == 'c' ? 0 : t.a) | t.m | t.xm) & ~(uint64_t)t.f;
       if (llvm::popcount(fr) > 12) return false;
       for (uint64_t sub = fr;; sub = (sub - 1) & fr) { // every submask
         out.insert((int64_t)sub | t.f);
@@ -479,9 +483,17 @@ void CallGraphPass::computeTaggedFields() {
     return true;
   };
   // A term with its symbolic part made free bits (a superset).
+  // The side of a combination that cannot be paired: another object's tag
+  // ('x') keeps its bits as an x-mask (a value of the field, U); this
+  // object's tag ('s') becomes free.
   auto freeOf = [](const Term &t) {
-    const int64_t fr = (t.src == 'c' ? 0 : t.a) | t.m;
-    return Term{'c', 0, t.f, fr & ~t.f};
+    Term r{'c', 0, t.f, 0};
+    if (t.src == 'x') {
+      r.xm = (t.a | t.xm) & ~t.f;
+      r.m = t.m & ~t.f & ~r.xm;
+    } else
+      r.m = ((t.src == 'c' ? 0 : t.a) | t.m | t.xm) & ~t.f;
+    return r;
   };
   auto analyzeTag = [&](const StoreInst *S, const Value *obj, const Field &D, TagStore &T) {
     // Memoized per value. A local slot and a parameter are the cycle
@@ -595,7 +607,7 @@ void CallGraphPass::computeTaggedFields() {
         const unsigned sb = C->getOperand(0)->getType()->getIntegerBitWidth(), db = C->getType()->getIntegerBitWidth();
         if (isa<TruncInst>(C) || isa<ZExtInst>(C)) {
           const int64_t m = mask(isa<TruncInst>(C) ? db : sb);
-          for (Term t : in) out.push_back({t.src, t.a & m, t.f & m, t.m & m, t.who, t.ld, t.ldMany});
+          for (Term t : in) out.push_back({t.src, t.a & m, t.f & m, t.m & m, t.who, t.ld, t.ldMany, t.xm & m});
           return true;
         }
         if (isa<SExtInst>(C)) {
@@ -610,7 +622,7 @@ void CallGraphPass::computeTaggedFields() {
         std::vector<Term> x, y;
         if (!ev(BO->getOperand(0), depth + 1, x) || !ev(BO->getOperand(1), depth + 1, y)) return false;
         auto exact = [](const std::vector<Term> &ts) { // constants, no free bits
-          for (const Term &t : ts) if ((t.src != 'c' && t.a != 0) || t.m != 0) return false;
+          for (const Term &t : ts) if ((t.src != 'c' && t.a != 0) || t.m != 0 || t.xm != 0) return false;
           return true;
         };
         const auto op = BO->getOpcode();
@@ -630,15 +642,23 @@ void CallGraphPass::computeTaggedFields() {
             if (q.src == 'c') q.a = 0;
             const char src = p.a ? p.src : q.a ? q.src : 'c';
             Term r{'c', 0, 0, 0};
+            // Per bit: known zero, one (f), the tag (a), U's projection
+            // (xm), or free (m). Tag against U, or U against U (two
+            // objects), is free.
+            const int64_t Zp = ~(p.a | p.f | p.m | p.xm), Zq = ~(q.a | q.f | q.m | q.xm);
+            int64_t Z;
             if (op == Instruction::Or) {
               r.f = p.f | q.f;
-              r.m = (p.m | q.m) & ~r.f;
-              r.a = (p.a | q.a) & ~r.f & ~r.m;
+              Z = Zp & Zq;
+              r.a = ((p.a & (Zq | q.a)) | (q.a & Zp)) & ~r.f;
+              r.xm = ((p.xm & Zq) | (q.xm & Zp)) & ~r.f;
             } else {
-              r.a = (p.a & q.a) | (p.a & q.f) | (q.a & p.f);
               r.f = p.f & q.f;
-              r.m = (((p.a | p.f | p.m) & q.m) | ((q.a | q.f | q.m) & p.m)) & ~r.f & ~r.a;
+              Z = Zp | Zq;
+              r.a = (p.a & (q.f | q.a)) | (q.a & p.f);
+              r.xm = (p.xm & q.f) | (q.xm & p.f);
             }
+            r.m = ~Z & ~r.f & ~r.a & ~r.xm;
             r.src = r.a ? src : 'c';
             r.who = p.a ? p.who : q.who;
             r.ld = p.a ? p.ld : q.ld;
@@ -786,12 +806,12 @@ void CallGraphPass::computeTaggedFields() {
     // The store keeps the tag's width.
     const unsigned w = widthOf(S->getValueOperand()->getType());
     const int64_t m = w >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << w) - 1);
-    std::set<std::tuple<char, int64_t, int64_t, int64_t>> seen;
+    std::set<std::tuple<char, int64_t, int64_t, int64_t, int64_t>> seen;
     for (const Term &t : ts) {
       const bool c = t.src == 'c' || (t.a & m) == 0;
       const int64_t f = t.f & m;
-      const Term n{c ? 'c' : t.src, c ? 0 : t.a & m & ~f, f, t.m & m & ~f, t.who, t.ld, t.ldMany};
-      if (seen.insert({n.src, n.a, n.f, n.m}).second) T.terms.push_back(n);
+      const Term n{c ? 'c' : t.src, c ? 0 : t.a & m & ~f, f, t.m & m & ~f, t.who, t.ld, t.ldMany, t.xm & m & ~f};
+      if (seen.insert({n.src, n.a, n.f, n.m, n.xm}).second) T.terms.push_back(n);
       else if (n.src == 's') // the same map read at another load: both must hold
         for (Term &e : T.terms)
           if (e.src == 's' && e.a == n.a && e.f == n.f && e.m == n.m && e.ld != n.ld) e.ldMany = true;
@@ -2139,8 +2159,15 @@ void CallGraphPass::computeTaggedFields() {
   // The last writers of field C.X of object `id` before `at` in Fn.
   size_t walksBack = 0, walksFwd = 0, walkBlocks = 0;
   std::map<const Function *, size_t> walkBlocksBy;
+  // Per-path guards (plan 3.51, ruling i): edges (pred, succ) the
+  // outermost walk does not cross (nested walks, in callees or summaries,
+  // never see them).
+  const std::set<std::pair<const BasicBlock *, const BasicBlock *>> *walkCuts = nullptr;
+  std::set<std::pair<const BasicBlock *, const BasicBlock *>> walkCutsHit; // the cut edges an open path reached
+  int walkDepth = 0;
   auto walkBack = [&](const FieldCtx &C, const Function *Fn, const Value *id, const Instruction *at) {
     walksBack++;
+    struct Depth { int &d; Depth(int &x) : d(x) { d++; } ~Depth() { d--; } } depthGuard{walkDepth};
     Walk R;
     auto openWhy = [&](const std::string &w) {
       if (!R.open) R.why = w;
@@ -2231,6 +2258,7 @@ void CallGraphPass::computeTaggedFields() {
       }
       if (B == &B->getParent()->getEntryBlock()) { R.entry = true; continue; }
       for (const BasicBlock *P : predecessors(B)) {
+        if (walkCuts && walkDepth == 1 && walkCuts->count({P, B})) { walkCutsHit.insert({P, B}); continue; } // a guarded path
         if (!seen.insert(P).second) continue;
         walkBlocks++;
         walkBlocksBy[Fn]++;
@@ -2466,6 +2494,102 @@ void CallGraphPass::computeTaggedFields() {
     as.insert(it->second.as.begin(), it->second.as.end());
     if (Ef) Ef->insert(Ef->end(), it->second.Es.begin(), it->second.Es.end());
   };
+  // Per-path guards (plan 3.51, ruling i). For a retag t of D with no
+  // dominating test: the tests on its identity's own D in its function
+  // whose successor edge is stable up to t (no D write of the object, no
+  // call that may write D, no redefinition of the identity in the region
+  // between the edge and t). Cutting all of them, if the F walk from t
+  // closes, every open path crosses one: that path's guard is its edge's
+  // test. Empty if not.
+  size_t pathGuarded = 0, coFills = 0;
+  auto pathGuards = [&](const TagStore &t, const Field &Df, const FieldCtx &Fc,
+                        const FieldCtx &Dc) -> std::vector<Test> {
+    const Function *Fn = t.I->getFunction();
+    const Defs &idDefs = defsOf(t.obj);
+    std::vector<Test> tests;
+    std::vector<std::pair<const BasicBlock *, const BasicBlock *>> edgeOf; // per test
+    std::set<std::pair<const BasicBlock *, const BasicBlock *>> cuts;
+    auto writesD = [&](const Instruction &I) {
+      if (&I == t.I) return false;
+      if (idDefs.insts.count(&I)) return true;
+      if (auto sit = Dc.stores.find(&I); sit != Dc.stores.end() && sameObj(sit->second, t.obj, &I)) return true;
+      if (const auto *CB = dyn_cast<CallBase>(&I); CB && !isa<IntrinsicInst>(CB) && !CB->isInlineAsm()) {
+        const Function *H = CB->getCalledFunction();
+        return H ? (H->isDeclaration() ? outsideRoots : Dc.mw.fns.count(H) != 0) : Dc.mw.viaIndirect;
+      }
+      return false;
+    };
+    for (const FnTest &ft : fnTestsOf(Fn)) {
+      if (isa<CallBase>(ft.dl) || ft.S != Df.first || ft.off != Df.second || !sameObj(ft.obj, t.obj, ft.Br))
+        continue;
+      for (unsigned si = 0; si < 2; si++) {
+        const BasicBlock *TB = ft.Br->getParent(), *Succ = ft.Br->getSuccessor(si);
+        if (ft.Br->getSuccessor(0) == ft.Br->getSuccessor(1)) continue;
+        // The region from Succ to t (not back through the test block); an
+        // edge into a join is cut as an edge, so Succ may have other
+        // predecessors.
+        std::set<const BasicBlock *> fwd{Succ}, reg;
+        std::vector<const BasicBlock *> work{Succ};
+        while (!work.empty()) {
+          const BasicBlock *B = work.back();
+          work.pop_back();
+          if (B == t.I->getParent()) continue;
+          for (const BasicBlock *N : successors(B))
+            if (N != TB && fwd.insert(N).second) work.push_back(N);
+        }
+        if (!fwd.count(t.I->getParent())) continue;
+        { // t's block on a cycle not through the test: t's own write comes between
+          std::set<const BasicBlock *> cyc;
+          std::vector<const BasicBlock *> w2(succ_begin(t.I->getParent()), succ_end(t.I->getParent()));
+          bool loops = false;
+          while (!w2.empty() && !loops) {
+            const BasicBlock *B = w2.back();
+            w2.pop_back();
+            if (B == TB || !cyc.insert(B).second) continue;
+            if (B == t.I->getParent()) loops = true;
+            for (const BasicBlock *N : successors(B)) w2.push_back(N);
+          }
+          if (loops) continue;
+        }
+        work = {t.I->getParent()};
+        reg.insert(t.I->getParent());
+        while (!work.empty()) {
+          const BasicBlock *B = work.back();
+          work.pop_back();
+          if (B == Succ) continue;
+          for (const BasicBlock *P : predecessors(B))
+            if (fwd.count(P) && reg.insert(P).second) work.push_back(P);
+        }
+        bool stable = true;
+        for (const Instruction *I = ft.dl->getNextNode(); I && I != ft.Br && stable; I = I->getNextNode())
+          stable = !writesD(*I);
+        for (const BasicBlock *B : reg) {
+          if (!stable) break;
+          if (idDefs.blocks.count(B)) { stable = false; break; }
+          for (const Instruction &I : *B) {
+            if (B == t.I->getParent() && &I == t.I) break; // after t: t's block is not re-entered (fwd stops there)
+            if (writesD(I)) { stable = false; break; }
+          }
+        }
+        if (!stable) continue;
+        cuts.insert({TB, Succ});
+        edgeOf.push_back({TB, Succ});
+        tests.push_back({ft.Br->getCondition(), ft.dl, si == 0, ft.off, Df.second});
+      }
+    }
+    if (tests.empty()) return {};
+    walkCuts = &cuts;
+    walkCutsHit.clear();
+    const Walk L = walkBack(Fc, Fn, t.obj, t.I);
+    walkCuts = nullptr;
+    if (L.open || L.entry) return {};
+    // Only the edges open paths reach guard them (a closed path stops
+    // before its edge and is a co-write).
+    std::vector<Test> used;
+    for (size_t q = 0; q < tests.size(); q++)
+      if (walkCutsHit.count(edgeOf[q])) used.push_back(tests[q]);
+    return used;
+  };
   // Rule (iii): an 's' term is the tag that held at its load L. It is the
   // current tag at the store only when the load is in the store's function
   // and no write of D to the object, no call that may write D, and no
@@ -2521,11 +2645,115 @@ void CallGraphPass::computeTaggedFields() {
           vals.insert(vals.end(), cs.begin(), cs.end());
         }
         if (constant)
-          for (int64_t v : vals) nt.push_back({'c', 0, (v & tm.a) | tm.f, tm.m & ~((v & tm.a) | tm.f)});
-        else
-          nt.push_back({'x', tm.a, tm.f, tm.m});
+          for (int64_t v : vals) {
+            const int64_t f = (v & tm.a) | tm.f;
+            Term c{'c', 0, f, tm.m & ~f};
+            c.xm = tm.xm & ~f;
+            nt.push_back(c);
+          }
+        else {
+          Term x{'x', tm.a, tm.f, tm.m};
+          x.xm = tm.xm;
+          nt.push_back(x);
+        }
       }
       if (changed) t.terms = std::move(nt);
+    }
+  }
+  // x-masks (plan 3.51): a term's bits taken from another object's tag of
+  // the field are the projection of U, every value the field holds in the
+  // program: the least fixpoint of its constants (0, memset fills, 'c'
+  // terms) under every tag write's maps, guards ignored (a superset). Each
+  // x-masked term becomes one term per projected value; if U widens (past
+  // 4096 values or a map with too many free bits), the bits are free.
+  size_t xmTerms = 0, xmFieldsWide = 0;
+  std::vector<std::string> xmFieldSizes;
+  for (auto &[Dx, ts] : dStores) {
+    bool any = false;
+    for (const TagStore &t : ts) for (const Term &tm : t.terms) any |= tm.xm != 0;
+    if (!any) continue;
+    unsigned w = 0;
+    for (const TagStore &t : ts) w = widthOf(t.I->getValueOperand()->getType());
+    const int64_t wm = w >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << w) - 1);
+    // Maps are bitwise, so U's projection onto a mask X is the fixpoint of
+    // the projected constants under the projected maps: computed per mask,
+    // at most 2^|X| values.
+    std::string whyWide;
+    std::set<int64_t> fills{0};
+    if (auto fit = fillsOf.find(Dx.first); fit != fillsOf.end())
+      for (const Fill &f : fit->second)
+        if (f.lo < Dx.second + (int64_t)(w / 8) && Dx.second < f.hi) {
+          if (f.fill < 0) { whyWide = "a non-constant memset"; break; }
+          int64_t v = 0;
+          for (unsigned k = 0; k < w / 8; k++) v = (v << 8) | f.fill;
+          fills.insert(v & wm);
+        }
+    for (const TagStore &t : ts)
+      if (t.unknown && whyWide.empty()) whyWide = "an unevaluable tag write at " + locOf(t.I);
+    std::map<int64_t, std::optional<std::set<int64_t>>> projOf; // mask -> U & mask (none: widened)
+    auto projection = [&](int64_t X) -> const std::optional<std::set<int64_t>> & {
+      auto [it, ins] = projOf.try_emplace(X);
+      if (!ins) return it->second;
+      if (!whyWide.empty() || llvm::popcount((uint64_t)X) > 12) return it->second;
+      std::set<int64_t> P;
+      for (int64_t v : fills) P.insert(v & X);
+      for (bool grew = true; grew;) {
+        grew = false;
+        const std::set<int64_t> cur = P;
+        for (const TagStore &t : ts)
+          for (const Term &tm : t.terms) {
+            const int64_t a = tm.a & X, f = tm.f & X, m = tm.m & X, xm = tm.xm & X;
+            if (llvm::popcount((uint64_t)(m | xm)) > 12) return it->second; // too free to enumerate
+            std::vector<int64_t> ins;
+            if (tm.src == 'c') ins.push_back(0);
+            else ins.assign(cur.begin(), cur.end());
+            const uint64_t fr = (uint64_t)m;
+            const std::set<int64_t> none{0};
+            for (int64_t v : ins)
+              for (int64_t x : xm ? cur : none) // another object's bits: some value of the field
+                for (uint64_t sub = fr;; sub = (sub - 1) & fr) {
+                  if (P.insert(((tm.src == 'c' ? 0 : v & a) | f | (int64_t)sub | (x & xm)) & X).second) grew = true;
+                  if (!sub) break;
+                }
+          }
+      }
+      return it->second = std::move(P);
+    };
+    bool wide = false;
+    std::string sizes;
+    std::set<int64_t> masks;
+    for (const TagStore &t : ts) for (const Term &tm : t.terms) if (tm.xm) masks.insert(tm.xm);
+    for (int64_t X : masks) {
+      const auto &P = projection(X);
+      if (!P) wide = true;
+      sizes += " mask 0x" + utohexstr((uint64_t)X) + ": " + (P ? std::to_string(P->size()) : std::string("widened"));
+    }
+    if (wide && whyWide.empty()) whyWide = "a projection too free to enumerate";
+    xmFieldsWide += wide;
+    xmFieldSizes.push_back(Dx.first + "+" + std::to_string(Dx.second) + ":" + sizes +
+                           (whyWide.empty() ? "" : " (" + whyWide + ")"));
+    for (TagStore &t : ts) {
+      std::vector<Term> nt;
+      for (const Term &tm : t.terms) {
+        if (!tm.xm) { nt.push_back(tm); continue; }
+        xmTerms++;
+        const auto &P = projection(tm.xm);
+        if (!P || P->size() > 64) {
+          Term r = tm;
+          r.m |= r.xm;
+          r.xm = 0;
+          nt.push_back(r);
+          continue;
+        }
+        for (int64_t x : *P) {
+          Term r = tm;
+          r.f |= x;
+          r.m &= ~x;
+          r.xm = 0;
+          nt.push_back(r);
+        }
+      }
+      t.terms = std::move(nt);
     }
   }
   for (auto &[Ff, fs] : fStores) {
@@ -2737,6 +2965,17 @@ void CallGraphPass::computeTaggedFields() {
           testsAtM(t.I, id, Df, Ff, all, pas, &Es);
           std::vector<Term> pre{idTerm};
           if (!all.empty()) g.push_back(all.back()), pre = Es.back();
+          else if (const std::vector<Test> pg = pathGuards(t, Df, Fc, Dc); !pg.empty()) {
+            // Guarded per path: each open path's map under its edge's test
+            // (a constant under a guard is a map with no input bits).
+            pathGuarded++;
+            for (const Term &q : t.terms)
+              for (const Test &T : pg) {
+                R.maps.push_back(q.src == 'c' ? Term{'s', 0, q.f, q.m} : q);
+                R.guards.push_back(q.src == 'x' ? std::vector<Test>{} : std::vector<Test>{T});
+              }
+            continue;
+          }
           for (const Term &q : t.terms)
             for (const Term &p : pre) {
               R.maps.push_back(q.src == 's' ? composeT(p, q) : q);
@@ -2916,12 +3155,25 @@ void CallGraphPass::computeTaggedFields() {
       // memset fills that may cover the tag: constant retags, or (a
       // non-constant fill) an unevaluable one.
       std::set<int64_t> pairFills;
+      std::vector<std::string> fillAt; // reports: fills retagging the field
       const Instruction *fillUnknownAt = nullptr;
       if (auto fit = fillsOf.find(S); fit != fillsOf.end())
         for (const Fill &f : fit->second)
           if (f.lo < dOff + dBytes && dOff < f.hi) {
+            // A fill covering all of F and D is a co-write: F's content
+            // becomes bytes (no pointer), so no writer's content is read
+            // under the filled tag through this object.
+            if (f.lo <= Ff.second && Ff.second + 8 <= f.hi && f.lo <= dOff && dOff + dBytes <= f.hi) {
+              coFills++;
+              continue;
+            }
             if (f.fill < 0) { if (!fillUnknownAt) fillUnknownAt = f.I; }
-            else pairFills.insert(f.fill);
+            else {
+              pairFills.insert(f.fill);
+              if (fillAt.size() < 8)
+                fillAt.push_back(locOf(f.I) + " [" + std::to_string(f.lo) + "," + std::to_string(f.hi) + ") byte " +
+                                 std::to_string(f.fill));
+            }
           }
       if (fillUnknownAt) {
         pairsNonConst++;
@@ -2963,6 +3215,7 @@ void CallGraphPass::computeTaggedFields() {
       std::vector<std::string> xformLab;         // per xform: where it comes from (reports)
       size_t guarded = 0, unguarded = 0;
       std::vector<std::string> unguardedAt, allRetagAt;
+      std::vector<std::pair<const Instruction *, std::string>> inPlaceHere; // unguarded open retags (rule row)
       std::vector<std::string> xformAt;
       bool setsAll = false;
       auto termStr = [](const Term &tm) {
@@ -2978,6 +3231,33 @@ void CallGraphPass::computeTaggedFields() {
         std::vector<std::vector<Term>> Es;
         bool hasS = false;
         for (const Term &tm : t->terms) hasS |= tm.src == 's';
+        // Per-path guards: when no test dominates the retag, the tests on
+        // its own D whose edges every open path crosses (cutting them
+        // closes the F walk); each path's guard is the test on its edge.
+        std::vector<Test> pg;
+        {
+          std::vector<Test> dom;
+          std::vector<std::vector<Term>> E2;
+          std::set<uint32_t> a2;
+          testsAtM(t->I, t->obj, Df, Ff, dom, a2, &E2);
+          if (dom.empty()) pg = pathGuards(*t, Df, Fc, Dc);
+        }
+        if (!pg.empty()) {
+          pathGuarded++;
+          for (const Term &tm : t->terms) {
+            if (tm.src == 'x') { anyImgs.push_back(tm); continue; }
+            const Term mp = tm.src == 's' ? tm : Term{'s', 0, tm.f, tm.m};
+            for (const Test &T : pg)
+              xforms.push_back(mp), xformGuard.push_back({T}),
+                  xformLab.push_back(locOf(t->I) + " guarded per path (" + locOf(T.d) + ")");
+          }
+          if (VerboseLevel >= 2) {
+            std::string d = locOf(t->I) + " {";
+            for (const Term &tm : t->terms) d += std::string(d.back() == '{' ? "" : ", ") + termStr(tm);
+            allRetagAt.push_back(d + "} [guarded per path by " + std::to_string(pg.size()) + " tests]");
+          }
+          continue;
+        }
         if (hasS) {
           std::vector<Test> all;
           testsAtM(t->I, t->obj, Df, Ff, all, pas, &Es);
@@ -2993,6 +3273,11 @@ void CallGraphPass::computeTaggedFields() {
           else if (!all.empty()) g.push_back(all.back()), pre = Es.back();
           (g.empty() ? unguarded : guarded)++;
           if (g.empty() && unguardedAt.size() < 40) unguardedAt.push_back(locOf(t->I) + ": " + lastTestsWhy);
+          if (g.empty()) {
+            std::string mp = "{";
+            for (const Term &tm : t->terms) mp += std::string(mp.size() > 1 ? ", " : "") + termStr(tm);
+            inPlaceHere.push_back({t->I, mp + "}"});
+          }
           for (const Term &tm : t->terms)
             if (tm.src == 's')
               for (const Term &e : pre) {
@@ -3369,6 +3654,8 @@ void CallGraphPass::computeTaggedFields() {
         keyed.push_back({r.I, adm});
         pairReadsKeyed++;
       }
+      for (auto &[I, mp] : inPlaceHere)
+        taggedInPlace.push_back({S + "+" + std::to_string(Ff.second) + " by +" + std::to_string(dOff), I, mp});
       if (keyed.empty()) {
         if (fs.size() >= 10) {
           size_t nAll = std::count(wAll.begin(), wAll.end(), true);
@@ -3397,6 +3684,7 @@ void CallGraphPass::computeTaggedFields() {
               std::string d = "    retag constants:";
               for (int64_t v : sets) d += " " + std::to_string(v);
               d += "; U " + std::string(full.uWide ? "widened" : std::to_string(full.uSize));
+              for (const std::string &fa : fillAt) d += "; fill " + fa;
               d += "; anyImgs " + std::to_string(anyImgs.size()) + ":";
               for (const Term &t : anyImgs) d += " " + termStr(t);
               taggedReport.push_back(d);
@@ -3591,7 +3879,11 @@ void CallGraphPass::computeTaggedFields() {
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
          << pairsUncertified << " by an uncertified tag; " << unionFields
          << " union members read as one pointer field; " << outParamWrites << " out-parameter F writes; "
-         << sTermsKept << " own-tag terms current at their store, " << sTermsAtLoad << " taken at their load (rule iii)\n");
+         << sTermsKept << " own-tag terms current at their store, " << sTermsAtLoad << " taken at their load (rule iii); "
+         << xmTerms << " terms with x-masks over " << xmFieldSizes.size() << " fields (" << xmFieldsWide << " U widened); "
+         << pathGuarded << " retags guarded per path; " << coFills << " fills that write F and D together\n");
+  if (VerboseLevel >= 2)
+    for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
   if (VerboseLevel >= 2) {
     for (const std::string &l : taggedReport) CG_LOG("TaggedFields:   " << l << "\n");
     CG_LOG("TaggedFields: predicate tests " << predClosed << " closed, " << predOpen << " open\n");

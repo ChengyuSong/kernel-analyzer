@@ -5619,6 +5619,13 @@ bool CallGraphPass::runCellResolution() {
            << inPre << " of them in the pre-solve domain (" << taggedOutsidePre.size() << " functions)\n";
       for (auto &[b, n] : byB) RO << "T outside callers: " << n << " via " << bnd[b].first << " " << bnd[b].second << "\n";
     }
+    if (!taggedInPlace.empty()) {
+      RO << "SUMMARY tagged fields in-place retags " << taggedInPlace.size()
+         << " (open tag writes no test guards and no content write accompanies: they retag every writer)\n";
+      for (auto &[f, I, mp] : taggedInPlace)
+        RO << "T in-place retag without content write, callers not all visible: " << instLoc(I) << " of " << f
+           << " map " << mp << "\n";
+    }
     if (!taggedUntested.empty()) {
       RO << "SUMMARY tagged fields untested reads " << taggedUntested.size()
          << " (reads of a field with candidate tags that no tag test guards: every writer)\n";

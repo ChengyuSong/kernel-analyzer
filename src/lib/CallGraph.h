@@ -521,6 +521,9 @@ protected:
   // Reads of a field with candidate tags that no tag test guards: they
   // admit every writer (field, site).
   std::vector<std::pair<std::string, const llvm::Instruction *>> taggedUntested;
+  // Open retags no test guards (in-place retags without a content write):
+  // (field and tag, site, map).
+  std::vector<std::tuple<std::string, const llvm::Instruction *, std::string>> taggedInPlace;
   std::vector<std::vector<uint32_t>> taggedPairAssumes; // per taggedPairs entry
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();

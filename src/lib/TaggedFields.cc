@@ -1473,6 +1473,7 @@ void CallGraphPass::computeTaggedFields() {
   };
   struct FieldCtx {
     Field X;
+    bool isD = false;
     std::map<const Instruction *, const Value *> stores; // named stores of X -> object identity
     MayWrite mw;                                        // functions that may write X
   };
@@ -1483,6 +1484,7 @@ void CallGraphPass::computeTaggedFields() {
     if (!P) {
       P = std::make_unique<FieldCtx>();
       P->X = X;
+      P->isD = isD;
       std::vector<const Instruction *> seeds;
       if (isD)
         for (const TagStore &t : dStores[X]) P->stores[t.I] = t.obj, seeds.push_back(t.I);
@@ -2073,6 +2075,43 @@ void CallGraphPass::computeTaggedFields() {
   std::function<const RetSum &(const FieldCtx &, const Function *)> retSumOf;
   std::function<Walk(const FieldCtx &, const Function *, const Value *, const Instruction *)> walkBackF;
   size_t retDefsClosed = 0, retDefsOpen = 0;
+  // Out-parameter writes (plan 3.51, Mem.u): does H write through its
+  // pointer parameter k on every return path (a store through it, or a
+  // call handing it to a callee that does)? Recursion in progress: no.
+  std::map<std::pair<const Function *, unsigned>, int> outMemo; // 0 busy, 1 yes, 2 no
+  std::function<bool(const Function *, unsigned)> outMustWrite = [&](const Function *H, unsigned k) -> bool {
+    auto [it, ins] = outMemo.try_emplace({H, k}, 0);
+    if (!ins) return it->second == 1;
+    if (H->isDeclaration() || k >= H->arg_size() || !H->getArg(k)->getType()->isPointerTy()) return (it->second = 2) == 1;
+    const Value *P = H->getArg(k);
+    bool all = true;
+    for (const BasicBlock &RB : *H) {
+      const auto *Ret = dyn_cast<ReturnInst>(RB.getTerminator());
+      if (!Ret || !all) continue;
+      std::set<const BasicBlock *> seen;
+      std::vector<std::pair<const BasicBlock *, const Instruction *>> work{{&RB, Ret}};
+      while (!work.empty() && all) {
+        auto [B, I] = work.back();
+        work.pop_back();
+        bool done = false;
+        for (; I && !done; I = I->getPrevNode()) {
+          if (const auto *St = dyn_cast<StoreInst>(I); St && argId(St->getPointerOperand()) == P) done = true;
+          else if (const auto *CB = dyn_cast<CallBase>(I); CB && CB->getCalledFunction())
+            for (unsigned j = 0; j < CB->arg_size() && !done; j++)
+              if (CB->getArgOperand(j)->getType()->isPointerTy() && argId(CB->getArgOperand(j)) == P &&
+                  outMustWrite(CB->getCalledFunction(), j))
+                done = true;
+        }
+        if (done) continue;
+        if (B == &H->getEntryBlock() || seen.size() > 4000) { all = false; break; }
+        for (const BasicBlock *Pb : predecessors(B))
+          if (seen.insert(Pb).second) work.push_back({Pb, &Pb->back()});
+      }
+    }
+    outMemo[{H, k}] = all ? 1 : 2;
+    return all;
+  };
+  size_t outParamWrites = 0;
   // The last writers of field C.X of object `id` before `at` in Fn.
   size_t walksBack = 0, walksFwd = 0, walkBlocks = 0;
   std::map<const Function *, size_t> walkBlocksBy;
@@ -2133,6 +2172,22 @@ void CallGraphPass::computeTaggedFields() {
           continue;
         }
         bool mapped = false, must = false;
+        // F's own address handed to a callee that writes through it on
+        // every path (sqlite3AtoF(z, &pMem->u.r, ..)): an F writer here.
+        if (!C.isD)
+          for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size() && !must; k++) {
+            const Value *A = CB->getArgOperand(k);
+            StructType *S2 = nullptr;
+            int64_t o2 = 0;
+            if (!A->getType()->isPointerTy() || !structGEP(A) ||
+                !accessSlot(CB, A, CB->getModule()->getDataLayout(), S2, o2) || !S2 || !S2->hasName() ||
+                stripStructNameSuffix(S2->getName()) != C.X.first || o2 != C.X.second ||
+                !sameObj(objKey(CB, A, S2), id, CB) || !outMustWrite(H, k))
+              continue;
+            outParamWrites++;
+            must = true;
+          }
+        if (must) { stopped = true; continue; }
         for (unsigned k = 0; k < CB->arg_size() && k < H->arg_size(); k++)
           if (CB->getArgOperand(k)->getType()->isPointerTy() && argId(CB->getArgOperand(k)) == id) {
             mapped = true;
@@ -2533,7 +2588,8 @@ void CallGraphPass::computeTaggedFields() {
           retags.push_back(&t);
           nonConstRetag |= t.unknown;
           openStores++;
-          openWhyOf[&t] = L.open ? L.why : "the function entry (F from before it)";
+          openWhyOf[&t] = (L.open ? L.why : std::string("the function entry (F from before it)")) +
+                          "; F writers on other paths: " + std::to_string(L.W.size());
           if (openAt.empty() && L.open) openAt = locOf(t.I) + ": " + L.why;
         } else closedStores++;
       }
@@ -2870,7 +2926,7 @@ void CallGraphPass::computeTaggedFields() {
         if (sym && VerboseLevel >= 2) {
           std::string d = locOf(t->I) + " {";
           for (const Term &tm : t->terms) d += std::string(d.back() == '{' ? "" : ", ") + termStr(tm);
-          allRetagAt.push_back(d + "}");
+          allRetagAt.push_back(d + "} [" + openWhyOf[t] + "]");
         }
         if (sym && xformAt.size() < 4) {
           std::string d = locOf(t->I) + " {";
@@ -3448,7 +3504,7 @@ void CallGraphPass::computeTaggedFields() {
          << " tests dropped: D may be written before the access), " << readsAll
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
          << pairsUncertified << " by an uncertified tag; " << unionFields
-         << " union members read as one pointer field\n");
+         << " union members read as one pointer field; " << outParamWrites << " out-parameter F writes\n");
   if (VerboseLevel >= 2) {
     for (const std::string &l : taggedReport) CG_LOG("TaggedFields:   " << l << "\n");
     CG_LOG("TaggedFields: predicate tests " << predClosed << " closed, " << predOpen << " open\n");

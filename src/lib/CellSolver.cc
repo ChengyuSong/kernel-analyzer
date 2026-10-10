@@ -5597,7 +5597,8 @@ bool CallGraphPass::runCellResolution() {
          << " flipped in the solve; alias assumptions " << asmUsed - asmFailed << " held, " << asmFailed
          << " failed; predicate tests: " << taggedCounts[7] << " closed, " << taggedCounts[8]
          << " open; outside-domain entries " << taggedOutsideEntries.size() << ", premise broken at "
-         << domainBroken.size() << "\n";
+         << (stoppedAt ? std::string("unknown (the solve stopped: no icall answers)") : std::to_string(domainBroken.size()))
+         << "\n";
     for (const std::string &d : domainBroken) RO << "T outside domain broken: " << d << "\n";
     if (!taggedPairs.empty()) {
       // Which functions the outside can call (their address reaches it),
@@ -5607,8 +5608,15 @@ bool CallGraphPass::runCellResolution() {
       size_t defined = 0, inPre = 0;
       for (auto &[Fn, b] : fnsOutside)
         if (!Fn->isDeclaration()) byB[b]++, defined++, inPre += taggedOutsidePre.count(Fn);
-      RO << "SUMMARY outside callers: " << defined << " defined functions reach the outside after the solve, "
-         << inPre << " of them in the pre-solve domain (" << taggedOutsidePre.size() << " functions)\n";
+      // A stopped solve has no icall answers: which callers the outside
+      // has is not known (calls through resolved targets are not followed).
+      if (stoppedAt)
+        RO << "SUMMARY outside callers: unknown (the solve stopped at pop " << stoppedAt
+           << ": no icall answers; at least " << defined << " defined functions reach the outside; pre-solve domain "
+           << taggedOutsidePre.size() << " functions)\n";
+      else
+        RO << "SUMMARY outside callers: " << defined << " defined functions reach the outside after the solve, "
+           << inPre << " of them in the pre-solve domain (" << taggedOutsidePre.size() << " functions)\n";
       for (auto &[b, n] : byB) RO << "T outside callers: " << n << " via " << bnd[b].first << " " << bnd[b].second << "\n";
     }
     if (!taggedUntested.empty()) {

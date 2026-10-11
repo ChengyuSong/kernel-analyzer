@@ -1140,6 +1140,18 @@ bool CallGraphPass::runCellResolution() {
   // by the step that minted them (verbose census).
   std::map<std::string, size_t> interiorBy;
   std::string mintCause = "seed";
+  // The cause a minting operation sets for its extent; the previous one
+  // comes back on exit, so no cell is credited to a stale step.
+  struct MintCause {
+    std::string *v = nullptr, old;
+    MintCause(std::string &cur, std::string c, bool on) {
+      if (!on) return;
+      v = &cur;
+      old = std::move(cur);
+      cur = std::move(c);
+    }
+    ~MintCause() { if (v) *v = std::move(old); }
+  };
   size_t interiorCells = 0, beyondLabel = 0, leftObject = 0;
   // The content cell of folded offset c of object o, made on first use.
   // The content cell an offset of object o lands in: folded through its
@@ -1215,6 +1227,7 @@ bool CallGraphPass::runCellResolution() {
   auto flipPair = [&](size_t pi, const std::string &why) {
     const TaggedPair &tp = taggedPairs[pi];
     if (!taggedFlipped.insert({tp.S, tp.F}).second) return;
+    MintCause mc(mintCause, "tag flip", VerboseLevel >= 2);
     if (taggedFlipAt.size() < 20)
       taggedFlipAt.push_back(tp.S + "+" + std::to_string(tp.F) + " by +" + std::to_string(tp.D) + ": " + why);
     for (uint32_t o2 = 0; o2 < objs.size(); o2++) {
@@ -1628,6 +1641,7 @@ bool CallGraphPass::runCellResolution() {
   };
   auto canonOff = contentKey;
   auto refold = [&](uint32_t o) {
+    MintCause mc(mintCause, "refold", VerboseLevel >= 2);
     // Header+tail: what lay past the header (minted while the object was
     // unknown) moves to the trailing object.
     if (objs[o].tail) {
@@ -1890,6 +1904,7 @@ bool CallGraphPass::runCellResolution() {
       objSeeds++;
     }
   }
+  mintCause = "other";
 
   // A variable index (stride s) from byte x of object o stays in the
   // innermost array holding x, arrays being one element: the same cell
@@ -1952,11 +1967,13 @@ bool CallGraphPass::runCellResolution() {
     // The member's own cell at `off` (an Off cell of object o).
     const Cell C{o, CellKind::Off, off, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0};
     const LazyLabel &L = lazyLabels[li];
-    if (VerboseLevel >= 2)
-      mintCause = (L.stride ? "stride " + std::to_string(L.stride)
-                            : (L.arith ? "arith +" : "member +") +
-                                  std::to_string(L.off)) +
-                  (objs[C.obj].repeats ? " (heap)" : "");
+    MintCause mc(mintCause,
+                 VerboseLevel < 2 ? std::string()
+                 : (L.stride ? "stride " + std::to_string(L.stride)
+                             : (L.arith ? "arith +" : "member +") +
+                                   std::to_string(L.off)) +
+                       (objs[C.obj].repeats ? " (heap)" : ""),
+                 VerboseLevel >= 2);
     switch (C.kind) {
     case CellKind::Func:
     case CellKind::Any:
@@ -3148,6 +3165,7 @@ bool CallGraphPass::runCellResolution() {
   uint64_t walkSteps = 0;
   size_t hubLinks = 0, funcDerefs = 0, outDerefs = 0;
   auto linkHub = [&](uint32_t h, uint32_t f) {
+    MintCause mc(mintCause, "hub link", VerboseLevel >= 2);
     const Cell &C = cells[findFact(f)];
     if (C.kind == CellKind::Func) { funcDerefs++; return; }
     if (C.kind == CellKind::Out) { outDerefs++; return; }
@@ -3972,6 +3990,7 @@ bool CallGraphPass::runCellResolution() {
   };
   auto copyRegion = [&](uint32_t os, int64_t a, uint32_t od, int64_t b,
                         int64_t len, const Instruction *at) {
+    MintCause mc(mintCause, "byte copy", VerboseLevel >= 2);
     // Effective type (C11 6.5p6): a copy into an object with no declared
     // type gives it the source's type. An unknown destination copied into
     // from its start learns the struct the source region starts with.

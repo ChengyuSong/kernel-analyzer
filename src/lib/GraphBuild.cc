@@ -264,6 +264,32 @@ static bool derivesFromLoweredVAListImpl(const Value *V,
   return false;
 }
 
+// Is address V written through: a store's address, or the destination of
+// a memcpy/memmove, directly or through further GEPs and casts? (A memset
+// writes bytes, not a type; a load, or a call that is not a copy, does not
+// write the type either.) Plan 3.53 rule 1: only a written step labels.
+static bool addressWrittenThrough(const Value *V) {
+  SmallVector<const Value *, 8> work{V};
+  SmallPtrSet<const Value *, 16> seen;
+  while (!work.empty() && seen.size() < 64) {
+    const Value *X = work.pop_back_val();
+    if (!seen.insert(X).second) continue;
+    for (const User *U : X->users()) {
+      if (const auto *SI = dyn_cast<StoreInst>(U)) {
+        if (SI->getPointerOperand() == X) return true;
+        continue;
+      }
+      if (const auto *MT = dyn_cast<MemTransferInst>(U)) {
+        if (MT->getRawDest() == X) return true;
+        continue;
+      }
+      if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U))
+        work.push_back(U);
+    }
+  }
+  return false;
+}
+
 // Detect lowered vararg loads (e.g. loads from __va_list_tag-based state)
 // when frontends lower va_arg to memory operations instead of VAArgInst.
 static bool derivesFromLoweredVAList(const Value *V) {
@@ -1774,16 +1800,17 @@ int CallGraphPass::fieldBucket(int64_t off) const {
 uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith,
                                      const StructType *ty, uint32_t extent) {
   if (lazyLabels.empty()) {
-    lazyLabels.push_back({0, 0, false, nullptr, 0, false});
-    lazyLabelIdx[{0, 0, false, nullptr, 0, false}] = 0;
+    lazyLabels.push_back({0, 0, false, nullptr, 0, false, false});
+    lazyLabelIdx[{0, 0, false, nullptr, 0, false, false}] = 0;
   }
   // An extent qualifies a strided step (the array's length) and an arith
   // step (the element size: a constant index stays in its array).
   if (stride == 0 && !arith) extent = 0;
   const bool written = gepWritten && (ty || stride);
-  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent, written),
+  const bool writes = gepWrites && ty;
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent, written, writes),
                                         (uint32_t)lazyLabels.size());
-  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent, written});
+  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent, written, writes});
   return it->second;
 }
 
@@ -4139,8 +4166,9 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
       CGP.addAssignmentEdge(ptrNode, valNode);
     else {
       CGP.gepWritten = GEP.getFunction()->hasOptNone();
+      CGP.gepWrites = addressWrittenThrough(&GEP);
       CGP.addFieldChainEdges(ptrNode, valNode, levels, ltys);
-      CGP.gepWritten = false;
+      CGP.gepWritten = CGP.gepWrites = false;
     }
     return;
   }

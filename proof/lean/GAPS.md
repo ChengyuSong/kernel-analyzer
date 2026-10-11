@@ -858,3 +858,77 @@ Not mechanized. Checked by executions:
 - consumer outputs byte-identical (libpng, SoK sets, libjpeg ×4);
 - httpd O0 to completion: icalls JSON and log identical;
 - tcpdump O0 at 1,300,000 pops: census log identical.
+
+## Bytes is not a label; written labels; label extent (CellSolver, 2026-10-11, plan 3.53 rule 1)
+
+An unlabeled object is unnamed: its cells are its raw byte offsets. Three
+changes:
+- **Writes label, reads do not.** A member step of struct T at offset 0
+  labels the object only when the step's address is written through: a
+  store's address, or a memcpy/memmove destination, through further GEPs
+  and casts (`addressWrittenThrough`). A copy into an unlabeled object
+  from its start gives it the source's struct (effective type).
+- **Bytes is not a label.** A variable byte index (stride 1, a byte walk)
+  into an unlabeled object yields the object's any-offset cell, which
+  writes and reads all of its content cells. A byte copy to or from an
+  unlabeled object (no learned element size) uses that object's
+  any-offset cell on its side.
+- **First typed use.** An object used as bytes while unlabeled (a
+  variable byte index, or a side of a byte copy) keeps that use. A later
+  struct write does not label it: a rule (b) row ("struct written into
+  storage used as bytes"), reported, not admitted. The write still flows:
+  its step yields the raw cell, or the any-offset cell.
+- **Extent.** A label covers one T at the start. What follows is decided
+  by the allocation's size:
+  - a multiple of sizeof T: an array of T;
+  - exactly sizeof T: one T;
+  - T plus trailing data, or a size that says nothing: one T followed by
+    an unknown trailing object.
+  A T-stride access (variable index or walk) on the latter makes it an
+  array of T (`extendToArray`). The trailing object's cells merge into
+  the header's element at offset + sizeof T modulo sizeof T. Its address
+  facts move there, it forwards to the header from then on, and its
+  any-offset cell is linked both ways to the header's. A trailing object
+  already labeled, or of a learned element size, refuses the extension
+  (counted). One label per allocation: a trailing object that is there
+  because the size said nothing never takes a label of its own. A typed
+  write into it makes the header an array of T; a write of another
+  struct there is a rule (b) row.
+- **Keyed accesses wait for a label.** A keyed union access through an
+  unlabeled object waits until the object is labeled, then links keyed.
+  At the fixpoint, accesses still waiting link unkeyed, and the solve
+  continues.
+
+Hypothesis (the naming rule as it stands): an object's layout is its
+first typed use in solve order. A later incompatible use (a struct
+written into storage used as bytes, or into an allocation laid out as
+another struct) is reported as rule (b), not admitted as a layout. The
+other order needs no row: a byte access on a labeled object runs over its
+fields (the any-offset cell). The order dependence is the old model's
+(bytes, then struct, was never labeled).
+
+Statement:
+- **Labeling renames within one object.** The cells it merges are cells
+  of the same object at offsets the label folds together; no two objects'
+  cells merge. A raw-offset cell +k becomes the cell of the field holding
+  k, and its facts and links go with it (refold).
+- **Every access stays sound before labeling.** A raw cell is exact for
+  its byte offset. The any-offset cell over-approximates every byte of
+  the object. A variable byte access or an unlabeled copy side therefore
+  reaches every cell it could touch, as the single bytes cell did.
+- **The array extension merges the same memory.** p[i].x (header cell x)
+  and p[1].x (trailing cell at sizeof T + x) are one byte once the object
+  is known to be an array, so the merge is a renaming inside the
+  allocation. Before the extension, a variable index stays in its element
+  ("index stays"), as for any array of one.
+- **A waiting keyed access is linked before the fixpoint is final.** It
+  is linked keyed if the object gets a label, unkeyed otherwise. The
+  solve does not stop with an access unlinked.
+
+Not mechanized. Checked by executions:
+- consumer outputs (libpng, libjpeg ×4) byte-identical;
+- httpd and tcpdump to completion (see the commit);
+- test/cfl-smoke.sh;
+- test/tagged-gaps.sh (the waiting keyed access restores
+  t_tagged_both/compose/fnptr, whose reads stepped before the writers
+  labeled the object).

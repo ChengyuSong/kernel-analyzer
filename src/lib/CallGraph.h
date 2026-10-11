@@ -134,10 +134,14 @@ protected:
   // whose types are the program's own: its address into an array is the
   // array's (plan 3.43 provenance). -O3 may rebase a field on a
   // neighbouring one (inbounds bounds only the allocation).
-  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; uint32_t extent; bool written = false; };
+  // writes: the step's address is written through (a store's address or a
+  // memcpy/memmove destination, through further GEPs and casts); only
+  // such a step labels an unlabeled object (plan 3.53, rule 1).
+  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; uint32_t extent; bool written = false; bool writes = false; };
   std::vector<LazyLabel> lazyLabels;
-  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *, uint32_t, bool>, uint32_t> lazyLabelIdx;
+  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *, uint32_t, bool, bool>, uint32_t> lazyLabelIdx;
   bool gepWritten = false; // the GEP being built is in an optnone function
+  bool gepWrites = false;  // the GEP being built is written through
   std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
   // --cfl-cells: byte copies (memcpy, CPY summaries) as copy constraints
   // the cell solver resolves per cell pair: src, dst, length (-1 unknown).

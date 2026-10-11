@@ -146,10 +146,21 @@ struct Obj {
   // Learned during the solve: a layout from the first typed access at
   // offset 0 of an unlabeled object.
   bool learnedLayout = false;
-  // An unlabeled object is unknown (its cells named ?#o, compatible only
-  // with itself) until its first typed use: a struct step gives a layout,
-  // byte arithmetic (a variable i8 index, a byte walk) makes it bytes.
-  bool bytes = false;
+  // An unlabeled object is unnamed (its cells named ?#o by raw offset)
+  // until its first typed write labels it (plan 3.53, rule 1: bytes is
+  // not a label). A variable byte index into it is its any-offset cell.
+  // A trailing object folded back into its header when the header became
+  // an array (a T-stride access): its addresses are the header's, fwdOff
+  // bytes on.
+  uint32_t fwd = UINT32_MAX;
+  int64_t fwdOff = 0;
+  // The trailing object is there because the size said nothing (not
+  // because it said T plus data): it never takes a label of its own.
+  bool tailUnsized = false;
+  // Used as bytes while unlabeled: a variable byte access, or a side of a
+  // byte copy (plan 3.53 rule 1 (ii)). Its layout is its first typed use,
+  // so a later struct write does not label it: a rule (b) row.
+  bool byteAccessed = false;
   // An unlabeled object is an array of unknown element: a variable index
   // of stride s says its element is s bytes (content folds modulo it).
   int64_t period = 0;
@@ -568,62 +579,70 @@ bool innermostArraySpan(Type *T, int64_t off, const DataLayout &DL, int64_t &lo,
   return found;
 }
 
+// An allocation size's source: through casts, and at -O0 a local slot that
+// never escapes (its only users are direct loads and exactly one store: no
+// call can write it through its address) forwards the stored value
+// (sqlite3: nByte = sizeof(Fts3SegReader) + (nElem+1)*sizeof(Fts3HashElem
+// *); malloc(nByte)).
+const Value *sizeThrough(const Value *V) {
+  for (int d = 0; d < 8; d++) {
+    if (const auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
+    if (const auto *L = dyn_cast<LoadInst>(V))
+      if (const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+        const StoreInst *only = nullptr;
+        bool ok = true, several = false;
+        for (const User *U : S->users()) {
+          if (isa<LoadInst>(U)) continue;
+          const auto *SI = dyn_cast<StoreInst>(U);
+          if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S) {
+            ok = false;
+            break;
+          }
+          several |= only != nullptr;
+          only = SI;
+        }
+        if (ok && only && !several) { V = only->getValueOperand(); continue; }
+        // A slot stored several times (fts3InitVtab reuses nByte): the
+        // store before the load in its block reaches it.
+        if (ok && several) {
+          const StoreInst *last = nullptr;
+          for (const Instruction *I = L->getPrevNode(); I && !last; I = I->getPrevNode())
+            if (const auto *SI = dyn_cast<StoreInst>(I))
+              if (SI->getPointerOperand() == S) last = SI;
+          if (last) { V = last->getValueOperand(); continue; }
+        }
+      }
+    break;
+  }
+  return V;
+}
+
+// Is size expression X a multiple of sz: a constant multiple (nonzero: a
+// size, not a flag), or a product (or shift) with one?
+bool isMultipleOf(const Value *X, uint64_t sz, bool nonzero = false) {
+  X = sizeThrough(X);
+  if (const auto *B = dyn_cast<BinaryOperator>(X)) {
+    if (B->getOpcode() == Instruction::Mul)
+      for (const Value *Op : B->operands())
+        if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(Op)))
+          return (!nonzero || K->getZExtValue()) && K->getZExtValue() % sz == 0;
+    if (B->getOpcode() == Instruction::Shl)
+      if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(B->getOperand(1))))
+        return K->getZExtValue() < 63 && (1ULL << K->getZExtValue()) % sz == 0;
+  }
+  if (const auto *K = dyn_cast<ConstantInt>(X))
+    return (!nonzero || K->getZExtValue()) && K->getZExtValue() % sz == 0;
+  return false;
+}
+
 // Does an allocation call's size argument say "a T followed by trailing
 // data": a constant larger than T and not a multiple of it, or a sum (any
 // depth: -O3 chains `sizeof(T) + 8*n + 40*m + k`) with a constant term of
 // at least sizeof(T) and some other term that is not a multiple of it
 // (`n*sizeof(T) + sizeof(T)` is an array of n+1)?
 bool headerPlusTail(const CallBase *C, uint64_t sz) {
-  // Casts, and at -O0 a local slot that never escapes (its only users are
-  // direct loads and exactly one store: no call can write it through its
-  // address) forwards the stored value (sqlite3: nByte = sizeof(Fts3SegReader)
-  // + (nElem+1)*sizeof(Fts3HashElem *); malloc(nByte)).
-  auto lookThrough = [](const Value *V) {
-    for (int d = 0; d < 8; d++) {
-      if (const auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
-      if (const auto *L = dyn_cast<LoadInst>(V))
-        if (const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
-          const StoreInst *only = nullptr;
-          bool ok = true, several = false;
-          for (const User *U : S->users()) {
-            if (isa<LoadInst>(U)) continue;
-            const auto *SI = dyn_cast<StoreInst>(U);
-            if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S) {
-              ok = false;
-              break;
-            }
-            several |= only != nullptr;
-            only = SI;
-          }
-          if (ok && only && !several) { V = only->getValueOperand(); continue; }
-          // A slot stored several times (fts3InitVtab reuses nByte): the
-          // store before the load in its block reaches it.
-          if (ok && several) {
-            const StoreInst *last = nullptr;
-            for (const Instruction *I = L->getPrevNode(); I && !last; I = I->getPrevNode())
-              if (const auto *SI = dyn_cast<StoreInst>(I))
-                if (SI->getPointerOperand() == S) last = SI;
-            if (last) { V = last->getValueOperand(); continue; }
-          }
-        }
-      break;
-    }
-    return V;
-  };
-  auto multipleOf = [&](const Value *X) {
-    X = lookThrough(X);
-    if (const auto *B = dyn_cast<BinaryOperator>(X)) {
-      if (B->getOpcode() == Instruction::Mul)
-        for (const Value *Op : B->operands())
-          if (const auto *K = dyn_cast<ConstantInt>(lookThrough(Op)))
-            return K->getZExtValue() % sz == 0;
-      if (B->getOpcode() == Instruction::Shl)
-        if (const auto *K = dyn_cast<ConstantInt>(lookThrough(B->getOperand(1))))
-          return K->getZExtValue() < 63 && (1ULL << K->getZExtValue()) % sz == 0;
-    }
-    if (const auto *K = dyn_cast<ConstantInt>(X)) return K->getZExtValue() % sz == 0;
-    return false;
-  };
+  auto lookThrough = sizeThrough;
+  auto multipleOf = [&](const Value *X) { return isMultipleOf(X, sz); };
   for (const Use &A : C->args()) {
     const Value *V = lookThrough(A.get());
     if (!V->getType()->isIntegerTy()) continue;
@@ -672,6 +691,15 @@ bool exactlyOne(const CallBase *C, uint64_t sz) {
     any = true;
   }
   return any && prod == sz;
+}
+
+// Does an allocation call's size say "an array of T": an integer argument
+// that is a multiple of sizeof(T) (calloc(n, sizeof T), malloc(n * sizeof
+// T), realloc(p, k * sizeof T))?
+bool sizeIsMultiple(const CallBase *C, uint64_t sz) {
+  for (const Use &A : C->args())
+    if (A.get()->getType()->isIntegerTy() && isMultipleOf(A.get(), sz, true)) return true;
+  return false;
 }
 
 std::string typeLabel(Type *T) {
@@ -908,6 +936,14 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> watchAt;
   boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> watchPending;
   boost::unordered_flat_set<uint64_t> watchSeen;
+  // Keyed accesses (--cfl-union-keys=tag) through an object not yet
+  // labeled wait for its label (whether the cell is a keyed slot is the
+  // label's to say): (hub, fact) by object. Linked keyed once it is
+  // labeled; at the fixpoint, those still waiting link unkeyed and the
+  // solve goes on.
+  boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> keyedWait;
+  std::function<void(uint32_t, uint32_t)> linkHubFn; // set once linkHub exists
+  size_t keyedWaits = 0, keyedFlushed = 0;
   std::function<void(uint32_t, uint32_t)> watchCheck;
   // Alias assumptions (plan 3.51): an entry on a node is the identity side
   // of assumption idx (off: the field) or an access of access set idx
@@ -1166,8 +1202,10 @@ bool CallGraphPass::runCellResolution() {
   std::string anyCause = "?";
   uint32_t anyCauseNode = UINT32_MAX;
   std::function<void(uint32_t)> noteAnyCause;
-  auto anyOf = [&](uint32_t o) -> uint32_t {
+  std::function<uint32_t(uint32_t)> anyOf;
+  anyOf = [&](uint32_t o) -> uint32_t {
     if (objs[o].any != UINT32_MAX) return objs[o].any;
+    if (objs[o].fwd != UINT32_MAX) return anyOf(objs[o].fwd); // folded into its header
     if (noteAnyCause) noteAnyCause(o);
     const uint32_t w = newNode(), r = newNode();
     const uint32_t f = newCell({o, CellKind::Any, 0, UINT32_MAX, w, r,
@@ -1204,7 +1242,7 @@ bool CallGraphPass::runCellResolution() {
   // the offset modulo the learned element size, else the raw offset.
   auto contentKey = [&](const Obj &O, int64_t off) -> int64_t {
     if (!O.layout)
-      return O.bytes ? 0 : O.period ? ((off % O.period) + O.period) % O.period : off;
+      return O.period ? ((off % O.period) + O.period) % O.period : off;
     assert(!(O.tail && off >= O.size) && "trailing offsets route to the tail object");
     off = ((off % O.size) + O.size) % O.size; // an array of one or more
     return foldIn(O.layout, off, DL);
@@ -1345,7 +1383,7 @@ bool CallGraphPass::runCellResolution() {
   auto cellName = [&](uint32_t o, int64_t c) -> std::string {
     const Obj &O = objs[o];
     if (!O.layout)
-      return O.bytes ? std::string("i8[]") : "?#" + std::to_string(o);
+      return "?#" + std::to_string(o);
     if (O.label == "i8" || inByteArray(O.layout, c, DL))
       return "i8[]";
     return O.label + "+" + std::to_string(c);
@@ -1366,6 +1404,10 @@ bool CallGraphPass::runCellResolution() {
   };
   // Byte `off` of object o, through trailing objects: (object, offset).
   auto locate = [&](uint32_t o, int64_t off) -> std::pair<uint32_t, int64_t> {
+    while (objs[o].fwd != UINT32_MAX) {
+      off += objs[o].fwdOff;
+      o = objs[o].fwd;
+    }
     while (objs[o].tail && off >= objs[o].size) {
       off -= objs[o].size;
       o = tailOf(o);
@@ -1504,9 +1546,7 @@ bool CallGraphPass::runCellResolution() {
     Obj &O = objs[o];
     if (!O.layout) {
       // An unlabeled array of learned element size: the address reduces
-      // modulo the element (bytes: to 0), as a heap object modulo its
-      // struct.
-      if (O.bytes) return mintOff(o, 0, false);
+      // modulo the element, as a heap object modulo its struct.
       if (O.period) return mintOff(o, ((off % O.period) + O.period) % O.period, false);
       return off < 0 ? outOf(o) : mintOff(o, off, false);
     }
@@ -1550,59 +1590,17 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> passedBy;
   size_t layoutsLearned = 0, refoldMerges = 0, periodsLearned = 0,
          tailObjects = 0;
-  size_t bytesLearned = 0;
   auto requestPeriod = [&](uint32_t o, int64_t s) {
     Obj &O = objs[o];
-    if (O.layout || O.bytes || O.fn || s <= 0) return;
+    if (O.layout || O.fn || s <= 0) return;
     const int64_t p = O.period ? std::gcd(O.period, s) : s;
     if (p == O.period) return;
     if (!O.period) periodsLearned++;
     O.period = p;
     refoldQueue.push_back(o);
   };
-  // Byte arithmetic at offset `at` of an unknown object: bytes from `at`
-  // on. At 0 the object is bytes; past 0 it is an unknown header followed
-  // by a trailing bytes object (`zDb = (char *)&t[1]` in the storage after
-  // a struct), so a struct learned later at 0 can still fill the header.
-  std::function<void(uint32_t)> noteBytesCause; // --cfl-cell-trace-obj
-  std::function<void(uint32_t, StructType *)> noteLayoutCause;
+  std::function<void(uint32_t, StructType *)> noteLayoutCause; // --cfl-cell-trace-obj
   std::string layoutCopyFrom; // the byte copy giving its effective type (trace)
-  std::function<void(uint32_t, int64_t)> requestBytes;
-  requestBytes = [&](uint32_t o, int64_t at) {
-    std::tie(o, at) = locate(o, at);
-    Obj &O = objs[o];
-    if (O.layout || O.bytes || O.fn) return;
-    if (at > 0) {
-      if (O.tail) { // bytes from below the current boundary: move it down
-        const uint32_t rest = O.tailObj; // bytes from the old boundary
-        Obj M;
-        M.origin = O.origin;
-        M.parentObj = o;
-        M.base = O.base + at;
-        M.bytes = true;
-        M.tail = rest != UINT32_MAX;
-        M.size = O.size - at;
-        M.tailObj = rest;
-        objs.push_back(std::move(M));
-        const uint32_t m = objs.size() - 1;
-        if (rest != UINT32_MAX) objs[rest].parentObj = m;
-        objs[o].tailObj = m;
-        objs[o].size = at;
-      } else {
-        O.tail = true;
-        O.size = at;
-        const uint32_t t = tailOf(o);
-        objs[t].bytes = true;
-      }
-      bytesLearned++;
-      refoldQueue.push_back(o); // cells past `at` move to the trailing bytes
-      return;
-    }
-    O.bytes = true;
-    bytesLearned++;
-    if (noteBytesCause) noteBytesCause(o);
-    refoldQueue.push_back(o); // renames its cells i8[]
-  };
   // An allocation whose constant size k is larger than struct S (and not a
   // multiple): the structs of exactly k bytes that start with S. Then S is
   // the first member of a container (C inheritance: code that writes only
@@ -1627,15 +1625,55 @@ bool CallGraphPass::runCellResolution() {
       }
     return n == 1 ? one : nullptr;
   };
+  // The extent a label covers (plan 3.53, rule 1): a T at the start, and
+  // what the allocation's size says of the rest. A constant or a multiple
+  // of T's size is an array of T; one T exactly is one; T plus trailing
+  // data, or a size that says nothing (a wrapper's argument, a length read
+  // from input), is a header followed by an unknown trailing object, until
+  // a T-stride access makes it an array (extendToArray).
+  size_t extentArrays = 0, extentOne = 0, extentHeader = 0, extentUnknown = 0,
+         arraysExtended = 0, extendRefused = 0, readStepsSkipped = 0, varByteAny = 0;
+  auto setExtent = [&](Obj &O, const Value *V) {
+    O.tail = false;
+    O.repeats = false;
+    const auto *C = dyn_cast_or_null<CallBase>(V);
+    const uint64_t at = (uint64_t)(O.base + O.size);
+    if (C && headerPlusTail(C, at)) { O.tail = true; extentHeader++; tailObjects++; }
+    else if (C && exactlyOne(C, at)) extentOne++;
+    else if (C && sizeIsMultiple(C, at)) { O.repeats = true; extentArrays++; }
+    else { O.tail = true; O.tailUnsized = true; extentUnknown++; }
+  };
+  // The extension of a header+tail object into an array of its T (defined
+  // with the steps; a label request on an unsized tail makes it).
+  std::function<void(uint32_t)> extendToArrayFn;
+  std::function<std::string(uint32_t)> nodeDescFn; // set once nodeDesc exists
+  size_t bytesWritesRefused = 0;
+  std::map<std::string, size_t> bytesWritesBy; // writing site | struct
+  size_t tailWritesFolded = 0;
+  std::map<std::pair<std::string, std::string>, size_t> tailFoldPairs;
   auto requestLayout = [&](uint32_t o, StructType *S) {
     Obj &O = objs[o];
-    if (O.layout || O.bytes || !S || S->isOpaque() || !S->isSized()) return;
+    if (O.layout || O.fn || !S || S->isOpaque() || !S->isSized()) return;
+    // One label per allocation: a typed write into the unknown data after
+    // a T (an allocation whose size said nothing) makes it an array of T,
+    // as the old array did; a write of another struct there is a rule (b)
+    // row (the object was laid out by its first typed write).
+    if (O.parentObj != UINT32_MAX && objs[O.parentObj].tailUnsized &&
+        objs[O.parentObj].tailObj == o) {
+      const uint32_t p = O.parentObj;
+      if (S != objs[p].layout) {
+        tailWritesFolded++;
+        tailFoldPairs[{objs[p].label, typeLabel(S)}]++;
+      }
+      extendToArrayFn(p);
+      return;
+    }
     int64_t sz = (int64_t)DL.getTypeAllocSize(S);
     if (sz <= 0) return;
     // The first member of a container its allocation size names: learn the
     // container; with several such containers, learn nothing yet (a later
     // step names the type).
-    if (!O.tail && O.base == 0)
+    if (O.base == 0)
       if (const auto *C = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin))) {
         size_t n = 0;
         if (StructType *CT = containerOfSize(C, S, sz, n)) {
@@ -1647,50 +1685,23 @@ bool CallGraphPass::runCellResolution() {
           return;
         }
       }
-    if (O.tail) {
-      // An unknown header before trailing bytes at O.size: the struct fills
-      // it (sz == size) or leaves an unknown gap before them (sz < size).
-      // A struct reaching into the bytes is the conflict (one-label).
-      if (sz > O.size) return;
-      if (sz < O.size) {
-        Obj Gp;
-        Gp.origin = O.origin;
-        Gp.parentObj = o;
-        Gp.base = O.base + sz;
-        Gp.tail = true;
-        Gp.size = O.size - sz;
-        Gp.tailObj = O.tailObj;
-        objs.push_back(std::move(Gp));
-        const uint32_t g = objs.size() - 1;
-        if (objs[g].tailObj != UINT32_MAX) objs[objs[g].tailObj].parentObj = g;
-        objs[o].tailObj = g;
-      }
-      Obj &H = objs[o];
-      H.layout = S;
-      H.repeats = false; // a header is one object
-      H.size = sz;
-      H.label = typeLabel(S);
-      H.learnedLayout = true;
-      layoutsLearned++;
-      if (noteLayoutCause) noteLayoutCause(o, S);
-      refoldQueue.push_back(o);
+    // An object used as bytes keeps that first use: a struct written into
+    // it is reported (rule (b)), not admitted as its layout. The write
+    // still flows: the step yields the raw cell (or the any-offset cell).
+    if (O.byteAccessed) {
+      bytesWritesRefused++;
+      const std::string site =
+          !layoutCopyFrom.empty() ? "copy at " + layoutCopyFrom.substr(0, layoutCopyFrom.find(" from "))
+          : curStepDst != UINT32_MAX ? nodeDescFn(curStepDst).substr(0, 120) : std::string("?");
+      bytesWritesBy[site + " | " + typeLabel(S)]++;
       return;
     }
     O.layout = S;
-    // An array of S of unknown extent, then unknown: the trailing data of
-    // a header (sqlite3's VdbeFrame: nMem Mems, then cursor pointers)
-    // indexed by element, offsets reduced modulo S's stride. Only a size
-    // that says otherwise makes it one S: exactly the header and one S, or
-    // one S followed by a constant remainder.
-    O.repeats = true;
     O.size = sz;
     O.label = typeLabel(S);
     O.learnedLayout = true;
-    if (const auto *C = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin))) {
-      if (headerPlusTail(C, (uint64_t)(O.base + sz))) { O.tail = true; O.repeats = false; tailObjects++; }
-      else if (exactlyOne(C, (uint64_t)(O.base + sz))) O.repeats = false;
-      else if (O.parentObj != UINT32_MAX) trailingArrays++;
-    }
+    setExtent(O, NF.getValueForNode(O.origin));
+    if (O.parentObj != UINT32_MAX) trailingArrays += O.repeats;
     layoutsLearned++;
     if (noteLayoutCause) noteLayoutCause(o, S);
     refoldQueue.push_back(o);
@@ -1755,7 +1766,6 @@ bool CallGraphPass::runCellResolution() {
       const Obj &O = objs[o];
       assert(!(O.tail && off >= O.size) && "moved to the trailing object above");
       if (O.repeats) off = ((off % O.size) + O.size) % O.size;
-      else if (!O.layout && O.bytes) off = 0;
       else if (!O.layout && O.period) off = ((off % O.period) + O.period) % O.period;
       byOff[{off, bit}].push_back(findFact(f));
     }
@@ -1811,16 +1821,22 @@ bool CallGraphPass::runCellResolution() {
       const uint32_t o = refoldQueue.back();
       refoldQueue.pop_back();
       refold(o);
-      if (!watchPending.empty() && (objs[o].layout || objs[o].bytes))
+      if (!watchPending.empty() && objs[o].layout)
         if (auto wit = watchPending.find(o); wit != watchPending.end()) {
           std::vector<std::pair<uint32_t, uint32_t>> ws = std::move(wit->second);
           watchPending.erase(wit);
           for (auto [wi, f] : ws) watchCheck(wi, findFact(f));
         }
+      if (!keyedWait.empty() && objs[o].layout)
+        if (auto kit = keyedWait.find(o); kit != keyedWait.end()) {
+          std::vector<std::pair<uint32_t, uint32_t>> ws = std::move(kit->second);
+          keyedWait.erase(kit);
+          for (auto [h, f] : ws) linkHubFn(h, findFact(f));
+        }
       // Typed now: its facts at the nodes it passed while unknown get the
       // one-label check (re-presented as pending; propagation is a no-op).
       auto pit = passedBy.find(o);
-      if (pit == passedBy.end() || (!objs[o].layout && !objs[o].bytes)) continue;
+      if (pit == passedBy.end() || !objs[o].layout) continue;
       std::vector<std::pair<uint32_t, uint32_t>> seen = std::move(pit->second);
       passedBy.erase(pit);
       std::sort(seen.begin(), seen.end());
@@ -1907,11 +1923,7 @@ bool CallGraphPass::runCellResolution() {
             heapContainerAmbiguous++;
           }
         }
-    if (O.layout && O.repeats)
-      if (const auto *C = dyn_cast_or_null<CallBase>(V)) {
-        if (headerPlusTail(C, (uint64_t)O.size)) { O.tail = true; tailObjects++; }
-        else if (exactlyOne(C, (uint64_t)O.size)) O.repeats = false;
-      }
+    if (O.layout && O.repeats && isa_and_nonnull<CallBase>(V)) setExtent(O, V);
     objs.push_back(std::move(O));
     return objs.size() - 1;
   };
@@ -1974,18 +1986,88 @@ bool CallGraphPass::runCellResolution() {
          byteWalkStays = 0, byteWalkStructRel = 0;
   // Sampled undefined-behavior exits: (pointer node, object, position, k).
   std::vector<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> byteStepUBAt;
+  // A T followed by unknown data, accessed at a T stride, is an array of T
+  // (plan 3.53, rule 1): the trailing object's cells and addresses fold
+  // into the header's element (offset + sizeof T, modulo T), and it
+  // forwards to the header from now on. Trailing data typed as something
+  // else, or of a learned element size, stays (refused, counted).
+  auto extendToArray = [&](uint32_t o) {
+    const uint32_t t = objs[o].tailObj;
+    if (t != UINT32_MAX && (objs[t].layout || objs[t].period || objs[t].tail ||
+                            !objs[t].keyed.empty())) {
+      extendRefused++;
+      return;
+    }
+    arraysExtended++;
+    objs[o].tail = false;
+    objs[o].tailUnsized = false;
+    objs[o].repeats = true;
+    objs[o].tailObj = UINT32_MAX;
+    if (t != UINT32_MAX) {
+      const int64_t d = objs[t].base - objs[o].base; // the header's size
+      objs[t].fwd = o;
+      objs[t].fwdOff = d;
+      // Content: each cell of t merges with the header's cell there.
+      std::vector<std::tuple<int64_t, uint32_t, uint32_t>> moved = std::move(objs[t].loadNodes);
+      objs[t].loadNodes.clear();
+      objs[t].content.clear();
+      for (auto &[c, u, pn] : moved) {
+        const auto [u2, p2] = contentOf(o, contentKey(objs[o], c + d));
+        mergeNodes(u2, u);
+        mergeNodes(p2, pn);
+      }
+      // Addresses: t's become the header's (re-folded by the refold).
+      std::vector<std::pair<int64_t, uint32_t>> past(objs[t].offCells.begin(), objs[t].offCells.end());
+      objs[t].offCells.clear();
+      for (auto &[key, f0] : past) {
+        const uint32_t f = findFact(f0);
+        const int64_t off = (key >> 1) + d;
+        const bool bit = (key & 1) != 0;
+        for (Member &mb : memb[f])
+          if (mb.first == t) mb = {o, encOff(decOff(mb.second) + d, (mb.second & kFoldedBit) != 0)};
+        if (cells[f].obj == t) {
+          cells[f].obj = o;
+          cells[f].off = off;
+        }
+        auto it = objs[o].offCells.find(off * 2 + (bit ? 1 : 0));
+        if (it == objs[o].offCells.end()) objs[o].offCells[off * 2 + (bit ? 1 : 0)] = f;
+        else it->second = mergeFacts(findFact(it->second), f);
+      }
+      // Its any-offset cell reads and writes all of the array.
+      if (objs[t].any != UINT32_MAX) {
+        const uint32_t a = anyOf(o);
+        addEdge(cells[objs[t].any].store, cells[a].store);
+        addEdge(cells[a].load, cells[objs[t].any].load);
+      }
+    }
+    refoldQueue.push_back(o);
+  };
+  extendToArrayFn = extendToArray;
   // arr: the result is an element address of its byte array (provenance).
   auto strideCells = [&](uint32_t o, int64_t x, int64_t s,
                          std::vector<uint32_t> &out, bool arr) {
     auto folded = [&](uint32_t o2, int64_t at) { return arr ? cellAtArr(o2, at) : cellAt(o2, at); };
     std::tie(o, x) = locate(o, x); // past a header: the trailing object
-    Obj &O = objs[o];
-    if (!O.layout) {
-      if (s == 1) requestBytes(o, x);
-      else requestPeriod(o, s);
+    if (!objs[o].layout) {
+      // A variable byte index into an unlabeled object: any byte of it,
+      // its any-offset cell (bytes is not a label). A wider stride: an
+      // array of s-byte elements.
+      if (s == 1) {
+        varByteAny++;
+        objs[o].byteAccessed = true;
+        out.push_back(anyOf(o));
+        return;
+      }
+      requestPeriod(o, s);
       out.push_back(cellAt(o, x));
       return;
     }
+    // A T-stride access on a T followed by unknown data: an array of T.
+    if (objs[o].tail && !objs[o].repeats && s % objs[o].size == 0) {
+      extendToArray(o);
+      std::tie(o, x) = locate(o, x);
+    }
+    Obj &O = objs[o];
     const int64_t pos = ((x % O.size) + O.size) % O.size;
     int64_t b = 0, e = 0;
     if (!innermostArray(O.layout, pos, DL, b, e)) {
@@ -2038,7 +2120,9 @@ bool CallGraphPass::runCellResolution() {
       llvm_unreachable("stepOne steps offset cells only");
     case CellKind::Off: {
       const Obj &O = objs[C.obj];
-      if (!O.layout && L.ty && !L.stride && !L.arith && C.off == 0) {
+      if (!O.layout && L.ty && !L.stride && !L.arith && C.off == 0 && !L.writes)
+        readStepsSkipped++; // a read does not label (plan 3.53, rule 1)
+      if (!O.layout && L.ty && !L.stride && !L.arith && C.off == 0 && L.writes) {
         // One label per pointer: a cell merged from several objects as
         // bytes, now accessed as struct L.ty, is the conflict itself.
         if (CFLCellOneLabel && curStepFact != UINT32_MAX &&
@@ -3203,7 +3287,7 @@ bool CallGraphPass::runCellResolution() {
                        ((mb.second & kFoldedBit) && (W.lo || W.hi));
       // Through the header into trailing objects.
       for (int d = 0; d < 16; d++) {
-        if (!objs[o].layout && !objs[o].bytes) {
+        if (!objs[o].layout) {
           watchPending[o].push_back({wi, f});
           break;
         }
@@ -3230,8 +3314,14 @@ bool CallGraphPass::runCellResolution() {
     uint32_t ld = C.load, st = C.store;
     auto kit = cellHubKey.find(h);
     if (kit != cellHubKey.end() && C.kind == CellKind::Off) {
-      // A keyed union access: its key's cell, for every member object.
+      // A keyed union access: its key's cell, for every member object
+      // (an object not yet labeled waits).
       for (auto [o, e] : memb[findFact(f)]) {
+        if (!objs[o].layout) {
+          keyedWait[o].push_back({h, f});
+          keyedWaits++;
+          continue;
+        }
         const uint32_t K = keyedOf(o, contentKey(objs[o], decOff(e)), kit->second);
         addEdge(K, h);
         if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], K);
@@ -3241,13 +3331,24 @@ bool CallGraphPass::runCellResolution() {
     addEdge(ld, h);
     if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], st);
   };
+  linkHubFn = linkHub;
+  // The keyed accesses still waiting at the fixpoint, on objects never
+  // labeled: linked unkeyed (the solve goes on from them).
+  auto flushKeyedWait = [&]() {
+    for (auto &[o, ws] : keyedWait)
+      for (auto [h, f0] : ws) {
+        const uint32_t f = findFact(f0);
+        addEdge(cells[f].load, h);
+        if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], cells[f].store);
+        keyedFlushed++;
+      }
+    keyedWait.clear();
+  };
   // The any-offset cells of every object a cell stands for, into dst.
   auto toAny = [&](uint32_t f, uint32_t dst) {
     anyCause = "field-any loop";
     anyCauseNode = dst;
     if (cells[f].kind == CellKind::Out) return; // outside stays outside
-    for (auto [o, e] : memb[f])
-      if (!objs[o].layout) requestBytes(o, 0); // a variable i8 index into it
     std::vector<uint32_t> &W = anyDst[f];
     if (std::find(W.begin(), W.end(), dst) != W.end()) return;
     W.push_back(dst);
@@ -3405,7 +3506,9 @@ bool CallGraphPass::runCellResolution() {
     return k + " @" + std::to_string(C.off) + " of " + describe(objs[C.obj]);
   };
   boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, uint32_t>> keyedPtrOf;
-  auto nodeDesc = [&](uint32_t m) -> std::string {
+  std::function<std::string(uint32_t)> nodeDesc;
+  nodeDescFn = [&](uint32_t m) { return nodeDesc(m); };
+  nodeDesc = [&](uint32_t m) -> std::string {
     if (m >= G) {
       for (uint32_t f = 0; f < cells.size(); f++) {
         const Cell &C = cells[f];
@@ -3976,14 +4079,6 @@ bool CallGraphPass::runCellResolution() {
       tracePathD(n, w.substr(0, w.find(" [")), 3); // depth 3: one level of why
     }
   };
-  noteBytesCause = [&](uint32_t o) {
-    if (CFLCellTraceObj.empty() ||
-        describe(objs[o]).find(CFLCellTraceObj) == std::string::npos)
-      return;
-    CG_LOG("Cells: BYTES " << describe(objs[o]) << " from offset 0, at "
-           << (anyCauseNode == UINT32_MAX ? std::string("?") : nodeDesc(anyCauseNode))
-           << " (" << mintCause << ")\n");
-  };
   // The access that gave an unlabeled object its layout: the stepped
   // pointer and the step's result (a member step), or a byte copy.
   noteLayoutCause = [&](uint32_t o, StructType *S) {
@@ -4013,14 +4108,10 @@ bool CallGraphPass::runCellResolution() {
   // touches is bytes.
   auto regionLen = [&](uint32_t o, int64_t a) -> int64_t {
     if (objs[o].fn) return 0; // a function holds no cells
-    if (!objs[o].layout && !objs[o].bytes && !objs[o].period) {
-      requestBytes(o, a); // may split o at a (bytes in a new trailing object)
-      std::tie(o, a) = locate(o, a);
-    }
     const Obj &O = objs[o];
     if (!O.layout) {
-      if (O.bytes) return 1;
-      assert(O.period && "copy from an unknown object that requestBytes left unknown");
+      // An unlabeled object's bytes are its any-offset cell: one position.
+      if (!O.period) return 1;
       return O.period - (((a % O.period) + O.period) % O.period);
     }
     int64_t pos = a;
@@ -4050,8 +4141,11 @@ bool CallGraphPass::runCellResolution() {
     }
   };
   boost::unordered_flat_map<std::pair<Type *, int64_t>, int64_t, FoldKeyHash> foldMemo;
+  // An unlabeled object without an element size is one key: its any-offset
+  // cell (bytes is not a label).
+  constexpr int64_t kCopyAny = std::numeric_limits<int64_t>::min();
   auto copyKey = [&](const Obj &O, int64_t off) -> int64_t {
-    if (!O.layout) return contentKey(O, off);
+    if (!O.layout) return O.period ? contentKey(O, off) : kCopyAny;
     assert(!(O.tail && off >= O.size) && "trailing offsets route to the tail object");
     off = ((off % O.size) + O.size) % O.size;
     auto [it, ins] = foldMemo.try_emplace({O.layout, off}, 0);
@@ -4064,12 +4158,11 @@ bool CallGraphPass::runCellResolution() {
     // Effective type (C11 6.5p6): a copy into an object with no declared
     // type gives it the source's type. An unknown destination copied into
     // from its start learns the struct the source region starts with.
-    if (!objs[od].layout && !objs[od].bytes && b == 0 && objs[os].layout) {
+    if (!objs[od].layout && b == 0 && objs[os].layout) {
       const Obj &Os = objs[os];
       const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
       if (StructType *S = structAt(Os.layout, fa, DL)) {
-        if (!CFLCellTraceObj.empty())
-          layoutCopyFrom = (at ? instLoc(at) : std::string("?")) + " from " + describe(Os) + " +" + std::to_string(fa);
+        layoutCopyFrom = (at ? instLoc(at) : std::string("?")) + " from " + describe(Os) + " +" + std::to_string(fa);
         requestLayout(od, S);
         layoutCopyFrom.clear();
         if (objs[od].layout) effectiveTyped++;
@@ -4138,7 +4231,7 @@ bool CallGraphPass::runCellResolution() {
     // A side's run at byte `off` of O, reached at position k: (period, end).
     auto runOf = [&](const Obj &O, int64_t off, int64_t k) -> std::pair<int64_t, int64_t> {
       const int64_t segEnd = O.tail ? k + (O.size - off) : kNoEnd;
-      if (!O.layout) return {O.bytes ? 1 : O.period, segEnd};
+      if (!O.layout) return {O.period ? O.period : 1, segEnd}; // any offset: one key
       const int64_t in = O.repeats ? ((off % O.size) + O.size) % O.size : off;
       const auto [e, aend] = foldPeriod(O.layout, in, DL);
       if (e > 0) return {e, std::min(segEnd, k + (aend - in))};
@@ -4203,11 +4296,14 @@ bool CallGraphPass::runCellResolution() {
             intNameToBytesAt.insert(instLoc(at) + " (" + Os.label + "+" + std::to_string(sk) + ")");
         }
       }
-      if (!Os.layout && !Os.bytes && Os.content.size() >= CFLCellCap &&
-          !Os.content.count(sk))
-        continue; // capped: its any-offset cell already reads everything
-      const auto [su, sp] = contentOf(so, sk);
-      const auto [du, dp] = contentOf(dob, dk);
+      auto sideOf = [&](uint32_t o, int64_t k, bool read) -> std::pair<uint32_t, uint32_t> {
+        if (k != kCopyAny) return contentOf(o, k);
+        objs[o].byteAccessed = true;
+        const Cell &A = cells[anyOf(o)];
+        return read ? std::make_pair(A.load, A.load) : std::make_pair(A.store, A.store);
+      };
+      const auto [su, sp] = sideOf(so, sk, true);
+      const auto [du, dp] = sideOf(dob, dk, false);
       if (CFLCellLeakCensus) // before the edge: its facts arrive inside addEdge
         leakCopyEdge.try_emplace((uint64_t)find(su != sp && du != dp ? su : sp) << 32 | find(du), curCopy);
       if (su != sp && du != dp) {
@@ -4315,7 +4411,7 @@ bool CallGraphPass::runCellResolution() {
       const Cell &C = cells[f];
       if (C.kind != CellKind::Off) return;
       bool unknown = true;
-      for (auto [o, e] : memb[f]) unknown &= !objs[o].layout && !objs[o].bytes;
+      for (auto [o, e] : memb[f]) unknown &= !objs[o].layout;
       if (unknown) return; // no name yet
       if (n >= soupAnchor.size()) soupAnchor.resize(numNodes + 1024, UINT32_MAX);
       if (soupAnchor[n] == UINT32_MAX) { soupAnchor[n] = f; return; }
@@ -4408,7 +4504,7 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_set<uint32_t> leakMergedByte;    // merged with a byte cell
   auto leakByteCell = [&](uint32_t o, int64_t c) {
     if (c == kLeakAny)
-      return objs[o].layout ? objs[o].label == "i8" : objs[o].bytes;
+      return objs[o].layout && objs[o].label == "i8";
     return cellName(o, c) == "i8[]";
   };
   auto leakIsByte = [&](uint32_t n) {
@@ -4504,7 +4600,7 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_map<const Value *, std::pair<size_t, size_t>> leakPtrViews;
   auto leakObjLabel = [&](uint32_t o) -> std::string {
     const Obj &O = objs[o];
-    return O.fn ? std::string("fn") : O.layout ? O.label : O.bytes ? std::string("bytes") : std::string("unnamed");
+    return O.fn ? std::string("fn") : O.layout ? O.label : std::string("unnamed");
   };
   // A pointer's objects and distinct labels ("bytes", "unnamed", "fn" for
   // the unlabeled kinds).
@@ -4718,8 +4814,9 @@ bool CallGraphPass::runCellResolution() {
         for (const std::string &e : ch) fits |= e.rfind(v + "+", 0) == 0;
         if (!fits) {
           misView = v;
-          auto [it, ins] = leakPtrViews.try_emplace(ptr);
-          if (ins) {
+          const auto tried = leakPtrViews.try_emplace(ptr);
+          const auto it = tried.first;
+          if (tried.second) {
             const uint32_t pn = leakNodeOf(ptr);
             if (pn != UINT32_MAX)
               pts[pn].forEach([&](uint32_t g) {
@@ -4853,7 +4950,7 @@ bool CallGraphPass::runCellResolution() {
         if (exits()) leakExit(find(w.node), n, UINT32_MAX);
         if (auto it = leakCellOf.find(n); it != leakCellOf.end()) {
           const Obj &O = objs[it->second.first];
-          if (!O.layout && !O.bytes && !O.fn)
+          if (!O.layout && !O.fn)
             leakProv.try_emplace((uint64_t)n << 32 | f, leakClassify(n, f, w, hasSrc));
         }
         return;
@@ -5053,6 +5150,10 @@ bool CallGraphPass::runCellResolution() {
   while (true) {
     if (!refoldQueue.empty()) drainRefolds();
     if (worklist.empty()) {
+      if (!keyedWait.empty()) {
+        flushKeyedWait();
+        if (!worklist.empty()) continue;
+      }
       if (CFLCellOneLabel) flushPending(true);
       break;
     }
@@ -5160,7 +5261,7 @@ bool CallGraphPass::runCellResolution() {
         // label, no conflict, no merge. Re-examined here once typed.
         bool unknown = true;
         for (auto [o, e] : memb[f])
-          unknown &= !objs[o].layout && !objs[o].bytes;
+          unknown &= !objs[o].layout;
         if (unknown) {
           for (auto [o, e] : memb[f]) passedBy[o].push_back({n, f});
           continue;
@@ -5293,7 +5394,15 @@ bool CallGraphPass::runCellResolution() {
          << byteWalkStays << " stay in it, " << byteWalkStructRel << " also struct-relative, "
          << leafMerges << " same-leaf coexistences (unmerged); "
          << "learned " << layoutsLearned << " layouts, " << periodsLearned
-         << " element sizes, " << bytesLearned << " byte arrays ("
+         << " element sizes; extents: " << extentArrays << " arrays by size, " << extentOne
+         << " one by size, " << extentHeader << " header + data by size, " << extentUnknown
+         << " one then unknown (size unknown), " << arraysExtended << " made arrays by a T-stride access ("
+         << extendRefused << " refused: typed trailing data; " << tailWritesFolded
+         << " by a write of another struct into the data after a T, folded: rule (b)); " << readStepsSkipped
+         << " member steps through unlabeled objects that do not write (no label), "
+         << varByteAny << " variable byte steps into unlabeled objects (their any-offset cell), "
+         << keyedWaits << " keyed accesses waited for a label (" << keyedFlushed
+         << " linked unkeyed at the fixpoint: never labeled) ("
          << refoldMerges << " cells merged by re-folding)\n");
   if (CFLCellUnify) canonicalizeSets();
   CG_LOG("Cells: " << leftObject << " byte offsets leaving a single "
@@ -6360,6 +6469,20 @@ bool CallGraphPass::runCellResolution() {
          << "function " << funcDerefs << ", of an outside address "
          << outDerefs << "\n");
   interiorReport();
+  CG_LOG("Cells: rule (b): struct written into storage used as bytes (not admitted as its "
+         << "layout; the value flows to the raw cell): " << bytesWritesRefused
+         << ", by writing site | struct:\n");
+  {
+    std::vector<std::pair<size_t, std::string>> top;
+    for (auto &[k, c] : bytesWritesBy) top.push_back({c, k});
+    std::sort(top.rbegin(), top.rend());
+    for (size_t i = 0; i < top.size() && i < 15; i++)
+      CG_LOG("Cells:   x" << top[i].first << " " << top[i].second << "\n");
+  }
+  // Writes of another struct into the data after a T, folded into its
+  // array (one label per allocation): rule (b) rows too.
+  ruleB += tailWritesFolded + bytesWritesRefused;
+  for (auto &[k, c] : tailFoldPairs) ruleBPairs[k] += c;
   CG_LOG("Cells: rule (b) member steps whose struct is not at the "
          << "address's offset: " << ruleB << " (" << ruleBPairs.size()
          << " object label / struct pairs)\n");

@@ -325,7 +325,8 @@ void CallGraphPass::runUnionCensus() {
   };
   // The debug type of a value (valueKey, defined below).
   std::function<std::string(const Value *, int)> valueKeyFwd;
-  auto position = [&](const Value *P, const DataLayout &DL) {
+  // `depth` is valueKey's, when the debug typing below runs inside it.
+  auto position = [&](const Value *P, const DataLayout &DL, int depth = 0) {
     Pos R;
     std::vector<const GEPOperator *> chain;
     P = P->stripPointerCasts();
@@ -346,7 +347,7 @@ void CallGraphPass::runUnionCensus() {
         total += O.getSExtValue();
       }
       if (total < 0 || !valueKeyFwd) return R;
-      const std::string k = valueKeyFwd(P, 0);
+      const std::string k = valueKeyFwd(P, depth + 1);
       if (k.rfind("ptr:", 0) != 0 || !fieldsOf.count(k.substr(4))) return R;
       R.S = k.substr(4);
       R.off = (uint64_t)total;
@@ -487,7 +488,7 @@ void CallGraphPass::runUnionCensus() {
               return typeKey(STy->getTypeArray()[0]);
     // A value loaded from a struct field: the field's declared type.
     if (const auto *LI = dyn_cast<LoadInst>(V)) {
-      const Pos Q = position(LI->getPointerOperand(), LI->getModule()->getDataLayout());
+      const Pos Q = position(LI->getPointerOperand(), LI->getModule()->getDataLayout(), depth);
       if (Q.ok && !unionAt(Q)) {
         auto it = fieldType.find({Q.S, Q.off});
         if (it != fieldType.end())

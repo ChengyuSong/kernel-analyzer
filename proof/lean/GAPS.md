@@ -748,6 +748,9 @@ Obligations left open:
      runs only when the tag satisfies them. The read admits the union
      over uses; an untested use makes it an untested read. This does not
      separate the uses inside the callee (they share j's value).
+   - A union slot keyed by tag also drops the 3.17 census keys of that
+     slot on every access before the tag keys go in: an access the tag
+     keying leaves unkeyed then reads every write of the slot, a superset.
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with

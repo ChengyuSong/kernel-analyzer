@@ -2694,7 +2694,7 @@ void CallGraphPass::computeTaggedFields() {
   // between the edge and t). Cutting all of them, if the F walk from t
   // closes, every open path crosses one: that path's guard is its edge's
   // test. Empty if not.
-  size_t pathGuarded = 0, coFills = 0;
+  size_t pathGuarded = 0, coFills = 0, censusSubsumed = 0;
   auto pathGuards = [&](const TagStore &t, const Field &Df, const FieldCtx &Fc,
                         const FieldCtx &Dc) -> std::vector<Test> {
     const Function *Fn = t.I->getFunction();
@@ -4035,6 +4035,29 @@ void CallGraphPass::computeTaggedFields() {
     // Install, once per F. Another mechanism's keys on a writer or a read
     // of F would not meet these: F stays unkeyed then.
     if (readAdm.empty()) continue;
+    // Union keys of this slot (plan 3.17's census) are subsumed for a union
+    // next to a certified tag: they are dropped for every access of the
+    // slot (an access left unkeyed reads every write), then the tag keys
+    // go in. Any other mechanism's keys refuse the field.
+    const std::string slotPrefix = S + "+" + std::to_string(Ff.second) + "#";
+    auto isCensus = [&](const Instruction *I) {
+      auto it = unionKeyNames.find(I);
+      if (it == unionKeyNames.end()) return false;
+      for (const std::string &k : it->second)
+        if (k.rfind(slotPrefix, 0) != 0 || k.rfind(slotPrefix + "t", 0) == 0) return false;
+      return true;
+    };
+    bool census = false;
+    for (const FAccess &w : fs) census |= isCensus(w.I);
+    for (const FAccess &r : fLoads[Ff]) census |= isCensus(r.I);
+    if (census) {
+      std::vector<const Instruction *> drop;
+      for (auto &[I, ks] : unionKeyNames)
+        if (!ks.empty() && ks.front().rfind(slotPrefix, 0) == 0 && ks.front().rfind(slotPrefix + "t", 0) != 0)
+          drop.push_back(I);
+      for (const Instruction *I : drop) unionKeyNames.erase(I);
+      censusSubsumed++;
+    }
     const Instruction *other = nullptr;
     for (const FAccess &w : fs) if (!other && unionKeyNames.count(w.I)) other = w.I;
     for (const FAccess &r : fLoads[Ff]) if (!other && unionKeyNames.count(r.I)) other = r.I;
@@ -4108,7 +4131,8 @@ void CallGraphPass::computeTaggedFields() {
          << sTermsKept << " own-tag terms current at their store, " << sTermsAtLoad << " taken at their load (rule iii); "
          << xmTerms << " terms with x-masks over " << xmFieldSizes.size() << " fields (" << xmFieldsWide << " U widened); "
          << pathGuarded << " retags guarded per path; " << coFills << " fills that write F and D together; "
-         << "parameter-pair tests: " << ppKeyedReads << " keyed reads, " << ppUntestedReads << " untested\n");
+         << "parameter-pair tests: " << ppKeyedReads << " keyed reads, " << ppUntestedReads << " untested; "
+         << censusSubsumed << " union slots taken over from the union census\n");
   if (VerboseLevel >= 2)
     for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
   if (VerboseLevel >= 2) {

@@ -899,6 +899,13 @@ changes:
   At the fixpoint, accesses still waiting link unkeyed, and the solve
   continues.
 
+Identity: a struct the linked IR merged away under another name (two
+isomorphic structs, one IR type) names its object's cells by its
+debug-info identity, from the declared variable, formal, global or copy
+source; offsets stay the IR layout's. Names never decide answers here
+(unification by name is a measurement switch), so this changes reports
+and checks only.
+
 Hypothesis (the naming rule as it stands): an object's layout is its
 first typed use in solve order. A later incompatible use (a struct
 written into storage used as bytes, or into an allocation laid out as

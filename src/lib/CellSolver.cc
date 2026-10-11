@@ -161,6 +161,10 @@ struct Obj {
   // byte copy (plan 3.53 rule 1 (ii)). Its layout is its first typed use,
   // so a later struct write does not label it: a rule (b) row.
   bool byteAccessed = false;
+  // Its debug-info identity, when the linked IR merged its struct away
+  // under the layout's name (block_header as struct.my_devt): names its
+  // cells; the layout (offsets) stays the IR type's.
+  std::string ident;
   // An unlabeled object is an array of unknown element: a variable index
   // of stride s says its element is s bytes (content folds modulo it).
   int64_t period = 0;
@@ -344,6 +348,47 @@ Type *leafAt(Type *T, int64_t off, const DataLayout &DL) {
     T = E;
   }
   return nullptr;
+}
+
+// The debug-info struct a declared object is, or a pointer value points
+// to: the declared type of the global, local, formal or spilled slot it
+// comes from (through casts; at -O0 a load of a slot reads the slot's
+// variable). Only a struct the linked IR merged away under another name
+// (block_header read as struct.my_devt): "struct.<tag>", else "".
+std::string diMergedIdent(const Value *P, bool pointee) {
+  P = P->stripPointerCasts();
+  const DIType *T = nullptr;
+  auto declOf = [](const AllocaInst *AI) -> const DIType * {
+    for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+      if (auto *V = DDI->getVariable()) return V->getType();
+    return nullptr;
+  };
+  if (pointee) {
+    if (const auto *L = dyn_cast<LoadInst>(P)) {
+      if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+        T = declOf(AI);
+    } else if (const auto *A = dyn_cast<Argument>(P)) {
+      if (const DISubprogram *SP = A->getParent()->getSubprogram())
+        if (const DISubroutineType *ST = SP->getType()) {
+          auto TA = ST->getTypeArray();
+          if (A->getArgNo() + 1 < TA.size()) T = TA[A->getArgNo() + 1];
+        }
+    }
+  } else if (const auto *AI = dyn_cast<AllocaInst>(P)) {
+    T = declOf(AI);
+  } else if (const auto *GV = dyn_cast<GlobalVariable>(P)) {
+    SmallVector<DIGlobalVariableExpression *, 1> E;
+    GV->getDebugInfo(E);
+    if (!E.empty()) T = E[0]->getVariable()->getType();
+  }
+  if (!T) return "";
+  const StringRef N = ka::diStructName(T, pointee);
+  if (N.empty()) return "";
+  const std::string name = "struct." + N.str();
+  const auto *I = dyn_cast<Instruction>(P);
+  const Module *M = I ? I->getModule() : isa<Argument>(P) ? cast<Argument>(P)->getParent()->getParent()
+                                                         : cast<GlobalValue>(P)->getParent();
+  return StructType::getTypeByName(M->getContext(), name) ? "" : name;
 }
 
 // Strip typedefs and qualifiers.
@@ -1386,7 +1431,7 @@ bool CallGraphPass::runCellResolution() {
       return "?#" + std::to_string(o);
     if (O.label == "i8" || inByteArray(O.layout, c, DL))
       return "i8[]";
-    return O.label + "+" + std::to_string(c);
+    return (O.ident.empty() ? O.label : O.ident) + "+" + std::to_string(c);
   };
   // The address fact (o, off): exact, or folded (off is element 0's).
   // The trailing object of header+tail object o, minted on first use.
@@ -1601,11 +1646,20 @@ bool CallGraphPass::runCellResolution() {
   };
   std::function<void(uint32_t, StructType *)> noteLayoutCause; // --cfl-cell-trace-obj
   std::string layoutCopyFrom; // the byte copy giving its effective type (trace)
+  uint32_t layoutCopySrc = UINT32_MAX; // its source object
   // An allocation whose constant size k is larger than struct S (and not a
   // multiple): the structs of exactly k bytes that start with S. Then S is
   // the first member of a container (C inheritance: code that writes only
   // `pub`), not a header before trailing data. *n = how many there are.
   size_t heapContainerRelabeled = 0, heapContainerAmbiguous = 0;
+  // Objects whose debug-info identity differs from the IR struct the
+  // linker kept: (IR label, identity) -> count.
+  std::map<std::pair<std::string, std::string>, size_t> identPairs;
+  auto noteIdent = [&](Obj &O, const std::string &id) {
+    if (id.empty() || id == O.label) return;
+    O.ident = id;
+    identPairs[{O.label, id}]++;
+  };
   auto containerOfSize = [&](const CallBase *C, const StructType *S, int64_t sz,
                              size_t &n) -> StructType * {
     n = 0;
@@ -1700,6 +1754,14 @@ bool CallGraphPass::runCellResolution() {
     O.size = sz;
     O.label = typeLabel(S);
     O.learnedLayout = true;
+    // Its identity: a copy's source's; a written step's pointer's declared
+    // pointee (debug info) where the IR merged that struct away.
+    if (layoutCopySrc != UINT32_MAX) {
+      if (objs[layoutCopySrc].label == O.label) noteIdent(O, objs[layoutCopySrc].ident);
+    } else if (curStepDst < G) {
+      if (const auto *GEP = dyn_cast_or_null<GEPOperator>(NF.getValueForNode(curStepDst)))
+        noteIdent(O, diMergedIdent(GEP->getPointerOperand(), true));
+    }
     setExtent(O, NF.getValueForNode(O.origin));
     if (O.parentObj != UINT32_MAX) trailingArrays += O.repeats;
     layoutsLearned++;
@@ -1900,6 +1962,8 @@ bool CallGraphPass::runCellResolution() {
       O.size = (int64_t)DL.getTypeAllocSize(O.layout);
     if (O.size <= 0) O.layout = nullptr; // opaque or empty: unlabeled
     else O.label = typeLabel(O.layout);
+    if (O.layout && (isa_and_nonnull<AllocaInst>(V) || isa_and_nonnull<GlobalVariable>(V)))
+      noteIdent(O, diMergedIdent(V, false));
     // A constant size larger than the label where some struct of exactly
     // that size starts with the label: the label is the first member of a
     // container (C inheritance: the allocating code writes only `pub`),
@@ -2282,7 +2346,7 @@ bool CallGraphPass::runCellResolution() {
       where = V->getName().str();
     }
     return where + (O.parentObj != UINT32_MAX ? " tail@" + std::to_string(O.base) : "") +
-           " [" + (O.layout ? O.label : std::string("unlabeled")) +
+           " [" + (O.layout ? (O.ident.empty() ? O.label : O.ident + " as " + O.label) : std::string("unlabeled")) +
            (O.repeats ? " array" : "") + "]";
   };
   auto massByObject = [&](size_t k) {
@@ -3903,6 +3967,13 @@ bool CallGraphPass::runCellResolution() {
     if (!OA.layout || !OB.layout) return 0; // bytes meet only bytes
     structChain(OA.layout, foldIn(OA.layout, cells[a].off, DL), DL, chainA);
     structChain(OB.layout, foldIn(OB.layout, cells[f].off, DL), DL, chainB);
+    // The outermost struct by its identity (debug info), not the name the
+    // linker kept for a merged layout.
+    auto byIdent = [](const Obj &O, std::vector<std::string> &ch) {
+      if (!O.ident.empty() && !ch.empty()) ch[0] = O.ident + ch[0].substr(ch[0].rfind('+'));
+    };
+    byIdent(OA, chainA);
+    byIdent(OB, chainB);
     for (const std::string &x : chainA)
       for (const std::string &y : chainB)
         if (x == y) return 2; // embedding (base and derived): one-way
@@ -4163,8 +4234,10 @@ bool CallGraphPass::runCellResolution() {
       const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
       if (StructType *S = structAt(Os.layout, fa, DL)) {
         layoutCopyFrom = (at ? instLoc(at) : std::string("?")) + " from " + describe(Os) + " +" + std::to_string(fa);
+        layoutCopySrc = fa == 0 ? os : UINT32_MAX; // the source's identity, from its start
         requestLayout(od, S);
         layoutCopyFrom.clear();
+        layoutCopySrc = UINT32_MAX;
         if (objs[od].layout) effectiveTyped++;
       }
     }
@@ -6469,6 +6542,16 @@ bool CallGraphPass::runCellResolution() {
          << "function " << funcDerefs << ", of an outside address "
          << outDerefs << "\n");
   interiorReport();
+  {
+    size_t n = 0;
+    std::string line;
+    for (auto &[k, c] : identPairs) {
+      n += c;
+      if (line.size() < 600) line += " " + k.second + " as " + k.first + " x" + std::to_string(c) + ";";
+    }
+    CG_LOG("Cells: debug-info identities the linked IR merged away: " << n << " objects ("
+           << identPairs.size() << " identity / IR struct pairs):" << line << "\n");
+  }
   CG_LOG("Cells: rule (b): struct written into storage used as bytes (not admitted as its "
          << "layout; the value flows to the raw cell): " << bytesWritesRefused
          << ", by writing site | struct:\n");

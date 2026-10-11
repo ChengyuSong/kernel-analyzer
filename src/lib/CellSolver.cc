@@ -1405,7 +1405,7 @@ bool CallGraphPass::runCellResolution() {
       stepOne;
   std::function<void(uint32_t, int64_t, uint32_t, int64_t, uint32_t)> walkOne;
   // The fact applyStep is stepping, and its node (one-label reports).
-  uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX;
+  uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX, curStepDst = UINT32_MAX;
   std::map<std::string, size_t> cloneCandidates, otherMeets; // one-label
   std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenConflict;
   size_t conflicts = 0;
@@ -1565,6 +1565,8 @@ bool CallGraphPass::runCellResolution() {
   // by a trailing bytes object (`zDb = (char *)&t[1]` in the storage after
   // a struct), so a struct learned later at 0 can still fill the header.
   std::function<void(uint32_t)> noteBytesCause; // --cfl-cell-trace-obj
+  std::function<void(uint32_t, StructType *)> noteLayoutCause;
+  std::string layoutCopyFrom; // the byte copy giving its effective type (trace)
   std::function<void(uint32_t, int64_t)> requestBytes;
   requestBytes = [&](uint32_t o, int64_t at) {
     std::tie(o, at) = locate(o, at);
@@ -1670,6 +1672,7 @@ bool CallGraphPass::runCellResolution() {
       H.label = typeLabel(S);
       H.learnedLayout = true;
       layoutsLearned++;
+      if (noteLayoutCause) noteLayoutCause(o, S);
       refoldQueue.push_back(o);
       return;
     }
@@ -1689,6 +1692,7 @@ bool CallGraphPass::runCellResolution() {
       else if (O.parentObj != UINT32_MAX) trailingArrays++;
     }
     layoutsLearned++;
+    if (noteLayoutCause) noteLayoutCause(o, S);
     refoldQueue.push_back(o);
   };
   auto canonOff = contentKey;
@@ -3980,6 +3984,19 @@ bool CallGraphPass::runCellResolution() {
            << (anyCauseNode == UINT32_MAX ? std::string("?") : nodeDesc(anyCauseNode))
            << " (" << mintCause << ")\n");
   };
+  // The access that gave an unlabeled object its layout: the stepped
+  // pointer and the step's result (a member step), or a byte copy.
+  noteLayoutCause = [&](uint32_t o, StructType *S) {
+    if (CFLCellTraceObj.empty() ||
+        describe(objs[o]).find(CFLCellTraceObj) == std::string::npos)
+      return;
+    CG_LOG("Cells: LAYOUT " << describe(objs[o]) << " learned " << typeLabel(S) << " ("
+           << mintCause << ") stepping "
+           << (curStepNode == UINT32_MAX ? std::string("?") : nodeDesc(curStepNode).substr(0, 160))
+           << " into "
+           << (curStepDst == UINT32_MAX ? std::string("?") : nodeDesc(curStepDst).substr(0, 200))
+           << (layoutCopyFrom.empty() ? std::string() : "; the copy at " + layoutCopyFrom) << "\n");
+  };
   noteAnyCause = [&](uint32_t o) {
     if (CFLCellTraceObj.empty() ||
         describe(objs[o]).find(CFLCellTraceObj) == std::string::npos)
@@ -4051,7 +4068,10 @@ bool CallGraphPass::runCellResolution() {
       const Obj &Os = objs[os];
       const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
       if (StructType *S = structAt(Os.layout, fa, DL)) {
+        if (!CFLCellTraceObj.empty())
+          layoutCopyFrom = (at ? instLoc(at) : std::string("?")) + " from " + describe(Os) + " +" + std::to_string(fa);
         requestLayout(od, S);
+        layoutCopyFrom.clear();
         if (objs[od].layout) effectiveTyped++;
       }
     }
@@ -4854,6 +4874,12 @@ bool CallGraphPass::runCellResolution() {
     // Cells of o renamed (bytes, a period, a layout): a provisional entry
     // in what is now a byte cell becomes its leak.
     leakRefold = [&](uint32_t o) {
+      // The refold merged o's cells (and moved a header's past its end to
+      // the trailing object): the representatives stand for o's cells now.
+      for (auto &[c, up] : objs[o].content) {
+        leakCellOf[find(up.first)] = std::make_pair(o, c);
+        leakCellOf[find(up.second)] = std::make_pair(o, c);
+      }
       for (auto &[c, up] : objs[o].content) {
         if (!leakByteCell(o, c)) continue;
         for (uint32_t x : {up.first, up.second}) {
@@ -5185,6 +5211,7 @@ bool CallGraphPass::runCellResolution() {
         const FieldEdge e = fieldOut[n][ei];
         for (uint32_t f : delta) {
           if (trackWhy) curWhy = {n, f, UINT32_MAX, e.walk ? W_WALK : W_STEP};
+          curStepDst = e.dst;
           if (e.walk) applyWalk(f, e);
           else applyStep(f, e.li, e.dst);
         }

@@ -4525,6 +4525,19 @@ bool CallGraphPass::runCellResolution() {
                " of " + describe(objs[it->second.first]);
       return E;
     }
+    if (auto dit = dispatchOf.find(n); dit != dispatchOf.end()) {
+      // A receiver's level node: the dispatch reads the byte cell as the
+      // holder's slot (a byte object taken for a holder struct).
+      const LevelKey &LK = dit->second;
+      const RecvSite &R = recvSites[LK.si];
+      key = "dispatch|" + std::to_string(LK.si) + "|" + std::to_string(LK.level);
+      E.kind = LK.guard == UINT32_MAX ? "method dispatch reads it as a holder's slot"
+                                      : "holder guard reads it as a holder's slot";
+      E.desc = (R.cs ? instLoc(R.cs) + " " + R.cs->getFunction()->getName().str() + " " + leakIR(R.cs)
+                     : std::string("a pseudo site of a holder guard")) +
+               ", level " + std::to_string(LK.level);
+      return E;
+    }
     if (n >= G || !(NF.isDereferenceNode(n) || NF.isObjectNode(n))) {
       E.kind = "other";
       E.desc = nodeDesc(n).substr(0, 160);
@@ -5625,9 +5638,20 @@ bool CallGraphPass::runCellResolution() {
   // Leak census report: the inert check of byte cells, then the leaks by
   // class and by site, with the non-char facts each explains.
   if (CFLCellLeakCensus) {
-    size_t allFacts = 0;
-    for (uint32_t m = 0; m < numNodes; m++)
-      if (find(m) == m) allFacts += pts[m].count();
+    // Every fact at the stop, and those downstream of a leak (by leak).
+    size_t allFacts = 0, downAll = 0;
+    std::vector<size_t> down(leakSites.size(), 0);
+    for (uint32_t m = 0; m < numNodes; m++) {
+      if (find(m) != m) continue;
+      allFacts += pts[m].count();
+      pts[m].forEach([&](uint32_t f0) {
+        auto it = leakTag.find((uint64_t)m << 32 | findFact(f0));
+        if (it == leakTag.end()) it = leakTag.find((uint64_t)m << 32 | f0);
+        if (it == leakTag.end()) return;
+        downAll++;
+        down[it->second]++;
+      });
+    }
     size_t byteCells = 0, inert = 0, onlyChar = 0, withLeak = 0, byteFacts = 0, untagged = 0;
     size_t kindFacts[4] = {0, 0, 0, 0};
     std::vector<size_t> siteMass(leakSites.size(), 0);
@@ -5694,14 +5718,12 @@ bool CallGraphPass::runCellResolution() {
            << byteFacts << " in byte cells, " << leakFacts << " of them non-char objects ("
            << pct(leakFacts, allFacts) << "% of all facts; struct " << kindFacts[1]
            << ", other non-char " << kindFacts[2] << ", function " << kindFacts[3] << "); "
-           << leakSites.size() << " leak sites, " << leakTag.size()
-           << " (node, fact) pairs downstream of one\n");
+           << leakSites.size() << " leak sites; " << downAll << " facts downstream of a leak ("
+           << pct(downAll, allFacts) << "% of all facts)\n");
     static const char *clsName[] = {"", "store into a byte or union field of a struct",
                                     "byte copy", "byte storage written through a struct view",
                                     "byte storage written through a char or untyped address",
                                     "vararg or bodiless call boundary", "other"};
-    std::vector<size_t> reach(leakSites.size(), 0);
-    for (auto &[k, s] : leakTag) reach[s]++;
     size_t clsMass[7] = {}, clsSites[7] = {}, clsExited[7] = {}, exitedAll = 0, exitedUntagged = 0;
     for (size_t s = 0; s < leakSites.size(); s++) {
       clsMass[leakSites[s].cls] += siteMass[s];
@@ -5745,7 +5767,7 @@ bool CallGraphPass::runCellResolution() {
       const LeakSite &L = leakSites[s];
       CG_LOG("Cells:   LEAK #" << i + 1 << " class " << L.cls << " exited " << L.exited << " ("
              << pct(L.exited, exitedAll) << "%), resident " << siteMass[s] << " ("
-             << pct(siteMass[s], leakFacts) << "%), born " << L.born << ", reach " << reach[s]
+             << pct(siteMass[s], leakFacts) << "%), born " << L.born << ", downstream " << down[s]
              << ": " << L.where << " | into " << L.into << " | " << L.detail
              << " | objects: " << objsTop << "\n");
     }

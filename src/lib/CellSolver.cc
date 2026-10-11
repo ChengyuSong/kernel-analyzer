@@ -74,6 +74,10 @@ public:
     else
       for (uint32_t f : S) fn(f);
   }
+  bool test(uint32_t f) const {
+    if (dense) return f < D.size() && D.test(f);
+    return std::binary_search(S.begin(), S.end(), f);
+  }
 };
 
 // Offsets one folded offset or one strided step may stand for before the
@@ -4025,6 +4029,14 @@ bool CallGraphPass::runCellResolution() {
   };
   auto copyPair = [&](uint32_t ci, uint32_t fs, uint32_t fd) {
     if (soupStop) return; // the profiler stopped: no more work
+    // The time cap, also between the pairs of a long byte-copy expansion
+    // (its edges may bring no new fact, so the arrival check never runs).
+    static uint32_t copyTick = 0;
+    if (CFLCellSoupProfile && CFLCellSoupTime && (++copyTick & 0x3ff) == 0 &&
+        std::chrono::duration<double>(Clock::now() - t0).count() > CFLCellSoupTime) {
+      soupStop = true;
+      return;
+    }
     fs = findFact(fs);
     fd = findFact(fd);
     if (!copyPairsDone.insert(std::make_tuple(ci, fs, fd)).second) return;
@@ -4081,6 +4093,7 @@ bool CallGraphPass::runCellResolution() {
     uint32_t node;
     size_t born = 0, mass = 0;
     std::vector<std::pair<uint32_t, size_t>> srcs; // entering source node, count
+    uint32_t src0 = UINT32_MAX, fact0 = UINT32_MAX; // the first entering fact
   };
   std::vector<SoupEntry> soupEntries;
   boost::unordered_flat_map<uint32_t, uint32_t> soupEntryAt;  // join node -> entry
@@ -4134,6 +4147,7 @@ bool CallGraphPass::runCellResolution() {
         for (auto &[sn, c] : E.srcs)
           if (sn == src) { c++; found = true; break; }
         if (!found && E.srcs.size() < 16) E.srcs.push_back({src, 1});
+        if (E.fact0 == UINT32_MAX) { E.src0 = src; E.fact0 = f; }
       }
       soupForeign.emplace((uint64_t)n << 32 | f, entry);
       soupEntries[entry].mass++;
@@ -4643,6 +4657,250 @@ bool CallGraphPass::runCellResolution() {
       explainWhy2(pointers[i].first, w.substr(0, w.find(" [")), depth + 1);
     }
   };
+  // Boundary census (measurement, plan 3.51 Part C input): through which
+  // function boundary did each soup entry's foreign name come? From the
+  // entry's first entering source, walk backward over the nodes holding
+  // a cell of that fact's object (copy, hub and field edges) to the first
+  // boundary of a function with two or more call sites (or its address
+  // taken): a pointer formal, a load through a formal (an out-parameter
+  // read or a field of the formal), the collector of stores through a
+  // formal (an out-parameter write), or the return. The entry's mass is
+  // attributed to it; entries with no such boundary on the path are
+  // counted as unattributed.
+  auto soupBoundaryCensus = [&](const std::vector<uint32_t> &order, size_t total) {
+    // The formal a pointer derives from: the argument itself, or (-O0) a
+    // load of the slot the argument was spilled to; through GEPs (field).
+    auto formalOf = [](const Value *P, bool &field) -> const Argument * {
+      field = false;
+      for (int k = 0; k < 8 && P; k++) {
+        P = P->stripPointerCasts();
+        if (const auto *A = dyn_cast<Argument>(P)) return A;
+        if (const auto *GP = dyn_cast<GEPOperator>(P)) { field = true; P = GP->getPointerOperand(); continue; }
+        if (const auto *L = dyn_cast<LoadInst>(P))
+          if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+            for (const User *U : AI->users())
+              if (const auto *SI = dyn_cast<StoreInst>(U))
+                if (SI->getPointerOperand()->stripPointerCasts() == AI)
+                  if (const auto *A = dyn_cast<Argument>(SI->getValueOperand()->stripPointerCasts()))
+                    return A;
+          }
+        return nullptr;
+      }
+      return nullptr;
+    };
+    auto sitesOf = [](const Function *F) {
+      size_t n = 0;
+      for (const User *U : F->users())
+        if (const auto *CB = dyn_cast<CallBase>(U))
+          if (CB->getCalledOperand() == F) n++;
+      return n;
+    };
+    // The values a function returns, through -O0 slots (bounded).
+    auto retShape = [&](const Function *F) -> std::string {
+      std::set<std::string> shapes;
+      std::vector<const Value *> work;
+      std::set<const Value *> seen;
+      for (const BasicBlock &BB : *F)
+        if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+          if (RI->getReturnValue()) work.push_back(RI->getReturnValue());
+      while (!work.empty() && seen.size() < 64) {
+        const Value *V = work.back()->stripPointerCasts();
+        work.pop_back();
+        if (!seen.insert(V).second) continue;
+        if (const auto *PN = dyn_cast<PHINode>(V)) {
+          for (const Value *In : PN->incoming_values()) work.push_back(In);
+        } else if (const auto *SL = dyn_cast<SelectInst>(V)) {
+          work.push_back(SL->getTrueValue());
+          work.push_back(SL->getFalseValue());
+        } else if (const auto *L = dyn_cast<LoadInst>(V)) {
+          const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+          if (AI) {
+            for (const User *U : AI->users())
+              if (const auto *SI = dyn_cast<StoreInst>(U))
+                if (SI->getPointerOperand()->stripPointerCasts() == AI)
+                  work.push_back(SI->getValueOperand());
+          } else {
+            bool field;
+            shapes.insert(formalOf(L->getPointerOperand(), field) && !field
+                              ? "return of a load through a formal"
+                              : "return of a load (lookup)");
+          }
+        } else if (const auto *CB = dyn_cast<CallBase>(V)) {
+          if (const Function *T = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts())) {
+            shapes.insert("return of a call to " + T->getName().str());
+          } else {
+            const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
+            bool field = false;
+            shapes.insert(CL && formalOf(CL->getPointerOperand(), field) && field
+                              ? "return through an indirect call on an argument's field"
+                              : "return of an indirect call");
+          }
+        } else if (isa<Argument>(V)) {
+          shapes.insert("returns its argument");
+        } else if (!isa<Constant>(V)) {
+          shapes.insert(std::string("return of ") + (isa<Instruction>(V)
+                            ? cast<Instruction>(V)->getOpcodeName() : "a value"));
+        }
+      }
+      std::string r;
+      for (const std::string &x : shapes) r += (r.empty() ? "" : "; ") + x;
+      return r.empty() ? "return" : r;
+    };
+    struct Bound { const Function *F; std::string which, shape; uint32_t rep; };
+    std::vector<Bound> bounds;
+    std::map<std::pair<const Function *, std::string>, uint32_t> boundIdx;
+    // A solver rep can be a collapsed class holding several boundaries:
+    // the mass is the class's, and the report lists them all.
+    boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> boundOf; // rep -> bounds
+    auto addBound = [&](uint32_t node, const Function *F, const std::string &which,
+                        const std::string &shape) {
+      if (sitesOf(F) < 2 && !F->hasAddressTaken()) return;
+      const uint32_t r = find(getCanonicalNode(node));
+      if (r >= numNodes) return;
+      auto [it, ins] = boundIdx.try_emplace({F, which}, (uint32_t)bounds.size());
+      if (ins) bounds.push_back({F, which, shape, r});
+      auto &v = boundOf[r];
+      if (std::find(v.begin(), v.end(), it->second) == v.end()) v.push_back(it->second);
+    };
+    // Formals and loads through them first: they win over a return that
+    // shares their class.
+    for (uint32_t n = 0; n < G; n++) {
+      const Value *V = NF.getValueForNode(n);
+      if (const auto *A = dyn_cast_or_null<Argument>(V)) {
+        if (A->getType()->isPointerTy() && NF.getValueNodeFor(A) == n)
+          addBound(n, A->getParent(), "arg" + std::to_string(A->getArgNo()), "formal");
+      } else if (const auto *L = dyn_cast_or_null<LoadInst>(V)) {
+        bool field;
+        if (const Argument *A = formalOf(L->getPointerOperand(), field))
+          addBound(n, A->getParent(), "arg" + std::to_string(A->getArgNo()) +
+                   (field ? " (field read)" : " (pointee read)"),
+                   field ? "field of a formal" : "out-parameter (read)");
+      } else if (NF.isDereferenceNode(n) && storeHub[n] != UINT32_MAX) {
+        const NodeIndex par = NF.getDerefParent(n);
+        const Value *PV = par == AndersNodeFactory::InvalidIndex ? nullptr : NF.getValueForNode(par);
+        bool field;
+        if (const Argument *A = PV ? formalOf(PV, field) : nullptr)
+          addBound(storeHub[n], A->getParent(), "arg" + std::to_string(A->getArgNo()) +
+                   (field ? " (field write)" : " (pointee write)"),
+                   field ? "field of a formal (write)" : "out-parameter (write)");
+      }
+    }
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (F.isDeclaration() || !F.getReturnType()->isPointerTy()) continue;
+        const NodeIndex rn = NF.getReturnNodeFor(&F);
+        if (rn != AndersNodeFactory::InvalidIndex) addBound(rn, &F, "ret", retShape(&F));
+      }
+    std::vector<std::vector<uint32_t>> rev(numNodes);
+    for (uint32_t u = 0; u < numNodes; u++) {
+      if (find(u) != u) continue;
+      for (uint32_t v : succ[u]) rev[find(v)].push_back(u);
+      for (const FieldEdge &e : fieldOut[u]) rev[find(e.dst)].push_back(u);
+    }
+    // A boundary is confluent when it holds two or more names.
+    boost::unordered_flat_map<uint32_t, size_t> namesMemo;
+    auto namesAt = [&](uint32_t r) {
+      auto [it, ins] = namesMemo.try_emplace(r, 0);
+      if (ins) {
+        boost::unordered_flat_set<uint32_t> names;
+        pts[r].forEach([&](uint32_t f) {
+          f = findFact(f);
+          if (cells[f].kind == CellKind::Off) names.insert(cells[f].name);
+        });
+        it->second = names.size();
+      }
+      return it->second;
+    };
+    // Entries covering 95% of the mass (at most 400).
+    size_t covered = 0, attributed = 0, walked = 0;
+    boost::unordered_flat_map<uint32_t, std::pair<size_t, size_t>> groupMass; // rep -> mass, entries
+    std::vector<uint32_t> mark(numNodes, UINT32_MAX);
+    std::vector<char> objWant(objs.size(), 0);
+    for (size_t i = 0; i < order.size() && i < 400 && covered * 20 < total * 19; i++) {
+      const SoupEntry &E = soupEntries[order[i]];
+      covered += E.mass;
+      walked++;
+      if (E.fact0 == UINT32_MAX) continue;
+      std::vector<uint32_t> wantObjs;
+      for (auto [o, e] : memb[findFact(E.fact0)]) { objWant[o] = 1; wantObjs.push_back(o); }
+      auto holds = [&](uint32_t m) {
+        bool h = false;
+        pts[m].forEach([&](uint32_t f) {
+          if (h) return;
+          for (auto [o, off] : memb[findFact(f)]) h |= objWant[o];
+        });
+        return h;
+      };
+      const uint32_t start = find(E.src0 < numNodes ? E.src0 : E.node);
+      uint32_t hit = UINT32_MAX;
+      std::vector<uint32_t> q{start};
+      mark[start] = (uint32_t)i;
+      for (size_t k = 0; k < q.size() && k < 200000 && hit == UINT32_MAX; k++) {
+        if (boundOf.count(q[k]) && namesAt(q[k]) >= 2) { hit = q[k]; break; }
+        for (uint32_t p : rev[q[k]])
+          if (mark[p] != (uint32_t)i && holds(p)) {
+            mark[p] = (uint32_t)i;
+            q.push_back(p);
+          }
+      }
+      for (uint32_t o : wantObjs) objWant[o] = 0;
+      if (hit == UINT32_MAX) continue;
+      auto &g = groupMass[hit];
+      g.first += E.mass;
+      g.second++;
+      attributed += E.mass;
+    }
+    // Class sizes (graph nodes per solver rep) for the reps hit.
+    boost::unordered_flat_map<uint32_t, size_t> classSize;
+    for (auto &[r, _] : groupMass) classSize[r] = 0;
+    for (uint32_t n = 0; n < G; n++) {
+      auto it = classSize.find(find(getCanonicalNode(n)));
+      if (it != classSize.end()) it->second++;
+    }
+    std::vector<std::pair<size_t, uint32_t>> go;
+    for (auto &[r, me] : groupMass) go.push_back({me.first, r});
+    std::sort(go.rbegin(), go.rend());
+    std::set<const Function *> fns;
+    for (auto &[m, r] : go)
+      for (uint32_t b : boundOf[r]) fns.insert(bounds[b].F);
+    CG_LOG("Cells: BOUNDARY census: the top " << walked << " entries hold " << covered
+           << " of " << total << " foreign facts; " << attributed
+           << " came through a boundary of a function with 2+ call sites holding 2+ names ("
+           << go.size() << " nodes, " << fns.size() << " functions), " << covered - attributed
+           << " through none\n");
+    std::set<const Function *> cum;
+    size_t cm = 0;
+    int pct = 50;
+    for (auto &[m, r] : go) {
+      cm += m;
+      for (uint32_t b : boundOf[r]) cum.insert(bounds[b].F);
+      while (pct <= 90 && cm * 100 >= (size_t)pct * attributed) {
+        CG_LOG("Cells:   BOUNDARY " << pct << "% of the attributed mass: " << cum.size()
+               << " functions\n");
+        pct += 20;
+      }
+    }
+    for (size_t i = 0; i < go.size() && i < 30; i++) {
+      const auto [m, r] = go[i];
+      std::vector<uint32_t> bs = boundOf[r];
+      std::stable_sort(bs.begin(), bs.end(), [&](uint32_t x, uint32_t y) {
+        return sitesOf(bounds[x].F) > sitesOf(bounds[y].F);
+      });
+      std::set<const Function *> fr;
+      for (uint32_t b : bs) fr.insert(bounds[b].F);
+      CG_LOG("Cells:   BOUNDARY node #" << r << ": mass " << m << " ("
+             << (total ? 100.0 * m / total : 0.0) << "%), " << groupMass[r].second
+             << " entries; " << namesAt(r) << " names; a class of " << classSize[r]
+             << " nodes holding " << bs.size() << " boundaries of " << fr.size()
+             << " functions" << (bs.size() > 200 ? " (first 200)" : "") << ":\n");
+      for (size_t j = 0; j < bs.size() && j < 200; j++) {
+        const Bound &B = bounds[bs[j]];
+        CG_LOG("Cells:     " << B.F->getName() << " " << B.which << ": " << B.shape << "; "
+               << sitesOf(B.F) << " call sites"
+               << (B.F->hasAddressTaken() ? " (address taken)" : "") << "\n");
+      }
+    }
+  };
   if (CFLCellSoupProfile) {
     // Node descriptions, memoized (nodeDesc scans the cells of a cell node).
     boost::unordered_flat_map<uint32_t, std::string> descMemo;
@@ -4747,6 +5005,7 @@ bool CallGraphPass::runCellResolution() {
       CG_LOG("Cells:   WIDTH formal " << formals[i].first << " names: " << nodeDesc(formals[i].second) << "\n");
     for (size_t i = 0; i < fields.size() && i < 25; i++)
       CG_LOG("Cells:   WIDTH field " << fields[i].first << " names: " << nodeDesc(fields[i].second) << "\n");
+    soupBoundaryCensus(order, total);
   }
   {
     std::vector<uint32_t> order;

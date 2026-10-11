@@ -1,7 +1,7 @@
 CUR_DIR = $(shell pwd)
 SRC_DIR := $(CUR_DIR)/src
 BUILD_DIR := $(CUR_DIR)/build
-BUILD_TYPE := $(BUILD_TYPE:=Release)
+BUILD_TYPE ?= Release
 
 include Makefile.inc
 

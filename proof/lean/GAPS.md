@@ -732,6 +732,22 @@ Obligations left open:
    - Out-parameter writes: a direct call handing &identity->F to a callee
      that writes through that parameter on every return path is an F
      writer at the call (F walks only).
+   - A memset fill covering all of F and D is the last F writer before its
+     own D write, so by the last-writer rule it is a co-write with the
+     fill constant as its tag, not a retag of every writer.
+   - Per-path guards: for an open retag with no dominating test, the
+     stable tests on its identity's own D are cut; if the F walk then
+     closes, every open path crosses a cut edge, and each such path's map
+     applies under its own edge's test. Only edges an open path reaches
+     guard.
+   - Parameter-pair tests: a read of F passed as parameter j of a direct
+     call, with the same identity's D (through casts) as parameter k, both
+     loads and the call in one block with no write between. The callee's
+     parameters are values, so a use of j dominated by tests on k
+     (branches, or switch edges: case values, default = none of them)
+     runs only when the tag satisfies them. The read admits the union
+     over uses; an untested use makes it an untested read. This does not
+     separate the uses inside the callee (they share j's value).
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with

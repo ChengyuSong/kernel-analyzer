@@ -492,7 +492,7 @@ protected:
   std::set<const llvm::Function *> adoptedAtomBodies;
   void unadoptKeyedBodies();
   std::vector<std::string> taggedReport;
-  std::array<size_t, 9> taggedCounts{}; // ..., predicate tests closed, open
+  std::array<size_t, 11> taggedCounts{}; // ..., predicate tests closed, open, parameter-pair reads keyed, untested
   // Keyed tagged-field pairs (struct, F offset, D offset, D size): the solver
   // flips a pair to unkeyed when a byte copy writes its tag other than as a
   // co-move (plan 3.51, the in-solve certificate check).

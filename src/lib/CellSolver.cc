@@ -5596,7 +5596,8 @@ bool CallGraphPass::runCellResolution() {
       RO << "SUMMARY tagged fields " << taggedPairs.size() << " pairs keyed, " << taggedFlipped.size()
          << " flipped in the solve; alias assumptions " << asmUsed - asmFailed << " held, " << asmFailed
          << " failed; predicate tests: " << taggedCounts[7] << " closed, " << taggedCounts[8]
-         << " open; outside-domain entries " << taggedOutsideEntries.size() << ", premise broken at "
+         << " open; parameter-pair tests: " << taggedCounts[9] << " keyed reads, " << taggedCounts[10]
+         << " untested; outside-domain entries " << taggedOutsideEntries.size() << ", premise broken at "
          << (stoppedAt ? std::string("unknown (the solve stopped: no icall answers)") : std::to_string(domainBroken.size()))
          << "\n";
     for (const std::string &d : domainBroken) RO << "T outside domain broken: " << d << "\n";

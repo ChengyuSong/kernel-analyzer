@@ -1863,6 +1863,15 @@ void CallGraphPass::computeTaggedFields() {
     bool onTrue;
     int64_t off, o1, o2 = INT64_MIN;
     unsigned w1 = 64;
+    // A test in a callee on a parameter the call passes the tag in
+    // (parameter-pair tests): the tag's value there is argExpr's, with
+    // argLeaf (the caller's load of D) the tag.
+    const Value *argExpr = nullptr;
+    const Instruction *argLeaf = nullptr;
+    // A switch edge: cond is the switch value; the edge holds iff it is
+    // one of caseVals (or, for the default edge, none of them).
+    bool sw = false, swDefault = false;
+    std::vector<int64_t> caseVals;
   };
   // Products (plan 3.51 ruling a): a predicate reading an integer tag and
   // a function-pointer tag of one object is judged on both at once; the
@@ -2064,11 +2073,28 @@ void CallGraphPass::computeTaggedFields() {
     }
     return false;
   };
+  // A switch edge on value x (width bw).
+  auto swHolds = [](const Test &t, int64_t x, unsigned bw) {
+    const uint64_t m = bw >= 64 ? ~uint64_t(0) : ((uint64_t(1) << bw) - 1);
+    bool in = false;
+    for (int64_t c : t.caseVals) in |= ((uint64_t)c & m) == ((uint64_t)x & m);
+    return t.swDefault ? !in : in;
+  };
   auto mayHold = [&](const std::vector<Test> &tests, const KnownBits &kb) {
     for (const Test &t : tests) {
       curT = &t;
-      auto r = evalKB(t.cond, t.d, kb);
+      std::optional<KnownBits> in = kb;
+      if (t.argExpr) {
+        in = evalKB(t.argExpr, t.argLeaf, kb);
+        if (!in) continue;
+        if (in->getBitWidth() != 64) in = in->sext(64);
+      }
+      auto r = evalKB(t.cond, t.d, *in);
       if (!r || !r->isConstant()) continue; // may hold
+      if (t.sw) {
+        if (!swHolds(t, (int64_t)r->getConstant().getZExtValue(), r->getBitWidth())) return false;
+        continue;
+      }
       if ((!r->getConstant().isZero()) != t.onTrue) return false;
     }
     return true;
@@ -2076,11 +2102,178 @@ void CallGraphPass::computeTaggedFields() {
   auto holds = [&](const std::vector<Test> &tests, int64_t v) {
     for (const Test &t : tests) {
       curT = &t;
-      auto r2 = eval(t.cond, t.d, v);
+      int64_t in = v;
+      if (t.argExpr) {
+        auto a = eval(t.argExpr, t.argLeaf, v);
+        if (!a) continue;
+        in = *a;
+      }
+      auto r2 = eval(t.cond, t.d, in);
       if (!r2) continue; // not evaluable: no constraint
+      if (t.sw) {
+        if (!swHolds(t, *r2, widthOf(t.cond->getType()))) return false;
+        continue;
+      }
       if ((*r2 != 0) != t.onTrue) return false;
     }
     return true;
+  };
+  // ---- Parameter-pair tests (plan 3.51) ----
+  // A callee G receiving an object's tag in parameter k and its F content
+  // in parameter j: per use of j, the tests on k whose edges dominate it
+  // (parameters are values: nothing in G changes them). A parameter's
+  // values: the argument, or the reloads of the -O0 slot it is stored to
+  // (nullopt if that slot has any other use).
+  auto paramVals = [&](const Function *G, unsigned k) -> std::optional<std::set<const Value *>> {
+    std::set<const Value *> vals;
+    const Argument *A = G->getArg(k);
+    vals.insert(A);
+    for (const User *U : A->users()) {
+      const auto *St = dyn_cast<StoreInst>(U);
+      const auto *AI = St ? dyn_cast<AllocaInst>(St->getPointerOperand()) : nullptr;
+      if (!AI || St->getValueOperand() != A) continue;
+      for (const User *V : AI->users()) {
+        if (V == St || isa<DbgInfoIntrinsic>(V)) continue;
+        const auto *L = dyn_cast<LoadInst>(V);
+        if (!L || L->getPointerOperand() != AI) return std::nullopt; // the slot is written or escapes
+        vals.insert(L);
+      }
+    }
+    return vals;
+  };
+  struct PPUse { const Instruction *use; std::vector<Test> tests; };
+  std::map<std::tuple<const Function *, unsigned, unsigned, int64_t>, std::optional<std::vector<PPUse>>> ppMemo;
+  auto ppSummary = [&](const Function *G, unsigned k, unsigned j, int64_t dOff) -> const std::optional<std::vector<PPUse>> & {
+    auto [it, ins] = ppMemo.try_emplace({G, k, j, dOff});
+    if (!ins) return it->second;
+    const auto kv = paramVals(G, k), jv = paramVals(G, j);
+    if (!kv || !jv) return it->second;
+    // The leaf of a condition: one value of parameter k, through casts and
+    // bit operations with constants.
+    auto leafOf = [&](const Value *C) -> const Instruction * {
+      const Value *leaf = nullptr;
+      std::vector<const Value *> work{C};
+      std::set<const Value *> seen;
+      while (!work.empty()) {
+        const Value *X = work.back();
+        work.pop_back();
+        if (!seen.insert(X).second || isa<Constant>(X)) continue;
+        if (kv->count(X)) { if (leaf && leaf != X) return nullptr; leaf = X; continue; }
+        if (isa<ICmpInst>(X) || isa<CastInst>(X) ||
+            (isa<BinaryOperator>(X) && (cast<BinaryOperator>(X)->getOpcode() == Instruction::And ||
+                                        cast<BinaryOperator>(X)->getOpcode() == Instruction::Or ||
+                                        cast<BinaryOperator>(X)->getOpcode() == Instruction::Xor))) {
+          for (const Value *Op : cast<User>(X)->operands()) work.push_back(Op);
+          continue;
+        }
+        return nullptr;
+      }
+      return dyn_cast_or_null<Instruction>(leaf); // the argument itself (-O3) is not an Instruction: unsupported
+    };
+    struct Edge { const BasicBlock *succ; Test t; };
+    std::vector<Edge> edges;
+    for (const BasicBlock &B : *G) {
+      const Instruction *Term = B.getTerminator();
+      if (const auto *Br = dyn_cast<BranchInst>(Term); Br && Br->isConditional()) {
+        const Instruction *leaf = leafOf(Br->getCondition());
+        if (!leaf || Br->getSuccessor(0) == Br->getSuccessor(1)) continue;
+        for (unsigned si = 0; si < 2; si++)
+          if (Br->getSuccessor(si)->getUniquePredecessor() == &B)
+            edges.push_back({Br->getSuccessor(si), {Br->getCondition(), leaf, si == 0, dOff, dOff}});
+      } else if (const auto *SW = dyn_cast<SwitchInst>(Term)) {
+        const Instruction *leaf = leafOf(SW->getCondition());
+        if (!leaf) continue;
+        std::map<const BasicBlock *, std::vector<int64_t>> labels;
+        std::vector<int64_t> all;
+        for (auto C : SW->cases()) {
+          labels[C.getCaseSuccessor()].push_back(C.getCaseValue()->getSExtValue());
+          all.push_back(C.getCaseValue()->getSExtValue());
+        }
+        for (auto &[Succ, vs] : labels) {
+          if (Succ == SW->getDefaultDest() || Succ->getUniquePredecessor() != &B) continue;
+          Test t{SW->getCondition(), leaf, true, dOff, dOff};
+          t.sw = true;
+          t.caseVals = vs;
+          edges.push_back({Succ, t});
+        }
+        const BasicBlock *Dflt = SW->getDefaultDest();
+        if (!labels.count(Dflt) && Dflt->getUniquePredecessor() == &B) {
+          Test t{SW->getCondition(), leaf, true, dOff, dOff};
+          t.sw = t.swDefault = true;
+          t.caseVals = all;
+          edges.push_back({Dflt, t});
+        }
+      }
+    }
+    DominatorTree &DT = domOf(G);
+    std::vector<PPUse> uses;
+    for (const Value *V : *jv)
+      for (const User *U : V->users()) {
+        const auto *UI = dyn_cast<Instruction>(U);
+        if (!UI || isa<DbgInfoIntrinsic>(UI)) continue;
+        if (const auto *St = dyn_cast<StoreInst>(UI); St && St->getValueOperand() == G->getArg(j) &&
+                                                         isa<AllocaInst>(St->getPointerOperand()))
+          continue; // the -O0 spill into its slot
+        PPUse pu{UI, {}};
+        for (const Edge &e : edges)
+          if (DT.dominates(e.succ, UI->getParent())) pu.tests.push_back(e.t);
+        uses.push_back(std::move(pu));
+      }
+    return it->second = std::move(uses);
+  };
+  // At a read of F: its value passed as parameter j of a direct call, with
+  // the same identity's D (through casts) as parameter k, both loads and
+  // the call in one block with no write between: one test set per use of
+  // j in the callee (an empty set: an untested use).
+  std::map<std::pair<const Instruction *, int64_t>, std::optional<std::vector<std::vector<Test>>>> ppReadMemo;
+  size_t ppKeyedReads = 0, ppUntestedReads = 0;
+  auto ppTestsFor = [&](const Instruction *R, const Value *robj, const Field &Df)
+      -> const std::optional<std::vector<std::vector<Test>>> & {
+    auto [it, ins] = ppReadMemo.try_emplace({R, Df.second});
+    if (!ins) return it->second;
+    const Value *v = R;
+    const CallBase *CB = nullptr;
+    for (int d = 0; d < 4 && !CB; d++) {
+      if (!v->hasOneUse()) return it->second;
+      const User *U = *v->user_begin();
+      if (const auto *C = dyn_cast<CallBase>(U)) CB = C;
+      else if (isa<CastInst>(U)) v = U;
+      else return it->second;
+    }
+    const Function *G = CB ? CB->getCalledFunction() : nullptr;
+    if (!G || G->isDeclaration() || CB->getParent() != R->getParent()) return it->second;
+    unsigned j = ~0u;
+    for (unsigned a = 0; a < CB->arg_size(); a++) if (CB->getArgOperand(a) == v) j = a;
+    if (j == ~0u || j >= G->arg_size()) return it->second;
+    for (unsigned k = 0; k < CB->arg_size() && k < G->arg_size(); k++) {
+      if (k == j || !CB->getArgOperand(k)->getType()->isIntegerTy()) continue;
+      const Value *x = CB->getArgOperand(k);
+      while (const auto *C = dyn_cast<CastInst>(x)) x = C->getOperand(0);
+      const auto *LD = dyn_cast<LoadInst>(x);
+      StructType *S2 = nullptr;
+      int64_t o2 = 0;
+      if (!LD || LD->getParent() != CB->getParent() ||
+          !accessSlot(LD, LD->getPointerOperand(), LD->getModule()->getDataLayout(), S2, o2) || !S2 ||
+          !S2->hasName() || stripStructNameSuffix(S2->getName()) != Df.first || o2 != Df.second ||
+          !sameObj(objKey(LD, LD->getPointerOperand(), S2), robj, CB))
+        continue;
+      // No write between the earlier load and the call.
+      const Instruction *first = LD->comesBefore(R) ? LD : R;
+      bool clean = true;
+      for (const Instruction *I = first->getNextNode(); I && I != CB; I = I->getNextNode())
+        if (!isa<DbgInfoIntrinsic>(I) && I->mayWriteToMemory()) clean = false;
+      if (!clean) continue;
+      const auto &sum = ppSummary(G, k, j, Df.second);
+      if (!sum) continue;
+      std::vector<std::vector<Test>> sets;
+      for (const PPUse &u : *sum) {
+        std::vector<Test> ts = u.tests;
+        for (Test &t : ts) t.argExpr = CB->getArgOperand(k), t.argLeaf = LD;
+        sets.push_back(std::move(ts));
+      }
+      return it->second = std::move(sets);
+    }
+    return it->second;
   };
   // ---- The co-write rule: last writers (plan 3.51) ----
   // Invariant: a writer W's tag set is the set of D values that can hold
@@ -2842,8 +3035,15 @@ void CallGraphPass::computeTaggedFields() {
       for (const FAccess &r : fLoads[Ff]) {
         std::vector<Test> tt;
         testsAtM(r.I, r.obj, Df, Ff, tt, pas);
-        if (!tt.empty() || (prodNeed.count(dOff) && prodRead.count(r.I))) tested[r.I] = r.obj, testedV.push_back(r.I);
-        if (!tt.empty()) anyTest.insert(r.I);
+        // A read whose value goes to a callee testing its tag parameter.
+        bool pp = false;
+        if (tt.empty())
+          if (const auto &ps = ppTestsFor(r.I, r.obj, Df); ps) {
+            pp = !ps->empty();
+            for (const auto &u : *ps) pp &= !u.empty();
+          }
+        if (!tt.empty() || pp || (prodNeed.count(dOff) && prodRead.count(r.I))) tested[r.I] = r.obj, testedV.push_back(r.I);
+        if (!tt.empty() || pp) anyTest.insert(r.I);
       }
       if (tested.empty()) { // no read with a stable test: no read can be keyed
         readsNoTest += fLoads[Ff].size();
@@ -3616,7 +3816,33 @@ void CallGraphPass::computeTaggedFields() {
       for (const FAccess &r : fLoads[Ff]) {
         std::vector<Test> tests;
         testsAtM(r.I, r.obj, Df, Ff, tests, pas);
-        if (tests.empty()) { readsNoTest++; continue; }
+        if (tests.empty()) {
+          // Parameter-pair tests: the union over the callee's uses of what
+          // each use's tests admit; an untested use admits every writer.
+          const auto &ps = ppTestsFor(r.I, r.obj, Df);
+          bool untested = !ps;
+          if (ps) for (const auto &u : *ps) untested |= u.empty();
+          if (untested) {
+            if (ps) ppUntestedReads++;
+            readsNoTest++;
+            continue;
+          }
+          std::vector<size_t> adm;
+          for (size_t i = 0; i < writers.size(); i++) {
+            bool ok = wAll[i];
+            for (size_t q = 0; q < ps->size() && !ok; q++) {
+              const TagSet &ws = full.w[i];
+              if (ws.wide) ok = !ws.kb.hasConflict() && mayHold((*ps)[q], ws.kb);
+              else for (int64_t v : ws.vals) if (holds((*ps)[q], v)) { ok = true; break; }
+            }
+            if (ok) adm.push_back(i);
+          }
+          if (adm.size() == writers.size()) { readsAll++; continue; }
+          keyed.push_back({r.I, adm});
+          pairReadsKeyed++;
+          ppKeyedReads++;
+          continue;
+        }
         std::vector<size_t> adm;
         const auto [TT, R] = tagsFor(tests);
         curR = R;
@@ -3881,7 +4107,8 @@ void CallGraphPass::computeTaggedFields() {
          << " union members read as one pointer field; " << outParamWrites << " out-parameter F writes; "
          << sTermsKept << " own-tag terms current at their store, " << sTermsAtLoad << " taken at their load (rule iii); "
          << xmTerms << " terms with x-masks over " << xmFieldSizes.size() << " fields (" << xmFieldsWide << " U widened); "
-         << pathGuarded << " retags guarded per path; " << coFills << " fills that write F and D together\n");
+         << pathGuarded << " retags guarded per path; " << coFills << " fills that write F and D together; "
+         << "parameter-pair tests: " << ppKeyedReads << " keyed reads, " << ppUntestedReads << " untested\n");
   if (VerboseLevel >= 2)
     for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
   if (VerboseLevel >= 2) {
@@ -3891,5 +4118,5 @@ void CallGraphPass::computeTaggedFields() {
       CG_LOG("TaggedFields:   open predicate tests: " << ne.first << " by " << k << ", e.g. " << ne.second << "\n");
   }
   taggedCounts = {pairsKeyed, writersTagged, writersUntagged, readsKeyed, readsNoTest, readsAll, pairsNonConst,
-                  predClosed, predOpen};
+                  predClosed, predOpen, ppKeyedReads, ppUntestedReads};
 }

@@ -4465,6 +4465,9 @@ bool CallGraphPass::runCellResolution() {
     s.erase(0, s.find_first_not_of(' '));
     return s.substr(0, 140);
   };
+  // Per store address: (objects labeled as its struct view, all objects)
+  // its pointer held when first asked.
+  boost::unordered_flat_map<const Value *, std::pair<size_t, size_t>> leakPtrViews;
   auto leakSiteOf = [&](int cls, const std::string &where, const std::string &into,
                         const std::string &detail) -> uint32_t {
     const std::string key = std::to_string(cls) + "|" + where + "|" + into;
@@ -4629,15 +4632,44 @@ bool CallGraphPass::runCellResolution() {
     const bool dStruct = dObj != UINT32_MAX && objs[dObj].layout && objs[dObj].label != "i8";
     const bool dBytes = dObj != UINT32_MAX && !dStruct;
     // A store (IR, initializer or seed) by its destination: 1, 3 or 4.
+    // A store whose address views its target as struct S writing a cell
+    // that is not S's there: if the pointer also holds S objects, it is
+    // imprecise and the byte cell is a wrong target (class 7); if it holds
+    // none, the program reads this storage as S (class 3, or 1 for a
+    // struct's byte field).
     auto byDest = [&](const Value *ptr, std::string &detail) {
+      const std::string v = ptr ? leakStructView(ptr) : "";
+      bool wrong = false;
+      if (!v.empty() && dObj != UINT32_MAX) {
+        std::vector<std::string> ch;
+        if (dStruct && dC != kLeakAny) structChain(objs[dObj].layout, dC, DL, ch);
+        bool fits = false;
+        for (const std::string &e : ch) fits |= e.rfind(v + "+", 0) == 0;
+        if (!fits) {
+          auto [it, ins] = leakPtrViews.try_emplace(ptr);
+          if (ins) {
+            const uint32_t pn = leakNodeOf(ptr);
+            if (pn != UINT32_MAX)
+              pts[pn].forEach([&](uint32_t g) {
+                it->second.second++;
+                for (auto [o, e] : memb[findFact(g)])
+                  if (objs[o].layout && objs[o].label == v) { it->second.first++; break; }
+              });
+          }
+          detail += "; viewed as " + v + ", the pointer holds " + std::to_string(it->second.first) +
+                    " " + v + " of " + std::to_string(it->second.second) + " objects";
+          wrong = it->second.first > 0;
+        } else {
+          detail += "; viewed as " + v;
+        }
+      }
+      if (wrong) return 7;
       if (dStruct) {
         if (dC != kLeakAny) detail += "; field " + leakFieldOf(dObj, dC);
         return 1;
       }
       if (!dBytes) return 6;
-      const std::string v = ptr ? leakStructView(ptr) : "";
-      if (!v.empty()) { detail += "; viewed as " + v; return 3; }
-      return 4;
+      return v.empty() ? 4 : 3;
     };
     if (!hasSrc || w.kind != W_EDGE) {
       static const char *kinds[] = {"seed or initializer", "edge", "field step", "pointer walk",
@@ -5723,8 +5755,9 @@ bool CallGraphPass::runCellResolution() {
     static const char *clsName[] = {"", "store into a byte or union field of a struct",
                                     "byte copy", "byte storage written through a struct view",
                                     "byte storage written through a char or untyped address",
-                                    "vararg or bodiless call boundary", "other"};
-    size_t clsMass[7] = {}, clsSites[7] = {}, clsExited[7] = {}, exitedAll = 0, exitedUntagged = 0;
+                                    "vararg or bodiless call boundary", "other",
+                                    "store through an imprecise pointer (it also holds the objects it views)"};
+    size_t clsMass[8] = {}, clsSites[8] = {}, clsExited[8] = {}, exitedAll = 0, exitedUntagged = 0;
     for (size_t s = 0; s < leakSites.size(); s++) {
       clsMass[leakSites[s].cls] += siteMass[s];
       clsExited[leakSites[s].cls] += leakSites[s].exited;
@@ -5737,7 +5770,7 @@ bool CallGraphPass::runCellResolution() {
     CG_LOG("Cells:   LEAK exits: " << leakExits.size() << " edges out of byte cells carry "
            << exitedAll << " non-char (node, fact) pairs out (" << exitedUntagged
            << " of them untagged)\n");
-    for (int c = 1; c <= 6; c++)
+    for (int c = 1; c <= 7; c++)
       CG_LOG("Cells:   LEAK class " << c << " (" << clsName[c] << "): exited " << clsExited[c]
              << " (" << pct(clsExited[c], exitedAll) << "%), resident " << clsMass[c] << " ("
              << pct(clsMass[c], leakFacts) << "%), " << clsSites[c] << " sites\n");

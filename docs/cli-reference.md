@@ -1,6 +1,6 @@
 # KAMain and KABaseline command-line reference
 
-Generated 2026-10-09 by `tools/gen-cli-reference.py` from the
+Generated 2026-10-11 by `tools/gen-cli-reference.py` from the
 `cl::opt` definitions (`src/lib/Flags.cc` for options both binaries share,
 `src/baseline/BaselineMain.cc` for the baseline's own). The descriptions in
 the code are the source of truth; the grouping is the flag census of
@@ -178,6 +178,7 @@ Removed options are errors that name their replacement; the list is in
 - **`--cfl-cell-why-at`** (default `""`): --cfl-cell-why instrument: also explain why each node whose description contains this holds the --cfl-cell-why object
 - **`--cfl-cell-collapse`** (default `true`): --cfl-cells: collapse copy cycles during the solve (the static collapse before any fact moves always runs). Off is a measurement instrument: nodes keep their own facts, so --cfl-cell-why can follow a fact through what would be one merged class (slower)
 - **`--cfl-cell-soup-profile`** (default `false`): --cfl-cells instrument (plan 3.34): never stops; every fact landing on a node where its name is incompatible with the node's first name is foreign, and inherits the ENTRY of the fact it came from or, at the first such join, makes this node its entry. Reports entries and construct classes ranked by the foreign facts they explain, the hubs, and width per formal and per struct field
+- **`--cfl-cell-leak-census`** (default `false`): --cfl-cell-soup-profile measurement: every non-char object's fact in a byte-named cell (i8[]) is walked back, along first arrivals, to the first edge where it entered a byte cell; the entries are classified (struct field, byte copy, buffer read as a struct, pointer stored into char storage, vararg or bodiless boundary, other) and ranked by the facts they explain at the profiler's stop point, with the inert check of byte cells
 - **`--cfl-cell-soup-cap`** (default `20000000`): --cfl-cell-soup-profile: stop (report, no answers) after this many foreign facts
 - **`--cfl-cell-soup-time`** (default `0`): --cfl-cell-soup-profile: stop (report, no answers) after this many seconds of propagation in one iteration (0: no limit); the report then includes the byte-copy cost table
 - **`--cfl-construct-census`** (default `false`): MEASUREMENT ONLY (plan 3.34 instrument 2): before the first solve, count the constructs that made soups so far, with examples and whether a summary covers them: allocator wrappers and pool allocators without a summary, generic containers (void* parameter stored into a field), method calls by path length, method-identity tests, unions with pointer members, varargs functions, struct copies through byte buffers

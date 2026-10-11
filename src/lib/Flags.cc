@@ -1198,6 +1198,17 @@ cl::opt<bool> CFLCellSoupProfile(
            "and per struct field"),
   cl::init(false));
 
+cl::opt<bool> CFLCellLeakCensus(
+  "cfl-cell-leak-census",
+  cl::desc("--cfl-cell-soup-profile measurement: every non-char object's "
+           "fact in a byte-named cell (i8[]) is walked back, along first "
+           "arrivals, to the first edge where it entered a byte cell; the "
+           "entries are classified (struct field, byte copy, buffer read as "
+           "a struct, pointer stored into char storage, vararg or bodiless "
+           "boundary, other) and ranked by the facts they explain at the "
+           "profiler's stop point, with the inert check of byte cells"),
+  cl::init(false));
+
 cl::opt<unsigned> CFLCellSoupCap(
   "cfl-cell-soup-cap",
   cl::desc("--cfl-cell-soup-profile: stop (report, no answers) after this "

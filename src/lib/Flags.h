@@ -136,6 +136,7 @@ extern cl::opt<bool> CFLCellCollapse;
 extern cl::opt<std::string> CFLCellWhyAt;
 extern cl::opt<bool> CFLCellReceivers;
 extern cl::opt<bool> CFLCellSoupProfile;
+extern cl::opt<bool> CFLCellLeakCensus;
 extern cl::opt<bool> CFLConstructCensus;
 extern cl::opt<unsigned> CFLCellSoupCap;
 extern cl::opt<unsigned> CFLCellSoupTime;

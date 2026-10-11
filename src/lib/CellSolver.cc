@@ -758,6 +758,15 @@ bool CallGraphPass::runCellResolution() {
   // only --cfl-cell-why records them per fact.
   const bool trackWhy = recordWhy || CFLCellSoupProfile;
   std::function<void(uint32_t, uint32_t)> soupArrive; // set once cells exist
+  // --cfl-cell-leak-census: the arrival hook and the merge hook (a merged
+  // node keeps its members' leaks); set once cells exist.
+  std::function<void(uint32_t, uint32_t)> leakArrive, leakMerge;
+  std::function<void(uint32_t)> leakRefold; // an object's cells were renamed
+  if (CFLCellLeakCensus && !CFLCellSoupProfile) {
+    errs() << "Cells: --cfl-cell-leak-census reports at the soup profiler's stop "
+           << "point; it needs --cfl-cell-soup-profile\n";
+    exit(1);
+  }
   bool soupStop = false;
   const bool whyStopAtAny = StringRef(CFLCellWhy).starts_with("any:");
   bool whyAnyArrived = false;
@@ -781,6 +790,7 @@ bool CallGraphPass::runCellResolution() {
     }
     if (pts[n].set(f)) {
       if (soupArrive) soupArrive(n, f);
+      if (leakArrive) leakArrive(n, f);
       if (recordWhy && whyWanted(f)) {
         Why w = curWhy;
         w.t = whyClock;
@@ -832,6 +842,14 @@ bool CallGraphPass::runCellResolution() {
     }
   std::vector<uint32_t> storeHub(G, UINT32_MAX);
   size_t staticCopies = 0, stores = 0;
+  // Leak census: a store collector's hub and the value nodes stored.
+  boost::unordered_flat_map<uint32_t, uint32_t> leakCollHub;
+  boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> leakCollIn;
+  // Leak census: the IR stores each store collector stands for (indexed
+  // before any merge), and the load results a hub feeds (factory nodes, before
+  // presolve merged them).
+  boost::unordered_flat_map<uint32_t, std::vector<NodeIndex>> leakHubLoads;
+  boost::unordered_flat_map<uint32_t, std::vector<const StoreInst *>> leakCollStores;
   for (const GraphEdge &E : Graph.edges()) {
     switch (E.kind) {
     case EdgeKind::Copy: {
@@ -840,9 +858,14 @@ bool CallGraphPass::runCellResolution() {
       if (isHub[b]) { // a store: into the cells the hub's pointers hold
         if (storeHub[b] == UINT32_MAX) storeHub[b] = newNode();
         addEdge(a, storeHub[b]);
+        if (CFLCellLeakCensus) {
+          leakCollHub.try_emplace(storeHub[b], b);
+          leakCollIn[storeHub[b]].push_back(a);
+        }
         stores++;
       } else {
         addEdge(a, b);
+        if (CFLCellLeakCensus && isHub[a]) leakHubLoads[a].push_back(E.to);
         staticCopies++;
       }
       break;
@@ -897,6 +920,7 @@ bool CallGraphPass::runCellResolution() {
   // successors and constraints have not seen).
   auto absorb = [&](uint32_t r, uint32_t m) {
     repOf[m] = r;
+    if (leakMerge) leakMerge(r, m);
     if (!asmAt.empty())
       if (auto ait = asmAt.find(m); ait != asmAt.end()) {
         std::vector<AsmEntry> es = std::move(ait->second);
@@ -1085,6 +1109,19 @@ bool CallGraphPass::runCellResolution() {
     }
     collapseSecs += std::chrono::duration<double>(Clock::now() - tc).count();
   };
+  if (CFLCellLeakCensus)
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F))
+          if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            if (NF.getValueNodeFor(SI->getValueOperand()) == AndersNodeFactory::InvalidIndex) continue;
+            const NodeIndex pn = NF.getValueNodeFor(SI->getPointerOperand());
+            if (pn == AndersNodeFactory::InvalidIndex || pn >= G) continue;
+            const uint32_t c = getCanonicalNode(pn);
+            if (c >= G) continue;
+            for (uint32_t h : hubsOf[c])
+              if (storeHub[h] != UINT32_MAX) leakCollStores[storeHub[h]].push_back(SI);
+          }
   collapseCycles(); // static cycles, before any fact moves
 
   // ---- Objects and cells ----
@@ -1116,6 +1153,10 @@ bool CallGraphPass::runCellResolution() {
     stepDst.emplace_back();
     return (uint32_t)cells.size() - 1;
   };
+  // Leak census: the cell a content node (U, P, a key's K) or an
+  // any-offset node stands for (kLeakAny).
+  constexpr int64_t kLeakAny = std::numeric_limits<int64_t>::min();
+  boost::unordered_flat_map<uint32_t, std::pair<uint32_t, int64_t>> leakCellOf;
   // The any-offset cell writes every content cell and reads them all.
   auto linkAny = [&](uint32_t a, uint32_t storeNode, uint32_t loadNode) {
     addEdge(cells[a].store, storeNode);
@@ -1132,6 +1173,10 @@ bool CallGraphPass::runCellResolution() {
     const uint32_t f = newCell({o, CellKind::Any, 0, UINT32_MAX, w, r,
                                 NF.getCellNode(objs[o].origin, internName("*"))});
     objs[o].any = f;
+    if (CFLCellLeakCensus) {
+      leakCellOf.emplace(w, std::make_pair(o, kLeakAny));
+      leakCellOf.emplace(r, std::make_pair(o, kLeakAny));
+    }
     addEdge(w, r);
     for (auto &[c, u, pn] : objs[o].loadNodes) linkAny(f, u, pn);
     return f;
@@ -1196,6 +1241,10 @@ bool CallGraphPass::runCellResolution() {
     }
     objs[o].content.emplace(c, std::make_pair(u, pn));
     objs[o].loadNodes.push_back({c, u, pn});
+    if (CFLCellLeakCensus) {
+      leakCellOf.emplace(u, std::make_pair(o, c));
+      leakCellOf.emplace(pn, std::make_pair(o, c));
+    }
     if (objs[o].any != UINT32_MAX) linkAny(objs[o].any, u, pn);
     if (objs[o].layout && !leafStart(objs[o].layout, c, DL)) {
       interiorCells++;
@@ -1284,6 +1333,7 @@ bool CallGraphPass::runCellResolution() {
     addEdge(n, pn);
     if (flippedAt(o, c)) addEdge(n, u);
     objs[o].keyed.emplace(kk, n);
+    if (CFLCellLeakCensus) leakCellOf.emplace(n, std::make_pair(o, c));
     keyedCells++;
     // Copies out of this slot carry the key along.
     for (size_t i = 0; i < objs[o].copyOut.size(); i++) {
@@ -1395,6 +1445,8 @@ bool CallGraphPass::runCellResolution() {
   };
   std::vector<CopyStat> copyStat;
   uint32_t curCopy = UINT32_MAX;
+  // Leak census: a byte copy's content edges (source, destination node).
+  boost::unordered_flat_map<uint64_t, uint32_t> leakCopyEdge;
   struct { uint32_t ci = UINT32_MAX, fs, os, od; } firstMismatch;
   uint64_t pops = 0; // worklist pops (the solve's clock)
   // Two cells of one name a node holds become one cell: their content
@@ -1748,6 +1800,7 @@ bool CallGraphPass::runCellResolution() {
       splitCells++;
       lateSplits++;
     }
+    if (leakRefold) leakRefold(o);
   };
   auto drainRefolds = [&]() {
     while (!refoldQueue.empty()) {
@@ -4135,6 +4188,8 @@ bool CallGraphPass::runCellResolution() {
         continue; // capped: its any-offset cell already reads everything
       const auto [su, sp] = contentOf(so, sk);
       const auto [du, dp] = contentOf(dob, dk);
+      if (CFLCellLeakCensus) // before the edge: its facts arrive inside addEdge
+        leakCopyEdge.try_emplace((uint64_t)find(su != sp && du != dp ? su : sp) << 32 | find(du), curCopy);
       if (su != sp && du != dp) {
         // Keyed union slot to keyed union slot: unkeyed to unkeyed, each
         // key to the same key (a realloc of a node array keeps its keys).
@@ -4176,6 +4231,8 @@ bool CallGraphPass::runCellResolution() {
     for (auto [o, e] : memb[fs]) copyStat[ci].srcObjs.insert(o);
     for (auto [o, e] : memb[fd]) copyStat[ci].dstObjs.insert(o);
     if (S.kind == CellKind::Any || D.kind == CellKind::Any) {
+      if (CFLCellLeakCensus)
+        leakCopyEdge.try_emplace((uint64_t)find(S.load) << 32 | find(D.store), ci);
       addEdge(S.load, D.store); // any offset: everything to everything
       return;
     }
@@ -4278,6 +4335,439 @@ bool CallGraphPass::runCellResolution() {
       soupEntries[entry].mass++;
       if (soupForeign.size() >= CFLCellSoupCap) soupStop = true;
     };
+
+  // ---- The leak census (--cfl-cell-leak-census) ----
+  // A byte-named cell (i8[]) carries no pointer in a well-typed program,
+  // so a non-char object's fact in one entered byte storage somewhere. A
+  // fact arriving anywhere inherits the leak of the fact it came from (the
+  // cause the solver is propagating), so a leak follows a pointer out of
+  // the byte cell and into the next one; a non-char fact entering a byte
+  // cell without one makes the arriving edge a leak, classified there:
+  //   1 a store or initializer into a byte or union field of a struct,
+  //   2 a byte copy, 3 a store into byte storage through a struct view,
+  //   4 a store into byte storage through a char or untyped address,
+  //   5 a vararg or bodiless call boundary, 6 anything else.
+  // Mass = non-char facts in byte cells at the stop, by leak.
+  struct LeakSite { int cls; std::string where, into, detail; size_t born = 0, exited = 0; };
+  // The exit side: an edge out of a byte cell into a node that is not one
+  // (a load's hub, a byte copy into a typed cell, anything else), with the
+  // non-char facts it carries out (by leak; untagged ones apart) and the
+  // byte cells they leave.
+  struct LeakExit {
+    std::string kind, desc;
+    size_t mass = 0, untagged = 0, edges = 0;
+    std::map<std::pair<uint32_t, int64_t>, size_t> from;
+  };
+  std::vector<LeakExit> leakExits;
+  boost::unordered_flat_map<uint64_t, uint32_t> leakExitIdx; // (byte node, node) -> exit
+  std::map<std::string, uint32_t> leakExitKey;              // site -> exit
+  // A non-char fact arriving in a cell of a not yet named object: its
+  // entry, classified then, becomes a leak if the object is named bytes.
+  boost::unordered_flat_map<uint64_t, uint32_t> leakProv;
+  // A hub that feeds only store collectors moves its facts (*q = *p, a
+  // pointer-sized move) instead of reading them: it and the collectors
+  // pass a byte cell's facts on, and the exit is where the move lands.
+  boost::unordered_flat_set<uint32_t> leakTransit;
+  std::vector<LeakSite> leakSites;
+  std::map<std::string, uint32_t> leakSiteIdx;
+  boost::unordered_flat_map<uint64_t, uint32_t> leakTag; // (node, fact) -> leak
+  boost::unordered_flat_set<uint32_t> leakMergedByte;    // merged with a byte cell
+  auto leakByteCell = [&](uint32_t o, int64_t c) {
+    if (c == kLeakAny)
+      return objs[o].layout ? objs[o].label == "i8" : objs[o].bytes;
+    return cellName(o, c) == "i8[]";
+  };
+  auto leakIsByte = [&](uint32_t n) {
+    auto it = leakCellOf.find(n);
+    if (it != leakCellOf.end() && leakByteCell(it->second.first, it->second.second))
+      return true;
+    return leakMergedByte.count(n) != 0;
+  };
+  // 0: a char or not yet named object; 1: a struct, union or class; 2:
+  // another non-char object (scalars, pointer arrays); 3: a function.
+  auto leakFactKind = [&](uint32_t f) -> int {
+    if (cells[f].kind == CellKind::Func) return 3;
+    int k = 0;
+    for (auto [o, e] : memb[f]) {
+      const Obj &O = objs[o];
+      if (O.fn) return 3;
+      if (!O.layout || O.label == "i8") continue;
+      const StringRef L(O.label);
+      if (L.starts_with("struct.") || L.starts_with("union.") || L.starts_with("class."))
+        return 1;
+      k = 2;
+    }
+    return k;
+  };
+  // The struct a store's address views its target as (through GEPs and
+  // casts), "" for a char or untyped address.
+  auto leakStructView = [&](const Value *P) -> std::string {
+    for (int k = 0; k < 8 && P; k++) {
+      P = P->stripPointerCasts();
+      const auto *GEP = dyn_cast<GEPOperator>(P);
+      if (!GEP) break;
+      const std::string l = typeLabel(GEP->getSourceElementType());
+      if (StringRef(l).starts_with("struct.") || StringRef(l).starts_with("union.") ||
+          StringRef(l).starts_with("class."))
+        return l;
+      P = GEP->getPointerOperand();
+    }
+    return "";
+  };
+  // Content c of struct object o: the enclosing structs, and the tagged
+  // pair whose field holds c (keyed, or flipped and why).
+  auto leakFieldOf = [&](uint32_t o, int64_t c) -> std::string {
+    std::vector<std::string> ch;
+    structChain(objs[o].layout, c, DL, ch);
+    std::string d;
+    for (const std::string &e : ch) d += (d.empty() ? "" : " > ") + e;
+    Type *T = objs[o].layout;
+    int64_t off = c;
+    for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
+      if (auto *ST = dyn_cast<StructType>(T)) {
+        if (ST->isOpaque()) break;
+        const StructLayout *SL = DL.getStructLayout(ST);
+        if ((uint64_t)off >= SL->getSizeInBytes()) break;
+        const unsigned i = SL->getElementContainingOffset(off);
+        if (ST->hasName())
+          if (auto it = tagPairsOf.find(stripStructNameSuffix(ST->getName()).str());
+              it != tagPairsOf.end())
+            for (size_t pi : it->second) {
+              const TaggedPair &tp = taggedPairs[pi];
+              if (tp.F < 0 || (uint64_t)tp.F >= SL->getSizeInBytes() ||
+                  SL->getElementContainingOffset(tp.F) != i)
+                continue;
+              const std::string pr = tp.S + "+" + std::to_string(tp.F);
+              d += "; tagged pair " + pr + " (tag +" + std::to_string(tp.D) + ")";
+              if (!taggedFlipped.count({tp.S, tp.F})) { d += " keyed"; continue; }
+              d += " FLIPPED";
+              for (const std::string &why : taggedFlipAt)
+                if (why.rfind(pr + " ", 0) == 0) { d += " (" + why + ")"; break; }
+            }
+        off -= (int64_t)SL->getElementOffset(i);
+        T = ST->getElementType(i);
+        continue;
+      }
+      Type *E = nullptr;
+      if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+      if (!E || DL.getTypeAllocSize(E) == 0) break;
+      off %= (int64_t)DL.getTypeAllocSize(E);
+      T = E;
+    }
+    if (inUnionSlot(objs[o], c)) d += "; keyed union slot";
+    return d;
+  };
+  auto leakIR = [](const Instruction *I) {
+    std::string s;
+    raw_string_ostream os(s);
+    I->print(os);
+    s = os.str();
+    s.erase(0, s.find_first_not_of(' '));
+    return s.substr(0, 140);
+  };
+  auto leakSiteOf = [&](int cls, const std::string &where, const std::string &into,
+                        const std::string &detail) -> uint32_t {
+    const std::string key = std::to_string(cls) + "|" + where + "|" + into;
+    auto [it, ins] = leakSiteIdx.try_emplace(key, (uint32_t)leakSites.size());
+    if (ins) leakSites.push_back({cls, where, into, detail});
+    return it->second;
+  };
+  // A bodiless or variadic callee among V's users (the call that models
+  // the write when no IR store does).
+  auto leakBodiless = [](const Value *V) -> std::string {
+    if (!V) return "";
+    for (const User *U : V->users())
+      if (const auto *CB = dyn_cast<CallBase>(U))
+        if (const Function *CF = CB->getCalledFunction())
+          if (CF->isDeclaration() || CF->isVarArg())
+            return CF->getName().str() + " at " + instLoc(CB);
+    return "";
+  };
+  // A value's solver node, or UINT32_MAX for one made after the solve
+  // began (no constraint mentions it).
+  auto leakNodeOf = [&](const Value *V) -> uint32_t {
+    const NodeIndex v = V ? NF.getValueNodeFor(V) : AndersNodeFactory::InvalidIndex;
+    if (v == AndersNodeFactory::InvalidIndex || v >= G) return UINT32_MAX;
+    const uint32_t c = getCanonicalNode(v);
+    return c < G ? find(c) : UINT32_MAX;
+  };
+  auto leakDesc = [&](uint32_t n) { return n == UINT32_MAX ? std::string("?") : nodeDesc(n).substr(0, 120); };
+  // The pointer value a hub (a dereference node, or a keyed one) reads or
+  // writes through.
+  auto leakHubPtr = [&](uint32_t h, NodeIndex &par) -> const Value * {
+    par = h < G ? NF.getDerefParent(h) : AndersNodeFactory::InvalidIndex;
+    if (h < G && par == AndersNodeFactory::InvalidIndex) {
+      if (keyedPtrOf.empty())
+        for (const auto &[pk, d] : keyedDerefOf) keyedPtrOf.emplace(d, pk);
+      if (auto it = keyedPtrOf.find(h); it != keyedPtrOf.end()) par = it->second.first;
+    }
+    return par == AndersNodeFactory::InvalidIndex ? nullptr : NF.getValueForNode(par);
+  };
+  // An exit's site (key) and its row.
+  auto leakExitAt = [&](uint32_t a, uint32_t n, std::string &key) -> LeakExit {
+    LeakExit E;
+    if (auto cit = leakCopyEdge.find((uint64_t)a << 32 | n); cit != leakCopyEdge.end()) {
+      const ByteCopy &BC = copies[cit->second];
+      key = "copy|" + std::to_string(cit->second);
+      E.kind = "byte copy into a typed cell";
+      E.desc = (BC.at ? instLoc(BC.at) + " " + leakIR(BC.at) : std::string("byte copy"));
+      if (auto it = leakCellOf.find(n); it != leakCellOf.end())
+        E.desc += " | e.g. into " + (it->second.second == kLeakAny ? std::string("*")
+                                     : cellName(it->second.first, it->second.second)) +
+                  " of " + describe(objs[it->second.first]);
+      return E;
+    }
+    key = "node|" + std::to_string(n);
+    if (auto it = leakCellOf.find(n); it != leakCellOf.end()) {
+      E.kind = "cell edge into a typed cell";
+      E.desc = (it->second.second == kLeakAny ? std::string("*")
+                : cellName(it->second.first, it->second.second)) +
+               " of " + describe(objs[it->second.first]);
+      return E;
+    }
+    if (n >= G || !(NF.isDereferenceNode(n) || NF.isObjectNode(n))) {
+      E.kind = "other";
+      E.desc = nodeDesc(n).substr(0, 160);
+      return E;
+    }
+    // A hub: the loads it feeds (its successors). A hub that feeds nothing
+    // (a pointer only stored through) reads nothing out: not an exit.
+    if (succ[n].empty()) return E; // kind "": skipped
+    bool allColl = true;
+    for (uint32_t v : succ[n]) allColl &= leakCollHub.count(find(v)) != 0;
+    const LoadInst *first = nullptr;
+    size_t ptrLoads = 0, loads = 0;
+    auto visit = [&](const Value *V) {
+      const auto *LI = dyn_cast_or_null<LoadInst>(V);
+      if (!LI) return;
+      loads++;
+      if (LI->getType()->isPointerTy()) ptrLoads++;
+      if (!first || (LI->getType()->isPointerTy() && !first->getType()->isPointerTy())) first = LI;
+    };
+    if (auto it = leakHubLoads.find(n); it != leakHubLoads.end())
+      for (NodeIndex v : it->second) visit(NF.getValueForNode(v));
+    else // merged: the hubs whose representative n is
+      for (auto &[m, vs] : leakHubLoads)
+        if (find(m) == n)
+          for (NodeIndex v : vs) visit(NF.getValueForNode(v));
+    if (!loads)
+      for (uint32_t v : succ[n]) visit(find(v) < G ? NF.getValueForNode(find(v)) : nullptr);
+    if (!loads && allColl) {
+      leakTransit.insert(n);
+      return E; // a move: skipped here, counted where it lands
+    }
+    NodeIndex par;
+    const Value *Vp = first ? first->getPointerOperand() : leakHubPtr(n, par);
+    const std::string view = Vp ? leakStructView(Vp) : "";
+    E.kind = !loads ? "hub feeding merged nodes (no load among its successors)"
+             : view.empty() ? "load through a char or untyped address"
+                            : "load through a struct view (" + view + ")";
+    E.desc = std::to_string(ptrLoads) + " pointer loads of " + std::to_string(loads) + " fed; " +
+             (first ? instLoc(first) + " " + first->getFunction()->getName().str() + " " + leakIR(first)
+                    : nodeDesc(n).substr(0, 80) + " -> " + std::to_string(succ[n].size()) +
+                          " successors, e.g. " + nodeDesc(find(succ[n][0])).substr(0, 120));
+    return E;
+  };
+  auto leakExit = [&](uint32_t a, uint32_t n, uint32_t s) {
+    auto [it, ins] = leakExitIdx.try_emplace((uint64_t)a << 32 | n, UINT32_MAX);
+    const bool moved = leakTransit.count(a) != 0;
+    if (ins) {
+      if (moved && leakCollHub.count(n)) { // the move goes on
+        leakTransit.insert(n);
+        return;
+      }
+      std::string key;
+      LeakExit E = leakExitAt(a, n, key);
+      if (E.kind.empty()) return; // not a read (memoized as UINT32_MAX)
+      if (moved) {
+        key += "|move";
+        E.kind = "pointer-sized move (*q = *p), then " + E.kind;
+      }
+      auto [kit, kins] = leakExitKey.try_emplace(key, (uint32_t)leakExits.size());
+      if (kins) leakExits.push_back(std::move(E));
+      it->second = kit->second;
+      leakExits[it->second].edges++;
+    }
+    if (it->second == UINT32_MAX) return;
+    if (moved && s == UINT32_MAX) return; // a move carries the cell's own facts only
+    LeakExit &E = leakExits[it->second];
+    E.mass++;
+    if (s == UINT32_MAX) E.untagged++;
+    else leakSites[s].exited++;
+    if (auto cit = leakCellOf.find(a); cit != leakCellOf.end()) {
+      if (E.from.size() < 64 || E.from.count(cit->second)) E.from[cit->second]++;
+    } else {
+      E.from[{UINT32_MAX, moved ? 1 : 0}]++;
+    }
+  };
+  // The leak a non-char fact f makes entering byte node n along cause w.
+  auto leakClassify = [&](uint32_t n, uint32_t f, const Why &w, bool hasSrc) -> uint32_t {
+    uint32_t dObj = UINT32_MAX;
+    int64_t dC = 0;
+    std::string into;
+    if (auto it = leakCellOf.find(n); it != leakCellOf.end()) {
+      dObj = it->second.first;
+      dC = it->second.second;
+      into = (dC == kLeakAny ? std::string("*") : cellName(dObj, dC)) + " of " +
+             describe(objs[dObj]);
+    } else {
+      into = "a cycle holding a byte cell: " + nodeDesc(n).substr(0, 120);
+    }
+    const bool dStruct = dObj != UINT32_MAX && objs[dObj].layout && objs[dObj].label != "i8";
+    const bool dBytes = dObj != UINT32_MAX && !dStruct;
+    // A store (IR, initializer or seed) by its destination: 1, 3 or 4.
+    auto byDest = [&](const Value *ptr, std::string &detail) {
+      if (dStruct) {
+        if (dC != kLeakAny) detail += "; field " + leakFieldOf(dObj, dC);
+        return 1;
+      }
+      if (!dBytes) return 6;
+      const std::string v = ptr ? leakStructView(ptr) : "";
+      if (!v.empty()) { detail += "; viewed as " + v; return 3; }
+      return 4;
+    };
+    if (!hasSrc || w.kind != W_EDGE) {
+      static const char *kinds[] = {"seed or initializer", "edge", "field step", "pointer walk",
+                                    "any-offset step", "hub", "byte copy", "dispatch"};
+      std::string detail = kinds[w.kind];
+      if (hasSrc) detail += " from " + nodeDesc(find(w.node)).substr(0, 140);
+      const int cls = w.kind == W_OTHER ? byDest(nullptr, detail) : 6;
+      return leakSiteOf(cls, kinds[w.kind], into, detail);
+    }
+    const uint32_t a = find(w.node);
+    if (auto cit = leakCopyEdge.find((uint64_t)a << 32 | n); cit != leakCopyEdge.end()) {
+      const ByteCopy &BC = copies[cit->second];
+      std::string from = "?";
+      if (auto it = leakCellOf.find(a); it != leakCellOf.end())
+        from = (it->second.second == kLeakAny ? std::string("*")
+                                               : cellName(it->second.first, it->second.second)) +
+               " of " + describe(objs[it->second.first]);
+      return leakSiteOf(2, BC.at ? instLoc(BC.at) + " " + leakIR(BC.at) : "byte copy", into,
+                        "from " + from + (dStruct ? "; into a struct interior" : ""));
+    }
+    if (auto hit = leakCollHub.find(a); hit != leakCollHub.end()) {
+      const uint32_t h = hit->second;
+      NodeIndex par;
+      const Value *Vp = leakHubPtr(h, par);
+      auto holds = [&](const Value *V) {
+        const uint32_t vn = leakNodeOf(V);
+        return vn != UINT32_MAX && pts[vn].test(f);
+      };
+      const StoreInst *SI = nullptr;
+      bool held = true;
+      if (auto sit = leakCollStores.find(a); sit != leakCollStores.end()) {
+        for (const StoreInst *S : sit->second)
+          if (holds(S->getValueOperand())) { SI = S; break; }
+        if (!SI && !sit->second.empty()) { SI = sit->second.front(); held = false; }
+      }
+      if (!SI && Vp)
+        for (const User *U : Vp->users())
+          if (const auto *S = dyn_cast<StoreInst>(U))
+            if (S->getPointerOperand() == Vp && holds(S->getValueOperand())) { SI = S; break; }
+      const Value *Vv = nullptr;
+      for (uint32_t v : leakCollIn[a])
+        if (find(v) < pts.size() && pts[find(v)].test(f)) { Vv = NF.getValueForNode(v); break; }
+      if (!SI && Vv)
+        for (const User *U : Vv->users())
+          if (const auto *S = dyn_cast<StoreInst>(U))
+            if (S->getValueOperand() == Vv) {
+              const uint32_t pn = leakNodeOf(S->getPointerOperand());
+              if (pn == UINT32_MAX) continue;
+              const auto &hs = hubsOf[pn];
+              if (std::find(hs.begin(), hs.end(), h) != hs.end()) { SI = S; break; }
+            }
+      if (SI) {
+        std::string detail = leakIR(SI) + (held ? "" : " (one of the collector's stores; none holds the fact now)");
+        const int cls = byDest(SI->getPointerOperand(), detail);
+        return leakSiteOf(cls, instLoc(SI) + " " + SI->getFunction()->getName().str(), into, detail);
+      }
+      std::string call = leakBodiless(Vp);
+      if (call.empty()) call = leakBodiless(Vv);
+      // A memcpy or memmove modeled as a load and a store: a byte copy.
+      if (StringRef(call).starts_with("llvm.memcpy") || StringRef(call).starts_with("llvm.memmove"))
+        return leakSiteOf(2, call, into, "a copy modeled as a load-store pair (*q = *p); pointer " +
+                                             leakDesc(leakNodeOf(Vp)));
+      const std::string detail = "no IR store; pointer " + leakDesc(leakNodeOf(Vp)) +
+                                 "; value " + leakDesc(leakNodeOf(Vv));
+      return leakSiteOf(call.empty() ? 6 : 5, call.empty() ? "store collector" : call, into, detail);
+    }
+    if (auto it = leakCellOf.find(a); it != leakCellOf.end()) {
+      const auto [so, sc] = it->second;
+      if (sc == kLeakAny)
+        return leakSiteOf(6, "any-offset write of " + describe(objs[so]), into, "");
+      return leakSiteOf(6, "cell edge from " + cellName(so, sc) + " of " + describe(objs[so]), into,
+                        "a byte copy merged away, or a union or tag-flip edge");
+    }
+    if (a < G && NF.isVarargNode(a))
+      return leakSiteOf(5, "vararg pool " + nodeDesc(a).substr(0, 100), into, "");
+    return leakSiteOf(6, "edge from " + nodeDesc(a).substr(0, 140), into, "");
+  };
+  if (CFLCellLeakCensus) {
+    leakArrive = [&](uint32_t n, uint32_t f) {
+      if (soupStop) return;
+      f = findFact(f);
+      const Why w = curWhy;
+      const bool hasSrc = w.node < numNodes && w.fact < cells.size() &&
+                          (w.kind == W_EDGE || w.kind == W_STEP || w.kind == W_WALK ||
+                           w.kind == W_ANY || w.kind == W_DISPATCH);
+      // An edge out of a byte cell into a node that is not one: an exit.
+      auto exits = [&]() {
+        return hasSrc && w.kind == W_EDGE && !leakIsByte(n) &&
+               (leakIsByte(find(w.node)) || leakTransit.count(find(w.node)));
+      };
+      if (hasSrc) {
+        auto it = leakTag.find((uint64_t)find(w.node) << 32 | findFact(w.fact));
+        if (it != leakTag.end()) {
+          leakTag.emplace((uint64_t)n << 32 | f, it->second);
+          if (leakFactKind(f) && exits()) leakExit(find(w.node), n, it->second);
+          return;
+        }
+      }
+      if (!leakFactKind(f)) return;
+      if (!leakIsByte(n)) {
+        if (exits()) leakExit(find(w.node), n, UINT32_MAX);
+        if (auto it = leakCellOf.find(n); it != leakCellOf.end()) {
+          const Obj &O = objs[it->second.first];
+          if (!O.layout && !O.bytes && !O.fn)
+            leakProv.try_emplace((uint64_t)n << 32 | f, leakClassify(n, f, w, hasSrc));
+        }
+        return;
+      }
+      const uint32_t s = leakClassify(n, f, w, hasSrc);
+      leakSites[s].born++;
+      leakTag.emplace((uint64_t)n << 32 | f, s);
+    };
+    leakMerge = [&](uint32_t r, uint32_t m) {
+      if (leakIsByte(m)) leakMergedByte.insert(r);
+      pts[m].forEach([&](uint32_t f) {
+        auto it = leakTag.find((uint64_t)m << 32 | f);
+        if (it != leakTag.end()) leakTag.try_emplace((uint64_t)r << 32 | f, it->second);
+        auto pit = leakProv.find((uint64_t)m << 32 | f);
+        if (pit != leakProv.end()) leakProv.try_emplace((uint64_t)r << 32 | f, pit->second);
+      });
+    };
+    // Cells of o renamed (bytes, a period, a layout): a provisional entry
+    // in what is now a byte cell becomes its leak.
+    leakRefold = [&](uint32_t o) {
+      for (auto &[c, up] : objs[o].content) {
+        if (!leakByteCell(o, c)) continue;
+        for (uint32_t x : {up.first, up.second}) {
+          const uint32_t R = find(x);
+          if (leakProv.empty() || R >= pts.size()) continue;
+          pts[R].forEach([&](uint32_t f0) {
+            const uint32_t f = findFact(f0);
+            const uint64_t k = (uint64_t)R << 32 | f;
+            if (leakTag.count(k)) return;
+            auto pit = leakProv.find(k);
+            if (pit == leakProv.end()) pit = leakProv.find((uint64_t)R << 32 | f0);
+            if (pit == leakProv.end()) return;
+            leakTag.emplace(k, pit->second);
+            leakSites[pit->second].born++;
+          });
+        }
+      }
+    };
+  }
 
   // ---- The icall cone (--cfl-cell-one-label) ----
   // Nodes whose facts can reach an indirect call's callee operand, on the
@@ -5131,6 +5621,182 @@ bool CallGraphPass::runCellResolution() {
     for (size_t i = 0; i < fields.size() && i < 25; i++)
       CG_LOG("Cells:   WIDTH field " << fields[i].first << " names: " << nodeDesc(fields[i].second) << "\n");
     soupBoundaryCensus(order, total);
+  }
+  // Leak census report: the inert check of byte cells, then the leaks by
+  // class and by site, with the non-char facts each explains.
+  if (CFLCellLeakCensus) {
+    size_t allFacts = 0;
+    for (uint32_t m = 0; m < numNodes; m++)
+      if (find(m) == m) allFacts += pts[m].count();
+    size_t byteCells = 0, inert = 0, onlyChar = 0, withLeak = 0, byteFacts = 0, untagged = 0;
+    size_t kindFacts[4] = {0, 0, 0, 0};
+    std::vector<size_t> siteMass(leakSites.size(), 0);
+    std::vector<boost::unordered_flat_map<uint32_t, size_t>> siteObjs(leakSites.size());
+    std::map<std::pair<uint32_t, int64_t>, size_t> untaggedAt;
+    boost::unordered_flat_set<uint32_t> seenRep;
+    std::vector<uint32_t> reps;
+    for (uint32_t o = 0; o < objs.size(); o++) {
+      auto cellOf = [&](int64_t c) {
+        reps.clear();
+        if (c == kLeakAny) {
+          reps.push_back(find(cells[objs[o].any].store));
+          reps.push_back(find(cells[objs[o].any].load));
+        } else {
+          const auto &up = objs[o].content.at(c);
+          reps.push_back(find(up.first));
+          reps.push_back(find(up.second));
+          for (auto &[kk, kn] : objs[o].keyed)
+            if ((int64_t)(uint32_t)(kk >> 32) == (int64_t)(uint32_t)c) reps.push_back(find(kn));
+        }
+        std::sort(reps.begin(), reps.end());
+        reps.erase(std::unique(reps.begin(), reps.end()), reps.end());
+        byteCells++;
+        size_t facts = 0;
+        bool leak = false;
+        for (uint32_t R : reps) {
+          facts += R < pts.size() ? pts[R].count() : 0;
+          const bool first = seenRep.insert(R).second;
+          if (R >= pts.size()) continue;
+          pts[R].forEach([&](uint32_t f0) {
+            const uint32_t f = findFact(f0);
+            const int k = leakFactKind(f);
+            if (k) leak = true;
+            if (!first) return;
+            byteFacts++;
+            if (!k) return;
+            kindFacts[k]++;
+            auto it = leakTag.find((uint64_t)R << 32 | f);
+            if (it == leakTag.end()) it = leakTag.find((uint64_t)R << 32 | f0);
+            if (it == leakTag.end()) {
+              untagged++;
+              untaggedAt[{o, c}]++;
+              return;
+            }
+            siteMass[it->second]++;
+            siteObjs[it->second][memb[f][0].first]++;
+          });
+        }
+        (facts == 0 ? inert : leak ? withLeak : onlyChar)++;
+      };
+      for (auto &[c, up] : objs[o].content)
+        if (leakByteCell(o, c)) cellOf(c);
+      if (objs[o].any != UINT32_MAX && leakByteCell(o, kLeakAny)) cellOf(kLeakAny);
+    }
+    const size_t leakFacts = kindFacts[1] + kindFacts[2] + kindFacts[3];
+    auto pct = [](size_t a, size_t b) {
+      char buf[32];
+      snprintf(buf, sizeof buf, "%.1f", b ? 100.0 * a / b : 0.0);
+      return std::string(buf);
+    };
+    CG_LOG("Cells: LEAK census: " << byteCells << " byte-named cells (i8[]): " << inert
+           << " hold no fact, " << onlyChar << " only char or unnamed objects' facts, "
+           << withLeak << " a non-char object's fact; facts: " << allFacts << " in all nodes, "
+           << byteFacts << " in byte cells, " << leakFacts << " of them non-char objects ("
+           << pct(leakFacts, allFacts) << "% of all facts; struct " << kindFacts[1]
+           << ", other non-char " << kindFacts[2] << ", function " << kindFacts[3] << "); "
+           << leakSites.size() << " leak sites, " << leakTag.size()
+           << " (node, fact) pairs downstream of one\n");
+    static const char *clsName[] = {"", "store into a byte or union field of a struct",
+                                    "byte copy", "byte storage written through a struct view",
+                                    "byte storage written through a char or untyped address",
+                                    "vararg or bodiless call boundary", "other"};
+    std::vector<size_t> reach(leakSites.size(), 0);
+    for (auto &[k, s] : leakTag) reach[s]++;
+    size_t clsMass[7] = {}, clsSites[7] = {}, clsExited[7] = {}, exitedAll = 0, exitedUntagged = 0;
+    for (size_t s = 0; s < leakSites.size(); s++) {
+      clsMass[leakSites[s].cls] += siteMass[s];
+      clsExited[leakSites[s].cls] += leakSites[s].exited;
+      clsSites[leakSites[s].cls]++;
+    }
+    for (const LeakExit &E : leakExits) {
+      exitedAll += E.mass;
+      exitedUntagged += E.untagged;
+    }
+    CG_LOG("Cells:   LEAK exits: " << leakExits.size() << " edges out of byte cells carry "
+           << exitedAll << " non-char (node, fact) pairs out (" << exitedUntagged
+           << " of them untagged)\n");
+    for (int c = 1; c <= 6; c++)
+      CG_LOG("Cells:   LEAK class " << c << " (" << clsName[c] << "): exited " << clsExited[c]
+             << " (" << pct(clsExited[c], exitedAll) << "%), resident " << clsMass[c] << " ("
+             << pct(clsMass[c], leakFacts) << "%), " << clsSites[c] << " sites\n");
+    CG_LOG("Cells:   LEAK untagged: " << untagged << " (" << pct(untagged, leakFacts)
+           << "%): the fact or the cell was not yet named when it arrived, or a cycle merge "
+           << "brought it\n");
+    std::vector<uint32_t> order(leakSites.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+      if (leakSites[x].exited != leakSites[y].exited) return leakSites[x].exited > leakSites[y].exited;
+      return siteMass[x] != siteMass[y] ? siteMass[x] > siteMass[y] : x < y;
+    });
+    size_t covered = 0;
+    for (size_t i = 0; i < order.size() && i < 60; i++) {
+      const uint32_t s = order[i];
+      if (!siteMass[s] && !leakSites[s].exited && i >= 10) break;
+      covered += siteMass[s];
+      std::vector<std::pair<size_t, uint32_t>> os;
+      for (auto &[o, c] : siteObjs[s]) os.push_back({c, o});
+      std::sort(os.begin(), os.end(), [](auto &x, auto &y) {
+        return x.first != y.first ? x.first > y.first : x.second < y.second;
+      });
+      std::string objsTop;
+      for (size_t j = 0; j < os.size() && j < 3; j++)
+        objsTop += (j ? "; " : "") + describe(objs[os[j].second]) + " " + std::to_string(os[j].first);
+      if (os.size() > 3) objsTop += "; +" + std::to_string(os.size() - 3) + " objects";
+      const LeakSite &L = leakSites[s];
+      CG_LOG("Cells:   LEAK #" << i + 1 << " class " << L.cls << " exited " << L.exited << " ("
+             << pct(L.exited, exitedAll) << "%), resident " << siteMass[s] << " ("
+             << pct(siteMass[s], leakFacts) << "%), born " << L.born << ", reach " << reach[s]
+             << ": " << L.where << " | into " << L.into << " | " << L.detail
+             << " | objects: " << objsTop << "\n");
+    }
+    CG_LOG("Cells:   LEAK the listed sites hold " << covered << " (" << pct(covered, leakFacts)
+           << "%) of the non-char facts in byte cells\n");
+    std::vector<std::pair<size_t, std::pair<uint32_t, int64_t>>> ut;
+    for (auto &[k, c] : untaggedAt) ut.push_back({c, k});
+    std::sort(ut.begin(), ut.end(), [](auto &x, auto &y) {
+      return x.first != y.first ? x.first > y.first : x.second < y.second;
+    });
+    for (size_t i = 0; i < ut.size() && i < 10; i++) {
+      const auto [o, c] = ut[i].second;
+      CG_LOG("Cells:   LEAK untagged " << ut[i].first << " in "
+             << (c == kLeakAny ? std::string("*") : cellName(o, c)) << " of "
+             << describe(objs[o]) << "\n");
+    }
+    // The exit table: where pointers leave byte cells, by facts carried.
+    std::vector<uint32_t> eo(leakExits.size());
+    std::iota(eo.begin(), eo.end(), 0);
+    std::sort(eo.begin(), eo.end(), [&](uint32_t x, uint32_t y) {
+      return leakExits[x].mass != leakExits[y].mass ? leakExits[x].mass > leakExits[y].mass : x < y;
+    });
+    std::map<std::string, size_t> exitKinds;
+    for (const LeakExit &E : leakExits)
+      exitKinds[E.kind.substr(0, E.kind.find(" ("))] += E.mass;
+    for (auto &[k, m] : exitKinds)
+      CG_LOG("Cells:   LEAK exit kind " << k << ": " << m << " (" << pct(m, exitedAll) << "%)\n");
+    size_t ecov = 0;
+    for (size_t i = 0; i < eo.size() && i < 40; i++) {
+      const LeakExit &E = leakExits[eo[i]];
+      ecov += E.mass;
+      std::vector<std::pair<size_t, std::pair<uint32_t, int64_t>>> fr;
+      for (auto &[k, c] : E.from) fr.push_back({c, k});
+      std::sort(fr.begin(), fr.end(), [](auto &x, auto &y) {
+        return x.first != y.first ? x.first > y.first : x.second < y.second;
+      });
+      std::string from;
+      for (size_t j = 0; j < fr.size() && j < 3; j++) {
+        const auto [o, c] = fr[j].second;
+        from += (j ? "; " : "") +
+                (o == UINT32_MAX ? std::string(c ? "a move" : "a cycle holding a byte cell")
+                 : (c == kLeakAny ? std::string("*") : cellName(o, c)) + " of " + describe(objs[o])) +
+                " " + std::to_string(fr[j].first);
+      }
+      if (fr.size() > 3) from += "; +" + std::to_string(fr.size() - 3) + " cells";
+      CG_LOG("Cells:   LEAK EXIT #" << i + 1 << " " << E.mass << " (" << pct(E.mass, exitedAll)
+             << "%, untagged " << E.untagged << ", " << E.edges << " edges): " << E.kind << " | " << E.desc
+             << " | from " << from << "\n");
+    }
+    CG_LOG("Cells:   LEAK the listed exits carry " << ecov << " (" << pct(ecov, exitedAll)
+           << "%)\n");
   }
   {
     std::vector<uint32_t> order;

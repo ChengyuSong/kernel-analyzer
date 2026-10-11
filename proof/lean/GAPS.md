@@ -825,3 +825,36 @@ Obligations left open:
    Not mechanized. Premises: bodiless calls write and read no slot under
    `pure` (item 7); writes the analysis has no statement for are out of
    scope (item 1).
+
+## Byte-copy walk: periodic runs are skipped (CellSolver copyRegion, 2026-10-11)
+
+A byte copy of L bytes walks positions k = 0..L-1. At each position it
+takes the (source object, destination object, source key, destination
+key) pair. Each new pair adds that pair's edges once; a repeated pair
+does nothing (`seenAt`). The walk now skips work it knows repeats:
+- *Statement.* Within a run, both sides keep their objects, and each
+  side's key is a periodic function of k (period ps, pd). Then the pair
+  at k equals the pair at k - lcm(ps, pd). So every position after the
+  first lcm(ps, pd) of the run repeats a pair already in `seenAt`. Jumping
+  to the run's end yields the same new pairs, in the same order, so the
+  edges and the tagged-field flips are the same.
+- *Periods.* foldIn folds every element of an array to element 0, so the
+  key is periodic with the element size up to the array's end
+  (foldPeriod, the outermost array). Other periods:
+  - an object of repeating layout: the layout's size;
+  - a byte buffer: 1;
+  - a learned element: its period;
+  - a scalar outside any array: none (the run is walked).
+- *Run ends.* A run never crosses:
+  - a change of either object (a header's trailing object begins);
+  - the end of a non-repeating layout object, where the walk stops;
+  - the end of the array that gave the period.
+
+`copyKey` memoizes foldIn per (layout, offset in one instance). It is the
+same function as `contentKey` on layout objects, which is checked by the
+gates.
+
+Not mechanized. Checked by executions:
+- consumer outputs byte-identical (libpng, SoK sets, libjpeg ×4);
+- httpd O0 to completion: icalls JSON and log identical;
+- tcpdump O0 at 1,300,000 pops: census log identical.

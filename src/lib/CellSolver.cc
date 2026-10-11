@@ -31,6 +31,7 @@
 #include "SCC.h"
 #include <llvm/ADT/BitVector.h>
 #include <deque>
+#include <numeric>
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/DebugInfo.h>
 
@@ -186,6 +187,57 @@ int64_t foldIn(Type *T, int64_t off, const DataLayout &DL) {
     return foldIn(E, off % e, DL);
   }
   return off;
+}
+
+// A byte copy's (source object, destination object, source key,
+// destination key) pair, visited once per copied region.
+struct SeenKey {
+  uint32_t so, dob;
+  int64_t sk, dk;
+  bool operator==(const SeenKey &o) const {
+    return so == o.so && dob == o.dob && sk == o.sk && dk == o.dk;
+  }
+};
+struct SeenKeyHash {
+  size_t operator()(const SeenKey &k) const {
+    uint64_t h = (uint64_t)k.so * 0x9E3779B97F4A7C15ull ^ k.dob;
+    h = (h ^ (uint64_t)k.sk) * 0xBF58476D1CE4E5B9ull;
+    return (size_t)((h ^ (uint64_t)k.dk) * 0x94D049BB133111EBull);
+  }
+};
+
+// Where foldIn's key repeats around byte `off` of one instance of T: the
+// outermost array containing it, as (element size, array end); every
+// element folds to element 0, so the key is periodic with the element size
+// up to the array's end. {0, 0} outside any array.
+std::pair<int64_t, int64_t> foldPeriod(Type *T, int64_t off, const DataLayout &DL) {
+  int64_t base = 0;
+  for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) return {0, 0};
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) return {0, 0};
+      unsigned i = SL->getElementContainingOffset(off);
+      const int64_t eo = (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      if (off - eo >= (int64_t)DL.getTypeAllocSize(T)) return {0, 0}; // padding
+      base += eo;
+      off -= eo;
+      continue;
+    }
+    Type *E = nullptr;
+    uint64_t n = 0;
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      E = AT->getElementType(); n = AT->getNumElements();
+    } else if (auto *VT = dyn_cast<FixedVectorType>(T)) {
+      E = VT->getElementType(); n = VT->getNumElements();
+    }
+    if (!E) return {0, 0};
+    const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+    if (e == 0 || off >= e * (int64_t)n) return {0, 0};
+    return {e, base + e * (int64_t)n};
+  }
+  return {0, 0};
 }
 
 // "function file:line" of an instruction (reports).
@@ -3900,6 +3952,24 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_map<uint32_t, std::vector<RelayEnd>> relayIn, relayOut;
   std::set<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> relaySeen;
   std::set<std::string> intNameToBytesAt;
+  // contentKey for the byte walk, with foldIn memoized per (layout,
+  // offset in one instance): a copy revisits the same few offsets of the
+  // same layouts for every cell pair.
+  struct FoldKeyHash {
+    size_t operator()(const std::pair<Type *, int64_t> &k) const {
+      return (size_t)(((uint64_t)(uintptr_t)k.first * 0x9E3779B97F4A7C15ull) ^
+                      ((uint64_t)k.second * 0xBF58476D1CE4E5B9ull));
+    }
+  };
+  boost::unordered_flat_map<std::pair<Type *, int64_t>, int64_t, FoldKeyHash> foldMemo;
+  auto copyKey = [&](const Obj &O, int64_t off) -> int64_t {
+    if (!O.layout) return contentKey(O, off);
+    assert(!(O.tail && off >= O.size) && "trailing offsets route to the tail object");
+    off = ((off % O.size) + O.size) % O.size;
+    auto [it, ins] = foldMemo.try_emplace({O.layout, off}, 0);
+    if (ins) it->second = foldIn(O.layout, off, DL);
+    return it->second;
+  };
   auto copyRegion = [&](uint32_t os, int64_t a, uint32_t od, int64_t b,
                         int64_t len, const Instruction *at) {
     // Effective type (C11 6.5p6): a copy into an object with no declared
@@ -3961,7 +4031,30 @@ bool CallGraphPass::runCellResolution() {
       else if (!srcTyped && dstTyped && relaySeen.insert({os, od, a, b}).second)
         relayOut[os].push_back({od, a, L, cellsOf(od, b, L), at});
     }
-    std::set<std::tuple<uint32_t, int64_t, uint32_t, int64_t>> seenAt;
+    boost::unordered_flat_set<SeenKey, SeenKeyHash> seenAt;
+    // Positions whose (object, content key) pair on both sides repeats an
+    // earlier one do nothing (seenAt). Over a run of positions each side's
+    // key is periodic: bytes (period 1), a learned element (its period),
+    // an array inside a labeled object (its element size, to the array's
+    // end), an array of the layout (the layout's size); a scalar outside
+    // any array is not. Once both sides are periodic and a whole common
+    // period of the run has been walked, every later position of the run
+    // repeats a pair, so the walk jumps to the run's end (which never
+    // passes a trailing object's start or a non-array object's end). Same
+    // pairs, same order, same edges.
+    constexpr int64_t kNoEnd = std::numeric_limits<int64_t>::max();
+    // A side's run at byte `off` of O, reached at position k: (period, end).
+    auto runOf = [&](const Obj &O, int64_t off, int64_t k) -> std::pair<int64_t, int64_t> {
+      const int64_t segEnd = O.tail ? k + (O.size - off) : kNoEnd;
+      if (!O.layout) return {O.bytes ? 1 : O.period, segEnd};
+      const int64_t in = O.repeats ? ((off % O.size) + O.size) % O.size : off;
+      const auto [e, aend] = foldPeriod(O.layout, in, DL);
+      if (e > 0) return {e, std::min(segEnd, k + (aend - in))};
+      if (O.repeats) return {O.size, segEnd};
+      return {0, segEnd};
+    };
+    int64_t runStart = 0, runEnd = -1, runP = 0;
+    uint32_t runSo = UINT32_MAX, runDo = UINT32_MAX;
     for (int64_t k = 0; k < L; k++) {
       // Past a header: the trailing object (located per position).
       const auto [so, sa] = locate(os, a + k);
@@ -3969,8 +4062,21 @@ bool CallGraphPass::runCellResolution() {
       const Obj &Os = objs[so], &Od = objs[dob];
       if (Os.layout && !Os.repeats && (sa < 0 || sa >= Os.size)) break;
       if (Od.layout && !Od.repeats && (db < 0 || db >= Od.size)) break;
-      const int64_t sk = contentKey(Os, sa), dk = contentKey(Od, db);
-      if (!seenAt.insert({so, sk, dob, dk}).second) continue;
+      if (k >= runEnd || so != runSo || dob != runDo) {
+        const auto [ps, es] = runOf(Os, sa, k);
+        const auto [pd, ed] = runOf(Od, db, k);
+        runStart = k;
+        runEnd = std::min(es, ed);
+        runP = ps > 0 && pd > 0 ? std::lcm(ps, pd) : 0;
+        runSo = so;
+        runDo = dob;
+      }
+      if (runP > 0 && k - runStart >= runP) {
+        k = std::min(runEnd, L) - 1; // the rest of the run repeats
+        continue;
+      }
+      const int64_t sk = copyKey(Os, sa), dk = copyKey(Od, db);
+      if (!seenAt.insert(SeenKey{so, dob, sk, dk}).second) continue;
       // A byte copy writing a tagged field's tag other than as a co-move
       // (the same struct at the same offset) is a write the census did not
       // name: the pair flips to unkeyed (plan 3.51).

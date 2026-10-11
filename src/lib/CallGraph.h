@@ -529,6 +529,9 @@ protected:
   // of F through the keys its own test admits, instead of the parameter.
   std::map<const llvm::Instruction *, std::vector<std::pair<const llvm::Instruction *, std::vector<std::string>>>>
       taggedParamChannels;
+  // The same uses: at a call that is not such a read, the call's content
+  // argument when the use's tests can hold for the call's tag argument.
+  std::map<const llvm::Instruction *, std::vector<const llvm::Value *>> taggedParamValueChannels;
   std::vector<std::vector<uint32_t>> taggedPairAssumes; // per taggedPairs entry
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();

@@ -5,7 +5,7 @@
 // what each use's case admits: the VTab and string writers, not the int
 // writer whose tag no case names. With per-use channels, each arm of the
 // switch reads only its own case's writers: the string never reaches the
-// VTab arm.
+// VTab arm, including from a call whose tag argument excludes the VTab case.
 // PAIR: struct.Op+8 by +0
 #include <stdlib.h>
 #define P4_VTAB (-12)
@@ -30,6 +30,11 @@ void setVtab(struct Op *o, struct VTab *v) { o->p4 = v; o->p4type = P4_VTAB; }
 void setStr(struct Op *o, struct Str *s) { o->p4 = s; o->p4type = P4_DYN; }
 void setInt(struct Op *o, struct Int *i) { o->p4 = i; o->p4type = P4_INT; }
 void freeOp(struct Op *o) { freeP4(o->p4type, o->p4); }
+// sqlite3VdbeChangeP4's shape: a call passing a tag and content that are
+// parameters, under a test excluding the VTab tag: it feeds no VTab use.
+void dropP4(void *z, int n) {
+  if (n != P4_VTAB) freeP4(n, z);
+}
 int main(int argc, char **argv) {
   struct Op *o = malloc(sizeof *o);
   struct VTab *v = malloc(sizeof *v);
@@ -40,5 +45,6 @@ int main(int argc, char **argv) {
   i->unlock = ifn;
   if (argc > 2) setVtab(o, v); else if (argc > 1) setStr(o, s); else setInt(o, i);
   freeOp(o);
+  dropP4(s, P4_DYN);
   return 0;
 }

@@ -330,6 +330,7 @@ void CallGraphPass::computeTaggedFields() {
   taggedUntested.clear();
   taggedInPlace.clear();
   taggedParamChannels.clear();
+  taggedParamValueChannels.clear();
   taggedAccessSets.clear();
   taggedWatches.clear();
   const auto t0 = std::chrono::steady_clock::now();
@@ -2240,7 +2241,8 @@ void CallGraphPass::computeTaggedFields() {
   // the call in one block with no write between: one test set per use of
   // j in the callee (an empty set: an untested use).
   std::map<std::pair<const Instruction *, int64_t>, std::optional<std::vector<std::vector<Test>>>> ppReadMemo;
-  struct PPUseInfo { const CallBase *CB = nullptr; const Function *G = nullptr; unsigned j = 0; std::vector<const Instruction *> uses; bool channelable = true; };
+  struct PPUseInfo { const CallBase *CB = nullptr; const Function *G = nullptr; unsigned j = 0, k = 0; int64_t dOff = 0;
+                     std::vector<const Instruction *> uses; bool channelable = true; };
   std::map<std::pair<const Instruction *, int64_t>, PPUseInfo> ppUseInfo; // per pp read: its call and the callee's uses
   size_t ppKeyedReads = 0, ppUntestedReads = 0, ppChannelCallees = 0;
   auto ppTestsFor = [&](const Instruction *R, const Value *robj, const Field &Df)
@@ -2286,6 +2288,8 @@ void CallGraphPass::computeTaggedFields() {
       ui.CB = CB;
       ui.G = G;
       ui.j = j;
+      ui.k = k;
+      ui.dOff = Df.second;
       for (const PPUse &u : *sum) ui.uses.push_back(u.use), ui.channelable &= u.channel;
       for (const PPUse &u : *sum) {
         std::vector<Test> ts = u.tests;
@@ -2295,6 +2299,64 @@ void CallGraphPass::computeTaggedFields() {
       return it->second = std::move(sets);
     }
     return it->second;
+  };
+  // Can a callee use's tests (on its tag parameter) hold at a call whose
+  // tag argument is E? E constant: evaluate. Otherwise, when the tests
+  // name finite values (switch cases), each such value is checked against
+  // the caller's tests on E's value that dominate the call (by integer
+  // identity); any other shape may hold.
+  auto mayHoldAtCall = [&](const CallBase *CB, const Value *E, const std::vector<Test> &T) -> bool {
+    if (T.empty()) return true;
+    const Value *e = E;
+    while (const auto *C = dyn_cast<CastInst>(e)) e = C->getOperand(0);
+    if (const auto *K = dyn_cast<ConstantInt>(E->stripPointerCasts())) return holds(T, K->getSExtValue());
+    if (const auto *K = dyn_cast<ConstantInt>(e)) return holds(T, K->getSExtValue());
+    std::vector<int64_t> cands;
+    for (const Test &t : T)
+      if (t.sw && !t.swDefault) { cands = t.caseVals; break; }
+    if (cands.empty()) return true;
+    const Value *eid = ids.intId(e, 0);
+    const Function *Fn = CB->getFunction();
+    DominatorTree &DT = domOf(Fn);
+    std::vector<Test> callerTests;
+    for (const BasicBlock &BB : *Fn) {
+      const auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+      if (!Br || !Br->isConditional() || Br->getSuccessor(0) == Br->getSuccessor(1)) continue;
+      // The condition's one leaf: E's value (same integer identity).
+      const Instruction *leaf = nullptr;
+      bool clean = true;
+      std::vector<const Value *> work{Br->getCondition()};
+      std::set<const Value *> seen;
+      while (!work.empty() && clean) {
+        const Value *X = work.back();
+        work.pop_back();
+        if (!seen.insert(X).second || isa<Constant>(X)) continue;
+        if (const auto *XI = dyn_cast<Instruction>(X); XI && !isa<ICmpInst>(XI) && !isa<CastInst>(XI) &&
+                                                       !isa<BinaryOperator>(XI)) {
+          if (ids.intId(XI, 0) != eid) { clean = false; break; }
+          if (leaf && leaf != XI) { clean = false; break; }
+          leaf = XI;
+          continue;
+        }
+        if (isa<ICmpInst>(X) || isa<CastInst>(X) ||
+            (isa<BinaryOperator>(X) && (cast<BinaryOperator>(X)->getOpcode() == Instruction::And ||
+                                        cast<BinaryOperator>(X)->getOpcode() == Instruction::Or ||
+                                        cast<BinaryOperator>(X)->getOpcode() == Instruction::Xor))) {
+          for (const Value *Op : cast<User>(X)->operands()) work.push_back(Op);
+          continue;
+        }
+        clean = false;
+      }
+      if (!clean || !leaf) continue;
+      for (unsigned si = 0; si < 2; si++) {
+        const BasicBlock *Succ = Br->getSuccessor(si);
+        if (Succ->getUniquePredecessor() == &BB && DT.dominates(Succ, CB->getParent()))
+          callerTests.push_back({Br->getCondition(), leaf, si == 0, 0, 0});
+      }
+    }
+    for (int64_t v : cands)
+      if (holds(T, v) && holds(callerTests, v)) return true;
+    return false;
   };
   // ---- The co-write rule: last writers (plan 3.51) ----
   // Invariant: a writer W's tag set is the set of D values that can hold
@@ -4275,10 +4337,29 @@ void CallGraphPass::computeTaggedFields() {
           calls++;
         }
         std::set<const CallBase *> seenCalls;
-        bool chan = true;
+        bool chan = calls != SIZE_MAX;
         for (const Instruction *R : Rs) seenCalls.insert(ppPerUse[R].second->CB), chan &= ppPerUse[R].second->channelable;
-        if (!chan) continue;
-        if (calls != seenCalls.size() || seenCalls.size() != Rs.size()) continue; // a call not covered
+        if (!chan || seenCalls.size() != Rs.size()) continue;
+        // The other calls: per use, the call's content argument when the
+        // use's tests can hold for the call's tag argument.
+        const PPUseInfo &ui0 = *ppPerUse[Rs.front()].second;
+        const auto &sum = ppSummary(G, ui0.k, ui0.j, ui0.dOff);
+        if (!sum) continue;
+        std::vector<std::pair<const Instruction *, const Value *>> valueEdges; // (use, content arg)
+        bool ok = true;
+        for (const User *U : G->users()) {
+          const auto *CB = cast<CallBase>(U);
+          if (seenCalls.count(CB)) continue;
+          if (ui0.k >= CB->arg_size() || ui0.j >= CB->arg_size()) { ok = false; break; }
+          for (const PPUse &u : *sum) {
+            if (!u.channel) { ok = false; break; }
+            if (mayHoldAtCall(CB, CB->getArgOperand(ui0.k), u.tests))
+              valueEdges.push_back({u.use, CB->getArgOperand(ui0.j)});
+          }
+          if (!ok) break;
+        }
+        if (!ok) continue;
+        for (auto &[u, X] : valueEdges) taggedParamValueChannels[u].push_back(X);
         for (const Instruction *R : Rs) {
           const auto &[perUse, ui] = ppPerUse[R];
           for (size_t q = 0; q < ui->uses.size() && q < perUse.size(); q++) {

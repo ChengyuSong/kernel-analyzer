@@ -137,11 +137,17 @@ protected:
   // writes: the step's address is written through (a store's address or a
   // memcpy/memmove destination, through further GEPs and casts); only
   // such a step labels an unlabeled object (plan 3.53, rule 1).
-  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; uint32_t extent; bool written = false; bool writes = false; };
+  // elem: the element struct a strided or constant-index level steps over
+  // (T in `gep T, p, i`): typed evidence that an object is an array of T.
+  struct LazyLabel { int64_t off; uint32_t stride; bool arith; const llvm::StructType *ty; uint32_t extent; bool written = false; bool writes = false; const llvm::StructType *elem = nullptr; };
   std::vector<LazyLabel> lazyLabels;
-  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *, uint32_t, bool, bool>, uint32_t> lazyLabelIdx;
+  std::map<std::tuple<int64_t, uint32_t, bool, const llvm::StructType *, uint32_t, bool, bool, const llvm::StructType *>, uint32_t> lazyLabelIdx;
   bool gepWritten = false; // the GEP being built is in an optnone function
   bool gepWrites = false;  // the GEP being built is written through
+  // The element struct of each level of the GEP being built, and of the
+  // level whose label is being made.
+  llvm::SmallVector<const llvm::StructType *, 4> gepElems;
+  const llvm::StructType *gepElem = nullptr;
   std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
   // --cfl-cells: byte copies (memcpy, CPY summaries) as copy constraints
   // the cell solver resolves per cell pair: src, dst, length (-1 unknown).
@@ -161,7 +167,8 @@ protected:
   bool decomposeGEPLevels(const llvm::GEPOperator *GEP,
                           const llvm::DataLayout &DL,
                           llvm::SmallVectorImpl<int64_t> &levels,
-                          llvm::SmallVectorImpl<const llvm::StructType *> *types = nullptr) const;
+                          llvm::SmallVectorImpl<const llvm::StructType *> *types = nullptr,
+                          llvm::SmallVectorImpl<const llvm::StructType *> *elems = nullptr) const;
   void addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                           llvm::ArrayRef<int64_t> levels,
                           llvm::ArrayRef<const llvm::StructType *> types = {});

@@ -1800,17 +1800,18 @@ int CallGraphPass::fieldBucket(int64_t off) const {
 uint32_t CallGraphPass::lazyLabelFor(int64_t off, uint32_t stride, bool arith,
                                      const StructType *ty, uint32_t extent) {
   if (lazyLabels.empty()) {
-    lazyLabels.push_back({0, 0, false, nullptr, 0, false, false});
-    lazyLabelIdx[{0, 0, false, nullptr, 0, false, false}] = 0;
+    lazyLabels.push_back({0, 0, false, nullptr, 0, false, false, nullptr});
+    lazyLabelIdx[{0, 0, false, nullptr, 0, false, false, nullptr}] = 0;
   }
   // An extent qualifies a strided step (the array's length) and an arith
   // step (the element size: a constant index stays in its array).
   if (stride == 0 && !arith) extent = 0;
   const bool written = gepWritten && (ty || stride);
   const bool writes = gepWrites && ty;
-  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent, written, writes),
+  const StructType *elem = (stride || arith) ? gepElem : nullptr;
+  auto [it, ins] = lazyLabelIdx.emplace(std::make_tuple(off, stride, arith, ty, extent, written, writes, elem),
                                         (uint32_t)lazyLabels.size());
-  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent, written, writes});
+  if (ins) lazyLabels.push_back({off, stride, arith, ty, extent, written, writes, elem});
   return it->second;
 }
 
@@ -1866,9 +1867,11 @@ NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
 bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
                                        const DataLayout &DL,
                                        SmallVectorImpl<int64_t> &levels,
-                                       SmallVectorImpl<const StructType *> *types) const {
+                                       SmallVectorImpl<const StructType *> *types,
+                                       SmallVectorImpl<const StructType *> *elems) const {
   levels.clear();
   if (types) types->clear();
+  if (elems) elems->clear();
   // --cfl-cells: a GEP with a nonzero constant first index and constant
   // indices is one byte offset. -O3 writes a field of the struct a pointer
   // is cast to as an index over the pointer's own type (`gep sqlite3_vtab,
@@ -1883,6 +1886,7 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
         if (O.getSExtValue() != 0) { // an untyped offset: it moves
           levels.push_back(O.getSExtValue());
           if (types) types->push_back(nullptr);
+          if (elems) elems->push_back(nullptr);
         }
         return true;
       }
@@ -1905,6 +1909,7 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
       if (off != 0) {
         levels.push_back(off);
         if (types) types->push_back(STy);
+        if (elems) elems->push_back(nullptr);
       }
     } else if (exactFieldLabels()) {
       // Exact addresses: a constant array index is an exact element
@@ -1921,9 +1926,11 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
           const int64_t eszBits = esz < (1u << 20) ? (int64_t)esz << 40 : 0;
           levels.push_back(off | kArithLevelTag | eszBits);
           if (types) types->push_back(nullptr);
+          if (elems) elems->push_back(dyn_cast<StructType>(Ty));
         } else if (off != 0) {
           levels.push_back(off);
           if (types) types->push_back(nullptr);
+          if (elems) elems->push_back(nullptr);
         }
       } else {
         if (esz == 0) { first = false; continue; } // no offset
@@ -1941,6 +1948,7 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
         if (count > 0xffffffffULL || count * esz > 0xffffffffULL) count = 0;
         levels.push_back(kStridedLevelTag | ((int64_t)esz << 32) | (int64_t)count);
         if (types) types->push_back(nullptr);
+        if (elems) elems->push_back(dyn_cast<StructType>(Ty));
       }
     } else if (first) {
       Type *Ty = GTI.getIndexedType();
@@ -1956,6 +1964,7 @@ bool CallGraphPass::decomposeGEPLevels(const GEPOperator *GEP,
         if (off != 0) {
           levels.push_back(off);
           if (types) types->push_back(nullptr);
+          if (elems) elems->push_back(nullptr);
         }
       }
     }
@@ -1975,6 +1984,7 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                           : getFieldPtrNode(cur, levels[k]);
     if (next == cur)
       continue;
+    gepElem = k < gepElems.size() ? gepElems[k] : nullptr;
     if (levels[k] > 0 && (levels[k] & kStridedLevelTag)) { // strided step (negative = container_of offset)
       const uint32_t stride = (uint32_t)((levels[k] >> 32) & 0x3fffffff);
       const uint32_t count = (uint32_t)(levels[k] & 0xffffffff);
@@ -1990,6 +2000,7 @@ void CallGraphPass::addFieldChainEdges(NodeIndex baseNode, NodeIndex resultNode,
                          k < types.size() ? types[k] : nullptr);
     cur = next;
   }
+  gepElem = nullptr;
 }
 
 void CallGraphPass::addFieldWildcardLoop(NodeIndex n, const char *why) {
@@ -4160,7 +4171,7 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
     SmallVector<int64_t, 4> levels;
     SmallVector<const StructType *, 4> ltys;
     const DataLayout &DL = GEP.getModule()->getDataLayout();
-    if (!CGP.decomposeGEPLevels(cast<GEPOperator>(&GEP), DL, levels, &ltys))
+    if (!CGP.decomposeGEPLevels(cast<GEPOperator>(&GEP), DL, levels, &ltys, &CGP.gepElems))
       CGP.applyFieldFallback(ptrNode, valNode, "gep-variable-offset");
     else if (levels.empty())
       CGP.addAssignmentEdge(ptrNode, valNode);
@@ -4170,6 +4181,7 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
       CGP.addFieldChainEdges(ptrNode, valNode, levels, ltys);
       CGP.gepWritten = CGP.gepWrites = false;
     }
+    CGP.gepElems.clear(); // only this GEP's levels carry them
     return;
   }
 

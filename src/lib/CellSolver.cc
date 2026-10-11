@@ -1493,6 +1493,7 @@ bool CallGraphPass::runCellResolution() {
   std::function<void(uint32_t, int64_t, uint32_t, int64_t, uint32_t)> walkOne;
   // The fact applyStep is stepping, and its node (one-label reports).
   uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX, curStepDst = UINT32_MAX;
+  uint32_t curStepLi = UINT32_MAX; // the label of the step or walk being applied
   std::map<std::string, size_t> cloneCandidates, otherMeets; // one-label
   std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenConflict;
   size_t conflicts = 0;
@@ -1686,7 +1687,8 @@ bool CallGraphPass::runCellResolution() {
   // from input), is a header followed by an unknown trailing object, until
   // a T-stride access makes it an array (extendToArray).
   size_t extentArrays = 0, extentOne = 0, extentHeader = 0, extentUnknown = 0,
-         arraysExtended = 0, extendRefused = 0, readStepsSkipped = 0, varByteAny = 0;
+         arraysExtended = 0, extendRefused = 0, readStepsSkipped = 0, varByteAny = 0,
+         tailIndexAny = 0;
   auto setExtent = [&](Obj &O, const Value *V) {
     O.tail = false;
     O.repeats = false;
@@ -1701,6 +1703,7 @@ bool CallGraphPass::runCellResolution() {
   // with the steps; a label request on an unsized tail makes it).
   std::function<void(uint32_t)> extendToArrayFn;
   std::function<std::string(uint32_t)> nodeDescFn; // set once nodeDesc exists
+  std::function<std::string(const Obj &)> describeFn; // set once describe exists
   size_t bytesWritesRefused = 0;
   std::map<std::string, size_t> bytesWritesBy; // writing site | struct
   size_t tailWritesFolded = 0;
@@ -1708,18 +1711,21 @@ bool CallGraphPass::runCellResolution() {
   auto requestLayout = [&](uint32_t o, StructType *S) {
     Obj &O = objs[o];
     if (O.layout || O.fn || !S || S->isOpaque() || !S->isSized()) return;
-    // One label per allocation: a typed write into the unknown data after
-    // a T (an allocation whose size said nothing) makes it an array of T,
-    // as the old array did; a write of another struct there is a rule (b)
+    // One label per allocation: the unknown data after a T (an allocation
+    // whose size said nothing) takes no label of its own. A write of T
+    // there makes it an array of T; a write of another struct is a rule (b)
     // row (the object was laid out by its first typed write).
     if (O.parentObj != UINT32_MAX && objs[O.parentObj].tailUnsized &&
         objs[O.parentObj].tailObj == o) {
       const uint32_t p = O.parentObj;
-      if (S != objs[p].layout) {
-        tailWritesFolded++;
-        tailFoldPairs[{objs[p].label, typeLabel(S)}]++;
+      if (S == objs[p].layout) {
+        extendToArrayFn(p); // a T written at a T stride: an array of T
+        return;
       }
-      extendToArrayFn(p);
+      // Another struct written into the data after a T: reported (rule
+      // (b)), not admitted; the write flows to the raw cell.
+      tailWritesFolded++;
+      tailFoldPairs[{objs[p].label, typeLabel(S)}]++;
       return;
     }
     int64_t sz = (int64_t)DL.getTypeAllocSize(S);
@@ -2050,6 +2056,13 @@ bool CallGraphPass::runCellResolution() {
          byteWalkStays = 0, byteWalkStructRel = 0;
   // Sampled undefined-behavior exits: (pointer node, object, position, k).
   std::vector<std::tuple<uint32_t, uint32_t, int64_t, int64_t>> byteStepUBAt;
+  // An unlabeled object used as bytes (its first typed use); the leak
+  // census re-reads its cells (now byte storage).
+  auto markBytes = [&](uint32_t o) {
+    if (objs[o].byteAccessed) return;
+    objs[o].byteAccessed = true;
+    if (leakRefold) leakRefold(o);
+  };
   // A T followed by unknown data, accessed at a T stride, is an array of T
   // (plan 3.53, rule 1): the trailing object's cells and addresses fold
   // into the header's element (offset + sizeof T, modulo T), and it
@@ -2063,6 +2076,17 @@ bool CallGraphPass::runCellResolution() {
       return;
     }
     arraysExtended++;
+    if (!CFLCellTraceObj.empty() && describeFn(objs[o]).find(CFLCellTraceObj) != std::string::npos) {
+      std::string lab = "?";
+      if (curStepLi != UINT32_MAX) {
+        const LazyLabel &L = lazyLabels[curStepLi];
+        lab = (L.ty ? typeLabel(const_cast<StructType *>(L.ty)) : std::string("untyped")) +
+              " stride " + std::to_string(L.stride) + " off " + std::to_string(L.off) +
+              (L.arith ? " arith" : "");
+      }
+      CG_LOG("Cells: EXTEND " << describeFn(objs[o]) << " to an array by step [" << lab << "] at "
+             << (curStepDst < G ? nodeDescFn(curStepDst).substr(0, 200) : std::string("?")) << "\n");
+    }
     objs[o].tail = false;
     objs[o].tailUnsized = false;
     objs[o].repeats = true;
@@ -2108,8 +2132,9 @@ bool CallGraphPass::runCellResolution() {
   };
   extendToArrayFn = extendToArray;
   // arr: the result is an element address of its byte array (provenance).
+  // elem: the element struct the index steps over (typed evidence).
   auto strideCells = [&](uint32_t o, int64_t x, int64_t s,
-                         std::vector<uint32_t> &out, bool arr) {
+                         std::vector<uint32_t> &out, bool arr, const StructType *elem) {
     auto folded = [&](uint32_t o2, int64_t at) { return arr ? cellAtArr(o2, at) : cellAt(o2, at); };
     std::tie(o, x) = locate(o, x); // past a header: the trailing object
     if (!objs[o].layout) {
@@ -2118,7 +2143,7 @@ bool CallGraphPass::runCellResolution() {
       // array of s-byte elements.
       if (s == 1) {
         varByteAny++;
-        objs[o].byteAccessed = true;
+        markBytes(o);
         out.push_back(anyOf(o));
         return;
       }
@@ -2126,10 +2151,20 @@ bool CallGraphPass::runCellResolution() {
       out.push_back(cellAt(o, x));
       return;
     }
-    // A T-stride access on a T followed by unknown data: an array of T.
-    if (objs[o].tail && !objs[o].repeats && s % objs[o].size == 0) {
+    // A T-typed index (over elements of T) on a T followed by unknown data:
+    // an array of T. A stride that only equals T's size is no evidence.
+    if (objs[o].tail && !objs[o].repeats && elem && elem == objs[o].layout &&
+        s % objs[o].size == 0) {
       extendToArray(o);
       std::tie(o, x) = locate(o, x);
+    }
+    // Still a T followed by data whose size said nothing (no T-typed
+    // evidence, or the extension refused): a variable index from the T may
+    // reach that data, so it reaches the data's any-offset cell too (the
+    // T alone is not known to be an array of one).
+    if (objs[o].tailUnsized && objs[o].tail && !objs[o].repeats) {
+      tailIndexAny++;
+      out.push_back(anyOf(tailOf(o)));
     }
     Obj &O = objs[o];
     const int64_t pos = ((x % O.size) + O.size) % O.size;
@@ -2201,7 +2236,7 @@ bool CallGraphPass::runCellResolution() {
       if (!O.layout) {
         if (L.stride) {
           stridedUnlabeled++;
-          strideCells(C.obj, C.off + L.off, (int64_t)L.stride, res, false);
+          strideCells(C.obj, C.off + L.off, (int64_t)L.stride, res, false, L.elem);
         } else {
           res.push_back(cellAt(C.obj, C.off + L.off));
         }
@@ -2295,7 +2330,7 @@ bool CallGraphPass::runCellResolution() {
       // of it: as the source was, or by a written index into the array).
       for (int64_t a : actual)
         strideCells(C.obj, a + L.off, (int64_t)L.stride, res,
-                    (eoff & kFoldedBit) || (L.written && L.extent > 0));
+                    (eoff & kFoldedBit) || (L.written && L.extent > 0), L.elem);
       break;
     }
     }
@@ -2349,6 +2384,7 @@ bool CallGraphPass::runCellResolution() {
            " [" + (O.layout ? (O.ident.empty() ? O.label : O.ident + " as " + O.label) : std::string("unlabeled")) +
            (O.repeats ? " array" : "") + "]";
   };
+  describeFn = describe;
   auto massByObject = [&](size_t k) {
     std::vector<uint64_t> mass(objs.size(), 0), holders(objs.size(), 0);
     uint64_t byKind[5] = {0, 0, 0, 0, 0};
@@ -3463,17 +3499,17 @@ bool CallGraphPass::runCellResolution() {
       const int64_t pos = O.layout && O.repeats ? ((at % O.size) + O.size) % O.size : at;
       if (O.layout && !O.tail && pos >= 0 && pos < O.size &&
           innermostArraySpan(O.layout, pos, DL, lo, hi, esz) && esz == 1 && hi - lo > 1) {
-        strideCells(o, decOff(c), g, walkOut, arr);
+        strideCells(o, decOff(c), g, walkOut, arr, L.elem);
         if (arr) byteWalkStays++;
         else {
           byteWalkStructRel++;
-          strideCells(o, decOff(c) + L.off, g, walkOut, false);
+          strideCells(o, decOff(c) + L.off, g, walkOut, false, L.elem);
         }
         for (uint32_t f2 : walkOut) add(dst, f2);
         return;
       }
     }
-    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut, arr);
+    strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut, arr, L.elem);
     for (uint32_t f2 : walkOut) add(dst, f2);
   };
   auto applyWalk = [&](uint32_t f, const FieldEdge &e) {
@@ -4371,7 +4407,7 @@ bool CallGraphPass::runCellResolution() {
       }
       auto sideOf = [&](uint32_t o, int64_t k, bool read) -> std::pair<uint32_t, uint32_t> {
         if (k != kCopyAny) return contentOf(o, k);
-        objs[o].byteAccessed = true;
+        markBytes(o);
         const Cell &A = cells[anyOf(o)];
         return read ? std::make_pair(A.load, A.load) : std::make_pair(A.store, A.store);
       };
@@ -4575,7 +4611,11 @@ bool CallGraphPass::runCellResolution() {
   std::map<std::string, uint32_t> leakSiteIdx;
   boost::unordered_flat_map<uint64_t, uint32_t> leakTag; // (node, fact) -> leak
   boost::unordered_flat_set<uint32_t> leakMergedByte;    // merged with a byte cell
+  // Byte storage: a cell named i8[], or any cell of an unlabeled object
+  // used as bytes (a variable byte access or a byte copy side: what the
+  // old model named bytes).
   auto leakByteCell = [&](uint32_t o, int64_t c) {
+    if (!objs[o].layout && objs[o].byteAccessed) return true;
     if (c == kLeakAny)
       return objs[o].layout && objs[o].label == "i8";
     return cellName(o, c) == "i8[]";
@@ -5386,6 +5426,7 @@ bool CallGraphPass::runCellResolution() {
         for (uint32_t f : delta) {
           if (trackWhy) curWhy = {n, f, UINT32_MAX, e.walk ? W_WALK : W_STEP};
           curStepDst = e.dst;
+          curStepLi = e.li;
           if (e.walk) applyWalk(f, e);
           else applyStep(f, e.li, e.dst);
         }
@@ -5470,8 +5511,9 @@ bool CallGraphPass::runCellResolution() {
          << " element sizes; extents: " << extentArrays << " arrays by size, " << extentOne
          << " one by size, " << extentHeader << " header + data by size, " << extentUnknown
          << " one then unknown (size unknown), " << arraysExtended << " made arrays by a T-stride access ("
-         << extendRefused << " refused: typed trailing data; " << tailWritesFolded
-         << " by a write of another struct into the data after a T, folded: rule (b)); " << readStepsSkipped
+         << extendRefused << " refused: typed trailing data; " << tailIndexAny
+         << " other variable indexes also reach the data after the T); " << tailWritesFolded
+         << " writes of another struct into the data after a T (rule (b): not admitted); " << readStepsSkipped
          << " member steps through unlabeled objects that do not write (no label), "
          << varByteAny << " variable byte steps into unlabeled objects (their any-offset cell), "
          << keyedWaits << " keyed accesses waited for a label (" << keyedFlushed

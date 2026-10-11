@@ -884,16 +884,20 @@ changes:
   - exactly sizeof T: one T;
   - T plus trailing data, or a size that says nothing: one T followed by
     an unknown trailing object.
-  A T-stride access (variable index or walk) on the latter makes it an
-  array of T (`extendToArray`). The trailing object's cells merge into
+  A T-typed index (a variable index or walk whose GEP steps over elements
+  of T; a stride that only equals sizeof T is no evidence) on the latter
+  makes it an array of T (`extendToArray`). Any other variable index from
+  the T, or one whose extension is refused, also reaches the trailing
+  data's any-offset cell: the T is not known to be an array of one. The trailing object's cells merge into
   the header's element at offset + sizeof T modulo sizeof T. Its address
   facts move there, it forwards to the header from then on, and its
   any-offset cell is linked both ways to the header's. A trailing object
   already labeled, or of a learned element size, refuses the extension
   (counted). One label per allocation: a trailing object that is there
-  because the size said nothing never takes a label of its own. A typed
-  write into it makes the header an array of T; a write of another
-  struct there is a rule (b) row.
+  because the size said nothing never takes a label of its own. A write
+  of T into it makes the header an array of T; a write of another struct
+  there is a rule (b) row, not admitted (the write flows to its raw
+  cell).
 - **Keyed accesses wait for a label.** A keyed union access through an
   unlabeled object waits until the object is labeled, then links keyed.
   At the fixpoint, accesses still waiting link unkeyed, and the solve
@@ -926,8 +930,9 @@ Statement:
 - **The array extension merges the same memory.** p[i].x (header cell x)
   and p[1].x (trailing cell at sizeof T + x) are one byte once the object
   is known to be an array, so the merge is a renaming inside the
-  allocation. Before the extension, a variable index stays in its element
-  ("index stays"), as for any array of one.
+  allocation. Without the extension, a variable index from the T reaches
+  both its own cell and the trailing data's any-offset cell, so p[i].x
+  meets p[1].x either way.
 - **A waiting keyed access is linked before the fixpoint is final.** It
   is linked keyed if the object gets a label, unkeyed otherwise. The
   solve does not stop with an access unlinked.

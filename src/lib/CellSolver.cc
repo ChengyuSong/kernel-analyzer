@@ -4348,7 +4348,21 @@ bool CallGraphPass::runCellResolution() {
   //   4 a store into byte storage through a char or untyped address,
   //   5 a vararg or bodiless call boundary, 6 anything else.
   // Mass = non-char facts in byte cells at the stop, by leak.
-  struct LeakSite { int cls; std::string where, into, detail; size_t born = 0, exited = 0; };
+  // A leak site: its class, where, the cell it enters, and (stores and
+  // copies) the pointers that chose the target: the store's address, or a
+  // copy's destination and source, with their objects and labels when the
+  // site was first seen; a struct view that did not fit the target.
+  struct LeakSite {
+    int cls;
+    std::string where, into, detail;
+    size_t born = 0, exited = 0;
+    uint64_t firstPop = 0;
+    uint32_t ptrNode = UINT32_MAX, srcNode = UINT32_MAX;
+    size_t ptrObjs = 0, ptrLabels = 0, srcObjs = 0, srcLabels = 0;
+    const Value *viewPtr = nullptr;
+    std::string view;
+    int recounted = 0; // the class before a stop-point recount moved it to 7
+  };
   // The exit side: an edge out of a byte cell into a node that is not one
   // (a load's hub, a byte copy into a typed cell, anything else), with the
   // non-char facts it carries out (by leak; untagged ones apart) and the
@@ -4468,12 +4482,48 @@ bool CallGraphPass::runCellResolution() {
   // Per store address: (objects labeled as its struct view, all objects)
   // its pointer held when first asked.
   boost::unordered_flat_map<const Value *, std::pair<size_t, size_t>> leakPtrViews;
+  auto leakObjLabel = [&](uint32_t o) -> std::string {
+    const Obj &O = objs[o];
+    return O.fn ? std::string("fn") : O.layout ? O.label : O.bytes ? std::string("bytes") : std::string("unnamed");
+  };
+  // A pointer's objects and distinct labels ("bytes", "unnamed", "fn" for
+  // the unlabeled kinds).
+  auto leakPtrShape = [&](uint32_t n, size_t &objs, size_t &labels) {
+    objs = labels = 0;
+    if (n == UINT32_MAX || find(n) >= pts.size()) return;
+    boost::unordered_flat_set<uint32_t> os;
+    std::set<std::string> ls;
+    pts[find(n)].forEach([&](uint32_t g) {
+      for (auto [o, e] : memb[findFact(g)])
+        if (os.insert(o).second)
+          ls.insert(leakObjLabel(o));
+    });
+    objs = os.size();
+    labels = ls.size();
+  };
+  bool leakNew = false; // the last leakSiteOf made its site
   auto leakSiteOf = [&](int cls, const std::string &where, const std::string &into,
                         const std::string &detail) -> uint32_t {
     const std::string key = std::to_string(cls) + "|" + where + "|" + into;
     auto [it, ins] = leakSiteIdx.try_emplace(key, (uint32_t)leakSites.size());
-    if (ins) leakSites.push_back({cls, where, into, detail});
+    leakNew = ins;
+    if (ins) {
+      leakSites.push_back({cls, where, into, detail});
+      leakSites.back().firstPop = pops;
+    }
     return it->second;
+  };
+  // The pointers of a new site, with their shapes now.
+  auto leakNote = [&](uint32_t id, uint32_t ptr, uint32_t src, const Value *viewPtr,
+                      const std::string &view) {
+    if (!leakNew) return;
+    LeakSite &L = leakSites[id];
+    L.ptrNode = ptr;
+    L.srcNode = src;
+    leakPtrShape(ptr, L.ptrObjs, L.ptrLabels);
+    leakPtrShape(src, L.srcObjs, L.srcLabels);
+    L.viewPtr = viewPtr;
+    L.view = view;
   };
   // A bodiless or variadic callee among V's users (the call that models
   // the write when no IR store does).
@@ -4637,6 +4687,7 @@ bool CallGraphPass::runCellResolution() {
     // imprecise and the byte cell is a wrong target (class 7); if it holds
     // none, the program reads this storage as S (class 3, or 1 for a
     // struct's byte field).
+    std::string misView; // a struct view that does not fit the target
     auto byDest = [&](const Value *ptr, std::string &detail) {
       const std::string v = ptr ? leakStructView(ptr) : "";
       bool wrong = false;
@@ -4646,6 +4697,7 @@ bool CallGraphPass::runCellResolution() {
         bool fits = false;
         for (const std::string &e : ch) fits |= e.rfind(v + "+", 0) == 0;
         if (!fits) {
+          misView = v;
           auto [it, ins] = leakPtrViews.try_emplace(ptr);
           if (ins) {
             const uint32_t pn = leakNodeOf(ptr);
@@ -4687,8 +4739,10 @@ bool CallGraphPass::runCellResolution() {
         from = (it->second.second == kLeakAny ? std::string("*")
                                                : cellName(it->second.first, it->second.second)) +
                " of " + describe(objs[it->second.first]);
-      return leakSiteOf(2, BC.at ? instLoc(BC.at) + " " + leakIR(BC.at) : "byte copy", into,
-                        "from " + from + (dStruct ? "; into a struct interior" : ""));
+      const uint32_t id = leakSiteOf(2, BC.at ? instLoc(BC.at) + " " + leakIR(BC.at) : "byte copy", into,
+                                     "from " + from + (dStruct ? "; into a struct interior" : ""));
+      leakNote(id, find(BC.dst), find(BC.src), nullptr, "");
+      return id;
     }
     if (auto hit = leakCollHub.find(a); hit != leakCollHub.end()) {
       const uint32_t h = hit->second;
@@ -4724,14 +4778,20 @@ bool CallGraphPass::runCellResolution() {
       if (SI) {
         std::string detail = leakIR(SI) + (held ? "" : " (one of the collector's stores; none holds the fact now)");
         const int cls = byDest(SI->getPointerOperand(), detail);
-        return leakSiteOf(cls, instLoc(SI) + " " + SI->getFunction()->getName().str(), into, detail);
+        const uint32_t id = leakSiteOf(cls, instLoc(SI) + " " + SI->getFunction()->getName().str(), into, detail);
+        leakNote(id, leakNodeOf(SI->getPointerOperand()), leakNodeOf(SI->getValueOperand()),
+                 SI->getPointerOperand(), misView);
+        return id;
       }
       std::string call = leakBodiless(Vp);
       if (call.empty()) call = leakBodiless(Vv);
       // A memcpy or memmove modeled as a load and a store: a byte copy.
-      if (StringRef(call).starts_with("llvm.memcpy") || StringRef(call).starts_with("llvm.memmove"))
-        return leakSiteOf(2, call, into, "a copy modeled as a load-store pair (*q = *p); pointer " +
-                                             leakDesc(leakNodeOf(Vp)));
+      if (StringRef(call).starts_with("llvm.memcpy") || StringRef(call).starts_with("llvm.memmove")) {
+        const uint32_t id = leakSiteOf(2, call, into, "a copy modeled as a load-store pair (*q = *p); pointer " +
+                                                          leakDesc(leakNodeOf(Vp)));
+        leakNote(id, leakNodeOf(Vp), leakNodeOf(Vv), nullptr, "");
+        return id;
+      }
       const std::string detail = "no IR store; pointer " + leakDesc(leakNodeOf(Vp)) +
                                  "; value " + leakDesc(leakNodeOf(Vv));
       return leakSiteOf(call.empty() ? 6 : 5, call.empty() ? "store collector" : call, into, detail);
@@ -5757,6 +5817,27 @@ bool CallGraphPass::runCellResolution() {
                                     "byte storage written through a char or untyped address",
                                     "vararg or bodiless call boundary", "other",
                                     "store through an imprecise pointer (it also holds the objects it views)"};
+    // The struct-view recount: a store whose view did not fit its target,
+    // through a pointer that holds objects of that view at the stop, is a
+    // store through an imprecise pointer (it held none when first seen).
+    size_t from3 = 0, from1 = 0;
+    for (LeakSite &L : leakSites) {
+      if (L.view.empty() || !L.viewPtr || L.cls == 7) continue;
+      const uint32_t pn = leakNodeOf(L.viewPtr);
+      size_t k = 0;
+      if (pn != UINT32_MAX)
+        pts[pn].forEach([&](uint32_t g) {
+          for (auto [o, e] : memb[findFact(g)])
+            if (objs[o].layout && objs[o].label == L.view) { k++; break; }
+        });
+      if (!k) continue;
+      (L.cls == 3 ? from3 : from1)++;
+      L.recounted = L.cls;
+      L.cls = 7;
+      L.detail += "; at the stop the pointer holds " + std::to_string(k) + " " + L.view;
+    }
+    CG_LOG("Cells:   LEAK recount at the stop: " << from3 + from1 << " sites moved to class 7 ("
+           << from3 << " from class 3, " << from1 << " from class 1)\n");
     size_t clsMass[8] = {}, clsSites[8] = {}, clsExited[8] = {}, exitedAll = 0, exitedUntagged = 0;
     for (size_t s = 0; s < leakSites.size(); s++) {
       clsMass[leakSites[s].cls] += siteMass[s];
@@ -5803,6 +5884,45 @@ bool CallGraphPass::runCellResolution() {
              << pct(siteMass[s], leakFacts) << "%), born " << L.born << ", downstream " << down[s]
              << ": " << L.where << " | into " << L.into << " | " << L.detail
              << " | objects: " << objsTop << "\n");
+    }
+    // The earliest leaks by solve order: the pop of a site's first entry,
+    // with its pointers' shapes then and at the stop. A pointer is precise
+    // when its objects carry one label (a copy: both pointers).
+    auto shapeOf = [&](const LeakSite &L) {
+      if (L.ptrNode == UINT32_MAX) return std::string("no pointer");
+      size_t o2, l2;
+      leakPtrShape(L.ptrNode, o2, l2);
+      std::string d = "pointer " + std::to_string(L.ptrObjs) + " objects/" + std::to_string(L.ptrLabels) +
+                      " labels at entry, " + std::to_string(o2) + "/" + std::to_string(l2) + " at the stop";
+      if (L.cls == 2 && L.srcNode != UINT32_MAX) {
+        leakPtrShape(L.srcNode, o2, l2);
+        d += "; source " + std::to_string(L.srcObjs) + "/" + std::to_string(L.srcLabels) + " at entry, " +
+             std::to_string(o2) + "/" + std::to_string(l2) + " at the stop";
+      }
+      return d;
+    };
+    auto precise = [&](const LeakSite &L) {
+      return L.ptrNode != UINT32_MAX && L.ptrLabels == 1 &&
+             (L.cls != 2 || L.srcNode == UINT32_MAX || L.srcLabels <= 1);
+    };
+    std::vector<uint32_t> early(leakSites.size());
+    std::iota(early.begin(), early.end(), 0);
+    std::sort(early.begin(), early.end(), [&](uint32_t x, uint32_t y) {
+      return leakSites[x].firstPop != leakSites[y].firstPop ? leakSites[x].firstPop < leakSites[y].firstPop
+                                                            : x < y;
+    });
+    for (int pass = 0; pass < 2; pass++) {
+      size_t shown = 0;
+      for (uint32_t s : early) {
+        const LeakSite &L = leakSites[s];
+        if (!L.born) continue; // provisional, never became a leak
+        if (pass == 0 && !precise(L)) continue;
+        if (++shown > 10) break;
+        CG_LOG("Cells:   LEAK EARLY " << (pass ? "any" : "precise") << " #" << shown << " pop " << L.firstPop
+               << " class " << L.cls << (L.recounted ? " (was " + std::to_string(L.recounted) + ")" : std::string())
+               << " exited " << L.exited << ", resident " << siteMass[s] << ", downstream " << down[s] << ": "
+               << L.where << " | into " << L.into << " | " << L.detail << " | " << shapeOf(L) << "\n");
+      }
     }
     CG_LOG("Cells:   LEAK the listed sites hold " << covered << " (" << pct(covered, leakFacts)
            << "%) of the non-char facts in byte cells\n");

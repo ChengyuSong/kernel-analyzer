@@ -3,7 +3,9 @@
 // and its content to a callee that switches on the tag parameter. The
 // caller's read of the content admits the union over the callee's uses of
 // what each use's case admits: the VTab and string writers, not the int
-// writer whose tag no case names.
+// writer whose tag no case names. With per-use channels, each arm of the
+// switch reads only its own case's writers: the string never reaches the
+// VTab arm.
 // PAIR: struct.Op+8 by +0
 #include <stdlib.h>
 #define P4_VTAB (-12)
@@ -16,7 +18,7 @@ struct Op { signed char p4type; void *p4; };
 void vfn(void) {}
 void sfn(void) {}
 void ifn(void) {}
-static void vtabUnlock(struct VTab *v) { v->unlock(); } // CHECK: vfn CHECK-NOT: ifn
+static void vtabUnlock(struct VTab *v) { v->unlock(); } // CHECK: vfn CHECK-NOT: ifn sfn
 static void freeStr(struct Str *s) { free(s); }
 static void freeP4(int t, void *p) {
   switch (t) {

@@ -3445,6 +3445,21 @@ NodeIndex CallGraphPass::keyedDeref(NodeIndex ptr, const std::string &key) {
 
 void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   if (!CGP.poolDrop.empty() && CGP.poolDrop.count(&I)) return; // pool state (closure checked)
+  // A per-use parameter channel (plan 3.51): this reload of a callee
+  // parameter reads, at each call, the caller's load of the field through
+  // the keys its own test admits, not the parameter's slot.
+  if (CFLCells)
+    if (auto ch = CGP.taggedParamChannels.find(&I); ch != CGP.taggedParamChannels.end()) {
+      NodeIndex valNode = CGP.getRepNodeForValue(&I);
+      if (valNode == AndersNodeFactory::InvalidIndex)
+        valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+      for (auto &[R, keys] : ch->second) {
+        const NodeIndex pN = CGP.getRepNodeForValue(cast<LoadInst>(R)->getPointerOperand());
+        assert(pN != AndersNodeFactory::InvalidIndex && "a channel's caller load has a pointer node");
+        for (const std::string &k : keys) CGP.addAssignmentEdge(CGP.keyedDeref(pN, k), valNode);
+      }
+      return;
+    }
   // Tracepoint keyed dispatch (task #35): inside __traceiter_X, the
   // funcs-head load reads cells that the kernel-scale giant absorbs —
   // the keyed channel replaces this read entirely (sound: the census
@@ -6191,6 +6206,7 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
         if (const auto *LI = dyn_cast<LoadInst>(&I)) {
           if (!containsPointerType(LI->getType()) || dedupKeep.count(LI))
             continue;
+          if (CFLCells && taggedParamChannels.count(LI)) continue; // its own channel, not the slot's value
           NodeIndex ptrNode = NF.getValueNodeFor(LI->getPointerOperand());
           NodeIndex valNode = NF.getValueNodeFor(LI);
           if (ptrNode == AndersNodeFactory::InvalidIndex ||

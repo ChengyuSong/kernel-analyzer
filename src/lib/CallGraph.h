@@ -524,6 +524,11 @@ protected:
   // Open retags no test guards (in-place retags without a content write):
   // (field and tag, site, map).
   std::vector<std::tuple<std::string, const llvm::Instruction *, std::string>> taggedInPlace;
+  // Per-use parameter channels (plan 3.51, parameter-pair tests): a tested
+  // use of a callee parameter reads, at each call site, the caller's load
+  // of F through the keys its own test admits, instead of the parameter.
+  std::map<const llvm::Instruction *, std::vector<std::pair<const llvm::Instruction *, std::vector<std::string>>>>
+      taggedParamChannels;
   std::vector<std::vector<uint32_t>> taggedPairAssumes; // per taggedPairs entry
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();

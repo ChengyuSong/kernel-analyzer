@@ -157,9 +157,39 @@ void CallGraphPass::labelAllocationSites(
       }
     return it->second;
   };
+  // The struct a variable of debug type T points to, by its IR name ("" if
+  // T is not a pointer to a struct the IR still has).
+  auto diPointee = [&](const DIType *T, const Module *M) -> std::string {
+    if (!T) return "";
+    const StringRef N = ka::diStructName(T, true);
+    if (N.empty()) return "";
+    llvm::StructType *S = llvm::StructType::getTypeByName(M->getContext(), "struct." + N.str());
+    return S && namedStruct(S) ? structKey(S) : "";
+  };
   auto labelSite = [&](const CallBase *C) {
     AllocSiteLabel L;
     const DataLayout &DL = C->getModule()->getDataLayout();
+    // The variable that receives the result, by its declared type (plan
+    // 3.53 1b: the site's own declaration comes first): a dbg.value on the
+    // result, or the slot the result is stored to (dbg.declare).
+    {
+      SmallVector<DbgValueInst *, 2> DVs;
+      findDbgValues(DVs, const_cast<CallBase *>(C));
+      for (DbgValueInst *DV : DVs)
+        if (L.siteDeclared.empty())
+          L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
+      SmallVector<const Value *, 4> vs{C};
+      for (size_t i = 0; i < vs.size() && L.siteDeclared.empty() && i < 8; i++)
+        for (const User *U : vs[i]->users()) {
+          if (isa<CastInst>(U)) { vs.push_back(U); continue; }
+          const auto *SI = dyn_cast<StoreInst>(U);
+          if (!SI || SI->getValueOperand() != vs[i]) continue;
+          if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
+            for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+              if (L.siteDeclared.empty())
+                L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
+        }
+    }
     std::vector<std::pair<const Value *, int64_t>> work{{C, 0}};
     std::set<const Value *> seen{C};
     auto push = [&](const Value *V, int64_t off) {
@@ -303,6 +333,12 @@ void CallGraphPass::staticLabels(
     allocationsOfCall(C, allocs);
     for (const CallBase *A : allocs) {
       auto &L = out[A];
+      // The receiving variable's declared struct first (1b), then the
+      // typed writes, then a declared struct found along the result.
+      if (!SL.siteDeclared.empty()) {
+        L.insert(SL.siteDeclared);
+        continue;
+      }
       L.insert(SL.types.begin(), SL.types.end());
       if (SL.types.empty() && !SL.declared.empty())
         L.insert(SL.declared);
@@ -437,6 +473,10 @@ void CallGraphPass::runTypeLabelCensus(
       for (uint32_t r : originsCreatedBy(A)) {
         OriginLabel &L = originLabel[r];
         L.kind = Heap;
+        if (!SL.siteDeclared.empty()) {
+          L.types.insert(SL.siteDeclared); // the receiving variable's declaration
+          continue;
+        }
         L.types.insert(SL.types.begin(), SL.types.end());
         if (SL.types.empty() && !SL.declared.empty())
           L.types.insert(SL.declared); // typed only by its variable

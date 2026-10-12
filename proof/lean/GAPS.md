@@ -911,7 +911,14 @@ source; offsets stay the IR layout's. Names never decide answers here
 and checks only.
 
 Hypothesis (the naming rule as it stands): an object's layout is its
-first typed use in solve order. A later incompatible use (a struct
+allocation site's declaration when the site has one (plan 3.53 1b: the
+struct the receiving variable's debug type points to, from a dbg.value
+on the result or the dbg.declare of the slot it is stored to; else the
+struct of the typed writes through the result in the allocating
+function), and otherwise its first typed use in solve order. The site
+label is fixed at mint time, before any solve-order write, so it removes
+the order dependence wherever a site declares; char, void and integer
+receivers declare nothing. A later incompatible use (a struct
 written into storage used as bytes, or into an allocation laid out as
 another struct) is reported as rule (b), not admitted as a layout. The
 other order needs no row: a byte access on a labeled object runs over its

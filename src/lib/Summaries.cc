@@ -236,13 +236,93 @@ void CallGraphPass::confirmFreshWrappers() {
                                SmallVectorImpl<const StoreInst *> &out) {
     reachingSlotStoresOf(L, AI, out);
   };
+  // A wrapper's summary as a summary-file line (ST, CPY, ALIAS sorted).
+  auto freshLine = [](StringRef name, ArrayRef<int> st, ArrayRef<int> cpy,
+                      ArrayRef<int> alias) {
+    std::string ln = name.str() + " FRESH";
+    for (int an : st) ln += " ST(*ret<-arg" + std::to_string(an) + ")";
+    for (int cj : cpy) ln += " CPY(ret<-arg" + std::to_string(cj) + ")";
+    for (int aj : alias) ln += " ALIAS(ret=arg" + std::to_string(aj) + ")";
+    return ln + " BODY";
+  };
+  // Hand rows of the shape the engine emits (FRESH, ST(*ret<-argN),
+  // CPY(ret<-argN), ALIAS(ret=argN), BODY) on functions with a body, as
+  // lines. After the fixpoint each is checked with its own row hidden
+  // and the others in place; a row the engine confirms with the same
+  // line is reported as redundant given the other rows (a set of such
+  // rows is removable when the engine reconfirms them all without it).
+  // The check promotes nothing.
+  std::map<const Function *, std::string> handRows;
+  for (auto &[HF, HS] : Ctx->FuncSummaries) {
+    if (HF->isDeclaration() || HF->empty() ||
+        !HF->getReturnType()->isPointerTy())
+      continue;
+    if (!HS->fresh || !HS->body || HS->none || HS->noop || HS->pool ||
+        HS->freeArg >= 0 || !HS->labels.empty())
+      continue;
+    SmallVector<int, 4> st, cpy, alias;
+    bool shape = true;
+    for (const auto &A : HS->atoms) {
+      using SA = GlobalContext::SummaryAtom;
+      bool plain = A.dst == -1 && A.src >= 0 && !A.gsrc && !A.gdst &&
+                   !A.gsrc2 && A.dstByteOff == 0 && A.srcByteOff == 0;
+      if (A.kind == SA::Fresh) continue;
+      if (A.kind == SA::Store && plain) st.push_back(A.src);
+      else if (A.kind == SA::Cpy && plain) cpy.push_back(A.src);
+      else if (A.kind == SA::Alias && plain) alias.push_back(A.src);
+      else { shape = false; break; }
+    }
+    if (!shape) continue;
+    for (auto *v : {&st, &cpy, &alias}) {
+      std::sort(v->begin(), v->end());
+      v->erase(std::unique(v->begin(), v->end()), v->end());
+    }
+    handRows[HF] = freshLine(HF->getName(), st, cpy, alias);
+  }
+  // Hides a hand row for the check of its own function; restores it on
+  // every exit from the loop body.
+  struct HiddenRow {
+    GlobalContext *C = nullptr;
+    const Function *F = nullptr;
+    const GlobalContext::FuncSummary *S = nullptr;
+    bool alloc = false;
+    void hide(GlobalContext *Cx, const Function *Fn) {
+      C = Cx; F = Fn; S = Cx->FuncSummaries.at(Fn);
+      alloc = Cx->AllocFuncs.erase(Fn);
+      Cx->FuncSummaries.erase(Fn);
+    }
+    ~HiddenRow() {
+      if (!C) return;
+      C->FuncSummaries[F] = S;
+      if (alloc) C->AllocFuncs.insert(F);
+    }
+  };
+  size_t redundantRows = 0;
   size_t round = 0;
-  bool changed = true;
-  while (changed) {
+  bool changed = true, checking = false;
+  // Counters as of the fixpoint: the check pass leaves them unchanged.
+  size_t sv[9];
+  std::map<std::string, size_t> svBuckets, svCallees;
+  while (changed || !checking) {
+    if (!changed) {
+      checking = true;
+      size_t *cs[] = {&g_freshPromoted, &g_freshRejRet, &g_freshRejEscape,
+                      &g_freshRejSide, &g_freshInit, &g_escapeSamples,
+                      &g_freshHelperComposed, &g_freshCpy, &g_freshAlias};
+      for (unsigned i = 0; i < 9; i++) sv[i] = *cs[i];
+      svBuckets = g_escapeBuckets;
+      svCallees = g_escapeCallees;
+    } else {
+      round++;
+    }
     changed = false;
-    round++;
     for (auto &mp : Ctx->Modules) {
       for (Function &F : *mp.first) {
+        HiddenRow hidden;
+        if (checking) {
+          if (!handRows.count(&F)) continue;
+          hidden.hide(Ctx, &F);
+        }
         if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
         if (!F.getReturnType()->isPointerTy()) continue;
         if (Ctx->AllocFuncs.count(&F) || Ctx->ContainerFuncs.count(&F))
@@ -339,7 +419,7 @@ void CallGraphPass::confirmFreshWrappers() {
         if (!ok) {
           g_freshRejRet++;
           static size_t r1Samples = 0;
-          if ((r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
+          if (!checking && (r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
             // With --cfl-trace-func every R1 rejection is logged (a
             // wrapper that should have been promoted is debugged here).
             std::string t; raw_string_ostream os(t); os << *r1bad;
@@ -620,7 +700,7 @@ void CallGraphPass::confirmFreshWrappers() {
         if (escaped || untracedInit) {
           g_freshRejEscape++;
           g_escapeBuckets[rejWhy ? rejWhy : "unknown"]++;
-          if (g_escapeSamples < 40 && rejWhy) {
+          if (!checking && g_escapeSamples < 40 && rejWhy) {
             g_escapeSamples++;
             CG_LOG("ConfirmFresh ESCAPE: " << F.getName() << " ["
                    << rejWhy << "]\n");
@@ -670,7 +750,7 @@ void CallGraphPass::confirmFreshWrappers() {
         }
         if (!ok) {
           g_freshRejSide++;
-          if (!CFLTraceFunc.empty() && r3bad) {
+          if (!checking && !CFLTraceFunc.empty() && r3bad) {
             std::string t; raw_string_ostream os(t); os << *r3bad;
             CG_LOG("ConfirmFresh R3: " << F.getName() << " side effect "
                    << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
@@ -738,6 +818,21 @@ void CallGraphPass::confirmFreshWrappers() {
         std::sort(cpyArgs.begin(), cpyArgs.end());
         cpyArgs.erase(std::unique(cpyArgs.begin(), cpyArgs.end()),
                       cpyArgs.end());
+        if (checking) {
+          // A hand row the engine confirms with the same line: reported,
+          // not promoted (the row stays in force).
+          std::sort(initArgs.begin(), initArgs.end());
+          initArgs.erase(std::unique(initArgs.begin(), initArgs.end()),
+                         initArgs.end());
+          if (initGlobals.empty() && !selfStore && subAllocs == 0 &&
+              freshLine(F.getName(), initArgs, cpyArgs, aliasArgs) ==
+                  handRows[&F]) {
+            redundantRows++;
+            CG_LOG("ConfirmFresh: REDUNDANT hand row " << handRows[&F]
+                   << " (the engine confirms it given the other rows)\n");
+          }
+          continue;
+        }
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
@@ -815,11 +910,7 @@ void CallGraphPass::confirmFreshWrappers() {
         {
           // The promotion as a summary-file line (harvestable: a library
           // run's output becomes its interface summary).
-          std::string ln = F.getName().str() + " FRESH";
-          for (int an : initArgs) ln += " ST(*ret<-arg" + std::to_string(an) + ")";
-          for (int cj : cpyArgs) ln += " CPY(ret<-arg" + std::to_string(cj) + ")";
-          for (int aj : aliasArgs) ln += " ALIAS(ret=arg" + std::to_string(aj) + ")";
-          ln += " BODY";
+          std::string ln = freshLine(F.getName(), initArgs, cpyArgs, aliasArgs);
           if (selfStore) ln += " # +self-store";
           if (subAllocs) ln += " # +" + std::to_string(subAllocs) + " sub-alloc";
           CG_LOG("ConfirmFresh: LINE " << ln << "\n");
@@ -827,6 +918,17 @@ void CallGraphPass::confirmFreshWrappers() {
       }
     }
   }
+  {
+    size_t *cs[] = {&g_freshPromoted, &g_freshRejRet, &g_freshRejEscape,
+                    &g_freshRejSide, &g_freshInit, &g_escapeSamples,
+                    &g_freshHelperComposed, &g_freshCpy, &g_freshAlias};
+    for (unsigned i = 0; i < 9; i++) *cs[i] = sv[i];
+    g_escapeBuckets = svBuckets;
+    g_escapeCallees = svCallees;
+  }
+  CG_LOG("ConfirmFresh: " << redundantRows << " of " << handRows.size()
+         << " hand FRESH rows the engine confirms with the same line, "
+         << "given the other rows\n");
   CG_LOG("ConfirmFresh: " << g_freshPromoted << " wrappers promoted ("
          << g_freshInit << " alloc-init with ST atoms, " << g_freshCpy
          << " copying with CPY atoms, " << g_freshAlias

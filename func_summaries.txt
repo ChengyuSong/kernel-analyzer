@@ -103,41 +103,49 @@ xmemdup FRESH CPY(ret<-arg0)
 # Reallocation continues the old object (ALIAS, plan 3.30): its names and
 # content are the old ones; FRESH covers realloc(NULL, n). A use of the
 # old pointer after the call is undefined behavior (reported, not modeled).
-# Drafted from the sources (sqlite 3.38.5, binutils 5279478, libpng
-# 1.6); none of these allocation paths can be inferred fresh from the IR
-# (dispatch through a function pointer: xMalloc, png_ptr->malloc_fn;
-# pool slots loaded from a free list).
-sqlite3_malloc FRESH BODY
-sqlite3_malloc64 FRESH BODY
+# The wrapper confirmer (--cfl-confirm-fresh, on by default) infers
+# pure-fresh, copying (CPY) and realloc (ALIAS) wrappers from the IR,
+# including wrappers over the rows below. A hand row it confirms with
+# the same line, given the other rows, is reported at --verbose=2
+# ("REDUNDANT hand row") and is not kept here (18 removed 2026-10-12,
+# checked as a set). The rows below are the allocation paths it cannot
+# confirm, drafted from the sources (sqlite 3.38.5, binutils 5279478,
+# libpng 1.6); each block says which confirmer rule the IR fails (R1: a
+# return that is not fresh; R3: a pointer side effect) or which kept row
+# it rests on.
+# sqlite3Malloc: the result comes back through mallocWithAlarm's
+# out-parameter, from the xMalloc dispatch (R1). sqlite3Realloc: an
+# indirect call through xRealloc (R1). dbMallocRawFinish: calls
+# __assert_fail with pointer arguments (R3). sqlite3DbMallocRawNN returns
+# a lookaside slot loaded from the free list or dbMallocRawFinish's
+# result (R1); the Db realloc chain rests on it and on sqlite3Realloc.
 sqlite3Malloc FRESH BODY
-sqlite3MallocZero FRESH BODY
-sqlite3DbMallocZero FRESH BODY
-sqlite3DbMallocRaw FRESH BODY
 sqlite3DbMallocRawNN FRESH BODY
 dbMallocRawFinish FRESH BODY
-sqlite3_realloc FRESH ALIAS(ret=arg0) BODY
-sqlite3_realloc64 FRESH ALIAS(ret=arg0) BODY
 sqlite3Realloc FRESH ALIAS(ret=arg0) BODY
 sqlite3DbRealloc FRESH ALIAS(ret=arg1) BODY
 sqlite3DbReallocOrFree FRESH ALIAS(ret=arg1) BODY
 dbReallocFinish FRESH ALIAS(ret=arg1) BODY
 # The default xMalloc/xRealloc (sqlite3MemMalloc/Realloc: malloc with an
-# 8-byte size header, the user pointer past it), and allocation wrappers
-# that only allocate (fts3HashMalloc zeroes; contextMalloc reports
-# SQLITE_TOOBIG; pcache1Alloc takes a pool slot or calls sqlite3Malloc).
+# 8-byte size header; the user pointer past it is an interior pointer,
+# R1). contextMalloc reports SQLITE_TOOBIG through
+# sqlite3_context_db_handle (R3). pcache1Alloc and rowSetEntryAlloc
+# return a pool slot loaded from memory (R1); sqlite3PageMalloc rests on
+# pcache1Alloc.
 sqlite3MemMalloc FRESH BODY
 sqlite3MemRealloc FRESH ALIAS(ret=arg0) BODY
-fts3HashMalloc FRESH BODY
 contextMalloc FRESH BODY
 pcache1Alloc FRESH BODY
 sqlite3PageMalloc FRESH BODY
-sqlite3Fts3MallocZero FRESH BODY
 rowSetEntryAlloc FRESH BODY
-# Reallocating wrappers: the old block continues (ALIAS); fts3ReallocOrFree
-# frees it on failure; sqlite3ArrayAllocate grows pArray by one slot.
+# Reallocating wrappers: the old block continues (ALIAS). fts3ReallocOrFree
+# frees it on failure through sqlite3_free, which the confirmer does not
+# exempt (R3); sqlite3ArrayAllocate grows pArray by one slot and rests on
+# sqlite3DbRealloc.
 fts3ReallocOrFree FRESH ALIAS(ret=arg0) BODY
 sqlite3ArrayAllocate FRESH ALIAS(ret=arg1) BODY
-# The fuzz harness's xMalloc/xRealloc (fuzzershell OOM injection).
+# The fuzz harness's xMalloc/xRealloc (fuzzershell OOM injection): an
+# indirect call through the saved real allocator (R1).
 oomMalloc FRESH BODY
 oomRealloc FRESH ALIAS(ret=arg0) BODY
 # Deallocators (FREE): stores through the freed block and of it (the
@@ -167,21 +175,19 @@ sqlite3LookasideUsed POOL
 sqlite3_db_status POOL
 sqlite3LeaveMutexAndCloseZombie POOL
 sqlite3PCacheBufferSetup POOL
+# binutils: bfd_alloc and bfd_hash_allocate carve from an objalloc chunk
+# (an interior pointer, R1; plan 3.53 rule 3 replaces these with the
+# carve form), and _objalloc_alloc returns its own recursive call's
+# result or a carve (R1).
 bfd_alloc FRESH BODY
-bfd_zalloc FRESH BODY
-bfd_alloc2 FRESH BODY
-bfd_zalloc2 FRESH BODY
-bfd_malloc FRESH BODY
-bfd_zmalloc FRESH BODY
-bfd_malloc2 FRESH BODY
 bfd_hash_allocate FRESH BODY
 _objalloc_alloc FRESH BODY
+# libpng: png_malloc_base calls png_ptr->malloc_fn when set (an indirect
+# call, R1). png_malloc, png_malloc_array and png_realloc_array call
+# png_error with pointer arguments (R3).
 png_malloc_base FRESH BODY
 png_malloc FRESH BODY
-png_calloc FRESH BODY
-png_malloc_warn FRESH BODY
 png_malloc_array FRESH BODY
-png_malloc_array_checked FRESH BODY
 png_realloc_array FRESH ALIAS(ret=arg1) BODY
 # libjpeg-turbo jmemmgr.c: alloc_small / alloc_large hand out chunks of a
 # pool (jpeg_get_small / jpeg_get_large blocks, kept on small_list /

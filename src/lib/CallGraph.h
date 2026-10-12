@@ -475,6 +475,9 @@ protected:
   // pool fields that no other function touches; not modeled.
   std::unordered_set<const llvm::Instruction *> poolDrop;
   void checkPoolClosure();
+  // Pool carves (plan 3.53 rule 3): forms, handle-field and chunk-base
+  // checks, reported per pool (Carves.cc).
+  void checkPoolCarves();
   // Varargs renderers (plan 3.41): functions whose pointer reads through a
   // va_list are data only (printed, measured, compared, copied as chars):
   // those reads carry no facts; variadic wrappers whose va_lists reach only

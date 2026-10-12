@@ -21,6 +21,7 @@ set (KACoreSource
   Summaries.cc
   Census.cc
   Slots.cc
+  Carves.cc
   TaggedFields.cc
   Dump.cc
   IRSidecar.cc

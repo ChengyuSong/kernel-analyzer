@@ -350,41 +350,12 @@ Type *leafAt(Type *T, int64_t off, const DataLayout &DL) {
   return nullptr;
 }
 
-// The debug-info struct a declared object is, or a pointer value points
-// to: the declared type of the global, local, formal or spilled slot it
-// comes from (through casts; at -O0 a load of a slot reads the slot's
-// variable). Only a struct the linked IR merged away under another name
-// (block_header read as struct.my_devt): "struct.<tag>", else "".
+// diDeclaredStruct, only for a struct the linked IR merged away under
+// another name (block_header read as struct.my_devt), else "".
 std::string diMergedIdent(const Value *P, bool pointee) {
+  const std::string name = diDeclaredStruct(P, pointee);
+  if (name.empty()) return "";
   P = P->stripPointerCasts();
-  const DIType *T = nullptr;
-  auto declOf = [](const AllocaInst *AI) -> const DIType * {
-    for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
-      if (auto *V = DDI->getVariable()) return V->getType();
-    return nullptr;
-  };
-  if (pointee) {
-    if (const auto *L = dyn_cast<LoadInst>(P)) {
-      if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
-        T = declOf(AI);
-    } else if (const auto *A = dyn_cast<Argument>(P)) {
-      if (const DISubprogram *SP = A->getParent()->getSubprogram())
-        if (const DISubroutineType *ST = SP->getType()) {
-          auto TA = ST->getTypeArray();
-          if (A->getArgNo() + 1 < TA.size()) T = TA[A->getArgNo() + 1];
-        }
-    }
-  } else if (const auto *AI = dyn_cast<AllocaInst>(P)) {
-    T = declOf(AI);
-  } else if (const auto *GV = dyn_cast<GlobalVariable>(P)) {
-    SmallVector<DIGlobalVariableExpression *, 1> E;
-    GV->getDebugInfo(E);
-    if (!E.empty()) T = E[0]->getVariable()->getType();
-  }
-  if (!T) return "";
-  const StringRef N = ka::diStructName(T, pointee);
-  if (N.empty()) return "";
-  const std::string name = "struct." + N.str();
   const auto *I = dyn_cast<Instruction>(P);
   const Module *M = I ? I->getModule() : isa<Argument>(P) ? cast<Argument>(P)->getParent()->getParent()
                                                          : cast<GlobalValue>(P)->getParent();

@@ -12,6 +12,7 @@
 // summary checks (pool closure).
 
 #include "CallGraphInternal.h"
+#include "NamedCells.h"
 #include <llvm/IR/Metadata.h>
 
 // Does struct type T hold a struct named S at byte offset off (itself, or
@@ -142,4 +143,39 @@ static void structCoverRec(Type *T, int64_t lo, int64_t hi, const DataLayout &DL
 void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
                  const std::function<void(StructType *, int64_t, int64_t)> &visit) {
   structCoverRec(T, lo, hi, DL, visit, 0);
+}
+
+// The debug-info struct a declared object is, or a pointer value points
+// to: the declared type of the global, local, formal or spilled slot it
+// comes from (through casts; at -O0 a load of a slot reads the slot's
+// variable): "struct.<tag>", else "" (no declaration, or not a struct).
+std::string diDeclaredStruct(const Value *P, bool pointee) {
+  P = P->stripPointerCasts();
+  const DIType *T = nullptr;
+  auto declOf = [](const AllocaInst *AI) -> const DIType * {
+    for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+      if (auto *V = DDI->getVariable()) return V->getType();
+    return nullptr;
+  };
+  if (pointee) {
+    if (const auto *L = dyn_cast<LoadInst>(P)) {
+      if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+        T = declOf(AI);
+    } else if (const auto *A = dyn_cast<Argument>(P)) {
+      if (const DISubprogram *SP = A->getParent()->getSubprogram())
+        if (const DISubroutineType *ST = SP->getType()) {
+          auto TA = ST->getTypeArray();
+          if (A->getArgNo() + 1 < TA.size()) T = TA[A->getArgNo() + 1];
+        }
+    }
+  } else if (const auto *AI = dyn_cast<AllocaInst>(P)) {
+    T = declOf(AI);
+  } else if (const auto *GV = dyn_cast<GlobalVariable>(P)) {
+    SmallVector<DIGlobalVariableExpression *, 1> E;
+    GV->getDebugInfo(E);
+    if (!E.empty()) T = E[0]->getVariable()->getType();
+  }
+  if (!T) return "";
+  const StringRef N = ka::diStructName(T, pointee);
+  return N.empty() ? "" : "struct." + N.str();
 }

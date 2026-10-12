@@ -336,6 +336,7 @@ bool CallGraphPass::doInitialization(Module *M) {
   }
   if (CFLCells && iteration == 0 && M == Ctx->Modules.back().first) {
     checkPoolClosure();
+    checkPoolCarves();
     computeVarargSinks();
     computeVarargKeys();
   }

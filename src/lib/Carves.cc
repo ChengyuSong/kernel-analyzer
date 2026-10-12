@@ -564,10 +564,30 @@ void CallGraphPass::checkPoolCarves() {
                   continue;
                 }
                 // -O3 joins the reload of a bump field with a refill's free
-                // space: the join is the field's value.
+                // space: the join is the field's value, when every incoming
+                // value is (a reload of the field, a chunk's free space, null,
+                // or such a join). A join with anything else (a formal: the
+                // caller's `entry`, the uncopied `string`) is a data use of
+                // the free-space value, which is the carve.
+                std::function<bool(const Value *, const std::string &, int)> spaceJoin =
+                    [&](const Value *X, const std::string &k, int d) -> bool {
+                  X = X->stripPointerCasts();
+                  if (isa<ConstantPointerNull>(X) || loadsField(X, k, 3)) return true;
+                  if (const auto *XG = dyn_cast<GEPOperator>(X))
+                    if (fromAlloc(XG->getPointerOperand(), 0)) return true; // chunk + HDR
+                  if (d > 3) return false;
+                  if (const auto *P = dyn_cast<PHINode>(X)) {
+                    for (const Value *In : P->incoming_values())
+                      if (!spaceJoin(In, k, d + 1)) return false;
+                    return true;
+                  }
+                  if (const auto *Sel = dyn_cast<SelectInst>(X))
+                    return spaceJoin(Sel->getTrueValue(), k, d + 1) && spaceJoin(Sel->getFalseValue(), k, d + 1);
+                  return false;
+                };
                 std::string bk;
                 for (const std::string &k : bumpFields)
-                  if (bk.empty() && loadsField(UI, k, 0)) bk = k;
+                  if (bk.empty() && loadsField(UI, k, 0) && spaceJoin(UI, k, 0)) bk = k;
                 if (!bk.empty()) {
                   HV b = h;
                   b.field = bk;

@@ -1080,6 +1080,12 @@ establish it:
   The chunk's free-space start (`chunk + HDR` stored into H) and -O3's
   joins of a reload of H with a refill's free space are the H route,
   covered by this check.
+- **Joins.** A phi or select is a free-space value, so the carve may sit
+  on it, only when every incoming value is one: a reload of the cursor,
+  a chunk's free-space start, null, or such a join. Otherwise the carve
+  sits on the free-space operand, and the other operands keep flowing.
+  This is the allocate-unless-provided shape: `phi [carve, entry]` in
+  bfd_hash_newfunc's family, and `phi [carve, string]` in bfd_hash_lookup.
 - **Chunk bases.** An allocation stored into a handle field is accessed
   only:
   - at its header fields;

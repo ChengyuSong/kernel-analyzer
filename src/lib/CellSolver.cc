@@ -1686,13 +1686,18 @@ bool CallGraphPass::runCellResolution() {
     // whose size said nothing) takes no label of its own. A write of T
     // there makes it an array of T; a write of another struct is a rule (b)
     // row (the object was laid out by its first typed write).
+    // The data after a T taking the T itself is the next element, whatever
+    // the size said (a sized header+tail too: bfd_zalloc(abfd,
+    // nsymz * sizeof (carsym) + stringsize + 1) walked by carsym++): an
+    // array of T, never a chain of trailing objects.
+    if (O.parentObj != UINT32_MAX && objs[O.parentObj].tailObj == o &&
+        S == objs[O.parentObj].layout) {
+      extendToArrayFn(O.parentObj); // a T written at a T stride: an array of T
+      return;
+    }
     if (O.parentObj != UINT32_MAX && objs[O.parentObj].tailUnsized &&
         objs[O.parentObj].tailObj == o) {
       const uint32_t p = O.parentObj;
-      if (S == objs[p].layout) {
-        extendToArrayFn(p); // a T written at a T stride: an array of T
-        return;
-      }
       // Another struct written into the data after a T: reported (rule
       // (b)), not admitted; the write flows to the raw cell.
       tailWritesFolded++;

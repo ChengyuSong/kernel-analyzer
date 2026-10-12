@@ -895,9 +895,16 @@ changes:
   already labeled, or of a learned element size, refuses the extension
   (counted). One label per allocation: a trailing object that is there
   because the size said nothing never takes a label of its own. A write
-  of T into it makes the header an array of T; a write of another struct
-  there is a rule (b) row, not admitted (the write flows to its raw
-  cell).
+  of another struct there is a rule (b) row, not admitted (the write
+  flows to its raw cell).
+- **Same T after the header.** A write of the header's own T into the
+  trailing object right after the header makes the allocation an array
+  of T, whatever the size said: T plus data, or a size that says nothing.
+  This is a renaming inside the allocation. Any bytes beyond the array
+  (binutils' carsym block: a string table after the entries) run over
+  the elements, as any byte access on a labeled object does. Before this
+  rule, a sized header+tail walked by `p++` minted a trailing object per
+  step, each the header of the next: no fixpoint.
 - **Keyed accesses wait for a label.** A keyed union access through an
   unlabeled object waits until the object is labeled, then links keyed.
   At the fixpoint, accesses still waiting link unkeyed, and the solve

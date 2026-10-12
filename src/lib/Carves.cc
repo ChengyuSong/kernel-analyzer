@@ -149,8 +149,14 @@ void CallGraphPass::checkPoolCarves() {
   };
 
   // Does V come from an allocation (through casts, GEPs, local slots)?
+  // The slot walks below go 8 hops deep; at -O0 a slot has many loads and
+  // stores, so each query remembers the (value, depth) pairs it has seen:
+  // the same answer, without the exponential re-walks (cjpeg -O0 hung).
+  std::set<std::pair<const Value *, int>> seenAlloc;
   std::function<bool(const Value *, int)> fromAlloc = [&](const Value *V, int d) -> bool {
     if (d > 8) return false;
+    if (d == 0) seenAlloc.clear();
+    if (!seenAlloc.insert({V, d}).second) return false; // walked from here at this depth
     V = V->stripPointerCasts();
     if (const auto *G = dyn_cast<GEPOperator>(V)) return fromAlloc(G->getPointerOperand(), d + 1);
     if (const auto *CB = dyn_cast<CallBase>(V)) return isAllocCall(CB);
@@ -347,8 +353,11 @@ void CallGraphPass::checkPoolCarves() {
         };
         // Allocations stored (through casts, GEPs, local slots) into a
         // handle field are chunk bases.
+        std::set<std::pair<const Value *, int>> seenReach;
         std::function<std::string(const Value *, int)> reachesHandle = [&](const Value *V, int d) -> std::string {
           if (d > 8) return "";
+          if (d == 0) seenReach.clear();
+          if (!seenReach.insert({V, d}).second) return ""; // walked from here at this depth
           for (const User *U : V->users()) {
             if (const auto *S = dyn_cast<StoreInst>(U)) {
               if (S->getValueOperand() != V) continue;

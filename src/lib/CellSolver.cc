@@ -1934,6 +1934,17 @@ bool CallGraphPass::runCellResolution() {
       O.repeats = AI->isArrayAllocation();
     } else if (const auto *C = dyn_cast_or_null<CallBase>(V)) {
       auto lit = labels.find(C);
+      if (!CFLCellTraceObj.empty()) {
+        const Function *CF = C->getCalledFunction();
+        const std::string who = C->getFunction()->getName().str() + "::call " +
+                                (CF ? CF->getName().str() : std::string("?"));
+        if (who.find(CFLCellTraceObj) != std::string::npos) {
+          std::string ls;
+          if (lit != labels.end())
+            for (const std::string &l : lit->second) ls += " " + l;
+          CG_LOG("Cells: SITE " << who << " at " << instLoc(C) << ": site labels {" << ls << " }\n");
+        }
+      }
       // Labels of one object at its start, one embedding the other at
       // offset 0 (my_memory_mgr and its first member jpeg_memory_mgr:
       // `mem->pub.f = ..`): the container is the object's type.
@@ -2170,10 +2181,12 @@ bool CallGraphPass::runCellResolution() {
     const int64_t pos = ((x % O.size) + O.size) % O.size;
     int64_t b = 0, e = 0;
     if (!innermostArray(O.layout, pos, DL, b, e)) {
-      // No array holds the address: what it points to is a single object
-      // (the object itself, or one embedded in it), an array of one: the
-      // index stays.
-      indexOutsideArray++;
+      // No array inside the layout holds the address: an array of the
+      // layout (a heap array of T) is indexed legally; otherwise what it
+      // points to is a single object (the object itself, or one embedded
+      // in it), an array of one: the index stays (counted: undefined
+      // behavior past element 0).
+      if (!O.repeats) indexOutsideArray++;
       out.push_back(cellAt(o, pos));
       return;
     }

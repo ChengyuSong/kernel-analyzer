@@ -64,6 +64,10 @@ protected:
     void visitMemTransferInst(llvm::MemTransferInst &I);
     void visitMemSetInst(llvm::MemSetInst &I);
     void visitInstruction(llvm::Instruction &I) {} // Default handler for unhandled instructions
+    // A certified pool's carve is its own allocation site; any other
+    // instruction goes to its handler.
+    using llvm::InstVisitor<InstHandler>::visit;
+    void visit(llvm::Instruction &I);
   };
 
   friend class InstHandler;
@@ -476,8 +480,13 @@ protected:
   std::unordered_set<const llvm::Instruction *> poolDrop;
   void checkPoolClosure();
   // Pool carves (plan 3.53 rule 3): forms, handle-field and chunk-base
-  // checks, reported per pool (Carves.cc).
+  // checks, reported per pool (Carves.cc). With --cfl-pool-carves, the
+  // carves of certified pools (each its own allocation site) and the
+  // pools' own bookkeeping (handle-field stores, rewinds, pointer
+  // arithmetic on handles: exempt from the confirmer's R3).
   void checkPoolCarves();
+  std::unordered_map<const llvm::Instruction *, std::string> poolCarves;
+  std::unordered_set<const llvm::Instruction *> poolBookkeeping;
   // Varargs renderers (plan 3.41): functions whose pointer reads through a
   // va_list are data only (printed, measured, compared, copied as chars):
   // those reads carry no facts; variadic wrappers whose va_lists reach only

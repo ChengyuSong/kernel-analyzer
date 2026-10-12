@@ -109,17 +109,22 @@ xmemdup FRESH CPY(ret<-arg0)
 # the same line, given the other rows, is reported at --verbose=2
 # ("REDUNDANT hand row") and is not kept here (18 removed 2026-10-12,
 # checked as a set; 3 more once a call that does not return was exempt
-# from R3: sqlite3PageMalloc, png_malloc, png_malloc_array). The rows below are the allocation paths it cannot
-# confirm, drafted from the sources (sqlite 3.38.5, binutils 5279478,
-# libpng 1.6); each block says which confirmer rule the IR fails (R1: a
-# return that is not fresh; R3: a pointer side effect) or which kept row
-# it rests on.
+# from R3: sqlite3PageMalloc, png_malloc, png_malloc_array). Pools that
+# pass the carve checks (--cfl-pool-carves, plan 3.53 rule 3) are carves,
+# and their wrappers are confirmed from the IR (binutils bfd_alloc,
+# bfd_hash_allocate, and _objalloc_alloc at the greatest fixpoint: its
+# recursion is assumed fresh). The rows below are the allocation paths
+# it cannot confirm, drafted from the sources (sqlite 3.38.5, binutils
+# 5279478, libpng 1.6); each block says which confirmer rule the IR fails
+# (R1: a return that is not fresh; R3: a pointer side effect) or which
+# kept row it rests on.
 # sqlite3Malloc: the result comes back through mallocWithAlarm's
 # out-parameter, from the xMalloc dispatch (R1). sqlite3Realloc: an
 # indirect call through xRealloc (R1). dbMallocRawFinish: calls
-# sqlite3OomFault(db), which sets the connection's state (R3). sqlite3DbMallocRawNN returns
-# a lookaside slot loaded from the free list or dbMallocRawFinish's
-# result (R1); the Db realloc chain rests on it and on sqlite3Realloc.
+# sqlite3OomFault(db), which sets the connection's state (R3).
+# sqlite3DbMallocRawNN returns a lookaside slot loaded from the free list
+# or dbMallocRawFinish's result (R1); the Db realloc chain rests on it
+# and on sqlite3Realloc.
 sqlite3Malloc FRESH BODY
 sqlite3DbMallocRawNN FRESH BODY
 dbMallocRawFinish FRESH BODY
@@ -175,13 +180,6 @@ sqlite3LookasideUsed POOL
 sqlite3_db_status POOL
 sqlite3LeaveMutexAndCloseZombie POOL
 sqlite3PCacheBufferSetup POOL
-# binutils: bfd_alloc and bfd_hash_allocate carve from an objalloc chunk
-# (an interior pointer, R1; plan 3.53 rule 3 replaces these with the
-# carve form), and _objalloc_alloc returns its own recursive call's
-# result or a carve (R1).
-bfd_alloc FRESH BODY
-bfd_hash_allocate FRESH BODY
-_objalloc_alloc FRESH BODY
 # libpng: png_malloc_base calls png_ptr->malloc_fn when set (an indirect
 # call, R1); the engine confirms png_malloc and png_malloc_array over it
 # (their png_error calls do not return). png_realloc_array copies the old

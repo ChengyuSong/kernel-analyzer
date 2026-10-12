@@ -107,6 +107,7 @@ extern cl::opt<std::string> CFLBatchSpill;
 extern cl::opt<bool> CFLProbeBlobFormation;
 extern cl::opt<bool> CFLConfirmInvoke;
 extern cl::opt<bool> CFLConfirmFresh;
+extern cl::opt<bool> CFLPoolCarves;
 extern cl::opt<std::string> CFLAblateMints;
 extern cl::opt<std::string> FuncSummaryFile;
 extern cl::opt<std::string> CFLAblateFuncs;

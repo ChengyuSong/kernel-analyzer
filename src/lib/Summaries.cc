@@ -299,21 +299,123 @@ void CallGraphPass::confirmFreshWrappers() {
   };
   size_t redundantRows = 0;
   size_t round = 0;
-  bool changed = true, checking = false;
-  // Counters as of the fixpoint: the check pass leaves them unchanged.
+  // Phases. Lfp: rounds promote wrappers over confirmed allocators until
+  // none is added (least fixpoint). Then the recursive candidates (members
+  // of a cycle of direct calls among unconfirmed pointer-returning
+  // functions: _objalloc_alloc calls itself) get the greatest fixpoint
+  // (plan 3.53 rule 3, Fable 2026-10-12): the set is assumed fresh
+  // (`assumed`: its calls are fresh sources), Probe rounds check each
+  // member under that assumption and drop the failures until the set is
+  // stable, and a GfpPromote round promotes the survivors; Lfp then runs
+  // again over them. Check: the redundancy report, last.
+  enum Phase { Lfp, Probe, GfpPromote, Check } phase = Lfp;
+  std::unordered_set<const Function *> assumed, passed;
+  bool gfpDone = false;
+  bool changed = true;
+  // Counters as of the fixpoint: probe and check rounds leave them unchanged.
+  size_t *cs[] = {&g_freshPromoted, &g_freshRejRet, &g_freshRejEscape,
+                  &g_freshRejSide, &g_freshInit, &g_escapeSamples,
+                  &g_freshHelperComposed, &g_freshCpy, &g_freshAlias};
   size_t sv[9];
   std::map<std::string, size_t> svBuckets, svCallees;
-  while (changed || !checking) {
-    if (!changed) {
-      checking = true;
-      size_t *cs[] = {&g_freshPromoted, &g_freshRejRet, &g_freshRejEscape,
-                      &g_freshRejSide, &g_freshInit, &g_escapeSamples,
-                      &g_freshHelperComposed, &g_freshCpy, &g_freshAlias};
-      for (unsigned i = 0; i < 9; i++) sv[i] = *cs[i];
-      svBuckets = g_escapeBuckets;
-      svCallees = g_escapeCallees;
+  auto saveCounters = [&]() {
+    for (unsigned i = 0; i < 9; i++) sv[i] = *cs[i];
+    svBuckets = g_escapeBuckets;
+    svCallees = g_escapeCallees;
+  };
+  auto restoreCounters = [&]() {
+    for (unsigned i = 0; i < 9; i++) *cs[i] = sv[i];
+    g_escapeBuckets = svBuckets;
+    g_escapeCallees = svCallees;
+  };
+  // Unconfirmed pointer-returning functions with a body that lie on a
+  // cycle of direct calls among themselves (Tarjan).
+  auto recursiveCandidates = [&]() {
+    auto eligible = [&](const Function *G) {
+      return G && !G->isDeclaration() && !G->empty() && G->getReturnType()->isPointerTy() &&
+             !Ctx->AllocFuncs.count(G) && !Ctx->ContainerFuncs.count(G) && !Ctx->FuncSummaries.count(G);
+    };
+    auto callees = [&](const Function *G, SmallVectorImpl<const Function *> &out) {
+      for (const Instruction &I : instructions(*G))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (const Function *CF = CB->getCalledFunction()) {
+            const Function *D = CF->isDeclaration() ? getFuncDef(const_cast<Function *>(CF)) : CF;
+            if (eligible(D)) out.push_back(D);
+          }
+    };
+    std::unordered_set<const Function *> out;
+    std::unordered_map<const Function *, unsigned> index, low;
+    std::unordered_set<const Function *> onStack;
+    std::vector<const Function *> stack;
+    unsigned next = 0;
+    std::function<void(const Function *)> strong = [&](const Function *V) {
+      index[V] = low[V] = next++;
+      stack.push_back(V);
+      onStack.insert(V);
+      SmallVector<const Function *, 8> succ;
+      callees(V, succ);
+      bool self = false;
+      for (const Function *W : succ) {
+        self |= W == V;
+        if (!index.count(W)) {
+          strong(W);
+          low[V] = std::min(low[V], low[W]);
+        } else if (onStack.count(W)) {
+          low[V] = std::min(low[V], index[W]);
+        }
+      }
+      if (low[V] != index[V]) return;
+      std::vector<const Function *> scc;
+      const Function *W;
+      do {
+        W = stack.back();
+        stack.pop_back();
+        onStack.erase(W);
+        scc.push_back(W);
+      } while (W != V);
+      if (scc.size() > 1 || self) out.insert(scc.begin(), scc.end());
+    };
+    for (auto &mp : Ctx->Modules)
+      for (Function &G : *mp.first)
+        if (eligible(&G) && !index.count(&G)) strong(&G);
+    return out;
+  };
+  size_t gfpRounds = 0, gfpPromoted = 0;
+  bool first = true;
+  while (true) {
+    if (first) {
+      first = false;
+    } else if (phase == Lfp) {
+      if (!changed) {
+        assumed = gfpDone ? std::unordered_set<const Function *>() : recursiveCandidates();
+        phase = assumed.empty() ? Check : Probe;
+        saveCounters();
+      }
+    } else if (phase == Probe) {
+      restoreCounters();
+      if (passed.size() == assumed.size()) {
+        phase = GfpPromote;
+      } else if (passed.empty()) {
+        assumed.clear();
+        gfpDone = true;
+        phase = Check;
+      } else {
+        assumed = passed;
+      }
+    } else if (phase == GfpPromote) {
+      assumed.clear();
+      gfpDone = !changed; // nothing promoted: no further greatest fixpoint
+      phase = Lfp;
+      changed = true;
     } else {
-      round++;
+      break; // the check ran
+    }
+    const bool checking = phase == Check, probing = phase == Probe;
+    const bool quiet = checking || probing;
+    if (phase == Lfp || phase == GfpPromote) round++;
+    if (probing) {
+      passed.clear();
+      gfpRounds++;
     }
     changed = false;
     for (auto &mp : Ctx->Modules) {
@@ -322,6 +424,12 @@ void CallGraphPass::confirmFreshWrappers() {
         if (checking) {
           if (!handRows.count(&F)) continue;
           hidden.hide(Ctx, &F);
+          // A recursive row is checked at its greatest fixpoint: its own
+          // calls are assumed fresh while it is checked.
+          assumed.clear();
+          assumed.insert(&F);
+        } else if ((probing || phase == GfpPromote) && !assumed.count(&F)) {
+          continue;
         }
         if (F.isDeclaration() || F.isIntrinsic() || F.empty()) continue;
         if (!F.getReturnType()->isPointerTy()) continue;
@@ -342,6 +450,9 @@ void CallGraphPass::confirmFreshWrappers() {
         SmallVector<std::pair<const CallBase *, int>, 4> aliasSrcs;
         auto calleeFresh = [&](const CallBase *CB) {
           const Function *CF = CB->getCalledFunction();
+          if (CF && !assumed.empty() &&
+              assumed.count(CF->isDeclaration() ? getFuncDef(const_cast<Function *>(CF)) : CF))
+            return true; // inside the assumed-fresh set (greatest fixpoint)
           if (!CF || !Ctx->AllocFuncs.count(CF)) return false;
           auto sit = Ctx->FuncSummaries.find(CF);
           if (sit == Ctx->FuncSummaries.end())
@@ -377,6 +488,8 @@ void CallGraphPass::confirmFreshWrappers() {
           const Value *v = work.pop_back_val();
           if (!onRetPath.insert(v).second) continue;
           if (isa<ConstantPointerNull>(v) || isa<UndefValue>(v)) continue;
+          // A carve of a certified pool is a fresh object (rule 3).
+          if (const auto *CI = dyn_cast<Instruction>(v); CI && poolCarves.count(CI)) continue;
           if (const auto *CE = dyn_cast<ConstantExpr>(v)) {
             if (CE->getOpcode() == Instruction::IntToPtr) continue; // ERR_PTR
             ok = false;
@@ -419,7 +532,7 @@ void CallGraphPass::confirmFreshWrappers() {
         if (!ok) {
           g_freshRejRet++;
           static size_t r1Samples = 0;
-          if ((!checking || !CFLTraceFunc.empty()) && (r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
+          if ((!quiet || !CFLTraceFunc.empty()) && (r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
             // With --cfl-trace-func every R1 rejection is logged (a
             // wrapper that should have been promoted is debugged here).
             std::string t; raw_string_ostream os(t); os << *r1bad;
@@ -447,7 +560,8 @@ void CallGraphPass::confirmFreshWrappers() {
         {
           SmallVector<const Value *, 8> gwork;
           for (const Value *v : onRetPath)
-            if (isa<CallBase>(v)) gwork.push_back(v);
+            if (isa<CallBase>(v) || (isa<Instruction>(v) && poolCarves.count(cast<Instruction>(v))))
+              gwork.push_back(v);
           SmallPtrSet<const Value *, 16> seen;
           while (!gwork.empty() && !escaped) {
             const Value *v = gwork.pop_back_val();
@@ -470,6 +584,9 @@ void CallGraphPass::confirmFreshWrappers() {
                 continue;
               }
               if (const auto *SI = dyn_cast<StoreInst>(U)) {
+                // The pool's own bump (p + n stored back into H) moves
+                // no object: the next carve is another.
+                if (poolBookkeeping.count(SI)) continue;
                 // store INTO the fresh graph is init; storing the fresh
                 // pointer ITSELF somewhere else is an escape — bucket
                 // it by where it lands.
@@ -700,7 +817,7 @@ void CallGraphPass::confirmFreshWrappers() {
         if (escaped || untracedInit) {
           g_freshRejEscape++;
           g_escapeBuckets[rejWhy ? rejWhy : "unknown"]++;
-          if ((!checking || !CFLTraceFunc.empty()) && g_escapeSamples < 40 && rejWhy) {
+          if ((!quiet || !CFLTraceFunc.empty()) && g_escapeSamples < 40 && rejWhy) {
             g_escapeSamples++;
             CG_LOG("ConfirmFresh ESCAPE: " << F.getName() << " ["
                    << rejWhy << "]\n");
@@ -713,6 +830,7 @@ void CallGraphPass::confirmFreshWrappers() {
         for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
              ++II) {
           const Instruction *I2 = &*II;
+          if (poolBookkeeping.count(I2)) continue; // a certified pool's own state
           if (const auto *SI = dyn_cast<StoreInst>(I2)) {
             if (initStores.count(I2)) continue;
             // A store into a non-escaping local slot moves nothing out
@@ -737,6 +855,10 @@ void CallGraphPass::confirmFreshWrappers() {
             // kept body (BODY).
             if (CB->doesNotReturn() && isa_and_nonnull<UnreachableInst>(CB->getNextNonDebugInstruction()))
               continue;
+            if (CF && !assumed.empty() &&
+                assumed.count(CF->isDeclaration() ? getFuncDef(const_cast<Function *>(CF)) : CF))
+              continue; // inside the assumed-fresh set
+
             if (CF) { // NOOP-summarized callee (strlen in xstrdup):
               auto nit = Ctx->FuncSummaries.find(CF); // transfers nothing
               if (nit != Ctx->FuncSummaries.end() && nit->second->noop)
@@ -840,6 +962,10 @@ void CallGraphPass::confirmFreshWrappers() {
           }
           continue;
         }
+        if (probing) {
+          passed.insert(&F); // fresh under the assumption
+          continue;
+        }
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
@@ -907,6 +1033,7 @@ void CallGraphPass::confirmFreshWrappers() {
           else if (aliasArgs.empty()) g_freshInit++;
         }
         g_freshPromoted++;
+        if (phase == GfpPromote) gfpPromoted++;
         changed = true;
         if (g_freshPromoted <= 20)
           CG_LOG("ConfirmFresh: promoted " << F.getName()
@@ -925,14 +1052,10 @@ void CallGraphPass::confirmFreshWrappers() {
       }
     }
   }
-  {
-    size_t *cs[] = {&g_freshPromoted, &g_freshRejRet, &g_freshRejEscape,
-                    &g_freshRejSide, &g_freshInit, &g_escapeSamples,
-                    &g_freshHelperComposed, &g_freshCpy, &g_freshAlias};
-    for (unsigned i = 0; i < 9; i++) *cs[i] = sv[i];
-    g_escapeBuckets = svBuckets;
-    g_escapeCallees = svCallees;
-  }
+  restoreCounters();
+  if (gfpRounds)
+    CG_LOG("ConfirmFresh: recursive candidates: " << gfpRounds << " probe rounds, " << gfpPromoted
+           << " promoted at the greatest fixpoint\n");
   CG_LOG("ConfirmFresh: " << redundantRows << " of " << handRows.size()
          << " hand FRESH rows the engine confirms with the same line, "
          << "given the other rows\n");

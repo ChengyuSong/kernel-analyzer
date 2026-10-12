@@ -990,6 +990,15 @@ cl::opt<bool> CFLConfirmInvoke(
            "census-reported for human review"),
   cl::init(false));
 
+cl::opt<bool> CFLPoolCarves(
+  "cfl-pool-carves",
+  cl::desc("--cfl-cells: each carve of a certified pool (plan 3.53 rule 3: "
+           "a bump, counter or header carve whose handle fields and chunk "
+           "bases pass the checks) is its own allocation site; the "
+           "confirmer takes carve results as fresh sources. Off: pools are "
+           "recognized and reported only"),
+  cl::init(true));
+
 cl::opt<bool> CFLConfirmFresh(
   "cfl-confirm-fresh",
   cl::desc("Body-confirm PURE-FRESH allocation wrappers (returns trace "

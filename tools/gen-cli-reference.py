@@ -31,7 +31,7 @@ GROUPS = [
         cfl-batch-workers cfl-batch-spill'''),
     ('Summaries, provers, confirmers', '''func-summaries cfl-propose-chain-summaries
         cfl-propose-solved-summaries cfl-adopt-proposed-summaries cfl-propose-noop-summaries
-        cfl-propose-atom-summaries cfl-atoms-global-stores cfl-adopt-skip cfl-confirm-fresh
+        cfl-propose-atom-summaries cfl-atoms-global-stores cfl-adopt-skip cfl-confirm-fresh cfl-pool-carves
         cfl-confirm-invoke cfl-census-invoke cfl-census-extern-bound'''),
     ('Names: field and object tables', '''cfl-regfield-apply cfl-regfield-obj
         cfl-regfield-report cfl-regfield-audit cfl-regfield-watch cfl-filter-ledger'''),

@@ -2153,6 +2153,7 @@ size_t g_sinkArenaSites = 0;
 size_t g_innerAllocSites = 0;
 size_t g_p2iNumberOnly = 0;
 size_t g_carves = 0;
+size_t g_poolCarves = 0; // carves of certified pools made allocation sites (plan 3.53 rule 3)
 size_t g_dataOnlyGeps = 0;
 size_t g_freeDropped = 0;
 static NodeIndex g_sinkArenaObj[2] = {AndersNodeFactory::InvalidIndex,
@@ -2805,6 +2806,21 @@ bool CallGraphPass::runOnFunction(Function *F) {
 }
 
 // Implementation of InstHandler visitor methods
+void CallGraphPass::InstHandler::visit(Instruction &I) {
+  if (CGP.poolCarves.empty() || !CGP.poolCarves.count(&I)) {
+    InstVisitor<InstHandler>::visit(I);
+    return;
+  }
+  // A carve of a certified pool (plan 3.53 rule 3): a fresh object; the
+  // chunk pointer it was computed from does not flow into it.
+  NodeIndex valNode = CGP.getRepNodeForValue(&I);
+  if (valNode == AndersNodeFactory::InvalidIndex)
+    valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
+  CGP.AllocSites.insert(valNode);
+  CGP.Graph.addDeref(valNode, CGP.NF.createOpaqueObjectNode(&I, true));
+  g_poolCarves++;
+}
+
 void CallGraphPass::InstHandler::visitReturnInst(ReturnInst &I) {
   if (I.getNumOperands() > 0) {
     Value *rv = I.getOperand(0);

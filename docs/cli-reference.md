@@ -1,6 +1,6 @@
 # KAMain and KABaseline command-line reference
 
-Generated 2026-10-11 by `tools/gen-cli-reference.py` from the
+Generated 2026-10-12 by `tools/gen-cli-reference.py` from the
 `cl::opt` definitions (`src/lib/Flags.cc` for options both binaries share,
 `src/baseline/BaselineMain.cc` for the baseline's own). The descriptions in
 the code are the source of truth; the grouping is the flag census of
@@ -111,6 +111,7 @@ Removed options are errors that name their replacement; the list is in
 - **`--cfl-atoms-global-stores`** (default `false`): Allow generated atoms with GLOBAL deref targets (ST/MV*(*@g<-...)). QUARANTINED default-off: at 5.18 one such adoption welded the target global's cell cluster into the pool (+27k pairs); mechanism unpinned. Read-side @g atoms (ALIAS/LD) are unaffected
 - **`--cfl-adopt-skip`** (default `""`): Comma-separated fn names excluded from per-run summary adoption (attribution bisection tool)
 - **`--cfl-confirm-fresh`** (default `true`): Body-confirm PURE-FRESH allocation wrappers (returns trace only to fresh sources, no escapes, no pointer side effects) and promote them to allocator status, to fixpoint over wrapper chains — per-callsite object identities for their callers (task #17). Rejections tallied by reason
+- **`--cfl-pool-carves`** (default `true`): --cfl-cells: each carve of a certified pool (plan 3.53 rule 3: a bump, counter or header carve whose handle fields and chunk bases pass the checks) is its own allocation site; the confirmer takes carve results as fresh sources. Off: pools are recognized and reported only
 - **`--cfl-confirm-invoke`** (default `false`): Auto-confirm INVOKE pair summaries where the proof is local (task #28 tier 2): DIRECT synchronous invocation of a fn formal, and PASSTHRU forwarding into already-summarized INVOKE callees (wrapper-chain fixpoint) — both under the completeness discipline (every pointer formal accounted or reject to LEDGER). Deferred FIELD/COSTORE shapes stay census-reported for human review
 - **`--cfl-census-invoke`** (default `false`): MEASUREMENT-ONLY census: scan defined functions for the (fn,data) registration shapes behind the INVOKE summary atom (fptr formal invoked with another formal; formal stored into another formal's field; formals co-stored into one object), then rank candidates by constant-Function evidence at their direct callsites. Emits proposal lines for review; adds no edges
 - **`--cfl-census-extern-bound`** (default `false`): MEASUREMENT-ONLY census (task #45): rank called-but-never-defined functions (asm-defined symbols, firmware stubs) by pointer args / fn-ptr args / pointer returns — the summary-writing worklist for the extern boundary; sum=1 marks names the --func-summaries file already covers. Adds no edges

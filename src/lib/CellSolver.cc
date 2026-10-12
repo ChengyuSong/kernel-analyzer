@@ -6330,6 +6330,7 @@ bool CallGraphPass::runCellResolution() {
          << " loads of integer names (no facts; " << g_counterRetired << " counters); "
          << g_vaMachineryLoads << " va_list bookkeeping loads (no vararg edges); " << g_carves
          << " carved regions (one past an array, used as another type; see CARVE lines); "
+         << g_poolCarves << " pool carves (allocation sites; see PoolCarve lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   if (!taggedPairs.empty())
     CG_LOG("Cells: tagged fields (plan 3.51): " << taggedPairs.size() << " keyed pairs, "

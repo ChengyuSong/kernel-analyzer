@@ -1012,3 +1012,128 @@ in unreachable. Examples: bpf_error, png_error, __assert_fail.
 - **Rows removed:** the redundancy report then confirms sqlite3PageMalloc,
   png_malloc and png_malloc_array with the same line, checked as a set,
   so their hand rows are removed.
+
+Recursive wrappers (plan 3.53 rule 3, Fable 2026-10-12). A candidate on a
+cycle of direct calls among unconfirmed pointer-returning functions is
+judged at the greatest fixpoint. The candidate set is assumed fresh: a
+call into it is a fresh source. Candidates that fail R1 to R3 under that
+assumption are removed, and this repeats until the set is stable. The
+survivors are promoted (`_objalloc_alloc`, which returns its own
+recursive call or a carve). A recursive hand row is checked the same
+way in the redundancy report, with its own calls assumed fresh.
+- **Statement:** a survivor's result is fresh, by induction on call
+  depth. At depth 0 every return is null or a fresh source outside the
+  set. At depth n + 1 a call into the set returns, by the hypothesis, a
+  fresh object at depth n. A call that does not terminate returns
+  nothing.
+
+## Pool carves (Carves.cc checkPoolCarves, --cfl-pool-carves, 2026-10-12, plan 3.53 rule 3)
+
+**Invariant.** At a carve, every byte at or above the cursor has been
+unwritten since the chunk's refill (a rewind is FREE). So the carved
+region has no content to lose when it becomes a fresh object. What makes
+this hold:
+- a single cursor that only moves forward;
+- no second route into the chunk: the chunk-base check, and no taken
+  field addresses;
+- rule (a), for a carve result's own overrun.
+
+A pool bumps a pointer through the free space of a chunk it allocated
+and hands out the pieces. Without carves every piece is the chunk object
+(one origin for every bfd_alloc). With them, each carve site of a
+certified pool is its own allocation site: the carve result is a fresh
+object, and the flow from the chunk pointer into it is cut. Each object
+is laid out by its first typed use (rule 1).
+
+**Forms.**
+- Before-bump: `p = load H; store H, p + n`; the result is p.
+- Minus-len: `store H, (load H) + n`; the result is `(load H) - n`.
+- Counter: `store C, C - n`; the result is `(load M) + C`. M and C are
+  fields of one struct.
+- Header: `c = malloc(HDR + n)`, with c stored into a chunk field; the
+  result is `c + HDR`, the n bytes past the header. The header fields are
+  ordinary cells of the malloc object.
+
+**Pool fields.** A bumped field H (or counter base M) is a pool field
+only when an allocation refills it somewhere. A bumped field that is
+never refilled is a cursor over data. It keeps today's flow and is
+counted.
+
+**Checks.** The hypothesis of carve-as-fresh is that a chunk's carved
+contents are reached only through carve results. Two static checks
+establish it:
+- **Handle fields.** These are the pool fields plus every field a chunk
+  pointer is stored into (closure). Every load of a handle field is used
+  only by:
+  - the forms;
+  - stores into handle fields;
+  - icmp, ptrtoint, pointer difference;
+  - free, memset.
+
+  The chunk's free-space start (`chunk + HDR` stored into H) and -O3's
+  joins of a reload of H with a refill's free space are the H route,
+  covered by this check.
+- **Chunk bases.** An allocation stored into a handle field is accessed
+  only:
+  - at its header fields;
+  - by stores into handle fields;
+  - by free, compares, memset;
+  - by the carve.
+
+  A GEP at or past the header that is not the carve refuses the pool.
+
+- **One forward cursor.** A pool hands each piece out once, so:
+  - a pool has one bump or counter field;
+  - that field only moves forward.
+
+  A cursor that also moves back (`top - 1` stored) is a stack, and two
+  cursors through one chunk are a queue. Both read back what they handed
+  out (libyaml's token queue and state stacks, refused). A handle field
+  that receives a pointer into the free space (a saved cursor, a queue's
+  tail) is read as a free-space pointer, not a chunk start.
+- **No field addresses taken.** A handle field whose address is taken
+  (`&q->tail` passed to an extend function, a memset over the struct) is
+  written where the checks do not look, and that refuses the pool.
+
+Any other use refuses the pool, and the refusal is printed with its
+site. Fields are keyed by debug-info struct identity (IR-merged structs
+stay apart), with the IR type as the counted fallback.
+
+**Three hypotheses under rule (a)** (no forged pointers), not checked:
+- **The pool's own arithmetic is exempt.** `R = load H - n` and
+  `M + C` compute a pointer into the chunk from a field value. They are
+  forged pointers in the sense of rule (a), admitted only as the
+  recognized forms.
+- **A field at offset 0 is accessed by its type.** Its address is the
+  struct's address. Passing the struct (`objalloc_alloc(o, n)`) is not a
+  taken field address, so a callee is assumed to reach the field through
+  a typed access the checks see.
+- **A rewound value is a carve result of the same pool.** A store into a
+  bump field whose value is a formal, or a join of handle values with a
+  formal (objalloc_free_block's `o->current_ptr = b`), is a rewind with
+  FREE semantics: the pieces after it are dead. The static check cannot
+  see across callers that b came from this pool.
+
+**Statement.** In a pool that passes both checks, under the two
+hypotheses, the carved bytes `[R, R + n)` are reached only through R and
+pointers derived from R. A carve object therefore loses no flow:
+- the handle fields carry no pointer into program data, since their
+  loads have no data use;
+- a chunk base reaches the free space only through the carve forms;
+- the bump makes the pieces of one chunk pairwise disjoint until a
+  rewind.
+
+**Temporal abstraction.** Rewind as FREE is the abstraction of malloc
+after free: memory handed out again is a new object, and content
+written through an older carve is not read through the new one. The
+analysis is not temporal. The assumption is the one recorded for
+lookaside and objalloc reuse in func_summaries.txt.
+
+**Confirmer.** A carve result is a fresh source for R1. The certified
+pools' bookkeeping (handle-field stores, the bump, rewinds, ptrtoint of
+handles) is exempt from R2 and R3, because it is the pool's own state
+that the checks cover. bfd_alloc and bfd_hash_allocate are then
+confirmed, and so is _objalloc_alloc (greatest fixpoint); their hand
+rows are removed.
+
+Not mechanized. Checked by executions; see the rule 3 commit's gates.

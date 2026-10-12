@@ -23,8 +23,15 @@
 //   chunk bases: an allocation stored into a handle field is accessed
 //     only below its header (the header's own fields), and the only GEP
 //     at or past the header is the header carve.
-// A use outside these refuses the pool, printed with its site. This file
-// recognizes and reports (--verbose=2); the effect is not on yet.
+// A pool has one cursor (bump or counter field) and it only moves forward:
+// a cursor that moves back is a stack, two cursors through one chunk are a
+// queue, and both read back what they handed out. A handle field whose
+// address is taken is written where the checks do not look. A use outside
+// these refuses the pool, printed with its site. Reported
+// at --verbose=2. With --cfl-pool-carves the carves of certified pools
+// become allocation sites (GraphBuild) and fresh sources for the wrapper
+// confirmer, whose R2/R3 exempt the pools' bookkeeping (GAPS.md, "Pool
+// carves").
 
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
@@ -184,7 +191,29 @@ void CallGraphPass::checkPoolCarves() {
     return false;
   };
 
+  // Does GEP G step back (a negative constant, or the negation of a
+  // length: `p - n`)?
+  auto stepsBack = [](const GEPOperator *G) {
+    for (const Use &Ix : G->indices()) {
+      const Value *X = peelInt(Ix.get());
+      if (const auto *C = dyn_cast<ConstantInt>(X); C && C->isNegative()) return true;
+      if (const auto *BO = dyn_cast<BinaryOperator>(X)) {
+        const auto *Z = dyn_cast<ConstantInt>(BO->getOperand(0));
+        const auto *M = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (BO->getOpcode() == Instruction::Sub && Z && Z->isZero()) return true;
+        if (BO->getOpcode() == Instruction::Mul && M && M->isMinusOne()) return true;
+      }
+    }
+    return false;
+  };
+
   std::set<std::string> handleFields, bumpFields, baseFields; // baseFields: counter carves' M
+  // Bumped fields that also move back (`top - 1` stored: a stack, which
+  // reads back what it handed out).
+  std::map<std::string, const Instruction *> backward;
+  // Handle fields that receive pointers into the free space (saved
+  // cursors, a queue's tail): their loads are free-space pointers (B).
+  std::set<std::string> interior;
   // A pool's bump or base field is refilled with an allocation (a chunk)
   // somewhere; a bumped field never refilled is a cursor over data.
   std::set<std::string> refilled;
@@ -209,6 +238,9 @@ void CallGraphPass::checkPoolCarves() {
   std::vector<Carve> carves;
   std::vector<Refusal> refusals;
   std::vector<std::pair<const Instruction *, std::string>> rewinds;
+  // The pools' own bookkeeping: stores into handle fields, rewinds,
+  // pointer arithmetic on handles (with a field of their pool).
+  std::vector<std::pair<const Instruction *, std::string>> bookkeeping;
 
   // Bumps and counter decrements, per function; counter carves name M.
   std::map<const Function *, std::set<std::string>> bumpIn, counterIn;
@@ -225,8 +257,12 @@ void CallGraphPass::checkPoolCarves() {
         if (V->getType()->isPointerTy()) {
           const auto *G = dyn_cast<GEPOperator>(V->stripPointerCasts());
           if (G && !G->hasAllZeroIndices() && loadsField(G->getPointerOperand(), k, 0)) {
-            bumpIn[&F].insert(k);
-            bumpFields.insert(k);
+            if (stepsBack(G)) {
+              backward.emplace(k, SI);
+            } else {
+              bumpIn[&F].insert(k);
+              bumpFields.insert(k);
+            }
           }
         } else if (const auto *B = dyn_cast<BinaryOperator>(peelInt(V))) {
           // C - n, or C + (negative constant) at -O3.
@@ -296,8 +332,9 @@ void CallGraphPass::checkPoolCarves() {
 
   // To a fixpoint over the handle fields; the last round records.
   for (;;) {
-    const size_t before = handleFields.size();
+    const size_t before = handleFields.size(), beforeInterior = interior.size();
     carves.clear();
+    bookkeeping.clear();
     refusals.clear();
     rewinds.clear();
     for (auto &[M, _] : Ctx->Modules)
@@ -337,7 +374,7 @@ void CallGraphPass::checkPoolCarves() {
             const std::string k = fieldKey(L, L->getPointerOperand());
             if (handleFields.count(k)) {
               HV h;
-              h.flavor = (bumpFields.count(k) || baseFields.count(k)) ? 'B' : 'C';
+              h.flavor = (bumpFields.count(k) || baseFields.count(k) || interior.count(k)) ? 'B' : 'C';
               h.field = h.pool = k;
               if (h.flavor == 'B') bSeeds.push_back({L, h});
               else add(L, h);
@@ -398,7 +435,11 @@ void CallGraphPass::checkPoolCarves() {
             for (const User *U : V->users()) {
               const auto *UI = dyn_cast<Instruction>(U);
               if (!UI || isa<DbgInfoIntrinsic>(UI)) continue;
-              if (isa<ICmpInst>(UI) || isa<PtrToIntInst>(UI)) continue;
+              if (isa<ICmpInst>(UI)) continue;
+            if (isa<PtrToIntInst>(UI)) {
+              bookkeeping.push_back({UI, h.pool});
+              continue;
+            }
               if (const auto *S = dyn_cast<StoreInst>(UI)) {
                 if (S->getValueOperand() == V) {
                   const Value *A = S->getPointerOperand();
@@ -424,17 +465,22 @@ void CallGraphPass::checkPoolCarves() {
                     continue;
                   }
                   handleFields.insert(k);
+                  // A field that receives a pointer into the free space
+                  // holds interior pointers: its loads are not chunk starts.
+                  if (h.flavor == 'B') interior.insert(k);
                   join(h.pool, k);
                   continue;
                 }
                 // V as the address: a chunk base's header field.
                 if (h.flavor == 'C' && !fieldKey(S, S->getPointerOperand()).empty()) continue;
-                refuse(h, "written through: " + instText(S), S);
+                if (h.flavor == 'B') dataUse(V, h, S); // through the carve, or refused
+                else refuse(h, "written through: " + instText(S), S);
                 continue;
               }
               if (const auto *L = dyn_cast<LoadInst>(UI)) {
                 if (h.flavor == 'C' && !fieldKey(L, L->getPointerOperand()).empty()) continue;
-                refuse(h, "read through: " + instText(L), L);
+                if (h.flavor == 'B') dataUse(V, h, L); // through the carve, or refused
+                else refuse(h, "read through: " + instText(L), L);
                 continue;
               }
               if (const auto *CB = dyn_cast<CallBase>(UI)) {
@@ -454,12 +500,18 @@ void CallGraphPass::checkPoolCarves() {
                     add(G, h);
                     continue;
                   }
-                  // A carve unless its only uses compare (bounds: p + space).
+                  // Bounds (`p + space` compared) carry nothing.
                   bool cmpOnly = true;
                   for (const User *GU : G->users())
                     cmpOnly &= isa<ICmpInst>(GU) || isa<PtrToIntInst>(GU) || isa<DbgInfoIntrinsic>(GU);
                   if (cmpOnly) continue;
-                  dataUse(G, h, G);
+                  // The carve is this GEP in the minus-len and counter
+                  // forms; any other GEP uses V, which is the carve
+                  // (before-bump) or refused.
+                  if (stepsBack(cast<GEPOperator>(G)) || !counterCarve(cast<GEPOperator>(G), &F).empty())
+                    dataUse(G, h, G);
+                  else
+                    dataUse(V, h, G);
                   continue;
                 }
                 // A chunk base: a header field access (a struct GEP) stays a
@@ -486,6 +538,17 @@ void CallGraphPass::checkPoolCarves() {
                 continue;
               }
               if (isa<PHINode>(UI) || isa<SelectInst>(UI)) {
+                // A join used only by compares and pointer differences
+                // carries no pointer (objalloc_free_block: the saved
+                // pointer or the freed block, subtracted).
+                bool arith = true;
+                for (const User *JU : UI->users())
+                  arith &= isa<ICmpInst>(JU) || isa<PtrToIntInst>(JU) || isa<DbgInfoIntrinsic>(JU);
+                if (arith) {
+                  for (const User *JU : UI->users())
+                    if (isa<PtrToIntInst>(JU)) bookkeeping.push_back({cast<Instruction>(JU), h.pool});
+                  continue;
+                }
                 // A chunk base joins others (checked below, once all are known).
                 if (h.flavor == 'C') {
                   add(UI, h);
@@ -535,7 +598,10 @@ void CallGraphPass::checkPoolCarves() {
             if (RS) rs.push_back(RS);
           }
           if (rewind) {
-            for (const StoreInst *RS : rs) rewinds.push_back({RS, fieldKey(RS, RS->getPointerOperand())});
+            for (const StoreInst *RS : rs) {
+              rewinds.push_back({RS, fieldKey(RS, RS->getPointerOperand())});
+              bookkeeping.push_back({RS, fieldKey(RS, RS->getPointerOperand())});
+            }
             continue;
           }
           refuse(h, "a chunk base joined with data: " + instText(I), I);
@@ -545,11 +611,27 @@ void CallGraphPass::checkPoolCarves() {
           const auto *S = dyn_cast<StoreInst>(&I);
           if (!S || !S->getValueOperand()->getType()->isPointerTy()) continue;
           const std::string k = fieldKey(S, S->getPointerOperand());
-          if (!handleFields.count(k) || isHandle(S->getValueOperand())) continue;
+          if (!handleFields.count(k)) continue;
+          if (isHandle(S->getValueOperand())) {
+            bookkeeping.push_back({S, k});
+            continue;
+          }
           bool carved = false;
           for (const Carve &c : carves) carved |= c.I == S->getValueOperand()->stripPointerCasts();
+          // The bump after a carve (a new chunk's first piece + n): the
+          // pool's free space, its own state.
+          if (const auto *BG = dyn_cast<GEPOperator>(S->getValueOperand()->stripPointerCasts());
+              BG && bumpFields.count(k)) {
+            bool ofCarve = false;
+            for (const Carve &c : carves) ofCarve |= c.I == BG->getPointerOperand()->stripPointerCasts();
+            if (ofCarve) {
+              bookkeeping.push_back({S, k});
+              continue;
+            }
+          }
           if (bumpFields.count(k) && !carved && fromFormal(S->getValueOperand(), 0)) {
             rewinds.push_back({S, k});
+            bookkeeping.push_back({S, k});
           } else if (!carved) {
             HV h;
             h.field = k;
@@ -557,7 +639,7 @@ void CallGraphPass::checkPoolCarves() {
           }
         }
       }
-    if (handleFields.size() == before) break;
+    if (handleFields.size() == before && interior.size() == beforeInterior) break;
     for (const std::string &f : handleFields) parent.emplace(f, f);
   }
 
@@ -573,6 +655,58 @@ void CallGraphPass::checkPoolCarves() {
   std::map<std::string, std::vector<const Refusal *>> refused;
   for (const Refusal &r : refusals)
     refused[handleFields.count(r.field) ? pool(r.field) : r.field].push_back(&r);
+  // A handle field whose address is taken (`&q->tail` passed to an
+  // extend function) is written where the checks do not look.
+  std::map<std::string, std::string> addrTaken;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      if (!F.isDeclaration())
+        for (const Instruction &I : instructions(F)) {
+          const auto *G = dyn_cast<GetElementPtrInst>(&I);
+          // A field's address indexes into the struct; an all-zero GEP is
+          // the struct's own address (the field at offset 0, its uses are
+          // the struct pointer's), and one index is element arithmetic
+          // (`(char *)p + CHUNK_SIZE` as p + 254).
+          if (!G || G->hasAllZeroIndices() || G->getNumIndices() < 2) continue;
+          const std::string k = fieldKey(G, G);
+          if (k.empty() || !handleFields.count(k) || addrTaken.count(pool(k))) continue;
+          std::function<const User *(const Value *, int)> badUse = [&](const Value *V, int d) -> const User * {
+            for (const User *U : V->users()) {
+              if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == V) continue;
+              if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == V && S->getValueOperand() != V)
+                continue;
+              if (isa<DbgInfoIntrinsic>(U)) continue;
+              if (isa<BitCastInst>(U) && d < 4) {
+                if (const User *B = badUse(U, d + 1)) return B;
+                continue;
+              }
+              return U;
+            }
+            return nullptr;
+          };
+          if (const User *U = badUse(G, 0))
+            addrTaken[pool(k)] = "the address of " + k + " is taken at " + instLocStr(G) + ": " +
+                                 (isa<Instruction>(U) ? instText(cast<Instruction>(U)) : std::string("a constant"));
+        }
+  // Structural refusals: a pool hands each piece out once, through one
+  // cursor that only moves forward. A cursor that also moves back is a
+  // stack, and two cursors through one chunk are a queue: both read back
+  // what they handed out.
+  std::map<std::string, std::string> structural;
+  std::map<std::string, std::set<std::string>> cursorsOf;
+  for (const std::string &f : handleFields)
+    if (bumpFields.count(f) || baseFields.count(f)) cursorsOf[pool(f)].insert(f);
+  for (auto &[p, cs] : cursorsOf)
+    if (cs.size() > 1) {
+      std::string l;
+      for (const std::string &c : cs) l += " " + c;
+      structural[p] = "two cursors through one chunk (a queue):" + l;
+    }
+  for (auto &[k, SI] : backward)
+    if (handleFields.count(k))
+      structural[pool(k)] = "the cursor " + k + " moves back (a stack) at " + instLocStr(SI) + ": " + instText(SI);
+  for (auto &[p, why] : addrTaken) structural.emplace(p, why);
+  auto isRefused = [&](const std::string &p) { return refused.count(p) || structural.count(p); };
   size_t nRefused = 0, nPools = 0;
   for (auto &[p, fs] : fields) {
     nPools++;
@@ -582,11 +716,13 @@ void CallGraphPass::checkPoolCarves() {
     size_t rw = 0;
     for (auto &[_, f] : rewinds) rw += pool(f) == p;
     auto rit = refused.find(p);
-    if (rit != refused.end()) nRefused++;
-    CG_LOG("PoolCarve: " << (rit == refused.end() ? "POOL" : "REFUSED") << " fields" << fl
+    if (isRefused(p)) nRefused++;
+    CG_LOG("PoolCarve: " << (isRefused(p) ? "REFUSED" : "POOL") << " fields" << fl
            << "; carves" << (fm.empty() ? " none" : fm) << "; rewinds " << rw
            << (rit == refused.end() ? "" : "; refused by " + std::to_string(rit->second.size()) + " uses")
            << "\n");
+    if (auto sit = structural.find(p); sit != structural.end())
+      CG_LOG("PoolCarve:   refused: " << sit->second << "\n");
     for (const Instruction *I : headerCarves[p])
       CG_LOG("PoolCarve:   header carve " << instLocStr(I) << ": " << instText(I) << "\n");
     if (rit != refused.end())
@@ -598,6 +734,15 @@ void CallGraphPass::checkPoolCarves() {
   if (VerboseLevel >= 3)
     for (const Carve &c : carves)
       CG_DEBUG("PoolCarve: carve " << c.form << " " << c.field << " at " << instLocStr(c.I) << ": " << instText(c.I) << "\n");
+  // The effect: certified pools' carves and bookkeeping.
+  poolCarves.clear();
+  poolBookkeeping.clear();
+  if (CFLPoolCarves) {
+    for (const Carve &c : carves)
+      if (!isRefused(pool(c.field))) poolCarves[c.I] = c.form;
+    for (auto &[I, f] : bookkeeping)
+      if (!isRefused(pool(f))) poolBookkeeping.insert(I);
+  }
   size_t fb = 0;
   for (const std::string &f : handleFields) fb += irFallback.count(f);
   CG_LOG("PoolCarve: " << nPools << " pools (" << nRefused << " refused), " << handleFields.size()

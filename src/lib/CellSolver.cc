@@ -1923,7 +1923,7 @@ bool CallGraphPass::runCellResolution() {
   staticLabels(labels);
   const double labelSecs =
       std::chrono::duration<double>(Clock::now() - t0).count();
-  size_t heapLabeled = 0, heapUnlabeled = 0, heapConflict = 0;
+  size_t heapLabeled = 0, heapUnlabeled = 0, heapConflict = 0, heapPtrArrays = 0;
   auto newObj = [&](NodeIndex origin, const Value *V) -> uint32_t {
     Obj O;
     O.origin = origin;
@@ -1963,7 +1963,16 @@ bool CallGraphPass::runCellResolution() {
         }
         if (outer.size() == 1) lit->second = std::move(outer);
       }
-      if (lit != labels.end() && lit->second.size() == 1) {
+      if (lit != labels.end() && lit->second.size() == 1 &&
+          StringRef(*lit->second.begin()).starts_with("ptr[]:")) {
+        // The site's variable declares an array of pointer slots (T **):
+        // element = one pointer, its extent from the size below.
+        O.layout = PointerType::get(C->getContext(), 0);
+        O.repeats = true;
+        O.ident = StringRef(*lit->second.begin()).drop_front(6).str() + "[]";
+        heapLabeled++;
+        heapPtrArrays++;
+      } else if (lit != labels.end() && lit->second.size() == 1) {
         O.layout = StructType::getTypeByName(C->getContext(),
                                              *lit->second.begin());
         O.repeats = true;
@@ -6577,7 +6586,8 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: iteration " << iteration << ": " << objs.size()
          << " origins (" << funcSeeds << " function seeds, " << objSeeds
          << " objects (" << tailMinted << " trailing, " << trailingArrays << " of them arrays of unknown extent, " << tailMoved
-         << " cells moved to them); heap " << heapLabeled << " labeled (" << tailObjects
+         << " cells moved to them); heap " << heapLabeled << " labeled (" << heapPtrArrays
+         << " arrays of pointer slots, " << tailObjects
          << " header + trailing data), " << heapUnlabeled
          << " unlabeled, " << heapConflict << " with conflicting labels, "
          << heapContainerRelabeled << " relabeled to the container their size names, "

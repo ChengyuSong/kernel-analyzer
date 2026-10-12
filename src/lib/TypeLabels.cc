@@ -166,6 +166,28 @@ void CallGraphPass::labelAllocationSites(
     llvm::StructType *S = llvm::StructType::getTypeByName(M->getContext(), "struct." + N.str());
     return S && namedStruct(S) ? structKey(S) : "";
   };
+  // A variable of debug type T** (void **, char **): an array of pointer
+  // slots; the declared pointee's name for the reports ("" otherwise).
+  auto diPtrArray = [](const DIType *T) -> std::string {
+    auto strip = [](const DIType *X) {
+      for (int i = 0; i < 16 && X; i++) {
+        const auto *D = dyn_cast<DIDerivedType>(X);
+        if (!D) break;
+        const auto tag = D->getTag();
+        if (tag != dwarf::DW_TAG_typedef && tag != dwarf::DW_TAG_const_type &&
+            tag != dwarf::DW_TAG_volatile_type && tag != dwarf::DW_TAG_restrict_type)
+          break;
+        X = D->getBaseType();
+      }
+      return X;
+    };
+    const auto *P = dyn_cast_or_null<DIDerivedType>(strip(T));
+    if (!P || P->getTag() != dwarf::DW_TAG_pointer_type) return "";
+    const auto *Q = dyn_cast_or_null<DIDerivedType>(strip(P->getBaseType()));
+    if (!Q || Q->getTag() != dwarf::DW_TAG_pointer_type) return "";
+    const DIType *E = strip(Q->getBaseType());
+    return (E && !E->getName().empty() ? E->getName().str() : std::string("void")) + " *";
+  };
   auto labelSite = [&](const CallBase *C) {
     AllocSiteLabel L;
     const DataLayout &DL = C->getModule()->getDataLayout();
@@ -175,19 +197,25 @@ void CallGraphPass::labelAllocationSites(
     {
       SmallVector<DbgValueInst *, 2> DVs;
       findDbgValues(DVs, const_cast<CallBase *>(C));
-      for (DbgValueInst *DV : DVs)
+      for (DbgValueInst *DV : DVs) {
         if (L.siteDeclared.empty())
           L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
+        if (L.sitePtrArray.empty())
+          L.sitePtrArray = diPtrArray(DV->getVariable()->getType());
+      }
       SmallVector<const Value *, 4> vs{C};
-      for (size_t i = 0; i < vs.size() && L.siteDeclared.empty() && i < 8; i++)
+      for (size_t i = 0; i < vs.size() && L.siteDeclared.empty() && L.sitePtrArray.empty() && i < 8; i++)
         for (const User *U : vs[i]->users()) {
           if (isa<CastInst>(U)) { vs.push_back(U); continue; }
           const auto *SI = dyn_cast<StoreInst>(U);
           if (!SI || SI->getValueOperand() != vs[i]) continue;
           if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
-            for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+            for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI))) {
               if (L.siteDeclared.empty())
                 L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
+              if (L.sitePtrArray.empty())
+                L.sitePtrArray = diPtrArray(DDI->getVariable()->getType());
+            }
         }
     }
     std::vector<std::pair<const Value *, int64_t>> work{{C, 0}};
@@ -337,6 +365,12 @@ void CallGraphPass::staticLabels(
       // typed writes, then a declared struct found along the result.
       if (!SL.siteDeclared.empty()) {
         L.insert(SL.siteDeclared);
+        continue;
+      }
+      // An array of pointer slots, its declared pointee named after the
+      // marker (the cell solver lays it out as ptr elements).
+      if (!SL.sitePtrArray.empty()) {
+        L.insert("ptr[]:" + SL.sitePtrArray);
         continue;
       }
       L.insert(SL.types.begin(), SL.types.end());

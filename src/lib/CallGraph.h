@@ -269,6 +269,7 @@ protected:
     std::set<std::string> types; // outermost struct of typed writes at offset 0
     std::string declared;        // the struct its debug-info variable declares
     std::string siteDeclared;    // the struct the receiving variable points to (debug info)
+    std::string sitePtrArray;    // T** receiver: an array of pointer slots ("alent *")
     bool scalarUse = false;      // accessed as scalars/arrays (a buffer)
   };
   void labelAllocationSites(

@@ -683,7 +683,10 @@ bool headerPlusTail(const CallBase *C, uint64_t sz) {
     bool header = false, other = false;
     for (const Value *T : terms) {
       const auto *K = dyn_cast<ConstantInt>(T);
-      if (K && K->getZExtValue() >= sz) header = true;
+      // A constant term is a header size only when it is positive: the -O3
+      // sum `nsymz * 16 + (len - 8 * nsymz - 8) + 1` carries -8, which read
+      // unsigned (2^64 - 8) was "a header" at every offset.
+      if (K && !K->isNegative() && K->getZExtValue() >= sz) header = true;
       else if (!multipleOf(T)) other = true;
     }
     if (header && other) return true;

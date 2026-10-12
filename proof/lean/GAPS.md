@@ -883,7 +883,10 @@ changes:
   - a multiple of sizeof T: an array of T;
   - exactly sizeof T: one T;
   - T plus trailing data, or a size that says nothing: one T followed by
-    an unknown trailing object.
+    an unknown trailing object. "T plus data" needs a positive constant
+    term of at least sizeof T. A negative term (-O3 folds `len - 8*n - 8
+    + 1` into a sum carrying -8) is no header size, so such a size says
+    nothing.
   A T-typed index (a variable index or walk whose GEP steps over elements
   of T; a stride that only equals sizeof T is no evidence) on the latter
   makes it an array of T (`extendToArray`). Any other variable index from

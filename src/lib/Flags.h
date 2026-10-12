@@ -130,6 +130,7 @@ extern cl::opt<bool> CFLCellMergePtrs;
 extern cl::opt<bool> CFLCellOneLabel;
 extern cl::opt<unsigned> CFLCellOneLabelMax;
 extern cl::opt<unsigned> CFLCellCensusAt;
+extern cl::opt<std::string> CFLCellStopAnswers;
 extern cl::opt<std::string> CFLCellCensusFormal;
 extern cl::opt<std::string> CFLCellTraceObj;
 extern cl::opt<std::string> CFLCellWhy;

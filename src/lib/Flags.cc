@@ -1151,6 +1151,14 @@ cl::opt<bool> CFLCellMergePtrs(
            "them) become one node, at each periodic cycle collapse"),
   cl::init(false));
 
+cl::opt<std::string> CFLCellStopAnswers(
+  "cfl-cell-stop-answers",
+  cl::desc("With --cfl-cell-census-at: write the partial state at the stop "
+           "to this file (pops, cells, facts, and each indirect call's "
+           "targets at that point), the cells gate's pin for a run stopped "
+           "before its fixpoint (test/cells-gate.sh)"),
+  cl::init(""));
+
 cl::opt<unsigned> CFLCellCensusAt(
   "cfl-cell-census-at",
   cl::desc("MEASUREMENT ONLY: --cfl-cells stops propagating after this "

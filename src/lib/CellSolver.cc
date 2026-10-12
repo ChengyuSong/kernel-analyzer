@@ -5297,8 +5297,8 @@ bool CallGraphPass::runCellResolution() {
       if (!recordWhy) confluenceCensus();
       errs() << "Cells: --cfl-cell-census-at stopped the solve (measurement "
              << "only, no answers)\n";
-      if (!recordWhy) exit(0);
-      stoppedAt = pops; // the --cfl-cell-why reports run on the partial state
+      if (!recordWhy && CFLCellStopAnswers.empty()) exit(0);
+      stoppedAt = pops; // the why reports and the stop answers describe the partial state
       break;
     }
     delta.clear();
@@ -5464,6 +5464,7 @@ bool CallGraphPass::runCellResolution() {
   size_t resolved = 0, totalTargets = 0, newPairs = 0, typeRej = 0;
   const std::vector<const CallBase *> icallSnapshot(
       Ctx->IndirectCallInsts.begin(), Ctx->IndirectCallInsts.end());
+  std::vector<std::pair<const CallBase *, std::vector<std::string>>> stopAnswers;
   for (const CallBase *CS : icallSnapshot) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
     const NodeIndex fn = NF.getValueNodeFor(fptr);
@@ -5481,6 +5482,12 @@ bool CallGraphPass::runCellResolution() {
       targets.insert(F);
     });
     if (!targets.empty()) { resolved++; totalTargets += targets.size(); }
+    if (stoppedAt && !CFLCellStopAnswers.empty()) {
+      std::vector<std::string> names;
+      for (const Function *F : targets) names.push_back(F->getName().str());
+      std::sort(names.begin(), names.end());
+      stopAnswers.push_back({CS, std::move(names)});
+    }
     for (const Function *F : targets)
       if (wireResolvedCallee(CS, F)) newPairs++;
   }
@@ -7188,6 +7195,30 @@ bool CallGraphPass::runCellResolution() {
     RO << "\n== varargs keyed by format specifier (plan 3.47)\n";
     for (const std::string &d : varargReport) RO << "V " << d << "\n";
     CG_LOG("Cells: rule report written to " << CFLRuleReport << "\n");
+  }
+  if (stoppedAt && !CFLCellStopAnswers.empty()) {
+    // The partial state at the stop, one line per indirect call (its
+    // function, location and ordinal there), sorted: the cells gate pins it.
+    std::error_code EC;
+    raw_fd_ostream SO(CFLCellStopAnswers, EC, sys::fs::OF_Text);
+    if (EC) {
+      errs() << "FATAL: cannot write " << CFLCellStopAnswers << ": " << EC.message() << "\n";
+      exit(1);
+    }
+    SO << "STOP pops " << stoppedAt << " cells " << cells.size() << " facts " << factMass << "\n";
+    std::vector<std::string> lines;
+    for (auto &[CS, names] : stopAnswers) {
+      unsigned pos = 0; // the call's position in its function
+      for (const Instruction &I : instructions(*CS->getFunction())) {
+        if (&I == CS) break;
+        pos++;
+      }
+      std::string l = CS->getFunction()->getName().str() + " " + instLoc(CS) + " #" + std::to_string(pos) + ":";
+      for (const std::string &n : names) l += " " + n;
+      lines.push_back(l);
+    }
+    std::sort(lines.begin(), lines.end());
+    for (const std::string &l : lines) SO << l << "\n";
   }
   if (stoppedAt) {
     errs() << "Cells: stopped at " << stoppedAt << " pops (--cfl-cell-census-at); "

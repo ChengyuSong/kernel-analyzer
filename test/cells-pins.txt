@@ -1,0 +1,9 @@
+libpng pairs 9 sha256 b558679a33af5ad1
+cjpeg-O0 pairs 544 sha256 22ebeab67d89d47c
+djpeg-O0 pairs 859 sha256 a2b8babd4508f39a
+cjpeg-O3 pairs 531 sha256 354fcd4f613335c8
+djpeg-O3 pairs 821 sha256 3eadc937257cfeb2
+httpd pairs 468 sha256 e2a9a3f5a67355c8
+tcpdump pairs 6267 sha256 a9267114c2399339
+nm-O0 pops 199999 cells 10814 facts 6584584 sha256 0df93e910ecf6d52
+nm-O3 pops 199999 cells 123275 facts 903672 sha256 aeabcabf8d8859fc

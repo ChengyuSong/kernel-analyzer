@@ -997,7 +997,7 @@ cl::opt<bool> CFLConfirmFresh(
            "and promote them to allocator status, to fixpoint over "
            "wrapper chains — per-callsite object identities for their "
            "callers (task #17). Rejections tallied by reason"),
-  cl::init(false));
+  cl::init(true));
 
 cl::opt<std::string> CFLAblateMints(
   "cfl-ablate-mints",

@@ -22,6 +22,10 @@ static std::map<std::string, size_t> g_escapeCallees;
 void CallGraphPass::confirmFreshWrappers() {
   static GlobalContext::FuncSummary pureFresh; // stable address for the map
   pureFresh.fresh = true;
+  // A promoted wrapper keeps its body (BODY): its own calls stay in the
+  // call graph (png_create_info_struct's memset) and its icalls resolve;
+  // the call site's result is still the fresh per-site object.
+  pureFresh.body = true;
   auto isNoopIntrinsic = [](const Function *IF) {
     if (!IF->isIntrinsic()) return false;
     StringRef n = IF->getName();
@@ -723,6 +727,7 @@ void CallGraphPass::confirmFreshWrappers() {
           Ctx->OwnedSummaries.emplace_back();
           GlobalContext::FuncSummary &S = Ctx->OwnedSummaries.back();
           S.fresh = true;
+          S.body = true;
           std::sort(initArgs.begin(), initArgs.end());
           initArgs.erase(std::unique(initArgs.begin(), initArgs.end()),
                          initArgs.end());
@@ -783,6 +788,7 @@ void CallGraphPass::confirmFreshWrappers() {
           std::string ln = F.getName().str() + " FRESH";
           for (int an : initArgs) ln += " ST(*ret<-arg" + std::to_string(an) + ")";
           for (int cj : cpyArgs) ln += " CPY(ret<-arg" + std::to_string(cj) + ")";
+          ln += " BODY";
           if (selfStore) ln += " # +self-store";
           if (subAllocs) ln += " # +" + std::to_string(subAllocs) + " sub-alloc";
           CG_LOG("ConfirmFresh: LINE " << ln << "\n");

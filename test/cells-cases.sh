@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cell-solver regression cases (test/t_pool_*.c, plan 3.53): each read
+# Cell-solver regression cases (test/t_pool_*.c, test/t_cells_*.c, plan 3.53): each read
 # marked "// CHECK: f g ..." must resolve to at least those targets under
 # --cfl-cells; "// CFLAGS:" sets the compile flags (default -O0 -g);
 # "// MAXCELLS: N" bounds the cells of the first solve (a runaway is a
@@ -14,7 +14,7 @@ CLANG=${CLANG:-/usr/lib/llvm-18/bin/clang}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 fail=0
-for c in t_pool_*.c; do
+for c in t_pool_*.c t_cells_*.c; do
   n=${c%.c}
   flags=$(grep -o "// CFLAGS: .*" "$c" | sed 's|// CFLAGS: ||')
   [ -z "$flags" ] && flags="-O0"

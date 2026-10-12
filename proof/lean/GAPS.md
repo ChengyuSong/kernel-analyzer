@@ -891,7 +891,21 @@ changes:
   of T; a stride that only equals sizeof T is no evidence) on the latter
   makes it an array of T (`extendToArray`). Any other variable index from
   the T, or one whose extension is refused, also reaches the trailing
-  data's any-offset cell: the T is not known to be an array of one. The trailing object's cells merge into
+  data's any-offset cell: the T is not known to be an array of one. This
+  holds for a sized "T plus data" as for a size that says nothing. The
+  link was for the unsized case only, and that was the hole:
+  `s[argc - 1].fn()` on a sized carsym block resolved nothing.
+  - **Implicit array.** Under a variable index, a T that is not an array
+    is read as an implicit array: the result is a folded address over the
+    header's fields plus the data's any-offset cell. An element step
+    after it (extent sizeof T: `p[i - 1]` as a second GEP) stays in the
+    element instead of leaving the T. This is the sound
+    over-approximation when the extension is refused. The link and the
+    step apply to the composed offset, not only to the GEP that carries
+    the variable.
+  - **Cases.** test/t_cells_backstep.c (a T walked by `p++`, whose
+    trailing object has T's period, so the extension is refused) and
+    test/t_cells_backstep2.c (the data holds another struct). The trailing object's cells merge into
   the header's element at offset + sizeof T modulo sizeof T. Its address
   facts move there, it forwards to the header from then on, and its
   any-offset cell is linked both ways to the header's. A trailing object

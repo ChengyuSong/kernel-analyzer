@@ -2161,7 +2161,10 @@ bool CallGraphPass::runCellResolution() {
     // evidence, or the extension refused): a variable index from the T may
     // reach that data, so it reaches the data's any-offset cell too (the
     // T alone is not known to be an array of one).
-    if (objs[o].tailUnsized && objs[o].tail && !objs[o].repeats) {
+    // The same for a T plus data whose size said so (the extension
+    // refused): the index may still run past the T.
+    const bool tailIndex = objs[o].tail && !objs[o].repeats;
+    if (tailIndex) {
       tailIndexAny++;
       out.push_back(anyOf(tailOf(o)));
     }
@@ -2175,7 +2178,10 @@ bool CallGraphPass::runCellResolution() {
       // in it), an array of one: the index stays (counted: undefined
       // behavior past element 0).
       if (!O.repeats) indexOutsideArray++;
-      out.push_back(cellAt(o, pos));
+      // A T followed by data: the index is some element, an address of
+      // the implicit array (folded), so a constant step after it (`p[i -
+      // 1]`) stays in the element instead of leaving the T.
+      out.push_back(tailIndex ? cellAtArr(o, pos) : cellAt(o, pos));
       return;
     }
     if (s % e == 0) { out.push_back(folded(o, pos)); return; }
@@ -2272,12 +2278,15 @@ bool CallGraphPass::runCellResolution() {
         // field of the struct a pointer is cast to as an index over the
         // pointer's own type (`gep sqlite3_vtab, %p, 20` for a field of
         // Fts3Table). Byte offsets (gep i8) and member steps move.
+        // A folded address of a T followed by data came from a variable
+        // index over T: an element of the implicit array of T.
+        const bool tailElem = O.tail && (eoff & kFoldedBit) && O.size == (int64_t)L.extent;
         const bool inArray =
-            (O.repeats && O.size == (int64_t)L.extent) ||
+            (O.repeats && O.size == (int64_t)L.extent) || tailElem ||
             inArrayOfSize(O.layout, ((C.off % O.size) + O.size) % O.size,
                           (int64_t)L.extent, DL);
         const bool index = L.arith && L.extent > 1 && L.off % L.extent == 0 &&
-                           !O.tail && // &p[1] of a header block: its trailing data
+                           (!O.tail || tailElem) && // &p[1] of a header block: its trailing data
                            inArray;
         if (L.arith && L.extent > 1 && L.off % L.extent == 0 && !O.tail && !inArray &&
             L.off != 0)
@@ -2322,7 +2331,7 @@ bool CallGraphPass::runCellResolution() {
           }
         }
         for (int64_t a : actual)
-          res.push_back(index ? cellAt(C.obj, a)
+          res.push_back(index ? (tailElem ? cellAtArr(C.obj, a) : cellAt(C.obj, a))
                         : L.ty && L.written ? cellAtArr(C.obj, a + L.off) // into an array member as such
                                : cellAt(C.obj, a + L.off));
         break;

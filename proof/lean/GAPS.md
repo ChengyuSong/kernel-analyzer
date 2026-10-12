@@ -951,3 +951,47 @@ Not mechanized. Checked by executions:
 - test/tagged-gaps.sh (the waiting keyed access restores
   t_tagged_both/compose/fnptr, whose reads stepped before the writers
   labeled the object).
+
+## Confirmed fresh wrappers (Summaries confirmFreshWrappers, 2026-10-11, plan 3.53 follow-ups 1 and 2)
+
+A function with a body and no summary is confirmed as an allocation
+wrapper when three conditions hold:
+- R1: every returned value traces, through phis, selects, casts and spill
+  reloads, to null or to a call of a fresh source;
+- R2: the fresh value has no other use than reaching the return, the
+  classified init stores and composed init helpers;
+- R3: the body has no other pointer side effect.
+A confirmed wrapper's own call sites then mint one fresh object per site
+(FRESH), and its body is still analyzed (BODY): its calls stay in the
+graph, but its result is not the callee's object.
+
+A fresh source is a FRESH callee (from the file, promoted, or
+hardcoded). Its other atoms, when present, are inherited with the formal
+that reaches the argument they name:
+- CPY(ret<-argK) (the strdup shape) becomes CPY(ret<-arg_i);
+- ALIAS(ret=argK) (the realloc shape: FRESH covers realloc(NULL, n), the
+  alias carries the old object) becomes ALIAS(ret=arg_i), for each formal
+  i of the wrapper that reaches argK. Null may also reach it (the
+  realloc(NULL, n) path). Anything else reaching it rejects the wrapper
+  (`alias-src-untraced`).
+A callee with any other atom is not a fresh source.
+
+Statement:
+- **A confirmed wrapper's result is the callee's result, renamed per call
+  site.** By R1, each return is null, a fresh object, or (under ALIAS) the
+  object passed in arg_i. By R2 and R3, no other reference to the fresh
+  object leaves the wrapper. So the object is reachable only through this
+  call's result, and a per-call-site identity loses no flow. The ALIAS
+  atom carries arg_i's facts into the result, as the callee's atom
+  carries argK's. Using the old pointer after a moving realloc is
+  undefined behavior (reported, not modeled; plan 3.30).
+- **The promoted line is what the file would say.** The engine emits the
+  summary-file line (`ConfirmFresh: LINE`). A hand realloc row that the
+  engine confirms with the same line is removed from `func_summaries.txt`:
+  bfd_realloc and bfd_realloc_or_free. Realloc rows the engine cannot
+  confirm stay: sqlite3's realloc family (dispatch through xRealloc) and
+  png_realloc_array (malloc_fn, then a copy).
+
+Not mechanized. Checked by executions (see the commits 07be17c and
+follow-up 2): consumer outputs, httpd and tcpdump to completion,
+test/cfl-smoke.sh, test/tagged-gaps.sh.

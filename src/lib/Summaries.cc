@@ -16,7 +16,7 @@
 
 static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
               g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
-              g_freshHelperComposed = 0, g_freshCpy = 0;
+              g_freshHelperComposed = 0, g_freshCpy = 0, g_freshAlias = 0;
 static std::map<std::string, size_t> g_escapeBuckets;
 static std::map<std::string, size_t> g_escapeCallees;
 void CallGraphPass::confirmFreshWrappers() {
@@ -255,6 +255,11 @@ void CallGraphPass::confirmFreshWrappers() {
         // reaches the callee's argK (resolved after R3). A callee with
         // any other atom (init stores, invoke) is not composed here.
         SmallVector<std::pair<const CallBase *, int>, 4> cpySrcs;
+        // A callee whose result also ALIASes its argK (realloc: FRESH
+        // covers realloc(NULL, n), the alias carries the old object): the
+        // wrapper aliases whichever of its own formals reaches argK (plan
+        // 3.53 follow-up 2: the realloc-wrapper shape).
+        SmallVector<std::pair<const CallBase *, int>, 4> aliasSrcs;
         auto calleeFresh = [&](const CallBase *CB) {
           const Function *CF = CB->getCalledFunction();
           if (!CF || !Ctx->AllocFuncs.count(CF)) return false;
@@ -268,6 +273,11 @@ void CallGraphPass::confirmFreshWrappers() {
             if (A.kind == GlobalContext::SummaryAtom::Cpy && A.dst == -1 &&
                 A.src >= 0) {
               cpySrcs.push_back({CB, A.src});
+              continue;
+            }
+            if (A.kind == GlobalContext::SummaryAtom::Alias && A.dst == -1 &&
+                A.src >= 0 && A.srcByteOff == 0) {
+              aliasSrcs.push_back({CB, A.src});
               continue;
             }
             return false;
@@ -672,30 +682,27 @@ void CallGraphPass::confirmFreshWrappers() {
         // and casts) or null (realloc(NULL, n) is malloc). Anything else
         // — a local object, a global, a loaded pointer, a call result in
         // a loop — is not composable and rejects the wrapper.
-        SmallVector<int, 4> cpyArgs;
-        bool cpyOk = true;
-        for (auto &[CCB, K] : cpySrcs) {
-          if (K >= (int)CCB->arg_size()) { cpyOk = false; break; }
-          SmallVector<const Value *, 4> tw{
-              CCB->getArgOperand(K)->stripPointerCasts()};
+        // The formals of F that reach argument K of call CCB (through
+        // spill reloads and casts; null is allowed: realloc(NULL, n) is
+        // malloc). Anything else is not composable.
+        auto formalsAt = [&](const CallBase *CCB, int K, SmallVectorImpl<int> &out) {
+          if (K >= (int)CCB->arg_size()) return false;
+          SmallVector<const Value *, 4> tw{CCB->getArgOperand(K)->stripPointerCasts()};
           SmallPtrSet<const Value *, 8> tseen;
-          while (!tw.empty() && cpyOk) {
+          while (!tw.empty()) {
             const Value *tv = tw.pop_back_val();
             if (!tseen.insert(tv).second) continue;
             if (const auto *TA = dyn_cast<Argument>(tv)) {
-              if (TA->getParent() == &F) {
-                cpyArgs.push_back((int)TA->getArgNo());
-                continue;
-              }
-              cpyOk = false;
-              break;
+              if (TA->getParent() != &F) return false;
+              out.push_back((int)TA->getArgNo());
+              continue;
             }
             if (isa<ConstantPointerNull>(tv)) continue;
             if (const auto *TL = dyn_cast<LoadInst>(tv)) {
               if (const AllocaInst *AI = isSpillSlot(TL->getPointerOperand())) {
                 SmallVector<const StoreInst *, 4> defs;
                 reachingSlotStores(TL, AI, defs);
-                if (defs.empty()) { cpyOk = false; break; }
+                if (defs.empty()) return false;
                 for (const StoreInst *D : defs)
                   tw.push_back(D->getValueOperand()->stripPointerCasts());
                 continue;
@@ -705,15 +712,29 @@ void CallGraphPass::confirmFreshWrappers() {
               tw.push_back(TC->getOperand(0));
               continue;
             }
-            cpyOk = false;
+            return false;
           }
-          if (!cpyOk) break;
-        }
+          return true;
+        };
+        SmallVector<int, 4> cpyArgs, aliasArgs;
+        bool cpyOk = true;
+        for (auto &[CCB, K] : cpySrcs)
+          if (!formalsAt(CCB, K, cpyArgs)) { cpyOk = false; break; }
         if (!cpyOk) {
           g_freshRejEscape++;
           g_escapeBuckets["cpy-src-untraced"]++;
           continue;
         }
+        bool aliasOk = true;
+        for (auto &[CCB, K] : aliasSrcs)
+          if (!formalsAt(CCB, K, aliasArgs)) { aliasOk = false; break; }
+        if (!aliasOk) {
+          g_freshRejEscape++;
+          g_escapeBuckets["alias-src-untraced"]++;
+          continue;
+        }
+        std::sort(aliasArgs.begin(), aliasArgs.end());
+        aliasArgs.erase(std::unique(aliasArgs.begin(), aliasArgs.end()), aliasArgs.end());
         std::sort(cpyArgs.begin(), cpyArgs.end());
         cpyArgs.erase(std::unique(cpyArgs.begin(), cpyArgs.end()),
                       cpyArgs.end());
@@ -721,7 +742,7 @@ void CallGraphPass::confirmFreshWrappers() {
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
         if (initArgs.empty() && initGlobals.empty() && !selfStore &&
-            subAllocs == 0 && cpyArgs.empty()) {
+            subAllocs == 0 && cpyArgs.empty() && aliasArgs.empty()) {
           Ctx->FuncSummaries[&F] = &pureFresh;
         } else {
           Ctx->OwnedSummaries.emplace_back();
@@ -771,16 +792,25 @@ void CallGraphPass::confirmFreshWrappers() {
             A.src = cj;
             S.atoms.push_back(A);
           }
+          for (int aj : aliasArgs) {
+            GlobalContext::SummaryAtom A{};
+            A.kind = GlobalContext::SummaryAtom::Alias;
+            A.dst = -1; // ret = argaj (the realloc'd object)
+            A.src = aj;
+            S.atoms.push_back(A);
+          }
+          if (!aliasArgs.empty()) g_freshAlias++;
           Ctx->FuncSummaries[&F] = &S;
           if (!cpyArgs.empty()) g_freshCpy++;
-          else g_freshInit++;
+          else if (aliasArgs.empty()) g_freshInit++;
         }
         g_freshPromoted++;
         changed = true;
         if (g_freshPromoted <= 20)
           CG_LOG("ConfirmFresh: promoted " << F.getName()
                  << (initArgs.empty() ? "" : " [alloc-init]")
-                 << (cpyArgs.empty() ? "" : " [copy]") << " (round "
+                 << (cpyArgs.empty() ? "" : " [copy]")
+                 << (aliasArgs.empty() ? "" : " [realloc]") << " (round "
                  << round << ")\n");
         {
           // The promotion as a summary-file line (harvestable: a library
@@ -788,6 +818,7 @@ void CallGraphPass::confirmFreshWrappers() {
           std::string ln = F.getName().str() + " FRESH";
           for (int an : initArgs) ln += " ST(*ret<-arg" + std::to_string(an) + ")";
           for (int cj : cpyArgs) ln += " CPY(ret<-arg" + std::to_string(cj) + ")";
+          for (int aj : aliasArgs) ln += " ALIAS(ret=arg" + std::to_string(aj) + ")";
           ln += " BODY";
           if (selfStore) ln += " # +self-store";
           if (subAllocs) ln += " # +" + std::to_string(subAllocs) + " sub-alloc";
@@ -798,7 +829,8 @@ void CallGraphPass::confirmFreshWrappers() {
   }
   CG_LOG("ConfirmFresh: " << g_freshPromoted << " wrappers promoted ("
          << g_freshInit << " alloc-init with ST atoms, " << g_freshCpy
-         << " copying with CPY atoms) in " << round
+         << " copying with CPY atoms, " << g_freshAlias
+         << " realloc wrappers with ALIAS atoms) in " << round
          << " rounds; " << g_freshHelperComposed << " init-helper calls "
          << "composed; rejected " << g_freshRejRet << " ret-not-fresh, "
          << g_freshRejEscape << " escapes, " << g_freshRejSide

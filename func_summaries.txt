@@ -174,8 +174,6 @@ bfd_zalloc2 FRESH BODY
 bfd_malloc FRESH BODY
 bfd_zmalloc FRESH BODY
 bfd_malloc2 FRESH BODY
-bfd_realloc FRESH ALIAS(ret=arg0) BODY
-bfd_realloc_or_free FRESH ALIAS(ret=arg0) BODY
 bfd_hash_allocate FRESH BODY
 _objalloc_alloc FRESH BODY
 png_malloc_base FRESH BODY

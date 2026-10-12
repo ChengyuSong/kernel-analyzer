@@ -419,7 +419,7 @@ void CallGraphPass::confirmFreshWrappers() {
         if (!ok) {
           g_freshRejRet++;
           static size_t r1Samples = 0;
-          if (!checking && (r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
+          if ((!checking || !CFLTraceFunc.empty()) && (r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
             // With --cfl-trace-func every R1 rejection is logged (a
             // wrapper that should have been promoted is debugged here).
             std::string t; raw_string_ostream os(t); os << *r1bad;
@@ -700,7 +700,7 @@ void CallGraphPass::confirmFreshWrappers() {
         if (escaped || untracedInit) {
           g_freshRejEscape++;
           g_escapeBuckets[rejWhy ? rejWhy : "unknown"]++;
-          if (!checking && g_escapeSamples < 40 && rejWhy) {
+          if ((!checking || !CFLTraceFunc.empty()) && g_escapeSamples < 40 && rejWhy) {
             g_escapeSamples++;
             CG_LOG("ConfirmFresh ESCAPE: " << F.getName() << " ["
                    << rejWhy << "]\n");
@@ -730,6 +730,13 @@ void CallGraphPass::confirmFreshWrappers() {
             if (CF && (isNoopIntrinsic(CF) || Ctx->AllocFuncs.count(CF) ||
                        isFreeFn(CF->getName())))
               continue;
+            // A call that does not return (noreturn on the call or the
+            // callee, the block ending in unreachable: bpf_error,
+            // __assert_fail, png_error): no execution through it returns
+            // the result, and its effects (a longjmp included) stay in the
+            // kept body (BODY).
+            if (CB->doesNotReturn() && isa_and_nonnull<UnreachableInst>(CB->getNextNonDebugInstruction()))
+              continue;
             if (CF) { // NOOP-summarized callee (strlen in xstrdup):
               auto nit = Ctx->FuncSummaries.find(CF); // transfers nothing
               if (nit != Ctx->FuncSummaries.end() && nit->second->noop)
@@ -750,7 +757,7 @@ void CallGraphPass::confirmFreshWrappers() {
         }
         if (!ok) {
           g_freshRejSide++;
-          if (!checking && !CFLTraceFunc.empty() && r3bad) {
+          if (!CFLTraceFunc.empty() && r3bad) {
             std::string t; raw_string_ostream os(t); os << *r3bad;
             CG_LOG("ConfirmFresh R3: " << F.getName() << " side effect "
                    << StringRef(os.str()).ltrim().substr(0, 80) << "\n");

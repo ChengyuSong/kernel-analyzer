@@ -108,7 +108,8 @@ xmemdup FRESH CPY(ret<-arg0)
 # including wrappers over the rows below. A hand row it confirms with
 # the same line, given the other rows, is reported at --verbose=2
 # ("REDUNDANT hand row") and is not kept here (18 removed 2026-10-12,
-# checked as a set). The rows below are the allocation paths it cannot
+# checked as a set; 3 more once a call that does not return was exempt
+# from R3: sqlite3PageMalloc, png_malloc, png_malloc_array). The rows below are the allocation paths it cannot
 # confirm, drafted from the sources (sqlite 3.38.5, binutils 5279478,
 # libpng 1.6); each block says which confirmer rule the IR fails (R1: a
 # return that is not fresh; R3: a pointer side effect) or which kept row
@@ -116,7 +117,7 @@ xmemdup FRESH CPY(ret<-arg0)
 # sqlite3Malloc: the result comes back through mallocWithAlarm's
 # out-parameter, from the xMalloc dispatch (R1). sqlite3Realloc: an
 # indirect call through xRealloc (R1). dbMallocRawFinish: calls
-# __assert_fail with pointer arguments (R3). sqlite3DbMallocRawNN returns
+# sqlite3OomFault(db), which sets the connection's state (R3). sqlite3DbMallocRawNN returns
 # a lookaside slot loaded from the free list or dbMallocRawFinish's
 # result (R1); the Db realloc chain rests on it and on sqlite3Realloc.
 sqlite3Malloc FRESH BODY
@@ -130,13 +131,12 @@ dbReallocFinish FRESH ALIAS(ret=arg1) BODY
 # 8-byte size header; the user pointer past it is an interior pointer,
 # R1). contextMalloc reports SQLITE_TOOBIG through
 # sqlite3_context_db_handle (R3). pcache1Alloc and rowSetEntryAlloc
-# return a pool slot loaded from memory (R1); sqlite3PageMalloc rests on
-# pcache1Alloc.
+# return a pool slot loaded from memory (R1); the engine confirms
+# sqlite3PageMalloc over pcache1Alloc.
 sqlite3MemMalloc FRESH BODY
 sqlite3MemRealloc FRESH ALIAS(ret=arg0) BODY
 contextMalloc FRESH BODY
 pcache1Alloc FRESH BODY
-sqlite3PageMalloc FRESH BODY
 rowSetEntryAlloc FRESH BODY
 # Reallocating wrappers: the old block continues (ALIAS). fts3ReallocOrFree
 # frees it on failure through sqlite3_free, which the confirmer does not
@@ -183,11 +183,11 @@ bfd_alloc FRESH BODY
 bfd_hash_allocate FRESH BODY
 _objalloc_alloc FRESH BODY
 # libpng: png_malloc_base calls png_ptr->malloc_fn when set (an indirect
-# call, R1). png_malloc, png_malloc_array and png_realloc_array call
-# png_error with pointer arguments (R3).
+# call, R1); the engine confirms png_malloc and png_malloc_array over it
+# (their png_error calls do not return). png_realloc_array copies the old
+# array into the new block (memcpy, a content flow the confirmer does not
+# express; R3).
 png_malloc_base FRESH BODY
-png_malloc FRESH BODY
-png_malloc_array FRESH BODY
 png_realloc_array FRESH ALIAS(ret=arg1) BODY
 # libjpeg-turbo jmemmgr.c: alloc_small / alloc_large hand out chunks of a
 # pool (jpeg_get_small / jpeg_get_large blocks, kept on small_list /

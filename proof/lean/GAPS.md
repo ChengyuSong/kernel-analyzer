@@ -995,3 +995,20 @@ Statement:
 Not mechanized. Checked by executions (see the commits 07be17c and
 follow-up 2): consumer outputs, httpd and tcpdump to completion,
 test/cfl-smoke.sh, test/tagged-gaps.sh.
+
+Calls that do not return (Fable 2026-10-12). R3 exempts a call marked
+noreturn (the attribute on the call or on its callee) whose block ends
+in unreachable. Examples: bpf_error, png_error, __assert_fail.
+- **Statement:** a path through such a call never returns the wrapper's
+  result, so R1 and R2 are unaffected on it.
+- **Effects are still analyzed.** BODY keeps the body, so every effect
+  of the call is analyzed as part of it, as before the exemption. That
+  includes a longjmp back to an outer frame (bpf_error longjmps to
+  pcap_compile's setjmp). The longjmp moves control, not data. The
+  flows-to facts are flow-insensitive, so it does not change them. The
+  one place control transfer matters is covered by the premise in item
+  9 of the tagged-fields gaps: a call returns only through its returns,
+  and longjmp is not modeled.
+- **Rows removed:** the redundancy report then confirms sqlite3PageMalloc,
+  png_malloc and png_malloc_array with the same line, checked as a set,
+  so their hand rows are removed.

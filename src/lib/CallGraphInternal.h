@@ -95,6 +95,9 @@ bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o);
 // CellSolver.cc: the debug-info struct ("struct.<tag>") a declared object
 // is, or (pointee) a pointer value points to; "" if none.
 std::string diDeclaredStruct(const Value *P, bool pointee);
+// The indirect calls in IR order (module, function, instruction): the
+// context keeps them in a pointer set, whose order follows the heap layout.
+std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx);
 // The named structs bytes [lo, hi) of T lie in (T itself, members,
 // array elements folded to element 0), each with the interval inside it.
 void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,

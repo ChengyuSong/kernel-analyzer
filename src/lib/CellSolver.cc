@@ -1997,10 +1997,37 @@ bool CallGraphPass::runCellResolution() {
     return objs.size() - 1;
   };
 
+  // A stable order for the pointer-keyed sets the solve walks (a
+  // SmallPtrSet iterates in pointer-hash order, so fact numbering, and the
+  // pop order with it, followed the heap layout): module, function and
+  // instruction position.
+  std::unordered_map<const Value *, uint64_t> stableOrd;
+  {
+    uint64_t k = 0;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        stableOrd[&F] = k++;
+        for (Instruction &I : instructions(F)) stableOrd[&I] = k++;
+      }
+  }
+  auto stableKey = [&](const Value *V) {
+    auto it = stableOrd.find(V);
+    return it == stableOrd.end() ? UINT64_MAX : it->second;
+  };
+  std::vector<const Function *> addrTakenSorted(Ctx->AddressTakenFuncs.begin(),
+                                                Ctx->AddressTakenFuncs.end());
+  std::sort(addrTakenSorted.begin(), addrTakenSorted.end(), [&](const Function *a, const Function *b) {
+    const uint64_t ka = stableKey(a), kb = stableKey(b);
+    return ka != kb ? ka < kb : a->getName() < b->getName();
+  });
+  std::vector<const CallBase *> icallsSorted(Ctx->IndirectCallInsts.begin(), Ctx->IndirectCallInsts.end());
+  std::sort(icallsSorted.begin(), icallsSorted.end(),
+            [&](const CallBase *a, const CallBase *b) { return stableKey(a) < stableKey(b); });
+
   // ---- Seeds: functions and objects ----
   size_t funcSeeds = 0, objSeeds = 0;
   std::unordered_map<const Function *, uint32_t> funcFact;
-  for (const Function *F : Ctx->AddressTakenFuncs) {
+  for (const Function *F : addrTakenSorted) {
     const NodeIndex vn = NF.getValueNodeFor(F);
     if (vn == AndersNodeFactory::InvalidIndex) continue;
     const uint32_t n = canon(vn);
@@ -2536,7 +2563,7 @@ bool CallGraphPass::runCellResolution() {
   size_t recvUnstepped = 0, recvNoNode = 0, recvBound = 0, recvLevels = 0;
   if (CFLCellReceivers) {
     std::vector<std::pair<const Value *, const Value *>> path;
-    for (const CallBase *CS : Ctx->IndirectCallInsts) {
+    for (const CallBase *CS : icallsSorted) {
       const int k = dispatchReceiver(CS, &path);
       if (k < 0) continue;
       const NodeIndex bn = NF.getValueNodeFor(path[0].first),
@@ -2958,6 +2985,8 @@ bool CallGraphPass::runCellResolution() {
   if (CFLCellReceivers && !recvSites.empty()) {
     for (auto &[CS, FS] : Ctx->Callees)
       for (const Function *F : FS) callers[F].push_back(CS);
+    for (auto &[F, cs] : callers) // stable: Callees iterates in pointer order
+      std::sort(cs.begin(), cs.end(), [&](const CallBase *a, const CallBase *b) { return stableKey(a) < stableKey(b); });
     for (uint32_t si = 0; si < recvSites.size(); si++)
       if (recvSites[si].cs) siteOf[recvSites[si].cs] = si;
     guardIdx.assign(numNodes, UINT32_MAX);
@@ -5479,8 +5508,9 @@ bool CallGraphPass::runCellResolution() {
 
   // ---- Answers ----
   size_t resolved = 0, totalTargets = 0, newPairs = 0, typeRej = 0;
-  const std::vector<const CallBase *> icallSnapshot(
-      Ctx->IndirectCallInsts.begin(), Ctx->IndirectCallInsts.end());
+  // In IR order, targets in IR order: the wiring order sets the next
+  // iteration's edge order.
+  const std::vector<const CallBase *> icallSnapshot = icallsSorted;
   std::vector<std::pair<const CallBase *, std::vector<std::string>>> stopAnswers;
   for (const CallBase *CS : icallSnapshot) {
     Value *fptr = CS->getCalledOperand()->stripPointerCastsAndAliases();
@@ -5505,7 +5535,12 @@ bool CallGraphPass::runCellResolution() {
       std::sort(names.begin(), names.end());
       stopAnswers.push_back({CS, std::move(names)});
     }
-    for (const Function *F : targets)
+    std::vector<const Function *> targetsSorted(targets.begin(), targets.end());
+    std::sort(targetsSorted.begin(), targetsSorted.end(), [&](const Function *a, const Function *b) {
+      const uint64_t ka = stableKey(a), kb = stableKey(b);
+      return ka != kb ? ka < kb : a->getName() < b->getName();
+    });
+    for (const Function *F : targetsSorted)
       if (wireResolvedCallee(CS, F)) newPairs++;
   }
 

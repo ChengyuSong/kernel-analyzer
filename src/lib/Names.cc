@@ -673,7 +673,7 @@ void CallGraphPass::runRegFieldGapReport() {
                                  // key absorbs ALL loose tables
   };
   std::map<std::string, Disp> disp;
-  for (auto *CB : Ctx->IndirectCallInsts) {
+  for (auto *CB : icallsInIROrder(Ctx)) {
     auto ci = Ctx->Callees.find(CB);
     if (ci == Ctx->Callees.end() || ci->second.empty()) continue;
     const auto *LI =
@@ -998,7 +998,7 @@ void CallGraphPass::runRegFieldGapReport() {
     };
     std::map<std::string, ObjLedger> led; // "key slot=N"
     size_t objSkipOpen = 0, objSkipNonConst = 0;
-    for (auto *CB : Ctx->IndirectCallInsts) {
+    for (auto *CB : icallsInIROrder(Ctx)) {
       auto ci = Ctx->Callees.find(CB);
       if (ci == Ctx->Callees.end() || ci->second.empty()) continue;
       const auto *L1 =

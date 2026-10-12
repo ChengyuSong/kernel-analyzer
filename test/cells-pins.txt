@@ -7,3 +7,5 @@ httpd pairs 468 sha256 e2a9a3f5a67355c8
 tcpdump pairs 6267 sha256 a9267114c2399339
 nm-O0 pops 199999 cells 10371 facts 5919503 sha256 bbb7e98cd7da95a0
 nm-O3 pops 199999 cells 9991 facts 980746 sha256 17d1ae282939c555
+tiffsplit-O0 pops 141107 cells 2719 facts 13741353 sha256 c57fb5e6eb70e78d
+tiffsplit-O3 pops 992059 cells 6612 facts 30624089 sha256 0f44aa58e3b88bb8

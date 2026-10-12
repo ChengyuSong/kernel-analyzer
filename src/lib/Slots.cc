@@ -179,3 +179,12 @@ std::string diDeclaredStruct(const Value *P, bool pointee) {
   const StringRef N = ka::diStructName(T, pointee);
   return N.empty() ? "" : "struct." + N.str();
 }
+
+std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx) {
+  std::vector<const CallBase *> out;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I); CB && Ctx->IndirectCallInsts.count(CB)) out.push_back(CB);
+  return out;
+}

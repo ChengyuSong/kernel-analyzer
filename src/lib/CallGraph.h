@@ -275,6 +275,11 @@ protected:
     std::string siteDeclared;    // the struct the receiving variable points to (debug info)
     std::string sitePtrArray;    // T** receiver: an array of pointer slots ("alent *")
     bool scalarUse = false;      // accessed as scalars/arrays (a buffer)
+    // Segments declared at the site (plan 3.53 rule 1, extent): a constant
+    // offset c > 0 of the result cast to B* (the receiving variable's
+    // declared pointee) or written through a B struct GEP; "" when two
+    // declarations disagree.
+    std::map<int64_t, std::string> segments;
   };
   void labelAllocationSites(
       std::unordered_map<const llvm::CallBase *, AllocSiteLabel> &siteLabel,
@@ -283,6 +288,9 @@ protected:
                          std::set<const llvm::CallBase *> &out);
   void staticLabels(
       std::unordered_map<const llvm::Value *, std::set<std::string>> &out);
+  // Per allocation call: the segments its creating sites declare (several
+  // creating sites: kept only where they agree).
+  std::unordered_map<const llvm::Value *, std::map<int64_t, std::string>> allocSegments;
   // --cfl-union-keys: the key names of each keyed union access, filled by
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).

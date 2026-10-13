@@ -899,7 +899,23 @@ changes:
   ("variable indexes into a declared array field assumed within its
   bound"). The link remains for the implicit array of T (no array holds
   the address), an array ending at T's end (a trailing or flexible array,
-  `[0]`, `[1]` or any N whose end is the layout's size), and a byte index. This
+  `[0]`, `[1]` or any N whose end is the layout's size), and a byte index.
+  Segment clause (Fable, 2026-10-13), for an allocation of KNOWN size
+  only: it is a sequence of segments, the header T and then the tail,
+  and rule 1 applies to the tail recursively. The tail's label is the
+  site's declaration at its constant offset (1b extended: `(B *)(result
+  + c)` received by a variable declared B*, or a B struct GEP written
+  at c), else its first typed use at constant offset 0 in solve order;
+  its extent from the known size by the extent rule (a multiple of B:
+  an array; exactly B: one; B plus data: header B and a further tail).
+  What follows the last labeled segment stays data (any-offset cell).
+  The variable-index link reaches only that unlabeled remainder; an
+  index from T landing in a labeled segment is counted as assumed within
+  its bound. Unknown size: unchanged (no segment on unsized storage).
+  Not admitted: a label from a non-constant offset or a variable-offset
+  cast. Order: with a label from first use, an index step that runs
+  before the tail is typed links the then-unlabeled tail (solve order,
+  like rule 1's first use; reported). This
   holds for a sized "T plus data" as for a size that says nothing. The
   link was for the unsized case only, and that was the hole:
   `s[argc - 1].fn()` on a sized carsym block resolved nothing.

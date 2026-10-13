@@ -224,8 +224,52 @@ void CallGraphPass::labelAllocationSites(
       if (seen.insert(V).second)
         work.emplace_back(V, off);
     };
+    auto segment = [&](int64_t off, const std::string &B) {
+      if (off <= 0 || B.empty()) return;
+      auto [it, ins] = L.segments.try_emplace(off, B);
+      if (!ins && it->second != B) it->second.clear(); // two declarations: none
+    };
+    // The segments' own walk (records only segments): from result + c, the
+    // variable receiving it (its declared pointee), its reloads when that
+    // slot is stored once, constant GEPs, and struct GEPs written there
+    // (`pCsr = (Fts3MultiSegReader *)&pFilter[1]` after `pFilter = ...`).
+    std::set<std::pair<const Value *, int64_t>> segSeen;
+    std::function<void(const Value *, int64_t, int)> segWalk = [&](const Value *V, int64_t off, int depth) {
+      if (off <= 0 || depth > 8 || !segSeen.insert({V, off}).second) return;
+      SmallVector<DbgValueInst *, 2> DVs;
+      findDbgValues(DVs, const_cast<Value *>(V));
+      for (DbgValueInst *DV : DVs) segment(off, diPointee(DV->getVariable()->getType(), C->getModule()));
+      for (const User *U : V->users()) {
+        if (const auto *CI = dyn_cast<CastInst>(U)) {
+          if (CI->getType()->isPointerTy()) segWalk(CI, off, depth + 1);
+        } else if (const auto *SI = dyn_cast<StoreInst>(U); SI && SI->getValueOperand() == V) {
+          const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts());
+          if (!AI) continue;
+          for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+            segment(off, diPointee(DDI->getVariable()->getType(), C->getModule()));
+          const FnAddrs &FA = addrsOf(SI->getFunction());
+          const std::string K = addrKey(SI->getPointerOperand(), 0);
+          auto st = FA.stores.find(K);
+          if (st != FA.stores.end() && st->second.size() == 1)
+            if (auto ld = FA.loads.find(K); ld != FA.loads.end())
+              for (const LoadInst *LI : ld->second) segWalk(LI, off, depth + 1);
+        } else if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == V) {
+          auto *ST = dyn_cast<llvm::StructType>(G->getSourceElementType());
+          const auto *I0 = G->getNumIndices() ? dyn_cast<ConstantInt>(*G->idx_begin()) : nullptr;
+          if (namedStruct(ST) && I0 && I0->isZero()) {
+            bool written = false;
+            for (const User *GU : G->users())
+              if (const auto *S2 = dyn_cast<StoreInst>(GU)) written |= S2->getPointerOperand() == G;
+            if (written) segment(off, structKey(ST));
+          }
+          APInt A(64, 0);
+          if (G->accumulateConstantOffset(DL, A)) segWalk(G, off + A.getSExtValue(), depth + 1);
+        }
+      }
+    };
     for (size_t i = 0; i < work.size(); i++) {
       const auto [V, off] = work[i];
+      if (off > 0) segWalk(V, off, 0);
       // A variable's declared struct names the object only at its start
       // (`Fts3Table *t = (Fts3Table *)&p[1]` is not p's type).
       if (L.declared.empty() && off == 0)
@@ -249,14 +293,16 @@ void CallGraphPass::labelAllocationSites(
                 L.scalarUse = true;
           // A struct GEP at the object's start names its type.
           auto *ST = dyn_cast<llvm::StructType>(G->getSourceElementType());
-          if (off == 0 && namedStruct(ST)) {
+          if (namedStruct(ST)) {
             bool written = false;
             for (const User *GU : G->users())
               if (const auto *SI = dyn_cast<StoreInst>(GU))
                 written |= SI->getPointerOperand() == G;
               else
                 written |= isa<GEPOperator>(GU) || isa<CastInst>(GU);
-            if (written)
+            const auto *I0 = G->getNumIndices() ? dyn_cast<ConstantInt>(*G->idx_begin()) : nullptr;
+            (void)I0;
+            if (written && off == 0)
               L.types.insert(structKey(ST));
           }
           APInt A(64, 0);
@@ -356,10 +402,19 @@ void CallGraphPass::staticLabels(
   std::unordered_map<const CallBase *, AllocSiteLabel> siteLabel;
   size_t allocCalls = 0, wrapperCalls = 0;
   labelAllocationSites(siteLabel, allocCalls, wrapperCalls);
+  allocSegments.clear();
+  std::set<const Value *> segSeen;
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;
     allocationsOfCall(C, allocs);
     for (const CallBase *A : allocs) {
+      // Segments: the creating sites must agree (a wrapper's allocation is
+      // created by every caller).
+      std::map<int64_t, std::string> seg;
+      for (auto &[c, B] : SL.segments)
+        if (!B.empty()) seg[c] = B;
+      if (segSeen.insert(A).second) allocSegments[A] = std::move(seg);
+      else if (allocSegments[A] != seg) allocSegments[A].clear();
       auto &L = out[A];
       // The receiving variable's declared struct first (1b), then the
       // typed writes, then a declared struct found along the result.

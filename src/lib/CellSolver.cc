@@ -1576,13 +1576,22 @@ bool CallGraphPass::runCellResolution() {
   };
   // The address fact (o, off): exact, or folded (off is element 0's).
   // The trailing object of header+tail object o, minted on first use.
-  size_t tailMinted = 0, tailMoved = 0;
+  size_t tailMinted = 0, tailMoved = 0, segmentsLabeled = 0;
+  // Tails a variable index linked while unlabeled, and how many of them a
+  // later first typed use labeled (rule 1's own solve order; counted).
+  boost::unordered_flat_set<uint32_t> tailLinkedUnlabeled;
+  size_t tailLinkedThenLabeled = 0;
+  // A segment the site declares at the tail's start (plan 3.53 rule 1:
+  // an allocation of known size is a sequence of segments), its label and
+  // extent from the known size; set once the extent rule exists.
+  std::function<void(Obj &)> segmentLabel;
   auto tailOf = [&](uint32_t o) -> uint32_t {
     if (objs[o].tailObj != UINT32_MAX) return objs[o].tailObj;
     Obj T;
     T.origin = objs[o].origin;
     T.parentObj = o;
     T.base = objs[o].base + objs[o].size;
+    if (!objs[o].tailUnsized && segmentLabel) segmentLabel(T); // unknown size: no segment
     objs.push_back(std::move(T));
     objs[o].tailObj = objs.size() - 1;
     tailMinted++;
@@ -1842,6 +1851,20 @@ bool CallGraphPass::runCellResolution() {
     else if (C && sizeIsMultiple(C, at)) { O.repeats = true; extentArrays++; }
     else { O.tail = true; O.tailUnsized = true; extentUnknown++; }
   };
+  segmentLabel = [&](Obj &T) {
+    const Value *V = NF.getValueForNode(T.origin);
+    auto sit = allocSegments.find(V);
+    if (sit == allocSegments.end()) return;
+    auto bit = sit->second.find(T.base);
+    if (bit == sit->second.end()) return;
+    StructType *B = StructType::getTypeByName(V->getContext(), bit->second);
+    if (!B || B->isOpaque() || !B->isSized()) return;
+    T.layout = B;
+    T.size = (int64_t)DL.getTypeAllocSize(B);
+    T.label = typeLabel(B);
+    setExtent(T, V); // one B, an array of B, or B and a further tail (recursively)
+    segmentsLabeled++;
+  };
   // The extension of a header+tail object into an array of its T (defined
   // with the steps; a label request on an unsized tail makes it).
   std::function<void(uint32_t)> extendToArrayFn;
@@ -1908,6 +1931,7 @@ bool CallGraphPass::runCellResolution() {
     O.size = sz;
     O.label = typeLabel(S);
     O.learnedLayout = true;
+    if (tailLinkedUnlabeled.erase(o)) tailLinkedThenLabeled++;
     // Its identity: a copy's source's; a written step's pointer's declared
     // pointee (debug info) where the IR merged that struct away.
     if (layoutCopySrc != UINT32_MAX) {
@@ -2376,8 +2400,19 @@ bool CallGraphPass::runCellResolution() {
       const bool runsOn = s == 1 || !inArray ||
                           !innermostArraySpan(O.layout, pos, DL, lo, hi, esz) || hi >= O.size;
       if (runsOn) {
-        tailIndexAny++;
-        out.push_back(anyOf(tailOf(o)));
+        // The unlabeled remainder: past the labeled segments (an index from
+        // T landing in a segment of another label is assumed within bound).
+        uint32_t t = tailOf(o);
+        while (objs[t].layout && objs[t].fwd == UINT32_MAX && objs[t].tail && !objs[t].repeats) {
+          indexInBoundedArray++;
+          t = tailOf(t);
+        }
+        if (objs[t].layout && objs[t].fwd == UINT32_MAX) indexInBoundedArray++; // the last segment: no remainder
+        else {
+          tailIndexAny++;
+          if (!objs[t].layout) tailLinkedUnlabeled.insert(t);
+          out.push_back(anyOf(t));
+        }
       } else
         indexInBoundedArray++;
     }
@@ -7151,7 +7186,8 @@ bool CallGraphPass::runCellResolution() {
       std::chrono::duration<double>(Clock::now() - t0).count();
   CG_LOG("Cells: iteration " << iteration << ": " << objs.size()
          << " origins (" << funcSeeds << " function seeds, " << objSeeds
-         << " objects (" << tailMinted << " trailing, " << trailingArrays << " of them arrays of unknown extent, " << tailMoved
+         << " objects (" << tailMinted << " trailing, " << segmentsLabeled << " of them segments the site declares, "
+         << trailingArrays << " of them arrays of unknown extent, " << tailMoved
          << " cells moved to them); heap " << heapLabeled << " labeled (" << heapPtrArrays
          << " arrays of pointer slots, " << tailObjects
          << " header + trailing data), " << heapUnlabeled
@@ -7724,6 +7760,7 @@ bool CallGraphPass::runCellResolution() {
        << leftObject << " offsets past a single object, " << indexOutsideArray
        << " variable indexes on a single object, " << indexInBoundedArray
        << " variable indexes into a declared array field assumed within its bound, "
+       << tailLinkedThenLabeled << " variable indexes linked a tail labeled later, "
           "pointer subtractions across objects: always "
        << rrPtrAlways << ", may " << rrPtrMay << "\n";
     {

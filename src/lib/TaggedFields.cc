@@ -498,7 +498,7 @@ void CallGraphPass::computeTaggedFields() {
       return it->second;
     }
     if (const auto *CE = dyn_cast<ConstantExpr>(V); CE && CE->getOpcode() == Instruction::IntToPtr)
-      if (const auto *K = dyn_cast<ConstantInt>(CE->getOperand(0))) {
+      if (const auto *K = dyn_cast<ConstantInt>(CE->getOperand(0)); K && K->getBitWidth() <= 64) {
         const int64_t c = K->getSExtValue();
         if (c == -1) return kAllOnes;
         if (c >= 0 && c < kFnBase) return c;
@@ -506,7 +506,10 @@ void CallGraphPass::computeTaggedFields() {
     return std::nullopt;
   };
   auto constOf = [&](const Value *V) -> std::optional<int64_t> {
-    if (const auto *K = dyn_cast<ConstantInt>(V)) return K->getSExtValue();
+    if (const auto *K = dyn_cast<ConstantInt>(V)) {
+      if (K->getBitWidth() > 64) return std::nullopt; // not a term (u128)
+      return K->getSExtValue();
+    }
     if (V->getType()->isPointerTy() && isa<Constant>(V)) return ptrConst(V);
     return std::nullopt;
   };
@@ -721,6 +724,10 @@ void CallGraphPass::computeTaggedFields() {
     };
     ev1 = [&](const Value *V, int depth, std::vector<Term> &out) -> bool {
       if (depth > 24 || out.size() > kMaxTerms) return false;
+      // An integer wider than 64 bits (kernel u128 arithmetic) is not a
+      // term: the store is not evaluable, its pair refused or unkeyed and
+      // counted, as for any such store.
+      if (V->getType()->isIntegerTy() && V->getType()->getIntegerBitWidth() > 64) return false;
       if (auto c = constOf(V)) {
         out.push_back({'c', 0, *c, 0});
         return true;
@@ -2439,7 +2446,7 @@ void CallGraphPass::computeTaggedFields() {
             edges.push_back({Br->getSuccessor(si), {Br->getCondition(), leaf, si == 0, dOff, dOff}});
       } else if (const auto *SW = dyn_cast<SwitchInst>(Term)) {
         const Instruction *leaf = leafOf(SW->getCondition());
-        if (!leaf) continue;
+        if (!leaf || SW->getCondition()->getType()->getIntegerBitWidth() > 64) continue; // u128: no tag test
         std::map<const BasicBlock *, std::vector<int64_t>> labels;
         std::vector<int64_t> all;
         for (auto C : SW->cases()) {
@@ -2558,8 +2565,9 @@ void CallGraphPass::computeTaggedFields() {
     if (T.empty()) return true;
     const Value *e = E;
     while (const auto *C = dyn_cast<CastInst>(e)) e = C->getOperand(0);
-    if (const auto *K = dyn_cast<ConstantInt>(E->stripPointerCasts())) return holds(T, K->getSExtValue());
-    if (const auto *K = dyn_cast<ConstantInt>(e)) return holds(T, K->getSExtValue());
+    if (const auto *K = dyn_cast<ConstantInt>(E->stripPointerCasts()); K && K->getBitWidth() <= 64)
+      return holds(T, K->getSExtValue());
+    if (const auto *K = dyn_cast<ConstantInt>(e); K && K->getBitWidth() <= 64) return holds(T, K->getSExtValue());
     std::vector<int64_t> cands;
     for (const Test &t : T)
       if (t.sw && !t.swDefault) { cands = t.caseVals; break; }

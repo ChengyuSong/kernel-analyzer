@@ -228,6 +228,14 @@ int main(int argc, char **argv) {
       // summary provers (NOOP, atom, solved) are IR proofs and adoption
       // installs them as call-site summaries: both run under cells
       // (plan 3.37 item 2).
+      // The tracepoint keyed channel (task #35) severs the registration
+      // and iterator flows the cell solver names: under cells a
+      // tracepoint's probes flow through tracepoint_probe_register's body
+      // into tp->funcs, and __traceiter_X's dispatch resolves by flow.
+      if (CFLTracepointKeys.getNumOccurrences() && CFLTracepointKeys)
+        cliErrors.push_back("--cfl-cells refuses --cfl-tracepoint-keys (the cell "
+                            "solver names the tracepoint cells; no keyed channel)");
+      CFLTracepointKeys = false;
       for (cl::opt<bool> *o :
            {&CFLProposeChainSummaries, &CFLRegFieldApply, &CFLRegFieldObj}) {
         if (o->getNumOccurrences() && *o)

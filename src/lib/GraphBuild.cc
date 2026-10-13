@@ -2978,7 +2978,10 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
   // wiring func -> deref(key-global) is exact and covers the body's
   // only pointer effect; non-global keys fall through to the generic
   // path + LEDGER.
-  if (CFLStaticCall) {
+  // Under --cfl-cells none of these primitives runs: __static_call_update's
+  // body stores key->func (a named cell) and tracepoint_probe_register's
+  // body stores the probe into tp->funcs, ordinary flow.
+  if (CFLStaticCall && !CFLCells) {
     Function *UF = CS.getCalledFunction();
     if (UF && UF->getName() == "__static_call_update" &&
         CS.arg_size() >= 3) {
@@ -3222,7 +3225,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
       // live in the type-erased hub — reading them imported the whole
       // hub: km showed __SCT__tp_func_sched_wakeup "resolving" to
       // array_map ops).
-      if (Suffix.starts_with("tp_func_")) {
+      if (Suffix.starts_with("tp_func_") && !CFLCells) { // cells: through the key, as any
         std::string iterName =
             ("__traceiter_" + Suffix.drop_front(8)).str();
         Function *Iter = F->getParent()->getFunction(iterName);

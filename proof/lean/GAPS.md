@@ -1070,7 +1070,18 @@ lands, so a block created as scalars or bytes and later used as a
 struct through an escape is a counted row instead of a label. Kernel
 note: `unsigned long storage[]` used as aligned struct storage becomes a
 rule (b) row through the element cells, less precise than a first use
-and sound; acceptable, counted. A later incompatible use (a struct
+and sound; acceptable, counted. Kernel dispatch (Fable 2026-10-13): a
+static_call trampoline is a load of its key's func cell. A direct call
+to a bodiless `__SCT__X` is an indirect call whose callee is the content
+of (@__SCK__X, static_call_key.func); the trampoline is never an origin;
+the key's initializer and `__static_call_update`'s store `key->func =
+func` (a body in the corpus) are ordinary flow. Premise, per site:
+"trampoline __SCT__X dispatches through __SCK__X.func". A trampoline
+without a visible key stays an extern call (outside), counted.
+`__traceiter_X` is a defined function, called directly; its dispatch
+over tp->funcs resolves by flow (one allocation pool for every
+tracepoint's probe array: an allocation-site confluence, not modeled
+away). A later incompatible use (a struct
 written into storage used as bytes, or into an allocation laid out as
 another struct) is reported as rule (b), not admitted as a layout. The
 other order needs no row: a byte access on a labeled object runs over its

@@ -808,13 +808,28 @@ bool CallGraphPass::runCellResolution() {
   const auto t0 = Clock::now();
   const DataLayout &DL = Ctx->Modules.front().first->getDataLayout();
 
-  // The kernel's answer-level channels (static_call tables, tracepoint
-  // keys) live in the cluster solver's resolution; refuse their inputs.
-  for (const CallBase *CS : Ctx->IndirectCallInsts)
-    if (const Function *CF = CS->getCalledFunction())
-      assert(!CF->getName().starts_with("__SCT__") &&
-             !CF->getName().starts_with("__traceiter_") &&
-             "--cfl-cells does not model static_call or tracepoint dispatch");
+  // Kernel dispatch as named cells (plan 3.53, kernel census, Fable
+  // 2026-10-13). A direct call to a bodiless __SCT__X trampoline is an
+  // indirect call through the cell (@__SCK__X, static_call_key.func)
+  // (GraphBuild: the key's load into the call's callee node; the
+  // trampoline is never an origin); the key's initializer and
+  // __static_call_update's store `key->func = func` are ordinary flow.
+  // __traceiter_X is a defined function and a call to it a direct call;
+  // its `it_func = funcs->func` dispatch resolves by flow from
+  // tracepoint_probe_register's store into tp->funcs.
+  {
+    size_t traceIterCalls = 0;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F))
+          if (const auto *CB = dyn_cast<CallBase>(&I))
+            if (const Function *CF = CB->getCalledFunction(); CF && CF->getName().starts_with("__traceiter_"))
+              traceIterCalls++;
+    if (g_staticCallWired || g_staticCallNoKey || traceIterCalls)
+      CG_LOG("Cells: kernel dispatch: " << g_staticCallWired << " __SCT__ sites rewritten through their key, "
+             << g_staticCallNoKey << " __SCT__ sites without a visible key (an extern call: outside), "
+             << traceIterCalls << " __traceiter_ direct calls kept\n");
+  }
 
   // ---- Solver nodes: graph nodes keep their factory index; cells and
   // store collectors are numbered after them. ----

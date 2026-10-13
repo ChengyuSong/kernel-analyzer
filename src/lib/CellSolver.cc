@@ -1683,6 +1683,7 @@ bool CallGraphPass::runCellResolution() {
   // other side's member objects.
   size_t factMerges = 0;
   auto mergeFacts = [&](uint32_t a, uint32_t b) {
+    MintCause mc(mintCause, "fact merge", VerboseLevel >= 2);
     a = findFact(a);
     b = findFact(b);
     if (a == b) return a;
@@ -2920,6 +2921,18 @@ bool CallGraphPass::runCellResolution() {
   // method's fetch and its reload in F.
   struct Guard { const Function *F; uint32_t si, node; std::vector<uint32_t> held; bool dropped = false; };
   std::vector<Guard> guards;
+  boost::unordered_flat_map<uint64_t, Why> heldWhy; // (guard, fact) -> the cause it arrived by
+  // A held fact admitted (or released): with the cause it arrived by
+  // (first-arrival records only).
+  auto admitHeld = [&](uint32_t gi, uint32_t f) {
+    const Why saved = curWhy;
+    if (trackWhy)
+      if (auto it = heldWhy.find((uint64_t)gi << 32 | f); it != heldWhy.end()) curWhy = it->second;
+    admitting = true;
+    add(guards[gi].node, f);
+    admitting = false;
+    curWhy = saved;
+  };
   boost::unordered_flat_set<uint64_t> guardAdmitted, guardSeen; // (guard, holder)
   size_t guardHeldFacts = 0, guardDropped = 0, guardRefused = 0;
   std::vector<std::string> guardRefusedAt;
@@ -3238,9 +3251,7 @@ bool CallGraphPass::runCellResolution() {
           if (Gd.F != F || Gd.dropped) continue;
           Gd.dropped = true;
           guardsLiveDropped++;
-          admitting = true;
-          for (uint32_t f : Gd.held) add(Gd.node, f);
-          admitting = false;
+          for (uint32_t f : Gd.held) admitHeld((uint32_t)(&Gd - guards.data()), f);
         }
         return;
       }
@@ -3462,6 +3473,7 @@ bool CallGraphPass::runCellResolution() {
   }
   guardHold = [&](uint32_t gi, uint32_t n, uint32_t f) {
     Guard &Gd = guards[gi];
+    if (trackWhy) heldWhy.try_emplace((uint64_t)gi << 32 | f, curWhy); // its cause, for the admission
     if (!guardSeen.insert((uint64_t)gi << 32 | f).second && !Gd.dropped &&
         !guardAdmitted.count((uint64_t)gi << 32 | f))
       return; // already held
@@ -3488,18 +3500,14 @@ bool CallGraphPass::runCellResolution() {
       if (Gd.dropped || find(Gd.node) == Gd.node) continue;
       Gd.dropped = true;
       guardDropped++;
-      admitting = true;
-      for (uint32_t f : Gd.held) add(Gd.node, f);
-      admitting = false;
+      for (uint32_t f : Gd.held) admitHeld(gi, f);
     }
   };
   guardAdmit = [&](uint32_t gi, uint32_t f, uint32_t F) {
     Guard &Gd = guards[gi];
     if (objs[cells[F].obj].fn != Gd.F) return;
     if (!guardAdmitted.insert((uint64_t)gi << 32 | f).second) return;
-    admitting = true;
-    add(Gd.node, f);
-    admitting = false;
+    admitHeld(gi, f);
   };
 
   // Watched stores: each root's node; a root with no node is refused
@@ -4985,6 +4993,72 @@ bool CallGraphPass::runCellResolution() {
       if (soupForeign.size() >= CFLCellSoupCap) soupStop = true;
     };
 
+  // ---- The weld census (--cfl-cell-weld-census, Part C input) ----
+  // A weld: the first fact of a second label at a value node (an IR value,
+  // a formal, a return) that held one label; unlabeled storage is a label
+  // of its own. Its join is the cause that delivered that fact. A fact of
+  // the second label arriving from a node where it was already foreign
+  // descends from that weld (its mass); memory and hub nodes only pass the
+  // descent on. Welds are numbered in arrival order: the first ones are the
+  // causes, the later ones mostly their consequences.
+  struct Weld { uint32_t node, pop, anchor, fact, src, srcFact; uint8_t kind; size_t mass = 0; std::string ctx; };
+  std::vector<Weld> welds;
+  boost::unordered_flat_map<uint32_t, uint32_t> weldAnchor, weldAt;
+  boost::unordered_flat_map<uint64_t, uint32_t> weldForeign; // (node, fact) -> weld
+  auto isValueNode = [&](uint32_t n) {
+    if (n >= G || NF.isDereferenceNode(n) || NF.isObjectNode(n)) return false;
+    const Value *V = NF.getValueForNode(n);
+    return V && (isa<Instruction>(V) || isa<Argument>(V) || NF.isReturnNode(n) || NF.isVarargNode(n));
+  };
+  if (CFLCellSoupProfile && CFLCellWeldCensus) {
+    auto soupPrev = soupArrive;
+    soupArrive = [&, soupPrev](uint32_t n, uint32_t f) {
+      if (soupPrev) soupPrev(n, f);
+      if (soupStop) return;
+      f = findFact(f);
+      if (cells[f].kind != CellKind::Off && cells[f].kind != CellKind::Any) return;
+      auto [ait, ins] = weldAnchor.try_emplace(n, f);
+      if (ins) return;
+      const uint32_t a = findFact(ait->second);
+      if (a == f) return;
+      // Byte storage (no label, or a char/byte array) is one label.
+      auto bytes = [&](uint32_t c) { // the cell's leaf: a char member of a struct is bytes too
+        Type *L = objs[cells[c].obj].layout;
+        if (!L) return true;
+        Type *T = leafAt(L, foldIn(L, cells[c].off, DL), DL);
+        while (T && T->isArrayTy()) T = T->getArrayElementType();
+        return T && T->isIntegerTy(8);
+      };
+      const bool la = !bytes(a), lf = !bytes(f);
+      if (!la && !lf) return; // bytes meet bytes: one label
+      if (la && lf) {
+        const uint64_t key = (uint64_t)a << 32 | f;
+        auto cit = compatMemo.find(key);
+        const int c = cit != compatMemo.end() ? cit->second : namesCompatible(a, f);
+        if (cit == compatMemo.end()) compatMemo.emplace(key, c);
+        if (c != 0) return;
+      }
+      const Why w = curWhy;
+      const bool hasSrc = w.node < numNodes && w.fact < cells.size() &&
+                          (w.kind == W_EDGE || w.kind == W_STEP || w.kind == W_WALK ||
+                           w.kind == W_ANY || w.kind == W_DISPATCH);
+      uint32_t wi = UINT32_MAX;
+      if (hasSrc)
+        if (auto it = weldForeign.find((uint64_t)find(w.node) << 32 | findFact(w.fact)); it != weldForeign.end())
+          wi = it->second;
+      if (wi == UINT32_MAX) {
+        if (!isValueNode(n)) return;
+        auto [wit, wins] = weldAt.try_emplace(n, (uint32_t)welds.size());
+        if (wins)
+          welds.push_back({n, (uint32_t)whyClock, a, f, hasSrc ? find(w.node) : UINT32_MAX,
+                           hasSrc ? findFact(w.fact) : UINT32_MAX, (uint8_t)w.kind, 0,
+                           hasSrc ? std::string() : mintCause}); // the replay's cause (merge, refold, ...)
+        wi = wit->second;
+      }
+      if (weldForeign.emplace((uint64_t)n << 32 | f, wi).second) welds[wi].mass++;
+    };
+  }
+
   // ---- The leak census (--cfl-cell-leak-census) ----
   // A byte-named cell (i8[]) carries no pointer in a well-typed program,
   // so a non-char object's fact in one entered byte storage somewhere. A
@@ -5777,7 +5851,10 @@ bool CallGraphPass::runCellResolution() {
     if (!chanFrom.empty()) // plan 3.54 (b): a channel source's new facts, on to its channels
       if (auto cit = chanFrom.find(n); cit != chanFrom.end())
         for (uint32_t cn : std::vector<uint32_t>(cit->second))
-          for (uint32_t f : delta) add(cn, f);
+          for (uint32_t f : delta) {
+            if (trackWhy) curWhy = {n, f, UINT32_MAX, W_EDGE};
+            add(cn, f);
+          }
     if (!watchAt.empty())
       if (auto wit = watchAt.find(n); wit != watchAt.end())
         for (uint32_t wi : std::vector<uint32_t>(wit->second))
@@ -5792,6 +5869,7 @@ bool CallGraphPass::runCellResolution() {
       if (pit != passOf.end()) { // a path store's value: admitted
         for (uint32_t f : delta) {
           guardAdmitted.insert((uint64_t)pit->second << 32 | f);
+          if (trackWhy) curWhy = {n, f, UINT32_MAX, W_EDGE};
           admitting = true;
           add(guards[pit->second].node, f);
           admitting = false;
@@ -6362,6 +6440,41 @@ bool CallGraphPass::runCellResolution() {
     CG_LOG("Cells: SOUP PROFILE: " << total << " foreign facts, " << soupEntries.size()
            << " entries (joins where an incompatible name entered)"
            << (soupStop ? " [stopped at the cap]" : "") << "\n");
+    if (CFLCellWeldCensus) {
+      // The first welds in arrival order (a first arrival seen before the
+      // stop cannot become earlier; later ones rank below these).
+      static const char *kn[] = {"other", "edge", "step", "walk", "any-offset", "hub", "copy", "dispatch"};
+      const char *tag = soupStop ? " (stop)" : " (fixpoint)";
+      CG_LOG("Cells: WELD CENSUS: " << welds.size() << " welds; the first 20 by arrival (pop):\n");
+      std::string filter;
+      for (size_t i = 0; i < welds.size() && i < 20; i++) {
+        const Weld &W = welds[i];
+        CG_LOG("Cells:   WELD #" << i + 1 << " pop " << W.pop << " at " << nodeDesc(W.node) << " | held "
+               << whyDesc(W.anchor) << " | got " << whyDesc(W.fact) << " | via " << kn[W.kind < 8 ? W.kind : 0]
+               << (W.ctx.empty() ? std::string() : " (" + W.ctx + ")") << " from " << (W.src != UINT32_MAX ? nodeDesc(W.src) : std::string("-")) << " | mass " << W.mass
+               << tag << ", " << format("%.2f", total ? 100.0 * W.mass / total : 0.0) << "% of the foreign facts"
+               << tag << "\n");
+        const std::string d = describe(objs[cells[W.fact].obj]);
+        const std::string want = d.substr(0, d.find(" ["));
+        if (filter.find(want) == std::string::npos) filter += (filter.empty() ? "" : "|") + want;
+        if (recordWhy) explainWhy2(W.src != UINT32_MAX ? W.src : W.node, want, 2);
+      }
+      CG_LOG("Cells: WELD CENSUS --cfl-cell-why filter for these: " << filter << "\n");
+      // Where the mass is: the heaviest welds, with their arrival rank.
+      std::vector<uint32_t> byMass(welds.size());
+      for (uint32_t i = 0; i < byMass.size(); i++) byMass[i] = i;
+      std::stable_sort(byMass.begin(), byMass.end(), [&](uint32_t x, uint32_t y) { return welds[x].mass > welds[y].mass; });
+      size_t first20 = 0;
+      for (size_t i = 0; i < welds.size() && i < 20; i++) first20 += welds[i].mass;
+      CG_LOG("Cells: WELD CENSUS mass: the first 20 carry " << first20 << tag << "; the heaviest:\n");
+      for (size_t i = 0; i < byMass.size() && i < 10; i++) {
+        const Weld &W = welds[byMass[i]];
+        CG_LOG("Cells:   HEAVY weld #" << byMass[i] + 1 << " pop " << W.pop << " mass " << W.mass << tag << " at "
+               << nodeDesc(W.node) << " | held " << whyDesc(W.anchor) << " | got " << whyDesc(W.fact) << " | via "
+               << kn[W.kind < 8 ? W.kind : 0] << (W.ctx.empty() ? std::string() : " (" + W.ctx + ")") << " from "
+               << (W.src != UINT32_MAX ? nodeDesc(W.src) : std::string("-")) << "\n");
+      }
+    }
     std::map<std::string, std::pair<size_t, size_t>> byClass; // mass, entries
     for (const SoupEntry &E : soupEntries) {
       auto &c = byClass[classOf(E.node)];

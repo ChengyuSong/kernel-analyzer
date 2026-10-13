@@ -1215,6 +1215,16 @@ cl::opt<bool> CFLCellSoupProfile(
            "and per struct field"),
   cl::init(false));
 
+cl::opt<bool> CFLCellWeldCensus(
+  "cfl-cell-weld-census",
+  cl::desc("--cfl-cell-soup-profile measurement (Part C input): a weld is the "
+           "first fact of a second label arriving at a value node that held "
+           "one label (byte storage, unlabeled or char, is a label of its own); welds are "
+           "listed in arrival order (the first 20), each with its join, the "
+           "mass of second-label facts descending from it at the profiler's "
+           "stop, and, with --cfl-cell-why naming its object, its first-arrival "
+           "chain"),
+  cl::init(false));
 cl::opt<bool> CFLCellLeakCensus(
   "cfl-cell-leak-census",
   cl::desc("--cfl-cell-soup-profile measurement: every non-char object's "

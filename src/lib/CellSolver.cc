@@ -931,6 +931,9 @@ bool CallGraphPass::runCellResolution() {
   }
   assert(graphFieldEdges == lazyFEdges.size() &&
          "every field edge carries an exact label");
+  // Static edges as inserted (staticCopies and stores count attempts,
+  // self-loops and duplicates included).
+  const size_t staticEdges = edgeSet.size();
   struct ByteCopy { uint32_t src, dst; int64_t len; const Instruction *at; };
   std::vector<ByteCopy> copies;
   for (auto &[sN, dN, len, at] : byteCopies) {
@@ -5533,7 +5536,7 @@ bool CallGraphPass::runCellResolution() {
   }
   // Collect mode runs on through the iterations (a soup often forms only
   // after calls resolve); it ends at the cap or at the last iteration.
-  dynEdges = edgeSet.size() - staticCopies - stores;
+  dynEdges = edgeSet.size() - staticEdges;
   const double solveSecs =
       std::chrono::duration<double>(Clock::now() - tSolve).count();
 

@@ -887,6 +887,18 @@ changes:
     term of at least sizeof T. A negative term (-O3 folds `len - 8*n - 8
     + 1` into a sum carrying -8) is no header size, so such a size says
     nothing.
+  The size is a term (ruling B, Fable 2026-10-13): a primitive
+  allocator's size operand(s) by its signature (malloc 0, calloc 0 x 1,
+  realloc 1, reallocarray 1 x 2, aligned_alloc/memalign 1, the kernel
+  family by its declared size index); a fresh wrapper's, the term of the
+  allocation it returns (a constant times up to two of its formals, and
+  possibly a further unknown factor: still a multiple of the known ones),
+  composed through the inner call and evaluated at the call site. Never
+  the call's integer arguments by position (`new_stmt(cstate, code)`: an
+  opcode is no size). A wrapper whose term is unknown (a summary row
+  without a body, a pool carve until its size is exported, return
+  sources that disagree) has an unknown size: one T, then unknown data.
+  Counted ("fresh wrappers with an unknown size term").
   A T-typed index (a variable index or walk whose GEP steps over elements
   of T; a stride that only equals sizeof T is no evidence) on the latter
   makes it an array of T (`extendToArray`). Any other variable index from

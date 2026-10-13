@@ -656,11 +656,12 @@ bool isMultipleOf(const Value *X, uint64_t sz, bool nonzero = false) {
 // depth: -O3 chains `sizeof(T) + 8*n + 40*m + k`) with a constant term of
 // at least sizeof(T) and some other term that is not a multiple of it
 // (`n*sizeof(T) + sizeof(T)` is an array of n+1)?
-bool headerPlusTail(const CallBase *C, uint64_t sz) {
+bool headerPlusTail(const std::vector<const Value *> &ops, uint64_t sz) {
   auto lookThrough = sizeThrough;
   auto multipleOf = [&](const Value *X) { return isMultipleOf(X, sz); };
-  for (const Use &A : C->args()) {
-    const Value *V = lookThrough(A.get());
+  if (ops.size() != 1) return false; // a product (calloc) is an array or one, not T plus data
+  for (const Value *A : ops) {
+    const Value *V = lookThrough(A);
     if (!V->getType()->isIntegerTy()) continue;
     if (const auto *K = dyn_cast<ConstantInt>(V)) {
       const uint64_t k = K->getZExtValue();
@@ -697,13 +698,11 @@ bool headerPlusTail(const CallBase *C, uint64_t sz) {
 // Does an allocation call allocate exactly sz bytes (its integer
 // arguments all constants, multiplying to sz: malloc(64), calloc(1, 64))?
 // Then it is one T, not an array of T.
-bool exactlyOne(const CallBase *C, uint64_t sz) {
+bool exactlyOne(const std::vector<const Value *> &ops, uint64_t sz) {
   uint64_t prod = 1;
   bool any = false;
-  for (const Use &A : C->args()) {
-    const Value *V = A.get();
-    while (const auto *CI = dyn_cast<CastInst>(V)) V = CI->getOperand(0);
-    if (!V->getType()->isIntegerTy()) continue;
+  for (const Value *V : ops) {
+    V = sizeThrough(V);
     const auto *K = dyn_cast<ConstantInt>(V);
     if (!K) return false;
     prod *= K->getZExtValue();
@@ -715,9 +714,9 @@ bool exactlyOne(const CallBase *C, uint64_t sz) {
 // Does an allocation call's size say "an array of T": an integer argument
 // that is a multiple of sizeof(T) (calloc(n, sizeof T), malloc(n * sizeof
 // T), realloc(p, k * sizeof T))?
-bool sizeIsMultiple(const CallBase *C, uint64_t sz) {
-  for (const Use &A : C->args())
-    if (A.get()->getType()->isIntegerTy() && isMultipleOf(A.get(), sz, true)) return true;
+bool sizeIsMultiple(const std::vector<const Value *> &ops, uint64_t sz) {
+  for (const Value *V : ops)
+    if (isMultipleOf(V, sz, true)) return true;
   return false;
 }
 
@@ -1813,13 +1812,146 @@ bool CallGraphPass::runCellResolution() {
     O.ident = id;
     identPairs[{O.label, id}]++;
   };
+  // The size of an allocating call (plan 3.53, ruling B): a term of the
+  // callee, a constant times up to two of its formals, evaluated at the
+  // call. A primitive allocator's term is its signature's size operand(s);
+  // a fresh wrapper's is its returned allocation's, composed through the
+  // inner call (a body is read; a summary row without a body has none).
+  // Never the call's integer arguments by position (`new_stmt(cstate,
+  // code)`: the opcode is no size). Unknown: the size says nothing.
+  // partial: a further factor that is not known (a product with one known
+  // factor is still a multiple of it; `(old + add) * element_size`).
+  struct SizeTerm { bool known = false; uint64_t c = 1; std::vector<unsigned> formals; bool partial = false; };
+  auto sigOf = [](StringRef N, std::vector<unsigned> &idx) {
+    idx.clear();
+    if (N == "calloc") idx = {0, 1};
+    else if (N == "realloc" || N == "aligned_alloc" || N == "memalign") idx = {1};
+    else if (N == "reallocarray") idx = {1, 2};
+    else if (N == "malloc" || N == "valloc" || N == "pvalloc") idx = {0};
+    else {
+      int size = -1, flag = -1;
+      if (isAllocFn(N, &size, &flag) && size >= 0) idx = {(unsigned)size};
+    }
+    return !idx.empty();
+  };
+  std::function<SizeTerm(const Value *, const Function *, int)> termIn =
+      [&](const Value *V, const Function *F, int d) -> SizeTerm {
+    if (d > 8) return {};
+    V = sizeThrough(V);
+    if (const auto *K = dyn_cast<ConstantInt>(V)) return {true, K->getZExtValue(), {}};
+    if (const auto *A = dyn_cast<Argument>(V); A && A->getParent() == F) return {true, 1, {A->getArgNo()}};
+    if (const auto *B = dyn_cast<BinaryOperator>(V)) {
+      if (B->getOpcode() == Instruction::Mul) {
+        SizeTerm a = termIn(B->getOperand(0), F, d + 1), b = termIn(B->getOperand(1), F, d + 1);
+        if (!a.known && !b.known) return {};
+        if (!a.known) { b.partial = true; return b; }
+        if (!b.known) { a.partial = true; return a; }
+        if (a.formals.size() + b.formals.size() > 2) return {};
+        a.c *= b.c;
+        a.partial |= b.partial;
+        a.formals.insert(a.formals.end(), b.formals.begin(), b.formals.end());
+        return a;
+      }
+      if (B->getOpcode() == Instruction::Shl)
+        if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(B->getOperand(1))); K && K->getZExtValue() < 63) {
+          SizeTerm a = termIn(B->getOperand(0), F, d + 1);
+          if (a.known) a.c <<= K->getZExtValue();
+          return a;
+        }
+    }
+    return {};
+  };
+  std::unordered_map<const Function *, SizeTerm> termMemo;
+  std::set<const Function *> termBusy;
+  std::function<SizeTerm(const Function *)> termOfFn;
+  // The term of call C expressed in F's formals (F null: C's own operands
+  // are not classified, the callee's term is returned as is).
+  auto callTerm = [&](const CallBase *C, const Function *F) -> SizeTerm {
+    const Function *CF = C->getCalledFunction();
+    if (!CF) return {};
+    std::vector<unsigned> idx;
+    SizeTerm inner;
+    if (sigOf(CF->getName(), idx)) inner = {true, 1, idx};
+    else if (auto sit = Ctx->FuncSummaries.find(CF); sit != Ctx->FuncSummaries.end() && sit->second &&
+             sit->second->fresh && !CF->isDeclaration())
+      inner = termOfFn(CF);
+    if (!inner.known) return {};
+    if (!F) return inner;
+    SizeTerm out{true, inner.c, {}, inner.partial};
+    for (unsigned k : inner.formals) {
+      if (k >= C->arg_size()) return {};
+      const SizeTerm a = termIn(C->getArgOperand(k), F, 0);
+      if (!a.known) { out.partial = true; continue; }
+      if (out.formals.size() + a.formals.size() > 2) return {};
+      out.c *= a.c;
+      out.partial |= a.partial;
+      out.formals.insert(out.formals.end(), a.formals.begin(), a.formals.end());
+    }
+    if (out.partial && out.c == 1 && out.formals.empty()) return {}; // no known factor
+    return out;
+  };
+  termOfFn = [&](const Function *F) -> SizeTerm {
+    if (auto it = termMemo.find(F); it != termMemo.end()) return it->second;
+    if (!termBusy.insert(F).second) return {};
+    std::optional<SizeTerm> agreed;
+    bool bad = false;
+    std::vector<const Value *> work;
+    std::set<const Value *> seen;
+    for (const BasicBlock &BB : *F)
+      if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+        if (RI->getReturnValue()) work.push_back(RI->getReturnValue());
+    while (!work.empty() && !bad) {
+      const Value *V = work.back()->stripPointerCasts();
+      work.pop_back();
+      if (!seen.insert(V).second || isa<ConstantPointerNull>(V)) continue;
+      if (const auto *PN = dyn_cast<PHINode>(V)) { for (const Value *In : PN->incoming_values()) work.push_back(In); continue; }
+      if (const auto *SI = dyn_cast<SelectInst>(V)) { work.push_back(SI->getTrueValue()); work.push_back(SI->getFalseValue()); continue; }
+      if (const auto *L = dyn_cast<LoadInst>(V)) // -O0: a slot stored once
+        if (const auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+          const StoreInst *only = nullptr;
+          int n = 0;
+          for (const User *U : A->users())
+            if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == A) only = St, n++;
+          if (n == 1) { work.push_back(only->getValueOperand()); continue; }
+        }
+      const auto *C = dyn_cast<CallBase>(V);
+      const SizeTerm t = C ? callTerm(C, F) : SizeTerm{}; // a pool carve, a GEP, ...: unknown (for now)
+      if (!t.known) { bad = true; break; }
+      if (!agreed) agreed = t;
+      else if (agreed->c != t.c || agreed->formals != t.formals || agreed->partial != t.partial) bad = true;
+    }
+    termBusy.erase(F);
+    return termMemo[F] = (bad || !agreed) ? SizeTerm{} : *agreed;
+  };
+  size_t promotedUnknownSize = 0;
+  // The size operands of an allocating call C (a product), false when the
+  // size is unknown.
+  auto sizeOps = [&](const CallBase *C, std::vector<const Value *> &ops) {
+    ops.clear();
+    const SizeTerm t = callTerm(C, nullptr);
+    if (!t.known) return false;
+    for (unsigned k : t.formals) {
+      if (k >= C->arg_size()) { ops.clear(); return false; }
+      ops.push_back(C->getArgOperand(k));
+    }
+    if (t.c != 1 || ops.empty())
+      ops.push_back(ConstantInt::get(Type::getInt64Ty(C->getContext()), t.c));
+    if (t.partial) ops.push_back(UndefValue::get(Type::getInt64Ty(C->getContext()))); // an unknown factor
+    return true;
+  };
   auto containerOfSize = [&](const CallBase *C, const StructType *S, int64_t sz,
                              size_t &n) -> StructType * {
     n = 0;
     uint64_t k = 0;
-    for (const Use &A : C->args())
-      if (const auto *K = dyn_cast<ConstantInt>(A.get()))
-        if (K->getZExtValue() > (uint64_t)sz && K->getZExtValue() % sz) k = K->getZExtValue();
+    std::vector<const Value *> ops;
+    if (sizeOps(C, ops)) {
+      uint64_t prod = 1;
+      bool allConst = true;
+      for (const Value *V : ops)
+        if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(V))) prod *= K->getZExtValue();
+        else allConst = false;
+      if (allConst && prod > (uint64_t)sz && prod % sz) k = prod;
+    }
     if (!k) return nullptr;
     const StructInfo *SI =
         Ctx->structAnalyzer.getStructInfo(S, const_cast<Module *>(C->getModule()));
@@ -1846,9 +1978,15 @@ bool CallGraphPass::runCellResolution() {
     O.repeats = false;
     const auto *C = dyn_cast_or_null<CallBase>(V);
     const uint64_t at = (uint64_t)(O.base + O.size);
-    if (C && headerPlusTail(C, at)) { O.tail = true; extentHeader++; tailObjects++; }
-    else if (C && exactlyOne(C, at)) extentOne++;
-    else if (C && sizeIsMultiple(C, at)) { O.repeats = true; extentArrays++; }
+    std::vector<const Value *> ops;
+    const bool sized = C && sizeOps(C, ops);
+    if (C && !sized)
+      if (const Function *CF = C->getCalledFunction())
+        if (auto sit = Ctx->FuncSummaries.find(CF); sit != Ctx->FuncSummaries.end() && sit->second && sit->second->fresh)
+          promotedUnknownSize++; // a fresh wrapper (promoted or a row) whose size term is unknown
+    if (sized && headerPlusTail(ops, at)) { O.tail = true; extentHeader++; tailObjects++; }
+    else if (sized && exactlyOne(ops, at)) extentOne++;
+    else if (sized && sizeIsMultiple(ops, at)) { O.repeats = true; extentArrays++; }
     else { O.tail = true; O.tailUnsized = true; extentUnknown++; }
   };
   segmentLabel = [&](Obj &T) {
@@ -6097,7 +6235,8 @@ bool CallGraphPass::runCellResolution() {
          << "learned " << layoutsLearned << " layouts, " << periodsLearned
          << " element sizes; extents: " << extentArrays << " arrays by size, " << extentOne
          << " one by size, " << extentHeader << " header + data by size, " << extentUnknown
-         << " one then unknown (size unknown), " << arraysExtended << " made arrays by a T-stride access ("
+         << " one then unknown (size unknown; " << promotedUnknownSize
+         << " of them fresh wrappers with an unknown size term), " << arraysExtended << " made arrays by a T-stride access ("
          << extendRefused << " refused: typed trailing data; " << tailIndexAny
          << " other variable indexes also reach the data after the T); " << tailWritesFolded
          << " writes of another struct into the data after a T (rule (b): not admitted); " << readStepsSkipped

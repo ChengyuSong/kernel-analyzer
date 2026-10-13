@@ -4148,6 +4148,11 @@ bool CallGraphPass::runCellResolution() {
   // are the ones seen so far.
   std::vector<std::string> copyMismatchAt;
   size_t copyMismatches = 0;
+  // Relay rows (plan 3.53 rule 4): a byte copy between storage of
+  // different labels, per (site, source label, destination label); a null
+  // label is bytes (an unlabeled object or a char array). The count is
+  // of copied regions.
+  std::map<std::tuple<const Instruction *, Type *, Type *>, size_t> relayRows;
   // Pointer subtractions across objects (kept for the rule report).
   size_t rrPtrAlways = 0, rrPtrMay = 0;
   std::vector<std::string> rrPtrAt;
@@ -4320,15 +4325,41 @@ bool CallGraphPass::runCellResolution() {
     // other is (equal, or embedded: base and derived). Otherwise the
     // program copies one struct over an unrelated one: report it (in
     // one-label stop mode, stop); the bytes are still copied.
+    auto startsIn = [&](StructType *S, Type *T, int64_t off) {
+      return S->hasName() &&
+             structStartsAt(T, off, stripStructNameSuffix(S->getName()), DL, S);
+    };
+    // Rule 4 (plan 3.53): storage of one label copied into storage of the
+    // same label (or into an unlabeled object from its start, which took
+    // the source's layout above) is copied cell to cell: the walk below
+    // maps every position through both layouts, so fields, union members
+    // and array elements move to their own cells. A copy between
+    // different labels is still walked position by position, through
+    // bytes on a byte side, and is a relay row.
+    {
+      auto labelAt = [&](uint32_t o, int64_t off) -> Type * {
+        const Obj &O = objs[o];
+        if (!O.layout || O.label == "i8") return nullptr;
+        const int64_t f = O.repeats ? ((off % O.size) + O.size) % O.size : off;
+        if (StructType *S = structAt(O.layout, f, DL)) return S;
+        return O.layout;
+      };
+      const auto [lso, lsa] = locate(os, a);
+      const auto [ldo, ldb] = locate(od, b);
+      Type *ls = labelAt(lso, lsa), *ld = labelAt(ldo, ldb);
+      auto fold = [&](const Obj &O, int64_t off) {
+        return O.repeats ? ((off % O.size) + O.size) % O.size : off;
+      };
+      const bool embedded =
+          ls && ld && ((isa<StructType>(ls) && startsIn(cast<StructType>(ls), objs[ldo].layout, fold(objs[ldo], ldb))) ||
+                       (isa<StructType>(ld) && startsIn(cast<StructType>(ld), objs[lso].layout, fold(objs[lso], lsa))));
+      if (ls != ld && !embedded) relayRows[{at, ls, ld}]++;
+    }
     if (objs[os].layout && objs[od].layout) {
       const Obj &Os = objs[os], &Od = objs[od];
       const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
       const int64_t fb = Od.repeats ? ((b % Od.size) + Od.size) % Od.size : b;
       StructType *Ss = structAt(Os.layout, fa, DL), *Sd = structAt(Od.layout, fb, DL);
-      auto startsIn = [&](StructType *S, Type *T, int64_t off) {
-        return S->hasName() &&
-               structStartsAt(T, off, stripStructNameSuffix(S->getName()), DL, S);
-      };
       if (Ss && Sd && Ss != Sd && !startsIn(Ss, Od.layout, fb) &&
           !startsIn(Sd, Os.layout, fa)) {
         if (!copyMismatches && curCopy != UINT32_MAX)
@@ -7167,14 +7198,24 @@ bool CallGraphPass::runCellResolution() {
        << "# Rows under --cfl-cells (plan 3.48 note): (b) counts member steps of\n"
        << "# struct T on an address whose object has another label at that offset;\n"
        << "# (c) lists the premises the solver assumes (untyped writes and bodiless\n"
-       << "# calls write no struct slot) and struct copies between unrelated types.\n";
+       << "# calls write no struct slot), struct copies between unrelated types, and\n"
+       << "# relay rows: byte copies between differently labeled storage (3.53 rule 4).\n";
     RO << "SUMMARY a " << aData << " pointers from data, " << aConst
        << " from constant addresses, " << aLost << " from pointers lost before the cast\n";
     RO << "SUMMARY b " << ruleB << " member steps whose struct is not at the address's offset ("
        << ruleBPairs.size() << " object label / struct pairs)\n";
+    // Rule 4: one row per (site, source label, destination label); types
+    // that print as one label (renamed copies of a struct) are one row.
+    std::map<std::string, size_t> relayLines;
+    for (auto &[k, n] : relayRows) {
+      auto [I, ls, ld] = k;
+      auto lab = [](Type *T) { return T ? typeLabel(T) : std::string("bytes"); };
+      relayLines[(I ? instLoc(I) : std::string("?")) + ": " + lab(ls) + " into " + lab(ld)] += n;
+    }
     RO << "SUMMARY c " << modUntypedWrites << " untyped writes and " << modBodiless
        << " calls of bodiless functions assumed to write no struct slot; "
-       << copyMismatches << " copies between unrelated structs\n";
+       << copyMismatches << " copies between unrelated structs; " << relayLines.size()
+       << " relay rows (byte copies between differently labeled storage, rule 4)\n";
     RO << "SUMMARY UB " << byteStepUB << " byte steps leaving a byte array, "
        << leftObject << " offsets past a single object, " << indexOutsideArray
        << " variable indexes on a single object, pointer subtractions across objects: always "
@@ -7295,6 +7336,7 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[c, k] : bTop) RO << "B x" << c << " object " << k.first << " stepped as " << k.second << "\n";
     RO << "\n== (c) premises and copies between unrelated structs\n";
     for (const std::string &d : copyMismatchAt) RO << "C copy " << d << "\n";
+    for (auto &[r, n] : relayLines) RO << "C relay " << r << " (" << n << " regions)\n";
     RO << "C integer name copied into bytes: " << intNameToBytes << " positions\n";
     for (const std::string &d : intNameToBytesAt) RO << "C int-to-bytes " << d << "\n";
     RO << "\n== UB undefined behavior (counted, not followed)\n";

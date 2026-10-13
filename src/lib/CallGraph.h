@@ -487,6 +487,9 @@ protected:
   void checkPoolCarves();
   std::unordered_map<const llvm::Instruction *, std::string> poolCarves;
   std::unordered_set<const llvm::Instruction *> poolBookkeeping;
+  // The certified pools' handle fields ("objalloc+0"), checked after the
+  // solve: a write into one outside the forms is a rule row.
+  std::set<std::string> poolHandleFields;
   // Varargs renderers (plan 3.41): functions whose pointer reads through a
   // va_list are data only (printed, measured, compared, copied as chars):
   // those reads carry no facts; variadic wrappers whose va_lists reach only

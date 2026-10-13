@@ -641,10 +641,12 @@ void CallGraphPass::checkPoolCarves() {
           if (!S || !S->getValueOperand()->getType()->isPointerTy()) continue;
           const std::string k = fieldKey(S, S->getPointerOperand());
           if (!handleFields.count(k)) continue;
-          if (isHandle(S->getValueOperand())) {
-            bookkeeping.push_back({S, k});
-            continue;
-          }
+          // A typed store into a handle field is the pool's own state once
+          // the pool is certified: classified here as a handle store, a
+          // bump, a rewind, or a refusal (which refuses the pool). The
+          // post-solve pass then looks only at writes this check cannot see.
+          bookkeeping.push_back({S, k});
+          if (isHandle(S->getValueOperand())) continue;
           bool carved = false;
           for (const Carve &c : carves) carved |= c.I == S->getValueOperand()->stripPointerCasts();
           // The bump after a carve (a new chunk's first piece + n): the
@@ -766,7 +768,10 @@ void CallGraphPass::checkPoolCarves() {
   // The effect: certified pools' carves and bookkeeping.
   poolCarves.clear();
   poolBookkeeping.clear();
+  poolHandleFields.clear();
   if (CFLPoolCarves) {
+    for (const std::string &f : handleFields)
+      if (!isRefused(pool(f))) poolHandleFields.insert(f);
     for (const Carve &c : carves)
       if (!isRefused(pool(c.field))) poolCarves[c.I] = c.form;
     for (auto &[I, f] : bookkeeping)

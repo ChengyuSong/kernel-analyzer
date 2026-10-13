@@ -1159,6 +1159,32 @@ written through an older carve is not read through the new one. The
 analysis is not temporal. The assumption is the one recorded for
 lookaside and objalloc reuse in func_summaries.txt.
 
+**Post-solve check of the handle cells.** After the solve, every store or
+block copy (memcpy, memmove) whose pointer may reach a certified pool's
+handle cell, other than the pool's own typed accesses classified before
+the solve, is a rule row:
+
+> the solver's facts admit a writer of this handle cell outside the pool's
+> forms (site); the carve model assumes that write does not change the
+> handle; sound when the program keeps its pool discipline; first cause:
+> the imprecise pointer at (site)
+
+- The first cause is the leak census's tag on the reaching fact at the
+  writer's pointer, under --cfl-cell-leak-census.
+- These rows are a class-7 leak into the handle (a store through an
+  imprecise pointer), not a new rule class. They fall with the soup and
+  are tracked in the per-program state like the other counts.
+- The rows check the third hypothesis (a handle reached only through
+  typed accesses) as far as the solver's facts allow. The certificate is
+  kept where rows exist: they come from the solver's imprecision (soup
+  pointers holding the pool descriptor), not from program writes. Under
+  the certificate a handle load has no data use, so anything that lands
+  in a handle cell never flows into program data.
+- Counts at 2026-10-12, run at the cells gate's 200K stop for nm-new:
+  - tcpdump O0/O3: 0;
+  - nm-new O3: 0;
+  - nm-new O0: 358.
+
 **Confirmer.** A carve result is a fresh source for R1. The certified
 pools' bookkeeping (handle-field stores, the bump, rewinds, ptrtoint of
 handles) is exempt from R2 and R3, because it is the pool's own state

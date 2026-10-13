@@ -53,7 +53,7 @@ Removed options are errors that name their replacement; the list is in
 - **`--bc-list`** (default `""`): File containing input bitcode file paths, one per line
 - **`--verbose`** (default `0`): Verbose level
 - **`--log-timestamps`** (default `false`): Prefix every KA_LOG line with [+<seconds>] elapsed since process start (phase profiling; default off — the prefix changes the log format pin-extraction scripts anchor on)
-- **`--mem-limit`** (default `80`): Memory limit as percentage of physical RAM (0 = unlimited, default 80)
+- **`--mem-limit`** (default `80`): Memory limit as a PERCENTAGE of physical RAM, not GB (0 = unlimited, default 80): on a 1.5 TB machine 40 is about 594 GB, 2 about 30 GB; the process exits when its resident size passes it (--mem-limit-mode)
 - **`--mem-limit-mode`** (default `"rss"`): How --mem-limit is enforced: 'rss' (default) = watchdog thread on /proc/self/status VmRSS — measures RESIDENT memory, immune to allocator reservations / transient doublings / mapped files that inflate virtual size; 'as' = legacy RLIMIT_AS on virtual address space (overcounts by 1.2-2x under many threads); 'off' = no in-process limit — use when a cgroup enforces it (docker --memory)
 - **`--callgraph-json`** (default `""`): Export call graph to JSON file
 - **`--cfl-dump-icalls`** (default `false`): Dump one ICALL line per resolved (callsite, callee) pair; sort the lines to diff runs (5M+ lines on whole-kernel inputs)

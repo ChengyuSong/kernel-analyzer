@@ -6774,6 +6774,84 @@ bool CallGraphPass::runCellResolution() {
       for (const std::string &w : where) CG_LOG("Cells:     " << w << "\n");
     }
   }
+  // ---- Pool handle cells after the solve (plan 3.53 rule 3). The carve
+  // checks before the solve see typed accesses only. A write into a
+  // certified pool's handle cell from anywhere but the pool's own form
+  // sites (bump, refill, handle-field stores, rewinds) is a rule row:
+  // "pool handle written outside its forms". This checks the hypothesis
+  // that an offset-0 handle is reached only through typed accesses
+  // (`*(void **)o = p` through the struct's address). ----
+  std::vector<std::pair<const Instruction *, std::string>> poolRows;
+  if (!poolHandleFields.empty()) {
+    std::set<std::string> poolStructs;
+    for (const std::string &f : poolHandleFields) poolStructs.insert(f.substr(0, f.rfind('+')));
+    auto structOf = [&](const Obj &O) {
+      std::string l = stripStructNameSuffix(O.ident.empty() ? O.label : O.ident).str();
+      return StringRef(l).starts_with("struct.") ? l.substr(7) : l;
+    };
+    // The handle fields a write through fact f reaches: its cell's field;
+    // every handle field of the struct at or past the cell for a block
+    // copy (memcpy, memmove; a memset writes no pointer), and all of them
+    // for an any-offset cell.
+    auto reach = [&](uint32_t f, bool block, std::set<std::string> &out) -> bool {
+      const size_t before = out.size();
+      const Cell &c = cells[f];
+      if (c.kind != CellKind::Off && c.kind != CellKind::Any) return false;
+      const Obj &O = objs[c.obj];
+      if (!O.layout) return false;
+      const std::string s = structOf(O);
+      if (!poolStructs.count(s)) return false;
+      for (const std::string &h : poolHandleFields) {
+        if (h.compare(0, s.size() + 1, s + "+") != 0) continue;
+        const int64_t ho = std::stoll(h.substr(s.size() + 1));
+        if (c.kind == CellKind::Any || (block && ho >= c.off) || (!block && ho == c.off)) out.insert(h);
+      }
+      return out.size() > before;
+    };
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F)) {
+          const Value *Addr = nullptr;
+          bool block = false;
+          if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+            Addr = SI->getPointerOperand();
+          } else if (const auto *MI = dyn_cast<MemTransferInst>(&I)) {
+            Addr = MI->getDest(); // a memset writes no pointer
+            block = true;
+          }
+          if (!Addr || poolBookkeeping.count(&I)) continue;
+          const NodeIndex n = NF.getValueNodeFor(Addr);
+          if (n == AndersNodeFactory::InvalidIndex || getCanonicalNode(n) >= G) continue;
+          std::set<std::string> hit;
+          const uint32_t pn = find(canon(n));
+          uint32_t cause = UINT32_MAX; // the leak that carried a reaching fact here
+          bool tagged = false;
+          pts[pn].forEach([&](uint32_t f) {
+            if (!reach(f, block, hit) || tagged) return;
+            if (auto it = leakTag.find((uint64_t)pn << 32 | findFact(f)); it != leakTag.end()) {
+              cause = it->second;
+              tagged = true;
+            }
+          });
+          if (hit.empty()) continue;
+          // The row: the solver's facts admit a writer of the handle cell
+          // outside the forms, and its first cause (the leak census's tag
+          // of the reaching fact at the writer's pointer).
+          std::string fs;
+          for (const std::string &h : hit) fs += (fs.empty() ? "" : " ") + h;
+          fs += "; first cause: ";
+          if (!CFLCellLeakCensus) fs += "unknown (run with --cfl-cell-leak-census)";
+          else if (!tagged) fs += "not carried by a byte-storage leak";
+          else fs += "the imprecise pointer at " + leakSites[cause].where;
+          poolRows.push_back({&I, fs});
+        }
+    CG_LOG("Cells: pool handle cells (" << poolHandleFields.size() << " fields of the certified pools): "
+           << poolRows.size() << " writes outside the pools' forms (rule rows: the carve model assumes "
+           << "they do not change the handle; sound when the program keeps its pool discipline)\n");
+    for (size_t i = 0; i < poolRows.size() && i < 20; i++)
+      CG_LOG("Cells:   the solver's facts admit a writer of the handle cell outside the pool's forms at "
+             << instLoc(poolRows[i].first) << ": " << poolRows[i].second << "\n");
+  }
   if (!CFLRuleReport.empty()) {
     std::error_code EC;
     raw_fd_ostream RO(CFLRuleReport, EC, sys::fs::OF_Text);
@@ -7246,6 +7324,15 @@ bool CallGraphPass::runCellResolution() {
     }
     RO << "\n== varargs keyed by format specifier (plan 3.47)\n";
     for (const std::string &d : varargReport) RO << "V " << d << "\n";
+    if (!poolHandleFields.empty()) {
+      RO << "\n== pool handle cells written outside the pools' forms (plan 3.53 rule 3)\n";
+      RO << "SUMMARY pool handles " << poolHandleFields.size() << " fields, " << poolRows.size()
+         << " writes outside the forms\n";
+      for (auto &[I, fs] : poolRows)
+        RO << "P the solver's facts admit a writer of this handle cell outside the pool's forms (" << instLoc(I)
+           << "); the carve model assumes that write does not change the handle; sound when the program keeps "
+           << "its pool discipline: " << fs << "\n";
+    }
     CG_LOG("Cells: rule report written to " << CFLRuleReport << "\n");
   }
   if (stoppedAt && !CFLCellStopAnswers.empty()) {

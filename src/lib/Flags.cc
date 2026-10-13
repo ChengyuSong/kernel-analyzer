@@ -1353,7 +1353,10 @@ cl::opt<std::string> IRSidecarDir(
   cl::init(""));
 
 cl::opt<int> MemLimitPct(
-  "mem-limit", cl::desc("Memory limit as percentage of physical RAM (0 = unlimited, default 80)"), cl::init(80));
+  "mem-limit", cl::desc("Memory limit as a PERCENTAGE of physical RAM, not GB (0 = unlimited, "
+                        "default 80): on a 1.5 TB machine 40 is about 594 GB, 2 about 30 GB; the "
+                        "process exits when its resident size passes it (--mem-limit-mode)"),
+  cl::init(80));
 
 cl::opt<std::string> MemLimitMode(
   "mem-limit-mode",

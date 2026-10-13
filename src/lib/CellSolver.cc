@@ -979,7 +979,11 @@ bool CallGraphPass::runCellResolution() {
           if (!CS || isa<IntrinsicInst>(CS)) continue;
           auto cit = taggedEntryChannels.find(CS);
           for (unsigned k = 0; k < CS->arg_size(); k++) {
-            if (!CS->getArgOperand(k)->getType()->isPointerTy()) continue;
+            // A constant is never a channel's actual (that is the receiver's
+            // identity, a load or an argument), and its node, with no copy
+            // edge into it, shares no class with one; asking the factory for
+            // it could mint a node after the graph was fixed.
+            if (!CS->getArgOperand(k)->getType()->isPointerTy() || isa<Constant>(CS->getArgOperand(k))) continue;
             const NodeIndex vn = NF.getValueNodeFor(CS->getArgOperand(k));
             if (vn == AndersNodeFactory::InvalidIndex) continue;
             ActualChan &ac = actualChan[canon(vn)];
@@ -2753,10 +2757,17 @@ bool CallGraphPass::runCellResolution() {
         // The addresses stepped to, the loaded one first: a chain of GEPs
         // when the field is in a struct embedded in the object.
         std::vector<const Value *> addrs{Slot};
+        bool constStep = false;
         for (const Value *X = Slot->stripPointerCasts(); const auto *G = dyn_cast<GEPOperator>(X);) {
           X = G->getPointerOperand()->stripPointerCasts();
           if (X == V) break;
+          constStep |= isa<Constant>(X); // a constant GEP of a global: no node to step (plain wiring)
           addrs.push_back(X);
+        }
+        if (constStep) {
+          R.all = true;
+          R.lis.push_back({});
+          continue;
         }
         std::vector<uint32_t> steps;
         const Value *B = V;

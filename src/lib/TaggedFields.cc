@@ -1068,15 +1068,32 @@ void CallGraphPass::computeTaggedFields() {
         if (const GEPOperator *FG = dyn_cast<GEPOperator>(&I); FG && structGEP(&I) == FG) {
           StructType *S0 = dyn_cast<StructType>(FG->getSourceElementType());
           APInt Ap(64, 0);
-          if (S0 && S0->hasName() && FG->accumulateConstantOffset(DL, Ap))
-            for (const User *U : I.users()) {
-              if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == &I) continue;
-              if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == &I) continue;
-              if (isa<DbgInfoIntrinsic>(U)) continue;
+          if (S0 && S0->hasName() && FG->accumulateConstantOffset(DL, Ap)) {
+            // Through pointer-to-pointer casts (the typed-pointer upgrade
+            // leaves `bitcast ptr %f to ptr` before a store at -O0): the
+            // address is still used only as a load or store address.
+            std::vector<const Value *> work{&I};
+            bool esc = false;
+            while (!work.empty() && !esc) {
+              const Value *A = work.back();
+              work.pop_back();
+              for (const User *U : A->users()) {
+                if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == A) continue;
+                if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == A) continue;
+                if (isa<DbgInfoIntrinsic>(U)) continue;
+                if (const auto *C = dyn_cast<BitCastInst>(U); C && C->getType()->isPointerTy()) {
+                  work.push_back(C);
+                  continue;
+                }
+                esc = true;
+                break;
+              }
+            }
+            if (esc) {
               const Field ef{stripStructNameSuffix(S0->getName()).str(), Ap.getSExtValue()};
               if (escapedAt.emplace(ef, locOf(&I)).second) {}
-              break;
             }
+          }
         }
         const Value *Addr = nullptr;
         Type *T = nullptr;

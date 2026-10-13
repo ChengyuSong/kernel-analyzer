@@ -1046,7 +1046,9 @@ store to a struct global or local itself is its member at offset 0), a
 field's only for a scalar or pointer-slot pointee: a struct-pointer field
 is a base-class slot (libjpeg `cinfo->dest`, declared
 jpeg_destination_mgr *, receives a my_destination_mgr; taking it made
-cjpeg-O3 run out of memory), so its pointee declares nothing. The
+cjpeg-O3 run out of memory), so its pointee declares nothing (a
+base-class slot: the block falls to other creating sites' declarations
+or its first typed use; counted in the rule report, "SUMMARY sites"). The
 result's uses are followed through a slot stored once, and through a
 cursor slot: every other store into it is a reload of it stepped by a GEP
 (`*ep++ = d`; `p += nodewords`, a variable step, inbounds in the block),
@@ -1057,7 +1059,10 @@ positions, and the mark changes where a later write lands, not whether. A slot t
 holds another value (a call result, a foreign load; a null store is no other block: binutils
 _bfd_pei_swap_sym_in's `name` holds _bfd_coff_internal_syment_name's
 result, then the bfd_alloc) leaves the site unclassified, counted: it
-gives neither a scalar label nor a bytes mark. Uses inside a callee the
+gives neither a scalar label nor a bytes mark (counted: "receiver kind
+unclassified", SUMMARY sites). A declared scalar array takes no extent
+rule: its element label already names every element, and the extent rule
+can only cut a tail, which a scalar array has none of. Uses inside a callee the
 block is passed to are not followed (part 3, callee formals: not built;
 neither example needed it). Neither part has a soundness premise: the label or mark
 changes which cell a later struct write lands in, never whether it

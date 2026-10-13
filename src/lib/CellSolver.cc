@@ -8346,6 +8346,9 @@ bool CallGraphPass::runCellResolution() {
        << "# (c) lists the premises the solver assumes (untyped writes and bodiless\n"
        << "# calls write no struct slot), struct copies between unrelated types, and\n"
        << "# relay rows: byte copies between differently labeled storage (3.53 rule 4).\n";
+    RO << "SUMMARY sites " << censusSites << " allocation sites: " << censusStructFieldOnly
+       << " whose only receiver is a struct-pointer field (no declaration: a base-class slot), "
+       << censusUnclassified << " receiver kind unclassified (a result slot also holding another value)\n";
     RO << "SUMMARY a " << aData << " pointers from data, " << aConst
        << " from constant addresses, " << aLost << " from pointers lost before the cast\n";
     RO << "SUMMARY b " << ruleB << " member steps whose struct is not at the address's offset ("

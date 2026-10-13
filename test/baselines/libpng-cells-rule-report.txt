@@ -4,6 +4,7 @@
 # (c) lists the premises the solver assumes (untyped writes and bodiless
 # calls write no struct slot), struct copies between unrelated types, and
 # relay rows: byte copies between differently labeled storage (3.53 rule 4).
+SUMMARY sites 53 allocation sites: 6 whose only receiver is a struct-pointer field (no declaration: a base-class slot), 3 receiver kind unclassified (a result slot also holding another value)
 SUMMARY a 0 pointers from data, 0 from constant addresses, 0 from pointers lost before the cast
 SUMMARY b 0 member steps whose struct is not at the address's offset (0 object label / struct pairs); struct written into storage declared scalar: 0 writes (0 struct steps)
 SUMMARY c 0 untyped writes and 0 calls of bodiless functions assumed to write no struct slot; 0 copies between unrelated structs; 0 relay rows (byte copies between differently labeled storage, rule 4)

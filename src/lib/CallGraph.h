@@ -287,6 +287,8 @@ protected:
     // type); the result's slot is a cursor walking the block (followed),
     // or a slot stored with other values too (the site unclassified).
     bool fieldReceiver = false, cursorSlot = false, slotUnclassified = false;
+    // A struct-pointer field received it: a base-class slot, no declaration.
+    bool structFieldSeen = false;
     // Segments declared at the site (plan 3.53 rule 1, extent): a constant
     // offset c > 0 of the result cast to B* (the receiving variable's
     // declared pointee) or written through a B struct GEP; "" when two
@@ -307,6 +309,11 @@ protected:
   // string functions): marked used as bytes at mint (ruling A; a mark,
   // not a label).
   std::unordered_set<const llvm::Value *> allocBytesOnly;
+  // The site census's counts for the rule report (staticLabels): sites,
+  // sites whose only receiver is a struct-pointer field (no declaration),
+  // sites whose receiver kind is unclassified (a result slot also holding
+  // another value).
+  size_t censusSites = 0, censusStructFieldOnly = 0, censusUnclassified = 0;
   // --cfl-union-keys: the key names of each keyed union access, filled by
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).

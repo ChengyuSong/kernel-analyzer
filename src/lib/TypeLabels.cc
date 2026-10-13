@@ -323,6 +323,9 @@ void CallGraphPass::labelAllocationSites(
             StringRef Tag = stripStructNameSuffix(ST->getName());
             Tag.consume_front("struct.");
             if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue());
+                MT && !diPointee(MT, C->getModule()).empty())
+              L.structFieldSeen = true;
+            if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue());
                 MT && L.siteDeclared.empty() && L.sitePtrArray.empty() && L.siteScalar.empty()) {
               L.sitePtrArray = diPtrArray(MT);
               L.siteScalar = diScalar(MT);
@@ -686,18 +689,24 @@ void CallGraphPass::staticLabels(
   for (auto &[A, b] : bytesAgreed)
     if (b) allocBytesOnly.insert(A);
   {
-    size_t field = 0, cursor = 0, unclassified = 0, scalars = 0;
+    size_t field = 0, cursor = 0, unclassified = 0, scalars = 0, structField = 0;
     for (auto &[C, SL] : siteLabel) {
       field += SL.fieldReceiver;
       cursor += SL.cursorSlot;
       unclassified += SL.slotUnclassified;
+      structField += SL.structFieldSeen && SL.siteDeclared.empty() && SL.sitePtrArray.empty() &&
+                     SL.siteScalar.empty();
     }
+    censusSites = siteLabel.size();
+    censusStructFieldOnly = structField;
+    censusUnclassified = unclassified;
     for (auto &[A, e] : scalarAgreed) scalars += !e.empty();
     CG_LOG("TypeLabels: allocation sites " << siteLabel.size() << ": " << field
            << " receivers are struct fields (their declared member type, 1b), " << cursor
            << " result slots are cursors walking the block (followed), " << unclassified
            << " result slots also hold other values (unclassified); " << scalars
-           << " allocations scalar-only, " << allocBytesOnly.size() << " bytes-only at every creating site\n");
+           << " allocations scalar-only, " << allocBytesOnly.size() << " bytes-only at every creating site; "
+           << structField << " sites whose only receiver is a struct-pointer field (no declaration)\n");
   }
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;

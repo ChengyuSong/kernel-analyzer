@@ -925,7 +925,15 @@ changes:
   sum's own operand). A header carve of `malloc(HDR + n)` at HDR is n
   (the sum's operand). binutils: bfd_alloc, bfd_zalloc,
   bfd_hash_allocate and _objalloc_alloc are round8(n, 1 when zero), exact
-  at constant sizes; bfd_alloc2's actual is a product, the gcd fact.
+  at constant sizes. Through a product actual (row (2), Fable 2026-10-13):
+  a zero-guarded wrapper term applied to an argument that is itself a
+  term t gives "t, k when zero"; rounding to a of c x n folds exactly when
+  a divides c (round8(72 n) = 72 n). The zero case names no element (k
+  bytes, zero elements; an access past them is a forged pointer, rule
+  (a)), so bfd_alloc2(abfd, n, 72) is an array of coff_symbol_struct with
+  no tail; at the site a product of the caller's own formals is a
+  multiple of c. Counted ("sized by a product through a zero-guarded
+  wrapper"). The gcd fact stays for returns that genuinely disagree.
   A pool carve's size (rule 3) by its form: before-bump, the bump n;
   counter, the decrement; minus-len, the length; header, the chunk
   call's size minus the header offset (each n times its GEP's element

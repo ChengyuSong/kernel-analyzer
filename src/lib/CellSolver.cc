@@ -1934,7 +1934,10 @@ bool CallGraphPass::runCellResolution() {
     bool partial = false;
     int64_t add = 0;
     uint64_t align = 0;
-    // The one formal reads zeroK where it is 0 (`if (!n) n = 1`); -1: none.
+    // The product c x formals reads zeroK where it is 0 (`if (!n) n = 1`;
+    // row (2): also a product actual, bfd_alloc2's size * n); -1: none.
+    // With partial: a multiple of c x formals, or zeroK bytes holding no
+    // element (the zero case names no element).
     int64_t zeroK = -1;
     bool isConst() const { return known && formals.empty() && !partial && !align; }
     bool operator==(const SizeTerm &o) const {
@@ -1947,7 +1950,7 @@ bool CallGraphPass::runCellResolution() {
   auto nonzero = [](const SizeTerm &t) {
     if (!t.known || t.partial) return false;
     if (t.isConst()) return t.c != 0;
-    return t.zeroK > 0 && t.formals.size() == 1 && t.c > 0 && t.add >= 0;
+    return t.zeroK > 0 && !t.formals.empty() && t.c > 0 && t.add >= 0;
   };
   auto constT = [](uint64_t k) { SizeTerm t; t.known = true; t.c = k; return t; };
   // What every value of t is a multiple of.
@@ -2004,6 +2007,7 @@ bool CallGraphPass::runCellResolution() {
       if (a.align) return multiple(a.align * b.c);
       a.c *= b.c;
       a.add *= (int64_t)b.c;
+      if (a.zeroK >= 0) a.zeroK *= (int64_t)b.c; // the zero case scales too
       return norm(a);
     }
     if (a.add || b.add || a.align || b.align || a.zeroK >= 0 || b.zeroK >= 0 ||
@@ -2017,6 +2021,12 @@ bool CallGraphPass::runCellResolution() {
   auto alignT = [&](SizeTerm x, uint64_t al) -> SizeTerm {
     if (x.isConst()) return constT((x.c + al - 1) & ~(al - 1));
     if (x.known && x.align && x.align % al == 0) return x; // already rounded to al
+    // A multiple of al rounded to al is itself (row (2): round8(72 n) is
+    // 72 n); its zero case rounds.
+    if (x.known && !x.align && !x.add && x.c % al == 0 && (x.partial || !x.formals.empty())) {
+      if (x.zeroK >= 0) x.zeroK = (int64_t)(((uint64_t)x.zeroK + al - 1) & ~(al - 1));
+      return x;
+    }
     if (!x.known || x.partial || x.align) return multiple(std::max(al, x.align));
     x.align = al;
     return x;
@@ -2181,17 +2191,17 @@ bool CallGraphPass::runCellResolution() {
     SizeTerm out = constT(inner.c);
     for (unsigned k : inner.formals) {
       if (k >= C->arg_size()) return {};
-      SizeTerm a = termIn(C->getArgOperand(k), F, 0);
-      if (inner.zeroK >= 0) { // "the formal, zeroK when zero" at this actual
-        if (a.isConst() && a.c == 0) a = constT((uint64_t)inner.zeroK);
-        else if (a.known && !nonzero(a)) {
-          if (!a.partial && !a.align && a.zeroK < 0 && a.formals.size() == 1 && a.c == 1 && !a.add)
-            a.zeroK = inner.zeroK; // a bare formal of F: carried up
-          else
-            a = multiple(std::gcd(multOf(a), (uint64_t)inner.zeroK)); // the join with zeroK
-        }
+      out = timesT(out, termIn(C->getArgOperand(k), F, 0));
+    }
+    if (inner.zeroK >= 0) { // "the product, zeroK when zero" at these actuals
+      const int64_t zk = inner.zeroK;
+      if (out.isConst() && out.c == 0) out = constT((uint64_t)zk);
+      else if (out.known && !nonzero(out)) {
+        if (!out.align && !out.add && out.zeroK < 0 && (!out.formals.empty() || out.partial))
+          out.zeroK = zk; // carried up: a product of F's formals, or a multiple (row (2))
+        else
+          out = multiple(std::gcd(multOf(out), (uint64_t)zk)); // the join with zeroK
       }
-      out = timesT(out, a);
     }
     if (inner.partial) out = timesT(out, SizeTerm{});
     if (inner.add) out = plusK(out, inner.add);
@@ -2288,6 +2298,9 @@ bool CallGraphPass::runCellResolution() {
     return termMemo[F] = out;
   };
   size_t promotedUnknownSize = 0;
+  // Allocations sized by a product through a zero-guarded wrapper (row
+  // (2): bfd_alloc2(abfd, n, 72) = a multiple of 72).
+  std::set<const CallBase *> zeroProductSites;
   // The size of an allocation site V as operands and an addend (size =
   // add + the product of ops; an undef operand is a factor not known),
   // false when the size is unknown. A call's inner term is evaluated at
@@ -2298,10 +2311,13 @@ bool CallGraphPass::runCellResolution() {
     ops.clear();
     add = 0;
     LLVMContext &Cx = V->getContext();
+    // A term at the site: a constant, a multiple; a product of the site's
+    // own formals (values unknown here) is a multiple of c (its zero case
+    // names no element, row (2)).
     auto fromTerm = [&](const SizeTerm &t) {
-      if (!t.known || !t.formals.empty() || t.align) return false;
+      if (!t.known || t.align || (!t.formals.empty() && t.add)) return false;
       ops.push_back(ConstantInt::get(Type::getInt64Ty(Cx), t.c));
-      if (t.partial) ops.push_back(UndefValue::get(Type::getInt64Ty(Cx)));
+      if (t.partial || !t.formals.empty()) ops.push_back(UndefValue::get(Type::getInt64Ty(Cx)));
       return true;
     };
     if (const auto *I = dyn_cast<Instruction>(V); I && poolCarves.count(I)) return fromTerm(carveTerm(I));
@@ -2309,8 +2325,14 @@ bool CallGraphPass::runCellResolution() {
     if (!C) return false;
     const SizeTerm t = callTerm(C, nullptr);
     if (!t.known) return false;
-    if (t.align || t.zeroK >= 0)
-      return fromTerm(callTerm(C, C->getFunction())) || (t.align && fromTerm(multiple(t.align)));
+    if (t.align || t.zeroK >= 0) {
+      const SizeTerm e = callTerm(C, C->getFunction());
+      if (fromTerm(e)) {
+        if (t.zeroK >= 0 && !e.isConst()) zeroProductSites.insert(C); // row (2)
+        return true;
+      }
+      return t.align && fromTerm(multiple(t.align));
+    }
     for (unsigned k : t.formals) {
       if (k >= C->arg_size()) { ops.clear(); return false; }
       ops.push_back(C->getArgOperand(k));
@@ -6728,7 +6750,8 @@ bool CallGraphPass::runCellResolution() {
          << " one by size, " << extentHeader << " header + data by size, " << extentUnknown
          << " one then unknown (size unknown; " << promotedUnknownSize
          << " of them fresh wrappers with an unknown size term; " << carveUnknownSize.size()
-         << " pool carves with an unknown size term), " << arraysExtended << " made arrays by a T-stride access ("
+         << " pool carves with an unknown size term; " << zeroProductSites.size()
+         << " sized by a product through a zero-guarded wrapper), " << arraysExtended << " made arrays by a T-stride access ("
          << extendRefused << " refused: typed trailing data; " << tailIndexAny
          << " other variable indexes also reach the data after the T); " << tailWritesFolded
          << " writes of another struct into the data after a T (rule (b): not admitted); " << readStepsSkipped

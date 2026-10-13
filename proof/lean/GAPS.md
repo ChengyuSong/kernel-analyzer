@@ -1268,12 +1268,14 @@ embedded at a constant offset (tif->tif_tagmethods.vsetfield: two GEPs at
 - The certificate composes too: an embedded struct's address used only
   as the base of its fields' constant GEPs is not an escape. A store
   named by the embedded struct alone covers D as well.
-- Open (for review): an embedded struct's address passed elsewhere is
-  recorded at its own offset only, as before composition, so it does
-  not uncertify the fields inside it. The stricter reading (every byte
-  of it escapes) costs libpng its zstream pair, whose address goes to
-  bodiless zlib calls (the receivers premise says they write no struct
-  slot).
+- An embedded struct's address used any other way is the escaping
+  address of every byte of it, [o0, o0 + sizeof), by exactly the test a
+  field's own address gets: a byte is certified or not whatever GEP
+  spells its address. The escape check has no bodiless exemption; the
+  "bodiless callees write no struct slot" premise is for path stability
+  and is not widened into the certificate (zlib does write z_stream
+  fields: libpng's zstream pair is uncertified, its address escapes at
+  the zlib calls).
 
 **Saved and restored methods.** A codec's cleanup restores the method
 it saved at install (`tif->tif_tagmethods.vgetfield = sp->vgetparent`),
@@ -1311,7 +1313,9 @@ it.
   other entry.
 - A channel is a transfer the argument's pops make, not a copy edge, so
   saved-parent chains (every VSetField's parent may be every VSetField)
-  close no copy cycle for the collapse to merge. A method passing its
+  close no copy cycle for the collapse to merge. The term lives on the
+  entry edge: the cycle collapse, lossless for facts, is lossy for
+  terms, so the formals must not merge. A method passing its
   receiver into its own formal adds nothing: by the identity check the
   argument is the formal's own value, already there.
 

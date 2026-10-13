@@ -1197,7 +1197,9 @@ void CallGraphPass::computeTaggedFields() {
         // address) may be written unnamed.
         // An embedded struct's address used only as the base of its own
         // fields' constant GEPs is not an escape: those GEPs are checked
-        // themselves, under their composed names (plan 3.54 (a)).
+        // themselves, under their composed names (plan 3.54 (a)). Any other
+        // use escapes every byte of it, by the test a field's own address
+        // gets: a byte is certified or not whatever GEP spells its address.
         if (const GEPOperator *FG = dyn_cast<GEPOperator>(&I); FG && structGEP(&I) == FG) {
           StructType *S0 = nullptr;
           int64_t o0 = 0;
@@ -1228,9 +1230,12 @@ void CallGraphPass::computeTaggedFields() {
                 break;
               }
             }
-            if (esc) // at its own offset, as before composition (an embedded struct's
-                     // escape does not reach its fields' names: open question to 3.54)
-              escapedAt[stripStructNameSuffix(S0->getName()).str()].push_back({o0, o0 + 1, locOf(&I)});
+            if (esc) { // every byte of it: an embedded struct's escape is its fields' (plan 3.54 (a))
+              Type *RT = FG->getResultElementType();
+              const int64_t sz = RT->isSized() ? (int64_t)DL.getTypeAllocSize(RT) : 1;
+              escapedAt[stripStructNameSuffix(S0->getName()).str()].push_back(
+                  {o0, o0 + std::max<int64_t>(sz, 1), locOf(&I)});
+            }
           }
         }
         const Value *Addr = nullptr;

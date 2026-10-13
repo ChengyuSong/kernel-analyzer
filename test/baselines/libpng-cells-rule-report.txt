@@ -11,7 +11,7 @@ SUMMARY UB 0 byte steps leaving a byte array, 0 offsets past a single object, 5 
 SUMMARY outside 0 indirect calls complete, 9 depend on an outside boundary (--cfl-outside=pure), bodiless call 9, outside indirect call 2
 SUMMARY pwc 20 cycles with offset (typed 5: walks 0, counters 5 retired by the integer-name test and 0 kept on the int-launder fallback; untyped 15, mixed 0; through a C++ class step 0); indirect-call width downstream of the walks: 0 of 9 targets
 SUMMARY varargs 0 renderers mapped, 0 va_arg reads keyed, 0 unkeyed; call sites: 0 constant format, 0 non-constant, 0 unparsed
-SUMMARY tagged fields 3 pairs keyed, 3 flipped in the solve; alias assumptions 3 held, 1 failed; predicate tests: 0 closed, 11 open; parameter-pair tests: 0 keyed reads, 0 untested; outside-domain entries 0, premise broken at 0
+SUMMARY tagged fields 2 pairs keyed, 2 flipped in the solve; alias assumptions 3 held, 1 failed; predicate tests: 0 closed, 11 open; parameter-pair tests: 0 keyed reads, 0 untested; outside-domain entries 0, premise broken at 0
 SUMMARY outside callers: 10 defined functions reach the outside after the solve, 8 of them in the pre-solve domain (8 functions)
 T outside callers: 10 via bodiless call _setjmp
 SUMMARY tagged fields untested reads 222 (reads of a field with candidate tags that no tag test guards: every writer)

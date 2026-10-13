@@ -1039,7 +1039,27 @@ uses, and the list must not be "completed" with them: rule 1 lets a
 fresh block take a copy source's layout (the bison YYSTYPE shape).
 memset is neutral. A creating site that classes the block otherwise
 gives neither (every site must agree; escapes of the pointer do not
-disqualify). Neither part has a soundness premise: the label or mark
+disqualify). The site's reach (row 3, Fable 2026-10-13): the receiving
+declaration is a variable's or a struct field's (`opt_state->space =
+malloc(..)`: the field's declared member type, through nested members; a
+store to a struct global or local itself is its member at offset 0), a
+field's only for a scalar or pointer-slot pointee: a struct-pointer field
+is a base-class slot (libjpeg `cinfo->dest`, declared
+jpeg_destination_mgr *, receives a my_destination_mgr; taking it made
+cjpeg-O3 run out of memory), so its pointee declares nothing. The
+result's uses are followed through a slot stored once, and through a
+cursor slot: every other store into it is a reload of it stepped by a GEP
+(`*ep++ = d`; `p += nodewords`, a variable step, inbounds in the block),
+the forward-only cursor the pool recognizer names; the cursor's reloads
+classify the block (no offsets, no labels from them). A variable step is
+admitted because the census needs only the kinds of the uses, never their
+positions, and the mark changes where a later write lands, not whether. A slot that also
+holds another value (a call result, a foreign load; a null store is no other block: binutils
+_bfd_pei_swap_sym_in's `name` holds _bfd_coff_internal_syment_name's
+result, then the bfd_alloc) leaves the site unclassified, counted: it
+gives neither a scalar label nor a bytes mark. Uses inside a callee the
+block is passed to are not followed (part 3, callee formals: not built;
+neither example needed it). Neither part has a soundness premise: the label or mark
 changes which cell a later struct write lands in, never whether it
 lands, so a block created as scalars or bytes and later used as a
 struct through an escape is a counted row instead of a label. Kernel

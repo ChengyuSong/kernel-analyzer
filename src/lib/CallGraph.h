@@ -283,6 +283,10 @@ protected:
     std::set<std::string> scalarTypes;
     std::string siteScalar;
     bool ptrAccess = false, structAccess = false, strUse = false;
+    // The receiver is a struct field (row 3: 1b reads its declared member
+    // type); the result's slot is a cursor walking the block (followed),
+    // or a slot stored with other values too (the site unclassified).
+    bool fieldReceiver = false, cursorSlot = false, slotUnclassified = false;
     // Segments declared at the site (plan 3.53 rule 1, extent): a constant
     // offset c > 0 of the result cast to B* (the receiving variable's
     // declared pointee) or written through a B struct GEP; "" when two

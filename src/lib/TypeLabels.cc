@@ -263,12 +263,72 @@ void CallGraphPass::labelAllocationSites(
         if (L.siteScalar.empty())
           L.siteScalar = diScalar(DV->getVariable()->getType());
       }
+      // The declared type of struct S's member starting at byte off (through
+      // nested struct members), or null.
+      auto diMemberAt = [&](const DICompositeType *Cc, uint64_t off) -> const DIType * {
+        for (int depth = 0; Cc && depth < 8; depth++) {
+          const DIDerivedType *In = nullptr;
+          for (const DINode *E : Cc->getElements()) {
+            const auto *D = dyn_cast<DIDerivedType>(E);
+            if (!D || D->getTag() != dwarf::DW_TAG_member || D->isStaticMember()) continue;
+            const uint64_t MO = D->getOffsetInBits() / 8, MS = (D->getSizeInBits() + 7) / 8;
+            if (MO == off && !isa_and_nonnull<DICompositeType>(D->getBaseType())) return D->getBaseType();
+            if (off >= MO && off < MO + MS) In = D;
+          }
+          if (!In) return nullptr;
+          const DIType *MT = In->getBaseType();
+          while (const auto *DD = dyn_cast_or_null<DIDerivedType>(MT))
+            if (DD->getTag() == dwarf::DW_TAG_typedef || DD->getTag() == dwarf::DW_TAG_const_type ||
+                DD->getTag() == dwarf::DW_TAG_volatile_type)
+              MT = DD->getBaseType();
+            else
+              break;
+          const auto *MC = dyn_cast_or_null<DICompositeType>(MT);
+          if (!MC || MC->getTag() != dwarf::DW_TAG_structure_type) return nullptr;
+          off -= In->getOffsetInBits() / 8;
+          Cc = MC;
+        }
+        return nullptr;
+      };
       SmallVector<const Value *, 4> vs{C};
       for (size_t i = 0; i < vs.size() && L.siteDeclared.empty() && L.sitePtrArray.empty() && i < 8; i++)
         for (const User *U : vs[i]->users()) {
           if (isa<CastInst>(U)) { vs.push_back(U); continue; }
           const auto *SI = dyn_cast<StoreInst>(U);
           if (!SI || SI->getValueOperand() != vs[i]) continue;
+          // A struct field receiving the result (`opt_state->space =
+          // malloc(..)`, row 3): its declared member type, as a variable's,
+          // for a scalar or pointer-slot pointee only. A struct-pointer
+          // field is a base-class slot (libjpeg `cinfo->dest`, declared
+          // jpeg_destination_mgr *, receives a my_destination_mgr): its
+          // pointee under-declares the block, so it declares nothing.
+          // A struct GEP at a constant offset, or a struct global or local
+          // itself (its member at offset 0: `st.space = ..` at -O0).
+          const Value *FP = SI->getPointerOperand()->stripPointerCasts();
+          llvm::StructType *ST = nullptr;
+          bool known = false;
+          APInt A(64, 0);
+          if (const auto *G = dyn_cast<GEPOperator>(FP)) {
+            ST = dyn_cast<llvm::StructType>(G->getSourceElementType());
+            const auto *I0 = G->getNumIndices() ? dyn_cast<ConstantInt>(*G->idx_begin()) : nullptr;
+            known = I0 && I0->isZero() && G->accumulateConstantOffset(DL, A);
+          } else if (const auto *GV = dyn_cast<GlobalVariable>(FP)) {
+            ST = dyn_cast<llvm::StructType>(GV->getValueType());
+            known = true;
+          } else if (const auto *AI = dyn_cast<AllocaInst>(FP)) {
+            ST = dyn_cast<llvm::StructType>(AI->getAllocatedType());
+            known = true;
+          }
+          if (known && namedStruct(ST)) {
+            StringRef Tag = stripStructNameSuffix(ST->getName());
+            Tag.consume_front("struct.");
+            if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue());
+                MT && L.siteDeclared.empty() && L.sitePtrArray.empty() && L.siteScalar.empty()) {
+              L.sitePtrArray = diPtrArray(MT);
+              L.siteScalar = diScalar(MT);
+              L.fieldReceiver = !L.sitePtrArray.empty() || !L.siteScalar.empty();
+            }
+          }
           if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
             for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI))) {
               if (L.siteDeclared.empty())
@@ -420,6 +480,56 @@ void CallGraphPass::labelAllocationSites(
               if (ld != FA.loads.end())
                 for (const LoadInst *LI : ld->second)
                   push(LI, 0);
+            } else if (const auto *Slot = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts());
+                       Slot && st != FA.stores.end() && st->second.size() > 1) {
+              // A cursor walking the block (`*ep++ = d`; opt_init's
+              // `p += nodewords`): every other store into the slot is a
+              // reload of it stepped by a GEP (a constant or a variable
+              // index: inbounds, it stays in the block). Its reloads are the
+              // block at an unknown offset: their accesses classify it (no
+              // offsets, no labels from them); any other store (a call
+              // result, a foreign load, a join) leaves the site
+              // unclassified, and an unclassified site gives neither a
+              // scalar label nor a bytes mark. A null store is skipped.
+              bool cursor = true;
+              for (const StoreInst *S2 : st->second) {
+                // null is no other block (`return NULL` through the -O0
+                // return slot on a failed allocation).
+                if (S2 == SI || isa<ConstantPointerNull>(S2->getValueOperand()->stripPointerCasts())) continue;
+                const auto *G2 = dyn_cast<GEPOperator>(S2->getValueOperand()->stripPointerCasts());
+                const auto *L2 = G2 ? dyn_cast<LoadInst>(G2->getPointerOperand()->stripPointerCasts()) : nullptr;
+                cursor &= G2 && L2 && L2->getPointerOperand()->stripPointerCasts() == Slot;
+              }
+              if (!cursor) {
+                L.slotUnclassified = true;
+                CG_DEBUG("TypeLabels: result slot holds other values: " << C->getFunction()->getName() << " "
+                         << *SI << "\n");
+              } else if (auto ld = FA.loads.find(K); ld != FA.loads.end()) {
+                L.cursorSlot = true;
+                for (const LoadInst *LI : ld->second)
+                  for (const User *CU : LI->users()) {
+                    const Value *P = CU;
+                    if (const auto *G2 = dyn_cast<GEPOperator>(CU)) {
+                      if (G2->getPointerOperand() != LI) continue;
+                      if (isa<llvm::StructType>(G2->getSourceElementType())) L.structAccess = true;
+                    } else {
+                      P = LI;
+                    }
+                    auto access = [&](const User *AU, const Value *Ptr) {
+                      if (const auto *AL = dyn_cast<LoadInst>(AU); AL && AL->getPointerOperand() == Ptr)
+                        noteAccess(AL->getType());
+                      else if (const auto *AS = dyn_cast<StoreInst>(AU); AS && AS->getPointerOperand() == Ptr)
+                        noteAccess(AS->getValueOperand()->getType());
+                      else if (const auto *AC = dyn_cast<CallBase>(AU))
+                        if (const Function *CF = AC->getCalledFunction(); CF && stringFn(CF->getName()))
+                          for (const Use &A : AC->args())
+                            if (A.get() == Ptr) L.strUse = true;
+                    };
+                    if (P == LI) access(CU, LI);
+                    else
+                      for (const User *GU : P->users()) access(GU, P);
+                  }
+              }
             }
           }
         }
@@ -494,7 +604,7 @@ void CallGraphPass::staticLabels(
   // one that does not gives neither.
   auto plain = [](const AllocSiteLabel &SL) {
     return SL.types.empty() && SL.declared.empty() && SL.siteDeclared.empty() && SL.sitePtrArray.empty() &&
-           !SL.ptrAccess && !SL.structAccess;
+           !SL.ptrAccess && !SL.structAccess && !SL.slotUnclassified;
   };
   auto scalarOf = [&](const AllocSiteLabel &SL) -> std::string {
     if (!plain(SL) || SL.strUse) return "";
@@ -508,11 +618,62 @@ void CallGraphPass::staticLabels(
       if (t != "i8") return false;
     return SL.strUse || !SL.scalarTypes.empty();
   };
+  // A promoted fresh wrapper's call creates its block inside the wrapper:
+  // the wrapper's own allocation sites (its returns, through casts, joins
+  // and -O0 slots) are part of this creating site (pcap_ether_aton fills
+  // its block itself, its callers do not touch it).
+  auto innerSites = [&](const Function *F, std::vector<const CallBase *> &out) {
+    std::set<const Value *> seen;
+    std::vector<const Value *> work;
+    for (const BasicBlock &BB : *F)
+      if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+        if (RI->getReturnValue()) work.push_back(RI->getReturnValue());
+    while (!work.empty() && seen.size() < 64) {
+      const Value *V = work.back()->stripPointerCasts();
+      work.pop_back();
+      if (!seen.insert(V).second) continue;
+      if (const auto *PN = dyn_cast<PHINode>(V)) {
+        for (const Value *In : PN->incoming_values()) work.push_back(In);
+      } else if (const auto *Sel = dyn_cast<SelectInst>(V)) {
+        work.push_back(Sel->getTrueValue());
+        work.push_back(Sel->getFalseValue());
+      } else if (const auto *LI = dyn_cast<LoadInst>(V)) {
+        if (const auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()->stripPointerCasts()))
+          for (const User *U : Slot->users())
+            if (const auto *S2 = dyn_cast<StoreInst>(U); S2 && S2->getPointerOperand() == Slot)
+              work.push_back(S2->getValueOperand());
+      } else if (const auto *CB = dyn_cast<CallBase>(V)) {
+        if (siteLabel.count(CB)) out.push_back(CB);
+      }
+    }
+  };
+  auto effective = [&](const CallBase *C, const AllocSiteLabel &SL) {
+    AllocSiteLabel M = SL;
+    const Function *F = C->getCalledFunction();
+    auto fit = F ? Ctx->FuncSummaries.find(F) : Ctx->FuncSummaries.end();
+    if (fit == Ctx->FuncSummaries.end() || !fit->second || !fit->second->fresh || F->isDeclaration()) return M;
+    std::vector<const CallBase *> inner;
+    innerSites(F, inner);
+    for (const CallBase *I : inner) {
+      if (I == C) continue;
+      const AllocSiteLabel &IS = siteLabel.at(I);
+      M.scalarTypes.insert(IS.scalarTypes.begin(), IS.scalarTypes.end());
+      M.ptrAccess |= IS.ptrAccess;
+      M.structAccess |= IS.structAccess || !IS.types.empty() || !IS.declared.empty() ||
+                        !IS.siteDeclared.empty() || !IS.sitePtrArray.empty();
+      M.strUse |= IS.strUse;
+      M.slotUnclassified |= IS.slotUnclassified;
+      if (!IS.siteScalar.empty() && M.siteScalar.empty()) M.siteScalar = IS.siteScalar;
+      else if (!IS.siteScalar.empty() && M.siteScalar != IS.siteScalar) M.structAccess = true; // two scalars
+    }
+    return M;
+  };
   std::map<const CallBase *, std::string> scalarAgreed; // "" : no agreement
   std::map<const CallBase *, bool> bytesAgreed;
-  for (auto &[C, SL] : siteLabel) {
+  for (auto &[C, SL0] : siteLabel) {
     std::set<const CallBase *> allocs;
     allocationsOfCall(C, allocs);
+    const AllocSiteLabel SL = effective(C, SL0);
     const std::string e = scalarOf(SL);
     const bool b = bytesOnly(SL);
     for (const CallBase *A : allocs) {
@@ -524,6 +685,20 @@ void CallGraphPass::staticLabels(
   }
   for (auto &[A, b] : bytesAgreed)
     if (b) allocBytesOnly.insert(A);
+  {
+    size_t field = 0, cursor = 0, unclassified = 0, scalars = 0;
+    for (auto &[C, SL] : siteLabel) {
+      field += SL.fieldReceiver;
+      cursor += SL.cursorSlot;
+      unclassified += SL.slotUnclassified;
+    }
+    for (auto &[A, e] : scalarAgreed) scalars += !e.empty();
+    CG_LOG("TypeLabels: allocation sites " << siteLabel.size() << ": " << field
+           << " receivers are struct fields (their declared member type, 1b), " << cursor
+           << " result slots are cursors walking the block (followed), " << unclassified
+           << " result slots also hold other values (unclassified); " << scalars
+           << " allocations scalar-only, " << allocBytesOnly.size() << " bytes-only at every creating site\n");
+  }
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;
     allocationsOfCall(C, allocs);

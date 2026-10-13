@@ -2770,7 +2770,9 @@ bool CallGraphPass::runCellResolution() {
             heapContainerAmbiguous++;
           }
         }
-    if (O.layout && O.repeats && isa_and_nonnull<CallBase>(V)) setExtent(O, V);
+    // A declared scalar array is an array of its scalar whatever the size
+    // says (ruling A): no header, no trailing object.
+    if (O.layout && O.repeats && !O.declScalar && isa_and_nonnull<CallBase>(V)) setExtent(O, V);
     objs.push_back(std::move(O));
     return objs.size() - 1;
   };

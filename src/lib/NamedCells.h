@@ -119,6 +119,11 @@ public:
                                          const llvm::DataLayout &DL);
   // The named IR struct a C struct tag denotes in module M.
   llvm::StructType *structByTag(const llvm::Module *M, llvm::StringRef Tag);
+  // The debug-info composite of the named struct with C tag Tag, or null.
+  const llvm::DICompositeType *diStruct(llvm::StringRef Tag) const {
+    auto It = DIStruct.find(Tag.str());
+    return It == DIStruct.end() ? nullptr : It->second;
+  }
   // The struct an untyped base pointer is declared to point to: a formal
   // by its subprogram's parameter type, any other value by the variable
   // a dbg.value describes it as. The IR type when the module still has

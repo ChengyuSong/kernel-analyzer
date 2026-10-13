@@ -1216,3 +1216,142 @@ confirmed, and so is _objalloc_alloc (greatest fixpoint); their hand
 rows are removed.
 
 Not mechanized. Checked by executions; see the rule 3 commit's gates.
+
+## Method-installed state (TaggedFields entry tests, CellSolver formal split, 2026-10-12, plan 3.54)
+
+A method M installed in a function-pointer field D of struct S, with a
+data field F of S written alongside it (libtiff's tif_decoderow and
+tif_data; the kernel's f_op and private_data; sqlite3's pModule and
+pVtab). This is item 9 of the keys above, with the method pointer as the
+tag and the dispatch as the test.
+
+**The test.** A dispatch site `o->D(o, ...)` is a test of D on o. The
+callee is a load of D on the receiver (dispatchReceiver, one level), and
+nothing is written between that load and the call (no store, no call).
+- When the dispatch enters M, D == M held at the load.
+- F holds then what it held at the load.
+
+**The read.** Inside M, a read of o'->F, where o' is M's receiver formal
+(its identity, by the reaching-definition rules of item 9), gets the
+entry test D == M. Its admitted writers are those whose tag set
+contains M, by item 9's evaluation unchanged: retags, last writers,
+alias assumptions and flips all apply.
+
+The entry test is made only when:
+- M is installed (its address stored as a constant) in D. M may be
+  installed in several fields D1..Dn: the read's admitted writers are
+  then the union over the Di of the writers co-written with M in Di
+  (every writer if any Di admits every writer), intersected with what
+  the read admits on its own. The formal is split only for dispatches
+  through test sites of fields every one of its keyed reads was keyed
+  through (the intersection of the reads' field sets); a dispatch
+  through any other field is an other entry;
+- M's address does not reach the outside (taggedOutsidePre: entries
+  the solve does not see);
+- no write to F of the object can come between M's entry and the read
+  (item 9's stability check, from the entry block).
+
+A retag of D (a method swapped without its state) is item 9's retag. A
+write of F between the entry and the read refuses the test, and the
+refusal is printed with its reason.
+
+**D in an embedded struct (3.54 (a)).** A method field inside a struct
+embedded at a constant offset (tif->tif_tagmethods.vsetfield: two GEPs at
+-O0) is named by its offset in the outermost struct, as one GEP or the
+-O3 struct-path TBAA tag names it; the object is the outermost struct's.
+- Only through a struct whose fields are accessed inside that one
+  embedding and nowhere else (no field GEP from another base, no TBAA
+  access naming it as the base). A struct also used on its own keeps its
+  own field names, so a field never has two names.
+- The dispatch's level steps through the chain of constant GEPs
+  (dispatchReceiver, the solver's receiver levels, slot offsets).
+- The certificate composes too: an embedded struct's address used only
+  as the base of its fields' constant GEPs is not an escape. A store
+  named by the embedded struct alone covers D as well.
+- Open (for review): an embedded struct's address passed elsewhere is
+  recorded at its own offset only, as before composition, so it does
+  not uncertify the fields inside it. The stricter reading (every byte
+  of it escapes) costs libpng its zstream pair, whose address goes to
+  bodiless zlib calls (the receivers premise says they write no struct
+  slot).
+
+**Saved and restored methods.** A codec's cleanup restores the method
+it saved at install (`tif->tif_tagmethods.vgetfield = sp->vgetparent`),
+then frees its state and writes F = NULL. The restored value is not
+evaluated (an unknown tag). As for any tag store, a tag its object's
+content is never read under (D or F rewritten first on every path)
+retags nothing. Two places now apply that rule:
+- A call-site effect (the restore in a callee, TIFFPredictorCleanup)
+  whose callee can execute no tested read of F, and after which the
+  content is never read under the tag it leaves. "Mapped only" (every
+  path meets a tag write computed from the left tag first) counts as
+  never read when each of those writes is itself never read under.
+- A store of a vector of pointers (-O3 restores two saved methods with one
+  `<2 x ptr>` store) is a write of each lane's field with an unknown
+  value: a tag store like any other, own to the certificate.
+
+**Terms along the receiver (3.54 (b)).** The tag is a fact about the
+object (which installer ran), and passing the object on does not change
+it.
+- An object entering method X through a test carries the term {X}.
+- A call in X that passes X's receiver identity as an argument is a
+  channel when the F fields read under terms are unwritten from X's
+  entry to the call (item 9's stability check; its alias assumptions go
+  to those fields' pairs).
+- The callee's formal, when it is a split method formal, receives X's
+  state for each object through that channel: X's terms, or "other" if
+  the object entered X otherwise, X is not split, or X holds no state
+  for it. Later changes at X follow (monotone).
+- Inside callee Y, a keyed read of o->F for an object carrying term
+  {X} also admits the writers whose tag set for each D of X's tests
+  contains X; every writer when the read is not keyed under one of those
+  D. The dispatch test is the case X = Y.
+- A static edge into the formal is a channel only if every call
+  argument with that node is one, from one caller formal; else it is an
+  other entry.
+- A channel is a transfer the argument's pops make, not a copy edge, so
+  saved-parent chains (every VSetField's parent may be every VSetField)
+  close no copy cycle for the collapse to merge. A method passing its
+  receiver into its own formal adds nothing: by the identity check the
+  argument is the formal's own value, already there.
+
+**The split.** The entry test holds only for entries through a test
+dispatch, so the solver splits M's receiver formal A:
+- Every other entry arrives at a node Ao, which feeds A: every static
+  edge into A (direct calls, call sites wired by resolution, seeds) and
+  every dispatch through a site that is not a test of D.
+- An object that ever arrives at Ao, or that a fact at Ao comes to
+  stand for after a cell merge, is "other". Each entry-keyed read also
+  reads it unkeyed, through the read's entry hub.
+- An object that has entered A only through test dispatches is read
+  through the admitted keys alone.
+- If A, Ao or a channel into A is merged with another node (a cycle
+  collapse), or A's node is shared, the formal is not split: every
+  object reads unkeyed, and so does every object it passed on.
+
+All of this is monotone. An object becomes other and gains the unkeyed
+link at any point of the solve, and nothing is unlinked.
+
+**Soundness**, per entry:
+- Through a test dispatch: item 9's argument with the test at the
+  dispatch's load. The content F holds at the read is a writer's whose
+  tag set contains M.
+- Through a channel from X: at X's entry the content F held was a
+  writer's whose tag set contains a term of the object (by induction
+  over the channel chain, the base case a test entry); F is unwritten
+  from X's entry to the call and from Y's entry to the read, so the
+  same content is read.
+- Through any other entry: the unkeyed read, every writer.
+
+The rows are in the rule report: "T entry" per method formal (D, the
+installers, the reads keyed, the test sites), the refusals by reason,
+and per formal its test-dispatch and other entries and the objects read
+unkeyed.
+
+Cases: test/t_tagged_method.c (each codec's method sees its own state)
+and test/t_tagged_method_direct.c (a direct call sees both). Probes,
+recorded in the commit: a method swapped without its state; F written
+in the method or by a callee before the read; a method installed in two
+fields; a method's address passed to a bodiless function.
+
+Not mechanized. Checked by executions; see the 3.54 commit's gates.

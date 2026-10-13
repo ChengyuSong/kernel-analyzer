@@ -7,9 +7,9 @@
 #     icalls JSON's sha256;
 #   nm-new O0/O3, stopped at a fixed pop: pops, cells and facts at the stop
 #     and the sha256 of the partial answers (--cfl-cell-stop-answers);
-#   tiffsplit O0 (at 150K pops) and O3 (at 1M) likewise: it has not finished since 07be17c
-#     (the codec states at tif_data, plan 3.54); the pin moves to
-#     completion when 3.54 lets it finish.
+#   tiffsplit O0 (at 150K pops) and O3 (at 1M) likewise: it has not finished since 07be17c,
+#     nor with plan 3.54 (method-installed state, embedded method fields,
+#     terms along the receiver); the residue is in the 3.54 commit.
 # Usage: test/cells-gate.sh [OUTDIR] [--update]; OUTDIR must not exist
 # (every run writes fresh files: no output of an earlier run is ever
 # compared). A run that does not exit 0 (a timeout is 124) is a failure,

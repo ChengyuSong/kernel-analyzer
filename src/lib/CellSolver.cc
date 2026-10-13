@@ -877,6 +877,128 @@ bool CallGraphPass::runCellResolution() {
     assert(c < G && "edge endpoint created after the solve began");
     return c;
   };
+  // ---- Method entries (plan 3.54) ----
+  // A method formal whose reads are keyed by its entry test is split:
+  // every entry other than a test dispatch (the static edges: direct
+  // calls and wired call sites; a dispatch through any other site)
+  // arrives at its other-entry node Ao, which feeds the formal. An object
+  // that ever arrives at Ao is "other": the formal's entry-keyed reads
+  // also read it unkeyed (the read's entry hub); an object that entered
+  // only through test dispatches is read through the admitted keys alone.
+  struct EntryF {
+    uint32_t A = UINT32_MAX, Ao = UINT32_MAX;
+    bool poisoned = false; // every object reads unkeyed (no split, or merged)
+    std::string why;
+    boost::unordered_flat_set<uint32_t> other; // objects that entered other than by a test
+    // Plan 3.54 (b): object -> the terms it entered with (formal indices:
+    // a test entry of this formal is its own index; a channel brings the
+    // caller's terms), and the formals it was passed on to.
+    boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> terms, subs;
+    // object -> (entry hub, fact, read) where its cells are read: linked
+    // per term it gains, and unkeyed once it enters otherwise.
+    boost::unordered_flat_map<uint32_t, std::vector<std::array<uint32_t, 3>>> held;
+    size_t testEntries = 0, otherEntries = 0, chanEntries = 0, flushed = 0, termLinks = 0;
+  };
+  std::vector<EntryF> entryF(taggedEntryFormals.size());
+  boost::unordered_flat_map<uint32_t, uint32_t> entryOfA, entryOfAo;
+  boost::unordered_flat_map<uint32_t, uint32_t> entryOfKey; // hub key -> entry read (taggedEntryReadList)
+  for (uint32_t j = 0; j < taggedEntryReadList.size(); j++)
+    entryOfKey[NF.internCellName(taggedEntryHubKey(taggedEntryReadList[j]))] = j;
+  std::function<void(uint32_t, const std::string &)> entryPoison;
+  std::function<void(uint32_t, uint32_t)> entryOtherFn, entryTestFn;
+  std::function<void(uint32_t, uint32_t)> entryMergedFn;
+  std::function<void(uint32_t, uint32_t, uint32_t)> chanArriveFn;
+  std::function<void(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)> termLinkFn;
+  for (uint32_t fi = 0; fi < entryF.size(); fi++) {
+    const auto &E = taggedEntryFormals[fi];
+    EntryF &ef = entryF[fi];
+    const NodeIndex fv = NF.getValueNodeFor(E.M->getArg(E.k));
+    if (fv == AndersNodeFactory::InvalidIndex) {
+      ef.poisoned = true;
+      ef.why = "the formal has no node";
+      continue;
+    }
+    const uint32_t A = canon(fv);
+    if (auto it = entryOfA.find(A); it != entryOfA.end()) {
+      ef.poisoned = entryF[it->second].poisoned = true;
+      ef.why = entryF[it->second].why = "the formal shares its node with another method's formal";
+      continue;
+    }
+    ef.A = A;
+    ef.Ao = newNode();
+    entryOfA[A] = fi;
+    entryOfAo[ef.Ao] = fi;
+  }
+  // Until the solve's hubs exist nothing waits: poisoning is the flag
+  // (reassigned with the flush below).
+  entryPoison = [&](uint32_t fi, const std::string &why) {
+    if (!entryF[fi].poisoned) entryF[fi].poisoned = true, entryF[fi].why = why;
+  };
+  // Plan 3.54 (b): a channel (caller formal X -> callee formal Y) is a node
+  // feeding Y's formal; objects arriving there take X's state for them.
+  // A call's argument k into Y is a channel when the call passes X's
+  // object on (taggedEntryChannels) with every F Y's reads read unwritten.
+  boost::unordered_flat_map<uint64_t, uint32_t> chanNodeOf;               // (X, Y) -> node
+  // A static channel's source (a call argument's node, by its current
+  // representative) -> the channel nodes its pops feed.
+  boost::unordered_flat_map<uint32_t, std::vector<uint32_t>> chanFrom;
+  boost::unordered_flat_map<uint32_t, std::pair<uint32_t, uint32_t>> chanOfNode; // node -> (X, Y)
+  auto chanNode = [&](uint32_t fx, uint32_t fy) {
+    auto [it, ins] = chanNodeOf.try_emplace((uint64_t)fx << 32 | fy, 0);
+    if (ins) {
+      it->second = newNode();
+      chanOfNode[it->second] = {fx, fy};
+      addEdge(it->second, entryF[fy].A);
+    }
+    return it->second;
+  };
+  auto chanValid = [&](const TaggedChannel &ch, uint32_t fy) {
+    const auto &EX = taggedEntryFormals[ch.from], &EY = taggedEntryFormals[fy];
+    if (EX.S != EY.S || entryF[ch.from].A == UINT32_MAX) return false;
+    for (int64_t F : EY.Fs)
+      if (!ch.Fs.count(F)) return false;
+    return true;
+  };
+  auto chanFor = [&](const CallBase *CS, unsigned k, uint32_t fy) -> int64_t {
+    if (!CS) return -1;
+    auto cit = taggedEntryChannels.find(CS);
+    if (cit == taggedEntryChannels.end()) return -1;
+    for (const TaggedChannel &ch : cit->second)
+      if (ch.k == k && chanValid(ch, fy)) return ch.from;
+    return -1;
+  };
+  // A static edge's source as a call argument: its channel, if every call
+  // argument with that node is one (from one caller formal), else none.
+  struct ActualChan { int64_t fx = -1; std::vector<const TaggedChannel *> chs; bool mixed = false; };
+  boost::unordered_flat_map<uint32_t, ActualChan> actualChan;
+  if (!entryF.empty() && !taggedEntryChannels.empty())
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &Fn : *M)
+        for (Instruction &I : instructions(Fn)) {
+          const auto *CS = dyn_cast<CallBase>(&I);
+          if (!CS || isa<IntrinsicInst>(CS)) continue;
+          auto cit = taggedEntryChannels.find(CS);
+          for (unsigned k = 0; k < CS->arg_size(); k++) {
+            if (!CS->getArgOperand(k)->getType()->isPointerTy()) continue;
+            const NodeIndex vn = NF.getValueNodeFor(CS->getArgOperand(k));
+            if (vn == AndersNodeFactory::InvalidIndex) continue;
+            ActualChan &ac = actualChan[canon(vn)];
+            const TaggedChannel *ch = nullptr;
+            if (cit != taggedEntryChannels.end())
+              for (const TaggedChannel &c : cit->second)
+                if (c.k == k) ch = &c;
+            if (!ch || (ac.fx >= 0 && ac.fx != (int64_t)ch->from)) { ac.mixed = true; continue; }
+            ac.fx = ch->from;
+            ac.chs.push_back(ch);
+          }
+        }
+  auto staticChan = [&](uint32_t a, uint32_t fy) -> int64_t {
+    auto it = actualChan.find(a);
+    if (it == actualChan.end() || it->second.mixed || it->second.fx < 0) return -1;
+    for (const TaggedChannel *ch : it->second.chs)
+      if (!chanValid(*ch, fy)) return -1;
+    return it->second.fx;
+  };
   std::vector<char> isHub(G, 0), inGraph(G, 0);
   size_t graphFieldEdges = 0;
   for (const GraphEdge &E : Graph.edges())
@@ -911,7 +1033,27 @@ bool CallGraphPass::runCellResolution() {
         }
         stores++;
       } else {
-        addEdge(a, b);
+        uint32_t to = b;
+        bool hooked = false;
+        if (!entryOfA.empty())
+          if (auto eit = entryOfA.find(b); eit != entryOfA.end()) { // plan 3.54
+            const int64_t fx = staticChan(a, eit->second);
+            if (fx < 0)
+              to = entryF[eit->second].Ao;
+            else {
+              // A channel (3.54 (b)): a transfer the pops of a make, not a
+              // copy edge, so channels close no cycle for the collapse to
+              // merge; into the caller's own formal, nothing (the argument
+              // is the formal's own value: its facts are there).
+              hooked = true;
+              if ((uint32_t)fx != eit->second) {
+                const uint32_t cn = chanNode((uint32_t)fx, eit->second);
+                auto &v = chanFrom[a];
+                if (std::find(v.begin(), v.end(), cn) == v.end()) v.push_back(cn);
+              }
+            }
+          }
+        if (!hooked) addEdge(a, to);
         if (CFLCellLeakCensus && isHub[a]) leakHubLoads[a].push_back(E.to);
         staticCopies++;
       }
@@ -931,6 +1073,8 @@ bool CallGraphPass::runCellResolution() {
   }
   assert(graphFieldEdges == lazyFEdges.size() &&
          "every field edge carries an exact label");
+  for (EntryF &ef : entryF)
+    if (ef.Ao != UINT32_MAX) addEdge(ef.Ao, ef.A);
   // Static edges as inserted (staticCopies and stores count attempts,
   // self-loops and duplicates included).
   const size_t staticEdges = edgeSet.size();
@@ -977,6 +1121,22 @@ bool CallGraphPass::runCellResolution() {
   // and re-propagates every fact (members brought facts the others'
   // successors and constraints have not seen).
   auto absorb = [&](uint32_t r, uint32_t m) {
+    if (!entryOfA.empty()) // plan 3.54: a split node merged with another: no split
+      for (uint32_t x : {r, m}) {
+        if (auto it = entryOfA.find(x); it != entryOfA.end()) entryPoison(it->second, "the formal merged in a cycle");
+        if (auto it = entryOfAo.find(x); it != entryOfAo.end()) entryPoison(it->second, "the formal merged in a cycle");
+        if (auto it = chanOfNode.find(x); it != chanOfNode.end())
+          entryPoison(it->second.second, "a channel into the formal merged in a cycle");
+      }
+    if (!chanFrom.empty()) // plan 3.54 (b): a channel source merged: the class feeds its channels
+      if (auto it = chanFrom.find(m); it != chanFrom.end()) {
+        std::vector<uint32_t> cs = std::move(it->second);
+        chanFrom.erase(it);
+        auto &v = chanFrom[r];
+        for (uint32_t cn : cs)
+          if (std::find(v.begin(), v.end(), cn) == v.end()) v.push_back(cn);
+        // (finalize re-pends every fact of r: its next pop sends them all)
+      }
     repOf[m] = r;
     if (leakMerge) leakMerge(r, m);
     if (!asmAt.empty())
@@ -1560,6 +1720,7 @@ bool CallGraphPass::runCellResolution() {
     anyDst[b] = {};
     walkDst[b] = {};
     stepDst[b] = {};
+    if (entryMergedFn) entryMergedFn(a, b); // plan 3.54: the merged cell's objects
     return a;
   };
   // The exact address of byte `off` of object o (a heap array is one
@@ -2539,18 +2700,26 @@ bool CallGraphPass::runCellResolution() {
   // some level is not a field step of the graph passes every receiver to
   // every method (the plain wiring, counted).
   // The byte offset an address adds to its base pointer (0: the pointer
-  // itself), INT64_MIN when not constant.
+  // itself), INT64_MIN when not constant; through a chain of constant
+  // GEPs (a field of an embedded struct, as dispatchReceiver steps it).
   auto slotOffset = [&](const Value *Slot) -> int64_t {
-    const auto *G = dyn_cast<GEPOperator>(Slot->stripPointerCasts());
-    if (!G) return 0;
-    APInt A(64, 0);
-    return G->accumulateConstantOffset(DL, A) ? A.getSExtValue() : INT64_MIN;
+    int64_t off = 0;
+    const Value *X = Slot->stripPointerCasts();
+    while (const auto *G = dyn_cast<GEPOperator>(X)) {
+      APInt A(64, 0);
+      if (!G->accumulateConstantOffset(DL, A)) return INT64_MIN;
+      off += A.getSExtValue();
+      X = G->getPointerOperand()->stripPointerCasts();
+    }
+    return off;
   };
   struct RecvSite {
     const CallBase *cs;
     unsigned k;
     uint32_t base, callee;
-    std::vector<uint32_t> lis; // per level: the field step (UINT32_MAX: none)
+    // Per level: the field steps from the level's pointer to the address
+    // loaded, one per GEP of the chain (empty: the pointer itself).
+    std::vector<std::vector<uint32_t>> lis;
     bool all = false;          // every receiver to every method
     std::string sig;           // the path's shape (types and constant indices)
     const Value *slot0;        // the address loaded at level 0
@@ -2581,20 +2750,32 @@ bool CallGraphPass::runCellResolution() {
       for (auto [V, Slot] : path) {
         // The shape by byte offsets: linking renames a struct per unit.
         R.sig += "|" + std::to_string(slotOffset(Slot));
-        const NodeIndex vn = NF.getValueNodeFor(V), sn = NF.getValueNodeFor(Slot);
-        uint32_t li = UINT32_MAX;
-        bool stepped = vn != AndersNodeFactory::InvalidIndex &&
-                       (sn == AndersNodeFactory::InvalidIndex ||
-                        find(canon(sn)) == find(canon(vn)));
-        if (!stepped && vn != AndersNodeFactory::InvalidIndex)
-          for (const FieldEdge &e : fieldOut[find(canon(vn))])
-            if (!e.walk && find(e.dst) == find(canon(sn))) {
-              li = e.li;
-              stepped = true;
-              break;
-            }
-        R.all |= !stepped;
-        R.lis.push_back(li);
+        // The addresses stepped to, the loaded one first: a chain of GEPs
+        // when the field is in a struct embedded in the object.
+        std::vector<const Value *> addrs{Slot};
+        for (const Value *X = Slot->stripPointerCasts(); const auto *G = dyn_cast<GEPOperator>(X);) {
+          X = G->getPointerOperand()->stripPointerCasts();
+          if (X == V) break;
+          addrs.push_back(X);
+        }
+        std::vector<uint32_t> steps;
+        const Value *B = V;
+        for (auto ait = addrs.rbegin(); ait != addrs.rend(); ++ait) {
+          const NodeIndex vn = NF.getValueNodeFor(B), sn = NF.getValueNodeFor(*ait);
+          bool stepped = vn != AndersNodeFactory::InvalidIndex &&
+                         (sn == AndersNodeFactory::InvalidIndex ||
+                          find(canon(sn)) == find(canon(vn)));
+          if (!stepped && vn != AndersNodeFactory::InvalidIndex)
+            for (const FieldEdge &e : fieldOut[find(canon(vn))])
+              if (!e.walk && find(e.dst) == find(canon(sn))) {
+                steps.push_back(e.li);
+                stepped = true;
+                break;
+              }
+          R.all |= !stepped;
+          B = *ait;
+        }
+        R.lis.push_back(std::move(steps));
       }
       const uint32_t si = recvSites.size();
       recvSites.push_back(R);
@@ -2618,14 +2799,21 @@ bool CallGraphPass::runCellResolution() {
     const RecvSite &R = recvSites[si];
     const Cell &C = cells[g];
     if (C.kind == CellKind::Func || C.kind == CellKind::Out) return; // no slot
-    std::vector<uint32_t> slots;
-    if (R.lis[level] == UINT32_MAX || C.kind == CellKind::Any) slots.push_back(g);
-    else
-      for (size_t i = 0; i < memb[g].size(); i++) {
-        const Member mb = memb[g][i];
-        const std::vector<uint32_t> &S = stepOne(mb.first, mb.second, R.lis[level]);
-        slots.insert(slots.end(), S.begin(), S.end());
+    std::vector<uint32_t> slots{g};
+    for (uint32_t li : R.lis[level]) { // each field step of the level's chain
+      std::vector<uint32_t> next;
+      for (uint32_t c : slots) {
+        const CellKind ck = cells[c].kind;
+        if (ck == CellKind::Any) { next.push_back(c); continue; }
+        if (ck == CellKind::Func || ck == CellKind::Out) continue; // no slot
+        for (size_t i = 0; i < memb[c].size(); i++) {
+          const Member mb = memb[c][i];
+          const std::vector<uint32_t> &S = stepOne(mb.first, mb.second, li);
+          next.insert(next.end(), S.begin(), S.end());
+        }
       }
+      slots.swap(next);
+    }
     auto &M = guard == UINT32_MAX ? recvLevel : guardLevel;
     const uint64_t key =
         ((uint64_t)(guard == UINT32_MAX ? si : guard) << 40) ^ ((uint64_t)level << 32) ^ f;
@@ -2685,9 +2873,29 @@ bool CallGraphPass::runCellResolution() {
       if (!isCompatible(R.cs, Fn)) continue; // not a target (the answers' rule)
       const NodeIndex fv = NF.getValueNodeFor(Fn->getArg(R.k));
       if (fv == AndersNodeFactory::InvalidIndex) continue;
-      const uint32_t formal = find(canon(fv));
+      uint32_t formal = find(canon(fv));
       if (onDispatchTarget) onDispatchTarget(K.si, Fn);
       if (trackWhy) curWhy = {R.base, K.f, F, W_DISPATCH};
+      // Plan 3.54: into a split formal, only a test site's receiver enters
+      // directly (with the formal's own term); a call passing a method
+      // formal's object on enters through its channel (3.54 (b)); any other
+      // dispatch is an other entry.
+      if (!entryOfA.empty())
+        if (auto eit = entryOfA.find(canon(fv)); eit != entryOfA.end()) {
+          const uint32_t fy = eit->second;
+          const auto &E = taggedEntryFormals[fy];
+          auto sit = taggedEntrySites.find(R.cs);
+          const bool test = K.f != UINT32_MAX && R.k == E.k && sit != taggedEntrySites.end() &&
+                            sit->second.first == E.S && E.Ds.count(sit->second.second);
+          if (test) {
+            entryF[fy].testEntries++;
+            entryTestFn(fy, K.f);
+          } else if (const int64_t fx = chanFor(R.cs, R.k, fy); fx >= 0) {
+            if ((uint32_t)fx == fy) continue; // its own object, already at its formal
+            formal = find(chanNode((uint32_t)fx, fy));
+          } else
+            formal = find(entryF[fy].Ao);
+        }
       if (K.f == UINT32_MAX) addEdge(R.base, formal);
       else add(formal, K.f);
     }
@@ -3209,7 +3417,7 @@ bool CallGraphPass::runCellResolution() {
             }
             tGuard++;
             // A pseudo site: level 1 steps the holder to the tested slot.
-            RecvSite PS{nullptr, 0, n, n, {UINT32_MAX, li}};
+            RecvSite PS{nullptr, 0, n, n, {{}, {li}}};
             const uint32_t si = recvSites.size();
             recvSites.push_back(PS);
             const uint32_t gi = guards.size();
@@ -3455,6 +3663,30 @@ bool CallGraphPass::runCellResolution() {
     hubLinks++;
     uint32_t ld = C.load, st = C.store;
     auto kit = cellHubKey.find(h);
+    if (kit != cellHubKey.end() && !entryOfKey.empty())
+      if (auto eh = entryOfKey.find(kit->second); eh != entryOfKey.end()) {
+        // A method's entry-keyed read (plan 3.54), its other side: an
+        // object that entered the formal other than by a test dispatch or
+        // a channel is read unkeyed; one that came through a channel reads
+        // the keys its terms admit (3.54 (b)); the link points are kept for
+        // the terms or the other entries still to come.
+        const uint32_t j = eh->second, fi = taggedEntryReads.at(taggedEntryReadList[j]);
+        EntryF &ef = entryF[fi];
+        const std::vector<Member> ms = memb[findFact(f)];
+        bool now = ef.poisoned || C.kind != CellKind::Off;
+        if (!now)
+          for (auto [o, e] : ms) now |= ef.other.count(o) != 0;
+        if (now) {
+          addEdge(ld, h);
+          return;
+        }
+        for (auto [o, e] : ms) {
+          ef.held[o].push_back({h, f, j});
+          if (auto tit = ef.terms.find(o); tit != ef.terms.end())
+            for (uint32_t t : std::vector<uint32_t>(tit->second)) termLinkFn(fi, j, h, f, o, t);
+        }
+        return;
+      }
     if (kit != cellHubKey.end() && C.kind == CellKind::Off) {
       // A keyed union access: its key's cell, for every member object
       // (an object not yet labeled waits).
@@ -3474,6 +3706,114 @@ bool CallGraphPass::runCellResolution() {
     if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], st);
   };
   linkHubFn = linkHub;
+  // Plan 3.54: object bookkeeping of the split formals.
+  // Read j of formal fi, at hub h, for object o of fact f, under term t (a
+  // formal whose method X the object's entry tested, 3.54 (b)): the keys of
+  // the writers a test D == X admits, for each D of X's tests; every writer
+  // when one of them is not keyed for the read.
+  termLinkFn = [&](uint32_t fi, uint32_t j, uint32_t h, uint32_t f, uint32_t o, uint32_t t) {
+    if (t == fi) return; // its own test: the read's own keys
+    EntryF &ef = entryF[fi];
+    const auto &ET = taggedEntryFormals[t];
+    auto tk = taggedEntryTermKeys.find(taggedEntryReadList[j]);
+    std::vector<uint32_t> kids;
+    bool all = ET.Ds.empty() || tk == taggedEntryTermKeys.end();
+    for (int64_t D : ET.Ds) {
+      if (all) break;
+      auto dit = tk->second.find(D);
+      if (dit == tk->second.end()) { all = true; break; }
+      auto xit = dit->second.find(ET.M);
+      if (xit == dit->second.end()) { all = true; break; } // every writer
+      for (const std::string &kn : xit->second) kids.push_back(NF.internCellName(kn));
+    }
+    ef.termLinks++;
+    if (all || !objs[o].layout) {
+      addEdge(cells[findFact(f)].load, h);
+      return;
+    }
+    const std::vector<Member> ms = memb[findFact(f)];
+    for (auto [o2, e] : ms) {
+      if (o2 != o) continue;
+      for (uint32_t kid : kids) addEdge(keyedOf(o, contentKey(objs[o], decOff(e)), kid), h);
+    }
+  };
+  std::function<void(uint32_t, uint32_t)> entryOtherObj = [&](uint32_t fi, uint32_t o) {
+    EntryF &ef = entryF[fi];
+    if (!ef.other.insert(o).second) return;
+    if (auto hit = ef.held.find(o); hit != ef.held.end()) {
+      const auto hs = std::move(hit->second);
+      ef.held.erase(hit);
+      for (auto [h, f0, j] : hs) {
+        addEdge(cells[findFact(f0)].load, h);
+        ef.flushed++;
+      }
+    }
+    if (auto sit = ef.subs.find(o); sit != ef.subs.end())
+      for (uint32_t z : std::vector<uint32_t>(sit->second)) entryOtherObj(z, o);
+  };
+  std::function<void(uint32_t, uint32_t, uint32_t)> entryTermObj = [&](uint32_t fi, uint32_t o, uint32_t t) {
+    EntryF &ef = entryF[fi];
+    if (ef.other.count(o)) return; // read unkeyed already, and so are those it was passed to
+    auto &ts = ef.terms[o];
+    if (std::find(ts.begin(), ts.end(), t) != ts.end()) return;
+    ts.push_back(t);
+    if (auto hit = ef.held.find(o); hit != ef.held.end())
+      for (auto [h, f0, j] : std::vector<std::array<uint32_t, 3>>(hit->second)) termLinkFn(fi, j, h, f0, o, t);
+    if (auto sit = ef.subs.find(o); sit != ef.subs.end())
+      for (uint32_t z : std::vector<uint32_t>(sit->second)) entryTermObj(z, o, t);
+  };
+  entryOtherFn = [&](uint32_t fi, uint32_t f) {
+    entryF[fi].otherEntries++;
+    for (auto [o, e] : std::vector<Member>(memb[findFact(f)])) entryOtherObj(fi, o);
+  };
+  entryTestFn = [&](uint32_t fi, uint32_t f) {
+    for (auto [o, e] : std::vector<Member>(memb[findFact(f)])) entryTermObj(fi, o, fi);
+  };
+  // An object arriving through the channel X -> Y takes X's state for it
+  // (and Y follows X's later changes): other at X (or X not split, or no
+  // state there) is other at Y; else X's terms.
+  chanArriveFn = [&](uint32_t fx, uint32_t fy, uint32_t f) {
+    EntryF &X = entryF[fx];
+    entryF[fy].chanEntries++;
+    for (auto [o, e] : std::vector<Member>(memb[findFact(f)])) {
+      auto &sb = X.subs[o];
+      if (std::find(sb.begin(), sb.end(), fy) == sb.end()) sb.push_back(fy);
+      auto tit = X.terms.find(o);
+      if (X.poisoned || X.other.count(o) || tit == X.terms.end() || tit->second.empty()) {
+        entryOtherObj(fy, o);
+        continue;
+      }
+      for (uint32_t t : std::vector<uint32_t>(tit->second)) entryTermObj(fy, o, t);
+    }
+  };
+  entryPoison = [&](uint32_t fi, const std::string &why) { // with the flush
+    EntryF &ef = entryF[fi];
+    if (ef.poisoned) return;
+    ef.poisoned = true;
+    ef.why = why;
+    for (auto &[o, hs] : ef.held)
+      for (auto [h, f0, j] : hs) {
+        addEdge(cells[findFact(f0)].load, h);
+        ef.flushed++;
+      }
+    ef.held.clear();
+    for (auto &[o, zs] : std::vector<std::pair<uint32_t, std::vector<uint32_t>>>(ef.subs.begin(), ef.subs.end()))
+      for (uint32_t z : zs) entryOtherObj(z, o);
+  };
+  // A cell merge: a cell at an other-entry node, or at a channel, now
+  // stands for more objects.
+  entryMergedFn = [&](uint32_t a, uint32_t b) {
+    for (uint32_t fi = 0; fi < entryF.size(); fi++) {
+      EntryF &ef = entryF[fi];
+      if (ef.poisoned || ef.Ao == UINT32_MAX) continue;
+      const uint32_t ao = find(ef.Ao);
+      if (pts[ao].test(a) || pts[ao].test(b)) entryOtherFn(fi, a);
+    }
+    for (auto &[cn, xy] : chanOfNode) {
+      const uint32_t c = find(cn);
+      if (pts[c].test(a) || pts[c].test(b)) chanArriveFn(xy.first, xy.second, a);
+    }
+  };
   // The keyed accesses still waiting at the fixpoint, on objects never
   // labeled: linked unkeyed (the solve goes on from them).
   auto flushKeyedWait = [&]() {
@@ -5330,6 +5670,19 @@ bool CallGraphPass::runCellResolution() {
              << coneReported << " inside\n");
   };
   std::vector<uint32_t> delta;
+  // Plan 3.54: facts a split formal holds before the solve (seeds) entered
+  // it other than by a dispatch.
+  for (uint32_t fi = 0; fi < entryF.size(); fi++)
+    if (entryF[fi].A != UINT32_MAX) {
+      std::vector<uint32_t> fs;
+      pts[find(entryF[fi].A)].forEach([&](uint32_t f) { fs.push_back(findFact(f)); });
+      for (uint32_t f : fs) entryOtherFn(fi, f);
+    }
+  for (auto &[cn, xy] : chanOfNode) { // plan 3.54 (b): a channel's facts before the solve
+    std::vector<uint32_t> fs;
+    pts[find(cn)].forEach([&](uint32_t f) { fs.push_back(findFact(f)); });
+    for (uint32_t f : fs) chanArriveFn(xy.first, xy.second, f);
+  }
   uint64_t lastCollapsePops = 0;
   size_t edgesAtCollapse = edgeSet.size();
   uint32_t stoppedAt = 0;
@@ -5404,6 +5757,16 @@ bool CallGraphPass::runCellResolution() {
       if (pops % (1u << 22) == 0) massByObject(12);
     }
     for (uint32_t &f : delta) f = findFact(f);
+    if (!entryOfAo.empty()) // plan 3.54: objects entering a split formal otherwise
+      if (auto eit = entryOfAo.find(n); eit != entryOfAo.end())
+        for (uint32_t f : delta) entryOtherFn(eit->second, f);
+    if (!chanOfNode.empty()) // plan 3.54 (b): objects passed on through a channel
+      if (auto cit = chanOfNode.find(n); cit != chanOfNode.end())
+        for (uint32_t f : delta) chanArriveFn(cit->second.first, cit->second.second, f);
+    if (!chanFrom.empty()) // plan 3.54 (b): a channel source's new facts, on to its channels
+      if (auto cit = chanFrom.find(n); cit != chanFrom.end())
+        for (uint32_t cn : std::vector<uint32_t>(cit->second))
+          for (uint32_t f : delta) add(cn, f);
     if (!watchAt.empty())
       if (auto wit = watchAt.find(n); wit != watchAt.end())
         for (uint32_t wi : std::vector<uint32_t>(wit->second))
@@ -7295,6 +7658,34 @@ bool CallGraphPass::runCellResolution() {
         RO << "SUMMARY outside callers: " << defined << " defined functions reach the outside after the solve, "
            << inPre << " of them in the pre-solve domain (" << taggedOutsidePre.size() << " functions)\n";
       for (auto &[b, n] : byB) RO << "T outside callers: " << n << " via " << bnd[b].first << " " << bnd[b].second << "\n";
+    }
+    if (!taggedEntryRows.empty() || !entryF.empty()) {
+      // Plan 3.54: per method formal, how its objects entered (stop
+      // numbers when the solve stopped).
+      size_t other = 0, onlyKeys = 0, poisoned = 0, carried = 0, chanSites = 0;
+      for (const EntryF &ef : entryF) {
+        poisoned += ef.poisoned;
+        other += ef.other.size();
+        for (auto &[o, hs] : ef.held) onlyKeys += !hs.empty();
+        for (auto &[o, ts] : ef.terms) carried += !ef.other.count(o) && ts.size() > 1;
+      }
+      for (auto &[cs, chs] : taggedEntryChannels) chanSites += chs.size();
+      RO << "SUMMARY method entry tests (3.54) " << entryF.size() << " method formals, "
+         << taggedEntryReads.size() << " reads keyed by an entry test; " << taggedEntrySites.size()
+         << " dispatch sites are tests; " << chanSites << " calls pass a formal's object on, "
+         << chanNodeOf.size() << " channels used (3.54 (b)); " << poisoned
+         << " formals not split (every object unkeyed); objects " << other << " entered otherwise (unkeyed), "
+         << onlyKeys << " read through keys, " << carried << " of them with terms carried in"
+         << (stoppedAt ? " (at the stop)" : "") << "\n";
+      for (const std::string &r : taggedEntryRows) RO << "T entry " << r << "\n";
+      for (uint32_t fi = 0; fi < entryF.size(); fi++) {
+        const EntryF &ef = entryF[fi];
+        RO << "T entry formal " << taggedEntryFormals[fi].M->getName() << " arg " << taggedEntryFormals[fi].k
+           << ": " << ef.testEntries << " test-dispatch entries, " << ef.chanEntries << " channel entries, "
+           << ef.otherEntries << " other entries, " << ef.other.size() << " objects read unkeyed, "
+           << ef.termLinks << " term links"
+           << (ef.poisoned ? " (not split: " + ef.why + ")" : std::string()) << "\n";
+      }
     }
     if (!taggedInPlace.empty()) {
       RO << "SUMMARY tagged fields in-place retags " << taggedInPlace.size()

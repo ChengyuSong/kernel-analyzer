@@ -29,6 +29,63 @@
 using namespace llvm;
 
 namespace {
+// The struct GEP an embedded struct's address is: a constant GEP from
+// element 0 whose result is the inner access's struct (plan 3.54 (a)).
+static const GEPOperator *embeddingGEP(const Value *A, const Type *Inner) {
+  const GEPOperator *O = structGEP(A);
+  if (!O || !O->hasAllConstantIndices() || O->getResultElementType() != Inner) return nullptr;
+  const auto *I0 = O->getNumIndices() ? dyn_cast<ConstantInt>(*O->idx_begin()) : nullptr;
+  const auto *OS = dyn_cast<StructType>(O->getSourceElementType());
+  return I0 && I0->isZero() && OS && OS->hasName() ? O : nullptr;
+}
+// The structs whose fields are only ever accessed inside one embedding
+// (struct name -> outer struct name, its offset there): computed per run
+// (computeTaggedFields). A struct also used on its own (z_stream_s, a
+// standalone png_unknown_chunk_t) keeps its own field names, so one field
+// never has two names.
+static std::map<std::string, std::pair<std::string, int64_t>> g_embedOnly;
+static const DataLayout &dataLayoutOf(const Value *V) {
+  V = V->stripPointerCasts();
+  if (const auto *I = dyn_cast<Instruction>(V)) return I->getModule()->getDataLayout();
+  if (const auto *A = dyn_cast<Argument>(V)) return A->getParent()->getParent()->getDataLayout();
+  if (const auto *GV = dyn_cast<GlobalValue>(V)) return GV->getParent()->getDataLayout();
+  if (const auto *CE = dyn_cast<GEPOperator>(V)) return dataLayoutOf(CE->getPointerOperand());
+  llvm_unreachable("an access address with no module");
+}
+// One composition step: the embedding of the inner struct S at A, when S
+// is only ever accessed there.
+static const GEPOperator *composeStep(const Value *A, const Type *S, const DataLayout &DL, int64_t &by) {
+  const GEPOperator *O = embeddingGEP(A, S);
+  if (!O) return nullptr;
+  const auto *ST = dyn_cast<StructType>(S);
+  if (!ST || !ST->hasName()) return nullptr;
+  auto it = g_embedOnly.find(stripStructNameSuffix(ST->getName()).str());
+  APInt Ap(64, 0);
+  if (it == g_embedOnly.end() || !O->accumulateConstantOffset(DL, Ap) ||
+      it->second != std::make_pair(stripStructNameSuffix(O->getSourceElementType()->getStructName()).str(),
+                                   Ap.getSExtValue()))
+    return nullptr;
+  by = Ap.getSExtValue();
+  return O;
+}
+// accessSlot, composed outward (plan 3.54 (a)): a field of a struct
+// embedded at a constant offset in another (tif->tif_tagmethods.vsetfield,
+// two GEPs at -O0) is named by its offset in the outermost struct, as one
+// GEP or the struct-path TBAA tag (-O3) names it; only through structs
+// accessed in no other way (g_embedOnly).
+static bool composedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, StructType *&S,
+                         int64_t &off) {
+  if (!accessSlot(I, Addr, DL, S, off)) return false;
+  const GEPOperator *G = structGEP(Addr);
+  if (!G || G->getSourceElementType() != S) return true; // named by its TBAA tag
+  int64_t by = 0;
+  for (const GEPOperator *O = composeStep(G->getPointerOperand(), S, DL, by); O;
+       O = composeStep(O->getPointerOperand(), S, DL, by)) {
+    S = cast<StructType>(O->getSourceElementType());
+    off += by;
+  }
+  return true;
+}
 // The object an access belongs to: the struct GEP's base, through -O0
 // local slots by reaching definitions: a reload of a slot is the value of
 // the one store reaching it (two reloads name one object only when they
@@ -158,7 +215,7 @@ struct ObjIds {
     if (!St || St->isVolatile() || !A->getAllocatedType()->isPointerTy()) return false;
     StructType *S = nullptr;
     int64_t off = 0;
-    return accessSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), S, off) && S && S->hasName() &&
+    return composedSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), S, off) && S && S->hasName() &&
            St->getPointerOperand()->stripPointerCasts() != A;
   }
   // objSize: the accessed struct's size (a -O3 byte offset inside it is a
@@ -171,8 +228,19 @@ struct ObjIds {
       const auto *I0 = G->getNumIndices() ? dyn_cast<ConstantInt>(*G->idx_begin()) : nullptr;
       if (G->hasAllConstantIndices() && I0) {
         const bool bytes = G->getSourceElementType()->isIntegerTy(8) && G->getNumIndices() == 1;
-        if (bytes ? (I0->getSExtValue() >= 0 && I0->getSExtValue() < objSize) : I0->isZero())
+        if (bytes ? (I0->getSExtValue() >= 0 && I0->getSExtValue() < objSize) : I0->isZero()) {
           B = G->getPointerOperand()->stripPointerCasts();
+          // A field of an embedded struct: the object is the outermost
+          // struct's (plan 3.54 (a)).
+          if (!bytes) {
+            int64_t by = 0;
+            const DataLayout &DL = dataLayoutOf(Addr);
+            for (const Type *In = G->getSourceElementType(); const GEPOperator *O = composeStep(B, In, DL, by);) {
+              In = O->getSourceElementType();
+              B = O->getPointerOperand()->stripPointerCasts();
+            }
+          }
+        }
       }
     }
     if (depth > 8) return B;
@@ -333,6 +401,58 @@ void CallGraphPass::computeTaggedFields() {
   taggedParamValueChannels.clear();
   taggedAccessSets.clear();
   taggedWatches.clear();
+  taggedEntryFormals.clear();
+  taggedEntryReads.clear();
+  taggedEntryTermKeys.clear();
+  // Plan 3.54 (a): the structs only ever accessed inside one embedding
+  // (every field GEP of the struct steps from the same outer struct's
+  // constant GEP at the same offset; no struct-path TBAA access names it
+  // as the base). Only their fields are named by the outer struct.
+  g_embedOnly.clear();
+  {
+    std::map<std::string, std::set<std::pair<std::string, int64_t>>> targets;
+    std::set<std::string> standalone;
+    auto classify = [&](const GEPOperator *G, const DataLayout &DL) {
+      const auto *T = dyn_cast<StructType>(G->getSourceElementType());
+      if (!T || !T->hasName()) return;
+      const std::string tn = stripStructNameSuffix(T->getName()).str();
+      const GEPOperator *O = embeddingGEP(G->getPointerOperand(), T);
+      APInt Ap(64, 0);
+      if (O && O->accumulateConstantOffset(DL, Ap))
+        targets[tn].insert({stripStructNameSuffix(O->getSourceElementType()->getStructName()).str(), Ap.getSExtValue()});
+      else
+        standalone.insert(tn);
+    };
+    for (auto &[M, _] : Ctx->Modules) {
+      const DataLayout &DL = M->getDataLayout();
+      for (Function &F : *M)
+        for (Instruction &I : instructions(F)) {
+          if (const auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+            classify(cast<GEPOperator>(G), DL);
+            continue;
+          }
+          const Value *Addr = nullptr;
+          if (const auto *L = dyn_cast<LoadInst>(&I)) Addr = L->getPointerOperand();
+          else if (const auto *St = dyn_cast<StoreInst>(&I)) Addr = St->getPointerOperand();
+          if (!Addr) continue;
+          if (const GEPOperator *G = structGEP(Addr)) {
+            if (!isa<Instruction>(G)) classify(G, DL); // a constant GEP of a global
+            continue;
+          }
+          StructType *S = nullptr;
+          int64_t off = 0;
+          if (accessSlot(&I, Addr, DL, S, off) && S && S->hasName()) // named by its TBAA tag alone
+            standalone.insert(stripStructNameSuffix(S->getName()).str());
+        }
+    }
+    for (auto &[tn, ts] : targets)
+      if (ts.size() == 1 && !standalone.count(tn)) g_embedOnly[tn] = *ts.begin();
+  }
+  taggedEntryReadList.clear();
+  taggedEntryReadIdx.clear();
+  taggedEntryChannels.clear();
+  taggedEntrySites.clear();
+  taggedEntryRows.clear();
   const auto t0 = std::chrono::steady_clock::now();
   if (!CFLCells || CFLUnionKeys != "tag") return;
   // The value a tag store writes, as terms (v & a) | f | s, s any
@@ -390,7 +510,10 @@ void CallGraphPass::computeTaggedFields() {
     if (V->getType()->isPointerTy() && isa<Constant>(V)) return ptrConst(V);
     return std::nullopt;
   };
-  auto widthOf = [](Type *T) -> unsigned { return T->isPointerTy() ? 64u : T->getIntegerBitWidth(); };
+  auto widthOf = [](Type *T) -> unsigned {
+    if (const auto *VT = dyn_cast<FixedVectorType>(T)) T = VT->getElementType(); // a lane (plan 3.54)
+    return T->isPointerTy() ? 64u : T->getIntegerBitWidth();
+  };
   // The outside domain of a function pointer (ruling a.2 and Q1, the 3.48
   // exposure question applied to function values): code outside the
   // corpus can name only NULL, -1, its own functions (one value,
@@ -415,7 +538,7 @@ void CallGraphPass::computeTaggedFields() {
         if (const auto *St = dyn_cast<StoreInst>(U); St && St->getValueOperand() == V) {
           StructType *S2 = nullptr;
           int64_t o2 = 0;
-          if (accessSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), S2, o2) && S2 &&
+          if (composedSlot(St, St->getPointerOperand(), St->getModule()->getDataLayout(), S2, o2) && S2 &&
               S2->hasName())
             continue;
           return true;
@@ -455,6 +578,7 @@ void CallGraphPass::computeTaggedFields() {
   struct FAccess { const Instruction *I; const Value *obj; };
   using Field = std::pair<std::string, int64_t>; // (struct, offset)
   std::map<Field, std::vector<FAccess>> fStores, fLoads;
+  std::map<Field, std::vector<FAccess>> vecLanes; // vector-of-pointer stores, per lane's field
   std::map<Field, std::vector<TagStore>> dStores;
   std::set<Field> fnFields;
   std::map<Field, std::vector<FAccess>> uStores, uLoads; // union members' non-pointer accesses
@@ -766,7 +890,7 @@ void CallGraphPass::computeTaggedFields() {
         StructType *S2 = nullptr;
         int64_t off2 = 0;
         if ((L->getType()->isIntegerTy() || L->getType()->isPointerTy()) &&
-            accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, off2) && S2 &&
+            composedSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, off2) && S2 &&
             S2->hasName() && stripStructNameSuffix(S2->getName()) == D.first && off2 == D.second) {
           const Value *who = objKey(L, L->getPointerOperand(), S2);
           out.push_back({sameObj(who, obj, L) ? 's' : 'x', -1, 0, 0, who, L});
@@ -838,8 +962,14 @@ void CallGraphPass::computeTaggedFields() {
   std::vector<TaggedWatch> watchCand;
   size_t storesNamed = 0, storesChar = 0, storesStruct = 0, storesWatched = 0, storesUnwatchable = 0;
   std::string unwatchableAt;
-  using Field0 = std::pair<std::string, int64_t>;
-  std::map<Field0, std::string> escapedAt; // fields whose address escapes
+  struct EscRange { int64_t lo, hi; std::string at; };
+  std::map<std::string, std::vector<EscRange>> escapedAt; // byte ranges whose address escapes, by struct
+  auto escapedOver = [&](const std::string &S, int64_t lo, int64_t hi) -> const std::string * {
+    if (auto it = escapedAt.find(S); it != escapedAt.end())
+      for (const EscRange &e : it->second)
+        if (e.lo < hi && lo < e.hi) return &e.at;
+    return nullptr;
+  };
   // memset fills, by the struct bytes they may cover (classified like
   // stores: typed objects and struct GEPs cover, char data is ignored,
   // other roots are watched in the solve); fill -1: not a constant.
@@ -999,7 +1129,7 @@ void CallGraphPass::computeTaggedFields() {
   auto classify = [&](const Instruction *I, const Value *Addr, int64_t w, const DataLayout &DL) {
     StructType *S0 = nullptr;
     int64_t o0 = 0;
-    if (accessSlot(I, Addr, DL, S0, o0) && S0 && S0->hasName()) {
+    if (composedSlot(I, Addr, DL, S0, o0) && S0 && S0->hasName()) {
       addCover(S0, o0, o0, false, w, I, DL);
       storesNamed++;
       return;
@@ -1065,10 +1195,13 @@ void CallGraphPass::computeTaggedFields() {
           classify(CX, CX->getPointerOperand(), (int64_t)DL.getTypeStoreSize(CX->getNewValOperand()->getType()), DL);
         // A field whose address escapes (used other than as a load or store
         // address) may be written unnamed.
+        // An embedded struct's address used only as the base of its own
+        // fields' constant GEPs is not an escape: those GEPs are checked
+        // themselves, under their composed names (plan 3.54 (a)).
         if (const GEPOperator *FG = dyn_cast<GEPOperator>(&I); FG && structGEP(&I) == FG) {
-          StructType *S0 = dyn_cast<StructType>(FG->getSourceElementType());
-          APInt Ap(64, 0);
-          if (S0 && S0->hasName() && FG->accumulateConstantOffset(DL, Ap)) {
+          StructType *S0 = nullptr;
+          int64_t o0 = 0;
+          if (composedSlot(&I, &I, DL, S0, o0) && S0 && S0->hasName()) {
             // Through pointer-to-pointer casts (the typed-pointer upgrade
             // leaves `bitcast ptr %f to ptr` before a store at -O0): the
             // address is still used only as a load or store address.
@@ -1085,14 +1218,19 @@ void CallGraphPass::computeTaggedFields() {
                   work.push_back(C);
                   continue;
                 }
+                if (const auto *IG = dyn_cast<GetElementPtrInst>(U);
+                    IG && IG->getPointerOperand() == A && IG->hasAllConstantIndices() &&
+                    IG->getSourceElementType() == FG->getResultElementType() &&
+                    FG->getResultElementType()->isStructTy())
+                  if (const auto *I0 = dyn_cast<ConstantInt>(*IG->idx_begin()); I0 && I0->isZero())
+                    continue; // a field of the embedded struct: checked as its own GEP
                 esc = true;
                 break;
               }
             }
-            if (esc) {
-              const Field ef{stripStructNameSuffix(S0->getName()).str(), Ap.getSExtValue()};
-              if (escapedAt.emplace(ef, locOf(&I)).second) {}
-            }
+            if (esc) // at its own offset, as before composition (an embedded struct's
+                     // escape does not reach its fields' names: open question to 3.54)
+              escapedAt[stripStructNameSuffix(S0->getName()).str()].push_back({o0, o0 + 1, locOf(&I)});
           }
         }
         const Value *Addr = nullptr;
@@ -1102,7 +1240,7 @@ void CallGraphPass::computeTaggedFields() {
         else continue;
         StructType *ST = nullptr;
         int64_t off = 0;
-        if (!accessSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) continue;
+        if (!composedSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) continue;
         const Field fld{stripStructNameSuffix(ST->getName()).str(), off};
         const Value *obj = objKey(&I, Addr, ST);
         // A union member (plan 3.51, Mem.u): every access of any width
@@ -1122,8 +1260,26 @@ void CallGraphPass::computeTaggedFields() {
           analyzeTag(cast<StoreInst>(&I), obj, fld, TS);
           dStores[fld].push_back(std::move(TS));
         }
+        else if (const auto *VT = dyn_cast<FixedVectorType>(T);
+                 VT && VT->getElementType()->isPointerTy() && isa<StoreInst>(&I)) {
+          // A store of a vector of pointers (-O3 restores two saved
+          // methods with one <2 x ptr> store): a write of each lane's field.
+          const int64_t es = (int64_t)DL.getTypeStoreSize(VT->getElementType());
+          for (unsigned i = 0; i < VT->getNumElements(); i++)
+            vecLanes[{fld.first, off + (int64_t)i * es}].push_back({&I, obj});
+        }
       }
   }
+  // A function-pointer field written as a vector lane: a tag store whose
+  // value is not evaluated (unknown); like any tag store, it retags nothing
+  // when its tag is never read under.
+  for (auto &[fld, ws] : vecLanes)
+    if (fnFields.count(fld))
+      for (const FAccess &w : ws) {
+        TagStore TS{cast<StoreInst>(w.I), w.obj};
+        TS.unknown = true;
+        dStores[fld].push_back(std::move(TS));
+      }
   // A union member with pointer stores is a pointer field whose writers
   // are all its stores (an integer or float write holds no pointer) and
   // whose reads are its pointer and pointer-width integer loads; its
@@ -1145,6 +1301,37 @@ void CallGraphPass::computeTaggedFields() {
       analyzeTag(cast<StoreInst>(w.I), w.obj, fld, TS);
       dStores[fld].push_back(std::move(TS));
     }
+  // Method-installed state (plan 3.54). Where each function is installed:
+  // the function-pointer fields its address is stored into as a constant.
+  // The dispatch sites that are tests of such a field D: the callee is a
+  // load of D on the receiver (dispatchReceiver, one level), and nothing
+  // is written between the load and the call (no store, no call), so the
+  // content F of the receiver at the call is its content at the test.
+  std::map<const Function *, std::set<Field>> fnInstalled;
+  std::map<Field, std::set<const Function *>> installedIn; // the methods of D (plan 3.54 (b))
+  std::set<Field> entrySiteFields;
+  for (const Field &fld : fnFields) {
+    for (const FAccess &w : fStores[fld])
+      if (const auto *G = dyn_cast<Function>(cast<StoreInst>(w.I)->getValueOperand()->stripPointerCasts()))
+        fnInstalled[G].insert(fld), installedIn[fld].insert(G);
+    for (const FAccess &r : fLoads[fld]) {
+      const auto *L = cast<LoadInst>(r.I);
+      for (const User *U : L->users()) {
+        const auto *CS = dyn_cast<CallBase>(U);
+        if (!CS || CS->getCalledOperand()->stripPointerCasts() != L || CS->getParent() != L->getParent()) continue;
+        std::vector<std::pair<const Value *, const Value *>> path;
+        if (dispatchReceiver(CS, &path) < 0 || path.size() != 1 || path[0].second != L->getPointerOperand()) continue;
+        bool quiet = L->comesBefore(CS);
+        for (const Instruction *I = L->getNextNode(); quiet && I && I != CS; I = I->getNextNode())
+          if (I->mayWriteToMemory() && !isa<DbgInfoIntrinsic>(I)) quiet = false;
+        if (!quiet) continue;
+        taggedEntrySites[CS] = {fld.first, fld.second};
+        entrySiteFields.insert(fld);
+      }
+    }
+  }
+  size_t entryTestsMade = 0;
+  std::map<std::string, size_t> entryRefusals; // why a method's reads take no entry test
   // ---- per (S, F, D): writers, retags, reads ----
   size_t pairsUncertified = 0;
   size_t pairsKeyed = 0, readsKeyed = 0, readsNoTest = 0, readsAll = 0, pairsNonConst = 0,
@@ -1190,7 +1377,7 @@ void CallGraphPass::computeTaggedFields() {
         if (isa<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) continue;
         StructType *S2 = nullptr;
         int64_t o2 = 0;
-        if (!accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, o2) || !S2 || !S2->hasName()) {
+        if (!composedSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, o2) || !S2 || !S2->hasName()) {
           R.why = "an unnamed load at " + locOf(&I);
           return R;
         }
@@ -1254,7 +1441,7 @@ void CallGraphPass::computeTaggedFields() {
           }
           StructType *S2 = nullptr;
           int64_t o2 = 0;
-          accessSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, o2);
+          composedSlot(L, L->getPointerOperand(), L->getModule()->getDataLayout(), S2, o2);
           auto it = vals.find(o2);
           if (it == vals.end()) { fail = true; break; }
           env[&I] = it->second;
@@ -1384,7 +1571,7 @@ void CallGraphPass::computeTaggedFields() {
       const auto *DL0 = cast<LoadInst>(dl);
       StructType *S2 = nullptr;
       int64_t o2 = 0;
-      if (!accessSlot(DL0, DL0->getPointerOperand(), DL0->getModule()->getDataLayout(), S2, o2) || !S2 ||
+      if (!composedSlot(DL0, DL0->getPointerOperand(), DL0->getModule()->getDataLayout(), S2, o2) || !S2 ||
           !S2->hasName())
         continue;
       it->second.push_back({Br, dl, stripStructNameSuffix(S2->getName()).str(), o2, objKey(DL0, DL0->getPointerOperand(), S2)});
@@ -1792,11 +1979,14 @@ void CallGraphPass::computeTaggedFields() {
   // composed, E = the maps from the test to the access; unstable when that
   // effect is open. The last passage: from Succ to `at` without
   // re-entering the test's block.
+  // Br null: from the function's entry (Succ its entry block; an entry
+  // test, plan 3.54, reads only).
   std::string unstableWhy; // why the last test was dropped (reports)
   auto stableBetween = [&](const Instruction *dl, const BranchInst *Br, const BasicBlock *Succ, const Instruction *at,
                            const Field &X, bool isD, const Value *obj, std::set<uint32_t> &as,
                            std::vector<Term> *E) {
-    if (dl->getParent() != Br->getParent()) { unstableWhy = "the test's load is in another block"; return false; }
+    assert((Br || !isD) && "an entry test is a read's");
+    if (Br && dl->getParent() != Br->getParent()) { unstableWhy = "the test's load is in another block"; return false; }
     const FieldCtx &C = ctxOf(X, isD);
     auto writes = [&](const Instruction &I) {
       if (&I == at) return false;
@@ -1820,8 +2010,9 @@ void CallGraphPass::computeTaggedFields() {
       }
       return false;
     };
-    for (const Instruction *I = dl->getNextNode(); I && I != Br; I = I->getNextNode())
-      if (writes(*I)) { unstableWhy = "a write at " + locOf(I) + " between the test's load and its branch"; return false; }
+    if (Br)
+      for (const Instruction *I = dl->getNextNode(); I && I != Br; I = I->getNextNode())
+        if (writes(*I)) { unstableWhy = "a write at " + locOf(I) + " between the test's load and its branch"; return false; }
     if (isD) {
       EffMemo memo;
       std::set<const Instruction *> cyc;
@@ -1831,7 +2022,7 @@ void CallGraphPass::computeTaggedFields() {
       if (E) *E = std::move(e.maps);
       return true;
     }
-    const BasicBlock *TB = Br->getParent();
+    const BasicBlock *TB = Br ? Br->getParent() : nullptr;
     std::set<const BasicBlock *> fwd, bwd;
     std::vector<const BasicBlock *> work{Succ};
     fwd.insert(Succ);
@@ -1896,6 +2087,11 @@ void CallGraphPass::computeTaggedFields() {
     // one of caseVals (or, for the default edge, none of them).
     bool sw = false, swDefault = false;
     std::vector<int64_t> caseVals;
+    // An entry test (plan 3.54): D == entryFn on entry to entryFn through
+    // a dispatch o->D(o, ...), o its formal entryK (a switch edge on the
+    // read itself standing for the tag: cond == d).
+    const Function *entryFn = nullptr;
+    unsigned entryK = 0;
   };
   std::vector<std::vector<Test>> termFilters; // Term::flt
   // Products (plan 3.51 ruling a): a predicate reading an integer tag and
@@ -1939,6 +2135,37 @@ void CallGraphPass::computeTaggedFields() {
         if (Ef) Ef->push_back(std::move(E));
       }
     }
+    // Plan 3.54: no test in the function, but the function is a method
+    // installed in D and the object is its receiver formal. On entry
+    // through a dispatch o->D(o, ...) (a test site), D == M held at the
+    // dispatch's load of D, and F has not been written since (the site's
+    // check, then this function's up to the read). The test stands for
+    // those entries only: the solver gives every other entry of the formal
+    // the unkeyed read. Reads only (a retag keeps its own tests).
+    if (!tests.empty() || Ef || pp || !entrySiteFields.count(Df)) return;
+    const Function *M = Fn;
+    int k = -1;
+    for (unsigned i = 0; i < M->arg_size() && k < 0; i++)
+      if (M->getArg(i)->getType()->isPointerTy() && argId(M->getArg(i)) == obj) k = (int)i;
+    if (k < 0) return; // not the receiver formal
+    auto iit = fnInstalled.find(M);
+    if (iit == fnInstalled.end() || !iit->second.count(Df)) return; // not a method of D
+    auto refuse = [&](const std::string &why) {
+      entryRefusals[why]++;
+      lastTestsWhy = "no entry test: " + why;
+    };
+    if (taggedOutsidePre.count(M)) return refuse("the method's address may reach the outside (entries the solve does not see)");
+    std::set<uint32_t> a2;
+    if (!stableBetween(nullptr, nullptr, &M->getEntryBlock(), at, Ff, false, obj, a2, nullptr))
+      return refuse("F may be written between the entry and the read: " + unstableWhy);
+    as.insert(a2.begin(), a2.end());
+    Test t{at, at, true, Df.second, Df.second};
+    t.sw = true;
+    t.caseVals = {*ptrConst(M)};
+    t.entryFn = M;
+    t.entryK = (unsigned)k;
+    tests.push_back(std::move(t));
+    entryTestsMade++;
   };
   // The test being evaluated (its packing of the tag), and field o's
   // value in tag v.
@@ -2288,7 +2515,7 @@ void CallGraphPass::computeTaggedFields() {
       StructType *S2 = nullptr;
       int64_t o2 = 0;
       if (!LD || LD->getParent() != CB->getParent() ||
-          !accessSlot(LD, LD->getPointerOperand(), LD->getModule()->getDataLayout(), S2, o2) || !S2 ||
+          !composedSlot(LD, LD->getPointerOperand(), LD->getModule()->getDataLayout(), S2, o2) || !S2 ||
           !S2->hasName() || stripStructNameSuffix(S2->getName()) != Df.first || o2 != Df.second ||
           !sameObj(objKey(LD, LD->getPointerOperand(), S2), robj, CB))
         continue;
@@ -2524,7 +2751,7 @@ void CallGraphPass::computeTaggedFields() {
             StructType *S2 = nullptr;
             int64_t o2 = 0;
             if (!A->getType()->isPointerTy() || !structGEP(A) ||
-                !accessSlot(CB, A, CB->getModule()->getDataLayout(), S2, o2) || !S2 || !S2->hasName() ||
+                !composedSlot(CB, A, CB->getModule()->getDataLayout(), S2, o2) || !S2 || !S2->hasName() ||
                 stripStructNameSuffix(S2->getName()) != C.X.first || o2 != C.X.second ||
                 !sameObj(objKey(CB, A, S2), id, CB) || !outMustWrite(H, k))
               continue;
@@ -3227,6 +3454,19 @@ void CallGraphPass::computeTaggedFields() {
     struct CompRes { std::vector<bool> any; std::vector<std::set<int64_t>> vals; std::vector<std::optional<KnownBits>> kb; std::set<uint32_t> as; };
     std::map<int64_t, CompRes> comps; // the components of products
     std::map<const Instruction *, std::vector<size_t>> readAdm;
+    // Plan 3.54: a read's entry-test admissions, per field its method is
+    // entered by: their union (an entry through D's site has D == M); a
+    // field admitting every writer makes the union every writer (entryAll).
+    // byTerm (plan 3.54 (b)): per field, per method X of it, the writers
+    // a test D == X admits (absent: every writer).
+    struct EntryAdm {
+      std::pair<const Function *, unsigned> fn;
+      std::set<int64_t> fields;
+      std::set<size_t> adm;
+      std::map<int64_t, std::map<const Function *, std::vector<size_t>>> byTerm;
+    };
+    std::map<const Instruction *, EntryAdm> entryAdm;
+    std::set<const Instruction *> entryAll;
     std::vector<bool> namedW(fs.size(), false);
     std::vector<TaggedPair> fPairs;
     std::vector<std::set<uint32_t>> fPairAs;
@@ -3454,7 +3694,8 @@ void CallGraphPass::computeTaggedFields() {
       std::vector<std::vector<Test>> effGuards;
       std::vector<std::string> effLab;
       bool effUnknownRetag = false;
-      size_t effSites = 0, effAbsorbed = 0;
+      size_t effSites = 0, effAbsorbed = 0, effUnseen = 0;
+      std::string effOpenSite; // the first open effect that retags (the row's site)
       // Recursion: rounds from the empty effect, each starting where the
       // last one ended, until no value changes (maps only grow).
       auto sameCE = [&](const CEff &a, const CEff &b) {
@@ -3492,6 +3733,31 @@ void CallGraphPass::computeTaggedFields() {
           {
             const CEff E = contentEff(G, k);
             if (E.maps.empty() && !E.open) continue; // the incoming content is never retagged
+            // As for a tag store: a callee that can execute no tested read
+            // of F, after which the content is never read under the tag it
+            // leaves (D or F rewritten first on every path), meets no
+            // content: its effect gives nothing and retags nothing (a
+            // cleanup restoring a saved method, then freeing the state).
+            {
+              std::set<uint32_t> a2;
+              // Mapped only (2): every path meets a tag write computed from
+              // the left tag first; when each of those writes is itself
+              // never read under, the chain meets no content either.
+              auto unseen = [&](const Obs &ob) {
+                if (ob.r == 0) return true;
+                if (ob.r != 2) return false;
+                for (const Instruction *d : ob.mapAt) {
+                  auto tit = tagStoreAt.find(d);
+                  if (tit == tagStoreAt.end() || obsFull(tit->second->obj, d, a2).r != 0) return false;
+                }
+                return true;
+              };
+              if (!mrF.fns.count(G) && unseen(obsFull(argId(CB->getArgOperand(k)), CB, a2))) {
+                effUnseen++;
+                pas.insert(a2.begin(), a2.end());
+                continue;
+              }
+            }
             effSites++;
             (E.open ? effOpen : effClosed)++;
             if (E.open && effOpenAt.size() < 8) effOpenAt.push_back(locOf(CB) + " -> " + G->getName().str());
@@ -3522,6 +3788,7 @@ void CallGraphPass::computeTaggedFields() {
               continue;
             }
             effUnknownRetag |= E.open;
+            if (E.open && effOpenSite.empty()) effOpenSite = locOf(CB) + " -> " + G->getName().str();
             effMaps.insert(effMaps.end(), E.maps.begin(), E.maps.end());
             effGuards.insert(effGuards.end(), E.guards.begin(), E.guards.end());
             for (size_t q = 0; q < E.maps.size(); q++) effLab.push_back("call " + locOf(CB) + " -> " + G->getName().str());
@@ -3572,18 +3839,38 @@ void CallGraphPass::computeTaggedFields() {
       std::set<const Instruction *> own;
       for (const TagStore &t : ds) own.insert(t.I);
       const Instruction *coveredBy = nullptr;
-      if (auto cit = covers.find(S); cit != covers.end())
-        for (const Cover &c : cit->second)
-          if (c.lo < dOff + dBytes && dOff < c.hi && !(c.lo == dOff && c.hi == dOff + dBytes && own.count(c.I))) {
-            coveredBy = c.I;
-            break;
-          }
-      if (coveredBy || storesUnwatchable || escapedAt.count(Df)) {
+      auto coveredIn = [&](const std::string &SN, int64_t lo, int64_t hi) {
+        if (auto cit = covers.find(SN); cit != covers.end())
+          for (const Cover &c : cit->second)
+            // An own write: exactly D, or a vector store with D as a lane.
+            if (c.lo < hi && lo < c.hi &&
+                !(own.count(c.I) && c.lo <= lo && hi <= c.hi && ((c.lo == lo && c.hi == hi) ||
+                                                               (lo - c.lo) % (hi - lo) == 0))) {
+              coveredBy = c.I;
+              return;
+            }
+      };
+      coveredIn(S, dOff, dOff + dBytes);
+      // D in an embedded struct (plan 3.54 (a)): a store named by the
+      // embedded struct alone covers it too.
+      if (!coveredBy && !ds.empty()) {
+        const auto *TI = cast<StoreInst>(ds.front().I);
+        const DataLayout &TDL = TI->getModule()->getDataLayout();
+        StructType *STy = nullptr;
+        int64_t o = 0;
+        if (composedSlot(TI, TI->getPointerOperand(), TDL, STy, o) && STy)
+          structCover(STy, dOff, dOff + dBytes, TDL, [&](StructType *ST2, int64_t l, int64_t h) {
+            const std::string N2 = stripStructNameSuffix(ST2->getName()).str();
+            if (N2 != S && !coveredBy) coveredIn(N2, l, h);
+          });
+      }
+      const std::string *escAt = escapedOver(S, dOff, dOff + std::max<int64_t>(dBytes, 1));
+      if (coveredBy || storesUnwatchable || escAt) {
         pairsUncertified++;
         if (fs.size() >= 10)
           taggedReport.push_back("UNKEYED " + S + "+" + std::to_string(Ff.second) + " by +" +
                                  std::to_string(dOff) + ": tag not certified (" +
-                                 (escapedAt.count(Df) ? "its address escapes at " + escapedAt[Df]
+                                 (escAt ? "its address escapes at " + *escAt
                                   : coveredBy ? "an unnamed or wider store covers it at " + locOf(coveredBy)
                                               : "a store with no watchable pointer, e.g. " + unwatchableAt) + ")");
         continue;
@@ -3625,7 +3912,8 @@ void CallGraphPass::computeTaggedFields() {
           for (const TagStore *t : retags) if (t->unknown) { at = t->I; break; }
           taggedReport.push_back("UNKEYED " + S + "+" + std::to_string(Ff.second) + " by +" +
                                  std::to_string(dOff) + " (" + std::to_string(fs.size()) +
-                                 " writes): non-constant retag at " + locOf(at) + " (" +
+                                 " writes): non-constant retag at " +
+                                 (at ? locOf(at) : "the call " + effOpenSite + " (an open effect)") + " (" +
                                  std::to_string(std::count_if(retags.begin(), retags.end(),
                                      [](const TagStore *t) { return t->unknown; })) + " of " +
                                  std::to_string(retags.size()) + " retags)");
@@ -4063,10 +4351,13 @@ void CallGraphPass::computeTaggedFields() {
       };
       // Reads: the stable tests of D (same object) dominating them.
       std::vector<std::pair<const Instruction *, std::vector<size_t>>> keyed;
+      std::map<const Instruction *, std::pair<const Function *, unsigned>> entryHere; // plan 3.54
+      std::map<const Instruction *, std::map<const Function *, std::vector<size_t>>> termAdm; // plan 3.54 (b)
       size_t pairReadsKeyed = 0;
       for (const FAccess &r : fLoads[Ff]) {
         std::vector<Test> tests;
         testsAtM(r.I, r.obj, Df, Ff, tests, pas);
+        if (tests.size() == 1 && tests[0].entryFn) entryHere[r.I] = {tests[0].entryFn, tests[0].entryK};
         if (tests.empty()) {
           // Parameter-pair tests: the union over the callee's uses of what
           // each use's tests admit; an untested use admits every writer.
@@ -4131,7 +4422,34 @@ void CallGraphPass::computeTaggedFields() {
             }
         }
         curR = wmask;
-        if (adm.size() == writers.size()) { readsAll++; continue; }
+        if (adm.size() == writers.size()) {
+          readsAll++;
+          if (entryHere.count(r.I)) entryAll.insert(r.I);
+          continue;
+        }
+        // Plan 3.54 (b): what the entry test would admit for each method
+        // of D, for objects entering with that method's term.
+        if (entryHere.count(r.I))
+          for (const Function *X : installedIn[Df]) {
+            if (!ptrConst(X)) continue;
+            std::vector<Test> tx = tests;
+            tx[0].caseVals = {*ptrConst(X)};
+            const auto [TX, RX] = tagsFor(tx);
+            curR = RX;
+            std::vector<size_t> ax;
+            for (size_t i = 0; i < writers.size(); i++) {
+              if (wAll[i]) { ax.push_back(i); continue; }
+              const TagSet &ws = TX->w[i];
+              if (ws.wide) {
+                if (!ws.kb.hasConflict() && mayHold(tx, ws.kb)) ax.push_back(i);
+                continue;
+              }
+              for (int64_t v : ws.vals)
+                if (holdsP(tx, v)) { ax.push_back(i); break; }
+            }
+            curR = wmask;
+            if (ax.size() < writers.size()) termAdm[r.I][X] = std::move(ax);
+          }
         keyed.push_back({r.I, adm});
         pairReadsKeyed++;
       }
@@ -4145,7 +4463,8 @@ void CallGraphPass::computeTaggedFields() {
                           (uAll ? std::string("widened") : std::to_string(full.uSize)) + " tags, " +
                           std::to_string(nAll) + " writers with any tag; bits observed " +
                           std::to_string(llvm::popcount((uint64_t)projR)) + "; call-site effects " + std::to_string(effSites) +
-                          " (" + std::to_string(effAbsorbed) + " absorbed by callers); tag stores " +
+                          " (" + std::to_string(effAbsorbed) + " absorbed by callers, " + std::to_string(effUnseen) +
+                          " never read under); tag stores " +
                           std::to_string(absorbedStores) + " accounted at call sites, " + std::to_string(unseenStores) +
                           " never read under, " + std::to_string(closedStores) +
                           " closed, " + std::to_string(openStores) + " open (retags" +
@@ -4207,7 +4526,22 @@ void CallGraphPass::computeTaggedFields() {
       for (size_t i = 0; i < writers.size(); i++) any |= !writers[i].unknown;
       if (!any) continue;
       for (size_t i = 0; i < writers.size(); i++) if (!writers[i].unknown) namedW[i] = true;
-      for (auto &[I, adm] : keyed) keyRead(I, adm);
+      // Entry-keyed reads (plan 3.54) collect a union over D fields
+      // (installed below); the others intersect over Ds (keyRead).
+      size_t entryKeyed = 0;
+      for (auto &[I, adm] : keyed) {
+        auto eit = entryHere.find(I);
+        if (eit == entryHere.end()) {
+          keyRead(I, adm);
+          continue;
+        }
+        EntryAdm &ea = entryAdm[I];
+        ea.fn = eit->second;
+        ea.fields.insert(dOff);
+        ea.adm.insert(adm.begin(), adm.end());
+        ea.byTerm[dOff] = termAdm[I];
+        entryKeyed++;
+      }
       fPairs.push_back({S, Ff.second, dOff, (int64_t)(dWidth / 8)});
       fPairAs.push_back(pas);
       fDims.push_back("+" + std::to_string(dOff));
@@ -4216,7 +4550,8 @@ void CallGraphPass::computeTaggedFields() {
       for (const std::string &v : via) extra += "; bound " + v;
       taggedReport.push_back("KEYED " + S + "+" + std::to_string(Ff.second) + " by +" +
                                std::to_string(dOff) + ": " + std::to_string(writers.size()) + " writers, " +
-                               std::to_string(pairReadsKeyed) + " reads keyed, " +
+                               std::to_string(pairReadsKeyed) + " reads keyed (" + std::to_string(entryKeyed) +
+                               " by a method's entry test), " +
                                std::to_string(retags.size()) + " retags, bits observed " + std::to_string(llvm::popcount((uint64_t)projR)) + " (" + std::to_string(closedStores) +
                                " tag stores closed; " + std::to_string(observedWriters) + " writers read under their prior tag; " +
                                std::to_string(guarded) +
@@ -4287,6 +4622,20 @@ void CallGraphPass::computeTaggedFields() {
                              " x +" + std::to_string(P.d2) + ": " + std::to_string(prodKeyed) +
                              " reads keyed by predicates of both");
     }
+    // Plan 3.54: an entry-keyed read admits the union of its fields'
+    // admissions, intersected with what a test of every entry admits.
+    std::map<const Instruction *, const EntryAdm *> entryKeyedF;
+    for (auto &[I, ea] : entryAdm) {
+      if (entryAll.count(I)) continue;
+      const std::vector<size_t> u(ea.adm.begin(), ea.adm.end());
+      auto [it, ins] = readAdm.try_emplace(I, u);
+      if (!ins) {
+        std::vector<size_t> both;
+        std::set_intersection(it->second.begin(), it->second.end(), u.begin(), u.end(), std::back_inserter(both));
+        it->second = std::move(both);
+      }
+      entryKeyedF[I] = &ea;
+    }
     // Install, once per F. Another mechanism's keys on a writer or a read
     // of F would not meet these: F stays unkeyed then.
     if (readAdm.empty()) continue;
@@ -4336,6 +4685,32 @@ void CallGraphPass::computeTaggedFields() {
       // Its callee's tested uses read it through their own tests' keys,
       // when every call of the callee is such a read (below).
       readsKeyed++;
+    }
+    // Plan 3.54: the installed entry-keyed reads and their formals; a
+    // formal's test fields are those every one of its reads was tested on.
+    for (auto &[I, ea] : entryKeyedF) {
+      auto [M, k] = ea->fn;
+      uint32_t fi = 0;
+      while (fi < taggedEntryFormals.size() && (taggedEntryFormals[fi].M != M || taggedEntryFormals[fi].k != k)) fi++;
+      if (fi == taggedEntryFormals.size()) taggedEntryFormals.push_back({M, k, S, ea->fields});
+      TaggedEntryFormal &E = taggedEntryFormals[fi];
+      assert(E.S == S && "a formal's reads are of one struct");
+      std::set<int64_t> both;
+      std::set_intersection(E.Ds.begin(), E.Ds.end(), ea->fields.begin(), ea->fields.end(), std::inserter(both, both.end()));
+      E.Ds = std::move(both);
+      E.Fs.insert(Ff.second);
+      taggedEntryReads[I] = fi;
+      auto &tk = taggedEntryTermKeys[I];
+      for (auto &[d, byX] : ea->byTerm) {
+        auto &dk = tk[d];
+        for (auto &[X, ax] : byX) {
+          std::vector<std::string> ks;
+          for (size_t i : ax)
+            if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i));
+          if (ks.empty()) ks.push_back(prefix + "none");
+          dk[X] = std::move(ks);
+        }
+      }
     }
     // Per-use channels: for a callee G and content parameter j whose every
     // call (G's address not taken) is a keyed pp read of this field, each
@@ -4400,6 +4775,48 @@ void CallGraphPass::computeTaggedFields() {
     taggedReport.push_back("KEYS " + S + "+" + std::to_string(Ff.second) + " by " + dims + ": " +
                            std::to_string(readAdm.size()) + " reads keyed");
   }
+  for (auto &[M, _] : Ctx->Modules) // the entry reads in IR order (their hub keys)
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F))
+        if (taggedEntryReads.count(&I)) {
+          taggedEntryReadIdx[&I] = taggedEntryReadList.size();
+          taggedEntryReadList.push_back(&I);
+        }
+  // Plan 3.54 (b): the channels. A call in a method X that passes X's
+  // receiver identity on as an argument carries X's terms for the object
+  // when the F fields read under them are unwritten from X's entry to the
+  // call; the alias assumptions that rests on go to those fields' pairs.
+  size_t channelsMade = 0;
+  {
+    std::map<std::string, std::set<int64_t>> fsOf;
+    for (const TaggedEntryFormal &E : taggedEntryFormals) fsOf[E.S].insert(E.Fs.begin(), E.Fs.end());
+    for (uint32_t fi = 0; fi < taggedEntryFormals.size(); fi++) {
+      const TaggedEntryFormal &E = taggedEntryFormals[fi];
+      const Value *id = argId(E.M->getArg(E.k));
+      for (const Instruction &I : instructions(*E.M)) {
+        const auto *CS = dyn_cast<CallBase>(&I);
+        if (!CS || isa<IntrinsicInst>(CS) || CS->isInlineAsm()) continue;
+        for (unsigned k = 0; k < CS->arg_size(); k++) {
+          if (!CS->getArgOperand(k)->getType()->isPointerTy() || argId(CS->getArgOperand(k)) != id) continue;
+          TaggedChannel ch{k, fi, {}};
+          std::set<uint32_t> as;
+          for (int64_t F : fsOf[E.S]) {
+            std::set<uint32_t> a2;
+            if (stableBetween(nullptr, nullptr, &E.M->getEntryBlock(), CS, Field{E.S, F}, false, id, a2, nullptr)) {
+              ch.Fs.insert(F);
+              as.insert(a2.begin(), a2.end());
+            }
+          }
+          if (ch.Fs.empty()) continue;
+          for (size_t q = 0; q < taggedPairs.size(); q++)
+            if (taggedPairs[q].S == E.S && ch.Fs.count(taggedPairs[q].F))
+              taggedPairAssumes[q].insert(taggedPairAssumes[q].end(), as.begin(), as.end());
+          taggedEntryChannels[CS].push_back(std::move(ch));
+          channelsMade++;
+        }
+      }
+    }
+  }
   if (pairsKeyed) {
     std::set<std::tuple<const Value *, int64_t, int64_t, bool, unsigned>> seenWatch;
     for (const TaggedWatch &w : watchCand)
@@ -4444,6 +4861,40 @@ void CallGraphPass::computeTaggedFields() {
          << censusSubsumed << " union slots taken over from the union census; " << ppChannelCallees
          << " callees with per-use parameter channels; " << valueTests
          << " value tests narrowing a tag taken at its load\n");
+  // Plan 3.54 rows: per method formal, its D field, its installers and
+  // its keyed reads; the refusals by reason.
+  {
+    std::map<uint32_t, size_t> readsOf;
+    for (auto &[I, fi] : taggedEntryReads) readsOf[fi]++;
+    for (uint32_t fi = 0; fi < taggedEntryFormals.size(); fi++) {
+      const TaggedEntryFormal &E = taggedEntryFormals[fi];
+      std::set<std::string> inst;
+      std::string dl;
+      for (int64_t D : E.Ds) {
+        dl += (dl.empty() ? "+" : ", +") + std::to_string(D);
+        for (const FAccess &w : fStores[Field{E.S, D}])
+          if (cast<StoreInst>(w.I)->getValueOperand()->stripPointerCasts() == E.M)
+            inst.insert(w.I->getFunction()->getName().str());
+      }
+      std::string il;
+      for (const std::string &n : inst) il += (il.empty() ? "" : ", ") + n;
+      size_t sites = 0;
+      for (auto &[CS, f] : taggedEntrySites) sites += f.first == E.S && E.Ds.count(f.second);
+      taggedEntryRows.push_back("method " + E.M->getName().str() + " arg " + std::to_string(E.k) + ": " + E.S +
+                                " by " + (dl.empty() ? std::string("no field (every entry unkeyed)") : dl) + ", " +
+                                std::to_string(readsOf[fi]) +
+                                " reads keyed by its entry test; installed by " + il + "; " +
+                                std::to_string(sites) + " dispatch sites of the fields are tests");
+    }
+    for (auto &[why, n] : entryRefusals)
+      taggedEntryRows.push_back("refused " + std::to_string(n) + " reads: " + why);
+  }
+  CG_LOG("TaggedFields: method entry tests (plan 3.54): " << taggedEntrySites.size() << " dispatch sites are tests ("
+         << entrySiteFields.size() << " fields); " << entryTestsMade << " entry tests made; "
+         << taggedEntryReads.size() << " reads keyed by them, through " << taggedEntryFormals.size()
+         << " method formals; " << channelsMade << " calls pass a formal's object on with its terms (3.54 (b))\n");
+  if (VerboseLevel >= 2)
+    for (const std::string &r : taggedEntryRows) CG_LOG("TaggedFields:   ENTRY " << r << "\n");
   if (VerboseLevel >= 2)
     for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
   if (VerboseLevel >= 2) {

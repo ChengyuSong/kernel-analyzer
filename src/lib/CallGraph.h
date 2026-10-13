@@ -564,6 +564,45 @@ protected:
   // argument when the use's tests can hold for the call's tag argument.
   std::map<const llvm::Instruction *, std::vector<const llvm::Value *>> taggedParamValueChannels;
   std::vector<std::vector<uint32_t>> taggedPairAssumes; // per taggedPairs entry
+  // Method-installed state (plan 3.54): the dispatch o->D(o, ...) is a test
+  // of D on o. A read of F through method M's receiver formal k is keyed
+  // by D == M for the entries through such a dispatch (the formal's D
+  // fields: struct, offsets; a method installed in several fields is
+  // entered through any of them); the solver splits the formal's other
+  // entries off, and they read F unkeyed.
+  struct TaggedEntryFormal {
+    const llvm::Function *M;
+    unsigned k;
+    std::string S;
+    std::set<int64_t> Ds, Fs; // its test fields, the fields its entry-keyed reads read
+  };
+  std::vector<TaggedEntryFormal> taggedEntryFormals;
+  std::map<const llvm::Instruction *, uint32_t> taggedEntryReads; // keyed read -> formal
+  // The entry-keyed reads in IR order; a read's entry hub key is
+  // "#entry<formal>.<index here>" (taggedEntryHubKey).
+  std::vector<const llvm::Instruction *> taggedEntryReadList;
+  std::map<const llvm::Instruction *, uint32_t> taggedEntryReadIdx;
+  std::string taggedEntryHubKey(const llvm::Instruction *I) const {
+    return "#entry" + std::to_string(taggedEntryReads.at(I)) + "." + std::to_string(taggedEntryReadIdx.at(I));
+  }
+  // Tag propagation along the receiver (plan 3.54 (b)): an object entering
+  // a method X by a test carries the term {X}; passed on as an argument by
+  // X (its receiver identity, F unwritten since X's entry), the callee's
+  // formal receives X's terms for it. Per entry-keyed read, per D field,
+  // per method X installed in D: the keys of the writers whose tag set
+  // meets {X} ("*": every writer).
+  std::map<const llvm::Instruction *, std::map<int64_t, std::map<const llvm::Function *, std::vector<std::string>>>>
+      taggedEntryTermKeys;
+  // The calls that pass a method formal's object on: (argument index, the
+  // caller's formal), with the F fields unwritten from the caller's entry
+  // to the call.
+  struct TaggedChannel { unsigned k; uint32_t from; std::set<int64_t> Fs; };
+  std::map<const llvm::CallBase *, std::vector<TaggedChannel>> taggedEntryChannels;
+  // The dispatch sites that are tests: the callee loaded from D of the
+  // receiver, nothing written between the load and the call.
+  std::map<const llvm::CallBase *, std::pair<std::string, int64_t>> taggedEntrySites;
+  // Entry-test refusals and counts for the rule report (plan 3.54 rows).
+  std::vector<std::string> taggedEntryRows;
   bool globalDedupScanFunction(const llvm::Function *F);
   bool globalDedupScanAccessPaths();
   void globalDedupScanCallEdges(const llvm::Function *F,

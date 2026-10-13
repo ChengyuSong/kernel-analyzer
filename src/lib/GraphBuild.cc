@@ -626,13 +626,14 @@ int CallGraphPass::dispatchReceiver(
   if (CS->isInlineAsm() || CS->getCalledFunction()) return -1;
   const auto *LI = dyn_cast<LoadInst>(CS->getCalledOperand()->stripPointerCasts());
   // From the callee back to an argument: each level is a load from a
-  // constant GEP of a pointer, or from the pointer itself (offset 0;
-  // stripPointerCasts also strips an all-zero GEP).
+  // chain of constant GEPs of a pointer (a field of a struct embedded in
+  // the object: p->ops.f; plan 3.54), or from the pointer itself (offset
+  // 0; stripPointerCasts also strips an all-zero GEP).
   std::vector<std::pair<const Value *, const Value *>> path;
   for (int depth = 0; LI && depth < 4; depth++) {
     const Value *Slot = LI->getPointerOperand();
     const Value *P = Slot->stripPointerCasts();
-    if (const auto *G = dyn_cast<GEPOperator>(P)) {
+    while (const auto *G = dyn_cast<GEPOperator>(P)) {
       if (!G->hasAllConstantIndices()) return -1;
       P = G->getPointerOperand()->stripPointerCasts();
     }
@@ -3677,6 +3678,12 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
   // A read admitting several keys (a tagged field, plan 3.51) reads each.
   bool multiKeyed = false;
   if (CFLCells) {
+    // A read keyed by a method's entry test (plan 3.54) also reads through
+    // its entry hub (one per read): unkeyed for the objects that entered
+    // the method's formal otherwise, and the keys of the terms an object
+    // carried in through a channel (3.54 (b)); the solver decides which.
+    if (auto eit = CGP.taggedEntryReads.find(&I); eit != CGP.taggedEntryReads.end())
+      CGP.addAssignmentEdge(CGP.keyedDeref(ptrNode, CGP.taggedEntryHubKey(&I)), valNode);
     auto kit = CGP.unionKeyNames.find(&I);
     if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
       derefNode = CGP.keyedDeref(ptrNode, kit->second[0]);
@@ -6289,6 +6296,8 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
               for (const std::string &k : kit->second) lk += k + ";";
             if (auto vk = varargReadKeys.find(LI); vk != varargReadKeys.end())
               for (const std::string &k : vk->second) lk += k + ";";
+            if (auto ek = taggedEntryReads.find(LI); ek != taggedEntryReads.end())
+              lk += taggedEntryHubKey(LI) + ";"; // plan 3.54: its formal's entries
           }
           if (!lk.empty() || (CFLCells && unionUnknownOf.count(LI))) {
             if (lk.empty()) lk = "?";
@@ -6481,10 +6490,10 @@ static bool splitConstAddr(const Value *A, const DataLayout &DL, const Value *&b
                            int64_t &off) {
   const Value *X = A->stripPointerCasts();
   off = 0;
-  if (const auto *G = dyn_cast<GEPOperator>(X)) {
+  while (const auto *G = dyn_cast<GEPOperator>(X)) { // a chain: p->ops.f (plan 3.54)
     APInt Ap(64, 0);
     if (!G->accumulateConstantOffset(DL, Ap)) return false;
-    off = Ap.getSExtValue();
+    off += Ap.getSExtValue();
     X = G->getPointerOperand()->stripPointerCasts();
   }
   base = X;

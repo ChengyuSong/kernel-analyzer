@@ -911,6 +911,21 @@ changes:
   fact: a multiple of the gcd of what each is a multiple of (gcd 1:
   unknown). A self call's term is F's own at its arguments, assumed and
   checked against the other returns until it holds.
+  The zero case (Fable 2026-10-13, that shape only): a slot whose two
+  reaching stores are a formal and a constant k, the constant's stored
+  under a branch on that formal compared equal to 0 (`if (!n) n = 1`;
+  -O2 `umax(n, 1)`, the same function; -O3 `select (n == 0), K, round(n)`
+  with K a multiple of the rounding), is "the formal, k when zero". At a
+  call it reads k for a zero constant and the actual when the actual is
+  known nonzero (a nonzero constant, or a term already reading k > 0 when
+  zero, scaled up or rounded); a bare formal of the caller carries it
+  up; any other actual keeps only the gcd fact. Exact identities, no
+  approximation: a known-nonzero value is unchanged by the zero case,
+  and `(y + a - 1) & -a` over y already rounded to a is y (read from the
+  sum's own operand). A header carve of `malloc(HDR + n)` at HDR is n
+  (the sum's operand). binutils: bfd_alloc, bfd_zalloc,
+  bfd_hash_allocate and _objalloc_alloc are round8(n, 1 when zero), exact
+  at constant sizes; bfd_alloc2's actual is a product, the gcd fact.
   A pool carve's size (rule 3) by its form: before-bump, the bump n;
   counter, the decrement; minus-len, the length; header, the chunk
   call's size minus the header offset (each n times its GEP's element
@@ -923,7 +938,8 @@ changes:
   the user allocator hook returns a block of the requested size,
   libpng's documented contract). A slot's value reaching a load is the
   last store before it in its block, else in the nearest block up a
-  chain of single predecessors, else, when every store to the slot is
+  chain of single predecessors, else the one store every predecessor's
+  chain reaches (all the same), else, when every store to the slot is
   in the entry block, the last one there.
   A T-typed index (a variable index or walk whose GEP steps over elements
   of T; a stride that only equals sizeof T is no evidence) on the latter

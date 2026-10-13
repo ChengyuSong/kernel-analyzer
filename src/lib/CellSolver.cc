@@ -595,53 +595,82 @@ bool innermostArraySpan(Type *T, int64_t off, const DataLayout &DL, int64_t &lo,
   return found;
 }
 
+// The last store into slot S at or before I, walking back in I's block.
+const StoreInst *lastStoreFrom(const Instruction *I, const AllocaInst *S) {
+  for (; I; I = I->getPrevNode())
+    if (const auto *SI = dyn_cast<StoreInst>(I); SI && SI->getPointerOperand() == S) return SI;
+  return nullptr;
+}
+// The last store into S in BB, and the last one before L in L's block.
+const StoreInst *lastStoreIn(const BasicBlock *BB, const AllocaInst *S) { return lastStoreFrom(&BB->back(), S); }
+const StoreInst *lastStoreBefore(const Instruction *L, const AllocaInst *S) {
+  return lastStoreFrom(L->getPrevNode(), S);
+}
+
+// The store into S reaching BB's end: BB's last, else up a chain of single
+// predecessors (not through `stop`, the block a load is in).
+const StoreInst *storeAtEnd(const BasicBlock *BB, const AllocaInst *S, const BasicBlock *stop) {
+  std::set<const BasicBlock *> walked{stop};
+  for (; BB && walked.insert(BB).second; BB = BB->getSinglePredecessor())
+    if (const StoreInst *SI = lastStoreIn(BB, S)) return SI;
+  return nullptr;
+}
+
+// Is A a slot (only loaded, and stored into by value)? *several: stored
+// more than once; *only: its store when once.
+bool sizeSlot(const AllocaInst *A, bool &several, const StoreInst *&only) {
+  several = false;
+  only = nullptr;
+  for (const User *U : A->users()) {
+    if (isa<LoadInst>(U)) continue;
+    const auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand() != A || SI->getValueOperand() == A) return false;
+    several |= only != nullptr;
+    only = SI;
+  }
+  return only != nullptr;
+}
+
+// The one store reaching load L of slot S stored several times: the last
+// store before L in its block, else in the nearest block up a chain of
+// single predecessors, else the store every predecessor's chain reaches
+// (all the same one), else, when every store is in the entry block, the
+// last one there. Null when none of these decides it.
+const StoreInst *reachingStore(const LoadInst *L, const AllocaInst *S) {
+  const BasicBlock *B = L->getParent();
+  if (const StoreInst *SI = lastStoreBefore(L, S)) return SI;
+  if (const BasicBlock *P = B->getSinglePredecessor()) return storeAtEnd(P, S, B);
+  const StoreInst *agreed = nullptr;
+  bool all = !pred_empty(B);
+  for (const BasicBlock *P : predecessors(B)) {
+    const StoreInst *SI = storeAtEnd(P, S, B);
+    all &= SI && (!agreed || SI == agreed);
+    agreed = SI;
+  }
+  if (all && agreed) return agreed;
+  const BasicBlock *E = &L->getFunction()->getEntryBlock();
+  if (B == E) return nullptr;
+  for (const User *U : S->users())
+    if (const auto *SI = dyn_cast<StoreInst>(U); SI && SI->getParent() != E) return nullptr;
+  return lastStoreIn(E, S);
+}
+
 // An allocation size's source: through casts, and at -O0 a local slot that
-// never escapes (its only users are direct loads and exactly one store: no
+// never escapes (its only users are direct loads and stores into it: no
 // call can write it through its address) forwards the stored value
-// (sqlite3: nByte = sizeof(Fts3SegReader) + (nElem+1)*sizeof(Fts3HashElem
-// *); malloc(nByte)).
+// reaching the load (sqlite3: nByte = sizeof(Fts3SegReader) +
+// (nElem+1)*sizeof(Fts3HashElem *); malloc(nByte); fts3InitVtab reuses
+// nByte; newchunk rounds n at entry).
 const Value *sizeThrough(const Value *V) {
   for (int d = 0; d < 8; d++) {
     if (const auto *CI = dyn_cast<CastInst>(V)) { V = CI->getOperand(0); continue; }
     if (const auto *L = dyn_cast<LoadInst>(V))
       if (const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+        bool several = false;
         const StoreInst *only = nullptr;
-        bool ok = true, several = false;
-        for (const User *U : S->users()) {
-          if (isa<LoadInst>(U)) continue;
-          const auto *SI = dyn_cast<StoreInst>(U);
-          if (!SI || SI->getPointerOperand() != S || SI->getValueOperand() == S) {
-            ok = false;
-            break;
-          }
-          several |= only != nullptr;
-          only = SI;
-        }
-        if (ok && only && !several) { V = only->getValueOperand(); continue; }
-        // A slot stored several times (fts3InitVtab reuses nByte): the
-        // last store before the load in its block reaches it, else the
-        // last one in the block's single predecessor (and on up a chain of
-        // single predecessors), else, when every store is in the entry
-        // block, the last one there (newchunk: n rounded up at entry).
-        if (ok && several) {
-          auto lastIn = [&](const BasicBlock *BB, const Instruction *from) -> const StoreInst * {
-            for (const Instruction *I = from; I; I = I->getPrevNode())
-              if (const auto *SI = dyn_cast<StoreInst>(I); SI && SI->getPointerOperand() == S) return SI;
-            return nullptr;
-          };
-          const StoreInst *last = lastIn(L->getParent(), L->getPrevNode());
-          std::set<const BasicBlock *> walked{L->getParent()};
-          for (const BasicBlock *BB = L->getParent()->getSinglePredecessor(); !last && BB && walked.insert(BB).second;
-               BB = BB->getSinglePredecessor())
-            last = lastIn(BB, &BB->back());
-          if (!last && L->getParent() != &L->getFunction()->getEntryBlock()) {
-            const BasicBlock *E = &L->getFunction()->getEntryBlock();
-            bool entryOnly = true;
-            for (const User *U : S->users())
-              if (const auto *SI = dyn_cast<StoreInst>(U)) entryOnly &= SI->getParent() == E;
-            if (entryOnly) last = lastIn(E, &E->back());
-          }
-          if (last) { V = last->getValueOperand(); continue; }
+        if (sizeSlot(S, several, only)) {
+          if (!several) { V = only->getValueOperand(); continue; }
+          if (const StoreInst *SI = reachingStore(L, S)) { V = SI->getValueOperand(); continue; }
         }
       }
     break;
@@ -1863,7 +1892,15 @@ bool CallGraphPass::runCellResolution() {
   // nothing gives a count, a header or a tail position from it. Sums of
   // two products, a rounding whose input is not exact, and two returns
   // that disagree keep only that fact: a multiple of the gcd of what each
-  // is a multiple of (gcd 1: unknown).
+  // is a multiple of (gcd 1: unknown). zeroK (Fable 2026-10-13, only this
+  // shape): a slot whose two reaching stores are a formal and a constant
+  // k, the constant's under a branch on that formal compared equal to 0
+  // (`if (!n) n = 1`; at -O3 a select), is "the formal, k when zero". At a
+  // call it reads k for a zero constant, the actual when the actual is
+  // known nonzero (a nonzero constant, or a term already reading k > 0
+  // when zero, scaled up or rounded), the formal itself carried up when
+  // the actual is a bare formal of the caller, and otherwise only the gcd
+  // fact. Rounding an already rounded term is that term.
   struct SizeTerm {
     bool known = false;
     uint64_t c = 1;
@@ -1871,11 +1908,20 @@ bool CallGraphPass::runCellResolution() {
     bool partial = false;
     int64_t add = 0;
     uint64_t align = 0;
+    // The one formal reads zeroK where it is 0 (`if (!n) n = 1`); -1: none.
+    int64_t zeroK = -1;
     bool isConst() const { return known && formals.empty() && !partial && !align; }
     bool operator==(const SizeTerm &o) const {
       return known == o.known && c == o.c && formals == o.formals && partial == o.partial && add == o.add &&
-             align == o.align;
+             align == o.align && zeroK == o.zeroK;
     }
+  };
+  // Is every value of t nonzero (a formal read k > 0 when 0, scaled and
+  // shifted up, or rounded)?
+  auto nonzero = [](const SizeTerm &t) {
+    if (!t.known || t.partial) return false;
+    if (t.isConst()) return t.c != 0;
+    return t.zeroK > 0 && t.formals.size() == 1 && t.c > 0 && t.add >= 0;
   };
   auto constT = [](uint64_t k) { SizeTerm t; t.known = true; t.c = k; return t; };
   // What every value of t is a multiple of.
@@ -1894,6 +1940,7 @@ bool CallGraphPass::runCellResolution() {
   };
   // A constant's add folds into c (a size below 0 is no size).
   auto norm = [](SizeTerm t) {
+    if (t.formals.empty()) t.zeroK = -1;
     if (t.known && t.formals.empty() && !t.partial && !t.align) {
       const int64_t v = (int64_t)t.c + t.add;
       if (v < 0) return SizeTerm{};
@@ -1921,7 +1968,7 @@ bool CallGraphPass::runCellResolution() {
     if (!a.known && !b.known) return {};
     if (!a.known) std::swap(a, b);
     if (!b.known) { // a further unknown factor
-      if (a.add || a.align || a.formals.empty()) return multiple(multOf(a));
+      if (a.add || a.align || a.zeroK >= 0 || a.formals.empty()) return multiple(multOf(a));
       a.partial = true;
       return a;
     }
@@ -1933,7 +1980,8 @@ bool CallGraphPass::runCellResolution() {
       a.add *= (int64_t)b.c;
       return norm(a);
     }
-    if (a.add || b.add || a.align || b.align || a.formals.size() + b.formals.size() > 2)
+    if (a.add || b.add || a.align || b.align || a.zeroK >= 0 || b.zeroK >= 0 ||
+        a.formals.size() + b.formals.size() > 2)
       return multiple(multOf(a) * multOf(b));
     a.c *= b.c;
     a.partial |= b.partial;
@@ -1942,6 +1990,7 @@ bool CallGraphPass::runCellResolution() {
   };
   auto alignT = [&](SizeTerm x, uint64_t al) -> SizeTerm {
     if (x.isConst()) return constT((x.c + al - 1) & ~(al - 1));
+    if (x.known && x.align && x.align % al == 0) return x; // already rounded to al
     if (!x.known || x.partial || x.align) return multiple(std::max(al, x.align));
     x.align = al;
     return x;
@@ -1971,6 +2020,72 @@ bool CallGraphPass::runCellResolution() {
     V = sizeThrough(V);
     if (const auto *K = dyn_cast<ConstantInt>(V)) return K->isNegative() ? SizeTerm{} : constT(K->getZExtValue());
     if (const auto *A = dyn_cast<Argument>(V); A && A->getParent() == F) return {true, 1, {A->getArgNo()}};
+    // "x, k when zero": x's term with zeroK, or x's own when it is nonzero.
+    auto whenZero = [&](const Value *X, const ConstantInt *K) -> SizeTerm {
+      if (!K || K->isNegative()) return {};
+      SizeTerm t = termIn(X, F, d + 1);
+      if (nonzero(t)) return t;
+      if (t.known && !t.partial && !t.align && t.zeroK < 0 && t.formals.size() == 1 && t.c == 1 && !t.add) {
+        t.zeroK = K->getSExtValue();
+        return t;
+      }
+      return {};
+    };
+    // Is C `x == 0` (eq) or `x != 0` (!eq)? Returns x.
+    auto zeroTest = [](const Value *C, bool &eq) -> const Value * {
+      const auto *Cmp = dyn_cast<ICmpInst>(C);
+      const auto *Z = Cmp ? dyn_cast<ConstantInt>(Cmp->getOperand(1)) : nullptr;
+      if (!Z || !Z->isZero()) return nullptr;
+      if (Cmp->getPredicate() != ICmpInst::ICMP_EQ && Cmp->getPredicate() != ICmpInst::ICMP_NE) return nullptr;
+      eq = Cmp->getPredicate() == ICmpInst::ICMP_EQ;
+      return Cmp->getOperand(0);
+    };
+    if (const auto *II = dyn_cast<IntrinsicInst>(V); II && II->getIntrinsicID() == Intrinsic::umax)
+      for (unsigned o = 0; o < 2; o++) // -O2: umax(x, 1) is x ? x : 1, the same function
+        if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(II->getArgOperand(o))); K && K->isOne())
+          return whenZero(II->getArgOperand(1 - o), K);
+    if (const auto *Sel = dyn_cast<SelectInst>(V)) { // -O3: select (x == 0), k, x
+      bool eq = false;
+      const Value *X = zeroTest(Sel->getCondition(), eq);
+      const Value *KV = eq ? Sel->getTrueValue() : Sel->getFalseValue();
+      const Value *XV = eq ? Sel->getFalseValue() : Sel->getTrueValue();
+      const auto *K = dyn_cast<ConstantInt>(sizeThrough(KV));
+      if (X && sizeThrough(X) == sizeThrough(XV)) return whenZero(XV, K);
+      // The test before a rounding of the same formal (-O3 bfd_alloc:
+      // select (n == 0), 8, (n + 7) & -8): the rounded formal reading K
+      // when zero, K a multiple of the rounding (round(K) is K).
+      const SizeTerm tx = X ? termIn(X, F, d + 1) : SizeTerm{};
+      SizeTerm ty = termIn(XV, F, d + 1);
+      if (K && !K->isNegative() && tx.known && tx.formals.size() == 1 && tx.c == 1 && !tx.add && !tx.align &&
+          !tx.partial && tx.zeroK < 0 && ty.known && ty.formals == tx.formals && ty.c == 1 && !ty.add &&
+          ty.align && !ty.partial && ty.zeroK < 0 && K->getZExtValue() % ty.align == 0) {
+        ty.zeroK = K->getSExtValue();
+        return ty;
+      }
+      return {};
+    }
+    if (const auto *L = dyn_cast<LoadInst>(V)) { // -O0: the slot form of the same
+      const auto *S = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+      bool several = false;
+      const StoreInst *only = nullptr;
+      const BasicBlock *B = L->getParent();
+      if (!S || !sizeSlot(S, several, only) || lastStoreBefore(L, S) || pred_size(B) != 2) return {};
+      const BasicBlock *P = nullptr, *Q = nullptr;
+      for (const BasicBlock *X : predecessors(B))
+        if (const BasicBlock *XP = X->getSinglePredecessor(); XP && XP != X && is_contained(predecessors(B), XP))
+          P = X, Q = XP;
+      if (!P) return {};
+      const auto *BrP = dyn_cast<BranchInst>(P->getTerminator());
+      const auto *Br = dyn_cast<BranchInst>(Q->getTerminator());
+      const StoreInst *SK = lastStoreIn(P, S);
+      const StoreInst *SQ = storeAtEnd(Q, S, B);
+      if (!BrP || BrP->isConditional() || !Br || !Br->isConditional() || !SK || !SQ) return {};
+      bool eq = false;
+      const Value *X = zeroTest(Br->getCondition(), eq);
+      if (!X || Br->getSuccessor(eq ? 0 : 1) != P || Br->getSuccessor(eq ? 1 : 0) != B) return {};
+      if (sizeThrough(X) != sizeThrough(SQ->getValueOperand())) return {};
+      return whenZero(SQ->getValueOperand(), dyn_cast<ConstantInt>(SK->getValueOperand()));
+    }
     const auto *B = dyn_cast<BinaryOperator>(V);
     if (!B) return {};
     const auto *K1 = dyn_cast<ConstantInt>(sizeThrough(B->getOperand(1)));
@@ -1992,6 +2107,19 @@ bool CallGraphPass::runCellResolution() {
       // rounded up.
       if (K1 && K1->isNegative() && (-K1->getValue()).isPowerOf2()) {
         const uint64_t al = (-K1->getValue()).getZExtValue();
+        // (y + al - 1) & -al, also ((y + al) - 1) & -al: y rounded up, read
+        // from the sum's own operand (y may itself be rounded).
+        int64_t k = 0;
+        const Value *Y = sizeThrough(B->getOperand(0));
+        for (int i = 0; i < 2; i++) {
+          const auto *S = dyn_cast<BinaryOperator>(Y);
+          const auto *C = S ? dyn_cast<ConstantInt>(sizeThrough(S->getOperand(1))) : nullptr;
+          if (!C || (S->getOpcode() != Instruction::Add && S->getOpcode() != Instruction::Sub)) break;
+          k += S->getOpcode() == Instruction::Add ? C->getSExtValue() : -C->getSExtValue();
+          Y = sizeThrough(S->getOperand(0));
+        }
+        if (k == (int64_t)al - 1)
+          if (const SizeTerm y = termIn(Y, F, d + 1); y.known) return alignT(y, al);
         SizeTerm x = termIn(B->getOperand(0), F, d + 1);
         if (x.isConst()) return constT(x.c & ~(al - 1));
         if (x.known && !x.partial && !x.align && x.add == (int64_t)al - 1) {
@@ -2027,7 +2155,17 @@ bool CallGraphPass::runCellResolution() {
     SizeTerm out = constT(inner.c);
     for (unsigned k : inner.formals) {
       if (k >= C->arg_size()) return {};
-      out = timesT(out, termIn(C->getArgOperand(k), F, 0));
+      SizeTerm a = termIn(C->getArgOperand(k), F, 0);
+      if (inner.zeroK >= 0) { // "the formal, zeroK when zero" at this actual
+        if (a.isConst() && a.c == 0) a = constT((uint64_t)inner.zeroK);
+        else if (a.known && !nonzero(a)) {
+          if (!a.partial && !a.align && a.zeroK < 0 && a.formals.size() == 1 && a.c == 1 && !a.add)
+            a.zeroK = inner.zeroK; // a bare formal of F: carried up
+          else
+            a = multiple(std::gcd(multOf(a), (uint64_t)inner.zeroK)); // the join with zeroK
+        }
+      }
+      out = timesT(out, a);
     }
     if (inner.partial) out = timesT(out, SizeTerm{});
     if (inner.add) out = plusK(out, inner.add);
@@ -2042,8 +2180,21 @@ bool CallGraphPass::runCellResolution() {
     SizeTerm t;
     if (it != poolCarveSizes.end() && it->second.n)
       t = timesT(termIn(it->second.n, F, 0), constT(it->second.scale));
-    else if (it != poolCarveSizes.end() && it->second.chunk)
-      t = plusK(callTerm(it->second.chunk, F), -it->second.off);
+    else if (it != poolCarveSizes.end() && it->second.chunk) {
+      // malloc(HDR + n) carved at HDR is n (the sum's own operand, not the
+      // sum's term less HDR: a rounded n stays exact).
+      const CallBase *CC = it->second.chunk;
+      std::vector<unsigned> idx;
+      const Function *CF = CC->getCalledFunction();
+      if (CF && sigOf(CF->getName(), idx) && idx.size() == 1 && idx[0] < CC->arg_size())
+        if (const auto *B = dyn_cast<BinaryOperator>(sizeThrough(CC->getArgOperand(idx[0])));
+            B && B->getOpcode() == Instruction::Add)
+          for (unsigned o = 0; o < 2 && !t.known; o++)
+            if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(B->getOperand(o)));
+                K && K->getSExtValue() == it->second.off)
+              t = termIn(B->getOperand(1 - o), F, 0);
+      if (!t.known) t = plusK(callTerm(CC, F), -it->second.off);
+    }
     if (!t.known) carveUnknownSize.insert(I);
     return t;
   };
@@ -2095,7 +2246,20 @@ bool CallGraphPass::runCellResolution() {
       bad = !next.known || round == 4;
     }
     termBusy.erase(F);
-    return termMemo[F] = (bad || !agreed) ? SizeTerm{} : *agreed;
+    const SizeTerm out = (bad || !agreed) ? SizeTerm{} : *agreed;
+    if (VerboseLevel >= 3) {
+      std::string ts = "unknown";
+      if (out.known) {
+        ts = std::to_string(out.c);
+        for (unsigned k : out.formals) ts += " x arg" + std::to_string(k);
+        if (out.zeroK >= 0) ts += " (" + std::to_string(out.zeroK) + " when zero)";
+        if (out.add) ts += (out.add > 0 ? " + " : " - ") + std::to_string(out.add > 0 ? out.add : -out.add);
+        if (out.align) ts = "round" + std::to_string(out.align) + "(" + ts + ")";
+        if (out.partial) ts = "a multiple of " + ts;
+      }
+      CG_DEBUG("Cells: size term of " << F->getName() << ": " << ts << "\n");
+    }
+    return termMemo[F] = out;
   };
   size_t promotedUnknownSize = 0;
   // The size of an allocation site V as operands and an addend (size =
@@ -2119,7 +2283,8 @@ bool CallGraphPass::runCellResolution() {
     if (!C) return false;
     const SizeTerm t = callTerm(C, nullptr);
     if (!t.known) return false;
-    if (t.align) return fromTerm(callTerm(C, C->getFunction())) || fromTerm(multiple(t.align));
+    if (t.align || t.zeroK >= 0)
+      return fromTerm(callTerm(C, C->getFunction())) || (t.align && fromTerm(multiple(t.align)));
     for (unsigned k : t.formals) {
       if (k >= C->arg_size()) { ops.clear(); return false; }
       ops.push_back(C->getArgOperand(k));

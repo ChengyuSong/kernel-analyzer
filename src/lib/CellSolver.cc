@@ -161,6 +161,9 @@ struct Obj {
   // byte copy (plan 3.53 rule 1 (ii)). Its layout is its first typed use,
   // so a later struct write does not label it: a rule (b) row.
   bool byteAccessed = false;
+  // Labeled at mint as an array of the scalar every creating site declares
+  // and uses (ruling A): a struct step into it is a rule (b) row.
+  bool declScalar = false;
   // Its debug-info identity, when the linked IR merged its struct away
   // under the layout's name (block_header as struct.my_devt): names its
   // cells; the layout (offsets) stays the IR type's.
@@ -2368,6 +2371,9 @@ bool CallGraphPass::runCellResolution() {
   std::function<std::string(uint32_t)> nodeDescFn; // set once nodeDesc exists
   std::function<std::string(const Obj &)> describeFn; // set once describe exists
   size_t bytesWritesRefused = 0;
+  // Ruling A: struct steps into storage declared scalar (rule (b): folded
+  // into the array's element cells, flow kept), and how many write.
+  size_t scalarStructSteps = 0, scalarStructWrites = 0;
   std::map<std::string, size_t> bytesWritesBy; // writing site | struct
   size_t tailWritesFolded = 0;
   std::map<std::pair<std::string, std::string>, size_t> tailFoldPairs;
@@ -2592,7 +2598,8 @@ bool CallGraphPass::runCellResolution() {
   staticLabels(labels);
   const double labelSecs =
       std::chrono::duration<double>(Clock::now() - t0).count();
-  size_t heapLabeled = 0, heapUnlabeled = 0, heapConflict = 0, heapPtrArrays = 0;
+  size_t heapLabeled = 0, heapUnlabeled = 0, heapConflict = 0, heapPtrArrays = 0, heapScalarArrays = 0,
+         heapBytesMarked = 0;
   auto newObj = [&](NodeIndex origin, const Value *V) -> uint32_t {
     Obj O;
     O.origin = origin;
@@ -2641,6 +2648,24 @@ bool CallGraphPass::runCellResolution() {
         O.ident = StringRef(*lit->second.begin()).drop_front(6).str() + "[]";
         heapLabeled++;
         heapPtrArrays++;
+      } else if (lit != labels.end() && lit->second.size() == 1 &&
+                 StringRef(*lit->second.begin()).starts_with("scal[]:")) {
+        // Ruling A: every creating site declares and uses one scalar (a
+        // float table): an array of it, labeled at mint.
+        const StringRef e = StringRef(*lit->second.begin()).drop_front(7);
+        LLVMContext &Cx = C->getContext();
+        unsigned bits = 0;
+        O.layout = e == "float" ? Type::getFloatTy(Cx)
+                   : e == "double" ? Type::getDoubleTy(Cx)
+                   : e == "half" ? Type::getHalfTy(Cx)
+                   : e.drop_front(1).getAsInteger(10, bits) ? nullptr
+                                                            : (Type *)IntegerType::get(Cx, bits);
+        assert(O.layout && "a scalar label names a scalar type");
+        O.repeats = true;
+        O.declScalar = true;
+        O.ident = e.str() + "[]";
+        heapLabeled++;
+        heapScalarArrays++;
       } else if (lit != labels.end() && lit->second.size() == 1) {
         O.layout = StructType::getTypeByName(C->getContext(),
                                              *lit->second.begin());
@@ -2651,6 +2676,13 @@ bool CallGraphPass::runCellResolution() {
         heapConflict++;
       } else {
         heapUnlabeled++;
+        // Ruling A: every creating site uses it only as bytes (sdup's
+        // string): used as bytes from mint, so a struct write arriving
+        // through an imprecise pointer is a rule (b) row, not its label.
+        if (allocBytesOnly.count(C)) {
+          O.byteAccessed = true;
+          heapBytesMarked++;
+        }
       }
     }
     if (O.layout && O.layout->isSized())
@@ -2996,6 +3028,10 @@ bool CallGraphPass::runCellResolution() {
         if (!ruleB && curStepFact != UINT32_MAX)
           firstRuleB = {curStepNode, C.obj, L.ty};
         ruleB++;
+        if (O.declScalar) {
+          scalarStructSteps++;
+          scalarStructWrites += L.writes;
+        }
         ruleBPairs[{O.label, stripStructNameSuffix(L.ty->getName()).str()}]++;
         // One label per pointer: a pointer used as L.ty holding an object
         // of another struct is the conflict itself.
@@ -7688,9 +7724,10 @@ bool CallGraphPass::runCellResolution() {
          << " objects (" << tailMinted << " trailing, " << segmentsLabeled << " of them segments the site declares, "
          << trailingArrays << " of them arrays of unknown extent, " << tailMoved
          << " cells moved to them); heap " << heapLabeled << " labeled (" << heapPtrArrays
-         << " arrays of pointer slots, " << tailObjects
+         << " arrays of pointer slots, " << heapScalarArrays << " arrays of a declared scalar, " << tailObjects
          << " header + trailing data), " << heapUnlabeled
-         << " unlabeled, " << heapConflict << " with conflicting labels, "
+         << " unlabeled (" << heapBytesMarked << " used as bytes from mint), " << heapConflict
+         << " with conflicting labels, "
          << heapContainerRelabeled << " relabeled to the container their size names, "
          << heapContainerAmbiguous << " left unlabeled (several containers of that size)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
@@ -7718,6 +7755,9 @@ bool CallGraphPass::runCellResolution() {
     CG_LOG("Cells: debug-info identities the linked IR merged away: " << n << " objects ("
            << identPairs.size() << " identity / IR struct pairs):" << line << "\n");
   }
+  CG_LOG("Cells: rule (b): struct written into storage declared scalar (ruling A; folded into "
+         << "the array's element cells, flow kept): " << scalarStructWrites << " writes, "
+         << scalarStructSteps << " struct steps in all\n");
   CG_LOG("Cells: rule (b): struct written into storage used as bytes (not admitted as its "
          << "layout; the value flows to the raw cell): " << bytesWritesRefused
          << ", by writing site | struct:\n");
@@ -8242,7 +8282,8 @@ bool CallGraphPass::runCellResolution() {
     RO << "SUMMARY a " << aData << " pointers from data, " << aConst
        << " from constant addresses, " << aLost << " from pointers lost before the cast\n";
     RO << "SUMMARY b " << ruleB << " member steps whose struct is not at the address's offset ("
-       << ruleBPairs.size() << " object label / struct pairs)\n";
+       << ruleBPairs.size() << " object label / struct pairs); struct written into storage declared scalar: "
+       << scalarStructWrites << " writes (" << scalarStructSteps << " struct steps)\n";
     // Rule 4: one row per (site, source label, destination label); types
     // that print as one label (renamed copies of a struct) are one row.
     std::map<std::string, size_t> relayLines;

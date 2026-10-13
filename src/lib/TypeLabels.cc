@@ -44,6 +44,30 @@ bool namedStruct(const llvm::StructType *ST) {
          !ST->getName().starts_with("union");
 }
 
+// A scalar access's element ("float", "i16"; a vector's element), "" for
+// anything else.
+std::string scalarName(llvm::Type *T) {
+  if (auto *VT = dyn_cast<llvm::VectorType>(T)) T = VT->getElementType();
+  if (T->isIntegerTy()) return "i" + std::to_string(T->getIntegerBitWidth());
+  if (T->isFloatTy()) return "float";
+  if (T->isDoubleTy()) return "double";
+  if (T->isHalfTy()) return "half";
+  return "";
+}
+
+// String functions: their pointer arguments are used as bytes (ruling A).
+// memcpy/memmove are not here: a fresh block takes a copy source's layout
+// (rule 1), so a copy destination is no byte use; memset is neutral.
+bool stringFn(llvm::StringRef N) {
+  static const std::set<std::string> fns = {
+      "strcpy", "strncpy", "strlcpy", "stpcpy", "stpncpy", "strcat", "strncat", "strlcat",
+      "strlen", "strnlen", "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strchr", "strrchr",
+      "strstr", "strdup", "strndup", "sprintf", "snprintf", "vsprintf", "vsnprintf",
+      "__strcpy_chk", "__strncpy_chk", "__strcat_chk", "__strncat_chk", "__sprintf_chk",
+      "__snprintf_chk", "__vsprintf_chk", "__vsnprintf_chk", "__stpcpy_chk", "__strlcpy_chk"};
+  return fns.count(N.str()) != 0;
+}
+
 } // namespace
 
 // Allocation calls (allocators and their wrappers) labeled by the typed
@@ -188,6 +212,40 @@ void CallGraphPass::labelAllocationSites(
     const DIType *E = strip(Q->getBaseType());
     return (E && !E->getName().empty() ? E->getName().str() : std::string("void")) + " *";
   };
+  // A variable of debug type T* with T a scalar of 2+ bytes (float,
+  // double, int, long, an enum; not char or bool): T's IR name.
+  auto diScalar = [](const DIType *T) -> std::string {
+    auto strip = [](const DIType *X) {
+      for (int i = 0; i < 16 && X; i++) {
+        const auto *D = dyn_cast<DIDerivedType>(X);
+        if (!D) break;
+        const auto tag = D->getTag();
+        if (tag != dwarf::DW_TAG_typedef && tag != dwarf::DW_TAG_const_type &&
+            tag != dwarf::DW_TAG_volatile_type && tag != dwarf::DW_TAG_restrict_type)
+          break;
+        X = D->getBaseType();
+      }
+      return X;
+    };
+    const auto *P = dyn_cast_or_null<DIDerivedType>(strip(T));
+    if (!P || P->getTag() != dwarf::DW_TAG_pointer_type) return "";
+    const DIType *E = strip(P->getBaseType());
+    if (!E) return "";
+    const uint64_t bits = E->getSizeInBits();
+    if (const auto *C = dyn_cast<DICompositeType>(E))
+      return C->getTag() == dwarf::DW_TAG_enumeration_type && bits >= 16 ? "i" + std::to_string(bits) : "";
+    const auto *B = dyn_cast<DIBasicType>(E);
+    if (!B || bits < 16) return "";
+    switch (B->getEncoding()) {
+    case dwarf::DW_ATE_float:
+      return bits == 32 ? "float" : bits == 64 ? "double" : bits == 16 ? "half" : "";
+    case dwarf::DW_ATE_signed:
+    case dwarf::DW_ATE_unsigned:
+      return "i" + std::to_string(bits);
+    default:
+      return "";
+    }
+  };
   auto labelSite = [&](const CallBase *C) {
     AllocSiteLabel L;
     const DataLayout &DL = C->getModule()->getDataLayout();
@@ -202,6 +260,8 @@ void CallGraphPass::labelAllocationSites(
           L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
         if (L.sitePtrArray.empty())
           L.sitePtrArray = diPtrArray(DV->getVariable()->getType());
+        if (L.siteScalar.empty())
+          L.siteScalar = diScalar(DV->getVariable()->getType());
       }
       SmallVector<const Value *, 4> vs{C};
       for (size_t i = 0; i < vs.size() && L.siteDeclared.empty() && L.sitePtrArray.empty() && i < 8; i++)
@@ -215,6 +275,8 @@ void CallGraphPass::labelAllocationSites(
                 L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
               if (L.sitePtrArray.empty())
                 L.sitePtrArray = diPtrArray(DDI->getVariable()->getType());
+              if (L.siteScalar.empty())
+                L.siteScalar = diScalar(DDI->getVariable()->getType());
             }
         }
     }
@@ -267,6 +329,12 @@ void CallGraphPass::labelAllocationSites(
         }
       }
     };
+    // An access's type: a scalar's element, or a pointer / struct access.
+    auto noteAccess = [&](llvm::Type *T) {
+      if (T->isPointerTy()) L.ptrAccess = true;
+      else if (T->isAggregateType()) L.structAccess = true;
+      else if (const std::string n = scalarName(T); !n.empty()) L.scalarTypes.insert(n);
+    };
     for (size_t i = 0; i < work.size(); i++) {
       const auto [V, off] = work[i];
       if (off > 0) segWalk(V, off, 0);
@@ -282,15 +350,22 @@ void CallGraphPass::labelAllocationSites(
         } else if (const auto *LI = dyn_cast<LoadInst>(U)) {
           if (!LI->getType()->isPointerTy() && !LI->getType()->isAggregateType())
             L.scalarUse = true;
+          noteAccess(LI->getType());
         } else if (const auto *G = dyn_cast<GEPOperator>(U)) {
           if (G->getPointerOperand() != V)
             continue;
           if (!isa<llvm::StructType>(G->getSourceElementType()))
-            for (const User *GU : G->users())
+            for (const User *GU : G->users()) {
               if ((isa<LoadInst>(GU) && !GU->getType()->isPointerTy()) ||
                   (isa<StoreInst>(GU) &&
                    !cast<StoreInst>(GU)->getValueOperand()->getType()->isPointerTy()))
                 L.scalarUse = true;
+              if (isa<LoadInst>(GU)) noteAccess(GU->getType());
+              else if (const auto *GS = dyn_cast<StoreInst>(GU); GS && GS->getPointerOperand() == G)
+                noteAccess(GS->getValueOperand()->getType());
+            }
+          else
+            L.structAccess = true;
           // A struct GEP at the object's start names its type.
           auto *ST = dyn_cast<llvm::StructType>(G->getSourceElementType());
           if (namedStruct(ST)) {
@@ -308,11 +383,17 @@ void CallGraphPass::labelAllocationSites(
           APInt A(64, 0);
           if (G->accumulateConstantOffset(DL, A))
             push(G, off + A.getSExtValue());
+        } else if (const auto *CB = dyn_cast<CallBase>(U)) {
+          const Function *CF = CB->getCalledFunction();
+          if (CF && stringFn(CF->getName()))
+            for (const Use &A : CB->args())
+              if (A.get() == V) L.strUse = true;
         } else if (const auto *SI = dyn_cast<StoreInst>(U)) {
           if (SI->getPointerOperand() == V) {
             if (!SI->getValueOperand()->getType()->isPointerTy() &&
                 !SI->getValueOperand()->getType()->isAggregateType())
               L.scalarUse = true;
+            noteAccess(SI->getValueOperand()->getType());
             // A store at the object through a struct-path TBAA tag: the
             // tag's struct starts where the access offset is the tag's own
             // offset in it (an access at 24 + offsetof(Fts3Table, db) is a
@@ -403,7 +484,46 @@ void CallGraphPass::staticLabels(
   size_t allocCalls = 0, wrapperCalls = 0;
   labelAllocationSites(siteLabel, allocCalls, wrapperCalls);
   allocSegments.clear();
+  allocBytesOnly.clear();
   std::set<const Value *> segSeen;
+  // Ruling A (plan 3.53, completes 1b): a site that declares nothing of a
+  // struct or a pointer and accesses the block only as one scalar of 2+
+  // bytes (with its receiver's declared scalar, if any) classes it as an
+  // array of that scalar ("scal[]:float"); only as bytes (char accesses,
+  // string functions) as byte storage. Every creating site must agree:
+  // one that does not gives neither.
+  auto plain = [](const AllocSiteLabel &SL) {
+    return SL.types.empty() && SL.declared.empty() && SL.siteDeclared.empty() && SL.sitePtrArray.empty() &&
+           !SL.ptrAccess && !SL.structAccess;
+  };
+  auto scalarOf = [&](const AllocSiteLabel &SL) -> std::string {
+    if (!plain(SL) || SL.strUse) return "";
+    std::set<std::string> el = SL.scalarTypes;
+    if (!SL.siteScalar.empty()) el.insert(SL.siteScalar);
+    return el.size() == 1 && *el.begin() != "i8" && *el.begin() != "i1" ? *el.begin() : "";
+  };
+  auto bytesOnly = [&](const AllocSiteLabel &SL) {
+    if (!plain(SL) || !SL.siteScalar.empty()) return false;
+    for (const std::string &t : SL.scalarTypes)
+      if (t != "i8") return false;
+    return SL.strUse || !SL.scalarTypes.empty();
+  };
+  std::map<const CallBase *, std::string> scalarAgreed; // "" : no agreement
+  std::map<const CallBase *, bool> bytesAgreed;
+  for (auto &[C, SL] : siteLabel) {
+    std::set<const CallBase *> allocs;
+    allocationsOfCall(C, allocs);
+    const std::string e = scalarOf(SL);
+    const bool b = bytesOnly(SL);
+    for (const CallBase *A : allocs) {
+      auto [it, ins] = scalarAgreed.try_emplace(A, e);
+      if (!ins && it->second != e) it->second.clear();
+      auto [bt, bins] = bytesAgreed.try_emplace(A, b);
+      if (!bins) bt->second = bt->second && b;
+    }
+  }
+  for (auto &[A, b] : bytesAgreed)
+    if (b) allocBytesOnly.insert(A);
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;
     allocationsOfCall(C, allocs);
@@ -426,6 +546,10 @@ void CallGraphPass::staticLabels(
       // marker (the cell solver lays it out as ptr elements).
       if (!SL.sitePtrArray.empty()) {
         L.insert("ptr[]:" + SL.sitePtrArray);
+        continue;
+      }
+      if (auto it = scalarAgreed.find(A); it != scalarAgreed.end() && !it->second.empty()) {
+        L.insert("scal[]:" + it->second);
         continue;
       }
       L.insert(SL.types.begin(), SL.types.end());

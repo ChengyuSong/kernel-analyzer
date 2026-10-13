@@ -1019,8 +1019,31 @@ on the result or the dbg.declare of the slot it is stored to; else the
 struct of the typed writes through the result in the allocating
 function), and otherwise its first typed use in solve order. The site
 label is fixed at mint time, before any solve-order write, so it removes
-the order dependence wherever a site declares; char, void and integer
-receivers declare nothing. A later incompatible use (a struct
+the order dependence wherever a site declares; char and void receivers
+declare nothing. Scalar clause (ruling A, Fable 2026-10-13, completing
+1b): a block whose every creating site declares no struct and no pointer
+and accesses it only as one scalar of 2+ bytes (float, double, int,
+long, an enum; a vector's element counts as its element), with the
+receiving variable's declared scalar pointee if it has one, is an array
+of that scalar from mint ("float[]"); a struct step into it is rule (b),
+"struct written into storage declared scalar", folded into the array's
+element cells with the flow kept (an S-typed read through it reads the
+write: sound, counted). A block whose every creating site uses it only
+as bytes (char loads and stores, the string functions: str*, sprintf)
+is marked used as bytes from mint (a mark, not a label; bytes is not a
+label), so a struct written later is the existing row "struct written
+into storage used as bytes". memcpy/memmove destinations are not byte
+uses, and the list must not be "completed" with them: rule 1 lets a
+fresh block take a copy source's layout (the bison YYSTYPE shape).
+memset is neutral. A creating site that classes the block otherwise
+gives neither (every site must agree; escapes of the pointer do not
+disqualify). Neither part has a soundness premise: the label or mark
+changes which cell a later struct write lands in, never whether it
+lands, so a block created as scalars or bytes and later used as a
+struct through an escape is a counted row instead of a label. Kernel
+note: `unsigned long storage[]` used as aligned struct storage becomes a
+rule (b) row through the element cells, less precise than a first use
+and sound; acceptable, counted. A later incompatible use (a struct
 written into storage used as bytes, or into an allocation laid out as
 another struct) is reported as rule (b), not admitted as a layout. The
 other order needs no row: a byte access on a labeled object runs over its

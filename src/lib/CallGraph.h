@@ -275,6 +275,14 @@ protected:
     std::string siteDeclared;    // the struct the receiving variable points to (debug info)
     std::string sitePtrArray;    // T** receiver: an array of pointer slots ("alent *")
     bool scalarUse = false;      // accessed as scalars/arrays (a buffer)
+    // Ruling A (plan 3.53, completes 1b): the element types of its scalar
+    // accesses ("float", "i16", "i8"; a vector's element), the receiving
+    // variable's declared scalar pointee, and whether the site accesses
+    // it as pointers or structs, or passes it to a string function
+    // (str*, sprintf: byte uses). memcpy/memmove/memset are neither.
+    std::set<std::string> scalarTypes;
+    std::string siteScalar;
+    bool ptrAccess = false, structAccess = false, strUse = false;
     // Segments declared at the site (plan 3.53 rule 1, extent): a constant
     // offset c > 0 of the result cast to B* (the receiving variable's
     // declared pointee) or written through a B struct GEP; "" when two
@@ -291,6 +299,10 @@ protected:
   // Per allocation call: the segments its creating sites declare (several
   // creating sites: kept only where they agree).
   std::unordered_map<const llvm::Value *, std::map<int64_t, std::string>> allocSegments;
+  // Allocations every creating site uses only as bytes (char accesses,
+  // string functions): marked used as bytes at mint (ruling A; a mark,
+  // not a label).
+  std::unordered_set<const llvm::Value *> allocBytesOnly;
   // --cfl-union-keys: the key names of each keyed union access, filled by
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).

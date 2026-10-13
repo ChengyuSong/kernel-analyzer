@@ -1062,7 +1062,10 @@ result, then the bfd_alloc) leaves the site unclassified, counted: it
 gives neither a scalar label nor a bytes mark (counted: "receiver kind
 unclassified", SUMMARY sites). A declared scalar array takes no extent
 rule: its element label already names every element, and the extent rule
-can only cut a tail, which a scalar array has none of. Uses inside a callee the
+can only cut a tail, which a scalar array has none of. The same holds
+for a pointer-slot array declared at mint (1b's T** receiver): its label
+names every slot, it takes no extent rule, and a mismatched struct write
+folds into slot cells with the flow kept (Fable 2026-10-13). Uses inside a callee the
 block is passed to are not followed (part 3, callee formals: not built;
 neither example needed it). Neither part has a soundness premise: the label or mark
 changes which cell a later struct write lands in, never whether it

@@ -495,18 +495,40 @@ void CallGraphPass::labelAllocationSites(
               // unclassified, and an unclassified site gives neither a
               // scalar label nor a bytes mark. A null store is skipped.
               bool cursor = true;
+              std::string other; // the first other value's kind (verbose)
               for (const StoreInst *S2 : st->second) {
                 // null is no other block (`return NULL` through the -O0
                 // return slot on a failed allocation).
                 if (S2 == SI || isa<ConstantPointerNull>(S2->getValueOperand()->stripPointerCasts())) continue;
                 const auto *G2 = dyn_cast<GEPOperator>(S2->getValueOperand()->stripPointerCasts());
                 const auto *L2 = G2 ? dyn_cast<LoadInst>(G2->getPointerOperand()->stripPointerCasts()) : nullptr;
-                cursor &= G2 && L2 && L2->getPointerOperand()->stripPointerCasts() == Slot;
+                const bool step = G2 && L2 && L2->getPointerOperand()->stripPointerCasts() == Slot;
+                if (!step && other.empty()) {
+                  const Value *OV = S2->getValueOperand()->stripPointerCasts();
+                  if (const auto *OC = dyn_cast<CallBase>(OV))
+                    other = std::string(Ctx->AllocSites.count(const_cast<CallBase *>(OC))
+                                            ? "another allocation" : "a call result") +
+                            (OC->getCalledFunction() ? " (" + OC->getCalledFunction()->getName().str() + ")" : "");
+                  else if (isa<LoadInst>(OV)) other = "a load";
+                  else if (isa<Argument>(OV)) other = "a formal";
+                  else if (isa<GEPOperator>(OV)) other = "a pointer step from another value";
+                  else if (isa<PHINode>(OV) || isa<SelectInst>(OV)) other = "a join";
+                  else if (isa<GlobalValue>(OV) || isa<Constant>(OV)) other = "a constant address";
+                  else other = "other";
+                }
+                cursor &= step;
               }
               if (!cursor) {
                 L.slotUnclassified = true;
-                CG_DEBUG("TypeLabels: result slot holds other values: " << C->getFunction()->getName() << " "
-                         << *SI << "\n");
+                std::string var = "unnamed slot";
+                for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(Slot)))
+                  if (auto *Var = DDI->getVariable()) {
+                    var = Var->getName().str();
+                    if (Var->getName() == "retval" || Var->getName().empty()) var = "return slot";
+                  }
+                if (!Slot->hasName() && var == "unnamed slot") var = "return slot or temporary";
+                CG_DEBUG("TypeLabels: result slot holds other values: " << C->getFunction()->getName() << " slot "
+                         << var << " also holds " << other << "\n");
               } else if (auto ld = FA.loads.find(K); ld != FA.loads.end()) {
                 L.cursorSlot = true;
                 for (const LoadInst *LI : ld->second)

@@ -164,6 +164,9 @@ struct Obj {
   // Labeled at mint as an array of the scalar every creating site declares
   // and uses (ruling A): a struct step into it is a rule (b) row.
   bool declScalar = false;
+  // Declared at mint as an array of its element (a scalar, ruling A; a
+  // pointer slot, 1b's T**): every element is named, no extent rule.
+  bool declArray = false;
   // Widened from T to a container S that has T at offset 0 (row 2): the
   // cells inside T keep T's names (widenLabel+c for c < widenSize).
   std::string widenLabel;
@@ -2716,6 +2719,7 @@ bool CallGraphPass::runCellResolution() {
         // element = one pointer, its extent from the size below.
         O.layout = PointerType::get(C->getContext(), 0);
         O.repeats = true;
+        O.declArray = true;
         O.ident = StringRef(*lit->second.begin()).drop_front(6).str() + "[]";
         heapLabeled++;
         heapPtrArrays++;
@@ -2734,6 +2738,7 @@ bool CallGraphPass::runCellResolution() {
         assert(O.layout && "a scalar label names a scalar type");
         O.repeats = true;
         O.declScalar = true;
+        O.declArray = true;
         O.ident = e.str() + "[]";
         heapLabeled++;
         heapScalarArrays++;
@@ -2785,9 +2790,10 @@ bool CallGraphPass::runCellResolution() {
             heapContainerAmbiguous++;
           }
         }
-    // A declared scalar array is an array of its scalar whatever the size
-    // says (ruling A): no header, no trailing object.
-    if (O.layout && O.repeats && !O.declScalar && isa_and_nonnull<CallBase>(V)) setExtent(O, V);
+    // A declared array (of a scalar, ruling A; of pointer slots, 1b) is an
+    // array of its element whatever the size says: no header, no trailing
+    // object.
+    if (O.layout && O.repeats && !O.declArray && isa_and_nonnull<CallBase>(V)) setExtent(O, V);
     objs.push_back(std::move(O));
     return objs.size() - 1;
   };

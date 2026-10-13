@@ -164,6 +164,10 @@ struct Obj {
   // Labeled at mint as an array of the scalar every creating site declares
   // and uses (ruling A): a struct step into it is a rule (b) row.
   bool declScalar = false;
+  // Widened from T to a container S that has T at offset 0 (row 2): the
+  // cells inside T keep T's names (widenLabel+c for c < widenSize).
+  std::string widenLabel;
+  int64_t widenSize = 0;
   // Its debug-info identity, when the linked IR merged its struct away
   // under the layout's name (block_header as struct.my_devt): names its
   // cells; the layout (offsets) stays the IR type's.
@@ -1638,6 +1642,7 @@ bool CallGraphPass::runCellResolution() {
       return "?#" + std::to_string(o);
     if (O.label == "i8" || inByteArray(O.layout, c, DL))
       return "i8[]";
+    if (O.widenSize && c >= 0 && c < O.widenSize) return O.widenLabel + "+" + std::to_string(c);
     return (O.ident.empty() ? O.label : O.ident) + "+" + std::to_string(c);
   };
   // The address fact (o, off): exact, or folded (off is element 0's).
@@ -2365,6 +2370,57 @@ bool CallGraphPass::runCellResolution() {
     setExtent(T, V); // one B, an array of B, or B and a further tail (recursively)
     segmentsLabeled++;
   };
+  // Row 2 (plan 3.53, Fable 2026-10-13): a struct step naming S at the
+  // start of an object labeled T, where S has T at offset 0 (the
+  // embedding: C inheritance, `container_of` at 0) and the allocation's
+  // known constant size fits S, widens the label to S. Only a T followed by
+  // data whose trailing object is not yet used: inside T the folded
+  // offsets are the same under S, so every existing cell keeps its meaning
+  // and its name; an array of T (folded element addresses), a used tail,
+  // an unknown or too small size refuse, counted by reason.
+  size_t widened = 0;
+  std::map<std::string, size_t> widenRefused;
+  auto tryWiden = [&](uint32_t o, const StructType *S) -> bool {
+    Obj &O = objs[o];
+    auto *T = dyn_cast_or_null<StructType>(O.layout);
+    if (!T || !S || O.fn || O.parentObj != UINT32_MAX || O.base != 0 || O.declScalar || S->isOpaque() ||
+        !S->isSized() || !T->hasName() ||
+        !structStartsAt(const_cast<StructType *>(S), 0, stripStructNameSuffix(T->getName()), DL, T))
+      return false;
+    const int64_t sS = (int64_t)DL.getTypeAllocSize(const_cast<StructType *>(S));
+    const Value *V = NF.getValueForNode(O.origin);
+    std::vector<const Value *> ops;
+    int64_t add = 0;
+    uint64_t prod = 1;
+    bool constant = V && sizeOps(V, ops, add);
+    for (const Value *X : ops)
+      if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(X))) prod *= K->getZExtValue();
+      else constant = false;
+    const char *why = !constant ? "size not a known constant"
+                      : (int64_t)prod + add < sS ? "the container does not fit the size"
+                      : O.repeats ? "an array of T (element addresses fold)"
+                      : !O.tail ? "one T exactly"
+                      : O.tailObj != UINT32_MAX ? "the data after T is already used"
+                      : nullptr;
+    if (why) {
+      widenRefused[why]++;
+      return false;
+    }
+    O.widenLabel = O.ident.empty() ? O.label : O.ident;
+    O.widenSize = O.size;
+    O.layout = const_cast<StructType *>(S);
+    O.size = sS;
+    O.label = typeLabel(O.layout);
+    O.ident.clear();
+    // The extent by the size against S (statistics are the mint's).
+    const size_t s1 = extentArrays, s2 = extentOne, s3 = extentHeader, s4 = extentUnknown, s5 = tailObjects,
+                 s6 = promotedUnknownSize;
+    setExtent(O, V);
+    extentArrays = s1, extentOne = s2, extentHeader = s3, extentUnknown = s4, tailObjects = s5,
+    promotedUnknownSize = s6;
+    widened++;
+    return true;
+  };
   // The extension of a header+tail object into an array of its T (defined
   // with the steps; a label request on an unsized tail makes it).
   std::function<void(uint32_t)> extendToArrayFn;
@@ -3023,6 +3079,9 @@ bool CallGraphPass::runCellResolution() {
         }
         break;
       }
+      if (L.ty && L.stride == 0 && C.off == 0 &&
+          !structStartsAt(O.layout, C.off, stripStructNameSuffix(L.ty->getName()), DL, L.ty))
+        tryWiden(C.obj, L.ty); // row 2: a container of the label at offset 0
       if (L.ty && L.stride == 0 &&
           !structStartsAt(O.layout, C.off, stripStructNameSuffix(L.ty->getName()), DL, L.ty)) {
         if (!ruleB && curStepFact != UINT32_MAX)
@@ -7754,6 +7813,12 @@ bool CallGraphPass::runCellResolution() {
     }
     CG_LOG("Cells: debug-info identities the linked IR merged away: " << n << " objects ("
            << identPairs.size() << " identity / IR struct pairs):" << line << "\n");
+  }
+  {
+    std::string why;
+    for (auto &[w, n] : widenRefused) why += "; " + std::to_string(n) + " " + w;
+    CG_LOG("Cells: labels widened to a container at offset 0 (row 2): " << widened << "; refused"
+           << (why.empty() ? std::string(": none") : why) << "\n");
   }
   CG_LOG("Cells: rule (b): struct written into storage declared scalar (ruling A; folded into "
          << "the array's element cells, flow kept): " << scalarStructWrites << " writes, "

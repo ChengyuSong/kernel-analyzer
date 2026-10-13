@@ -1028,7 +1028,9 @@ receiving variable's declared scalar pointee if it has one, is an array
 of that scalar from mint ("float[]"); a struct step into it is rule (b),
 "struct written into storage declared scalar", folded into the array's
 element cells with the flow kept (an S-typed read through it reads the
-write: sound, counted). A block whose every creating site uses it only
+write: sound, counted). Folding is sound both ways, and the only layout
+read that sees the write is a pointer-typed load at a scalar element,
+itself a mismatched access (Fable 2026-10-13: no raw-cell twin). A block whose every creating site uses it only
 as bytes (char loads and stores, the string functions: str*, sprintf)
 is marked used as bytes from mint (a mark, not a label; bytes is not a
 label), so a struct written later is the existing row "struct written
@@ -1048,7 +1050,17 @@ written into storage used as bytes, or into an allocation laid out as
 another struct) is reported as rule (b), not admitted as a layout. The
 other order needs no row: a byte access on a labeled object runs over its
 fields (the any-offset cell). The order dependence is the old model's
-(bytes, then struct, was never labeled).
+(bytes, then struct, was never labeled). Containers at offset 0 (row 2,
+Fable 2026-10-13): a struct step naming S at the start of an object
+labeled T, where S has T at offset 0 and the allocation's known constant
+size fits S, widens the label to S, the extent by the size against S.
+Only a T followed by data whose trailing object is not yet used: inside T
+the folded offsets are the same under S, so every existing cell keeps
+its meaning, and its name (cell names inside T stay T's leaf names; new
+cells past T are S's). Refused, counted by reason: an unknown or
+non-constant size, a size S does not fit, an array of T (its folded
+element addresses would change meaning), one T exactly, a used trailing
+object; such a step stays a rule (b) row.
 
 Statement:
 - **Labeling renames within one object.** The cells it merges are cells

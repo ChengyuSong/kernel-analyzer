@@ -1183,7 +1183,30 @@ the solve, is a rule row:
 - Counts at 2026-10-12, run at the cells gate's 200K stop for nm-new:
   - tcpdump O0/O3: 0;
   - nm-new O3: 0;
-  - nm-new O0: 358.
+  - nm-new O0: 358 with handle stores modeled; 0 once they are not (see
+    below). All 358 had their first cause at the bump or the rewind
+    through the imprecise `o`.
+
+**Handle stores are not modeled.** A certified pool's handle values are
+not data: cursor reloads, free-space pointers, chunk pointers, rewind
+values.
+- **Why.** The chunk's contents are reached only through carve results,
+  which are fresh objects, and its header fields hold only handles. So a
+  handle value leads to no cell that can hold a function or a data
+  pointer of the program.
+- **So.** A store whose stored value is a handle value adds nothing a
+  consumer can read, whatever its destination, and is not modeled. That
+  covers the bump, rewinds, refills into handle fields, `chunk->next =
+  o->chunks` and `o->chunks = chunk`.
+- **The destination does not matter.** The argument is about the value,
+  not about where it lands: a store through an imprecise descriptor
+  pointer (binutils' `o`, loaded from abfd->memory) is covered without
+  asserting that the pointer is precise.
+- **Hypothesis:** the certificate. Stores of other values into handle
+  fields stay modeled (under the certificate there are none, and the
+  post-solve check reports any the solve admits).
+- **Counts per pool** are in the PoolCarve report ("N handle stores …
+  not modeled"): nm-new objalloc 23 (O0) and 146 (O3); tcpdump newchunk 2 (O0) and 309 (O3, inlined).
 
 **Confirmer.** A carve result is a fresh source for R1. The certified
 pools' bookkeeping (handle-field stores, the bump, rewinds, ptrtoint of

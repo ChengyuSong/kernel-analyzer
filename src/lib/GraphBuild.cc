@@ -3748,6 +3748,13 @@ static bool holdsFormal(const Value *V, const Argument *A, int depth = 8) {
 
 void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   if (!CGP.poolDrop.empty() && CGP.poolDrop.count(&I)) return; // pool state (closure checked)
+  // A certified pool's handle value (a cursor reload, a free-space or chunk
+  // pointer, a rewind value) is not data: the chunk's contents are reached
+  // only through carve results, and its header fields hold only handles,
+  // so it leads to no cell that holds a pointer of the program. A store of
+  // one adds nothing a consumer can read, wherever it lands (plan 3.53
+  // rule 3; GAPS.md "Pool carves").
+  if (!CGP.poolHandleStores.empty() && CGP.poolHandleStores.count(&I)) return;
   Value *val = I.getOperand(0);
   // --cfl-cells, FREE(argN): inside a deallocator, a store through the
   // freed block (pBuf->pNext = ...) or of it (db->lookaside.pFree = pBuf)

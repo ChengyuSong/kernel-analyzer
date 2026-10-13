@@ -754,6 +754,13 @@ void CallGraphPass::checkPoolCarves() {
            << "\n");
     if (auto sit = structural.find(p); sit != structural.end())
       CG_LOG("PoolCarve:   refused: " << sit->second << "\n");
+    if (!isRefused(p)) {
+      std::set<const Instruction *> hs;
+      for (auto &[I, f] : bookkeeping)
+        if (isa<StoreInst>(I) && pool(f) == p) hs.insert(I);
+      CG_LOG("PoolCarve:   " << hs.size() << " handle stores (the bump, rewinds, refills, chunk links) "
+             << (CFLPoolCarves ? "not modeled" : "modeled (--cfl-pool-carves off)") << "\n");
+    }
     for (const Instruction *I : headerCarves[p])
       CG_LOG("PoolCarve:   header carve " << instLocStr(I) << ": " << instText(I) << "\n");
     if (rit != refused.end())
@@ -769,7 +776,10 @@ void CallGraphPass::checkPoolCarves() {
   poolCarves.clear();
   poolBookkeeping.clear();
   poolHandleFields.clear();
+  poolHandleStores.clear();
   if (CFLPoolCarves) {
+    for (auto &[I, f] : bookkeeping)
+      if (isa<StoreInst>(I) && !isRefused(pool(f))) poolHandleStores.insert(I);
     for (const std::string &f : handleFields)
       if (!isRefused(pool(f))) poolHandleFields.insert(f);
     for (const Carve &c : carves)

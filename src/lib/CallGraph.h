@@ -490,6 +490,9 @@ protected:
   // The certified pools' handle fields ("objalloc+0"), checked after the
   // solve: a write into one outside the forms is a rule row.
   std::set<std::string> poolHandleFields;
+  // Stores whose value is a certified pool's handle value (the bump,
+  // rewinds, refills into handle fields, chunk list links): not modeled.
+  std::unordered_set<const llvm::Instruction *> poolHandleStores;
   // Varargs renderers (plan 3.41): functions whose pointer reads through a
   // va_list are data only (printed, measured, compared, copied as chars):
   // those reads carry no facts; variadic wrappers whose va_lists reach only

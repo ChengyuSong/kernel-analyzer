@@ -3715,12 +3715,18 @@ bool CallGraphPass::runCellResolution() {
               if (!C->isDeclaration()) calls[&F].push_back(C);
         }
       }
+    // Every key first: modOf[C] inside the loop must not insert (a flat
+    // map's insert rehashes and would free the MS being extended).
+    for (auto &[F, cs] : calls) {
+      modOf.try_emplace(F);
+      for (const Function *C : cs) modOf.try_emplace(C);
+    }
     for (bool grew = true; grew;) {
       grew = false;
       for (auto &[F, cs] : calls) {
-        ModSet &MS = modOf[F];
+        ModSet &MS = modOf.find(F)->second;
         for (const Function *C : cs) {
-          const ModSet &CM = modOf[C];
+          const ModSet &CM = modOf.find(C)->second;
           if (CM.all && !MS.all) { MS.all = true; grew = true; }
           for (const auto &k : CM.slots)
             if (MS.slots.insert(k).second) grew = true;
@@ -6209,8 +6215,11 @@ bool CallGraphPass::runCellResolution() {
       if (hasSrc) {
         auto it = leakTag.find((uint64_t)find(w.node) << 32 | findFact(w.fact));
         if (it != leakTag.end()) {
-          leakTag.emplace((uint64_t)n << 32 | f, it->second);
-          if (leakFactKind(f) && exits()) leakExit(find(w.node), n, it->second);
+          // The tag by value: the emplace may rehash leakTag and free the
+          // slot `it` points into (the kernel census read it after).
+          const uint32_t tag = it->second;
+          leakTag.emplace((uint64_t)n << 32 | f, tag);
+          if (leakFactKind(f) && exits()) leakExit(find(w.node), n, tag);
           return;
         }
       }
@@ -6231,10 +6240,15 @@ bool CallGraphPass::runCellResolution() {
     leakMerge = [&](uint32_t r, uint32_t m) {
       if (leakIsByte(m)) leakMergedByte.insert(r);
       pts[m].forEach([&](uint32_t f) {
-        auto it = leakTag.find((uint64_t)m << 32 | f);
-        if (it != leakTag.end()) leakTag.try_emplace((uint64_t)r << 32 | f, it->second);
-        auto pit = leakProv.find((uint64_t)m << 32 | f);
-        if (pit != leakProv.end()) leakProv.try_emplace((uint64_t)r << 32 | f, pit->second);
+        // By value: the insert may rehash the map `it` points into.
+        if (auto it = leakTag.find((uint64_t)m << 32 | f); it != leakTag.end()) {
+          const uint32_t tag = it->second;
+          leakTag.try_emplace((uint64_t)r << 32 | f, tag);
+        }
+        if (auto pit = leakProv.find((uint64_t)m << 32 | f); pit != leakProv.end()) {
+          const auto prov = pit->second;
+          leakProv.try_emplace((uint64_t)r << 32 | f, prov);
+        }
       });
     };
     // Cells of o renamed (bytes, a period, a layout): a provisional entry

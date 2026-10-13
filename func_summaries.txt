@@ -19,6 +19,9 @@
 #                    (standalone; replaces hardcoded free/utility lists)
 #   BODY             the function body is analyzed too (a FRESH
 #                    wrapper keeps its own calls in the graph)
+#   SIZE(argN[*argM]) the FRESH result's size (--cfl-cells extents),
+#                    where the body does not give it; the premise is
+#                    stated in the row's comment
 #
 # Provenance: migrated 2026-07-24 from the hardcoded isAllocFn table
 # (src/lib/Annotation.cc) — task #26 — plus the dup family with copy
@@ -184,8 +187,11 @@ sqlite3PCacheBufferSetup POOL
 # call, R1); the engine confirms png_malloc and png_malloc_array over it
 # (their png_error calls do not return). png_realloc_array copies the old
 # array into the new block (memcpy, a content flow the confirmer does not
-# express; R3).
-png_malloc_base FRESH BODY
+# express; R3). SIZE(arg1): the block is of the requested size, by
+# libpng's documented contract for the user allocator hook (malloc_fn
+# "returns a pointer to size bytes", png_set_mem_fn); the indirect call
+# gives no size of its own.
+png_malloc_base FRESH SIZE(arg1) BODY
 png_realloc_array FRESH ALIAS(ret=arg1) BODY
 # libjpeg-turbo jmemmgr.c: alloc_small / alloc_large hand out chunks of a
 # pool (jpeg_get_small / jpeg_get_large blocks, kept on small_list /

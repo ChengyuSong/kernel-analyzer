@@ -896,9 +896,35 @@ changes:
   composed through the inner call and evaluated at the call site. Never
   the call's integer arguments by position (`new_stmt(cstate, code)`: an
   opcode is no size). A wrapper whose term is unknown (a summary row
-  without a body, a pool carve until its size is exported, return
-  sources that disagree) has an unknown size: one T, then unknown data.
-  Counted ("fresh wrappers with an unknown size term").
+  without a body or a SIZE, a carve whose size operand has no form
+  shape, return sources with no common factor) has an unknown size: one
+  T, then unknown data. Counted ("fresh wrappers with an unknown size
+  term").
+  Term grammar (row 1, Fable 2026-10-13): add + c x formals (up to two),
+  possibly rounded up to a power of two (`(n + 7) & -8`; folded when n
+  is constant at the call: newchunk(cs, sizeof *p) is sizeof *p rounded
+  up), and the partial factor. Partial means exactly: the size is a
+  MULTIPLE of c x formals and nothing more. It decides array-or-not for
+  an element whose size is c or a divisor of c, and never yields a
+  count, a header, or a tail position. `x & -a` with x not exact, a sum
+  of two products, and two returns whose terms differ keep only that
+  fact: a multiple of the gcd of what each is a multiple of (gcd 1:
+  unknown). A self call's term is F's own at its arguments, assumed and
+  checked against the other returns until it holds.
+  A pool carve's size (rule 3) by its form: before-bump, the bump n;
+  counter, the decrement; minus-len, the length; header, the chunk
+  call's size minus the header offset (each n times its GEP's element
+  size). A carve whose size operand is not one of those shapes (a
+  first piece of a fresh chunk that stays in the free space, a bump
+  that differs between stores) is unknown, counted ("pool carves with
+  an unknown size term"; per pool on the PoolCarve line). A row may
+  declare its size (SIZE(argN), func_summaries.txt) where its body
+  does not give it; the premise is the row's comment (png_malloc_base:
+  the user allocator hook returns a block of the requested size,
+  libpng's documented contract). A slot's value reaching a load is the
+  last store before it in its block, else in the nearest block up a
+  chain of single predecessors, else, when every store to the slot is
+  in the entry block, the last one there.
   A T-typed index (a variable index or walk whose GEP steps over elements
   of T; a stride that only equals sizeof T is no evidence) on the latter
   makes it an array of T (`extendToArray`). Any other variable index from

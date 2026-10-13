@@ -210,6 +210,10 @@ public:
     // meaning, the call is wired as usual; its accesses count as the
     // family's in the pool-closure check (plan 3.38).
     bool pool = false;
+    // SIZE(argN) or SIZE(argN*argM): the size of the FRESH result (plan
+    // 3.53 ruling B), declared where the body does not give it (an
+    // allocator hook; the premise goes in the row's comment).
+    std::vector<unsigned> sizeArgs;
     // AS(argN@K:T): the body accessed argN + K as struct T (plan 3.46).
     // No transfer: the typed-access evidence a body-replacing summary
     // would otherwise drop. At a call site the object(s) at argN + K

@@ -45,10 +45,11 @@ std::string instLocStr(const Instruction *I) {
   return s;
 }
 
-std::string instText(const Instruction *I) {
+std::string instText(const Value *I) {
   std::string s;
   raw_string_ostream os(s);
-  I->print(os);
+  if (isa<Instruction>(I)) I->print(os);
+  else I->printAsOperand(os, true);
   s = os.str();
   if (size_t p = s.find(", !dbg"); p != std::string::npos) s.resize(p);
   size_t b = s.find_first_not_of(' ');
@@ -239,7 +240,7 @@ void CallGraphPass::checkPoolCarves() {
     if (ra != rb) parent[rb] = ra;
   };
 
-  struct Carve { const Instruction *I; std::string form, field; };
+  struct Carve { const Instruction *I; std::string form, field; CarveSize size; };
   struct Refusal { std::string field, why; const Instruction *I; };
   std::vector<Carve> carves;
   std::vector<Refusal> refusals;
@@ -281,7 +282,7 @@ void CallGraphPass::checkPoolCarves() {
     }
   // Counter carves: gep (load M), C with C decremented here (its reload,
   // or the decremented value itself at -O3).
-  auto counterCarve = [&](const GEPOperator *G, const Function *F) -> std::string {
+  auto counterCarve = [&](const GEPOperator *G, const Function *F, std::string *cOut = nullptr) -> std::string {
     if (G->getNumIndices() != 1) return "";
     const auto *LM = dyn_cast<LoadInst>(G->getPointerOperand()->stripPointerCasts());
     const Value *X = peelInt(G->idx_begin()->get());
@@ -309,6 +310,7 @@ void CallGraphPass::checkPoolCarves() {
     if (m.empty() || !counterIn[F].count(c)) return "";
     if (m.substr(0, m.rfind('+')) != c.substr(0, c.rfind('+'))) return ""; // one struct
     join(m, c);
+    if (cOut) *cOut = c;
     return m;
   };
   for (auto &[M, _] : Ctx->Modules)
@@ -408,10 +410,91 @@ void CallGraphPass::checkPoolCarves() {
               if (S->getValueOperand() == V && fieldKey(S, S->getPointerOperand()) == h.field) return true;
           return false;
         };
-        auto carve = [&](const Instruction *I, const std::string &form, const std::string &f) {
+        // A carve's size by its form (CallGraph.h, CarveSize); a size
+        // operand of another shape is left unknown. n's from the stores
+        // of field k in F whose value step(V) gives: all of them the same.
+        auto oneOf = [&](const std::string &k, const std::function<const Value *(const Value *)> &step) {
+          const Value *n = nullptr;
+          for (const Instruction &J : instructions(F))
+            if (const auto *S = dyn_cast<StoreInst>(&J); S && fieldKey(S, S->getPointerOperand()) == k) {
+              const Value *x = step(S->getValueOperand());
+              if (!x) continue;
+              const auto *a = dyn_cast<ConstantInt>(x), *b = dyn_cast_or_null<ConstantInt>(n);
+              if (n && x != n && !(a && b && a->getValue() == b->getValue())) return (const Value *)nullptr;
+              n = x;
+            }
+          return n;
+        };
+        auto scaleOf = [&](const GEPOperator *G) {
+          return (uint64_t)F.getParent()->getDataLayout().getTypeAllocSize(G->getSourceElementType());
+        };
+        auto negated = [&](const Value *X) -> const Value * {
+          X = peelInt(X);
+          if (const auto *K = dyn_cast<ConstantInt>(X); K && K->isNegative())
+            return ConstantInt::get(K->getType(), -K->getValue());
+          if (const auto *BO = dyn_cast<BinaryOperator>(X)) {
+            const auto *Z = dyn_cast<ConstantInt>(BO->getOperand(0));
+            const auto *M = dyn_cast<ConstantInt>(BO->getOperand(1));
+            if (BO->getOpcode() == Instruction::Sub && Z && Z->isZero()) return BO->getOperand(1);
+            if (BO->getOpcode() == Instruction::Mul && M && M->isMinusOne()) return BO->getOperand(0);
+          }
+          return nullptr;
+        };
+        auto sizeOf = [&](const Instruction *I, const std::string &form, const HV &h) {
+          CarveSize z;
+          const auto *G = dyn_cast<GEPOperator>(I);
+          if (form == "minus-len" && G && G->getNumIndices() == 1) {
+            if ((z.n = negated(G->idx_begin()->get()))) z.scale = scaleOf(G);
+          } else if (form == "counter" && G) {
+            std::string c;
+            counterCarve(G, &F, &c);
+            if (!c.empty()) {
+              z.n = oneOf(c, [&](const Value *V) -> const Value * {
+                const auto *B = dyn_cast<BinaryOperator>(peelInt(V));
+                if (!B || !loadsField(B->getOperand(0), c, 0)) return nullptr;
+                if (B->getOpcode() == Instruction::Sub) return B->getOperand(1);
+                return B->getOpcode() == Instruction::Add ? negated(B->getOperand(1)) : nullptr;
+              });
+              z.scale = scaleOf(G);
+            }
+          } else if (form == "before-bump") {
+            uint64_t sc = 0;
+            z.n = oneOf(h.field, [&](const Value *V) -> const Value * {
+              const auto *B = dyn_cast<GEPOperator>(V->stripPointerCasts());
+              if (!B || B->getNumIndices() != 1 || stepsBack(B) || !loadsField(B->getPointerOperand(), h.field, 0))
+                return nullptr;
+              if (sc && sc != scaleOf(B)) sc = UINT64_MAX;
+              else sc = scaleOf(B);
+              return B->idx_begin()->get();
+            });
+            if (sc == UINT64_MAX || !sc) z.n = nullptr;
+            else z.scale = sc;
+          } else if (form == "header" && G && h.flavor == 'C' && h.alloc) {
+            // c + HDR over the chunk call itself (through casts and a
+            // slot stored once).
+            const Value *B = G->getPointerOperand()->stripPointerCasts();
+            for (int d = 0; d < 4 && B != h.alloc; d++) {
+              const auto *L = dyn_cast<LoadInst>(B);
+              if (!L || !localSlot(L->getPointerOperand())) break;
+              const StoreInst *only = nullptr;
+              int stores = 0;
+              for (const User *U : L->getPointerOperand()->users())
+                if (const auto *S = dyn_cast<StoreInst>(U)) only = S, stores++;
+              if (stores != 1) break;
+              B = only->getValueOperand()->stripPointerCasts();
+            }
+            APInt off(64, 0);
+            if (B == h.alloc && G->accumulateConstantOffset(F.getParent()->getDataLayout(), off)) {
+              z.chunk = h.alloc;
+              z.off = off.getSExtValue();
+            }
+          }
+          return z;
+        };
+        auto carve = [&](const Instruction *I, const std::string &form, const std::string &f, const HV &h) {
           for (const Carve &c : carves)
             if (c.I == I) return;
-          carves.push_back({I, form, f});
+          carves.push_back({I, form, f, sizeOf(I, form, h)});
         };
         auto refuse = [&](const HV &h, const std::string &why, const Instruction *at) {
           refusals.push_back({h.pool, why, at});
@@ -421,19 +504,19 @@ void CallGraphPass::checkPoolCarves() {
           const auto *I = dyn_cast<Instruction>(V);
           if (!I) return refuse(h, "a constant handle used as data: " + instText(at), at);
           if (h.flavor == 'B') {
-            if (h.field.empty() && h.alloc) return carve(I, "header", h.pool); // a new chunk's first piece
+            if (h.field.empty() && h.alloc) return carve(I, "header", h.pool, h); // a new chunk's first piece
             if (const auto *G = dyn_cast<GEPOperator>(V)) {
-              if (!counterCarve(G, &F).empty()) return carve(I, "counter", h.field);
+              if (!counterCarve(G, &F).empty()) return carve(I, "counter", h.field, h);
             }
             if (bumpIn.count(&F) && bumpIn[&F].count(h.field)) {
               const auto *G = dyn_cast<GEPOperator>(V);
-              return carve(I, G && !G->hasAllZeroIndices() ? "minus-len" : "before-bump", h.field);
+              return carve(I, G && !G->hasAllZeroIndices() ? "minus-len" : "before-bump", h.field, h);
             }
             return refuse(h, "a pointer into the free space used as data where nothing bumps it: " + instText(at), at);
           }
           if (const auto *G = dyn_cast<GEPOperator>(V))
             if (h.alloc && G->hasAllConstantIndices() && !G->hasAllZeroIndices())
-              return carve(I, "header", h.pool);
+              return carve(I, "header", h.pool, h);
           refuse(h, "a chunk base used as data: " + instText(at), at);
         };
         auto drain = [&]() {
@@ -677,10 +760,11 @@ void CallGraphPass::checkPoolCarves() {
   // Report per pool.
   std::map<std::string, std::set<std::string>> fields;
   for (const std::string &f : handleFields) fields[pool(f)].insert(f);
-  std::map<std::string, std::map<std::string, size_t>> forms;
+  std::map<std::string, std::map<std::string, size_t>> forms, unsized;
   std::map<std::string, std::vector<const Instruction *>> headerCarves;
   for (const Carve &c : carves) {
     forms[pool(c.field)][c.form]++;
+    if (!c.size.n && !c.size.chunk) unsized[pool(c.field)][c.form]++;
     if (c.form == "header") headerCarves[pool(c.field)].push_back(c.I);
   }
   std::map<std::string, std::vector<const Refusal *>> refused;
@@ -743,7 +827,10 @@ void CallGraphPass::checkPoolCarves() {
     nPools++;
     std::string fl, fm;
     for (const std::string &f : fs) fl += " " + f + (irFallback.count(f) ? " (IR type at some access)" : "");
-    for (auto &[form, n] : forms[p]) fm += " " + form + " " + std::to_string(n);
+    for (auto &[form, n] : forms[p]) {
+      fm += " " + form + " " + std::to_string(n);
+      if (const size_t u = unsized[p][form]) fm += " (" + std::to_string(u) + " of them size unknown)";
+    }
     size_t rw = 0;
     for (auto &[_, f] : rewinds) rw += pool(f) == p;
     auto rit = refused.find(p);
@@ -771,9 +858,14 @@ void CallGraphPass::checkPoolCarves() {
   for (auto &[I, f] : rewinds) CG_LOG("PoolCarve: rewind " << f << " at " << instLocStr(I) << ": " << instText(I) << "\n");
   if (VerboseLevel >= 3)
     for (const Carve &c : carves)
-      CG_DEBUG("PoolCarve: carve " << c.form << " " << c.field << " at " << instLocStr(c.I) << ": " << instText(c.I) << "\n");
+      CG_DEBUG("PoolCarve: carve " << c.form << " " << c.field << " at " << instLocStr(c.I) << ": " << instText(c.I)
+               << "; size " << (c.size.n ? instText(c.size.n) + " x " + std::to_string(c.size.scale)
+                                : c.size.chunk ? "chunk " + instText(c.size.chunk) + " - " + std::to_string(c.size.off)
+                                               : std::string("unknown"))
+               << "\n");
   // The effect: certified pools' carves and bookkeeping.
   poolCarves.clear();
+  poolCarveSizes.clear();
   poolBookkeeping.clear();
   poolHandleFields.clear();
   poolHandleStores.clear();
@@ -783,7 +875,10 @@ void CallGraphPass::checkPoolCarves() {
     for (const std::string &f : handleFields)
       if (!isRefused(pool(f))) poolHandleFields.insert(f);
     for (const Carve &c : carves)
-      if (!isRefused(pool(c.field))) poolCarves[c.I] = c.form;
+      if (!isRefused(pool(c.field))) {
+        poolCarves[c.I] = c.form;
+        poolCarveSizes[c.I] = c.size;
+      }
     for (auto &[I, f] : bookkeeping)
       if (!isRefused(pool(f))) poolBookkeeping.insert(I);
   }

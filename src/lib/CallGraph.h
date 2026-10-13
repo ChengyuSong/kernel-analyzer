@@ -494,6 +494,17 @@ protected:
   // arithmetic on handles: exempt from the confirmer's R3).
   void checkPoolCarves();
   std::unordered_map<const llvm::Instruction *, std::string> poolCarves;
+  // A carve's size (plan 3.53 row 1), by form: before-bump the bump n,
+  // counter the decrement, minus-len the length, all n * scale bytes;
+  // header the chunk call's size minus off. Neither n nor chunk: the
+  // form's size operand is not one of those shapes (unknown).
+  struct CarveSize {
+    const llvm::Value *n = nullptr;
+    uint64_t scale = 1;
+    const llvm::CallBase *chunk = nullptr;
+    int64_t off = 0;
+  };
+  std::unordered_map<const llvm::Instruction *, CarveSize> poolCarveSizes;
   std::unordered_set<const llvm::Instruction *> poolBookkeeping;
   // The certified pools' handle fields ("objalloc+0"), checked after the
   // solve: a write into one outside the forms is a rule row.

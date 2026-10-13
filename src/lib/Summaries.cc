@@ -1216,6 +1216,15 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       } else if (t == "POOL") {
         S.pool = true;
         continue;
+      } else if (t.consume_front("SIZE(") && t.consume_back(")")) {
+        SmallVector<StringRef, 2> fs;
+        t.split(fs, '*');
+        for (StringRef f : fs) {
+          unsigned n = 0;
+          if (!f.consume_front("arg") || f.getAsInteger(10, n) || fs.size() > 2) { bad = true; break; }
+          S.sizeArgs.push_back(n);
+        }
+        continue;
       } else if (t.consume_front("FREE(arg") && t.consume_back(")")) {
         int n = -1;
         if (t.getAsInteger(10, n) || n < 0) { bad = true; continue; }

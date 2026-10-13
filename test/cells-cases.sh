@@ -5,7 +5,8 @@
 # "// MAXCELLS: N" bounds the cells of the first solve (a runaway is a
 # failure, as is not finishing in 120 s); "// LOG: re" and "// NOLOG: re"
 # require (forbid) a match in the --verbose=2 log. Exits nonzero on any
-# miss.
+# miss. "CHECK-NOT: f ..." after the CHECK targets: targets that must not
+# appear.
 # KAMAIN= overrides the binary.
 set -u
 cd "$(dirname "$0")"
@@ -37,7 +38,8 @@ for c in t_pool_*.c t_cells_*.c; do
   done < <(grep -o "// NOLOG: .*" "$c" | sed 's|// NOLOG: ||')
   if [ -n "$bad" ]; then echo "FAIL[$n]:$bad"; fail=1; continue; fi
   line=$(grep -n "// CHECK:" "$c" | cut -d: -f1)
-  want=$(grep "// CHECK:" "$c" | sed 's/.*CHECK: //')
+  want=$(grep "// CHECK:" "$c" | sed 's/.*CHECK: //; s/ CHECK-NOT:.*//')
+  wantnot=$(grep "CHECK-NOT:" "$c" | sed 's/.*CHECK-NOT: //')
   got=$(python3 - "$OUT/$n.json" "$c" "$line" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -49,6 +51,7 @@ PY
 )
   miss=""
   for f in $want; do grep -qw "$f" <<<"$got" || miss="$miss $f"; done
+  for f in $wantnot; do grep -qw "$f" <<<"$got" && miss="$miss not:$f"; done
   if [ -z "$miss" ]; then echo "PASS[$n] ($got; ${cells:-?} cells)"
   else echo "FAIL[$n]: missing$miss (got: $got)"; fail=1; fi
 done

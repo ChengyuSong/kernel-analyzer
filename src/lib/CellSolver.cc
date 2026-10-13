@@ -2246,6 +2246,7 @@ bool CallGraphPass::runCellResolution() {
   // congruent to x modulo gcd(s, element). An unlabeled object is an array
   // of s-byte elements (stride 1: bytes). An index from an address in no
   // array is undefined behavior: counted, the address stays.
+  size_t indexInBoundedArray = 0; // a variable index into a declared array field within T: within its bound
   size_t indexOutsideArray = 0, indexAsOffset = 0, indexStays = 0, leafMerges = 0, byteStepUB = 0,
          byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0,
          byteWalkStays = 0, byteWalkStructRel = 0;
@@ -2359,15 +2360,28 @@ bool CallGraphPass::runCellResolution() {
     // T alone is not known to be an array of one).
     // The same for a T plus data whose size said so (the extension
     // refused): the index may still run past the T.
+    // Not from inside a declared array field that ends strictly within T:
+    // an index there stays in that field (past its bound is a forged
+    // pointer, rule (a): counted, assumed within the bound). The link
+    // stays for the implicit array of T (no array holds the address), an
+    // array that ends at T's end (trailing or flexible: the index runs
+    // on), and a byte index.
     const bool tailIndex = objs[o].tail && !objs[o].repeats;
-    if (tailIndex) {
-      tailIndexAny++;
-      out.push_back(anyOf(tailOf(o)));
-    }
     Obj &O = objs[o];
     const int64_t pos = ((x % O.size) + O.size) % O.size;
     int64_t b = 0, e = 0;
-    if (!innermostArray(O.layout, pos, DL, b, e)) {
+    const bool inArray = innermostArray(O.layout, pos, DL, b, e);
+    if (tailIndex) {
+      int64_t lo = 0, hi = 0, esz = 0;
+      const bool runsOn = s == 1 || !inArray ||
+                          !innermostArraySpan(O.layout, pos, DL, lo, hi, esz) || hi >= O.size;
+      if (runsOn) {
+        tailIndexAny++;
+        out.push_back(anyOf(tailOf(o)));
+      } else
+        indexInBoundedArray++;
+    }
+    if (!inArray) {
       // No array inside the layout holds the address: an array of the
       // layout (a heap array of T) is indexed legally; otherwise what it
       // points to is a single object (the object itself, or one embedded
@@ -7708,7 +7722,9 @@ bool CallGraphPass::runCellResolution() {
        << " relay rows (byte copies between differently labeled storage, rule 4)\n";
     RO << "SUMMARY UB " << byteStepUB << " byte steps leaving a byte array, "
        << leftObject << " offsets past a single object, " << indexOutsideArray
-       << " variable indexes on a single object, pointer subtractions across objects: always "
+       << " variable indexes on a single object, " << indexInBoundedArray
+       << " variable indexes into a declared array field assumed within its bound, "
+          "pointer subtractions across objects: always "
        << rrPtrAlways << ", may " << rrPtrMay << "\n";
     {
       std::string k;

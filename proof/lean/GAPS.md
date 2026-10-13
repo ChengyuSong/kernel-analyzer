@@ -891,7 +891,15 @@ changes:
   of T; a stride that only equals sizeof T is no evidence) on the latter
   makes it an array of T (`extendToArray`). Any other variable index from
   the T, or one whose extension is refused, also reaches the trailing
-  data's any-offset cell: the T is not known to be an array of one. This
+  data's any-offset cell: the T is not known to be an array of one.
+  Bound clause (Fable, 2026-10-13): not an index whose address lies
+  inside a declared array field that ends strictly within T (Fts3Table's
+  `aStmt[40]` at +112..+432 of 544 bytes): it stays in that field, and
+  indexing past a declared bound is a forged pointer, rule (a), counted
+  ("variable indexes into a declared array field assumed within its
+  bound"). The link remains for the implicit array of T (no array holds
+  the address), an array ending at T's end (a trailing or flexible array,
+  `[0]`, `[1]` or any N whose end is the layout's size), and a byte index. This
   holds for a sized "T plus data" as for a size that says nothing. The
   link was for the unsized case only, and that was the hole:
   `s[argc - 1].fn()` on a sized carsym block resolved nothing.

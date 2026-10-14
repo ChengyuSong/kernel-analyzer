@@ -29,6 +29,7 @@
 
 #include "CallGraphInternal.h"
 #include "SCC.h"
+#include "ValueMap.h"
 #include <llvm/ADT/BitVector.h>
 #include <deque>
 #include <numeric>
@@ -3656,7 +3657,7 @@ bool CallGraphPass::runCellResolution() {
   // guards' premise: no write of the guarded path between the check (the
   // dispatch or the identity test) and the reload.
   struct ModSet { std::set<std::pair<std::string, int64_t>> slots; bool all = false; };
-  boost::unordered_flat_map<const Function *, ModSet> modOf;
+  ValueMap<const Function *, ModSet> modOf;
   // Premises, counted: writes into untyped memory (a byte or pointer
   // buffer, a memcpy/memset whose destination has no struct type) do not
   // hit a struct's pointer slot; bodiless functions write no slot.
@@ -3707,7 +3708,7 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[M, _] : Ctx->Modules)
       for (Function &F : *M) {
         if (F.isDeclaration()) continue;
-        ModSet &MS = modOf[&F];
+        modOf.update(&F, [&](ModSet &MS) {
         for (Instruction &I : instructions(F)) {
           if (const auto *SI = dyn_cast<StoreInst>(&I)) {
             const Type *VT = SI->getValueOperand()->getType();
@@ -3745,33 +3746,37 @@ bool CallGraphPass::runCellResolution() {
             for (const Function *C : cit->second)
               if (!C->isDeclaration()) calls[&F].push_back(C);
         }
+        });
       }
-    // Every key first: modOf[C] inside the loop must not insert (a flat
-    // map's insert rehashes and would free the MS being extended).
+    // Every key first, so the fixpoint only reads and updates in place
+    // (ValueMap: no reference survives an insert).
     for (auto &[F, cs] : calls) {
-      modOf.try_emplace(F);
-      for (const Function *C : cs) modOf.try_emplace(C);
+      modOf.update(F, [](ModSet &) {});
+      for (const Function *C : cs) modOf.update(C, [](ModSet &) {});
     }
     for (bool grew = true; grew;) {
       grew = false;
-      for (auto &[F, cs] : calls) {
-        ModSet &MS = modOf.find(F)->second;
-        for (const Function *C : cs) {
-          const ModSet &CM = modOf.find(C)->second;
-          if (CM.all && !MS.all) { MS.all = true; grew = true; }
-          for (const auto &k : CM.slots)
-            if (MS.slots.insert(k).second) grew = true;
-        }
-      }
+      for (auto &[F, cs] : calls)
+        modOf.update(F, [&](ModSet &MS) {
+          for (const Function *C : cs) {
+            if (C == F) continue; // its own set: already in MS
+            modOf.with(C, [&](const ModSet &CM) {
+              if (CM.all && !MS.all) { MS.all = true; grew = true; }
+              for (const auto &k : CM.slots)
+                if (MS.slots.insert(k).second) grew = true;
+            });
+          }
+        });
     }
   };
   auto mayWrite = [&](const Function *F, const std::pair<std::string, int64_t> &slot) {
-    auto it = modOf.find(F);
-    if (it == modOf.end()) return false;
-    if (it->second.all) return true;
-    for (const auto &w : it->second.slots)
-      if (slotMatches(w, slot)) return true;
-    return false;
+    bool any = false;
+    modOf.with(F, [&](const ModSet &MS) {
+      if (MS.all) { any = true; return; }
+      for (const auto &w : MS.slots)
+        if (slotMatches(w, slot)) { any = true; return; }
+    });
+    return any;
   };
   // Does instruction K (in a function body) possibly write the slot?
   auto instWrites = [&](const Instruction &K, const std::pair<std::string, int64_t> &slot) {
@@ -5795,14 +5800,14 @@ bool CallGraphPass::runCellResolution() {
   std::map<std::string, uint32_t> leakExitKey;              // site -> exit
   // A non-char fact arriving in a cell of a not yet named object: its
   // entry, classified then, becomes a leak if the object is named bytes.
-  boost::unordered_flat_map<uint64_t, uint32_t> leakProv;
+  ValueMap<uint64_t, uint32_t> leakProv;
   // A hub that feeds only store collectors moves its facts (*q = *p, a
   // pointer-sized move) instead of reading them: it and the collectors
   // pass a byte cell's facts on, and the exit is where the move lands.
   boost::unordered_flat_set<uint32_t> leakTransit;
   std::vector<LeakSite> leakSites;
   std::map<std::string, uint32_t> leakSiteIdx;
-  boost::unordered_flat_map<uint64_t, uint32_t> leakTag; // (node, fact) -> leak
+  ValueMap<uint64_t, uint32_t> leakTag; // (node, fact) -> leak
   boost::unordered_flat_set<uint32_t> leakMergedByte;    // merged with a byte cell
   // Byte storage: a cell named i8[], or any cell of an unlabeled object
   // used as bytes (a variable byte access or a byte copy side: what the
@@ -6244,13 +6249,9 @@ bool CallGraphPass::runCellResolution() {
                (leakIsByte(find(w.node)) || leakTransit.count(find(w.node)));
       };
       if (hasSrc) {
-        auto it = leakTag.find((uint64_t)find(w.node) << 32 | findFact(w.fact));
-        if (it != leakTag.end()) {
-          // The tag by value: the emplace may rehash leakTag and free the
-          // slot `it` points into (the kernel census read it after).
-          const uint32_t tag = it->second;
-          leakTag.emplace((uint64_t)n << 32 | f, tag);
-          if (leakFactKind(f) && exits()) leakExit(find(w.node), n, tag);
+        if (const auto tag = leakTag.get((uint64_t)find(w.node) << 32 | findFact(w.fact))) {
+          leakTag.insert((uint64_t)n << 32 | f, *tag);
+          if (leakFactKind(f) && exits()) leakExit(find(w.node), n, *tag);
           return;
         }
       }
@@ -6260,26 +6261,19 @@ bool CallGraphPass::runCellResolution() {
         if (auto it = leakCellOf.find(n); it != leakCellOf.end()) {
           const Obj &O = objs[it->second.first];
           if (!O.layout && !O.fn)
-            leakProv.try_emplace((uint64_t)n << 32 | f, leakClassify(n, f, w, hasSrc));
+            leakProv.insert((uint64_t)n << 32 | f, leakClassify(n, f, w, hasSrc));
         }
         return;
       }
       const uint32_t s = leakClassify(n, f, w, hasSrc);
       leakSites[s].born++;
-      leakTag.emplace((uint64_t)n << 32 | f, s);
+      leakTag.insert((uint64_t)n << 32 | f, s);
     };
     leakMerge = [&](uint32_t r, uint32_t m) {
       if (leakIsByte(m)) leakMergedByte.insert(r);
       pts[m].forEach([&](uint32_t f) {
-        // By value: the insert may rehash the map `it` points into.
-        if (auto it = leakTag.find((uint64_t)m << 32 | f); it != leakTag.end()) {
-          const uint32_t tag = it->second;
-          leakTag.try_emplace((uint64_t)r << 32 | f, tag);
-        }
-        if (auto pit = leakProv.find((uint64_t)m << 32 | f); pit != leakProv.end()) {
-          const auto prov = pit->second;
-          leakProv.try_emplace((uint64_t)r << 32 | f, prov);
-        }
+        if (const auto tag = leakTag.get((uint64_t)m << 32 | f)) leakTag.insert((uint64_t)r << 32 | f, *tag);
+        if (const auto prov = leakProv.get((uint64_t)m << 32 | f)) leakProv.insert((uint64_t)r << 32 | f, *prov);
       });
     };
     // Cells of o renamed (bytes, a period, a layout): a provisional entry
@@ -6300,11 +6294,11 @@ bool CallGraphPass::runCellResolution() {
             const uint32_t f = findFact(f0);
             const uint64_t k = (uint64_t)R << 32 | f;
             if (leakTag.count(k)) return;
-            auto pit = leakProv.find(k);
-            if (pit == leakProv.end()) pit = leakProv.find((uint64_t)R << 32 | f0);
-            if (pit == leakProv.end()) return;
-            leakTag.emplace(k, pit->second);
-            leakSites[pit->second].born++;
+            auto prov = leakProv.get(k);
+            if (!prov) prov = leakProv.get((uint64_t)R << 32 | f0);
+            if (!prov) return;
+            leakTag.insert(k, *prov);
+            leakSites[*prov].born++;
           });
         }
       }
@@ -7267,11 +7261,11 @@ bool CallGraphPass::runCellResolution() {
       if (find(m) != m) continue;
       allFacts += pts[m].count();
       pts[m].forEach([&](uint32_t f0) {
-        auto it = leakTag.find((uint64_t)m << 32 | findFact(f0));
-        if (it == leakTag.end()) it = leakTag.find((uint64_t)m << 32 | f0);
-        if (it == leakTag.end()) return;
+        auto tag = leakTag.get((uint64_t)m << 32 | findFact(f0));
+        if (!tag) tag = leakTag.get((uint64_t)m << 32 | f0);
+        if (!tag) return;
         downAll++;
-        down[it->second]++;
+        down[*tag]++;
       });
     }
     size_t byteCells = 0, inert = 0, onlyChar = 0, withLeak = 0, byteFacts = 0, untagged = 0;
@@ -7311,15 +7305,15 @@ bool CallGraphPass::runCellResolution() {
             byteFacts++;
             if (!k) return;
             kindFacts[k]++;
-            auto it = leakTag.find((uint64_t)R << 32 | f);
-            if (it == leakTag.end()) it = leakTag.find((uint64_t)R << 32 | f0);
-            if (it == leakTag.end()) {
+            auto tag = leakTag.get((uint64_t)R << 32 | f);
+            if (!tag) tag = leakTag.get((uint64_t)R << 32 | f0);
+            if (!tag) {
               untagged++;
               untaggedAt[{o, c}]++;
               return;
             }
-            siteMass[it->second]++;
-            siteObjs[it->second][memb[f][0].first]++;
+            siteMass[*tag]++;
+            siteObjs[*tag][memb[f][0].first]++;
           });
         }
         (facts == 0 ? inert : leak ? withLeak : onlyChar)++;
@@ -8066,8 +8060,8 @@ bool CallGraphPass::runCellResolution() {
           bool tagged = false;
           pts[pn].forEach([&](uint32_t f) {
             if (!reach(f, block, hit) || tagged) return;
-            if (auto it = leakTag.find((uint64_t)pn << 32 | findFact(f)); it != leakTag.end()) {
-              cause = it->second;
+            if (const auto tag = leakTag.get((uint64_t)pn << 32 | findFact(f))) {
+              cause = *tag;
               tagged = true;
             }
           });

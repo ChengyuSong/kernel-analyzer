@@ -492,6 +492,9 @@ void CallGraphPass::checkPoolCarves() {
           return z;
         };
         auto carve = [&](const Instruction *I, const std::string &form, const std::string &f, const HV &h) {
+          // One pointer, one carve: a cast (or zero-offset GEP) of a carve
+          // is that carve, recorded at the value it casts.
+          if (const auto *B = dyn_cast<Instruction>(I->stripPointerCasts())) I = B;
           for (const Carve &c : carves)
             if (c.I == I) return;
           carves.push_back({I, form, f, sizeOf(I, form, h)});

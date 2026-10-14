@@ -2943,6 +2943,8 @@ bool CallGraphPass::runCellResolution() {
     return v && (isa<AllocaInst>(v) || isa<GlobalVariable>(v));
   };
   std::vector<NodeIndex> members;
+  size_t repNotSite = 0, multiSiteClasses = 0;
+  std::map<std::string, size_t> repKinds; // what represents a class that is not its site
   for (uint32_t n = 0; n < G; n++) {
     if (!inGraph[n] || getCanonicalNode(n) != n) continue;
     members.clear();
@@ -2952,11 +2954,44 @@ bool CallGraphPass::runCellResolution() {
       const bool special = m == NF.getUniversalPtrNode() ||
                            m == NF.getUniversalObjNode();
       if (!special && !isOrigin(m)) continue;
+      // An allocation's object is named by its own site, whatever node
+      // represents its dedup class: one object per site.
+      auto sit = AllocSiteNodes.find(m);
+      if (!special && sit != AllocSiteNodes.end()) {
+        assert(!sit->second.empty() && "an allocation class without a site");
+        if (sit->second.size() > 1) multiSiteClasses++;
+        for (NodeIndex own : sit->second) {
+          if (own != m) {
+            repNotSite++;
+            const Value *RV = NF.getValueForNode(m);
+            repKinds[!RV                                ? "no value"
+                     : isa<Argument>(RV)                ? "formal"
+                     : isa<CastInst>(RV)                ? "cast"
+                     : isa<GetElementPtrInst>(RV)       ? "GEP"
+                     : isa<PHINode>(RV) || isa<SelectInst>(RV) ? "phi/select"
+                     : isa<LoadInst>(RV)                ? "load"
+                     : isa<CallBase>(RV)                ? "call"
+                                                        : "other"]++;
+          }
+          CG_DEBUG("Cells: allocation site #" << own << " under representative #" << m << " (class #" << n
+                   << ", " << members.size() << " members)\n");
+          add(n, cellAt(newObj(own, NF.getValueForNode(own)), 0));
+          objSeeds++;
+        }
+        continue;
+      }
+      assert((special || !AllocSites.count(m)) && "an allocation site without its own node");
       const uint32_t o = newObj(m, NF.getValueForNode(m));
       add(n, cellAt(o, 0));
       objSeeds++;
     }
   }
+  CG_LOG("Cells: allocation sites: " << repNotSite << " seeded by their own node under a class representative "
+         << "that is not the site (" << [&] {
+              std::string k;
+              for (auto &[w, c] : repKinds) k += (k.empty() ? "" : ", ") + w + " " + std::to_string(c);
+              return k.empty() ? std::string("none") : k;
+            }() << "), " << multiSiteClasses << " classes with more than one site\n");
   mintCause = "other";
 
   // A variable index (stride s) from byte x of object o stays in the

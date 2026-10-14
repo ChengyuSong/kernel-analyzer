@@ -9875,7 +9875,7 @@ bool CallGraphPass::wireResolvedCallee(const CallBase *CS, const Function *F) {
       g_innerAllocSites++;
     } else {
       Ctx->AllocSites.insert(CS);
-      AllocSites.insert(callNode);
+      addAllocSite(callNode, NF.getValueNodeFor(CS));
       NodeIndex heapObj = NF.createOpaqueObjectNode(CS, true);
       Graph.addDeref(callNode, heapObj);
     }

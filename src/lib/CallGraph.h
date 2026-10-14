@@ -712,6 +712,16 @@ protected:
   unsigned iteration;
 
   std::unordered_set<NodeIndex> AllocSites;
+  // An allocation site's own value node, by the class representative
+  // AllocSites holds: an object's Value is its allocation site, never the
+  // representative of its dedup class (a formal, a cast). Two sites in one
+  // class are two objects.
+  std::unordered_map<NodeIndex, std::vector<NodeIndex>> AllocSiteNodes;
+  void addAllocSite(NodeIndex rep, NodeIndex own) {
+    AllocSites.insert(rep);
+    auto &v = AllocSiteNodes[rep];
+    if (std::find(v.begin(), v.end(), own) == v.end()) v.push_back(own);
+  }
 
   CalleeMap calleeByType;
 

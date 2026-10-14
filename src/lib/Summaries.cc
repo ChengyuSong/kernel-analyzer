@@ -2266,7 +2266,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         g_opaqueProvenance[subObj] = tag;
       }
       Graph.addDeref(subVal, subObj);
-      AllocSites.insert(subVal); // origin identity for the mint loop
+      addAllocSite(subVal, subVal); // origin identity for the mint loop
       {
         CellWriteSize ws(*this, Ctx->Modules.front().first->getDataLayout()
                                     .getPointerSize());

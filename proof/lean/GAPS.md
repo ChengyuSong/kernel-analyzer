@@ -1739,3 +1739,36 @@ in the method or by a callee before the read; a method installed in two
 fields; a method's address passed to a bodiless function.
 
 Not mechanized. Checked by executions; see the 3.54 commit's gates.
+
+## Objects are named by their allocation sites (CellSolver seeding, 2026-10-14)
+
+The global dedup merges copy-equivalent value nodes before the graph is
+built (casts, zero-offset GEPs, all-same phis, a single-callsite actual
+with its formal), and union by rank picks each class's representative.
+An allocation's class can be represented by a formal or a cast: the
+kernel's acpi_pci_root_add allocation shares a class with
+acpi_pci_root_create's formal. Graph build records the site under its
+class representative (AllocSites), and the cells solver seeded the
+object from the representative's value. The object was then named and
+labeled by that value: the azx bus object was labeled struct.hdac_bus
+(its embedded struct) by its first typed use, not by its allocation.
+
+- **Statement:** an object's Value is its allocation site. Graph build
+  records each site's own value node beside the representative, and the
+  solver seeds one object per site, with the site's own node as origin.
+  Two sites in one class are two objects, both in the class's facts.
+- **Asserted:** every allocation class has a site, and every allocation
+  node seeded has its own node. The log counts the sites seeded under a
+  representative that is not the site, by the representative's kind, and
+  the classes with more than one site.
+- **Facts:** the class's facts are unchanged (the class still holds the
+  object). What changes is the object's name, its label and its extent,
+  which are read from the site.
+- **One pointer, one carve:** a pool carve is recorded at its value with
+  casts and zero-offset GEPs stripped. A before-bump carve's phi and the
+  phi's bitcast were two carves of one pointer (bfd_hash_insert,
+  _bfd_stringtab_add); they shared one class, so they were one object
+  only by the dedup. Recorded once, they are one site.
+
+Case: test/t_cells_allocsite.c (malloc under a formal's class, at -O1).
+Not mechanized. Checked by executions; see the commit's gates.

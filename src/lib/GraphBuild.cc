@@ -2844,7 +2844,7 @@ void CallGraphPass::InstHandler::visit(Instruction &I) {
   NodeIndex valNode = CGP.getRepNodeForValue(&I);
   if (valNode == AndersNodeFactory::InvalidIndex)
     valNode = CGP.getCanonicalNode(CGP.NF.createValueNode(&I));
-  CGP.AllocSites.insert(valNode);
+  CGP.addAllocSite(valNode, CGP.NF.getValueNodeFor(&I));
   CGP.Graph.addDeref(valNode, CGP.NF.createOpaqueObjectNode(&I, true));
   g_poolCarves++;
 }
@@ -2917,7 +2917,7 @@ void CallGraphPass::InstHandler::visitCallBase(CallBase &CS) {
                             summaryKeepsBody(CGP.Ctx, PF);
     NodeIndex heapObj = AndersNodeFactory::InvalidIndex;
     if (!innerAlloc) {
-      CGP.AllocSites.insert(valNode);
+      CGP.addAllocSite(valNode, CGP.NF.getValueNodeFor(&CS));
       heapObj = CGP.NF.createOpaqueObjectNode(&CS, true);
       CGP.Graph.addDeref(valNode, heapObj);
     } else {
@@ -4216,7 +4216,7 @@ void CallGraphPass::InstHandler::visitGetElementPtrInst(GetElementPtrInst &GEP) 
   if (CFLCells) {
     std::string why;
     if (carvingGEP(GEP, why)) {
-      CGP.AllocSites.insert(valNode);
+      CGP.addAllocSite(valNode, CGP.NF.getValueNodeFor(&GEP));
       CGP.Graph.addDeref(valNode, CGP.NF.createOpaqueObjectNode(&GEP, true));
       g_carves++;
       std::string loc = GEP.getFunction()->getName().str();

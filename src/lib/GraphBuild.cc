@@ -4400,7 +4400,7 @@ void CallGraphPass::InstHandler::visitPHINode(PHINode &PHI) {
     const bool ceP2I = CE && CE->getOpcode() == Instruction::PtrToInt;
     NodeIndex srcNode = CGP.getRepNodeForValue(src);
     if (srcNode != AndersNodeFactory::InvalidIndex &&
-        !(ceP2I && CGP.NF.isSpecialNode(srcNode))) {
+        !(ceP2I && (CGP.NF.isSpecialNode(srcNode) || CFLCells))) {
       CGP.addAssignmentEdge(srcNode, dstNode);
       return;
     }
@@ -4454,7 +4454,7 @@ void CallGraphPass::InstHandler::visitSelectInst(SelectInst &I) {
     const bool ceP2I = CE && CE->getOpcode() == Instruction::PtrToInt;
     NodeIndex srcNode = CGP.getRepNodeForValue(src);
     if (srcNode != AndersNodeFactory::InvalidIndex &&
-        !(ceP2I && CGP.NF.isSpecialNode(srcNode))) {
+        !(ceP2I && (CGP.NF.isSpecialNode(srcNode) || CFLCells))) {
       CGP.addAssignmentEdge(srcNode, dstNode);
       return;
     }

@@ -17,6 +17,7 @@
 #include <llvm/Support/FileSystem.h>
 
 #include <limits>
+#include "Flags.h"
 #include <sstream>
 
 #include "NodeFactory.h"
@@ -292,9 +293,16 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
         // chain): carry the base's identity instead of dropping to the
         // inert int node — closes the address-as-integer laundering hole
         // (store i64 ptrtoint(@gv) ... load ... inttoptr).
+        // --cfl-cells (Fable 2026-10-13): a constant integer is not a
+        // carrier, and a ptrtoint constant is a value node of its object.
+        // The shared constant-int node must never hold a fact (a nameless
+        // hub every integer constant reads: the kernel's ERR_PTR arms read
+        // every ptrtoint-constant pointer stored anywhere).
         if (const Constant *base = singlePtrToIntBase(c))
-            if (percpuPtiBase(base))
+            if (CFLCells || percpuPtiBase(base)) {
+                if (CFLCells) ptrToIntConstants.insert(c);
                 return getValueNodeFor(base);
+            }
         return ConstantIntIndex;
     }
 
@@ -381,8 +389,11 @@ NodeIndex AndersNodeFactory::getValueNodeForConstant(const llvm::Constant* c) {
                 // ERR_PTR-style) have no IR object: null.
                 if (const Constant *base =
                         singlePtrToIntBase(cast<Constant>(ce->getOperand(0))))
-                    if (percpuPtiBase(base))
+                    if (CFLCells || percpuPtiBase(base)) {
+                        if (CFLCells) ptrToIntConstants.insert(c);
                         return getValueNodeFor(base);
+                    }
+                if (CFLCells) absoluteAddresses.insert(c);
                 return NullPtrIndex;
             }
             case Instruction::PtrToInt:

@@ -599,7 +599,18 @@ Obligations left open:
 1. Graph fidelity: the statement set encodes the IR (every pointer-moving
    instruction, summary atom and special case is a statement or a sound
    over-approximation of one). The 3.10 special-case table is the
-   inventory; not mechanized (cf. F9).
+   inventory; not mechanized (cf. F9). A constant integer is not a
+   carrier; a ptrtoint constant is a value node of its object (Fable
+   2026-10-13, --cfl-cells): an integer constant derived from one pointer
+   (a ptrtoint chain, a rebased inttoptr) gets its pointer's value node,
+   and the factory's shared constant-int node ends the solve without a
+   fact (asserted). Before, a store of `ptrtoint(@g)` seeded that shared
+   node and every integer constant read it (the kernel's ERR_PTR arms
+   carried secondary_startup_64 to every list reader). The solved-summary
+   prover evaluates such a constant as its global (a folded chain as an
+   unknown value), not as nothing: an empty value made the store vanish
+   from an adopted OK-EMPTY summary (both solvers' prover: a soundness
+   fix, the flows-to consumer outputs may gain pairs, attributed).
 2. Environment model: which objects are environment sites (argv/envp,
    the fuzzer buffer, one per extern global, one per bodiless callee
    without a summary, one per formal of a never-called function) and the

@@ -4774,6 +4774,32 @@ bool CallGraphPass::runCellResolution() {
                     : C.kind == CellKind::Any ? "*" : "out";
     return k + " @" + std::to_string(C.off) + " of " + describe(objs[C.obj]);
   };
+  // A constant integer is not a carrier (Fable 2026-10-13): the shared
+  // constant-int node ends the solve (or a census stop) without a fact; a
+  // ptrtoint constant is a value node of its object (NodeFactory).
+  auto checkConstInt = [&]() {
+    const uint32_t k4 = find(NF.getConstantIntNode());
+    if (pts[k4].count()) {
+      size_t shown = 0;
+      pts[k4].forEach([&](uint32_t f) {
+        if (shown++ < 4) CG_LOG("Cells: the constant-int node holds " << factDescP(f) << "\n");
+      });
+      assert(false && "the constant-int node holds a fact: a nameless hub every integer constant reads");
+    }
+    size_t atStore = 0, atPhi = 0, atCall = 0, atOther = 0;
+    for (const Constant *K : NF.ptrToIntConstants)
+      for (const User *U : K->users()) {
+        if (const auto *SI = dyn_cast<StoreInst>(U); SI && SI->getValueOperand() == K) atStore++;
+        else if (isa<PHINode>(U) || isa<SelectInst>(U)) atPhi++;
+        else if (isa<CallBase>(U) || isa<ReturnInst>(U)) atCall++;
+        else if (isa<Instruction>(U)) atOther++;
+      }
+    CG_LOG("Cells: " << NF.ptrToIntConstants.size()
+           << " integer constants derived from one pointer given their pointer's node (uses: " << atStore
+           << " stored, " << atPhi << " joined, " << atCall << " passed or returned, " << atOther << " other); "
+           << NF.absoluteAddresses.size() << " inttoptr constants of a pure integer (a fixed address: null); "
+           << "the constant-int node holds no fact\n");
+  };
   boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, uint32_t>> keyedPtrOf;
   std::function<std::string(uint32_t)> nodeDesc;
   nodeDescFn = [&](uint32_t m) { return nodeDesc(m); };
@@ -4820,6 +4846,11 @@ bool CallGraphPass::runCellResolution() {
       k = (I->getFunction()->getName() + ": " ).str() + os.str().substr(0, 140);
     } else if (const auto *A = dyn_cast_or_null<Argument>(V)) {
       k = (A->getParent()->getName() + " arg" + Twine(A->getArgNo())).str();
+    } else if (m <= NF.getConstantIntNode()) {
+      // The factory's special nodes, by name.
+      static const char *special[] = {"the universal pointer", "the universal object", "the null pointer",
+                                      "the null object", "the constant-int node"};
+      k = special[m];
     } else if (NF.isObjectNode(m) && NF.getDerefParent(m) == AndersNodeFactory::InvalidIndex) {
       // An object's own memory node (a global, stack slot or allocation).
       const Value *OV = NF.getValueForNode(m);
@@ -6578,6 +6609,7 @@ bool CallGraphPass::runCellResolution() {
     static uint64_t allPops = 0;
     if (CFLCellCensusAt && ++allPops >= CFLCellCensusAt) {
       if (!recordWhy) confluenceCensus();
+      checkConstInt();
       errs() << "Cells: --cfl-cell-census-at stopped the solve (measurement "
              << "only, no answers)\n";
       if (!recordWhy && CFLCellStopAnswers.empty()) exit(0);
@@ -6798,6 +6830,7 @@ bool CallGraphPass::runCellResolution() {
   // ---- Report ----
   size_t factMass = 0, offCells = 0, anyCells = 0;
   for (uint32_t n = 0; n < numNodes; n++) factMass += pts[n].count();
+  checkConstInt();
 
   CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
          << walkSteps << " walk steps, " << indexOutsideArray

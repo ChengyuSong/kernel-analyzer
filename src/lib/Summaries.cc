@@ -4256,6 +4256,22 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                 return {LV{6, 0, 0, nullptr}};
               }
               if (const auto *C = dyn_cast<Constant>(V)) {
+                // An integer constant derived from a pointer (`h->start =
+                // (u64)secondary_startup_64`) carries it: the global for a
+                // plain ptrtoint, an unknown value for folded arithmetic.
+                // Not an empty value: an empty value made the store vanish
+                // from an adopted OK-EMPTY summary.
+                if (!C->getType()->isPointerTy() && constantHasPtrToInt(C, 6)) {
+                  const auto *CE = dyn_cast<ConstantExpr>(C);
+                  if (CE && CE->getOpcode() == Instruction::PtrToInt)
+                    if (const auto *G4 =
+                            dyn_cast<GlobalValue>(CE->getOperand(0)->stripPointerCastsAndAliases())) {
+                      if (G4->isDeclaration() && G4->hasName())
+                        if (auto git4 = Ctx->Gobjs.find(G4->getGUID()); git4 != Ctx->Gobjs.end()) G4 = git4->second;
+                      return {LV{3, 0, 0, G4}};
+                    }
+                  return {LV{6, 0, 0, nullptr}};
+                }
                 if (!C->getType()->isPointerTy()) return {};
                 return {LV{6, 0, 0, nullptr}};
               }

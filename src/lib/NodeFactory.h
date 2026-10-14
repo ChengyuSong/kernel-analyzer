@@ -128,6 +128,12 @@ private:
     boost::unordered_flat_map<const NodeIndex, NodeIndex> derefMap;
     // derefParentMap - the inverse: a dereference node's pointer.
     boost::unordered_flat_map<NodeIndex, NodeIndex> derefParentMap;
+public:
+    // --cfl-cells: integer constants derived from one pointer (ptrtoint
+    // chains, rebased inttoptr), given their base's value node; inttoptr
+    // constants of a pure integer (a fixed address: null today). Counted.
+    std::set<const llvm::Constant *> ptrToIntConstants, absoluteAddresses;
+private:
 
     // gepMap - constant GEP expressions: (base value node, byte offset) ->
     // the value node of the address, so equal addresses share one node.

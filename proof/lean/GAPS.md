@@ -1622,6 +1622,23 @@ only.
 Not mechanized. The census re-cut (nm-new, sqlite3; tcpdump unchanged)
 measures it after the gates. Case: test/t_cells_container_mint.c.
 
+**Pool chunks inside the body** (Fable 2026-10-14). O3 (containment):
+every fresh block the body makes goes only into the owner's storage.
+At -O3 objalloc_alloc is inlined into the constructors, so the body
+makes the pool's own chunk and stores it into the pool's handle field
+(objalloc.c:168 `o->chunks = chunk`). A fresh block stored, through
+casts, by a handle store of a CERTIFIED pool (the same certificate as
+closure (a)) is pool storage, not an element: the certificate covers
+its uses, and its carves are the elements. It is exempt from element
+containment and counted ("N pool chunks allocated inside the body").
+Any other destination keeps O3 FAIL. Verdicts are per binary: each
+verdict line carries the body's optimization level (from optnone).
+`_bfd_error_handler ROLE(pure)` is a leaf premise: it formats and prints
+through the global hook, and its indirect call is checked after the
+solve (pure over icall: a target with a pointer store, a block copy or
+an indirect call breaks it, so a vararg pointer stored there fails it).
+Case: test/t_cells_container_poolchunk.c.
+
 ## Method-installed state (TaggedFields entry tests, CellSolver formal split, 2026-10-12, plan 3.54)
 
 A method M installed in a function-pointer field D of struct S, with a

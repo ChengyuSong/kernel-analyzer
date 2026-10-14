@@ -1256,10 +1256,29 @@ void CallGraphPass::checkContainerClosure() {
     }
     // Every fresh block the body makes goes only into the owner's storage
     // (a new element, a key copy), so a store into one is a store into
-    // the container.
+    // the container. A fresh block stored into a certified pool's handle
+    // field is pool storage (a chunk: objalloc_alloc inlined into a
+    // constructor at -O3), not an element: the pool's certificate covers
+    // its uses, and its carves are the elements (Fable 2026-10-14).
+    size_t poolChunks = 0;
+    auto poolChunk = [&](const Instruction *I) {
+      SmallVector<const Value *, 4> w{I};
+      for (size_t k = 0; k < w.size(); k++)
+        for (const User *U : w[k]->users()) {
+          if (const auto *SI = dyn_cast<StoreInst>(U);
+              SI && SI->getValueOperand() == w[k] && poolHandleStores.count(SI))
+            return true;
+          if (isa<CastInst>(U)) w.push_back(U);
+        }
+      return false;
+    };
     for (const Function *F : body)
       for (const Instruction &I : instructions(*F))
         if (isa<CallBase>(&I) && I.getType()->isPointerTy() && get(&I) == FRS) {
+          if (poolChunk(&I)) {
+            poolChunks++;
+            continue;
+          }
           std::set<const Value *> seen;
           elemUses(&I, F->getName().str() + " (a fresh block)", seen);
         }
@@ -1269,6 +1288,7 @@ void CallGraphPass::checkContainerClosure() {
     std::string o3 = bad3.empty() ? "O3 PASS" : "O3 FAIL(";
     for (const std::string &b : bad3) o3 += (o3.back() == '(' ? "" : "; ") + b;
     if (!bad3.empty()) o3 += ")";
+    if (poolChunks) o3 += " (" + std::to_string(poolChunks) + " pool chunks allocated inside the body: certified pool storage)";
     if (moves) o1 += " (" + std::to_string(moves) + " element moves within one owner)";
     // O6 (body reads): every pointer field of an element the body reads
     // is one the body writes (a body read of an owner-written field would
@@ -1291,7 +1311,7 @@ void CallGraphPass::checkContainerClosure() {
     for (const std::string &b : bad6) o6 += " " + b;
     if (!bad6.empty()) o6 += ")";
     C.obligations = {o1, o2, o3, o4, o6};
-    C.verified = sentOk && o1.rfind("O1 PASS", 0) == 0 && o2 == "O2 PASS" && o3 == "O3 PASS" && o4 == "O4 PASS" &&
+    C.verified = sentOk && o1.rfind("O1 PASS", 0) == 0 && o2 == "O2 PASS" && o3.rfind("O3 PASS", 0) == 0 && o4 == "O4 PASS" &&
                  o6 == "O6 PASS";
     if (C.verified) {
       const size_t ci = &C - &Ctx->Containers[0];
@@ -1409,7 +1429,14 @@ void CallGraphPass::checkContainerClosure() {
           " handle fields, " + std::to_string(links.size()) + " link fields, " + std::to_string(code.size()) +
           " code fields (" + std::to_string(codeTargetCount) + " targets through closed code fields)");
     for (const std::string &o : C.obligations) cline("  " + o);
-    cline(std::string("  ") + (C.verified ? "VERIFIED (rows applied)" : "REJECTED (rows not applied)"));
+    // Verdicts are per binary: the body's optimization level with each
+    // (clang -O0 marks every function optnone).
+    size_t optnone = 0;
+    for (const Function *F : body) optnone += F->hasOptNone();
+    const std::string level = optnone == body.size() ? "the body at -O0"
+                              : optnone == 0         ? "the body optimized"
+                                                     : "the body partly at -O0";
+    cline(std::string("  ") + (C.verified ? "VERIFIED (rows applied)" : "REJECTED (rows not applied)") + "; " + level);
   }
 }
 

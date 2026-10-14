@@ -1624,4 +1624,9 @@ bfd_hash_replace ROLE(insert) OWNER(arg0) ELEM(arg2)
 bfd_hash_rename ROLE(insert) OWNER(arg0) ELEM(arg2)
 bfd_hash_allocate ROLE(carve) POOL(arg0)
 bfd_hash_hash ROLE(pure)
+# _bfd_error_handler (reached from the constructors at -O3, where
+# objalloc_alloc's failure path is inlined) formats and prints through the
+# global hook _bfd_error_internal: a leaf, its indirect call checked after
+# the solve against the hook's targets.
+_bfd_error_handler ROLE(pure)
 @container end

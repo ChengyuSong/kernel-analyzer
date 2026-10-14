@@ -1680,7 +1680,10 @@ bool CallGraphPass::runCellResolution() {
     T.origin = objs[o].origin;
     T.parentObj = o;
     T.base = objs[o].base + objs[o].size;
-    if (!objs[o].tailUnsized && segmentLabel) segmentLabel(T); // unknown size: no segment
+    // The site's declared segment at the tail's start, known size or not
+    // (row (3): a constant-offset cast declares [c, c + sizeof B) as a
+    // receiver declares T at 0; the size only ever governed the extent).
+    if (segmentLabel) segmentLabel(T);
     objs.push_back(std::move(T));
     objs[o].tailObj = objs.size() - 1;
     tailMinted++;

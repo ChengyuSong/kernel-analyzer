@@ -962,8 +962,8 @@ changes:
   bound"). The link remains for the implicit array of T (no array holds
   the address), an array ending at T's end (a trailing or flexible array,
   `[0]`, `[1]` or any N whose end is the layout's size), and a byte index.
-  Segment clause (Fable, 2026-10-13), for an allocation of KNOWN size
-  only: it is a sequence of segments, the header T and then the tail,
+  Segment clause (Fable, 2026-10-13): an allocation is a sequence of
+  segments, the header T and then the tail,
   and rule 1 applies to the tail recursively. The tail's label is the
   site's declaration at its constant offset (1b extended: `(B *)(result
   + c)` received by a variable declared B*, or a B struct GEP written
@@ -973,7 +973,13 @@ changes:
   What follows the last labeled segment stays data (any-offset cell).
   The variable-index link reaches only that unlabeled remainder; an
   index from T landing in a labeled segment is counted as assumed within
-  its bound. Unknown size: unchanged (no segment on unsized storage).
+  its bound. Unknown size (row (3), Fable 2026-10-13): the site's
+  DECLARED segments still apply, as a struct-pointer receiver declares T
+  at offset 0 without knowing the size (sqlite3_malloc(808) whose term
+  dies at sqlite3Malloc's indirect xMalloc, then `&pWriter[1]` ->
+  Fts3SegFilter, `&pFilter[1]` -> Fts3MultiSegReader); each segment's
+  extent is unknown, so what follows the last declared segment stays
+  unknown, raw data; an unsized tail takes no label from a first use.
   Not admitted: a label from a non-constant offset or a variable-offset
   cast. Order: with a label from first use, an index step that runs
   before the tail is typed links the then-unlabeled tail (solve order,

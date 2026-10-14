@@ -2996,7 +2996,17 @@ bool CallGraphPass::runCellResolution() {
                                                         : "other"]++;
           }
           CG_DEBUG("Cells: allocation site #" << own << " under representative #" << m << " (class #" << n
-                   << ", " << members.size() << " members)\n");
+                   << ", " << members.size() << " members): " << [&] {
+                     std::string t;
+                     raw_string_ostream os(t);
+                     for (NodeIndex x : {own, m})
+                       if (const Value *XV = NF.getValueForNode(x)) {
+                         if (const auto *I = dyn_cast<Instruction>(XV)) os << I->getFunction()->getName() << ":";
+                         XV->print(os);
+                         os << " | ";
+                       }
+                     return os.str().substr(0, 400);
+                   }() << "\n");
           add(n, cellAt(newObj(own, NF.getValueForNode(own)), 0));
           objSeeds++;
         }
@@ -3403,9 +3413,25 @@ bool CallGraphPass::runCellResolution() {
       if (const auto *CB = dyn_cast<CallBase>(I))
         if (const Function *CF = CB->getCalledFunction())
           where += " " + CF->getName().str();
-    } else if (V) {
+    } else if (const auto *A = dyn_cast_or_null<Argument>(V)) {
+      // An object originating at a formal: an environment (outside) object.
+      where = "arg#" + std::to_string(A->getArgNo()) + " of " + A->getParent()->getName().str() + " (outside)";
+    } else if (V && V->hasName()) {
       where = V->getName().str();
+    } else if (V) {
+      // Never an empty name: an unnamed global prints its slot and type,
+      // a constant expression itself.
+      std::string t;
+      raw_string_ostream os(t);
+      const auto *GV = dyn_cast<GlobalValue>(V);
+      V->printAsOperand(os, false, GV ? GV->getParent() : nullptr);
+      if (const auto *G = dyn_cast<GlobalVariable>(V)) {
+        os << " unnamed global: ";
+        G->getValueType()->print(os);
+      }
+      where = os.str().substr(0, 160);
     }
+    where += " #" + std::to_string(O.origin);
     if (O.rowOwner != UINT32_MAX) where = "element of the owner obj#" + std::to_string(O.rowOwner) + " at " + where;
     return where + (O.parentObj != UINT32_MAX ? " tail@" + std::to_string(O.base) : "") +
            " [" + (O.layout ? (O.ident.empty() ? O.label : O.ident + " as " + O.label) : std::string("unlabeled")) +
@@ -5024,6 +5050,37 @@ bool CallGraphPass::runCellResolution() {
           par = it->second.first;
           key = " key " + NF.cellNameString(it->second.second);
         }
+      if (par == AndersNodeFactory::InvalidIndex) {
+        // An unexpected node: name it before the assertion.
+        bool keyed = false;
+        for (const auto &[pk, d] : keyedDerefOf) keyed |= d == m;
+        const Value *MV = NF.getValueForNode(m);
+        std::string mv;
+        if (MV) { raw_string_ostream os(mv); MV->print(os); }
+        errs() << "Cells: a hub without a pointer: node #" << m << " (dereference " << NF.isDereferenceNode(m)
+               << ", object " << NF.isObjectNode(m) << ", value " << NF.isValueNode(m) << ", keyed " << keyed
+               << ", named shadow " << isShadowCell(m) << ", rep #" << find(m) << ", value " << mv.substr(0, 160)
+               << ")\n";
+        // Its creator shows in its edges: the first ones in and out.
+        static const char *kindName[] = {"copy", "deref", "field", "fieldany"};
+        size_t shown = 0;
+        for (const GraphEdge &E : Graph.edges()) {
+          if (E.to != m && E.from != m) continue;
+          const NodeIndex o = E.to == m ? E.from : E.to;
+          std::string ov;
+          if (const Value *OV = NF.getValueForNode(o)) {
+            raw_string_ostream os(ov);
+            if (const auto *I = dyn_cast<Instruction>(OV)) os << I->getFunction()->getName() << ": ";
+            OV->print(os);
+          }
+          errs() << "Cells:   " << (E.to == m ? "in " : "out ") << kindName[(int)E.kind] << " "
+                 << (E.to == m ? "from" : "to") << " #" << o << " (dereference " << NF.isDereferenceNode(o)
+                 << ", object " << NF.isObjectNode(o) << ", value " << NF.isValueNode(o) << ", parent #"
+                 << (int64_t)(NF.isDereferenceNode(o) ? (int64_t)NF.getDerefParent(o) : -1) << ") "
+                 << ov.substr(0, 160) << "\n";
+          if (++shown >= 8) break;
+        }
+      }
       assert(par != AndersNodeFactory::InvalidIndex && "a hub without a pointer");
       k = "hub of #" + std::to_string(par) + key;
       if (const auto *I = dyn_cast_or_null<Instruction>(NF.getValueForNode(par)))
@@ -6762,8 +6819,9 @@ bool CallGraphPass::runCellResolution() {
       checkConstInt();
       errs() << "Cells: --cfl-cell-census-at stopped the solve (measurement "
              << "only, no answers)\n";
-      if (!recordWhy && CFLCellStopAnswers.empty()) exit(0);
-      stoppedAt = pops; // the why reports and the stop answers describe the partial state
+      // The reports (soup profile, weld census, mass) describe the partial
+      // state whether or not stop answers are asked for.
+      stoppedAt = pops;
       break;
     }
     delta.clear();

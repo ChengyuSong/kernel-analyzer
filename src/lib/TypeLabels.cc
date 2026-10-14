@@ -627,18 +627,24 @@ void CallGraphPass::staticLabels(
   // array of that scalar ("scal[]:float"); only as bytes (char accesses,
   // string functions) as byte storage. Every creating site must agree:
   // one that does not gives neither.
+  // The receiver's KIND is its declaration (the variable's or field's
+  // debug type), whatever else its slot holds; FOLLOWING the slot's uses
+  // needs the single-store or cursor condition (Fable 2026-10-13). So a
+  // shared slot still declares a scalar array; a bytes mark, which only
+  // followed uses give, needs the slot followed.
   auto plain = [](const AllocSiteLabel &SL) {
     return SL.types.empty() && SL.declared.empty() && SL.siteDeclared.empty() && SL.sitePtrArray.empty() &&
-           !SL.ptrAccess && !SL.structAccess && !SL.slotUnclassified;
+           !SL.ptrAccess && !SL.structAccess;
   };
   auto scalarOf = [&](const AllocSiteLabel &SL) -> std::string {
     if (!plain(SL) || SL.strUse) return "";
+    if (SL.slotUnclassified && SL.siteScalar.empty()) return ""; // uses not followed, nothing declared
     std::set<std::string> el = SL.scalarTypes;
     if (!SL.siteScalar.empty()) el.insert(SL.siteScalar);
     return el.size() == 1 && *el.begin() != "i8" && *el.begin() != "i1" ? *el.begin() : "";
   };
   auto bytesOnly = [&](const AllocSiteLabel &SL) {
-    if (!plain(SL) || !SL.siteScalar.empty()) return false;
+    if (!plain(SL) || SL.slotUnclassified || !SL.siteScalar.empty()) return false;
     for (const std::string &t : SL.scalarTypes)
       if (t != "i8") return false;
     return SL.strUse || !SL.scalarTypes.empty();
@@ -711,24 +717,31 @@ void CallGraphPass::staticLabels(
   for (auto &[A, b] : bytesAgreed)
     if (b) allocBytesOnly.insert(A);
   {
-    size_t field = 0, cursor = 0, unclassified = 0, scalars = 0, structField = 0;
+    size_t field = 0, cursor = 0, unclassified = 0, scalars = 0, structField = 0, sharedDeclared = 0,
+           undeclared = 0;
     for (auto &[C, SL] : siteLabel) {
       field += SL.fieldReceiver;
       cursor += SL.cursorSlot;
       unclassified += SL.slotUnclassified;
-      structField += SL.structFieldSeen && SL.siteDeclared.empty() && SL.sitePtrArray.empty() &&
-                     SL.siteScalar.empty();
+      const bool decl = !SL.siteDeclared.empty() || !SL.sitePtrArray.empty() || !SL.siteScalar.empty();
+      const bool sfOnly = SL.structFieldSeen && !decl;
+      structField += sfOnly;
+      sharedDeclared += SL.slotUnclassified && decl;
+      undeclared += !decl && !sfOnly;
     }
     censusSites = siteLabel.size();
     censusStructFieldOnly = structField;
     censusUnclassified = unclassified;
+    censusSharedDeclared = sharedDeclared;
+    censusUndeclared = undeclared;
     for (auto &[A, e] : scalarAgreed) scalars += !e.empty();
     CG_LOG("TypeLabels: allocation sites " << siteLabel.size() << ": " << field
            << " receivers are struct fields (their declared member type, 1b), " << cursor
            << " result slots are cursors walking the block (followed), " << unclassified
            << " result slots also hold other values (unclassified); " << scalars
            << " allocations scalar-only, " << allocBytesOnly.size() << " bytes-only at every creating site; "
-           << structField << " sites whose only receiver is a struct-pointer field (no declaration)\n");
+           << structField << " sites whose only receiver is a struct-pointer field (no declaration); "
+           << sharedDeclared << " declared through a shared slot; " << undeclared << " with no declaration\n");
   }
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;

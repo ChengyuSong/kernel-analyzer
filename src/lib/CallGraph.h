@@ -313,7 +313,8 @@ protected:
   // sites whose only receiver is a struct-pointer field (no declaration),
   // sites whose receiver kind is unclassified (a result slot also holding
   // another value).
-  size_t censusSites = 0, censusStructFieldOnly = 0, censusUnclassified = 0;
+  size_t censusSites = 0, censusStructFieldOnly = 0, censusUnclassified = 0, censusSharedDeclared = 0,
+         censusUndeclared = 0;
   // --cfl-union-keys: the key names of each keyed union access, filled by
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).

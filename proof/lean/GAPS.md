@@ -1073,8 +1073,16 @@ positions, and the mark changes where a later write lands, not whether. A slot t
 holds another value (a call result, a foreign load; a null store is no other block: binutils
 _bfd_pei_swap_sym_in's `name` holds _bfd_coff_internal_syment_name's
 result, then the bfd_alloc) leaves the site unclassified, counted: it
-gives neither a scalar label nor a bytes mark (counted: "receiver kind
-unclassified", SUMMARY sites). A declared scalar array takes no extent
+gives no bytes mark (followed uses are what give it). The receiver's
+KIND is its declaration, the variable's or field's debug type, whatever
+else its slot holds (Fable 2026-10-13): a slot that also holds another
+allocation, a load, a call result or a formal still declares its kind
+(struct, pointer slots, scalar) for every fresh block stored into it;
+its uses are followed only under the single-store or cursor condition.
+Sound as ruling A: the declaration is what the program wrote for the
+variable; a block too small or large for it is the extent rule's
+business. Counted (SUMMARY sites): "declared through a shared slot" and
+"with no declaration" (the genuinely kindless). A declared scalar array takes no extent
 rule: its element label already names every element, and the extent rule
 can only cut a tail, which a scalar array has none of. The same holds
 for a pointer-slot array declared at mint (1b's T** receiver): its label

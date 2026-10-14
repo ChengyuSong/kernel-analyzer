@@ -4977,6 +4977,17 @@ bool CallGraphPass::runCellResolution() {
            << "the constant-int node holds no fact\n");
   };
   boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, uint32_t>> keyedPtrOf;
+  // A hub's pointer the way the solver knows it: a dereference edge whose
+  // target's representative is the hub (the factory parent is the original
+  // node's; a representative may have none). Built on first use.
+  boost::unordered_flat_map<NodeIndex, NodeIndex> hubPtrOf;
+  auto hubPointer = [&](NodeIndex h) -> NodeIndex {
+    if (hubPtrOf.empty())
+      for (const GraphEdge &E : Graph.edges())
+        if (E.kind == EdgeKind::Deref) hubPtrOf.emplace(canon(E.to), canon(E.from));
+    auto it = hubPtrOf.find(h);
+    return it == hubPtrOf.end() ? AndersNodeFactory::InvalidIndex : it->second;
+  };
   std::function<std::string(uint32_t)> nodeDesc;
   nodeDescFn = [&](uint32_t m) { return nodeDesc(m); };
   nodeDesc = [&](uint32_t m) -> std::string {
@@ -5050,6 +5061,8 @@ bool CallGraphPass::runCellResolution() {
           par = it->second.first;
           key = " key " + NF.cellNameString(it->second.second);
         }
+      if (par == AndersNodeFactory::InvalidIndex && (par = hubPointer(m)) != AndersNodeFactory::InvalidIndex)
+        key = " (a representative: its pointer by the dereference edge)";
       if (par == AndersNodeFactory::InvalidIndex) {
         // An unexpected node: name it before the assertion.
         bool keyed = false;
@@ -6286,6 +6299,7 @@ bool CallGraphPass::runCellResolution() {
       if (keyedPtrOf.empty())
         for (const auto &[pk, d] : keyedDerefOf) keyedPtrOf.emplace(d, pk);
       if (auto it = keyedPtrOf.find(h); it != keyedPtrOf.end()) par = it->second.first;
+      else par = hubPointer(h);
     }
     return par == AndersNodeFactory::InvalidIndex ? nullptr : NF.getValueForNode(par);
   };

@@ -3488,6 +3488,12 @@ bool mayCarryPtrProvenance(const Value *V, unsigned depth,
     return constantHasPtrToInt(C, 6);
   }
   if (isa<LoadInst>(V)) return true; // slot-to-slot int copies stay live
+  // An atomic's old value is a load of its slot (xchg's result, a
+  // compare-and-swap's first field).
+  if (isa<AtomicRMWInst>(V)) return true;
+  if (const auto *EV = dyn_cast<ExtractValueInst>(V);
+      EV && isa<AtomicCmpXchgInst>(EV->getAggregateOperand()) && EV->getNumIndices() == 1 && EV->getIndices()[0] == 0)
+    return true;
   if (isa<Argument>(V))
     return true; // formals are wired witness-gated now: facts only if
                  // some caller actually passed provenance
@@ -3522,6 +3528,17 @@ static bool mayBecomePointer(const Value *V, unsigned depth, bool &declined) {
     if (isa<IntToPtrInst>(U)) return true;
     if (const auto *SI = dyn_cast<StoreInst>(U)) {
       if (SI->getValueOperand() == V) return true; // flows onward via memory
+      continue;
+    }
+    // An atomic exchange's stored value, a compare-and-swap's expected or
+    // new value: stored like a store's value (-O0 lowers __atomic_* through
+    // a slot: `store ptr p, s; v = load i64, s; atomicrmw xchg q, v`).
+    if (const auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
+      if (RMW->getValOperand() == V) return true;
+      continue;
+    }
+    if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(U)) {
+      if (CX->getNewValOperand() == V || CX->getCompareOperand() == V) return true;
       continue;
     }
     if (isa<ReturnInst>(U))

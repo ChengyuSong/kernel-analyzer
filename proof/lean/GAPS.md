@@ -611,6 +611,18 @@ Obligations left open:
    unknown value), not as nothing: an empty value made the store vanish
    from an adopted OK-EMPTY summary (both solvers' prover: a soundness
    fix, the flows-to consumer outputs may gain pairs, attributed).
+   An atomic exchange or compare-and-swap moves its integer operands
+   like a store and a load (Fable 2026-10-14): at -O0, clang lowers
+   __atomic_* through a slot (`store ptr p, s; v = load i64, s; atomicrmw
+   xchg q, v`), and the integer load fed only the atomic, which no
+   use-side rule admitted, so the exchange stored nothing (both solvers).
+   An atomic's stored value (xchg's value, cmpxchg's expected and new
+   values) flows onward like a store's value operand, and its old value
+   (xchg's result, cmpxchg's first field) is a load of its slot. At -O2
+   the atomics take pointer operands and were already exact. (A finding
+   on the way, withdrawn: atomics are NOT nameless hubs under cells;
+   every cells access goes through its pointer's dereference node, and
+   names come from the field edges and object layouts.)
 2. Environment model: which objects are environment sites (argv/envp,
    the fuzzer buffer, one per extern global, one per bodiless callee
    without a summary, one per formal of a never-called function) and the

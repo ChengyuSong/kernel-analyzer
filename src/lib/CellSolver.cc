@@ -3088,6 +3088,7 @@ bool CallGraphPass::runCellResolution() {
     if (!ins) return it->second;
     std::vector<uint32_t> res;
     stepCalls++;
+    assert(li < lazyLabels.size() && o < objs.size() && "stepOne: a label or object out of range");
     // The member's own cell at `off` (an Off cell of object o).
     const Cell C{o, CellKind::Off, off, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0};
     const LazyLabel &L = lazyLabels[li];
@@ -3498,6 +3499,8 @@ bool CallGraphPass::runCellResolution() {
   boost::unordered_flat_map<uint64_t, uint32_t> guardLevel; // (guard, holder, level) -> node
   auto linkLevel = [&](uint32_t si, uint32_t f, uint32_t level, uint32_t g,
                        uint32_t guard = UINT32_MAX) {
+    assert(si < recvSites.size() && level < recvSites[si].lis.size() && g < cells.size() &&
+           "linkLevel: a site, level or cell out of range");
     const RecvSite &R = recvSites[si];
     const Cell &C = cells[g];
     if (C.kind == CellKind::Func || C.kind == CellKind::Out) return; // no slot
@@ -3558,6 +3561,7 @@ bool CallGraphPass::runCellResolution() {
   std::function<void(uint32_t, const Function *)> onDispatchTarget;
   auto dispatch = [&](uint32_t P, const std::vector<uint32_t> &dlt) {
     const LevelKey K = dispatchOf[P];
+    assert(K.si < recvSites.size() && "dispatch: a site out of range");
     const RecvSite &R = recvSites[K.si];
     if (K.level + 1 < R.lis.size()) { // holders: on to the next level
       for (uint32_t g : dlt) linkLevel(K.si, K.f, K.level + 1, g, K.guard);
@@ -4139,7 +4143,9 @@ bool CallGraphPass::runCellResolution() {
             }
             tGuard++;
             // A pseudo site: level 1 steps the holder to the tested slot.
-            RecvSite PS{nullptr, 0, n, n, {{}, {li}}};
+            // At offset 0 there is no step: level 1 is the pointer itself
+            // (an empty chain), never the UINT32_MAX "no label yet" sentinel.
+            RecvSite PS{nullptr, 0, n, n, {{}, li == UINT32_MAX ? std::vector<uint32_t>{} : std::vector<uint32_t>{li}}};
             const uint32_t si = recvSites.size();
             recvSites.push_back(PS);
             const uint32_t gi = guards.size();
@@ -4172,6 +4178,7 @@ bool CallGraphPass::runCellResolution() {
     for (const std::string &d : idTestAt) CG_LOG("Cells:   identity test " << d << "\n");
   }
   guardHold = [&](uint32_t gi, uint32_t n, uint32_t f) {
+    assert(gi < guards.size() && f < cells.size() && "guardHold: a guard or fact out of range");
     Guard &Gd = guards[gi];
     if (trackWhy) heldWhy.try_emplace((uint64_t)gi << 32 | f, curWhy); // its cause, for the admission
     if (!guardSeen.insert((uint64_t)gi << 32 | f).second && !Gd.dropped &&

@@ -2,7 +2,9 @@
 # The AddressSanitizer gate: run before any commit touching
 # src/lib/CellSolver.cc, FlowsToSolver.cc or the census/profiler code.
 # Builds (or reuses) the sanitizer build directory asan/ (NOT release/:
-# -fsanitize=address -fno-omit-frame-pointer, Release flags otherwise,
+# -fsanitize=address -fsanitize-recover=address -fno-omit-frame-pointer,
+# Release flags otherwise (recover mode: a diagnostic run reports every
+# distinct error; the gate still fails on any report),
 # jemalloc replaced by libdl so ASan sees every allocation), then runs
 # test/cells-cases.sh, the small cells pins (libpng, cjpeg-O0, djpeg-O0)
 # and test/asan-census.sh (tcpdump with the census instruments) against
@@ -16,8 +18,8 @@ if [ ! -f asan/CMakeCache.txt ]; then
   mkdir -p asan
   (cd asan && PATH=$LLVM/bin:$PATH LLVM_ROOT_DIR=$LLVM/bin LLVM_LIBRARY_DIRS=$LLVM/lib \
      LLVM_INCLUDE_DIRS=$LLVM/include CC=clang CXX=clang++ cmake ../src -DCMAKE_BUILD_TYPE=Release \
-     -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -gline-tables-only" \
-     -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address -DJEMALLOC_LIB=/usr/lib/x86_64-linux-gnu/libdl.so.2 \
+     -DCMAKE_CXX_FLAGS="-fsanitize=address -fsanitize-recover=address -fno-omit-frame-pointer -gline-tables-only" \
+     -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address -fsanitize-recover=address" -DJEMALLOC_LIB=/usr/lib/x86_64-linux-gnu/libdl.so.2 \
      > cmake.log 2>&1) || { echo "FAIL[asan-gate]: cmake (asan/cmake.log)"; exit 1; }
 fi
 (cd asan && make -j"$(nproc)" KAMain > build.log 2>&1) || { echo "FAIL[asan-gate]: build (asan/build.log)"; exit 1; }

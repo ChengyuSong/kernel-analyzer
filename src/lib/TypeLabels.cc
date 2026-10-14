@@ -256,6 +256,7 @@ void CallGraphPass::labelAllocationSites(
       SmallVector<DbgValueInst *, 2> DVs;
       findDbgValues(DVs, const_cast<CallBase *>(C));
       for (DbgValueInst *DV : DVs) {
+        L.hasReceiver = true;
         if (L.siteDeclared.empty())
           L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
         if (L.sitePtrArray.empty())
@@ -322,9 +323,10 @@ void CallGraphPass::labelAllocationSites(
           if (known && namedStruct(ST)) {
             StringRef Tag = stripStructNameSuffix(ST->getName());
             Tag.consume_front("struct.");
-            if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue());
-                MT && !diPointee(MT, C->getModule()).empty())
-              L.structFieldSeen = true;
+            if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue())) {
+              L.hasReceiver = true;
+              if (!diPointee(MT, C->getModule()).empty()) L.structFieldSeen = true;
+            }
             if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue());
                 MT && L.siteDeclared.empty() && L.sitePtrArray.empty() && L.siteScalar.empty()) {
               L.sitePtrArray = diPtrArray(MT);
@@ -334,6 +336,7 @@ void CallGraphPass::labelAllocationSites(
           }
           if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
             for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI))) {
+              L.hasReceiver = true;
               if (L.siteDeclared.empty())
                 L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
               if (L.sitePtrArray.empty())
@@ -718,7 +721,7 @@ void CallGraphPass::staticLabels(
     if (b) allocBytesOnly.insert(A);
   {
     size_t field = 0, cursor = 0, unclassified = 0, scalars = 0, structField = 0, sharedDeclared = 0,
-           undeclared = 0;
+           undeclared = 0, undeclaredByRule = 0;
     for (auto &[C, SL] : siteLabel) {
       field += SL.fieldReceiver;
       cursor += SL.cursorSlot;
@@ -728,6 +731,7 @@ void CallGraphPass::staticLabels(
       structField += sfOnly;
       sharedDeclared += SL.slotUnclassified && decl;
       undeclared += !decl && !sfOnly;
+      undeclaredByRule += !decl && !sfOnly && SL.hasReceiver;
     }
     censusSites = siteLabel.size();
     censusStructFieldOnly = structField;
@@ -741,7 +745,9 @@ void CallGraphPass::staticLabels(
            << " result slots also hold other values (unclassified); " << scalars
            << " allocations scalar-only, " << allocBytesOnly.size() << " bytes-only at every creating site; "
            << structField << " sites whose only receiver is a struct-pointer field (no declaration); "
-           << sharedDeclared << " declared through a shared slot; " << undeclared << " with no declaration\n");
+           << sharedDeclared << " declared through a shared slot; " << undeclared << " with no declaration ("
+           << undeclaredByRule << " received by a variable or field whose type declares nothing (char *, void *), "
+           << undeclared - undeclaredByRule << " with no receiving variable: returned or passed on)\n");
   }
   for (auto &[C, SL] : siteLabel) {
     std::set<const CallBase *> allocs;

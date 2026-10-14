@@ -289,6 +289,10 @@ protected:
     bool fieldReceiver = false, cursorSlot = false, slotUnclassified = false;
     // A struct-pointer field received it: a base-class slot, no declaration.
     bool structFieldSeen = false;
+    // A variable or field received it (declared or not): with no
+    // declaration, its type declares nothing (char *, void *) by rule;
+    // without one the result went straight to a return or a call.
+    bool hasReceiver = false;
     // Segments declared at the site (plan 3.53 rule 1, extent): a constant
     // offset c > 0 of the result cast to B* (the receiving variable's
     // declared pointee) or written through a B struct GEP; "" when two

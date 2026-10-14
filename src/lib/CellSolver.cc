@@ -119,6 +119,9 @@ inline int64_t decOff(int64_t e) { return e & ~kFoldedBit; }
 
 struct Obj {
   NodeIndex origin;
+  // A container element minted per owner (plan 3.55): the owner object
+  // (UINT32_MAX: not a row object).
+  uint32_t rowOwner = UINT32_MAX;
   const Function *fn = nullptr;
   Type *layout = nullptr; // null: unlabeled
   bool repeats = false;   // an array of `layout` of unknown length
@@ -852,6 +855,8 @@ bool CallGraphPass::runCellResolution() {
   std::vector<uint32_t> repOf;
   std::vector<std::vector<uint32_t>> hubsOf; // pointer -> its hubs
   std::vector<std::vector<uint32_t>> rowsAt; // owner pointer -> its container row links
+  std::vector<std::vector<uint32_t>> mintsAt; // owner pointer -> its element mint links
+  std::vector<std::vector<uint32_t>> inheritAt; // a body's element value -> the containers it serves
   std::vector<std::vector<FieldEdge>> fieldOut;
   std::vector<char> anyLoop;
   // Per node: the fact it holds under each name (unification by name).
@@ -865,7 +870,8 @@ bool CallGraphPass::runCellResolution() {
     size_t cap = std::max<size_t>(n, pts.size() * 3 / 2);
     const size_t old = repOf.size();
     pts.resize(cap); pend.resize(cap); succ.resize(cap); inWL.resize(cap, 0);
-    hubsOf.resize(cap); rowsAt.resize(cap); fieldOut.resize(cap); anyLoop.resize(cap, 0);
+    hubsOf.resize(cap); rowsAt.resize(cap); mintsAt.resize(cap); inheritAt.resize(cap);
+    fieldOut.resize(cap); anyLoop.resize(cap, 0);
     byName.resize(cap);
     oneCell.resize(cap, UINT32_MAX);
     copiesAt.resize(cap);
@@ -1114,6 +1120,18 @@ bool CallGraphPass::runCellResolution() {
     if (rowLinks[i].in != AndersNodeFactory::InvalidIndex) inGraph[canon(rowLinks[i].in)] = 1;
     if (rowLinks[i].out != AndersNodeFactory::InvalidIndex) inGraph[canon(rowLinks[i].out)] = 1;
   }
+  for (uint32_t i = 0; i < mintLinks.size(); i++) {
+    const uint32_t o = canon(mintLinks[i].owner);
+    inGraph[o] = inGraph[canon(mintLinks[i].out)] = 1;
+    mintsAt[o].push_back(i);
+  }
+  for (uint32_t ci = 0; ci < containerElemSources.size(); ci++)
+    for (const Value *E : containerElemSources[ci]) {
+      const NodeIndex n = getRepNodeForValue(E);
+      if (n == AndersNodeFactory::InvalidIndex) continue;
+      inGraph[canon(n)] = 1;
+      inheritAt[canon(n)].push_back(ci);
+    }
   std::vector<uint32_t> storeHub(G, UINT32_MAX);
   size_t staticCopies = 0, stores = 0;
   // Leak census: a store collector's hub and the value nodes stored.
@@ -1267,6 +1285,10 @@ bool CallGraphPass::runCellResolution() {
     hubsOf[m].clear();
     rowsAt[r].insert(rowsAt[r].end(), rowsAt[m].begin(), rowsAt[m].end());
     rowsAt[m].clear();
+    mintsAt[r].insert(mintsAt[r].end(), mintsAt[m].begin(), mintsAt[m].end());
+    mintsAt[m].clear();
+    inheritAt[r].insert(inheritAt[r].end(), inheritAt[m].begin(), inheritAt[m].end());
+    inheritAt[m].clear();
     fieldOut[r].insert(fieldOut[r].end(), fieldOut[m].begin(),
                        fieldOut[m].end());
     fieldOut[m].clear();
@@ -3384,6 +3406,7 @@ bool CallGraphPass::runCellResolution() {
     } else if (V) {
       where = V->getName().str();
     }
+    if (O.rowOwner != UINT32_MAX) where = "element of the owner obj#" + std::to_string(O.rowOwner) + " at " + where;
     return where + (O.parentObj != UINT32_MAX ? " tail@" + std::to_string(O.base) : "") +
            " [" + (O.layout ? (O.ident.empty() ? O.label : O.ident + " as " + O.label) : std::string("unlabeled")) +
            (O.repeats ? " array" : "") + "]";
@@ -4547,17 +4570,77 @@ bool CallGraphPass::runCellResolution() {
                             boost::hash<std::tuple<uint32_t, int64_t, uint32_t>>>
       rowCell;
   size_t rowFacts = 0, rowSkipped = 0;
+  // Copies, not references: minting cells and nodes grows cells and memb.
   auto linkRow = [&](uint32_t li, uint32_t f) {
-    const Cell &C = cells[findFact(f)];
-    if (C.kind != CellKind::Off && C.kind != CellKind::Any) { rowSkipped++; return; }
+    const CellKind kind = cells[findFact(f)].kind;
+    if (kind != CellKind::Off && kind != CellKind::Any) { rowSkipped++; return; }
     const RowLink &L = rowLinks[li];
-    for (auto [o, e] : memb[findFact(f)]) {
-      const int64_t off = C.kind == CellKind::Any ? INT64_MIN : decOff(e);
+    const std::vector<Member> ms = memb[findFact(f)];
+    for (auto [o, e] : ms) {
+      const int64_t off = kind == CellKind::Any ? INT64_MIN : decOff(e);
       auto [it, ins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
       if (ins) it->second = newNode();
       rowFacts++;
       if (L.in != AndersNodeFactory::InvalidIndex) addEdge(canon(L.in), it->second);
       if (L.out != AndersNodeFactory::InvalidIndex) addEdge(it->second, canon(L.out));
+    }
+  };
+  // The element mint: (owner object, site) -> the row object; per
+  // container, the row objects minted, and the (body element, row object)
+  // pairs whose inherited fields are linked.
+  std::map<std::pair<uint32_t, const Value *>, uint32_t> mintedObj;
+  std::vector<std::vector<uint32_t>> mintedOf(containerElemSources.size());
+  boost::unordered_flat_set<uint64_t> inherited;
+  size_t inheritLinks = 0;
+  // Row object R inherits body element C's body-written fields (C -> R).
+  auto inheritFields = [&](uint32_t C, uint32_t R, uint32_t ci) {
+    if (C == R || objs[C].rowOwner != UINT32_MAX || objs[C].fn || !inherited.insert((uint64_t)C << 32 | R).second)
+      return;
+    for (int64_t w : containerInherit[ci]) {
+      // A body write at no constant offset rejects a minting container
+      // (Containers.cc): never here.
+      assert(w >= 0 && "an inherited field at no constant offset");
+      // Through forwards and trailing objects on both sides.
+      const auto [co, cw] = locate(C, w);
+      const auto [ro, rw] = locate(R, w);
+      const auto a = contentOf(co, contentKey(objs[co], cw)), b = contentOf(ro, contentKey(objs[ro], rw));
+      addEdge(a.second, b.first);
+      inheritLinks++;
+    }
+  };
+  std::function<void(uint32_t, uint32_t)> linkMint = [&](uint32_t li, uint32_t f) {
+    const CellKind kind = cells[findFact(f)].kind;
+    if (kind != CellKind::Off && kind != CellKind::Any) { rowSkipped++; return; }
+    const MintLink &L = mintLinks[li];
+    const std::vector<Member> ms = memb[findFact(f)];
+    for (auto [o, e] : ms) {
+      auto [it, ins] = mintedObj.try_emplace(std::make_pair(o, L.site), 0);
+      if (ins) {
+        const NodeIndex sn = NF.getValueNodeFor(L.site);
+        it->second = newObj(sn == AndersNodeFactory::InvalidIndex ? L.out : sn, nullptr);
+        objs[it->second].rowOwner = o;
+        mintedOf[L.cont].push_back(it->second);
+        // Its inherited fields from every body element already known.
+        const uint32_t R = it->second;
+        for (const Value *E : containerElemSources[L.cont])
+          if (const NodeIndex n = getRepNodeForValue(E); n != AndersNodeFactory::InvalidIndex) {
+            std::vector<uint32_t> gs;
+            pts[find(canon(n))].forEach([&](uint32_t g) { gs.push_back(g); });
+            for (uint32_t g : gs) inheritFields(cells[g].obj, R, L.cont);
+          }
+      }
+      const uint32_t fr = cellAt(it->second, 0);
+      add(find(canon(L.out)), fr);
+      if (L.name != UINT32_MAX) {
+        const int64_t off = kind == CellKind::Any ? INT64_MIN : decOff(e);
+        auto [rc, rins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
+        if (rins) rc->second = newNode();
+        add(find(rc->second), fr);
+      }
+      // Storage visibility and the body's own writes: the row object is
+      // one of the body's elements.
+      for (const Value *E : containerElemSources[L.cont])
+        if (const NodeIndex n = getRepNodeForValue(E); n != AndersNodeFactory::InvalidIndex) add(find(canon(n)), fr);
     }
   };
   // Plan 3.54: object bookkeeping of the split formals.
@@ -6810,6 +6893,13 @@ bool CallGraphPass::runCellResolution() {
         }
       for (size_t ri = 0; ri < rowsAt[n].size(); ri++)
         for (uint32_t f : delta) linkRow(rowsAt[n][ri], f);
+      for (size_t mi = 0; mi < mintsAt[n].size(); mi++)
+        for (uint32_t f : delta) linkMint(mintsAt[n][mi], f);
+      for (size_t ii = 0; ii < inheritAt[n].size(); ii++) {
+        const uint32_t ci = inheritAt[n][ii];
+        for (uint32_t f : delta)
+          for (size_t k = 0; k < mintedOf[ci].size(); k++) inheritFields(cells[f].obj, mintedOf[ci][k], ci);
+      }
       curStepNode = n;
       anyCauseNode = n;
       for (size_t ei = 0; ei < fieldOut[n].size(); ei++) {
@@ -6901,20 +6991,17 @@ bool CallGraphPass::runCellResolution() {
   for (uint32_t n = 0; n < numNodes; n++) factMass += pts[n].count();
   checkConstInt();
   checkContainerPremises(stoppedAt != 0);
-  if (!rowLinks.empty())
-    CG_LOG("Cells: container rows: " << rowLinks.size() << " row links at call sites, " << rowCell.size()
-           << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped
-           << " owner facts not an object offset)\n");
-  // The owners' width at the row sites (report only, Fable 2026-10-14):
-  // the widest owner pointers, with the kinds of objects they hold.
-  if (!rowLinks.empty()) {
+  // The owners' width at the row and mint sites (report only, Fable
+  // 2026-10-14): the widest owner pointers, with the kinds of objects they
+  // hold (struct label, byte storage, a trailing object, unlabeled).
+  if (!rowLinks.empty() || !mintLinks.empty()) {
     std::vector<std::pair<size_t, std::string>> sites;
     std::set<uint32_t> allOwners;
-    for (const RowLink &L : rowLinks) {
+    auto siteOf = [&](NodeIndex owner, const std::string &what) {
       std::map<std::string, size_t> kinds;
       std::set<uint32_t> mine;
       size_t nCells = 0;
-      pts[find(canon(L.owner))].forEach([&](uint32_t f) {
+      pts[find(canon(owner))].forEach([&](uint32_t f) {
         for (auto [o, e] : memb[findFact(f)]) {
           (void)e;
           nCells++;
@@ -6925,20 +7012,33 @@ bool CallGraphPass::runCellResolution() {
                 : !O.layout ? "unlabeled" : O.label]++;
         }
       });
+      const size_t w = mine.size();
       std::vector<std::pair<size_t, std::string>> ks;
       for (auto &[k, n] : kinds) ks.push_back({n, k});
       std::sort(ks.rbegin(), ks.rend());
-      std::string d = "row at " + nodeDescFn(canon(L.owner)).substr(0, 120) + ": " + std::to_string(mine.size()) +
-                      " owner objects in " + std::to_string(nCells) + " cells (";
+      std::string d = what + ": " + std::to_string(w) + " owner objects in " + std::to_string(nCells) + " cells (";
       for (size_t i = 0; i < ks.size() && i < 4; i++) d += (i ? ", " : "") + ks[i].second + " " + std::to_string(ks[i].first);
       if (ks.size() > 4) d += ", ...";
-      sites.push_back({mine.size(), d + ")"});
+      sites.push_back({w, d + ")"});
+    };
+    for (const RowLink &L : rowLinks) {
+      const Value *V = NF.getValueForNode(L.owner);
+      siteOf(L.owner, "row at " + (V ? nodeDescFn(canon(L.owner)).substr(0, 120) : std::string("?")));
     }
+    for (const MintLink &L : mintLinks) siteOf(L.owner, "mint at " + nodeDescFn(canon(L.owner)).substr(0, 120));
     std::sort(sites.rbegin(), sites.rend());
-    CG_LOG("Cells: owner width at " << sites.size() << " row sites: " << allOwners.size()
+    CG_LOG("Cells: owner width at " << sites.size() << " row/mint sites: " << allOwners.size()
            << " distinct owner objects; the widest:\n");
     for (size_t i = 0; i < sites.size() && i < 10; i++) CG_LOG("Cells:   " << sites[i].second << "\n");
   }
+  if (!mintLinks.empty())
+    CG_LOG("Cells: element mint: " << mintLinks.size() << " mint links (" << inlineInserts
+           << " inline inserts), " << mintedObj.size() << " row objects minted, " << inheritLinks
+           << " inherited field links\n");
+  if (!rowLinks.empty())
+    CG_LOG("Cells: container rows: " << rowLinks.size() << " row links at call sites, " << rowCell.size()
+           << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped
+           << " owner facts not an object offset)\n");
 
   CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
          << walkSteps << " walk steps, " << indexOutsideArray

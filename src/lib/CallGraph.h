@@ -553,6 +553,27 @@ protected:
   // cell flows to (the call's result); the cell's name.
   struct RowLink { NodeIndex owner, in, out; uint32_t name; };
   std::vector<RowLink> rowLinks;
+  // The element mint (Fable 2026-10-13): at an insert site s whose element
+  // is its result (or an inline insert: an owner-code call to a
+  // constructor), RET is the object (O, s, elem) for each owner object O,
+  // minted as owner facts arrive; it enters the owner's element cell, the
+  // body's element values (storage visibility, the body's own writes), and
+  // inherits the fields the body writes on its own element (C -> row).
+  struct MintLink {
+    NodeIndex owner, out;
+    uint32_t name;          // the element cell's name (UINT32_MAX: none)
+    const llvm::Value *site;
+    size_t cont;
+  };
+  std::vector<MintLink> mintLinks;
+  size_t inlineInserts = 0; // (d): owner-code constructor calls minted
+  // Per verified container: the body's element values (constructor results
+  // in the body), the byte offsets the body writes on an element, and the
+  // constructors (code-field targets) with the argument that carries the
+  // owner.
+  std::vector<std::vector<const llvm::Value *>> containerElemSources;
+  std::vector<std::vector<int64_t>> containerInherit;
+  std::vector<std::map<const llvm::Function *, unsigned>> containerCtors;
   // After the solve: the pure rows' indirect calls against the solver's
   // targets (Containers.cc).
   void checkContainerPremises(bool stopped);

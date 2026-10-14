@@ -1594,8 +1594,33 @@ O1-O4 and O6: nothing else can hold an element's address before a lookup
 returns it except the owner's closed storage, so every element a lookup
 can find was inserted through a row into that owner's cell.
 
+**The element mint** (Fable 2026-10-13/14). An insert whose element is
+its result (ELEM(ret): bfd_hash_insert; bfd_hash_lookup with CREATE)
+makes the element inside the body. At such a site s outside the body,
+RET is the row object (O, s, elem), one per owner object O in
+pts(owner actual), minted as the owner's facts arrive. It enters the
+owner's element cell (O, "C.elems") and the body's element values (the
+constructor results inside the body), so the body's own reads and writes
+of an element reach it. It inherits the offsets the body writes on its
+own element objects (C -> row, never row -> C); a container whose body
+writes an element at an unknown offset is not minted (refused, printed).
+A CREATE argument that is the constant false makes the site a lookup
+only.
+- **Inline insert, (d):** an owner-code call to a verified container's
+  constructor (a code-field target), outside the body, is an insert site
+  s: its element is of the owner passed to the constructor. RET is minted
+  per owner as above. An element derived from that owner value (the same
+  SSA value, or the same GEP shape) re-stored into a link field of an
+  element of the same owner is a same-owner re-store (O1).
+- **Statement:** the row object (O, s, elem) stands for every element
+  made at s for an owner in O. Every such element is reachable only
+  through the owner's closed storage (O1-O3) and through the result at s,
+  so naming it by (O, s) loses no flow: an element of O is never an
+  element of another owner, and the body's own accesses to its elements
+  reach the row object through the element values.
+
 Not mechanized. The census re-cut (nm-new, sqlite3; tcpdump unchanged)
-measures it after the gates.
+measures it after the gates. Case: test/t_cells_container_mint.c.
 
 ## Method-installed state (TaggedFields entry tests, CellSolver formal split, 2026-10-12, plan 3.54)
 

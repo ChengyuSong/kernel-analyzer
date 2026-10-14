@@ -1594,6 +1594,10 @@ htab_traverse DISPATCH(arg1:f0<-*arg0@24@htab_traverse_noresize) DISPATCH(arg1:f
 # that cell (plus null). Rows of an unverified container are not applied.
 # Premise of every row: the owner's elements are reached only through the
 # container's functions and the owner's closed storage (O1-O3, checked).
+# OWNER(argN) names the cell argN points to: a table embedded in another
+# object (bfd_get_section_by_name's &abfd->section_htab) is that object's
+# cell at the table's offset, and the element cell is keyed (owner object,
+# offset, name); no separate form.
 @container sqlite3_hash
 # sqlite3's Hash (count, htsize, first, ht): the data pointer kept per key;
 # the HashElem is the body's own object; sqlite3HashInsert(pH, key, data)

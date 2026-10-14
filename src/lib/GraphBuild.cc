@@ -917,17 +917,49 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
         if (n == AndersNodeFactory::InvalidIndex) n = getCanonicalNode(NF.createValueNode(V));
         return n;
       };
+      const uint32_t elemsName = NF.internCellName(Ctx->Containers[rit->second.cont].name + ".elems");
+      // ELEM(ret): the element is the call's result: minted per owner at
+      // this site. A lookup with CREATE mints too, unless the create
+      // argument is the constant false (then it only looks up).
+      bool mints = R.elem == -1 && (R.role == CR::Insert || R.role == CR::Lookup);
+      if (mints && R.role == CR::Lookup && R.create >= 0 && (unsigned)R.create < CS->arg_size())
+        if (const auto *KC = dyn_cast<ConstantInt>(CS->getArgOperand(R.create)); KC && KC->isZero()) mints = false;
+      if (R.owner >= 0 && (unsigned)R.owner < CS->arg_size() && CS->getType()->isPointerTy() &&
+          (R.role == CR::Lookup || R.role == CR::Insert) && R.elem == -1) {
+        const NodeIndex own = nodeOf(CS->getArgOperand(R.owner)), out = nodeOf(CS);
+        if (R.role == CR::Lookup) rowLinks.push_back({own, AndersNodeFactory::InvalidIndex, out, elemsName});
+        if (mints) mintLinks.push_back({own, out, elemsName, CS, rit->second.cont});
+        retBound = true;
+      }
       if ((R.role == CR::Lookup || R.role == CR::Insert) && R.owner >= 0 && (unsigned)R.owner < CS->arg_size() &&
           R.elem != -1) {
         NodeIndex in = AndersNodeFactory::InvalidIndex, out = AndersNodeFactory::InvalidIndex;
         if (R.role == CR::Insert && (unsigned)R.elem < CS->arg_size()) in = nodeOf(CS->getArgOperand(R.elem));
         if (CS->getType()->isPointerTy()) out = nodeOf(CS);
-        rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), in, out,
-                            NF.internCellName(Ctx->Containers[rit->second.cont].name + ".elems")});
+        rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), in, out, elemsName});
         if (in != AndersNodeFactory::InvalidIndex && out != AndersNodeFactory::InvalidIndex)
           addAssignmentEdge(in, out); // the insert hands back its own element too
         retBound = true;
       }
+    }
+  // (d) An inline insert (Fable 2026-10-14): an owner-code call to a
+  // verified container's constructor (a code-field target) makes an
+  // element of the owner passed to it: RET is minted per owner at this
+  // site and enters the owner's element cell.
+  if (CFLCells && CS->getCalledFunction() && !retBound && CS->getType()->isPointerTy())
+    for (size_t ci = 0; ci < containerCtors.size(); ci++) {
+      auto cit = containerCtors[ci].find(CF);
+      if (cit == containerCtors[ci].end() || containerBodies[ci].count(CS->getFunction()) ||
+          cit->second >= CS->arg_size())
+        continue;
+      NodeIndex own = getRepNodeForValue(CS->getArgOperand(cit->second));
+      if (own == AndersNodeFactory::InvalidIndex) own = getCanonicalNode(NF.createValueNode(CS->getArgOperand(cit->second)));
+      NodeIndex out = getRepNodeForValue(CS);
+      if (out == AndersNodeFactory::InvalidIndex) out = getCanonicalNode(NF.createValueNode(CS));
+      mintLinks.push_back({own, out, NF.internCellName(Ctx->Containers[ci].name + ".elems"), CS, ci});
+      inlineInserts++;
+      retBound = true;
+      break;
     }
   {
     auto sit = Ctx->FuncSummaries.find(CF);

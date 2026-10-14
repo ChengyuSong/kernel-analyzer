@@ -503,6 +503,9 @@ void CallGraphPass::checkContainerClosure() {
   containerReport.clear();
   containerRowOf.clear();
   containerBodies.clear();
+  containerElemSources.clear();
+  containerInherit.clear();
+  containerCtors.clear();
   auto cline = [&](const std::string &l) {
     CG_LOG("Container: " << l << "\n");
     containerReport.push_back(l);
@@ -965,15 +968,148 @@ void CallGraphPass::checkContainerClosure() {
       const uint8_t a = get(baseOf(S->getPointerOperand())) & ~NUL, v = get(S->getValueOperand());
       return body.count(S->getFunction()) && a && !(a & ~(OWN | DER | FRS)) && v && !(v & ~(DER | NUL | FRS));
     };
+    const DataLayout &DL0 = Ctx->Modules.front().first->getDataLayout();
+    // (d) Inline inserts (Fable 2026-10-14): the constructors (code-field
+    // targets) and the argument the owner is passed at.
+    std::map<const Function *, unsigned> ctorsHere;
+    for (const Function *F : body)
+      for (const Instruction &I : instructions(*F))
+        if (const auto *CB = dyn_cast<CallBase>(&I); CB && !CB->getCalledFunction())
+          if (const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
+            const std::string K = fieldKey(CL, CL->getPointerOperand());
+            if (code.count(K) && !codeOpen.count(K))
+              for (unsigned a = 0; a < CB->arg_size(); a++)
+                if (get(CB->getArgOperand(a)) == OWN)
+                  for (const Function *T : codeTargets[K]) ctorsHere.emplace(T, a);
+          }
+    // An owner value by its shape: through casts, -O0 slots stored once and
+    // constant address steps (`&abfd->section_htab` computed twice is one).
+    std::function<std::string(const Value *, int)> ownerShape = [&](const Value *V, int d) -> std::string {
+      V = V->stripPointerCasts();
+      if (d > 8) return "";
+      if (const auto *L = dyn_cast<LoadInst>(V))
+        if (const Value *SL = L->getPointerOperand()->stripPointerCasts(); transientSlot(SL)) {
+          const StoreInst *only = nullptr;
+          for (const User *U : SL->users())
+            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == SL) {
+              if (only) return "";
+              only = S;
+            }
+          return only ? ownerShape(only->getValueOperand(), d + 1) : "";
+        }
+      if (const auto *G = dyn_cast<GEPOperator>(V)) {
+        APInt Off(64, 0);
+        if (!G->accumulateConstantOffset(DL0, Off)) return "";
+        const std::string b = ownerShape(G->getPointerOperand(), d + 1);
+        return b.empty() ? "" : b + "+" + std::to_string(Off.getSExtValue());
+      }
+      std::string t;
+      raw_string_ostream os(t);
+      os << (const void *)V;
+      return os.str();
+    };
+    // Outside the body: the owner a value is an element of (a row's or a
+    // constructor's result, through casts, slots stored once and constant
+    // steps); "" if none.
+    std::function<std::string(const Value *, int)> elemOwner = [&](const Value *V, int d) -> std::string {
+      V = V->stripPointerCasts();
+      if (d > 8) return "";
+      if (const auto *L = dyn_cast<LoadInst>(V))
+        if (const Value *SL = L->getPointerOperand()->stripPointerCasts(); transientSlot(SL)) {
+          const StoreInst *only = nullptr;
+          for (const User *U : SL->users())
+            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == SL) {
+              if (only) return "";
+              only = S;
+            }
+          return only ? elemOwner(only->getValueOperand(), d + 1) : "";
+        }
+      if (const auto *G = dyn_cast<GEPOperator>(V)) return elemOwner(G->getPointerOperand(), d + 1);
+      const auto *CB = dyn_cast<CallBase>(V);
+      const Function *G = CB ? CB->getCalledFunction() : nullptr;
+      if (!G) return "";
+      if (const CR *R = rowOf(G); R && R->owner >= 0 && (R->role == CR::Lookup || R->role == CR::Insert) &&
+                                  R->elem == -1 && (unsigned)R->owner < CB->arg_size())
+        return ownerShape(CB->getArgOperand(R->owner), 0);
+      if (auto cit = ctorsHere.find(G); cit != ctorsHere.end() && cit->second < CB->arg_size())
+        return ownerShape(CB->getArgOperand(cit->second), 0);
+      return "";
+    };
+    std::vector<std::string> inlineSites;
+    auto isInlineMove = [&](const StoreInst *S) {
+      if (body.count(S->getFunction())) return false;
+      const std::string a = elemOwner(baseOf(S->getPointerOperand()), 0), v = elemOwner(S->getValueOperand(), 0);
+      if (a.empty() || a != v) return false;
+      inlineSites.push_back(S->getFunction()->getName().str() + ": " + valueText(S));
+      return true;
+    };
     std::set<std::string> checked1 = handle;
     checked1.insert(links.begin(), links.end());
     for (const std::string &K : checked1) {
       bool ok = true;
       for (const StoreInst *S : fields[K].foreignSI)
-        if (isMove(S)) moves++;
+        if (isMove(S) || isInlineMove(S)) moves++;
         else if (ok) ok = false, firstBad1[K] = S;
       if (!ok) open1.insert(K);
     }
+    // A block copy anywhere whose destination is an element struct (one
+    // embedding a container struct) is a store of the source's fields:
+    // the source an element of the same owner, or in the body derived or
+    // fresh; memset is a null store (Fable 2026-10-14, per-field
+    // decomposition). Destinations named by the copy's struct access.
+    std::set<std::string> elemStructs;
+    for (const std::string &L : links) elemStructs.insert(L.substr(0, L.rfind('+')));
+    std::function<bool(StringRef, int)> embedsElem = [&](StringRef Tag, int d) -> bool {
+      if (elemStructs.count("struct." + Tag.str())) return true;
+      if (d > 4) return false;
+      auto dit = diStructs.find(Tag.str());
+      if (dit == diStructs.end()) return false;
+      for (const DINode *E : dit->second->getElements())
+        if (const auto *M = dyn_cast<DIDerivedType>(E); M && M->getTag() == dwarf::DW_TAG_member)
+          if (const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(M->getBaseType()));
+              CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && M->getOffsetInBits() == 0 &&
+              embedsElem(CT->getName(), d + 1))
+            return true;
+      return false;
+    };
+    size_t copiesInto = 0;
+    std::string badCopy;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (const Instruction &I : instructions(F)) {
+          const auto *MT = dyn_cast<MemTransferInst>(&I);
+          if (!MT) continue;
+          const std::string K = fieldKey(MT, MT->getRawDest());
+          if (K.empty()) continue;
+          // The destination range [off, off + len) against the link fields
+          // of a container struct embedded at the start, and the owner's
+          // handle fields.
+          const std::string S = K.substr(0, K.rfind('+'));
+          const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
+          const auto *LenC = dyn_cast<ConstantInt>(MT->getLength());
+          const int64_t len = LenC ? (int64_t)LenC->getZExtValue() : INT64_MAX / 2;
+          std::vector<int64_t> pos;
+          if (embedsElem(StringRef(S).drop_front(7), 0))
+            for (const std::string &L : links) pos.push_back(std::stoll(L.substr(L.rfind('+') + 1)));
+          for (const std::string &H : handle)
+            if (H.substr(0, H.rfind('+')) == S) pos.push_back(std::stoll(H.substr(H.rfind('+') + 1)));
+          bool covers = false;
+          for (int64_t p0 : pos) covers |= p0 >= off && p0 < off + len;
+          if (!covers) continue;
+          copiesInto++;
+          if (body.count(&F)) {
+            const uint8_t src = get(baseOf(MT->getRawSource())) & ~NUL;
+            if (src && !(src & ~(DER | FRS))) continue;
+          } else {
+            const std::string a = elemOwner(MT->getRawDest(), 0), v = elemOwner(MT->getRawSource(), 0);
+            if (!a.empty() && a == v) {
+              inlineSites.push_back(F.getName().str() + ": " + valueText(MT));
+              continue;
+            }
+          }
+          if (badCopy.empty()) badCopy = F.getName().str() + ": " + valueText(MT);
+        }
+    if (!badCopy.empty()) open1.insert("an element copied from another value [" + badCopy + "]");
     std::string o1 = open1.empty() ? "O1 PASS" : "O1 FAIL(open:";
     for (const std::string &K : open1) {
       o1 += " " + K;
@@ -982,6 +1118,11 @@ void CallGraphPass::checkContainerClosure() {
               std::to_string(get(S->getValueOperand())) + "]";
     }
     if (!open1.empty()) o1 += ")";
+    if (!inlineSites.empty()) {
+      o1 += " (inline insert: " + std::to_string(inlineSites.size()) + " same-owner stores or copies outside the body:";
+      for (size_t i = 0; i < inlineSites.size() && i < 4; i++) o1 += " [" + inlineSites[i] + "]";
+      o1 += ")";
+    }
     // O4: every callee outside the body is a row of this container, a
     // carve row, an allocation or a free (modeled), a prover no-op, a pure
     // row, or does not return; an indirect call is checked as a code field
@@ -1154,10 +1295,100 @@ void CallGraphPass::checkContainerClosure() {
                  o6 == "O6 PASS";
     if (C.verified) {
       const size_t ci = &C - &Ctx->Containers[0];
-      if (containerBodies.size() <= ci) containerBodies.resize(ci + 1);
+      if (containerBodies.size() <= ci) {
+        containerBodies.resize(ci + 1);
+        containerElemSources.resize(ci + 1);
+        containerInherit.resize(ci + 1);
+        containerCtors.resize(ci + 1);
+      }
       containerBodies[ci] = body;
-      for (const auto &[fn, R] : C.rows)
-        if (auto it = byName.find(fn); it != byName.end()) containerRowOf[it->second] = {ci, R};
+      // The element mint's inputs: the body's element values (constructor
+      // results: an indirect call through a closed code field), the
+      // constructors with the argument the owner is passed at, and the
+      // byte offsets the body writes on an element (from the element's
+      // start; -1: a write at an offset not constant).
+      std::set<int64_t> W;
+      // Constructors first (the element bases below need them).
+      for (const Function *F : body)
+        for (const Instruction &I : instructions(*F))
+          if (const auto *CB = dyn_cast<CallBase>(&I); CB && !CB->getCalledFunction())
+            if (const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
+              const std::string K = fieldKey(CL, CL->getPointerOperand());
+              if (code.count(K) && !codeOpen.count(K))
+                for (unsigned a = 0; a < CB->arg_size(); a++)
+                  if (get(CB->getArgOperand(a)) == OWN)
+                    for (const Function *T : codeTargets[K]) containerCtors[ci].emplace(T, a);
+            }
+      // An element base: in a constructor, its fresh blocks; elsewhere, a
+      // constructor call's result (through casts and -O0 slots).
+      auto elemBase = [&](const Value *A, const Function *F) {
+        if (containerCtors[ci].count(F)) return (get(A) & FRS) != 0;
+        A = A->stripPointerCasts();
+        if (const auto *L = dyn_cast<LoadInst>(A); L && transientSlot(L->getPointerOperand()->stripPointerCasts())) {
+          for (const User *U : L->getPointerOperand()->stripPointerCasts()->users())
+            if (const auto *S2 = dyn_cast<StoreInst>(U))
+              if (const auto *CB = dyn_cast<CallBase>(S2->getValueOperand()->stripPointerCasts());
+                  CB && !CB->getCalledFunction())
+                return true;
+          return false;
+        }
+        const auto *CB = dyn_cast<CallBase>(A);
+        return CB && !CB->getCalledFunction();
+      };
+      for (const Function *F : body)
+        for (const Instruction &I : instructions(*F)) {
+          if (const auto *CB = dyn_cast<CallBase>(&I); CB && !CB->getCalledFunction())
+            if (const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
+              const std::string K = fieldKey(CL, CL->getPointerOperand());
+              if (code.count(K) && !codeOpen.count(K)) containerElemSources[ci].push_back(CB);
+            }
+          // A store, or a block write (memcpy/memset: every pointer-aligned
+          // offset of its range), through an element.
+          const Value *A = nullptr;
+          int64_t len = 1;
+          if (const auto *S = dyn_cast<StoreInst>(&I)) A = S->getPointerOperand();
+          else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+            A = MI->getRawDest();
+            const auto *LC = dyn_cast<ConstantInt>(MI->getLength());
+            len = LC ? (int64_t)LC->getZExtValue() : -1;
+          }
+          if (!A) continue;
+          A = A->stripPointerCasts();
+          int64_t off = 0;
+          bool known = len >= 0;
+          while (const auto *G = dyn_cast<GEPOperator>(A)) {
+            APInt Off(64, 0);
+            if (G->accumulateConstantOffset(F->getParent()->getDataLayout(), Off)) off += Off.getSExtValue();
+            else known = false;
+            A = G->getPointerOperand()->stripPointerCasts();
+          }
+          if (!elemBase(A, F)) continue;
+          if (!known) W.insert(-1);
+          else if (len <= 1) W.insert(off);
+          else
+            for (int64_t w = off & ~int64_t(7); w < off + len; w += 8) W.insert(w);
+        }
+      containerInherit[ci].assign(W.begin(), W.end());
+      // A body write at no constant element offset cannot be inherited
+      // field by field: a container that mints (an ELEM(ret) row or a
+      // constructor) is rejected.
+      bool mintsHere = !containerCtors[ci].empty();
+      for (const auto &[fn, R] : C.rows) mintsHere |= R.elem == -1;
+      if (mintsHere && W.count(-1)) {
+        C.verified = false;
+        C.obligations.push_back("mint FAIL(a body write into an element at no constant offset)");
+        containerBodies[ci].clear();
+        containerElemSources[ci].clear();
+        containerCtors[ci].clear();
+        containerInherit[ci].clear();
+      }
+      std::string ws;
+      for (int64_t w : W) ws += " " + std::to_string(w);
+      cline("  element mint: " + std::to_string(containerElemSources[ci].size()) + " element sources in the body, " +
+            std::to_string(containerCtors[ci].size()) + " constructors, inherited offsets {" + ws + " }");
+      if (C.verified)
+        for (const auto &[fn, R] : C.rows)
+          if (auto it = byName.find(fn); it != byName.end()) containerRowOf[it->second] = {ci, R};
     }
     for (const std::string &l : sentLines) C.obligations.push_back(l);
     for (const auto &[fn, R] : C.rows) {

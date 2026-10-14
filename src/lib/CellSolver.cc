@@ -7277,6 +7277,53 @@ bool CallGraphPass::runCellResolution() {
                << kn[W.kind < 8 ? W.kind : 0] << (W.ctx.empty() ? std::string() : " (" + W.ctx + ")") << " from "
                << (W.src != UINT32_MAX ? nodeDesc(W.src) : std::string("-")) << "\n");
       }
+      // By subsystem (report only): the source directory of the weld
+      // site's module; for the kernel, the directory under linux-*/ (one
+      // level more under drivers/, net/, fs/, arch/, sound/).
+      auto subsystemOf = [&](uint32_t n) -> std::string {
+        const Function *F = nullptr;
+        for (int d = 0; d < 4 && n < G && !F; d++) {
+          const Value *V = NF.getValueForNode(n);
+          if (const auto *I = dyn_cast_or_null<Instruction>(V)) F = I->getFunction();
+          else if (const auto *A = dyn_cast_or_null<Argument>(V)) F = A->getParent();
+          else if (const auto *FV = dyn_cast_or_null<Function>(V)) F = FV;
+          else if (NF.getDerefParent(n) != AndersNodeFactory::InvalidIndex) n = NF.getDerefParent(n);
+          else break;
+        }
+        if (!F) return "(no function)";
+        SmallVector<StringRef, 16> cs;
+        StringRef(F->getParent()->getModuleIdentifier()).split(cs, '/', -1, false);
+        for (size_t i = 0; i + 1 < cs.size(); i++)
+          if (cs[i].starts_with("linux")) {
+            std::string sub = cs[i + 1].str();
+            static const std::set<std::string> deep = {"drivers", "net", "fs", "arch", "sound"};
+            if (deep.count(sub) && i + 3 < cs.size()) sub += "/" + cs[i + 2].str();
+            return sub;
+          }
+        return cs.size() > 1 ? cs[cs.size() - 2].str() : std::string("(module)");
+      };
+      std::map<std::string, std::array<size_t, 6>> bySub; // all n/mass, first 20 n/mass, heavy 10 n/mass
+      for (size_t i = 0; i < welds.size(); i++) {
+        auto &t = bySub[subsystemOf(welds[i].node)];
+        t[0]++;
+        t[1] += welds[i].mass;
+        if (i < 20) t[2]++, t[3] += welds[i].mass;
+      }
+      for (size_t i = 0; i < byMass.size() && i < 10; i++) {
+        auto &t = bySub[subsystemOf(welds[byMass[i]].node)];
+        t[4]++;
+        t[5] += welds[byMass[i]].mass;
+      }
+      std::vector<std::pair<size_t, std::string>> subs;
+      for (auto &[k, t] : bySub) subs.push_back({t[1], k});
+      std::sort(subs.rbegin(), subs.rend());
+      CG_LOG("Cells: WELD CENSUS by subsystem of the weld site (" << bySub.size() << " subsystems; welds, mass" << tag
+             << "; first 20; heaviest 10):\n");
+      for (auto &[m, k] : subs) {
+        const auto &t = bySub[k];
+        CG_LOG("Cells:   SUBSYSTEM " << k << ": " << t[0] << " welds, mass " << t[1] << "; first 20: " << t[2]
+               << ", mass " << t[3] << "; heaviest 10: " << t[4] << ", mass " << t[5] << "\n");
+      }
     }
     std::map<std::string, std::pair<size_t, size_t>> byClass; // mass, entries
     for (const SoupEntry &E : soupEntries) {

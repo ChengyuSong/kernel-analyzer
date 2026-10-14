@@ -8479,6 +8479,11 @@ bool CallGraphPass::runCellResolution() {
        << censusSharedDeclared << " declared through a shared slot (uses not followed), " << censusUndeclared
        << " with no declaration (" << censusUnclassified << " result slots also hold another value; "
        << censusReachedReloads << " of those sites have reloads only their own store reaches: followed for segments)\n";
+    if (!containerClosureReport.empty()) {
+      RO << "# Container closure (plan 3.55 obligation 1, --cfl-container-closure, report only): per field\n"
+         << "# fed fresh blocks, closed or open with the failing uses.\n";
+      for (const std::string &l : containerClosureReport) RO << "CLOSURE " << l << "\n";
+    }
     RO << "SUMMARY segments declared by a receiver: " << censusSegments[0] << " a struct (" << censusSegments[1]
        << " indexed by a stride of it: arrays without an extent), " << censusSegments[2] << " arrays of pointer slots, "
        << censusSegments[3] << " arrays of a declared scalar, " << censusSegments[4] << " bytes (a char receiver); "

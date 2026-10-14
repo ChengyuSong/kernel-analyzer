@@ -666,6 +666,8 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
+  if (CFLCells && CFLContainerClosure && iteration == 0 && M == Ctx->Modules.front().first)
+    checkContainerClosure(); // report only: after carves and the confirmer's fresh wrappers
 
   if (CFLConfirmInvoke && iteration == 0 && M == Ctx->Modules.front().first)
     confirmInvokeSummaries(); // before any callsite wiring

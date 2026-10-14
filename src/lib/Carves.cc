@@ -869,6 +869,7 @@ void CallGraphPass::checkPoolCarves() {
   poolBookkeeping.clear();
   poolHandleFields.clear();
   poolHandleStores.clear();
+  poolFieldAccess.clear();
   if (CFLPoolCarves) {
     for (auto &[I, f] : bookkeeping)
       if (isa<StoreInst>(I) && !isRefused(pool(f))) poolHandleStores.insert(I);
@@ -881,6 +882,19 @@ void CallGraphPass::checkPoolCarves() {
       }
     for (auto &[I, f] : bookkeeping)
       if (!isRefused(pool(f))) poolBookkeeping.insert(I);
+    // Every load and store of a certified pool's handle field, by pool:
+    // the confirmer's certificate-bound exemption (plan 3.55 (a)) reads the
+    // same certificate.
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        for (const Instruction &I : instructions(F)) {
+          const Value *A = nullptr;
+          if (const auto *L = dyn_cast<LoadInst>(&I)) A = L->getPointerOperand();
+          else if (const auto *S = dyn_cast<StoreInst>(&I)) A = S->getPointerOperand();
+          if (!A) continue;
+          const std::string k = fieldKey(&I, A);
+          if (!k.empty() && handleFields.count(k) && !isRefused(pool(k))) poolFieldAccess[&I] = pool(k);
+        }
   }
   size_t fb = 0;
   for (const std::string &f : handleFields) fb += irFallback.count(f);

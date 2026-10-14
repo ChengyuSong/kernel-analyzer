@@ -1418,7 +1418,104 @@ that the checks cover. bfd_alloc and bfd_hash_allocate are then
 confirmed, and so is _objalloc_alloc (greatest fixpoint); their hand
 rows are removed.
 
+**The confirmer and the solver read the same certificate** (plan 3.55
+(a), Fable 2026-10-13). A pool's constructor stores into the handle fields
+of the block it returns: `ret->chunks = malloc(..); chunk = ret->chunks;
+ret->current_ptr = (char *)chunk + HDR` (objalloc_create). A store into a
+CERTIFIED pool's handle field of a value derived from THAT pool's chunk
+(a read of one of its handle fields, through casts, address steps and
+spill slots) is the pool's own bookkeeping, not an escape or an
+untraced init; so is a read of such a handle field of the fresh block
+whose every use stays in the pool (compares, writes into the pool's
+handle fields through it, stores of it into them). Bound to the
+certificate: only where PoolCarve certifies both the handle field and
+the chunk's fields as one pool (objalloc+0/+16 with objalloc_chunk+0/+8);
+any other field, or a value from elsewhere, stays an escape. It is the
+same statement the solver uses not to model handle stores: a handle value
+leads to no cell that holds program data. Counted ("handle-field reads
+and stores exempted by a pool certificate", ConfirmFresh line).
+
 Not mechanized. Checked by executions; see the rule 3 commit's gates.
+
+## Container storage closure (Containers.cc, --cfl-container-closure, 2026-10-13, plan 3.55 deliverable 1)
+
+A container's storage is a block its owner object holds in a field K
+(bfd_hash_table+0, the bucket array; sqlite3's FuncDefHash). Today a cell
+of such storage is (allocation site, k): every table made at one site
+shares one name, so every lookup meets every table's entries.
+
+**Obligation 1, storage closure, is the FEED condition** (checked per
+field K; Fable 2026-10-13): every store into K stores a fresh block (an
+allocation, a confirmed fresh wrapper's result, a certified pool carve, a
+join of those with null), null, or a re-store of K's own reload of the
+SAME owner (its base pointer, or a -O0 local stored once; `old_table =
+t->table; ... t->table = old_table`). `a->t = b->t` moves a block between
+owners: it is another value, and it opens the field it is stored into. A
+field failing the condition is open, with the other values reported (rule
+report section CLOSURE).
+
+The load side opens nothing. A pointer read from K carries the refined
+name (O, C) wherever it goes, so passing it on, returning it, joining it
+or storing it elsewhere is ordinary flow; the report lists where such
+addresses go, as information. (A first version also opened K on those
+uses; that stricter check is withdrawn.)
+
+**Paired sites.** A fresh block's site C is owner-paired only when every
+use of its result before the feed is the feed store into the closed field
+or a transient use (casts, address steps, -O0 local slots, compares,
+writes through it, free, a call to a pool API below). If C's result also
+reaches an open field, a return, another call or a global, C keeps its
+plain object, and the closed field's cell holds plain C for that site
+(the field stays closed; counted "closed feeds whose site is not paired").
+Without this a block leaving by the other path would have no name while
+the owner pointer has no fact.
+
+**Pool APIs** (3.55 (b), Fable 2026-10-13): the feed condition for a
+pool's OWN handle fields, whose chunk list is fed inside the pool's
+functions through a formal (`o->chunks = chunk` in _objalloc_alloc). A
+handle value passed to a callee stays in the pool when the callee's
+formal reaches only (i) one certified pool's handle fields (reads and
+writes through it, as the PoolCarve certificate names them), (ii)
+non-pointer fields of the descriptor (objalloc's current_space: no
+pointer moves), (iii) compares, (iv) freeing the descriptor, (v) the same
+check through further callees with a body (a recursive call adds no use:
+greatest fixpoint). Stored elsewhere, returned, passed to a bodiless or
+indirect call: not a pool API. The function set is what the check finds,
+never a list of names; counted per program (nm-new 3: _objalloc_alloc,
+objalloc_free, objalloc_free_block; sqlite3 0; tcpdump 0). Carves made
+from a closed handle are the owner's storage: (P, carve site) with P the
+pool object at the carve, itself (owner, pool site); rule 1 lays each
+out, the carve form's size term as its extent.
+
+**Statement (the model, before any census).** Closure refines a cell
+(site, k) into (owner object, storage, k), per owner object. Sound
+because, under obligation 1, every concrete block made at the site is
+reachable from exactly one owner object's field K: it enters only by a
+fresh feed (a new block, one owner) or a re-store of the same block, and
+null adds none. An abstract owner object stands for its concrete owners,
+so the refined name is a function of the concrete block. Pointers TO the
+storage, once read from the owner's field, may flow anywhere: they carry
+the refined name, which is the name of every access to that block.
+- Two owner objects made at one allocation site keep one name (the
+  site-confluence row; owners are as precise as the solver's objects).
+- The refinement splits objects, never merges cells: no two blocks'
+  cells merge that the site's single name did not already merge.
+
+**The primitive: an owner-paired mint** (Fable 2026-10-13). For a closed
+field K and a feed store `o->K = v` of a paired site C: when an owner fact
+O reaches o, the object (O, C) is minted (lazily, as o's facts grow) and
+added to the cell (O, K) ONLY, and to v's node, so v's transient uses
+hold every (O_i, C). Plain C is never minted for a paired site. Re-stores
+are ordinary stores. Sound: a concrete block of C is stored into some
+owner c in the concretization of O_i and is named (O_i, C); v
+over-approximates with every (O_j, C); nothing else reaches the block.
+Rejected alternative, do not rebuild it: keep C and add content edges
+from C to each (O, C). A read through the raw pointer after an owner's
+write would miss that write (unsound), and edges both ways would merge
+every owner's contents through C (no precision).
+
+Not mechanized. The census re-cut (nm-new, sqlite3; tcpdump unchanged)
+measures it after the gates.
 
 ## Method-installed state (TaggedFields entry tests, CellSolver formal split, 2026-10-12, plan 3.54)
 

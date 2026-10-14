@@ -19,9 +19,10 @@ for c in t_pool_*.c t_cells_*.c; do
   n=${c%.c}
   flags=$(grep -o "// CFLAGS: .*" "$c" | sed 's|// CFLAGS: ||')
   [ -z "$flags" ] && flags="-O0"
+  kaflags=$(grep -o "// KAFLAGS: .*" "$c" | sed 's|// KAFLAGS: ||')
   "$CLANG" $flags -g -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
   timeout 120 "$BIN" --verbose=2 --func-summaries=../func_summaries.txt --cfl-cells --cfl-union-keys=tag \
-    --cfl-alloc-origins --cfl-whole-program --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" > "$OUT/$n.log" 2>&1
+    --cfl-alloc-origins --cfl-whole-program $kaflags --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" > "$OUT/$n.log" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL[$n]: exit $rc (124: did not finish in 120 s)"; fail=1; continue; fi
   maxc=$(grep -o "// MAXCELLS: [0-9]*" "$c" | grep -o "[0-9]*$")

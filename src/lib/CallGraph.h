@@ -534,6 +534,12 @@ protected:
   // pools' own bookkeeping (handle-field stores, rewinds, pointer
   // arithmetic on handles: exempt from the confirmer's R3).
   void checkPoolCarves();
+  // Container storage closure (plan 3.55 obligation 1, report only):
+  // --cfl-container-closure (Containers.cc).
+  void checkContainerClosure();
+  // Its per-field report (fed / closed / open with reason): a rule-report
+  // section.
+  std::vector<std::string> containerClosureReport;
   std::unordered_map<const llvm::Instruction *, std::string> poolCarves;
   // A carve's size (plan 3.53 row 1), by form: before-bump the bump n,
   // counter the decrement, minus-len the length, all n * scale bytes;
@@ -553,6 +559,9 @@ protected:
   // Stores whose value is a certified pool's handle value (the bump,
   // rewinds, refills into handle fields, chunk list links): not modeled.
   std::unordered_set<const llvm::Instruction *> poolHandleStores;
+  // Loads and stores of a certified pool's handle fields, by pool (the
+  // pool's representative field): the certificate the confirmer reads.
+  std::unordered_map<const llvm::Instruction *, std::string> poolFieldAccess;
   // Varargs renderers (plan 3.41): functions whose pointer reads through a
   // va_list are data only (printed, measured, compared, copied as chars):
   // those reads carry no facts; variadic wrappers whose va_lists reach only

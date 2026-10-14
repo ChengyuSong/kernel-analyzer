@@ -18,6 +18,10 @@ static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
               g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
               g_freshHelperComposed = 0, g_freshCpy = 0, g_freshAlias = 0;
 static std::map<std::string, size_t> g_escapeBuckets;
+// Stores (and handle-field reads) of promoted wrappers exempted by a pool
+// certificate (plan 3.55 (a)): the confirmer and the solver read the same
+// certificate.
+static std::set<const llvm::Instruction *> g_poolCertExempt;
 static std::map<std::string, size_t> g_escapeCallees;
 void CallGraphPass::confirmFreshWrappers() {
   static GlobalContext::FuncSummary pureFresh; // stable address for the map
@@ -235,6 +239,64 @@ void CallGraphPass::confirmFreshWrappers() {
   auto reachingSlotStores = [](const LoadInst *L, const AllocaInst *AI,
                                SmallVectorImpl<const StoreInst *> &out) {
     reachingSlotStoresOf(L, AI, out);
+  };
+  // Plan 3.55 (a), certificate-bound: the pool's own bookkeeping is not an
+  // escape. Only where the PoolCarve certificate names the field (a
+  // certified pool's handle field, poolFieldAccess) and the value derives
+  // from that pool's chunk: a read of one of its handle fields, through
+  // casts, address steps and spill slots (objalloc_create: `chunk =
+  // ret->chunks; ret->current_ptr = (char *)chunk + HDR`).
+  std::function<bool(const Value *, const std::string &, int)> poolDerived =
+      [&](const Value *x, const std::string &P, int d) -> bool {
+    x = x->stripPointerCasts();
+    if (d > 8) return false;
+    if (const auto *L = dyn_cast<LoadInst>(x)) {
+      if (auto it = poolFieldAccess.find(L); it != poolFieldAccess.end()) return it->second == P;
+      if (const AllocaInst *AI = isSpillSlot(L->getPointerOperand())) {
+        SmallVector<const StoreInst *, 4> defs;
+        reachingSlotStores(L, AI, defs);
+        if (defs.empty()) return false;
+        for (const StoreInst *D : defs)
+          if (!poolDerived(D->getValueOperand(), P, d + 1)) return false;
+        return true;
+      }
+      return false;
+    }
+    if (const auto *G = dyn_cast<GEPOperator>(x)) return poolDerived(G->getPointerOperand(), P, d + 1);
+    return false;
+  };
+  // Every use of a handle-field read stays in the pool P: compares, writes
+  // into P's handle fields through it (the chunk's header), and stores of it
+  // (or a step of it) into P's handle fields. Those stores are returned.
+  auto poolUsesOnly = [&](const LoadInst *L0, const std::string &P,
+                          SmallVectorImpl<const Instruction *> &stores) -> bool {
+    SmallVector<const Value *, 8> w{L0};
+    SmallPtrSet<const Value *, 16> seen;
+    while (!w.empty()) {
+      const Value *x = w.pop_back_val();
+      if (!seen.insert(x).second) continue;
+      for (const User *U : x->users()) {
+        if (isa<ICmpInst>(U) || isa<DbgInfoIntrinsic>(U)) continue;
+        if (isa<CastInst>(U) || isa<GetElementPtrInst>(U)) { w.push_back(U); continue; }
+        if (const auto *S = dyn_cast<StoreInst>(U)) {
+          auto it = poolFieldAccess.find(S);
+          if (it != poolFieldAccess.end() && it->second == P) { stores.push_back(S); continue; }
+          if (S->getValueOperand() == x)
+            if (const AllocaInst *AI = isSpillSlot(S->getPointerOperand())) {
+              for (const User *AU : AI->users())
+                if (const auto *RL = dyn_cast<LoadInst>(AU)) {
+                  SmallVector<const StoreInst *, 4> defs;
+                  reachingSlotStores(RL, AI, defs);
+                  if (llvm::is_contained(defs, S)) w.push_back(RL);
+                }
+              continue;
+            }
+          return false;
+        }
+        return false;
+      }
+    }
+    return true;
   };
   // A wrapper's summary as a summary-file line (ST, CPY, ALIAS sorted).
   auto freshLine = [](StringRef name, ArrayRef<int> st, ArrayRef<int> cpy,
@@ -550,6 +612,7 @@ void CallGraphPass::confirmFreshWrappers() {
         // duplication). Anything else remains an escape.
         SmallPtrSet<const Value *, 16> freshGraph; // fresh ptr + GEPs
         SmallPtrSet<const Instruction *, 8> initStores;
+        SmallVector<const Instruction *, 4> certExempt; // pool bookkeeping (plan 3.55 (a))
         SmallPtrSet<const Instruction *, 4> initCalls; // composed helpers
         SmallVector<int, 4> initArgs;
         SmallVector<const GlobalValue *, 4> initGlobals;
@@ -582,6 +645,20 @@ void CallGraphPass::confirmFreshWrappers() {
               if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U)) {
                 gwork.push_back(uv);
                 continue;
+              }
+              // A read of a certified pool's handle field of the object
+              // whose value stays in that pool (plan 3.55 (a)).
+              if (const auto *LU = dyn_cast<LoadInst>(U); LU && LU->getPointerOperand() == v) {
+                SmallVector<const Instruction *, 4> ps;
+                auto it = poolFieldAccess.find(LU);
+                if (it != poolFieldAccess.end() && poolUsesOnly(LU, it->second, ps)) {
+                  certExempt.push_back(LU);
+                  for (const Instruction *PS : ps) {
+                    initStores.insert(PS);
+                    certExempt.push_back(PS);
+                  }
+                  continue;
+                }
               }
               if (const auto *SI = dyn_cast<StoreInst>(U)) {
                 // The pool's own bump (p + n stored back into H) moves
@@ -701,6 +778,14 @@ void CallGraphPass::confirmFreshWrappers() {
                       continue;
                     }
                   }
+                }
+                // Into a certified pool's handle field, a value derived
+                // from that pool's chunk (plan 3.55 (a)).
+                if (auto it = poolFieldAccess.find(SI);
+                    it != poolFieldAccess.end() && poolDerived(sv, it->second, 0)) {
+                  initStores.insert(SI);
+                  certExempt.push_back(SI);
+                  continue;
                 }
                 untracedInit = true; // ptr from load/call: reject
                 rejWhy = isa<GlobalValue>(sv)   ? "init-from-global"
@@ -1033,6 +1118,7 @@ void CallGraphPass::confirmFreshWrappers() {
           else if (aliasArgs.empty()) g_freshInit++;
         }
         g_freshPromoted++;
+        if (phase == Lfp || phase == GfpPromote) g_poolCertExempt.insert(certExempt.begin(), certExempt.end());
         if (phase == GfpPromote) gfpPromoted++;
         changed = true;
         if (g_freshPromoted <= 20)
@@ -1066,7 +1152,8 @@ void CallGraphPass::confirmFreshWrappers() {
          << " rounds; " << g_freshHelperComposed << " init-helper calls "
          << "composed; rejected " << g_freshRejRet << " ret-not-fresh, "
          << g_freshRejEscape << " escapes, " << g_freshRejSide
-         << " ptr-side-effects\n");
+         << " ptr-side-effects; " << g_poolCertExempt.size()
+         << " handle-field reads and stores exempted by a pool certificate (the pool's own bookkeeping)\n");
   for (auto &eb : g_escapeBuckets)
     CG_LOG("ConfirmFresh escape-bucket[" << eb.first << "]: " << eb.second
            << "\n");

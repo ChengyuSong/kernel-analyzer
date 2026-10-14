@@ -999,6 +999,20 @@ cl::opt<bool> CFLPoolCarves(
            "recognized and reported only"),
   cl::init(true));
 
+cl::opt<bool> CFLContainerClosure(
+  "cfl-container-closure",
+  cl::desc("--cfl-cells, report only (plan 3.55 obligation 1): container "
+           "storage closure. A struct field is closed when every store "
+           "into it stores a fresh block, null, or its own reload of the "
+           "same owner (the feed condition); where addresses read from it "
+           "go is reported as information. A fed block whose site sends it "
+           "elsewhere too (not only into the field, transient uses or a "
+           "pool API: a callee whose formal reaches only one certified "
+           "pool's handle fields, recursively; 3.55 (b)) leaves its site "
+           "unpaired. Reported per field (--verbose=2, and the rule "
+           "report's CLOSURE section)"),
+  cl::init(false));
+
 cl::opt<bool> CFLConfirmFresh(
   "cfl-confirm-fresh",
   cl::desc("Body-confirm PURE-FRESH allocation wrappers (returns trace "

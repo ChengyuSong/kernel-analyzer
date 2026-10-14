@@ -239,6 +239,29 @@ public:
   std::deque<FuncSummary> OwnedSummaries;
   std::unordered_map<const llvm::Function*, const FuncSummary*> FuncSummaries;
 
+  // Plan 3.55: containers (func_summaries.txt `@container NAME` blocks).
+  // A row names a function's role on the owner passed at OWNER(argN); the
+  // engine verifies each container (obligations O1-O6, Containers.cc)
+  // before its rows are applied per call site.
+  struct ContainerRow {
+    enum Role { Lookup, Insert, Traverse, Remove, Carve, Pure } role = Pure;
+    int owner = -2;  // argN; -2: none
+    int elem = -2;   // argN, -1 ret; -2: none
+    int create = -2; // argN (lookup with create)
+    int pool = -2;   // argN (carve)
+    int key = -2;    // argN (deliverable 2)
+    std::string field; // T+off of the key (deliverable 2)
+    unsigned line = 0;
+  };
+  struct ContainerSpec {
+    std::string name, provenance = "hand";
+    std::map<std::string, ContainerRow> rows; // function name -> row
+    // The engine's verdict: verified, or the first failing obligation.
+    bool verified = false;
+    std::vector<std::string> obligations; // "O1 PASS", "O3 FAIL(reason)", ...
+  };
+  std::vector<ContainerSpec> Containers;
+
   // Map a callsite to all potential callee functions.
   CalleeMap Callees;
 

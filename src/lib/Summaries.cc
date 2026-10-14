@@ -1239,6 +1239,15 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   // function (the kernel's sort, sem_init, strlcpy; tcpdump's strlcpy)
   // gets its body analyzed, not the libc model.
   bool scopeExtern = false;
+  // `@container NAME` ... `@container end`: rows of one container (plan
+  // 3.55): `<function> ROLE(lookup|insert|traverse|remove|carve|pure)
+  // [OWNER(argN)] [ELEM(argN|ret)] [CREATE(argN)] [POOL(argN)]
+  // [KEY(argN) FIELD(T+off)]`; not transfer atoms.
+  GlobalContext::ContainerSpec *curContainer = nullptr;
+  auto badRow = [&](StringRef why) {
+    errs() << "FuncSummary: " << path << ":" << lineNo << ": container row: " << why << "\n";
+    assert(false && "malformed container row in func_summaries.txt");
+  };
   while (std::getline(in, line)) {
     lineNo++;
     StringRef L = StringRef(line).trim();
@@ -1247,6 +1256,19 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       StringRef d = L.drop_front(1).trim();
       if (d == "scope extern") { scopeExtern = true; continue; }
       if (d == "scope all") { scopeExtern = false; continue; }
+      if (d.consume_front("container ")) {
+        d = d.trim();
+        if (d == "end") {
+          if (!curContainer) badRow("@container end without a block");
+          curContainer = nullptr;
+          continue;
+        }
+        if (curContainer || d.empty()) badRow("nested or unnamed @container");
+        Ctx->Containers.emplace_back();
+        curContainer = &Ctx->Containers.back();
+        curContainer->name = d.str();
+        continue;
+      }
       errs() << "FuncSummary: " << path << ":" << lineNo
              << ": unknown directive '" << L << "'\n";
       assert(false && "unknown func_summaries directive");
@@ -1254,6 +1276,46 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
     }
     SmallVector<StringRef, 6> toks;
     L.split(toks, ' ', -1, false);
+    if (curContainer) {
+      GlobalContext::ContainerRow R;
+      R.line = lineNo;
+      bool role = false;
+      auto argOf = [&](StringRef t, int &out) {
+        if (!parseRef(t, out)) badRow(("bad reference '" + t + "'").str());
+      };
+      for (size_t i = 1; i < toks.size(); i++) {
+        StringRef t = toks[i].trim();
+        if (t.empty()) continue;
+        if (!t.consume_back(")")) badRow(("bad token '" + t + "'").str());
+        auto [k, v] = t.split('(');
+        if (k == "ROLE") {
+          using CR = GlobalContext::ContainerRow;
+          role = true;
+          if (v == "lookup") R.role = CR::Lookup;
+          else if (v == "insert") R.role = CR::Insert;
+          else if (v == "traverse") R.role = CR::Traverse;
+          else if (v == "remove") R.role = CR::Remove;
+          else if (v == "carve") R.role = CR::Carve;
+          else if (v == "pure") R.role = CR::Pure;
+          else badRow(("unknown role '" + v + "'").str());
+        } else if (k == "OWNER") argOf(v, R.owner);
+        else if (k == "ELEM") argOf(v, R.elem);
+        else if (k == "CREATE") argOf(v, R.create);
+        else if (k == "POOL") argOf(v, R.pool);
+        else if (k == "KEY") argOf(v, R.key);
+        else if (k == "FIELD") R.field = v.str();
+        else badRow(("unknown key '" + k + "'").str());
+      }
+      using CR = GlobalContext::ContainerRow;
+      if (!role) badRow("no ROLE");
+      if ((R.role == CR::Lookup || R.role == CR::Insert || R.role == CR::Traverse || R.role == CR::Remove) &&
+          R.owner < 0)
+        badRow("a lookup/insert/traverse/remove row needs OWNER(argN)");
+      if (R.role == CR::Insert && R.elem == -2) badRow("an insert row needs ELEM");
+      if (R.role == CR::Carve && R.pool < 0) badRow("a carve row needs POOL(argN)");
+      if (!curContainer->rows.emplace(toks[0].str(), R).second) badRow("a function twice in one container");
+      continue;
+    }
     GlobalContext::FuncSummary S;
     S.externOnly = scopeExtern;
     bool hasChainAtom = false;
@@ -1555,6 +1617,9 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
     }
     Ctx->SummarySpecs.emplace_back(toks[0].str(), std::move(S));
   }
+  if (curContainer) badRow("unterminated @container block");
+  for (const auto &C : Ctx->Containers)
+    CG_LOG("FuncSummary: container " << C.name << ": " << C.rows.size() << " rows (" << C.provenance << ")\n");
   CG_LOG("FuncSummary: loaded " << Ctx->SummarySpecs.size() << " specs from "
          << path << " (" << nFresh << " FRESH, " << nCpy << " CPY, "
          << nAlias << " ALIAS, " << nSt << " ST, " << nLd << " LD, "

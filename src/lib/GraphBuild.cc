@@ -902,6 +902,33 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
   // earlier via the AllocSites branch; this path serves non-fresh
   // summaries and fresh ones reached through indirect resolution.
   bool retBound = false;
+  // A verified container's row (plan 3.55), at a call site outside the
+  // container's body: the arguments are wired as usual (the body runs and
+  // its side effects through them stay); the result comes only from the
+  // row: a lookup reads the owner's element cell, an insert writes its
+  // element there (and may hand back an element of the cell, or its own).
+  if (CFLCells && CS->getCalledFunction())
+    if (auto rit = containerRowOf.find(CF);
+        rit != containerRowOf.end() && !containerBodies[rit->second.cont].count(CS->getFunction())) {
+      using CR = GlobalContext::ContainerRow;
+      const CR &R = rit->second.row;
+      auto nodeOf = [&](const Value *V) {
+        NodeIndex n = getRepNodeForValue(V);
+        if (n == AndersNodeFactory::InvalidIndex) n = getCanonicalNode(NF.createValueNode(V));
+        return n;
+      };
+      if ((R.role == CR::Lookup || R.role == CR::Insert) && R.owner >= 0 && (unsigned)R.owner < CS->arg_size() &&
+          R.elem != -1) {
+        NodeIndex in = AndersNodeFactory::InvalidIndex, out = AndersNodeFactory::InvalidIndex;
+        if (R.role == CR::Insert && (unsigned)R.elem < CS->arg_size()) in = nodeOf(CS->getArgOperand(R.elem));
+        if (CS->getType()->isPointerTy()) out = nodeOf(CS);
+        rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), in, out,
+                            NF.internCellName(Ctx->Containers[rit->second.cont].name + ".elems")});
+        if (in != AndersNodeFactory::InvalidIndex && out != AndersNodeFactory::InvalidIndex)
+          addAssignmentEdge(in, out); // the insert hands back its own element too
+        retBound = true;
+      }
+    }
   {
     auto sit = Ctx->FuncSummaries.find(CF);
     // Summaries bind the callee's transfer to THIS callsite's actuals
@@ -6667,7 +6694,9 @@ void CallGraphPass::runGlobalDedup() {
   size_t totalCallees = 0, multiCallees = 0;
   for (auto &[CF, Count] : callsiteCount) {
     totalCallees++;
-    if (Count == 1)
+    // A container row's call site takes its result from the row (plan
+    // 3.55), never the body's return: no actual/formal or return merge.
+    if (Count == 1 && !containerRowOf.count(CF))
       singleCallsiteCallees.insert(CF);
     else
       multiCallees++;

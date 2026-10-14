@@ -9,10 +9,10 @@
 // another way before the feed (tbl.aux's block is returned too) leaves its
 // site unpaired.
 // KAFLAGS: --cfl-container-closure
-// LOG: CLOSED struct.tbl\+0: fed 1 fresh blocks \(0 of them leave
+// LOG: CLOSED struct.tbl\+0: fed 1 fresh blocks \(0 through a formal; 0 of them leave
 // LOG: CLOSED struct.tbl\+0: .* 1 re-stores
 // LOG: OPEN struct.pair\+0: .* 1 stores of another value
-// LOG: CLOSED struct.tbl\+8: fed 1 fresh blocks \(1 of them leave by another way too
+// LOG: CLOSED struct.tbl\+8: fed 1 fresh blocks \(0 through a formal; 1 of them leave by another way too
 // LOG: addresses read from it flow: passed to use_slots
 #include <stdlib.h>
 typedef void (*fn)(void);

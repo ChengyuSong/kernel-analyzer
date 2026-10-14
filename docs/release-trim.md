@@ -6,6 +6,11 @@ pure deletion of default-off paths, gated by cfl-smoke + the
 canonical pin.
 
 REMOVED:
+- loadContainerFile (2026-10-14, plan 3.55): the LLM container JSON loader
+  (LLMAnalysis.cc), never called; containers are now `@container` blocks in
+  func_summaries.txt, verified by the engine (Containers.cc). The rest of
+  the old LLM container path (ContainerFuncs, handleContainerCall, the
+  container prompt) goes with the offline proposal tool's step.
 - witness-taint (2026-09-04): retired experiment, falsified by
   design review + GT. Files deleted; flag deleted.
 - incremental cross-iteration solving (2026-09-04): divergent at

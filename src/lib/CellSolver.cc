@@ -851,6 +851,7 @@ bool CallGraphPass::runCellResolution() {
   // representative inherits every constraint of its members.
   std::vector<uint32_t> repOf;
   std::vector<std::vector<uint32_t>> hubsOf; // pointer -> its hubs
+  std::vector<std::vector<uint32_t>> rowsAt; // owner pointer -> its container row links
   std::vector<std::vector<FieldEdge>> fieldOut;
   std::vector<char> anyLoop;
   // Per node: the fact it holds under each name (unification by name).
@@ -864,7 +865,7 @@ bool CallGraphPass::runCellResolution() {
     size_t cap = std::max<size_t>(n, pts.size() * 3 / 2);
     const size_t old = repOf.size();
     pts.resize(cap); pend.resize(cap); succ.resize(cap); inWL.resize(cap, 0);
-    hubsOf.resize(cap); fieldOut.resize(cap); anyLoop.resize(cap, 0);
+    hubsOf.resize(cap); rowsAt.resize(cap); fieldOut.resize(cap); anyLoop.resize(cap, 0);
     byName.resize(cap);
     oneCell.resize(cap, UINT32_MAX);
     copiesAt.resize(cap);
@@ -1105,6 +1106,14 @@ bool CallGraphPass::runCellResolution() {
         hubsOf[p].push_back(h);
       isHub[h] = 1;
     }
+  // Container rows (plan 3.55): each row link at its owner pointer.
+  for (uint32_t i = 0; i < rowLinks.size(); i++) {
+    const uint32_t o = canon(rowLinks[i].owner);
+    inGraph[o] = 1;
+    rowsAt[o].push_back(i);
+    if (rowLinks[i].in != AndersNodeFactory::InvalidIndex) inGraph[canon(rowLinks[i].in)] = 1;
+    if (rowLinks[i].out != AndersNodeFactory::InvalidIndex) inGraph[canon(rowLinks[i].out)] = 1;
+  }
   std::vector<uint32_t> storeHub(G, UINT32_MAX);
   size_t staticCopies = 0, stores = 0;
   // Leak census: a store collector's hub and the value nodes stored.
@@ -1256,6 +1265,8 @@ bool CallGraphPass::runCellResolution() {
     succ[m].clear();
     hubsOf[r].insert(hubsOf[r].end(), hubsOf[m].begin(), hubsOf[m].end());
     hubsOf[m].clear();
+    rowsAt[r].insert(rowsAt[r].end(), rowsAt[m].begin(), rowsAt[m].end());
+    rowsAt[m].clear();
     fieldOut[r].insert(fieldOut[r].end(), fieldOut[m].begin(),
                        fieldOut[m].end());
     fieldOut[m].clear();
@@ -4493,6 +4504,27 @@ bool CallGraphPass::runCellResolution() {
     if (storeHub[h] != UINT32_MAX) addEdge(storeHub[h], st);
   };
   linkHubFn = linkHub;
+  // A container row at an owner fact (plan 3.55): the owner's element cell
+  // (owner object, offset, container), its own node, outside every content
+  // cell, so no other access reads or writes it; an insert's element flows
+  // in, a lookup's result reads it.
+  boost::unordered_flat_map<std::tuple<uint32_t, int64_t, uint32_t>, uint32_t,
+                            boost::hash<std::tuple<uint32_t, int64_t, uint32_t>>>
+      rowCell;
+  size_t rowFacts = 0, rowSkipped = 0;
+  auto linkRow = [&](uint32_t li, uint32_t f) {
+    const Cell &C = cells[findFact(f)];
+    if (C.kind != CellKind::Off && C.kind != CellKind::Any) { rowSkipped++; return; }
+    const RowLink &L = rowLinks[li];
+    for (auto [o, e] : memb[findFact(f)]) {
+      const int64_t off = C.kind == CellKind::Any ? INT64_MIN : decOff(e);
+      auto [it, ins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
+      if (ins) it->second = newNode();
+      rowFacts++;
+      if (L.in != AndersNodeFactory::InvalidIndex) addEdge(canon(L.in), it->second);
+      if (L.out != AndersNodeFactory::InvalidIndex) addEdge(it->second, canon(L.out));
+    }
+  };
   // Plan 3.54: object bookkeeping of the split formals.
   // Read j of formal fi, at hub h, for object o of fact f, under term t (a
   // formal whose method X the object's entry tested, 3.54 (b)): the keys of
@@ -6741,6 +6773,8 @@ bool CallGraphPass::runCellResolution() {
           if (trackWhy) curWhy = {n, f, UINT32_MAX, W_HUB};
           linkHub(h, f);
         }
+      for (size_t ri = 0; ri < rowsAt[n].size(); ri++)
+        for (uint32_t f : delta) linkRow(rowsAt[n][ri], f);
       curStepNode = n;
       anyCauseNode = n;
       for (size_t ei = 0; ei < fieldOut[n].size(); ei++) {
@@ -6831,6 +6865,45 @@ bool CallGraphPass::runCellResolution() {
   size_t factMass = 0, offCells = 0, anyCells = 0;
   for (uint32_t n = 0; n < numNodes; n++) factMass += pts[n].count();
   checkConstInt();
+  checkContainerPremises(stoppedAt != 0);
+  if (!rowLinks.empty())
+    CG_LOG("Cells: container rows: " << rowLinks.size() << " row links at call sites, " << rowCell.size()
+           << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped
+           << " owner facts not an object offset)\n");
+  // The owners' width at the row sites (report only, Fable 2026-10-14):
+  // the widest owner pointers, with the kinds of objects they hold.
+  if (!rowLinks.empty()) {
+    std::vector<std::pair<size_t, std::string>> sites;
+    std::set<uint32_t> allOwners;
+    for (const RowLink &L : rowLinks) {
+      std::map<std::string, size_t> kinds;
+      std::set<uint32_t> mine;
+      size_t nCells = 0;
+      pts[find(canon(L.owner))].forEach([&](uint32_t f) {
+        for (auto [o, e] : memb[findFact(f)]) {
+          (void)e;
+          nCells++;
+          if (!mine.insert(o).second) continue;
+          allOwners.insert(o);
+          const Obj &O = objs[o];
+          kinds[O.fn ? "function" : O.byteAccessed ? "bytes" : O.parentObj != UINT32_MAX ? "tail"
+                : !O.layout ? "unlabeled" : O.label]++;
+        }
+      });
+      std::vector<std::pair<size_t, std::string>> ks;
+      for (auto &[k, n] : kinds) ks.push_back({n, k});
+      std::sort(ks.rbegin(), ks.rend());
+      std::string d = "row at " + nodeDescFn(canon(L.owner)).substr(0, 120) + ": " + std::to_string(mine.size()) +
+                      " owner objects in " + std::to_string(nCells) + " cells (";
+      for (size_t i = 0; i < ks.size() && i < 4; i++) d += (i ? ", " : "") + ks[i].second + " " + std::to_string(ks[i].first);
+      if (ks.size() > 4) d += ", ...";
+      sites.push_back({mine.size(), d + ")"});
+    }
+    std::sort(sites.rbegin(), sites.rend());
+    CG_LOG("Cells: owner width at " << sites.size() << " row sites: " << allOwners.size()
+           << " distinct owner objects; the widest:\n");
+    for (size_t i = 0; i < sites.size() && i < 10; i++) CG_LOG("Cells:   " << sites[i].second << "\n");
+  }
 
   CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
          << walkSteps << " walk steps, " << indexOutsideArray
@@ -8563,6 +8636,10 @@ bool CallGraphPass::runCellResolution() {
       RO << "# Container closure (plan 3.55 obligation 1, --cfl-container-closure, report only): per field\n"
          << "# fed fresh blocks, closed or open with the failing uses.\n";
       for (const std::string &l : containerClosureReport) RO << "CLOSURE " << l << "\n";
+    }
+    if (!containerReport.empty()) {
+      RO << "# Containers (plan 3.55): rows by provenance, the body, obligations O1-O6 PASS/FAIL, verdict.\n";
+      for (const std::string &l : containerReport) RO << "CONTAINER " << l << "\n";
     }
     RO << "SUMMARY segments declared by a receiver: " << censusSegments[0] << " a struct (" << censusSegments[1]
        << " indexed by a stride of it: arrays without an extent), " << censusSegments[2] << " arrays of pointer slots, "

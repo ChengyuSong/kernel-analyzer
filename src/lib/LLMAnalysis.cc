@@ -553,59 +553,6 @@ int loadAllocatorFile(GlobalContext *Ctx, StringRef Path) {
   return 1;
 }
 
-int loadContainerFile(GlobalContext *Ctx, StringRef Path) {
-  auto BufOrErr = MemoryBuffer::getFile(Path);
-  if (!BufOrErr) {
-    LLM_LOG("Container file not available: " << Path << ": "
-            << BufOrErr.getError().message() << "\n");
-    return 0;
-  }
-
-  if ((*BufOrErr)->getBufferSize() == 0) {
-    LLM_LOG("Container file is empty: " << Path << "\n");
-    return 0;
-  }
-
-  Expected<json::Value> Parsed = json::parse((*BufOrErr)->getBuffer());
-  if (!Parsed) {
-    WARNING("Failed to parse container JSON: " << toString(Parsed.takeError()) << "\n");
-    return -1;
-  }
-
-  // Build name -> Function* map for lookup
-  std::unordered_map<std::string, Function*> NameToFunc;
-  for (auto &[id, F] : Ctx->Funcs)
-    NameToFunc[F->getName().str()] = F;
-
-  // Reuse processContainerResponse by constructing a batch from matched names
-  const json::Object *Obj = Parsed->getAsObject();
-  if (!Obj) return -1;
-  const json::Array *Containers = Obj->getArray("containers");
-  if (!Containers) return -1;
-
-  // Collect matching functions for the batch
-  std::vector<Function*> Batch;
-  for (const json::Value &V : *Containers) {
-    const json::Object *Entry = V.getAsObject();
-    if (!Entry) continue;
-    auto NameVal = Entry->getString("name");
-    if (!NameVal) continue;
-    auto it = NameToFunc.find(NameVal->str());
-    if (it != NameToFunc.end())
-      Batch.push_back(it->second);
-  }
-
-  // Re-serialize and process through existing handler
-  std::string JsonStr;
-  raw_string_ostream JsonOS(JsonStr);
-  JsonOS << json::Value(std::move(*Parsed));
-  JsonOS.flush();
-
-  size_t Added = processContainerResponse(Ctx, JsonStr, Batch);
-  LLM_LOG("Loaded " << Added << " container function(s) from " << Path << "\n");
-  return 1;
-}
-
 // ---------------------------------------------------------------------------
 // Kerneldoc-driven INVOKE mining (task #28 tier 3)
 // ---------------------------------------------------------------------------

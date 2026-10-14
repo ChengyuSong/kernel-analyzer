@@ -540,6 +540,22 @@ protected:
   // Its per-field report (fed / closed / open with reason): a rule-report
   // section.
   std::vector<std::string> containerClosureReport;
+  // The containers' obligations (fed / O1-O6 verdicts): a rule-report
+  // section.
+  std::vector<std::string> containerReport;
+  // Verified containers' rows, applied per call site outside the body
+  // (plan 3.55): the row of each function, and each container's body.
+  struct RowApply { size_t cont; GlobalContext::ContainerRow row; };
+  std::map<const llvm::Function *, RowApply> containerRowOf;
+  std::vector<std::set<const llvm::Function *>> containerBodies;
+  // A row's transfer at one call site: the owner pointer; the facts that
+  // enter the owner's element cell (an insert's element) and the node the
+  // cell flows to (the call's result); the cell's name.
+  struct RowLink { NodeIndex owner, in, out; uint32_t name; };
+  std::vector<RowLink> rowLinks;
+  // After the solve: the pure rows' indirect calls against the solver's
+  // targets (Containers.cc).
+  void checkContainerPremises(bool stopped);
   std::unordered_map<const llvm::Instruction *, std::string> poolCarves;
   // A carve's size (plan 3.53 row 1), by form: before-bump the bump n,
   // counter the decrement, minus-len the length, all n * scale bytes;

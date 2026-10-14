@@ -1584,3 +1584,40 @@ bfd_hash_traverse DISPATCH(arg1:f0<-**arg0@0) DISPATCH(arg1:f1<-arg2)
 bfd_link_hash_traverse DISPATCH(arg1:f0<-**arg0@0) DISPATCH(arg1:f1<-arg2)
 htab_traverse_noresize DISPATCH(arg1:f0<-*arg0@24) DISPATCH(arg1:f1<-arg2)
 htab_traverse DISPATCH(arg1:f0<-*arg0@24@htab_traverse_noresize) DISPATCH(arg1:f1<-arg2@htab_traverse_noresize)
+
+# ---- Containers (plan 3.55 deliverable 1; hand rows, Fable 2026-10-13) ----
+# A container's rows name each function's role on the owner its OWNER(argN)
+# points to. Under --cfl-cells the engine checks obligations O1-O6 (storage
+# closure, element provenance and containment, leaf premises, body reads)
+# and applies a VERIFIED container's rows per call site: an insert's element
+# flows into the owner's element cell (O, "C.elems"); a lookup's result is
+# that cell (plus null). Rows of an unverified container are not applied.
+# Premise of every row: the owner's elements are reached only through the
+# container's functions and the owner's closed storage (O1-O3, checked).
+@container sqlite3_hash
+# sqlite3's Hash (count, htsize, first, ht): the data pointer kept per key;
+# the HashElem is the body's own object; sqlite3HashInsert(pH, key, data)
+# returns the replaced data (or the new data when it cannot allocate), and
+# data == 0 removes the key (a no-op under may semantics).
+sqlite3HashInsert ROLE(insert) OWNER(arg0) ELEM(arg2)
+sqlite3HashFind ROLE(lookup) OWNER(arg0)
+# sqlite3HashClear frees every element and resets the table (a remove: no
+# effect under may semantics); the benign-malloc brackets and
+# sqlite3MallocSize are leaves (their indirect calls are checked).
+sqlite3HashClear ROLE(remove) OWNER(arg0)
+strHash ROLE(pure)
+sqlite3BeginBenignMalloc ROLE(pure)
+sqlite3EndBenignMalloc ROLE(pure)
+sqlite3MallocSize ROLE(pure)
+@container end
+@container bfd_hash
+# binutils' generic hash table: entries made by the table's newfunc (a
+# code field fed at bfd_hash_table_init_n), chained from table->table.
+bfd_hash_lookup ROLE(lookup) OWNER(arg0) CREATE(arg2) ELEM(ret)
+bfd_hash_insert ROLE(insert) OWNER(arg0) ELEM(ret)
+bfd_hash_replace ROLE(insert) OWNER(arg0) ELEM(arg2)
+# bfd_hash_rename re-files an element of the table under a new string.
+bfd_hash_rename ROLE(insert) OWNER(arg0) ELEM(arg2)
+bfd_hash_allocate ROLE(carve) POOL(arg0)
+bfd_hash_hash ROLE(pure)
+@container end

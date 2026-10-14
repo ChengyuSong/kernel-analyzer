@@ -1525,6 +1525,75 @@ from C to each (O, C). A read through the raw pointer after an owner's
 write would miss that write (unsound), and edges both ways would merge
 every owner's contents through C (no precision).
 
+**Container rows** (plan 3.55 deliverable 1; func_summaries.txt `@container`
+blocks, Containers.cc; Fable 2026-10-13/14). A row names a function's role on
+the owner at OWNER(argN). Before any row is applied, the engine checks the
+container; failing any obligation REJECTS it (its rows are not applied, the
+bodies are solved as today).
+- The body: the row functions, the functions only they call (direct
+  calls, address never taken), the constants fed into a closed code field
+  (below) and what only those call.
+- Derivation: a value of a body function is derived from its owner o when
+  loaded through o's closed handle fields, or through LINK fields (pointer
+  members of the container's structs that point back into them: next, prev,
+  a bucket's chain) or storage slots of a derived value; another member is
+  the element's payload. A fresh block the body makes, and an insert's
+  ELEM(argN), count as the owner's new elements under O3's containment.
+  Across body calls a formal is derived when every body call passes a value
+  derived from the same caller owner value, with the owner passed too.
+  The null part of a class is ignored at a load or a store (it never
+  executes).
+- O1: every handle and link field is closed: every store into it is a
+  fresh feed, null, a same-owner re-store, or an element moving within one
+  owner (a derived, new or null value stored, in the body, into the owner
+  or one of its elements). A field's feed set is computed through
+  non-escaping formals, each call site's actual judged at its caller.
+- O2: a lookup returns null, a derived value, a payload of one, or an
+  insert row's result.
+- O3: an insert's element, and every fresh block the body makes, goes only
+  into the owner's storage: stores into the owner or its elements, writes
+  through it, reads (a copy's source), zeroing, a body helper's or a row's
+  formal (checked there), a no-op callee, returned. A block copy INTO it is
+  a store of the source's fields: the source must be derived or fresh
+  (per-field decomposition).
+- O4: every callee outside the body is a row of the container, a carve
+  row, an allocation or a free, a prover no-op, a pure row, or does not
+  return. An indirect call through a closed code field calls its fed
+  constants (code-field closure: every store into the field is a function
+  constant, a formal fed only by constants, null or a same-owner reload; an
+  aggregate copy of the owner opens it); the solver's targets at that site
+  are checked to agree (post-solve). A pure row's own indirect calls are a
+  premise checked after the solve against the solver's targets (no target,
+  or each target with no pointer store, no block copy, no indirect call);
+  a check made at a stop is labeled so, and no number comes from it.
+- O6: every element pointer field the body reads is one the body writes.
+- Sentinel element (a checked identity guard): a zero-initialized global of
+  a container struct the body hands out as an element ("absent"). (s1) its
+  address stays in the body: never stored to memory, never returned by a
+  row, never passed out; (s2) a guard field g, a pointer zero in the
+  initializer; (s3) every store (and block write) through a pointer that
+  may be the sentinel is dominated by a test `p->g != null` on the same
+  pointer value (the SSA value, or a reload of a slot stored once, so no
+  store lies between the test and the reload); there, p is not the
+  sentinel. The induction: base, the zero initializer; step, a store into
+  the sentinel's g would need the sentinel's g non-null, false. (s4) a
+  field is concluded null in the sentinel only when every store into it is
+  in the guarded set. Loads of such fields through a may-sentinel pointer
+  contribute null.
+
+**Transfer and adoption.** At a call site OUTSIDE the body, a verified
+row's transfer replaces the call's result: an insert's element flows into
+the owner's element cell (O, "C.elems") for every O in pts(owner actual);
+a lookup's result is that cell (plus null); the argument-to-formal wiring
+stays, so the body's own side effects through the arguments (counts, the
+storage stores) remain, and the body is still solved for its own callers.
+The element cell is its own node, outside every content cell, so no other
+access reads or writes it. Single-callsite merges (global dedup) skip row
+functions: the call's result must not be the body's return. Sound given
+O1-O4 and O6: nothing else can hold an element's address before a lookup
+returns it except the owner's closed storage, so every element a lookup
+can find was inserted through a row into that owner's cell.
+
 Not mechanized. The census re-cut (nm-new, sqlite3; tcpdump unchanged)
 measures it after the gates.
 

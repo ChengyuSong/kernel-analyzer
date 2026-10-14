@@ -168,6 +168,9 @@ struct Obj {
   // Declared at mint as an array of its element (a scalar, ruling A; a
   // pointer slot, 1b's T**): every element is named, no extent rule.
   bool declArray = false;
+  // A segment the site indexes by a stride of its struct: an array of it
+  // without an extent (the struct analogue of declArray).
+  bool segArray = false;
   // Widened from T to a container S that has T at offset 0 (row 2): the
   // cells inside T keep T's names (widenLabel+c for c < widenSize).
   std::string widenLabel;
@@ -1666,7 +1669,8 @@ bool CallGraphPass::runCellResolution() {
   };
   // The address fact (o, off): exact, or folded (off is element 0's).
   // The trailing object of header+tail object o, minted on first use.
-  size_t tailMinted = 0, tailMoved = 0, segmentsLabeled = 0;
+  size_t tailMinted = 0, tailMoved = 0, segmentsLabeled = 0, segmentArrays = 0, segmentsBytes = 0,
+         segmentsPtrArrays = 0, segmentsScalarArrays = 0;
   // Tails a variable index linked while unlabeled, and how many of them a
   // later first typed use labeled (rule 1's own solve order; counted).
   boost::unordered_flat_set<uint32_t> tailLinkedUnlabeled;
@@ -2406,13 +2410,59 @@ bool CallGraphPass::runCellResolution() {
     if (sit == allocSegments.end()) return;
     auto bit = sit->second.find(T.base);
     if (bit == sit->second.end()) return;
+    // A segment declared by a receiver of another kind, as the result's
+    // receiver declares the block (Fable 2026-10-13): bytes (char *), byte-
+    // used from mint; an array of pointer slots (T **) or of a declared
+    // scalar, every element named, no extent rule.
+    const StringRef K = bit->second;
+    if (K == "bytes") {
+      T.byteAccessed = true;
+      segmentsBytes++;
+      return;
+    }
+    if (K.starts_with("ptr[]:") || K.starts_with("scal[]:")) {
+      LLVMContext &Cx = V->getContext();
+      if (K.starts_with("ptr[]:")) {
+        T.layout = PointerType::get(Cx, 0);
+        T.ident = K.drop_front(6).str() + "[]";
+        segmentsPtrArrays++;
+      } else {
+        const StringRef e = K.drop_front(7);
+        unsigned bits = 0;
+        T.layout = e == "float" ? Type::getFloatTy(Cx)
+                   : e == "double" ? Type::getDoubleTy(Cx)
+                   : e == "half" ? Type::getHalfTy(Cx)
+                   : e.drop_front(1).getAsInteger(10, bits) ? nullptr
+                                                            : (Type *)IntegerType::get(Cx, bits);
+        assert(T.layout && "a scalar label names a scalar type");
+        T.ident = e.str() + "[]";
+        T.declScalar = true;
+        segmentsScalarArrays++;
+      }
+      T.size = (int64_t)DL.getTypeAllocSize(T.layout);
+      T.label = typeLabel(T.layout);
+      T.repeats = true;
+      T.declArray = true;
+      segmentsLabeled++;
+      return;
+    }
     StructType *B = StructType::getTypeByName(V->getContext(), bit->second);
     if (!B || B->isOpaque() || !B->isSized()) return;
     T.layout = B;
     T.size = (int64_t)DL.getTypeAllocSize(B);
     T.label = typeLabel(B);
-    setExtent(T, V); // one B, an array of B, or B and a further tail (recursively)
     segmentsLabeled++;
+    // The site indexes it by a stride of B (`&VdbeFrameMem(p)[n]`): an
+    // array of B without an extent, every element named, no tail; data
+    // after it at a variable offset folds into B's element cells.
+    if (auto ait = allocSegmentArrays.find(V); ait != allocSegmentArrays.end() && ait->second.count(T.base)) {
+      T.repeats = true;
+      T.declArray = true;
+      T.segArray = true;
+      segmentArrays++;
+      return;
+    }
+    setExtent(T, V); // one B, an array of B, or B and a further tail (recursively)
   };
   // Row 2 (plan 3.53, Fable 2026-10-13): a struct step naming S at the
   // start of an object labeled T, where S has T at offset 0 (the
@@ -2905,6 +2955,7 @@ bool CallGraphPass::runCellResolution() {
   // of s-byte elements (stride 1: bytes). An index from an address in no
   // array is undefined behavior: counted, the address stays.
   size_t indexInBoundedArray = 0; // a variable index into a declared array field within T: within its bound
+  size_t segArrayOtherStride = 0; // another stride over a segment array: data after it, folded
   size_t indexOutsideArray = 0, indexAsOffset = 0, indexStays = 0, leafMerges = 0, byteStepUB = 0,
          byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0,
          byteWalkStays = 0, byteWalkStructRel = 0;
@@ -3049,6 +3100,16 @@ bool CallGraphPass::runCellResolution() {
         }
       } else
         indexInBoundedArray++;
+    }
+    if (!inArray && O.segArray && s % O.size != 0) {
+      // Another stride over a segment array of T (`(VdbeCursor **)&aMem[n]`:
+      // the data after the array at a variable offset): it may land on any
+      // element offset its stride reaches, folded into T's element cells
+      // (rule (b), flow kept; counted).
+      segArrayOtherStride++;
+      const int64_t g = std::gcd(s, O.size);
+      for (int64_t j = pos % g; j < O.size; j += g) out.push_back(cellAtArr(o, j));
+      return;
     }
     if (!inArray) {
       // No array inside the layout holds the address: an array of the
@@ -6740,7 +6801,9 @@ bool CallGraphPass::runCellResolution() {
 
   CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
          << walkSteps << " walk steps, " << indexOutsideArray
-         << " variable indexes on a single object (array of one), " << indexStays
+         << " variable indexes on a single object (array of one), " << segArrayOtherStride
+         << " other strides over a segment array of a struct (data after it at a variable offset, folded), "
+         << indexStays
          << " constant indexes staying in their array, " << indexAsOffset
          << " constant indexes outside an array of their element (byte offsets), "
          << "byte offsets from inside a byte array: " << byteStepStays << " stay in it, "
@@ -7844,7 +7907,10 @@ bool CallGraphPass::runCellResolution() {
       std::chrono::duration<double>(Clock::now() - t0).count();
   CG_LOG("Cells: iteration " << iteration << ": " << objs.size()
          << " origins (" << funcSeeds << " function seeds, " << objSeeds
-         << " objects (" << tailMinted << " trailing, " << segmentsLabeled << " of them segments the site declares, "
+         << " objects (" << tailMinted << " trailing, " << segmentsLabeled << " of them segments the site declares ("
+         << segmentArrays << " arrays of their struct without an extent, " << segmentsPtrArrays
+         << " arrays of pointer slots, " << segmentsScalarArrays << " arrays of a declared scalar; "
+         << segmentsBytes << " more byte-used from mint by a char receiver), "
          << trailingArrays << " of them arrays of unknown extent, " << tailMoved
          << " cells moved to them); heap " << heapLabeled << " labeled (" << heapPtrArrays
          << " arrays of pointer slots, " << heapScalarArrays << " arrays of a declared scalar, " << tailObjects
@@ -8411,12 +8477,19 @@ bool CallGraphPass::runCellResolution() {
     RO << "SUMMARY sites " << censusSites << " allocation sites: " << censusStructFieldOnly
        << " whose only receiver is a struct-pointer field (no declaration: a base-class slot), "
        << censusSharedDeclared << " declared through a shared slot (uses not followed), " << censusUndeclared
-       << " with no declaration (" << censusUnclassified << " result slots also hold another value)\n";
+       << " with no declaration (" << censusUnclassified << " result slots also hold another value; "
+       << censusReachedReloads << " of those sites have reloads only their own store reaches: followed for segments)\n";
+    RO << "SUMMARY segments declared by a receiver: " << censusSegments[0] << " a struct (" << censusSegments[1]
+       << " indexed by a stride of it: arrays without an extent), " << censusSegments[2] << " arrays of pointer slots, "
+       << censusSegments[3] << " arrays of a declared scalar, " << censusSegments[4] << " bytes (a char receiver); "
+       << censusSegFieldSites << " sites through a struct field receiving the address\n";
     RO << "SUMMARY a " << aData << " pointers from data, " << aConst
        << " from constant addresses, " << aLost << " from pointers lost before the cast\n";
     RO << "SUMMARY b " << ruleB << " member steps whose struct is not at the address's offset ("
        << ruleBPairs.size() << " object label / struct pairs); struct written into storage declared scalar: "
-       << scalarStructWrites << " writes (" << scalarStructSteps << " struct steps)\n";
+       << scalarStructWrites << " writes (" << scalarStructSteps << " struct steps); struct array followed by other "
+       << "data at a variable offset (another stride over a segment array, folded into its element cells): "
+       << segArrayOtherStride << " steps\n";
     // Rule 4: one row per (site, source label, destination label); types
     // that print as one label (renamed copies of a struct) are one row.
     std::map<std::string, size_t> relayLines;

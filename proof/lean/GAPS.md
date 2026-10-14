@@ -1082,12 +1082,41 @@ its uses are followed only under the single-store or cursor condition.
 Sound as ruling A: the declaration is what the program wrote for the
 variable; a block too small or large for it is the extent rule's
 business. Counted (SUMMARY sites): "declared through a shared slot" and
-"with no declaration" (the genuinely kindless). A declared scalar array takes no extent
+"with no declaration" (the genuinely kindless). A site with no receiving
+variable (its result returned or passed straight to a call) declares
+nothing; counted (census line: "with no receiving variable"). Following
+the result into the callee's formal (part 3) is not built: by the per-site
+rule such sites are rarely heavy (Fable 2026-10-13). A declared scalar array takes no extent
 rule: its element label already names every element, and the extent rule
 can only cut a tail, which a scalar array has none of. The same holds
 for a pointer-slot array declared at mint (1b's T** receiver): its label
 names every slot, it takes no extent rule, and a mismatched struct write
-folds into slot cells with the flow kept (Fable 2026-10-13). Uses inside a callee the
+folds into slot cells with the flow kept (Fable 2026-10-13). The third
+form, a struct (Fable 2026-10-13, sqlite3's OP_Program frame): a declared
+segment of struct T that the site also indexes by a variable index of T
+(`pEnd = &VdbeFrameMem(pFrame)[n]`; not a carve, whose result is used as
+another type, and not a constant step, `(C *)&b[1]` being the next
+segment's start) is an array of T without an extent: every element
+named by T's field cells, no tail. Data after it at a variable offset
+(`p->apCsr = (VdbeCursor **)&aMem[nMem]`, a field receiver, so no carve)
+reaches it by another stride, which folds into T's element cells at
+every offset the stride reaches (rule (b), flow kept; counted "struct
+array followed by other data at a variable offset"). Sound as the other
+two: the label names every element, and a mismatched stride lands in the
+element cells it can touch. Receiver kinds apply to every declared
+segment as to the result (Fable 2026-10-13, sqlite3's jsonParseCached):
+an address `p + c` (c > 0) received by a variable or a struct field
+declares the segment at c by the receiver's kind: a struct (a variable
+only; a struct-pointer field is row 3's base-class slot), an array of
+pointer slots (T **), of a declared scalar, or byte storage (char *:
+`p->zJson = (char *)&p[1]`, used as bytes from mint, inert: a mark, not
+a label). Counted by kind ("SUMMARY segments declared by a receiver").
+A result slot that also holds other values is followed for SEGMENTS only
+through its reloads that the site's store alone reaches (pFrame,
+assigned four ways in sqlite3VdbeExec; the reloads after the allocation
+are the block): such a reload holds exactly the result, as a single-store
+slot's reloads do; the site stays unclassified for its scalar and bytes
+marks. Counted (SUMMARY sites). Uses inside a callee the
 block is passed to are not followed (part 3, callee formals: not built;
 neither example needed it). Neither part has a soundness premise: the label or mark
 changes which cell a later struct write lands in, never whether it

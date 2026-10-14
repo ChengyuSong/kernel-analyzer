@@ -147,6 +147,9 @@ bool isPtrWidthInt(const Type *T, const DataLayout &DL);
 bool linkerBoundsSectionKeys(StringRef N, std::vector<std::string> &exact, std::vector<std::string> &prefix);
 bool linkerExcludedFamily(StringRef K);
 const AllocaInst *spillSlotOf(const Value *v);
+// --cfl-cells carving (GraphBuild.cc): `&a[n]` used as another type starts
+// a region of its own; `why` names the other type.
+bool carvingGEP(const GetElementPtrInst &GEP, std::string &why);
 void reachingSlotStoresOf(const LoadInst *L, const AllocaInst *AI, SmallVectorImpl<const StoreInst *> &out);
 void loadFuncSummaries(GlobalContext *Ctx, const std::string &path);
 const GlobalContext::FuncSummary * summaryForName(GlobalContext *Ctx, StringRef name, bool hasBody = false);

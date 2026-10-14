@@ -246,9 +246,59 @@ void CallGraphPass::labelAllocationSites(
       return "";
     }
   };
+  // A variable of debug type char * (any 8-bit character or byte type, not
+  // bool): byte storage.
+  auto diCharPointer = [](const DIType *T) {
+    auto strip = [](const DIType *X) {
+      for (int i = 0; i < 16 && X; i++) {
+        const auto *D = dyn_cast<DIDerivedType>(X);
+        if (!D) break;
+        const auto tag = D->getTag();
+        if (tag != dwarf::DW_TAG_typedef && tag != dwarf::DW_TAG_const_type &&
+            tag != dwarf::DW_TAG_volatile_type && tag != dwarf::DW_TAG_restrict_type)
+          break;
+        X = D->getBaseType();
+      }
+      return X;
+    };
+    const auto *P = dyn_cast_or_null<DIDerivedType>(strip(T));
+    if (!P || P->getTag() != dwarf::DW_TAG_pointer_type) return false;
+    const auto *B = dyn_cast_or_null<DIBasicType>(strip(P->getBaseType()));
+    if (!B || B->getSizeInBits() != 8) return false;
+    const unsigned e = B->getEncoding();
+    return e == dwarf::DW_ATE_signed_char || e == dwarf::DW_ATE_unsigned_char || e == dwarf::DW_ATE_signed ||
+           e == dwarf::DW_ATE_unsigned;
+  };
   auto labelSite = [&](const CallBase *C) {
     AllocSiteLabel L;
     const DataLayout &DL = C->getModule()->getDataLayout();
+    // The declared type of struct S's member starting at byte off (through
+    // nested struct members), or null.
+    auto diMemberAt = [&](const DICompositeType *Cc, uint64_t off) -> const DIType * {
+      for (int depth = 0; Cc && depth < 8; depth++) {
+        const DIDerivedType *In = nullptr;
+        for (const DINode *E : Cc->getElements()) {
+          const auto *D = dyn_cast<DIDerivedType>(E);
+          if (!D || D->getTag() != dwarf::DW_TAG_member || D->isStaticMember()) continue;
+          const uint64_t MO = D->getOffsetInBits() / 8, MS = (D->getSizeInBits() + 7) / 8;
+          if (MO == off && !isa_and_nonnull<DICompositeType>(D->getBaseType())) return D->getBaseType();
+          if (off >= MO && off < MO + MS) In = D;
+        }
+        if (!In) return nullptr;
+        const DIType *MT = In->getBaseType();
+        while (const auto *DD = dyn_cast_or_null<DIDerivedType>(MT))
+          if (DD->getTag() == dwarf::DW_TAG_typedef || DD->getTag() == dwarf::DW_TAG_const_type ||
+              DD->getTag() == dwarf::DW_TAG_volatile_type)
+            MT = DD->getBaseType();
+          else
+            break;
+        const auto *MC = dyn_cast_or_null<DICompositeType>(MT);
+        if (!MC || MC->getTag() != dwarf::DW_TAG_structure_type) return nullptr;
+        off -= In->getOffsetInBits() / 8;
+        Cc = MC;
+      }
+      return nullptr;
+    };
     // The variable that receives the result, by its declared type (plan
     // 3.53 1b: the site's own declaration comes first): a dbg.value on the
     // result, or the slot the result is stored to (dbg.declare).
@@ -264,33 +314,6 @@ void CallGraphPass::labelAllocationSites(
         if (L.siteScalar.empty())
           L.siteScalar = diScalar(DV->getVariable()->getType());
       }
-      // The declared type of struct S's member starting at byte off (through
-      // nested struct members), or null.
-      auto diMemberAt = [&](const DICompositeType *Cc, uint64_t off) -> const DIType * {
-        for (int depth = 0; Cc && depth < 8; depth++) {
-          const DIDerivedType *In = nullptr;
-          for (const DINode *E : Cc->getElements()) {
-            const auto *D = dyn_cast<DIDerivedType>(E);
-            if (!D || D->getTag() != dwarf::DW_TAG_member || D->isStaticMember()) continue;
-            const uint64_t MO = D->getOffsetInBits() / 8, MS = (D->getSizeInBits() + 7) / 8;
-            if (MO == off && !isa_and_nonnull<DICompositeType>(D->getBaseType())) return D->getBaseType();
-            if (off >= MO && off < MO + MS) In = D;
-          }
-          if (!In) return nullptr;
-          const DIType *MT = In->getBaseType();
-          while (const auto *DD = dyn_cast_or_null<DIDerivedType>(MT))
-            if (DD->getTag() == dwarf::DW_TAG_typedef || DD->getTag() == dwarf::DW_TAG_const_type ||
-                DD->getTag() == dwarf::DW_TAG_volatile_type)
-              MT = DD->getBaseType();
-            else
-              break;
-          const auto *MC = dyn_cast_or_null<DICompositeType>(MT);
-          if (!MC || MC->getTag() != dwarf::DW_TAG_structure_type) return nullptr;
-          off -= In->getOffsetInBits() / 8;
-          Cc = MC;
-        }
-        return nullptr;
-      };
       SmallVector<const Value *, 4> vs{C};
       for (size_t i = 0; i < vs.size() && L.siteDeclared.empty() && L.sitePtrArray.empty() && i < 8; i++)
         for (const User *U : vs[i]->users()) {
@@ -352,6 +375,18 @@ void CallGraphPass::labelAllocationSites(
       if (seen.insert(V).second)
         work.emplace_back(V, off);
     };
+    // A receiver's kind for a segment, as for the result (Fable 2026-10-13:
+    // receiver kinds apply to every declared segment): its struct; an array
+    // of pointer slots (T **); of a declared scalar (float *, int *); bytes
+    // (char *: `p->zJson = (char *)&p[1]`, byte-used from mint). A struct-
+    // pointer FIELD declares nothing (row 3: a base-class slot).
+    auto segKind = [&](const DIType *T, bool field) -> std::string {
+      if (!T) return "";
+      if (std::string S = diPointee(T, C->getModule()); !S.empty()) return field ? "" : S;
+      if (std::string P = diPtrArray(T); !P.empty()) return "ptr[]:" + P;
+      if (std::string E = diScalar(T); !E.empty()) return "scal[]:" + E;
+      return diCharPointer(T) ? "bytes" : "";
+    };
     auto segment = [&](int64_t off, const std::string &B) {
       if (off <= 0 || B.empty()) return;
       auto [it, ins] = L.segments.try_emplace(off, B);
@@ -366,15 +401,30 @@ void CallGraphPass::labelAllocationSites(
       if (off <= 0 || depth > 8 || !segSeen.insert({V, off}).second) return;
       SmallVector<DbgValueInst *, 2> DVs;
       findDbgValues(DVs, const_cast<Value *>(V));
-      for (DbgValueInst *DV : DVs) segment(off, diPointee(DV->getVariable()->getType(), C->getModule()));
+      for (DbgValueInst *DV : DVs) segment(off, segKind(DV->getVariable()->getType(), false));
       for (const User *U : V->users()) {
         if (const auto *CI = dyn_cast<CastInst>(U)) {
           if (CI->getType()->isPointerTy()) segWalk(CI, off, depth + 1);
         } else if (const auto *SI = dyn_cast<StoreInst>(U); SI && SI->getValueOperand() == V) {
           const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts());
-          if (!AI) continue;
+          if (!AI) {
+            // A struct field receiving the segment's address (`p->zJson =
+            // (char *)&p[1]`): its declared member type.
+            const auto *FG = dyn_cast<GEPOperator>(SI->getPointerOperand()->stripPointerCasts());
+            auto *FS = FG ? dyn_cast<llvm::StructType>(FG->getSourceElementType()) : nullptr;
+            const auto *F0 = FG && FG->getNumIndices() ? dyn_cast<ConstantInt>(*FG->idx_begin()) : nullptr;
+            APInt FA0(64, 0);
+            if (namedStruct(FS) && F0 && F0->isZero() && FG->accumulateConstantOffset(DL, FA0)) {
+              StringRef Tag = stripStructNameSuffix(FS->getName());
+              Tag.consume_front("struct.");
+              const std::string k = segKind(diMemberAt(accessNames->diStruct(Tag), FA0.getZExtValue()), true);
+              segment(off, k);
+              if (!k.empty()) L.segFieldReceivers++;
+            }
+            continue;
+          }
           for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
-            segment(off, diPointee(DDI->getVariable()->getType(), C->getModule()));
+            segment(off, segKind(DDI->getVariable()->getType(), false));
           const FnAddrs &FA = addrsOf(SI->getFunction());
           const std::string K = addrKey(SI->getPointerOperand(), 0);
           auto st = FA.stores.find(K);
@@ -389,6 +439,17 @@ void CallGraphPass::labelAllocationSites(
             for (const User *GU : G->users())
               if (const auto *S2 = dyn_cast<StoreInst>(GU)) written |= S2->getPointerOperand() == G;
             if (written) segment(off, structKey(ST));
+          } else if (namedStruct(ST) && G->getNumIndices() == 1 && !I0) {
+            // A variable index of ST from the segment's start
+            // (`&VdbeFrameMem(pFrame)[n]`): an array of ST. Not a carve (the
+            // result used as another type starts the next region), and not a
+            // constant step (`(C *)&b[1]` is the next segment's start).
+            std::string why;
+            const auto *GI = dyn_cast<GetElementPtrInst>(G);
+            if (GI && !carvingGEP(*GI, why)) {
+              auto [it, ins] = L.segStrides.try_emplace(off, structKey(ST));
+              if (!ins && it->second != structKey(ST)) it->second.clear();
+            }
           }
           APInt A(64, 0);
           if (G->accumulateConstantOffset(DL, A)) segWalk(G, off + A.getSExtValue(), depth + 1);
@@ -523,6 +584,36 @@ void CallGraphPass::labelAllocationSites(
               }
               if (!cursor) {
                 L.slotUnclassified = true;
+                // Its reloads that only this store reaches (sqlite3's
+                // OP_Program: pFrame is assigned four ways; the reloads
+                // after the allocation are the block) hold exactly the
+                // result: as a single-store slot's reloads, they declare
+                // segments (VdbeFrameMem(pFrame) at 128). Only segments: the
+                // site stays unclassified for its scalar and bytes marks. A
+                // slot whose address is used otherwise is not followed.
+                bool spill = true;
+                for (const User *SU : Slot->users())
+                  if (const auto *S3 = dyn_cast<StoreInst>(SU)) spill &= S3->getPointerOperand() == Slot;
+                  else spill &= isa<LoadInst>(SU) || isa<DbgInfoIntrinsic>(SU);
+                if (auto ld = FA.loads.find(K); spill && ld != FA.loads.end())
+                  for (const LoadInst *LI : ld->second) {
+                    if (LI->getPointerOperand()->stripPointerCasts() != Slot) continue;
+                    SmallVector<const StoreInst *, 4> defs;
+                    reachingSlotStoresOf(LI, Slot, defs);
+                    if (defs.empty() || llvm::any_of(defs, [&](const StoreInst *D) { return D != SI; })) continue;
+                    L.reachedReloads++;
+                    std::function<void(const Value *, int)> fromReload = [&](const Value *R, int depth) {
+                      for (const User *RU : R->users())
+                        if (const auto *RC = dyn_cast<CastInst>(RU); RC && RC->getType()->isPointerTy() && depth < 4)
+                          fromReload(RC, depth + 1);
+                        else if (const auto *RG = dyn_cast<GEPOperator>(RU); RG && RG->getPointerOperand() == R) {
+                          APInt A(64, 0);
+                          if (RG->accumulateConstantOffset(DL, A) && A.getSExtValue() > 0)
+                            segWalk(RG, A.getSExtValue(), 0);
+                        }
+                    };
+                    fromReload(LI, 0);
+                  }
                 std::string var = "unnamed slot";
                 for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(Slot)))
                   if (auto *Var = DDI->getVariable()) {
@@ -622,6 +713,7 @@ void CallGraphPass::staticLabels(
   size_t allocCalls = 0, wrapperCalls = 0;
   labelAllocationSites(siteLabel, allocCalls, wrapperCalls);
   allocSegments.clear();
+  allocSegmentArrays.clear();
   allocBytesOnly.clear();
   std::set<const Value *> segSeen;
   // Ruling A (plan 3.53, completes 1b): a site that declares nothing of a
@@ -721,9 +813,10 @@ void CallGraphPass::staticLabels(
     if (b) allocBytesOnly.insert(A);
   {
     size_t field = 0, cursor = 0, unclassified = 0, scalars = 0, structField = 0, sharedDeclared = 0,
-           undeclared = 0, undeclaredByRule = 0;
+           undeclared = 0, undeclaredByRule = 0, reached = 0;
     for (auto &[C, SL] : siteLabel) {
       field += SL.fieldReceiver;
+      reached += SL.reachedReloads > 0;
       cursor += SL.cursorSlot;
       unclassified += SL.slotUnclassified;
       const bool decl = !SL.siteDeclared.empty() || !SL.sitePtrArray.empty() || !SL.siteScalar.empty();
@@ -732,17 +825,26 @@ void CallGraphPass::staticLabels(
       sharedDeclared += SL.slotUnclassified && decl;
       undeclared += !decl && !sfOnly;
       undeclaredByRule += !decl && !sfOnly && SL.hasReceiver;
+      if (!decl && !sfOnly && !SL.hasReceiver && VerboseLevel >= 3) {
+        const Function *CF = C->getCalledFunction();
+        CG_DEBUG("TypeLabels: no receiving variable: " << C->getFunction()->getName() << "::call "
+                 << (CF ? CF->getName() : StringRef("?")) << "\n");
+      }
     }
     censusSites = siteLabel.size();
     censusStructFieldOnly = structField;
     censusUnclassified = unclassified;
     censusSharedDeclared = sharedDeclared;
     censusUndeclared = undeclared;
+    censusReachedReloads = reached;
+    censusSegFieldSites = 0;
+    for (auto &[C, SL] : siteLabel) censusSegFieldSites += SL.segFieldReceivers > 0;
     for (auto &[A, e] : scalarAgreed) scalars += !e.empty();
     CG_LOG("TypeLabels: allocation sites " << siteLabel.size() << ": " << field
            << " receivers are struct fields (their declared member type, 1b), " << cursor
            << " result slots are cursors walking the block (followed), " << unclassified
-           << " result slots also hold other values (unclassified); " << scalars
+           << " result slots also hold other values (unclassified), " << reached
+           << " of them have reloads only their own store reaches (followed for segments); " << scalars
            << " allocations scalar-only, " << allocBytesOnly.size() << " bytes-only at every creating site; "
            << structField << " sites whose only receiver is a struct-pointer field (no declaration); "
            << sharedDeclared << " declared through a shared slot; " << undeclared << " with no declaration ("
@@ -758,8 +860,18 @@ void CallGraphPass::staticLabels(
       std::map<int64_t, std::string> seg;
       for (auto &[c, B] : SL.segments)
         if (!B.empty()) seg[c] = B;
-      if (segSeen.insert(A).second) allocSegments[A] = std::move(seg);
-      else if (allocSegments[A] != seg) allocSegments[A].clear();
+      // The ones the site also indexes by a stride of their struct: arrays
+      // of it without an extent.
+      std::set<int64_t> arr;
+      for (auto &[c, B] : seg)
+        if (auto st = SL.segStrides.find(c); st != SL.segStrides.end() && st->second == B) arr.insert(c);
+      if (segSeen.insert(A).second) {
+        allocSegments[A] = std::move(seg);
+        allocSegmentArrays[A] = std::move(arr);
+      } else {
+        if (allocSegments[A] != seg) allocSegments[A].clear();
+        if (allocSegmentArrays[A] != arr) allocSegmentArrays[A].clear();
+      }
       auto &L = out[A];
       // The receiving variable's declared struct first (1b), then the
       // typed writes, then a declared struct found along the result.
@@ -832,6 +944,22 @@ void CallGraphPass::staticLabels(
           decl(AI, AI->getAllocatedType(), DT);
         }
   }
+  // Segments by the kind their receivers declare (after agreement).
+  size_t sStruct = 0, sPtr = 0, sScal = 0, sBytes = 0, sArr = 0;
+  for (auto &[A, seg] : allocSegments)
+    for (auto &[c, k] : seg) {
+      const StringRef K = k;
+      if (K == "bytes") sBytes++;
+      else if (K.starts_with("ptr[]:")) sPtr++;
+      else if (K.starts_with("scal[]:")) sScal++;
+      else sStruct++;
+    }
+  for (auto &[A, arr] : allocSegmentArrays) sArr += arr.size();
+  censusSegments = {sStruct, sArr, sPtr, sScal, sBytes};
+  CG_LOG("TypeLabels: segments the sites declare: " << sStruct << " a struct (" << sArr
+         << " of them indexed by a stride of it: arrays without an extent), " << sPtr << " arrays of pointer slots, "
+         << sScal << " arrays of a declared scalar, " << sBytes << " bytes (a char receiver); "
+         << censusSegFieldSites << " sites declare one through a struct field receiving its address\n");
 }
 
 void CallGraphPass::runTypeLabelCensus(

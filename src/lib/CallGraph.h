@@ -293,11 +293,21 @@ protected:
     // declaration, its type declares nothing (char *, void *) by rule;
     // without one the result went straight to a return or a call.
     bool hasReceiver = false;
+    // Reloads of a shared result slot that only the site's store reaches
+    // (followed for segments only).
+    size_t reachedReloads = 0;
     // Segments declared at the site (plan 3.53 rule 1, extent): a constant
     // offset c > 0 of the result cast to B* (the receiving variable's
     // declared pointee) or written through a B struct GEP; "" when two
     // declarations disagree.
     std::map<int64_t, std::string> segments;
+    // A segment the site also indexes by a stride of its struct (`&aMem[i]`,
+    // `pMem++` on VdbeFrameMem(pFrame)): an array of it without an extent
+    // (the struct analogue of ruling A's scalar and 1b's pointer-slot
+    // arrays). Offset -> struct; "" when two strides disagree.
+    std::map<int64_t, std::string> segStrides;
+    // Segment declarations read from a struct field receiving the address.
+    size_t segFieldReceivers = 0;
   };
   void labelAllocationSites(
       std::unordered_map<const llvm::CallBase *, AllocSiteLabel> &siteLabel,
@@ -309,6 +319,8 @@ protected:
   // Per allocation call: the segments its creating sites declare (several
   // creating sites: kept only where they agree).
   std::unordered_map<const llvm::Value *, std::map<int64_t, std::string>> allocSegments;
+  // The offsets of those segments the site indexes as arrays of their struct.
+  std::unordered_map<const llvm::Value *, std::set<int64_t>> allocSegmentArrays;
   // Allocations every creating site uses only as bytes (char accesses,
   // string functions): marked used as bytes at mint (ruling A; a mark,
   // not a label).
@@ -318,7 +330,8 @@ protected:
   // sites whose receiver kind is unclassified (a result slot also holding
   // another value).
   size_t censusSites = 0, censusStructFieldOnly = 0, censusUnclassified = 0, censusSharedDeclared = 0,
-         censusUndeclared = 0;
+         censusUndeclared = 0, censusReachedReloads = 0, censusSegFieldSites = 0;
+  std::array<size_t, 5> censusSegments{}; // struct, of them arrays, ptr[], scal[], bytes
   // --cfl-union-keys: the key names of each keyed union access, filled by
   // runUnionCensus's inference before graph build, applied by the
   // load/store visitors (plan 3.17).

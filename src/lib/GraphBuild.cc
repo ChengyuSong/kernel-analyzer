@@ -4022,7 +4022,7 @@ static bool sameStructAsPointee(Type *T, const DIType *PT, const DataLayout &DL)
 }
 
 // Is GEP a carve? `why` gets the other type it is used as.
-static bool carvingGEP(const GetElementPtrInst &GEP, std::string &why) {
+bool carvingGEP(const GetElementPtrInst &GEP, std::string &why) {
   // A variable last index over an array of T: the pointer level (`&a[n]`)
   // or an array member (`&p->aToken[nToken]`, past a flexible array).
   if (GEP.getNumIndices() == 0 || isa<ConstantInt>((GEP.idx_end() - 1)->get()))

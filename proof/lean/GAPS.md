@@ -1265,6 +1265,45 @@ way in the redundancy report, with its own calls assumed fresh.
   fresh object at depth n. A call that does not terminate returns
   nothing.
 
+Init atoms carry their offsets (Fable 2026-10-14). An alloc-init
+wrapper's atoms ST(*ret <- argI), ST(*ret <- @g), the self-store and
+FreshSub were built at offset 0. Under cells, an allocator called inside
+a kept allocator body has no object (the outer FRESH stands for it), so
+the body's own stores write nothing and the atoms are the stores' only
+effect: `c->ops = g` landed in the object's first cell and a read of
+`c->ops` found nothing.
+- **Statement:** an init atom carries the byte offset of its store from
+  the fresh pointer (casts and constant GEPs accumulated); unknown
+  offsets (a variable index, a negative offset) are a write of unknown
+  extent. A composed init helper's offsets are from its object
+  parameter, and compose by adding the offset of that parameter inside
+  the fresh object. A self-store also carries the offset of the interior
+  address it stores. (Cells runs a field-sensitive graph, 13 buckets set
+  by --cfl-cells, so both offsets take exact field edges. Flows-to applies
+  a summary atom's offsets only under field buckets, --cfl-field-buckets
+  > 0, as --cfl-nexus-fields sets; with 0 buckets, the default "full",
+  "base" and "pexact" configurations, every atom reads and writes its
+  base cell and the offsets are inert.)
+- **Integer carriers:** a pointer-width integer stored through the fresh
+  pointer that graph build treats as a carrier (its int-store rule:
+  ptrtoint upstream, an integer formal, a load or a call) moves a
+  pointer. A constant ptrtoint is classified as its pointer (a global);
+  a ptrtoint instruction is already a side effect that refuses the
+  wrapper (R3). Any other carrier is classified by its sources, followed
+  through casts, arithmetic, joins and spill-slot reloads: a formal is
+  an argument atom (cflow's depmap_alloc stores `count` and a size
+  computed from it: ST(*ret<-arg0) ST(*ret@8<-arg0)), a ptrtoint
+  constant a global atom, a plain constant no source; a load from
+  memory or a call refuses the wrapper, as a stored loaded pointer does
+  (`init-int-carrier`). Helpers follow the same rule, and a
+  helper's integer-carrier store outside its object is a side effect
+  that rejects it.
+
+Cases: test/t_cells_freshinit.c (a global at +16, a helper's formal at
++40 through the helper's object at +32, a stored loaded pointer refused),
+test/t_cells_freshinit_int.c (constant ptrtoint stores) and
+test/t_cells_freshinit_intarg.c (an integer formal, its -O0 reload).
+
 ## Pool carves (Carves.cc checkPoolCarves, --cfl-pool-carves, 2026-10-12, plan 3.53 rule 3)
 
 **Invariant.** At a carve, every byte at or above the cursor has been

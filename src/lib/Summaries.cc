@@ -23,6 +23,70 @@ static std::map<std::string, size_t> g_escapeBuckets;
 // certificate.
 static std::set<const llvm::Instruction *> g_poolCertExempt;
 static std::map<std::string, size_t> g_escapeCallees;
+
+// An init store's place in the fresh object: the constant byte offset of
+// address P from the pointer its cast and constant-GEP chain starts at;
+// -1 (a write of unknown extent) for a variable index or a negative
+// offset.
+static int initOffset(const llvm::Value *P, const llvm::DataLayout &DL) {
+  const llvm::Value *X = P->stripPointerCasts();
+  int64_t off = 0;
+  while (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(X)) {
+    llvm::APInt Ap(DL.getIndexTypeSizeInBits(G->getType()), 0);
+    if (!G->accumulateConstantOffset(DL, Ap)) return -1;
+    off += Ap.getSExtValue();
+    X = G->getPointerOperand()->stripPointerCasts();
+  }
+  return off < 0 || off > INT32_MAX ? -1 : (int)off;
+}
+// A pointer-carrying integer's sources (Fable 2026-10-14): what its bits
+// can come from, through casts, arithmetic, joins and spill-slot reloads.
+// A formal of F (an argument atom), a global (a ptrtoint constant) and a
+// pure constant (no source) are what an init atom can name; a load from
+// memory or a call is not, and refuses (false).
+static bool intCarrierSources(const llvm::Value *V, const llvm::Function &F,
+                              llvm::SmallVectorImpl<int> &args,
+                              llvm::SmallVectorImpl<const llvm::GlobalValue *> &globs,
+                              llvm::SmallPtrSetImpl<const llvm::Value *> &seen, unsigned depth) {
+  using namespace llvm;
+  if (!seen.insert(V).second) return true;
+  if (depth == 0) return false;
+  if (isa<ConstantInt>(V) || isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return true;
+  if (const auto *A = dyn_cast<Argument>(V)) {
+    if (A->getParent() != &F) return false;
+    args.push_back((int)A->getArgNo());
+    return true;
+  }
+  if (const auto *G = dyn_cast<GlobalValue>(V)) {
+    globs.push_back(G);
+    return true;
+  }
+  if (const auto *P = dyn_cast<PtrToIntOperator>(V))
+    return intCarrierSources(P->getPointerOperand()->stripPointerCasts(), F, args, globs, seen, depth - 1);
+  if (const auto *L = dyn_cast<LoadInst>(V)) {
+    const AllocaInst *AI = spillSlotOf(L->getPointerOperand());
+    if (!AI) return false;
+    SmallVector<const StoreInst *, 4> defs;
+    reachingSlotStoresOf(L, AI, defs);
+    if (defs.empty()) return false;
+    for (const StoreInst *D : defs)
+      if (!intCarrierSources(D->getValueOperand()->stripPointerCasts(), F, args, globs, seen, depth - 1))
+        return false;
+    return true;
+  }
+  const auto *U = dyn_cast<User>(V);
+  if (!U || !(isa<BinaryOperator>(V) || isa<CastInst>(V) || isa<PHINode>(V) || isa<SelectInst>(V) ||
+              isa<FreezeInst>(V) || isa<ConstantExpr>(V)))
+    return false;
+  for (const Use &Op : U->operands()) {
+    if (isa<SelectInst>(V) && Op.getOperandNo() == 0) continue; // the condition is not a source
+    if (!intCarrierSources(Op.get()->stripPointerCasts(), F, args, globs, seen, depth - 1)) return false;
+  }
+  return true;
+}
+static int addOffsets(int a, int b) {
+  return a < 0 || b < 0 || (int64_t)a + b > INT32_MAX ? -1 : a + b;
+}
 void CallGraphPass::confirmFreshWrappers() {
   static GlobalContext::FuncSummary pureFresh; // stable address for the map
   pureFresh.fresh = true;
@@ -50,9 +114,11 @@ void CallGraphPass::confirmFreshWrappers() {
   struct InitInfo {
     bool valid = false;
     int objParam = -1;
-    SmallVector<int, 4> srcFormals; // helper formal indices stored into obj
-    SmallVector<const GlobalValue *, 4> srcGlobals; // globals stored into obj
-    bool selfStore = false;         // obj-interior stored into obj
+    // Each with the byte offset of its store from the object parameter
+    // (-1: unknown).
+    SmallVector<std::pair<int, int>, 4> srcFormals; // helper formal indices stored into obj
+    SmallVector<std::pair<const GlobalValue *, int>, 4> srcGlobals; // globals stored into obj
+    SmallVector<std::pair<int, int>, 2> selfStores; // obj-interior stored into obj: (dst, src) offsets
   };
   static std::map<const Function *, InitInfo> initCache;
   std::function<const InitInfo &(const Function *)> initOnlyInfoRef;
@@ -66,20 +132,21 @@ void CallGraphPass::confirmFreshWrappers() {
     int obj = -1;
     bool bad = false;
     SmallPtrSet<const Value *, 16> objGraph;
-    SmallVector<int, 4> srcs;
-    SmallVector<const GlobalValue *, 4> gsrcs;
+    SmallVector<std::pair<int, int>, 4> srcs;
+    SmallVector<std::pair<const GlobalValue *, int>, 4> gsrcs;
     SmallPtrSet<const Instruction *, 4> nestedInit;
-    bool self = false;
+    SmallVector<std::pair<int, int>, 2> self;
+    const DataLayout &CDL = C->getParent()->getDataLayout();
     for (const Argument &A2 : C->args()) {
       if (!A2.getType()->isPointerTy()) continue;
       // walk this param's derived-pointer graph
       SmallVector<const Value *, 8> w2{&A2};
       SmallPtrSet<const Value *, 16> g2;
       bool storedInto = false, escapes = false;
-      SmallVector<int, 4> mySrcs;
-      SmallVector<const GlobalValue *, 4> myGsrcs;
+      SmallVector<std::pair<int, int>, 4> mySrcs;
+      SmallVector<std::pair<const GlobalValue *, int>, 4> myGsrcs;
       SmallPtrSet<const Instruction *, 4> myNested;
-      bool mySelf = false;
+      SmallVector<std::pair<int, int>, 2> mySelf;
       while (!w2.empty() && !escapes) {
         const Value *v2 = w2.pop_back_val();
         if (!g2.insert(v2).second) continue;
@@ -99,7 +166,11 @@ void CallGraphPass::confirmFreshWrappers() {
               const Value *tb = SI2->getPointerOperand()->stripPointerCasts();
               while (const auto *G3 = dyn_cast<GetElementPtrInst>(tb))
                 tb = G3->getPointerOperand()->stripPointerCasts();
-              if (g2.count(tb) || tb == &A2) { mySelf = true; storedInto = true; continue; }
+              if (g2.count(tb) || tb == &A2) {
+                mySelf.push_back({initOffset(SI2->getPointerOperand(), CDL), initOffset(v2, CDL)});
+                storedInto = true;
+                continue;
+              }
               if (v2 == &A2) {
                 if (const auto *TA = dyn_cast<Argument>(tb)) {
                   if (TA->getParent() == C && TA != &A2)
@@ -112,14 +183,33 @@ void CallGraphPass::confirmFreshWrappers() {
             // store INTO param memory
             storedInto = true;
             const Value *sv2 = SI2->getValueOperand()->stripPointerCasts();
-            if (!containsPointerType(sv2->getType())) continue;
+            if (!containsPointerType(sv2->getType())) {
+              // A pointer-carrying integer (the graph's int-store rule):
+              // a ptrtoint is its pointer, any other carrier itself.
+              bool declined = false;
+              if (!isPtrWidthInt(sv2->getType(), CDL) || shouldSkipValue(sv2) ||
+                  !mayCarryPtrProvenance(sv2, 8, declined))
+                continue;
+              SmallVector<int, 2> ia;
+              SmallVector<const GlobalValue *, 2> ig;
+              SmallPtrSet<const Value *, 8> seen;
+              if (!intCarrierSources(sv2, *C, ia, ig, seen, 16)) {
+                escapes = true; // a loaded or returned integer: no atom kind
+                break;
+              }
+              const int at = initOffset(SI2->getPointerOperand(), CDL);
+              for (int a : ia) mySrcs.push_back({a, at});
+              for (const GlobalValue *g : ig) myGsrcs.push_back({g, at});
+              continue;
+            }
             if (isa<ConstantPointerNull>(sv2)) continue;
-            if (g2.count(sv2)) { mySelf = true; continue; }
+            const int at = initOffset(SI2->getPointerOperand(), CDL);
+            if (g2.count(sv2)) { mySelf.push_back({at, initOffset(sv2, CDL)}); continue; }
             if (const auto *SA = dyn_cast<Argument>(sv2)) {
-              if (SA->getParent() == C) { mySrcs.push_back((int)SA->getArgNo()); continue; }
+              if (SA->getParent() == C) { mySrcs.push_back({(int)SA->getArgNo(), at}); continue; }
             }
             if (const auto *SG = dyn_cast<GlobalValue>(sv2)) {
-              myGsrcs.push_back(SG); // ops tables etc.
+              myGsrcs.push_back({SG, at}); // ops tables etc.
               continue;
             }
             escapes = true; // derived value: reject helper
@@ -145,30 +235,34 @@ void CallGraphPass::confirmFreshWrappers() {
                     pOk = false;
               if (pOk) {
                 okNested = true;
-                for (int m3 : ni.srcFormals) {
+                // The nested helper's offsets are from its object
+                // parameter, which sits at `nb` in ours.
+                const int nb = initOffset(NC->getArgOperand(ni.objParam), CDL);
+                for (auto [m3, ho] : ni.srcFormals) {
                   if (m3 >= (int)NC->arg_size()) { okNested = false; break; }
                   const Value *av2 =
                       NC->getArgOperand(m3)->stripPointerCasts();
                   if (!containsPointerType(av2->getType())) continue;
                   if (isa<ConstantPointerNull>(av2)) continue;
-                  if (g2.count(av2)) { mySelf = true; continue; }
+                  if (g2.count(av2)) { mySelf.push_back({addOffsets(nb, ho), initOffset(av2, CDL)}); continue; }
                   if (const auto *NA = dyn_cast<Argument>(av2)) {
                     if (NA->getParent() == C) {
-                      mySrcs.push_back((int)NA->getArgNo());
+                      mySrcs.push_back({(int)NA->getArgNo(), addOffsets(nb, ho)});
                       continue;
                     }
                   }
                   if (const auto *NG = dyn_cast<GlobalValue>(av2)) {
-                    myGsrcs.push_back(NG);
+                    myGsrcs.push_back({NG, addOffsets(nb, ho)});
                     continue;
                   }
                   okNested = false;
                   break;
                 }
                 if (okNested) {
-                  for (const GlobalValue *NG2 : ni.srcGlobals)
-                    myGsrcs.push_back(NG2);
-                  if (ni.selfStore) mySelf = true;
+                  for (auto [NG2, ho] : ni.srcGlobals)
+                    myGsrcs.push_back({NG2, addOffsets(nb, ho)});
+                  for (auto [d, s2] : ni.selfStores)
+                    mySelf.push_back({addOffsets(nb, d), addOffsets(nb, s2)});
                   storedInto = true;
                   myNested.insert(NC);
                 }
@@ -203,7 +297,11 @@ void CallGraphPass::confirmFreshWrappers() {
         if (!objGraph.count(pb3) &&
             !(isa<Argument>(pb3) &&
               cast<Argument>(pb3)->getArgNo() == (unsigned)obj)) {
-          if (containsPointerType(SI3->getValueOperand()->getType()))
+          const Value *v3 = SI3->getValueOperand();
+          bool declined = false;
+          if (containsPointerType(v3->getType()) ||
+              (isPtrWidthInt(v3->getType(), CDL) && !shouldSkipValue(v3) &&
+               mayCarryPtrProvenance(v3, 8, declined)))
             return inf;
         }
         continue;
@@ -222,7 +320,7 @@ void CallGraphPass::confirmFreshWrappers() {
     inf.objParam = obj;
     inf.srcFormals = srcs;
     inf.srcGlobals = gsrcs;
-    inf.selfStore = self;
+    inf.selfStores = self;
     return inf;
   };
   auto &initOnlyInfo = initOnlyInfoRef;
@@ -299,10 +397,12 @@ void CallGraphPass::confirmFreshWrappers() {
     return true;
   };
   // A wrapper's summary as a summary-file line (ST, CPY, ALIAS sorted).
-  auto freshLine = [](StringRef name, ArrayRef<int> st, ArrayRef<int> cpy,
+  auto freshLine = [](StringRef name, ArrayRef<std::pair<int, int>> st, ArrayRef<int> cpy,
                       ArrayRef<int> alias) {
     std::string ln = name.str() + " FRESH";
-    for (int an : st) ln += " ST(*ret<-arg" + std::to_string(an) + ")";
+    for (auto [an, at] : st)
+      ln += " ST(*ret" + (at == 0 ? std::string() : at < 0 ? std::string("@X") : "@" + std::to_string(at)) +
+            "<-arg" + std::to_string(an) + ")";
     for (int cj : cpy) ln += " CPY(ret<-arg" + std::to_string(cj) + ")";
     for (int aj : alias) ln += " ALIAS(ret=arg" + std::to_string(aj) + ")";
     return ln + " BODY";
@@ -322,20 +422,25 @@ void CallGraphPass::confirmFreshWrappers() {
     if (!HS->fresh || !HS->body || HS->none || HS->noop || HS->pool ||
         HS->freeArg >= 0 || !HS->labels.empty())
       continue;
-    SmallVector<int, 4> st, cpy, alias;
+    SmallVector<std::pair<int, int>, 4> st;
+    SmallVector<int, 4> cpy, alias;
     bool shape = true;
     for (const auto &A : HS->atoms) {
       using SA = GlobalContext::SummaryAtom;
       bool plain = A.dst == -1 && A.src >= 0 && !A.gsrc && !A.gdst &&
                    !A.gsrc2 && A.dstByteOff == 0 && A.srcByteOff == 0;
       if (A.kind == SA::Fresh) continue;
-      if (A.kind == SA::Store && plain) st.push_back(A.src);
+      if (A.kind == SA::Store && A.dst == -1 && A.src >= 0 && !A.gsrc && !A.gdst && !A.gsrc2 &&
+          A.srcByteOff == 0)
+        st.push_back({A.src, A.dstByteOff});
       else if (A.kind == SA::Cpy && plain) cpy.push_back(A.src);
       else if (A.kind == SA::Alias && plain) alias.push_back(A.src);
       else { shape = false; break; }
     }
     if (!shape) continue;
-    for (auto *v : {&st, &cpy, &alias}) {
+    std::sort(st.begin(), st.end());
+    st.erase(std::unique(st.begin(), st.end()), st.end());
+    for (auto *v : {&cpy, &alias}) {
       std::sort(v->begin(), v->end());
       v->erase(std::unique(v->begin(), v->end()), v->end());
     }
@@ -614,10 +719,13 @@ void CallGraphPass::confirmFreshWrappers() {
         SmallPtrSet<const Instruction *, 8> initStores;
         SmallVector<const Instruction *, 4> certExempt; // pool bookkeeping (plan 3.55 (a))
         SmallPtrSet<const Instruction *, 4> initCalls; // composed helpers
-        SmallVector<int, 4> initArgs;
-        SmallVector<const GlobalValue *, 4> initGlobals;
-        unsigned subAllocs = 0;
-        bool selfStore = false;
+        // Each init store with the byte offset of its address from the
+        // fresh pointer (-1: unknown, a write of unknown extent).
+        SmallVector<std::pair<int, int>, 4> initArgs;
+        SmallVector<std::pair<const GlobalValue *, int>, 4> initGlobals;
+        SmallVector<int, 2> subAllocs;
+        SmallVector<std::pair<int, int>, 2> selfStores; // (dst, src) offsets
+        const DataLayout &FDL = F.getParent()->getDataLayout();
         bool escaped = false, untracedInit = false;
         const char *rejWhy = nullptr; // escape-anatomy bucket
         {
@@ -689,7 +797,7 @@ void CallGraphPass::confirmFreshWrappers() {
                     // self-linkage (INIT_LIST_HEAD): object interior
                     // stored into the object itself
                     initStores.insert(SI);
-                    selfStore = true;
+                    selfStores.push_back({initOffset(SI->getPointerOperand(), FDL), initOffset(v, FDL)});
                     continue;
                   }
                   if (const auto *PA = dyn_cast<Argument>(pb))
@@ -707,7 +815,29 @@ void CallGraphPass::confirmFreshWrappers() {
                 const Value *sv =
                     SI->getValueOperand()->stripPointerCasts();
                 if (!containsPointerType(sv->getType())) {
+                  // A pointer-width integer the graph treats as a carrier
+                  // (graph build's int-store rule) moves a pointer: its
+                  // sources through casts, arithmetic, joins and slots
+                  // are the atoms (formals, ptrtoint globals); a loaded or
+                  // returned integer is no atom kind.
+                  bool declined = false;
+                  if (!isPtrWidthInt(sv->getType(), FDL) || shouldSkipValue(sv) ||
+                      !mayCarryPtrProvenance(sv, 8, declined)) {
+                    initStores.insert(SI);
+                    continue;
+                  }
+                  SmallVector<int, 2> ia;
+                  SmallVector<const GlobalValue *, 2> ig;
+                  SmallPtrSet<const Value *, 8> seen;
+                  if (!intCarrierSources(sv, F, ia, ig, seen, 16)) {
+                    untracedInit = true;
+                    rejWhy = "init-int-carrier";
+                    break;
+                  }
                   initStores.insert(SI);
+                  const int at = initOffset(SI->getPointerOperand(), FDL);
+                  for (int a : ia) initArgs.push_back({a, at});
+                  for (const GlobalValue *g : ig) initGlobals.push_back({g, at});
                   continue;
                 }
                 // O0: the stored value is a reload of a spilled formal
@@ -733,8 +863,9 @@ void CallGraphPass::confirmFreshWrappers() {
                     }
                     if (allOk) {
                       initStores.insert(SI);
-                      initArgs.append(args2.begin(), args2.end());
-                      initGlobals.append(globs2.begin(), globs2.end());
+                      const int at = initOffset(SI->getPointerOperand(), FDL);
+                      for (int a2 : args2) initArgs.push_back({a2, at});
+                      for (const GlobalValue *g2 : globs2) initGlobals.push_back({g2, at});
                       continue;
                     }
                   }
@@ -742,7 +873,7 @@ void CallGraphPass::confirmFreshWrappers() {
                 if (const auto *A2 = dyn_cast<Argument>(sv)) {
                   if (A2->getParent() == &F) {
                     initStores.insert(SI);
-                    initArgs.push_back((int)A2->getArgNo());
+                    initArgs.push_back({(int)A2->getArgNo(), initOffset(SI->getPointerOperand(), FDL)});
                     continue;
                   }
                 }
@@ -752,7 +883,7 @@ void CallGraphPass::confirmFreshWrappers() {
                 }
                 if (const auto *GVs = dyn_cast<GlobalValue>(sv)) {
                   initStores.insert(SI); // ops table / named fn into fresh
-                  initGlobals.push_back(GVs);
+                  initGlobals.push_back({GVs, initOffset(SI->getPointerOperand(), FDL)});
                   continue;
                 }
                 if (const auto *SubCB = dyn_cast<CallBase>(sv)) {
@@ -774,7 +905,7 @@ void CallGraphPass::confirmFreshWrappers() {
                     }
                     if (subOk) {
                       initStores.insert(SI);
-                      subAllocs++;
+                      subAllocs.push_back(initOffset(SI->getPointerOperand(), FDL));
                       continue;
                     }
                   }
@@ -852,8 +983,11 @@ void CallGraphPass::confirmFreshWrappers() {
                         posOk = false; // fresh escapes via a second slot
                   if (posOk) {
                     bool mapOk = true;
-                    SmallVector<int, 4> mapped;
-                    for (int m2 : inf.srcFormals) {
+                    SmallVector<std::pair<int, int>, 4> mapped;
+                    // The helper's offsets are from its object parameter,
+                    // which sits at `hb` in the fresh object.
+                    const int hb = initOffset(CB2->getArgOperand(inf.objParam), FDL);
+                    for (auto [m2, ho] : inf.srcFormals) {
                       if (m2 >= (int)CB2->arg_size()) { mapOk = false; break; }
                       const Value *av =
                           CB2->getArgOperand(m2)->stripPointerCasts();
@@ -861,7 +995,7 @@ void CallGraphPass::confirmFreshWrappers() {
                       if (isa<ConstantPointerNull>(av)) continue;
                       if (const auto *AA = dyn_cast<Argument>(av)) {
                         if (AA->getParent() == &F) {
-                          mapped.push_back((int)AA->getArgNo());
+                          mapped.push_back({(int)AA->getArgNo(), addOffsets(hb, ho)});
                           continue;
                         }
                       }
@@ -869,10 +1003,11 @@ void CallGraphPass::confirmFreshWrappers() {
                       break;
                     }
                     if (mapOk) {
-                      for (int g3 : mapped) initArgs.push_back(g3);
-                      for (const GlobalValue *G5 : inf.srcGlobals)
-                        initGlobals.push_back(G5);
-                      if (inf.selfStore) selfStore = true;
+                      initArgs.append(mapped.begin(), mapped.end());
+                      for (auto [G5, ho] : inf.srcGlobals)
+                        initGlobals.push_back({G5, addOffsets(hb, ho)});
+                      for (auto [d, s2] : inf.selfStores)
+                        selfStores.push_back({addOffsets(hb, d), addOffsets(hb, s2)});
                       initCalls.insert(CB2);
                       composed = true;
                       g_freshHelperComposed++;
@@ -1038,7 +1173,7 @@ void CallGraphPass::confirmFreshWrappers() {
           std::sort(initArgs.begin(), initArgs.end());
           initArgs.erase(std::unique(initArgs.begin(), initArgs.end()),
                          initArgs.end());
-          if (initGlobals.empty() && !selfStore && subAllocs == 0 &&
+          if (initGlobals.empty() && selfStores.empty() && subAllocs.empty() &&
               freshLine(F.getName(), initArgs, cpyArgs, aliasArgs) ==
                   handRows[&F]) {
             redundantRows++;
@@ -1054,8 +1189,8 @@ void CallGraphPass::confirmFreshWrappers() {
         // Promote. Pure fresh -> shared static summary; alloc-init ->
         // generated {FRESH, ST(*ret <- argI)...} summary (owned by Ctx).
         Ctx->AllocFuncs.insert(&F);
-        if (initArgs.empty() && initGlobals.empty() && !selfStore &&
-            subAllocs == 0 && cpyArgs.empty() && aliasArgs.empty()) {
+        if (initArgs.empty() && initGlobals.empty() && selfStores.empty() &&
+            subAllocs.empty() && cpyArgs.empty() && aliasArgs.empty()) {
           Ctx->FuncSummaries[&F] = &pureFresh;
         } else {
           Ctx->OwnedSummaries.emplace_back();
@@ -1065,24 +1200,32 @@ void CallGraphPass::confirmFreshWrappers() {
           std::sort(initArgs.begin(), initArgs.end());
           initArgs.erase(std::unique(initArgs.begin(), initArgs.end()),
                          initArgs.end());
-          for (int an : initArgs) {
+          // Each atom writes where its store wrote: *ret at the store's
+          // byte offset (-1: unknown extent).
+          for (auto [an, at] : initArgs) {
             GlobalContext::SummaryAtom A{};
             A.kind = GlobalContext::SummaryAtom::Store;
             A.dst = -1; // *ret
+            A.dstByteOff = at;
             A.src = an;
             S.atoms.push_back(A);
           }
-          if (selfStore) {
+          std::sort(selfStores.begin(), selfStores.end());
+          selfStores.erase(std::unique(selfStores.begin(), selfStores.end()), selfStores.end());
+          for (auto [at, from] : selfStores) {
             GlobalContext::SummaryAtom A{};
             A.kind = GlobalContext::SummaryAtom::Store;
             A.dst = -1;
+            A.dstByteOff = at;
             A.src = -1; // object interior stored into itself
+            A.srcByteOff = from;
             S.atoms.push_back(A);
           }
-          for (unsigned si2 = 0; si2 < subAllocs; si2++) {
+          for (int at : subAllocs) {
             GlobalContext::SummaryAtom A{};
             A.kind = GlobalContext::SummaryAtom::FreshSub;
             A.dst = -1; // sub-object into *ret
+            A.dstByteOff = at;
             S.atoms.push_back(A);
           }
           {
@@ -1090,10 +1233,11 @@ void CallGraphPass::confirmFreshWrappers() {
             initGlobals.erase(
                 std::unique(initGlobals.begin(), initGlobals.end()),
                 initGlobals.end());
-            for (const GlobalValue *G5 : initGlobals) {
+            for (auto [G5, at] : initGlobals) {
               GlobalContext::SummaryAtom A{};
               A.kind = GlobalContext::SummaryAtom::Store;
               A.dst = -1; // *ret
+              A.dstByteOff = at;
               A.gsrc = G5;
               S.atoms.push_back(A);
             }
@@ -1131,8 +1275,11 @@ void CallGraphPass::confirmFreshWrappers() {
           // The promotion as a summary-file line (harvestable: a library
           // run's output becomes its interface summary).
           std::string ln = freshLine(F.getName(), initArgs, cpyArgs, aliasArgs);
-          if (selfStore) ln += " # +self-store";
-          if (subAllocs) ln += " # +" + std::to_string(subAllocs) + " sub-alloc";
+          if (!selfStores.empty()) ln += " # +self-store";
+          if (!subAllocs.empty()) ln += " # +" + std::to_string(subAllocs.size()) + " sub-alloc";
+          for (auto [G5, at] : initGlobals)
+            ln += " # ST(*ret" + (at == 0 ? std::string() : at < 0 ? std::string("@X") : "@" + std::to_string(at)) +
+                  "<-" + G5->getName().str() + ")";
           CG_LOG("ConfirmFresh: LINE " << ln << "\n");
         }
       }
@@ -2268,10 +2415,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       Graph.addDeref(subVal, subObj);
       addAllocSite(subVal, subVal); // origin identity for the mint loop
       {
-        CellWriteSize ws(*this, Ctx->Modules.front().first->getDataLayout()
-                                    .getPointerSize());
-        WritePos wp(*this, SF, A.dst, nullptr, 0);
-        addAssignmentEdge(subVal, getRepDerefNode(getCanonicalNode(d)));
+        CellWriteSize ws(*this, summaryWriteSize(A.dstByteOff), summaryCellOffset(A.dstByteOff));
+        WritePos wp(*this, SF, A.dst, nullptr, A.dstByteOff);
+        addAssignmentEdge(subVal, summaryDerefCell(d, A.dstByteOff));
       }
       g_sumFreshSub++;
       break;

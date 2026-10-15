@@ -13,7 +13,9 @@
 
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
+#include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/IR/Operator.h>
 
 // Does struct type T hold a struct named S at byte offset off (itself, or
 // through first-member / field embedding)?
@@ -97,6 +99,186 @@ bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o) {
   return false;
 }
 
+// The innermost named struct holding byte `off` of ST, the offset there,
+// and the scalar the byte lies in with the byte's offset inside it.
+bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::string, int64_t> &K, Type *&leaf,
+                    int64_t &inLeaf) {
+  K = {"", 0};
+  for (int depth = 0; depth < 64 && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) return false;
+      if (ST->hasName()) K = {stripStructNameSuffix(ST->getName()).str(), off};
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+      const unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      continue;
+    }
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      const int64_t es = (int64_t)DL.getTypeAllocSize(AT->getElementType());
+      if (es == 0) return false;
+      K.second -= off - off % es; // an array member's elements share its name
+      off %= es;
+      T = AT->getElementType();
+      continue;
+    }
+    leaf = T;
+    inLeaf = off;
+    return !K.first.empty();
+  }
+  return false;
+}
+
+// An access through a struct's array member at a variable index
+// (xa_node.slots[offset]): the struct GEP whose last index is variable and
+// whose prefix names the array; the member's start stands for the slot.
+bool arraySlot(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off) {
+  const GEPOperator *G = structGEP(Addr);
+  if (!G || G->getNumIndices() < 3) return false;
+  S = dyn_cast<StructType>(G->getSourceElementType());
+  if (!S || !S->hasName()) return false;
+  SmallVector<Value *, 8> idx(G->idx_begin(), G->idx_end() - 1);
+  for (Value *V : idx)
+    if (!isa<ConstantInt>(V)) return false;
+  if (!isa<ArrayType>(GetElementPtrInst::getIndexedType(S, idx))) return false;
+  off = (int64_t)DL.getIndexedOffsetInType(S, idx);
+  return true;
+}
+
+// A use the linker drops: a global in a ".discard.*" section
+// (EXPORT_SYMBOL's __ADDRESSABLE entry) takes no address in the program.
+bool PointeeResolver::discarded(const User *U) {
+  for (int i = 0; i < 4 && U; i++) {
+    if (const auto *GV = dyn_cast<GlobalVariable>(U)) return GV->getSection().starts_with(".discard");
+    if (!isa<Constant>(U) || U->getNumUses() != 1) return false;
+    U = *U->user_begin();
+  }
+  return false;
+}
+
+StructType *PointeeResolver::atZero(StructType *S) {
+  for (int d = 0; d < 32 && S && !S->isOpaque() && S->getNumElements(); d++) {
+    auto *E = dyn_cast<StructType>(S->getElementType(0));
+    if (!E || !E->hasName() || E->isOpaque()) break;
+    S = E;
+  }
+  return S;
+}
+
+// Direct call sites per callee (a defined function and the declarations of
+// its name in other modules); callees whose address is taken.
+PointeeResolver::PointeeResolver(const GlobalContext *Ctx) {
+  std::map<std::string, const Function *> defOf;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      if (!F.isDeclaration() && !F.hasLocalLinkage()) defOf.emplace(F.getName().str(), &F);
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M) {
+      const Function *D = &F;
+      if (F.isDeclaration()) {
+        auto it = defOf.find(F.getName().str());
+        if (it == defOf.end()) continue;
+        D = it->second;
+      }
+      for (const Use &U : F.uses()) {
+        const auto *CB = dyn_cast<CallBase>(U.getUser());
+        if (CB && CB->isCallee(&U)) sites[D].push_back(CB);
+        else if (!discarded(U.getUser())) taken.insert(D);
+      }
+    }
+}
+StructType *PointeeResolver::get(const Value *A, LLVMContext &C, int depth) {
+  A = A->stripPointerCasts();
+  if (depth > 6) return nullptr;
+  std::string n;
+  SmallVector<DbgValueInst *, 2> DVs;
+  findDbgValues(DVs, const_cast<Value *>(A));
+  for (DbgValueInst *DV : DVs)
+    if (n.empty())
+      if (const StringRef N = ka::diStructName(DV->getVariable()->getType(), true); !N.empty()) n = "struct." + N.str();
+  if (n.empty()) n = diDeclaredStruct(A, true);
+  if (n.empty() && (isa<GlobalVariable>(A) || isa<AllocaInst>(A))) n = diDeclaredStruct(A, false);
+  if (!n.empty()) return StructType::getTypeByName(C, n);
+  // (1b) The object's own declaration (Fable 2026-10-15): a global's or a
+  // local's IR value type when it is a named struct (an array of one: its
+  // element), normalized to its innermost struct at offset 0. A struct GEP
+  // of another struct on the same object is a pun: unnamed.
+  {
+    Type *T = nullptr;
+    if (const auto *GV = dyn_cast<GlobalVariable>(A)) T = GV->getValueType();
+    else if (const auto *AI = dyn_cast<AllocaInst>(A)) T = AI->getAllocatedType();
+    while (auto *AT = dyn_cast_or_null<ArrayType>(T)) T = AT->getElementType();
+    if (auto *ST = dyn_cast_or_null<StructType>(T); ST && ST->hasName() && !ST->isOpaque()) {
+      StructType *D = atZero(ST);
+      for (const User *U : A->users())
+        if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A)
+          if (auto *S = dyn_cast<StructType>(G->getSourceElementType()); S && S->hasName() && atZero(S) != D)
+            return nullptr;
+      return viaDecl = true, D;
+    }
+  }
+  // Sibling GEPs (Fable 2026-10-15): the value is the base of struct GEPs
+  // of one struct in its function; the GEP's source type is the program's
+  // declaration of that expression. Two structs (after the offset-0
+  // normalization) are a pun: unnamed.
+  {
+    StructType *agreed = nullptr;
+    bool clash = false;
+    for (const User *U : A->users())
+      if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A)
+        if (auto *S = dyn_cast<StructType>(G->getSourceElementType()); S && S->hasName()) {
+          S = atZero(S);
+          clash |= agreed && agreed != S;
+          agreed = S;
+        }
+    if (clash) return nullptr;
+    if (agreed) return viaSibling = true, agreed;
+  }
+  if (const auto *PN = dyn_cast<PHINode>(A)) {
+    StructType *agreed = nullptr;
+    for (const Value *In : PN->incoming_values()) {
+      if (In == PN) continue;
+      StructType *S = get(In, C, depth + 1);
+      if (!S || (agreed && agreed != S)) return nullptr;
+      agreed = S;
+    }
+    return agreed;
+  }
+  if (const GEPOperator *G = structGEP(A))
+    if (auto *S = dyn_cast<StructType>(G->getResultElementType()); S && S->hasName() && G->hasAllConstantIndices())
+      return S;
+  if (const auto *Arg = dyn_cast<Argument>(A)) {
+    viaFormal = true;
+    if (auto it = memo.find(Arg); it != memo.end()) return it->second;
+    if (!busy.insert(Arg).second) return nullptr; // a cycle among formals decides nothing
+    StructType *agreed = nullptr;
+    const Function *F = Arg->getParent();
+    auto sit = sites.find(F);
+    bool ok = !taken.count(F) && sit != sites.end() && !sit->second.empty();
+    for (size_t i = 0; ok && i < sit->second.size(); i++) {
+      const CallBase *CB = sit->second[i];
+      if (Arg->getArgNo() >= CB->arg_size()) { ok = false; break; }
+      StructType *S = get(CB->getArgOperand(Arg->getArgNo()), C, depth + 1);
+      if (S) S = atZero(S);
+      if (!S || (agreed && agreed != S)) ok = false;
+      else agreed = S;
+    }
+    busy.erase(Arg);
+    StructType *R = ok ? agreed : nullptr;
+    memo[Arg] = R;
+    return R;
+  }
+  return nullptr;
+}
+
+bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P, StructType *&S,
+               int64_t &off) {
+  if ((accessSlot(I, Addr, DL, S, off) && S && S->hasName()) || arraySlot(Addr, DL, S, off)) return true;
+  P.viaFormal = P.viaSibling = P.viaDecl = false;
+  S = P.get(Addr, I->getContext()), off = 0;
+  return S != nullptr;
+}
 
 // The named structs bytes [lo, hi) of T lie in, outermost first, each with
 // the interval inside it (array elements fold to element 0: an interval

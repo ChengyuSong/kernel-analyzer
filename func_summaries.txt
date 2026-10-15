@@ -1655,3 +1655,56 @@ bfd_hash_hash ROLE(pure)
 # the solve against the hook's targets.
 _bfd_error_handler ROLE(pure)
 @container end
+
+# ---- Kernel intrusive containers in report mode (plan 3.55 R3/R5; Fable
+# 2026-10-15). A report block is checked (O1-O6 and the declared storage)
+# and reported per container in the log and the rule report; its rows are
+# never applied. Data-pointer form: the element is the caller's embedded
+# node, no element mint. `@storage` declares the slots (the kernel IR has no
+# debug info to name its links); the engine checks the declaration: every
+# element-derived store lands in a declared slot, every declared slot is
+# written only in the rows and at admitted sites (R2 self-links, R4 integer
+# reuse, null stores, implicit inserts paired with an insert row call), and
+# a LINKWORD by its R1 verdict. Slots match through embedding (rb_root+0 is
+# the rb_root inside any owner).
+@container rbtree report
+# lib/rbtree.c (5.18). rb_root.rb_node is the handle; rb_root_cached adds
+# rb_leftmost; rb_node.rb_right (+8) and rb_left (+16) are links;
+# __rb_parent_color (+0) is parent | color, a link word (R1).
+@storage HANDLE(rb_root+0) HANDLE(rb_root_cached+8) LINK(rb_node+8) LINK(rb_node+16) LINKWORD(rb_node+0)
+rb_insert_color ROLE(insert) OWNER(arg1) ELEM(arg0)
+rb_erase ROLE(remove) OWNER(arg1) ELEM(arg0)
+rb_first ROLE(lookup) OWNER(arg0)
+rb_last ROLE(lookup) OWNER(arg0)
+rb_first_postorder ROLE(lookup) OWNER(arg0)
+# A traverse row's result is the element set of the containers that contain
+# its ELEM argument (its O3 containment set); an uncontained element leaves
+# the call to the body (counted "traverse of an uncontained element").
+rb_next ROLE(traverse) ELEM(arg0)
+rb_prev ROLE(traverse) ELEM(arg0)
+rb_next_postorder ROLE(traverse) ELEM(arg0)
+# rb_replace_node(victim, new, root): new takes victim's place (victim
+# removed: may semantics, counted).
+rb_replace_node ROLE(insert) OWNER(arg2) ELEM(arg1)
+rb_replace_node_rcu ROLE(insert) OWNER(arg2) ELEM(arg1)
+# The augmented forms take the rotate callback as a formal (a code field
+# under the feeds-through-formals rule).
+__rb_insert_augmented ROLE(insert) OWNER(arg1) ELEM(arg0)
+__rb_erase_color ROLE(remove) OWNER(arg1)
+# lib/timerqueue.c wrappers: head+0 is its rb_root_cached's rb_root, the
+# element the timerqueue_node's rb_node at +0.
+timerqueue_add ROLE(insert) OWNER(arg0) ELEM(arg1)
+timerqueue_del ROLE(remove) OWNER(arg0) ELEM(arg1)
+timerqueue_iterate_next ROLE(traverse) ELEM(arg0)
+@container end
+@container llist report
+# lib/llist.c (5.18): llist_head.first is the handle, llist_node.next the
+# link. llist_add_batch(new_first, new_last, head) links a pre-built chain
+# (two element arguments; the chain between them is owner code's);
+# llist_del_first returns the removed first element (may semantics: the
+# removal is counted, the result checked like a lookup's).
+@storage HANDLE(llist_head+0) LINK(llist_node+0)
+llist_add_batch ROLE(insert) OWNER(arg2) ELEM(arg0) ELEM(arg1)
+llist_del_first ROLE(remove) OWNER(arg0) ELEM(ret)
+llist_reverse_order ROLE(traverse) ELEM(arg0)
+@container end

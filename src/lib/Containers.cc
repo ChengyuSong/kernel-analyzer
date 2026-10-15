@@ -57,12 +57,16 @@ bool transientSlot(const Value *A) {
 } // namespace
 
 void CallGraphPass::checkContainerClosure() {
-  // A field access's key: its IR struct (linker suffix stripped) and offset.
+  // A field access's key: its IR struct (linker suffix stripped) and offset,
+  // named by its struct GEP or TBAA tag, an array member at a variable index,
+  // or at offset 0 with neither by the address's pointee (one naming rule
+  // with the link words, plan 3.55 R3 D3).
+  PointeeResolver pointees(Ctx);
   auto fieldKey = [&](const Instruction *I, const Value *Addr) -> std::string {
     if (isa<AllocaInst>(Addr->stripPointerCasts())) return "";
     StructType *S = nullptr;
     int64_t off = 0;
-    if (!accessSlot(I, Addr, I->getModule()->getDataLayout(), S, off) || !S || !S->hasName()) return "";
+    if (!namedSlot(I, Addr, I->getModule()->getDataLayout(), pointees, S, off) || !S || !S->hasName()) return "";
     return stripStructNameSuffix(S->getName()).str() + "+" + std::to_string(off);
   };
   auto isFresh = [&](const CallBase *CB) {
@@ -612,8 +616,15 @@ void CallGraphPass::checkContainerClosure() {
       const DISubprogram *SP = it->second->getSubprogram();
       const DISubroutineType *ST = SP ? SP->getType() : nullptr;
       if (ST && (unsigned)R.owner + 1 < ST->getTypeArray().size())
-        if (const StringRef N = ka::diStructName(ST->getTypeArray()[R.owner + 1], true); !N.empty())
+        if (const StringRef N = ka::diStructName(ST->getTypeArray()[R.owner + 1], true); !N.empty()) {
           ownerTypes.insert("struct." + N.str());
+          continue;
+        }
+      // No debug info (the kernel corpus): the owner formal's pointee by the
+      // naming rule (sibling GEPs, phi, formal provenance).
+      if ((unsigned)R.owner < it->second->arg_size())
+        if (StructType *S = pointees.get(it->second->getArg(R.owner), it->second->getContext()))
+          ownerTypes.insert(stripStructNameSuffix(S->getName()).str());
     }
     // O1: every data pointer field of an owner type the body reads or
     // writes is closed (a field whose loads are called is a code field:
@@ -757,6 +768,117 @@ void CallGraphPass::checkContainerClosure() {
             grew = true;
     }
 
+    // Declared storage (plan 3.55 R3 D2, Fable 2026-10-15): `@storage`
+    // names the handle, link and link-word slots by their innermost struct
+    // (rb_root+0 is the rb_root inside any owner). A proposal the engine
+    // checks: against debug info where the program has it, from the store
+    // side below (every element-derived store lands in a declared slot;
+    // every declared slot is written only in the rows and at admitted
+    // sites), and a LINKWORD by its R1 verdict. Without debug info (the
+    // kernel), the declaration is what names the links.
+    const bool declared = !C.storage.empty();
+    const DataLayout &CDL = Ctx->Modules.front().first->getDataLayout();
+    // "struct.T+off" of the field holding byte off of S (innermost struct).
+    auto innerKeyOf = [&](StructType *S, int64_t off) -> std::string {
+      std::pair<std::string, int64_t> K;
+      Type *leaf = nullptr;
+      int64_t in = 0;
+      if (!S || !innermostField(S, off, CDL, K, leaf, in)) return "";
+      return K.first + "+" + std::to_string(K.second - in);
+    };
+    // (1c) The rows' premise (Fable 2026-10-15): a row's OWNER formal points
+    // to the struct of the block's HANDLE at +0, each ELEM formal to the
+    // struct of its LINK/LINKWORD slots. It types those formals in the body
+    // and nothing else; it is discharged at every call site below.
+    std::map<const Argument *, StructType *> premise;
+    auto ckey = [&](const Instruction *I, const Value *A) -> std::string {
+      if (!declared) return fieldKey(I, A);
+      if (isa<AllocaInst>(A->stripPointerCasts())) return "";
+      StructType *S = nullptr;
+      int64_t off = 0;
+      if (!namedSlot(I, A, CDL, pointees, S, off) || !S->hasName()) {
+        const auto *Arg = dyn_cast<Argument>(A->stripPointerCasts());
+        auto pit = Arg ? premise.find(Arg) : premise.end();
+        if (pit == premise.end()) return "";
+        return innerKeyOf(pit->second, 0);
+      }
+      return innerKeyOf(S, off);
+    };
+    std::set<std::string> declHandle, declLink, declWord, unusedDecl;
+    StructType *premiseOwnerT = nullptr, *premiseElemT = nullptr;
+    std::vector<std::string> diMismatch;
+    if (declared) {
+      // Each module has its own context: a declared struct is the first
+      // defined one of that name (linker suffix stripped) in any module.
+      std::map<std::string, StructType *> byStructName;
+      for (auto &[M, _] : Ctx->Modules)
+        for (StructType *ST : M->getIdentifiedStructTypes())
+          if (ST->hasName() && !ST->isOpaque()) byStructName.emplace(stripStructNameSuffix(ST->getName()).str(), ST);
+      for (const auto &Sl : C.storage) {
+        auto sit = byStructName.find(Sl.type);
+        StructType *S = sit == byStructName.end() ? nullptr : sit->second;
+        std::string K = innerKeyOf(S, Sl.off);
+        if (K.empty()) {
+          // A struct this program does not define (rb_root_cached in a
+          // program without cached trees): unused, not a disagreement.
+          unusedDecl.insert(Sl.type + "+" + std::to_string(Sl.off) + " (no such field here)");
+          continue;
+        }
+        using CS = GlobalContext::ContainerSlot;
+        (Sl.kind == CS::Handle ? declHandle : Sl.kind == CS::Link ? declLink : declWord).insert(K);
+        unusedDecl.insert(K);
+      }
+      // Debug info, where the program has it: the links it names (pointer
+      // members back into the container's structs) and the handle slots
+      // (pointer members of the owner) against the declaration.
+      for (const std::string &K : links)
+        if (!declLink.count(K)) diMismatch.push_back("debug info names link " + K + ", not declared");
+      for (const std::string &K : declLink) {
+        const std::string S = StringRef(K).substr(7, K.rfind('+') - 7).str();
+        if (diStructs.count(S) && !links.count(K))
+          diMismatch.push_back("declared link " + K + " is no pointer back into the container by debug info");
+      }
+      for (const std::string &K : declHandle) {
+        const std::string S = StringRef(K).substr(7, K.rfind('+') - 7).str();
+        if (!diStructs.count(S)) continue;
+        bool ptr = false;
+        for (auto &[o, P] : ptrMembers(S)) ptr |= "struct." + S + "+" + std::to_string(o) == K;
+        if (!ptr) diMismatch.push_back("declared handle " + K + " is no pointer member by debug info");
+      }
+      // The premise's structs: the HANDLE at +0, the LINK/LINKWORD slots'
+      // (one struct each, else no premise).
+      StructType *ownerT = nullptr, *elemT = nullptr;
+      bool ownerOne = true, elemOne = true;
+      for (const auto &Sl : C.storage) {
+        auto sit = byStructName.find(Sl.type);
+        if (sit == byStructName.end()) continue;
+        using CS = GlobalContext::ContainerSlot;
+        StructType *&T = Sl.kind == CS::Handle ? ownerT : elemT;
+        bool &one = Sl.kind == CS::Handle ? ownerOne : elemOne;
+        if (Sl.kind == CS::Handle && Sl.off != 0) continue;
+        if (T && T != sit->second) one = false;
+        T = sit->second;
+      }
+      if (!ownerOne) ownerT = nullptr;
+      if (!elemOne) elemT = nullptr;
+      premiseOwnerT = ownerT, premiseElemT = elemT;
+      for (const auto &[fn, R] : C.rows) {
+        auto it = byName.find(fn);
+        if (it == byName.end() || !body.count(it->second)) continue;
+        const Function *F = it->second;
+        if (ownerT && R.owner >= 0 && (unsigned)R.owner < F->arg_size()) premise[F->getArg(R.owner)] = ownerT;
+        std::vector<int> es = R.moreElems;
+        if (R.elem >= 0) es.push_back(R.elem);
+        for (int e : es)
+          if (elemT && (unsigned)e < F->arg_size()) premise[F->getArg(e)] = elemT;
+      }
+      handle = declHandle;
+      links = declLink;
+      links.insert(declWord.begin(), declWord.end());
+    }
+    const unsigned pw = CDL.getPointerSizeInBits();
+    const bool wordInts = !declWord.empty(); // link words carry pointers in integers
+
     // Owner derivation over the body (a monotone dataflow): each pointer
     // value of a body function, relative to its owner formal: the owner
     // (OWN), derived from it through closed handle fields and then any
@@ -833,6 +955,8 @@ void CallGraphPass::checkContainerClosure() {
     auto get = [&](const Value *V) -> uint8_t {
       V = V->stripPointerCasts();
       if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return NUL;
+      // A link word's null plus tag (declared LINKWORD storage).
+      if (const auto *CI = dyn_cast<ConstantInt>(V); CI && CI->getValue().ult(8)) return NUL;
       if (const auto *GV = dyn_cast<GlobalVariable>(V); GV && sentinels.count(GV)) return SEN;
       if (isa<Constant>(V)) return OTH; // a global, a function: not the owner's
       auto it = cls.find(V);
@@ -844,37 +968,59 @@ void CallGraphPass::checkContainerClosure() {
       while (const auto *G = dyn_cast<GEPOperator>(A)) A = G->getPointerOperand()->stripPointerCasts();
       return A;
     };
+    // The class of what an access at address A reads (an asm's slot: the
+    // call itself is the access).
+    auto loadClass = [&](const Instruction *L, const Value *A) -> uint8_t {
+      const Value *B = baseOf(A);
+      if (transientSlot(B)) {
+        uint8_t m = 0;
+        for (const User *U : B->users())
+          if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == B)
+            m |= get(S->getValueOperand());
+        if ((m & SEN) && guardedAt(B, L)) m &= ~SEN; // under `p->g != null`
+        return m;
+      }
+      // A load through null never executes: the null part of the base
+      // adds nothing.
+      const uint8_t b = get(B) & ~NUL;
+      const std::string K = ckey(L, A);
+      uint8_t m = 0;
+      if (b & OWN) m |= handle.count(K) ? DER : OTH;
+      // Through an element: a link field or a storage slot (an array
+      // element, no struct field) stays in the container; another field
+      // is the element's payload.
+      // A fresh block the body makes is contained (O3 checks it): new
+      // storage or a new element, read like a derived one.
+      if (b & (DER | FRS)) m |= K.empty() || links.count(K) ? DER : PAY;
+      // A sentinel's field is null (s4: every store into it is guarded,
+      // checked below; the container fails otherwise).
+      if (b & SEN) m |= NUL;
+      if (b & (INS | OTH | PAY)) m |= OTH;
+      return m ? m : (b ? OTH : 0);
+    };
     auto transfer = [&](const Instruction &I) -> uint8_t {
       if (poolCarves.count(&I)) return FRS; // a certified pool carve: a fresh block
-      if (const auto *L = dyn_cast<LoadInst>(&I)) {
-        const Value *B = baseOf(L->getPointerOperand());
-        if (transientSlot(B)) {
-          uint8_t m = 0;
-          for (const User *U : B->users())
-            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == B)
-              m |= get(S->getValueOperand());
-          if ((m & SEN) && guardedAt(B, L)) m &= ~SEN; // under `p->g != null`
-          return m;
-        }
-        // A load through null never executes: the null part of the base
-        // adds nothing.
-        const uint8_t b = get(B) & ~NUL;
-        const std::string K = fieldKey(L, L->getPointerOperand());
-        uint8_t m = 0;
-        if (b & OWN) m |= handle.count(K) ? DER : OTH;
-        // Through an element: a link field or a storage slot (an array
-        // element, no struct field) stays in the container; another field
-        // is the element's payload.
-        // A fresh block the body makes is contained (O3 checks it): new
-        // storage or a new element, read like a derived one.
-        if (b & (DER | FRS)) m |= K.empty() || links.count(K) ? DER : PAY;
-        // A sentinel's field is null (s4: every store into it is guarded,
-        // checked below; the container fails otherwise).
-        if (b & SEN) m |= NUL;
-        if (b & (INS | OTH | PAY)) m |= OTH;
-        return m ? m : (b ? OTH : 0);
-      }
+      if (const auto *L = dyn_cast<LoadInst>(&I)) return loadClass(L, L->getPointerOperand());
       if (isa<GetElementPtrInst>(&I) || isa<CastInst>(&I)) return get(I.getOperand(0));
+      // A link word's arithmetic (tags set, cleared, tested): the pointer it
+      // carries (declared LINKWORD storage only).
+      if (const auto *BO = dyn_cast<BinaryOperator>(&I)) {
+        uint8_t m = 0;
+        for (const Value *Op : BO->operands())
+          if (!isa<Constant>(Op)) m |= get(Op);
+        return m;
+      }
+      // An inline asm's result: what its slots and raw pointers read, as the
+      // graph build models it (asmModel).
+      if (const auto *CB = dyn_cast<CallBase>(&I); CB && CB->isInlineAsm()) {
+        const AsmModel AM = asmModel(*CB, &CDL);
+        uint8_t m = 0;
+        for (const AsmModel::Slot &Sl : AM.slots)
+          if (!Sl.output && Sl.load.ok) m |= loadClass(CB, Sl.ptr);
+        if (AM.resPtrCapable)
+          for (const Value *A : AM.rawPtrs) m |= loadClass(CB, A);
+        return m ? m : OTH;
+      }
       if (const auto *PN = dyn_cast<PHINode>(&I)) {
         uint8_t m = 0;
         for (const Value *In : PN->incoming_values()) m |= get(In);
@@ -910,10 +1056,20 @@ void CallGraphPass::checkContainerClosure() {
           if (A.getType()->isPointerTy() && oit != ownerIdx.end() && (int)A.getArgNo() == oit->second) join(&A, OWN);
         // An insert row's ELEM(argN): the element coming in (O3 checks it
         // goes only into the owner's storage), like a new element.
-        if (const CR *R = rowOf(F); R && R->role == CR::Insert && R->elem >= 0 && (unsigned)R->elem < F->arg_size())
-          join(F->getArg(R->elem), FRS);
+        if (const CR *R = rowOf(F); R && R->role == CR::Insert) {
+          if (R->elem >= 0 && (unsigned)R->elem < F->arg_size()) join(F->getArg(R->elem), FRS);
+          for (int e : R->moreElems)
+            if ((unsigned)e < F->arg_size()) join(F->getArg(e), FRS);
+        }
+        // A remove's or a traverse's ELEM(argN): an element already in the
+        // container (rb_erase's node, rb_next's start), read like a derived one.
+        if (const CR *R = rowOf(F); R && (R->role == CR::Remove || R->role == CR::Traverse) && R->elem >= 0 &&
+                                    (unsigned)R->elem < F->arg_size())
+          join(F->getArg(R->elem), DER);
         for (const Instruction &I : instructions(*F)) {
-          if (I.getType()->isPointerTy()) join(&I, transfer(I));
+          // Pointers; and with declared link words, pointer-width integers
+          // (a link word's load, its tags, ptrtoint and inttoptr).
+          if (I.getType()->isPointerTy() || (wordInts && I.getType()->isIntegerTy(pw))) join(&I, transfer(I));
           if (const auto *RI = dyn_cast<ReturnInst>(&I); RI && RI->getReturnValue()) {
             uint8_t &r = retCls[F];
             const uint8_t m = get(RI->getReturnValue());
@@ -1081,73 +1237,514 @@ void CallGraphPass::checkContainerClosure() {
       inlineSites.push_back(S->getFunction()->getName().str() + ": " + valueText(S));
       return true;
     };
-    std::set<std::string> checked1 = handle;
-    checked1.insert(links.begin(), links.end());
-    for (const std::string &K : checked1) {
-      bool ok = true;
-      for (const StoreInst *S : fields[K].foreignSI)
-        if (isMove(S) || isInlineMove(S)) moves++;
-        else if (ok) ok = false, firstBad1[K] = S;
-      if (!ok) open1.insert(K);
-    }
-    // A block copy anywhere whose destination is an element struct (one
-    // embedding a container struct) is a store of the source's fields:
-    // the source an element of the same owner, or in the body derived or
-    // fresh; memset is a null store (Fable 2026-10-14, per-field
-    // decomposition). Destinations named by the copy's struct access.
-    std::set<std::string> elemStructs;
-    for (const std::string &L : links) elemStructs.insert(L.substr(0, L.rfind('+')));
-    std::function<bool(StringRef, int)> embedsElem = [&](StringRef Tag, int d) -> bool {
-      if (elemStructs.count("struct." + Tag.str())) return true;
-      if (d > 4) return false;
-      auto dit = diStructs.find(Tag.str());
-      if (dit == diStructs.end()) return false;
-      for (const DINode *E : dit->second->getElements())
-        if (const auto *M = dyn_cast<DIDerivedType>(E); M && M->getTag() == dwarf::DW_TAG_member)
-          if (const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(M->getBaseType()));
-              CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && M->getOffsetInBits() == 0 &&
-              embedsElem(CT->getName(), d + 1))
-            return true;
-      return false;
-    };
-    size_t copiesInto = 0;
-    std::string badCopy;
-    for (auto &[M, _] : Ctx->Modules)
-      for (Function &F : *M)
-        for (const Instruction &I : instructions(F)) {
-          const auto *MT = dyn_cast<MemTransferInst>(&I);
-          if (!MT) continue;
-          const std::string K = fieldKey(MT, MT->getRawDest());
-          if (K.empty()) continue;
-          // The destination range [off, off + len) against the link fields
-          // of a container struct embedded at the start, and the owner's
-          // handle fields.
-          const std::string S = K.substr(0, K.rfind('+'));
-          const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
-          const auto *LenC = dyn_cast<ConstantInt>(MT->getLength());
-          const int64_t len = LenC ? (int64_t)LenC->getZExtValue() : INT64_MAX / 2;
-          std::vector<int64_t> pos;
-          if (embedsElem(StringRef(S).drop_front(7), 0))
-            for (const std::string &L : links) pos.push_back(std::stoll(L.substr(L.rfind('+') + 1)));
-          for (const std::string &H : handle)
-            if (H.substr(0, H.rfind('+')) == S) pos.push_back(std::stoll(H.substr(H.rfind('+') + 1)));
-          bool covers = false;
-          for (int64_t p0 : pos) covers |= p0 >= off && p0 < off + len;
-          if (!covers) continue;
-          copiesInto++;
-          if (body.count(&F)) {
-            const uint8_t src = get(baseOf(MT->getRawSource())) & ~NUL;
-            if (src && !(src & ~(DER | FRS))) continue;
-          } else {
-            const std::string a = elemOwner(MT->getRawDest(), 0), v = elemOwner(MT->getRawSource(), 0);
-            if (!a.empty() && a == v) {
-              inlineSites.push_back(F.getName().str() + ": " + valueText(MT));
+    // ---- O1 on declared storage (plan 3.55 R3 D2, D5, D6; Fable 2026-10-15).
+    // Every write into a declared slot, anywhere in the program (stores,
+    // block writes, an asm's stores by the graph build's model), is a row
+    // body's, or admitted: null (a wide null store over the slots), a
+    // self-link (R2: an element's own address into its own slot), a link
+    // word reused as an integer (R4: a constant, or arithmetic over a load of
+    // the same cell; an atomic's tied old value is a same-cell re-store), a
+    // same-owner re-store in owner code (a value derived from the owner into
+    // a slot derived from it), an implicit insert (an element into a derived
+    // slot, paired with an insert row call on the same element and owner
+    // value in the function), or a link store on that inserted element. And
+    // every element-derived store in a body or owner code lands in a
+    // declared slot. An access through an owner or element value that no
+    // rule names is a naming failure, never a pass.
+    std::map<std::string, size_t> o1Admit;
+    std::map<std::string, std::vector<std::string>> o1Fail;
+    std::vector<std::string> o1Naming, implicitMatched, implicitUnmatched, wordLines;
+    size_t lookupsByDerivation = 0, rowSites = 0;
+    // (1c) discharged per call site: agrees, disagrees (FAIL), unnamed
+    // (an ASSUMPTION, listed).
+    size_t premiseArgs = 0, premiseAgree = 0, premiseNull = 0;
+    std::vector<std::string> premiseFail, premiseAssume;
+    std::set<std::string> ownerValues;
+    if (declared) {
+      auto siteText = [](const Instruction *I) {
+        std::string s = I->getFunction()->getName().str() + ": " + valueText(I);
+        return s.size() > 200 ? s.substr(0, 200) : s;
+      };
+      // The declared slot kind an access names ('h', 'l', 'w'; 0 none), by
+      // the access (At) or, for an address alone, its struct GEP or pointee.
+      auto addrKey = [&](const Value *A) -> std::string {
+        if (const auto *G = dyn_cast<GEPOperator>(A)) {
+          auto *S = dyn_cast<StructType>(G->getSourceElementType());
+          APInt Off(64, 0);
+          if (S && S->hasName() && G->accumulateConstantOffset(CDL, Off)) return innerKeyOf(S, Off.getSExtValue());
+          return "";
+        }
+        return innerKeyOf(pointees.get(A, A->getContext()), 0);
+      };
+      auto kindOf = [&](const std::string &K) -> char {
+        return declHandle.count(K) ? 'h' : declLink.count(K) ? 'l' : declWord.count(K) ? 'w' : 0;
+      };
+      auto slotOf = [&](const Instruction *At, const Value *A) -> char {
+        return kindOf(At ? ckey(At, A) : addrKey(A));
+      };
+      // The fields an access at A may write: its own name, or, for a phi or
+      // select of field addresses (rb_link_node's `*p`, rb_erase's child
+      // slot), every entry's (null entries add none). Empty: unnamed.
+      std::function<bool(const Instruction *, const Value *, std::vector<std::pair<StructType *, int64_t>> &, int)>
+          addrSlots = [&](const Instruction *At, const Value *A, std::vector<std::pair<StructType *, int64_t>> &out,
+                          int d) -> bool {
+        StructType *S = nullptr;
+        int64_t off = 0;
+        if (namedSlot(At, A, CDL, pointees, S, off) && S->hasName()) {
+          out.push_back({S, off});
+          return true;
+        }
+        const Value *V = A->stripPointerCasts();
+        if (d > 4 || !(isa<PHINode>(V) || isa<SelectInst>(V))) return false;
+        std::vector<const Value *> ins;
+        if (const auto *PN = dyn_cast<PHINode>(V)) ins.assign(PN->incoming_values().begin(), PN->incoming_values().end());
+        else ins = {cast<SelectInst>(V)->getTrueValue(), cast<SelectInst>(V)->getFalseValue()};
+        static thread_local std::set<const Value *> onPath;
+        if (!onPath.insert(V).second) return true; // a cycle adds no field
+        bool ok = true;
+        for (const Value *In : ins)
+          if (!isa<ConstantPointerNull>(In) && !isa<UndefValue>(In) && !addrSlots(At, In, out, d + 1)) ok = false;
+        onPath.erase(V);
+        return ok;
+      };
+      // Row call sites, grouped per function by owner value (SSA value or
+      // constant GEP shape).
+      struct Group {
+        std::vector<const Value *> owners, elems;
+        std::vector<const CallBase *> inserts;
+        std::map<const Value *, uint8_t> cls;
+      };
+      std::map<const Function *, std::map<std::string, Group>> groups;
+      auto rowAt = [&](const CallBase *CB) -> const CR * {
+        const Function *G = CB->getCalledFunction();
+        if (!G) return nullptr;
+        auto it = C.rows.find(G->getName().str());
+        return it == C.rows.end() || it->second.role == CR::Pure || it->second.role == CR::Carve ? nullptr
+                                                                                                : &it->second;
+      };
+      for (auto &[M, _] : Ctx->Modules)
+        for (const Function &F : *M)
+          for (const Instruction &I : instructions(F)) {
+            const auto *CB = dyn_cast<CallBase>(&I);
+            const CR *R = CB ? rowAt(CB) : nullptr;
+            if (!R || R->owner < 0 || (unsigned)R->owner >= CB->arg_size()) continue;
+            const Value *o = CB->getArgOperand(R->owner);
+            const std::string sh = ownerShape(o, 0);
+            Group &Gp = groups[&F][sh.empty() ? valueText(o) : sh];
+            Gp.owners.push_back(o->stripPointerCasts());
+            if (!body.count(&F)) rowSites++, ownerValues.insert(F.getName().str() + ":" + (sh.empty() ? valueText(o) : sh));
+            if (R->role == CR::Insert) Gp.inserts.push_back(CB);
+            else if (R->elem >= 0 && (unsigned)R->elem < CB->arg_size())
+              Gp.elems.push_back(CB->getArgOperand(R->elem)->stripPointerCasts());
+          }
+      // (1c): every row call's OWNER and ELEM actuals against the premise:
+      // named by a route (or a constant GEP into a struct that embeds the
+      // premise's struct there) and agreeing, named otherwise (FAIL), or
+      // named by nothing (an ASSUMPTION at that site).
+      for (auto &[M, _] : Ctx->Modules)
+        for (const Function &F : *M)
+          for (const Instruction &I : instructions(F)) {
+            const auto *CB = dyn_cast<CallBase>(&I);
+            const CR *R = CB ? rowAt(CB) : nullptr;
+            if (!R) continue;
+            std::vector<std::pair<int, StructType *>> args;
+            if (R->owner >= 0) args.push_back({R->owner, premiseOwnerT});
+            if (R->elem >= 0) args.push_back({R->elem, premiseElemT});
+            for (int e : R->moreElems) args.push_back({e, premiseElemT});
+            for (auto [a, T] : args) {
+              if (!T || (unsigned)a >= CB->arg_size()) continue;
+              premiseArgs++;
+              const Value *V = CB->getArgOperand(a)->stripPointerCasts();
+              const std::string TN = stripStructNameSuffix(T->getName()).str();
+              const std::string at = siteText(CB) + " (arg" + std::to_string(a) + ", " + TN + ")";
+              if (isa<ConstantPointerNull>(V)) { premiseNull++; continue; } // no object
+              int verdict = -1; // 1 agree, 0 disagree, -1 unnamed
+              std::string as;   // what the actual is named as
+              if (const auto *PA = dyn_cast<Argument>(V); PA && premise.count(PA)) {
+                verdict = premise[PA] == T; // a row's own premise-typed formal
+                as = stripStructNameSuffix(premise[PA]->getName()).str();
+              } else if (const auto *G = dyn_cast<GEPOperator>(V)) {
+                auto *S = dyn_cast<StructType>(G->getSourceElementType());
+                APInt Off(64, 0);
+                if (S && S->hasName() && G->accumulateConstantOffset(CDL, Off)) {
+                  verdict = embedsAt(S, Off.getSExtValue(), TN, CDL);
+                  as = stripStructNameSuffix(S->getName()).str() + "+" + std::to_string(Off.getSExtValue());
+                }
+              }
+              if (verdict < 0)
+                if (StructType *S = pointees.get(V, V->getContext())) {
+                  verdict = embedsAt(S, 0, TN, CDL);
+                  as = stripStructNameSuffix(S->getName()).str() + "+0";
+                }
+              if (verdict == 1) premiseAgree++;
+              else if (verdict == 0) premiseFail.push_back(at + ": named " + as);
+              else premiseAssume.push_back(at);
+            }
+          }
+      for (auto &[F, gs] : groups)
+        for (auto &[sh, Gp] : gs) {
+          (void)sh;
+          Gp.cls = deriveOwnerCode(*F, Gp.owners, Gp.elems, slotOf, [&](const CallBase *CB, const OwnerClassFn &g) {
+            const CR *R = rowAt(CB);
+            if (!R || R->role == CR::Insert) return false;
+            if (R->role == CR::Remove && R->elem != -1) return false; // no result
+            if (R->owner >= 0 && (unsigned)R->owner < CB->arg_size() && (g(CB->getArgOperand(R->owner)) & OC_OWNER))
+              return true;
+            return R->elem >= 0 && (unsigned)R->elem < CB->arg_size() && (g(CB->getArgOperand(R->elem)) & OC_VAL);
+          });
+        }
+      auto strip = [](const Value *V) {
+        for (int i = 0; i < 8; i++) {
+          V = V->stripPointerCasts();
+          if (const auto *P = dyn_cast<PtrToIntOperator>(V)) V = P->getPointerOperand();
+          else if (const auto *Z = dyn_cast<ZExtInst>(V)) V = Z->getOperand(0);
+          else break;
+        }
+        return V;
+      };
+      auto isNullV = [](const Value *V) {
+        if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return true;
+        const auto *CI = dyn_cast<ConstantInt>(V);
+        return CI && CI->isZero();
+      };
+      // R4: arithmetic over loads of the cell at A (or constants).
+      std::function<bool(const Value *, const Value *, int)> selfDerived = [&](const Value *V, const Value *A,
+                                                                               int d) -> bool {
+        if (d > 8) return false;
+        if (isa<ConstantInt>(V)) return true;
+        if (const auto *L = dyn_cast<LoadInst>(V))
+          return L->getPointerOperand()->stripPointerCasts() == A->stripPointerCasts();
+        if (const auto *BO = dyn_cast<BinaryOperator>(V))
+          return selfDerived(BO->getOperand(0), A, d + 1) && selfDerived(BO->getOperand(1), A, d + 1);
+        if (const auto *CI = dyn_cast<CastInst>(V); CI && !isa<PtrToIntInst>(CI)) return selfDerived(CI->getOperand(0), A, d + 1);
+        return false;
+      };
+      auto groupsOf = [&](const Function *F) -> std::map<std::string, Group> * {
+        auto it = groups.find(F);
+        return it == groups.end() ? nullptr : &it->second;
+      };
+      // A write by the asm model's raw-pointer rule (every value input
+      // through every raw pointer input) fails under its own class.
+      bool rawWrite = false;
+      auto fail = [&](const std::string &why, const Instruction *I) {
+        o1Fail[rawWrite ? "asm model over-approximation (a raw pointer input written): " + why : why].push_back(siteText(I));
+      };
+      std::set<const Instruction *> implicitSeen;
+      // One write: (instruction, address, value or source, bytes, kind).
+      enum WK { WStore, WFill, WCopy };
+      auto onWrite = [&](const Instruction *I, const Value *A, const Value *V, int64_t bytes, WK wk) {
+        const Function *F = I->getFunction();
+        const bool inBody = body.count(F);
+        auto *gs = groupsOf(F);
+        const Value *B = baseOf(A);
+        if (isa<AllocaInst>(B)) return;
+        // Is the base an owner or element value here (body or owner code)?
+        uint8_t ocB = 0;
+        bool baseIsInserted = false;
+        if (gs)
+          for (auto &[sh, Gp] : *gs) {
+            (void)sh;
+            auto it = Gp.cls.find(B);
+            if (it != Gp.cls.end()) ocB |= it->second;
+            for (const Value *o : Gp.owners) ocB |= o == B ? OC_OWNER : 0;
+            for (const CallBase *CB : Gp.inserts) {
+              const CR *R = rowAt(CB);
+              auto isE = [&](int e) { return e >= 0 && (unsigned)e < CB->arg_size() && baseOf(CB->getArgOperand(e)) == B; };
+              baseIsInserted |= isE(R->elem);
+              for (int e : R->moreElems) baseIsInserted |= isE(e);
+            }
+          }
+        const uint8_t bodyB = inBody ? get(B) & ~NUL : 0;
+        const bool containerBase =
+            (bodyB & (OWN | DER | FRS)) || (ocB & (OC_OWNER | OC_VAL | OC_SLOT)) || baseIsInserted;
+        std::vector<std::pair<StructType *, int64_t>> named;
+        if (!addrSlots(I, A, named, 0)) {
+          if (containerBase) o1Naming.push_back(siteText(I) + (rawWrite ? " (an asm raw-pointer write)" : " (a write)"));
+          return;
+        }
+        // The declared slots [off, off + bytes) covers, for each field the
+        // address may name.
+        std::vector<std::pair<std::string, char>> covered;
+        bool someUncovered = false; // a field the address may name that holds no declared slot
+        for (auto &[S, off] : named) {
+          const size_t before = covered.size();
+          structCover(S, off, bytes < 0 ? INT64_MAX / 2 : off + bytes, CDL,
+                      [&](StructType *ST, int64_t lo, int64_t h) {
+                        if (!ST->hasName()) return;
+                        const std::string SN = stripStructNameSuffix(ST->getName()).str();
+                        for (const std::set<std::string> *D : {&declHandle, &declLink, &declWord})
+                          for (const std::string &K : *D) {
+                            const size_t p = K.rfind('+');
+                            if (K.compare(0, p, SN) != 0) continue;
+                            const int64_t o = std::stoll(K.substr(p + 1));
+                            if (o >= lo && o < h) covered.push_back({K, kindOf(K)});
+                          }
+                      });
+          someUncovered |= covered.size() == before;
+        }
+        // D2 (i): an element-derived value stored where the address may name
+        // a field outside the declared slots.
+        if (someUncovered && wk == WStore && containerBase && V->getType()->isPointerTy()) {
+          const uint8_t vb = inBody ? get(V) : 0;
+          uint8_t vo = 0;
+          if (gs)
+            for (auto &SG : *gs)
+              if (auto it = SG.second.cls.find(strip(V)); it != SG.second.cls.end()) vo |= it->second;
+          if ((vb & (DER | FRS)) || (vo & OC_VAL)) fail("an element stored outside the declared storage", I);
+        }
+        if (covered.empty()) return;
+        for (auto &[K, kind] : covered) {
+          unusedDecl.erase(K);
+          const uint64_t slotBytes = kind == 'w' ? pw / 8 : CDL.getPointerSize();
+          if (wk == WFill) {
+            if (isNullV(V)) o1Admit["null fills"]++;
+            else fail("a block fill of another value over " + K, I);
+            continue;
+          }
+          if (wk == WCopy) {
+            // A block copy: the source's fields; an element of the same owner
+            // in owner code, a derived or fresh block in the body.
+            const Value *SB = baseOf(V);
+            uint8_t so = 0;
+            if (gs)
+              for (auto &[sh, Gp] : *gs) {
+                (void)sh;
+                if (auto it = Gp.cls.find(SB); it != Gp.cls.end()) so |= it->second;
+              }
+            if ((inBody && (get(SB) & ~NUL) && !(get(SB) & ~(DER | FRS | NUL))) || (so & OC_VAL))
+              o1Admit["element copies"]++;
+            else
+              fail("a block copy of another value over " + K, I);
+            continue;
+          }
+          if ((uint64_t)bytes > slotBytes) {
+            if (isNullV(V) || (isa<Constant>(V) && cast<Constant>(V)->isNullValue())) o1Admit["wide null stores"]++;
+            else fail("a wide store of another value over " + K, I);
+            continue;
+          }
+          if (isNullV(V)) { o1Admit["null stores"]++; continue; }
+          if (const auto *CI = dyn_cast<ConstantInt>(V); CI && kind == 'w' && CI->getValue().ult(8)) {
+            o1Admit["null plus tag (R1)"]++;
+            continue;
+          }
+          // R2: the element's own address (its object's) into its own slot,
+          // tagged or not.
+          const Value *SV = strip(V);
+          if (const auto *BO = dyn_cast<BinaryOperator>(SV); BO && isa<ConstantInt>(BO->getOperand(1)))
+            SV = strip(BO->getOperand(0));
+          if (SV->getType()->isPointerTy() && baseOf(SV) == B) {
+            o1Admit["self-link stores (R2)"]++;
+            continue;
+          }
+          if (!V->getType()->isPointerTy()) {
+            if (const auto *L = dyn_cast<LoadInst>(V); L && L->getPointerOperand()->stripPointerCasts() == A->stripPointerCasts()) {
+              o1Admit["same-cell re-stores (R4)"]++;
+              continue;
+            }
+            if (selfDerived(V, A, 0) && !isa<PtrToIntOperator>(strip(V))) {
+              o1Admit[isa<ConstantInt>(V) ? "link word reused as integer: constants (R4)"
+                                          : "link word reused as integer: self-derived (R4)"]++;
+              continue;
+            }
+          } else if (const auto *L = dyn_cast<LoadInst>(V);
+                     L && L->getPointerOperand()->stripPointerCasts() == A->stripPointerCasts()) {
+            o1Admit["same-cell re-stores (R4)"]++;
+            continue;
+          }
+          if (inBody) {
+            // The body's own stores: a value derived from its owner, an
+            // element coming in, or a fresh block (with link words: their
+            // tagged words).
+            const uint8_t v = get(V), a = bodyB;
+            if (a && !(a & ~(OWN | DER | FRS)) && v && !(v & ~(DER | NUL | FRS))) {
+              o1Admit["body stores"]++;
               continue;
             }
           }
-          if (badCopy.empty()) badCopy = F.getName().str() + ": " + valueText(MT);
+          bool done = false;
+          if (gs)
+            for (auto &SG : *gs) {
+              Group &Gp = SG.second;
+              auto cl = [&](const Value *X) {
+                auto it = Gp.cls.find(strip(X));
+                uint8_t m = it == Gp.cls.end() ? 0 : it->second;
+                for (const Value *e : Gp.elems) m |= e == strip(X) ? OC_VAL : 0;
+                for (const Value *o : Gp.owners) m |= o == strip(X) ? OC_OWNER : 0;
+                return m;
+              };
+              const uint8_t ac = cl(A), bc = cl(B), vc = cl(V);
+              const bool derivedSlot = (ac & OC_SLOT) || (bc & (OC_OWNER | OC_VAL));
+              if (derivedSlot && (vc & (OC_VAL | OC_WORD))) {
+                o1Admit["same-owner re-stores (derived)"]++;
+                done = true;
+                break;
+              }
+              if (derivedSlot && V->getType()->isPointerTy()) {
+                // An implicit insert: paired with an insert row call in this
+                // function on the same element and owner value.
+                bool matched = false;
+                for (const CallBase *CB : Gp.inserts) {
+                  const CR *R = rowAt(CB);
+                  auto isE = [&](int e) {
+                    return e >= 0 && (unsigned)e < CB->arg_size() &&
+                           CB->getArgOperand(e)->stripPointerCasts() == V->stripPointerCasts();
+                  };
+                  matched |= isE(R->elem);
+                  for (int e : R->moreElems) matched |= isE(e);
+                }
+                // One site, whichever slots its address may name.
+                if (implicitSeen.insert(I).second) {
+                  (matched ? implicitMatched : implicitUnmatched).push_back(siteText(I));
+                  if (matched) o1Admit["implicit inserts (matched)"]++;
+                  else fail("an implicit insert with no insert row call on the same element and owner", I);
+                }
+                done = true;
+                break;
+              }
+              if (baseIsInserted && (vc & (OC_VAL | OC_WORD))) {
+                o1Admit["link stores on the inserted element"]++;
+                done = true;
+                break;
+              }
+            }
+          if (!done) fail(inBody ? "the body stores another value into " + K : "a store into " + K + " outside the rows", I);
         }
-    if (!badCopy.empty()) open1.insert("an element copied from another value [" + badCopy + "]");
+      };
+      for (auto &[M, _] : Ctx->Modules)
+        for (const Function &F : *M)
+          for (const Instruction &I : instructions(F)) {
+            if (const auto *S = dyn_cast<StoreInst>(&I)) {
+              onWrite(S, S->getPointerOperand(), S->getValueOperand(),
+                      (int64_t)CDL.getTypeStoreSize(S->getValueOperand()->getType()), WStore);
+            } else if (const auto *MS = dyn_cast<MemSetInst>(&I)) {
+              const auto *Len = dyn_cast<ConstantInt>(MS->getLength());
+              onWrite(MS, MS->getDest(), MS->getValue(), Len ? (int64_t)Len->getZExtValue() : -1, WFill);
+            } else if (const auto *MT = dyn_cast<MemTransferInst>(&I)) {
+              const auto *Len = dyn_cast<ConstantInt>(MT->getLength());
+              onWrite(MT, MT->getRawDest(), MT->getRawSource(), Len ? (int64_t)Len->getZExtValue() : -1, WCopy);
+            } else if (const auto *CB = dyn_cast<CallBase>(&I); CB && CB->isInlineAsm()) {
+              // The asm's stores, by the graph build's model.
+              const AsmModel AM = asmModel(*CB, &CDL);
+              for (const AsmModel::Slot &Sl : AM.slots)
+                if (Sl.output)
+                  for (const AsmModel::Value_ &In : Sl.stores) onWrite(CB, Sl.ptr, In.val, CDL.getPointerSize(), WStore);
+              rawWrite = true;
+              if (AM.memEffects)
+                for (const Value *P : AM.rawPtrs)
+                  for (const AsmModel::Value_ &In : AM.valueInputs)
+                    if (In.ok) onWrite(CB, P, In.val, CDL.getPointerSize(), WStore);
+              rawWrite = false;
+            }
+          }
+      // Reads: lookups by derivation in owner code, and reads through owner
+      // or element values that no rule names (the body's and owner code's).
+      for (auto &[M, _] : Ctx->Modules)
+        for (const Function &F : *M) {
+          auto *gs = groupsOf(&F);
+          const bool inBody = body.count(&F);
+          if (!gs && !inBody) continue;
+          for (const Instruction &I : instructions(F)) {
+            const auto *L = dyn_cast<LoadInst>(&I);
+            if (!L) continue;
+            const Value *B = baseOf(L->getPointerOperand());
+            uint8_t oc = 0;
+            if (gs)
+              for (auto &[sh, Gp] : *gs) {
+                (void)sh;
+                if (auto it = Gp.cls.find(B); it != Gp.cls.end()) oc |= it->second;
+                for (const Value *o : Gp.owners) oc |= o == B ? OC_OWNER : 0;
+                if (auto it = Gp.cls.find(L); it != Gp.cls.end() && !inBody && (it->second & (OC_VAL | OC_WORD)))
+                  lookupsByDerivation++;
+              }
+            const bool containerBase = (inBody && (get(B) & (OWN | DER | FRS))) || (oc & (OC_OWNER | OC_VAL | OC_SLOT));
+            std::vector<std::pair<StructType *, int64_t>> named;
+            if (containerBase && !isa<AllocaInst>(B) && !addrSlots(L, L->getPointerOperand(), named, 0))
+              o1Naming.push_back(siteText(L) + " (a read)");
+          }
+        }
+      // A LINKWORD's R1 verdict, its assumptions carried.
+      for (const std::string &K : declWord) {
+        auto it = linkWordVerdicts.find(K);
+        if (it == linkWordVerdicts.end()) {
+          wordLines.push_back("link word " + K + ": no R1 verdict (never read back as a pointer here)");
+          continue;
+        }
+        wordLines.push_back("link word " + K + ": R1 " + it->second.first);
+        for (const std::string &a : it->second.second) wordLines.push_back("  ASSUMPTION " + K + ": " + a);
+        if (it->second.first.rfind("PASS", 0) != 0) o1Fail["link word " + K + " fails R1 (" + it->second.first + ")"];
+      }
+      for (const std::string &m : diMismatch) o1Fail["declared storage disagrees: " + m];
+    }
+
+    if (!declared) {
+      std::set<std::string> checked1 = handle;
+      checked1.insert(links.begin(), links.end());
+      for (const std::string &K : checked1) {
+        bool ok = true;
+        for (const StoreInst *S : fields[K].foreignSI)
+          if (isMove(S) || isInlineMove(S)) moves++;
+          else if (ok) ok = false, firstBad1[K] = S;
+        if (!ok) open1.insert(K);
+      }
+      // A block copy anywhere whose destination is an element struct (one
+      // embedding a container struct) is a store of the source's fields:
+      // the source an element of the same owner, or in the body derived or
+      // fresh; memset is a null store (Fable 2026-10-14, per-field
+      // decomposition). Destinations named by the copy's struct access.
+      std::set<std::string> elemStructs;
+      for (const std::string &L : links) elemStructs.insert(L.substr(0, L.rfind('+')));
+      std::function<bool(StringRef, int)> embedsElem = [&](StringRef Tag, int d) -> bool {
+        if (elemStructs.count("struct." + Tag.str())) return true;
+        if (d > 4) return false;
+        auto dit = diStructs.find(Tag.str());
+        if (dit == diStructs.end()) return false;
+        for (const DINode *E : dit->second->getElements())
+          if (const auto *M = dyn_cast<DIDerivedType>(E); M && M->getTag() == dwarf::DW_TAG_member)
+            if (const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(M->getBaseType()));
+                CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && M->getOffsetInBits() == 0 &&
+                embedsElem(CT->getName(), d + 1))
+              return true;
+        return false;
+      };
+      size_t copiesInto = 0;
+      std::string badCopy;
+      for (auto &[M, _] : Ctx->Modules)
+        for (Function &F : *M)
+          for (const Instruction &I : instructions(F)) {
+            const auto *MT = dyn_cast<MemTransferInst>(&I);
+            if (!MT) continue;
+            const std::string K = fieldKey(MT, MT->getRawDest());
+            if (K.empty()) continue;
+            // The destination range [off, off + len) against the link fields
+            // of a container struct embedded at the start, and the owner's
+            // handle fields.
+            const std::string S = K.substr(0, K.rfind('+'));
+            const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
+            const auto *LenC = dyn_cast<ConstantInt>(MT->getLength());
+            const int64_t len = LenC ? (int64_t)LenC->getZExtValue() : INT64_MAX / 2;
+            std::vector<int64_t> pos;
+            if (embedsElem(StringRef(S).drop_front(7), 0))
+              for (const std::string &L : links) pos.push_back(std::stoll(L.substr(L.rfind('+') + 1)));
+            for (const std::string &H : handle)
+              if (H.substr(0, H.rfind('+')) == S) pos.push_back(std::stoll(H.substr(H.rfind('+') + 1)));
+            bool covers = false;
+            for (int64_t p0 : pos) covers |= p0 >= off && p0 < off + len;
+            if (!covers) continue;
+            copiesInto++;
+            if (body.count(&F)) {
+              const uint8_t src = get(baseOf(MT->getRawSource())) & ~NUL;
+              if (src && !(src & ~(DER | FRS))) continue;
+            } else {
+              const std::string a = elemOwner(MT->getRawDest(), 0), v = elemOwner(MT->getRawSource(), 0);
+              if (!a.empty() && a == v) {
+                inlineSites.push_back(F.getName().str() + ": " + valueText(MT));
+                continue;
+              }
+            }
+            if (badCopy.empty()) badCopy = F.getName().str() + ": " + valueText(MT);
+          }
+      if (!badCopy.empty()) open1.insert("an element copied from another value [" + badCopy + "]");
+    }
     std::string o1 = open1.empty() ? "O1 PASS" : "O1 FAIL(open:";
     for (const std::string &K : open1) {
       o1 += " " + K;
@@ -1161,6 +1758,25 @@ void CallGraphPass::checkContainerClosure() {
       for (size_t i = 0; i < inlineSites.size() && i < 4; i++) o1 += " [" + inlineSites[i] + "]";
       o1 += ")";
     }
+    if (declared) {
+      // Every failing reason with its count and first site; naming failures
+      // fail too (an unnamed access through an owner or element value never
+      // passes).
+      if (o1Fail.empty() && o1Naming.empty()) {
+        o1 = "O1 PASS";
+      } else if (o1Fail.empty()) {
+        o1 = "O1 FAIL on naming (" + std::to_string(o1Naming.size()) +
+             " accesses through owner or element values that no rule names)";
+      } else {
+        o1 = "O1 FAIL(";
+        for (auto &[why, sites] : o1Fail) {
+          o1 += (o1.back() == '(' ? "" : "; ") + why;
+          if (!sites.empty()) o1 += ": " + std::to_string(sites.size()) + " [" + sites[0] + "]";
+        }
+        if (!o1Naming.empty()) o1 += "; on naming: " + std::to_string(o1Naming.size());
+        o1 += ")";
+      }
+    }
     // O4: every callee outside the body is a row of this container, a
     // carve row, an allocation or a free (modeled), a prover no-op, a pure
     // row, or does not return; an indirect call is checked as a code field
@@ -1171,6 +1787,12 @@ void CallGraphPass::checkContainerClosure() {
         const auto *CB = dyn_cast<CallBase>(&I);
         if (!CB || isa<DbgInfoIntrinsic>(CB)) continue;
         const Function *G = CB->getCalledFunction();
+        // An inline asm is modeled (asmModel), no callee, unless its text calls.
+        if (CB->isInlineAsm()) {
+          const StringRef AsmText = cast<InlineAsm>(CB->getCalledOperand())->getAsmString();
+          if (AsmText.contains("call")) bad4.insert("an asm that calls in " + F->getName().str());
+          continue;
+        }
         if (!G) {
           const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
           const std::string K = CL ? fieldKey(CL, CL->getPointerOperand()) : "";
@@ -1223,6 +1845,31 @@ void CallGraphPass::checkContainerClosure() {
             }
             if (const auto *CB = dyn_cast<CallBase>(UI)) {
               const Function *G = CB->getCalledFunction();
+              // An inline asm, by the graph build's model: the element stored
+              // into a slot or written through a raw pointer of the owner's
+              // storage, or written and read through (a raw pointer itself).
+              if (CB->isInlineAsm()) {
+                const AsmModel AM = asmModel(*CB, &CDL);
+                auto intoOwner = [&](const Value *P) {
+                  const uint8_t b = get(baseOf(P)) & ~NUL;
+                  return b && !(b & ~(OWN | DER | FRS));
+                };
+                for (const AsmModel::Slot &Sl : AM.slots)
+                  if (Sl.output)
+                    for (const AsmModel::Value_ &In : Sl.stores)
+                      if (In.ok && In.val->stripPointerCasts() == E->stripPointerCasts() && !intoOwner(Sl.ptr))
+                        bad3.insert(fn + ": stored by an asm into " + valueText(CB));
+                // The model's raw-pointer rule writes every value input through
+                // every raw pointer input: its own class (Fable 2026-10-15).
+                if (AM.memEffects)
+                  for (const AsmModel::Value_ &In : AM.valueInputs)
+                    if (In.ok && In.val->stripPointerCasts() == E->stripPointerCasts())
+                      for (const Value *P : AM.rawPtrs)
+                        if (!intoOwner(P))
+                          bad3.insert("asm model over-approximation: " + fn + ": written through a raw pointer input by " +
+                                      valueText(CB));
+                continue;
+              }
               if (const auto *MI = dyn_cast<MemIntrinsic>(CB)) {
                 // Reading it (a copy's source) moves nothing out; zeroing it
                 // is a null store; filling it stores the source's fields, so
@@ -1274,7 +1921,7 @@ void CallGraphPass::checkContainerClosure() {
       auto it = byName.find(fn);
       if (it == byName.end() || !body.count(it->second)) continue;
       const Function *F = it->second;
-      if (R.role == CR::Lookup || R.role == CR::Traverse)
+      if (R.role == CR::Lookup || R.role == CR::Traverse || (R.role == CR::Remove && R.elem == -1))
         for (const Instruction &I : instructions(*F))
           if (const auto *RI = dyn_cast<ReturnInst>(&I); RI && RI->getReturnValue() &&
                                                          RI->getReturnValue()->getType()->isPointerTy()) {
@@ -1285,6 +1932,8 @@ void CallGraphPass::checkContainerClosure() {
       if (R.role == CR::Insert || (R.role == CR::Lookup && R.create >= 0 && R.elem == -1)) {
         std::set<const Value *> seen;
         if (R.elem >= 0 && (unsigned)R.elem < F->arg_size()) elemUses(F->getArg(R.elem), fn, seen);
+        for (int e : R.moreElems)
+          if ((unsigned)e < F->arg_size()) elemUses(F->getArg(e), fn, seen);
         if (R.elem == -1)
           for (const Instruction &I : instructions(*F))
             if (const auto *RI = dyn_cast<ReturnInst>(&I); RI && RI->getReturnValue())
@@ -1333,15 +1982,36 @@ void CallGraphPass::checkContainerClosure() {
     // see the body's object without the owner's writes).
     std::set<std::string> bodyWrites, bad6;
     for (const Function *F : body)
-      for (const Instruction &I : instructions(*F))
-        if (const auto *S = dyn_cast<StoreInst>(&I))
-          if (const std::string K = fieldKey(S, S->getPointerOperand()); !K.empty()) bodyWrites.insert(K);
+      for (const Instruction &I : instructions(*F)) {
+        const Value *A = nullptr;
+        int64_t bytes = 0;
+        if (const auto *S = dyn_cast<StoreInst>(&I)) {
+          A = S->getPointerOperand();
+          bytes = (int64_t)CDL.getTypeStoreSize(S->getValueOperand()->getType());
+          if (const std::string K = ckey(S, A); !K.empty()) bodyWrites.insert(K);
+        } else if (const auto *MS = dyn_cast<MemSetInst>(&I); MS && declared) {
+          A = MS->getDest();
+          const auto *Len = dyn_cast<ConstantInt>(MS->getLength());
+          bytes = Len ? (int64_t)Len->getZExtValue() : INT64_MAX / 4;
+        }
+        // Declared storage: every declared slot a wide store or a fill spans.
+        StructType *S = nullptr;
+        int64_t off = 0;
+        if (!declared || !A || !namedSlot(&I, A, CDL, pointees, S, off) || !S->hasName()) continue;
+        structCover(S, off, off + bytes, CDL, [&](StructType *ST, int64_t lo, int64_t h) {
+          if (!ST->hasName()) return;
+          const std::string SN = stripStructNameSuffix(ST->getName()).str();
+          for (const std::string &K : links)
+            if (const size_t p = K.rfind('+'); K.compare(0, p, SN) == 0)
+              if (const int64_t o = std::stoll(K.substr(p + 1)); o >= lo && o < h) bodyWrites.insert(K);
+        });
+      }
     for (const Function *F : body)
       for (const Instruction &I : instructions(*F))
         if (const auto *L = dyn_cast<LoadInst>(&I); L && L->getType()->isPointerTy()) {
           const uint8_t b = get(baseOf(L->getPointerOperand())) & ~NUL;
           if (!(b & (DER | FRS))) continue;
-          const std::string K = fieldKey(L, L->getPointerOperand());
+          const std::string K = ckey(L, L->getPointerOperand());
           if (K.empty() || ownerTypes.count(K.substr(0, K.rfind('+')))) continue;
           if (!bodyWrites.count(K)) bad6.insert(F->getName().str() + "." + K);
         }
@@ -1349,8 +2019,10 @@ void CallGraphPass::checkContainerClosure() {
     for (const std::string &b : bad6) o6 += " " + b;
     if (!bad6.empty()) o6 += ")";
     C.obligations = {o1, o2, o3, o4, o6};
-    C.verified = sentOk && o1.rfind("O1 PASS", 0) == 0 && o2 == "O2 PASS" && o3.rfind("O3 PASS", 0) == 0 && o4 == "O4 PASS" &&
-                 o6 == "O6 PASS";
+    const bool holds = sentOk && o1.rfind("O1 PASS", 0) == 0 && o2 == "O2 PASS" && o3.rfind("O3 PASS", 0) == 0 &&
+                       o4 == "O4 PASS" && o6 == "O6 PASS" && premiseFail.empty();
+    // A report block is checked and reported, never applied (plan 3.55 R3 D1).
+    C.verified = holds && !C.report;
     if (C.verified) {
       const size_t ci = &C - &Ctx->Containers[0];
       if (containerBodies.size() <= ci) {
@@ -1653,12 +2325,53 @@ void CallGraphPass::checkContainerClosure() {
     if (!sentOk) C.obligations.push_back("a sentinel failed: its loads count as another value (O2 FAIL)");
     std::string bl;
     for (const Function *F : body) bl += (bl.empty() ? "" : " ") + F->getName().str();
-    cline(C.name + " (" + C.provenance + "): " + std::to_string(C.rows.size()) + " rows, body {" + bl + "}" +
+    cline(C.name + " (" + C.provenance + (C.report ? ", report" : "") + "): " + std::to_string(C.rows.size()) +
+          " rows, body {" + bl + "}" +
           (missing.empty() ? "" : "; rows without a body here: " + missing) + "; owner types:" +
           [&] { std::string t; for (auto &x : ownerTypes) t += " " + x; return t; }() + "; " + std::to_string(handle.size()) +
           " handle fields, " + std::to_string(links.size()) + " link fields, " + std::to_string(code.size()) +
           " code fields (" + std::to_string(codeTargetCount) + " targets through closed code fields)");
     for (const std::string &o : C.obligations) cline("  " + o);
+    if (declared) {
+      // Declared storage (R3 D2): the slots, what wrote them, what failed.
+      auto list = [](const std::set<std::string> &s) {
+        std::string r;
+        for (const std::string &x : s) r += " " + x;
+        return r.empty() ? std::string(" none") : r;
+      };
+      cline("  storage (" + C.provenance + ", declared): handle" + list(declHandle) + "; link" + list(declLink) +
+            "; link word" + list(declWord) + "; unused declared storage" + list(unusedDecl));
+      std::string adm;
+      for (auto &[k, n] : o1Admit) adm += (adm.empty() ? "" : ", ") + k + " " + std::to_string(n);
+      cline("  storage writes admitted: " + (adm.empty() ? std::string("none") : adm));
+      for (auto &[why, sites] : o1Fail) {
+        cline("  storage FAIL " + why + (sites.empty() ? std::string() : ": " + std::to_string(sites.size()) + " sites"));
+        for (size_t i = 0; i < sites.size() && i < 8; i++) cline("    " + sites[i]);
+      }
+      for (const std::string &w : wordLines) cline("  " + w);
+      if (premiseOwnerT || premiseElemT) {
+        cline("  row premise (1c): owner " +
+              (premiseOwnerT ? stripStructNameSuffix(premiseOwnerT->getName()).str() : std::string("none")) +
+              ", element " + (premiseElemT ? stripStructNameSuffix(premiseElemT->getName()).str() : std::string("none")) +
+              "; " + std::to_string(premiseArgs) + " call-site arguments: " + std::to_string(premiseAgree) + " agree, " +
+              std::to_string(premiseFail.size()) + " disagree (FAIL), " + std::to_string(premiseAssume.size()) +
+              " named by nothing (ASSUMPTION), " + std::to_string(premiseNull) + " null");
+        for (const std::string &s : premiseFail) cline("    premise FAIL: " + s);
+        for (const std::string &s : premiseAssume) cline("    ASSUMPTION premise: " + s);
+      }
+      cline("  owner code: " + std::to_string(rowSites) + " row call sites outside the body, " +
+            std::to_string(ownerValues.size()) + " owner values (SSA value or GEP shape, per function); implicit inserts " +
+            std::to_string(implicitMatched.size()) + " matched, " + std::to_string(implicitUnmatched.size()) +
+            " unmatched; " + std::to_string(lookupsByDerivation) + " lookups by derivation");
+      for (size_t i = 0; i < implicitMatched.size() && i < 8; i++) cline("    implicit insert matched: " + implicitMatched[i]);
+      for (size_t i = 0; i < implicitUnmatched.size() && i < 8; i++)
+        cline("    implicit insert UNMATCHED: " + implicitUnmatched[i]);
+      if (!o1Naming.empty()) {
+        cline("  naming FAIL: " + std::to_string(o1Naming.size()) +
+              " accesses through owner or element values that no rule names");
+        for (size_t i = 0; i < o1Naming.size() && i < 8; i++) cline("    " + o1Naming[i]);
+      }
+    }
     // Verdicts are per binary: the body's optimization level with each
     // (clang -O0 marks every function optnone).
     size_t optnone = 0;
@@ -1666,7 +2379,11 @@ void CallGraphPass::checkContainerClosure() {
     const std::string level = optnone == body.size() ? "the body at -O0"
                               : optnone == 0         ? "the body optimized"
                                                      : "the body partly at -O0";
-    cline(std::string("  ") + (C.verified ? "VERIFIED (rows applied)" : "REJECTED (rows not applied)") + "; " + level);
+    cline(std::string("  ") +
+          (C.report ? (holds ? "REPORT ONLY: the obligations hold (rows not applied)"
+                             : "REPORT ONLY: the obligations fail (rows not applied)")
+                    : C.verified ? "VERIFIED (rows applied)" : "REJECTED (rows not applied)") +
+          "; " + level);
   }
 }
 

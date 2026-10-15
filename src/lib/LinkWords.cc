@@ -47,183 +47,6 @@ using namespace llvm;
 namespace {
 using FieldKey = std::pair<std::string, int64_t>; // (struct name, byte offset)
 
-// The innermost named struct holding byte `off` of ST, the offset there,
-// and the scalar the byte lies in with the byte's offset inside it.
-static bool innermostField(Type *T, int64_t off, const DataLayout &DL, FieldKey &K, Type *&leaf,
-                           int64_t &inLeaf) {
-  K = {"", 0};
-  for (int depth = 0; depth < 64 && off >= 0; depth++) {
-    if (auto *ST = dyn_cast<StructType>(T)) {
-      if (ST->isOpaque()) return false;
-      if (ST->hasName()) K = {stripStructNameSuffix(ST->getName()).str(), off};
-      const StructLayout *SL = DL.getStructLayout(ST);
-      if ((uint64_t)off >= SL->getSizeInBytes()) return false;
-      const unsigned i = SL->getElementContainingOffset(off);
-      off -= (int64_t)SL->getElementOffset(i);
-      T = ST->getElementType(i);
-      continue;
-    }
-    if (auto *AT = dyn_cast<ArrayType>(T)) {
-      const int64_t es = (int64_t)DL.getTypeAllocSize(AT->getElementType());
-      if (es == 0) return false;
-      K.second -= off - off % es; // an array member's elements share its name
-      off %= es;
-      T = AT->getElementType();
-      continue;
-    }
-    leaf = T;
-    inLeaf = off;
-    return !K.first.empty();
-  }
-  return false;
-}
-
-// An access through a struct's array member at a variable index
-// (xa_node.slots[offset]): the struct GEP whose last index is variable and
-// whose prefix names the array; the member's start stands for the slot.
-static bool arraySlot(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off) {
-  const GEPOperator *G = structGEP(Addr);
-  if (!G || G->getNumIndices() < 3) return false;
-  S = dyn_cast<StructType>(G->getSourceElementType());
-  if (!S || !S->hasName()) return false;
-  SmallVector<Value *, 8> idx(G->idx_begin(), G->idx_end() - 1);
-  for (Value *V : idx)
-    if (!isa<ConstantInt>(V)) return false;
-  if (!isa<ArrayType>(GetElementPtrInst::getIndexedType(S, idx))) return false;
-  off = (int64_t)DL.getIndexedOffsetInType(S, idx);
-  return true;
-}
-
-// The struct an address with no struct GEP and no TBAA tag points to (the
-// kernel builds with -fno-strict-aliasing: `node->__rb_parent_color` on a
-// formal or a phi is a plain load at offset 0), in order (Fable 2026-10-15):
-// 1. the declared pointee of its variable (dbg.value), formal, slot or
-//    object; a phi's entries when they all agree;
-// 2. formal provenance: a formal of a function whose address is never taken
-//    and whose call sites are all known points to the struct every site's
-//    actual names (a struct GEP's result, a phi of them, or a caller's formal
-//    by the same rule, to a depth bound); a disagreement or an unknown site
-//    leaves it unnamed;
-// 3. else unnamed (counted by the caller).
-struct PointeeResolver {
-  // Direct call sites per callee (a defined function and the declarations of
-  // its name in other modules); callees whose address is taken.
-  std::map<const Function *, std::vector<const CallBase *>> sites;
-  std::set<const Function *> taken;
-  std::map<const Argument *, StructType *> memo;
-  std::set<const Argument *> busy;
-  size_t byDI = 0, bySibling = 0, byFormal = 0;
-  bool viaFormal = false, viaSibling = false; // how the last lookup was decided
-
-  // A use the linker drops: a global in a ".discard.*" section
-  // (EXPORT_SYMBOL's __ADDRESSABLE entry) takes no address in the program.
-  static bool discarded(const User *U) {
-    for (int i = 0; i < 4 && U; i++) {
-      if (const auto *GV = dyn_cast<GlobalVariable>(U)) return GV->getSection().starts_with(".discard");
-      if (!isa<Constant>(U) || U->getNumUses() != 1) return false;
-      U = *U->user_begin();
-    }
-    return false;
-  }
-  // The innermost named struct at offset 0 of S (timerqueue_node -> rb_node):
-  // what an offset-0 access through a pointer to S names, so call sites agree
-  // when they pass embeddings that share their first member.
-  static StructType *atZero(StructType *S) {
-    for (int d = 0; d < 32 && S && !S->isOpaque() && S->getNumElements(); d++) {
-      auto *E = dyn_cast<StructType>(S->getElementType(0));
-      if (!E || !E->hasName() || E->isOpaque()) break;
-      S = E;
-    }
-    return S;
-  }
-
-  explicit PointeeResolver(const GlobalContext *Ctx) {
-    std::map<std::string, const Function *> defOf;
-    for (auto &[M, _] : Ctx->Modules)
-      for (Function &F : *M)
-        if (!F.isDeclaration() && !F.hasLocalLinkage()) defOf.emplace(F.getName().str(), &F);
-    for (auto &[M, _] : Ctx->Modules)
-      for (Function &F : *M) {
-        const Function *D = &F;
-        if (F.isDeclaration()) {
-          auto it = defOf.find(F.getName().str());
-          if (it == defOf.end()) continue;
-          D = it->second;
-        }
-        for (const Use &U : F.uses()) {
-          const auto *CB = dyn_cast<CallBase>(U.getUser());
-          if (CB && CB->isCallee(&U)) sites[D].push_back(CB);
-          else if (!discarded(U.getUser())) taken.insert(D);
-        }
-      }
-  }
-
-  StructType *get(const Value *A, LLVMContext &C, int depth = 0) {
-    A = A->stripPointerCasts();
-    if (depth > 6) return nullptr;
-    std::string n;
-    SmallVector<DbgValueInst *, 2> DVs;
-    findDbgValues(DVs, const_cast<Value *>(A));
-    for (DbgValueInst *DV : DVs)
-      if (n.empty())
-        if (const StringRef N = ka::diStructName(DV->getVariable()->getType(), true); !N.empty()) n = "struct." + N.str();
-    if (n.empty()) n = diDeclaredStruct(A, true);
-    if (n.empty() && (isa<GlobalVariable>(A) || isa<AllocaInst>(A))) n = diDeclaredStruct(A, false);
-    if (!n.empty()) return StructType::getTypeByName(C, n);
-    // Sibling GEPs (Fable 2026-10-15): the value is the base of struct GEPs
-    // of one struct in its function; the GEP's source type is the program's
-    // declaration of that expression. Two structs (after the offset-0
-    // normalization) are a pun: unnamed.
-    {
-      StructType *agreed = nullptr;
-      bool clash = false;
-      for (const User *U : A->users())
-        if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A)
-          if (auto *S = dyn_cast<StructType>(G->getSourceElementType()); S && S->hasName()) {
-            S = atZero(S);
-            clash |= agreed && agreed != S;
-            agreed = S;
-          }
-      if (clash) return nullptr;
-      if (agreed) return viaSibling = true, agreed;
-    }
-    if (const auto *PN = dyn_cast<PHINode>(A)) {
-      StructType *agreed = nullptr;
-      for (const Value *In : PN->incoming_values()) {
-        if (In == PN) continue;
-        StructType *S = get(In, C, depth + 1);
-        if (!S || (agreed && agreed != S)) return nullptr;
-        agreed = S;
-      }
-      return agreed;
-    }
-    if (const GEPOperator *G = structGEP(A))
-      if (auto *S = dyn_cast<StructType>(G->getResultElementType()); S && S->hasName() && G->hasAllConstantIndices())
-        return S;
-    if (const auto *Arg = dyn_cast<Argument>(A)) {
-      viaFormal = true;
-      if (auto it = memo.find(Arg); it != memo.end()) return it->second;
-      if (!busy.insert(Arg).second) return nullptr; // a cycle among formals decides nothing
-      StructType *agreed = nullptr;
-      const Function *F = Arg->getParent();
-      auto sit = sites.find(F);
-      bool ok = !taken.count(F) && sit != sites.end() && !sit->second.empty();
-      for (size_t i = 0; ok && i < sit->second.size(); i++) {
-        const CallBase *CB = sit->second[i];
-        if (Arg->getArgNo() >= CB->arg_size()) { ok = false; break; }
-        StructType *S = get(CB->getArgOperand(Arg->getArgNo()), C, depth + 1);
-        if (S) S = atZero(S);
-        if (!S || (agreed && agreed != S)) ok = false;
-        else agreed = S;
-      }
-      busy.erase(Arg);
-      StructType *R = ok ? agreed : nullptr;
-      memo[Arg] = R;
-      return R;
-    }
-    return nullptr;
-  }
-};
 
 static const Value *stripIntCasts(const Value *V) {
   for (int i = 0; i < 16; i++) {
@@ -283,6 +106,7 @@ static std::string encodedClass(const Value *V) {
 void CallGraphPass::computeLinkWords() {
   linkWordReport.clear();
   linkWordFields.clear();
+  linkWordVerdicts.clear();
   struct Field {
     std::vector<const StoreInst *> stores;
     std::vector<const LoadInst *> loads;
@@ -335,9 +159,13 @@ void CallGraphPass::computeLinkWords() {
         StructType *ST = nullptr;
         int64_t off = 0;
         if ((!accessSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) && !arraySlot(Addr, DL, ST, off)) {
-          pointees.viaFormal = pointees.viaSibling = false;
+          pointees.viaFormal = pointees.viaSibling = pointees.viaDecl = false;
           ST = pointees.get(Addr, I.getContext()), off = 0;
-          if (ST) (pointees.viaFormal ? pointees.byFormal : pointees.viaSibling ? pointees.bySibling : pointees.byDI)++;
+          if (ST)
+            (pointees.viaFormal    ? pointees.byFormal
+             : pointees.viaSibling ? pointees.bySibling
+             : pointees.viaDecl    ? pointees.byDecl
+                                   : pointees.byDI)++;
           if (!ST) {
             // Would it have fed a link word? A pointer-width integer access
             // that reads into inttoptr or stores a ptrtoint-derived word.
@@ -640,6 +468,7 @@ void CallGraphPass::computeLinkWords() {
     line(keyName(K) + ": " + verdict + "; stores " + std::to_string(Fd.stores.size()) + " {" + counts(st) +
          "}; self-link " + std::to_string(selfLink) + ", self-derived " + std::to_string(selfDerived) + ", copies " +
          std::to_string(copies) + "; loads " + std::to_string(Fd.loads.size()) + " {" + counts(ld) + "}");
+    linkWordVerdicts[keyName(K)] = {verdict, assumes};
     for (const std::string &a : assumes)
       line("  ASSUMPTION " + keyName(K) + ": the program relies on tag 0 at this read: " + a);
     for (const std::string &f : fails) line("  FAIL " + keyName(K) + ": " + f);
@@ -727,7 +556,8 @@ void CallGraphPass::computeLinkWords() {
   for (size_t i = 0; i < top.size() && i < 10; i++) tops += (i ? ", " : "") + top[i].second + " " + std::to_string(top[i].first);
   for (auto &[n, fn] : top) linkWordReport.push_back("  UNNAMED " + fn + " " + std::to_string(n)); // the full list: rule report only
   line("naming of offset-0 accesses with no struct GEP or TBAA: " + std::to_string(pointees.byDI) +
-       " accesses by declared type, " + std::to_string(pointees.bySibling) + " by sibling GEPs, " +
+       " accesses by declared type, " + std::to_string(pointees.byDecl) + " by the object's IR type, " +
+       std::to_string(pointees.bySibling) + " by sibling GEPs, " +
        std::to_string(pointees.byFormal) + " by formal provenance; " + std::to_string(nUnnamed) +
        " unnamed that would feed a link word, in " + std::to_string(unnamedIn.size()) + " functions" +
        (tops.empty() ? "" : " (" + tops + ")"));

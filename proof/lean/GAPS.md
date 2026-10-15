@@ -1939,7 +1939,10 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   relies on tag 0 at that read: an ASSUMPTION line, not checked.
 - **Naming at offset 0 with no struct GEP and no TBAA** (the kernel builds
   with -fno-strict-aliasing and the 5.18 corpus has no debug info): the
-  address's declared pointee, by debug info; else by sibling GEPs (the
+  address's declared pointee, by debug info; else by the object's own
+  IR type (1b: a global's or local's value type when it is a named
+  struct, or an array of one; a struct GEP of another struct on the same
+  object is a pun); else by sibling GEPs (the
   value is the base of struct GEPs of one struct in its function, after
   normalizing each struct to its innermost struct at offset 0; two structs
   are a pun: unnamed); else by formal provenance (a function whose address
@@ -1969,4 +1972,90 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   shared traverse return (cured by traverse rows by derivation, R5).
 
 Cases: test/t_cells_linkword_{rb,rotate,plus8,addtag,xarray,sibling}.c.
+Not mechanized. Checked by executions; see the commit's gates.
+
+## Containers in report mode (Containers.cc, ContainerOwnerCode.cc, 2026-10-15, plan 3.55 R3/R5)
+
+A `@container NAME report` block in func_summaries.txt (the kernel's
+rbtree and llist, rows as ruled in R5) is checked like any container and
+reported per container in the log and the rule report; its rows are
+never applied.
+
+- **Statement (no fact changes):** a report block adds no edge, no row
+  link and no mint; the solver's facts and answers are those of the same
+  run without the block. Checked by executions: the cells and consumer
+  gates on programs without the rows' functions are byte-identical, and
+  t_cells_container_report keeps both targets of a lookup a row would
+  narrow.
+- **Declared storage** (`@storage HANDLE(T+off) LINK(T+off)
+  LINKWORD(T+off)`): a proposal named by the innermost struct holding
+  the slot (rb_root+0 matches the rb_root inside any owner), checked from
+  both sides: (i) every element-derived store in a row body or in owner
+  code lands in a declared slot (an address that may name an undeclared
+  field fails "an element stored outside the declared storage"); (ii)
+  every write into a declared slot anywhere in the program is a row
+  body's or an admitted site, else O1 fails with the site. A declared
+  slot nothing writes is counted "unused declared storage", not a
+  failure. Where the program has debug info, the declaration must agree
+  with it (links: pointer members back into the container's structs;
+  handles: pointer members). A LINKWORD needs its R1 verdict PASS (or
+  PASS with assumptions, carried into the container's lines).
+- **Admitted writes (premises, counted):** null stores and fills, a link
+  word's null plus tag (R1); a self-link (R2: the element's own object
+  address, tagged or not, into its own slot: it introduces no other
+  owner's element); a link word reused as an integer (R4: a constant, or
+  arithmetic over a load of the same cell); a same-cell re-store (an
+  atomic's tied old value, R4 family); a same-owner re-store in owner
+  code; an implicit insert; a link store on the element an insert row
+  call in the same function takes.
+- **Owner-code derivation (D5):** in a function that passes owner value
+  o to a row, a value or slot is derived from o when it is o's
+  handle-slot address or load, a link (or decoded link word) address or
+  load of a derived value, a phi or select all of whose non-null entries
+  are derived (a greatest fixpoint: loop-carried descents close), or a
+  row's result on a derived argument; an element argument of a remove row
+  on o is derived. An owner or element whose own address names a declared
+  slot (a handle or link at +0) is that slot's address. A phi or select of
+  field addresses names every entry's field.
+- **Implicit insert (D6):** a store of a pointer into a derived slot is an
+  implicit insert site, matched when an insert row call in the same
+  function takes the same element (SSA value) and the same owner value
+  (SSA value or constant GEP shape); an unmatched one fails O1 with its
+  site. A row that is also owner code (timerqueue_add calls
+  rb_insert_color) is checked both ways.
+- **Inline asm (D4):** an asm's memory effects are the graph build's
+  model (asmModel, called by both): an indirect output stores each direct
+  pointer (or witnessed pointer-width) input, an indirect input is read
+  into the result, raw pointer inputs are read and, with memory effects,
+  written with every value input. The checker judges those stores and
+  loads like any other.
+- **Naming:** one rule with the link words (struct GEP, TBAA, an array
+  member at a variable index, else the resolver at offset 0). An access
+  through an owner or element value that no rule names is a naming
+  failure ("FAIL on naming", sites listed), never a pass. A pointer
+  loaded from a field has no named pointee without debug info (rule (2),
+  field pointee inference, not built): the kernel's llist bodies fail on
+  naming, which the report measures.
+- **Row premise (1c):** a row types its OWNER formal as the struct of the
+  block's HANDLE at +0 and each ELEM formal as the struct of its LINK and
+  LINKWORD slots, in the body and nothing else (every other value is still
+  named by derivation or a naming route). The premise is discharged at
+  every call site: an actual named by a route, or a constant GEP into a
+  struct that embeds the premise's struct at that offset, agrees; an
+  actual named as another struct fails the row at that site; an actual
+  nothing names is a per-site ASSUMPTION, listed (the same shape as R1's
+  unmasked inttoptr); a null actual carries no object.
+- **Asm model over-approximation:** the model's raw-pointer rule writes
+  every value input through every raw pointer input (llist's cmpxchg
+  writes new_first and the old head through each other). Such writes fail
+  under their own class. A constraint-aware model (only memory-constrained
+  operands are addresses) would remove them, and is unsound without
+  reading the asm text where a register pointer is dereferenced: a
+  measured follow-up.
+- **Traverse rows:** RET is the element set of the containers that contain
+  the ELEM argument (its O3 containment set); an element no container
+  contains leaves the call to the body ("traverse of an uncontained
+  element"). Specified for enabling; nothing is applied in report mode.
+
+Cases: test/t_cells_container_{rb,rb_unmatched,storage_bad,llist,llist_int,report,naming}.c.
 Not mechanized. Checked by executions; see the commit's gates.

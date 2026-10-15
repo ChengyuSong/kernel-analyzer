@@ -643,6 +643,10 @@ protected:
   void computeLinkWords();
   std::vector<std::string> linkWordReport;
   std::set<std::pair<std::string, int64_t>> linkWordFields;
+  // Every candidate's verdict ("PASS", "PASS with N assumptions", "FAIL ...")
+  // and its ASSUMPTION sites, by "struct.T+off" (read by the containers'
+  // LINKWORD storage, plan 3.55 R3).
+  std::map<std::string, std::pair<std::string, std::vector<std::string>>> linkWordVerdicts;
   std::array<size_t, 11> taggedCounts{}; // ..., predicate tests closed, open, parameter-pair reads keyed, untested
   // Keyed tagged-field pairs (struct, F offset, D offset, D size): the solver
   // flips a pair to unkeyed when a byte copy writes its tag other than as a

@@ -92,6 +92,82 @@ const GEPOperator *structGEP(const Value *A);
 bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
                 StructType *&S, int64_t &off);
 bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o);
+// GraphBuild.cc: an inline asm's memory effects as the graph build models
+// them (handleInlineAsm adds its edges from this; the container checker
+// reads the same model). A value input's `ok`: a pointer, or a
+// pointer-width integer witnessed to carry (stores) or become (loads) one.
+struct AsmModel {
+  struct Value_ {
+    const Value *val = nullptr;
+    int argIdx = -1;
+    bool ok = false, witnessed = false, declined = false;
+  };
+  struct Slot {
+    const Value *ptr = nullptr; // the indirect operand
+    int argIdx = -1;
+    bool output = false;         // =*m: written with `stores`; *m: read into the result
+    std::vector<Value_> stores;  // output: the direct inputs that may be stored
+    Value_ load;                 // input: whether the result receives *ptr
+  };
+  std::vector<Slot> slots;
+  bool resPtrCapable = false, resDeclined = false;
+  bool memEffects = false;            // a memory clobber or an indirect output
+  std::vector<const Value *> rawPtrs; // raw pointer inputs read (and, with memEffects, written)
+  std::vector<Value_> valueInputs;    // what a raw pointer input may be written with
+};
+AsmModel asmModel(const CallBase &CS, const DataLayout *DL);
+// ContainerOwnerCode.cc (plan 3.55 R3 D5): in owner code F, the classes of
+// values derived from the owner values `owners`: OC_OWNER the owner,
+// OC_SLOT a declared slot's address, OC_VAL an element (loaded through a
+// slot, a link word decoded, a row's result), OC_WORD a link word.
+// slotOf(At, A): the declared slot kind ('h', 'l', 'w') an access at A (At
+// the accessing instruction, or null for an address) names, 0 if none.
+// rowRet(CB, cls): whether a row call's result is derived given the classes.
+enum : uint8_t { OC_OWNER = 1, OC_SLOT = 2, OC_VAL = 4, OC_WORD = 8 };
+using OwnerClassFn = std::function<uint8_t(const Value *)>;
+std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::vector<const Value *> &owners,
+                                                 const std::vector<const Value *> &elems,
+                                                 const std::function<char(const Instruction *, const Value *)> &slotOf,
+                                                 const std::function<bool(const CallBase *, const OwnerClassFn &)> &rowRet);
+// The innermost named struct holding byte `off` of T (array members fold
+// to their element 0), the offset there, and the scalar the byte lies in
+// with the byte's offset inside it.
+bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::string, int64_t> &K, Type *&leaf,
+                    int64_t &inLeaf);
+// An access through a struct's array member at a variable index: the
+// member's start stands for the slot.
+bool arraySlot(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off);
+// The struct an address with no struct GEP and no TBAA tag points to (an
+// offset-0 access; the kernel builds with -fno-strict-aliasing and carries
+// no debug info), in order (Fable 2026-10-15): debug info; a global's or
+// local's own IR type (1b: a named struct, or an array of one); sibling GEPs (the
+// value is the base of struct GEPs of one struct, after normalizing to the
+// innermost struct at offset 0; two structs are a pun: unnamed); a phi whose
+// entries agree; a struct GEP's result type; formal provenance (a formal of
+// a function whose address is never taken, uses from ".discard*" sections
+// excluded, and whose call sites all name one struct). Else unnamed.
+class PointeeResolver {
+public:
+  explicit PointeeResolver(const GlobalContext *Ctx);
+  StructType *get(const Value *A, LLVMContext &C, int depth = 0);
+  // The innermost named struct at offset 0 of S (timerqueue_node -> rb_node).
+  static StructType *atZero(StructType *S);
+  // How lookups were decided (counted by get's callers).
+  size_t byDI = 0, byDecl = 0, bySibling = 0, byFormal = 0;
+  bool viaFormal = false, viaSibling = false, viaDecl = false; // how the last lookup was decided
+
+private:
+  static bool discarded(const User *U);
+  std::map<const Function *, std::vector<const CallBase *>> sites;
+  std::set<const Function *> taken;
+  std::map<const Argument *, StructType *> memo;
+  std::set<const Argument *> busy;
+};
+// The (struct, byte offset) an access names: its struct GEP or TBAA tag
+// (accessSlot), an array member at a variable index (arraySlot), or, at
+// offset 0 with neither, the address's pointee by the resolver.
+bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P, StructType *&S,
+               int64_t &off);
 // CellSolver.cc: the debug-info struct ("struct.<tag>") a declared object
 // is, or (pointee) a pointer value points to; "" if none.
 std::string diDeclaredStruct(const Value *P, bool pointee);

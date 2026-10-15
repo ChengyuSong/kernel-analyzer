@@ -666,6 +666,8 @@ bool CallGraphPass::doModulePass(Module *M) {
 
   if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
+  if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
+    computeLinkWords(); // plan 3.55 R1: tagged-pointer link words (report only; read by R3's LINKWORD storage)
   if (CFLCells && (CFLContainerClosure || !Ctx->Containers.empty()) && iteration == 0 &&
       M == Ctx->Modules.front().first)
     checkContainerClosure(); // report only: after carves and the confirmer's fresh wrappers
@@ -689,8 +691,6 @@ bool CallGraphPass::doModulePass(Module *M) {
     runUnionCensus(); // census, and the union keys graph build applies
   if (CFLCells && CFLUnionKeys == "tag" && iteration == 0 && M == Ctx->Modules.front().first)
     computeTaggedFields(); // plan 3.51: keys for fields tagged by a sibling
-  if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
-    computeLinkWords(); // plan 3.55 R1: tagged-pointer link words (report only)
   if (CFLCells && CFLUnionKeys != "off" && iteration == 0 && M == Ctx->Modules.front().first)
     unadoptKeyedBodies(); // keyed bodies keep their accesses
 

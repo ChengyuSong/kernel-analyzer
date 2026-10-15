@@ -2293,6 +2293,161 @@ void CallGraphPass::ensureConstGEPFieldEdges(const ConstantExpr *CE) {
 
 static bool mayBecomePointer(const llvm::Value *V, unsigned depth,
                              bool &declined);
+// The memory effects of an inline asm, as the graph build models them (one
+// model: handleInlineAsm adds its edges from it, the container checker reads
+// it). Slots: indirect operands of a pointer (or pointer-width integer)
+// element type; an output slot may receive any pointer-typed direct input,
+// or a pointer-width integer input witnessed to carry a pointer; an input
+// slot is read into the result when the result is a pointer or witnessed to
+// become one. Raw pointer inputs (not immediates, except %gs:/%fs:
+// addressed ones): read into a pointer-capable result; written with every
+// value input, and copied between, when the asm declares memory effects (a
+// memory clobber or any indirect output).
+AsmModel asmModel(const CallBase &CS, const DataLayout *DL) {
+  AsmModel AM;
+  auto *IA = cast<InlineAsm>(CS.getCalledOperand());
+  auto Constraints = InlineAsm::ParseConstraints(IA->getConstraintString());
+  unsigned argIdx = 0;
+  std::vector<int> cToArg(Constraints.size(), -1);
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    auto &CI = Constraints[i];
+    if (CI.Type == InlineAsm::isClobber
+#if LLVM_VERSION_MAJOR >= 15
+        || CI.Type == InlineAsm::isLabel
+#endif
+    )
+      continue;
+    if (CI.hasArg())
+      cToArg[i] = argIdx++;
+  }
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    auto &CI = Constraints[i];
+    if (!CI.isIndirect)
+      continue;
+    int aIdx = cToArg[i];
+    if (aIdx < 0 || (unsigned)aIdx >= CS.arg_size())
+      continue;
+#if LLVM_VERSION_MAJOR >= 15
+    Type *ET = CS.getParamElementType(aIdx);
+#else
+    Type *ET = CS.getArgOperand(aIdx)->getType()->isPointerTy()
+      ? CS.getArgOperand(aIdx)->getType()->getPointerElementType()
+      : nullptr;
+#endif
+    // ptr-typed slot, or a ptr-WIDTH int slot (asm atomics on i64 —
+    // xchgq/lock cmpxchgq — launder fptrs exactly like the IR-level
+    // _Atomic lowering; same witness discipline as visitLoad/StoreInst)
+    bool ptrSlot = ET && containsPointerType(ET);
+    bool widthSlot = !ptrSlot && ET && DL && isPtrWidthInt(ET->getScalarType(), *DL);
+    if (!ptrSlot && !widthSlot)
+      continue;
+    AsmModel::Slot Sl;
+    Sl.ptr = CS.getArgOperand(aIdx);
+    Sl.argIdx = aIdx;
+    if (CI.Type == InlineAsm::isOutput) {
+      Sl.output = true;
+      for (unsigned j = 0; j < Constraints.size(); j++) {
+        if (Constraints[j].Type != InlineAsm::isInput)
+          continue;
+        int sIdx = cToArg[j];
+        if (sIdx < 0 || (unsigned)sIdx >= CS.arg_size())
+          continue;
+        const Value *srcVal = CS.getArgOperand(sIdx);
+        if (Constraints[j].isIndirect)
+          continue;
+        // laundered constants arrive as ptrtoint CEs whose i64 type
+        // resolves to the shared ConstantInt node — unwrap to the
+        // underlying pointer so the edge carries the real identity
+        if (auto *PTI = dyn_cast<PtrToIntOperator>(srcVal))
+          srcVal = PTI->getPointerOperand();
+        AsmModel::Value_ In;
+        In.val = srcVal;
+        In.argIdx = sIdx;
+        In.ok = srcVal->getType()->isPointerTy();
+        if (!In.ok && widthSlot && DL && isPtrWidthInt(srcVal->getType(), *DL)) {
+          bool declined = false;
+          In.ok = mayCarryPtrProvenance(srcVal, 8, declined);
+          In.witnessed = In.ok;
+          In.declined = !In.ok && declined;
+        }
+        Sl.stores.push_back(In);
+      }
+    } else if (CI.Type == InlineAsm::isInput) {
+      Sl.load.ok = CS.getType()->isPointerTy() || containsPointerType(CS.getType());
+      if (!Sl.load.ok && DL && isPtrWidthInt(CS.getType(), *DL)) {
+        bool declined = false;
+        Sl.load.ok = mayBecomePointer(&CS, 8, declined);
+        Sl.load.witnessed = Sl.load.ok;
+        Sl.load.declined = !Sl.load.ok && declined;
+      }
+    } else {
+      continue;
+    }
+    AM.slots.push_back(std::move(Sl));
+  }
+
+  bool memClobber = false, anyIndirectOut = false;
+  for (auto &CI : Constraints) {
+    if (CI.Type == InlineAsm::isClobber) {
+      for (const std::string &Code : CI.Codes)
+        if (StringRef(Code).contains("memory")) memClobber = true;
+    } else if (CI.Type == InlineAsm::isOutput && CI.isIndirect) {
+      anyIndirectOut = true;
+    }
+  }
+  AM.memEffects = memClobber || anyIndirectOut;
+  AM.resPtrCapable = CS.getType()->isPointerTy() || containsPointerType(CS.getType());
+  if (!AM.resPtrCapable && !CS.getType()->isVoidTy() && DL && isPtrWidthInt(CS.getType(), *DL)) {
+    bool declined = false;
+    AM.resPtrCapable = mayBecomePointer(&CS, 8, declined);
+    AM.resDeclined = declined;
+  }
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    auto &CI = Constraints[i];
+    if (CI.Type != InlineAsm::isInput || CI.isIndirect)
+      continue;
+    int aIdx = cToArg[i];
+    if (aIdx < 0 || (unsigned)aIdx >= CS.arg_size())
+      continue;
+    const Value *A = CS.getArgOperand(aIdx);
+    {
+      AsmModel::Value_ In;
+      In.argIdx = aIdx;
+      const Value *V = A;
+      if (auto *PTI = dyn_cast<PtrToIntOperator>(V))
+        V = PTI->getPointerOperand();
+      In.val = V;
+      In.ok = V->getType()->isPointerTy();
+      if (!In.ok && DL && isPtrWidthInt(V->getType(), *DL)) {
+        bool declined = false;
+        In.ok = mayCarryPtrProvenance(V, 8, declined);
+        In.declined = !In.ok && declined;
+      }
+      AM.valueInputs.push_back(In);
+    }
+    if (!A->getType()->isPointerTy())
+      continue;
+    bool allImm = !CI.Codes.empty();
+    for (const std::string &Code : CI.Codes)
+      allImm &= (Code == "i" || Code == "s" || Code == "n" || Code == "X");
+    if (allImm) {
+      // %gs:/%fs:-addressed immediates ARE runtime accesses: x86
+      // percpu codegen passes the percpu symbol as an "i" operand
+      // and the asm reads %gs:sym (this_cpu_read — pcpu_hot's
+      // current_task load = `current`). The segment rebase is
+      // base-to-base relocation under the declared percpu
+      // invariant, so *(sym) -> result is the exact model. Found
+      // via the th3 (LLVM-14) corpus: 226 dropped current-loads
+      // surfaced as IntToPtr src-node-not-found (2026-08-18).
+      StringRef AsmStr(IA->getAsmString());
+      if (!AsmStr.contains("%gs:") && !AsmStr.contains("%fs:"))
+        continue; // true link-time symbol, no runtime access
+    }
+    AM.rawPtrs.push_back(A);
+  }
+  return AM;
+}
+
 void CallGraphPass::handleInlineAsm(CallBase &CS) {
   // Named cells: asm writes of unknown extent; a cell-to-cell flow here
   // moves values, not bytes in place.
@@ -2361,152 +2516,54 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
     addAssignmentEdge(srcNode, dstNode);
   }
 
-  // 2. Indirect memory operands with pointer elementtype.
-  // =*m (output, indirect): asm writes to *arg. Conservatively, any pointer-typed
-  //   direct input could be stored there.
-  // *m (input, indirect): asm reads from *arg. Loaded value could flow to
-  //   pointer-typed outputs.
-  for (unsigned i = 0; i < Constraints.size(); i++) {
-    auto &CI = Constraints[i];
-    if (!CI.isIndirect)
-      continue;
-    int aIdx = cToArg[i];
-    if (aIdx < 0 || (unsigned)aIdx >= CS.arg_size())
-      continue;
-
-#if LLVM_VERSION_MAJOR >= 15
-    Type *ET = CS.getParamElementType(aIdx);
-#else
-    Type *ET = CS.getArgOperand(aIdx)->getType()->isPointerTy()
-      ? CS.getArgOperand(aIdx)->getType()->getPointerElementType()
-      : nullptr;
-#endif
-    // ptr-typed slot, or a ptr-WIDTH int slot (asm atomics on i64 —
-    // xchgq/lock cmpxchgq — launder fptrs exactly like the IR-level
-    // _Atomic lowering; same witness discipline as visitLoad/StoreInst)
-    bool ptrSlot = ET && containsPointerType(ET);
-    bool widthSlot = !ptrSlot && ET && curDL &&
-                     isPtrWidthInt(ET->getScalarType(), *curDL);
-    if (!ptrSlot && !widthSlot)
-      continue;
-
-    NodeIndex ptrNode = getRepNodeForValue(CS.getArgOperand(aIdx));
+  // 2. Indirect memory operands with pointer elementtype, and 2b. raw
+  // pointer inputs (asmModel: the one model of an asm's memory effects,
+  // also read by the container checker).
+  const AsmModel AM = asmModel(CS, curDL);
+  for (const AsmModel::Slot &Sl : AM.slots) {
+    NodeIndex ptrNode = getRepNodeForValue(Sl.ptr);
     if (ptrNode == AndersNodeFactory::InvalidIndex)
       continue;
     NodeIndex derefNode = getRepDerefNode(ptrNode);
 
-    if (CI.Type == InlineAsm::isOutput) {
+    if (Sl.output) {
       // store to *ptr — any ptr-typed direct input, or witnessed
       // ptr-width int input, could be what the asm stores
-      for (unsigned j = 0; j < Constraints.size(); j++) {
-        if (Constraints[j].Type != InlineAsm::isInput)
+      for (const AsmModel::Value_ &In : Sl.stores) {
+        if (In.witnessed) g_asmWidthWitnessed++;
+        else if (In.declined) g_asmLaunderDeclined++;
+        if (!In.ok)
           continue;
-        int sIdx = cToArg[j];
-        if (sIdx < 0 || (unsigned)sIdx >= CS.arg_size())
-          continue;
-        Value *srcVal = CS.getArgOperand(sIdx);
-        if (Constraints[j].isIndirect)
-          continue;
-        // laundered constants arrive as ptrtoint CEs whose i64 type
-        // resolves to the shared ConstantInt node — unwrap to the
-        // underlying pointer so the edge carries the real identity
-        if (auto *PTI = dyn_cast<PtrToIntOperator>(srcVal))
-          srcVal = PTI->getPointerOperand();
-        bool ok = srcVal->getType()->isPointerTy();
-        if (!ok && widthSlot && curDL &&
-            isPtrWidthInt(srcVal->getType(), *curDL)) {
-          bool declined = false;
-          ok = mayCarryPtrProvenance(srcVal, 8, declined);
-          if (ok) g_asmWidthWitnessed++;
-          else if (declined) g_asmLaunderDeclined++;
-        }
-        if (!ok)
-          continue;
-        NodeIndex srcNode = getRepNodeForValue(srcVal);
+        NodeIndex srcNode = getRepNodeForValue(In.val);
         if (srcNode == AndersNodeFactory::InvalidIndex ||
             NF.isSpecialNode(srcNode))
           continue;
-        CG_DEBUG("InlineAsm: indirect store edge from input arg " << sIdx
-                 << " to deref of output arg " << aIdx << "\n");
+        CG_DEBUG("InlineAsm: indirect store edge from input arg " << In.argIdx
+                 << " to deref of output arg " << Sl.argIdx << "\n");
         addAssignmentEdge(srcNode, derefNode);
         g_asmSlotStores++;
       }
-    } else if (CI.Type == InlineAsm::isInput) {
+    } else {
       // load from *ptr — flows to the result if it is ptr-typed, or
       // ptr-width and witnessed to become a pointer downstream
-      bool ok = CS.getType()->isPointerTy() ||
-                containsPointerType(CS.getType());
-      if (!ok && curDL && isPtrWidthInt(CS.getType(), *curDL)) {
-        bool declined = false;
-        ok = mayBecomePointer(&CS, 8, declined);
-        if (ok) g_asmWidthWitnessed++;
-        else if (declined) g_asmLaunderDeclined++;
-      }
-      if (ok) {
+      if (Sl.load.witnessed) g_asmWidthWitnessed++;
+      else if (Sl.load.declined) g_asmLaunderDeclined++;
+      if (Sl.load.ok) {
         NodeIndex dstNode = getRepNodeForValue(&CS);
         if (dstNode == AndersNodeFactory::InvalidIndex)
           dstNode = getCanonicalNode(NF.createValueNode(&CS)); // i64 result
         CG_DEBUG("InlineAsm: indirect load edge from deref of input arg "
-                 << aIdx << " to result\n");
+                 << Sl.argIdx << " to result\n");
         addAssignmentEdge(derefNode, dstNode);
         g_asmSlotLoads++;
       }
     }
   }
 
-  // 2b. Raw pointer register/address inputs ("p"/"r" constraints with
-  // pointer-typed args): the asm may READ through them regardless of
-  // clobbers (percpu this_cpu_read_stable), and WRITE through them
-  // when it declares memory effects (memory clobber or any indirect
-  // output) — rep movs/stos, uaccess bodies. Immediate-constraint
-  // pointers (metadata symbols) are excluded like the census does.
   {
-    bool memClobber = false, anyIndirectOut = false;
-    for (auto &CI : Constraints) {
-      if (CI.Type == InlineAsm::isClobber) {
-        for (const std::string &Code : CI.Codes)
-          if (StringRef(Code).contains("memory")) memClobber = true;
-      } else if (CI.Type == InlineAsm::isOutput && CI.isIndirect) {
-        anyIndirectOut = true;
-      }
-    }
-    bool resPtrCapable = CS.getType()->isPointerTy() ||
-                         containsPointerType(CS.getType());
-    if (!resPtrCapable && !CS.getType()->isVoidTy() && curDL &&
-        isPtrWidthInt(CS.getType(), *curDL)) {
-      bool declined = false;
-      resPtrCapable = mayBecomePointer(&CS, 8, declined);
-      if (declined) g_asmLaunderDeclined++;
-    }
+    if (AM.resDeclined) g_asmLaunderDeclined++;
     SmallVector<NodeIndex, 4> rawPtrDerefs;
-    SmallVector<Value *, 4> valueInputs;
-    for (unsigned i = 0; i < Constraints.size(); i++) {
-      auto &CI = Constraints[i];
-      if (CI.Type != InlineAsm::isInput || CI.isIndirect)
-        continue;
-      int aIdx = cToArg[i];
-      if (aIdx < 0 || (unsigned)aIdx >= CS.arg_size())
-        continue;
-      Value *A = CS.getArgOperand(aIdx);
-      valueInputs.push_back(A);
-      if (!A->getType()->isPointerTy())
-        continue;
-      bool allImm = !CI.Codes.empty();
-      for (const std::string &Code : CI.Codes)
-        allImm &= (Code == "i" || Code == "s" || Code == "n" || Code == "X");
-      if (allImm) {
-        // %gs:/%fs:-addressed immediates ARE runtime accesses: x86
-        // percpu codegen passes the percpu symbol as an "i" operand
-        // and the asm reads %gs:sym (this_cpu_read — pcpu_hot's
-        // current_task load = `current`). The segment rebase is
-        // base-to-base relocation under the declared percpu
-        // invariant, so *(sym) -> result is the exact model. Found
-        // via the th3 (LLVM-14) corpus: 226 dropped current-loads
-        // surfaced as IntToPtr src-node-not-found (2026-08-18).
-        StringRef AsmStr(IA->getAsmString());
-        if (!AsmStr.contains("%gs:") && !AsmStr.contains("%fs:"))
-          continue; // true link-time symbol, no runtime access
-      }
+    for (const Value *A : AM.rawPtrs) {
       NodeIndex pNode = getRepNodeForValue(A);
       if (pNode == AndersNodeFactory::InvalidIndex)
         continue;
@@ -2536,26 +2593,19 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
       }
     }
     for (NodeIndex derefP : rawPtrDerefs) {
-      if (resPtrCapable) {
+      if (AM.resPtrCapable) {
         NodeIndex dstNode = getRepNodeForValue(&CS);
         if (dstNode == AndersNodeFactory::InvalidIndex)
           dstNode = getCanonicalNode(NF.createValueNode(&CS)); // i64 result
         addAssignmentEdge(derefP, dstNode);
         g_asmRegLoads++;
       }
-      if (memClobber || anyIndirectOut) {
-        for (Value *V : valueInputs) {
-          if (auto *PTI = dyn_cast<PtrToIntOperator>(V))
-            V = PTI->getPointerOperand();
-          bool ok = V->getType()->isPointerTy();
-          if (!ok && curDL && isPtrWidthInt(V->getType(), *curDL)) {
-            bool declined = false;
-            ok = mayCarryPtrProvenance(V, 8, declined);
-            if (!ok && declined) g_asmLaunderDeclined++;
-          }
-          if (!ok)
+      if (AM.memEffects) {
+        for (const AsmModel::Value_ &In : AM.valueInputs) {
+          if (!In.ok && In.declined) g_asmLaunderDeclined++;
+          if (!In.ok)
             continue;
-          NodeIndex srcNode = getRepNodeForValue(V);
+          NodeIndex srcNode = getRepNodeForValue(In.val);
           if (srcNode == AndersNodeFactory::InvalidIndex ||
               NF.isSpecialNode(srcNode))
             continue;

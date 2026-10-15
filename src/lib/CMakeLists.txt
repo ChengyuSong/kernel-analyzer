@@ -23,6 +23,7 @@ set (KACoreSource
   Slots.cc
   Carves.cc
   Containers.cc
+  ContainerOwnerCode.cc
   TaggedFields.cc
   LinkWords.cc
   Dump.cc

@@ -1389,7 +1389,9 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   // `@container NAME` ... `@container end`: rows of one container (plan
   // 3.55): `<function> ROLE(lookup|insert|traverse|remove|carve|pure)
   // [OWNER(argN)] [ELEM(argN|ret)] [CREATE(argN)] [POOL(argN)]
-  // [KEY(argN) FIELD(T+off)]`; not transfer atoms.
+  // [KEY(argN) FIELD(T+off)]`; not transfer atoms. `@container NAME report`:
+  // a report block (checked, never applied). `@storage HANDLE(T+off)
+  // LINK(T+off) LINKWORD(T+off) ...` inside a block declares its storage.
   GlobalContext::ContainerSpec *curContainer = nullptr;
   auto badRow = [&](StringRef why) {
     errs() << "FuncSummary: " << path << ":" << lineNo << ": container row: " << why << "\n";
@@ -1413,7 +1415,32 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
         if (curContainer || d.empty()) badRow("nested or unnamed @container");
         Ctx->Containers.emplace_back();
         curContainer = &Ctx->Containers.back();
-        curContainer->name = d.str();
+        if (d.consume_back(" report")) curContainer->report = true;
+        curContainer->name = d.trim().str();
+        if (curContainer->name.empty() || StringRef(curContainer->name).contains(' '))
+          badRow("a container name is one word, optionally followed by 'report'");
+        continue;
+      }
+      if (d.consume_front("storage ")) {
+        if (!curContainer) badRow("@storage outside a @container block");
+        SmallVector<StringRef, 8> st;
+        d.split(st, ' ', -1, false);
+        if (st.empty()) badRow("@storage without slots");
+        for (StringRef t : st) {
+          t = t.trim();
+          GlobalContext::ContainerSlot Sl;
+          Sl.line = lineNo;
+          if (t.consume_front("HANDLE(")) Sl.kind = GlobalContext::ContainerSlot::Handle;
+          else if (t.consume_front("LINKWORD(")) Sl.kind = GlobalContext::ContainerSlot::LinkWord;
+          else if (t.consume_front("LINK(")) Sl.kind = GlobalContext::ContainerSlot::Link;
+          else badRow(("bad storage slot '" + t + "'").str());
+          if (!t.consume_back(")")) badRow(("bad storage slot '" + t + "'").str());
+          auto [ty, off] = t.rsplit('+');
+          if (ty.empty() || off.empty() || off.getAsInteger(10, Sl.off) || Sl.off < 0)
+            badRow(("bad storage slot T+off '" + t + "'").str());
+          Sl.type = ("struct." + ty).str();
+          curContainer->storage.push_back(Sl);
+        }
         continue;
       }
       errs() << "FuncSummary: " << path << ":" << lineNo
@@ -1446,7 +1473,15 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
           else if (v == "pure") R.role = CR::Pure;
           else badRow(("unknown role '" + v + "'").str());
         } else if (k == "OWNER") argOf(v, R.owner);
-        else if (k == "ELEM") argOf(v, R.elem);
+        else if (k == "ELEM" && R.elem != -2) {
+          // A second element argument (llist_add_batch's chain end): checked
+          // in a report block; applying it is not built.
+          if (!curContainer->report) badRow("a second ELEM is checked in report blocks only (applying it is not built)");
+          int e = -2;
+          argOf(v, e);
+          if (e < 0) badRow("a second ELEM must be an argument");
+          R.moreElems.push_back(e);
+        } else if (k == "ELEM") argOf(v, R.elem);
         else if (k == "CREATE") argOf(v, R.create);
         else if (k == "POOL") argOf(v, R.pool);
         else if (k == "KEY") argOf(v, R.key);
@@ -1455,9 +1490,12 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       }
       using CR = GlobalContext::ContainerRow;
       if (!role) badRow("no ROLE");
-      if ((R.role == CR::Lookup || R.role == CR::Insert || R.role == CR::Traverse || R.role == CR::Remove) &&
-          R.owner < 0)
-        badRow("a lookup/insert/traverse/remove row needs OWNER(argN)");
+      if ((R.role == CR::Lookup || R.role == CR::Insert || R.role == CR::Remove) && R.owner < 0)
+        badRow("a lookup/insert/remove row needs OWNER(argN)");
+      // A traverse row names its owner or the element it starts from
+      // (rb_next ELEM(arg0): its result is by derivation from the element).
+      if (R.role == CR::Traverse && R.owner < 0 && R.elem < 0)
+        badRow("a traverse row needs OWNER(argN) or ELEM(argN)");
       if (R.role == CR::Insert && R.elem == -2) badRow("an insert row needs ELEM");
       if (R.role == CR::Carve && R.pool < 0) badRow("a carve row needs POOL(argN)");
       if (!curContainer->rows.emplace(toks[0].str(), R).second) badRow("a function twice in one container");

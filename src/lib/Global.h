@@ -251,10 +251,24 @@ public:
     int pool = -2;   // argN (carve)
     int key = -2;    // argN (deliverable 2)
     std::string field; // T+off of the key (deliverable 2)
+    std::vector<int> moreElems; // further ELEM(argN) (llist_add_batch's chain end); report blocks only
+    unsigned line = 0;
+  };
+  // A container's declared storage (`@storage HANDLE(T+off) LINK(T+off)
+  // LINKWORD(T+off)`, plan 3.55 R3): a proposal the engine checks from both
+  // sides (Fable 2026-10-15), named by the innermost struct holding it.
+  struct ContainerSlot {
+    enum Kind { Handle, Link, LinkWord } kind = Handle;
+    std::string type; // "struct.T"
+    int64_t off = 0;
     unsigned line = 0;
   };
   struct ContainerSpec {
     std::string name, provenance = "hand";
+    // A report block (`@container NAME report`): checked and reported, its
+    // rows never applied.
+    bool report = false;
+    std::vector<ContainerSlot> storage;
     std::map<std::string, ContainerRow> rows; // function name -> row
     // The engine's verdict: verified, or the first failing obligation.
     bool verified = false;

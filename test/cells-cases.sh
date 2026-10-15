@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Cell-solver regression cases (test/t_pool_*.c, test/t_cells_*.c, plan 3.53): each read
 # marked "// CHECK: f g ..." must resolve to at least those targets under
-# --cfl-cells; "// CFLAGS:" sets the compile flags (default -O0 -g);
+# --cfl-cells; "// CFLAGS:" sets the compile flags (default -O0; -g is
+# passed first, so "-g0" there builds without debug info, as the kernel is);
 # "// MAXCELLS: N" bounds the cells of the first solve (a runaway is a
 # failure, as is not finishing in 120 s); "// LOG: re" and "// NOLOG: re"
 # require (forbid) a match in the --verbose=2 log. Exits nonzero on any
@@ -21,10 +22,10 @@ for c in t_pool_*.c t_cells_*.c; do
   flags=$(grep -o "// CFLAGS: .*" "$c" | sed 's|// CFLAGS: ||')
   [ -z "$flags" ] && flags="-O0"
   kaflags=$(grep -o "// KAFLAGS: .*" "$c" | sed 's|// KAFLAGS: ||')
-  "$CLANG" $flags -g -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
+  "$CLANG" -g $flags -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
   mods=()
   for m in $(grep -o "// MODULE: .*" "$c" | sed 's|// MODULE: ||'); do
-    "$CLANG" $flags -g -emit-llvm -c "$m" -o "$OUT/${m%.c}.bc" || { echo "FAIL[$n]: compile $m"; fail=1; continue 2; }
+    "$CLANG" -g $flags -emit-llvm -c "$m" -o "$OUT/${m%.c}.bc" || { echo "FAIL[$n]: compile $m"; fail=1; continue 2; }
     mods+=("$OUT/${m%.c}.bc")
   done
   timeout 120 "$BIN" --verbose=2 --func-summaries=../func_summaries.txt --cfl-cells --cfl-union-keys=tag \

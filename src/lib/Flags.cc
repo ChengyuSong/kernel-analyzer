@@ -1249,6 +1249,22 @@ cl::opt<bool> CFLCellLeakCensus(
            "boundary, other) and ranked by the facts they explain at the "
            "profiler's stop point, with the inert check of byte cells"),
   cl::init(false));
+cl::opt<std::string> CFLCellVarargActuals(
+  "cfl-cell-vararg-actuals",
+  cl::desc("--cfl-cell-soup-profile measurement: at the profiler's stop, for "
+           "each direct call of the named variadic functions ('|'-separated), "
+           "the facts each pointer actual in the variadic part holds, with "
+           "their member objects, and the facts of the function's vararg pool "
+           "that no actual holds; report only"),
+  cl::init(""));
+cl::opt<bool> CFLCellSlotCensus(
+  "cfl-cell-slot-census",
+  cl::desc("--cfl-cell-leak-census measurement: at the profiler's stop, the "
+           "facts in content cells by the slot their object's layout has at "
+           "the cell's offset (a pointer, a pointer-width integer, unlabeled "
+           "bytes, or no pointer-width slot), with the cells without one "
+           "ranked by facts and the store sites that fed each; report only"),
+  cl::init(false));
 
 cl::opt<unsigned> CFLCellSoupCap(
   "cfl-cell-soup-cap",

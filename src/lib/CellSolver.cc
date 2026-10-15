@@ -1579,6 +1579,16 @@ bool CallGraphPass::runCellResolution() {
   };
   size_t splitCells = 0, keyedCells = 0, lateSplits = 0;
   size_t trailingArrays = 0; // trailing objects of a header taken as arrays of unknown extent
+  uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX, curStepDst = UINT32_MAX;
+  uint32_t curStepLi = UINT32_MAX; // the label of the step or walk being applied
+  // --cfl-cell-slot-census: what minted each content cell (the mint cause,
+  // the arrival being applied, and for a step or walk its result node).
+  struct SlotMint {
+    std::string cause;
+    Why why;
+    uint32_t stepDst = UINT32_MAX;
+  };
+  boost::unordered_flat_map<std::pair<uint32_t, int64_t>, SlotMint> slotMint;
   auto contentOf = [&](uint32_t o, int64_t c) -> std::pair<uint32_t, uint32_t> {
     auto it = objs[o].content.find(c);
     if (it != objs[o].content.end()) return it->second;
@@ -1592,6 +1602,10 @@ bool CallGraphPass::runCellResolution() {
     }
     objs[o].content.emplace(c, std::make_pair(u, pn));
     objs[o].loadNodes.push_back({c, u, pn});
+    if (CFLCellSlotCensus)
+      slotMint.try_emplace(std::make_pair(o, c),
+                           SlotMint{mintCause, curWhy,
+                                    curWhy.kind == W_STEP || curWhy.kind == W_WALK ? curStepDst : UINT32_MAX});
     if (CFLCellLeakCensus) {
       leakCellOf.emplace(u, std::make_pair(o, c));
       leakCellOf.emplace(pn, std::make_pair(o, c));
@@ -1775,8 +1789,6 @@ bool CallGraphPass::runCellResolution() {
       stepOne;
   std::function<void(uint32_t, int64_t, uint32_t, int64_t, uint32_t)> walkOne;
   // The fact applyStep is stepping, and its node (one-label reports).
-  uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX, curStepDst = UINT32_MAX;
-  uint32_t curStepLi = UINT32_MAX; // the label of the step or walk being applied
   std::map<std::string, size_t> cloneCandidates, otherMeets; // one-label
   std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenConflict;
   size_t conflicts = 0;
@@ -6481,6 +6493,44 @@ bool CallGraphPass::runCellResolution() {
       E.from[{UINT32_MAX, moved ? 1 : 0}]++;
     }
   };
+  // The IR store by which fact f entered through store collector a (of hub
+  // h): one of the collector's stores whose value holds f (else its first,
+  // held = false), else a store through the hub's pointer, else one of the
+  // stored value's stores into the hub. Vp, Vv: the hub's pointer and the
+  // stored value that holds f.
+  auto leakStoreAt = [&](uint32_t a, uint32_t h, uint32_t f, const Value *&Vp, const Value *&Vv,
+                         bool &held) -> const StoreInst * {
+    NodeIndex par;
+    Vp = leakHubPtr(h, par);
+    auto holds = [&](const Value *V) {
+      const uint32_t vn = leakNodeOf(V);
+      return vn != UINT32_MAX && pts[vn].test(f);
+    };
+    const StoreInst *SI = nullptr;
+    held = true;
+    if (auto sit = leakCollStores.find(a); sit != leakCollStores.end()) {
+      for (const StoreInst *S : sit->second)
+        if (holds(S->getValueOperand())) { SI = S; break; }
+      if (!SI && !sit->second.empty()) { SI = sit->second.front(); held = false; }
+    }
+    if (!SI && Vp)
+      for (const User *U : Vp->users())
+        if (const auto *S = dyn_cast<StoreInst>(U))
+          if (S->getPointerOperand() == Vp && holds(S->getValueOperand())) { SI = S; break; }
+    Vv = nullptr;
+    for (uint32_t v : leakCollIn[a])
+      if (find(v) < pts.size() && pts[find(v)].test(f)) { Vv = NF.getValueForNode(v); break; }
+    if (!SI && Vv)
+      for (const User *U : Vv->users())
+        if (const auto *S = dyn_cast<StoreInst>(U))
+          if (S->getValueOperand() == Vv) {
+            const uint32_t pn = leakNodeOf(S->getPointerOperand());
+            if (pn == UINT32_MAX) continue;
+            const auto &hs = hubsOf[pn];
+            if (std::find(hs.begin(), hs.end(), h) != hs.end()) { SI = S; break; }
+          }
+    return SI;
+  };
   // The leak a non-char fact f makes entering byte node n along cause w.
   auto leakClassify = [&](uint32_t n, uint32_t f, const Why &w, bool hasSrc) -> uint32_t {
     uint32_t dObj = UINT32_MAX;
@@ -6561,36 +6611,9 @@ bool CallGraphPass::runCellResolution() {
       return id;
     }
     if (auto hit = leakCollHub.find(a); hit != leakCollHub.end()) {
-      const uint32_t h = hit->second;
-      NodeIndex par;
-      const Value *Vp = leakHubPtr(h, par);
-      auto holds = [&](const Value *V) {
-        const uint32_t vn = leakNodeOf(V);
-        return vn != UINT32_MAX && pts[vn].test(f);
-      };
-      const StoreInst *SI = nullptr;
+      const Value *Vp = nullptr, *Vv = nullptr;
       bool held = true;
-      if (auto sit = leakCollStores.find(a); sit != leakCollStores.end()) {
-        for (const StoreInst *S : sit->second)
-          if (holds(S->getValueOperand())) { SI = S; break; }
-        if (!SI && !sit->second.empty()) { SI = sit->second.front(); held = false; }
-      }
-      if (!SI && Vp)
-        for (const User *U : Vp->users())
-          if (const auto *S = dyn_cast<StoreInst>(U))
-            if (S->getPointerOperand() == Vp && holds(S->getValueOperand())) { SI = S; break; }
-      const Value *Vv = nullptr;
-      for (uint32_t v : leakCollIn[a])
-        if (find(v) < pts.size() && pts[find(v)].test(f)) { Vv = NF.getValueForNode(v); break; }
-      if (!SI && Vv)
-        for (const User *U : Vv->users())
-          if (const auto *S = dyn_cast<StoreInst>(U))
-            if (S->getValueOperand() == Vv) {
-              const uint32_t pn = leakNodeOf(S->getPointerOperand());
-              if (pn == UINT32_MAX) continue;
-              const auto &hs = hubsOf[pn];
-              if (std::find(hs.begin(), hs.end(), h) != hs.end()) { SI = S; break; }
-            }
+      const StoreInst *SI = leakStoreAt(a, hit->second, f, Vp, Vv, held);
       if (SI) {
         std::string detail = leakIR(SI) + (held ? "" : " (one of the collector's stores; none holds the fact now)");
         const int cls = byDest(SI->getPointerOperand(), detail);
@@ -6690,6 +6713,182 @@ bool CallGraphPass::runCellResolution() {
           });
         }
       }
+    };
+  }
+
+  // ---- The slot census (--cfl-cell-slot-census) ----
+  // A content cell's slot: what its object's layout has at the cell's
+  // offset. A pointer, a pointer-width integer (where the int-store rule
+  // admits a pointer-carrying integer), unlabeled bytes, the any-offset
+  // cell and a union's bytes can hold a pointer; a char or other integer
+  // member, a float or other scalar, the interior of a scalar and an
+  // offset past the layout cannot. Report only: at the stop, the facts in
+  // cells by slot, and the cells without a pointer-width slot by facts,
+  // with the sites whose arrivals fed them (a store's site, its pointer's
+  // shape, and the stored facts' origin kinds).
+  // A va_list object's cells hold the engine's vararg pool (va_start
+  // writes the creator's arguments there, LoweredVAArg reads them): an
+  // engine pool cell, reported on its own line, out of the no-slot mass.
+  enum SlotKind : uint8_t {
+    SL_PTR, SL_INTPTR, SL_BYTES, SL_ANY, SL_UNION, // can hold a pointer
+    SL_VAPOOL,                                     // the engine's pool
+    SL_CHAR, SL_INT, SL_OTHER, SL_INTERIOR, SL_BEYOND, SL_N
+  };
+  static const char *const slotNames[SL_N] = {
+      "pointer member", "pointer-width integer", "unlabeled bytes", "any-offset cell", "union bytes",
+      "engine pool cell (a va_list's arguments)",
+      "char member or char object", "other integer member", "float or other scalar member",
+      "interior of a scalar member", "past the layout or opaque"};
+  // Fact origin kinds: what allocated the stored pointer's object.
+  static const char *const originNames[8] = {"function", "global", "stack", "heap", "row",
+                                             "trailing", "outside", "other"};
+  // A slot witness (a pointer-width access through an address that is
+  // untyped or views the object as a struct enclosing the cell), by kind:
+  // through a va_arg value (the vararg pool's address, ruling 3), other
+  // untyped, or a fitting view.
+  static const char *const witnessNames[3] = {"untyped witness", "untyped witness (vararg pool)",
+                                              "witness through a fitting view"};
+  // A lowered va_arg's value: a load through the reg_save_area or
+  // overflow_arg_area pointer loaded from a __va_list_tag.
+  auto vaArgValue = [](const Value *V) {
+    const auto *LI = dyn_cast<LoadInst>(V);
+    if (!LI) return false;
+    std::vector<const Value *> work{LI->getPointerOperand()};
+    std::set<const Value *> seen;
+    while (!work.empty() && seen.size() < 32) {
+      const Value *P = work.back();
+      work.pop_back();
+      if (!seen.insert(P).second) continue;
+      if (const auto *PN = dyn_cast<PHINode>(P)) {
+        for (const Value *In : PN->incoming_values()) work.push_back(In);
+      } else if (const auto *GEP = dyn_cast<GEPOperator>(P)) {
+        work.push_back(GEP->getPointerOperand());
+      } else if (const auto *BC = dyn_cast<BitCastOperator>(P)) {
+        work.push_back(BC->getOperand(0));
+      } else if (const auto *L = dyn_cast<LoadInst>(P)) {
+        if (const auto *AG = dyn_cast<GEPOperator>(L->getPointerOperand()))
+          if (const auto *ST = dyn_cast<StructType>(AG->getSourceElementType()))
+            if (ST->hasName() && ST->getName().starts_with("struct.__va_list_tag")) return true;
+      }
+    }
+    return false;
+  };
+  const unsigned ptrBits = DL.getPointerSizeInBits();
+  auto slotOf = [&](uint32_t o, int64_t c) -> uint8_t {
+    const Obj &O = objs[o];
+    if (!O.layout) return SL_BYTES;
+    if (StringRef(O.label).starts_with("struct.__va_list_tag")) return SL_VAPOOL;
+    Type *T = O.layout;
+    int64_t off = c;
+    for (int depth = 0; depth < 64; depth++) {
+      if (off < 0) return SL_BEYOND;
+      if (auto *ST = dyn_cast<StructType>(T)) {
+        if (ST->isOpaque()) return SL_BEYOND;
+        if (ST->hasName() && ST->getName().starts_with("union.")) return SL_UNION;
+        const StructLayout *SL = DL.getStructLayout(ST);
+        if ((uint64_t)off >= SL->getSizeInBytes()) return SL_BEYOND;
+        const unsigned i = SL->getElementContainingOffset(off);
+        off -= (int64_t)SL->getElementOffset(i);
+        T = ST->getElementType(i);
+        continue;
+      }
+      Type *E = nullptr;
+      if (auto *AT = dyn_cast<ArrayType>(T)) E = AT->getElementType();
+      else if (auto *VT = dyn_cast<FixedVectorType>(T)) E = VT->getElementType();
+      if (E) {
+        const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+        if (e == 0) return SL_BEYOND;
+        off %= e;
+        T = E;
+        continue;
+      }
+      if (off != 0) return off < (int64_t)DL.getTypeAllocSize(T) ? SL_INTERIOR : SL_BEYOND;
+      if (T->isPointerTy()) return SL_PTR;
+      if (T->isIntegerTy(ptrBits)) return SL_INTPTR;
+      if (T->isIntegerTy(8)) return SL_CHAR;
+      if (T->isIntegerTy()) return SL_INT;
+      return SL_OTHER;
+    }
+    return SL_BEYOND;
+  };
+  auto originKind = [&](uint32_t f) -> int {
+    if (cells[f].kind == CellKind::Func) return 0;
+    for (auto [o, e] : memb[f]) {
+      const Obj &O = objs[o];
+      if (O.fn) return 0;
+      if (O.rowOwner != UINT32_MAX) return 4;
+      if (O.parentObj != UINT32_MAX) return 5;
+      const Value *V = NF.getValueForNode(O.origin);
+      if (isa_and_nonnull<GlobalVariable>(V)) return 1;
+      if (isa_and_nonnull<AllocaInst>(V)) return 2;
+      if (isa_and_nonnull<CallBase>(V)) return 3;
+      if (isa_and_nonnull<Argument>(V)) return 6;
+      return 7;
+    }
+    return 7;
+  };
+  // A feeding site: an IR store (its address), or a tagged cause: the
+  // kind in bits 40..47 and a node (or copy) in the low 32 bits.
+  enum SlotCause : uint64_t { SC_COLL = 1, SC_COPY, SC_CELL, SC_EDGE, SC_WHY };
+  auto slotCauseKey = [](uint64_t kind, uint64_t sub, uint32_t x) {
+    return 1ull << 63 | kind << 40 | sub << 32 | x;
+  };
+  struct SlotFeed {
+    uint64_t arrivals = 0;
+    uint64_t byOrigin[8] = {};
+  };
+  boost::unordered_flat_map<std::pair<uint32_t, int64_t>, uint32_t> slotFeedIdx;
+  std::vector<boost::unordered_flat_map<uint64_t, SlotFeed>> slotFeeds;
+  uint64_t slotArrivals = 0;
+  boost::unordered_flat_map<uint64_t, uint32_t> slotStoreColl; // a store site -> the collector it was found by
+  if (!CFLCellVarargActuals.empty() && !CFLCellSoupProfile) {
+    errs() << "Cells: --cfl-cell-vararg-actuals reports at the soup profiler's stop point; "
+           << "it needs --cfl-cell-soup-profile\n";
+    exit(1);
+  }
+  if (CFLCellSlotCensus && !CFLCellLeakCensus) {
+    errs() << "Cells: --cfl-cell-slot-census reads the leak census's cell and store maps; "
+           << "it needs --cfl-cell-leak-census\n";
+    exit(1);
+  }
+  if (CFLCellSlotCensus) {
+    auto leakPrev = leakArrive;
+    leakArrive = [&, leakPrev](uint32_t n, uint32_t f) {
+      leakPrev(n, f);
+      if (soupStop) return;
+      const auto it = leakCellOf.find(n);
+      if (it == leakCellOf.end()) return;
+      const auto [o, c] = it->second;
+      if (c == kLeakAny || objs[o].fn || slotOf(o, c) < SL_CHAR) return;
+      f = findFact(f);
+      const Why w = curWhy;
+      const bool hasSrc = w.node < numNodes && w.fact < cells.size() &&
+                          (w.kind == W_EDGE || w.kind == W_STEP || w.kind == W_WALK ||
+                           w.kind == W_ANY || w.kind == W_DISPATCH);
+      uint64_t key;
+      if (hasSrc && w.kind == W_EDGE) {
+        const uint32_t a = find(w.node);
+        if (auto hit = leakCollHub.find(a); hit != leakCollHub.end()) {
+          const Value *Vp = nullptr, *Vv = nullptr;
+          bool held = true;
+          const StoreInst *SI = leakStoreAt(a, hit->second, f, Vp, Vv, held);
+          key = SI ? (uint64_t)(uintptr_t)SI : slotCauseKey(SC_COLL, 0, a);
+          if (SI) slotStoreColl.try_emplace(key, a);
+        } else if (auto cit = leakCopyEdge.find((uint64_t)a << 32 | n); cit != leakCopyEdge.end()) {
+          key = slotCauseKey(SC_COPY, 0, cit->second);
+        } else {
+          key = slotCauseKey(leakCellOf.count(a) ? SC_CELL : SC_EDGE, 0, a);
+        }
+      } else {
+        key = slotCauseKey(SC_WHY, w.kind, hasSrc ? find(w.node) : UINT32_MAX);
+      }
+      const auto [iit, ins] = slotFeedIdx.try_emplace(it->second, (uint32_t)slotFeeds.size());
+      const uint32_t idx = iit->second;
+      if (ins) slotFeeds.emplace_back();
+      SlotFeed &F = slotFeeds[idx][key];
+      F.arrivals++;
+      F.byOrigin[originKind(f)]++;
+      slotArrivals++;
     };
   }
 
@@ -8001,6 +8200,378 @@ bool CallGraphPass::runCellResolution() {
     }
     CG_LOG("Cells:   LEAK the listed exits carry " << ecov << " (" << pct(ecov, exitedAll)
            << "%)\n");
+  }
+  // Slot census report: facts in content cells by slot, then the cells
+  // without a pointer-width slot by facts, with the sites that fed them.
+  if (CFLCellSlotCensus) {
+    auto pct = [](uint64_t a, uint64_t b) {
+      char buf[16];
+      snprintf(buf, sizeof buf, "%.1f", b ? 100.0 * (double)a / (double)b : 0.0);
+      return std::string(buf);
+    };
+    uint64_t mass[SL_N] = {}, ncells[SL_N] = {}, all = 0, shared = 0;
+    std::vector<std::tuple<uint64_t, uint32_t, int64_t, uint8_t>> noSlot; // facts, o, c, slot
+    boost::unordered_flat_set<uint32_t> seen;
+    for (uint32_t o = 0; o < objs.size(); o++) {
+      const Obj &O = objs[o];
+      if (O.fn) continue;
+      if (O.any != UINT32_MAX) { // the facts written at any offset
+        const uint32_t R = find(cells[O.any].store);
+        if (seen.insert(R).second) {
+          mass[SL_ANY] += pts[R].count();
+          ncells[SL_ANY]++;
+        } else {
+          shared++;
+        }
+      }
+      for (const auto &[c, up] : O.content) {
+        const uint32_t R = find(up.second); // the read side: every write the cell holds
+        if (!seen.insert(R).second) { shared++; continue; }
+        const uint64_t m = pts[R].count();
+        const uint8_t k = slotOf(o, c);
+        mass[k] += m;
+        ncells[k]++;
+        if (k >= SL_CHAR && m) noSlot.emplace_back(m, o, c, k);
+      }
+    }
+    uint64_t none = 0, noneCells = 0;
+    for (int k = 0; k < SL_N; k++) all += mass[k];
+    for (int k = SL_CHAR; k < SL_N; k++) none += mass[k], noneCells += ncells[k];
+    CG_LOG("Cells: SLOT census at " << pops << " pops: " << all << " facts in content cells ("
+           << shared << " cells share a node with one counted)\n");
+    CG_LOG("Cells:   SLOT classes by the layout's leaf at the cell's offset: a slot is a pointer member, "
+           "a pointer-width integer (an i" << ptrBits << " leaf, admitted or not), unlabeled bytes, the "
+           "any-offset cell, or a union's bytes; a va_list's cells are the engine's vararg pool (apart); "
+           "no slot is a char member or char object, another integer "
+           "member, a float or other scalar member, the interior of a scalar member, or past the layout\n");
+    for (int k = 0; k < SL_N; k++)
+      CG_LOG("Cells:   SLOT " << (k == SL_VAPOOL ? "engine" : k < SL_CHAR ? "has a slot" : "NO slot") << ": " << slotNames[k] << ": "
+             << mass[k] << " facts (" << pct(mass[k], all) << "%) in " << ncells[k] << " cells\n");
+    CG_LOG("Cells:   SLOT no pointer-width slot: " << none << " facts (" << pct(none, all) << "%) in "
+           << noneCells << " cells; " << slotArrivals << " arrivals into them recorded by site\n");
+    std::sort(noSlot.begin(), noSlot.end(), [](const auto &x, const auto &y) {
+      return std::get<0>(x) != std::get<0>(y) ? std::get<0>(x) > std::get<0>(y) : x < y;
+    });
+    // By object: equal cells of one object (the bytes of a scalar each
+    // fed by its any-offset cell) would fill the cell list.
+    {
+      std::map<uint32_t, std::pair<uint64_t, uint64_t>> byObj; // facts, cells
+      for (const auto &[m, o, c, k] : noSlot) {
+        byObj[o].first += m;
+        byObj[o].second++;
+      }
+      std::vector<std::pair<uint64_t, uint32_t>> ord;
+      for (const auto &[o, mc] : byObj) ord.emplace_back(mc.first, o);
+      std::sort(ord.begin(), ord.end(), [](const auto &x, const auto &y) {
+        return x.first != y.first ? x.first > y.first : x.second < y.second;
+      });
+      for (size_t i = 0; i < ord.size() && i < 10; i++)
+        CG_LOG("Cells:   SLOT object #" << i + 1 << " " << ord[i].first << " facts (" << pct(ord[i].first, none)
+               << "% of no-slot) in " << byObj[ord[i].second].second << " cells: "
+               << describe(objs[ord[i].second]) << "\n");
+      // The top objects' no-slot cells: what minted each (the mint cause,
+      // the step's result), and the loads and stores through pointers that
+      // hold its address (width, site, the address's struct view). A
+      // pointer-width access is a slot the layout does not declare.
+      std::vector<std::pair<const Value *, uint32_t>> derefPtrs; // pointer value, its node
+      if (!ord.empty())
+        for (const GraphEdge &E : Graph.edges())
+          if (E.kind == EdgeKind::Deref)
+            if (const Value *V = NF.getValueForNode(E.from)) derefPtrs.emplace_back(V, canon(E.from));
+      const uint64_t ptrBytes = ptrBits / 8;
+      for (size_t i = 0; i < ord.size() && i < 3; i++) {
+        const uint32_t o = ord[i].second;
+        const Obj &O = objs[o];
+        size_t undeclared = 0, listed = 0, otherLayout = 0;
+        size_t witnessCells[3] = {0, 0, 0}; // cells by witness kind
+        // Cells with the same mint and accesses print as one line.
+        std::map<std::string, size_t> groupIdx, objWitness;
+        std::vector<std::tuple<std::string, std::vector<int64_t>, uint64_t>> groups;
+        for (const auto &[m, oo, c, k] : noSlot) {
+          if (oo != o) continue;
+          listed++;
+          std::vector<std::string> chainAt;
+          structChain(O.layout, c, DL, chainAt);
+          std::string mint = "minted before the census (no record)";
+          if (auto mit = slotMint.find(std::make_pair(o, c)); mit != slotMint.end()) {
+            const SlotMint &M = mit->second;
+            static const char *kinds[] = {"seed or other", "edge", "field step", "pointer walk",
+                                          "any-offset step", "hub link", "byte copy", "dispatch"};
+            mint = "minted by [" + M.cause + "] during a " + kinds[M.why.kind];
+            if (M.stepDst != UINT32_MAX) {
+              const Value *SV = M.stepDst < G ? NF.getValueForNode(M.stepDst) : nullptr;
+              if (const auto *SI = dyn_cast_or_null<Instruction>(SV)) {
+                mint += " at " + instLoc(SI) + " " + leakIR(SI);
+                // A step through a struct that does not enclose c here: one
+                // pointer holding objects of several layouts (ruling 6).
+                if (const auto *GEP = dyn_cast<GEPOperator>(SI)) {
+                  const std::string l = typeLabel(GEP->getSourceElementType());
+                  bool fits = !StringRef(l).starts_with("struct.");
+                  for (const std::string &e : chainAt) fits |= e.rfind(l + "+", 0) == 0;
+                  if (!fits) {
+                    mint += " | STEP THROUGH ANOTHER LAYOUT (" + l + ")";
+                    otherLayout++;
+                  }
+                }
+              } else {
+                mint += " to " + leakDesc(M.stepDst);
+              }
+            } else if (M.why.kind == W_COPY && M.why.node < copies.size()) { // node: the copy's index
+              const ByteCopy &BC = copies[M.why.node];
+              mint += " " + (BC.at ? instLoc(BC.at) + " " + leakIR(BC.at) : std::string("(no site)")) +
+                      ", len " + std::to_string(BC.len);
+            } else if (M.why.node < numNodes) {
+              mint += " from " + leakDesc(find(M.why.node));
+            }
+          }
+          // The address facts of the cell (offsets that fold to c).
+          std::vector<uint32_t> F;
+          for (const auto &[key, f] : O.offCells) {
+            const int64_t off = cells[f].off;
+            if (O.tail && off >= O.size) continue;
+            if (contentKey(O, off) == c) F.push_back(findFact(f));
+          }
+          std::map<uint64_t, size_t> widths;
+          std::vector<std::string> ex;
+          std::set<const Instruction *> seenI;
+          // A pointer-width access is a slot the layout does not declare
+          // when its address is untyped or views the object as one of the
+          // structs enclosing c; through another struct's view it is a
+          // pointer holding the wrong object (counted apart).
+          bool ptrWide = false;
+          size_t ptrWideMisView = 0;
+          std::set<std::string> witnesses; // the pointer-width accesses that make it a slot
+          std::set<int> witnessKinds;
+          for (const auto &[V, pn] : derefPtrs) {
+            const uint32_t r = find(pn);
+            if (r >= pts.size()) continue;
+            bool holds = false;
+            for (uint32_t f : F) holds |= pts[r].test(f);
+            if (!holds) continue;
+            for (const User *U : V->users()) {
+              const auto *I = dyn_cast<Instruction>(U);
+              if (!I || !seenI.insert(I).second) continue;
+              Type *T = nullptr;
+              const char *what = nullptr;
+              if (const auto *LI = dyn_cast<LoadInst>(I); LI && LI->getPointerOperand() == V) T = LI->getType(), what = "load";
+              else if (const auto *SI = dyn_cast<StoreInst>(I); SI && SI->getPointerOperand() == V)
+                T = SI->getValueOperand()->getType(), what = "store";
+              if (!T) continue;
+              const uint64_t w = DL.getTypeStoreSize(T);
+              widths[w]++;
+              const std::string v = leakStructView(V);
+              if (w >= ptrBytes) {
+                bool fits = v.empty();
+                for (const std::string &e : chainAt) fits |= e.rfind(v + "+", 0) == 0;
+                if (fits) {
+                  ptrWide = true;
+                  const int wk = !v.empty() ? 2 : vaArgValue(V) ? 1 : 0;
+                  witnessKinds.insert(wk);
+                  witnesses.insert(std::string(what) + " " + std::to_string(w) + "B " + instLoc(I) + " " + leakIR(I) +
+                                   " (" + witnessNames[wk] + (v.empty() ? "" : ": viewed as " + v) + ")");
+                } else {
+                  ptrWideMisView++;
+                }
+              }
+              if (ex.size() < 4 || (w >= ptrBytes && ex.size() < 6)) {
+                ex.push_back(std::string(what) + " " + std::to_string(w) + "B " + instLoc(I) + " " + leakIR(I) +
+                             (v.empty() ? " (untyped address)" : " (named: viewed as " + v + ")"));
+              }
+            }
+          }
+          std::string ws;
+          for (const auto &[w, n] : widths) ws += (ws.empty() ? "" : ", ") + std::to_string(w) + "B x" + std::to_string(n);
+          if (ptrWide) undeclared++;
+          std::string wks;
+          for (int wk : witnessKinds) {
+            wks += (wks.empty() ? "" : ", ") + std::string(witnessNames[wk]);
+            witnessCells[wk]++;
+          }
+          std::string body = std::string(slotNames[k]) + (ptrWide ? ", UNDECLARED SLOT: " + wks : "") +
+                             (ptrWideMisView ? ", " + std::to_string(ptrWideMisView) +
+                                                   " pointer-width accesses viewing another struct (a wrong target)"
+                                             : std::string()) +
+                             "): " + mint + "\nCells:       accesses through its address facts: " +
+                             (ws.empty() ? std::string("none") : ws) + "\n";
+          for (const std::string &e : ex) body += "Cells:         " + e + "\n";
+          for (const std::string &e : witnesses) body += "Cells:         SLOT WITNESS " + e + "\n";
+          for (const std::string &e : witnesses) objWitness[e]++;
+          auto [git, gins] = groupIdx.try_emplace(body, groups.size());
+          if (gins) groups.push_back({body, {}, 0});
+          std::get<1>(groups[git->second]).push_back(c);
+          std::get<2>(groups[git->second]) += m;
+        }
+        for (const auto &[body, offs, gm] : groups) {
+          std::string os;
+          for (size_t j = 0; j < offs.size(); j++) os += (j ? " +" : "+") + std::to_string(offs[j]);
+          CG_LOG("Cells:     SLOT cells " << os << " of " << O.label << " (" << offs.size() << " cells, " << gm
+                 << " facts, " << body);
+        }
+        CG_LOG("Cells:   SLOT object #" << i + 1 << ": " << listed << " no-slot cells with facts, " << undeclared
+               << " with a pointer-width access (undeclared slot: " << witnessCells[0] << " " << witnessNames[0] << ", "
+               << witnessCells[1] << " " << witnessNames[1] << ", " << witnessCells[2] << " " << witnessNames[2]
+               << "), " << otherLayout << " minted by a step through another layout\n");
+        for (const auto &[e, n] : objWitness)
+          CG_LOG("Cells:   SLOT object #" << i + 1 << " witness in " << n << " cells: " << e << "\n");
+      }
+    }
+    auto siteDesc = [&](uint64_t key, uint32_t target) -> std::string {
+      if (!(key >> 63)) {
+        const auto *SI = reinterpret_cast<const StoreInst *>((uintptr_t)key);
+        const uint32_t pn = leakNodeOf(SI->getPointerOperand());
+        size_t po = 0, pl = 0;
+        leakPtrShape(pn, po, pl);
+        // Does the store's address hold the target object? A collector
+        // standing for several stores (a shared hub) names the first whose
+        // value holds the fact, which need not be the one that wrote it.
+        bool holdsTarget = false;
+        if (pn != UINT32_MAX)
+          pts[pn].forEach([&](uint32_t g) {
+            for (auto [mo, e] : memb[findFact(g)]) holdsTarget |= mo == target;
+          });
+        std::string hub;
+        if (auto cit = slotStoreColl.find(key); cit != slotStoreColl.end())
+          if (auto hit = leakCollHub.find(cit->second); hit != leakCollHub.end()) {
+            NodeIndex par;
+            const Value *Vp = leakHubPtr(hit->second, par);
+            hub = "; collector's hub pointer " + (Vp ? leakDesc(leakNodeOf(Vp)) : std::string("?")) + ", " +
+                  std::to_string(leakCollStores.count(cit->second) ? leakCollStores.find(cit->second)->second.size() : 0) +
+                  " IR stores";
+          }
+        const std::string v = leakStructView(SI->getPointerOperand());
+        return "store " + instLoc(SI) + " " + leakIR(SI) +
+               " | address " + (v.empty() ? std::string("char or untyped") : "viewed as " + v) + ", holds " +
+               std::to_string(po) + " objects of " + std::to_string(pl) + " labels" +
+               (holdsTarget ? ", the target among them" : ", NOT the target (attribution by a shared collector)") + hub;
+      }
+      const uint64_t kind = key >> 40 & 0xff, sub = key >> 32 & 0xff;
+      const uint32_t x = (uint32_t)key;
+      switch (kind) {
+      case SC_COLL: {
+        NodeIndex par;
+        const uint32_t h = leakCollHub.count(x) ? leakCollHub.find(x)->second : UINT32_MAX;
+        const Value *Vp = h == UINT32_MAX ? nullptr : leakHubPtr(h, par);
+        const std::string call = leakBodiless(Vp);
+        return "store collector without an IR store" + (call.empty() ? std::string() : " (" + call + ")") +
+               "; pointer " + leakDesc(leakNodeOf(Vp));
+      }
+      case SC_COPY: {
+        const ByteCopy &BC = copies[x];
+        return "byte copy " + (BC.at ? instLoc(BC.at) + " " + leakIR(BC.at) : std::string("(no site)"));
+      }
+      case SC_CELL: {
+        const auto it = leakCellOf.find(x);
+        return "cell edge from " +
+               (it->second.second == kLeakAny ? std::string("*") : cellName(it->second.first, it->second.second)) +
+               " of " + describe(objs[it->second.first]);
+      }
+      case SC_EDGE:
+        return "edge from " + leakDesc(x);
+      default: {
+        static const char *kinds[] = {"seed or initializer", "edge", "field step", "pointer walk",
+                                      "any-offset step", "hub", "byte copy", "dispatch"};
+        return std::string(kinds[sub]) + (x == UINT32_MAX ? std::string() : " from " + leakDesc(x));
+      }
+      }
+    };
+    for (size_t i = 0; i < noSlot.size() && i < 10; i++) {
+      const auto [m, o, c, k] = noSlot[i];
+      Type *L = leafAt(objs[o].layout, c, DL);
+      std::string leaf = "-";
+      if (L) {
+        leaf.clear();
+        raw_string_ostream os(leaf);
+        L->print(os);
+        os.flush();
+      }
+      CG_LOG("Cells:   SLOT #" << i + 1 << " " << m << " facts (" << pct(m, none) << "% of no-slot): "
+             << cellName(o, c) << " of " << describe(objs[o]) << " | " << slotNames[k] << ", leaf " << leaf
+             << " | " << leakFieldOf(o, c) << "\n");
+      const auto fit = slotFeedIdx.find(std::make_pair(o, c));
+      if (fit == slotFeedIdx.end()) {
+        CG_LOG("Cells:     no arrival recorded (its facts came by a merge or before the census hook)\n");
+        continue;
+      }
+      std::vector<std::pair<uint64_t, uint64_t>> sites; // arrivals, key
+      uint64_t arrived = 0;
+      for (const auto &[key, F] : slotFeeds[fit->second]) {
+        sites.emplace_back(F.arrivals, key);
+        arrived += F.arrivals;
+      }
+      std::sort(sites.begin(), sites.end(), [](const auto &x, const auto &y) {
+        return x.first != y.first ? x.first > y.first : x.second < y.second;
+      });
+      CG_LOG("Cells:     " << arrived << " arrivals from " << sites.size() << " sites\n");
+      for (size_t j = 0; j < sites.size() && j < 5; j++) {
+        const SlotFeed &F = slotFeeds[fit->second].find(sites[j].second)->second;
+        std::string by;
+        for (int q = 0; q < 8; q++)
+          if (F.byOrigin[q]) by += (by.empty() ? "" : ", ") + std::string(originNames[q]) + " " + std::to_string(F.byOrigin[q]);
+        CG_LOG("Cells:     fed " << F.arrivals << " (" << by << ") by " << siteDesc(sites[j].second, o) << "\n");
+      }
+    }
+  }
+  // --cfl-cell-vararg-actuals: per direct call of the named variadic
+  // functions, the facts each pointer actual in the variadic part holds
+  // (members named: a fact unified by name lists every object), then the
+  // pool's facts that no actual holds (they came another way).
+  if (!CFLCellVarargActuals.empty()) {
+    std::set<std::string> want;
+    for (StringRef w : llvm::split(StringRef(CFLCellVarargActuals.getValue()), '|'))
+      if (!w.empty()) want.insert(w.str());
+    auto fdesc = [&](uint32_t f) -> std::string {
+      const Cell &C = cells[f];
+      if (C.kind == CellKind::Func) return describe(objs[C.obj]);
+      if (C.kind == CellKind::Out) return "an outside fact of " + describe(objs[C.obj]);
+      std::string d = (C.kind == CellKind::Any ? std::string("*") : NF.cellNameString(C.name)) + " @" +
+                      std::to_string(C.off) + " of {";
+      for (size_t i = 0; i < memb[f].size() && i < 6; i++)
+        d += (i ? "; " : "") + describe(objs[memb[f][i].first]);
+      if (memb[f].size() > 6) d += "; ... " + std::to_string(memb[f].size()) + " members";
+      return d + "}";
+    };
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (!F.isVarArg() || !want.count(F.getName().str())) continue;
+        boost::unordered_flat_set<uint32_t> byActual;
+        size_t calls = 0;
+        for (const User *U : F.users()) {
+          const auto *CB = dyn_cast<CallBase>(U);
+          if (!CB || CB->getCalledFunction() != &F) continue;
+          calls++;
+          for (unsigned i = F.getFunctionType()->getNumParams(); i < CB->arg_size(); i++) {
+            const Value *A = CB->getArgOperand(i);
+            if (!A->getType()->isPointerTy()) continue;
+            const uint32_t an = leakNodeOf(A);
+            if (an == UINT32_MAX || an >= pts.size()) {
+              CG_LOG("Cells: VARARG " << F.getName() << " " << instLoc(CB) << " actual " << i << ": no node\n");
+              continue;
+            }
+            std::string fs;
+            size_t nf = 0;
+            pts[an].forEach([&](uint32_t g) {
+              const uint32_t f = findFact(g);
+              byActual.insert(f);
+              if (nf++ < 6) fs += "\nCells:     " + fdesc(f);
+            });
+            CG_LOG("Cells: VARARG " << F.getName() << " " << instLoc(CB) << " actual " << i << " "
+                   << leakDesc(an) << ": " << nf << " facts" << fs << "\n");
+          }
+        }
+        const NodeIndex pool = NF.getVarargNodeFor(&F);
+        const uint32_t pn = pool == AndersNodeFactory::InvalidIndex || pool >= G ? UINT32_MAX : find(getCanonicalNode(pool));
+        size_t inPool = 0, notByActual = 0;
+        std::string rest;
+        if (pn != UINT32_MAX && pn < pts.size())
+          pts[pn].forEach([&](uint32_t g) {
+            inPool++;
+            const uint32_t f = findFact(g);
+            if (byActual.count(f)) return;
+            if (notByActual++ < 12) rest += "\nCells:     " + fdesc(f);
+          });
+        CG_LOG("Cells: VARARG " << F.getName() << ": " << calls << " direct calls; pool " << inPool << " facts, "
+               << notByActual << " held by no actual" << rest << "\n");
+      }
   }
   {
     std::vector<uint32_t> order;

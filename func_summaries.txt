@@ -1428,8 +1428,16 @@ bpf_map_kvfree NOOP
 jent_zfree NOOP
 jent_kvzfree NOOP
 kfree_const NOOP
-kfree_rcu NOOP
-kvfree_rcu NOOP
+# deferred free: the object is freed after a grace period; its pointer
+# flows nowhere we model. kfree_rcu/kvfree_rcu are macros (no symbol) that
+# call kvfree_call_rcu; in 5.18 its rcu_callback_t argument is an encoded
+# kfree offset, not a function (rcupdate.h:906/934), in 6.x the object
+# pointer. Definitions read: 5.18 kernel/rcu/tree.c:3564, 6.8.2
+# kernel/rcu/tree.c:3408, 6.18.7 mm/slab_common.c:1288/1966.
+kvfree_call_rcu NOOP
+# bulk free (free family): 5.18 mm/slub.c:3644, 6.8.2 mm/slub.c:4514,
+# 6.18.7 mm/slub.c:7344.
+kmem_cache_free_bulk NOOP
 # print/debug sinks (vararg byte formatting, no pointer transfer)
 _printk NOOP
 printk NOOP

@@ -6186,6 +6186,7 @@ bool CallGraphPass::runCellResolution() {
     const Value *viewPtr = nullptr;
     std::string view;
     int recounted = 0; // the class before a stop-point recount moved it to 7
+    uint32_t anyObj = UINT32_MAX; // class 6 "any-offset write of X": X
   };
   // The exit side: an edge out of a byte cell into a node that is not one
   // (a load's hub, a byte copy into a typed cell, anything else), with the
@@ -6639,14 +6640,26 @@ bool CallGraphPass::runCellResolution() {
     }
     if (auto it = leakCellOf.find(a); it != leakCellOf.end()) {
       const auto [so, sc] = it->second;
-      if (sc == kLeakAny)
-        return leakSiteOf(6, "any-offset write of " + describe(objs[so]), into, "");
+      if (sc == kLeakAny) {
+        const uint32_t id = leakSiteOf(6, "any-offset write of " + describe(objs[so]), into, "");
+        leakSites[id].anyObj = so;
+        return id;
+      }
       return leakSiteOf(6, "cell edge from " + cellName(so, sc) + " of " + describe(objs[so]), into,
                         "a byte copy merged away, or a union or tag-flip edge");
     }
     if (a < G && NF.isVarargNode(a))
       return leakSiteOf(5, "vararg pool " + nodeDesc(a).substr(0, 100), into, "");
     return leakSiteOf(6, "edge from " + nodeDesc(a).substr(0, 140), into, "");
+  };
+  // The feeder of each non-char fact entering a typed object's any-offset
+  // cell (its write side): an IR store (its address), or a tagged cause
+  // (kind in bits 40..47, a node or copy in the low 32 bits). A class-6
+  // "any-offset write of X" leak relays what X's feeders wrote (plan, slot
+  // census ruling 1): its rank goes to them.
+  boost::unordered_flat_map<uint64_t, uint64_t> leakAnyFeed; // (object << 32 | fact) -> feeder
+  auto leakFeedKey = [](uint64_t kind, uint64_t sub, uint32_t x) {
+    return 1ull << 63 | kind << 40 | sub << 32 | x;
   };
   if (CFLCellLeakCensus) {
     leakArrive = [&](uint32_t n, uint32_t f) {
@@ -6656,6 +6669,32 @@ bool CallGraphPass::runCellResolution() {
       const bool hasSrc = w.node < numNodes && w.fact < cells.size() &&
                           (w.kind == W_EDGE || w.kind == W_STEP || w.kind == W_WALK ||
                            w.kind == W_ANY || w.kind == W_DISPATCH);
+      if (auto ait = leakCellOf.find(n); ait != leakCellOf.end() && ait->second.second == kLeakAny) {
+        const uint32_t o = ait->second.first;
+        if (objs[o].layout && !objs[o].fn && objs[o].any != UINT32_MAX && find(cells[objs[o].any].store) == n &&
+            !leakByteCell(o, kLeakAny) && leakFactKind(f)) {
+          const uint64_t k = (uint64_t)o << 32 | f;
+          if (!leakAnyFeed.count(k)) {
+            uint64_t key;
+            if (hasSrc && w.kind == W_EDGE) {
+              const uint32_t a = find(w.node);
+              if (auto hit = leakCollHub.find(a); hit != leakCollHub.end()) {
+                const Value *Vp = nullptr, *Vv = nullptr;
+                bool held = true;
+                const StoreInst *SI = leakStoreAt(a, hit->second, f, Vp, Vv, held);
+                key = SI ? (uint64_t)(uintptr_t)SI : leakFeedKey(1, 0, a);
+              } else if (auto cit = leakCopyEdge.find((uint64_t)a << 32 | n); cit != leakCopyEdge.end()) {
+                key = leakFeedKey(2, 0, cit->second);
+              } else {
+                key = leakFeedKey(leakCellOf.count(a) ? 3 : 4, 0, a);
+              }
+            } else {
+              key = leakFeedKey(5, w.kind, hasSrc ? find(w.node) : UINT32_MAX);
+            }
+            leakAnyFeed.emplace(k, key);
+          }
+        }
+      }
       // An edge out of a byte cell into a node that is not one: an exit.
       auto exits = [&]() {
         return hasSrc && w.kind == W_EDGE && !leakIsByte(n) &&
@@ -8026,18 +8065,42 @@ bool CallGraphPass::runCellResolution() {
   // Leak census report: the inert check of byte cells, then the leaks by
   // class and by site, with the non-char facts each explains.
   if (CFLCellLeakCensus) {
-    // Every fact at the stop, and those downstream of a leak (by leak).
-    size_t allFacts = 0, downAll = 0;
-    std::vector<size_t> down(leakSites.size(), 0);
+    // Every fact at the stop, and those downstream of a leak (by leak). A
+    // fact in a cell whose layout has no pointer-width slot there and is
+    // not char (the interior of a scalar, another integer, a float, past
+    // the layout) is no landing (slot census ruling 1): counted apart, out
+    // of its leak's downstream. Facts a class-6 any-offset write tagged
+    // are credited to the feeders of that object's any-offset cell.
+    size_t allFacts = 0, downAll = 0, noLandAll = 0;
+    std::vector<size_t> down(leakSites.size(), 0), noLand(leakSites.size(), 0);
+    size_t noLandCls[SL_N] = {};
+    std::map<uint32_t, std::map<uint64_t, std::pair<size_t, size_t>>> siteFeeders; // site -> feeder -> (landed, no landing)
     for (uint32_t m = 0; m < numNodes; m++) {
       if (find(m) != m) continue;
       allFacts += pts[m].count();
+      uint8_t nl = SL_N;
+      if (auto it = leakCellOf.find(m); it != leakCellOf.end() && it->second.second != kLeakAny &&
+                                        !objs[it->second.first].fn) {
+        const uint8_t k = slotOf(it->second.first, it->second.second);
+        if (k == SL_INT || k == SL_OTHER || k == SL_INTERIOR || k == SL_BEYOND) nl = k;
+      }
       pts[m].forEach([&](uint32_t f0) {
         auto tag = leakTag.get((uint64_t)m << 32 | findFact(f0));
         if (!tag) tag = leakTag.get((uint64_t)m << 32 | f0);
         if (!tag) return;
         downAll++;
-        down[*tag]++;
+        if (nl != SL_N) {
+          noLandAll++;
+          noLandCls[nl]++;
+          noLand[*tag]++;
+        } else {
+          down[*tag]++;
+        }
+        if (const uint32_t ao = leakSites[*tag].anyObj; ao != UINT32_MAX) {
+          const auto fit = leakAnyFeed.find((uint64_t)ao << 32 | findFact(f0));
+          auto &e = siteFeeders[*tag][fit == leakAnyFeed.end() ? 0 : fit->second];
+          (nl != SL_N ? e.second : e.first)++;
+        }
       });
     }
     size_t byteCells = 0, inert = 0, onlyChar = 0, withLeak = 0, byteFacts = 0, untagged = 0;
@@ -8154,8 +8217,54 @@ bool CallGraphPass::runCellResolution() {
     CG_LOG("Cells:   LEAK untagged: " << untagged << " (" << pct(untagged, leakFacts)
            << "%): the fact or the cell was not yet named when it arrived, or a cycle merge "
            << "brought it\n");
-    std::vector<uint32_t> order(leakSites.size());
-    std::iota(order.begin(), order.end(), 0);
+    CG_LOG("Cells:   LEAK no landing: " << noLandAll << " of the " << downAll
+           << " downstream facts sit in cells with no pointer-width slot that are not char (interior of a scalar "
+           << noLandCls[SL_INTERIOR] << ", other integer " << noLandCls[SL_INT] << ", float or other scalar "
+           << noLandCls[SL_OTHER] << ", past the layout " << noLandCls[SL_BEYOND]
+           << "); counted apart, out of each leak's downstream\n");
+    // A feeder of an object's any-offset cell, by its key.
+    auto feederDesc = [&](uint64_t key) -> std::string {
+      if (key == 0) return "no recorded feeder (merge or pre-hook)";
+      if (!(key >> 63)) {
+        const auto *SI = reinterpret_cast<const StoreInst *>((uintptr_t)key);
+        const std::string v = leakStructView(SI->getPointerOperand());
+        return "store " + instLoc(SI) + " " + leakIR(SI) + " | address " +
+               (v.empty() ? std::string("char or untyped") : "viewed as " + v);
+      }
+      const uint64_t kind = key >> 40 & 0xff, sub = key >> 32 & 0xff;
+      const uint32_t x = (uint32_t)key;
+      switch (kind) {
+      case 1: {
+        NodeIndex par;
+        const auto hit = leakCollHub.find(x);
+        const Value *Vp = hit == leakCollHub.end() ? nullptr : leakHubPtr(hit->second, par);
+        return "store collector without an IR store; pointer " + leakDesc(leakNodeOf(Vp));
+      }
+      case 2:
+        return "byte copy " + (copies[x].at ? instLoc(copies[x].at) + " " + leakIR(copies[x].at) : std::string("(no site)"));
+      case 3: {
+        const auto it = leakCellOf.find(x);
+        return "cell edge from " +
+               (it->second.second == kLeakAny ? std::string("*") : cellName(it->second.first, it->second.second)) +
+               " of " + describe(objs[it->second.first]);
+      }
+      case 4:
+        return "edge from " + leakDesc(x);
+      default: {
+        static const char *kinds[] = {"seed or initializer", "edge", "field step", "pointer walk",
+                                      "any-offset step", "hub", "byte copy", "dispatch"};
+        return std::string(kinds[sub]) + (x == UINT32_MAX ? std::string() : " from " + leakDesc(x));
+      }
+      }
+    };
+    // A class-6 any-offset write whose tagged facts are all no landing
+    // hands its rank to its feeders (ANY-FEEDER below); it is listed there.
+    auto handedOver = [&](uint32_t s) {
+      return leakSites[s].anyObj != UINT32_MAX && down[s] == 0 && noLand[s] > 0;
+    };
+    std::vector<uint32_t> order;
+    for (uint32_t s = 0; s < leakSites.size(); s++)
+      if (!handedOver(s)) order.push_back(s);
     std::sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
       if (leakSites[x].exited != leakSites[y].exited) return leakSites[x].exited > leakSites[y].exited;
       return siteMass[x] != siteMass[y] ? siteMass[x] > siteMass[y] : x < y;
@@ -8178,8 +8287,21 @@ bool CallGraphPass::runCellResolution() {
       CG_LOG("Cells:   LEAK #" << i + 1 << " class " << L.cls << " exited " << L.exited << " ("
              << pct(L.exited, exitedAll) << "%), resident " << siteMass[s] << " ("
              << pct(siteMass[s], leakFacts) << "%), born " << L.born << ", downstream " << down[s]
+             << (noLand[s] ? ", no landing " + std::to_string(noLand[s]) : std::string())
              << ": " << L.where << " | into " << L.into << " | " << L.detail
              << " | objects: " << objsTop << "\n");
+      if (auto sit = siteFeeders.find(s); sit != siteFeeders.end()) {
+        std::vector<std::pair<size_t, uint64_t>> fs;
+        for (const auto &[k, lz] : sit->second) fs.emplace_back(lz.first + lz.second, k);
+        std::sort(fs.begin(), fs.end(), [](const auto &x, const auto &y) {
+          return x.first != y.first ? x.first > y.first : x.second < y.second;
+        });
+        for (size_t j = 0; j < fs.size() && j < 3; j++) {
+          const auto &lz = sit->second.at(fs[j].second);
+          CG_LOG("Cells:     fed by " << feederDesc(fs[j].second) << ": landed " << lz.first << ", no landing "
+                 << lz.second << "\n");
+        }
+      }
     }
     // The earliest leaks by solve order: the pop of a site's first entry,
     // with its pointers' shapes then and at the stop. A pointer is precise
@@ -8218,6 +8340,31 @@ bool CallGraphPass::runCellResolution() {
                << " class " << L.cls << (L.recounted ? " (was " + std::to_string(L.recounted) + ")" : std::string())
                << " exited " << L.exited << ", resident " << siteMass[s] << ", downstream " << down[s] << ": "
                << L.where << " | into " << L.into << " | " << L.detail << " | " << shapeOf(L) << "\n");
+      }
+    }
+    {
+      // The feeders that took a handed-over site's rank: by the facts they
+      // fanned out through it, each with the sites it took over.
+      std::map<uint64_t, size_t> feederMass;
+      std::map<uint64_t, std::vector<uint32_t>> feederSites;
+      for (uint32_t s = 0; s < leakSites.size(); s++) {
+        if (!handedOver(s)) continue;
+        for (const auto &[k, lz] : siteFeeders[s]) {
+          feederMass[k] += lz.first + lz.second;
+          feederSites[k].push_back(s);
+        }
+      }
+      std::vector<std::pair<size_t, uint64_t>> fo;
+      for (const auto &[k, m] : feederMass) fo.emplace_back(m, k);
+      std::sort(fo.begin(), fo.end(), [](const auto &x, const auto &y) {
+        return x.first != y.first ? x.first > y.first : x.second < y.second;
+      });
+      CG_LOG("Cells:   LEAK any-offset writes handed to their feeders: " << feederSites.size() << " feeders\n");
+      for (size_t i = 0; i < fo.size() && i < 20; i++) {
+        CG_LOG("Cells:   LEAK ANY-FEEDER #" << i + 1 << " fans out " << fo[i].first << ": "
+               << feederDesc(fo[i].second) << "\n");
+        for (uint32_t s : feederSites[fo[i].second])
+          CG_LOG("Cells:     " << leakSites[s].where << ": " << noLand[s] << " facts, all no landing\n");
       }
     }
     CG_LOG("Cells:   LEAK the listed sites hold " << covered << " (" << pct(covered, leakFacts)

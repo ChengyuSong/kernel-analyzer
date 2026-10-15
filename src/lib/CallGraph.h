@@ -574,6 +574,14 @@ protected:
   std::vector<std::vector<const llvm::Value *>> containerElemSources;
   std::vector<std::vector<int64_t>> containerInherit;
   std::vector<std::map<const llvm::Function *, unsigned>> containerCtors;
+  // The row object's layout (Fable 2026-10-14): the largest element type
+  // among the constructors (all share the base entry as a prefix).
+  std::vector<llvm::StructType *> containerElemType;
+  // Per verified container: each code-field feed as (the owner value at
+  // the feeding site, the constructors fed there), and each constructor's
+  // element struct: a row object takes its OWNER's constructor's layout.
+  std::vector<std::vector<std::pair<const llvm::Value *, std::set<const llvm::Function *>>>> containerOwnerCtors;
+  std::vector<std::map<const llvm::Function *, llvm::StructType *>> containerCtorType;
   // After the solve: the pure rows' indirect calls against the solver's
   // targets (Containers.cc).
   void checkContainerPremises(bool stopped);

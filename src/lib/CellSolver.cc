@@ -122,6 +122,8 @@ struct Obj {
   // A container element minted per owner (plan 3.55): the owner object
   // (UINT32_MAX: not a row object).
   uint32_t rowOwner = UINT32_MAX;
+  // Laid out at mint as the largest constructor element: never a tail.
+  bool rowLaidOut = false;
   const Function *fn = nullptr;
   Type *layout = nullptr; // null: unlabeled
   bool repeats = false;   // an array of `layout` of unknown length
@@ -1714,6 +1716,7 @@ bool CallGraphPass::runCellResolution() {
   std::function<void(Obj &)> segmentLabel;
   auto tailOf = [&](uint32_t o) -> uint32_t {
     if (objs[o].tailObj != UINT32_MAX) return objs[o].tailObj;
+    assert(!objs[o].rowLaidOut && "a row object laid out as its largest constructor element has no tail");
     Obj T;
     T.origin = objs[o].origin;
     T.parentObj = o;
@@ -4617,12 +4620,16 @@ bool CallGraphPass::runCellResolution() {
   std::map<std::pair<uint32_t, const Value *>, uint32_t> mintedObj;
   std::vector<std::vector<uint32_t>> mintedOf(containerElemSources.size());
   boost::unordered_flat_set<uint64_t> inherited;
-  size_t inheritLinks = 0;
+  size_t inheritLinks = 0, rowsLaidOut = 0, rowsByOwnerCtor = 0, rowsByLargestOfSeveral = 0, rowsByGlobalLargest = 0;
   // Row object R inherits body element C's body-written fields (C -> R).
   auto inheritFields = [&](uint32_t C, uint32_t R, uint32_t ci) {
     if (C == R || objs[C].rowOwner != UINT32_MAX || objs[C].fn || !inherited.insert((uint64_t)C << 32 | R).second)
       return;
     for (int64_t w : containerInherit[ci]) {
+      // A row object laid out by its owner's constructor has no bytes past
+      // that element: offsets the body writes on larger elements of other
+      // owners are not its fields.
+      if (objs[R].rowLaidOut && w >= objs[R].size) continue;
       // A body write at no constant offset rejects a minting container
       // (Containers.cc): never here.
       assert(w >= 0 && "an inherited field at no constant offset");
@@ -4645,6 +4652,47 @@ bool CallGraphPass::runCellResolution() {
         const NodeIndex sn = NF.getValueNodeFor(L.site);
         it->second = newObj(sn == AndersNodeFactory::InvalidIndex ? L.out : sn, nullptr);
         objs[it->second].rowOwner = o;
+        // Its layout (Fable 2026-10-14): its OWNER's constructor's element
+        // (the constants fed into o's code field at the feeding sites whose
+        // owner value holds o); several: the largest of them; none known
+        // yet: the container's largest. A write past it asserts (a wrong
+        // pairing), it never falls back to a tail.
+        StructType *RT = nullptr;
+        if (L.cont < containerOwnerCtors.size()) {
+          std::set<const Function *> ctors;
+          for (const auto &[V, fs] : containerOwnerCtors[L.cont]) {
+            const NodeIndex vn = getRepNodeForValue(V);
+            if (vn == AndersNodeFactory::InvalidIndex) continue;
+            bool holds = false;
+            pts[find(canon(vn))].forEach([&](uint32_t g) {
+              for (auto [mo, me] : memb[findFact(g)])
+                holds |= mo == o && me == e; // the same owner: object and offset (an object may embed several)
+            });
+            if (holds) ctors.insert(fs.begin(), fs.end());
+          }
+          for (const Function *Fc : ctors)
+            if (auto tit = containerCtorType[L.cont].find(Fc); tit != containerCtorType[L.cont].end() && tit->second)
+              if (!RT || DL.getTypeAllocSize(tit->second) > DL.getTypeAllocSize(RT)) RT = tit->second;
+          if (RT) (ctors.size() == 1 ? rowsByOwnerCtor : rowsByLargestOfSeveral)++;
+          std::string cs;
+          for (const Function *Fc : ctors) cs += (cs.empty() ? "" : " ") + Fc->getName().str();
+          CG_LOG("Cells: row object at " << nodeDescFn(canon(L.out)).substr(0, 100) << " of owner "
+                 << describeFn(objs[o]).substr(0, 100) << ": constructors {" << cs << "}"
+                 << (RT ? " -> " + typeLabel(RT) : std::string(" -> none known")) << "\n");
+        }
+        if (!RT && L.cont < containerElemType.size() && containerElemType[L.cont]) {
+          RT = containerElemType[L.cont];
+          rowsByGlobalLargest++;
+        }
+        if (RT) {
+          Obj &R = objs[it->second];
+          R.layout = RT;
+          R.size = (int64_t)DL.getTypeAllocSize(R.layout);
+          R.label = typeLabel(R.layout);
+          R.repeats = false;
+          R.rowLaidOut = true;
+          rowsLaidOut++;
+        }
         mintedOf[L.cont].push_back(it->second);
         // Its inherited fields from every body element already known.
         const uint32_t R = it->second;
@@ -7105,8 +7153,10 @@ bool CallGraphPass::runCellResolution() {
   }
   if (!mintLinks.empty())
     CG_LOG("Cells: element mint: " << mintLinks.size() << " mint links (" << inlineInserts
-           << " inline inserts), " << mintedObj.size() << " row objects minted, " << inheritLinks
-           << " inherited field links\n");
+           << " inline inserts), " << mintedObj.size() << " row objects minted (" << rowsByOwnerCtor
+           << " by the owner's constructor, " << rowsByLargestOfSeveral << " by the largest of several, "
+           << rowsByGlobalLargest << " by the container's largest element: owner's constructor unknown), "
+           << inheritLinks << " inherited field links\n");
   if (!rowLinks.empty())
     CG_LOG("Cells: container rows: " << rowLinks.size() << " row links at call sites, " << rowCell.size()
            << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped

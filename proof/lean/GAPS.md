@@ -1670,8 +1670,31 @@ only.
   element of another owner, and the body's own accesses to its elements
   reach the row object through the element values.
 
+- **Row object layout** (Fable 2026-10-14): a row object (O, s, elem) takes
+  its OWNER's constructor's element: the code-field feeds are paired with
+  their owner where the constant is fed (up the formal/formal call
+  sites: `bfd_hash_table_init(&nbfd->section_htab,
+  bfd_section_hash_newfunc)`), and an owner object matches a feed whose
+  owner value holds its cell (object and offset). One constructor: its
+  struct; several: the largest of them; none known at the mint: the
+  container's largest. A constructor's element is its own fresh block of
+  constant size (a call, or a certified pool carve; a chunk-relative
+  carve is the same request as the constant one), typed by a typed step,
+  else a local variable's debug type, else the unique struct of that size
+  that embeds a struct the body steps through on an element (the struct
+  analyzer's embedding table); every constructor's struct must embed that
+  body struct at offset 0, or the mint is refused ("element size
+  unknown"). The row object has no trailing object (asserted: a write
+  past its layout is a wrong pairing); inherited body offsets past its
+  element belong to other owners' larger elements and are not inherited.
+- **Statement:** an owner's elements are all made by the constructor its
+  code field holds, so its row object is laid out as that element; the
+  constructors' structs share the body's element struct at offset 0, so
+  the body's own accesses name the same bytes in every element.
+
 Not mechanized. The census re-cut (nm-new, sqlite3; tcpdump unchanged)
-measures it after the gates. Case: test/t_cells_container_mint.c.
+measures it after the gates. Cases: test/t_cells_container_mint.c,
+test/t_cells_container_poolchunk.c.
 
 **Pool chunks inside the body** (Fable 2026-10-14). O3 (containment):
 every fresh block the body makes goes only into the owner's storage.

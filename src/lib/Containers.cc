@@ -506,6 +506,9 @@ void CallGraphPass::checkContainerClosure() {
   containerElemSources.clear();
   containerInherit.clear();
   containerCtors.clear();
+  containerElemType.clear();
+  containerOwnerCtors.clear();
+  containerCtorType.clear();
   auto cline = [&](const std::string &l) {
     CG_LOG("Container: " << l << "\n");
     containerReport.push_back(l);
@@ -657,10 +660,45 @@ void CallGraphPass::checkContainerClosure() {
       onStack.erase(A);
       return true;
     };
+    // Each feed paired with its owner (Fable 2026-10-14): the owner value
+    // the store's base names and the constants fed there; through a formal
+    // pair (`table->newfunc = newfunc` in an init function), one pair per
+    // call site of that function, with the owner actual.
+    std::vector<std::pair<const Value *, std::set<const Function *>>> ownerFeeds;
     for (const std::string &K : code) {
       std::set<const Function *> T;
       for (const StoreInst *S : fields[K].allSI) {
         std::set<const Argument *> onStack;
+        {
+          const Value *B = S->getPointerOperand()->stripPointerCasts();
+          while (const auto *G = dyn_cast<GEPOperator>(B)) B = G->getPointerOperand()->stripPointerCasts();
+          const Argument *OA = formalOf(B), *VA = formalOf(S->getValueOperand()->stripPointerCasts());
+          // Up the call sites while both the owner and the code value are
+          // the caller's formals; pair them where the constant is fed.
+          std::function<void(const Argument *, const Argument *, int)> pairUp = [&](const Argument *OF, const Argument *VF,
+                                                                                    int depth) {
+            const Function *F = OF->getParent();
+            if (depth > 8 || F->hasAddressTaken()) return;
+            for (const User *U : F->users()) {
+              const auto *CB = dyn_cast<CallBase>(U);
+              if (!CB || CB->getCalledOperand()->stripPointerCasts() != F) continue;
+              const Value *OV = CB->getArgOperand(OF->getArgNo()), *VV = CB->getArgOperand(VF->getArgNo());
+              const Argument *OF2 = formalOf(OV->stripPointerCasts()), *VF2 = formalOf(VV->stripPointerCasts());
+              if (OF2 && VF2 && OF2->getParent() == VF2->getParent()) {
+                pairUp(OF2, VF2, depth + 1);
+                continue;
+              }
+              std::set<const Function *> fs;
+              std::set<const Argument *> st;
+              if (constsOf(VV, fs, st) && !fs.empty()) ownerFeeds.push_back({OV, fs});
+            }
+          };
+          if (OA && VA && OA->getParent() == VA->getParent()) {
+            pairUp(OA, VA, 0);
+          } else if (const auto *Fn = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts())) {
+            ownerFeeds.push_back({B, {Fn}});
+          }
+        }
         if (constsOf(S->getValueOperand(), T, onStack)) continue;
         if (reloadOf(S->getValueOperand(), K, ownerOf(S->getPointerOperand()), 0)) continue;
         codeOpen[K] = S->getFunction()->getName().str() + ": " + valueText(S);
@@ -1320,7 +1358,11 @@ void CallGraphPass::checkContainerClosure() {
         containerElemSources.resize(ci + 1);
         containerInherit.resize(ci + 1);
         containerCtors.resize(ci + 1);
+        containerElemType.resize(ci + 1, nullptr);
+        containerOwnerCtors.resize(ci + 1);
+        containerCtorType.resize(ci + 1);
       }
+      containerOwnerCtors[ci] = ownerFeeds;
       containerBodies[ci] = body;
       // The element mint's inputs: the body's element values (constructor
       // results: an indirect call through a closed code field), the
@@ -1328,6 +1370,7 @@ void CallGraphPass::checkContainerClosure() {
       // byte offsets the body writes on an element (from the element's
       // start; -1: a write at an offset not constant).
       std::set<int64_t> W;
+      std::set<StructType *> bodyElemTypes; // the structs the body steps through on an element
       // Constructors first (the element bases below need them).
       for (const Function *F : body)
         for (const Instruction &I : instructions(*F))
@@ -1376,36 +1419,223 @@ void CallGraphPass::checkContainerClosure() {
           A = A->stripPointerCasts();
           int64_t off = 0;
           bool known = len >= 0;
+          StructType *stepT = nullptr; // the struct the step on the element base names
           while (const auto *G = dyn_cast<GEPOperator>(A)) {
             APInt Off(64, 0);
             if (G->accumulateConstantOffset(F->getParent()->getDataLayout(), Off)) off += Off.getSExtValue();
             else known = false;
+            stepT = dyn_cast<StructType>(G->getSourceElementType());
             A = G->getPointerOperand()->stripPointerCasts();
           }
           if (!elemBase(A, F)) continue;
+          if (stepT && stepT->hasName() && !containerCtors[ci].count(F)) bodyElemTypes.insert(stepT);
           if (!known) W.insert(-1);
           else if (len <= 1) W.insert(off);
           else
             for (int64_t w = off & ~int64_t(7); w < off + len; w += 8) W.insert(w);
         }
       containerInherit[ci].assign(W.begin(), W.end());
+      // The row object's layout: each constructor's element is its fresh
+      // block, of the constant size the block's call passes, typed by the
+      // struct of that size its typed uses step through; the row object
+      // takes the largest (they share the base entry as a prefix, so two
+      // constructors' fields at one offset are the same bytes of one
+      // object). A size not constant, or no struct of that size, refuses
+      // the mint.
+      std::string sizeFail;
+      StructType *elemT = nullptr;
+      std::vector<StructType *> ctorTypes;
+      // The struct analyzer's embedding table (transitive): base name ->
+      // the structs that hold it at offset 0, with one IR type each.
+      std::map<std::string, std::set<std::string>> embeds;
+      std::map<std::string, StructType *> typeOf;
+      Ctx->structAnalyzer.forEachContainer([&](const StructType *St, const Module *, const StructType *Ct, unsigned off) {
+        if (off == 0 && St->hasName() && Ct->hasName()) {
+          embeds[stripStructNameSuffix(St->getName()).str()].insert(stripStructNameSuffix(Ct->getName()).str());
+          typeOf.emplace(stripStructNameSuffix(Ct->getName()).str(), const_cast<StructType *>(Ct));
+        }
+      });
+      const DataLayout &EDL = Ctx->Modules.front().first->getDataLayout();
+      for (const auto &[T, a] : containerCtors[ci]) {
+        (void)a;
+        // A carve on a new chunk (chunk + header: objalloc_alloc's new-chunk
+        // path) has a chunk-relative size only; it is the same request as
+        // the constructor's other path, so it fails only when no element of
+        // this constructor has a constant size.
+        std::string chunkRelative;
+        bool measured = false;
+        for (const Instruction &I : instructions(*T)) {
+          // A constructor's element: a fresh call of its own (not another
+          // constructor: a derived entry's newfunc calls its base's with the
+          // block it allocated; not a certified pool's chunk), or a certified
+          // pool carve (objalloc_alloc inlined at -O3), of a constant size.
+          uint64_t sz = 0;
+          if (const auto *CB = dyn_cast<CallBase>(&I)) {
+            if (!CB->getType()->isPointerTy() || !(get(CB) & FRS)) continue;
+            if (const Function *G = CB->getCalledFunction(); G && (body.count(G) || containerCtors[ci].count(G)))
+              continue;
+            if (poolChunk(CB)) continue;
+            // Its size: the call's constant integer arguments (one; two
+            // multiply, calloc's shape).
+            uint64_t prod = 1;
+            unsigned consts = 0;
+            for (const Value *Arg : CB->args())
+              if (const auto *K = dyn_cast<ConstantInt>(Arg); K && K->getBitWidth() >= 32) {
+                prod *= K->getZExtValue();
+                consts++;
+              }
+            if (consts == 0 || consts > 2) {
+              sizeFail = T->getName().str() + ": " + valueText(CB);
+              continue;
+            }
+            sz = prod;
+          } else if (poolCarves.count(&I) && (get(&I) & FRS)) {
+            auto zit = poolCarveSizes.find(&I);
+            const auto *K = zit == poolCarveSizes.end() ? nullptr : dyn_cast_or_null<ConstantInt>(zit->second.n);
+            if (!K) {
+              if (zit != poolCarveSizes.end() && zit->second.chunk)
+                chunkRelative = T->getName().str() + ": a carve of no constant size " + valueText(&I);
+              else
+                sizeFail = T->getName().str() + ": a carve of no constant size " + valueText(&I);
+              continue;
+            }
+            sz = K->getZExtValue() * zit->second.scale;
+          } else {
+            continue;
+          }
+          // Its type: a struct of that size its derived values step through.
+          StructType *found = nullptr;
+          SmallVector<const Value *, 8> w{&I};
+          SmallPtrSet<const Value *, 16> seenV;
+          while (!w.empty() && !found) {
+            const Value *V = w.pop_back_val();
+            if (!seenV.insert(V).second) continue;
+            for (const User *U : V->users()) {
+              if (const auto *G = dyn_cast<GEPOperator>(U)) {
+                if (auto *ST = dyn_cast<StructType>(G->getSourceElementType());
+                    ST && ST->isSized() && EDL.getTypeAllocSize(ST) == sz) {
+                  found = ST;
+                  break;
+                }
+                if (G->hasAllZeroIndices()) w.push_back(U);
+              } else if (isa<CastInst>(U) || isa<PHINode>(U) || isa<SelectInst>(U)) {
+                w.push_back(U);
+              } else if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V) {
+                if (transientSlot(S->getPointerOperand()->stripPointerCasts()))
+                  for (const User *LU : S->getPointerOperand()->stripPointerCasts()->users())
+                    if (isa<LoadInst>(LU)) w.push_back(LU);
+              }
+            }
+          }
+          // No typed step (-O3 steps by bytes): the debug type of a local
+          // variable the constructor declares as a pointer to a struct of that size
+          // (`struct elf_strtab_hash_entry *ret`, optimized out but declared),
+          // by its IR name; two different such structs decide nothing.
+          if (!found) {
+            std::set<StructType *> cands;
+            for (const Instruction &J : instructions(*T)) {
+              const auto *DV = dyn_cast<DbgVariableIntrinsic>(&J);
+              if (!DV || DV->getVariable()->getArg()) continue; // a local, not a parameter (`table`)
+              const DIType *DT = DV->getVariable()->getType();
+              bool viaPtr = false;
+              for (int k = 0; k < 8 && DT; k++) {
+                const auto *D = dyn_cast<DIDerivedType>(DT);
+                if (!D) break;
+                if (D->getTag() == dwarf::DW_TAG_pointer_type) {
+                  if (viaPtr) { DT = nullptr; break; }
+                  viaPtr = true;
+                } else if (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_const_type &&
+                           D->getTag() != dwarf::DW_TAG_volatile_type) {
+                  DT = nullptr;
+                  break;
+                }
+                DT = D->getBaseType();
+              }
+              const auto *CT = dyn_cast_or_null<DICompositeType>(DT);
+              if (!viaPtr || !CT || CT->getName().empty() || CT->getSizeInBits() != sz * 8) continue;
+              if (auto *ST = StructType::getTypeByName(T->getContext(), ("struct." + CT->getName()).str());
+                  ST && ST->isSized() && EDL.getTypeAllocSize(ST) == sz)
+                cands.insert(ST);
+            }
+            if (cands.size() == 1) found = *cands.begin();
+          }
+          // Last: the one struct of that size that holds a struct the body
+          // steps through on an element at offset 0 (the struct analyzer's
+          // embedding table).
+          if (!found) {
+            std::set<std::string> names;
+            for (StructType *B : bodyElemTypes) {
+              const std::string bn = stripStructNameSuffix(B->getName()).str();
+              if (B->isSized() && EDL.getTypeAllocSize(B) == sz) names.insert(bn);
+              for (const std::string &cn : embeds[bn])
+                if (StructType *CT = typeOf[cn]; CT && CT->isSized() && EDL.getTypeAllocSize(CT) == sz) names.insert(cn);
+            }
+            if (names.size() == 1) found = typeOf.count(*names.begin()) && typeOf[*names.begin()]
+                                                 ? typeOf[*names.begin()]
+                                                 : StructType::getTypeByName(T->getContext(), "struct." + *names.begin());
+          }
+          if (!found) {
+            sizeFail = T->getName().str() + ": no struct of " + std::to_string(sz) + " bytes at " + valueText(&I);
+            continue;
+          }
+          measured = true;
+          ctorTypes.push_back(found);
+          if (StructType *&CT = containerCtorType[ci][T]; !CT || EDL.getTypeAllocSize(found) > EDL.getTypeAllocSize(CT))
+            CT = found;
+          if (!elemT || EDL.getTypeAllocSize(found) > EDL.getTypeAllocSize(elemT)) elemT = found;
+        }
+        if (!measured && !chunkRelative.empty() && sizeFail.empty()) sizeFail = chunkRelative;
+      }
+      // One object per element: every constructor's struct embeds the
+      // smallest (the base entry) at offset 0, by the struct analyzer's
+      // embedding table (transitive), so their fields at one offset are
+      // the same bytes of one object.
+      if (elemT && sizeFail.empty()) {
+        // The base: a struct the body itself steps through on an element
+        // that every constructor's struct is or embeds at offset 0.
+        std::string baseName;
+        for (StructType *B : bodyElemTypes) {
+          const std::string bn = stripStructNameSuffix(B->getName()).str();
+          bool all = true;
+          for (StructType *T : ctorTypes) {
+            const std::string n = stripStructNameSuffix(T->getName()).str();
+            all &= n == bn || embeds[bn].count(n);
+          }
+          if (all) {
+            baseName = bn;
+            break;
+          }
+        }
+        if (baseName.empty())
+          sizeFail = "no struct the body steps through on an element is embedded at offset 0 of every constructor's"
+                     " element (struct analyzer)";
+      }
+      containerElemType[ci] = elemT;
       // A body write at no constant element offset cannot be inherited
       // field by field: a container that mints (an ELEM(ret) row or a
       // constructor) is rejected.
       bool mintsHere = !containerCtors[ci].empty();
       for (const auto &[fn, R] : C.rows) mintsHere |= R.elem == -1;
-      if (mintsHere && W.count(-1)) {
+      if (mintsHere && (W.count(-1) || !sizeFail.empty() || (!containerCtors[ci].empty() && !elemT))) {
         C.verified = false;
-        C.obligations.push_back("mint FAIL(a body write into an element at no constant offset)");
+        C.obligations.push_back(W.count(-1) ? "mint FAIL(a body write into an element at no constant offset)"
+                                            : "mint FAIL(element size unknown: " +
+                                                  (sizeFail.empty() ? std::string("no constructor element") : sizeFail) + ")");
         containerBodies[ci].clear();
         containerElemSources[ci].clear();
         containerCtors[ci].clear();
         containerInherit[ci].clear();
+        containerElemType[ci] = nullptr;
+        containerOwnerCtors[ci].clear();
+        containerCtorType[ci].clear();
       }
       std::string ws;
       for (int64_t w : W) ws += " " + std::to_string(w);
       cline("  element mint: " + std::to_string(containerElemSources[ci].size()) + " element sources in the body, " +
-            std::to_string(containerCtors[ci].size()) + " constructors, inherited offsets {" + ws + " }");
+            std::to_string(containerCtors[ci].size()) + " constructors (row objects laid out as " +
+            (elemT ? elemT->getName().str() + ", " + std::to_string(EDL.getTypeAllocSize(elemT)) + " bytes"
+                   : std::string("none")) +
+            "), inherited offsets {" + ws + " }");
       if (C.verified)
         for (const auto &[fn, R] : C.rows)
           if (auto it = byName.find(fn); it != byName.end()) containerRowOf[it->second] = {ci, R};

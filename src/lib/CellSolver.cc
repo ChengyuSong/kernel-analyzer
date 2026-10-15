@@ -6996,38 +6996,68 @@ bool CallGraphPass::runCellResolution() {
     computeCone();
     computeFptrObjs();
     std::vector<PendingConflict> keep;
+    // --cfl-cell-one-label-object asks where the object first meets another
+    // label: its conflicts are reported inside the cone or not, with
+    // function-pointer objects or not (both marked); the cone and the
+    // function-pointer tests decide only in the unfiltered mode.
+    const bool filtered = !CFLCellOneLabelObject.empty();
     for (PendingConflict &P : pendingConf) {
-      if (!inCone[find(P.n)]) { keep.push_back(P); continue; }
+      const bool inC = inCone[find(P.n)] != 0;
       // Fact level: only objects carrying function pointers can change a
       // target set (both sides for two names; the stepped or copied object
       // otherwise). Harmless ones wait: the fixpoint may still change.
       const bool matters =
           P.kind == 0 ? factCarriesFptrs(P.a) && factCarriesFptrs(P.f)
           : factCarriesFptrs(P.f); // the stepped / copied-from object
-      if (!matters) {
-        if (final) coneHarmless++;
-        else keep.push_back(P);
-        continue;
+      if (!filtered) {
+        if (!inC) { keep.push_back(P); continue; }
+        if (!matters) {
+          if (final) coneHarmless++;
+          else keep.push_back(P);
+          continue;
+        }
       }
+      const std::string marks = std::string(" [fn-ptr: ") + (matters ? "yes" : "no") +
+                                ", in cone: " + (inC ? "yes" : "no") + "]";
       if (CFLCellOneLabelMax <= 1) {
-        CG_LOG("Cells: (inside the icall cone: " << coneSize << " nodes from "
+        CG_LOG("Cells: (" << (inC ? "inside" : "outside") << " the icall cone: " << coneSize << " nodes from "
                << icallOps.size() << " icall operands; the conflict arose at pop "
-               << P.pop << ")\n");
+               << P.pop << ")" << marks << "\n");
         if (P.kind == 1) reportTypedStep(P.n, findFact(P.f), P.S, P.why.c_str()); // exits
         if (P.kind == 0) reportConflict(P.n, findFact(P.a), findFact(P.f));
         else CG_LOG("Cells: NAME CONFLICT at pop " << P.pop
                     << ": a copy between unrelated structs: " << P.why << "\n");
         reportDefects();
         errs() << "Cells: --cfl-cell-one-label stopped at the first name "
-               << "conflict inside the icall cone (measurement only, no answers)\n";
+               << "conflict" << (filtered ? "" : " inside the icall cone") << " (measurement only, no answers)\n";
         errs() << "Cells: stopped at " << pops << " pops (one-label stop, 1 conflict)\n";
         exit(0);
       }
-      if (P.kind != 0) continue; // collect mode counts those in otherMeets
+      if (P.kind != 0) {
+        if (!filtered) continue; // collect mode counts those in otherMeets
+        // A step of another struct or a copy between unrelated structs:
+        // the cell, and how its objects arrived.
+        conflicts++;
+        coneReported++;
+        const uint32_t f = findFact(P.f);
+        CG_LOG("Cells: NAME CONFLICT #" << conflicts << " at pop " << P.pop << marks << ": " << nodeDesc(P.n)
+               << ": " << (P.kind == 1 ? "a step as " + (P.S && P.S->hasName() ? P.S->getName().str() : std::string("<struct>")) +
+                                             " of a cell " + P.why
+                                       : "a copy between unrelated structs: " + P.why)
+               << " | cell = " << factDesc(f).substr(0, 160) << "\n");
+        std::set<std::string> seen;
+        for (auto [o, eo] : memb[f]) {
+          const std::string w = describe(objs[o]);
+          if (!seen.insert(w).second || seen.size() > 3) continue;
+          tracePathD(P.n, w.substr(0, w.find(" [")), 3);
+        }
+        if (conflicts >= CFLCellOneLabelMax) finishCollect();
+        continue;
+      }
       conflicts++;
       coneReported++;
       const uint32_t a = findFact(P.a), f = findFact(P.f);
-      CG_LOG("Cells: NAME CONFLICT #" << conflicts << " at pop " << P.pop << ": "
+      CG_LOG("Cells: NAME CONFLICT #" << conflicts << " at pop " << P.pop << marks << ": "
              << nodeDesc(P.n) << ": A = " << factDesc(a).substr(0, 160)
              << " | B = " << factDesc(f).substr(0, 160) << "\n");
       meetPoints(P.n, a, f);

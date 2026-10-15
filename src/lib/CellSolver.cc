@@ -1800,7 +1800,18 @@ bool CallGraphPass::runCellResolution() {
   // are counted.
   boost::unordered_flat_set<uint32_t> pendingNodes;
   size_t pendingDup = 0;
+  size_t oneLabelFiltered = 0;
+  std::function<bool(uint32_t)> oneLabelMatch; // set once describe exists
   auto pend1 = [&](PendingConflict P) {
+    // --cfl-cell-one-label-object: only a conflict whose held or arriving
+    // cell belongs to a matching object.
+    if (!CFLCellOneLabelObject.empty() && oneLabelMatch) {
+      const bool match = oneLabelMatch(P.f) || (P.kind == 0 && oneLabelMatch(P.a));
+      if (!match) {
+        oneLabelFiltered++;
+        return;
+      }
+    }
     if (CFLCellOneLabelMax <= 1 && !pendingNodes.insert(P.n).second) {
       pendingDup++;
       return;
@@ -3441,6 +3452,15 @@ bool CallGraphPass::runCellResolution() {
            (O.repeats ? " array" : "") + "]";
   };
   describeFn = describe;
+  // A fact matches --cfl-cell-one-label-object when an object it holds
+  // does (its description contains the pattern).
+  oneLabelMatch = [&](uint32_t f) {
+    for (auto [o, e] : std::vector<Member>(memb[findFact(f)])) {
+      (void)e;
+      if (describe(objs[o]).find(CFLCellOneLabelObject) != std::string::npos) return true;
+    }
+    return false;
+  };
   auto massByObject = [&](size_t k) {
     std::vector<uint64_t> mass(objs.size(), 0), holders(objs.size(), 0);
     uint64_t byKind[5] = {0, 0, 0, 0, 0};
@@ -6817,7 +6837,12 @@ bool CallGraphPass::runCellResolution() {
              << " icall operands; " << pendingConf.size() + pendingDup
              << " conflicts outside it (unreported), " << coneHarmless
              << " inside but without function-pointer objects on both sides, "
-             << coneReported << " inside\n");
+             << coneReported << " inside"
+             << (CFLCellOneLabelObject.empty() ? std::string()
+                                               : "; " + std::to_string(oneLabelFiltered) +
+                                                     " conflicts filtered out (no object matching \"" +
+                                                     CFLCellOneLabelObject.getValue() + "\")")
+             << "\n");
   };
   std::vector<uint32_t> delta;
   // Plan 3.54: facts a split formal holds before the solve (seeds) entered

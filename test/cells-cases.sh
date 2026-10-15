@@ -38,6 +38,8 @@ for c in t_pool_*.c t_cells_*.c; do
     [ -n "$re" ] && grep -qE "$re" "$OUT/$n.log" && bad="$bad [NOLOG $re]"
   done < <(grep -o "// NOLOG: .*" "$c" | sed 's|// NOLOG: ||')
   if [ -n "$bad" ]; then echo "FAIL[$n]:$bad"; fail=1; continue; fi
+  # A measurement-only case (LOG/NOLOG, no CHECK: the mode stops without answers).
+  if ! grep -q "// CHECK:" "$c"; then echo "PASS[$n] (log only)"; continue; fi
   line=$(grep -n "// CHECK:" "$c" | cut -d: -f1)
   want=$(grep "// CHECK:" "$c" | sed 's/.*CHECK: //; s/ CHECK-NOT:.*//')
   wantnot=$(grep "CHECK-NOT:" "$c" | sed 's/.*CHECK-NOT: //')

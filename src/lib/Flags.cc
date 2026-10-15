@@ -1292,6 +1292,14 @@ cl::opt<bool> CFLCellOneLabel(
            "cells and how each arrived"),
   cl::init(false));
 
+cl::opt<std::string> CFLCellOneLabelObject(
+  "cfl-cell-one-label-object",
+  cl::desc("--cfl-cell-one-label: only name conflicts whose held or arriving "
+           "cell belongs to an object whose description contains this "
+           "substring count (stop, collect); the others are counted and the "
+           "solve goes on. Measurement only"),
+  cl::init(""));
+
 cl::opt<unsigned> CFLCellOneLabelMax(
   "cfl-cell-one-label-max",
   cl::desc("--cfl-cell-one-label: collect this many name conflicts (each "

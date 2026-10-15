@@ -6,7 +6,8 @@
 # failure, as is not finishing in 120 s); "// LOG: re" and "// NOLOG: re"
 # require (forbid) a match in the --verbose=2 log. Exits nonzero on any
 # miss. "CHECK-NOT: f ..." after the CHECK targets: targets that must not
-# appear.
+# appear. "// MODULE: t2_x.c" (repeatable): another module, compiled the
+# same way and passed after the case's own (named t2_*, so not a case).
 # KAMAIN= overrides the binary.
 set -u
 cd "$(dirname "$0")"
@@ -21,8 +22,13 @@ for c in t_pool_*.c t_cells_*.c; do
   [ -z "$flags" ] && flags="-O0"
   kaflags=$(grep -o "// KAFLAGS: .*" "$c" | sed 's|// KAFLAGS: ||')
   "$CLANG" $flags -g -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
+  mods=()
+  for m in $(grep -o "// MODULE: .*" "$c" | sed 's|// MODULE: ||'); do
+    "$CLANG" $flags -g -emit-llvm -c "$m" -o "$OUT/${m%.c}.bc" || { echo "FAIL[$n]: compile $m"; fail=1; continue 2; }
+    mods+=("$OUT/${m%.c}.bc")
+  done
   timeout 120 "$BIN" --verbose=2 --func-summaries=../func_summaries.txt --cfl-cells --cfl-union-keys=tag \
-    --cfl-alloc-origins --cfl-whole-program $kaflags --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" > "$OUT/$n.log" 2>&1
+    --cfl-alloc-origins --cfl-whole-program $kaflags --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" "${mods[@]}" > "$OUT/$n.log" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL[$n]: exit $rc (124: did not finish in 120 s)"; fail=1; continue; fi
   maxc=$(grep -o "// MAXCELLS: [0-9]*" "$c" | grep -o "[0-9]*$")

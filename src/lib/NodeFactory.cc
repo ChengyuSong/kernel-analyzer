@@ -179,11 +179,18 @@ NodeIndex AndersNodeFactory::getCellNode(NodeIndex origin, uint32_t name) {
 }
 
 NodeIndex AndersNodeFactory::createDereferenceNode(const NodeIndex ptr) {
+    // A pointer's dereference node is made once: look before appending, or
+    // a second request (a global's initializer in its defining module after
+    // an earlier module read the global) leaves a node with no pointer and
+    // no edges.
+    if (ptr != InvalidIndex) {
+        auto it = derefMap.find(ptr);
+        if (it != derefMap.end())
+            return it->second;
+    }
     unsigned nextIdx = nodes.size();
     nodes.emplace_back(AndersNode(AndersNode::DEREF_NODE, nextIdx));
     if (ptr != InvalidIndex) {
-        if (derefMap.count(ptr))
-            return derefMap[ptr];
         derefMap[ptr] = nextIdx;
         derefParentMap[nextIdx] = ptr;
     }

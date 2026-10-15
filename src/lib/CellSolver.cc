@@ -3291,7 +3291,7 @@ bool CallGraphPass::runCellResolution() {
         // bytes, now accessed as struct L.ty, is the conflict itself.
         if (CFLCellOneLabel && curStepFact != UINT32_MAX &&
             memb[curStepFact].size() > 1) {
-          if (CFLCellOneLabelMax <= 1)
+          if (CFLCellOneLabelMax <= 1 || !CFLCellOneLabelObject.empty()) // also collect mode, filtered
             pend1({1, curStepNode, 0, curStepFact, L.ty,
                                    "merged from several objects as bytes", pops});
           otherMeets["bytes-then-struct"]++;
@@ -3323,7 +3323,7 @@ bool CallGraphPass::runCellResolution() {
         // One label per pointer: a pointer used as L.ty holding an object
         // of another struct is the conflict itself.
         if (CFLCellOneLabel && curStepFact != UINT32_MAX) {
-          if (CFLCellOneLabelMax <= 1)
+          if (CFLCellOneLabelMax <= 1 || !CFLCellOneLabelObject.empty()) // also collect mode, filtered
             pend1({1, curStepNode, 0, curStepFact, L.ty,
                                    "of another struct", pops});
           otherMeets["struct-mismatch"]++;
@@ -5846,7 +5846,8 @@ bool CallGraphPass::runCellResolution() {
             " (" + typeLabel(Ss) + ") into " + describe(Od) + " +" +
             std::to_string(fb) + " (" + typeLabel(Sd) + ")";
         if (copyMismatchAt.size() < 8) copyMismatchAt.push_back(d);
-        if (CFLCellOneLabel && CFLCellOneLabelMax <= 1 && curCopyDst != UINT32_MAX)
+        if (CFLCellOneLabel && (CFLCellOneLabelMax <= 1 || !CFLCellOneLabelObject.empty()) &&
+            curCopyDst != UINT32_MAX) // also collect mode, filtered
           pend1({2, curCopyDst, 0, curCopySrcFact, nullptr, d, pops});
         if (CFLCellOneLabel) otherMeets["copy-mismatch"]++;
       }
@@ -7113,6 +7114,11 @@ bool CallGraphPass::runCellResolution() {
              << nodeDesc(P.n) << ": A = " << factDesc(a).substr(0, 160)
              << " | B = " << factDesc(f).substr(0, 160) << "\n");
       meetPoints(P.n, a, f);
+      // Both arrival paths, as the stop mode prints them (depth 3).
+      for (uint32_t x : {a, f}) {
+        const std::string w = describe(objs[memb[x][0].first]);
+        tracePathD(P.n, w.substr(0, w.find(" [")), 3);
+      }
       if (conflicts >= CFLCellOneLabelMax) finishCollect();
     }
     pendingConf.swap(keep);

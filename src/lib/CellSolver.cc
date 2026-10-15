@@ -1812,6 +1812,10 @@ bool CallGraphPass::runCellResolution() {
   // are counted.
   boost::unordered_flat_set<uint32_t> pendingNodes;
   size_t pendingDup = 0;
+  // Collect mode reports a conflict once: a repeat (the same node, kind
+  // and facts, after merges) is counted, not reported again.
+  std::set<std::array<uint32_t, 4>> collectSeen;
+  size_t collectDup = 0;
   size_t oneLabelFiltered = 0;
   std::function<bool(uint32_t)> oneLabelMatch; // set once describe exists
   auto pend1 = [&](PendingConflict P) {
@@ -1953,7 +1957,7 @@ bool CallGraphPass::runCellResolution() {
     O.period = p;
     refoldQueue.push_back(o);
   };
-  std::function<void(uint32_t, StructType *)> noteLayoutCause; // --cfl-cell-trace-obj
+  std::function<void(uint32_t, StructType *)> noteLayoutCause; // --cfl-cell-trace-obj, --cfl-cell-why
   std::string layoutCopyFrom; // the byte copy giving its effective type (trace)
   uint32_t layoutCopySrc = UINT32_MAX; // its source object
   // An allocation whose constant size k is larger than struct S (and not a
@@ -5630,7 +5634,157 @@ bool CallGraphPass::runCellResolution() {
   // Pointer subtractions across objects (kept for the rule report).
   size_t rrPtrAlways = 0, rrPtrMay = 0;
   std::vector<std::string> rrPtrAt;
+  // --cfl-cell-why: the chain of first causes that brought a cell of
+  // `want` into `target`, latest first; the pointers whose hub links or
+  // steps the chain used are explained in turn (two levels).
+  // factDesc names offset cells only.
+  auto whyDesc = [&](uint32_t f) {
+    f = findFact(f);
+    return cells[f].kind == CellKind::Off ? factDesc(f) : factDescP(f);
+  };
+  std::function<void(uint32_t, const std::string &, int)> explainWhy2;
+  auto explainWhy = [&](uint32_t target, const std::string &want) {
+    explainWhy2(target, want, 0);
+  };
+  explainWhy2 = [&](uint32_t target, const std::string &want, int depth) {
+    const std::string ind(2 + depth * 4, ' ');
+    auto matches = [&](uint32_t f) {
+      f = findFact(f);
+      if (describe(objs[cells[f].obj]).find(want) != std::string::npos) return true;
+      for (auto [o, e] : memb[f])
+        if (describe(objs[o]).find(want) != std::string::npos) return true;
+      return false;
+    };
+    uint32_t f0 = UINT32_MAX;
+    pts[target].forEach([&](uint32_t f) {
+      if (f0 == UINT32_MAX && matches(f)) f0 = f;
+    });
+    if (f0 == UINT32_MAX) {
+      CG_LOG("Cells:" << ind << nodeDesc(target) << " holds no cell of '" << want << "'\n");
+      return;
+    }
+    CG_LOG("Cells:" << ind << "why does " << nodeDesc(target) << " hold "
+           << whyDesc(f0) << "? (latest cause first)\n");
+    std::vector<std::pair<uint32_t, uint32_t>> pointers; // pointer, its fact
+    boost::unordered_flat_set<uint64_t> seen;
+    uint32_t n = target, f = f0;
+    for (int k = 0; k < 400; k++) {
+      const uint64_t key = (uint64_t)n << 32 | f;
+      if (!seen.insert(key).second) { CG_LOG("Cells:" << ind << "  (cycle)\n"); break; }
+      auto it = factWhy.find(key);
+      if (it == factWhy.end()) {
+        CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << ": " << whyDesc(f)
+               << " (seed, or arrived before a merge)\n");
+        break;
+      }
+      const Why w = it->second;
+      std::string how;
+      switch (w.kind) {
+      case W_EDGE: {
+        auto eit = edgeWhy.find((uint64_t)w.node << 32 | n);
+        const Why e = eit == edgeWhy.end() ? Why() : eit->second;
+        if (e.kind == W_HUB) {
+          how = "edge made by a load/store through " + nodeDesc(e.node) +
+                " holding " + whyDesc(e.fact);
+          pointers.push_back({find(e.node), e.fact});
+        } else if (e.kind == W_COPY) {
+          how = "byte copy " + instLoc(copies[e.node].at) + " (" +
+                whyDesc(e.fact) + " into " + whyDesc(e.extra) + ")";
+          pointers.push_back({find(copies[e.node].src), e.fact});
+        } else if (e.kind == W_OTHER && eit != edgeWhy.end()) {
+          how = "edge (made outside the propagation loop)";
+        } else if (eit == edgeWhy.end()) {
+          how = "static copy edge or byte-copy content edge (unrecorded)";
+        } else {
+          static const char *kn[] = {"other", "edge", "step", "walk", "any-offset", "hub", "copy", "dispatch"};
+          how = std::string("edge made during a ") + kn[e.kind] + " at " +
+                (e.node < numNodes ? nodeDesc(e.node) : std::string("?")) +
+                " holding " + (e.fact < cells.size() ? whyDesc(e.fact) : std::string("?"));
+          if (e.node < numNodes && e.fact < cells.size())
+            pointers.push_back({find(e.node), e.fact});
+        }
+        break;
+      }
+      case W_STEP: how = "step"; break;
+      case W_WALK: how = "walk"; break;
+      case W_ANY: how = "any-offset (field-any loop)"; break;
+      case W_DISPATCH:
+        how = "method dispatch of " +
+              (w.extra < cells.size() ? whyDesc(w.extra) : std::string("?")) +
+              " to the receiver";
+        break;
+      default: how = "other (seed, refold, finalize, merge replay)"; break;
+      }
+      if (w.kind == W_STEP || w.kind == W_WALK || w.kind == W_ANY ||
+          w.kind == W_DISPATCH) {
+        how += " of " + whyDesc(w.fact);
+        CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << " <- " << how << "\n");
+        if (w.node == UINT32_MAX) break;
+        n = find(w.node);
+        f = findFact(w.fact);
+        continue;
+      }
+      CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << " <- " << how << "\n");
+      if (w.kind != W_EDGE || w.node == UINT32_MAX) break;
+      n = find(w.node);
+      f = findFact(w.fact);
+    }
+    if (depth >= 2) return;
+    // The first pointers the chain loaded or copied through.
+    for (size_t i = 0; i < pointers.size() && i < 2; i++) {
+      const uint32_t fo = findFact(pointers[i].second);
+      const std::string w = describe(objs[cells[fo].obj]);
+      explainWhy2(pointers[i].first, w.substr(0, w.find(" [")), depth + 1);
+    }
+  };
+  // --cfl-cell-why-at=NODE: why the nodes NODE describes hold the object;
+  // run at every report (a one-label stop, a census-at or soup-cap stop,
+  // the fixpoint), from reportDefects.
+  auto whyAtReport = [&]() {
+    if (recordWhy && !CFLCellWhyAt.empty()) {
+      std::set<uint32_t> asked;
+      boost::unordered_flat_map<uint32_t, uint32_t> classSize;
+      for (uint32_t m = 0; m < numNodes; m++) classSize[find(m)]++;
+      // Only nodes whose class holds a fact can hold the object (and only
+      // those are described: an orphan dereference node has no pointer).
+      for (uint32_t m = 0; m < numNodes; m++)
+        if (pts[find(m)].count() && nodeDesc(m).find(CFLCellWhyAt) != std::string::npos &&
+            asked.insert(find(m)).second) {
+          CG_LOG("Cells: why-at " << nodeDesc(m) << ": class " << find(m) << " of "
+                 << classSize[find(m)] << " nodes, represented by " << nodeDesc(find(m)) << "\n");
+          for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
+            if (!alt.empty()) explainWhy(find(m), alt.str());
+        }
+      if (asked.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
+    }
+  };
+  // Orphan dereference nodes (Fable 2026-10-15): a dereference node with
+  // no parent pointer, no keyed pointer and no dereference edge should not
+  // exist (nodeDesc asserts on one); counted and listed, with the value
+  // the factory recorded for it.
+  auto orphanDerefCensus = [&]() {
+    boost::unordered_flat_set<uint32_t> keyedDerefs;
+    for (const auto &[pk, d] : keyedDerefOf) keyedDerefs.insert(d);
+    std::vector<uint32_t> orphans;
+    for (uint32_t m = 0; m < G; m++) // graph nodes (cell nodes are the solver's own)
+      if (NF.isDereferenceNode(m) && NF.getDerefParent(m) == AndersNodeFactory::InvalidIndex &&
+          !keyedDerefs.count(m) && hubPointer(m) == AndersNodeFactory::InvalidIndex)
+        orphans.push_back(m);
+    CG_LOG("Cells: orphan dereference nodes: " << orphans.size() << "\n");
+    for (size_t i = 0; i < orphans.size() && i < 10; i++) {
+      std::string v = "none";
+      if (const Value *MV = NF.getValueForNode(orphans[i])) {
+        v.clear();
+        raw_string_ostream os(v);
+        if (const auto *I = dyn_cast<Instruction>(MV)) os << I->getFunction()->getName() << ": ";
+        MV->print(os);
+      }
+      CG_LOG("Cells:   orphan dereference node #" << orphans[i] << ", value " << v.substr(0, 200) << "\n");
+    }
+  };
   auto reportDefects = [&]() {
+    whyAtReport();
+    orphanDerefCensus();
     CG_LOG("Cells: " << copyMismatches
            << " copies between unrelated structs (copied byte by byte, "
               "reported)\n");
@@ -5671,6 +5825,7 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[fn, k] : cloneCandidates) c += (c.empty() ? "" : ",") + fn;
     std::string o;
     for (auto &[k, v] : otherMeets) o += " " + k + "=" + std::to_string(v);
+    errs() << "Cells: " << collectDup << " repeats of a reported conflict skipped (same node, kind and facts)\n";
     errs() << "Cells: " << conflicts << " name conflicts; meets elsewhere:" << o
            << "\nCLONE-CANDIDATES: " << c << "\n";
     errs() << "Cells: stopped at " << pops << " pops (one-label stop, " << conflicts << " conflicts)\n";
@@ -5708,11 +5863,15 @@ bool CallGraphPass::runCellResolution() {
   };
   // The access that gave an unlabeled object its layout: the stepped
   // pointer and the step's result (a member step), or a byte copy.
+  // Also for the --cfl-cell-why objects (each '|' alternative), with the
+  // pop: where a wrong-target pointer labeled the object first.
   noteLayoutCause = [&](uint32_t o, StructType *S) {
-    if (CFLCellTraceObj.empty() ||
-        describe(objs[o]).find(CFLCellTraceObj) == std::string::npos)
-      return;
-    CG_LOG("Cells: LAYOUT " << describe(objs[o]) << " learned " << typeLabel(S) << " ("
+    const std::string d = describe(objs[o]);
+    bool want = !CFLCellTraceObj.empty() && d.find(CFLCellTraceObj) != std::string::npos;
+    for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
+      if (!want && !alt.empty() && d.find(alt.str()) != std::string::npos) want = true;
+    if (!want) return;
+    CG_LOG("Cells: LAYOUT " << d << " learned " << typeLabel(S) << " at pop " << pops << " ("
            << mintCause << ") stepping "
            << (curStepNode == UINT32_MAX ? std::string("?") : nodeDesc(curStepNode).substr(0, 160))
            << " into "
@@ -7086,8 +7245,13 @@ bool CallGraphPass::runCellResolution() {
         errs() << "Cells: stopped at " << pops << " pops (one-label stop, 1 conflict)\n";
         exit(0);
       }
+      if (P.kind != 0 && !filtered) continue; // collect mode counts those in otherMeets
+      if (!collectSeen.insert({find(P.n), (uint32_t)P.kind, P.kind == 0 ? findFact(P.a) : 0u, findFact(P.f)})
+               .second) {
+        collectDup++;
+        continue;
+      }
       if (P.kind != 0) {
-        if (!filtered) continue; // collect mode counts those in otherMeets
         // A step of another struct or a copy between unrelated structs:
         // the cell, and how its objects arrived.
         conflicts++;
@@ -7546,109 +7710,6 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: " << cellHubKey.size() << " keyed union accesses, "
          << splitCells << " union-slot cells (" << lateSplits << " split when their object was typed), " << keyedCells
          << " keyed cells\n");
-  // --cfl-cell-why: the chain of first causes that brought a cell of
-  // `want` into `target`, latest first; the pointers whose hub links or
-  // steps the chain used are explained in turn (two levels).
-  // factDesc names offset cells only.
-  auto whyDesc = [&](uint32_t f) {
-    f = findFact(f);
-    return cells[f].kind == CellKind::Off ? factDesc(f) : factDescP(f);
-  };
-  std::function<void(uint32_t, const std::string &, int)> explainWhy2;
-  auto explainWhy = [&](uint32_t target, const std::string &want) {
-    explainWhy2(target, want, 0);
-  };
-  explainWhy2 = [&](uint32_t target, const std::string &want, int depth) {
-    const std::string ind(2 + depth * 4, ' ');
-    auto matches = [&](uint32_t f) {
-      f = findFact(f);
-      if (describe(objs[cells[f].obj]).find(want) != std::string::npos) return true;
-      for (auto [o, e] : memb[f])
-        if (describe(objs[o]).find(want) != std::string::npos) return true;
-      return false;
-    };
-    uint32_t f0 = UINT32_MAX;
-    pts[target].forEach([&](uint32_t f) {
-      if (f0 == UINT32_MAX && matches(f)) f0 = f;
-    });
-    if (f0 == UINT32_MAX) {
-      CG_LOG("Cells:" << ind << nodeDesc(target) << " holds no cell of '" << want << "'\n");
-      return;
-    }
-    CG_LOG("Cells:" << ind << "why does " << nodeDesc(target) << " hold "
-           << whyDesc(f0) << "? (latest cause first)\n");
-    std::vector<std::pair<uint32_t, uint32_t>> pointers; // pointer, its fact
-    boost::unordered_flat_set<uint64_t> seen;
-    uint32_t n = target, f = f0;
-    for (int k = 0; k < 400; k++) {
-      const uint64_t key = (uint64_t)n << 32 | f;
-      if (!seen.insert(key).second) { CG_LOG("Cells:" << ind << "  (cycle)\n"); break; }
-      auto it = factWhy.find(key);
-      if (it == factWhy.end()) {
-        CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << ": " << whyDesc(f)
-               << " (seed, or arrived before a merge)\n");
-        break;
-      }
-      const Why w = it->second;
-      std::string how;
-      switch (w.kind) {
-      case W_EDGE: {
-        auto eit = edgeWhy.find((uint64_t)w.node << 32 | n);
-        const Why e = eit == edgeWhy.end() ? Why() : eit->second;
-        if (e.kind == W_HUB) {
-          how = "edge made by a load/store through " + nodeDesc(e.node) +
-                " holding " + whyDesc(e.fact);
-          pointers.push_back({find(e.node), e.fact});
-        } else if (e.kind == W_COPY) {
-          how = "byte copy " + instLoc(copies[e.node].at) + " (" +
-                whyDesc(e.fact) + " into " + whyDesc(e.extra) + ")";
-          pointers.push_back({find(copies[e.node].src), e.fact});
-        } else if (e.kind == W_OTHER && eit != edgeWhy.end()) {
-          how = "edge (made outside the propagation loop)";
-        } else if (eit == edgeWhy.end()) {
-          how = "static copy edge or byte-copy content edge (unrecorded)";
-        } else {
-          static const char *kn[] = {"other", "edge", "step", "walk", "any-offset", "hub", "copy", "dispatch"};
-          how = std::string("edge made during a ") + kn[e.kind] + " at " +
-                (e.node < numNodes ? nodeDesc(e.node) : std::string("?")) +
-                " holding " + (e.fact < cells.size() ? whyDesc(e.fact) : std::string("?"));
-          if (e.node < numNodes && e.fact < cells.size())
-            pointers.push_back({find(e.node), e.fact});
-        }
-        break;
-      }
-      case W_STEP: how = "step"; break;
-      case W_WALK: how = "walk"; break;
-      case W_ANY: how = "any-offset (field-any loop)"; break;
-      case W_DISPATCH:
-        how = "method dispatch of " +
-              (w.extra < cells.size() ? whyDesc(w.extra) : std::string("?")) +
-              " to the receiver";
-        break;
-      default: how = "other (seed, refold, finalize, merge replay)"; break;
-      }
-      if (w.kind == W_STEP || w.kind == W_WALK || w.kind == W_ANY ||
-          w.kind == W_DISPATCH) {
-        how += " of " + whyDesc(w.fact);
-        CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << " <- " << how << "\n");
-        if (w.node == UINT32_MAX) break;
-        n = find(w.node);
-        f = findFact(w.fact);
-        continue;
-      }
-      CG_LOG("Cells:" << ind << "  " << nodeDesc(n) << " <- " << how << "\n");
-      if (w.kind != W_EDGE || w.node == UINT32_MAX) break;
-      n = find(w.node);
-      f = findFact(w.fact);
-    }
-    if (depth >= 2) return;
-    // The first pointers the chain loaded or copied through.
-    for (size_t i = 0; i < pointers.size() && i < 2; i++) {
-      const uint32_t fo = findFact(pointers[i].second);
-      const std::string w = describe(objs[cells[fo].obj]);
-      explainWhy2(pointers[i].first, w.substr(0, w.find(" [")), depth + 1);
-    }
-  };
   // Boundary census (measurement, plan 3.51 Part C input): through which
   // function boundary did each soup entry's foreign name come? From the
   // entry's first entering source, walk backward over the nodes holding
@@ -8878,20 +8939,6 @@ bool CallGraphPass::runCellResolution() {
                         wd = describe(objs[firstMismatch.od]);
       explainWhy(find(C.src), ws.substr(0, ws.find(" [")));
       explainWhy(find(C.dst), wd.substr(0, wd.find(" [")));
-    }
-    // --cfl-cell-why-at=NODE: why the nodes NODE describes hold the object.
-    if (recordWhy && !CFLCellWhyAt.empty()) {
-      std::set<uint32_t> asked;
-      boost::unordered_flat_map<uint32_t, uint32_t> classSize;
-      for (uint32_t m = 0; m < numNodes; m++) classSize[find(m)]++;
-      for (uint32_t m = 0; m < numNodes; m++)
-        if (nodeDesc(m).find(CFLCellWhyAt) != std::string::npos && asked.insert(find(m)).second) {
-          CG_LOG("Cells: why-at " << nodeDesc(m) << ": class " << find(m) << " of "
-                 << classSize[find(m)] << " nodes, represented by " << nodeDesc(find(m)) << "\n");
-          for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
-            if (!alt.empty()) explainWhy(find(m), alt.str());
-        }
-      if (asked.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
     }
   }
   if (CFLCellReceivers)

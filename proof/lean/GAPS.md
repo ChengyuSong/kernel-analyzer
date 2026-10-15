@@ -1670,6 +1670,36 @@ only.
   element of another owner, and the body's own accesses to its elements
   reach the row object through the element values.
 
+- **Size label** (Fable 2026-10-14): a heap object whose allocation size
+  is a constant S larger than its label T (the label its site's uses or
+  its first typed access give) takes the label of the struct of size S
+  that embeds T at offset 0, by the struct analyzer's embedding table
+  (transitive). Exactly one such struct: relabeled. Several: T stays,
+  counted as "ambiguous size label" with the candidates printed. None, a
+  non-constant size, or T already of size S: unchanged. A multiple of T's
+  size is an array of T (plan 3.53, rule 1), not a container. An
+  allocator's size comes from a summary row's SIZE, else its signature
+  (the allocator table), else its body's inferred term: a row's size
+  position is read before the allocator table (whose kmalloc*/__kmalloc*
+  prefix entry takes arg0, the cache, in kmalloc_trace(s, flags, size)).
+  The kmalloc cache forms of the pinned kernels have rows: 5.18
+  kmem_cache_alloc_trace / _node_trace, 6.8.2 kmalloc_trace /
+  kmalloc_node_trace, 6.18.7 __kmalloc_cache_noprof / _node_noprof (the
+  request, arg2 / arg3).
+  Worked example (5.18): snd_hda_codec_device_init allocates
+  kmem_cache_alloc_trace(.., 1640) and first uses it as struct
+  hdac_device (944 bytes). In the 5.18 kernel IR (2,623 modules) the only
+  struct holding hdac_device by value is hda_codec, at offset 0, 1640
+  bytes in all 8 modules that define it; 1640 is not a multiple of 944.
+  The object is a hda_codec; before the rule its bytes past 944 were past
+  hdac_device's layout, and a step as hda_codec was a name conflict.
+- **Statement:** a label partitions one object's bytes into named cells;
+  this rule chooses the partition the program's own sizeof declares (the
+  allocation asks for the container, the code reached it first through
+  its first member). It narrows no flow: every access keeps its offset,
+  only the names past T's size change from bytes past the layout to the
+  container's members (no type narrowing, rule untouched). The row object
+  layout below uses the same rule for a constructor's element.
 - **Row object layout** (Fable 2026-10-14): a row object (O, s, elem) takes
   its OWNER's constructor's element: the code-field feeds are paired with
   their owner where the constant is fed (up the formal/formal call
@@ -1681,8 +1711,8 @@ only.
   constant size (a call, or a certified pool carve; a chunk-relative
   carve is the same request as the constant one), typed by a typed step,
   else a local variable's debug type, else the unique struct of that size
-  that embeds a struct the body steps through on an element (the struct
-  analyzer's embedding table); every constructor's struct must embed that
+  that embeds a struct the body steps through on an element (the size
+  label above); every constructor's struct must embed that
   body struct at offset 0, or the mint is refused ("element size
   unknown"). The row object has no trailing object (asserted: a write
   past its layout is a wrong pairing); inherited body offsets past its

@@ -1192,6 +1192,23 @@ krealloc_array NONE
 # would fake a fresh return identity AND skip their bodies
 kmalloc_fix_flags NONE
 kmalloc_slab NONE
+# kmalloc(size) with a constant size inlines to a call on the size's
+# kmalloc cache that still carries the request: the block holds at least
+# `size` bytes and the caller uses `size` of them, so its size is the
+# request (the size label, GAPS "Size label": snd_hda_codec_device_init's
+# 1640-byte hda_codec). A row's SIZE is read before the allocator table,
+# whose kmalloc*/__kmalloc* prefix entry would take arg0, the cache. Only
+# the pinned kernels, signatures read in their sources; before the
+# kmalloc*/__kmalloc* rows (first match).
+# 5.18: include/linux/slab.h:458, :462
+kmem_cache_alloc_trace FRESH SIZE(arg2)
+kmem_cache_alloc_node_trace FRESH SIZE(arg3)
+# 6.8.2 (the km set): include/linux/slab.h:515, :518
+kmalloc_trace FRESH SIZE(arg2)
+kmalloc_node_trace FRESH SIZE(arg3)
+# 6.18.7: include/linux/slab.h:880, :883
+__kmalloc_cache_noprof FRESH SIZE(arg2)
+__kmalloc_cache_node_noprof FRESH SIZE(arg3)
 kmalloc* FRESH
 __kmalloc* FRESH
 kzalloc* FRESH

@@ -2249,8 +2249,11 @@ bool CallGraphPass::runCellResolution() {
     SizeTerm inner;
     auto sit = Ctx->FuncSummaries.find(CF);
     const GlobalContext::FuncSummary *FS = sit != Ctx->FuncSummaries.end() ? sit->second : nullptr;
-    if (sigOf(CF->getName(), idx)) inner = {true, 1, idx};
-    else if (FS && FS->fresh && !FS->sizeArgs.empty()) inner = {true, 1, FS->sizeArgs}; // a row's SIZE
+    // A row's SIZE is read before the allocator table (GAPS "Size label"):
+    // an explicit row beats the table's prefix guess (kmalloc* takes arg0,
+    // the cache, in kmalloc_trace(s, flags, size)).
+    if (FS && FS->fresh && !FS->sizeArgs.empty()) inner = {true, 1, FS->sizeArgs};
+    else if (sigOf(CF->getName(), idx)) inner = {true, 1, idx};
     else if (FS && FS->fresh && !CF->isDeclaration())
       inner = termOfFn(CF);
     if (!inner.known) return {};
@@ -2410,6 +2413,13 @@ bool CallGraphPass::runCellResolution() {
     add = t.add;
     return true;
   };
+  // The size label (GAPS "Size label"): a heap object whose allocation
+  // size is a constant k larger than its label S takes the struct of size
+  // k that embeds S at offset 0 (the struct analyzer's embedding table,
+  // transitive); one such struct names it, several leave S (counted with
+  // the candidates), none leaves S. A multiple of S's size is an array of
+  // S (plan 3.53, rule 1), not a container.
+  std::map<std::string, size_t> sizeLabelAmbiguous; // "S at k: {candidates}" -> objects
   auto containerOfSize = [&](const CallBase *C, const StructType *S, int64_t sz,
                              size_t &n) -> StructType * {
     n = 0;
@@ -2430,11 +2440,18 @@ bool CallGraphPass::runCellResolution() {
         Ctx->structAnalyzer.getStructInfo(S, const_cast<Module *>(C->getModule()));
     if (!SI) return nullptr;
     StructType *one = nullptr;
+    std::set<std::string> cands;
     for (auto &[ct, offs] : SI->getContainers())
       if (offs.count(0) && ct->isSized() && DL.getTypeAllocSize(const_cast<StructType *>(ct)) == k) {
         n++;
         one = const_cast<StructType *>(ct);
+        cands.insert(typeLabel(one));
       }
+    if (n > 1) {
+      std::string c;
+      for (const std::string &x : cands) c += (c.empty() ? "" : ", ") + x;
+      sizeLabelAmbiguous[typeLabel(const_cast<StructType *>(S)) + " at " + std::to_string(k) + " bytes: {" + c + "}"]++;
+    }
     return n == 1 ? one : nullptr;
   };
   // The extent a label covers (plan 3.53, rule 1): a T at the start, and
@@ -2614,8 +2631,8 @@ bool CallGraphPass::runCellResolution() {
     int64_t sz = (int64_t)DL.getTypeAllocSize(S);
     if (sz <= 0) return;
     // The first member of a container its allocation size names: learn the
-    // container; with several such containers, learn nothing yet (a later
-    // step names the type).
+    // container (GAPS "Size label"); with several such containers, the
+    // first-access label (counted with the candidates).
     if (O.base == 0)
       if (const auto *C = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin))) {
         size_t n = 0;
@@ -2624,8 +2641,7 @@ bool CallGraphPass::runCellResolution() {
           sz = (int64_t)DL.getTypeAllocSize(S);
           heapContainerRelabeled++;
         } else if (n > 1) {
-          heapContainerAmbiguous++;
-          return;
+          heapContainerAmbiguous++; // the first-access label stays
         }
       }
     // An object used as bytes keeps that first use: a struct written into
@@ -2905,9 +2921,9 @@ bool CallGraphPass::runCellResolution() {
     // A constant size larger than the label where some struct of exactly
     // that size starts with the label: the label is the first member of a
     // container (C inheritance: the allocating code writes only `pub`),
-    // not a header before trailing data. One such container: its type;
-    // several (cjpeg -O3: huff and phuff encoders are both 200 bytes):
-    // unlabeled, learned from the first struct step.
+    // not a header before trailing data (GAPS "Size label"). One such
+    // container: its type; several (cjpeg -O3: huff and phuff encoders are
+    // both 200 bytes): the label stays, counted with the candidates.
     if (O.layout && O.repeats)
       if (const auto *C = dyn_cast_or_null<CallBase>(V))
         if (const auto *ST = dyn_cast<StructType>(O.layout)) {
@@ -2919,10 +2935,7 @@ bool CallGraphPass::runCellResolution() {
             O.repeats = false;
             heapContainerRelabeled++;
           } else if (n > 1) {
-            O.layout = nullptr;
-            O.size = 0;
-            O.label.clear();
-            heapContainerAmbiguous++;
+            heapContainerAmbiguous++; // the label stays
           }
         }
     // A declared array (of a scalar, ruling A; of pointer slots, 1b) is an
@@ -9139,9 +9152,11 @@ bool CallGraphPass::runCellResolution() {
          << " unlabeled (" << heapBytesMarked << " used as bytes from mint), " << heapConflict
          << " with conflicting labels, "
          << heapContainerRelabeled << " relabeled to the container their size names, "
-         << heapContainerAmbiguous << " left unlabeled (several containers of that size)), "
+         << heapContainerAmbiguous << " ambiguous size labels (several containers of that size; the label stays)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
          << anyCells << " any-offset, " << outMints << " outside)\n");
+  for (const auto &[k, n] : sizeLabelAmbiguous)
+    CG_LOG("Cells:   ambiguous size label: " << k << " (" << n << " objects)\n");
   CG_LOG("Cells: " << numNodes << " solver nodes, " << staticCopies
          << " copies, " << stores << " stores, " << lazyFEdges.size()
          << " field edges, " << dynEdges << " hub edges (" << hubLinks

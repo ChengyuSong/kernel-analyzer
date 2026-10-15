@@ -5660,6 +5660,7 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[k, v] : otherMeets) o += " " + k + "=" + std::to_string(v);
     errs() << "Cells: " << conflicts << " name conflicts; meets elsewhere:" << o
            << "\nCLONE-CANDIDATES: " << c << "\n";
+    errs() << "Cells: stopped at " << pops << " pops (one-label stop, " << conflicts << " conflicts)\n";
     exit(0);
   };
   reportTypedStep = [&](uint32_t n, uint32_t f, const StructType *S,
@@ -5679,6 +5680,7 @@ bool CallGraphPass::runCellResolution() {
     reportDefects();
     errs() << "Cells: --cfl-cell-one-label stopped at the first name "
            << "conflict (measurement only, no answers)\n";
+    errs() << "Cells: stopped at " << pops << " pops (one-label stop, 1 conflict)\n";
     exit(0);
   };
   auto reportConflict = [&](uint32_t n, uint32_t a, uint32_t f) {
@@ -7018,6 +7020,7 @@ bool CallGraphPass::runCellResolution() {
         reportDefects();
         errs() << "Cells: --cfl-cell-one-label stopped at the first name "
                << "conflict inside the icall cone (measurement only, no answers)\n";
+        errs() << "Cells: stopped at " << pops << " pops (one-label stop, 1 conflict)\n";
         exit(0);
       }
       if (P.kind != 0) continue; // collect mode counts those in otherMeets
@@ -7043,6 +7046,37 @@ bool CallGraphPass::runCellResolution() {
                                                      CFLCellOneLabelObject.getValue() + "\")")
              << "\n");
   };
+  // At a stop other than the mode's own (a soup cap, census-at): the cone
+  // line the final flush would print, and the conflicts still held (outside
+  // the cone, or inside without function-pointer objects on both sides).
+  auto coneStopSummary = [&]() {
+    computeCone();
+    computeFptrObjs();
+    size_t outside = 0, harmless = 0;
+    std::vector<std::string> held;
+    for (const PendingConflict &P : pendingConf) {
+      const bool inC = inCone[find(P.n)] != 0;
+      const bool matters = P.kind == 0 ? factCarriesFptrs(P.a) && factCarriesFptrs(P.f) : factCarriesFptrs(P.f);
+      (inC ? harmless : outside)++;
+      if (held.size() < 10)
+        held.push_back("pop " + std::to_string(P.pop) + " [fn-ptr: " + (matters ? "yes" : "no") +
+                       ", in cone: " + (inC ? "yes" : "no") + "] " + nodeDesc(P.n).substr(0, 120) + ": " +
+                       (P.kind == 0 ? "A = " + factDesc(findFact(P.a)).substr(0, 120) + " | B = "
+                        : P.kind == 1 ? std::string("a step of another struct: ")
+                                      : std::string("a copy between unrelated structs: ")) +
+                       factDesc(findFact(P.f)).substr(0, 120));
+    }
+    CG_LOG("Cells: icall cone at the stop: " << coneSize << " nodes from " << icallOps.size()
+           << " icall operands; " << conflicts << " conflicts reported; held: " << outside
+           << " outside the cone, " << harmless << " inside but without function-pointer objects on both sides; "
+           << pendingDup << " further conflicts at nodes already holding one"
+           << (CFLCellOneLabelObject.empty() ? std::string()
+                                             : "; " + std::to_string(oneLabelFiltered) +
+                                                   " conflicts filtered out (no object matching \"" +
+                                                   CFLCellOneLabelObject.getValue() + "\")")
+           << "\n");
+    for (const std::string &h : held) CG_LOG("Cells:   held " << h << "\n");
+  };
   std::vector<uint32_t> delta;
   // Plan 3.54: facts a split formal holds before the solve (seeds) entered
   // it other than by a dispatch.
@@ -7060,6 +7094,7 @@ bool CallGraphPass::runCellResolution() {
   uint64_t lastCollapsePops = 0;
   size_t edgesAtCollapse = edgeSet.size();
   uint32_t stoppedAt = 0;
+  std::string stopKind; // the stop's name in the final line
   while (true) {
     if (!refoldQueue.empty()) drainRefolds();
     if (worklist.empty()) {
@@ -7089,12 +7124,14 @@ bool CallGraphPass::runCellResolution() {
       for (const std::string &d : taggedFlipAt) errs() << "Cells:   unkeyed during solve: " << d << "\n";
       for (const std::string &d : asmFailSites) errs() << "Cells:   alias assumption failed at " << d << "\n";
       stoppedAt = pops;
+      stopKind = soupForeign.size() >= CFLCellSoupCap ? "soup-cap stop" : "soup-time stop";
       break;
     }
     if (whyAnyArrived) {
       errs() << "Cells: --cfl-cell-why any: the queried any-offset cell arrived; "
              << "stopping (measurement only, no answers)\n";
       stoppedAt = pops;
+      stopKind = "why-any stop";
       break;
     }
     // Pops counted over all iterations (the stop lands in the iteration
@@ -7108,6 +7145,7 @@ bool CallGraphPass::runCellResolution() {
       // The reports (soup profile, weld census, mass) describe the partial
       // state whether or not stop answers are asked for.
       stoppedAt = pops;
+      stopKind = "census-at stop";
       break;
     }
     delta.clear();
@@ -9734,7 +9772,8 @@ bool CallGraphPass::runCellResolution() {
     for (const std::string &l : lines) SO << l << "\n";
   }
   if (stoppedAt) {
-    errs() << "Cells: stopped at " << stoppedAt << " pops (--cfl-cell-census-at); "
+    if (CFLCellOneLabel) coneStopSummary();
+    errs() << "Cells: stopped at " << stoppedAt << " pops (" << stopKind << "); "
            << "the reports above describe the partial state\n";
     exit(0);
   }

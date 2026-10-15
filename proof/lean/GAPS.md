@@ -1918,3 +1918,55 @@ labeled by that value: the azx bus object was labeled struct.hdac_bus
 
 Case: test/t_cells_allocsite.c (malloc under a formal's class, at -O1).
 Not mechanized. Checked by executions; see the commit's gates.
+
+## Link words (LinkWords.cc, report only, 2026-10-15, plan 3.55 R1 step 1)
+
+An integer field that holds a pointer whose low bits carry data
+(rb_node.__rb_parent_color = parent | color) is classified, before any
+solve, by the shapes of its stores and loads. The flow is not changed:
+the integer round trip (ptrtoint | k, masks, compares, inttoptr) already
+keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
+
+- **Statement:** a candidate (a pointer-width integer field with a load
+  reaching inttoptr) passes when every store's value is a tagged word
+  (ptrtoint(p), a constant < 8, a copy of a passing field, or/xor with a
+  tag value, add of a tag value onto a word with known-zero low bits, a
+  clear `& c` with ~c < 8, phi/select of these) and every load's uses end
+  in inttoptr, a compare, a tag extraction, or a store into a passing
+  field. A greatest fixpoint over candidates (a copy's status is its
+  source's).
+- **Assumed, per site:** an inttoptr with no clear on the way (rb_red_parent)
+  relies on tag 0 at that read: an ASSUMPTION line, not checked.
+- **Naming at offset 0 with no struct GEP and no TBAA** (the kernel builds
+  with -fno-strict-aliasing and the 5.18 corpus has no debug info): the
+  address's declared pointee, by debug info; else by sibling GEPs (the
+  value is the base of struct GEPs of one struct in its function, after
+  normalizing each struct to its innermost struct at offset 0; two structs
+  are a pun: unnamed); else by formal provenance (a function whose address
+  is never taken: every call site's actual names the same struct, after the
+  same normalization). A use from a ".discard*" section (EXPORT_SYMBOL's
+  __addressable marker) does not take the address: the linker drops it.
+  An access none of these name is counted per function; a copy through it
+  fails its field "on naming".
+- **Scope:** the classification reads SSA. At -O0 a value passes through
+  a local slot, so -O0 code is out of scope by design (like the -O3
+  typing); its fields fail as copies from unnamed accesses.
+- **Pointer fields** that receive encoded words (XArray slots: node | 2,
+  values, internal constants) are reported by shape only (R1 addendum (b)
+  is measured, not built).
+- **Worked example: an ASSUMPTION site's consequence** (kernel why runs on
+  72c3496, 2026-10-15). RB_CLEAR_NODE in timerqueue_del stores the hda
+  codec's suspend-timer node address into its own __rb_parent_color
+  (hda_codec+296; R2's self-link, which stays in the element's cells).
+  rb_insert_color reads that word as the node's parent and converts it
+  unmasked (`%98 = inttoptr` of the loaded word: an ASSUMPTION site, tag
+  0), then stores the "parent" into the node's own rb_right (hda_codec+304).
+  rb_next's rb_right load returns the node, and rb_next's return, shared by
+  every tree, carries it to proc_keys_start, which steps it as struct key.
+  Every read and write targets the right cell for the value it carries:
+  the loss is the sentinel read as a parent (flow-insensitively: the
+  program overwrites the word in rb_link_node before any insert) and the
+  shared traverse return (cured by traverse rows by derivation, R5).
+
+Cases: test/t_cells_linkword_{rb,rotate,plus8,addtag,xarray,sibling}.c.
+Not mechanized. Checked by executions; see the commit's gates.

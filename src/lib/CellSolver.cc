@@ -9777,6 +9777,11 @@ bool CallGraphPass::runCellResolution() {
       RO << "# Containers (plan 3.55): rows by provenance, the body, obligations O1-O6 PASS/FAIL, verdict.\n";
       for (const std::string &l : containerReport) RO << "CONTAINER " << l << "\n";
     }
+    if (!linkWordReport.empty()) {
+      RO << "# Link words (plan 3.55 R1, report only): integer fields read as pointers, by store and load\n"
+         << "# shape; ASSUMPTION lines are reads that rely on tag 0; encoded pointer fields by shape only.\n";
+      for (const std::string &l : linkWordReport) RO << "LINKWORD " << l << "\n";
+    }
     RO << "SUMMARY segments declared by a receiver: " << censusSegments[0] << " a struct (" << censusSegments[1]
        << " indexed by a stride of it: arrays without an extent), " << censusSegments[2] << " arrays of pointer slots, "
        << censusSegments[3] << " arrays of a declared scalar, " << censusSegments[4] << " bytes (a char receiver); "

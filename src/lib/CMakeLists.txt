@@ -24,6 +24,7 @@ set (KACoreSource
   Carves.cc
   Containers.cc
   TaggedFields.cc
+  LinkWords.cc
   Dump.cc
   IRSidecar.cc
   IRCensus.cc

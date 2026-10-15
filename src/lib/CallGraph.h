@@ -637,6 +637,12 @@ protected:
   std::set<const llvm::Function *> adoptedAtomBodies;
   void unadoptKeyedBodies();
   std::vector<std::string> taggedReport;
+  // Link words (plan 3.55 R1, LinkWords.cc): integer fields holding a
+  // pointer with tag bits, classified by store and load shape (report only);
+  // the fields that pass.
+  void computeLinkWords();
+  std::vector<std::string> linkWordReport;
+  std::set<std::pair<std::string, int64_t>> linkWordFields;
   std::array<size_t, 11> taggedCounts{}; // ..., predicate tests closed, open, parameter-pair reads keyed, untested
   // Keyed tagged-field pairs (struct, F offset, D offset, D size): the solver
   // flips a pair to unkeyed when a byte copy writes its tag other than as a

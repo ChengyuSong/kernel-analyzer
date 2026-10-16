@@ -129,7 +129,11 @@ AsmModel asmModel(const CallBase &CS, const DataLayout *DL);
 // goes to *assumed. Owners and elements are identified by object and
 // offset: a step from the object to a declared slot whose struct starts at
 // an owner's or element's offset is that one's slot (slotStart(A): the
-// slot's offset inside its declared struct, -1 if A names none).
+// slot's offset inside its declared struct, -1 if A names none). By byte
+// arithmetic from a derived value (Fable 2026-10-16 S4): a pointer at the
+// value's address is the value, one at an offset in elemSlots (the element
+// struct's declared slots) is that slot; *byteSlots gets each such address
+// with its offsets (a select of constant indices: every one a slot).
 enum : uint8_t { OC_OWNER = 1, OC_SLOT = 2, OC_VAL = 4, OC_WORD = 8 };
 using OwnerClassFn = std::function<uint8_t(const Value *)>;
 std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::vector<const Value *> &owners,
@@ -138,7 +142,12 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
                                                  const std::function<bool(const CallBase *, const OwnerClassFn &)> &rowRet,
                                                  const DataLayout &DL, StructType *elemT,
                                                  std::vector<const Value *> *assumed,
-                                                 const std::function<int64_t(const Value *)> &slotStart);
+                                                 const std::function<int64_t(const Value *)> &slotStart,
+                                                 const std::set<int64_t> &elemSlots,
+                                                 std::map<const Value *, std::vector<int64_t>> *byteSlots);
+// A pointer's object and constant byte offset (casts and constant GEPs
+// folded; a phi or select whose entries agree is that object and offset).
+std::pair<const Value *, int64_t> rootOff(const Value *V, const DataLayout &DL, int depth = 0);
 // The innermost named struct holding byte `off` of T (array members fold
 // to their element 0), the offset there, and the scalar the byte lies in
 // with the byte's offset inside it. A union on the path stops the name

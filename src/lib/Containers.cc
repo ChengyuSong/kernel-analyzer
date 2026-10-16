@@ -1246,6 +1246,22 @@ void CallGraphPass::checkContainerClosure() {
             }
           return only ? ownerShape(only->getValueOperand(), d + 1) : "";
         }
+      // A phi or select whose entries agree is that value (Fable 2026-10-16
+      // S3: rb_add_cached computes `&root->rb_root` on both paths).
+      if (isa<PHINode>(V) || isa<SelectInst>(V)) {
+        std::vector<const Value *> ins;
+        if (const auto *PN = dyn_cast<PHINode>(V)) ins.assign(PN->incoming_values().begin(), PN->incoming_values().end());
+        else ins = {cast<SelectInst>(V)->getTrueValue(), cast<SelectInst>(V)->getFalseValue()};
+        std::string agreed;
+        bool ok = true;
+        for (const Value *In : ins) {
+          if (In->stripPointerCasts() == V) continue;
+          const std::string x = d < 6 ? ownerShape(In, d + 2) : "";
+          if (x.empty() || (!agreed.empty() && x != agreed)) ok = false;
+          agreed = x;
+        }
+        if (ok && !agreed.empty()) return agreed;
+      }
       // Constant steps fold into one offset from the object (Fable
       // 2026-10-15, 4(b)): `&root->rb_root` (+0) is the owner `root`.
       if (const auto *G = dyn_cast<GEPOperator>(V)) {
@@ -1316,6 +1332,7 @@ void CallGraphPass::checkContainerClosure() {
     std::map<std::string, std::vector<std::string>> o1Fail;
     std::vector<std::string> o1Naming, implicitMatched, implicitUnmatched, wordLines, unionSites;
     std::map<std::string, size_t> unionStorage; // class 2: storage inside a union (writes)
+    std::vector<std::string> plainFieldSites;   // an element pointer kept in a plain field (examples)
     std::vector<std::string> linkInvariant, traverseJoined; // listed assumptions in owner code
     size_t lookupsByDerivation = 0, rowSites = 0;
     // (1c) discharged per call site: agrees, disagrees (FAIL), unnamed
@@ -1351,9 +1368,13 @@ void CallGraphPass::checkContainerClosure() {
       auto slotOf = [&](const Instruction *At, const Value *A) -> char {
         return kindOf(At ? ckey(At, A) : addrKey(A));
       };
+      // Owner-code slots named by byte arithmetic from a derived value (S4):
+      // address -> its offsets in the element struct.
+      std::map<const Value *, std::vector<int64_t>> byteSlotsAll;
       // The fields an access at A may write: its own name, or, for a phi or
       // select of field addresses (rb_link_node's `*p`, rb_erase's child
-      // slot), every entry's (null entries add none). Empty: unnamed.
+      // slot), every entry's (null entries add none), or the slots byte
+      // arithmetic names (S4). Empty: unnamed.
       std::function<bool(const Instruction *, const Value *, std::vector<std::pair<StructType *, int64_t>> &, int)>
           addrSlots = [&](const Instruction *At, const Value *A, std::vector<std::pair<StructType *, int64_t>> &out,
                           int d) -> bool {
@@ -1361,6 +1382,10 @@ void CallGraphPass::checkContainerClosure() {
         int64_t off = 0;
         if (namedSlot(At, A, CDL, pointees, S, off) && S->hasName()) {
           out.push_back({S, off});
+          return true;
+        }
+        if (auto bit = byteSlotsAll.find(A->stripPointerCasts()); bit != byteSlotsAll.end() && premiseElemT) {
+          for (int64_t k : bit->second) out.push_back({premiseElemT, k});
           return true;
         }
         const Value *V = A->stripPointerCasts();
@@ -1497,9 +1522,17 @@ void CallGraphPass::checkContainerClosure() {
               else premiseFail.push_back(at + ": named " + as);
             }
           }
+      // The element struct's declared slots, by offset (S4).
+      std::set<int64_t> elemSlotOffs;
+      if (premiseElemT)
+        for (const std::set<std::string> *D : {&declLink, &declWord})
+          for (const std::string &K : *D)
+            if (K.compare(0, K.rfind('+'), stripStructNameSuffix(premiseElemT->getName()).str()) == 0)
+              elemSlotOffs.insert(std::stoll(K.substr(K.rfind('+') + 1)));
       for (auto &[F, gs] : groups)
         for (auto &[sh, Gp] : gs) {
           (void)sh;
+          std::map<const Value *, std::vector<int64_t>> byteSlots;
           Gp.cls = deriveOwnerCode(*F, Gp.owners, Gp.elems, slotOf, [&](const CallBase *CB, const OwnerClassFn &g) {
             const CR *R = rowAt(CB);
             if (!R || R->role == CR::Insert) return false;
@@ -1511,7 +1544,12 @@ void CallGraphPass::checkContainerClosure() {
             const std::string K = addrKey(A);
             if (!kindOf(K)) return -1;
             return std::stoll(K.substr(K.rfind('+') + 1));
-          });
+          }, elemSlotOffs, &byteSlots);
+          for (auto &[A, ks] : byteSlots) {
+            std::vector<int64_t> &all = byteSlotsAll[A];
+            for (int64_t k : ks)
+              if (std::find(all.begin(), all.end(), k) == all.end()) all.push_back(k);
+          }
           for (const Value *L : Gp.assumed) linkInvariant.push_back(F->getName().str() + ": read by " + valueText(L));
           for (const CallBase *CB : Gp.joined) traverseJoined.push_back(siteText(CB));
         }
@@ -1571,7 +1609,11 @@ void CallGraphPass::checkContainerClosure() {
             for (const Value *o : Gp.owners) ocB |= o == B ? OC_OWNER : 0;
             for (const CallBase *CB : Gp.inserts) {
               const CR *R = rowAt(CB);
-              auto isE = [&](int e) { return e >= 0 && (unsigned)e < CB->arg_size() && baseOf(CB->getArgOperand(e)) == B; };
+              auto isE = [&](int e) {
+                if (e < 0 || (unsigned)e >= CB->arg_size()) return false;
+                const Value *X = CB->getArgOperand(e);
+                return baseOf(X) == B || rootOff(X, CDL).first == B; // S3: a phi of equal steps
+              };
               baseIsInserted |= isE(R->elem);
               for (int e : R->moreElems) baseIsInserted |= isE(e);
             }
@@ -1589,17 +1631,22 @@ void CallGraphPass::checkContainerClosure() {
         // address may name.
         std::vector<std::pair<std::string, char>> covered;
         bool someUncovered = false; // a field the address may name that holds no declared slot
+        bool uncoveredDeclared = false; // ... and lies in a struct the block declares slots of
         bool inUnion = false;       // bytes inside a union whose IR member holds a declared slot
         auto declaredIn = [&](StructType *ST, int64_t lo, int64_t h, std::vector<std::pair<std::string, char>> &out) {
           if (!ST->hasName()) return;
           const std::string SN = stripStructNameSuffix(ST->getName()).str();
+          const size_t before = out.size();
+          bool declStruct = false;
           for (const std::set<std::string> *D : {&declHandle, &declLink, &declWord})
             for (const std::string &K : *D) {
               const size_t p = K.rfind('+');
-              if (K.compare(0, p, SN) != 0) continue;
+              if (K.compare(0, p, SN) != 0 || p != SN.size()) continue;
+              declStruct = true;
               const int64_t o = std::stoll(K.substr(p + 1));
               if (o >= lo && o < h) out.push_back({K, kindOf(K)});
             }
+          uncoveredDeclared |= declStruct && out.size() == before;
         };
         for (auto &[S, off] : named) {
           const size_t before = covered.size();
@@ -1612,7 +1659,9 @@ void CallGraphPass::checkContainerClosure() {
               [&](StructType *ST, int64_t lo, int64_t h) { declaredIn(ST, lo, h, covered); },
               [&](StructType *U, int64_t lo, int64_t h) {
                 std::vector<std::pair<std::string, char>> inside;
+                const bool keep = uncoveredDeclared; // a union's members are class 2, not D2
                 structCover(U, lo, h, CDL, [&](StructType *ST, int64_t l2, int64_t h2) { declaredIn(ST, l2, h2, inside); });
+                uncoveredDeclared = keep;
                 unionHere |= !inside.empty();
               });
           inUnion |= unionHere;
@@ -1630,7 +1679,21 @@ void CallGraphPass::checkContainerClosure() {
           if (gs)
             for (auto &SG : *gs)
               if (auto it = SG.second.cls.find(strip(V)); it != SG.second.cls.end()) vo |= it->second;
-          if ((vb & (DER | FRS)) || (vo & OC_VAL)) fail("an element stored outside the declared storage", I);
+          // An element pointer kept in a plain field (a cursor: ext4's
+          // info->curr_node) is ordinary flow, counted, never a FAIL (Fable
+          // 2026-10-16: O1 constrains stores into declared slots and stores
+          // of link values, not every copy of an element pointer). A field
+          // of a struct the block declares slots of that holds none (a fourth
+          // pointer in rb_node) is the declared storage checked from the
+          // program's side (D2): it stays a FAIL.
+          if ((vb & (DER | FRS)) || (vo & OC_VAL)) {
+            if (uncoveredDeclared) {
+              fail("an element stored outside the declared storage", I);
+            } else {
+              o1Admit["an element pointer kept in a plain field"]++;
+              if (plainFieldSites.size() < 8) plainFieldSites.push_back(siteText(I));
+            }
+          }
         }
         if (covered.empty()) return;
         // A copy over exactly the element's declared link record (every
@@ -2555,6 +2618,7 @@ void CallGraphPass::checkContainerClosure() {
               "counted, not a write of the slot): " + std::to_string(unionStorage["writes"]) + " writes");
         for (const std::string &u : unionSites) cline("    " + u);
       }
+      for (const std::string &u : plainFieldSites) cline("    an element pointer kept in a plain field: " + u);
       for (auto &[why, sites] : o1Fail) {
         cline("  storage FAIL " + why + (sites.empty() ? std::string() : ": " + std::to_string(sites.size()) + " sites"));
         for (size_t i = 0; i < sites.size() && i < 8; i++) cline("    " + sites[i]);

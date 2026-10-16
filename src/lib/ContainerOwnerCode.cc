@@ -19,20 +19,71 @@
 #include "CallGraphInternal.h"
 #include <llvm/ADT/PostOrderIterator.h>
 #include <llvm/IR/CFG.h>
+#include <optional>
 
 // A pointer's object and constant byte offset from it (casts and constant
-// GEPs folded).
-static std::pair<const Value *, int64_t> rootOff(const Value *V, const DataLayout &DL) {
+// GEPs folded; a phi or select whose entries agree on object and offset is
+// that object and offset, Fable 2026-10-16 S3: rb_add_cached's
+// `&root->rb_root` computed on both paths).
+std::pair<const Value *, int64_t> rootOff(const Value *V, const DataLayout &DL, int depth) {
   int64_t o = 0;
   for (int i = 0; i < 16; i++) {
     V = V->stripPointerCasts();
-    const auto *G = dyn_cast<GEPOperator>(V);
-    APInt A(64, 0);
-    if (!G || !G->accumulateConstantOffset(DL, A)) break;
-    o += A.getSExtValue();
-    V = G->getPointerOperand();
+    if (const auto *G = dyn_cast<GEPOperator>(V)) {
+      APInt A(64, 0);
+      if (!G->accumulateConstantOffset(DL, A)) break;
+      o += A.getSExtValue();
+      V = G->getPointerOperand();
+      continue;
+    }
+    if (depth >= 4 || !(isa<PHINode>(V) || isa<SelectInst>(V))) break;
+    std::vector<const Value *> ins;
+    if (const auto *PN = dyn_cast<PHINode>(V)) ins.assign(PN->incoming_values().begin(), PN->incoming_values().end());
+    else ins = {cast<SelectInst>(V)->getTrueValue(), cast<SelectInst>(V)->getFalseValue()};
+    std::optional<std::pair<const Value *, int64_t>> agreed;
+    bool ok = true;
+    for (const Value *In : ins) {
+      if (In->stripPointerCasts() == V) continue;
+      const auto ro = rootOff(In, DL, depth + 1);
+      if (agreed && *agreed != ro) ok = false;
+      agreed = ro;
+    }
+    if (ok && agreed && agreed->first != V) V = agreed->first, o += agreed->second;
+    break;
   }
   return {V, o};
+}
+
+// The byte steps a GEP may take: one offset when every index is constant,
+// one per constant when exactly one index is a select or phi of constants
+// (interval_tree_generic's `&parent->rb_left / rb_right` as a word index);
+// empty otherwise. By bytes, the GEP's types irrelevant (Fable 2026-10-16 S4).
+static std::vector<int64_t> gepSteps(const GEPOperator *G, const DataLayout &DL) {
+  std::vector<int64_t> outs{0};
+  for (gep_type_iterator GTI = gep_type_begin(G), E = gep_type_end(G); GTI != E; ++GTI) {
+    const Value *Idx = GTI.getOperand();
+    if (StructType *ST = GTI.getStructTypeOrNull()) {
+      const int64_t a = (int64_t)DL.getStructLayout(ST)->getElementOffset(cast<ConstantInt>(Idx)->getZExtValue());
+      for (int64_t &o : outs) o += a;
+      continue;
+    }
+    const int64_t sz = (int64_t)DL.getTypeAllocSize(GTI.getIndexedType());
+    std::vector<const Value *> alts{Idx};
+    if (const auto *S = dyn_cast<SelectInst>(Idx)) alts = {S->getTrueValue(), S->getFalseValue()};
+    else if (const auto *PN = dyn_cast<PHINode>(Idx)) alts.assign(PN->incoming_values().begin(), PN->incoming_values().end());
+    std::vector<int64_t> cs;
+    for (const Value *A : alts) {
+      const auto *C = dyn_cast<ConstantInt>(A);
+      if (!C) return {};
+      cs.push_back(C->getSExtValue());
+    }
+    if (cs.size() > 1 && outs.size() > 1) return {}; // one variable index only
+    std::vector<int64_t> next;
+    for (int64_t o : outs)
+      for (int64_t c : cs) next.push_back(o + c * sz);
+    outs = next;
+  }
+  return outs;
 }
 
 std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::vector<const Value *> &owners,
@@ -41,24 +92,37 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
                                                  const std::function<bool(const CallBase *, const OwnerClassFn &)> &rowRet,
                                                  const DataLayout &DL, StructType *elemT,
                                                  std::vector<const Value *> *assumed,
-                                                 const std::function<int64_t(const Value *)> &slotStart) {
+                                                 const std::function<int64_t(const Value *)> &slotStart,
+                                                 const std::set<int64_t> &elemSlots,
+                                                 std::map<const Value *, std::vector<int64_t>> *byteSlots) {
   std::vector<const Value *> grown(elems.begin(), elems.end());
+  std::map<const Value *, std::pair<const Value *, int64_t>> roMemo;
+  auto ro = [&](const Value *V) {
+    auto it = roMemo.find(V);
+    if (it != roMemo.end()) return it->second;
+    const auto r = rootOff(V, DL);
+    roMemo.emplace(V, r);
+    return r;
+  };
   // Nodes assumed elements under the link invariant, by object and offset.
   std::set<std::pair<const Value *, int64_t>> linkObj;
   const int64_t elemSize = elemT && !elemT->isOpaque() ? (int64_t)DL.getTypeAllocSize(elemT) : 0;
   for (int outer = 0;; outer++) {
     assert(outer < 64 && "owner-code derivation (link invariant) did not settle");
   std::map<const Value *, uint8_t> cls, assume;
+  std::map<const Value *, std::vector<int64_t>> byteRound; // S4 slots: their offsets in the element struct
   const uint8_t TOP = OC_SLOT | OC_VAL | OC_WORD;
   for (const Instruction &I : instructions(F))
     if (isa<PHINode>(I) || isa<SelectInst>(I)) assume[&I] = TOP;
   const std::set<const Value *> ownerSet(owners.begin(), owners.end()), elemSet(grown.begin(), grown.end());
   // Elements by object and offset: a step from the object into an
   // element's declared field is that element's slot.
-  std::set<std::pair<const Value *, int64_t>> objAt;
-  for (const Value *O : owners) objAt.insert(rootOff(O, DL));
+  std::set<std::pair<const Value *, int64_t>> objAt, ownerAt, elemAt;
+  for (const Value *O : owners) ownerAt.insert(ro(O));
   if (elemSize)
-    for (const Value *E : grown) objAt.insert(rootOff(E, DL));
+    for (const Value *E : grown) elemAt.insert(ro(E));
+  objAt.insert(ownerAt.begin(), ownerAt.end());
+  objAt.insert(elemAt.begin(), elemAt.end());
   objAt.insert(linkObj.begin(), linkObj.end());
   auto look = [](const Value *V) {
     for (int i = 0; i < 8; i++) {
@@ -76,12 +140,31 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
     if (fresh) it->second = slotOf(nullptr, V) != 0;
     return it->second;
   };
+  // Constant addresses (`&L.tree[0]` as a constant GEP): a declared slot of
+  // an owner or element by object and offset, known before the fixpoint so
+  // a load through one is derived (Fable 2026-10-16 S2: mod_tree's root).
+  std::set<const Value *> constSlots;
+  for (const Instruction &I : instructions(F))
+    for (const Value *Op : I.operands())
+      if (const auto *CE = dyn_cast<ConstantExpr>(Op); CE && isa<GEPOperator>(CE))
+        if (const int64_t k = slotStart(CE); k >= 0) {
+          const auto [r, o] = ro(CE);
+          if (objAt.count({r, o - k})) constSlots.insert(CE);
+        }
   OwnerClassFn get = [&](const Value *V) -> uint8_t {
     V = look(V);
     uint8_t m = 0;
     if (ownerSet.count(V)) m |= OC_OWNER;
     if (elemSet.count(V)) m |= OC_VAL;
-    if (!linkObj.empty() && V->getType()->isPointerTy() && linkObj.count(rootOff(V, DL))) m |= OC_VAL;
+    if (constSlots.count(V)) m |= OC_SLOT;
+    // Owners and elements by object and offset (Fable 2026-10-16 S1: an
+    // element at +0 of its object, `&epi->rbn` through a zero GEP).
+    if (V->getType()->isPointerTy() && !isa<Constant>(V) &&
+        (!linkObj.empty() || !ownerAt.empty() || !elemAt.empty())) {
+      const auto r = ro(V);
+      if (ownerAt.count(r)) m |= OC_OWNER;
+      if (elemAt.count(r) || linkObj.count(r)) m |= OC_VAL;
+    }
     if (auto it = assume.find(V); it != assume.end()) return m | it->second;
     if (auto it = cls.find(V); it != cls.end()) m |= it->second;
     if ((m & (OC_OWNER | OC_VAL)) && !(m & OC_SLOT) && isSlot(V)) m |= OC_SLOT;
@@ -98,10 +181,39 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
       const uint8_t b = get(GEP->getPointerOperand());
       if ((b & (OC_OWNER | OC_VAL)) && slotOf(nullptr, &I)) return OC_SLOT;
       if (const int64_t k = slotStart(&I); k >= 0) {
-        const auto [r, o] = rootOff(&I, DL);
+        const auto [r, o] = ro(&I);
         if (objAt.count({r, o - k})) return OC_SLOT;
       }
-      return GEP->hasAllZeroIndices() ? b & OC_SLOT : 0;
+      if (GEP->hasAllZeroIndices()) return b & OC_SLOT;
+      // Byte arithmetic from a derived value (Fable 2026-10-16 S4): through
+      // container_of and word steps, a pointer at the value's own address is
+      // the value; at a declared slot offset of the element struct, that
+      // slot (each step of a select of constant indices must be one).
+      if (elemSize && !elemSlots.empty()) {
+        std::vector<int64_t> acc{0};
+        const Value *P = &I;
+        for (int d = 0; d < 8; d++) {
+          const auto *G = dyn_cast<GEPOperator>(P);
+          if (!G) break;
+          const std::vector<int64_t> st = gepSteps(G, DL);
+          if (st.empty() || (st.size() > 1 && acc.size() > 1)) break;
+          std::vector<int64_t> next;
+          for (int64_t a : acc)
+            for (int64_t s : st) next.push_back(a + s);
+          acc = next;
+          P = look(G->getPointerOperand());
+          if (!(get(P) & OC_VAL)) continue;
+          bool self = true, slots = true;
+          for (int64_t a : acc) self &= a == 0, slots &= elemSlots.count(a) > 0;
+          if (self) return OC_VAL | (elemSlots.count(0) ? OC_SLOT : 0);
+          if (slots) {
+            if (byteSlots) byteRound[&I] = acc;
+            return OC_SLOT;
+          }
+          break;
+        }
+      }
+      return 0;
     }
     if (isa<BitCastInst>(&I) || isa<AddrSpaceCastInst>(&I)) return get(I.getOperand(0)) & ~OC_OWNER;
     if (isa<PtrToIntInst>(&I)) return get(I.getOperand(0)) & (OC_VAL | OC_OWNER) ? OC_WORD : 0;
@@ -152,7 +264,7 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
   ReversePostOrderTraversal<const Function *> RPOT(&F);
   for (int round = 0;; round++) {
     assert(round < 256 && "owner-code derivation did not settle");
-    cls.clear();
+    cls.clear(), byteRound.clear();
     for (const BasicBlock *BB : RPOT)
       for (const Instruction &I : *BB)
         if (!assume.count(&I))
@@ -166,15 +278,8 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
   }
   for (auto &[V, a] : assume)
     if (a) cls[V] = a;
-  // Constant addresses (`&L.tree[0]` as a constant GEP): a declared slot of
-  // an owner or element by object and offset.
-  for (const Instruction &I : instructions(F))
-    for (const Value *Op : I.operands())
-      if (const auto *CE = dyn_cast<ConstantExpr>(Op); CE && isa<GEPOperator>(CE) && !cls.count(CE))
-        if (const int64_t k = slotStart(CE); k >= 0) {
-          const auto [r, o] = rootOff(CE, DL);
-          if (objAt.count({r, o - k})) cls[CE] = OC_SLOT;
-        }
+  for (const Value *CE : constSlots) cls[CE] |= OC_SLOT;
+  if (byteSlots) *byteSlots = byteRound;
   if (!elemSize) return cls;
   // Backward: what an element was read from. Through phis and selects (each
   // entry, on its path), casts, a link word's decode (inttoptr of tag ops
@@ -183,7 +288,7 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
   auto isVal = [&](const Value *V) {
     V = look(V);
     if (elemSet.count(V)) return true;
-    if (V->getType()->isPointerTy() && objAt.count(rootOff(V, DL)) && !ownerSet.count(V)) return true;
+    if (V->getType()->isPointerTy() && objAt.count(ro(V)) && !ownerSet.count(V)) return true;
     auto it = cls.find(V);
     return it != cls.end() && (it->second & OC_VAL);
   };
@@ -222,7 +327,7 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
     // The node: the slot's address less the slot's offset in its struct.
     const int64_t ks = slotStart(L->getPointerOperand());
     if (ks < 0) continue;
-    auto [r, o] = rootOff(L->getPointerOperand(), DL);
+    auto [r, o] = ro(L->getPointerOperand());
     const std::pair<const Value *, int64_t> N{r, o - ks};
     if (objAt.count(N) || linkObj.count(N)) continue;
     bool dup = false;

@@ -2149,7 +2149,47 @@ the listed ASSUMPTIONs.
   inline) is an honest FAIL in its own class, counted and listed; a
   body-shape match is deliverable 2.
 
+### Residue of report arm #2 (Fable 2026-10-16, after the whole-kernel report at fc2f459)
+
+- **An element pointer kept in a plain field (D2(i) refined):** O1
+  constrains stores into declared slots and stores of link values, not
+  every copy of an element pointer. An element stored into a field of a
+  struct the block declares no slots of (ext4_readdir's `info->curr_node`,
+  a cursor) is ordinary flow the solver carries: counted, listed, never a
+  FAIL. Soundness of the rows does not rest on this check: it is carried by
+  O2, since a lookup's or traverse's RET derived from an undeclared field
+  fails provenance. An element stored into a pointer field of a struct the
+  block declares slots of that holds no declared slot (a fourth pointer in
+  rb_node) stays the D2 FAIL "an element stored outside the declared
+  storage": evidence that the storage proposal is incomplete, the proposal
+  checked from the program's side. A union's members are class 2, not this
+  test.
+- **Identity by object and offset, everywhere (4(b) completed):**
+  - an owner or element value is recognized by its object and constant
+    offset wherever it appears, not only by SSA value (S1: the group keeps
+    `&epi->rbn` stripped to `epi` when the element is at +0, rb_next's
+    actual is the unstripped zero-index GEP);
+  - a phi or select whose entries agree on object and offset is that object
+    and offset (S3: rb_add_cached computes `&root->rb_root` and
+    `&node->rb` on both paths and passes the phis to the row);
+  - by byte arithmetic from a derived value, the intermediate GEP types
+    irrelevant (S4): a pointer at the value's own address is the value; one
+    at a declared slot offset of the element struct is that slot; a GEP
+    whose only variable index is a select or phi of constants is the set of
+    its constant steps, each of which must be a slot (interval_tree_generic's
+    `rb_entry(parent)` then `&parent->rb_left / rb_right` as a word index,
+    find_va_links' `&va->rb_node` rebuilt from the node).
+  - Constant addresses that name an owner's or element's slot are known
+    before the derivation (S2: a descent from mod_tree's root read through
+    a constant GEP is derived).
+  These add no premise: the identities are the program's own arithmetic.
+  Values derived through them make the container_of reads from those
+  values visible as naming failures ("a step past the layout of rb_node"),
+  which they were all along.
+
 Cases: test/t_cells_container_{rb,rb_unmatched,storage_bad,llist,llist_int,report,naming,
-embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_add}.c
-(rows for the rbtree cases in t2_cells_rblib.c, shapes in cells_rb.h).
+embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_add,cursor}.c
+and t_cells_container_{zero_gep,const_root,phi_owner,bytestep}.ll (shapes from
+the kernel's clang-14 IR that clang-18 no longer emits; rows for the rbtree
+cases in t2_cells_rblib.c, shapes in cells_rb.h).
 Not mechanized. Checked by executions; see the commit's gates.

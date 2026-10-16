@@ -9,7 +9,10 @@
 # miss. "CHECK-NOT: f ..." after the CHECK targets: targets that must not
 # appear. "// MODULE: t2_x.c" (repeatable): another module, compiled the
 # same way and passed after the case's own (named t2_*, so not a case).
-# KAMAIN= overrides the binary.
+# KAMAIN= overrides the binary. A case may be LLVM assembly (t_cells_*.ll,
+# directives in "; //" comments): a shape only older front ends emit (the
+# kernel's clang-14 zero-index GEPs), assembled as written; its MODULEs are
+# compiled with its CFLAGS.
 set -u
 cd "$(dirname "$0")"
 BIN=${KAMAIN:-../release/lib/KAMain}
@@ -17,12 +20,17 @@ CLANG=${CLANG:-/usr/lib/llvm-18/bin/clang}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 fail=0
-for c in t_pool_*.c t_cells_*.c; do
-  n=${c%.c}
+for c in t_pool_*.c t_cells_*.c t_cells_*.ll; do
+  [ -e "$c" ] || continue
+  n=${c%.*}
   flags=$(grep -o "// CFLAGS: .*" "$c" | sed 's|// CFLAGS: ||')
   [ -z "$flags" ] && flags="-O0"
   kaflags=$(grep -o "// KAFLAGS: .*" "$c" | sed 's|// KAFLAGS: ||')
-  "$CLANG" -g $flags -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
+  if [ "${c##*.}" = ll ]; then
+    "$(dirname "$CLANG")/llvm-as" "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: assemble"; fail=1; continue; }
+  else
+    "$CLANG" -g $flags -emit-llvm -c "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: compile"; fail=1; continue; }
+  fi
   mods=()
   for m in $(grep -o "// MODULE: .*" "$c" | sed 's|// MODULE: ||'); do
     "$CLANG" -g $flags -emit-llvm -c "$m" -o "$OUT/${m%.c}.bc" || { echo "FAIL[$n]: compile $m"; fail=1; continue 2; }

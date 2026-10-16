@@ -2557,7 +2557,8 @@ bool CallGraphPass::runCellResolution() {
   // an unknown or too small size refuse, counted by reason.
   size_t widened = 0;
   // Objects an anonymous struct would label (isAnonStruct): unlabeled.
-  size_t anonObjects = 0, anonLayoutsRefused = 0;
+  size_t anonObjects = 0;
+  boost::unordered_flat_set<uint32_t> anonLayoutRefused; // objects
   std::map<std::string, size_t> widenRefused;
   auto tryWiden = [&](uint32_t o, const StructType *S) -> bool {
     Obj &O = objs[o];
@@ -2656,7 +2657,7 @@ bool CallGraphPass::runCellResolution() {
     // An anonymous struct names nothing (isAnonStruct): the object stays
     // unlabeled, its cells by byte offset.
     if (isAnonStruct(S)) {
-      anonLayoutsRefused++;
+      anonLayoutRefused.insert(o);
       return;
     }
     // An object used as bytes keeps that first use: a struct written into
@@ -9233,8 +9234,8 @@ bool CallGraphPass::runCellResolution() {
   for (const auto &[k, n] : sizeLabelAmbiguous)
     CG_LOG("Cells:   ambiguous size label: " << k << " (" << n << " objects)\n");
   CG_LOG("Cells: anonymous structs label nothing: " << anonObjects
-         << " globals and stack objects unlabeled, " << anonLayoutsRefused
-         << " typed writes that would have labeled an object\n");
+         << " globals and stack objects unlabeled, " << anonLayoutRefused.size()
+         << " objects a typed write would have labeled\n");
   CG_LOG("Cells: " << numNodes << " solver nodes, " << staticCopies
          << " copies, " << stores << " stores, " << lazyFEdges.size()
          << " field edges, " << dynEdges << " hub edges (" << hubLinks

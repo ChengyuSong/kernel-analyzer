@@ -2007,7 +2007,12 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   `%struct.anon.20`); debug info then names its fields by the C tag
   (struct.elf_internal_dyn+8). Never a per-module name: clang numbers one
   anonymous type differently in two modules, and a name that differs
-  between modules would separate a store from its load.
+  between modules would separate a store from its load. The IR linker
+  renames a colliding anonymous type again (`struct.anon.9.932`), so every
+  numeric suffix is stripped before the name is judged. The one residual
+  ambiguity: a C struct literally tagged `anon` (`struct anon { ... }`)
+  has clang's anonymous name and is treated as anonymous; it is not
+  special-cased (the treatment only withholds names, so it is sound).
 - **Unions stop the name** (Fable 2026-10-15, class 2): the IR's type of a
   union is clang's representative member, never the program's choice
   (5.18's timerfd_ctx `union { struct hrtimer tmr; struct alarm alarm; }`

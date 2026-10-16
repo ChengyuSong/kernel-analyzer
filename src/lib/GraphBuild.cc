@@ -375,8 +375,11 @@ StringRef stripStructNameSuffix(StringRef Name) {
 // name names nothing (Fable 2026-10-16): a field of one is named by the
 // enclosing named struct and the byte offset there, and with no enclosing
 // named struct by the object's byte offset; never by the anonymous name.
+// The IR linker renames a colliding one again (`struct.anon.9.932`): every
+// numeric suffix goes.
 bool isAnonStructName(StringRef Name) {
-  const StringRef N = stripStructNameSuffix(Name);
+  StringRef N = Name;
+  for (StringRef M = stripStructNameSuffix(N); M != N; M = stripStructNameSuffix(N)) N = M;
   return N == "struct.anon" || N == "union.anon";
 }
 bool isAnonStruct(const StructType *ST) {

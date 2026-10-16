@@ -310,12 +310,15 @@ StructType *structAt(Type *T, int64_t off, const DataLayout &DL) {
 }
 
 // Does a struct named like S start at offset `off` of T (through nested
-// members and array elements)?
+// members and array elements)? An anonymous struct's name names nothing
+// (isAnonStruct): it is found only as the type Same itself, or one of its
+// layout.
 bool structStartsAt(Type *T, int64_t off, StringRef S, const DataLayout &DL,
                     const StructType *Same = nullptr) {
+  const bool anon = isAnonStructName(S);
   for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
     if (auto *ST = dyn_cast<StructType>(T)) {
-      if (ST->hasName() && stripStructNameSuffix(ST->getName()) == S)
+      if (anon ? ST == Same : ST->hasName() && stripStructNameSuffix(ST->getName()) == S)
         return true;
       // Layout-identical types are one type to -O3 (it indexes a
       // TermOffsetCtx as a SnippetIter): the same struct here.
@@ -499,7 +502,7 @@ void structChain(Type *T, int64_t off, const DataLayout &DL,
   out.clear();
   for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
     if (auto *ST = dyn_cast<StructType>(T)) {
-      if (ST->hasName())
+      if (ST->hasName() && !isAnonStruct(ST))
         out.push_back(stripStructNameSuffix(ST->getName()).str() + "+" +
                       std::to_string(off));
       if (ST->isOpaque()) return;
@@ -2553,11 +2556,13 @@ bool CallGraphPass::runCellResolution() {
   // and its name; an array of T (folded element addresses), a used tail,
   // an unknown or too small size refuse, counted by reason.
   size_t widened = 0;
+  // Objects an anonymous struct would label (isAnonStruct): unlabeled.
+  size_t anonObjects = 0, anonLayoutsRefused = 0;
   std::map<std::string, size_t> widenRefused;
   auto tryWiden = [&](uint32_t o, const StructType *S) -> bool {
     Obj &O = objs[o];
     auto *T = dyn_cast_or_null<StructType>(O.layout);
-    if (!T || !S || O.fn || O.parentObj != UINT32_MAX || O.base != 0 || O.declScalar || S->isOpaque() ||
+    if (!T || !S || isAnonStruct(S) || O.fn || O.parentObj != UINT32_MAX || O.base != 0 || O.declScalar || S->isOpaque() ||
         !S->isSized() || !T->hasName() ||
         !structStartsAt(const_cast<StructType *>(S), 0, stripStructNameSuffix(T->getName()), DL, T))
       return false;
@@ -2648,6 +2653,12 @@ bool CallGraphPass::runCellResolution() {
           heapContainerAmbiguous++; // the first-access label stays
         }
       }
+    // An anonymous struct names nothing (isAnonStruct): the object stays
+    // unlabeled, its cells by byte offset.
+    if (isAnonStruct(S)) {
+      anonLayoutsRefused++;
+      return;
+    }
     // An object used as bytes keeps that first use: a struct written into
     // it is reported (rule (b)), not admitted as its layout. The write
     // still flows: the step yields the raw cell (or the any-offset cell).
@@ -2920,6 +2931,17 @@ bool CallGraphPass::runCellResolution() {
       O.size = (int64_t)DL.getTypeAllocSize(O.layout);
     if (O.size <= 0) O.layout = nullptr; // opaque or empty: unlabeled
     else O.label = typeLabel(O.layout);
+    // A global or stack object of an anonymous struct (or an array of one):
+    // unlabeled, its cells by byte offset (isAnonStruct), its size kept.
+    if (O.layout) {
+      Type *E = O.layout;
+      while (auto *AT = dyn_cast<ArrayType>(E)) E = AT->getElementType();
+      if (isAnonStruct(dyn_cast<StructType>(E))) {
+        O.layout = nullptr;
+        O.label.clear();
+        anonObjects++;
+      }
+    }
     if (O.layout && (isa_and_nonnull<AllocaInst>(V) || isa_and_nonnull<GlobalVariable>(V)))
       noteIdent(O, diMergedIdent(V, false));
     // A constant size larger than the label where some struct of exactly
@@ -3883,7 +3905,7 @@ bool CallGraphPass::runCellResolution() {
     const auto *G = dyn_cast<GEPOperator>(X);
     if (!G) return false;
     const auto *ST = dyn_cast<StructType>(G->getSourceElementType());
-    if (!ST || !ST->hasName()) return false;
+    if (!ST || !ST->hasName() || isAnonStruct(ST)) return false; // anonymous: names nothing
     const std::string S = stripStructNameSuffix(ST->getName()).str();
     APInt Ap(64, 0);
     if (!G->accumulateConstantOffset(DL, Ap) || Len < 0) {
@@ -3902,7 +3924,7 @@ bool CallGraphPass::runCellResolution() {
       if (!G->accumulateConstantOffset(DL, Ap)) return false;
       key.second = Ap.getSExtValue();
       if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-        if (ST->hasName()) key.first = stripStructNameSuffix(ST->getName()).str();
+        if (ST->hasName() && !isAnonStruct(ST)) key.first = stripStructNameSuffix(ST->getName()).str();
     }
     return true;
   };
@@ -9210,6 +9232,9 @@ bool CallGraphPass::runCellResolution() {
          << anyCells << " any-offset, " << outMints << " outside)\n");
   for (const auto &[k, n] : sizeLabelAmbiguous)
     CG_LOG("Cells:   ambiguous size label: " << k << " (" << n << " objects)\n");
+  CG_LOG("Cells: anonymous structs label nothing: " << anonObjects
+         << " globals and stack objects unlabeled, " << anonLayoutsRefused
+         << " typed writes that would have labeled an object\n");
   CG_LOG("Cells: " << numNodes << " solver nodes, " << staticCopies
          << " copies, " << stores << " stores, " << lazyFEdges.size()
          << " field edges, " << dynEdges << " hub edges (" << hubLinks

@@ -50,10 +50,12 @@ static bool leadingZero(const GEPOperator *G) {
 
 // The (struct, byte offset) an access names: its struct GEP, else its
 // struct-path TBAA tag (-O3 drops all-zero GEPs; the tag keeps the base
-// struct and the offset).
+// struct and the offset). accessSlotAny may answer an anonymous struct;
+// accessSlot never does (below).
 static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off);
-bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
-                       StructType *&S, int64_t &off) {
+static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off);
+static bool accessSlotAny(const Instruction *I, const Value *Addr, const DataLayout &DL, StructType *&S,
+                          int64_t &off) {
   if (const GEPOperator *G = structGEP(Addr)) {
     S = dyn_cast<StructType>(G->getSourceElementType());
     APInt Ap(64, 0);
@@ -64,6 +66,15 @@ bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
   }
   return tbaaSlot(I, S, off);
 }
+// A field of an anonymous struct is named by the enclosing named struct on
+// the address's chain and the byte offset there (isAnonStruct), else by the
+// access's TBAA tag (its base is a named struct); with neither, no name.
+bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
+                       StructType *&S, int64_t &off) {
+  if (!accessSlotAny(I, Addr, DL, S, off)) return false;
+  if (!S || !isAnonStruct(S)) return true;
+  return enclosingNamed(Addr, DL, S, off) || tbaaSlot(I, S, off);
+}
 static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off) {
   const MDNode *Tag = I->getMetadata(LLVMContext::MD_tbaa);
   if (!Tag || Tag->getNumOperands() < 3 || Tag->getOperand(0) == Tag->getOperand(1)) return false;
@@ -72,7 +83,7 @@ static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off) {
   const auto *TO = mdconst::dyn_extract<ConstantInt>(Tag->getOperand(2));
   if (!N || !TO) return false;
   S = StructType::getTypeByName(I->getContext(), ("struct." + N->getString()).str());
-  if (!S) return false;
+  if (!S || isAnonStruct(S)) return false;
   // The tag's offset is relative to the base struct; the address must be
   // the struct's start plus that offset, which the tag asserts.
   off = TO->getSExtValue();
@@ -114,15 +125,6 @@ bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o) {
 // The innermost named struct holding byte `off` of ST, the offset there,
 // and the scalar the byte lies in with the byte's offset inside it.
 static bool isUnionType(const StructType *ST) { return ST->hasName() && ST->getName().starts_with("union."); }
-// An anonymous struct or union (`struct.anon.12`): its IR name is clang's
-// counter, and the linker's suffix strip makes every one `struct.anon`, so
-// it names nothing; its fields are named by the enclosing named struct and
-// the byte offset there (Fable 2026-10-16), as TBAA names them.
-static bool isAnonType(const StructType *ST) {
-  if (!ST->hasName()) return false;
-  const StringRef N = stripStructNameSuffix(ST->getName());
-  return N == "struct.anon" || N == "union.anon";
-}
 
 bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::string, int64_t> &K, Type *&leaf,
                     int64_t &inLeaf, bool *inUnion) {
@@ -136,7 +138,7 @@ bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::s
         // offset there (K.second goes on accumulating below).
         if (K.first.empty()) return false;
         uni = true;
-      } else if (!uni && ST->hasName() && !isAnonType(ST)) {
+      } else if (!uni && ST->hasName() && !isAnonStruct(ST)) {
         K = {stripStructNameSuffix(ST->getName()).str(), off};
       }
       const StructLayout *SL = DL.getStructLayout(ST);
@@ -427,7 +429,7 @@ static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *
     if (!G->accumulateConstantOffset(DL, A)) return false;
     acc += A.getSExtValue();
     auto *GS = dyn_cast<StructType>(G->getSourceElementType());
-    if (GS && GS->hasName() && !GS->isOpaque() && !isAnonType(GS)) {
+    if (GS && GS->hasName() && !GS->isOpaque() && !isAnonStruct(GS)) {
       if (acc < 0 || acc >= (int64_t)DL.getTypeAllocSize(GS)) return false;
       S = GS, off = acc;
       return true;
@@ -444,7 +446,7 @@ static bool namedSlotAny(const Instruction *I, const Value *Addr, const DataLayo
   // base, or the resolver).
   const GEPOperator *G = structGEP(Addr);
   const bool step = G && G->hasAllConstantIndices() && !leadingZero(G);
-  if (!step && accessSlot(I, Addr, DL, S, off) && S && S->hasName()) return true;
+  if (!step && accessSlotAny(I, Addr, DL, S, off) && S && S->hasName()) return true;
   if (step && tbaaSlot(I, S, off) && S && S->hasName()) return true;
   if (arraySlot(Addr, DL, S, off)) return true;
   return namedPtr(Addr, DL, P, S, off);
@@ -454,7 +456,7 @@ bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, Po
                int64_t &off) {
   P.viaFormal = P.viaSibling = P.viaDecl = P.viaBase = P.viaResolver = P.anonUnnamed = false, P.pastS = nullptr;
   if (!namedSlotAny(I, Addr, DL, P, S, off)) return false;
-  if (!S || !isAnonType(S)) return true;
+  if (!S || !isAnonStruct(S)) return true;
   // An anonymous struct's field: by the enclosing named struct, else unnamed.
   P.anonUnnamed = !enclosingNamed(Addr, DL, S, off);
   (P.anonUnnamed ? P.anonUnnamedN : P.anonByEnclosing)++;

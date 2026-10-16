@@ -176,13 +176,13 @@ SmallVector<DbgValueInst *, 2> dbgValuesOf(const Value *V) {
   return out;
 }
 
+// The C tag of a named IR struct (the link rename's ".N" stripped by the
+// canonical stripStructNameSuffix). Never called for an anonymous struct
+// (isAnonStruct), whose name names nothing.
 std::string stripSuffix(StringRef N) {
+  N = stripStructNameSuffix(N);
   N.consume_front("struct.");
   N.consume_front("union.");
-  size_t dot = N.rfind('.');
-  if (dot != StringRef::npos && dot > 0 &&
-      N.substr(dot + 1).find_first_not_of("0123456789") == StringRef::npos)
-    N = N.substr(0, dot);
   return N.str();
 }
 
@@ -325,10 +325,15 @@ void CallGraphPass::runUnionCensus() {
   };
   // The debug type of a value (valueKey, defined below).
   std::function<std::string(const Value *, int)> valueKeyFwd;
+  // Addresses whose chain starts at an anonymous struct: positioned by the
+  // base pointer's declared struct and offset, or with none (no position,
+  // the byte case); counted.
+  std::set<const Value *> anonPosNamed, anonPosNone;
   // `depth` is valueKey's, when the debug typing below runs inside it.
   auto position = [&](const Value *P, const DataLayout &DL, int depth = 0) {
     Pos R;
     std::vector<const GEPOperator *> chain;
+    const Value *const P0 = P;
     P = P->stripPointerCasts();
     while (const auto *G = dyn_cast<GEPOperator>(P)) {
       chain.push_back(G);
@@ -336,7 +341,9 @@ void CallGraphPass::runUnionCensus() {
     }
     const auto *ST = chain.empty() ? nullptr
                                    : dyn_cast<StructType>(chain.back()->getSourceElementType());
-    if (!ST || !ST->hasName()) {
+    // An anonymous struct's name names nothing (isAnonStruct): its
+    // position is the base pointer's, as for a raw pointer.
+    if (!ST || !ST->hasName() || isAnonStruct(ST)) {
       // -O3 on a raw pointer (an allocator's result): no GEP (offset 0) or
       // constant byte offsets. Typed by the pointer's debug type
       // (`Expr *pNew`), when it names a struct we know.
@@ -346,9 +353,12 @@ void CallGraphPass::runUnionCensus() {
         if (!G->accumulateConstantOffset(DL, O)) return R;
         total += O.getSExtValue();
       }
+      const bool anon = ST && isAnonStruct(ST);
+      if (anon) anonPosNone.insert(P0);
       if (total < 0 || !valueKeyFwd) return R;
       const std::string k = valueKeyFwd(P, depth + 1);
       if (k.rfind("ptr:", 0) != 0 || !fieldsOf.count(k.substr(4))) return R;
+      if (anon) anonPosNone.erase(P0), anonPosNamed.insert(P0);
       R.S = k.substr(4);
       R.off = (uint64_t)total;
       R.base = resolveBase(P);
@@ -461,7 +471,7 @@ void CallGraphPass::runUnionCensus() {
     // GEP (&a[i], a struct-typed index), through phis and selects.
     if (const auto *G = dyn_cast<GEPOperator>(V))
       if (const auto *ST = dyn_cast<StructType>(G->getResultElementType()))
-        if (ST->hasName() && G->getNumIndices() == 1)
+        if (ST->hasName() && !isAnonStruct(ST) && G->getNumIndices() == 1)
           return "ptr:" + stripSuffix(ST->getName());
     if (const auto *PN = dyn_cast<PHINode>(V)) {
       std::string k;
@@ -514,7 +524,7 @@ void CallGraphPass::runUnionCensus() {
       if (const auto *G = dyn_cast<GetElementPtrInst>(U))
         if (G->getPointerOperand() == LI)
           if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-            if (ST->hasName())
+            if (ST->hasName() && !isAnonStruct(ST))
               return "ptr:" + stripSuffix(ST->getName());
       if (const auto *CB = dyn_cast<CallBase>(U)) {
         if (CB->getCalledOperand() == LI)
@@ -784,7 +794,7 @@ void CallGraphPass::runUnionCensus() {
           const Value *B = A;
           if (A) {
             if (const auto *ST = dyn_cast<StructType>(A->getAllocatedType()))
-              if (ST->hasName()) S = stripSuffix(ST->getName());
+              if (ST->hasName() && !isAnonStruct(ST)) S = stripSuffix(ST->getName());
           } else {
             const std::string k = valueKey(Dst, 0);
             if (k.rfind("ptr:", 0) == 0 && fieldsOf.count(k.substr(4))) {
@@ -2124,7 +2134,7 @@ void CallGraphPass::runUnionCensus() {
       const auto *ST = dyn_cast<StructType>(A->getAllocatedType());
       if (!ST) return !A->getAllocatedType()->isIntegerTy() &&
                       !A->getAllocatedType()->isArrayTy();
-      return !ST->hasName() || embedsStruct(stripSuffix(ST->getName()), S);
+      return !ST->hasName() || isAnonStruct(ST) || embedsStruct(stripSuffix(ST->getName()), S);
     }
     return true; // unknown destination
   };
@@ -2195,7 +2205,7 @@ void CallGraphPass::runUnionCensus() {
         auto declared = [&](Type *T) {
           while (auto *AT = dyn_cast<ArrayType>(T)) T = AT->getElementType();
           const auto *ST = dyn_cast<StructType>(T);
-          return ST && (!ST->hasName() || embedsStruct(stripSuffix(ST->getName()), S));
+          return ST && (!ST->hasName() || isAnonStruct(ST) || embedsStruct(stripSuffix(ST->getName()), S));
         };
         if (const auto *A = dyn_cast<AllocaInst>(U)) return declared(A->getAllocatedType());
         if (const auto *G = dyn_cast<GlobalVariable>(U)) return declared(G->getValueType());
@@ -3329,6 +3339,9 @@ void CallGraphPass::runUnionCensus() {
          << " in initializers): " << nSingle << " use one member, " << nTagVer
          << " tag-verified, " << nTag << " tag-tested, " << nCallback << " callback-keyable, " << nNone
          << " with no discriminator (" << nLowBit << " pointer low-bit tags)\n";
+  errs() << "UnionCensus: addresses through an anonymous struct: " << anonPosNamed.size()
+         << " positioned by the base pointer's declared struct and offset, " << anonPosNone.size()
+         << " with none (no position)\n";
   for (auto &L : lines)
     errs() << "UnionCensus: " << L.text << "\n";
 }

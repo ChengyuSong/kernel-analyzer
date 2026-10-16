@@ -39,9 +39,10 @@ std::string structKey(const llvm::StructType *ST) {
   return stripStructNameSuffix(ST->getName()).str();
 }
 
+// An anonymous struct's name names nothing (isAnonStruct): no label.
 bool namedStruct(const llvm::StructType *ST) {
   return ST && !ST->isLiteral() && ST->hasName() &&
-         !ST->getName().starts_with("union");
+         !ST->getName().starts_with("union") && !isAnonStruct(ST);
 }
 
 // A scalar access's element ("float", "i16"; a vector's element), "" for

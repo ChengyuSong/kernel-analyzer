@@ -1988,7 +1988,26 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   unnamed"), never the shared name. The innermost-field key stops at an
   anonymous struct the same way, and debug info's pointer members include
   an anonymous member's members at its offset (the links a block infers).
-  The solver's own cell names (Names.cc, sameType) are not changed by this.
+  The same rule everywhere a struct's name is read, through one predicate
+  (GraphBuild.cc isAnonStruct beside stripStructNameSuffix, whose ".N"
+  strip stays right for a named type's link rename): access names
+  (NamedCells isNamed) treat an anonymous struct as transparent, the
+  enclosing named struct's offset accumulating, and an access with no
+  named struct around one is no-struct (counted); accessSlot (tag tables,
+  TaggedFields, the census) names it by the enclosing named struct on the
+  chain, else by its TBAA tag, else not at all; the cell solver labels no
+  object by an anonymous type (a global or stack object of one, or a typed
+  write that would label one, stays unlabeled: cells by byte offset, size
+  kept), and a step of an anonymous type fits a layout only as that IR
+  type itself (structStartsAt, sameType, sameStruct); UnionCensus
+  positions an address whose chain starts at an anonymous struct by its
+  base pointer's declared struct and offset, else not at all (counted).
+  The linked IR can give a named C struct an anonymous IR type (the IR
+  linker merges isomorphic types: nm's elf_internal_dyn is
+  `%struct.anon.20`); debug info then names its fields by the C tag
+  (struct.elf_internal_dyn+8). Never a per-module name: clang numbers one
+  anonymous type differently in two modules, and a name that differs
+  between modules would separate a store from its load.
 - **Unions stop the name** (Fable 2026-10-15, class 2): the IR's type of a
   union is clang's representative member, never the program's choice
   (5.18's timerfd_ctx `union { struct hrtimer tmr; struct alarm alarm; }`

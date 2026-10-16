@@ -22,6 +22,7 @@ using namespace llvm;
 // GraphBuild.cc: "struct.foo.12" -> "struct.foo" (one type per name
 // across modules).
 StringRef stripStructNameSuffix(StringRef Name);
+bool isAnonStruct(const StructType *ST);
 
 namespace ka {
 
@@ -31,8 +32,11 @@ bool isUnion(const StructType *ST) {
   return ST->hasName() && ST->getName().starts_with("union");
 }
 
+// A struct whose name names it: an anonymous struct's does not (its
+// fields are named by the enclosing named struct, GraphBuild.cc
+// isAnonStruct), so it is transparent like a literal struct.
 bool isNamed(const StructType *ST) {
-  return !ST->isLiteral() && ST->hasName();
+  return !ST->isLiteral() && ST->hasName() && !isAnonStruct(ST);
 }
 
 bool sameType(Type *A, Type *B) {
@@ -210,6 +214,8 @@ uint32_t AccessNames::ofPosition(const Position &P, uint64_t Size,
     return ofSlot(P.S, (uint64_t)P.off, Size, DL);
   if (P.DIS && P.off >= 0)
     return ofDISlot(P.M, P.DIS, P.DITag, (uint64_t)P.off, Size, DL);
+  if (P.anonOnly && P.why == NoStruct)
+    anonOnly++;
   return miss(P.why);
 }
 
@@ -427,7 +433,11 @@ uint32_t AccessNames::unionSlot(StructType *S, uint64_t Base, uint64_t Rel,
 
 uint32_t AccessNames::ofSlot(StructType *S, uint64_t Off, uint64_t Size,
                              const DataLayout &DL) {
-  assert(S && isNamed(S) && "ofSlot: S must be a named struct");
+  assert(S && !S->isLiteral() && S->hasName() && "ofSlot: S must be a named struct");
+  if (!isNamed(S)) { // an anonymous struct outside any named one
+    anonOnly++;
+    return miss(NoStruct);
+  }
   if (Size == 0)
     Size = 1;
   Type *T = S;
@@ -536,6 +546,8 @@ AccessNames::Position AccessNames::position(const Value *Ptr,
         Off = 0;
         VarLost = false;
         Before.push_back(ST);
+      } else if (!S && isAnonStruct(ST)) {
+        R.anonOnly = true;
       }
     }
     return true;
@@ -666,23 +678,24 @@ uint32_t AccessNames::ofMemAccess(const Instruction &I, const Value *Ptr,
     return ofPosition(P, Size, DL);
   if (P.tainted) // a union or a pun on the chain: no name, whatever TBAA says
     return miss(P.why);
+  auto fail = [&]() { return ofPosition(P, Size, DL); }; // counted there
   // Struct-path tag: !{base type, access type, offset}; a struct access
   // has a base type node of the form !{!"tag", member, offset, ...}
   // distinct from the access type.
   const MDNode *Tag = I.getMetadata(LLVMContext::MD_tbaa);
   if (!Tag || Tag->getNumOperands() < 3)
-    return miss(P.why);
+    return fail();
   const auto *Base = dyn_cast<MDNode>(Tag->getOperand(0));
   const auto *Acc = dyn_cast<MDNode>(Tag->getOperand(1));
   const auto *OffC = mdconst::dyn_extract<ConstantInt>(Tag->getOperand(2));
   if (!Base || !Acc || Base == Acc || !OffC || Base->getNumOperands() < 3)
-    return miss(P.why);
+    return fail();
   const auto *TagName = dyn_cast<MDString>(Base->getOperand(0));
   if (!TagName)
-    return miss(P.why);
+    return fail();
   StructType *S = structByTag(I.getModule(), TagName->getString());
   if (!S)
-    return miss(P.why);
+    return fail();
   const uint64_t Off = OffC->getZExtValue();
   if (Off >= DL.getTypeAllocSize(S))
     return miss(OutOfRange);
@@ -728,9 +741,10 @@ const SmallVector<uint32_t, 8> &AccessNames::leavesOf(StructType *S,
           walk(AT->getElementType(), Named, Base);
           return;
         }
-        Out.push_back(intern((stripStructNameSuffix(Named->getName()) + "+" +
-                              std::to_string(Base))
-                                 .str()));
+        if (Named) // a leaf of an anonymous struct outside any named one
+          Out.push_back(intern((stripStructNameSuffix(Named->getName()) + "+" +
+                                std::to_string(Base))
+                                   .str()));
       };
   walk(S, nullptr, 0);
   std::sort(Out.begin(), Out.end());

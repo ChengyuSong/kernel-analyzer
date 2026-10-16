@@ -56,7 +56,7 @@ void CallGraphPass::runRegFieldGapReport() {
         if (StructType *ST = GTI.getStructTypeOrNull()) {
           uint64_t fi = cast<ConstantInt>(GTI.getOperand())->getZExtValue();
           uint64_t eo = DL.getStructLayout(ST)->getElementOffset(fi);
-          if (ST->hasName()) {
+          if (ST->hasName() && !isAnonStruct(ST)) {
             SName = stripStructNameSuffix(ST->getStructName()).str();
             SOff = eo;
             haveS = true;
@@ -155,13 +155,13 @@ void CallGraphPass::runRegFieldGapReport() {
     for (auto &mp : Ctx->Modules) {
       const DataLayout &DL = mp.first->getDataLayout();
       for (StructType *ST : mp.first->getIdentifiedStructTypes()) {
-        if (!ST->hasName() || ST->isOpaque() || !ST->isSized()) continue;
+        if (!ST->hasName() || isAnonStruct(ST) || ST->isOpaque() || !ST->isSized()) continue;
         const std::string SN0 =
             stripStructNameSuffix(ST->getStructName()).str();
         const StructLayout *SL = DL.getStructLayout(ST);
         for (unsigned i = 0; i < ST->getNumElements(); i++)
           if (auto *ET = dyn_cast<StructType>(ST->getElementType(i)))
-            if (ET->hasName() &&
+            if (ET->hasName() && !isAnonStruct(ET) &&
                 linkTys.count(
                     stripStructNameSuffix(ET->getStructName()).str()))
               linkOffs[SN0].insert((int64_t)SL->getElementOffset(i));
@@ -266,11 +266,11 @@ void CallGraphPass::runRegFieldGapReport() {
             const Value *S = MI->getRawSource()->stripPointerCasts();
             if (const auto *AI = dyn_cast<AllocaInst>(S))
               if (auto *ST = dyn_cast<StructType>(AI->getAllocatedType()))
-                if (ST->hasName())
+                if (ST->hasName() && !isAnonStruct(ST))
                   return stripStructNameSuffix(ST->getStructName()).str();
             if (SG)
               if (auto *ST = dyn_cast<StructType>(SG->getValueType()))
-                if (ST->hasName())
+                if (ST->hasName() && !isAnonStruct(ST))
                   return stripStructNameSuffix(ST->getStructName()).str();
             return std::string();
           };
@@ -309,7 +309,7 @@ void CallGraphPass::runRegFieldGapReport() {
                 else if (const auto *DA = dyn_cast<AllocaInst>(DP))
                   DT = DA->getAllocatedType();
                 auto *DST = dyn_cast_or_null<StructType>(DT);
-                if (DST && DST->hasName()) {
+                if (DST && DST->hasName() && !isAnonStruct(DST)) {
                   DN = stripStructNameSuffix(DST->getStructName()).str();
                   DOff = 0;
                 }
@@ -339,7 +339,7 @@ void CallGraphPass::runRegFieldGapReport() {
               if (const auto *AI = dyn_cast<AllocaInst>(P))
                 if (auto *ST =
                         dyn_cast<StructType>(AI->getAllocatedType()))
-                  if (ST->hasName()) {
+                  if (ST->hasName() && !isAnonStruct(ST)) {
                     const std::string N =
                         stripStructNameSuffix(ST->getStructName()).str();
                     hazBulk.insert(N);
@@ -379,7 +379,7 @@ void CallGraphPass::runRegFieldGapReport() {
           // global residual, reported below.
           Type *VT = SI->getValueOperand()->getType();
           if (auto *ST = dyn_cast<StructType>(VT)) {
-            if (ST->hasName()) {
+            if (ST->hasName() && !isAnonStruct(ST)) {
               hazBulk.insert(
                   stripStructNameSuffix(ST->getStructName()).str());
               // obj channel: whole-object store of a LOADED value =
@@ -543,7 +543,7 @@ void CallGraphPass::runRegFieldGapReport() {
             if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
               StructType *ST = CS->getType();
               const StructLayout *SL = DL.getStructLayout(ST);
-              const bool named = ST->hasName();
+              const bool named = ST->hasName() && !isAnonStruct(ST);
               const std::string SN =
                   named ? stripStructNameSuffix(ST->getStructName()).str()
                         : PN;

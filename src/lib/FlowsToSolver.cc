@@ -2124,7 +2124,7 @@ bool CallGraphPass::runFlowsToResolution() {
   const DataLayout *lazyDL = Ctx->Modules.empty() ? nullptr : &Ctx->Modules.front().first->getDataLayout();
   auto sameStruct = [&](const StructType *a, const StructType *b) -> bool {
     if (a == b) return true;
-    if (!a || !b || !a->hasName() || !b->hasName()) return false;
+    if (!a || !b || !a->hasName() || !b->hasName() || isAnonStruct(a) || isAnonStruct(b)) return false;
     return stripStructNameSuffix(a->getName()) == stripStructNameSuffix(b->getName());
   };
   // A C union is lowered to a struct holding its largest member; any
@@ -3301,7 +3301,7 @@ bool CallGraphPass::runFlowsToResolution() {
     staticLabels(valueLabels);
     for (auto &[M, _] : Ctx->Modules)
       for (llvm::StructType *ST : M->getIdentifiedStructTypes())
-        if (!ST->isLiteral() && ST->hasName() && !ST->getName().starts_with("union"))
+        if (!ST->isLiteral() && ST->hasName() && !ST->getName().starts_with("union") && !isAnonStruct(ST))
           structByKey.emplace(stripStructNameSuffix(ST->getName()).str(), ST);
     CG_LOG("Labels: " << valueLabels.size() << " labeled values\n");
   }
@@ -3321,7 +3321,7 @@ bool CallGraphPass::runFlowsToResolution() {
         while (T->isArrayTy()) T = T->getArrayElementType();
         auto *ST = dyn_cast<llvm::StructType>(T);
         if (!ST || ST->isOpaque()) return;
-        if (ST->hasName() && !ST->isLiteral() && !ST->getName().starts_with("union")) {
+        if (ST->hasName() && !ST->isLiteral() && !ST->getName().starts_with("union") && !isAnonStruct(ST)) {
           const auto &in = embedsOf(stripStructNameSuffix(ST->getName()).str());
           out.insert(in.begin(), in.end());
           return;

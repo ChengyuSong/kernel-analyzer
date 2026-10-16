@@ -96,6 +96,8 @@ public:
     const llvm::DICompositeType *DIS = nullptr;
     llvm::StringRef DITag;
     const llvm::Module *M = nullptr;
+    // An anonymous struct on the chain with no named struct around it.
+    bool anonOnly = false;
   };
   Position position(const llvm::Value *Ptr, const llvm::DataLayout &DL);
   // Every leaf name of S (nested named structs by their own names,
@@ -145,6 +147,9 @@ public:
   uint32_t ofPosition(const Position &P, uint64_t Size,
                       const llvm::DataLayout &DL);
   uint64_t namedByTBAA = 0;
+  // Unnamed because the only struct around the access is anonymous
+  // (counted among NoStruct).
+  uint64_t anonOnly = 0;
   // Name of a `Size`-byte access at byte `Off` of named struct `S`, or
   // Unnamed. The descent ofAccess ends with.
   uint32_t ofSlot(llvm::StructType *S, uint64_t Off, uint64_t Size,

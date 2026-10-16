@@ -414,11 +414,14 @@ void CallGraphPass::computeTaggedFields() {
     std::set<std::string> standalone;
     auto classify = [&](const GEPOperator *G, const DataLayout &DL) {
       const auto *T = dyn_cast<StructType>(G->getSourceElementType());
-      if (!T || !T->hasName()) return;
+      // An anonymous struct's fields are named by its encloser already
+      // (accessSlot); a struct inside one keeps its own name.
+      if (!T || !T->hasName() || isAnonStruct(T)) return;
       const std::string tn = stripStructNameSuffix(T->getName()).str();
       const GEPOperator *O = embeddingGEP(G->getPointerOperand(), T);
       APInt Ap(64, 0);
-      if (O && O->accumulateConstantOffset(DL, Ap))
+      if (O && !isAnonStruct(dyn_cast<StructType>(O->getSourceElementType())) &&
+          O->accumulateConstantOffset(DL, Ap))
         targets[tn].insert({stripStructNameSuffix(O->getSourceElementType()->getStructName()).str(), Ap.getSExtValue()});
       else
         standalone.insert(tn);

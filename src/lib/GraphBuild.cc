@@ -369,6 +369,20 @@ StringRef stripStructNameSuffix(StringRef Name) {
   return Name;
 }
 
+// An anonymous struct or union. clang numbers them (`struct.anon`,
+// `struct.anon.12`: distinct types, and one type numbered differently in
+// two modules), and the strip above makes every one `struct.anon`, so the
+// name names nothing (Fable 2026-10-16): a field of one is named by the
+// enclosing named struct and the byte offset there, and with no enclosing
+// named struct by the object's byte offset; never by the anonymous name.
+bool isAnonStructName(StringRef Name) {
+  const StringRef N = stripStructNameSuffix(Name);
+  return N == "struct.anon" || N == "union.anon";
+}
+bool isAnonStruct(const StructType *ST) {
+  return ST && ST->hasName() && isAnonStructName(ST->getName());
+}
+
 // Walk GEP indexed type chain to find the innermost named struct field access.
 // Returns true if a named non-union struct field was found, with structName
 // and fieldIdx set to the stripped struct name and field index respectively.
@@ -1816,6 +1830,8 @@ void CallGraphPass::logNamedCells() const {
            std::to_string(accessNames->unnamedBy[w]);
   CG_LOG("NamedCells: unnamed accesses by reason:" << why << "; "
          << accessNames->namedByTBAA << " named by their TBAA tag\n");
+  CG_LOG("NamedCells: anonymous structs name nothing: " << accessNames->anonOnly
+         << " accesses with no named struct around one (no-struct)\n");
   CG_LOG("NamedCells: " << namedStats.typedWrites
          << " unnamed writes filed by their writer's field; certificate ("
          << CFLNamedUntyped << "): " << openNames.size() << "/"
@@ -5315,7 +5331,7 @@ llvm::StructType *CallGraphPass::initUseTypeOf(const GlobalVariable *GV) {
     while (T->isArrayTy())
       T = T->getArrayElementType();
     auto *ST = dyn_cast<llvm::StructType>(T);
-    if (!ST || ST->isLiteral() || !ST->hasName() ||
+    if (!ST || ST->isLiteral() || !ST->hasName() || isAnonStruct(ST) ||
         LLVM_STRING_STARTS_WITH(ST->getName(), "union"))
       continue;
     if (std::find(types.begin(), types.end(), ST) == types.end())
@@ -5540,7 +5556,7 @@ void CallGraphPass::processInitializer(NodeIndex ptrNode, Constant *init,
     const StructLayout *NL =
         (namedPlanes() && !isUnion) ? curDL->getStructLayout(STy) : nullptr;
     const uint64_t savedAbs = initAbsOff;
-    const bool namedTy = !STy->isLiteral() && STy->hasName();
+    const bool namedTy = !STy->isLiteral() && STy->hasName() && !isAnonStruct(STy);
     const bool fieldMode = Graph.fieldSensitive() &&
                            addrNode != AndersNodeFactory::InvalidIndex &&
                            curDL && STy;

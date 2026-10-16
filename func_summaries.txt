@@ -1649,6 +1649,14 @@ bfd_hash_replace ROLE(insert) OWNER(arg0) ELEM(arg2)
 bfd_hash_rename ROLE(insert) OWNER(arg0) ELEM(arg2)
 bfd_hash_allocate ROLE(carve) POOL(arg0)
 bfd_hash_hash ROLE(pure)
+# bfd_link_hash_lookup wraps bfd_hash_lookup on the bfd_hash_table at +0 of
+# its bfd_link_hash_table (DI: bfd_link_hash_table.table); with follow it
+# chases u.i.link from indirect and warning entries to another element.
+bfd_link_hash_lookup ROLE(lookup) OWNER(arg0) CREATE(arg2) ELEM(ret)
+# bfd_wrapped_link_hash_lookup(abfd, info, ...) looks up in info->hash
+# (bfd_link_info.hash, +40) under --wrap's renaming; its wrap_hash lookups
+# are only tested against null. Applied through its body.
+bfd_wrapped_link_hash_lookup ROLE(lookup) OWNER(*arg1@40) CREATE(arg3) ELEM(ret)
 # _bfd_error_handler (reached from the constructors at -O3, where
 # objalloc_alloc's failure path is inlined) formats and prints through the
 # global hook _bfd_error_internal: a leaf, its indirect call checked after

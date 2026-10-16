@@ -2255,6 +2255,11 @@ the listed ASSUMPTIONs.
   ASSUMPTION "owner re-read from the same slot". A write of the slot's own
   name keeps them apart. Used by the owner groups, the owner-code
   derivation (object identity) and the owner shapes (D6 pairing, (d)).
+  Across branches (Fable 2026-10-16): with no dominating read, the second
+  read is one value with a virtual read at the nearest common dominator of
+  the two, the same write test on every path from it to each read (nm-O0's
+  `info->hash` reloaded on both arms at linker.c:1785); reported as "across
+  branches", each site listed.
 - **Descents from a node not derived from the owner (S7), never a FAIL:**
   - a formal of the function at its own address, merged into a descent (a
     phi or select whose other entries are derived), is a listed ASSUMPTION
@@ -2293,11 +2298,58 @@ the listed ASSUMPTIONs.
 - **One report text:** every listing in the container report is sorted,
   so one input gives one text whatever the binary's heap layout (groups
   and bodies are keyed by pointer).
+- **An owner read through a pointer (Q-b, Fable 2026-10-16):** a lookup
+  row's OWNER(*argN@off) names the table at byte off of the formal's
+  pointee (bfd_wrapped_link_hash_lookup: bfd_link_info.hash at +40). Debug
+  info checks it (the pointee's member at off points to an owner type;
+  else the row FAILs and the block does not hold). It is applied through
+  its body: the function is no row link and stays out of the application
+  body set; its body is classified and checked (O2) like the body's, and
+  its callers' elements are its inner lookup's. A call's owner is the slot
+  *(A + off), one value with a real read of that slot in the caller (S6),
+  else a value of its own. Deferred: a RowLink owner-deref form for the
+  solver (never an unverified load of the slot at the call).
+- **Closed cursor fields on elements (Q-a, Q-e):** a pointer field of an
+  element into which every store program-wide (by name, block copies by
+  cover) is null or an element (in the body by class, outside by
+  elemOwner) is a CLOSED cursor. The cursor verdicts are those of the
+  greatest fixpoint in which every field a verdict leaned on ends closed:
+  a field under way reads as closed, a verdict that read another field so
+  leans on it, and a field that ends open withdraws every verdict that
+  leaned on it (transitively), decided again on its next use; premises
+  are listed only for fields that end closed. A read of
+  it from an element is an element of the same owner, under the listed
+  per-field premise "the element stored there is of the same table
+  instance". An ELEM(ret) row's RET may be a payload read only through
+  closed cursor fields, each payload read on its derivation included (a
+  load through a payload value is payload again: `ret = ret->u.i.link`);
+  a body read of a closed cursor field discharges O6 under the same
+  premise.
+- **A cursor inside a union (Q-d):** a store of another member over the
+  cursor's bytes is no store of the cursor only by the union keys (3.17 /
+  3.51, the keys an access carries), never by a discriminator read here:
+  every such store keyed, every read of the cursor keyed to admit none of
+  their keys. Without keys the field is not closed: "cursor inside union u
+  (S+off): no admitted discriminator", with the union census's and the
+  tagged fields' words (nm: bfd_link_hash_entry.u, whose members are
+  structs the census does not type by member, and whose tag `type:8` 3.51
+  widens at elflink.c:5250's bitfield write). The containers are checked
+  after the union keys and tagged fields for this (under --cfl-cells no
+  step between the check's old place and its new one runs).
+- **The caller's out-parameter (Q-c):** a load of a formal's pointee at +0
+  (`*hashp`) agrees with the other entries of a slot or phi as a per-site
+  ASSUMPTION "element from a caller's out-parameter, assumed an element of
+  the owner"; alone it names no owner. Slot and phi entries must agree
+  (S3 for stores). A block copy between two elements of one owner is
+  admitted (rb_replace_node's link-record copy, generalized).
+- **Verdict text:** a block that holds only under listed assumptions is
+  "VERIFIED under n assumptions", never a bare VERIFIED.
 
 Cases: test/t_cells_container_{rb,rb_unmatched,storage_bad,llist,llist_int,report,naming,
 embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_add,cursor}.c,
 t_cells_container_{zero_gep,const_root,phi_owner,bytestep,union_slot,reread,descent,formal_obj}.ll
 (shapes from the kernel's clang-14 IR that clang-18 no longer emits) and
-t_cells_container_del_all.c; rows for the rbtree cases in t2_cells_rblib.c,
+t_cells_container_del_all.c, t_cells_container_{cursor_closed,cursor_open,cursor_union,
+cursor_nested,deref_owner,outparam}.c (the bfd link-hash rows); rows for the rbtree cases in t2_cells_rblib.c,
 shapes in cells_rb.h.
 Not mechanized. Checked by executions; see the commit's gates.

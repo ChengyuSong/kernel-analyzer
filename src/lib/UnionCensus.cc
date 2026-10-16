@@ -247,6 +247,10 @@ void CallGraphPass::runUnionCensus() {
     std::sort(fs.begin(), fs.end());
     fs.erase(std::unique(fs.begin(), fs.end()), fs.end());
   }
+  unionFieldNotes.clear();
+  for (auto &[k, U] : unions)
+    unionFieldNotes["struct." + k.first][(int64_t)k.second] = {U.fieldName, (int64_t)U.size,
+                                                               "no access found by the union census"};
 
   // ---- 2. Accesses: (struct, byte offset from the object, base) ----
   // The stores into a pointer variable's stack slot (O0 keeps every
@@ -3256,6 +3260,14 @@ void CallGraphPass::runUnionCensus() {
     for (const Instruction *I : contra)
       t += "\n    contradicted read: " + locOf(I);
     lines.push_back({W.size() + Rd.size(), t});
+    unionFieldNotes["struct." + U->structName][(int64_t)U->off].census =
+        "union census: writes " + std::to_string(typedW) + "/" + std::to_string(W.size()) + " and reads " +
+        std::to_string(typedR) + "/" + std::to_string(Rd.size()) + " typed by member, " +
+        (best >= 0 ? "a co-written field @" + std::to_string(best) : std::string("no co-written field")) + "; " +
+        verdict +
+        (CFLUnionKeys != "off" ? "; keys: writes " + std::to_string(keyedW) + "/" + std::to_string(W.size()) +
+                                     ", reads " + std::to_string(keyedR) + "/" + std::to_string(Rd.size())
+                               : std::string());
   }
   if (!CFLCensusUnions) {
     errs() << "UnionKeys: " << membersByShape

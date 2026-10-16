@@ -246,6 +246,12 @@ public:
   struct ContainerRow {
     enum Role { Lookup, Insert, Traverse, Remove, Carve, Pure } role = Pure;
     int owner = -2;  // argN; -2: none
+    // OWNER(*argN@off): the owner is the pointer at byte off of argN's
+    // pointee (bfd_wrapped_link_hash_lookup's info->hash). Checked like any
+    // row, applied through its body (Fable 2026-10-16): no row link at the
+    // call site, and the function is not part of the body the rows it calls
+    // are applied outside of.
+    int ownerDeref = -1;
     int elem = -2;   // argN, -1 ret; -2: none
     int create = -2; // argN (lookup with create)
     int pool = -2;   // argN (carve)

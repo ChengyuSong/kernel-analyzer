@@ -1388,7 +1388,7 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
   bool scopeExtern = false;
   // `@container NAME` ... `@container end`: rows of one container (plan
   // 3.55): `<function> ROLE(lookup|insert|traverse|remove|carve|pure)
-  // [OWNER(argN)] [ELEM(argN|ret)] [CREATE(argN)] [POOL(argN)]
+  // [OWNER(argN|*argN@off)] [ELEM(argN|ret)] [CREATE(argN)] [POOL(argN)]
   // [KEY(argN) FIELD(T+off)]`; not transfer atoms. `@container NAME report`:
   // a report block (checked, never applied). `@storage HANDLE(T+off)
   // LINK(T+off) LINKWORD(T+off) ...` inside a block declares its storage.
@@ -1472,6 +1472,9 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
           else if (v == "carve") R.role = CR::Carve;
           else if (v == "pure") R.role = CR::Pure;
           else badRow(("unknown role '" + v + "'").str());
+        } else if (k == "OWNER" && v.consume_front("*")) {
+          if (!parseDerefRef(v, R.owner, R.ownerDeref) || R.owner < 0 || R.ownerDeref < 0)
+            badRow(("bad owner reference '*" + v + "'").str());
         } else if (k == "OWNER") argOf(v, R.owner);
         else if (k == "ELEM" && R.elem != -2) {
           // A second element argument (llist_add_batch's chain end): checked
@@ -1497,6 +1500,8 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
       if (R.role == CR::Traverse && R.owner < 0 && R.elem < 0)
         badRow("a traverse row needs OWNER(argN) or ELEM(argN)");
       if (R.role == CR::Insert && R.elem == -2) badRow("an insert row needs ELEM");
+      if (R.ownerDeref >= 0 && R.role != CR::Lookup) badRow("OWNER(*argN@off) is built for lookup rows only");
+      if (R.ownerDeref >= 0 && curContainer->report) badRow("OWNER(*argN@off) is built for applied blocks only");
       if (R.role == CR::Carve && R.pool < 0) badRow("a carve row needs POOL(argN)");
       if (!curContainer->rows.emplace(toks[0].str(), R).second) badRow("a function twice in one container");
       continue;

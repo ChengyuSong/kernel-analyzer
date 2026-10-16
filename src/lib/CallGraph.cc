@@ -668,9 +668,6 @@ bool CallGraphPass::doModulePass(Module *M) {
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
   if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
     computeLinkWords(); // plan 3.55 R1: tagged-pointer link words (report only; read by R3's LINKWORD storage)
-  if (CFLCells && (CFLContainerClosure || !Ctx->Containers.empty()) && iteration == 0 &&
-      M == Ctx->Modules.front().first)
-    checkContainerClosure(); // report only: after carves and the confirmer's fresh wrappers
 
   if (CFLConfirmInvoke && iteration == 0 && M == Ctx->Modules.front().first)
     confirmInvokeSummaries(); // before any callsite wiring
@@ -691,6 +688,14 @@ bool CallGraphPass::doModulePass(Module *M) {
     runUnionCensus(); // census, and the union keys graph build applies
   if (CFLCells && CFLUnionKeys == "tag" && iteration == 0 && M == Ctx->Modules.front().first)
     computeTaggedFields(); // plan 3.51: keys for fields tagged by a sibling
+  // Report only: after carves, the confirmer's fresh wrappers, and the
+  // union keys and tagged fields (a cursor inside a union is checked on
+  // its keys, plan 3.55 Q-d); under --cfl-cells nothing between its old
+  // place and here runs (tracepoint keys are refused, the confirmers and
+  // censuses are off unless asked).
+  if (CFLCells && (CFLContainerClosure || !Ctx->Containers.empty()) && iteration == 0 &&
+      M == Ctx->Modules.front().first)
+    checkContainerClosure();
   if (CFLCells && CFLUnionKeys != "off" && iteration == 0 && M == Ctx->Modules.front().first)
     unadoptKeyedBodies(); // keyed bodies keep their accesses
 

@@ -316,6 +316,7 @@ std::string locOf(const Instruction *I) {
 } // namespace
 
 void CallGraphPass::computeTaggedFields() {
+  widenedTagsOf.clear();
   ObjIds ids;
   // Where an identity's value is defined: an instruction (each execution
   // names another object), or a merge block (a phi). A walk that crosses
@@ -3402,6 +3403,9 @@ void CallGraphPass::computeTaggedFields() {
     xmFieldsWide += wide;
     xmFieldSizes.push_back(Dx.first + "+" + std::to_string(Dx.second) + ":" + sizes +
                            (whyWide.empty() ? "" : " (" + whyWide + ")"));
+    if (wide)
+      widenedTagsOf[Dx.first].push_back("tag " + Dx.first + "+" + std::to_string(Dx.second) + " widened" +
+                                        (whyWide.empty() ? "" : " (" + whyWide + ")"));
     for (TagStore &t : ts) {
       std::vector<Term> nt;
       for (const Term &tm : t.terms) {

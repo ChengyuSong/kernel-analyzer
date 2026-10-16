@@ -339,6 +339,13 @@ protected:
   // ... and the accesses of a keyed union whose key is unknown, with the
   // union's name prefix "struct.S+off".
   std::map<const llvm::Instruction *, std::string> unionUnknownOf;
+  // Every union field of a struct (debug info), by "struct.S" and byte
+  // offset: its field name, size, and the union census's short verdict
+  // (read by the containers' cursor check, plan 3.55 Q-d).
+  struct UnionFieldNote { std::string field; int64_t size = 0; std::string census; };
+  std::map<std::string, std::map<int64_t, UnionFieldNote>> unionFieldNotes;
+  // Tag fields 3.51 widened (no admitted tag), by "struct.S": "S+off: why".
+  std::map<std::string, std::vector<std::string>> widenedTagsOf;
   // --cfl-union-keys=tag (cell solver): the keyed union slots (struct,
   // byte offset, size), and the dereference node of each keyed access with
   // its key (an interned cell name).

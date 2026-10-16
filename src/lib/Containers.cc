@@ -1298,6 +1298,30 @@ void CallGraphPass::checkContainerClosure() {
       if (const auto *G = dyn_cast<GEPOperator>(V)) return elemOwner(G->getPointerOperand(), d + 1);
       const auto *CB = dyn_cast<CallBase>(V);
       const Function *G = CB ? CB->getCalledFunction() : nullptr;
+      // (d) through a closed code field (Fable 2026-10-16): every member of
+      // the closed set is a constructor paired with the owner at one
+      // argument, and the call's owner actual there is the object the field
+      // is read from (linker.c's `(*info->hash->table.newfunc)(NULL,
+      // &info->hash->table, name)`): the result is an element of that owner.
+      if (CB && !G)
+        if (const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
+          const std::string K = fieldKey(CL, CL->getPointerOperand());
+          auto tit = codeTargets.find(K);
+          if (!code.count(K) || codeOpen.count(K) || tit == codeTargets.end() || tit->second.empty()) return "";
+          int a = -1;
+          for (const Function *T : tit->second) {
+            auto cit = ctorsHere.find(T);
+            if (cit == ctorsHere.end() || (a >= 0 && (int)cit->second != a)) return "";
+            a = (int)cit->second;
+          }
+          if ((unsigned)a >= CB->arg_size()) return "";
+          const std::string o = ownerShape(CB->getArgOperand(a), 0), f = ownerShape(CL->getPointerOperand(), 0);
+          if (o.empty() || f.empty()) return "";
+          const size_t p = o.find('+');
+          const int64_t at = (p == std::string::npos ? 0 : std::stoll(o.substr(p + 1))) + std::stoll(K.substr(K.rfind('+') + 1));
+          const std::string root = p == std::string::npos ? o : o.substr(0, p);
+          return f == (at ? root + "+" + std::to_string(at) : root) ? o : "";
+        }
       if (!G) return "";
       if (const CR *R = rowOf(G); R && R->owner >= 0 && (R->role == CR::Lookup || R->role == CR::Insert) &&
                                   R->elem == -1 && (unsigned)R->owner < CB->arg_size())

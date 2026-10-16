@@ -1663,6 +1663,18 @@ only.
   per owner as above. An element derived from that owner value (the same
   SSA value, or the same GEP shape) re-stored into a link field of an
   element of the same owner is a same-owner re-store (O1).
+  Through a closed code field (Fable 2026-10-16): a call through a code
+  field whose closed set has only constructors, all paired with the owner
+  at the same argument, and whose owner actual there has the shape of the
+  object the field is read from (linker.c's `(*info->hash->table.newfunc)
+  (NULL, &info->hash->table, name)`), is such a constructor call: its
+  result is an element of that owner, for O1's same-owner pairing of
+  stores and copies (`*sub = *h`). The minting already counted such calls
+  as element sources (t_cells_container_ctor_field.c). A call whose owner
+  actual is another object is not paired
+  (t_cells_container_ctor_field_other.c). Two reads of the owner
+  that are separate loads of one field (-O0's `info->hash` read twice)
+  have different shapes; their identity is S6's re-read check, not this.
 - **Statement:** the row object (O, s, elem) stands for every element
   made at s for an owner in O. Every such element is reachable only
   through the owner's closed storage (O1-O3) and through the result at s,

@@ -317,6 +317,7 @@ std::string locOf(const Instruction *I) {
 
 void CallGraphPass::computeTaggedFields() {
   widenedTagsOf.clear();
+  size_t stepPosByTag = 0, stepPosUnnamed = 0, stepAddrUnnamed = 0, stepPosConst = 0, stepPosPast = 0;
   ObjIds ids;
   // Where an identity's value is defined: an instruction (each execution
   // names another object), or a merge block (a phi). A walk that crosses
@@ -1214,7 +1215,11 @@ void CallGraphPass::computeTaggedFields() {
         if (const GEPOperator *FG = dyn_cast<GEPOperator>(&I); FG && structGEP(&I) == FG) {
           StructType *S0 = nullptr;
           int64_t o0 = 0;
-          if (composedSlot(&I, &I, DL, S0, o0) && S0 && S0->hasName()) {
+          const bool named0 = composedSlot(&I, &I, DL, S0, o0) && S0 && S0->hasName();
+          if (!named0 && isa<StructType>(FG->getSourceElementType()) && FG->getNumIndices() &&
+              !(isa<ConstantInt>(*FG->idx_begin()) && cast<ConstantInt>(*FG->idx_begin())->isZero()))
+            stepAddrUnnamed++; // a byte step's address: no field of a name escapes by it
+          if (named0) {
             // Through pointer-to-pointer casts (the typed-pointer upgrade
             // leaves `bitcast ptr %f to ptr` before a store at -O0): the
             // address is still used only as a load or store address.
@@ -1256,7 +1261,25 @@ void CallGraphPass::computeTaggedFields() {
         else continue;
         StructType *ST = nullptr;
         int64_t off = 0;
-        if (!composedSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) continue;
+        // A struct GEP whose leading index is not 0 is a byte step: named
+        // only by its TBAA tag (accessSlot), else unnamed; counted.
+        const GEPOperator *SG = structGEP(Addr);
+        const bool step = SG && isa<StructType>(SG->getSourceElementType()) && SG->getNumIndices() &&
+                          !(isa<ConstantInt>(*SG->idx_begin()) && cast<ConstantInt>(*SG->idx_begin())->isZero());
+        const bool named = composedSlot(&I, Addr, DL, ST, off) && ST && ST->hasName();
+        if (step) {
+          (named ? stepPosByTag : stepPosUnnamed)++;
+          // Past the layout of the struct the step is written in (what the
+          // GEP alone used to name, S+off with off outside S).
+          APInt Ap(64, 0);
+          auto *GS = cast<StructType>(SG->getSourceElementType());
+          if (SG->accumulateConstantOffset(DL, Ap)) {
+            stepPosConst++;
+            if (!GS->isSized() || Ap.isNegative() || Ap.getSExtValue() >= (int64_t)DL.getTypeAllocSize(GS))
+              stepPosPast++;
+          }
+        }
+        if (!named) continue;
         const Field fld{stripStructNameSuffix(ST->getName()).str(), off};
         const Value *obj = objKey(&I, Addr, ST);
         // A union member (plan 3.51, Mem.u): every access of any width
@@ -4917,6 +4940,11 @@ void CallGraphPass::computeTaggedFields() {
     for (const std::string &r : taggedEntryRows) CG_LOG("TaggedFields:   ENTRY " << r << "\n");
   if (VerboseLevel >= 2)
     for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
+    CG_LOG("TaggedFields: accesses through a struct GEP whose leading index is not 0 (a byte step): "
+           << stepPosByTag << " named by their TBAA tag, " << stepPosUnnamed << " unnamed; " << stepPosConst
+           << " of them at constant indices (the GEP alone used to name them), " << stepPosPast
+           << " of those past the layout of the struct the step is written in; " << stepAddrUnnamed
+           << " such addresses taken (unnamed)\n");
   if (VerboseLevel >= 2) {
     for (const std::string &l : taggedReport) CG_LOG("TaggedFields:   " << l << "\n");
     CG_LOG("TaggedFields: predicate tests " << predClosed << " closed, " << predOpen << " open\n");

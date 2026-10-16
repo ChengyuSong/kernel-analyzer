@@ -40,6 +40,7 @@ const GEPOperator *structGEP(const Value *A) {
   return dyn_cast<GEPOperator>(A);
 }
 
+
 // Is a GEP's leading index the constant 0 (a step inside one object of its
 // source type, not over a whole object)?
 static bool leadingZero(const GEPOperator *G) {
@@ -48,15 +49,19 @@ static bool leadingZero(const GEPOperator *G) {
   return C && C->isZero();
 }
 
-// The (struct, byte offset) an access names: its struct GEP, else its
-// struct-path TBAA tag (-O3 drops all-zero GEPs; the tag keeps the base
-// struct and the offset). accessSlotAny may answer an anonymous struct;
-// accessSlot never does (below).
+// The (struct, byte offset) an access names: its struct GEP at leading index
+// 0, else its struct-path TBAA tag (-O3 drops all-zero GEPs; the tag keeps
+// the base struct and the offset). A GEP whose leading index is not 0 is a
+// byte step (fc2f459): it names nothing, its struct being only the type the
+// optimizer wrote the step in (-O3's `gep %struct.bfd_link_hash_entry, %h,
+// i64 1, i32 2, ...` is elf_link_hash_entry+96, past the 56 bytes of the
+// struct it names), so only the tag names it, as namedSlot does.
+// accessSlotAny may answer an anonymous struct; accessSlot never does.
 static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off);
 static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off);
 static bool accessSlotAny(const Instruction *I, const Value *Addr, const DataLayout &DL, StructType *&S,
                           int64_t &off) {
-  if (const GEPOperator *G = structGEP(Addr)) {
+  if (const GEPOperator *G = structGEP(Addr); G && leadingZero(G)) {
     S = dyn_cast<StructType>(G->getSourceElementType());
     APInt Ap(64, 0);
     if (S && S->hasName() && G->accumulateConstantOffset(DL, Ap)) {

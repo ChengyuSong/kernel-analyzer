@@ -1974,6 +1974,15 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   was read as the GEP's source struct plus an offset outside it, which no
   field holds: the access was silently unnamed in R1 and silently matched
   no slot in the container check.
+  The same route for every client of accessSlot (Fable 2026-10-16; the
+  tagged fields, the census, carves, the int-name flags, the summaries'
+  slot keys): a struct GEP at a non-zero leading index is a byte step,
+  named only by its TBAA tag, else unnamed and counted. Before, accessSlot
+  named it by the step's own struct and the offset past it: nm-O3's
+  TaggedFields keyed the tag "struct.bfd_link_hash_entry+96" (56 bytes),
+  which is elf_link_hash_entry's field written as a step over its first
+  member's type. An unnamed step's address taken is no escape of a named
+  field: stores through it are classified by their pointer's provenance.
 - **Anonymous structs name nothing** (Fable 2026-10-16): clang numbers
   them (`struct.anon`, `struct.anon.12`) and the linker's suffix strip
   makes every one `struct.anon`, so a field inside one was a key shared by

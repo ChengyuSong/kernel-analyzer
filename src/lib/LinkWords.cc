@@ -26,11 +26,15 @@
 // Pointer-typed fields that receive inttoptr-encoded words (XArray slots:
 // node | 2, values, internal constants) are reported by shape, no verdict
 // (R1 addendum (b) is measured, not built).
-// An access names its field by its struct GEP, its struct-path TBAA tag, an
-// array member's GEP at a variable index, or, at offset 0 with neither (the
-// kernel: -fno-strict-aliasing, no debug info), the address's declared
-// pointee (PointeeResolver: debug info, sibling GEPs, formal provenance).
-// A copy through an access none of these name fails its field "on naming".
+// An access names its field by namedSlot: its struct GEP at leading index
+// 0, its struct-path TBAA tag, an array member's GEP at a variable index,
+// or its pointer's name (a named base plus a GEP's byte offset, else the
+// pointee by PointeeResolver: debug info, the object's IR type, sibling
+// GEPs, formal provenance). A step past a named base's layout is unnamed
+// and counted apart; a path through a union is storage inside a union
+// (clang's representative member), counted, not an access of a field, and
+// a link word copied into or out of it is an ASSUMPTION. A copy through an
+// access none of these name fails its field "on naming".
 // The classification reads SSA: a value through a local slot (-O0) is a
 // copy from an unnamed access and fails its field.
 //
@@ -116,6 +120,9 @@ void CallGraphPass::computeLinkWords() {
   std::map<const Instruction *, FieldKey> fieldOf;
   PointeeResolver pointees(Ctx);
   std::map<const Function *, size_t> unnamedIn; // unnamed offset-0 accesses that would feed a link word
+  std::map<const Function *, size_t> pastIn;    // the same, a step past a named base's layout (class 3)
+  size_t unionAccesses = 0, unionFeeds = 0;     // storage inside a union (class 2)
+  std::set<const Instruction *> unionAcc;
   auto reachesI2P = [](const Value *L) {
     std::vector<const Value *> wl{L};
     std::set<const Value *> seen{L};
@@ -158,27 +165,36 @@ void CallGraphPass::computeLinkWords() {
         else continue;
         StructType *ST = nullptr;
         int64_t off = 0;
-        if ((!accessSlot(&I, Addr, DL, ST, off) || !ST || !ST->hasName()) && !arraySlot(Addr, DL, ST, off)) {
-          pointees.viaFormal = pointees.viaSibling = pointees.viaDecl = false;
-          ST = pointees.get(Addr, I.getContext()), off = 0;
-          if (ST)
-            (pointees.viaFormal    ? pointees.byFormal
-             : pointees.viaSibling ? pointees.bySibling
-             : pointees.viaDecl    ? pointees.byDecl
-                                   : pointees.byDI)++;
-          if (!ST) {
-            // Would it have fed a link word? A pointer-width integer access
-            // that reads into inttoptr or stores a ptrtoint-derived word.
-            if (AT->isIntegerTy(pw) && (isa<StoreInst>(&I) || reachesI2P(&I)) &&
-                (isa<LoadInst>(&I) || hasPtrToInt(cast<StoreInst>(&I)->getValueOperand())))
-              unnamedIn[&F]++;
-            continue;
-          }
+        // Would it feed a link word? A pointer-width integer access that
+        // reads into inttoptr or stores a ptrtoint-derived word.
+        auto feeds = [&] {
+          return AT->isIntegerTy(pw) && (isa<StoreInst>(&I) || reachesI2P(&I)) &&
+                 (isa<LoadInst>(&I) || hasPtrToInt(cast<StoreInst>(&I)->getValueOperand()));
+        };
+        if (!namedSlot(&I, Addr, DL, pointees, ST, off) || !ST || !ST->hasName()) {
+          // A step past the layout of a named base (class 3), or no name.
+          if (feeds()) (pointees.pastS ? pastIn : unnamedIn)[&F]++;
+          continue;
         }
+        if (pointees.viaBase) pointees.byBase++;
+        else if (pointees.viaResolver)
+          (pointees.viaFormal    ? pointees.byFormal
+           : pointees.viaSibling ? pointees.bySibling
+           : pointees.viaDecl    ? pointees.byDecl
+                                 : pointees.byDI)++;
         FieldKey K;
         Type *leaf = nullptr;
         int64_t inLeaf = 0;
-        if (!innermostField(ST, off, DL, K, leaf, inLeaf) || inLeaf != 0) continue;
+        bool inUnion = false;
+        if (!innermostField(ST, off, DL, K, leaf, inLeaf, &inUnion) || inLeaf != 0) continue;
+        // Storage inside a union (class 2): the IR's member is clang's
+        // representative, not the program's; not an access of its field.
+        if (inUnion) {
+          unionAccesses++;
+          unionAcc.insert(&I);
+          if (feeds()) unionFeeds++;
+          continue;
+        }
         const bool lInt = leaf->isIntegerTy(pw), lPtr = leaf->isPointerTy();
         if (!lInt && !lPtr) continue;
         if (DL.getTypeStoreSize(AT) != DL.getTypeStoreSize(leaf)) continue; // a partial or wide access
@@ -238,6 +254,7 @@ void CallGraphPass::computeLinkWords() {
     bool ok = true;
     std::string top, why;
     bool selfLink = false, selfDerived = false, copy = false, naming = false;
+    bool fromUnion = false; // a copy from storage inside a union (class 2: an assumption)
   };
   auto evalStore = [&](const StoreInst *S, const FieldKey &K) {
     StoreEval E;
@@ -273,6 +290,7 @@ void CallGraphPass::computeLinkWords() {
       if (isTag(V)) return true;                                    // tag bits over a null word
       if (const auto *L = dyn_cast<LoadInst>(V)) {
         if (L->getPointerOperand() == Addr) E.selfDerived = true;
+        if (unionAcc.count(L)) return E.fromUnion = E.copy = true, true;
         auto it = fieldOf.find(L);
         if (it == fieldOf.end()) return E.why = "copy from an unnamed access", E.naming = true, false;
         if (!cand.count(it->second)) return E.why = "copy from " + keyName(it->second) + " (not a link word)", false;
@@ -355,7 +373,7 @@ void CallGraphPass::computeLinkWords() {
     bool naming = false;
     const Instruction *at = nullptr;
     std::set<std::string> classes;
-    std::vector<const Instruction *> unmasked;
+    std::vector<const Instruction *> unmasked, intoUnion;
   };
   auto evalLoad = [&](const LoadInst *L) {
     LoadEval E;
@@ -398,7 +416,8 @@ void CallGraphPass::computeLinkWords() {
         } else if (const auto *S = dyn_cast<StoreInst>(UI)) {
           if (S->getValueOperand() != X) { fail("used as an address"); continue; }
           auto it = fieldOf.find(S);
-          if (it != fieldOf.end() && cand.count(it->second)) E.classes.insert("copy");
+          if (unionAcc.count(S)) E.classes.insert("copy into a union"), E.intoUnion.push_back(S);
+          else if (it != fieldOf.end() && cand.count(it->second)) E.classes.insert("copy");
           else if (it == fieldOf.end()) fail("copied into an unnamed access"), E.naming = true;
           else fail("stored into " + keyName(it->second) + " (not a link word)");
         } else if (isa<CallBase>(UI)) {
@@ -451,11 +470,13 @@ void CallGraphPass::computeLinkWords() {
       st[E.top]++;
       selfLink += E.selfLink, selfDerived += E.selfDerived, copies += E.copy;
       if (!E.ok) fails.push_back("store: " + E.why + " at " + siteOf(S)), namingFails += E.naming;
+      else if (E.fromUnion) assumes.push_back("storage inside a union (copied from it): " + siteOf(S));
     }
     for (const LoadInst *L : Fd.loads) {
       LoadEval E = evalLoad(L);
       for (const std::string &c : E.classes) ld[c]++;
       for (const Instruction *U : E.unmasked) assumes.push_back(siteOf(U));
+      for (const Instruction *U : E.intoUnion) assumes.push_back("storage inside a union (copied into it): " + siteOf(U));
       if (!E.ok) fails.push_back("load: " + E.why + " at " + siteOf(E.at)), namingFails += E.naming;
     }
     if (!pass) cand.erase(K);
@@ -470,7 +491,8 @@ void CallGraphPass::computeLinkWords() {
          std::to_string(copies) + "; loads " + std::to_string(Fd.loads.size()) + " {" + counts(ld) + "}");
     linkWordVerdicts[keyName(K)] = {verdict, assumes};
     for (const std::string &a : assumes)
-      line("  ASSUMPTION " + keyName(K) + ": the program relies on tag 0 at this read: " + a);
+      line("  ASSUMPTION " + keyName(K) + ": " +
+           (a.rfind("storage inside a union", 0) == 0 ? a : "the program relies on tag 0 at this read: " + a));
     for (const std::string &f : fails) line("  FAIL " + keyName(K) + ": " + f);
     if (pass) {
       linkWordFields.insert(K);
@@ -555,12 +577,18 @@ void CallGraphPass::computeLinkWords() {
   std::string tops;
   for (size_t i = 0; i < top.size() && i < 10; i++) tops += (i ? ", " : "") + top[i].second + " " + std::to_string(top[i].first);
   for (auto &[n, fn] : top) linkWordReport.push_back("  UNNAMED " + fn + " " + std::to_string(n)); // the full list: rule report only
-  line("naming of offset-0 accesses with no struct GEP or TBAA: " + std::to_string(pointees.byDI) +
+  size_t nPast = 0;
+  for (auto &[F, n] : pastIn) nPast += n;
+  line("naming of accesses with no struct GEP at leading index 0 or TBAA: " + std::to_string(pointees.byDI) +
        " accesses by declared type, " + std::to_string(pointees.byDecl) + " by the object's IR type, " +
        std::to_string(pointees.bySibling) + " by sibling GEPs, " +
-       std::to_string(pointees.byFormal) + " by formal provenance; " + std::to_string(nUnnamed) +
+       std::to_string(pointees.byFormal) + " by formal provenance, " + std::to_string(pointees.byBase) +
+       " by a named base plus a byte offset; " + std::to_string(nUnnamed) +
        " unnamed that would feed a link word, in " + std::to_string(unnamedIn.size()) + " functions" +
-       (tops.empty() ? "" : " (" + tops + ")"));
+       (tops.empty() ? "" : " (" + tops + ")") + "; " + std::to_string(nPast) +
+       " a step past the layout of a named base, in " + std::to_string(pastIn.size()) + " functions");
+  line("storage inside a union (the IR's member is clang's representative): " + std::to_string(unionAccesses) +
+       " accesses, " + std::to_string(unionFeeds) + " that would feed a link word");
   // The rule report carries the section only when the program has a link
   // word or an encoded pointer field (a rule the call graph then rests on);
   // the naming counts stay in the log.

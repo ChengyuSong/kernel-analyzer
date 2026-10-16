@@ -1,6 +1,7 @@
 // t_cells_container_llist_int.c — a link word reused as an integer (plan
-// 3.55 R4; the kfree_rcu bulk page: nr_records over llist_node.next). A
-// cached page leaves the llist through llist_del_first and owner code uses
+// 3.55 R4; the kfree_rcu bulk page: nr_records over llist_node.next, by a
+// cast as in 5.18, not a union: a union is class 2, t_cells_container_union).
+// A cached page leaves the llist through llist_del_first and owner code uses
 // its first word as a count: zeroing it is a null store, bumping it is
 // arithmetic over a load of the same cell (R4, admitted and counted). A
 // store of another integer into the same word fails O1 with its site.
@@ -53,23 +54,21 @@ __attribute__((noinline)) struct llist_node *llist_reverse_order(struct llist_no
   return new_head;
 }
 struct bulk {
-  union {
-    struct llist_node llist;
-    unsigned long nr_records;
-  };
+  struct llist_node llist;
   void *records[4];
 };
+#define NR(b) (*(unsigned long *)&(b)->llist.next)
 struct cache { int n; struct llist_head bkv; } K;
-__attribute__((noinline)) void bump(struct bulk *b) { b->nr_records++; }
-__attribute__((noinline)) void set_count(struct bulk *b, unsigned long n) { b->nr_records = n; }
+__attribute__((noinline)) void bump(struct bulk *b) { NR(b)++; }
+__attribute__((noinline)) void set_count(struct bulk *b, unsigned long n) { NR(b) = n; }
 unsigned long external_count(void);
 static struct bulk B1;
 int main(void) {
   llist_add_batch(&B1.llist, &B1.llist, &K.bkv);
   struct bulk *b = (struct bulk *)llist_del_first(&K.bkv);
   if (!b) return 0;
-  b->nr_records = 0;
+  NR(b) = 0;
   bump(b);
   set_count(b, external_count());
-  return (int)b->nr_records;
+  return (int)NR(b);
 }

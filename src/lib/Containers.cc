@@ -555,6 +555,56 @@ void CallGraphPass::checkContainerClosure() {
             CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && !CT->isForwardDecl())
           diStructs.emplace(CT->getName().str(), CT);
     }
+  // The struct analyzer's embedding table (transitive, every array element):
+  // does struct S of module M hold the struct named T at byte off? Looked
+  // up by S's own type (anonymous structs share a name across modules).
+  auto tableHolds = [&](StructType *S, int64_t off, StringRef T, const Module *M) {
+    Module *MM = const_cast<Module *>(M);
+    const StructInfo *SI = Ctx->structAnalyzer.getStructInfo(S, MM);
+    StructType *TT = StructType::getTypeByName(M->getContext(), T);
+    if (!TT)
+      for (StructType *ST : M->getIdentifiedStructTypes())
+        if (ST->hasName() && stripStructNameSuffix(ST->getName()) == T) { TT = ST; break; }
+    const StructInfo *TI = TT && !TT->isOpaque() ? Ctx->structAnalyzer.getStructInfo(TT, MM) : nullptr;
+    if (!SI || !TI) return false;
+    const auto &Cs = TI->getContainers();
+    auto it = Cs.find(SI->getRealType());
+    return it != Cs.end() && it->second.count((unsigned)off);
+  };
+  // Through debug info, where the program has it: does byte `off` of DI
+  // struct S lie in a member (any member of a union) that is or embeds the
+  // struct named T at that byte? 1 yes, 0 no, -1 no debug info for S.
+  std::function<bool(const DIType *, int64_t, StringRef, int)> diHolds = [&](const DIType *Ty, int64_t off,
+                                                                             StringRef T, int d) -> bool {
+    for (int i = 0; i < 16 && Ty; i++) {
+      const auto *D = dyn_cast<DIDerivedType>(Ty);
+      if (!D || D->getTag() == dwarf::DW_TAG_pointer_type || D->getTag() == dwarf::DW_TAG_member) break;
+      Ty = D->getBaseType();
+    }
+    const auto *CT = dyn_cast_or_null<DICompositeType>(Ty);
+    if (!CT || d > 32 || off < 0) return false;
+    if (CT->getTag() == dwarf::DW_TAG_array_type) {
+      const DIType *E = CT->getBaseType();
+      const uint64_t es = E ? E->getSizeInBits() / 8 : 0;
+      for (int i = 0; i < 16 && E && !es; i++)
+        if (const auto *ED = dyn_cast<DIDerivedType>(E)) E = ED->getBaseType();
+      const uint64_t es2 = E ? E->getSizeInBits() / 8 : 0;
+      return es2 && diHolds(CT->getBaseType(), off % (int64_t)es2, T, d + 1);
+    }
+    if (CT->getTag() == dwarf::DW_TAG_structure_type && off == 0 && CT->getName() == T) return true;
+    for (const DINode *E : CT->getElements()) {
+      const auto *Mb = dyn_cast<DIDerivedType>(E);
+      if (!Mb || Mb->getTag() != dwarf::DW_TAG_member || Mb->isStaticMember()) continue;
+      const int64_t mo = (int64_t)(Mb->getOffsetInBits() / 8), ms = (int64_t)(Mb->getSizeInBits() / 8);
+      if (off >= mo && (ms == 0 || off < mo + ms) && diHolds(Mb->getBaseType(), off - mo, T, d + 1)) return true;
+    }
+    return false;
+  };
+  auto diThroughUnion = [&](StringRef S, int64_t off, StringRef T) -> int {
+    auto it = diStructs.find(S.str());
+    if (it == diStructs.end()) return -1;
+    return diHolds(it->second, off, T, 0) ? 1 : 0;
+  };
   auto ptrMembers = [&](StringRef Tag) {
     std::vector<std::pair<uint64_t, std::string>> out;
     auto dit = diStructs.find(Tag.str());
@@ -1036,6 +1086,11 @@ void CallGraphPass::checkContainerClosure() {
           }
         if (G && body.count(G) && !rowOf(G)) return retCls[G];
         if (const CR *R = rowOf(G); R && R->role == CR::Insert) return INS;
+        // D7: a traverse row's result is an element of the containers that
+        // contain its ELEM argument (rb_erase_cached's `rb_next(node)`).
+        if (const CR *R = rowOf(G); R && R->role == CR::Traverse && R->elem >= 0 && (unsigned)R->elem < CB->arg_size())
+          if (const uint8_t e = get(CB->getArgOperand(R->elem)); (e & (DER | FRS)) && !(e & ~(DER | FRS | NUL)))
+            return DER | NUL;
         if (G && (Ctx->AllocFuncs.count(G) || carveFns.count(G->getName().str()))) return FRS;
         if (G)
           if (auto sit = Ctx->FuncSummaries.find(G); sit != Ctx->FuncSummaries.end() && sit->second && sit->second->fresh)
@@ -1191,11 +1246,17 @@ void CallGraphPass::checkContainerClosure() {
             }
           return only ? ownerShape(only->getValueOperand(), d + 1) : "";
         }
+      // Constant steps fold into one offset from the object (Fable
+      // 2026-10-15, 4(b)): `&root->rb_root` (+0) is the owner `root`.
       if (const auto *G = dyn_cast<GEPOperator>(V)) {
         APInt Off(64, 0);
         if (!G->accumulateConstantOffset(DL0, Off)) return "";
         const std::string b = ownerShape(G->getPointerOperand(), d + 1);
-        return b.empty() ? "" : b + "+" + std::to_string(Off.getSExtValue());
+        if (b.empty()) return "";
+        const size_t p = b.find('+');
+        const int64_t o = (p == std::string::npos ? 0 : std::stoll(b.substr(p + 1))) + Off.getSExtValue();
+        const std::string root = p == std::string::npos ? b : b.substr(0, p);
+        return o ? root + "+" + std::to_string(o) : root;
       }
       std::string t;
       raw_string_ostream os(t);
@@ -1253,17 +1314,25 @@ void CallGraphPass::checkContainerClosure() {
     // rule names is a naming failure, never a pass.
     std::map<std::string, size_t> o1Admit;
     std::map<std::string, std::vector<std::string>> o1Fail;
-    std::vector<std::string> o1Naming, implicitMatched, implicitUnmatched, wordLines;
+    std::vector<std::string> o1Naming, implicitMatched, implicitUnmatched, wordLines, unionSites;
+    std::map<std::string, size_t> unionStorage; // class 2: storage inside a union (writes)
+    std::vector<std::string> linkInvariant, traverseJoined; // listed assumptions in owner code
     size_t lookupsByDerivation = 0, rowSites = 0;
     // (1c) discharged per call site: agrees, disagrees (FAIL), unnamed
     // (an ASSUMPTION, listed).
-    size_t premiseArgs = 0, premiseAgree = 0, premiseNull = 0;
-    std::vector<std::string> premiseFail, premiseAssume;
+    size_t premiseArgs = 0, premiseAgree = 0, premiseNull = 0, premiseByBase = 0;
+    std::vector<std::string> premiseFail, premiseAssume, premiseUnion, premisePast, premiseUnionDI, tableDisagree;
     std::set<std::string> ownerValues;
     if (declared) {
       auto siteText = [](const Instruction *I) {
         std::string s = I->getFunction()->getName().str() + ": " + valueText(I);
         return s.size() > 200 ? s.substr(0, 200) : s;
+      };
+      // Class 3: the last naming stepped past a named base's layout.
+      auto pastText = [&]() -> std::string {
+        if (!pointees.pastS) return "";
+        return " (a step past the layout of " + stripStructNameSuffix(pointees.pastS->getName()).str() +
+               (pointees.pastOff < 0 ? "" : "+") + std::to_string(pointees.pastOff) + ")";
       };
       // The declared slot kind an access names ('h', 'l', 'w'; 0 none), by
       // the access (At) or, for an address alone, its struct GEP or pointee.
@@ -1311,6 +1380,8 @@ void CallGraphPass::checkContainerClosure() {
       // constant GEP shape).
       struct Group {
         std::vector<const Value *> owners, elems;
+        std::vector<const Value *> assumed;  // inlined removes: elements under the link invariant
+        std::vector<const CallBase *> joined; // traverse elements joined to the only owner group (r3)
         std::vector<const CallBase *> inserts;
         std::map<const Value *, uint8_t> cls;
       };
@@ -1331,16 +1402,44 @@ void CallGraphPass::checkContainerClosure() {
             const Value *o = CB->getArgOperand(R->owner);
             const std::string sh = ownerShape(o, 0);
             Group &Gp = groups[&F][sh.empty() ? valueText(o) : sh];
-            Gp.owners.push_back(o->stripPointerCasts());
+            // The owner object: a zero step from it is the same owner
+            // (4(b): rb_root_cached and its rb_root at +0).
+            for (const Value *ob = o->stripPointerCasts();;) {
+              Gp.owners.push_back(ob);
+              const auto *OG = dyn_cast<GEPOperator>(ob);
+              APInt Z(64, 0);
+              if (!OG || !OG->accumulateConstantOffset(DL0, Z) || !Z.isZero()) break;
+              ob = OG->getPointerOperand()->stripPointerCasts();
+            }
             if (!body.count(&F)) rowSites++, ownerValues.insert(F.getName().str() + ":" + (sh.empty() ? valueText(o) : sh));
             if (R->role == CR::Insert) Gp.inserts.push_back(CB);
             else if (R->elem >= 0 && (unsigned)R->elem < CB->arg_size())
               Gp.elems.push_back(CB->getArgOperand(R->elem)->stripPointerCasts());
           }
-      // (1c): every row call's OWNER and ELEM actuals against the premise:
-      // named by a route (or a constant GEP into a struct that embeds the
-      // premise's struct there) and agreeing, named otherwise (FAIL), or
-      // named by nothing (an ASSUMPTION at that site).
+      // A traverse row has no owner (rb_next(node)): in a function with one
+      // owner group, its element is that owner's (an inlined remove's node:
+      // `if (root->rb_leftmost == node) root->rb_leftmost = rb_next(node)`).
+      for (auto &[F, gs] : groups) {
+        if (gs.size() != 1) continue;
+        for (const Instruction &I : instructions(*F))
+          if (const auto *CB = dyn_cast<CallBase>(&I))
+            if (const CR *R = rowAt(CB); R && R->role == CR::Traverse && R->owner < 0 && R->elem >= 0 &&
+                                         (unsigned)R->elem < CB->arg_size()) {
+              gs.begin()->second.elems.push_back(CB->getArgOperand(R->elem)->stripPointerCasts());
+              if (!body.count(F)) gs.begin()->second.joined.push_back(CB);
+            }
+      }
+      // (1c): every row call's OWNER and ELEM actuals against the premise
+      // (Fable 2026-10-15, classes 1-3). The actual's name (namedPtr: a
+      // GEP's source struct only at leading index 0, else its base's name
+      // plus the byte offset) agrees when that struct holds the premise's
+      // struct there by the struct analyzer's embedding table (transitive,
+      // every array element); a union on the layout path stops the name:
+      // with debug info, it agrees through a union member that is or embeds
+      // the struct; without, the IR's member is clang's representative, so
+      // the site is an ASSUMPTION "inside union U" (the struct must fit).
+      // A step past a named base's layout, and an actual named by nothing,
+      // are ASSUMPTIONs; any other name disagrees (FAIL).
       for (auto &[M, _] : Ctx->Modules)
         for (const Function &F : *M)
           for (const Instruction &I : instructions(F)) {
@@ -1358,27 +1457,44 @@ void CallGraphPass::checkContainerClosure() {
               const std::string TN = stripStructNameSuffix(T->getName()).str();
               const std::string at = siteText(CB) + " (arg" + std::to_string(a) + ", " + TN + ")";
               if (isa<ConstantPointerNull>(V)) { premiseNull++; continue; } // no object
-              int verdict = -1; // 1 agree, 0 disagree, -1 unnamed
-              std::string as;   // what the actual is named as
               if (const auto *PA = dyn_cast<Argument>(V); PA && premise.count(PA)) {
-                verdict = premise[PA] == T; // a row's own premise-typed formal
-                as = stripStructNameSuffix(premise[PA]->getName()).str();
-              } else if (const auto *G = dyn_cast<GEPOperator>(V)) {
-                auto *S = dyn_cast<StructType>(G->getSourceElementType());
-                APInt Off(64, 0);
-                if (S && S->hasName() && G->accumulateConstantOffset(CDL, Off)) {
-                  verdict = embedsAt(S, Off.getSExtValue(), TN, CDL);
-                  as = stripStructNameSuffix(S->getName()).str() + "+" + std::to_string(Off.getSExtValue());
-                }
+                // A row's own premise-typed formal.
+                if (premise[PA] == T) premiseAgree++;
+                else premiseFail.push_back(at + ": named " + stripStructNameSuffix(premise[PA]->getName()).str());
+                continue;
               }
-              if (verdict < 0)
-                if (StructType *S = pointees.get(V, V->getContext())) {
-                  verdict = embedsAt(S, 0, TN, CDL);
-                  as = stripStructNameSuffix(S->getName()).str() + "+0";
-                }
-              if (verdict == 1) premiseAgree++;
-              else if (verdict == 0) premiseFail.push_back(at + ": named " + as);
-              else premiseAssume.push_back(at);
+              StructType *S = nullptr;
+              int64_t off = 0;
+              if (!namedPtr(V, CDL, pointees, S, off) || !S->hasName()) {
+                if (pointees.pastS)
+                  premisePast.push_back(at + ": " + stripStructNameSuffix(pointees.pastS->getName()).str() +
+                                        (pointees.pastOff < 0 ? "" : "+") + std::to_string(pointees.pastOff));
+                else
+                  premiseAssume.push_back(at);
+                continue;
+              }
+              const bool byBase = pointees.viaBase;
+              const std::string SN = stripStructNameSuffix(S->getName()).str();
+              const std::string as = SN + "+" + std::to_string(off);
+              StructType *U = nullptr;
+              int64_t uo = 0, us = 0;
+              if (unionOnPath(S, off, CDL, U, uo, us)) {
+                const int di = diThroughUnion(StringRef(SN).drop_front(7), off, StringRef(TN).drop_front(7));
+                const std::string where = "union at " + SN + "+" + std::to_string(uo) + ", +" + std::to_string(off - uo);
+                if (di == 1) premiseAgree++, premiseUnionDI.push_back(at + ": through the " + where);
+                else if (di == 0) premiseFail.push_back(at + ": named " + as + ", no member of the " + where + " is " + TN);
+                else if ((int64_t)CDL.getTypeAllocSize(T) > us - (off - uo))
+                  premiseFail.push_back(at + ": named " + as + ", " + TN + " does not fit in the " + where + " (" +
+                                        std::to_string(us) + " bytes)");
+                else premiseUnion.push_back(at + ": inside the " + where + " (members not in the IR)");
+                continue;
+              }
+              const bool agree = (SN == TN && off == 0) || tableHolds(S, off, TN, CB->getModule());
+              if (agree != embedsAtThroughArrays(S, off, TN, CDL))
+                tableDisagree.push_back(at + ": " + as + " (table " + (agree ? "yes" : "no") + ", layout walk " +
+                                        (agree ? "no" : "yes") + ")");
+              if (agree) premiseAgree++, premiseByBase += byBase;
+              else premiseFail.push_back(at + ": named " + as);
             }
           }
       for (auto &[F, gs] : groups)
@@ -1391,7 +1507,13 @@ void CallGraphPass::checkContainerClosure() {
             if (R->owner >= 0 && (unsigned)R->owner < CB->arg_size() && (g(CB->getArgOperand(R->owner)) & OC_OWNER))
               return true;
             return R->elem >= 0 && (unsigned)R->elem < CB->arg_size() && (g(CB->getArgOperand(R->elem)) & OC_VAL);
+          }, CDL, body.count(F) ? nullptr : premiseElemT, &Gp.assumed, [&](const Value *A) -> int64_t {
+            const std::string K = addrKey(A);
+            if (!kindOf(K)) return -1;
+            return std::stoll(K.substr(K.rfind('+') + 1));
           });
+          for (const Value *L : Gp.assumed) linkInvariant.push_back(F->getName().str() + ": read by " + valueText(L));
+          for (const CallBase *CB : Gp.joined) traverseJoined.push_back(siteText(CB));
         }
       auto strip = [](const Value *V) {
         for (int i = 0; i < 8; i++) {
@@ -1459,28 +1581,46 @@ void CallGraphPass::checkContainerClosure() {
             (bodyB & (OWN | DER | FRS)) || (ocB & (OC_OWNER | OC_VAL | OC_SLOT)) || baseIsInserted;
         std::vector<std::pair<StructType *, int64_t>> named;
         if (!addrSlots(I, A, named, 0)) {
-          if (containerBase) o1Naming.push_back(siteText(I) + (rawWrite ? " (an asm raw-pointer write)" : " (a write)"));
+          if (containerBase)
+            o1Naming.push_back(siteText(I) + (rawWrite ? " (an asm raw-pointer write)" : " (a write)") + pastText());
           return;
         }
         // The declared slots [off, off + bytes) covers, for each field the
         // address may name.
         std::vector<std::pair<std::string, char>> covered;
         bool someUncovered = false; // a field the address may name that holds no declared slot
+        bool inUnion = false;       // bytes inside a union whose IR member holds a declared slot
+        auto declaredIn = [&](StructType *ST, int64_t lo, int64_t h, std::vector<std::pair<std::string, char>> &out) {
+          if (!ST->hasName()) return;
+          const std::string SN = stripStructNameSuffix(ST->getName()).str();
+          for (const std::set<std::string> *D : {&declHandle, &declLink, &declWord})
+            for (const std::string &K : *D) {
+              const size_t p = K.rfind('+');
+              if (K.compare(0, p, SN) != 0) continue;
+              const int64_t o = std::stoll(K.substr(p + 1));
+              if (o >= lo && o < h) out.push_back({K, kindOf(K)});
+            }
+        };
         for (auto &[S, off] : named) {
           const size_t before = covered.size();
-          structCover(S, off, bytes < 0 ? INT64_MAX / 2 : off + bytes, CDL,
-                      [&](StructType *ST, int64_t lo, int64_t h) {
-                        if (!ST->hasName()) return;
-                        const std::string SN = stripStructNameSuffix(ST->getName()).str();
-                        for (const std::set<std::string> *D : {&declHandle, &declLink, &declWord})
-                          for (const std::string &K : *D) {
-                            const size_t p = K.rfind('+');
-                            if (K.compare(0, p, SN) != 0) continue;
-                            const int64_t o = std::stoll(K.substr(p + 1));
-                            if (o >= lo && o < h) covered.push_back({K, kindOf(K)});
-                          }
-                      });
-          someUncovered |= covered.size() == before;
+          bool unionHere = false;
+          // A union stops the cover (class 2): its IR member is clang's
+          // representative, so a declared slot there is storage inside a
+          // union, counted, not a write of that slot.
+          structCoverToUnions(
+              S, off, bytes < 0 ? INT64_MAX / 2 : off + bytes, CDL,
+              [&](StructType *ST, int64_t lo, int64_t h) { declaredIn(ST, lo, h, covered); },
+              [&](StructType *U, int64_t lo, int64_t h) {
+                std::vector<std::pair<std::string, char>> inside;
+                structCover(U, lo, h, CDL, [&](StructType *ST, int64_t l2, int64_t h2) { declaredIn(ST, l2, h2, inside); });
+                unionHere |= !inside.empty();
+              });
+          inUnion |= unionHere;
+          someUncovered |= covered.size() == before && !unionHere;
+        }
+        if (inUnion && covered.empty()) {
+          unionStorage["writes"]++;
+          if (unionSites.size() < 8) unionSites.push_back(siteText(I) + " (a write)");
         }
         // D2 (i): an element-derived value stored where the address may name
         // a field outside the declared slots.
@@ -1493,6 +1633,21 @@ void CallGraphPass::checkContainerClosure() {
           if ((vb & (DER | FRS)) || (vo & OC_VAL)) fail("an element stored outside the declared storage", I);
         }
         if (covered.empty()) return;
+        // A copy over exactly the element's declared link record (every
+        // LINK and LINKWORD slot of the element struct, its whole size):
+        // rb_replace_node's `*new = *victim`, the victim's parent word with
+        // its tag included (the new node takes the victim's place).
+        bool wholeRecord = false;
+        if (wk == WCopy && premiseElemT && named.size() == 1 && named[0].second == 0 &&
+            stripStructNameSuffix(named[0].first->getName()) == stripStructNameSuffix(premiseElemT->getName()) &&
+            bytes == (int64_t)CDL.getTypeAllocSize(premiseElemT)) {
+          std::set<std::string> want, got;
+          for (const std::set<std::string> *D : {&declLink, &declWord})
+            for (const std::string &K : *D)
+              if (K.compare(0, K.rfind('+'), stripStructNameSuffix(premiseElemT->getName())) == 0) want.insert(K);
+          for (auto &[K, kind] : covered) got.insert(K);
+          wholeRecord = !want.empty() && want == got;
+        }
         for (auto &[K, kind] : covered) {
           unusedDecl.erase(K);
           const uint64_t slotBytes = kind == 'w' ? pw / 8 : CDL.getPointerSize();
@@ -1512,7 +1667,7 @@ void CallGraphPass::checkContainerClosure() {
                 if (auto it = Gp.cls.find(SB); it != Gp.cls.end()) so |= it->second;
               }
             if ((inBody && (get(SB) & ~NUL) && !(get(SB) & ~(DER | FRS | NUL))) || (so & OC_VAL))
-              o1Admit["element copies"]++;
+              o1Admit[wholeRecord ? "copies of an element's links (with the link word's tag)" : "element copies"]++;
             else
               fail("a block copy of another value over " + K, I);
             continue;
@@ -1575,7 +1730,9 @@ void CallGraphPass::checkContainerClosure() {
               const uint8_t ac = cl(A), bc = cl(B), vc = cl(V);
               const bool derivedSlot = (ac & OC_SLOT) || (bc & (OC_OWNER | OC_VAL));
               if (derivedSlot && (vc & (OC_VAL | OC_WORD))) {
-                o1Admit["same-owner re-stores (derived)"]++;
+                // A relink (4(a)): a derived value into a derived slot
+                // (an inlined remove, a rotate, __rb_change_child).
+                o1Admit["owner-code relinks"]++;
                 done = true;
                 break;
               }
@@ -1585,9 +1742,26 @@ void CallGraphPass::checkContainerClosure() {
                 bool matched = false;
                 for (const CallBase *CB : Gp.inserts) {
                   const CR *R = rowAt(CB);
+                  // The same element: the actual itself, or a value it merges
+                  // through phis and selects (rb_insert_augmented_cached's
+                  // `*link = node` on the empty-tree path).
                   auto isE = [&](int e) {
-                    return e >= 0 && (unsigned)e < CB->arg_size() &&
-                           CB->getArgOperand(e)->stripPointerCasts() == V->stripPointerCasts();
+                    if (e < 0 || (unsigned)e >= CB->arg_size()) return false;
+                    // One object and offset (`&it->node` computed twice).
+                    if (ownerShape(CB->getArgOperand(e), 0) == ownerShape(V, 0) && !ownerShape(V, 0).empty()) return true;
+                    std::vector<const Value *> wl{CB->getArgOperand(e)->stripPointerCasts()};
+                    std::set<const Value *> seen(wl.begin(), wl.end());
+                    for (size_t k = 0; k < wl.size() && k < 64; k++) {
+                      if (wl[k] == V->stripPointerCasts()) return true;
+                      auto add = [&](const Value *X) {
+                        if (seen.insert(X->stripPointerCasts()).second) wl.push_back(X->stripPointerCasts());
+                      };
+                      if (const auto *PN = dyn_cast<PHINode>(wl[k]))
+                        for (const Value *In : PN->incoming_values()) add(In);
+                      else if (const auto *SL = dyn_cast<SelectInst>(wl[k]))
+                        add(SL->getTrueValue()), add(SL->getFalseValue());
+                    }
+                    return false;
                   };
                   matched |= isE(R->elem);
                   for (int e : R->moreElems) matched |= isE(e);
@@ -1607,6 +1781,12 @@ void CallGraphPass::checkContainerClosure() {
                 break;
               }
             }
+          if (!done && !inBody && !gs && kind == 'h' && V->getType()->isPointerTy()) {
+            // An element stored into a handle in a function that calls no
+            // row (__llist_add, static inline: no symbol to row).
+            fail("an inline insert with no row symbol (an element into " + K + " in a function that calls no row)", I);
+            done = true;
+          }
           if (!done) fail(inBody ? "the body stores another value into " + K : "a store into " + K + " outside the rows", I);
         }
       };
@@ -1659,7 +1839,7 @@ void CallGraphPass::checkContainerClosure() {
             const bool containerBase = (inBody && (get(B) & (OWN | DER | FRS))) || (oc & (OC_OWNER | OC_VAL | OC_SLOT));
             std::vector<std::pair<StructType *, int64_t>> named;
             if (containerBase && !isa<AllocaInst>(B) && !addrSlots(L, L->getPointerOperand(), named, 0))
-              o1Naming.push_back(siteText(L) + " (a read)");
+              o1Naming.push_back(siteText(L) + " (a read)" + pastText());
           }
         }
       // A LINKWORD's R1 verdict, its assumptions carried.
@@ -1826,6 +2006,24 @@ void CallGraphPass::checkContainerClosure() {
             const auto *UI = dyn_cast<Instruction>(U);
             if (!UI || isa<DbgInfoIntrinsic>(UI) || isa<ICmpInst>(UI)) continue;
             if (isa<CastInst>(UI) || isa<PHINode>(UI) || isa<SelectInst>(UI)) { elemUses(UI, fn, seen); continue; }
+            // The element as a link word (declared LINKWORD storage, R1's
+            // grammar): its ptrtoint with a tag set from a constant or from
+            // another word's tag extract, stored into a link word below.
+            if (const auto *BO = dyn_cast<BinaryOperator>(UI); BO && wordInts && E->getType()->isIntegerTy()) {
+              const Value *O = BO->getOperand(BO->getOperand(0) == E ? 1 : 0);
+              auto smallTag = [](const Value *X) {
+                const auto *C = dyn_cast<ConstantInt>(X);
+                return C && C->getValue().ult(8);
+              };
+              const auto *OA = dyn_cast<BinaryOperator>(O);
+              const bool tag = smallTag(O) || (OA && OA->getOpcode() == Instruction::And &&
+                                               (smallTag(OA->getOperand(0)) || smallTag(OA->getOperand(1))));
+              const auto op = BO->getOpcode();
+              if (tag && (op == Instruction::Or || op == Instruction::Xor || op == Instruction::Add)) {
+                elemUses(UI, fn, seen);
+                continue;
+              }
+            }
             if (const auto *G = dyn_cast<GetElementPtrInst>(UI)) {
               if (G->getPointerOperand() == E) continue; // a field of the element
             }
@@ -1839,7 +2037,15 @@ void CallGraphPass::checkContainerClosure() {
                 continue;
               }
               const uint8_t b = get(B) & ~NUL; // a store through null never executes
-              if (b && !(b & ~(OWN | DER | FRS))) continue; // into the owner's storage (or a new element)
+              // A tagged word only into a declared link word: one the access
+              // names, or the word at +0 of a body element (the element
+              // pointer itself is the address).
+              const bool wordOk =
+                  !E->getType()->isIntegerTy() ||
+                  (declared && (declWord.count(ckey(S, S->getPointerOperand())) ||
+                                (S->getPointerOperand()->stripPointerCasts() == B && premiseElemT &&
+                                 declWord.count(stripStructNameSuffix(premiseElemT->getName()).str() + "+0"))));
+              if (b && !(b & ~(OWN | DER | FRS)) && wordOk) continue; // into the owner's storage (or a new element)
               bad3.insert(fn + ": stored into " + valueText(S));
               continue;
             }
@@ -2344,6 +2550,11 @@ void CallGraphPass::checkContainerClosure() {
       std::string adm;
       for (auto &[k, n] : o1Admit) adm += (adm.empty() ? "" : ", ") + k + " " + std::to_string(n);
       cline("  storage writes admitted: " + (adm.empty() ? std::string("none") : adm));
+      if (!unionStorage.empty()) {
+        cline("  storage inside a union (a declared slot in the IR's member, which is clang's representative; "
+              "counted, not a write of the slot): " + std::to_string(unionStorage["writes"]) + " writes");
+        for (const std::string &u : unionSites) cline("    " + u);
+      }
       for (auto &[why, sites] : o1Fail) {
         cline("  storage FAIL " + why + (sites.empty() ? std::string() : ": " + std::to_string(sites.size()) + " sites"));
         for (size_t i = 0; i < sites.size() && i < 8; i++) cline("    " + sites[i]);
@@ -2353,11 +2564,20 @@ void CallGraphPass::checkContainerClosure() {
         cline("  row premise (1c): owner " +
               (premiseOwnerT ? stripStructNameSuffix(premiseOwnerT->getName()).str() : std::string("none")) +
               ", element " + (premiseElemT ? stripStructNameSuffix(premiseElemT->getName()).str() : std::string("none")) +
-              "; " + std::to_string(premiseArgs) + " call-site arguments: " + std::to_string(premiseAgree) + " agree, " +
-              std::to_string(premiseFail.size()) + " disagree (FAIL), " + std::to_string(premiseAssume.size()) +
+              "; " + std::to_string(premiseArgs) + " call-site arguments: " + std::to_string(premiseAgree) + " agree (" +
+              std::to_string(premiseByBase) + " named by a base plus a byte offset, " +
+              std::to_string(premiseUnionDI.size()) + " through a union member by debug info), " +
+              std::to_string(premiseFail.size()) + " disagree (FAIL), " + std::to_string(premiseUnion.size()) +
+              " inside a union (members not in the IR: ASSUMPTION), " + std::to_string(premisePast.size()) +
+              " a step past the layout of a named base (ASSUMPTION), " + std::to_string(premiseAssume.size()) +
               " named by nothing (ASSUMPTION), " + std::to_string(premiseNull) + " null");
         for (const std::string &s : premiseFail) cline("    premise FAIL: " + s);
+        for (const std::string &s : premiseUnionDI) cline("    premise through a union member: " + s);
+        for (const std::string &s : premiseUnion) cline("    ASSUMPTION premise, inside a union: " + s);
+        for (const std::string &s : premisePast) cline("    ASSUMPTION premise, a step past the layout of " + s);
         for (const std::string &s : premiseAssume) cline("    ASSUMPTION premise: " + s);
+        for (const std::string &s : tableDisagree)
+          cline("    embedding table disagrees with the IR layout walk: " + s);
       }
       cline("  owner code: " + std::to_string(rowSites) + " row call sites outside the body, " +
             std::to_string(ownerValues.size()) + " owner values (SSA value or GEP shape, per function); implicit inserts " +
@@ -2366,9 +2586,23 @@ void CallGraphPass::checkContainerClosure() {
       for (size_t i = 0; i < implicitMatched.size() && i < 8; i++) cline("    implicit insert matched: " + implicitMatched[i]);
       for (size_t i = 0; i < implicitUnmatched.size() && i < 8; i++)
         cline("    implicit insert UNMATCHED: " + implicitUnmatched[i]);
+      if (!linkInvariant.empty()) {
+        cline("  inlined removes: " + std::to_string(linkInvariant.size()) +
+              " nodes assumed elements by their link reads (the link invariant, the remove row's ELEM premise)");
+        for (const std::string &x : linkInvariant)
+          cline("    ASSUMPTION inlined remove: node assumed an element by its parent word: " + x);
+      }
+      if (!traverseJoined.empty()) {
+        cline("  traverse elements joined to the function's only owner group: " + std::to_string(traverseJoined.size()));
+        for (const std::string &x : traverseJoined)
+          cline("    ASSUMPTION traverse element joined the function's only owner group: " + x);
+      }
       if (!o1Naming.empty()) {
+        size_t past = 0;
+        for (const std::string &n : o1Naming) past += n.find("(a step past the layout of ") != std::string::npos;
         cline("  naming FAIL: " + std::to_string(o1Naming.size()) +
-              " accesses through owner or element values that no rule names");
+              " accesses through owner or element values that no rule names (" + std::to_string(past) +
+              " a step past the layout of a named base)");
         for (size_t i = 0; i < o1Naming.size() && i < 8; i++) cline("    " + o1Naming[i]);
       }
     }

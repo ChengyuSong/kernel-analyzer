@@ -1684,13 +1684,18 @@ rb_next ROLE(traverse) ELEM(arg0)
 rb_prev ROLE(traverse) ELEM(arg0)
 rb_next_postorder ROLE(traverse) ELEM(arg0)
 # rb_replace_node(victim, new, root): new takes victim's place (victim
-# removed: may semantics, counted).
-rb_replace_node ROLE(insert) OWNER(arg2) ELEM(arg1)
-rb_replace_node_rcu ROLE(insert) OWNER(arg2) ELEM(arg1)
+# removed: may semantics, counted). The victim is an element too: `*new =
+# *victim` copies its link record, parent word and color included, which is
+# the operation's meaning (the new node inherits the victim's parent word).
+rb_replace_node ROLE(insert) OWNER(arg2) ELEM(arg1) ELEM(arg0)
+rb_replace_node_rcu ROLE(insert) OWNER(arg2) ELEM(arg1) ELEM(arg0)
 # The augmented forms take the rotate callback as a formal (a code field
 # under the feeds-through-formals rule).
 __rb_insert_augmented ROLE(insert) OWNER(arg1) ELEM(arg0)
-__rb_erase_color ROLE(remove) OWNER(arg1)
+# __rb_erase_color(parent, root, rotate): the rebalance starts at parent,
+# an element already in the tree (rb_erase_augmented passes the removed
+# node's parent).
+__rb_erase_color ROLE(remove) OWNER(arg1) ELEM(arg0)
 # lib/timerqueue.c wrappers: head+0 is its rb_root_cached's rb_root, the
 # element the timerqueue_node's rb_node at +0.
 timerqueue_add ROLE(insert) OWNER(arg0) ELEM(arg1)

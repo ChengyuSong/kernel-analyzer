@@ -123,17 +123,37 @@ AsmModel asmModel(const CallBase &CS, const DataLayout *DL);
 // slotOf(At, A): the declared slot kind ('h', 'l', 'w') an access at A (At
 // the accessing instruction, or null for an address) names, 0 if none.
 // rowRet(CB, cls): whether a row call's result is derived given the classes.
+// Inlined removes (Fable 2026-10-15): a value whose link read (a LINK field,
+// or the LINKWORD decoded) is an element is an element too "under the link
+// invariant" (the premise the remove row's ELEM carries); each such value
+// goes to *assumed. Owners and elements are identified by object and
+// offset: a step from the object to a declared slot whose struct starts at
+// an owner's or element's offset is that one's slot (slotStart(A): the
+// slot's offset inside its declared struct, -1 if A names none).
 enum : uint8_t { OC_OWNER = 1, OC_SLOT = 2, OC_VAL = 4, OC_WORD = 8 };
 using OwnerClassFn = std::function<uint8_t(const Value *)>;
 std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::vector<const Value *> &owners,
                                                  const std::vector<const Value *> &elems,
                                                  const std::function<char(const Instruction *, const Value *)> &slotOf,
-                                                 const std::function<bool(const CallBase *, const OwnerClassFn &)> &rowRet);
+                                                 const std::function<bool(const CallBase *, const OwnerClassFn &)> &rowRet,
+                                                 const DataLayout &DL, StructType *elemT,
+                                                 std::vector<const Value *> *assumed,
+                                                 const std::function<int64_t(const Value *)> &slotStart);
 // The innermost named struct holding byte `off` of T (array members fold
 // to their element 0), the offset there, and the scalar the byte lies in
-// with the byte's offset inside it.
+// with the byte's offset inside it. A union on the path stops the name
+// (Fable 2026-10-15, class 2): the IR's union type is clang's representative
+// member, never the program's, so the name is the struct enclosing the
+// union with the byte's offset there, and *inUnion is set.
 bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::string, int64_t> &K, Type *&leaf,
-                    int64_t &inLeaf);
+                    int64_t &inLeaf, bool *inUnion = nullptr);
+// The first union on the layout path to byte `off` of T: the union type,
+// its start in T and its size.
+bool unionOnPath(Type *T, int64_t off, const DataLayout &DL, StructType *&U, int64_t &uOff, int64_t &uSize);
+// Does T hold a struct named S at byte `off`, through struct members and
+// array elements (each element), never through a union (its IR member is
+// clang's representative)?
+bool embedsAtThroughArrays(Type *T, int64_t off, StringRef S, const DataLayout &DL);
 // An access through a struct's array member at a variable index: the
 // member's start stands for the slot.
 bool arraySlot(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off);
@@ -153,8 +173,14 @@ public:
   // The innermost named struct at offset 0 of S (timerqueue_node -> rb_node).
   static StructType *atZero(StructType *S);
   // How lookups were decided (counted by get's callers).
-  size_t byDI = 0, byDecl = 0, bySibling = 0, byFormal = 0;
+  size_t byDI = 0, byDecl = 0, bySibling = 0, byFormal = 0, byBase = 0, pastLayout = 0;
   bool viaFormal = false, viaSibling = false, viaDecl = false; // how the last lookup was decided
+  // namedSlot/namedPtr (class 3, Fable 2026-10-15): named by its base's name
+  // plus a GEP's byte offset; or a step past the layout of pastS (the base
+  // named pastS, the offset pastOff outside [0, sizeof pastS)): unnamed.
+  bool viaBase = false, viaResolver = false;
+  StructType *pastS = nullptr;
+  int64_t pastOff = 0;
 
 private:
   static bool discarded(const User *U);
@@ -168,6 +194,13 @@ private:
 // offset 0 with neither, the address's pointee by the resolver.
 bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P, StructType *&S,
                int64_t &off);
+// The (struct, byte offset) a pointer value points into: a constant GEP
+// with leading index 0 names its source struct (an array of structs: its
+// element); any other constant GEP (a non-zero leading index, a byte GEP)
+// contributes only its byte offset to its base's name, which must stay
+// inside the base's struct (else a step past the layout: P.pastS); else the
+// resolver. A non-zero leading index is never evidence of the base's type.
+bool namedPtr(const Value *V, const DataLayout &DL, PointeeResolver &P, StructType *&S, int64_t &off, int depth = 0);
 // CellSolver.cc: the debug-info struct ("struct.<tag>") a declared object
 // is, or (pointee) a pointer value points to; "" if none.
 std::string diDeclaredStruct(const Value *P, bool pointee);
@@ -178,6 +211,11 @@ std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx);
 // array elements folded to element 0), each with the interval inside it.
 void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
                  const std::function<void(StructType *, int64_t, int64_t)> &visit);
+// The same, stopping at a union (its IR member is clang's representative):
+// onUnion gets the union and the interval inside it.
+void structCoverToUnions(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
+                         const std::function<void(StructType *, int64_t, int64_t)> &visit,
+                         const std::function<void(StructType *, int64_t, int64_t)> &onUnion);
 extern size_t g_intStoreUnmodeled;
 extern size_t g_intArgUnmodeled;
 extern size_t g_initCEDeclined;

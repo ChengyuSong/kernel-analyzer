@@ -5,7 +5,7 @@
 // base GEP'd as two unrelated structs (rb_node and other) is a pun: its offset-0 access stays
 // unnamed and is counted.
 // LOG: LinkWord: struct.rb_node\+0: PASS
-// LOG: by sibling GEPs, 0 by formal provenance; 1 unnamed that would feed a link word, in 1 functions \(pun 1\)
+// LOG: by sibling GEPs, 0 by formal provenance, 0 by a named base plus a byte offset; 1 unnamed that would feed a link word, in 1 functions \(pun 1\)
 struct rb_node {
   unsigned long __rb_parent_color;
   struct rb_node *rb_right, *rb_left;

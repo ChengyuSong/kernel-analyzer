@@ -1937,20 +1937,42 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   source's).
 - **Assumed, per site:** an inttoptr with no clear on the way (rb_red_parent)
   relies on tag 0 at that read: an ASSUMPTION line, not checked.
-- **Naming at offset 0 with no struct GEP and no TBAA** (the kernel builds
-  with -fno-strict-aliasing and the 5.18 corpus has no debug info): the
-  address's declared pointee, by debug info; else by the object's own
-  IR type (1b: a global's or local's value type when it is a named
-  struct, or an array of one; a struct GEP of another struct on the same
-  object is a pun); else by sibling GEPs (the
-  value is the base of struct GEPs of one struct in its function, after
-  normalizing each struct to its innermost struct at offset 0; two structs
-  are a pun: unnamed); else by formal provenance (a function whose address
-  is never taken: every call site's actual names the same struct, after the
-  same normalization). A use from a ".discard*" section (EXPORT_SYMBOL's
+- **Naming with no struct GEP at leading index 0 and no TBAA** (the
+  kernel builds with -fno-strict-aliasing and the 5.18 corpus has no
+  debug info): a GEP's source struct names its base only at leading
+  index 0; any other constant GEP (a non-zero leading index, which
+  InstCombine makes of `&hc->uuid_node` as `(rb_node *)hc + 1`, or a byte
+  GEP) contributes only its byte offset to its base's name, and that
+  offset must stay inside the base's struct, else the access is "a step
+  past the layout of S" (unnamed, counted apart: the base's enclosing
+  struct is unknown). A pointer is named by its declared pointee, by
+  debug info; else by the object's own IR type (1b: a global's or
+  local's value type when it is a named struct, or an array of one; a
+  struct GEP of another struct on the same object, both normalized to
+  their innermost struct at offset 0, is a pun); else by sibling GEPs
+  (the value is the base of leading-index-0 struct GEPs of one struct in
+  its function, after the same normalization; two structs are a pun:
+  unnamed; the name is the widest of them, so a byte step keeps its
+  extent); else by formal provenance (a function whose address is never
+  taken: every call site's actual names the same struct, after the same
+  normalization). A use from a ".discard*" section (EXPORT_SYMBOL's
   __addressable marker) does not take the address: the linker drops it.
   An access none of these name is counted per function; a copy through it
-  fails its field "on naming".
+  fails its field "on naming". Before 2026-10-15 a non-zero leading index
+  was read as the GEP's source struct plus an offset outside it, which no
+  field holds: the access was silently unnamed in R1 and silently matched
+  no slot in the container check.
+- **Unions stop the name** (Fable 2026-10-15, class 2): the IR's type of a
+  union is clang's representative member, never the program's choice
+  (5.18's timerfd_ctx `union { struct hrtimer tmr; struct alarm alarm; }`
+  is `{ %struct.alarm }`, so tmr._softexpires at +32 reads as
+  alarm.timer.node.node.__rb_parent_color). A layout path that crosses a
+  union names the enclosing struct and the byte offset there; the access
+  is "storage inside a union", counted, not an access of the
+  representative's field. A link word copied into or out of such storage
+  is an ASSUMPTION line of the field (union keys, plan 3.17, decide it
+  later), not a naming failure. Without debug info the IR has no other
+  member to consult.
 - **Scope:** the classification reads SSA. At -O0 a value passes through
   a local slot, so -O0 code is out of scope by design (like the -O3
   typing); its fields fail as copies from unnamed accesses.
@@ -1971,7 +1993,7 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   program overwrites the word in rb_link_node before any insert) and the
   shared traverse return (cured by traverse rows by derivation, R5).
 
-Cases: test/t_cells_linkword_{rb,rotate,plus8,addtag,xarray,sibling}.c.
+Cases: test/t_cells_linkword_{rb,rotate,plus8,addtag,xarray,sibling,union}.c.
 Not mechanized. Checked by executions; see the commit's gates.
 
 ## Containers in report mode (Containers.cc, ContainerOwnerCode.cc, 2026-10-15, plan 3.55 R3/R5)
@@ -2040,8 +2062,8 @@ never applied.
   block's HANDLE at +0 and each ELEM formal as the struct of its LINK and
   LINKWORD slots, in the body and nothing else (every other value is still
   named by derivation or a naming route). The premise is discharged at
-  every call site: an actual named by a route, or a constant GEP into a
-  struct that embeds the premise's struct at that offset, agrees; an
+  every call site: an actual named by a route as a struct that holds the
+  premise's struct at that offset (classes 1-3 below) agrees; an
   actual named as another struct fails the row at that site; an actual
   nothing names is a per-site ASSUMPTION, listed (the same shape as R1's
   unmasked inttoptr); a null actual carries no object.
@@ -2057,5 +2079,77 @@ never applied.
   contains leaves the call to the body ("traverse of an uncontained
   element"). Specified for enabling; nothing is applied in report mode.
 
-Cases: test/t_cells_container_{rb,rb_unmatched,storage_bad,llist,llist_int,report,naming}.c.
+### Report-arm rulings (Fable 2026-10-15, after the whole-kernel report at a297146)
+
+The whole-kernel FAIL mass was mostly the checker's own naming gaps. Each
+class below is counted and listed in report mode; applied mode inherits
+the listed ASSUMPTIONs.
+
+- **Class 1, embedding through arrays:** a premise actual inside another
+  struct agrees when the struct analyzer's embedding table (transitive,
+  every array element: latch_tree_root's `rb_root tree[2]`) holds the
+  premise's struct at that offset, looked up by the actual's own struct
+  type (anonymous structs share a name across modules). The table is
+  cross-checked against the IR layout walk; a disagreement is printed.
+- **Class 2, unions:** a layout path crossing a union stops (see Link
+  words). Premise: with debug info, the actual agrees "through the
+  union" when a DI member of the union at that offset is or embeds the
+  premise's struct, and fails otherwise; without debug info (the 5.18
+  corpus) the site is an ASSUMPTION "inside the union at S+o (members not
+  in the IR)", provided the premise's struct fits in the union from that
+  offset (else FAIL). Storage: a write whose bytes reach a declared slot
+  only through a union's representative member is "storage inside a
+  union", counted, not a write of the slot. Rebuilding the corpus with -g
+  turns this class into checked agreements or failures.
+- **Class 3, a step past a named base's layout:** an ASSUMPTION in the
+  premise, unnamed in R1 and in storage ("a step past the layout of S",
+  split out of the naming failures). Only a base nobody names wider
+  stays in the class: the 5.18 kernel's container_of steps (EXT4_I's
+  inode-296, alarm's hrtimer-32, work_struct offsets) and InstCombine's
+  `(rb_node *)hc + k` when clang rewrote every access of the object as an
+  rb_node GEP.
+- **Inlined removes (the link invariant):** rb_erase_augmented and
+  rb_erase_cached inline into owner code; the removed node reaches no row,
+  only its rebalance parent (`__rb_erase_color(parent, root, rotate)`)
+  does. In owner code a node whose link read (a LINK field, or the
+  LINKWORD decoded) is an element by D5 is an element too, a greatest
+  fixpoint with D5, each node listed "inlined remove: node assumed an
+  element by its parent word"; its stores are then owner-code relinks.
+  This is the premise the remove row's ELEM already carries: a program
+  that erases a stale node whose links still point into the container
+  violates it exactly as it would violate rb_erase's ELEM premise. Both
+  are the container's well-formedness, not a flow fact derived here.
+  Owners and elements are identified by object and offset (a step from
+  the object to a declared slot whose struct starts at an owner's or
+  element's offset is that one's slot: `&mm->holes_size.rb_leftmost`).
+- **Owner-code relinks (4(a)):** a store of a derived value into a derived
+  slot (an inlined remove, a rotate, __rb_change_child) is admitted and
+  counted; only a store of a value not derived from the owner is an
+  implicit insert that needs pairing.
+- **Pairing (4(b), D6 refined):** owner identity is the object plus the
+  constant offset (rb_root_cached and its rb_root at +0 are one owner;
+  rb_leftmost at +8 is a HANDLE of it); the same element is the insert
+  call's actual, a value it merges through phis and selects
+  (rb_insert_augmented_cached's `*link = node` on the empty-tree path), or
+  the same object and offset.
+- **Traverse elements in owner code:** in a function with exactly one owner
+  group, a traverse row's ELEM actual (`rb_next(node)` in an inlined
+  rb_erase_cached) joins that group: a per-site ASSUMPTION, listed. In a
+  row body, a traverse row's result on a derived element is derived (D7).
+- **Rows:** `__rb_erase_color` takes its parent as ELEM(arg0) (an element
+  already in the tree); rb_replace_node(_rcu) take the victim as a second
+  ELEM: `*new = *victim` copies the victim's link record, its parent word
+  and color included (the new node inherits the victim's parent word,
+  which is the operation's meaning), admitted as "a copy of an element's
+  links (with the link word's tag)"; O3 follows the new node through
+  ptrtoint and R1's tag ops into a declared LINKWORD store as a link
+  store.
+- **Inline insert with no row symbol:** an element stored into a handle in
+  a function that calls no row (rethook_hook's `__llist_add`, static
+  inline) is an honest FAIL in its own class, counted and listed; a
+  body-shape match is deliverable 2.
+
+Cases: test/t_cells_container_{rb,rb_unmatched,storage_bad,llist,llist_int,report,naming,
+embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_add}.c
+(rows for the rbtree cases in t2_cells_rblib.c, shapes in cells_rb.h).
 Not mechanized. Checked by executions; see the commit's gates.

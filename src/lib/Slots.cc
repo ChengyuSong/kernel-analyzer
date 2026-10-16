@@ -40,9 +40,18 @@ const GEPOperator *structGEP(const Value *A) {
   return dyn_cast<GEPOperator>(A);
 }
 
+// Is a GEP's leading index the constant 0 (a step inside one object of its
+// source type, not over a whole object)?
+static bool leadingZero(const GEPOperator *G) {
+  if (G->getNumIndices() == 0) return true;
+  const auto *C = dyn_cast<ConstantInt>(G->idx_begin()->get());
+  return C && C->isZero();
+}
+
 // The (struct, byte offset) an access names: its struct GEP, else its
 // struct-path TBAA tag (-O3 drops all-zero GEPs; the tag keeps the base
 // struct and the offset).
+static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off);
 bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
                        StructType *&S, int64_t &off) {
   if (const GEPOperator *G = structGEP(Addr)) {
@@ -53,6 +62,9 @@ bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
       return true;
     }
   }
+  return tbaaSlot(I, S, off);
+}
+static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off) {
   const MDNode *Tag = I->getMetadata(LLVMContext::MD_tbaa);
   if (!Tag || Tag->getNumOperands() < 3 || Tag->getOperand(0) == Tag->getOperand(1)) return false;
   const auto *B = dyn_cast<MDNode>(Tag->getOperand(0));
@@ -101,13 +113,23 @@ bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o) {
 
 // The innermost named struct holding byte `off` of ST, the offset there,
 // and the scalar the byte lies in with the byte's offset inside it.
+static bool isUnionType(const StructType *ST) { return ST->hasName() && ST->getName().starts_with("union."); }
+
 bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::string, int64_t> &K, Type *&leaf,
-                    int64_t &inLeaf) {
+                    int64_t &inLeaf, bool *inUnion) {
   K = {"", 0};
+  bool uni = false;
   for (int depth = 0; depth < 64 && off >= 0; depth++) {
     if (auto *ST = dyn_cast<StructType>(T)) {
       if (ST->isOpaque()) return false;
-      if (ST->hasName()) K = {stripStructNameSuffix(ST->getName()).str(), off};
+      if (!uni && isUnionType(ST)) {
+        // The name stops at the union: the enclosing struct, the byte's
+        // offset there (K.second goes on accumulating below).
+        if (K.first.empty()) return false;
+        uni = true;
+      } else if (!uni && ST->hasName()) {
+        K = {stripStructNameSuffix(ST->getName()).str(), off};
+      }
       const StructLayout *SL = DL.getStructLayout(ST);
       if ((uint64_t)off >= SL->getSizeInBytes()) return false;
       const unsigned i = SL->getElementContainingOffset(off);
@@ -125,7 +147,59 @@ bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::s
     }
     leaf = T;
     inLeaf = off;
+    if (inUnion) *inUnion = uni;
     return !K.first.empty();
+  }
+  return false;
+}
+
+bool unionOnPath(Type *T, int64_t off, const DataLayout &DL, StructType *&U, int64_t &uOff, int64_t &uSize) {
+  int64_t pos = 0;
+  for (int depth = 0; depth < 64 && off >= 0; depth++) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) return false;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      if (isUnionType(ST)) {
+        U = ST, uOff = pos, uSize = (int64_t)SL->getSizeInBytes();
+        return true;
+      }
+      if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+      const unsigned i = SL->getElementContainingOffset(off);
+      off -= (int64_t)SL->getElementOffset(i);
+      pos += (int64_t)SL->getElementOffset(i);
+      T = ST->getElementType(i);
+      continue;
+    }
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      const int64_t es = (int64_t)DL.getTypeAllocSize(AT->getElementType());
+      if (es == 0) return false;
+      pos += off - off % es;
+      off %= es;
+      T = AT->getElementType();
+      continue;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool embedsAtThroughArrays(Type *T, int64_t off, StringRef S, const DataLayout &DL) {
+  for (int depth = 0; depth < 64 && T && off >= 0; depth++) {
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      const int64_t es = (int64_t)DL.getTypeAllocSize(AT->getElementType());
+      if (es == 0 || off >= es * (int64_t)AT->getNumElements()) return false;
+      off %= es;
+      T = AT->getElementType();
+      continue;
+    }
+    auto *ST = dyn_cast<StructType>(T);
+    if (!ST || ST->isOpaque() || isUnionType(ST)) return false;
+    if (off == 0 && ST->hasName() && stripStructNameSuffix(ST->getName()) == S) return true;
+    const StructLayout *SL = DL.getStructLayout(ST);
+    if ((uint64_t)off >= SL->getSizeInBytes()) return false;
+    const unsigned i = SL->getElementContainingOffset(off);
+    off -= (int64_t)SL->getElementOffset(i);
+    T = ST->getElementType(i);
   }
   return false;
 }
@@ -160,7 +234,8 @@ bool PointeeResolver::discarded(const User *U) {
 StructType *PointeeResolver::atZero(StructType *S) {
   for (int d = 0; d < 32 && S && !S->isOpaque() && S->getNumElements(); d++) {
     auto *E = dyn_cast<StructType>(S->getElementType(0));
-    if (!E || !E->hasName() || E->isOpaque()) break;
+    // A union stops it: its IR member is clang's representative.
+    if (!E || !E->hasName() || E->isOpaque() || isUnionType(E) || isUnionType(S)) break;
     S = E;
   }
   return S;
@@ -202,8 +277,9 @@ StructType *PointeeResolver::get(const Value *A, LLVMContext &C, int depth) {
   if (!n.empty()) return StructType::getTypeByName(C, n);
   // (1b) The object's own declaration (Fable 2026-10-15): a global's or a
   // local's IR value type when it is a named struct (an array of one: its
-  // element), normalized to its innermost struct at offset 0. A struct GEP
-  // of another struct on the same object is a pun: unnamed.
+  // element). A struct GEP of another struct on the same object (after
+  // normalizing both to their innermost struct at offset 0) is a pun:
+  // unnamed.
   {
     Type *T = nullptr;
     if (const auto *GV = dyn_cast<GlobalVariable>(A)) T = GV->getValueType();
@@ -212,28 +288,35 @@ StructType *PointeeResolver::get(const Value *A, LLVMContext &C, int depth) {
     if (auto *ST = dyn_cast_or_null<StructType>(T); ST && ST->hasName() && !ST->isOpaque()) {
       StructType *D = atZero(ST);
       for (const User *U : A->users())
-        if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A)
+        if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A && leadingZero(G))
           if (auto *S = dyn_cast<StructType>(G->getSourceElementType()); S && S->hasName() && atZero(S) != D)
             return nullptr;
-      return viaDecl = true, D;
+      return viaDecl = true, ST; // the object's own type (its extent), not its +0 member
     }
   }
   // Sibling GEPs (Fable 2026-10-15): the value is the base of struct GEPs
   // of one struct in its function; the GEP's source type is the program's
   // declaration of that expression. Two structs (after the offset-0
-  // normalization) are a pun: unnamed.
+  // normalization) are a pun: unnamed. Only a GEP with leading index 0
+  // speaks for its base (a non-zero leading index is a byte step).
+  // The name is the widest of them (hash_cell over its rb_node at +0), so a
+  // byte step from the value keeps its extent.
   {
-    StructType *agreed = nullptr;
+    StructType *agreed = nullptr, *widest = nullptr;
     bool clash = false;
     for (const User *U : A->users())
-      if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A)
-        if (auto *S = dyn_cast<StructType>(G->getSourceElementType()); S && S->hasName()) {
-          S = atZero(S);
-          clash |= agreed && agreed != S;
-          agreed = S;
+      if (const auto *G = dyn_cast<GEPOperator>(U); G && G->getPointerOperand() == A && leadingZero(G))
+        if (auto *S = dyn_cast<StructType>(G->getSourceElementType()); S && S->hasName() && !S->isOpaque()) {
+          StructType *Z = atZero(S);
+          clash |= agreed && agreed != Z;
+          agreed = Z;
+          const auto *GI = dyn_cast<Instruction>(G);
+          if (!widest || (GI && GI->getModule()->getDataLayout().getTypeAllocSize(S) >
+                                    GI->getModule()->getDataLayout().getTypeAllocSize(widest)))
+            widest = S;
         }
     if (clash) return nullptr;
-    if (agreed) return viaSibling = true, agreed;
+    if (agreed) return viaSibling = true, widest;
   }
   if (const auto *PN = dyn_cast<PHINode>(A)) {
     StructType *agreed = nullptr;
@@ -246,7 +329,8 @@ StructType *PointeeResolver::get(const Value *A, LLVMContext &C, int depth) {
     return agreed;
   }
   if (const GEPOperator *G = structGEP(A))
-    if (auto *S = dyn_cast<StructType>(G->getResultElementType()); S && S->hasName() && G->hasAllConstantIndices())
+    if (auto *S = dyn_cast<StructType>(G->getResultElementType());
+        S && S->hasName() && G->hasAllConstantIndices() && leadingZero(G))
       return S;
   if (const auto *Arg = dyn_cast<Argument>(A)) {
     viaFormal = true;
@@ -272,12 +356,64 @@ StructType *PointeeResolver::get(const Value *A, LLVMContext &C, int depth) {
   return nullptr;
 }
 
+bool namedPtr(const Value *V, const DataLayout &DL, PointeeResolver &P, StructType *&S, int64_t &off, int depth) {
+  if (depth == 0) P.viaFormal = P.viaSibling = P.viaDecl = P.viaBase = P.viaResolver = false, P.pastS = nullptr;
+  while (const auto *BC = dyn_cast<BitCastOperator>(V)) V = BC->getOperand(0);
+  if (const auto *G = dyn_cast<GEPOperator>(V)) {
+    APInt Ap(64, 0);
+    if (G->accumulateConstantOffset(DL, Ap)) {
+      const int64_t bytes = Ap.getSExtValue();
+      Type *ST = G->getSourceElementType();
+      if (leadingZero(G)) {
+        if (auto *GS = dyn_cast<StructType>(ST); GS && GS->hasName() && !GS->isOpaque()) {
+          S = GS, off = bytes;
+          return true;
+        }
+        // An array of structs: its elements share the element's name.
+        if (auto *AT = dyn_cast<ArrayType>(ST)) {
+          Type *E = AT;
+          while (auto *A2 = dyn_cast<ArrayType>(E)) E = A2->getElementType();
+          const int64_t es = (int64_t)DL.getTypeAllocSize(E);
+          if (auto *ES = dyn_cast<StructType>(E); ES && ES->hasName() && !ES->isOpaque() && es > 0 && bytes >= 0) {
+            S = ES, off = bytes % es;
+            return true;
+          }
+        }
+      }
+      // A byte step from the base: the base's name plus the offset.
+      StructType *BS = nullptr;
+      int64_t bo = 0;
+      if (depth < 6 && namedPtr(G->getPointerOperand(), DL, P, BS, bo, depth + 1)) {
+        const int64_t total = bo + bytes;
+        if (total >= 0 && total < (int64_t)DL.getTypeAllocSize(BS)) {
+          S = BS, off = total, P.viaBase = true;
+          return true;
+        }
+        P.pastS = BS, P.pastOff = total;
+        return false;
+      }
+      if (auto *GS = dyn_cast<StructType>(ST); GS && GS->hasName() && !leadingZero(G) && !P.pastS)
+        P.pastS = GS, P.pastOff = bytes; // a step over a whole object nobody names
+      return false;
+    }
+  }
+  S = P.get(V, V->getContext()), off = 0;
+  if (depth == 0) P.viaResolver = S != nullptr;
+  return S != nullptr;
+}
+
 bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P, StructType *&S,
                int64_t &off) {
-  if ((accessSlot(I, Addr, DL, S, off) && S && S->hasName()) || arraySlot(Addr, DL, S, off)) return true;
-  P.viaFormal = P.viaSibling = P.viaDecl = false;
-  S = P.get(Addr, I->getContext()), off = 0;
-  return S != nullptr;
+  P.viaFormal = P.viaSibling = P.viaDecl = P.viaBase = P.viaResolver = false, P.pastS = nullptr;
+  // A struct GEP with leading index 0 or the TBAA tag; an array member at
+  // a variable index; else the pointer's name (a byte step from a named
+  // base, or the resolver).
+  const GEPOperator *G = structGEP(Addr);
+  const bool step = G && G->hasAllConstantIndices() && !leadingZero(G);
+  if (!step && accessSlot(I, Addr, DL, S, off) && S && S->hasName()) return true;
+  if (step && tbaaSlot(I, S, off) && S && S->hasName()) return true;
+  if (arraySlot(Addr, DL, S, off)) return true;
+  return namedPtr(Addr, DL, P, S, off);
 }
 
 // The named structs bytes [lo, hi) of T lie in, outermost first, each with
@@ -285,7 +421,7 @@ bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, Po
 // spanning an element boundary wraps).
 static void structCoverRec(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
                            const std::function<void(StructType *, int64_t, int64_t)> &visit,
-                           int depth) {
+                           int depth, const std::function<void(StructType *, int64_t, int64_t)> *onUnion) {
   if (depth > 64 || lo >= hi) return;
   if (auto *ST = dyn_cast<StructType>(T)) {
     if (ST->isOpaque()) {
@@ -297,12 +433,13 @@ static void structCoverRec(Type *T, int64_t lo, int64_t hi, const DataLayout &DL
     lo = std::max<int64_t>(lo, 0);
     hi = std::min(hi, sz);
     if (lo >= hi) return;
+    if (onUnion && isUnionType(ST)) return (*onUnion)(ST, lo, hi);
     if (ST->hasName()) visit(ST, lo, hi);
     for (unsigned i = 0; i < ST->getNumElements(); i++) {
       Type *E = ST->getElementType(i);
       const int64_t eo = (int64_t)SL->getElementOffset(i), es = (int64_t)DL.getTypeAllocSize(E);
       if (eo + es <= lo || eo >= hi) continue;
-      structCoverRec(E, std::max(lo, eo) - eo, std::min(hi, eo + es) - eo, DL, visit, depth + 1);
+      structCoverRec(E, std::max(lo, eo) - eo, std::min(hi, eo + es) - eo, DL, visit, depth + 1, onUnion);
     }
     return;
   }
@@ -316,15 +453,20 @@ static void structCoverRec(Type *T, int64_t lo, int64_t hi, const DataLayout &DL
   lo = std::max<int64_t>(lo, 0);
   if (n) hi = std::min(hi, es * (int64_t)n);
   if (lo >= hi) return;
-  if (hi - lo >= es) return structCoverRec(E, 0, es, DL, visit, depth + 1);
+  if (hi - lo >= es) return structCoverRec(E, 0, es, DL, visit, depth + 1, onUnion);
   const int64_t a = lo % es, b = a + (hi - lo);
-  if (b <= es) return structCoverRec(E, a, b, DL, visit, depth + 1);
-  structCoverRec(E, a, es, DL, visit, depth + 1);
-  structCoverRec(E, 0, b - es, DL, visit, depth + 1);
+  if (b <= es) return structCoverRec(E, a, b, DL, visit, depth + 1, onUnion);
+  structCoverRec(E, a, es, DL, visit, depth + 1, onUnion);
+  structCoverRec(E, 0, b - es, DL, visit, depth + 1, onUnion);
 }
 void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
                  const std::function<void(StructType *, int64_t, int64_t)> &visit) {
-  structCoverRec(T, lo, hi, DL, visit, 0);
+  structCoverRec(T, lo, hi, DL, visit, 0, nullptr);
+}
+void structCoverToUnions(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
+                         const std::function<void(StructType *, int64_t, int64_t)> &visit,
+                         const std::function<void(StructType *, int64_t, int64_t)> &onUnion) {
+  structCoverRec(T, lo, hi, DL, visit, 0, &onUnion);
 }
 
 // The debug-info struct a declared object is, or a pointer value points

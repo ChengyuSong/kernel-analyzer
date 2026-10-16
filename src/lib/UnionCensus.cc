@@ -127,6 +127,7 @@ struct UnionField {
   std::string structName, fieldName;
   uint64_t off = 0, size = 0; // bytes
   std::vector<std::pair<std::string, std::string>> members; // name, typeKey
+  std::vector<const DIType *> memberTypes;                  // debug type, by member
   // The members whose typed-pointer LLVM type is the union's storage type
   // (clang lowers a union to its first member of largest alignment, then
   // size); every other member is reached through a bitcast.
@@ -228,6 +229,7 @@ void CallGraphPass::runUnionCensus() {
         for (const DINode *UE : UT->getElements())
           if (const auto *UM = dyn_cast<DIDerivedType>(UE)) {
             U.members.emplace_back(UM->getName().str(), typeKey(UM->getBaseType()));
+            U.memberTypes.push_back(UM->getBaseType());
             const DIType *MT = UM->getBaseType();
             if (!storage || diAlign(MT) > diAlign(storage) ||
                 (diAlign(MT) == diAlign(storage) &&
@@ -544,15 +546,63 @@ void CallGraphPass::runUnionCensus() {
     }
     return "?";
   };
-  auto memberOf = [&](const UnionField &U, const std::string &key) {
+  // Does debug type T hold a field of type `key` exactly at byte `rel`
+  // (through nested structs, unions and array elements)?
+  std::function<bool(const DIType *, int64_t, const std::string &, int)> layoutHas =
+      [&](const DIType *T, int64_t rel, const std::string &key, int depth) -> bool {
+    T = stripDI(T);
+    if (!T || rel < 0 || depth > 8)
+      return false;
+    if (const auto *C = dyn_cast<DICompositeType>(T)) {
+      const unsigned tag = C->getTag();
+      if (tag == dwarf::DW_TAG_array_type) {
+        const DIType *E = stripDI(C->getBaseType());
+        const int64_t es = E ? (int64_t)((E->getSizeInBits() + 7) / 8) : 0;
+        return es > 0 && layoutHas(E, rel % es, key, depth + 1);
+      }
+      if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_union_type)
+        return false;
+      for (const DINode *N : C->getElements()) {
+        const auto *D = dyn_cast<DIDerivedType>(N);
+        if (!D || D->getTag() != dwarf::DW_TAG_member || D->isStaticMember())
+          continue;
+        const int64_t MO = (int64_t)(D->getOffsetInBits() / 8), MS = (int64_t)((D->getSizeInBits() + 7) / 8);
+        if (rel >= MO && rel < MO + std::max<int64_t>(MS, 1) && layoutHas(D->getBaseType(), rel - MO, key, depth + 1))
+          return true;
+      }
+      return false;
+    }
+    return rel == 0 && typeKey(T) == key;
+  };
+  // The member an access of type `key` at byte `rel` of the union is: the
+  // one whose type is the key; else (plan 3.51 (2), Fable 2026-10-16) the
+  // one whose layout holds a field of that type at rel, through nested
+  // structs (debug info only: a verdict gained with -g). Several members
+  // that fit: not typed, its own class (`shared`).
+  auto memberOf = [&](const UnionField &U, const std::string &key, int64_t rel, bool *byLayout = nullptr,
+                      bool *shared = nullptr) {
     std::vector<std::string> hits;
     for (auto &[nm, tk] : U.members)
       if (tk == key)
         hits.push_back(nm);
     if (hits.size() == 1)
       return hits[0];
+    if (!hits.empty())
+      return std::string("ambiguous");
+    if (key == "?" || key.empty() || rel < 0)
+      return std::string("?");
+    for (size_t i = 0; i < U.members.size() && i < U.memberTypes.size(); i++) {
+      const auto *C = dyn_cast_or_null<DICompositeType>(stripDI(U.memberTypes[i]));
+      if (C && layoutHas(C, rel, key, 0))
+        hits.push_back(U.members[i].first);
+    }
+    if (hits.size() == 1) {
+      if (byLayout) *byLayout = true;
+      return hits[0];
+    }
     if (hits.empty())
       return std::string("?");
+    if (shared) *shared = true;
     return std::string("ambiguous");
   };
   // A name for a constant written into a field: a tag value.
@@ -754,6 +804,7 @@ void CallGraphPass::runUnionCensus() {
     const Instruction *I = nullptr;      // or a global initializer:
     const GlobalVariable *GV = nullptr;
     std::string member;
+    bool byLayout = false, shared = false; // member typed by its layout; a field several members share
     const Value *base = nullptr;
     uint64_t embed = 0;
     CoSet co;          // tag candidates written to the same object
@@ -989,11 +1040,12 @@ void CallGraphPass::runUnionCensus() {
         s.I = &I;
         s.base = Q.base;
         s.embed = Q.embed;
+        const int64_t rel = (int64_t)Q.off - (int64_t)U->off;
         if (const auto *SI = dyn_cast<StoreInst>(&I))
-          s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0));
+          s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0), rel, &s.byLayout, &s.shared);
         else
-          s.member = memberOf(*U, readKey(cast<LoadInst>(&I)));
-        if (s.member == "?" || s.member == "ambiguous") {
+          s.member = memberOf(*U, readKey(cast<LoadInst>(&I)), rel, &s.byLayout, &s.shared);
+        if (!s.shared && (s.member == "?" || s.member == "ambiguous")) {
           // Typed-pointer IR (upgraded): an access of the storage type is a
           // GEP into the union struct; any other member keeps a no-op
           // bitcast of the union's address. Narrow by that, then by the
@@ -1104,7 +1156,7 @@ void CallGraphPass::runUnionCensus() {
         for (auto &[U, Q, C] : ul) {
           Site s;
           s.GV = &GV;
-          s.member = memberOf(*U, valueKey(C, 0));
+          s.member = memberOf(*U, valueKey(C, 0), (int64_t)Q.off - (int64_t)U->off, &s.byLayout, &s.shared);
           s.embed = Q.embed;
           s.co = co[{Q.embed, Q.S}];
           writes[U].push_back(s);
@@ -2075,7 +2127,7 @@ void CallGraphPass::runUnionCensus() {
            std::to_string(partial) + " writes with a callback field unset in context";
   };
 
-  size_t nUnions = 0, nTag = 0, nTagVer = 0, nCallback = 0, nNone = 0, nSingle = 0,
+  size_t nUnions = 0, nTag = 0, nTagVer = 0, nCallback = 0, nNone = 0, nSingle = 0, nUntyped = 0,
          nLowBit = 0, readContra = 0, pointerlessReads = 0;
   // Untested reads by where the search stopped (plan 3.30 P1).
   std::map<std::string, size_t> untestedBy;
@@ -2812,19 +2864,22 @@ void CallGraphPass::runUnionCensus() {
     }
     return R;
   };
+  size_t totLayout = 0, totShared = 0; // accesses typed by member layout; of a shared field
   for (const UnionField *U : touched) {
     nUnions++;
     auto &W = writes[U];
     auto &Rd = reads[U];
     std::set<std::string> realMembers;
-    size_t typedW = 0, typedR = 0, nInit = 0, nVia = 0;
+    size_t typedW = 0, typedR = 0, nInit = 0, nVia = 0, layoutW = 0, layoutR = 0, sharedW = 0, sharedR = 0;
     for (auto &s : W) {
       typedW += real(s.member);
+      layoutW += s.byLayout, sharedW += s.shared;
       nInit += s.GV != nullptr;
       if (real(s.member)) realMembers.insert(s.member);
     }
     for (auto &s : Rd) {
       typedR += real(s.member);
+      layoutR += s.byLayout, sharedR += s.shared;
       if (real(s.member)) realMembers.insert(s.member);
     }
     // Candidate fields: co-written at some union write site.
@@ -3184,7 +3239,12 @@ void CallGraphPass::runUnionCensus() {
       keyUnion(U, W, Rd, cbFields, governed, governsAll, keyedW, keyedR, keyNote);
     std::string verdict;
     const bool allW = best >= 0 && bestCov == W.size() && bestFD;
-    if (realMembers.size() <= 1) {
+    if (realMembers.empty()) {
+      // No access typed by member: nothing says one member is used (Fable
+      // 2026-10-16); every access is one plane.
+      verdict = "no typed access (keyed all)";
+      nUntyped++;
+    } else if (realMembers.size() == 1) {
       verdict = "one member used";
       nSingle++;
     } else if (writesWithCb == W.size() && cbFD && inCallback == Rd.size()) {
@@ -3212,6 +3272,11 @@ void CallGraphPass::runUnionCensus() {
                     " typed, " + std::to_string(nInit) + " initializers), reads " +
                     std::to_string(Rd.size()) + " (" + std::to_string(typedR) +
                     " typed); ";
+    if (layoutW + layoutR + sharedW + sharedR)
+      t += "by member layout (debug info): writes " + std::to_string(layoutW) + ", reads " + std::to_string(layoutR) +
+           " typed; a field several members share (not typed): writes " + std::to_string(sharedW) + ", reads " +
+           std::to_string(sharedR) + "; ";
+    totLayout += layoutW + layoutR, totShared += sharedW + sharedR;
     if (best >= 0) {
       std::string vals;
       size_t nv = 0;
@@ -3262,7 +3327,9 @@ void CallGraphPass::runUnionCensus() {
     lines.push_back({W.size() + Rd.size(), t});
     unionFieldNotes["struct." + U->structName][(int64_t)U->off].census =
         "union census: writes " + std::to_string(typedW) + "/" + std::to_string(W.size()) + " and reads " +
-        std::to_string(typedR) + "/" + std::to_string(Rd.size()) + " typed by member, " +
+        std::to_string(typedR) + "/" + std::to_string(Rd.size()) + " typed by member (" +
+        std::to_string(layoutW + layoutR) + " by member layout, " + std::to_string(sharedW + sharedR) +
+        " of a field several members share), " +
         (best >= 0 ? "a co-written field @" + std::to_string(best) : std::string("no co-written field")) + "; " +
         verdict +
         (CFLUnionKeys != "off" ? "; keys: writes " + std::to_string(keyedW) + "/" + std::to_string(W.size()) +
@@ -3348,9 +3415,11 @@ void CallGraphPass::runUnionCensus() {
             [](const Line &a, const Line &b) { return a.accesses > b.accesses; });
   errs() << "UnionCensus: " << unions.size() << " union fields in debug info, "
          << nUnions << " accessed (" << accesses << " accesses, " << initWrites
-         << " in initializers): " << nSingle << " use one member, " << nTagVer
+         << " in initializers): " << nUntyped << " with no typed access, " << nSingle << " use one member, " << nTagVer
          << " tag-verified, " << nTag << " tag-tested, " << nCallback << " callback-keyable, " << nNone
          << " with no discriminator (" << nLowBit << " pointer low-bit tags)\n";
+  errs() << "UnionCensus: accesses typed by member layout (debug info, plan 3.51 (2)): " << totLayout
+         << "; of a field several members share (not typed): " << totShared << "\n";
   errs() << "UnionCensus: addresses through an anonymous struct: " << anonPosNamed.size()
          << " positioned by the base pointer's declared struct and offset, " << anonPosNone.size()
          << " with none (no position)\n";

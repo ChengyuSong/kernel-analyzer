@@ -2,10 +2,10 @@
 // Fable 2026-10-16): binutils' bfd_link_hash_entry keeps its link in
 // u.i.link, over the same bytes as u.c.p (a string). A store of another
 // member is no store of the cursor only by the union keys (3.17 / 3.51);
-// here the union census types no access by member (its members are
-// structs) and keys none, so the cursor is not closed and the line names
-// the union and the engines' words.
-// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: not closed \(cursor inside union u \(struct.bfd_link_hash_entry\+32\): no admitted discriminator \(union census: writes 0/3 and reads 0/1 typed by member
+// here the union census types the link's store and read by member layout
+// (its members are structs) but keys none (one member used), so the cursor
+// is not closed and the line names the union and the engines' words.
+// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: not closed \(cursor inside union u \(struct.bfd_link_hash_entry\+32\): no admitted discriminator \(union census: writes 1/3 and reads 1/1 typed by member \(2 by member layout
 // LOG: Container:   REJECTED
 #include <stdlib.h>
 #include <string.h>

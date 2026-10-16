@@ -774,6 +774,19 @@ Obligations left open:
    - A union slot keyed by tag also drops the 3.17 census keys of that
      slot on every access before the tag keys go in: an access the tag
      keying leaves unkeyed then reads every write of the slot, a superset.
+   - Union members that are structs (plan 3.51 (2), Fable 2026-10-16):
+     the union census types an access by member when the access's debug
+     type is the member's; when no member's type is, an access at byte o
+     of the union with debug type T is of member m if m's layout (nested
+     structs and unions, array elements) holds a field of type T at o.
+     Several members that fit (binutils' u.*.next at +0 of every member):
+     not typed, counted as their own class ("a field several members
+     share"), as an access no member fits. Debug info only: a verdict the
+     -g build gains, none without it. A union with no access typed by
+     member is "no typed access (keyed all)": every access one plane, and
+     nothing says one member is used; "one member used" needs at least one
+     typed access, all of one member. Before, both read "one member
+     used".
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with

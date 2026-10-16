@@ -9741,13 +9741,16 @@ bool CallGraphPass::runCellResolution() {
       }
       nDepend++;
       std::string l = "R depends " + instLoc(CS) + ":";
-      std::set<std::string> kinds;
-      size_t shown = 0;
+      std::set<std::string> kinds, shown;
       for (uint32_t b : out) {
         kinds.insert(bnd[b].first);
         if (bnd[b].first == "bodiless call") byBodiless[bnd[b].second]++;
-        if (shown++ < 4) l += " [" + bnd[b].first + " " + bnd[b].second + "]";
+        shown.insert(" [" + bnd[b].first + " " + bnd[b].second + "]");
       }
+      // The first four by text, not by boundary id (ids follow discovery order).
+      size_t n = 0;
+      for (const std::string &s : shown)
+        if (n++ < 4) l += s;
       if (out.size() > 4) l += " (several: " + std::to_string(out.size()) + ")";
       for (const std::string &k : kinds) byKind[k]++;
       depRows.push_back(l);

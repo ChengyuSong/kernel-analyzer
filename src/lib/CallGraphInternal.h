@@ -134,6 +134,37 @@ AsmModel asmModel(const CallBase &CS, const DataLayout *DL);
 // value's address is the value, one at an offset in elemSlots (the element
 // struct's declared slots) is that slot; *byteSlots gets each such address
 // with its offsets (a select of constant indices: every one a slot).
+// Identities under listed assumptions (Fable 2026-10-16 S5-S7), in and out:
+// - unionOwnerAt / unionElemAt: owner and element actuals whose premise is
+//   "inside a union" (or a union member by debug info), by object and
+//   offset; a pointer at actual + k, k a declared slot offset of the owner
+//   struct (ownerSlots) or element struct (elemSlots), is that slot under
+//   the same assumption: *unionSlots gets it (owner?, k), unionUsed the
+//   actual (S5);
+// - ownerAt / elemAt: more owners and elements by object and offset (S7's
+//   cursor reads);
+// - formalNodes: phis and selects an entry of which is a formal of F (at
+//   its own address) assumed an element: "descent from a node assumed an
+//   element" (S7);
+// - canon: an object's identity (S6: a re-read of a named slot is its first
+//   read); rereads gets each re-read a match used;
+// - elemOffs (unionElemOffs: of union actuals): the element actuals'
+//   offsets in their objects; a formal of F (not an actual's object) at
+//   such an offset is a node assumed an element where a descent starts
+//   there (a LINK slot of it read, or the node merged by a phi or select;
+//   S7, Fable 2026-10-16 Q1), each one a match used going to formalObjUsed.
+struct OwnerCodeExtra {
+  std::function<const Value *(const Value *)> canon;
+  std::set<const Value *> rereads;
+  std::set<int64_t> elemOffs, unionElemOffs, elemLinkOffs; // elemLinkOffs: the element struct's LINK slots
+  std::set<const Value *> actualRoots; // the objects of the group's actuals: never a formal object here
+  std::set<std::pair<const Value *, int64_t>> formalObjUsed;
+  std::set<std::pair<const Value *, int64_t>> unionOwnerAt, unionElemAt, ownerAt, elemAt;
+  std::set<int64_t> ownerSlots;
+  std::map<const Value *, std::vector<std::pair<bool, int64_t>>> unionSlots;
+  std::set<std::pair<const Value *, int64_t>> unionUsed;
+  std::vector<const Instruction *> formalNodes;
+};
 enum : uint8_t { OC_OWNER = 1, OC_SLOT = 2, OC_VAL = 4, OC_WORD = 8 };
 using OwnerClassFn = std::function<uint8_t(const Value *)>;
 std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::vector<const Value *> &owners,
@@ -144,7 +175,8 @@ std::map<const Value *, uint8_t> deriveOwnerCode(const Function &F, const std::v
                                                  std::vector<const Value *> *assumed,
                                                  const std::function<int64_t(const Value *)> &slotStart,
                                                  const std::set<int64_t> &elemSlots,
-                                                 std::map<const Value *, std::vector<int64_t>> *byteSlots);
+                                                 std::map<const Value *, std::vector<int64_t>> *byteSlots,
+                                                 OwnerCodeExtra *X = nullptr);
 // A pointer's object and constant byte offset (casts and constant GEPs
 // folded; a phi or select whose entries agree is that object and offset).
 std::pair<const Value *, int64_t> rootOff(const Value *V, const DataLayout &DL, int depth = 0);

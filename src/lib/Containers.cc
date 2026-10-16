@@ -526,10 +526,6 @@ void CallGraphPass::checkContainerClosure() {
   for (const auto &C : Ctx->Containers)
     for (const auto &[fn, R] : C.rows)
       if (R.role == GlobalContext::ContainerRow::Carve) carveFns.insert(fn);
-  auto closedField = [&](const std::string &K) {
-    auto it = fields.find(K);
-    return it == fields.end() || it->second.foreign.empty();
-  };
   // A DI struct's pointer members: (byte offset, the struct the member
   // points to through typedefs and up to two pointer levels; "" if none).
   auto diStrip = [](const DIType *T) {
@@ -1233,7 +1229,137 @@ void CallGraphPass::checkContainerClosure() {
           }
     // An owner value by its shape: through casts, -O0 slots stored once and
     // constant address steps (`&abfd->section_htab` computed twice is one).
-    std::function<std::string(const Value *, int)> ownerShape = [&](const Value *V, int d) -> std::string {
+    std::function<std::string(const Value *, int)> ownerShape;
+    // S6 (Fable 2026-10-16): two loads of one named slot (the same field key
+    // at the same address shape), the first dominating the second, are one
+    // value when every write between them is named and its name differs from
+    // the slot's (a row call writes its declared storage): checked. An
+    // unnamed write or a call to a function that is not a row between them
+    // makes the identity a per-site ASSUMPTION "owner re-read from the same
+    // slot"; a write of the slot's own name keeps them apart. The earlier
+    // read: the nearest, then its own earlier read.
+    struct Reread {
+      const LoadInst *first = nullptr;
+      bool assumed = false;
+    };
+    std::map<const LoadInst *, Reread> rereadMemo;
+    std::map<const Function *, std::map<std::string, std::vector<const LoadInst *>>> loadsByKey;
+    std::map<const LoadInst *, Reread> rereadsUsed; // the identities shapes used (listed)
+    bool rereadQuiet = false;                       // inside the check itself: not a use
+    std::function<Reread(const LoadInst *, int)> sameRead = [&](const LoadInst *L2, int d) -> Reread {
+      if (auto it = rereadMemo.find(L2); it != rereadMemo.end()) return it->second;
+      rereadMemo[L2] = Reread{}; // a cycle reads as none
+      if (d > 4 || !L2->getType()->isPointerTy()) return Reread{};
+      const Function *F = L2->getFunction();
+      auto lit = loadsByKey.find(F);
+      if (lit == loadsByKey.end()) {
+        lit = loadsByKey.emplace(F, std::map<std::string, std::vector<const LoadInst *>>()).first;
+        for (const Instruction &I : instructions(*F))
+          if (const auto *L = dyn_cast<LoadInst>(&I); L && L->getType()->isPointerTy())
+            if (std::string K = ckey(L, L->getPointerOperand()); !K.empty()) lit->second[K].push_back(L);
+      }
+      const std::string N = ckey(L2, L2->getPointerOperand());
+      auto kit = N.empty() ? lit->second.end() : lit->second.find(N);
+      if (kit == lit->second.end() || kit->second.size() < 2) return Reread{};
+      auto &DT = domOf[F];
+      if (!DT) DT = std::make_unique<DominatorTree>(const_cast<Function &>(*F));
+      const bool q = rereadQuiet;
+      rereadQuiet = true;
+      const std::string sh2 = ownerShape(L2->getPointerOperand(), d + 1);
+      const LoadInst *L1 = nullptr; // the nearest dominating read
+      if (!sh2.empty())
+        for (const LoadInst *L : kit->second)
+          if (L != L2 && DT->dominates(L, L2) && (!L1 || DT->dominates(L1, L)) &&
+              ownerShape(L->getPointerOperand(), d + 1) == sh2)
+            L1 = L;
+      rereadQuiet = q;
+      if (!L1) return Reread{};
+      // The writes on a path from L1 to L2 that runs neither again: the
+      // rest of L1's block, the blocks between, the head of L2's block.
+      const BasicBlock *BA = L1->getParent(), *BB = L2->getParent();
+      std::vector<const Instruction *> span;
+      if (BA == BB) {
+        for (const Instruction *I = L1->getNextNode(); I && I != L2; I = I->getNextNode()) span.push_back(I);
+      } else {
+        for (const Instruction *I = L1->getNextNode(); I; I = I->getNextNode()) span.push_back(I);
+        for (const Instruction &I : *BB) {
+          if (&I == L2) break;
+          span.push_back(&I);
+        }
+        std::set<const BasicBlock *> fwd, bwd;
+        std::vector<const BasicBlock *> wl;
+        for (const BasicBlock *S : successors(BA))
+          if (S != BA && S != BB && fwd.insert(S).second) wl.push_back(S);
+        while (!wl.empty()) {
+          const BasicBlock *X = wl.back();
+          wl.pop_back();
+          for (const BasicBlock *S : successors(X))
+            if (S != BA && S != BB && fwd.insert(S).second) wl.push_back(S);
+        }
+        for (const BasicBlock *P : predecessors(BB))
+          if (P != BA && P != BB && bwd.insert(P).second) wl.push_back(P);
+        while (!wl.empty()) {
+          const BasicBlock *X = wl.back();
+          wl.pop_back();
+          for (const BasicBlock *P : predecessors(X))
+            if (P != BA && P != BB && bwd.insert(P).second) wl.push_back(P);
+        }
+        for (const BasicBlock *X : fwd)
+          if (bwd.count(X))
+            for (const Instruction &I : *X) span.push_back(&I);
+      }
+      const size_t np = N.rfind('+');
+      const std::string NS = N.substr(0, np);
+      const int64_t NO = std::stoll(N.substr(np + 1));
+      bool assumed = false;
+      for (const Instruction *W : span) {
+        if (!W->mayWriteToMemory() || isa<FenceInst>(W) || isa<DbgInfoIntrinsic>(W)) continue;
+        if (const auto *II = dyn_cast<IntrinsicInst>(W);
+            II && (II->isAssumeLikeIntrinsic() || II->getIntrinsicID() == Intrinsic::lifetime_start ||
+                   II->getIntrinsicID() == Intrinsic::lifetime_end))
+          continue;
+        const Value *P = nullptr;
+        if (const auto *S = dyn_cast<StoreInst>(W)) P = S->getPointerOperand();
+        else if (const auto *RMW = dyn_cast<AtomicRMWInst>(W)) P = RMW->getPointerOperand();
+        else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(W)) P = CX->getPointerOperand();
+        if (P) {
+          const std::string K = ckey(W, P);
+          if (K.empty()) assumed = true;
+          else if (K == N) return Reread{};
+          continue;
+        }
+        if (const auto *MI = dyn_cast<MemIntrinsic>(W)) {
+          StructType *S = nullptr;
+          int64_t off = 0;
+          const auto *Len = dyn_cast<ConstantInt>(MI->getLength());
+          if (!Len || !namedSlot(W, MI->getRawDest(), CDL, pointees, S, off) || !S->hasName()) {
+            assumed = true;
+            continue;
+          }
+          bool hits = false;
+          structCover(S, off, off + (int64_t)Len->getZExtValue(), CDL, [&](StructType *ST, int64_t lo, int64_t hi) {
+            hits |= ST->hasName() && stripStructNameSuffix(ST->getName()) == NS && NO >= lo && NO < hi;
+          });
+          if (hits) return Reread{};
+          continue;
+        }
+        if (const auto *CB = dyn_cast<CallBase>(W)) {
+          const Function *G = CB->getCalledFunction();
+          auto rit = G ? C.rows.find(G->getName().str()) : C.rows.end();
+          if (rit != C.rows.end()) {
+            if (declHandle.count(N) || declLink.count(N) || declWord.count(N) || handle.count(N) || links.count(N))
+              return Reread{};
+            continue;
+          }
+        }
+        assumed = true;
+      }
+      Reread out{L1, assumed};
+      if (const Reread r = sameRead(L1, d + 1); r.first) out = {r.first, assumed || r.assumed};
+      rereadMemo[L2] = out;
+      return out;
+    };
+    ownerShape = [&](const Value *V, int d) -> std::string {
       V = V->stripPointerCasts();
       if (d > 8) return "";
       if (const auto *L = dyn_cast<LoadInst>(V))
@@ -1274,6 +1400,12 @@ void CallGraphPass::checkContainerClosure() {
         const std::string root = p == std::string::npos ? b : b.substr(0, p);
         return o ? root + "+" + std::to_string(o) : root;
       }
+      // A re-read of a named slot is its first read (S6).
+      if (const auto *L = dyn_cast<LoadInst>(V))
+        if (const Reread r = sameRead(L, d); r.first) {
+          if (!rereadQuiet) rereadsUsed.emplace(L, r);
+          V = r.first;
+        }
       std::string t;
       raw_string_ostream os(t);
       os << (const void *)V;
@@ -1358,6 +1490,13 @@ void CallGraphPass::checkContainerClosure() {
     std::map<std::string, size_t> unionStorage; // class 2: storage inside a union (writes)
     std::vector<std::string> plainFieldSites;   // an element pointer kept in a plain field (examples)
     std::vector<std::string> linkInvariant, traverseJoined; // listed assumptions in owner code
+    // S5-S7 (Fable 2026-10-16): union actuals' slots, formal nodes, cursor
+    // fields, re-reads; listed.
+    std::map<const Value *, std::pair<bool, std::string>> unionActual; // actual -> (by debug info?, its site)
+    std::set<std::string> unionSlotActuals;
+    size_t unionSlotAddrs = 0;
+    std::vector<std::string> formalNodeSites, formalObjSites, cursorLines, cursorAssumed;
+    std::set<const Value *> rereadLoads;
     size_t lookupsByDerivation = 0, rowSites = 0;
     // (1c) discharged per call site: agrees, disagrees (FAIL), unnamed
     // (an ASSUMPTION, listed).
@@ -1395,6 +1534,8 @@ void CallGraphPass::checkContainerClosure() {
       // Owner-code slots named by byte arithmetic from a derived value (S4):
       // address -> its offsets in the element struct.
       std::map<const Value *, std::vector<int64_t>> byteSlotsAll;
+      // Slots at a union actual + k, under the premise's assumption (S5).
+      std::map<const Value *, std::vector<std::pair<StructType *, int64_t>>> unionSlotsAll;
       // The fields an access at A may write: its own name, or, for a phi or
       // select of field addresses (rb_link_node's `*p`, rb_erase's child
       // slot), every entry's (null entries add none), or the slots byte
@@ -1402,6 +1543,10 @@ void CallGraphPass::checkContainerClosure() {
       std::function<bool(const Instruction *, const Value *, std::vector<std::pair<StructType *, int64_t>> &, int)>
           addrSlots = [&](const Instruction *At, const Value *A, std::vector<std::pair<StructType *, int64_t>> &out,
                           int d) -> bool {
+        if (auto uit = unionSlotsAll.find(A->stripPointerCasts()); uit != unionSlotsAll.end()) {
+          out.insert(out.end(), uit->second.begin(), uit->second.end());
+          return true;
+        }
         StructType *S = nullptr;
         int64_t off = 0;
         if (namedSlot(At, A, CDL, pointees, S, off) && S->hasName()) {
@@ -1530,12 +1675,18 @@ void CallGraphPass::checkContainerClosure() {
               if (unionOnPath(S, off, CDL, U, uo, us)) {
                 const int di = diThroughUnion(StringRef(SN).drop_front(7), off, StringRef(TN).drop_front(7));
                 const std::string where = "union at " + SN + "+" + std::to_string(uo) + ", +" + std::to_string(off - uo);
-                if (di == 1) premiseAgree++, premiseUnionDI.push_back(at + ": through the " + where);
+                if (di == 1) {
+                  premiseAgree++, premiseUnionDI.push_back(at + ": through the " + where);
+                  unionActual.emplace(V, std::make_pair(true, at));
+                }
                 else if (di == 0) premiseFail.push_back(at + ": named " + as + ", no member of the " + where + " is " + TN);
                 else if ((int64_t)CDL.getTypeAllocSize(T) > us - (off - uo))
                   premiseFail.push_back(at + ": named " + as + ", " + TN + " does not fit in the " + where + " (" +
                                         std::to_string(us) + " bytes)");
-                else premiseUnion.push_back(at + ": inside the " + where + " (members not in the IR)");
+                else {
+                  premiseUnion.push_back(at + ": inside the " + where + " (members not in the IR)");
+                  unionActual.emplace(V, std::make_pair(false, at));
+                }
                 continue;
               }
               const bool agree = (SN == TN && off == 0) || tableHolds(S, off, TN, CB->getModule());
@@ -1546,37 +1697,201 @@ void CallGraphPass::checkContainerClosure() {
               else premiseFail.push_back(at + ": named " + as);
             }
           }
-      // The element struct's declared slots, by offset (S4).
-      std::set<int64_t> elemSlotOffs;
+      // The element struct's declared slots, by offset (S4); its LINK slots.
+      std::set<int64_t> elemSlotOffs, elemLinkOffs;
       if (premiseElemT)
         for (const std::set<std::string> *D : {&declLink, &declWord})
           for (const std::string &K : *D)
-            if (K.compare(0, K.rfind('+'), stripStructNameSuffix(premiseElemT->getName()).str()) == 0)
+            if (K.compare(0, K.rfind('+'), stripStructNameSuffix(premiseElemT->getName()).str()) == 0) {
               elemSlotOffs.insert(std::stoll(K.substr(K.rfind('+') + 1)));
-      for (auto &[F, gs] : groups)
-        for (auto &[sh, Gp] : gs) {
-          (void)sh;
-          std::map<const Value *, std::vector<int64_t>> byteSlots;
-          Gp.cls = deriveOwnerCode(*F, Gp.owners, Gp.elems, slotOf, [&](const CallBase *CB, const OwnerClassFn &g) {
-            const CR *R = rowAt(CB);
-            if (!R || R->role == CR::Insert) return false;
-            if (R->role == CR::Remove && R->elem != -1) return false; // no result
-            if (R->owner >= 0 && (unsigned)R->owner < CB->arg_size() && (g(CB->getArgOperand(R->owner)) & OC_OWNER))
-              return true;
-            return R->elem >= 0 && (unsigned)R->elem < CB->arg_size() && (g(CB->getArgOperand(R->elem)) & OC_VAL);
-          }, CDL, body.count(F) ? nullptr : premiseElemT, &Gp.assumed, [&](const Value *A) -> int64_t {
-            const std::string K = addrKey(A);
-            if (!kindOf(K)) return -1;
-            return std::stoll(K.substr(K.rfind('+') + 1));
-          }, elemSlotOffs, &byteSlots);
-          for (auto &[A, ks] : byteSlots) {
-            std::vector<int64_t> &all = byteSlotsAll[A];
-            for (int64_t k : ks)
-              if (std::find(all.begin(), all.end(), k) == all.end()) all.push_back(k);
+              if (D == &declLink) elemLinkOffs.insert(std::stoll(K.substr(K.rfind('+') + 1)));
+            }
+      std::set<int64_t> ownerSlotOffs;
+      if (premiseOwnerT)
+        for (const std::string &K : declHandle)
+          if (K.compare(0, K.rfind('+'), stripStructNameSuffix(premiseOwnerT->getName()).str()) == 0)
+            ownerSlotOffs.insert(std::stoll(K.substr(K.rfind('+') + 1)));
+      // An object's identity: a re-read of a named slot is its first read (S6).
+      auto canonRoot = [&](const Value *V) -> const Value * {
+        if (const auto *L = dyn_cast<LoadInst>(V))
+          if (const Reread r = sameRead(L, 0); r.first) return r.first;
+        return V;
+      };
+      auto canonRO = [&](const Value *V) {
+        auto r = rootOff(V, CDL);
+        r.first = canonRoot(r.first);
+        return r;
+      };
+      // An insert row call's element actuals.
+      auto insertElems = [&](const CallBase *CB) {
+        std::vector<const Value *> v;
+        const CR *R = rowAt(CB);
+        if (R->elem >= 0 && (unsigned)R->elem < CB->arg_size()) v.push_back(CB->getArgOperand(R->elem)->stripPointerCasts());
+        for (int e : R->moreElems)
+          if ((unsigned)e < CB->arg_size()) v.push_back(CB->getArgOperand(e)->stripPointerCasts());
+        return v;
+      };
+      // Cursor reads per group (S7): (the load, the element's offset in the
+      // object it points to).
+      std::map<std::pair<const Function *, std::string>, std::set<std::pair<const Value *, int64_t>>> cursorAt;
+      auto deriveAll = [&]() {
+        byteSlotsAll.clear(), unionSlotsAll.clear(), linkInvariant.clear(), traverseJoined.clear();
+        unionSlotActuals.clear(), formalNodeSites.clear(), formalObjSites.clear(), rereadLoads.clear();
+        for (auto &[F, gs] : groups)
+          for (auto &[sh, Gp] : gs) {
+            std::map<const Value *, std::vector<int64_t>> byteSlots;
+            OwnerCodeExtra X;
+            X.canon = canonRoot;
+            X.ownerSlots = ownerSlotOffs;
+            std::vector<std::pair<std::pair<const Value *, int64_t>, std::string>> uActs;
+            for (const Value *o : Gp.owners)
+              if (auto u = unionActual.find(o); u != unionActual.end())
+                X.unionOwnerAt.insert(canonRO(o)), uActs.push_back({canonRO(o), u->second.second});
+            std::vector<const Value *> es(Gp.elems.begin(), Gp.elems.end());
+            for (const CallBase *CB : Gp.inserts)
+              for (const Value *e : insertElems(CB)) es.push_back(e);
+            for (const Value *e : es)
+              if (auto u = unionActual.find(e); u != unionActual.end())
+                X.unionElemAt.insert(canonRO(e)), uActs.push_back({canonRO(e), u->second.second});
+            // The element actuals' offsets in their objects (a formal object's
+            // node there, Q1; +0 is the formal itself, S7's phi rule).
+            for (const Value *e : es)
+              if (const int64_t o = canonRO(e).second; o != 0) {
+                X.elemOffs.insert(o);
+                if (unionActual.count(e)) X.unionElemOffs.insert(o);
+              }
+            X.elemLinkOffs = elemLinkOffs;
+            for (const Value *v : es) X.actualRoots.insert(canonRO(v).first);
+            for (const Value *v : Gp.owners) X.actualRoots.insert(canonRO(v).first);
+            if (auto cit = cursorAt.find({F, sh}); cit != cursorAt.end()) X.elemAt = cit->second;
+            Gp.assumed.clear();
+            Gp.cls = deriveOwnerCode(*F, Gp.owners, Gp.elems, slotOf, [&](const CallBase *CB, const OwnerClassFn &g) {
+              const CR *R = rowAt(CB);
+              if (!R || R->role == CR::Insert) return false;
+              if (R->role == CR::Remove && R->elem != -1) return false; // no result
+              if (R->owner >= 0 && (unsigned)R->owner < CB->arg_size() && (g(CB->getArgOperand(R->owner)) & OC_OWNER))
+                return true;
+              return R->elem >= 0 && (unsigned)R->elem < CB->arg_size() && (g(CB->getArgOperand(R->elem)) & OC_VAL);
+            }, CDL, body.count(F) ? nullptr : premiseElemT, &Gp.assumed, [&](const Value *A) -> int64_t {
+              const std::string K = addrKey(A);
+              if (!kindOf(K)) return -1;
+              return std::stoll(K.substr(K.rfind('+') + 1));
+            }, elemSlotOffs, &byteSlots, &X);
+            for (auto &[A, ks] : byteSlots) {
+              std::vector<int64_t> &all = byteSlotsAll[A];
+              for (int64_t k : ks)
+                if (std::find(all.begin(), all.end(), k) == all.end()) all.push_back(k);
+            }
+            for (auto &[A, hs] : X.unionSlots) {
+              std::vector<std::pair<StructType *, int64_t>> &all = unionSlotsAll[A];
+              for (auto [own, k] : hs) {
+                const std::pair<StructType *, int64_t> sl{own ? premiseOwnerT : premiseElemT, k};
+                if (sl.first && std::find(all.begin(), all.end(), sl) == all.end()) all.push_back(sl);
+              }
+            }
+            for (auto &[ra, site] : uActs)
+              if (X.unionUsed.count(ra)) unionSlotActuals.insert(site);
+            for (const Instruction *I : X.formalNodes) formalNodeSites.push_back(siteText(I));
+            for (auto &[A, e] : X.formalObjUsed)
+              formalObjSites.push_back(F->getName().str() + ": " + valueText(A) + " at +" + std::to_string(e));
+            rereadLoads.insert(X.rereads.begin(), X.rereads.end());
+            for (const Value *L : Gp.assumed) linkInvariant.push_back(F->getName().str() + ": read by " + valueText(L));
+            for (const CallBase *CB : Gp.joined) traverseJoined.push_back(siteText(CB));
           }
-          for (const Value *L : Gp.assumed) linkInvariant.push_back(F->getName().str() + ": read by " + valueText(L));
-          for (const CallBase *CB : Gp.joined) traverseJoined.push_back(siteText(CB));
+        unionSlotAddrs = unionSlotsAll.size();
+      };
+      // Cursor fields (S7, Fable 2026-10-16): a pointer field that is not
+      // declared storage, of an owner's object, into which owner code stores
+      // an element of that owner (derived, a row's result, or an inserted
+      // element; through its object at offset e). Every store into the field
+      // program-wide (by name) storing null or such an element of the owner
+      // whose object holds the field: a CLOSED CURSOR, its reads from an
+      // owner's object derived elements at +e. Otherwise each such read is a
+      // per-site ASSUMPTION "a node read back from a plain field".
+      auto elemOffIn = [&](Group &Gp, const Value *V) -> int64_t {
+        for (const Value *W : {V, V->stripPointerCasts()})
+          if (auto it = Gp.cls.find(W); it != Gp.cls.end() && (it->second & OC_VAL)) return 0;
+        const auto r = canonRO(V);
+        std::vector<const Value *> es(Gp.elems.begin(), Gp.elems.end());
+        for (const CallBase *CB : Gp.inserts)
+          for (const Value *e : insertElems(CB)) es.push_back(e);
+        for (const Value *E : es)
+          if (const auto re = canonRO(E); re.first == r.first && re.second >= r.second) return re.second - r.second;
+        return -1;
+      };
+      auto ownerObjIn = [&](Group &Gp, const Value *Obj) {
+        for (const Value *o : Gp.owners)
+          if (canonRO(o).first == Obj) return true;
+        return false;
+      };
+      for (int round = 0;; round++) {
+        deriveAll();
+        if (round == 3 || !premiseElemT) break;
+        // field -> element offsets its owner-code stores carry; stores that are not such
+        std::map<std::string, std::set<int64_t>> cursorE;
+        for (auto &[F, gs] : groups)
+          for (const Instruction &I : instructions(*F))
+            if (const auto *S = dyn_cast<StoreInst>(&I); S && S->getValueOperand()->getType()->isPointerTy()) {
+              const std::string K = ckey(S, S->getPointerOperand());
+              if (K.empty() || kindOf(K)) continue;
+              const Value *Obj = canonRO(S->getPointerOperand()).first;
+              for (auto &[sh, Gp] : gs)
+                if (ownerObjIn(Gp, Obj))
+                  if (const int64_t e = elemOffIn(Gp, S->getValueOperand()); e >= 0) cursorE[K].insert(e);
+            }
+        std::map<std::string, bool> closed;
+        for (auto &[K, es] : cursorE) closed[K] = es.size() == 1;
+        if (!cursorE.empty())
+          for (auto &[M, _] : Ctx->Modules)
+            for (const Function &F : *M)
+              for (const Instruction &I : instructions(F))
+                if (const auto *S = dyn_cast<StoreInst>(&I)) {
+                  if (!S->getValueOperand()->getType()->isPointerTy()) continue;
+                  const std::string K = ckey(S, S->getPointerOperand());
+                  auto cit = closed.find(K);
+                  if (cit == closed.end() || !cit->second || isa<ConstantPointerNull>(S->getValueOperand())) continue;
+                  bool ok = false;
+                  if (auto *gs = groups.count(&F) ? &groups[&F] : nullptr) {
+                    const Value *Obj = canonRO(S->getPointerOperand()).first;
+                    for (auto &[sh, Gp] : *gs)
+                      ok |= ownerObjIn(Gp, Obj) && elemOffIn(Gp, S->getValueOperand()) == *cursorE[K].begin();
+                  }
+                  if (!ok) cit->second = false;
+                }
+        // The reads, from an owner's object, in owner code.
+        std::map<std::pair<const Function *, std::string>, std::set<std::pair<const Value *, int64_t>>> next;
+        cursorLines.clear(), cursorAssumed.clear();
+        for (auto &[K, c] : closed) {
+          if (cursorE[K].size() > 1) {
+            // Elements at several offsets: no one element a read could be.
+            std::string os;
+            for (int64_t e : cursorE[K]) os += " +" + std::to_string(e);
+            cursorLines.push_back(K + " holds elements at several offsets (" + os.substr(1) + "): its reads not derived");
+            continue;
+          }
+          cursorLines.push_back(K + (c ? " CLOSED CURSOR (every store an element of the owner, at +" +
+                                             std::to_string(*cursorE[K].begin()) + ")"
+                                       : " not closed"));
         }
+        std::set<std::string> assumedSeen;
+        for (auto &[F, gs] : groups)
+          for (const Instruction &I : instructions(*F))
+            if (const auto *L = dyn_cast<LoadInst>(&I); L && L->getType()->isPointerTy()) {
+              const std::string K = ckey(L, L->getPointerOperand());
+              auto cit = closed.find(K);
+              if (cit == closed.end() || cursorE[K].size() != 1) continue;
+              const int64_t e = *cursorE[K].begin();
+              const Value *Obj = canonRO(L->getPointerOperand()).first;
+              for (auto &[sh, Gp] : gs)
+                if (ownerObjIn(Gp, Obj)) {
+                  next[{F, sh}].insert({L, e});
+                  const std::string a = siteText(L) + " (" + K + ", +" + std::to_string(e) + ")";
+                  if (!cit->second && assumedSeen.insert(a).second) cursorAssumed.push_back(a);
+                }
+            }
+        if (next == cursorAt) break;
+        cursorAt = std::move(next);
+      }
       auto strip = [](const Value *V) {
         for (int i = 0; i < 8; i++) {
           V = V->stripPointerCasts();
@@ -1636,7 +1951,8 @@ void CallGraphPass::checkContainerClosure() {
               auto isE = [&](int e) {
                 if (e < 0 || (unsigned)e >= CB->arg_size()) return false;
                 const Value *X = CB->getArgOperand(e);
-                return baseOf(X) == B || rootOff(X, CDL).first == B; // S3: a phi of equal steps
+                return baseOf(X) == B || rootOff(X, CDL).first == B || // S3: a phi of equal steps
+                       canonRoot(rootOff(X, CDL).first) == canonRoot(B);    // S6: a re-read
               };
               baseIsInserted |= isE(R->elem);
               for (int e : R->moreElems) baseIsInserted |= isE(e);
@@ -1973,7 +2289,6 @@ void CallGraphPass::checkContainerClosure() {
               return true;
         return false;
       };
-      size_t copiesInto = 0;
       std::string badCopy;
       for (auto &[M, _] : Ctx->Modules)
         for (Function &F : *M)
@@ -1997,7 +2312,6 @@ void CallGraphPass::checkContainerClosure() {
             bool covers = false;
             for (int64_t p0 : pos) covers |= p0 >= off && p0 < off + len;
             if (!covers) continue;
-            copiesInto++;
             if (body.count(&F)) {
               const uint8_t src = get(baseOf(MT->getRawSource())) & ~NUL;
               if (src && !(src & ~(DER | FRS))) continue;
@@ -2617,7 +2931,12 @@ void CallGraphPass::checkContainerClosure() {
     }
     if (!sentOk) C.obligations.push_back("a sentinel failed: its loads count as another value (O2 FAIL)");
     std::string bl;
-    for (const Function *F : body) bl += (bl.empty() ? "" : " ") + F->getName().str();
+    {
+      std::vector<std::string> bn;
+      for (const Function *F : body) bn.push_back(F->getName().str());
+      std::sort(bn.begin(), bn.end());
+      for (const std::string &n : bn) bl += (bl.empty() ? "" : " ") + n;
+    }
     cline(C.name + " (" + C.provenance + (C.report ? ", report" : "") + "): " + std::to_string(C.rows.size()) +
           " rows, body {" + bl + "}" +
           (missing.empty() ? "" : "; rows without a body here: " + missing) + "; owner types:" +
@@ -2625,6 +2944,28 @@ void CallGraphPass::checkContainerClosure() {
           " handle fields, " + std::to_string(links.size()) + " link fields, " + std::to_string(code.size()) +
           " code fields (" + std::to_string(codeTargetCount) + " targets through closed code fields)");
     for (const std::string &o : C.obligations) cline("  " + o);
+    {
+      // S6: the re-reads owner code was identified by (here and in the
+      // owner shapes), checked or assumed.
+      std::map<const LoadInst *, Reread> rr;
+      for (const Value *V : rereadLoads)
+        if (const auto *L = dyn_cast<LoadInst>(V))
+          if (const Reread r = sameRead(L, 0); r.first) rr.emplace(L, r);
+      for (auto &[L, r] : rereadsUsed) rr.emplace(L, r);
+      size_t assumed = 0;
+      for (auto &[L, r] : rr) assumed += r.assumed;
+      if (!rr.empty()) {
+        cline("  owner re-read from the same slot (S6): " + std::to_string(rr.size() - assumed) +
+              " checked (every write between them named, none of the slot's name), " + std::to_string(assumed) +
+              " ASSUMPTION");
+        std::vector<std::string> sites;
+        for (auto &[L, r] : rr)
+          if (r.assumed)
+            sites.push_back(L->getFunction()->getName().str() + ": " + valueText(L) + " (first read " + valueText(r.first) + ")");
+        std::sort(sites.begin(), sites.end());
+        for (size_t i = 0; i < sites.size() && i < 8; i++) cline("    ASSUMPTION owner re-read from the same slot: " + sites[i]);
+      }
+    }
     if (declared) {
       // Declared storage (R3 D2): the slots, what wrote them, what failed.
       auto list = [](const std::set<std::string> &s) {
@@ -2674,6 +3015,11 @@ void CallGraphPass::checkContainerClosure() {
       for (size_t i = 0; i < implicitMatched.size() && i < 8; i++) cline("    implicit insert matched: " + implicitMatched[i]);
       for (size_t i = 0; i < implicitUnmatched.size() && i < 8; i++)
         cline("    implicit insert UNMATCHED: " + implicitUnmatched[i]);
+      // Every listing sorted: one input gives one report text whatever the
+      // binary's heap layout (groups and bodies are keyed by pointer).
+      for (std::vector<std::string> *L : {&formalNodeSites, &formalObjSites, &cursorAssumed, &linkInvariant,
+                                          &traverseJoined})
+        std::sort(L->begin(), L->end());
       if (!linkInvariant.empty()) {
         cline("  inlined removes: " + std::to_string(linkInvariant.size()) +
               " nodes assumed elements by their link reads (the link invariant, the remove row's ELEM premise)");
@@ -2684,6 +3030,28 @@ void CallGraphPass::checkContainerClosure() {
         cline("  traverse elements joined to the function's only owner group: " + std::to_string(traverseJoined.size()));
         for (const std::string &x : traverseJoined)
           cline("    ASSUMPTION traverse element joined the function's only owner group: " + x);
+      }
+      if (!unionSlotActuals.empty()) {
+        cline("  slots at a union actual (S5): " + std::to_string(unionSlotAddrs) + " addresses, " +
+              std::to_string(unionSlotActuals.size()) + " actuals");
+        for (const std::string &x : unionSlotActuals)
+          cline("    ASSUMPTION (the premise's) declared slots at a union actual + k: " + x);
+      }
+      if (!formalNodeSites.empty()) {
+        cline("  descents from a node assumed an element (S7): " + std::to_string(formalNodeSites.size()));
+        for (const std::string &x : formalNodeSites) cline("    ASSUMPTION descent from a node assumed an element: " + x);
+      }
+      if (!formalObjSites.empty()) {
+        cline("  descents from a formal object's node at +e (Q1): " + std::to_string(formalObjSites.size()));
+        for (const std::string &x : formalObjSites)
+          cline("    ASSUMPTION descent from a formal object's node at +e, assumed an element: " + x);
+      }
+      if (!cursorLines.empty()) {
+        cline("  cursor fields (S7): " + std::to_string(cursorLines.size()) + "; reads assumed " +
+              std::to_string(cursorAssumed.size()));
+        for (const std::string &x : cursorLines) cline("    cursor field " + x);
+        for (size_t i = 0; i < cursorAssumed.size() && i < 8; i++)
+          cline("    ASSUMPTION a node read back from a plain field: " + cursorAssumed[i]);
       }
       if (!o1Naming.empty()) {
         size_t past = 0;

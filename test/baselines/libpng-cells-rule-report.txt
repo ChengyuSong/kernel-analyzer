@@ -274,14 +274,14 @@ O bodiless inflateInit2_: 9 indirect calls depend on it
 O bodiless inflateEnd: 9 indirect calls depend on it
 O bodiless inflate: 9 indirect calls depend on it
 O bodiless _setjmp: 9 indirect calls depend on it
-R depends png_do_read_transformations pngrtran.c:5023: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
-R depends png_error pngerror.c:83: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
-R depends png_free pngmem.c:239: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 6)
-R depends png_handle_unknown pngrutil.c:2965: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
-R depends png_longjmp pngerror.c:763: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
-R depends png_malloc_base pngmem.c:91: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 6)
-R depends png_read_data pngrio.c:37: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
-R depends png_read_filter_row pngrutil.c:4179: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
-R depends png_read_row pngread.c:614: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflate] [bodiless call inflateReset2] (several: 5)
+R depends png_do_read_transformations pngrtran.c:5023: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
+R depends png_error pngerror.c:83: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
+R depends png_free pngmem.c:239: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 6)
+R depends png_handle_unknown pngrutil.c:2965: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
+R depends png_longjmp pngerror.c:763: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
+R depends png_malloc_base pngmem.c:91: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 6)
+R depends png_read_data pngrio.c:37: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
+R depends png_read_filter_row pngrutil.c:4179: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
+R depends png_read_row pngread.c:614: [bodiless call _setjmp] [bodiless call inflateEnd] [bodiless call inflateInit2_] [bodiless call inflateReset2] (several: 5)
 
 == varargs keyed by format specifier (plan 3.47)

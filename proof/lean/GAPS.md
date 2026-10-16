@@ -2197,11 +2197,68 @@ the listed ASSUMPTIONs.
   These add no premise: the identities are the program's own arithmetic.
   Values derived through them make the container_of reads from those
   values visible as naming failures ("a step past the layout of rb_node"),
-  which they were all along.
+  which they were all along. The classes a value has by its object and
+  offset are part of the derivation's result, for every reader of it (the
+  O1 check reads `&root->rb_node`, a zero step, as its object).
+- **Slots at a union actual (S5):** an owner or element actual whose
+  premise is "inside a union" (an ASSUMPTION without debug info; "through a
+  union member by debug info" with it) has its declared slots at actual +
+  k as slots, under that same assumption, listed once per actual
+  (vma_interval_tree_remove's `&vma->shared.rb`, kernfs's children root,
+  sk_buff's rbnode). No new premise: the row call already assumes the
+  struct is there.
+- **The owner read twice (S6):** two loads of one named slot (one field
+  key at one address shape), the first dominating the second, are one
+  value when every write on a path between them that runs neither again is
+  named and none has the slot's name; a row call's write set is its
+  declared storage: checked, counted. An unnamed write or a call to a
+  function that is not a row between them makes the identity a per-site
+  ASSUMPTION "owner re-read from the same slot". A write of the slot's own
+  name keeps them apart. Used by the owner groups, the owner-code
+  derivation (object identity) and the owner shapes (D6 pairing, (d)).
+- **Descents from a node not derived from the owner (S7), never a FAIL:**
+  - a formal of the function at its own address, merged into a descent (a
+    phi or select whose other entries are derived), is a listed ASSUMPTION
+    "descent from a node assumed an element" (insert_vmap_area_augment's
+    `from`);
+  - a pointer field of an owner's object that is not declared storage,
+    into which owner code stores an element of that owner (derived, a row's
+    result, or an inserted element, through its object at offset e): when
+    every store into the field program-wide (by name) stores null or such an
+    element of the owner whose object holds the field, at one offset e, the
+    field is a CLOSED CURSOR and its reads from an owner's object are
+    derived elements at +e (inet_frag_queue's fragments_tail); otherwise
+    each read is a per-site ASSUMPTION "a node read back from a plain
+    field". A field whose stores carry elements at several offsets derives
+    nothing (no one element a read could be).
+  - a descent that starts at a formal OBJECT's node at +e, e the element
+    actuals' offset in their objects (not 0, not an actual's own object;
+    a LINK slot of it read and the node used as a node, or the node merged
+    by a phi or select), is the same premise in another dress: a per-site
+    ASSUMPTION "descent from a formal object's node at +e" (Fable
+    2026-10-16 Q1: vma_interval_tree_insert_after's `prev` at +88, inside
+    the union as the actual's, then also a union actual's slots;
+    drm_mm_interval_tree_add_node's hole node). A constant step k over a
+    phi or select of objects each of which has an element at k is an
+    element (the phi meet over objects: insert_after's parent word
+    `&parent->shared.rb`, parent a phi of container_of(node) and `prev`).
+- **An asm by its model (D4, Q2):** an operand both read and written (an
+  output memory operand with its input, `+m` or `=*m` with `*m`) is a load
+  of the slot into the asm's result and a store of its inputs. Through a
+  derived HANDLE the result is an element: an inline llist_del_all is
+  `xchg(&head->first, NULL)`, a remove-all lookup by the asm model
+  (i915_active's barrier tasks: the detached chain rebuilt by
+  `node->next = previous` are relinks, llist_add_batch re-adds it on the
+  same head). An owner value at its own address is its declared handle at
+  +0 by the row's premise, named or not.
+- **One report text:** every listing in the container report is sorted,
+  so one input gives one text whatever the binary's heap layout (groups
+  and bodies are keyed by pointer).
 
 Cases: test/t_cells_container_{rb,rb_unmatched,storage_bad,llist,llist_int,report,naming,
-embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_add,cursor}.c
-and t_cells_container_{zero_gep,const_root,phi_owner,bytestep}.ll (shapes from
-the kernel's clang-14 IR that clang-18 no longer emits; rows for the rbtree
-cases in t2_cells_rblib.c, shapes in cells_rb.h).
+embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_add,cursor}.c,
+t_cells_container_{zero_gep,const_root,phi_owner,bytestep,union_slot,reread,descent,formal_obj}.ll
+(shapes from the kernel's clang-14 IR that clang-18 no longer emits) and
+t_cells_container_del_all.c; rows for the rbtree cases in t2_cells_rblib.c,
+shapes in cells_rb.h.
 Not mechanized. Checked by executions; see the commit's gates.

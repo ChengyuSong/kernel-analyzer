@@ -601,24 +601,35 @@ void CallGraphPass::checkContainerClosure() {
     if (it == diStructs.end()) return -1;
     return diHolds(it->second, off, T, 0) ? 1 : 0;
   };
+  // An anonymous struct member's members are the enclosing struct's, at
+  // its offset plus theirs (the IR names them so, Fable 2026-10-16).
+  std::function<void(const DICompositeType *, uint64_t, std::vector<std::pair<uint64_t, std::string>> &, int)>
+      ptrMembersOf = [&](const DICompositeType *Cc, uint64_t base, std::vector<std::pair<uint64_t, std::string>> &out,
+                         int d) {
+        for (const DINode *E : Cc->getElements()) {
+          const auto *M = dyn_cast<DIDerivedType>(E);
+          if (!M || M->getTag() != dwarf::DW_TAG_member || M->isStaticMember()) continue;
+          const DIType *T = diStrip(M->getBaseType());
+          if (const auto *AS = dyn_cast_or_null<DICompositeType>(T);
+              AS && AS->getTag() == dwarf::DW_TAG_structure_type && AS->getName().empty() && d < 8) {
+            ptrMembersOf(AS, base + M->getOffsetInBits() / 8, out, d + 1);
+            continue;
+          }
+          const auto *P = dyn_cast_or_null<DIDerivedType>(T);
+          if (!P || P->getTag() != dwarf::DW_TAG_pointer_type) continue;
+          const DIType *B = diStrip(P->getBaseType());
+          if (const auto *P2 = dyn_cast_or_null<DIDerivedType>(B); P2 && P2->getTag() == dwarf::DW_TAG_pointer_type)
+            B = diStrip(P2->getBaseType());
+          const auto *S = dyn_cast_or_null<DICompositeType>(B);
+          out.push_back({base + M->getOffsetInBits() / 8,
+                         S && S->getTag() == dwarf::DW_TAG_structure_type ? S->getName().str() : std::string()});
+        }
+      };
   auto ptrMembers = [&](StringRef Tag) {
     std::vector<std::pair<uint64_t, std::string>> out;
     auto dit = diStructs.find(Tag.str());
     const DICompositeType *Cc = dit == diStructs.end() ? nullptr : dit->second;
-    if (!Cc) return out;
-    for (const DINode *E : Cc->getElements()) {
-      const auto *M = dyn_cast<DIDerivedType>(E);
-      if (!M || M->getTag() != dwarf::DW_TAG_member || M->isStaticMember()) continue;
-      const DIType *T = diStrip(M->getBaseType());
-      const auto *P = dyn_cast_or_null<DIDerivedType>(T);
-      if (!P || P->getTag() != dwarf::DW_TAG_pointer_type) continue;
-      const DIType *B = diStrip(P->getBaseType());
-      if (const auto *P2 = dyn_cast_or_null<DIDerivedType>(B); P2 && P2->getTag() == dwarf::DW_TAG_pointer_type)
-        B = diStrip(P2->getBaseType());
-      const auto *S = dyn_cast_or_null<DICompositeType>(B);
-      out.push_back({M->getOffsetInBits() / 8,
-                     S && S->getTag() == dwarf::DW_TAG_structure_type ? S->getName().str() : std::string()});
-    }
+    if (Cc) ptrMembersOf(Cc, 0, out, 0);
     return out;
   };
   for (auto &C : Ctx->Containers) {
@@ -3075,6 +3086,10 @@ void CallGraphPass::checkContainerClosure() {
                     : C.verified ? "VERIFIED (rows applied)" : "REJECTED (rows not applied)") +
           "; " + level);
   }
+  if (!Ctx->Containers.empty())
+    CG_LOG("Container: anonymous struct fields: " << pointees.anonByEnclosing
+           << " named by the enclosing named struct and byte offset, " << pointees.anonUnnamedN
+           << " unnamed (no enclosing named struct on the access's GEP chain)\n");
 }
 
 // After the solve: a pure row's indirect calls (Fable 2026-10-14) take the

@@ -220,6 +220,11 @@ public:
   // plus a GEP's byte offset; or a step past the layout of pastS (the base
   // named pastS, the offset pastOff outside [0, sizeof pastS)): unnamed.
   bool viaBase = false, viaResolver = false;
+  // namedSlot: an anonymous struct's field with no enclosing named struct
+  // on its GEP chain (unnamed); counts of anonymous fields named by the
+  // enclosing struct and left unnamed.
+  bool anonUnnamed = false;
+  size_t anonByEnclosing = 0, anonUnnamedN = 0;
   StructType *pastS = nullptr;
   int64_t pastOff = 0;
 

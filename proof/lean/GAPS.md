@@ -1974,6 +1974,21 @@ keeps p's facts (ptrToIntTagRoundTripOnly); this adds the checked name.
   was read as the GEP's source struct plus an offset outside it, which no
   field holds: the access was silently unnamed in R1 and silently matched
   no slot in the container check.
+- **Anonymous structs name nothing** (Fable 2026-10-16): clang numbers
+  them (`struct.anon`, `struct.anon.12`) and the linker's suffix strip
+  makes every one `struct.anon`, so a field inside one was a key shared by
+  every anonymous struct in the program (binutils' bfd_link_hash_entry
+  u.i.link and an unrelated `struct.anon+8`: one cursor key). A field of
+  an anonymous struct is named by the nearest enclosing named struct on its
+  access's GEP chain (each step at leading index 0) and the byte offset
+  there, as struct-path TBAA names it at -O3 (bfd_link_hash_entry+40 at
+  both levels); with no enclosing named struct on the chain (a pointer to
+  the anonymous struct itself), the access is unnamed, counted ("anonymous
+  struct fields: n named by the enclosing named struct and byte offset, m
+  unnamed"), never the shared name. The innermost-field key stops at an
+  anonymous struct the same way, and debug info's pointer members include
+  an anonymous member's members at its offset (the links a block infers).
+  The solver's own cell names (Names.cc, sameType) are not changed by this.
 - **Unions stop the name** (Fable 2026-10-15, class 2): the IR's type of a
   union is clang's representative member, never the program's choice
   (5.18's timerfd_ctx `union { struct hrtimer tmr; struct alarm alarm; }`

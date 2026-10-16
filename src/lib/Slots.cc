@@ -114,6 +114,15 @@ bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o) {
 // The innermost named struct holding byte `off` of ST, the offset there,
 // and the scalar the byte lies in with the byte's offset inside it.
 static bool isUnionType(const StructType *ST) { return ST->hasName() && ST->getName().starts_with("union."); }
+// An anonymous struct or union (`struct.anon.12`): its IR name is clang's
+// counter, and the linker's suffix strip makes every one `struct.anon`, so
+// it names nothing; its fields are named by the enclosing named struct and
+// the byte offset there (Fable 2026-10-16), as TBAA names them.
+static bool isAnonType(const StructType *ST) {
+  if (!ST->hasName()) return false;
+  const StringRef N = stripStructNameSuffix(ST->getName());
+  return N == "struct.anon" || N == "union.anon";
+}
 
 bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::string, int64_t> &K, Type *&leaf,
                     int64_t &inLeaf, bool *inUnion) {
@@ -127,7 +136,7 @@ bool innermostField(Type *T, int64_t off, const DataLayout &DL, std::pair<std::s
         // offset there (K.second goes on accumulating below).
         if (K.first.empty()) return false;
         uni = true;
-      } else if (!uni && ST->hasName()) {
+      } else if (!uni && ST->hasName() && !isAnonType(ST)) {
         K = {stripStructNameSuffix(ST->getName()).str(), off};
       }
       const StructLayout *SL = DL.getStructLayout(ST);
@@ -402,9 +411,34 @@ bool namedPtr(const Value *V, const DataLayout &DL, PointeeResolver &P, StructTy
   return S != nullptr;
 }
 
-bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P, StructType *&S,
-               int64_t &off) {
-  P.viaFormal = P.viaSibling = P.viaDecl = P.viaBase = P.viaResolver = false, P.pastS = nullptr;
+// The nearest named, non-anonymous struct an address lies in by its chain
+// of constant GEPs (through casts), each step's struct at its leading index
+// 0: that struct and the address's byte offset in it.
+static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off) {
+  int64_t acc = 0;
+  const Value *V = Addr;
+  for (int i = 0; i < 16; i++) {
+    // Casts only: stripPointerCasts also strips all-zero GEPs, the steps
+    // this walk reads.
+    while (isa<BitCastOperator>(V) || isa<AddrSpaceCastOperator>(V)) V = cast<Operator>(V)->getOperand(0);
+    const auto *G = dyn_cast<GEPOperator>(V);
+    if (!G || !leadingZero(G)) return false;
+    APInt A(64, 0);
+    if (!G->accumulateConstantOffset(DL, A)) return false;
+    acc += A.getSExtValue();
+    auto *GS = dyn_cast<StructType>(G->getSourceElementType());
+    if (GS && GS->hasName() && !GS->isOpaque() && !isAnonType(GS)) {
+      if (acc < 0 || acc >= (int64_t)DL.getTypeAllocSize(GS)) return false;
+      S = GS, off = acc;
+      return true;
+    }
+    V = G->getPointerOperand();
+  }
+  return false;
+}
+
+static bool namedSlotAny(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P,
+                         StructType *&S, int64_t &off) {
   // A struct GEP with leading index 0 or the TBAA tag; an array member at
   // a variable index; else the pointer's name (a byte step from a named
   // base, or the resolver).
@@ -414,6 +448,17 @@ bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, Po
   if (step && tbaaSlot(I, S, off) && S && S->hasName()) return true;
   if (arraySlot(Addr, DL, S, off)) return true;
   return namedPtr(Addr, DL, P, S, off);
+}
+
+bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, PointeeResolver &P, StructType *&S,
+               int64_t &off) {
+  P.viaFormal = P.viaSibling = P.viaDecl = P.viaBase = P.viaResolver = P.anonUnnamed = false, P.pastS = nullptr;
+  if (!namedSlotAny(I, Addr, DL, P, S, off)) return false;
+  if (!S || !isAnonType(S)) return true;
+  // An anonymous struct's field: by the enclosing named struct, else unnamed.
+  P.anonUnnamed = !enclosingNamed(Addr, DL, S, off);
+  (P.anonUnnamed ? P.anonUnnamedN : P.anonByEnclosing)++;
+  return !P.anonUnnamed;
 }
 
 // The named structs bytes [lo, hi) of T lie in, outermost first, each with

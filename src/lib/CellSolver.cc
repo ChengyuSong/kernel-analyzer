@@ -7646,6 +7646,12 @@ bool CallGraphPass::runCellResolution() {
   // ---- Report ----
   size_t factMass = 0, offCells = 0, anyCells = 0;
   for (uint32_t n = 0; n < numNodes; n++) factMass += pts[n].count();
+  // The part of factMass in the key cells of keyed union slots: a key cell
+  // is fed by its slot's unkeyed cell (U -> K -> P), so it repeats U's
+  // facts by construction; each key adds them again.
+  size_t keyedMass = 0;
+  for (const Obj &O : objs)
+    for (const auto &[kk, node] : O.keyed) keyedMass += pts[node].count();
   checkConstInt();
   checkContainerPremises(stoppedAt != 0);
   // The owners' width at the row and mint sites (report only, Fable
@@ -9239,7 +9245,8 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: " << numNodes << " solver nodes, " << staticCopies
          << " copies, " << stores << " stores, " << lazyFEdges.size()
          << " field edges, " << dynEdges << " hub edges (" << hubLinks
-         << " links), " << pops << " pops, " << factMass << " facts, "
+         << " links), " << pops << " pops, " << factMass << " facts ("
+         << keyedMass << " in " << keyedCells << " key cells of keyed union slots), "
          << secs << " s (labels " << labelSecs << " s, propagation "
          << solveSecs << " s)\n");
   CG_LOG("Cells: any-offset from: " << cappedMints << " capped mints, "
@@ -10035,7 +10042,8 @@ bool CallGraphPass::runCellResolution() {
       errs() << "FATAL: cannot write " << CFLCellStopAnswers << ": " << EC.message() << "\n";
       exit(1);
     }
-    SO << "STOP pops " << stoppedAt << " cells " << cells.size() << " facts " << factMass << "\n";
+    SO << "STOP pops " << stoppedAt << " cells " << cells.size() << " facts " << factMass << " (" << keyedMass
+       << " in " << keyedCells << " key cells of keyed union slots)\n";
     std::vector<std::string> lines;
     for (auto &[CS, names] : stopAnswers) {
       unsigned pos = 0; // the call's position in its function

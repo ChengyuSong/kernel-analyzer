@@ -1808,8 +1808,8 @@ void CallGraphPass::checkContainerClosure() {
       const std::string KS = K.substr(0, kp);
       const int64_t KO = std::stoll(K.substr(kp + 1));
       const auto [uoff, UN] = unionAround(KS, KO);
-      std::string why, firstOther;
-      size_t stores = 0, others = 0;
+      std::string why, firstUnkeyed;
+      size_t stores = 0, others = 0, unkeyed = 0;
       bool othersKeyed = true;
       std::set<std::string> otherKeys;
       // A store that is no element: outside a union, the field is open;
@@ -1820,9 +1820,11 @@ void CallGraphPass::checkContainerClosure() {
           return;
         }
         others++;
-        if (firstOther.empty()) firstOther = F.getName().str() + ": " + text;
         if (const auto *ks = keysOf(&I)) otherKeys.insert(ks->begin(), ks->end());
-        else othersKeyed = false;
+        else {
+          othersKeyed = false;
+          if (!unkeyed++) firstUnkeyed = F.getName().str() + ": " + text;
+        }
       };
       for (auto &[M, _] : Ctx->Modules)
         for (const Function &F : *M)
@@ -1858,7 +1860,8 @@ void CallGraphPass::checkContainerClosure() {
           if (auto wit = widenedTagsOf.find(KS); wit != widenedTagsOf.end())
             for (const std::string &w : wit->second) engines += "; " + w;
           why = "cursor inside union " + UN->field + " (" + KS + "+" + std::to_string(uoff) +
-                "): no admitted discriminator (" + engines + "); a store of another member: " + firstOther;
+                "): no admitted discriminator (" + engines + "); " + std::to_string(unkeyed) + " of " +
+                std::to_string(others) + " stores of another member without union keys, e.g. " + firstUnkeyed;
         }
       }
       elemCursorLines[K] = "cursor field " + K + " on an element: " +

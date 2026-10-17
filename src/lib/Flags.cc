@@ -1168,7 +1168,8 @@ cl::opt<bool> CFLCellMergePtrs(
 cl::opt<std::string> CFLCellStopAnswers(
   "cfl-cell-stop-answers",
   cl::desc("With --cfl-cell-census-at: write the partial state at the stop "
-           "to this file (pops, cells, facts, and each indirect call's "
+           "to this file (pops, cells, facts and how many of them sit in the "
+           "key cells of keyed union slots, and each indirect call's "
            "targets at that point), the cells gate's pin for a run stopped "
            "before its fixpoint (test/cells-gate.sh)"),
   cl::init(""));

@@ -6,7 +6,8 @@
 #   full runs (libpng, libjpeg x4, httpd, tcpdump): answer pairs and the
 #     icalls JSON's sha256;
 #   nm-new O0/O3, stopped at a fixed pop: pops, cells and facts at the stop
-#     and the sha256 of the partial answers (--cfl-cell-stop-answers);
+#     (with the facts in key cells of keyed union slots, which repeat their
+#     slot's unkeyed facts by construction) and the sha256 of the partial answers (--cfl-cell-stop-answers);
 #   tiffsplit O0 (at 150K pops) and O3 (at 1M) likewise: it has not finished since 07be17c,
 #     nor with plan 3.54 (method-installed state, embedded method fields,
 #     terms along the receiver); the residue is in the 3.54 commit.

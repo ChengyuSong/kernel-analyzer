@@ -1,12 +1,17 @@
 // t_cells_container_cursor_union_copy.c — a cursor inside a union with a
 // block copy of a whole entry over it (binutils linker.c:1785, the warning
 // symbol: `*sub = *h; sub->type = bfd_link_hash_warning; sub->u.i.link = h;`).
-// The copy writes the cursor's bytes with no union keys of its own, so the
-// cursor stays open, and the reason names the store without keys (before:
-// the first store of another member found, here main's u.c.p store,
-// which has union keys).
-// NOLOG: a store of another member: main:
-// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: not closed \(cursor inside union u .*: no admitted discriminator .*; 1 of 3 stores of another member without union keys, e\.g\. make_warning: call void @llvm\.memcpy.* \(a block copy\)\)
+// A copy of the whole struct between two objects of it is key-preserving
+// (Fable 2026-10-17, Q1 (b)): under the cursor's keys it moves the cursor's
+// own content, so it is no store into the cursor, and the cursor closes on
+// its other stores (at the commit before: "1 of 3 stores of another member
+// without union keys, e.g. make_warning: ... (a block copy)"). The block
+// stays REJECTED for the stores that remain: `sub->u.i.link = h` stores a
+// formal no rule makes an element, read by the tag-keyed chase, and the
+// copy's source is that formal (O1).
+// NOLOG: \(a block copy\)
+// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: CLOSED \(.*; 1 copies of the whole struct, key-preserving\)
+// LOG: O2 FAIL\(bfd_link_hash_lookup returns .*a read of the cursor that admits another member's store
 // LOG: Container:   REJECTED
 #include <stdlib.h>
 #include <string.h>

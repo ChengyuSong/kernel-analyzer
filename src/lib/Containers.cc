@@ -1551,6 +1551,18 @@ void CallGraphPass::checkContainerClosure() {
     // or an out-parameter's pointee (Q-c: assumed, listed per site).
     const std::string kAny = "\x01";
     std::set<const Value *> eoOnPath;
+    // All container verdicts are one greatest fixpoint (Fable 2026-10-17):
+    // whatever is under way, a cursor field or a value, is assumed (closed,
+    // an element) inside the evaluations it encloses, and every verdict
+    // that rested on it is withdrawn when it ends otherwise. A value under
+    // way met by an element test of a cursor's store (elementStored) is
+    // assumed an element; the cursor fields whose checks began inside the
+    // value's evaluation lean on it (valueLeans).
+    std::vector<std::string> cursorStack;                      // cursor fields under way (below)
+    std::vector<const Value *> eoHits;                         // values under way an evaluation met
+    std::map<const Value *, size_t> eoPathDepth;               // value under way -> cursorStack depth at its start
+    std::map<const Value *, std::set<std::string>> valueLeans; // value under way -> fields that assumed it an element
+    std::function<void(const std::set<std::string> &)> withdrawCursors;
     // Assumptions an answer rests on, pending until its caller admits it.
     std::vector<std::string> eoPending;
     std::set<std::string> outParamAssumed, cursorInstance, derefReadAssumed;
@@ -1646,7 +1658,11 @@ void CallGraphPass::checkContainerClosure() {
       // Several entries (a slot's stores, a phi's or select's values), null
       // aside: every one an element of one owner.
       auto agree = [&](const Value *Key, const std::vector<const Value *> &ins) -> std::string {
-        if (!eoOnPath.insert(Key).second) return kAny;
+        if (!eoOnPath.insert(Key).second) {
+          eoHits.push_back(Key);
+          return kAny;
+        }
+        eoPathDepth[Key] = cursorStack.size();
         std::string agreed;
         bool ok = true, any = false;
         for (const Value *In : ins) {
@@ -1660,6 +1676,13 @@ void CallGraphPass::checkContainerClosure() {
           if (x != kAny) agreed = x;
         }
         eoOnPath.erase(Key);
+        eoPathDepth.erase(Key);
+        if (auto lit = valueLeans.find(Key); lit != valueLeans.end()) {
+          // Not an element after all: the fields that assumed it decide again.
+          const std::set<std::string> leaned = std::move(lit->second);
+          valueLeans.erase(lit);
+          if (!ok || !any) withdrawCursors(leaned);
+        }
         if (!ok || !any) return "";
         return agreed.empty() ? kAny : agreed;
       };
@@ -1754,8 +1777,9 @@ void CallGraphPass::checkContainerClosure() {
     // as closed, holds only if that field ends closed; when it ends open,
     // every verdict that leaned on it is dropped and decided again on its
     // next use.
-    std::vector<std::string> cursorStack;                      // fields under way
     std::map<std::string, std::set<std::string>> cursorLeans;  // field -> under-way fields it read as closed
+    std::map<const LoadInst *, std::string> cursorReadBad;      // read -> why, once its field's keys refuted it
+    std::map<std::string, std::vector<const LoadInst *>> cursorReadsUnderWay; // field -> reads passed while it was under way
     auto elementStored = [&](const Function &F, const Value *V) {
       V = V->stripPointerCasts();
       if (isa<ConstantPointerNull>(V)) return true;
@@ -1763,8 +1787,18 @@ void CallGraphPass::checkContainerClosure() {
         const uint8_t m = get(V);
         return m && !(m & ~(DER | FRS | INS | NUL));
       }
-      const size_t mark = eoMark();
-      const bool ok = !elemOwner(V, 0).empty();
+      const size_t mark = eoMark(), hits = eoHits.size();
+      const std::string o = elemOwnerR(V, 0);
+      bool ok = !o.empty() && o != kAny;
+      // A value under way (its evaluation encloses this check): assumed an
+      // element, the cursor fields begun inside its evaluation leaning on it.
+      if (o == kAny)
+        for (size_t i = hits; i < eoHits.size(); i++)
+          if (auto dit = eoPathDepth.find(eoHits[i]); dit != eoPathDepth.end()) {
+            ok = true;
+            for (size_t j = dit->second; j < cursorStack.size(); j++) valueLeans[eoHits[i]].insert(cursorStack[j]);
+          }
+      eoHits.resize(hits);
       eoSettle(mark, ok);
       return ok;
     };
@@ -1793,8 +1827,52 @@ void CallGraphPass::checkContainerClosure() {
       const std::vector<std::string> &ks = it->second;
       return (isa<StoreInst>(I) ? perKeyWrite(ks) : perKeyRead(ks)) ? &ks : nullptr;
     };
-    std::function<std::string(const std::string &)> cursorField;
+    // Withdraw verdicts that rested on an assumption that failed: the fields
+    // named, and every field that read one of them as closed while it was
+    // under way (transitively); a field still under way stays.
+    withdrawCursors = [&](const std::set<std::string> &fs) {
+      std::vector<std::string> drop;
+      for (const std::string &F : fs)
+        if (std::find(cursorStack.begin(), cursorStack.end(), F) == cursorStack.end()) drop.push_back(F);
+      for (size_t i = 0; i < drop.size(); i++)
+        for (auto &[F, leans] : cursorLeans)
+          if (leans.count(drop[i]) && std::find(drop.begin(), drop.end(), F) == drop.end() &&
+              std::find(cursorStack.begin(), cursorStack.end(), F) == cursorStack.end())
+            drop.push_back(F);
+      for (const std::string &F : drop) {
+        cursorOpen.erase(F);
+        elemCursorLines.erase(F);
+        cursorOtherKeys.erase(F);
+        cursorLeans.erase(F);
+      }
+    };
+    std::function<std::string(const std::string &)> cursorField, cursorFieldOnce;
+    // A read of the cursor checked while the cursor was under way passed
+    // (its other members' keys were not known yet); once they are, each such
+    // read is checked, and a refuted one makes the field decide again, the
+    // read failing from then on.
+    std::function<std::string(const std::string &, const LoadInst *)> keyedRead;
     cursorField = [&](const std::string &K) -> std::string {
+      if (cursorOpen.count(K)) return cursorFieldOnce(K); // under way, or decided
+      for (;;) {
+        const std::string why = cursorFieldOnce(K);
+        auto pit = cursorReadsUnderWay.find(K);
+        if (pit == cursorReadsUnderWay.end()) return why;
+        const std::vector<const LoadInst *> reads = std::move(pit->second);
+        cursorReadsUnderWay.erase(pit);
+        if (!why.empty()) return why;
+        bool refuted = false;
+        for (const LoadInst *LI : reads)
+          if (!cursorReadBad.count(LI))
+            if (std::string r = keyedRead(K, LI); !r.empty()) {
+              cursorReadBad[LI] = r;
+              refuted = true;
+            }
+        if (!refuted) return why;
+        withdrawCursors({K});
+      }
+    };
+    cursorFieldOnce = [&](const std::string &K) -> std::string {
       if (auto cit = cursorOpen.find(K); cit != cursorOpen.end()) {
         // Under way: closed for now; every field above it on the stack
         // leans on it.
@@ -1809,7 +1887,7 @@ void CallGraphPass::checkContainerClosure() {
       const int64_t KO = std::stoll(K.substr(kp + 1));
       const auto [uoff, UN] = unionAround(KS, KO);
       std::string why, firstUnkeyed;
-      size_t stores = 0, others = 0, unkeyed = 0;
+      size_t stores = 0, others = 0, unkeyed = 0, wholeCopies = 0;
       bool othersKeyed = true;
       std::set<std::string> otherKeys;
       // A store that is no element: outside a union, the field is open;
@@ -1845,6 +1923,21 @@ void CallGraphPass::checkContainerClosure() {
                             covers |= T->hasName() && stripStructNameSuffix(T->getName()) == KS && KO >= lo && KO < hi;
                           });
               if (!covers) continue;
+              // A copy of a whole struct between two objects of it (Fable
+              // 2026-10-17, Q1 (b)) is key-preserving: under each key the
+              // destination's content is the source's, tag and union bytes
+              // moving together (3.53 rule 4, cell to cell), so under the
+              // cursor's keys it moves the cursor's own content: no store into
+              // the cursor, with no owner condition.
+              StructType *SS = nullptr;
+              int64_t soff = 0;
+              if (Len && off == 0 && DS->isSized() &&
+                  (int64_t)Len->getZExtValue() == (int64_t)CDL.getTypeAllocSize(DS) &&
+                  namedSlot(MT, MT->getRawSource(), CDL, pointees, SS, soff) && SS && soff == 0 && SS->hasName() &&
+                  stripStructNameSuffix(SS->getName()) == stripStructNameSuffix(DS->getName())) {
+                wholeCopies++;
+                continue;
+              }
               stores++;
               if (!elementStored(F, MT->getRawSource())) notElement(F, I, valueText(MT) + " (a block copy)");
             }
@@ -1866,7 +1959,11 @@ void CallGraphPass::checkContainerClosure() {
       }
       elemCursorLines[K] = "cursor field " + K + " on an element: " +
                            (why.empty() ? "CLOSED (" + std::to_string(stores) + " stores, each null or an element" +
-                                              keyed + ")"
+                                              keyed +
+                                              (wholeCopies ? "; " + std::to_string(wholeCopies) +
+                                                                 " copies of the whole struct, key-preserving"
+                                                           : std::string()) +
+                                              ")"
                                         : "not closed (" + why + ")");
       cursorOpen[K] = why;
       cursorStack.pop_back();
@@ -1890,8 +1987,7 @@ void CallGraphPass::checkContainerClosure() {
     };
     // A read of a cursor field: the field closed, and inside a union the
     // read keyed to admit no store of another member.
-    auto cursorRead = [&](const std::string &K, const LoadInst *LI) -> std::string {
-      if (std::string why = cursorField(K); !why.empty()) return why;
+    keyedRead = [&](const std::string &K, const LoadInst *LI) -> std::string {
       auto oit = cursorOtherKeys.find(K);
       if (oit == cursorOtherKeys.end()) return "";
       const auto *ks = keysOf(LI);
@@ -1899,6 +1995,15 @@ void CallGraphPass::checkContainerClosure() {
       for (const std::string &k : *ks)
         if (oit->second.count(k)) return "a read of the cursor that admits another member's store: " + valueText(LI);
       return "";
+    };
+    auto cursorRead = [&](const std::string &K, const LoadInst *LI) -> std::string {
+      if (std::string why = cursorField(K); !why.empty()) return why;
+      if (auto bit = cursorReadBad.find(LI); bit != cursorReadBad.end()) return bit->second;
+      if (std::find(cursorStack.begin(), cursorStack.end(), K) != cursorStack.end()) {
+        cursorReadsUnderWay[K].push_back(LI); // checked when K's keys are known
+        return "";
+      }
+      return keyedRead(K, LI);
     };
     cursorClosed = [&](const Value *L) {
       const auto *LI = cast<LoadInst>(L);

@@ -2398,6 +2398,36 @@ the listed ASSUMPTIONs.
   load through a payload value is payload again: `ret = ret->u.i.link`);
   a body read of a closed cursor field discharges O6 under the same
   premise.
+- **One greatest fixpoint, values too (F1, Fable 2026-10-17):** all the
+  container verdicts are one greatest fixpoint. Whatever is under way, a
+  cursor field, a value's element evaluation (an -O0 slot's or a phi's
+  entries), or a read of a cursor whose other members' keys are not known
+  yet, is assumed (closed, an element, admitted) inside the evaluations it
+  encloses; every verdict that rested on it is withdrawn when it ends
+  otherwise, and decided again on its next use. A cursor field whose check
+  began inside a value's evaluation and met that value as a stored element
+  leans on it, and is withdrawn if the value ends no element; a read
+  passed while its cursor was under way is checked once the cursor's keys
+  are known, and a refuted read fails from then on, its cursor deciding
+  again (each round refutes one more read: it ends). The inconsistency
+  this removes: a value under way was treated pessimistically (not an
+  element) while a cursor under way was treated optimistically (closed).
+  On nm-O0 the cursor bfd_link_hash_entry+40 was first checked inside the
+  evaluation of the source h of linker.c:1785's copy (`h = h->u.i.link`
+  is one of h's stores), met h under way as the copy's source, and came
+  out open on it, which then failed h. With withdrawal the verdicts do not
+  depend on the order the checks reach them; no pre-pass is needed.
+- **A copy of the whole struct (Q1 (b), Fable 2026-10-17):** a block copy
+  between two objects of one struct (the destination's and the source's
+  named slots the same struct at offset 0, the length its size) is
+  key-preserving: under each key the destination's content is the
+  source's, tag and union bytes moving together (3.53 rule 4, cell to
+  cell). Under a cursor's keys it moves the cursor's own content, so it is
+  no store into the cursor, with no owner condition. This is what a block
+  copy's elementStored(source) means in general: under each key the copy
+  stores the source's content under that key. O1's admittance of the link
+  words a copy covers keeps the same-owner condition (the rb_replace_node
+  rule).
 - **A cursor inside a union (Q-d):** a store of another member over the
   cursor's bytes is no store of the cursor only by the union keys (3.17 /
   3.51, the keys an access carries), never by a discriminator read here:
@@ -2427,6 +2457,6 @@ embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_ad
 t_cells_container_{zero_gep,const_root,phi_owner,bytestep,union_slot,reread,descent,formal_obj}.ll
 (shapes from the kernel's clang-14 IR that clang-18 no longer emits) and
 t_cells_container_del_all.c, t_cells_container_{cursor_closed,cursor_open,cursor_union,
-cursor_nested,deref_owner,outparam}.c (the bfd link-hash rows); rows for the rbtree cases in t2_cells_rblib.c,
+cursor_nested,deref_owner,outparam,cursor_union_copy,cursor_underway}.c (the bfd link-hash rows); rows for the rbtree cases in t2_cells_rblib.c,
 shapes in cells_rb.h.
 Not mechanized. Checked by executions; see the commit's gates.

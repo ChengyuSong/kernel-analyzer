@@ -3104,6 +3104,12 @@ void CallGraphPass::computeTaggedFields() {
   // closes, every open path crosses one: that path's guard is its edge's
   // test. Empty if not.
   size_t pathGuarded = 0, coFills = 0, censusSubsumed = 0;
+  // Census member keys dropped for accesses over F's bytes: F's own, and
+  // others that lose a member key without gaining a tag key.
+  size_t censusDropF = 0, censusDropNotF = 0, censusReadsKept = 0;
+  std::map<const Instruction *, std::string> tagPrefixOf; // tag-keyed accesses: their pair's key prefix
+  std::set<const Instruction *> uncheckedReplaced; // the census's UNCHECKED reads a tag pair keys
+  std::map<const Instruction *, std::string> tagWriteOf; // writes of F keyed in both schemes: their pair's prefix
   auto pathGuards = [&](const TagStore &t, const Field &Df, const FieldCtx &Fc,
                         const FieldCtx &Dc) -> std::vector<Test> {
     const Function *Fn = t.I->getFunction();
@@ -4724,52 +4730,143 @@ void CallGraphPass::computeTaggedFields() {
     // Install, once per F. Another mechanism's keys on a writer or a read
     // of F would not meet these: F stays unkeyed then.
     if (readAdm.empty()) continue;
-    // Union keys of this slot (plan 3.17's census) are subsumed for a union
-    // next to a certified tag: they are dropped for every access of the
-    // slot (an access left unkeyed reads every write), then the tag keys
-    // go in. Any other mechanism's keys refuse the field.
+    // Union keys of the union slot holding F (plan 3.17's census, keyed by
+    // the union field's own offset: unionFieldNotes) are subsumed for a
+    // union next to a certified tag: they are dropped for every access
+    // whose bytes overlap F's (an access left unkeyed reads every write),
+    // then the tag keys go in; accesses to other bytes of the slot keep
+    // their member keys (Fable 2026-10-16). Any other mechanism's keys
+    // refuse the field.
     const std::string slotPrefix = S + "+" + std::to_string(Ff.second) + "#";
+    int64_t uoff = Ff.second;
+    if (auto nit = unionFieldNotes.find(S); nit != unionFieldNotes.end()) {
+      auto uit = nit->second.upper_bound(Ff.second);
+      if (uit != nit->second.begin()) {
+        --uit;
+        if (Ff.second < uit->first + std::max<int64_t>(uit->second.size, 1)) uoff = uit->first;
+      }
+    }
+    const std::string censusPrefix = S + "+" + std::to_string(uoff) + "#";
     auto isCensus = [&](const Instruction *I) {
       auto it = unionKeyNames.find(I);
-      if (it == unionKeyNames.end()) return false;
+      if (it == unionKeyNames.end() || it->second.empty()) return false;
       for (const std::string &k : it->second)
-        if (k.rfind(slotPrefix, 0) != 0 || k.rfind(slotPrefix + "t", 0) == 0) return false;
+        if (k.rfind(censusPrefix, 0) != 0 || k.rfind(slotPrefix + "!t", 0) == 0) return false;
       return true;
     };
-    bool census = false;
-    for (const FAccess &w : fs) census |= isCensus(w.I);
-    for (const FAccess &r : fLoads[Ff]) census |= isCensus(r.I);
-    if (census) {
-      std::vector<const Instruction *> drop;
-      for (auto &[I, ks] : unionKeyNames)
-        if (!ks.empty() && ks.front().rfind(slotPrefix, 0) == 0 && ks.front().rfind(slotPrefix + "t", 0) != 0)
-          drop.push_back(I);
-      for (const Instruction *I : drop) unionKeyNames.erase(I);
-      censusSubsumed++;
-    }
+    // Another mechanism's keys on an access of F refuse the field, before
+    // anything is dropped (a refused pair leaves the census keys as they
+    // are).
     const Instruction *other = nullptr;
-    for (const FAccess &w : fs) if (!other && unionKeyNames.count(w.I)) other = w.I;
-    for (const FAccess &r : fLoads[Ff]) if (!other && unionKeyNames.count(r.I)) other = r.I;
+    for (const FAccess &w : fs) if (!other && unionKeyNames.count(w.I) && !isCensus(w.I)) other = w.I;
+    for (const FAccess &r : fLoads[Ff]) if (!other && unionKeyNames.count(r.I) && !isCensus(r.I)) other = r.I;
     if (other) {
+      std::string ok;
+      for (const std::string &k : unionKeyNames[other]) ok += (ok.empty() ? "" : " ") + k;
       taggedReport.push_back("UNKEYED " + S + "+" + std::to_string(Ff.second) + ": an access already keyed otherwise at " +
-                             locOf(other));
+                             locOf(other) + " {" + ok + "}");
       continue;
     }
-    const std::string prefix = S + "+" + std::to_string(Ff.second) + "#t";
-    for (size_t i = 0; i < fs.size(); i++) {
-      if (!namedW[i]) { writersUntagged++; continue; }
-      unionKeyNames[fs[i].I] = {prefix + "w" + std::to_string(i)};
-      writersTagged++;
+    // Two partitions of one set of writes (Fable 2026-10-16): the tag keys
+    // and the union census's member keys of the slot holding F, each with a
+    // catch-all ("every member": the census prefix + "?"; "every tag": the
+    // tag prefix + "?"). Every write over F's bytes carries a key of each
+    // scheme (its member key or the census catch-all; its tag key or the
+    // tag catch-all); every read carries one scheme's keys and that
+    // scheme's catch-all: the tag keys where a stable dominating test keys
+    // it (a checked read), else its census member key (the user's
+    // 2026-10-07 assumption, unchanged), else none (it reads the whole slot:
+    // every key, both catch-alls and the unkeyed cell). The unkeyed cell
+    // (what neither scheme types) is read by every read of the slot. A read
+    // in either scheme meets every write of that scheme, and every write is
+    // in both. "#!t": no member or function name (the census's keys) starts
+    // with '!' (bfd.tdata's member tekhex_data did start with "t").
+    const std::string prefix = S + "+" + std::to_string(Ff.second) + "#!t";
+    const std::string tagAll = prefix + "?", censusAll = censusPrefix + "?";
+    const int64_t fsz = (int64_t)fs.front().I->getModule()->getDataLayout().getPointerSize();
+    std::set<const Instruction *> mine;
+    for (const FAccess &w : fs) mine.insert(w.I);
+    for (const FAccess &r : fLoads[Ff]) mine.insert(r.I);
+    auto overF = [&](const Instruction *I) { // the access's bytes, by the one naming route (accessSlot)
+      const Value *Addr = getLoadStorePointerOperand(I);
+      const Type *AT = Addr ? getLoadStoreType(const_cast<Instruction *>(I)) : nullptr;
+      StructType *S2 = nullptr;
+      int64_t o2 = 0;
+      const DataLayout &DL2 = I->getModule()->getDataLayout();
+      const bool named = Addr && AT && AT->isSized() && accessSlot(I, Addr, DL2, S2, o2) && S2 && S2->hasName() &&
+                         stripStructNameSuffix(S2->getName()) == S;
+      if (!named) return true; // bytes unknown: over F's, as far as one can tell
+      const int64_t hi2 = o2 + (int64_t)DL2.getTypeStoreSize(const_cast<Type *>(AT));
+      return hi2 > Ff.second && o2 < Ff.second + fsz;
+    };
+    // Two schemes only where the census keys the slot: an access of F, or
+    // another over F's bytes, carries census keys. Elsewhere (F in no
+    // union, or one the census did not key) the tag keys alone, as before:
+    // a tagged write its key, an untagged one the unkeyed cell, a read its
+    // writers' keys.
+    bool censusHere = false;
+    for (const FAccess &w : fs) censusHere |= isCensus(w.I);
+    for (const FAccess &r : fLoads[Ff]) censusHere |= isCensus(r.I);
+    for (auto &[I, ks] : unionKeyNames)
+      if (!censusHere && !mine.count(I) && isCensus(I) && overF(I)) censusHere = true;
+    if (!censusHere) {
+      for (size_t i = 0; i < fs.size(); i++) {
+        if (!namedW[i]) { writersUntagged++; continue; }
+        unionKeyNames[fs[i].I] = {prefix + "w" + std::to_string(i)};
+        writersTagged++;
+      }
+      for (auto &[I, adm] : readAdm) {
+        std::vector<std::string> ks;
+        for (size_t i : adm)
+          if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i));
+        if (ks.empty()) ks.push_back(prefix + "none");
+        if (uncheckedReads.count(I)) uncheckedReplaced.insert(I);
+        unionKeyNames[I] = ks;
+        tagPrefixOf[I] = prefix;
+        readsKeyed++;
+      }
     }
-    for (auto &[I, adm] : readAdm) {
-      std::vector<std::string> ks;
-      for (size_t i : adm)
-        if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i));
-      if (ks.empty()) ks.push_back(prefix + "none");
-      unionKeyNames[I] = ks;
-      // Its callee's tested uses read it through their own tests' keys,
-      // when every call of the callee is such a read (below).
-      readsKeyed++;
+    if (censusHere) {
+      // The census-keyed accesses over F's bytes that are not F's: a write
+      // gains the tag catch-all (every tag); a read keeps its member key and
+      // reads the census catch-all too.
+      bool tookCensus = false;
+      for (auto &[I, ks] : unionKeyNames) {
+        if (mine.count(I) || !isCensus(I) || !overF(I)) continue;
+        ks.push_back(isa<StoreInst>(I) ? tagAll : censusAll);
+        tookCensus = true;
+        (isa<StoreInst>(I) ? censusDropNotF : censusReadsKept)++;
+      }
+      for (size_t i = 0; i < fs.size(); i++) {
+        std::vector<std::string> ks;
+        if (isCensus(fs[i].I)) ks = unionKeyNames[fs[i].I], tookCensus = true, censusDropF++;
+        else ks.push_back(censusAll); // untyped by member: every member
+        if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i)), writersTagged++;
+        else ks.push_back(tagAll), writersUntagged++; // untagged: every tag
+        unionKeyNames[fs[i].I] = ks;
+        tagWriteOf[fs[i].I] = prefix;
+      }
+      if (tookCensus) censusSubsumed++;
+      for (auto &[I, adm] : readAdm) {
+        std::vector<std::string> ks;
+        for (size_t i : adm)
+          if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i));
+        if (ks.empty()) ks.push_back(prefix + "none");
+        ks.push_back(tagAll);
+        if (uncheckedReads.count(I)) uncheckedReplaced.insert(I);
+        unionKeyNames[I] = ks;
+        tagPrefixOf[I] = prefix;
+        // Its callee's tested uses read it through their own tests' keys,
+        // when every call of the callee is such a read (below).
+        readsKeyed++;
+      }
+      // F's reads the pair does not key: their census member key and the
+      // census catch-all (a census-keyed read of F), else the whole slot.
+      for (const FAccess &r : fLoads[Ff]) {
+        if (readAdm.count(r.I) || !isCensus(r.I)) continue;
+        unionKeyNames[r.I].push_back(censusAll);
+        censusReadsKept++;
+      }
     }
     // Plan 3.54: the installed entry-keyed reads and their formals; a
     // formal's test fields are those every one of its reads was tested on.
@@ -4943,9 +5040,36 @@ void CallGraphPass::computeTaggedFields() {
          << xmTerms << " terms with x-masks over " << xmFieldSizes.size() << " fields (" << xmFieldsWide << " U widened); "
          << pathGuarded << " retags guarded per path; " << coFills << " fills that write F and D together; "
          << "parameter-pair tests: " << ppKeyedReads << " keyed reads, " << ppUntestedReads << " untested; "
-         << censusSubsumed << " union slots taken over from the union census; " << ppChannelCallees
+         << censusSubsumed << " union slots keyed in both schemes, tag and union census (writes of F with a member key "
+         << censusDropF << ", other writes over F's bytes made every tag " << censusDropNotF
+         << ", reads over F's bytes keeping their member key " << censusReadsKept << "); " << ppChannelCallees
          << " callees with per-use parameter channels; " << valueTests
          << " value tests narrowing a tag taken at its load\n");
+  // The census's UNCHECKED reads a tag pair keys by a stable dominating
+  // test: checked now, so no longer listed assumptions; the final count is
+  // net of them (a read the pair does not key keeps its member key).
+  CG_LOG("UnionKeys: " << uncheckedReplaced.size()
+         << " UNCHECKED reads replaced by tag keys (keyed by a stable test of the tag); net UNCHECKED reads: "
+         << uncheckedReads.size() - uncheckedReplaced.size() << " of " << uncheckedReads.size() << "\n");
+  // The two schemes (asserted): a tag-keyed read carries only its pair's
+  // keys (with its catch-all); a write of F a key of each scheme (a
+  // catch-all counts).
+  for (const auto &[I, pre] : tagPrefixOf) {
+    auto it = unionKeyNames.find(I);
+    if (it == unionKeyNames.end()) continue;
+    for (const std::string &k : it->second) {
+      assert(k.rfind(pre, 0) == 0 && "a tag-keyed read with another kind of key");
+      (void)k;
+    }
+  }
+  for (const auto &[I, pre] : tagWriteOf) {
+    auto it = unionKeyNames.find(I);
+    assert(it != unionKeyNames.end() && "a write of a doubly keyed slot with no key");
+    bool tagSide = false, memberSide = false;
+    for (const std::string &k : it->second) (k.rfind(pre, 0) == 0 ? tagSide : memberSide) = true;
+    assert(tagSide && memberSide && "a write of a doubly keyed slot without a key of each scheme");
+    (void)tagSide, (void)memberSide;
+  }
   // Plan 3.54 rows: per method formal, its D field, its installers and
   // its keyed reads; the refusals by reason.
   {

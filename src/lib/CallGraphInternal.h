@@ -87,6 +87,30 @@ extern bool g_sumAuthoritative;
 bool shouldSkipFunction(const Function *F);
 StringRef stripStructNameSuffix(StringRef Name);
 bool isAnonStructName(StringRef Name);
+// A union slot keyed in two schemes (TaggedFields: a tag pair over a slot
+// the union census keys by member): each scheme's catch-all key ("every
+// member": the census prefix + "?"; "every tag": the tag prefix + "?").
+// Is a key list one write's keys, one per scheme (one key; or a tag key
+// "#!t..." among them)? Any other list (the union census's several
+// callback keys on one write) writes the unkeyed cell, as before.
+inline bool perKeyWrite(const std::vector<std::string> &ks) {
+  if (ks.size() == 1) return true;
+  for (const std::string &k : ks)
+    if (k.find("#!t") != std::string::npos) return true;
+  return false;
+}
+// Is a key list one read's keys in one scheme, filed per key: one key; tag
+// keys (with the tag catch-all); or one census member key with the census
+// catch-all of its slot. Any other list reads the whole slot, as before.
+inline bool perKeyRead(const std::vector<std::string> &ks) {
+  if (ks.size() == 1) return true;
+  bool allTag = true;
+  for (const std::string &k : ks) allTag &= k.find("#!t") != std::string::npos;
+  if (allTag) return true;
+  if (ks.size() != 2 || ks[1].size() < 2 || ks[1].compare(ks[1].size() - 2, 2, "#?") != 0) return false;
+  const size_t h = ks[0].rfind('#');
+  return h != std::string::npos && ks[0].compare(0, h + 1, ks[1], 0, ks[1].size() - 1) == 0;
+}
 bool isAnonStruct(const StructType *ST);
 // Slots.cc: an access's (struct, byte offset), across embedding and -O3.
 bool embedsAt(Type *T, int64_t off, StringRef S, const DataLayout &DL);

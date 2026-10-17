@@ -1784,9 +1784,14 @@ void CallGraphPass::checkContainerClosure() {
       if (KO >= uit->first + std::max<int64_t>(uit->second.size, 1)) return {0, nullptr};
       return {uit->first, &uit->second};
     };
+    // The keys the solver files an access under (GraphBuild), or null when
+    // it reaches the slot's unkeyed cell (a write) or the whole slot (a
+    // read): key lists the solver does not file per key.
     auto keysOf = [&](const Instruction *I) -> const std::vector<std::string> * {
       auto it = unionKeyNames.find(I);
-      return it == unionKeyNames.end() || it->second.empty() ? nullptr : &it->second;
+      if (it == unionKeyNames.end() || it->second.empty()) return nullptr;
+      const std::vector<std::string> &ks = it->second;
+      return (isa<StoreInst>(I) ? perKeyWrite(ks) : perKeyRead(ks)) ? &ks : nullptr;
     };
     std::function<std::string(const std::string &)> cursorField;
     cursorField = [&](const std::string &K) -> std::string {
@@ -1846,8 +1851,8 @@ void CallGraphPass::checkContainerClosure() {
       if (why.empty() && UN && others) {
         if (othersKeyed) {
           cursorOtherKeys[K] = otherKeys;
-          keyed = ", " + std::to_string(others) + " stores of other members of union " + UN->field +
-                  " excluded by their union keys (each read of the cursor keyed to admit none)";
+          keyed = ", or " + std::to_string(others) + " stores of other members of union " + UN->field +
+                  ", each with union keys; a read of the cursor is closed only if it admits none of them";
         } else {
           std::string engines = UN->census;
           if (auto wit = widenedTagsOf.find(KS); wit != widenedTagsOf.end())
@@ -3034,7 +3039,7 @@ void CallGraphPass::checkContainerClosure() {
               }
               if (const std::string why = cursorRead(K, PL); !why.empty())
                 bad2.insert(fn + " returns " + valueText(RI->getReturnValue()) + " (read from " + K +
-                            ", a cursor field not closed)");
+                            ", a cursor field not closed: " + why + ")");
               else {
                 cursorUsed.insert(K);
                 if (const std::string u = PL ? uncheckedOf(K, PL) : std::string(); !u.empty()) uncheckedCursor.insert(u);

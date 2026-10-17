@@ -346,8 +346,9 @@ protected:
   std::map<std::string, std::map<int64_t, UnionFieldNote>> unionFieldNotes;
   // The union census's UNCHECKED reads (keyed by their own member with no
   // settling check, the user's rule of 2026-10-07), with the key it gave
-  // each: a closure that rests on one lists it (the containers' cursor
-  // check).
+  // each: a tag pair that keys one replaces its keys (TaggedFields), net of
+  // which the final count is printed; a closure that rests on one lists it
+  // (the containers' cursor check).
   std::map<const llvm::Instruction *, std::string> uncheckedReads;
   // Tag fields 3.51 widened (no admitted tag), by "struct.S": "S+off: why".
   std::map<std::string, std::vector<std::string>> widenedTagsOf;

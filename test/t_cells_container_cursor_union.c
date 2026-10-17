@@ -8,7 +8,7 @@
 // read: no assumption beyond the instance premise). Before the object
 // identity fix the pair never formed (the store's object was &c->u, the tag
 // store's c), and the cursor was "no admitted discriminator".
-// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: CLOSED \(3 stores, each null or an element, 1 stores of other members of union u excluded by their union keys
+// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: CLOSED \(3 stores, each null or an element, or 1 stores of other members of union u, each with union keys
 // LOG: TaggedFields:   KEYS struct.bfd_link_hash_entry\+40 by \+24: 1 reads keyed
 // NOLOG: UNCHECKED\): bfd_link_hash_lookup
 // LOG: Container:   VERIFIED under 1 assumptions

@@ -3353,7 +3353,7 @@ void CallGraphPass::runUnionCensus() {
       std::string t;
       for (auto &[w, c] : uncheckedBy) { n += c; t += ", " + w + " " + std::to_string(c); }
       errs() << "UnionKeys: " << n << " reads keyed by their own member without a settling "
-             << "check (warned, see UNCHECKED lines)" << t << "\n";
+             << "check (warned, see UNCHECKED lines; before tag keys, net count from the tagged fields)" << t << "\n";
     }
     size_t uw = 0, ur = 0;
     std::map<std::string, size_t> byWhy;

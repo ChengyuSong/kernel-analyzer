@@ -3836,9 +3836,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
     if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
       derefNode = CGP.keyedDeref(ptrNode, kit->second[0]);
     else if (kit != CGP.unionKeyNames.end() && kit->second.size() > 1) {
-      bool tagged = true;
-      for (const std::string &k : kit->second) tagged &= k.find("#t") != std::string::npos;
-      if (tagged) {
+      if (perKeyRead(kit->second)) { // one scheme's keys (with its catch-all)
         for (const std::string &k : kit->second)
           CGP.addAssignmentEdge(CGP.keyedDeref(ptrNode, k), valNode);
         multiKeyed = true;
@@ -3953,8 +3951,9 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
             // A tagged union member's integer write (plan 3.51) writes
             // its own key's cell.
             auto kit = CFLCells ? CGP.unionKeyNames.find(&I) : CGP.unionKeyNames.end();
-            if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
-              CGP.addAssignmentEdge(valNode, CGP.keyedDeref(pN, kit->second[0]));
+            if (kit != CGP.unionKeyNames.end() && perKeyWrite(kit->second))
+              for (const std::string &k : kit->second) // each scheme's key
+                CGP.addAssignmentEdge(valNode, CGP.keyedDeref(pN, k));
             else
               CGP.addAssignmentEdge(valNode, CGP.getRepDerefNode(pN));
           }
@@ -4016,12 +4015,20 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   }
 
   // A keyed union access writes its key's cell (--cfl-cells), through
-  // its own hub only: the pointer's shared hub would read every member.
+  // its own hub only: the pointer's shared hub would read every member. A
+  // write keyed in two schemes (a union slot with a tag pair: its census
+  // member key, or the census catch-all; its tag key, or the tag catch-all)
+  // writes each key's cell.
   NodeIndex derefNode = AndersNodeFactory::InvalidIndex;
+  SmallVector<NodeIndex, 2> moreDerefs;
   if (CFLCells) {
     auto kit = CGP.unionKeyNames.find(&I);
-    if (kit != CGP.unionKeyNames.end() && kit->second.size() == 1)
-      derefNode = CGP.keyedDeref(ptrNode, kit->second[0]);
+    if (kit != CGP.unionKeyNames.end() && perKeyWrite(kit->second))
+      for (const std::string &k : kit->second) {
+        const NodeIndex n = CGP.keyedDeref(ptrNode, k);
+        if (derefNode == AndersNodeFactory::InvalidIndex) derefNode = n;
+        else moreDerefs.push_back(n);
+      }
   }
   if (derefNode == AndersNodeFactory::InvalidIndex)
     derefNode = CGP.getRepDerefNode(ptrNode);
@@ -4079,6 +4086,7 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
     CGP.namedAccessLog.emplace_back(derefNode, names[0], &I);
   CellWriteSize ws(CGP, CGP.curDL->getTypeStoreSize(val->getType()));
   CGP.wireNamedStore(valNode, derefNode, names);
+  for (NodeIndex n : moreDerefs) CGP.addAssignmentEdge(valNode, n);
 }
 
 // --cfl-cells: carving. One allocation cut into regions of run-time size

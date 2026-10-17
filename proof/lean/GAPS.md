@@ -771,9 +771,38 @@ Obligations left open:
      runs only when the tag satisfies them. The read admits the union
      over uses; an untested use makes it an untested read. This does not
      separate the uses inside the callee (they share j's value).
-   - A union slot keyed by tag also drops the 3.17 census keys of that
-     slot on every access before the tag keys go in: an access the tag
-     keying leaves unkeyed then reads every write of the slot, a superset.
+   - A union slot with a tag pair is keyed in two schemes (Fable
+     2026-10-16): the tag keys of the pair (F, D) and the 3.17 census
+     member keys of the union slot holding F (keyed by the union's own
+     offset, struct.S+off#member). They are two partitions of the same set
+     of writes, each with a catch-all: "every member" (struct.S+off#?) and
+     "every tag" (struct.S+F#!t?). Every write over F's bytes carries a key
+     of each scheme: its member key or the census catch-all, its tag key or
+     the tag catch-all. Every read carries one scheme's keys and that
+     scheme's catch-all: the tag keys where a stable dominating test of D
+     keys it (a checked read), else its census member key (the user's
+     2026-10-07 assumption, an UNCHECKED read, unchanged). A read keyed by
+     neither reads the whole slot: every key, both catch-alls and the
+     unkeyed cell. The unkeyed cell (what neither scheme types) is read by
+     every read of the slot, in either scheme. So a read in either scheme
+     meets every write of that scheme (its keys, its catch-all, the unkeyed
+     cell), every write is in both, and no read misses a write; a tag-keyed
+     read is not widened by a write the census alone cannot type.
+     Asserted: a tag-keyed read carries only its pair's keys, a write of F
+     a key of each scheme (a catch-all counts). Only where the census keys
+     the slot (an access of F, or another over F's bytes, carries census
+     keys); elsewhere a pair keys as before, one scheme: a tagged write its
+     key, an untagged one the unkeyed cell, a read its writers' keys (both
+     schemes on a slot with no census keys only multiplied key cells:
+     tiffsplit-O0's tiff+816 method-field pair did not reach its stop).
+     The census prints its UNCHECKED total before tag keys; the tagged fields print how many of
+     those reads a tag now keys and the net count. Tag keys are spelled
+     "#!t..." (no member or function name starts with '!': bfd.tdata's
+     member tekhex_data did start with "t"); another mechanism's keys on an
+     access of F refuse the pair before any key changes. Before, the census
+     keys were looked for under F's own prefix, never found for a member
+     inside a union, and the pair was refused as "already keyed otherwise"
+     (bfd_link_hash_entry.u.i.link once the census typed u's members).
    - Union members that are structs (plan 3.51 (2), Fable 2026-10-16):
      the union census types an access by member when the access's debug
      type is the member's; when no member's type is, an access at byte o

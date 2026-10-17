@@ -91,6 +91,8 @@ bool isAnonStruct(const StructType *ST);
 // Slots.cc: an access's (struct, byte offset), across embedding and -O3.
 bool embedsAt(Type *T, int64_t off, StringRef S, const DataLayout &DL);
 const GEPOperator *structGEP(const Value *A);
+bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off,
+                    const Value **base = nullptr);
 bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
                 StructType *&S, int64_t &off);
 bool tbaaReaches(const Instruction *I, StringRef SN, int64_t o);

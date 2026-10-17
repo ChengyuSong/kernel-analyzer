@@ -1554,13 +1554,18 @@ void CallGraphPass::checkContainerClosure() {
     // Assumptions an answer rests on, pending until its caller admits it.
     std::vector<std::string> eoPending;
     std::set<std::string> outParamAssumed, cursorInstance, derefReadAssumed;
+    std::set<std::string> uncheckedCursor; // "field\tread": a cursor read admitted by an UNCHECKED census key
     std::vector<std::string> derefReadChecked;
     auto eoMark = [&]() { return eoPending.size(); };
     auto eoSettle = [&](size_t mark, bool admitted) {
       if (admitted)
         for (size_t i = mark; i < eoPending.size(); i++) {
           const std::string &a = eoPending[i];
-          (a[0] == 'o' ? outParamAssumed : a[0] == 'c' ? cursorInstance : derefReadAssumed).insert(a.substr(1));
+          (a[0] == 'o'   ? outParamAssumed
+           : a[0] == 'c' ? cursorInstance
+           : a[0] == 'u' ? uncheckedCursor
+                         : derefReadAssumed)
+              .insert(a.substr(1));
         }
       eoPending.resize(mark);
     };
@@ -1634,6 +1639,7 @@ void CallGraphPass::checkContainerClosure() {
       return ownerShape(L1, 0);
     };
     std::function<std::string(const Value *)> cursorClosed;
+    std::function<std::string(const std::string &, const LoadInst *)> uncheckedOf; // (below)
     std::function<std::string(const Value *, int)> elemOwnerR = [&](const Value *V, int d) -> std::string {
       V = V->stripPointerCasts();
       if (d > 12) return "";
@@ -1678,6 +1684,7 @@ void CallGraphPass::checkContainerClosure() {
           const std::string o = elemOwnerR(baseOf(L->getPointerOperand()), d + 1);
           if (!o.empty() && cursorClosed(L).empty()) {
             eoPending.push_back("c" + K);
+            if (const std::string u = uncheckedOf(K, L); !u.empty()) eoPending.push_back("u" + u);
             return o;
           }
         }
@@ -1888,6 +1895,18 @@ void CallGraphPass::checkContainerClosure() {
     cursorClosed = [&](const Value *L) {
       const auto *LI = cast<LoadInst>(L);
       return cursorRead(fieldKey(LI, LI->getPointerOperand()), LI);
+    };
+    // A read of a cursor inside a union admitted by the union census's
+    // member key, the read one of its UNCHECKED reads (keyed by its own
+    // member with no settling check, the user's rule of 2026-10-07): the
+    // closure rests on that assumption, listed. A read a tag pair keys has
+    // other keys (checked) and adds nothing.
+    uncheckedOf = [&](const std::string &K, const LoadInst *LI) -> std::string {
+      auto uit = uncheckedReads.find(LI);
+      if (!cursorOtherKeys.count(K) || uit == uncheckedReads.end()) return "";
+      const auto *ks = keysOf(LI);
+      if (!ks || std::find(ks->begin(), ks->end(), uit->second) == ks->end()) return "";
+      return K + "\t" + LI->getFunction()->getName().str() + ": " + valueText(LI);
     };
     std::vector<std::string> inlineSites;
     auto isInlineMove = [&](const StoreInst *S) {
@@ -3016,8 +3035,10 @@ void CallGraphPass::checkContainerClosure() {
               if (const std::string why = cursorRead(K, PL); !why.empty())
                 bad2.insert(fn + " returns " + valueText(RI->getReturnValue()) + " (read from " + K +
                             ", a cursor field not closed)");
-              else
+              else {
                 cursorUsed.insert(K);
+                if (const std::string u = PL ? uncheckedOf(K, PL) : std::string(); !u.empty()) uncheckedCursor.insert(u);
+              }
             }
           }
       if (R.role == CR::Insert || (R.role == CR::Lookup && R.create >= 0 && R.elem == -1)) {
@@ -3111,6 +3132,7 @@ void CallGraphPass::checkContainerClosure() {
           if (cursorOpen.count(K) && cursorRead(K, L).empty()) {
             o6Cursor.insert(K);
             cursorUsed.insert(K);
+            if (const std::string u = uncheckedOf(K, L); !u.empty()) uncheckedCursor.insert(u);
             continue;
           }
           bad6.insert(F->getName().str() + "." + K);
@@ -3458,6 +3480,13 @@ void CallGraphPass::checkContainerClosure() {
       it = cursorOpen.count(*it) && cursorOpen[*it].empty() ? std::next(it) : cursorInstance.erase(it);
     for (const std::string &K : cursorInstance) {
       cline("    ASSUMPTION closed cursor " + K + ": the element stored there is of the same table instance");
+      nAssume++;
+    }
+    for (const std::string &u : uncheckedCursor) { // of the fields that ended closed
+      const std::string K = u.substr(0, u.find('\t'));
+      if (!cursorOpen.count(K) || !cursorOpen[K].empty()) continue;
+      cline("    ASSUMPTION closed cursor " + K + ": a read admitted by its own member's census key without a "
+            "settling check (UNCHECKED): " + u.substr(u.find('\t') + 1));
       nAssume++;
     }
     for (const std::string &x : outParamAssumed) {

@@ -344,6 +344,11 @@ protected:
   // (read by the containers' cursor check, plan 3.55 Q-d).
   struct UnionFieldNote { std::string field; int64_t size = 0; std::string census; };
   std::map<std::string, std::map<int64_t, UnionFieldNote>> unionFieldNotes;
+  // The union census's UNCHECKED reads (keyed by their own member with no
+  // settling check, the user's rule of 2026-10-07), with the key it gave
+  // each: a closure that rests on one lists it (the containers' cursor
+  // check).
+  std::map<const llvm::Instruction *, std::string> uncheckedReads;
   // Tag fields 3.51 widened (no admitted tag), by "struct.S": "S+off: why".
   std::map<std::string, std::vector<std::string>> widenedTagsOf;
   // --cfl-union-keys=tag (cell solver): the keyed union slots (struct,

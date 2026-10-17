@@ -58,7 +58,6 @@ static bool leadingZero(const GEPOperator *G) {
 // struct it names), so only the tag names it, as namedSlot does.
 // accessSlotAny may answer an anonymous struct; accessSlot never does.
 static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off);
-static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off);
 static bool accessSlotAny(const Instruction *I, const Value *Addr, const DataLayout &DL, StructType *&S,
                           int64_t &off) {
   if (const GEPOperator *G = structGEP(Addr); G && leadingZero(G)) {
@@ -420,8 +419,10 @@ bool namedPtr(const Value *V, const DataLayout &DL, PointeeResolver &P, StructTy
 
 // The nearest named, non-anonymous struct an address lies in by its chain
 // of constant GEPs (through casts), each step's struct at its leading index
-// 0: that struct and the address's byte offset in it.
-static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off) {
+// 0: that struct and the address's byte offset in it, and (base) the
+// pointer that struct's GEP steps from, the object the name belongs to
+// (TaggedFields' object identity walks the same steps, Fable 2026-10-16).
+bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *&S, int64_t &off, const Value **base) {
   int64_t acc = 0;
   const Value *V = Addr;
   for (int i = 0; i < 16; i++) {
@@ -437,6 +438,7 @@ static bool enclosingNamed(const Value *Addr, const DataLayout &DL, StructType *
     if (GS && GS->hasName() && !GS->isOpaque() && !isAnonStruct(GS)) {
       if (acc < 0 || acc >= (int64_t)DL.getTypeAllocSize(GS)) return false;
       S = GS, off = acc;
+      if (base) *base = G->getPointerOperand();
       return true;
     }
     V = G->getPointerOperand();

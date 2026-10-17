@@ -798,6 +798,17 @@ Obligations left open:
      changes other bits only, under the stability rule. A superset of the
      value's executions (known bits are sound), so no write is narrowed
      below what it can store.
+   - The object of an access is the one its name belongs to (Fable
+     2026-10-16, the identity principle of the owner code, S1-S6): a field
+     inside an anonymous struct or union is named by the enclosing named
+     struct and offset (accessSlot), and its object identity steps through
+     the same anonymous GEPs (constant, leading index 0) to the base of
+     that struct's GEP, by the same walk (enclosingNamed, one helper), then
+     outward through embed-only structs as any field's. Before, the object
+     was the anonymous member's address (&h->u), never the object a tag
+     store on h names, so a writer of u.i.link never co-wrote type and the
+     pair (bfd_link_hash_entry+40, +24) never formed. "Same object, same
+     function" is unchanged: the object now matches the name.
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with
@@ -2362,7 +2373,11 @@ the listed ASSUMPTIONs.
   cursor's bytes is no store of the cursor only by the union keys (3.17 /
   3.51, the keys an access carries), never by a discriminator read here:
   every such store keyed, every read of the cursor keyed to admit none of
-  their keys. Without keys the field is not closed: "cursor inside union u
+  their keys. A read admitted by the union census's own-member key with no
+  settling check (an UNCHECKED read, the user's 2026-10-07 rule) makes the
+  closure rest on that assumption: listed per read and counted in "VERIFIED
+  under n assumptions"; a read a tag pair keys is checked and adds nothing.
+  Without keys the field is not closed: "cursor inside union u
   (S+off): no admitted discriminator", with the union census's and the
   tagged fields' words (nm: bfd_link_hash_entry.u, whose members are
   structs the census does not type by member, and whose tag `type:8` 3.51

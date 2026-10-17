@@ -190,6 +190,7 @@ std::string stripSuffix(StringRef N) {
 } // namespace
 
 void CallGraphPass::runUnionCensus() {
+  uncheckedReads.clear();
   // ---- 1. Union fields of structs, from debug info ----
   std::map<std::pair<std::string, uint64_t>, UnionField> unions; // (S, off)
   std::map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> fieldsOf;
@@ -3206,6 +3207,7 @@ void CallGraphPass::runUnionCensus() {
           unionKeyNames[r.I] = {prefix + "#" + r.member};
           keyedR++;
           uncheckedBy[why]++;
+          uncheckedReads[r.I] = prefix + "#" + r.member;
           std::string others;
           for (const std::string &m : A.members)
             if (m != r.member) others += (others.empty() ? "" : " ") + m;

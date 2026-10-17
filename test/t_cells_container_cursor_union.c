@@ -1,12 +1,17 @@
 // t_cells_container_cursor_union.c — a cursor inside a union (plan 3.55 Q-d,
 // Fable 2026-10-16): binutils' bfd_link_hash_entry keeps its link in
 // u.i.link, over the same bytes as u.c.p (a string). A store of another
-// member is no store of the cursor only by the union keys (3.17 / 3.51);
-// here the union census types the link's store and read by member layout
-// (its members are structs) but keys none (one member used), so the cursor
-// is not closed and the line names the union and the engines' words.
-// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: not closed \(cursor inside union u \(struct.bfd_link_hash_entry\+32\): no admitted discriminator \(union census: writes 1/3 and reads 1/1 typed by member \(2 by member layout
-// LOG: Container:   REJECTED
+// member is no store of the cursor only by the union keys (3.17 / 3.51).
+// Here the tag pair (u.i.link by type) keys the chase's read under its
+// `type == 1` test, and main's u.c.p store is written with type 2: the read
+// admits none of its keys, so the cursor is closed on tag keys (a checked
+// read: no assumption beyond the instance premise). Before the object
+// identity fix the pair never formed (the store's object was &c->u, the tag
+// store's c), and the cursor was "no admitted discriminator".
+// LOG: cursor field struct.bfd_link_hash_entry\+40 on an element: CLOSED \(3 stores, each null or an element, 1 stores of other members of union u excluded by their union keys
+// LOG: TaggedFields:   KEYS struct.bfd_link_hash_entry\+40 by \+24: 1 reads keyed
+// NOLOG: UNCHECKED\): bfd_link_hash_lookup
+// LOG: Container:   VERIFIED under 1 assumptions
 #include <stdlib.h>
 #include <string.h>
 typedef void (*fn)(void);

@@ -221,11 +221,34 @@ struct ObjIds {
   }
   // objSize: the accessed struct's size (a -O3 byte offset inside it is a
   // field of the base; past it, another element).
+  // Accesses whose struct GEP is an anonymous struct's: their object is
+  // the enclosing named struct's base (counted, by address).
+  std::set<const Value *> viaAnon;
   const Value *of(const Value *Addr, int64_t objSize = 0, int depth = 0) {
     const Value *B = Addr->stripPointerCasts();
+    // A field of an anonymous struct is named by the enclosing named struct
+    // (accessSlot), so its object is that struct's (the same walk,
+    // enclosingNamed); then outward as below.
+    bool anonDone = false;
+    if (const GEPOperator *G = structGEP(Addr); G && isAnonStruct(dyn_cast<StructType>(G->getSourceElementType()))) {
+      StructType *NS = nullptr;
+      int64_t noff = 0;
+      const Value *NB = nullptr;
+      if (enclosingNamed(Addr, dataLayoutOf(Addr), NS, noff, &NB) && NB) {
+        viaAnon.insert(Addr);
+        anonDone = true;
+        B = NB->stripPointerCasts();
+        int64_t by = 0;
+        const DataLayout &DL = dataLayoutOf(Addr);
+        for (const Type *In = NS; const GEPOperator *O = composeStep(B, In, DL, by);) {
+          In = O->getSourceElementType();
+          B = O->getPointerOperand()->stripPointerCasts();
+        }
+      }
+    }
     // A field of the object (constant indices from element 0); another
     // element of an array is another object.
-    if (const GEPOperator *G = structGEP(Addr)) {
+    if (const GEPOperator *G = anonDone ? nullptr : structGEP(Addr)) {
       const auto *I0 = G->getNumIndices() ? dyn_cast<ConstantInt>(*G->idx_begin()) : nullptr;
       if (G->hasAllConstantIndices() && I0) {
         const bool bytes = G->getSourceElementType()->isIntegerTy(8) && G->getNumIndices() == 1;
@@ -4959,6 +4982,8 @@ void CallGraphPass::computeTaggedFields() {
     for (const std::string &r : taggedEntryRows) CG_LOG("TaggedFields:   ENTRY " << r << "\n");
   if (VerboseLevel >= 2)
     for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
+    CG_LOG("TaggedFields: addresses through an anonymous struct whose object is the enclosing named struct's: "
+           << ids.viaAnon.size() << "\n");
     CG_LOG("TaggedFields: tag-write values evaluated by their known bits alone (LLVM computeKnownBits): "
            << knownBitsTerms << "\n");
     CG_LOG("TaggedFields: accesses through a struct GEP whose leading index is not 0 (a byte step): "

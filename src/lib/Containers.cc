@@ -1567,6 +1567,7 @@ void CallGraphPass::checkContainerClosure() {
     std::vector<std::string> eoPending;
     std::set<std::string> outParamAssumed, cursorInstance, derefReadAssumed;
     std::set<std::string> holderAssumed, holderInstance; // rule A: reads of open holders; closed holders used
+    std::set<std::string> p3Assumed; // P3: cursor reads of both schemes, the stores excluded by member name
     std::set<std::string> uncheckedCursor; // "field\tread": a cursor read admitted by an UNCHECKED census key
     std::vector<std::string> derefReadChecked;
     auto eoMark = [&]() { return eoPending.size(); };
@@ -1579,6 +1580,7 @@ void CallGraphPass::checkContainerClosure() {
            : a[0] == 'u' ? uncheckedCursor
            : a[0] == 'h' ? holderAssumed
            : a[0] == 'k' ? holderInstance
+           : a[0] == 'x' ? p3Assumed
                          : derefReadAssumed)
               .insert(a.substr(1));
         }
@@ -2261,14 +2263,34 @@ void CallGraphPass::checkContainerClosure() {
         if (oit->second.count(k)) return "a read of the cursor that admits another member's store: " + valueText(LI);
       return "";
     };
+    // A read of both schemes (P3) admits no other member's store only by
+    // excluding, by their member names, the stores of other members its tag
+    // admits: listed, also for a read admitted while its cursor is under way.
+    auto p3Note = [&](const LoadInst *LI) {
+      auto pit = p3Excluded.find(LI);
+      if (pit == p3Excluded.end() || pit->second.empty()) return;
+      size_t un = 0, tg = 0;
+      std::set<std::string> sites;
+      for (auto &[W, tagged] : pit->second) {
+        (tagged ? tg : un)++;
+        sites.insert(W->getFunction()->getName().str() + ": " + valueText(W) + (tagged ? " (tagged)" : ""));
+      }
+      std::string s = LI->getFunction()->getName().str() + ": " + valueText(LI) + ": " + std::to_string(un) +
+                      " untagged, " + std::to_string(tg) + " tagged stores:";
+      for (const std::string &x : sites) s += " [" + x + "]";
+      eoPending.push_back("x" + s);
+    };
     auto cursorRead = [&](const std::string &K, const LoadInst *LI) -> std::string {
       if (std::string why = cursorField(K); !why.empty()) return why;
       if (auto bit = cursorReadBad.find(LI); bit != cursorReadBad.end()) return bit->second;
       if (std::find(cursorStack.begin(), cursorStack.end(), K) != cursorStack.end()) {
         cursorReadsUnderWay[K].push_back(LI); // checked when K's keys are known
+        p3Note(LI);
         return "";
       }
-      return keyedRead(K, LI);
+      std::string r = keyedRead(K, LI);
+      if (r.empty()) p3Note(LI);
+      return r;
     };
     cursorClosed = [&](const Value *L) {
       const auto *LI = cast<LoadInst>(L);
@@ -3410,7 +3432,12 @@ void CallGraphPass::checkContainerClosure() {
                 bad2.insert(fn + " returns " + valueText(RI->getReturnValue()) + " (a payload value it cannot name)");
                 continue;
               }
-              if (const std::string why = cursorRead(K, PL); !why.empty())
+              // Outside an evaluation: the assumptions the read rests on (P3's
+              // exclusions) settle here.
+              const size_t mark = eoMark();
+              const std::string why = cursorRead(K, PL);
+              eoSettle(mark, why.empty());
+              if (!why.empty())
                 bad2.insert(fn + " returns " + valueText(RI->getReturnValue()) + " (read from " + K +
                             ", a cursor field not closed: " + why + ")");
               else {
@@ -3507,7 +3534,10 @@ void CallGraphPass::checkContainerClosure() {
           // A body read of a closed cursor field discharges O6 under the
           // listed instance premise (Fable 2026-10-16, Q-e): what it reads
           // is null or an element, whoever wrote it.
-          if (cursorOpen.count(K) && cursorRead(K, L).empty()) {
+          const size_t mark = eoMark();
+          const bool closed = cursorOpen.count(K) && cursorRead(K, L).empty();
+          eoSettle(mark, closed);
+          if (closed) {
             o6Cursor.insert(K);
             cursorUsed.insert(K);
             if (const std::string u = uncheckedOf(K, L); !u.empty()) uncheckedCursor.insert(u);
@@ -3877,6 +3907,10 @@ void CallGraphPass::checkContainerClosure() {
     }
     for (const std::string &x : holderAssumed) {
       cline("    ASSUMPTION a node read back from a holder, assumed an element: " + x);
+      nAssume++;
+    }
+    for (const std::string &x : p3Assumed) {
+      cline("    ASSUMPTION stores of other members excluded by their member name (a read of both schemes): " + x);
       nAssume++;
     }
     if (!localArraysRefused.empty())

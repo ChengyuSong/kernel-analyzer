@@ -424,6 +424,10 @@ void CallGraphPass::computeTaggedFields() {
   taggedOutsidePre.clear();
   taggedUntested.clear();
   taggedInPlace.clear();
+  taggedAdmitVia.clear();
+  taggedDisagreeRows.clear();
+  p3Excluded.clear();
+  p3Reads = 0;
   taggedParamChannels.clear();
   taggedParamValueChannels.clear();
   taggedAccessSets.clear();
@@ -3515,6 +3519,7 @@ void CallGraphPass::computeTaggedFields() {
   // others that lose a member key without gaining a tag key.
   size_t censusDropF = 0, censusDropNotF = 0, censusReadsKept = 0;
   std::map<const Instruction *, std::string> tagPrefixOf; // tag-keyed accesses: their pair's key prefix
+  std::map<const Instruction *, std::vector<std::string>> memberOf; // a tag-keyed read's census member key (P3)
   std::set<const Instruction *> uncheckedReplaced; // the census's UNCHECKED reads a tag pair keys
   std::map<const Instruction *, std::string> tagWriteOf; // writes of F keyed in both schemes: their pair's prefix
   auto pathGuards = [&](const TagStore &t, const Field &Df, const FieldCtx &Fc,
@@ -4752,7 +4757,7 @@ void CallGraphPass::computeTaggedFields() {
         size_t uSize = 0;
         std::vector<std::map<int64_t, std::pair<int64_t, std::string>>> prov; // reports
       };
-      const bool provOn = VerboseLevel >= 2 && fs.size() >= 20;
+      const bool provOn = (VerboseLevel >= 2 && fs.size() >= 20) || !CFLRuleReport.empty();
       std::map<int64_t, Tags> tagsByR;
       std::vector<bool> wAll(writers.size(), false);
       for (size_t i = 0; i < writers.size(); i++) wAll[i] = writers[i].unknown;
@@ -4901,6 +4906,22 @@ void CallGraphPass::computeTaggedFields() {
             if (!ws.kb.hasConflict() && mayHold(tests, ws.kb)) adm.push_back(i);
             continue;
           }
+          if (provOn && i < TT->prov.size())
+            for (int64_t v : ws.vals) {
+              if (!holdsP(tests, v)) continue;
+              std::set<std::string> &via = taggedAdmitVia[{r.I, writers[i].I}];
+              int64_t cur = v;
+              bool mapped = false;
+              for (int d = 0; d < 12; d++) {
+                auto pit = TT->prov[i].find(cur);
+                if (pit == TT->prov[i].end()) break;
+                via.insert(pit->second.second + ": 0x" + utohexstr((uint64_t)pit->second.first) + " -> 0x" +
+                           utohexstr((uint64_t)cur));
+                mapped = true;
+                cur = pit->second.first;
+              }
+              if (!mapped) via.insert("");
+            }
           for (int64_t v : ws.vals)
             if (holdsP(tests, v)) {
               adm.push_back(i);
@@ -5265,6 +5286,7 @@ void CallGraphPass::computeTaggedFields() {
         if (ks.empty()) ks.push_back(prefix + "none");
         ks.push_back(tagAll);
         if (uncheckedReads.count(I)) uncheckedReplaced.insert(I);
+        if (isCensus(I)) memberOf[I] = unionKeyNames[I]; // its census member key (P3)
         unionKeyNames[I] = ks;
         tagPrefixOf[I] = prefix;
         // Its callee's tested uses read it through their own tests' keys,
@@ -5277,6 +5299,60 @@ void CallGraphPass::computeTaggedFields() {
         if (readAdm.count(r.I) || !isCensus(r.I)) continue;
         unionKeyNames[r.I].push_back(censusAll);
         censusReadsKept++;
+      }
+      // Product keys (P3, Fable 2026-10-17): every write over F's bytes is
+      // filed under (tag key, member key) for each key of each scheme it
+      // carries, so a read can take one scheme or both. A read in one
+      // scheme reads every product with its scheme's component (as
+      // before: the same writes); a tag-keyed read that has a census member
+      // key m reads the intersection, the products (t, c) with t in its tag
+      // keys or the tag catch-all and c in {m, the census catch-all}: a
+      // write the census types as another member is excluded by its member
+      // name, the user's name-compatible-stores principle on the write
+      // side, a per-read ASSUMPTION listing those writes (an untagged
+      // write; or a tagged one, a tag/member disagreement, reported).
+      std::map<std::pair<std::string, std::string>, std::vector<const Instruction *>> prodWrites;
+      auto splitKeys = [&](const std::vector<std::string> &ks, std::vector<std::string> &tg, std::vector<std::string> &mm) {
+        for (const std::string &k : ks)
+          if (k.rfind(prefix, 0) == 0) tg.push_back(k);
+          else if (k.rfind(censusPrefix, 0) == 0) mm.push_back(k);
+      };
+      for (auto &[I, ks] : unionKeyNames) {
+        if (isa<LoadInst>(I) || !overF(I)) continue;
+        std::vector<std::string> tg, mm;
+        splitKeys(ks, tg, mm);
+        if (tg.empty() || mm.empty()) continue; // no write of this slot's two schemes
+        std::vector<std::string> ps;
+        for (const std::string &tk : tg)
+          for (const std::string &mk : mm) {
+            ps.push_back(tk + "&" + mk);
+            prodWrites[{tk, mk}].push_back(I);
+          }
+        ks = ps;
+      }
+      for (auto &[I, ks] : unionKeyNames) {
+        if (!isa<LoadInst>(I) || !overF(I)) continue;
+        std::vector<std::string> tg, mm;
+        splitKeys(ks, tg, mm);
+        if (tg.empty() && mm.empty()) continue;
+        auto mit = memberOf.find(I);
+        const bool both = !tg.empty() && mit != memberOf.end();
+        std::set<std::string> T(tg.begin(), tg.end()), M(mm.begin(), mm.end());
+        if (both) {
+          M.insert(mit->second.begin(), mit->second.end());
+          M.insert(censusAll);
+        }
+        std::vector<std::string> ps;
+        for (const auto &[pr, ws] : prodWrites) {
+          const bool tOk = tg.empty() || T.count(pr.first),
+                     mOk = (tg.empty() || both) ? M.count(pr.second) != 0 : true;
+          if (tOk && mOk) ps.push_back(pr.first + "&" + pr.second);
+          else if (both && tOk && !mOk)
+            for (const Instruction *W : ws) p3Excluded[I].push_back({W, pr.first != tagAll});
+        }
+        if (both) p3Reads++;
+        if (ps.empty()) ps.push_back(prefix + "none");
+        ks = ps;
       }
     }
     // Plan 3.54: the installed entry-keyed reads and their formals; a
@@ -5478,10 +5554,55 @@ void CallGraphPass::computeTaggedFields() {
   for (const auto &[I, pre] : tagWriteOf) {
     auto it = unionKeyNames.find(I);
     assert(it != unionKeyNames.end() && "a write of a doubly keyed slot with no key");
-    bool tagSide = false, memberSide = false;
-    for (const std::string &k : it->second) (k.rfind(pre, 0) == 0 ? tagSide : memberSide) = true;
-    assert(tagSide && memberSide && "a write of a doubly keyed slot without a key of each scheme");
-    (void)tagSide, (void)memberSide;
+    for (const std::string &k : it->second) {
+      const size_t amp = k.find('&');
+      assert(k.rfind(pre, 0) == 0 && amp != std::string::npos && amp + 1 < k.size() &&
+             "a write of a doubly keyed slot whose key is not a (tag, member) product");
+      (void)amp;
+    }
+  }
+  // P3: the reads of both schemes and the writes they exclude by member
+  // name (untagged; tagged: a tag/member disagreement).
+  {
+    size_t untagged = 0, tagged = 0;
+    for (auto &[R, ws] : p3Excluded)
+      for (auto &[W, tg] : ws) (tg ? tagged : untagged)++;
+    CG_LOG("UnionKeys: " << p3Reads << " tag-keyed reads with a census member key read both schemes; "
+           << untagged << " untagged and " << tagged
+           << " tagged stores of other members excluded by their member name (the tagged ones a tag/member disagreement)\n");
+    std::set<std::pair<const Instruction *, const Instruction *>> shown;
+    // Per tagged write excluded: the reads, and the maps by which their
+    // tests admit its tag (rule report).
+    std::map<const Instruction *, std::pair<std::set<const Instruction *>, std::set<std::string>>> byW;
+    for (auto &[R, ws] : p3Excluded)
+      for (auto &[W, tg] : ws) {
+        if (!tg) continue;
+        auto &bw = byW[W];
+        bw.first.insert(R);
+        auto vit = taggedAdmitVia.find({R, W});
+        if (vit == taggedAdmitVia.end()) bw.second.insert("?");
+        else bw.second.insert(vit->second.begin(), vit->second.end());
+        if (shown.insert({R, W}).second)
+          CG_LOG("UnionKeys:   tag/member disagreement: " << locOf(W) << " admitted by its tag at " << locOf(R)
+                 << ", another member by the census\n");
+      }
+    for (auto &[W, bw] : byW) {
+      // Grouped by map: "<map>: 0xA -> 0xB, ...".
+      std::map<std::string, std::vector<std::string>> byMap;
+      for (const std::string &l : bw.second) {
+        const size_t c = l.rfind(": 0x");
+        if (c == std::string::npos) byMap[l];
+        else byMap[l.substr(0, c)].push_back(l.substr(c + 2));
+      }
+      std::string via;
+      for (auto &[m, ts] : byMap) {
+        via += " [" + (m.empty() ? std::string("its own tag") : m == "?" ? std::string("no provenance recorded") : m);
+        for (size_t k = 0; k < ts.size(); k++) via += (k ? ", " : ": ") + ts[k];
+        via += "]";
+      }
+      taggedDisagreeRows.push_back(std::to_string(bw.first.size()) + " reads, 1 write (" + locOf(W) +
+                                   "), admitted by its tag through:" + via + "; another member by the census");
+    }
   }
   // Plan 3.54 rows: per method formal, its D field, its installers and
   // its keyed reads; the refusals by reason.

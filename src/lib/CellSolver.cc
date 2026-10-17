@@ -9956,6 +9956,16 @@ bool CallGraphPass::runCellResolution() {
         RO << "T in-place retag without content write, callers not all visible: " << instLoc(I) << " of " << f
            << " map " << mp << "\n";
     }
+    if (!taggedDisagreeRows.empty()) {
+      size_t nr = 0;
+      for (auto &[R, ws] : p3Excluded)
+        for (auto &[W, tg] : ws)
+          if (tg) { nr++; break; }
+      RO << "SUMMARY tagged fields tag/member disagreements: " << nr << " reads, " << taggedDisagreeRows.size()
+         << " writes (a read of both schemes admits a write by its tag that the census types as another member: "
+            "excluded by its member name)\n";
+      for (const std::string &r : taggedDisagreeRows) RO << "T tag/member disagreement: " << r << "\n";
+    }
     if (!taggedUntested.empty()) {
       RO << "SUMMARY tagged fields untested reads " << taggedUntested.size()
          << " (reads of a field with candidate tags that no tag test guards: every writer)\n";

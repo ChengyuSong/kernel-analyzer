@@ -1,16 +1,18 @@
 // t_cells_container_cursor_union_open.c — a cursor inside a union whose
-// other member's store sets no tag (plan 3.55 Q-d, Fable 2026-10-16):
-// setp writes u.c.p and never writes type, so the tag pair cannot key it;
-// the union census types the store by member layout (c) and keys the
-// chase's read by its own member (i), with no settling check (UNCHECKED,
-// the user's 2026-10-07 rule). With the slot keyed in both schemes the
-// chase's read is keyed by the tag (its `type == 1` test: a checked read),
-// and setp's write, untagged, is in the tag scheme's catch-all, which every
-// tag-keyed read reads: the read admits another member's store, the cursor
-// is open, the block REJECTED. (Before, the read closed on the census keys
-// alone, an UNCHECKED assumption.)
-// LOG: a cursor field not closed: a read of the cursor that admits another member's store
-// LOG: Container:   REJECTED
+// other member's store sets no tag (plan 3.55 Q-d, Fable 2026-10-16; P3,
+// Fable 2026-10-17): setp writes u.c.p and never writes type, so the tag
+// pair cannot key it; the union census types the store by member layout
+// (c). With the slot keyed in both schemes the chase's read is keyed by the
+// tag (its `type == 1` test: a checked read) and carries its census member
+// key (i): a read of both schemes. setp's write, untagged, is in the tag
+// scheme's catch-all, which the read's tag admits; its member c is not the
+// read's, so the read excludes it by its member name, and the closure rests
+// on that, listed (VERIFIED under 2 assumptions). Before P3 the read admitted
+// it and the block was REJECTED; a read that admits another member's store
+// still is (t_cells_container_cursor_union_copy.c).
+// LOG: ASSUMPTION stores of other members excluded by their member name \(a read of both schemes\): bfd_link_hash_lookup: .*: 1 untagged, 0 tagged stores: \[setp: store
+// LOG: Container:   VERIFIED under 2 assumptions
+// NOLOG: Container:   REJECTED
 #include <stdlib.h>
 #include <string.h>
 typedef void (*fn)(void);

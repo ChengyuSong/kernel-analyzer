@@ -692,6 +692,16 @@ protected:
   // Open retags no test guards (in-place retags without a content write):
   // (field and tag, site, map).
   std::vector<std::tuple<std::string, const llvm::Instruction *, std::string>> taggedInPlace;
+  // P3 (Fable 2026-10-17): per read of both schemes, the writes it excludes
+  // by their member name (the write, tagged: a tag/member disagreement).
+  std::map<const llvm::Instruction *, std::vector<std::pair<const llvm::Instruction *, bool>>> p3Excluded;
+  size_t p3Reads = 0;
+  // Per (tag-keyed read, writer): the maps on the provenance chains of the
+  // tags by which the read's tests admit the writer (empty label: the
+  // writer's own tag; recorded with the rule report or --verbose=2), and
+  // the rule-report rows of the tag/member disagreements they explain.
+  std::map<std::pair<const llvm::Instruction *, const llvm::Instruction *>, std::set<std::string>> taggedAdmitVia;
+  std::vector<std::string> taggedDisagreeRows;
   // Per-use parameter channels (plan 3.51, parameter-pair tests): a tested
   // use of a callee parameter reads, at each call site, the caller's load
   // of F through the keys its own test admits, instead of the parameter.

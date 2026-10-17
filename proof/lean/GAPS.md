@@ -834,6 +834,36 @@ Obligations left open:
      keys were looked for under F's own prefix, never found for a member
      inside a union, and the pair was refused as "already keyed otherwise"
      (bfd_link_hash_entry.u.i.link once the census typed u's members).
+   - Product keys, a read of both schemes (P3, Fable 2026-10-17): on a
+     slot keyed in two schemes, every write over F's bytes is filed under
+     its (tag key, member key) products (each a catch-all where the write
+     has none), the two partitions above as one partition. A read in one
+     scheme reads every product with its scheme's component: the same
+     writes as before. A tag-keyed read that also has a census member key m
+     (the key the census gave it before the tag keys replaced it) reads the
+     products (t, c) with t among its tag keys or the tag catch-all and c in
+     {m, the census catch-all}. So it meets every write its tag admits
+     except those the census types as another member: excluded by their
+     member name, under the name-compatible-stores rule (the user's
+     2026-10-11 principle, a store of another member's name is no store of
+     this one; the 2026-10-07 UNCHECKED assumption, now on the write side
+     of a checked read). Per read, a listed assumption naming the excluded
+     writes ("ASSUMPTION stores of other members excluded by their member
+     name (a read of both schemes)" where a container's cursor read rests
+     on it). Never excluded: a write the census cannot type (the census
+     catch-all, every member), a write of a void * member (the slot's
+     unkeyed cell, above). An excluded write the tag admits by a tag of its
+     own, retagged or not, is a tag/member disagreement: the two schemes
+     disagree about it, and one is wrong for the program. It is reported
+     with the retag maps by which the read's tests admit its tag (the
+     provenance chain of each admitted value, recorded with the rule
+     report), so the disagreement is diagnosed at its source: nm-O0's 17
+     reads of u.c.p under `type == common` admit linker.c:1720's u.i.link
+     write through elflink.c:1424 `hi->root.type = h->root.type`, a retag
+     its own function undoes, tag and content, before returning
+     (1458-1467): the census is right, the tag's flow-insensitive retag map
+     is the imprecision (for Q2). Sound under the assumption it lists, as
+     the UNCHECKED read was; never wider than the tag-keyed read alone.
    - Union members that are structs (plan 3.51 (2), Fable 2026-10-16):
      the union census types an access by member when the access's debug
      type is the member's; when no member's type is, an access at byte o

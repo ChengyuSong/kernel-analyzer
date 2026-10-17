@@ -2135,6 +2135,15 @@ void CallGraphPass::runUnionCensus() {
   std::map<std::string, size_t> uncheckedBy; // reads keyed by their own member, by why
   std::map<std::string, size_t> blockingWrites; // write of unknown tag -> reads it blocks
   std::map<std::string, std::map<std::string, size_t>> untestedByUnion;
+  // --cfl-union-keys=tag: the void * members (by union + "." + member):
+  // writes landed where every read sees them, reads of the whole slot, and
+  // the reads keyed by another member that see those writes.
+  struct GenericUse {
+    size_t writes = 0, reads = 0, othersSee = 0, othersUnchecked = 0;
+    std::vector<std::string> at;
+    std::map<std::string, size_t> seenBy; // the members of those reads
+  };
+  std::map<std::string, GenericUse> genericOf;
   // --cfl-union-keys=tag: per union, the accesses left unkeyed (the gap:
   // an unkeyed read sees every member). Pointerless writes carry nothing.
   struct Unkeyed {
@@ -3116,8 +3125,24 @@ void CallGraphPass::runUnionCensus() {
       // every member; an unkeyed write lands where every read sees it.
       const std::string prefix =
           "struct." + U->structName + "+" + std::to_string(U->off);
+      // A member declared `void *` (cv-qualified or not) is the program's
+      // generic view of the slot (bfd's tdata.any): C makes void *
+      // assignment-compatible with every object pointer, so by name it is
+      // compatible with every member. Its writes land where every read sees
+      // them (the census catch-all, its own key included), and its reads
+      // that no check settles read the whole slot (Fable 2026-10-17).
+      std::set<std::string> generic;
+      for (auto &[nm, tk] : U->members)
+        if (tk == "ptr:void") generic.insert(nm);
       for (auto &w : W) {
         if (!w.I) continue; // initializers write the unkeyed side
+        if (real(w.member) && generic.count(w.member)) {
+          unionUnknownOf[w.I] = prefix;
+          GenericUse &G = genericOf[prefix + "." + w.member];
+          G.writes++;
+          if (G.at.size() < 6) G.at.push_back(locOf(w.I));
+          continue;
+        }
         if (real(w.member)) { unionKeyNames[w.I] = {prefix + "#" + w.member}; keyedW++; }
         else {
           unionUnknownOf[w.I] = prefix;
@@ -3161,7 +3186,7 @@ void CallGraphPass::runUnionCensus() {
               std::any_of(W.begin(), W.end(), [&](const Site &w) {
                 return w.member == r.member && !pointerless(w);
               });
-          if (ownTyped && k != r.member) {
+          if (ownTyped && k != r.member && !generic.count(r.member)) {
             readContra++; // reads a member its facts rule out
             errs() << "UnionKeys: read of " << r.member << " at " << locOf(r.I)
                    << ": its facts admit only " << k << "\n";
@@ -3203,6 +3228,11 @@ void CallGraphPass::runUnionCensus() {
         // a read of a known member with no check that settles it is keyed by
         // that member, taken as correct, and warned for review of the
         // source; another member reaching it would be a potential bug.
+        if (real(r.member) && generic.count(r.member)) {
+          unionUnknownOf[r.I] = prefix; // the generic view: every member
+          genericOf[prefix + "." + r.member].reads++;
+          continue;
+        }
         if (real(r.member)) {
           unionKeyNames[r.I] = {prefix + "#" + r.member};
           keyedR++;
@@ -3234,6 +3264,19 @@ void CallGraphPass::runUnionCensus() {
           d += "; {";
           for (const std::string &m : A.members) d += m + " ";
           K.at.push_back(d.substr(0, d.size() - 1) + "})");
+        }
+      }
+      for (const std::string &g : generic) {
+        auto git = genericOf.find(prefix + "." + g);
+        if (git == genericOf.end() || !git->second.writes) continue;
+        for (auto &r : Rd) {
+          auto kit = unionKeyNames.find(r.I);
+          if (kit == unionKeyNames.end() || kit->second.size() != 1 || kit->second[0] == prefix + "#-" ||
+              kit->second[0] == prefix + "#" + g)
+            continue;
+          git->second.othersSee++;
+          git->second.seenBy[r.member]++;
+          if (uncheckedReads.count(r.I)) git->second.othersUnchecked++;
         }
       }
       cellUnionSlots.insert({U->structName, U->off, U->size});
@@ -3354,6 +3397,25 @@ void CallGraphPass::runUnionCensus() {
       for (auto &[w, c] : uncheckedBy) { n += c; t += ", " + w + " " + std::to_string(c); }
       errs() << "UnionKeys: " << n << " reads keyed by their own member without a settling "
              << "check (warned, see UNCHECKED lines; before tag keys, net count from the tagged fields)" << t << "\n";
+    }
+    {
+      size_t gw = 0, gr = 0;
+      for (auto &[g, G] : genericOf) gw += G.writes, gr += G.reads;
+      errs() << "UnionKeys: " << genericOf.size()
+             << " void* members read and written as any member (writes keyed #? too, reads admit every member): "
+             << gw << " writes, " << gr << " reads\n";
+      for (auto &[g, G] : genericOf) {
+        errs() << "UnionKeys:   " << g << ": " << G.writes << " writes, " << G.reads << " reads; "
+               << G.othersSee << " reads keyed by another member see its writes (" << G.othersUnchecked
+               << " of them UNCHECKED";
+        std::vector<std::pair<size_t, std::string>> by;
+        for (auto &[m, c] : G.seenBy) by.push_back({c, m});
+        std::sort(by.rbegin(), by.rend());
+        for (size_t i = 0; i < by.size(); i++) errs() << (i ? ", " : "; by member: ") << by[i].second << " " << by[i].first;
+        errs() << ")";
+        for (const std::string &a : G.at) errs() << " [" << a << "]";
+        errs() << "\n";
+      }
     }
     size_t uw = 0, ur = 0;
     std::map<std::string, size_t> byWhy;

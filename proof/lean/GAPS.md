@@ -847,6 +847,28 @@ Obligations left open:
      nothing says one member is used; "one member used" needs at least one
      typed access, all of one member. Before, both read "one member
      used".
+   - A union member declared `void *` (cv-qualified or not; Fable
+     2026-10-17) is the program's own generic view of the slot (bfd's
+     tdata.any). C makes void * assignment-compatible with every object
+     pointer (C11 6.3.2.3p1, 6.5.16.1p1), so under the name-compatible-
+     stores rule its writes are compatible with every member's reads and
+     its reads with every member's writes. A write the census types as such
+     a member lands in the slot's unkeyed cell (the census catch-all, read
+     by every read of the slot; its own member key is subsumed), and a read
+     of it that no check settles reads the whole slot (where it would have
+     been an UNCHECKED read keyed by its own member). A read a check
+     settles keeps the check's keys: the program's test excludes writes by
+     their tag, not by their member name. On a tag slot the write, unkeyed
+     by the census, takes the census catch-all among its keys like any write
+     the census does not type. Only widens: sound in every case. Before,
+     `abfd->tdata.any = bfd_zalloc (...)` was keyed by member any and every
+     UNCHECKED read of another member (elf_obj_data, ...) excluded it, so
+     the object reached no read but `any`'s (t_cells_union_voidptr.c). A
+     possible tightening, not implemented: a void * member is compatible
+     with the pointer-typed members only, not with integer members.
+     Counted: "UnionKeys: n void* members read and written as any member",
+     per member its writes, reads, and the reads keyed by another member
+     that now see its writes.
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

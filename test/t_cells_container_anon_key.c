@@ -12,7 +12,7 @@
 // LOG: Container:   O1 PASS
 // LOG: Container:   O2 PASS
 // LOG: Container:   VERIFIED
-// LOG: Container: anonymous struct fields: [1-9][0-9]* named by the enclosing named struct and byte offset, 0 unnamed
+// LOG: Container: anonymous struct fields: [1-9][0-9]* lookups \([1-9][0-9]* distinct instructions\) named by the enclosing named struct and byte offset, 0 lookups \(0 distinct instructions\) unnamed
 #include <stdlib.h>
 #include <string.h>
 typedef void (*fn)(void);

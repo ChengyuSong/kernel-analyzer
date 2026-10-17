@@ -587,9 +587,11 @@ void CallGraphPass::computeLinkWords() {
        " unnamed that would feed a link word, in " + std::to_string(unnamedIn.size()) + " functions" +
        (tops.empty() ? "" : " (" + tops + ")") + "; " + std::to_string(nPast) +
        " a step past the layout of a named base, in " + std::to_string(pastIn.size()) + " functions");
-  line("anonymous struct fields: " + std::to_string(pointees.anonByEnclosing) +
-       " named by the enclosing named struct and byte offset, " + std::to_string(pointees.anonUnnamedN) +
-       " unnamed (no enclosing named struct on the access's GEP chain)");
+  line("anonymous struct fields: " + std::to_string(pointees.anonByEnclosing) + " lookups (" +
+       std::to_string(pointees.anonByEnclosingAt.size()) +
+       " distinct instructions) named by the enclosing named struct and byte offset, " +
+       std::to_string(pointees.anonUnnamedN) + " lookups (" + std::to_string(pointees.anonUnnamedAt.size()) +
+       " distinct instructions) unnamed (no enclosing named struct on the access's GEP chain)");
   line("storage inside a union (the IR's member is clang's representative): " + std::to_string(unionAccesses) +
        " accesses, " + std::to_string(unionFeeds) + " that would feed a link word");
   // The rule report carries the section only when the program has a link

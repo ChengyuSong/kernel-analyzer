@@ -467,6 +467,7 @@ bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, Po
   // An anonymous struct's field: by the enclosing named struct, else unnamed.
   P.anonUnnamed = !enclosingNamed(Addr, DL, S, off);
   (P.anonUnnamed ? P.anonUnnamedN : P.anonByEnclosing)++;
+  (P.anonUnnamed ? P.anonUnnamedAt : P.anonByEnclosingAt).insert(I);
   return !P.anonUnnamed;
 }
 

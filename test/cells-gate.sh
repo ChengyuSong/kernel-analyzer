@@ -59,12 +59,14 @@ while IFS='|' read -r n in stop; do
   ln -s "$FS" "$d/fs.txt"
   ln -s "$in" "$d/in.bc"
   if [ "$stop" = 0 ]; then
-    ( cd "$d" && timeout 3600 ./k $A --cfl-dump-icalls-json=a.json in.bc > "$OUT/$n.log" 2>&1
-      echo $? > "$OUT/$n.rc"; [ -f "$d/a.json" ] && mv "$d/a.json" "$OUT/$n.json" ) &
+    ( s=$SECONDS; cd "$d" && timeout 3600 ./k $A --cfl-dump-icalls-json=a.json in.bc > "$OUT/$n.log" 2>&1
+      echo $? > "$OUT/$n.rc"; echo $((SECONDS - s)) > "$OUT/$n.secs"
+      [ -f "$d/a.json" ] && mv "$d/a.json" "$OUT/$n.json" ) &
   else
-    ( cd "$d" && timeout 3600 ./k $A --cfl-cell-census-at="$stop" --cfl-cell-stop-answers=a.stop in.bc \
+    ( s=$SECONDS; cd "$d" && timeout 3600 ./k $A --cfl-cell-census-at="$stop" --cfl-cell-stop-answers=a.stop in.bc \
         > "$OUT/$n.log" 2>&1
-      echo $? > "$OUT/$n.rc"; [ -f "$d/a.stop" ] && mv "$d/a.stop" "$OUT/$n.stop" ) &
+      echo $? > "$OUT/$n.rc"; echo $((SECONDS - s)) > "$OUT/$n.secs"
+      [ -f "$d/a.stop" ] && mv "$d/a.stop" "$OUT/$n.stop" ) &
     d2="$OUT/determinism-check-from-a-directory-of-another-length/run-$n"
     mkdir -p "$d2"
     ln -s "$BIN" "$d2/kamain-under-another-name"
@@ -112,5 +114,19 @@ while read -r line; do
   if [ "$line" = "$pin" ]; then echo "SAME $line"
   else echo "DIFF $n: pinned [$pin] got [$line]"; fail=1; fi
 done < "$got"
+# Per-program status (Fable 2026-10-17): whether the run reached its
+# fixpoint, and where a stop case stood (a stop case never does: it is
+# stopped at a fixed pop count, before).
+while IFS='|' read -r n in stop; do
+  rc=$(cat "$OUT/$n.rc" 2>/dev/null || echo missing)
+  secs=$(cat "$OUT/$n.secs" 2>/dev/null || echo "?")
+  if [ "$rc" != 0 ]; then echo "STATUS $n: rc=$rc after $secs s (124: did not finish in 3600 s)"
+  elif [ "$stop" = 0 ]; then
+    echo "STATUS $n: fixpoint, $(grep "^$n " "$got" | cut -d' ' -f2-3), $secs s"
+  else
+    read -r _ _ p _ _ _ f _ < "$OUT/$n.stop"
+    echo "STATUS $n: stop at $p pops of its iteration (--cfl-cell-census-at=$stop over all), $f facts, not at fixpoint, $secs s"
+  fi
+done <<< "$CASES"
 echo "cells gate: outputs in $OUT"
 exit $fail

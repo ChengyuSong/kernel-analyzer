@@ -28,12 +28,18 @@ inline double kaElapsedSec() {
 		std::chrono::steady_clock::now() - anchor).count();
 }
 
+// A log line is composed first and written in one call (errs() is
+// unbuffered: written piecewise, a line of another thread, the solver's
+// watchdog, could land inside it).
 #define KA_LOG(lv, stmt)							\
 	do {											\
 		if (VerboseLevel >= lv) {					\
+			std::string kaLogLine_;					\
+			llvm::raw_string_ostream kaLogOS_(kaLogLine_); \
 			if (LogTimestamps)						\
-				llvm::errs() << llvm::format("[+%.1fs] ", kaElapsedSec()); \
-			llvm::errs() << stmt;					\
+				kaLogOS_ << llvm::format("[+%.1fs] ", kaElapsedSec()); \
+			kaLogOS_ << stmt;						\
+			llvm::errs() << kaLogOS_.str();			\
 		}										\
 	} while(0)
 

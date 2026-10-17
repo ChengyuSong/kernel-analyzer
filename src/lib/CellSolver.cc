@@ -30,6 +30,7 @@
 #include "CallGraphInternal.h"
 #include "SCC.h"
 #include "ValueMap.h"
+#include "Watchdog.h"
 #include <llvm/ADT/BitVector.h>
 #include <deque>
 #include <numeric>
@@ -822,6 +823,11 @@ bool CallGraphPass::runCellResolution() {
   using Clock = std::chrono::steady_clock;
   const auto t0 = Clock::now();
   const DataLayout &DL = Ctx->Modules.front().first->getDataLayout();
+  // The timer progress line (Fable 2026-10-17): the phase the solver is in,
+  // whatever it is doing, so a stall is attributable from the log alone.
+  SolverWatchdog watchdog;
+  if (VerboseLevel >= 1) watchdog.start(iteration, CFLCellWatchdog);
+  watchdog.phase("kernel dispatch census");
 
   // Kernel dispatch as named cells (plan 3.53, kernel census, Fable
   // 2026-10-13). A direct call to a bodiless __SCT__X trampoline is an
@@ -846,6 +852,7 @@ bool CallGraphPass::runCellResolution() {
              << traceIterCalls << " __traceiter_ direct calls kept\n");
   }
 
+  watchdog.phase("solver nodes");
   // ---- Solver nodes: graph nodes keep their factory index; cells and
   // store collectors are numbered after them. ----
   const uint32_t G = NF.getNumNodes();
@@ -889,7 +896,19 @@ bool CallGraphPass::runCellResolution() {
     while (repOf[n] != n) n = repOf[n] = repOf[repOf[n]];
     return n;
   };
-  auto newNode = [&]() { grow(numNodes + 1); return numNodes++; };
+  // Every node past the graph's has a kind and the thing it is made for
+  // (an object, a site, a guard, a hub), so every node a report names is
+  // described (Fable 2026-10-17: no node of a report left undescribed).
+  enum class NK : uint8_t { EntryFormal, Channel, StoreHub, AnyWrite, AnyRead, Content, Key, ReadSide, Receiver,
+                            Dispatch, GuardLevel, IdPass, RowCell, NKinds };
+  std::vector<NK> nodeKind;        // node - G -> its kind
+  std::vector<uint32_t> nodeAbout; // node - G -> what it is made for
+  auto newNode = [&](NK k, uint32_t about) {
+    grow(numNodes + 1);
+    nodeKind.push_back(k);
+    nodeAbout.push_back(about);
+    return numNodes++;
+  };
   std::vector<uint32_t> worklist;
   auto push = [&](uint32_t n) {
     if (!inWL[n]) { inWL[n] = 1; worklist.push_back(n); }
@@ -975,12 +994,14 @@ bool CallGraphPass::runCellResolution() {
     curWhy = saved;
   };
 
+  watchdog.phase("static constraints");
   // ---- Static constraints ----
   auto canon = [&](NodeIndex n) -> uint32_t {
     uint32_t c = getCanonicalNode(n);
     assert(c < G && "edge endpoint created after the solve began");
     return c;
   };
+  watchdog.phase("method entries");
   // ---- Method entries (plan 3.54) ----
   // A method formal whose reads are keyed by its entry test is split:
   // every entry other than a test dispatch (the static edges: direct
@@ -1029,7 +1050,7 @@ bool CallGraphPass::runCellResolution() {
       continue;
     }
     ef.A = A;
-    ef.Ao = newNode();
+    ef.Ao = newNode(NK::EntryFormal, fi);
     entryOfA[A] = fi;
     entryOfAo[ef.Ao] = fi;
   }
@@ -1050,7 +1071,7 @@ bool CallGraphPass::runCellResolution() {
   auto chanNode = [&](uint32_t fx, uint32_t fy) {
     auto [it, ins] = chanNodeOf.try_emplace((uint64_t)fx << 32 | fy, 0);
     if (ins) {
-      it->second = newNode();
+      it->second = newNode(NK::Channel, 0);
       chanOfNode[it->second] = {fx, fy};
       addEdge(it->second, entryF[fy].A);
     }
@@ -1153,7 +1174,7 @@ bool CallGraphPass::runCellResolution() {
       const uint32_t a = canon(E.from), b = canon(E.to);
       inGraph[a] = inGraph[b] = 1;
       if (isHub[b]) { // a store: into the cells the hub's pointers hold
-        if (storeHub[b] == UINT32_MAX) storeHub[b] = newNode();
+        if (storeHub[b] == UINT32_MAX) storeHub[b] = newNode(NK::StoreHub, b);
         addEdge(a, storeHub[b]);
         if (CFLCellLeakCensus) {
           leakCollHub.try_emplace(storeHub[b], b);
@@ -1474,8 +1495,10 @@ bool CallGraphPass::runCellResolution() {
             for (uint32_t h : hubsOf[c])
               if (storeHub[h] != UINT32_MAX) leakCollStores[storeHub[h]].push_back(SI);
           }
+  watchdog.phase("static cycle collapse");
   collapseCycles(); // static cycles, before any fact moves
 
+  watchdog.phase("objects and cells");
   // ---- Objects and cells ----
   // A deque: objects are minted during the solve (trailing objects, gaps,
   // byte tails) while callers hold references to others.
@@ -1523,7 +1546,7 @@ bool CallGraphPass::runCellResolution() {
     if (objs[o].any != UINT32_MAX) return objs[o].any;
     if (objs[o].fwd != UINT32_MAX) return anyOf(objs[o].fwd); // folded into its header
     if (noteAnyCause) noteAnyCause(o);
-    const uint32_t w = newNode(), r = newNode();
+    const uint32_t w = newNode(NK::AnyWrite, o), r = newNode(NK::AnyRead, o);
     const uint32_t f = newCell({o, CellKind::Any, 0, UINT32_MAX, w, r,
                                 NF.getCellNode(objs[o].origin, internName("*"))});
     objs[o].any = f;
@@ -1595,10 +1618,10 @@ bool CallGraphPass::runCellResolution() {
   auto contentOf = [&](uint32_t o, int64_t c) -> std::pair<uint32_t, uint32_t> {
     auto it = objs[o].content.find(c);
     if (it != objs[o].content.end()) return it->second;
-    const uint32_t u = newNode();
+    const uint32_t u = newNode(NK::Content, o);
     uint32_t pn = u;
     if (inUnionSlot(objs[o], c)) { // write side U, read side P = U + keys
-      pn = newNode();
+      pn = newNode(NK::Content, o);
       addEdge(u, pn);
       unionView[u] = unionView[pn] = 1;
       splitCells++;
@@ -1696,7 +1719,7 @@ bool CallGraphPass::runCellResolution() {
     const uint64_t kk = ((uint64_t)(uint32_t)c << 32) | k;
     auto it = objs[o].keyed.find(kk);
     if (it != objs[o].keyed.end()) return it->second;
-    const uint32_t n = newNode();
+    const uint32_t n = newNode(NK::Key, o);
     addEdge(u, n);
     addEdge(n, pn);
     if (flippedAt(o, c)) addEdge(n, u);
@@ -2783,7 +2806,7 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[c, un] : objs[o].content) {
       auto &[u, pn] = un;
       if (find(u) != find(pn) || !inUnionSlot(objs[o], c)) continue;
-      const uint32_t p2 = newNode();
+      const uint32_t p2 = newNode(NK::ReadSide, o);
       const std::vector<uint32_t> outs = succ[find(u)];
       addEdge(u, p2);
       for (uint32_t x : outs) addEdge(p2, x);
@@ -3000,6 +3023,7 @@ bool CallGraphPass::runCellResolution() {
   std::sort(icallsSorted.begin(), icallsSorted.end(),
             [&](const CallBase *a, const CallBase *b) { return stableKey(a) < stableKey(b); });
 
+  watchdog.phase("seeds");
   // ---- Seeds: functions and objects ----
   size_t funcSeeds = 0, objSeeds = 0;
   std::unordered_map<const Function *, uint32_t> funcFact;
@@ -3273,6 +3297,7 @@ bool CallGraphPass::runCellResolution() {
     for (int64_t j = r0; j < e; j += g) out.push_back(folded(o, b + j));
   };
 
+  watchdog.phase("steps");
   // ---- Steps: a field edge maps each cell to the cell(s) at the new
   // offset, through every element its folded offset stands for. ----
   boost::unordered_flat_map<std::tuple<uint32_t, int64_t, uint32_t>,
@@ -3513,6 +3538,39 @@ bool CallGraphPass::runCellResolution() {
     }
     return false;
   };
+  // A node's class for the mass reports: a graph node by its value's kind
+  // (and function), a solver node by its kind (every node one).
+  static const char *nkName[] = {"entry formal", "channel", "store hub", "cell * write", "cell * read",
+                                 "content", "content key", "content read side", "receiver", "dispatch",
+                                 "guard level", "identity pass", "row cell"};
+  static_assert(sizeof(nkName) / sizeof(nkName[0]) == (size_t)NK::NKinds, "a name per node kind");
+  auto nodeClass = [&](uint32_t m, std::string &fn) -> std::string {
+    fn = "<none>";
+    std::string kind = m < G ? "graph" : nkName[(size_t)nodeKind[m - G]];
+    if (m < G) {
+      const Value *V = NF.getValueForNode(m);
+      if (const auto *I = dyn_cast_or_null<Instruction>(V)) {
+        fn = I->getFunction()->getName().str();
+        kind = I->getOpcodeName();
+      } else if (const auto *A = dyn_cast_or_null<Argument>(V)) {
+        fn = A->getParent()->getName().str();
+        kind = "formal";
+      } else if (NF.isDereferenceNode(m) || NF.isObjectNode(m)) {
+        kind = "hub";
+        const NodeIndex par = NF.getDerefParent(m);
+        if (par != AndersNodeFactory::InvalidIndex)
+          if (const auto *I = dyn_cast_or_null<Instruction>(
+                  NF.getValueForNode(par)))
+            fn = I->getFunction()->getName().str();
+      } else if (NF.isReturnNode(m) || NF.isVarargNode(m)) {
+        kind = NF.isReturnNode(m) ? "return" : "vararg";
+        fn = cast<Function>(V)->getName().str();
+      } else if (V) {
+        kind = "value";
+      }
+    }
+    return kind;
+  };
   auto massByObject = [&](size_t k) {
     std::vector<uint64_t> mass(objs.size(), 0), holders(objs.size(), 0);
     uint64_t byKind[5] = {0, 0, 0, 0, 0};
@@ -3527,6 +3585,27 @@ bool CallGraphPass::runCellResolution() {
     CG_LOG("Cells: mass by kind: function " << byKind[0] << ", offset "
            << byKind[1] << ", any " << byKind[2] << ", outside "
            << byKind[3] << ", residue " << byKind[4] << "\n");
+    // The facts by the class of the node holding them, every node one
+    // (graph nodes by their value's kind, solver nodes by theirs).
+    {
+      std::map<std::string, std::pair<uint64_t, uint64_t>> byClass; // class -> (facts, nodes)
+      for (uint32_t m = 0; m < numNodes; m++) {
+        if (find(m) != m) continue;
+        const size_t c = pts[m].count();
+        if (!c) continue;
+        std::string fn;
+        auto &[fs, ns] = byClass[(m < G ? "graph " : "solver ") + nodeClass(m, fn)];
+        fs += c;
+        ns++;
+      }
+      std::vector<std::pair<uint64_t, std::string>> cl;
+      for (auto &[k, v] : byClass)
+        cl.push_back({v.first, k + " " + std::to_string(v.first) + " in " + std::to_string(v.second) + " nodes"});
+      std::sort(cl.rbegin(), cl.rend());
+      std::string l;
+      for (auto &[f, s] : cl) l += (l.empty() ? " " : ", ") + s;
+      CG_LOG("Cells: facts by node class:" << l << "\n");
+    }
     std::vector<std::pair<uint64_t, uint32_t>> top;
     for (uint32_t o = 0; o < objs.size(); o++) top.push_back({mass[o], o});
     std::sort(top.rbegin(), top.rend());
@@ -3544,29 +3623,8 @@ bool CallGraphPass::runCellResolution() {
       bool has = false;
       pts[m].forEach([&](uint32_t f) { has |= cells[f].obj == o0; });
       if (!has) continue;
-      std::string fn = "<none>", kind = m < G ? "graph" : "cell/collector";
-      if (m < G) {
-        const Value *V = NF.getValueForNode(m);
-        if (const auto *I = dyn_cast_or_null<Instruction>(V)) {
-          fn = I->getFunction()->getName().str();
-          kind = I->getOpcodeName();
-        } else if (const auto *A = dyn_cast_or_null<Argument>(V)) {
-          fn = A->getParent()->getName().str();
-          kind = "formal";
-        } else if (NF.isDereferenceNode(m) || NF.isObjectNode(m)) {
-          kind = "hub";
-          const NodeIndex par = NF.getDerefParent(m);
-          if (par != AndersNodeFactory::InvalidIndex)
-            if (const auto *I = dyn_cast_or_null<Instruction>(
-                    NF.getValueForNode(par)))
-              fn = I->getFunction()->getName().str();
-        } else if (NF.isReturnNode(m) || NF.isVarargNode(m)) {
-          kind = NF.isReturnNode(m) ? "return" : "vararg";
-          fn = cast<Function>(V)->getName().str();
-        } else if (V) {
-          kind = "value";
-        }
-      }
+      std::string fn;
+      const std::string kind = nodeClass(m, fn);
       byFn[fn]++;
       byKindH[kind]++;
     }
@@ -3616,6 +3674,7 @@ bool CallGraphPass::runCellResolution() {
       return false;
     };
   }
+  watchdog.phase("method dispatch");
   // ---- Method dispatch (--cfl-cell-receivers) ----
   // A method call (*(p.path.slot))(.., p, ..) (dispatchReceiver; the graph
   // does not wire the receiver argument): each object o at p reaches the
@@ -3717,7 +3776,7 @@ bool CallGraphPass::runCellResolution() {
       if (R.all) {
         // Every receiver to every method: the callee's content, all of p.
         recvUnstepped++;
-        const uint32_t P = newNode();
+        const uint32_t P = newNode(NK::Receiver, si);
         dispatchOf[P] = {si, UINT32_MAX, (uint32_t)R.lis.size() - 1};
         addEdge(R.callee, P);
         continue;
@@ -3755,7 +3814,7 @@ bool CallGraphPass::runCellResolution() {
         ((uint64_t)(guard == UINT32_MAX ? si : guard) << 40) ^ ((uint64_t)level << 32) ^ f;
     auto [it, ins] = M.try_emplace(key, 0);
     if (ins) {
-      it->second = newNode();
+      it->second = newNode(guard == UINT32_MAX ? NK::Dispatch : NK::GuardLevel, si);
       dispatchOf[it->second] = {si, f, level, guard};
       if (level == 0 && guard == UINT32_MAX) recvBound++;
     }
@@ -4389,7 +4448,7 @@ bool CallGraphPass::runCellResolution() {
             for (const StoreInst *SI : pathStores) {
               const NodeIndex vn = NF.getValueNodeFor(SI->getValueOperand());
               if (vn == AndersNodeFactory::InvalidIndex) continue;
-              const uint32_t P = newNode();
+              const uint32_t P = newNode(NK::IdPass, gi);
               passOf[P] = gi;
               addEdge(find(canon(vn)), P);
             }
@@ -4475,7 +4534,30 @@ bool CallGraphPass::runCellResolution() {
   size_t asmUsed = 0, asmFailed = 0, asmNoNode = 0;
   std::vector<char> asmFailedAt(taggedAssumes.size(), 0);
   std::vector<boost::unordered_flat_map<uint32_t, uint32_t>> asmAccFirst(taggedAccessSets.size()); // obj -> access
-  std::vector<std::string> asmFailSites;
+  std::vector<std::string> asmFailSites; // the first 40, in detail
+  // Every failed assumption by class (uncapped): what failed it (an object
+  // reaching both sides, by the object's kind, or a missing node) and per
+  // tagged pair it unkeys.
+  std::map<std::string, size_t> asmFailByClass, asmFailByPair;
+  auto asmFailCount = [&](uint32_t a, const std::string &cls) {
+    asmFailByClass[cls]++;
+    std::set<std::string> ps;
+    for (uint32_t pi : asmPairs[a])
+      ps.insert(taggedPairs[pi].S + "+" + std::to_string(taggedPairs[pi].F) + " by +" +
+                std::to_string(taggedPairs[pi].D));
+    for (const std::string &s : ps) asmFailByPair[s]++;
+  };
+  auto asmClassLine = [&]() {
+    std::string l;
+    for (auto *M : {&asmFailByClass, &asmFailByPair}) {
+      std::vector<std::pair<size_t, std::string>> v;
+      for (auto &[k, c] : *M) v.push_back({c, k});
+      std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+      l += M == &asmFailByClass ? "; by class:" : "; by tagged pair:";
+      for (auto &[c, k] : v) l += " [" + k + "] " + std::to_string(c);
+    }
+    return l;
+  };
   if (!taggedPairs.empty()) {
     std::set<uint32_t> used, sets;
     for (uint32_t pi = 0; pi < taggedPairAssumes.size(); pi++)
@@ -4487,15 +4569,15 @@ bool CallGraphPass::runCellResolution() {
         }
       }
     asmUsed = used.size();
-    auto failAll = [&](uint32_t a, const std::string &why) {
-      if (!asmFailedAt[a]) { asmFailedAt[a] = 1; asmFailed++; }
+    auto failAll = [&](uint32_t a, const std::string &why, const char *cls) {
+      if (!asmFailedAt[a]) { asmFailedAt[a] = 1; asmFailed++; asmFailCount(a, cls); }
       for (uint32_t pi : asmPairs[a]) flipPair(pi, why);
     };
     for (uint32_t a : used) {
       const NodeIndex vn = NF.getValueNodeFor(taggedAssumes[a].id);
       if (vn == AndersNodeFactory::InvalidIndex) {
         asmNoNode++;
-        failAll(a, "alias assumption at " + taggedAssumes[a].site + ": its object has no node");
+        failAll(a, "alias assumption at " + taggedAssumes[a].site + ": its object has no node", "its object has no node");
         continue;
       }
       asmAt[find(canon(vn))].push_back({a, true, taggedAssumes[a].field, false});
@@ -4506,7 +4588,7 @@ bool CallGraphPass::runCellResolution() {
         if (bn == AndersNodeFactory::InvalidIndex) {
           asmNoNode++;
           for (uint32_t a : setAssumes[si]) failAll(a, "alias assumption at " + taggedAssumes[a].site +
-                                                           ": an access with no node");
+                                                           ": an access with no node", "an access with no node");
           continue;
         }
         asmAt[find(canon(bn))].push_back({si, false, A.k, A.var,
@@ -4535,6 +4617,13 @@ bool CallGraphPass::runCellResolution() {
         if (!asmFailedAt[a]) {
           asmFailedAt[a] = 1;
           asmFailed++;
+          {
+            const Obj &O = objs[o];
+            asmFailCount(a, "an object reaches both: " +
+                                (O.fn ? std::string("function") : O.byteAccessed ? std::string("bytes")
+                                 : O.parentObj != UINT32_MAX ? std::string("tail")
+                                 : !O.layout ? std::string("unlabeled") : O.label));
+          }
           {
             const TaggedAssume &TA = taggedAssumes[a];
             std::string acc = "?";
@@ -4608,6 +4697,7 @@ bool CallGraphPass::runCellResolution() {
     }
   };
 
+  watchdog.phase("propagation setup");
   // ---- Propagation (difference propagation over a worklist) ----
   const auto tSolve = Clock::now();
   uint64_t walkSteps = 0;
@@ -4680,7 +4770,7 @@ bool CallGraphPass::runCellResolution() {
     for (auto [o, e] : ms) {
       const int64_t off = kind == CellKind::Any ? INT64_MIN : decOff(e);
       auto [it, ins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
-      if (ins) it->second = newNode();
+      if (ins) it->second = newNode(NK::RowCell, o);
       rowFacts++;
       if (L.in != AndersNodeFactory::InvalidIndex) addEdge(canon(L.in), it->second);
       if (L.out != AndersNodeFactory::InvalidIndex) addEdge(it->second, canon(L.out));
@@ -4780,7 +4870,7 @@ bool CallGraphPass::runCellResolution() {
       if (L.name != UINT32_MAX) {
         const int64_t off = kind == CellKind::Any ? INT64_MIN : decOff(e);
         auto [rc, rins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
-        if (rins) rc->second = newNode();
+        if (rins) rc->second = newNode(NK::RowCell, o);
         add(find(rc->second), fr);
       }
       // Storage visibility and the body's own writes: the row object is
@@ -5108,7 +5198,58 @@ bool CallGraphPass::runCellResolution() {
     auto it = hubPtrOf.find(h);
     return it == hubPtrOf.end() ? AndersNodeFactory::InvalidIndex : it->second;
   };
-  std::function<std::string(uint32_t)> nodeDesc;
+  std::function<std::string(uint32_t)> nodeDesc, kindDesc;
+  // A solver node by its kind and what it is made for (every node one).
+  kindDesc = [&](uint32_t m) -> std::string {
+    const uint32_t a = nodeAbout[m - G];
+    const std::string id = " #" + std::to_string(m);
+    auto site = [&](uint32_t si) {
+      const RecvSite &R = recvSites[si];
+      return R.cs ? instLoc(R.cs) : std::string("a holder guard's pseudo site");
+    };
+    switch (nodeKind[m - G]) {
+    case NK::StoreHub:
+      return "<stores through hub #" + std::to_string(a) + id + ">";
+    case NK::EntryFormal: {
+      const auto &E = taggedEntryFormals[a];
+      return "method entry formal " + E.M->getName().str() + " arg" + std::to_string(E.k) + id;
+    }
+    case NK::Channel: {
+      auto cit = chanOfNode.find(m);
+      return cit == chanOfNode.end() ? "channel" + id
+                                     : "channel " + factDescP(cit->second.first) + " -> " +
+                                           factDescP(cit->second.second) + id;
+    }
+    case NK::AnyWrite:
+    case NK::AnyRead:
+      return std::string("cell * (") + (nodeKind[m - G] == NK::AnyWrite ? "write" : "read") +
+             ", not yet its cell's)" + id + " of " + describe(objs[a]);
+    case NK::Content:
+    case NK::Key:
+    case NK::ReadSide:
+      return std::string(nodeKind[m - G] == NK::Key        ? "content key"
+                         : nodeKind[m - G] == NK::ReadSide ? "content read side (P), replaced"
+                                                           : "content, replaced") +
+             id + " of " + describe(objs[a]);
+    case NK::Receiver:
+      return "receiver dispatch (every receiver) at " + site(a) + id;
+    case NK::Dispatch:
+    case NK::GuardLevel: {
+      auto dit = dispatchOf.find(m);
+      const std::string lv = dit == dispatchOf.end() ? "" : " level " + std::to_string(dit->second.level);
+      return std::string(nodeKind[m - G] == NK::Dispatch ? "receiver dispatch" : "holder guard level") + lv +
+             " at " + site(a) + id;
+    }
+    case NK::IdPass:
+      return "method-identity pass (" + guards[a].F->getName().str() + ") at " + site(guards[a].si) + id;
+    case NK::RowCell:
+      return "container row cell" + id + " of " + describe(objs[a]);
+    case NK::NKinds:
+      break;
+    }
+    assert(false && "a solver node of no kind");
+    return "<no kind" + id + ">";
+  };
   nodeDescFn = [&](uint32_t m) { return nodeDesc(m); };
   nodeDesc = [&](uint32_t m) -> std::string {
     if (m >= G) {
@@ -5138,11 +5279,7 @@ bool CallGraphPass::runCellResolution() {
                    " (K " + NF.cellNameString((uint32_t)kk) + ") #" +
                    std::to_string(m) + " of " + describe(objs[o]);
       }
-      for (uint32_t h = 0; h < G; h++)
-        if (storeHub[h] == m)
-          return "<stores through hub #" + std::to_string(h) + " #" +
-                 std::to_string(m) + ">";
-      return "<store collector #" + std::to_string(m) + ">";
+      return kindDesc(m);
     }
     const Value *V = NF.getValueForNode(m);
     std::string k;
@@ -7370,11 +7507,14 @@ bool CallGraphPass::runCellResolution() {
   size_t edgesAtCollapse = edgeSet.size();
   uint32_t stoppedAt = 0;
   std::string stopKind; // the stop's name in the final line
+  watchdog.phase("worklist");
   while (true) {
     if (!refoldQueue.empty()) drainRefolds();
     if (worklist.empty()) {
       if (!keyedWait.empty()) {
+        watchdog.phase("flush keyed waits");
         flushKeyedWait();
+        watchdog.phase("worklist");
         if (!worklist.empty()) continue;
       }
       if (CFLCellOneLabel) flushPending(true);
@@ -7395,7 +7535,7 @@ bool CallGraphPass::runCellResolution() {
       if (!taggedPairs.empty())
         errs() << "Cells: at the stop: " << pops << " pops; tagged pairs " << taggedPairs.size() << ", "
                << taggedFlipped.size() << " flipped; alias assumptions " << asmFailed << " of " << asmUsed
-               << " failed\n";
+               << " failed" << asmClassLine() << "\n";
       for (const std::string &d : taggedFlipAt) errs() << "Cells:   unkeyed during solve: " << d << "\n";
       for (const std::string &d : asmFailSites) errs() << "Cells:   alias assumption failed at " << d << "\n";
       stoppedAt = pops;
@@ -7413,6 +7553,7 @@ bool CallGraphPass::runCellResolution() {
     // that explodes, not in an earlier, cheap one).
     static uint64_t allPops = 0;
     if (CFLCellCensusAt && ++allPops >= CFLCellCensusAt) {
+      watchdog.phase("census-at stop: censuses");
       if (!recordWhy) confluenceCensus();
       checkConstInt();
       errs() << "Cells: --cfl-cell-census-at stopped the solve (measurement "
@@ -7429,6 +7570,7 @@ bool CallGraphPass::runCellResolution() {
     whyClock = pops;
     if (CFLCellOneLabel && (pops & 0x1fff) == 0 && !pendingConf.empty())
       flushPending(false);
+    if ((pops & 0xfff) == 0) watchdog.pops(pops);
     if (++pops % (1u << 20) == 0) {
       size_t mass = 0;
       for (uint32_t m = 0; m < numNodes; m++) mass += pts[m].count();
@@ -7590,11 +7732,17 @@ bool CallGraphPass::runCellResolution() {
              << ptrMerges << " ptr merges, " << hubLinks << " hub links\n");
     if (CFLCellCollapse && pops - lastCollapsePops >= (1u << 18) &&
         edgeSet.size() > edgesAtCollapse + edgesAtCollapse / 8) {
+      watchdog.phase("periodic cycle collapse");
       collapseCycles();
+      watchdog.phase("rekey receivers");
       rekeyReceivers();
+      watchdog.phase("drop merged guards");
       dropMergedGuards();
+      watchdog.phase("merge equal sets");
       if (CFLCellMergePtrs) mergeEqualSets();
+      watchdog.phase("canonicalize sets");
       if (CFLCellUnify) canonicalizeSets();
+      watchdog.phase("worklist");
       lastCollapsePops = pops;
       edgesAtCollapse = edgeSet.size();
     }
@@ -7605,6 +7753,7 @@ bool CallGraphPass::runCellResolution() {
   const double solveSecs =
       std::chrono::duration<double>(Clock::now() - tSolve).count();
 
+  watchdog.phase("answers");
   // ---- Answers ----
   size_t resolved = 0, totalTargets = 0, newPairs = 0, typeRej = 0;
   // In IR order, targets in IR order: the wiring order sets the next
@@ -7643,20 +7792,63 @@ bool CallGraphPass::runCellResolution() {
       if (wireResolvedCallee(CS, F)) newPairs++;
   }
 
+  watchdog.phase("report");
   // ---- Report ----
   size_t factMass = 0, offCells = 0, anyCells = 0;
   for (uint32_t n = 0; n < numNodes; n++) factMass += pts[n].count();
+  // Every node holding facts, described (--cfl-cell-node-facts): the cells'
+  // and contents' nodes in one pass, in nodeDesc's words, every other node
+  // by its kind.
+  watchdog.phase("report: node facts");
+  if (!CFLCellNodeFacts.empty()) {
+    std::vector<std::string> d(numNodes > G ? numNodes - G : 0);
+    auto at = [&](uint32_t m) -> std::string * { return m >= G && m < numNodes ? &d[m - G] : nullptr; };
+    for (uint32_t f = 0; f < cells.size(); f++) {
+      const Cell &C = cells[f];
+      const std::string k = C.kind == CellKind::Any ? "*" : C.kind == CellKind::Off ? NF.cellNameString(C.name) : "?";
+      for (const uint32_t m : {C.store, C.load})
+        if (std::string *s = at(m); s && s->empty())
+          *s = "cell " + k + (C.kind == CellKind::Any ? (C.store == m ? " (write)" : " (read)") : "") + " of " +
+               describe(objs[C.obj]);
+    }
+    for (uint32_t o = 0; o < objs.size(); o++) {
+      for (auto &[c, up] : objs[o].content)
+        for (const uint32_t m : {up.first, up.second})
+          if (std::string *s = at(m); s && s->empty())
+            *s = "content " + cellName(o, c) +
+                 (up.first == up.second ? "" : up.first == m ? " (U)" : " (P)") + " #" + std::to_string(m) +
+                 " of " + describe(objs[o]);
+      for (auto &[kk, kn] : objs[o].keyed)
+        if (std::string *s = at(kn); s && s->empty())
+          *s = "content " + cellName(o, (int64_t)(uint32_t)(kk >> 32)) + " (K " +
+               NF.cellNameString((uint32_t)kk) + ") #" + std::to_string(kn) + " of " + describe(objs[o]);
+    }
+    std::error_code EC;
+    raw_fd_ostream PO(CFLCellNodeFacts, EC, sys::fs::OF_Text);
+    if (EC) {
+      errs() << "FATAL: cannot write " << CFLCellNodeFacts << ": " << EC.message() << "\n";
+      exit(1);
+    }
+    for (uint32_t m = 0; m < numNodes; m++) {
+      if (find(m) != m) continue;
+      const size_t c = pts[m].count();
+      if (!c) continue;
+      PO << (m < G ? nodeDesc(m) : !d[m - G].empty() ? d[m - G] : kindDesc(m)) << "\t" << c << "\n";
+    }
+  }
   // The part of factMass in the key cells of keyed union slots: a key cell
   // is fed by its slot's unkeyed cell (U -> K -> P), so it repeats U's
   // facts by construction; each key adds them again.
   size_t keyedMass = 0;
   for (const Obj &O : objs)
     for (const auto &[kk, node] : O.keyed) keyedMass += pts[node].count();
+  watchdog.phase("report: container premises");
   checkConstInt();
   checkContainerPremises(stoppedAt != 0);
   // The owners' width at the row and mint sites (report only, Fable
   // 2026-10-14): the widest owner pointers, with the kinds of objects they
   // hold (struct label, byte storage, a trailing object, unlabeled).
+  watchdog.phase("report: owner widths");
   if (!rowLinks.empty() || !mintLinks.empty()) {
     std::vector<std::pair<size_t, std::string>> sites;
     std::set<uint32_t> allOwners;
@@ -7983,6 +8175,7 @@ bool CallGraphPass::runCellResolution() {
       }
     }
   };
+  watchdog.phase("report: soup profile");
   if (CFLCellSoupProfile) {
     // Node descriptions, memoized (nodeDesc scans the cells of a cell node).
     boost::unordered_flat_map<uint32_t, std::string> descMemo;
@@ -8012,7 +8205,12 @@ bool CallGraphPass::runCellResolution() {
     for (const SoupEntry &E : soupEntries) total += E.mass;
     CG_LOG("Cells: SOUP PROFILE: " << total << " foreign facts, " << soupEntries.size()
            << " entries (joins where an incompatible name entered)"
-           << (soupStop ? " [stopped at the cap]" : "") << "\n");
+           << (!soupStop ? std::string()
+               : soupForeign.size() >= CFLCellSoupCap
+                   ? " [stopped at the cap, " + std::to_string((unsigned)CFLCellSoupCap) + " foreign facts]"
+                   : " [stopped at the time limit, --cfl-cell-soup-time=" + std::to_string((unsigned)CFLCellSoupTime) +
+                         " s]")
+           << "\n");
     if (CFLCellWeldCensus) {
       // The first welds in arrival order (a first arrival seen before the
       // stop cannot become earlier; later ones rank below these).
@@ -8173,6 +8371,7 @@ bool CallGraphPass::runCellResolution() {
   }
   // Leak census report: the inert check of byte cells, then the leaks by
   // class and by site, with the non-char facts each explains.
+  watchdog.phase("report: leak census");
   if (CFLCellLeakCensus) {
     // Every fact at the stop, and those downstream of a leak (by leak). A
     // fact in a cell whose layout has no pointer-width slot there and is
@@ -8527,6 +8726,7 @@ bool CallGraphPass::runCellResolution() {
   }
   // Slot census report: facts in content cells by slot, then the cells
   // without a pointer-width slot by facts, with the sites that fed them.
+  watchdog.phase("report: slot census");
   if (CFLCellSlotCensus) {
     auto pct = [](uint64_t a, uint64_t b) {
       char buf[16];
@@ -8839,6 +9039,7 @@ bool CallGraphPass::runCellResolution() {
   // functions, the facts each pointer actual in the variadic part holds
   // (members named: a fact unified by name lists every object), then the
   // pool's facts that no actual holds (they came another way).
+  watchdog.phase("report: vararg actuals");
   if (!CFLCellVarargActuals.empty()) {
     std::set<std::string> want;
     for (StringRef w : llvm::split(StringRef(CFLCellVarargActuals.getValue()), '|'))
@@ -8986,6 +9187,7 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: " << copies.size() << " byte copies, " << copyPairs
          << " cell pairs copied, " << copyEdges << " content edges, "
          << effectiveTyped << " unknown destinations typed by the source\n");
+  watchdog.phase("report: defects");
   reportDefects();
   CG_LOG("Cells: " << g_innerAllocSites
          << " allocator calls inside kept allocator bodies (no object: the "
@@ -9006,7 +9208,7 @@ bool CallGraphPass::runCellResolution() {
            << watchPending.size() << " objects never typed with watched writes pending\n");
   if (!taggedPairs.empty()) {
     CG_LOG("Cells: alias assumptions (plan 3.51): " << asmUsed - asmFailed << " held, " << asmFailed
-           << " failed (" << asmNoNode << " for want of a node)\n");
+           << " failed (" << asmNoNode << " for want of a node)" << asmClassLine() << "\n");
     for (const std::string &d : asmFailSites) CG_LOG("Cells:   alias assumption failed at " << d << "\n");
   }
   for (const std::string &d : taggedFlipAt) CG_LOG("Cells:   unkeyed during solve: " << d << "\n");
@@ -9025,6 +9227,7 @@ bool CallGraphPass::runCellResolution() {
          << collapsedNodes << " solver nodes (" << collapseSecs << " s)\n");
   // The largest cycles: members by function, and the memory cells in them
   // (a cycle through a cell is a store and a load of one name).
+  watchdog.phase("report: big cycles");
   for (size_t ci = 0; ci < bigCycles.size(); ci++) {
     const auto &M = bigCycles[ci];
     std::map<std::string, size_t> byFn;
@@ -9221,6 +9424,7 @@ bool CallGraphPass::runCellResolution() {
   }
   const double secs =
       std::chrono::duration<double>(Clock::now() - t0).count();
+  watchdog.stop(); // before the solver's summary
   CG_LOG("Cells: iteration " << iteration << ": " << objs.size()
          << " origins (" << funcSeeds << " function seeds, " << objSeeds
          << " objects (" << tailMinted << " trailing, " << segmentsLabeled << " of them segments the site declares ("

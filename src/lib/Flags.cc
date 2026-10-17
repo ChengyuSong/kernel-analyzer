@@ -1165,6 +1165,19 @@ cl::opt<bool> CFLCellMergePtrs(
            "them) become one node, at each periodic cycle collapse"),
   cl::init(false));
 
+cl::opt<unsigned> CFLCellWatchdog(
+  "cfl-cell-watchdog",
+  cl::desc("--cfl-cells, with --verbose=1 or more: every this many seconds a line naming the solver's phase, the "
+           "time in it, the pops and the RSS, printed by a thread whatever the solver is doing (0: off)"),
+  cl::init(60));
+
+cl::opt<std::string> CFLCellNodeFacts(
+  "cfl-cell-node-facts",
+  cl::desc("--cfl-cells: write, at the end of the solve or at a stop, every solver node that holds facts, its "
+           "description (a graph node by its value, every other node by its kind and what it is made for) and "
+           "its fact count, one per line, to this file (report only)"),
+  cl::init(""));
+
 cl::opt<std::string> CFLCellStopAnswers(
   "cfl-cell-stop-answers",
   cl::desc("With --cfl-cell-census-at: write the partial state at the stop "

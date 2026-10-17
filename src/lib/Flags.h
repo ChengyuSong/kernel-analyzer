@@ -133,6 +133,8 @@ extern cl::opt<unsigned> CFLCellOneLabelMax;
 extern cl::opt<std::string> CFLCellOneLabelObject;
 extern cl::opt<unsigned> CFLCellCensusAt;
 extern cl::opt<std::string> CFLCellStopAnswers;
+extern cl::opt<std::string> CFLCellNodeFacts;
+extern cl::opt<unsigned> CFLCellWatchdog;
 extern cl::opt<std::string> CFLCellCensusFormal;
 extern cl::opt<std::string> CFLCellTraceObj;
 extern cl::opt<std::string> CFLCellWhy;

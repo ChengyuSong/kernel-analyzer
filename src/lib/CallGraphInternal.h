@@ -252,7 +252,8 @@ public:
   // on its GEP chain (unnamed); counts of anonymous fields named by the
   // enclosing struct and left unnamed.
   bool anonUnnamed = false;
-  size_t anonByEnclosing = 0, anonUnnamedN = 0;
+  size_t anonByEnclosing = 0, anonUnnamedN = 0; // per lookup (a site is looked up by each check)
+  std::set<const Instruction *> anonByEnclosingAt, anonUnnamedAt; // the distinct instructions
   StructType *pastS = nullptr;
   int64_t pastOff = 0;
 

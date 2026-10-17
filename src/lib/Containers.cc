@@ -4062,9 +4062,11 @@ void CallGraphPass::checkContainerClosure() {
           "; " + level);
   }
   if (!Ctx->Containers.empty())
-    CG_LOG("Container: anonymous struct fields: " << pointees.anonByEnclosing
-           << " named by the enclosing named struct and byte offset, " << pointees.anonUnnamedN
-           << " unnamed (no enclosing named struct on the access's GEP chain)\n");
+    CG_LOG("Container: anonymous struct fields: " << pointees.anonByEnclosing << " lookups ("
+           << pointees.anonByEnclosingAt.size()
+           << " distinct instructions) named by the enclosing named struct and byte offset, "
+           << pointees.anonUnnamedN << " lookups (" << pointees.anonUnnamedAt.size()
+           << " distinct instructions) unnamed (no enclosing named struct on the access's GEP chain)\n");
 }
 
 // After the solve: a pure row's indirect calls (Fable 2026-10-14) take the

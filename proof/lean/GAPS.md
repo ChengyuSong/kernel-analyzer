@@ -2448,6 +2448,35 @@ the listed ASSUMPTIONs.
   is one of h's stores), met h under way as the copy's source, and came
   out open on it, which then failed h. With withdrawal the verdicts do not
   depend on the order the checks reach them; no pre-pass is needed.
+- **Named holders (rule A, Fable 2026-10-17):** memory that is no field of
+  an element but holds entries is a holder when every store into it can be
+  enumerated by name (never by flow facts, which would be circular): (2) a
+  local whose address goes only to loads, stores, comparisons and actuals
+  of direct calls, followed into each callee formal that receives it (the
+  formal's -O0 spill reloads included), transitively; (3) the pointee array
+  of a named pointer field (elf_obj_tdata's sym_hashes): the stores through
+  pointers derived by name from reads of the field (index steps, -O0 locals
+  whose every store derives from it, a local under derivation agreeing:
+  `p = p + 1`), pointers into it passed to a callee followed into its
+  formal; (3') the pointee array of a local pointer whose every store is a
+  fresh block or null (binutils' sorted_sym_hash = bfd_malloc (..)), its
+  stores derived by name from that local in its own function and followed
+  into callees. A local holding a fresh block and another pointer is no
+  holder (counted). (1) is the cursor field above. A holder read is
+  evaluated in the same greatest fixpoint (the holder is a value under way
+  while its stores are evaluated): closed (every store null or an element)
+  it is an element under the premise that the element stored there is of
+  the same table instance, listed per holder; OPEN-REFUTED (a store of a
+  value known to be no element: a global object, a function, an integer)
+  it is no element; OPEN-UNPROVEN (a store of a value of unknown status, a
+  use no rule follows: an address stored to memory, a bodiless or indirect
+  call, a block write the engine cannot attribute) it is admitted as an
+  element under a per-site ASSUMPTION naming what keeps the holder open,
+  counted in "VERIFIED under n". Owners are named per function, so a
+  holder's stores in several functions are not compared: a holder read is
+  an element of no one owner shape, and O1's same-owner pairing, which
+  needs one owner, does not take it (a copy from a holder read stays
+  "another value").
 - **A copy of the whole struct (Q1 (b), Fable 2026-10-17):** a block copy
   between two objects of one struct (the destination's and the source's
   named slots the same struct at offset 0, the length its size) is
@@ -2488,6 +2517,7 @@ embed_array,union,union_nodi,past_layout,cached,inlined_remove,replace,inline_ad
 t_cells_container_{zero_gep,const_root,phi_owner,bytestep,union_slot,reread,descent,formal_obj}.ll
 (shapes from the kernel's clang-14 IR that clang-18 no longer emits) and
 t_cells_container_del_all.c, t_cells_container_{cursor_closed,cursor_open,cursor_union,
-cursor_nested,deref_owner,outparam,cursor_union_copy,cursor_underway}.c (the bfd link-hash rows); rows for the rbtree cases in t2_cells_rblib.c,
+cursor_nested,deref_owner,outparam,cursor_union_copy,cursor_underway,holder_outparam,holder_outparam_refuted,
+holder_outparam_escape,holder_array,holder_local,holder_local_other}.c (the bfd link-hash rows); rows for the rbtree cases in t2_cells_rblib.c,
 shapes in cells_rb.h.
 Not mechanized. Checked by executions; see the commit's gates.

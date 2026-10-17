@@ -1566,6 +1566,7 @@ void CallGraphPass::checkContainerClosure() {
     // Assumptions an answer rests on, pending until its caller admits it.
     std::vector<std::string> eoPending;
     std::set<std::string> outParamAssumed, cursorInstance, derefReadAssumed;
+    std::set<std::string> holderAssumed, holderInstance; // rule A: reads of open holders; closed holders used
     std::set<std::string> uncheckedCursor; // "field\tread": a cursor read admitted by an UNCHECKED census key
     std::vector<std::string> derefReadChecked;
     auto eoMark = [&]() { return eoPending.size(); };
@@ -1576,6 +1577,8 @@ void CallGraphPass::checkContainerClosure() {
           (a[0] == 'o'   ? outParamAssumed
            : a[0] == 'c' ? cursorInstance
            : a[0] == 'u' ? uncheckedCursor
+           : a[0] == 'h' ? holderAssumed
+           : a[0] == 'k' ? holderInstance
                          : derefReadAssumed)
               .insert(a.substr(1));
         }
@@ -1652,6 +1655,213 @@ void CallGraphPass::checkContainerClosure() {
     };
     std::function<std::string(const Value *)> cursorClosed;
     std::function<std::string(const std::string &, const LoadInst *)> uncheckedOf; // (below)
+    // Named holders (Fable 2026-10-17, rule A): memory that is no field of
+    // an element but holds entries, its every store enumerated by name
+    // (never by flow facts): (2) a local whose address goes only to call
+    // actuals, loads and stores, through each callee formal that receives
+    // it, transitively (the formal's uses closed the same way); (3) the
+    // pointee array of a named pointer field (elf_obj_tdata's sym_hashes):
+    // the stores through pointers derived by name from reads of that field.
+    // (1), a field of an element, is the cursor above. A read of a holder
+    // whose stores are all null or elements of one owner is an element of
+    // it, under the premise that the element stored there is of the same
+    // table instance; OPEN-REFUTED (a store of a value known to be no
+    // element: a global, a function, an integer) it is no element; OPEN-
+    // UNPROVEN (a store of a value of unknown status, a use no rule
+    // follows) it is admitted under a per-site ASSUMPTION naming what keeps
+    // the holder open. Holder reads are evaluated in the same greatest
+    // fixpoint (the holder is a value under way while its stores are).
+    struct Holder {
+      std::string name;                                            // for reports
+      const Value *key = nullptr;                                  // its eoOnPath key
+      std::vector<std::pair<const Value *, std::string>> stores;   // stored value, site
+      std::vector<std::string> open;                               // uses no rule follows
+    };
+    std::map<const Value *, Holder> localHolders;
+    std::set<const Value *> localArraysRefused; // (3') locals with a fresh block and another store
+    std::set<const Value *> afOnPath;           // locals under derivation (arrayFieldOf)
+    std::map<std::string, Holder> arrayHolders;
+    // A value known to be no element (OPEN-REFUTED), or "".
+    auto refutedClass = [&](const Value *V) -> std::string {
+      V = V->stripPointerCasts();
+      if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return "";
+      if (isa<Function>(V)) return "a function";
+      if (isa<IntToPtrInst>(V) || isa<ConstantInt>(V)) return "an integer";
+      if (isa<GlobalVariable>(V)) return "a global object";
+      if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+        if (CE->getOpcode() == Instruction::IntToPtr) return "an integer";
+        if (isa<GlobalVariable>(CE->stripPointerCasts()) || isa<GEPOperator>(CE)) return "a global object";
+      }
+      return "";
+    };
+    auto siteOf = [&](const Instruction *I) { return I->getFunction()->getName().str() + ": " + valueText(I); };
+    // (2) The uses of a holder pointer (the local, or a formal that receives
+    // it, with its -O0 spill reloads): stores into it, reads, actuals of
+    // direct calls (followed into the formal); anything else keeps it open.
+    std::function<void(const Value *, Holder &, std::set<const Value *> &)> holderUses =
+        [&](const Value *P, Holder &H, std::set<const Value *> &seen) {
+      if (!seen.insert(P).second) return;
+      for (const User *U : P->users()) {
+        const auto *I = dyn_cast<Instruction>(U);
+        if (!I || isa<DbgInfoIntrinsic>(I)) continue;
+        if (const auto *L = dyn_cast<LoadInst>(I); L && L->getPointerOperand() == P) continue;
+        if (isa<ICmpInst>(I)) continue; // a comparison of the pointer (`hashp != NULL`) reads nothing
+        if (const auto *S = dyn_cast<StoreInst>(I)) {
+          if (S->getPointerOperand() == P && S->getValueOperand() != P) {
+            H.stores.push_back({S->getValueOperand(), siteOf(S)});
+            continue;
+          }
+          // A formal's -O0 spill: its reloads are the formal.
+          if (const auto *A = dyn_cast<Argument>(P); A && S->getValueOperand() == P &&
+                                                     transientSlot(S->getPointerOperand()->stripPointerCasts())) {
+            const Value *SL = S->getPointerOperand()->stripPointerCasts();
+            size_t n = 0;
+            for (const User *V : SL->users())
+              if (isa<StoreInst>(V)) n++;
+            if (n == 1) {
+              for (const User *V : SL->users())
+                if (const auto *R = dyn_cast<LoadInst>(V)) holderUses(R, H, seen);
+              continue;
+            }
+          }
+          H.open.push_back("its address stored at " + siteOf(S));
+          continue;
+        }
+        if (const auto *CB = dyn_cast<CallBase>(I)) {
+          const Function *G = CB->getCalledFunction();
+          bool followed = false;
+          for (unsigned k = 0; k < CB->arg_size(); k++)
+            if (CB->getArgOperand(k) == P) {
+              if (!G || G->isDeclaration() || k >= G->arg_size()) {
+                H.open.push_back("passed to " + std::string(G ? "a bodiless call" : "an indirect call") + " at " +
+                                 siteOf(CB));
+                followed = true;
+                break;
+              }
+              holderUses(G->getArg(k), H, seen);
+              followed = true;
+            }
+          if (followed) continue;
+        }
+        H.open.push_back("a use at " + siteOf(I));
+      }
+    };
+    auto localHolder = [&](const AllocaInst *A) -> Holder & {
+      auto [it, ins] = localHolders.try_emplace(A);
+      if (!ins) return it->second;
+      it->second.name = "local " + A->getFunction()->getName().str() + ": " + valueText(A);
+      it->second.key = A;
+      std::set<const Value *> seen;
+      holderUses(A, it->second, seen);
+      return it->second;
+    };
+    // (3) The named pointer field whose pointee array an address derives
+    // from (through index steps, -O0 locals whose stores all derive from it,
+    // phis), or "".
+    std::function<std::string(const Value *, int)> arrayFieldOf = [&](const Value *P, int d) -> std::string {
+      P = P->stripPointerCasts();
+      if (d > 8) return "";
+      if (const auto *G = dyn_cast<GEPOperator>(P)) {
+        if (G->getSourceElementType()->isStructTy()) return "";
+        return arrayFieldOf(G->getPointerOperand(), d + 1);
+      }
+      if (const auto *L = dyn_cast<LoadInst>(P)) {
+        const Value *SL = L->getPointerOperand()->stripPointerCasts();
+        if (transientSlot(SL)) {
+          // A local under derivation (`p = p + 1`) agrees with the rest.
+          if (!afOnPath.insert(SL).second) return std::string(1, '\x01');
+          struct Pop { std::set<const Value *> &s; const Value *v; ~Pop() { s.erase(v); } } pop{afOnPath, SL};
+          // (3') A local every store of which is a fresh block (or null)
+          // holds the pointee array of that block (Fable 2026-10-17); a
+          // local whose stores all derive from one holder is that holder.
+          std::string k;
+          size_t fresh = 0, other = 0;
+          for (const User *U : SL->users())
+            if (const auto *S = dyn_cast<StoreInst>(U)) {
+              if (isa<ConstantPointerNull>(S->getValueOperand()->stripPointerCasts())) continue;
+              if (freshOf(S->getValueOperand(), 0)) { fresh++; continue; }
+              const std::string x = arrayFieldOf(S->getValueOperand(), d + 1);
+              if (x == std::string(1, '\x01')) continue; // itself, under derivation
+              if (x.empty() || (!k.empty() && x != k)) other++;
+              else k = x;
+            }
+          if (fresh && !other && k.empty())
+            return "local " + L->getFunction()->getName().str() + ": " + valueText(SL);
+          if (fresh) localArraysRefused.insert(SL); // a fresh block, and a store of another pointer
+          return other || fresh ? "" : k;
+        }
+        if (!L->getType()->isPointerTy()) return "";
+        return fieldKey(L, L->getPointerOperand());
+      }
+      if (const auto *PN = dyn_cast<PHINode>(P)) {
+        std::string k;
+        for (const Value *In : PN->incoming_values()) {
+          if (isa<ConstantPointerNull>(In->stripPointerCasts())) continue;
+          const std::string x = arrayFieldOf(In, d + 1);
+          if (x == std::string(1, '\x01')) continue;
+          if (x.empty() || (!k.empty() && x != k)) return "";
+          k = x;
+        }
+        return k;
+      }
+      return "";
+    };
+    auto arrayHolder = [&](const std::string &K, const Value *first) -> Holder & {
+      auto [it, ins] = arrayHolders.try_emplace(K);
+      if (!ins) return it->second;
+      Holder &H = it->second;
+      H.name = "the array " + K + " points to";
+      H.key = first;
+      // A local's block (3') is reached by name only in the local's own
+      // function (and the callees it passes a pointer into to, followed);
+      // a field's array anywhere.
+      std::vector<const Function *> scope;
+      if (K.rfind("local ", 0) == 0) scope.push_back(cast<Instruction>(first)->getFunction());
+      else
+        for (auto &[M, _] : Ctx->Modules)
+          for (const Function &F : *M) scope.push_back(&F);
+      for (const Function *FP : scope)
+          for (const Instruction &I : instructions(*FP)) {
+            if (const auto *S = dyn_cast<StoreInst>(&I)) {
+              if (S->getValueOperand()->getType()->isPointerTy() && arrayFieldOf(S->getPointerOperand(), 0) == K)
+                H.stores.push_back({S->getValueOperand(), siteOf(S)});
+              else if (S->getValueOperand()->getType()->isPointerTy() &&
+                       !transientSlot(S->getPointerOperand()->stripPointerCasts()) &&
+                       fieldKey(S, S->getPointerOperand()) != K && arrayFieldOf(S->getValueOperand(), 0) == K)
+                H.open.push_back("a pointer into it stored at " + siteOf(S));
+              // The field itself: a fresh block (an allocator's result) or
+              // null, or another pointer into the same array.
+              else if (S->getValueOperand()->getType()->isPointerTy() && fieldKey(S, S->getPointerOperand()) == K) {
+                const Value *V = S->getValueOperand()->stripPointerCasts();
+                if (!isa<ConstantPointerNull>(V) && !isa<CallBase>(V) && arrayFieldOf(V, 0) != K)
+                  H.open.push_back("the field set at " + siteOf(S));
+              }
+            } else if (const auto *CB = dyn_cast<CallBase>(&I); CB && !isa<MemIntrinsic>(CB)) {
+              // A pointer into the array passed on: followed into the
+              // callee's formal (its stores through it are the array's),
+              // like a local holder's.
+              for (unsigned k = 0; k < CB->arg_size(); k++) {
+                const Value *A = CB->getArgOperand(k);
+                if (!A->getType()->isPointerTy() || arrayFieldOf(A, 0) != K) continue;
+                const Function *G = CB->getCalledFunction();
+                if (!G || G->isDeclaration() || k >= G->arg_size()) {
+                  if (!isa<IntrinsicInst>(CB))
+                    H.open.push_back("passed to " + std::string(G ? "a bodiless call" : "an indirect call") + " at " +
+                                     siteOf(CB));
+                  continue;
+                }
+                std::set<const Value *> seen;
+                holderUses(G->getArg(k), H, seen);
+              }
+            } else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+              if (arrayFieldOf(MI->getRawDest(), 0) != K) continue;
+              if (const auto *MS = dyn_cast<MemSetInst>(MI))
+                if (const auto *Z = dyn_cast<ConstantInt>(MS->getValue()); Z && Z->isZero()) continue; // null fill
+              H.open.push_back("a block write at " + siteOf(MI));
+            }
+          }
+      return H;
+    };
     std::function<std::string(const Value *, int)> elemOwnerR = [&](const Value *V, int d) -> std::string {
       V = V->stripPointerCasts();
       if (d > 12) return "";
@@ -1699,6 +1909,56 @@ void CallGraphPass::checkContainerClosure() {
         if (outParamRead(L)) {
           eoPending.push_back("o" + L->getFunction()->getName().str() + ": " + valueText(L));
           return kAny;
+        }
+        // A read of a named holder (rule A).
+        if (L->getType()->isPointerTy() && !body.count(L->getFunction())) {
+          Holder *H = nullptr;
+          const Value *SL = L->getPointerOperand()->stripPointerCasts();
+          if (const auto *A = dyn_cast<AllocaInst>(SL); A && !transientSlot(A)) H = &localHolder(A);
+          else if (fieldKey(L, L->getPointerOperand()).empty())
+            if (const std::string K = arrayFieldOf(L->getPointerOperand(), 0); !K.empty())
+              H = &arrayHolder(K, L);
+          if (H) {
+            for (const auto &[v, site] : H->stores)
+              if (const std::string c = refutedClass(v); !c.empty()) return ""; // OPEN-REFUTED
+            if (!eoOnPath.insert(H->key).second) {
+              eoHits.push_back(H->key);
+              return kAny;
+            }
+            eoPathDepth[H->key] = cursorStack.size();
+            std::string agreed, unproven;
+            bool clash = false, multi = false;
+            for (const auto &[v, site] : H->stores) {
+              if (isa<ConstantPointerNull>(v->stripPointerCasts()) || isa<UndefValue>(v)) continue;
+              const std::string x = elemOwnerR(v, d + 1);
+              if (x.empty()) {
+                if (unproven.empty()) unproven = "store at " + site;
+                continue;
+              }
+              // Owners are named per function (an owner shape is a value of
+              // the function that reads it): a holder's stores in several
+              // functions name the table by different values, so they are
+              // not compared; the read is an element of the same table
+              // instance (the premise listed), of no one owner shape.
+              if (x != kAny && !agreed.empty() && x != agreed) multi = true;
+              if (x != kAny) agreed = x;
+            }
+            for (const std::string &o : H->open)
+              if (unproven.empty()) unproven = o;
+            eoOnPath.erase(H->key);
+            eoPathDepth.erase(H->key);
+            if (auto lit = valueLeans.find(H->key); lit != valueLeans.end()) {
+              const std::set<std::string> leaned = std::move(lit->second);
+              valueLeans.erase(lit);
+              if (clash) withdrawCursors(leaned);
+            }
+            if (clash) return "";
+            if (!unproven.empty())
+              eoPending.push_back("h" + siteOf(L) + ": " + H->name + " open by " + unproven);
+            else
+              eoPending.push_back("k" + H->name);
+            return agreed.empty() || multi ? kAny : agreed;
+          }
         }
         // A closed cursor field read from an element: an element of the same
         // owner, the stored one assumed of the same table instance.
@@ -1790,6 +2050,11 @@ void CallGraphPass::checkContainerClosure() {
       const size_t mark = eoMark(), hits = eoHits.size();
       const std::string o = elemOwnerR(V, 0);
       bool ok = !o.empty() && o != kAny;
+      // A read of a holder, closed or admitted under its listed assumption
+      // (rule A, OPEN-UNPROVEN), is an element of no one owner shape: an
+      // element.
+      if (o == kAny)
+        for (size_t i = mark; i < eoPending.size() && !ok; i++) ok = eoPending[i][0] == 'h' || eoPending[i][0] == 'k';
       // A value under way (its evaluation encloses this check): assumed an
       // element, the cursor fields begun inside its evaluation leaning on it.
       if (o == kAny)
@@ -3606,6 +3871,17 @@ void CallGraphPass::checkContainerClosure() {
       cline("    ASSUMPTION element from a caller's out-parameter, assumed an element of the owner: " + x);
       nAssume++;
     }
+    for (const std::string &x : holderInstance) {
+      cline("    ASSUMPTION closed holder " + x + ": the element stored there is of the same table instance");
+      nAssume++;
+    }
+    for (const std::string &x : holderAssumed) {
+      cline("    ASSUMPTION a node read back from a holder, assumed an element: " + x);
+      nAssume++;
+    }
+    if (!localArraysRefused.empty())
+      cline("  holders: " + std::to_string(localArraysRefused.size()) +
+            " locals pointing to a fresh block are no holder (another pointer stored to them too)");
     if (!derefReadChecked.empty() || !derefReadAssumed.empty()) {
       std::sort(derefReadChecked.begin(), derefReadChecked.end());
       cline("  deref owner read at a row call, one value with a read of the slot (S6): " +

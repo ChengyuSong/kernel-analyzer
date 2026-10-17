@@ -771,6 +771,37 @@ Obligations left open:
      runs only when the tag satisfies them. The read admits the union
      over uses; an untested use makes it an untested read. This does not
      separate the uses inside the callee (they share j's value).
+   - Set tests (Fable 2026-10-17, (T); reads only): a block dominating the
+     read that is entered only on edges of tests of D on the read's object
+     (`t == a || t == b`), or, as -O0 emits it, the edge of a branch on a
+     phi of conditions (`phi i1 [true, P1], [c2, P2]`: a constant entry
+     equal to the edge's value through its block's own test edge, a
+     condition entry through that condition on one load of D; a constant
+     entry that is not the edge's value never takes it). Whichever entry
+     control came through, its condition held: D satisfies one of the
+     alternatives. Each alternative is stable from its load to its branch
+     (which may be another block: the stretch, not back through either
+     block, writes no F of the object and redefines no pointer of it) and
+     from the edge to the read, every test block of the set left out of
+     the region.
+   - Dispatch tests (Fable 2026-10-17, (T); reads only): a switch
+     dominating the read on D, or on a value read from a constant 2-D
+     integer table one index of which is D (binutils' `switch
+     (link_action[row][prev])`; an -O0 local with one store between).
+     The edges that reach the read without passing back through the
+     switch decide: D is one of the values whose table entries, in any row
+     (the other index is not followed), the switch sends along such an
+     edge; for a switch on D itself, the case values of such edges, and
+     no test when the default edge is one. An index read through an -O0
+     local with several stores is each stored value: a constant among
+     them that the switch sends along such an edge leaves D untested (on
+     that path the index is not D); one it does not send is no path to
+     the read. Stability as for set tests, from D's load to the switch,
+     then from each such edge to the read.
+   - Evaluator gap: -O1 folds `t == 1 || t == 2` into `t - 1 <u 2`, and
+     the test evaluator has no add or sub, so such a test is no test
+     (the read untested, every writer admitted): sound, imprecise; for
+     after (T).
    - A union slot with a tag pair is keyed in two schemes (Fable
      2026-10-16): the tag keys of the pair (F, D) and the 3.17 census
      member keys of the union slot holding F (keyed by the union's own

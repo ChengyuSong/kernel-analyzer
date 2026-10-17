@@ -2063,11 +2063,17 @@ void CallGraphPass::computeTaggedFields() {
   // Br null: from the function's entry (Succ its entry block; an entry
   // test, plan 3.54, reads only).
   std::string unstableWhy; // why the last test was dropped (reports)
-  auto stableBetween = [&](const Instruction *dl, const BranchInst *Br, const BasicBlock *Succ, const Instruction *at,
+  // TBs: more test blocks left out of the region (a set test's); crossBlock:
+  // the test's load may be in another block than its branch (a dispatch).
+  auto stableBetween = [&](const Instruction *dl, const Instruction *Br, const BasicBlock *Succ, const Instruction *at,
                            const Field &X, bool isD, const Value *obj, std::set<uint32_t> &as,
-                           std::vector<Term> *E) {
+                           std::vector<Term> *E, const std::set<const BasicBlock *> *TBs = nullptr,
+                           bool crossBlock = false) {
     assert((Br || !isD) && "an entry test is a read's");
-    if (Br && dl->getParent() != Br->getParent()) { unstableWhy = "the test's load is in another block"; return false; }
+    if (Br && dl->getParent() != Br->getParent() && !crossBlock) {
+      unstableWhy = "the test's load is in another block";
+      return false;
+    }
     const FieldCtx &C = ctxOf(X, isD);
     auto writes = [&](const Instruction &I) {
       if (&I == at) return false;
@@ -2091,9 +2097,47 @@ void CallGraphPass::computeTaggedFields() {
       }
       return false;
     };
-    if (Br)
+    if (Br && dl->getParent() == Br->getParent())
       for (const Instruction *I = dl->getNextNode(); I && I != Br; I = I->getNextNode())
         if (writes(*I)) { unstableWhy = "a write at " + locOf(I) + " between the test's load and its branch"; return false; }
+    if (Br && dl->getParent() != Br->getParent()) {
+      // The load in another block (a dispatch's table index): the stretch
+      // from it to the branch, not back through either block, writes
+      // nothing and redefines no pointer of the object.
+      const BasicBlock *LB = dl->getParent(), *BB = Br->getParent();
+      std::set<const BasicBlock *> f2, mid;
+      std::vector<const BasicBlock *> w{LB};
+      while (!w.empty()) {
+        const BasicBlock *B = w.back();
+        w.pop_back();
+        for (const BasicBlock *N : successors(B))
+          if (N != LB && N != BB && f2.insert(N).second) w.push_back(N);
+      }
+      w = {BB};
+      std::set<const BasicBlock *> seen{BB};
+      while (!w.empty()) {
+        const BasicBlock *B = w.back();
+        w.pop_back();
+        for (const BasicBlock *P : predecessors(B))
+          if (f2.count(P) && seen.insert(P).second) mid.insert(P), w.push_back(P);
+      }
+      const Defs &d2 = defsOf(obj);
+      auto bad = [&](const Instruction &I) {
+        if (writes(I)) { unstableWhy = "a write at " + locOf(&I) + " between the test's load and its branch"; return true; }
+        if (d2.insts.count(&I)) { unstableWhy = "the object's pointer is defined between the test's load and its branch"; return true; }
+        return false;
+      };
+      for (const Instruction *I = dl->getNextNode(); I; I = I->getNextNode())
+        if (bad(*I)) return false;
+      for (const BasicBlock *B : mid) {
+        if (d2.blocks.count(B)) { unstableWhy = "the object's pointer merges between the test's load and its branch"; return false; }
+        for (const Instruction &I : *B)
+          if (bad(I)) return false;
+      }
+      if (d2.blocks.count(BB)) { unstableWhy = "the object's pointer merges at the test's branch"; return false; }
+      for (const Instruction *I = &BB->front(); I && I != Br; I = I->getNextNode())
+        if (bad(*I)) return false;
+    }
     if (isD) {
       EffMemo memo;
       std::set<const Instruction *> cyc;
@@ -2104,6 +2148,7 @@ void CallGraphPass::computeTaggedFields() {
       return true;
     }
     const BasicBlock *TB = Br ? Br->getParent() : nullptr;
+    auto isTB = [&](const BasicBlock *B) { return B == TB || (TBs && TBs->count(B)); };
     std::set<const BasicBlock *> fwd, bwd;
     std::vector<const BasicBlock *> work{Succ};
     fwd.insert(Succ);
@@ -2111,7 +2156,7 @@ void CallGraphPass::computeTaggedFields() {
       const BasicBlock *B = work.back();
       work.pop_back();
       for (const BasicBlock *N : successors(B))
-        if (N != TB && fwd.insert(N).second) work.push_back(N);
+        if (!isTB(N) && fwd.insert(N).second) work.push_back(N);
     }
     work = {at->getParent()};
     bwd.insert(at->getParent());
@@ -2120,7 +2165,7 @@ void CallGraphPass::computeTaggedFields() {
       work.pop_back();
       if (B == Succ) continue;
       for (const BasicBlock *P : predecessors(B))
-        if (P != TB && fwd.count(P) && bwd.insert(P).second) work.push_back(P);
+        if (!isTB(P) && fwd.count(P) && bwd.insert(P).second) work.push_back(P);
     }
     const Defs &idDefs = defsOf(obj);
     // Is `at`'s block on a cycle inside the region (so the code after `at`
@@ -2132,7 +2177,7 @@ void CallGraphPass::computeTaggedFields() {
       while (!w2.empty() && !atCycle) {
         const BasicBlock *B = w2.back();
         w2.pop_back();
-        if (B == TB || !sn.insert(B).second) continue;
+        if (isTB(B) || !sn.insert(B).second) continue;
         if (B == at->getParent()) atCycle = true;
         for (const BasicBlock *N : successors(B)) w2.push_back(N);
       }
@@ -2173,6 +2218,9 @@ void CallGraphPass::computeTaggedFields() {
     // read itself standing for the tag: cond == d).
     const Function *entryFn = nullptr;
     unsigned entryK = 0;
+    // A set test (Fable 2026-10-17, (T)): the test holds iff one of these
+    // does (each an edge's own test); the fields above are the first's.
+    std::vector<Test> anyOf;
   };
   std::vector<std::vector<Test>> termFilters; // Term::flt
   // Products (plan 3.51 ruling a): a predicate reading an integer tag and
@@ -2181,7 +2229,7 @@ void CallGraphPass::computeTaggedFields() {
   struct Prod { int64_t d1, d2; unsigned w1; };
   std::vector<Prod> prods;
   std::map<std::tuple<std::string, int64_t, int64_t>, int64_t> prodIdx;
-  size_t testsUnstable = 0;
+  size_t testsUnstable = 0, setTestsMade = 0, dispatchTestsMade = 0, dispatchTestsDropped = 0;
   // Reads (Ef null): stable against F writes. Retags (Ef set): each
   // test's composed D effect up to the access, parallel to tests.
   std::string lastTestsWhy; // the last testsAt's reason for dropping tests
@@ -2216,6 +2264,341 @@ void CallGraphPass::computeTaggedFields() {
         if (Ef) Ef->push_back(std::move(E));
       }
     }
+    // A set test (Fable 2026-10-17, (T)): a block dominating the read,
+    // entered only on edges of tests of D on this object (`t == a || t ==
+    // b`: each equality's true edge, the second test reached on the first's
+    // false edge): there D satisfies one of them. Each is stable from its
+    // edge up to the read, every test block of the set left out of the
+    // region. Reads only (a retag keeps its own tests).
+    if (tests.empty() && !Ef && !pp) {
+      const std::vector<FnTest> &fts = fnTestsOf(Fn);
+      for (const DomTreeNode *N = DT.getNode(at->getParent()); N && tests.empty(); N = N->getIDom()) {
+        const BasicBlock *J = N->getBlock();
+        if (J->hasNPredecessors(0) || J->getSinglePredecessor()) continue;
+        std::vector<std::pair<const FnTest *, bool>> alts; // test, its edge into J the true one
+        std::set<const BasicBlock *> TBs;
+        bool all = true;
+        for (const BasicBlock *P : predecessors(J)) {
+          const FnTest *hit = nullptr;
+          for (const FnTest &ft : fts)
+            if (ft.Br->getParent() == P && ft.S == Df.first && ft.obj == obj && ft.off == Df.second &&
+                !isa<CallBase>(ft.dl))
+              hit = &ft;
+          if (!hit || hit->Br->getSuccessor(0) == hit->Br->getSuccessor(1)) { all = false; break; }
+          if (TBs.insert(P).second) alts.push_back({hit, hit->Br->getSuccessor(0) == J});
+        }
+        if (!all || alts.size() < 2) continue;
+        std::set<uint32_t> a2;
+        bool stable = true;
+        for (const auto &[ft, onT] : alts)
+          if (!stableBetween(ft->dl, ft->Br, J, at, Ff, false, obj, a2, nullptr, &TBs)) {
+            testsUnstable++;
+            lastTestsWhy = "set test at " + locOf(ft->Br) + " dropped: " + unstableWhy;
+            stable = false;
+            break;
+          }
+        if (!stable) continue;
+        as.insert(a2.begin(), a2.end());
+        Test st{alts[0].first->Br->getCondition(), alts[0].first->dl, alts[0].second, Df.second, Df.second};
+        for (const auto &[ft, onT] : alts)
+          st.anyOf.push_back(Test{ft->Br->getCondition(), ft->dl, onT, Df.second, Df.second});
+        tests.push_back(std::move(st));
+        setTestsMade++;
+      }
+    }
+    // The same set test as -O0 emits it: a branch on a phi of conditions
+    // (`t == a || t == b` is `br (phi i1 [true, P1], [c2, P2])`). On the
+    // edge whose value is b, the read was reached through an entry whose
+    // value is b: a constant b entry through its block's own test of D
+    // (its edge into the phi's block), a condition entry through that
+    // condition on one load of D on this object; an entry whose constant
+    // is not b never takes the edge.
+    auto dLoadOf = [&](const Value *C) -> const LoadInst * {
+      const LoadInst *leaf = nullptr;
+      std::vector<const Value *> work{C};
+      std::set<const Value *> seen;
+      while (!work.empty()) {
+        const Value *X = work.back();
+        work.pop_back();
+        if (!seen.insert(X).second || isa<Constant>(X)) continue;
+        if (const auto *L = dyn_cast<LoadInst>(X)) {
+          if (leaf && leaf != L) return nullptr;
+          leaf = L;
+          continue;
+        }
+        if (isa<ICmpInst>(X) || isa<CastInst>(X) ||
+            (isa<BinaryOperator>(X) && (cast<BinaryOperator>(X)->getOpcode() == Instruction::And ||
+                                        cast<BinaryOperator>(X)->getOpcode() == Instruction::Or ||
+                                        cast<BinaryOperator>(X)->getOpcode() == Instruction::Xor))) {
+          for (const Value *Op : cast<User>(X)->operands()) work.push_back(Op);
+          continue;
+        }
+        return nullptr;
+      }
+      StructType *S2 = nullptr;
+      int64_t o2 = 0;
+      if (!leaf || !composedSlot(leaf, leaf->getPointerOperand(), leaf->getModule()->getDataLayout(), S2, o2) || !S2 ||
+          !S2->hasName() || stripStructNameSuffix(S2->getName()) != Df.first || o2 != Df.second ||
+          objKey(leaf, leaf->getPointerOperand(), S2) != obj)
+        return nullptr;
+      return leaf;
+    };
+    if (tests.empty() && !Ef && !pp) {
+      const std::vector<FnTest> &fts = fnTestsOf(Fn);
+      for (const DomTreeNode *N = DT.getNode(at->getParent()); N && tests.empty(); N = N->getIDom()) {
+        const BasicBlock *J = N->getBlock(), *B = J->getSinglePredecessor();
+        const auto *Br = B ? dyn_cast<BranchInst>(B->getTerminator()) : nullptr;
+        if (!Br || !Br->isConditional() || Br->getSuccessor(0) == Br->getSuccessor(1)) continue;
+        const auto *PN = dyn_cast<PHINode>(Br->getCondition());
+        if (!PN || PN->getParent() != B) continue;
+        const bool want = Br->getSuccessor(0) == J;
+        std::vector<Test> alts;
+        bool ok = true;
+        for (unsigned q = 0; q < PN->getNumIncomingValues() && ok; q++) {
+          const Value *V = PN->getIncomingValue(q);
+          const BasicBlock *P = PN->getIncomingBlock(q);
+          if (const auto *K = dyn_cast<ConstantInt>(V)) {
+            if (K->isOne() != want) continue; // this entry never takes the edge
+            const FnTest *hit = nullptr;
+            for (const FnTest &ft : fts)
+              if (ft.Br->getParent() == P && ft.S == Df.first && ft.obj == obj && ft.off == Df.second &&
+                  !isa<CallBase>(ft.dl) && ft.Br->getSuccessor(0) != ft.Br->getSuccessor(1))
+                hit = &ft;
+            if (!hit || (hit->Br->getSuccessor(0) != B && hit->Br->getSuccessor(1) != B)) { ok = false; break; }
+            alts.push_back(Test{hit->Br->getCondition(), hit->dl, hit->Br->getSuccessor(0) == B, Df.second, Df.second});
+            continue;
+          }
+          const LoadInst *dl = dLoadOf(V);
+          if (!dl) { ok = false; break; }
+          alts.push_back(Test{V, dl, want, Df.second, Df.second});
+        }
+        if (!ok || alts.empty()) continue;
+        std::set<uint32_t> a2;
+        bool stable = true;
+        for (const Test &x : alts)
+          if (!stableBetween(x.d, Br, J, at, Ff, false, obj, a2, nullptr, nullptr, true)) {
+            testsUnstable++;
+            lastTestsWhy = "set test at " + locOf(Br) + " dropped: " + unstableWhy;
+            stable = false;
+            break;
+          }
+        if (!stable) continue;
+        as.insert(a2.begin(), a2.end());
+        Test st = alts[0];
+        if (alts.size() > 1) st.anyOf = alts;
+        tests.push_back(std::move(st));
+        setTestsMade++;
+      }
+    }
+    // A dispatch (Fable 2026-10-17, (T)): a switch dominating the read on D
+    // itself or on a value read from a constant 2-D integer table, one index
+    // of which is D (binutils' `switch (link_action[row][prev])`, prev =
+    // h->type or a constant): on the switch's edges that reach the read
+    // (not back through the switch), D is one of the values whose table
+    // entries, in any row, take such an edge. A constant the index may also
+    // hold that takes such an edge leaves D untested. Each reaching edge
+    // stable up to the read, the stretch from D's load to the switch too.
+    if (tests.empty() && !Ef && !pp)
+      for (const DomTreeNode *N = DT.getNode(at->getParent()); N && tests.empty(); N = N->getIDom()) {
+        const auto *SW = dyn_cast<SwitchInst>(N->getBlock()->getTerminator());
+        if (!SW || N->getBlock() == at->getParent() || SW->getCondition()->getType()->getIntegerBitWidth() > 64) continue;
+        const BasicBlock *SB = SW->getParent();
+        // The value switched on: through an -O0 local with one store.
+        auto through = [&](const Value *V) -> const Value * {
+          for (int d = 0; d < 8; d++) {
+            V = V->stripPointerCasts();
+            if (const auto *L = dyn_cast<LoadInst>(V))
+              if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+                const StoreInst *one = nullptr;
+                for (const User *U : AI->users())
+                  if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand()->stripPointerCasts() == AI) {
+                    if (one) return nullptr;
+                    one = St;
+                  }
+                if (!one) return nullptr;
+                V = one->getValueOperand();
+                continue;
+              }
+            return V;
+          }
+          return nullptr;
+        };
+        // The terms an index or the switched value may be: D's expressions
+        // (each with its load of D) and constants.
+        struct DTerm { const Value *expr; const Instruction *dl; };
+        std::function<bool(const Value *, int, std::vector<DTerm> &, std::vector<int64_t> &)> terms =
+            [&](const Value *V, int d, std::vector<DTerm> &dts, std::vector<int64_t> &cs) -> bool {
+          if (d > 6) return false;
+          const Value *W = V;
+          while (const auto *C = dyn_cast<CastInst>(W)) {
+            if (!C->getType()->isIntegerTy() || !C->getOperand(0)->getType()->isIntegerTy()) break;
+            W = C->getOperand(0);
+          }
+          if (const auto *K = dyn_cast<ConstantInt>(W)) {
+            if (K->getBitWidth() > 64) return false;
+            cs.push_back(K->getSExtValue());
+            return true;
+          }
+          if (const auto *L = dyn_cast<LoadInst>(W))
+            if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+              bool any = false;
+              for (const User *U : AI->users())
+                if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand()->stripPointerCasts() == AI) {
+                  if (!terms(St->getValueOperand(), d + 1, dts, cs)) return false;
+                  any = true;
+                } else if (!isa<LoadInst>(U) && !isa<DbgInfoIntrinsic>(U)) return false; // the local escapes
+              return any;
+            }
+          if (const auto *PN = dyn_cast<PHINode>(W)) {
+            for (const Value *In : PN->incoming_values())
+              if (!terms(In, d + 1, dts, cs)) return false;
+            return true;
+          }
+          // An expression of one load of D on this object (casts and bit
+          // operations with constants).
+          const Instruction *leaf = nullptr;
+          std::vector<const Value *> work{W};
+          std::set<const Value *> seen;
+          while (!work.empty()) {
+            const Value *X = work.back();
+            work.pop_back();
+            if (!seen.insert(X).second || isa<Constant>(X)) continue;
+            if (const auto *L = dyn_cast<LoadInst>(X)) {
+              if (leaf && leaf != L) return false;
+              leaf = L;
+              continue;
+            }
+            if (isa<CastInst>(X) || (isa<BinaryOperator>(X) && (cast<BinaryOperator>(X)->getOpcode() == Instruction::And ||
+                                                                 cast<BinaryOperator>(X)->getOpcode() == Instruction::Or ||
+                                                                 cast<BinaryOperator>(X)->getOpcode() == Instruction::Xor))) {
+              for (const Value *Op : cast<User>(X)->operands()) work.push_back(Op);
+              continue;
+            }
+            return false;
+          }
+          const auto *DL0 = dyn_cast_or_null<LoadInst>(leaf);
+          StructType *S2 = nullptr;
+          int64_t o2 = 0;
+          if (!DL0 || !composedSlot(DL0, DL0->getPointerOperand(), DL0->getModule()->getDataLayout(), S2, o2) || !S2 ||
+              !S2->hasName() || stripStructNameSuffix(S2->getName()) != Df.first || o2 != Df.second ||
+              objKey(DL0, DL0->getPointerOperand(), S2) != obj)
+            return false;
+          dts.push_back({W, DL0});
+          return true;
+        };
+        // The switch's edges that reach the read without passing the switch.
+        std::map<const BasicBlock *, bool> reachMemo;
+        auto reaches = [&](const BasicBlock *S) {
+          auto [it, ins] = reachMemo.try_emplace(S, false);
+          if (!ins) return it->second;
+          std::set<const BasicBlock *> sn{S};
+          std::vector<const BasicBlock *> w{S};
+          while (!w.empty() && !it->second) {
+            const BasicBlock *B = w.back();
+            w.pop_back();
+            if (B == at->getParent()) it->second = true;
+            for (const BasicBlock *M : successors(B))
+              if (M != SB && sn.insert(M).second) w.push_back(M);
+          }
+          return it->second;
+        };
+        auto takes = [&](int64_t v) { // the switch on v takes an edge that reaches the read
+          for (auto C : SW->cases())
+            if (C.getCaseValue()->getSExtValue() == v) return reaches(C.getCaseSuccessor());
+          return reaches(SW->getDefaultDest());
+        };
+        const Value *SV = through(SW->getCondition());
+        if (!SV) continue;
+        std::vector<DTerm> dts;
+        std::vector<int64_t> cs, admitted; // admitted: D's index values (or D's values) that take a reaching edge
+        bool ok = false;
+        const auto *TL = dyn_cast<LoadInst>(SV);
+        const GlobalVariable *GV = nullptr;
+        std::vector<const Value *> idx;
+        if (TL && TL->getType()->isIntegerTy()) {
+          // The table read: GEPs from a constant [nr x [nc x iK]] global, indices (0, i1, i2).
+          const Value *P = TL->getPointerOperand();
+          std::vector<const Value *> rev;
+          for (int d = 0; d < 3; d++) {
+            const auto *G = dyn_cast<GEPOperator>(P);
+            if (!G) break;
+            std::vector<const Value *> ix(G->idx_begin(), G->idx_end());
+            if (ix.empty() || !isa<ConstantInt>(ix[0]) || !cast<ConstantInt>(ix[0])->isZero()) { rev.clear(); P = nullptr; break; }
+            for (size_t q = ix.size(); q-- > 1;) rev.push_back(ix[q]);
+            P = G->getPointerOperand();
+          }
+          GV = P ? dyn_cast<GlobalVariable>(P->stripPointerCasts()) : nullptr;
+          idx.assign(rev.rbegin(), rev.rend());
+        }
+        if (GV && GV->isConstant() && GV->hasDefinitiveInitializer() && idx.size() == 2) {
+          const auto *AT = dyn_cast<ArrayType>(GV->getValueType());
+          const auto *RT = AT ? dyn_cast<ArrayType>(AT->getElementType()) : nullptr;
+          if (RT && RT->getElementType()->isIntegerTy() && AT->getNumElements() * RT->getNumElements() <= 4096) {
+            const int64_t nr = (int64_t)AT->getNumElements(), nc = (int64_t)RT->getNumElements();
+            auto entry = [&](int64_t r, int64_t c) -> std::optional<int64_t> {
+              const Constant *Row = GV->getInitializer()->getAggregateElement((unsigned)r);
+              const Constant *E = Row ? Row->getAggregateElement((unsigned)c) : nullptr;
+              if (const auto *K = dyn_cast_or_null<ConstantInt>(E)) return K->getSExtValue();
+              return std::nullopt;
+            };
+            std::vector<DTerm> d0, d1;
+            std::vector<int64_t> c0, c1;
+            const bool t0 = terms(idx[0], 0, d0, c0), t1 = terms(idx[1], 0, d1, c1);
+            // D in exactly one index; the other any value.
+            const bool dRow = t0 && !d0.empty() && !(t1 && !d1.empty());
+            const bool dCol = t1 && !d1.empty() && !(t0 && !d0.empty());
+            if (dRow || dCol) {
+              dts = dRow ? d0 : d1;
+              cs = dRow ? c0 : c1;
+              const int64_t nD = dRow ? nr : nc, nO = dRow ? nc : nr;
+              ok = true;
+              for (int64_t k = 0; k < nD && ok; k++)
+                for (int64_t o = 0; o < nO; o++) {
+                  auto e = dRow ? entry(k, o) : entry(o, k);
+                  if (!e) { ok = false; break; }
+                  if (takes(*e)) { admitted.push_back(k); break; }
+                }
+            }
+          }
+        } else if (terms(SV, 0, dts, cs) && !dts.empty()) {
+          // A switch on D itself: its case values that take a reaching edge
+          // (the default's: D any value the cases do not name).
+          ok = !reaches(SW->getDefaultDest());
+          for (auto C : SW->cases())
+            if (reaches(C.getCaseSuccessor())) admitted.push_back(C.getCaseValue()->getSExtValue());
+        }
+        if (!ok || dts.empty()) continue;
+        bool untested = false;
+        for (int64_t c : cs) untested |= std::find(admitted.begin(), admitted.end(), c) != admitted.end();
+        if (untested) { dispatchTestsDropped++; lastTestsWhy = "dispatch at " + locOf(SW) + ": a constant the index may hold takes the edge"; continue; }
+        std::set<const BasicBlock *> succs;
+        for (const BasicBlock *S : successors(SB))
+          if (reaches(S)) succs.insert(S);
+        std::set<uint32_t> a2;
+        bool stable = true;
+        for (const DTerm &dt : dts) {
+          for (const BasicBlock *S : succs)
+            if (!stableBetween(dt.dl, SW, S, at, Ff, false, obj, a2, nullptr, nullptr, true)) { stable = false; break; }
+          if (!stable) break;
+        }
+        if (!stable) {
+          testsUnstable++;
+          lastTestsWhy = "dispatch at " + locOf(SW) + " dropped: " + unstableWhy;
+          continue;
+        }
+        as.insert(a2.begin(), a2.end());
+        std::vector<Test> alts;
+        for (const DTerm &dt : dts) {
+          Test x{dt.expr, dt.dl, true, Df.second, Df.second};
+          x.sw = true;
+          x.caseVals = admitted;
+          alts.push_back(std::move(x));
+        }
+        Test st = alts[0];
+        if (alts.size() > 1) st.anyOf = alts;
+        tests.push_back(std::move(st));
+        dispatchTestsMade++;
+      }
     // Plan 3.54: no test in the function, but the function is a method
     // installed in D and the object is its receiver formal. On entry
     // through a dispatch o->D(o, ...) (a test site), D == M held at the
@@ -2413,8 +2796,8 @@ void CallGraphPass::computeTaggedFields() {
     for (int64_t c : t.caseVals) in |= ((uint64_t)c & m) == ((uint64_t)x & m);
     return t.swDefault ? !in : in;
   };
-  auto mayHold = [&](const std::vector<Test> &tests, const KnownBits &kb) {
-    for (const Test &t : tests) {
+  auto mayHold1 = [&](const Test &t, const KnownBits &kb) {
+    do { // one test: `continue` is "no constraint"
       curT = &t;
       std::optional<KnownBits> in = kb;
       if (t.argExpr) {
@@ -2429,11 +2812,23 @@ void CallGraphPass::computeTaggedFields() {
         continue;
       }
       if ((!r->getConstant().isZero()) != t.onTrue) return false;
+    } while (false);
+    return true;
+  };
+  auto mayHold = [&](const std::vector<Test> &tests, const KnownBits &kb) {
+    for (const Test &t : tests) {
+      if (t.anyOf.empty()) {
+        if (!mayHold1(t, kb)) return false;
+        continue;
+      }
+      bool any = false;
+      for (const Test &a : t.anyOf) any = any || mayHold1(a, kb);
+      if (!any) return false;
     }
     return true;
   };
-  auto holds = [&](const std::vector<Test> &tests, int64_t v) {
-    for (const Test &t : tests) {
+  auto holds1 = [&](const Test &t, int64_t v) {
+    do { // one test: `continue` is "no constraint"
       curT = &t;
       int64_t in = v;
       if (t.argExpr) {
@@ -2448,6 +2843,18 @@ void CallGraphPass::computeTaggedFields() {
         continue;
       }
       if ((*r2 != 0) != t.onTrue) return false;
+    } while (false);
+    return true;
+  };
+  auto holds = [&](const std::vector<Test> &tests, int64_t v) {
+    for (const Test &t : tests) {
+      if (t.anyOf.empty()) {
+        if (!holds1(t, v)) return false;
+        continue;
+      }
+      bool any = false;
+      for (const Test &a : t.anyOf) any = any || holds1(a, v);
+      if (!any) return false;
     }
     return true;
   };
@@ -4143,8 +4550,12 @@ void CallGraphPass::computeTaggedFields() {
       // full-width sets widen: each read gets the sets for its own R.
       std::vector<std::string> wideTests, witnessLines;
       const int64_t wmask = dWidth >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << dWidth) - 1);
-      auto observedBits = [&](const std::vector<Test> &g) -> int64_t {
+      auto observedBits = [&](const std::vector<Test> &g0) -> int64_t {
         int64_t r = 0;
+        std::vector<Test> g; // a set test's alternatives each
+        for (const Test &t : g0)
+          if (t.anyOf.empty()) g.push_back(t);
+          else g.insert(g.end(), t.anyOf.begin(), t.anyOf.end());
         for (const Test &t : g) {
           uint64_t acc = 0;
           const bool ok = demand(t.cond, t.d, 1, acc);
@@ -5032,7 +5443,9 @@ void CallGraphPass::computeTaggedFields() {
          << " s; " << pairsKeyed << " pairs keyed (" << writersTagged << " tagged writers, "
          << writersUntagged << " untagged: no co-written tag in the writer's function); reads: "
          << readsKeyed << " keyed, " << readsNoTest << " with no stable dominating test (" << testsUnstable
-         << " tests dropped: D may be written before the access), " << readsAll
+         << " tests dropped: D may be written before the access), " << setTestsMade
+         << " set tests (t == a || t == b), " << dispatchTestsMade << " dispatch tests (a switch on D or on a constant table of it; "
+         << dispatchTestsDropped << " left untested: a constant the index may hold takes the edge), " << readsAll
          << " admitting every writer; " << pairsNonConst << " pairs unkeyed by a non-constant retag, "
          << pairsUncertified << " by an uncertified tag; " << unionFields
          << " union members read as one pointer field; " << outParamWrites << " out-parameter F writes; "

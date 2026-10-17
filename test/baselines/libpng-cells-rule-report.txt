@@ -16,6 +16,8 @@ SUMMARY varargs 0 renderers mapped, 0 va_arg reads keyed, 0 unkeyed; call sites:
 SUMMARY tagged fields 2 pairs keyed, 2 flipped in the solve; alias assumptions 3 held, 1 failed; predicate tests: 0 closed, 11 open; parameter-pair tests: 0 keyed reads, 0 untested; outside-domain entries 0, premise broken at 0
 SUMMARY outside callers: 10 defined functions reach the outside after the solve, 8 of them in the pre-solve domain (8 functions)
 T outside callers: 10 via bodiless call _setjmp
+SUMMARY tagged fields in-place retags 1 (open tag writes no test guards and no content write accompanies: they retag every writer)
+T in-place retag without content write, callers not all visible: png_create_read_struct_2 pngread.c:61 of struct.png_struct_def+464 by +288 map {s&4293918719|1048576}
 SUMMARY tagged fields untested reads 222 (reads of a field with candidate tags that no tag test guards: every writer)
 U untested read _Z14user_read_dataP14png_struct_defPhm contrib/oss-fuzz/libpng_read_fuzzer.cc:77 of struct.BufState+0
 U untested read _Z14user_read_dataP14png_struct_defPhm contrib/oss-fuzz/libpng_read_fuzzer.cc:79 of struct.BufState+0

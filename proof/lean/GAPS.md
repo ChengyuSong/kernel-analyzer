@@ -787,6 +787,17 @@ Obligations left open:
      nothing says one member is used; "one member used" needs at least one
      typed access, all of one member. Before, both read "one member
      used".
+   - Tag-write values by their known bits (plan 3.51 (3), Fable
+     2026-10-16): a value the evaluator cannot evaluate by its operands
+     (a call's result, a load it does not follow) is the set LLVM's
+     computeKnownBits allows: the known ones fixed, every bit not known
+     zero or one free; used only when something is known (else the write
+     is unevaluable, as before). A bitfield store beside the tag
+     (elflink.c:5250's `h->root.non_ir_ref_dynamic = x`, `(old & -513) |
+     ((x & 1) << 9)`) is then the old tag with bit 9 free: a write that
+     changes other bits only, under the stability rule. A superset of the
+     value's executions (known bits are sound), so no write is narrowed
+     below what it can store.
    - Unions: a union member with pointer stores is one field F. Every
      store of any width or type is an F writer, and its pointer and
      pointer-width integer loads are F reads. This is the same rule with

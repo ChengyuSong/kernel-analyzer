@@ -21,6 +21,7 @@
 #include "CallGraph.h"
 #include "CallGraphInternal.h"
 #include <llvm/IR/Dominators.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Support/KnownBits.h>
 #include <chrono>
 #include <deque>
@@ -318,6 +319,7 @@ std::string locOf(const Instruction *I) {
 void CallGraphPass::computeTaggedFields() {
   widenedTagsOf.clear();
   size_t stepPosByTag = 0, stepPosUnnamed = 0, stepAddrUnnamed = 0, stepPosConst = 0, stepPosPast = 0;
+  size_t knownBitsTerms = 0; // values evaluated by their known bits alone
   ObjIds ids;
   // Where an identity's value is defined: an instruction (each execution
   // names another object), or a merge block (a phi). A walk that crosses
@@ -722,7 +724,24 @@ void CallGraphPass::computeTaggedFields() {
       memoLog.push_back(V);
       if (!budget || !budget--) return false;
       std::vector<Term> mine;
-      if (!ev1(V, depth, mine)) return false; // memo stays empty: failed
+      if (!ev1(V, depth, mine)) {
+        // Not evaluable by its operands: its bits LLVM knows (plan 3.51 (3),
+        // Fable 2026-10-16), the known ones fixed and the rest free, when
+        // that is any knowledge at all. elflink.c:5250's
+        // `h->root.non_ir_ref_dynamic = x` inserts `(x & 1) << 9`: bit 9
+        // free, the others zero, so the store keeps the old load's bits
+        // over type:8 (a write changing other bits only).
+        const auto *IT = dyn_cast<IntegerType>(V->getType());
+        const auto *VI = dyn_cast<Instruction>(V);
+        if (!IT || IT->getBitWidth() > 64 || !VI) return false; // memo stays empty: failed
+        const KnownBits K = computeKnownBits(V, VI->getModule()->getDataLayout());
+        if (K.Zero.isZero() && K.One.isZero()) return false;
+        const unsigned w = IT->getBitWidth();
+        const int64_t wm = w >= 64 ? (int64_t)-1 : (int64_t)((uint64_t(1) << w) - 1);
+        const int64_t one = (int64_t)K.One.getZExtValue(), zero = (int64_t)K.Zero.getZExtValue();
+        mine.push_back({'c', 0, one, wm & ~(one | zero)});
+        knownBitsTerms++;
+      }
       memo[V] = mine;
       out.insert(out.end(), mine.begin(), mine.end());
       return out.size() <= kMaxTerms;
@@ -4940,6 +4959,8 @@ void CallGraphPass::computeTaggedFields() {
     for (const std::string &r : taggedEntryRows) CG_LOG("TaggedFields:   ENTRY " << r << "\n");
   if (VerboseLevel >= 2)
     for (const std::string &u : xmFieldSizes) CG_LOG("TaggedFields:   U of " << u << "\n");
+    CG_LOG("TaggedFields: tag-write values evaluated by their known bits alone (LLVM computeKnownBits): "
+           << knownBitsTerms << "\n");
     CG_LOG("TaggedFields: accesses through a struct GEP whose leading index is not 0 (a byte step): "
            << stepPosByTag << " named by their TBAA tag, " << stepPosUnnamed << " unnamed; " << stepPosConst
            << " of them at constant indices (the GEP alone used to name them), " << stepPosPast

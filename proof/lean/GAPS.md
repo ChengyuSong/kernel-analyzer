@@ -926,6 +926,31 @@ Obligations left open:
      excluded it: unsound (t_cells_union_void_value.c). Now it types no
      member (#?): only widens. The member declared void * keeps its own
      rule (above).
+   - A one-field union copy ((C''), Fable 2026-10-17): a store whose
+     value, stripped of no-op casts, is a load of the same union field of
+     an object (same struct, union offset, offset in the union, type), the
+     load feeding the store directly or through an -O0 spill local (one
+     store, used only as an address), on a census-keyed slot, is a per-key
+     copy of the field, not a write of an unknown member: the solver's
+     byte copy of those bytes, its own store edge not made. A key's two
+     components have different owners. The member component names the
+     bytes: it travels with them from the source (no member is inferred;
+     #? travels as #?). The tag component names the destination object's
+     state at the write: it is the store's own, the tag keys TaggedFields
+     gives the store like any other (the catch-all when it is untagged).
+     So a fact under (t, m) at the source lands under (t', m) for each of
+     the store's tag keys t' (on a census-only slot, the same key). It
+     needs no premise about the destination's tag; taking the source's tag
+     too (Q1 (b)'s whole-struct copy, where the tag bytes move with the
+     content) would. Listed per copy in the rule report ("ASSUMPTION a copy
+     of union S.u+rel between two objects keeps the source's member key
+     under the store's own tag keys"). In the container check it is a copy
+     of the cursor, not a store into it (Q1 (b)'s treatment): its facts keep
+     their keys, under the same-table premise. A function with such a copy
+     keeps its body: an adopted atom summary (a proven MV) would move the
+     field without its keys. -O3 shapes left as ordinary stores, counted: a
+     vector load/store copying several fields at once, a phi of loads of the
+     field. On nm-O0: elfxx-x86.c:1934 and elflink.c:1803 among 12 copies.
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

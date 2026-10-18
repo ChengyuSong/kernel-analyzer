@@ -3924,6 +3924,19 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
       }
     }
   }
+  // (C'') A one-field union copy (UnionCensus): a byte copy of the field
+  // from the load's address to the store's, each key to the destination's
+  // (the solver's copy), and no store edge of its own.
+  if (CFLCells && !CGP.unionCopyOf.empty())
+    if (auto cit = CGP.unionCopyOf.find(&I); cit != CGP.unionCopyOf.end()) {
+      const NodeIndex sN = CGP.getRepNodeForValue(cit->second->getPointerOperand());
+      const NodeIndex dN = CGP.getRepNodeForValue(I.getPointerOperand());
+      if (sN != AndersNodeFactory::InvalidIndex && dN != AndersNodeFactory::InvalidIndex) {
+        CGP.byteCopies.emplace_back(CGP.getCanonicalNode(sN), CGP.getCanonicalNode(dN),
+                                    (int64_t)I.getModule()->getDataLayout().getTypeStoreSize(val->getType()), &I);
+        return;
+      }
+    }
   if (!containsPointerType(val->getType())) {
     // Integer-laundered provenance: a pointer-width int store with a
     // def-side witness (ptrtoint upstream) still moves a pointer.

@@ -149,7 +149,7 @@ struct Obj {
   boost::unordered_flat_map<uint64_t, uint32_t> keyed; // (c, key) -> K
   // Copies out of a keyed union slot (src c -> dst object, dst c): a key
   // made here later is copied to the same key there.
-  std::vector<std::tuple<int64_t, uint32_t, int64_t>> copyOut;
+  std::vector<std::tuple<int64_t, uint32_t, int64_t, uint32_t>> copyOut; // src key, dst obj, dst key, tag map
   // Learned during the solve: a layout from the first typed access at
   // offset 0 of an unlabeled object.
   bool learnedLayout = false;
@@ -1713,6 +1713,30 @@ bool CallGraphPass::runCellResolution() {
   };
   // The cell of key k in content (o, c): its unkeyed writes and its own.
   std::function<uint32_t(uint32_t, int64_t, uint32_t)> keyedOf;
+  // (C'') A one-field union copy's keys: each source key's member component
+  // under the copying store's own tag keys (UINT32_MAX: the same key).
+  std::vector<std::vector<uint32_t>> copyTagMaps;            // map -> the store's tag keys (interned)
+  boost::unordered_flat_map<const Instruction *, uint32_t> copyTagMapOf;
+  boost::unordered_flat_map<uint64_t, std::vector<uint32_t>> copyKeyMemo;
+  for (auto &[S, tags] : unionCopyTags) {
+    copyTagMapOf[S] = copyTagMaps.size();
+    std::vector<uint32_t> v;
+    for (const std::string &tg : tags) v.push_back(NF.internCellName(tg));
+    copyTagMaps.push_back(std::move(v));
+  }
+  auto mapKey = [&](uint32_t mp, uint32_t k) -> std::vector<uint32_t> {
+    if (mp == UINT32_MAX) return {k};
+    const uint64_t mk = (uint64_t)mp << 32 | k;
+    if (auto it = copyKeyMemo.find(mk); it != copyKeyMemo.end()) return it->second;
+    const std::string name = NF.cellNameString(k);
+    const size_t amp = name.find('&');
+    std::vector<uint32_t> out;
+    for (uint32_t tg : copyTagMaps[mp])
+      out.push_back(amp == std::string::npos ? tg
+                                             : NF.internCellName(NF.cellNameString(tg) + name.substr(amp)));
+    copyKeyMemo.emplace(mk, out);
+    return out;
+  };
   keyedOf = [&](uint32_t o, int64_t c, uint32_t k) -> uint32_t {
     const auto [u, pn] = contentOf(o, c);
     if (u == pn) return u; // not a keyed slot: the key adds nothing
@@ -1728,8 +1752,9 @@ bool CallGraphPass::runCellResolution() {
     keyedCells++;
     // Copies out of this slot carry the key along.
     for (size_t i = 0; i < objs[o].copyOut.size(); i++) {
-      const auto [sc, od, dc] = objs[o].copyOut[i];
-      if (sc == c) addEdge(n, keyedOf(od, dc, k));
+      const auto [sc, od, dc, mp] = objs[o].copyOut[i];
+      if (sc == c)
+        for (uint32_t k2 : mapKey(mp, k)) addEdge(n, keyedOf(od, dc, k2));
     }
     return n;
   };
@@ -6285,12 +6310,16 @@ bool CallGraphPass::runCellResolution() {
         // Keyed union slot to keyed union slot: unkeyed to unkeyed, each
         // key to the same key (a realloc of a node array keeps its keys).
         addEdge(su, du);
-        objs[so].copyOut.push_back({sk, dob, dk});
+        uint32_t mp = UINT32_MAX;
+        if (at)
+          if (auto mit = copyTagMapOf.find(at); mit != copyTagMapOf.end()) mp = mit->second;
+        objs[so].copyOut.push_back({sk, dob, dk, mp});
         std::vector<std::pair<uint32_t, uint32_t>> ks; // key, node
         for (auto &[kk, kn] : objs[so].keyed)
           if ((int64_t)(uint32_t)(kk >> 32) == (int64_t)(uint32_t)sk)
             ks.push_back({(uint32_t)kk, kn});
-        for (auto [k, kn] : ks) addEdge(kn, keyedOf(dob, dk, k));
+        for (auto [k, kn] : ks)
+          for (uint32_t k2 : mapKey(mp, k)) addEdge(kn, keyedOf(dob, dk, k2));
       } else {
         addEdge(sp, du);
       }
@@ -10169,6 +10198,12 @@ bool CallGraphPass::runCellResolution() {
          << " writes (a read of both schemes admits a write by its tag that the census types as another member: "
             "excluded by its member name)\n";
       for (const std::string &r : taggedDisagreeRows) RO << "T tag/member disagreement: " << r << "\n";
+    }
+    if (!unionCopyOf.empty()) {
+      RO << "SUMMARY union one-field copies keeping the source's member keys: " << unionCopyOf.size()
+         << " (C''; left as ordinary stores at -O3 shapes: " << unionCopyVector << " vector copies, " << unionCopyPhi
+         << " phis of loads)\n";
+      for (const std::string &r : unionCopyRows) RO << "T " << r << "\n";
     }
     if (!unionAddrTyped.empty()) {
       RO << "SUMMARY union stores typed by a constant address's debug type: " << unionAddrTyped.size()

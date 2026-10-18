@@ -2154,7 +2154,7 @@ void CallGraphPass::checkContainerClosure() {
       const int64_t KO = std::stoll(K.substr(kp + 1));
       const auto [uoff, UN] = unionAround(KS, KO);
       std::string why, firstUnkeyed;
-      size_t stores = 0, others = 0, unkeyed = 0, wholeCopies = 0;
+      size_t stores = 0, others = 0, unkeyed = 0, wholeCopies = 0, fieldCopies = 0;
       bool othersKeyed = true;
       std::set<std::string> otherKeys;
       // A store that is no element: outside a union, the field is open;
@@ -2177,6 +2177,14 @@ void CallGraphPass::checkContainerClosure() {
             if (!why.empty()) break;
             if (const auto *S = dyn_cast<StoreInst>(&I)) {
               if (!S->getValueOperand()->getType()->isPointerTy() || fieldKey(S, S->getPointerOperand()) != K) continue;
+              // A copy of the same union field from another object ((C''),
+              // Fable 2026-10-17): its facts keep their keys, so under the
+              // cursor's keys it moves the cursor's own content (Q1 (b)'s
+              // treatment, one field): no store into the cursor.
+              if (unionCopyOf.count(S)) {
+                fieldCopies++;
+                continue;
+              }
               stores++;
               if (!elementStored(F, S->getValueOperand())) notElement(F, I, valueText(S));
             } else if (const auto *MT = dyn_cast<MemTransferInst>(&I)) {
@@ -2229,6 +2237,9 @@ void CallGraphPass::checkContainerClosure() {
                                               keyed +
                                               (wholeCopies ? "; " + std::to_string(wholeCopies) +
                                                                  " copies of the whole struct, key-preserving"
+                                                           : std::string()) +
+                                              (fieldCopies ? "; " + std::to_string(fieldCopies) +
+                                                                 " copies of the union field, key-preserving"
                                                            : std::string()) +
                                               ")"
                                         : "not closed (" + why + ")");

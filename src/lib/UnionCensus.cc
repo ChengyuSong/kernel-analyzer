@@ -192,6 +192,10 @@ std::string stripSuffix(StringRef N) {
 void CallGraphPass::runUnionCensus() {
   uncheckedReads.clear();
   unionAddrTyped.clear();
+  unionCopyOf.clear();
+  unionCopyTags.clear();
+  unionCopyRows.clear();
+  unionCopyVector = unionCopyPhi = 0;
   // ---- 1. Union fields of structs, from debug info ----
   std::map<std::pair<std::string, uint64_t>, UnionField> unions; // (S, off)
   std::map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> fieldsOf;
@@ -680,6 +684,25 @@ void CallGraphPass::runUnionCensus() {
     why = names + ", a constant address inside " + GV->getName().str();
     return *fits.begin();
   };
+  // (C'') The load a store copies: its value, stripped of no-op casts, a
+  // load; or a load of an -O0 spill local (only loads and stores of it as
+  // the address, one store) whose stored value, stripped, is a load.
+  auto copiedLoad = [&](const StoreInst *SI) -> const LoadInst * {
+    const auto *L = dyn_cast<LoadInst>(SI->getValueOperand()->stripPointerCasts());
+    if (!L) return nullptr;
+    if (const auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+      const StoreInst *only = nullptr;
+      for (const User *U : A->users()) {
+        if (const auto *LU = dyn_cast<LoadInst>(U); LU && LU->getPointerOperand() == A) continue;
+        const auto *S2 = dyn_cast<StoreInst>(U);
+        if (!S2 || S2->getPointerOperand() != A || S2->getValueOperand() == A || only) return nullptr;
+        only = S2;
+      }
+      if (!only) return nullptr;
+      L = dyn_cast<LoadInst>(only->getValueOperand()->stripPointerCasts());
+    }
+    return L;
+  };
   // A name for a constant written into a field: a tag value.
   auto constKey = [](const Value *V) -> std::string {
     V = V->stripPointerCasts();
@@ -885,6 +908,7 @@ void CallGraphPass::runUnionCensus() {
     CoSet co;          // tag candidates written to the same object
     bool viaCall = false;
     std::string addrWhy; // (C') typed by a constant address's debug type
+    const LoadInst *copyOf = nullptr; // (C'') a load of the same union field it copies
   };
   std::map<const UnionField *, std::vector<Site>> writes, reads;
   // Co-writes into the same object: (function, base, embed, struct) ->
@@ -1125,6 +1149,30 @@ void CallGraphPass::runUnionCensus() {
             s.addrWhy = why;
           } else {
             s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0), rel, &s.byLayout, &s.shared);
+          }
+          // (C'') A copy of the same union field from another object.
+          auto sameField = [&](const LoadInst *L) {
+            const Pos LQ = position(L->getPointerOperand(), DL);
+            return unionAt(LQ) == U && (int64_t)LQ.off - (int64_t)U->off == rel &&
+                   L->getType() == SI->getValueOperand()->getType();
+          };
+          if (SI->getValueOperand()->getType()->isPointerTy())
+            if (const LoadInst *L = copiedLoad(SI); L && sameField(L)) s.copyOf = L;
+          // The -O3 shapes left as ordinary stores (counted): a vector copy
+          // of several fields, a phi of loads of the field.
+          if (!s.copyOf) {
+            const Value *SV = SI->getValueOperand()->stripPointerCasts();
+            if (const auto *VL = dyn_cast<LoadInst>(SV); VL && SV->getType()->isVectorTy()) {
+              const Pos LQ = position(VL->getPointerOperand(), DL);
+              if (unionAt(LQ) == U) unionCopyVector++;
+            } else if (const auto *PN = dyn_cast<PHINode>(SV)) {
+              bool all = PN->getNumIncomingValues() > 0;
+              for (const Value *In : PN->incoming_values()) {
+                const auto *IL = dyn_cast<LoadInst>(In->stripPointerCasts());
+                all &= IL && sameField(IL);
+              }
+              if (all) unionCopyPhi++;
+            }
           }
         } else
           s.member = memberOf(*U, readKey(cast<LoadInst>(&I)), rel, &s.byLayout, &s.shared);
@@ -3218,6 +3266,24 @@ void CallGraphPass::runUnionCensus() {
         if (tk == "ptr:void") generic.insert(nm);
       for (auto &w : W) {
         if (!w.I) continue; // initializers write the unkeyed side
+        // (C'') A one-field copy: its keys travel from the source (the solver's
+        // byte copy); it keeps its own keys only for TaggedFields to give it
+        // its tag keys, and is no write of an unknown member.
+        if (w.copyOf) {
+          unionCopyOf[w.I] = w.copyOf;
+          std::string st;
+          raw_string_ostream os(st);
+          w.I->print(os);
+          st = StringRef(os.str()).ltrim().str();
+          st = st.substr(0, st.find(", !dbg"));
+          const Pos WQ = position(cast<StoreInst>(w.I)->getPointerOperand(), w.I->getModule()->getDataLayout());
+          unionCopyRows.push_back("ASSUMPTION a copy of union " + U->structName + "." + U->fieldName + "+" +
+                                  std::to_string((int64_t)WQ.off - (int64_t)U->off) +
+                                  " between two objects keeps the source's member key under the store's own tag keys: " +
+                                  w.I->getFunction()->getName().str() + ": " + st);
+          unionUnknownOf[w.I] = prefix;
+          continue;
+        }
         if (real(w.member) && generic.count(w.member)) {
           unionUnknownOf[w.I] = prefix;
           GenericUse &G = genericOf[prefix + "." + w.member];
@@ -3493,6 +3559,10 @@ void CallGraphPass::runUnionCensus() {
              << "check (warned, see UNCHECKED lines; before tag keys, net count from the tagged fields)" << t << "\n";
     }
     {
+      errs() << "UnionKeys: " << unionCopyOf.size()
+             << " one-field union copies keep the source's member keys (C''); left as ordinary stores at -O3 shapes: "
+             << unionCopyVector << " vector copies of several fields, " << unionCopyPhi << " phis of loads of the field\n";
+      for (const std::string &r : unionCopyRows) errs() << "UnionKeys:   " << r << "\n";
       errs() << "UnionKeys: " << unionAddrTyped.size()
              << " stores typed by a constant address's debug type (C': every object starting at the address fits the one member)\n";
       for (const std::string &r : unionAddrTyped) errs() << "UnionKeys:   " << r << "\n";

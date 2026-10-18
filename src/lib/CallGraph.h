@@ -353,6 +353,18 @@ protected:
   // (C') Union stores typed by a constant address's debug type: the listed
   // assumption per store (rule report).
   std::vector<std::string> unionAddrTyped;
+  // (C'') One-field union copies (Fable 2026-10-17): a store whose value is
+  // a load of the same union field (struct, union offset, offset in it,
+  // size) of another object, directly or through an -O0 spill local, is a
+  // per-key copy (a byte copy of the field, byteCopies): each key at the
+  // source goes to the destination with its member component and the
+  // store's own tag keys (unionCopyTags; empty on a census-only slot: the
+  // same key). The store makes no store edge. Rows for the rule report;
+  // the -O3 shapes left as ordinary stores, counted.
+  std::map<const llvm::Instruction *, const llvm::LoadInst *> unionCopyOf;   // store -> the load it copies
+  std::map<const llvm::Instruction *, std::vector<std::string>> unionCopyTags; // store -> its tag keys
+  std::vector<std::string> unionCopyRows;
+  size_t unionCopyVector = 0, unionCopyPhi = 0;
   // Tag fields 3.51 widened (no admitted tag), by "struct.S": "S+off: why".
   std::map<std::string, std::vector<std::string>> widenedTagsOf;
   // --cfl-union-keys=tag (cell solver): the keyed union slots (struct,

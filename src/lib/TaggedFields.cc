@@ -5561,6 +5561,18 @@ void CallGraphPass::computeTaggedFields() {
       (void)amp;
     }
   }
+  // (C'') A one-field union copy's own tag keys: the tag components of its
+  // product keys (on a slot keyed in both schemes; on a census-only slot it
+  // has none, and each key goes to the same key).
+  for (auto &[S, L] : unionCopyOf) {
+    (void)L;
+    auto it = unionKeyNames.find(S);
+    if (it == unionKeyNames.end()) continue;
+    std::set<std::string> tags;
+    for (const std::string &k : it->second)
+      if (const size_t amp = k.find('&'); amp != std::string::npos) tags.insert(k.substr(0, amp));
+    if (!tags.empty()) unionCopyTags[S].assign(tags.begin(), tags.end());
+  }
   // P3: the reads of both schemes and the writes they exclude by member
   // name (untagged; tagged: a tag/member disagreement).
   {

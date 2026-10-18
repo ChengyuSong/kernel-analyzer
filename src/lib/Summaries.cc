@@ -5929,7 +5929,7 @@ void CallGraphPass::unadoptKeyedBodies() {
   std::set<const Function *> keyed;
   for (const Function *F : adoptedAtomBodies)
     for (const Instruction &I : instructions(*F))
-      if (unionKeyNames.count(&I)) { keyed.insert(F); break; }
+      if (unionKeyNames.count(&I) || unionCopyOf.count(&I)) { keyed.insert(F); break; } // (C'') a copy keeps its keys
   for (bool changed = !keyed.empty(); changed;) {
     changed = false;
     for (const Function *F : adoptedAtomBodies) {

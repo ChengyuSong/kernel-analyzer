@@ -737,6 +737,7 @@ void CallGraphPass::checkContainerClosure() {
     // writes is closed (a field whose loads are called is a code field:
     // O4's).
     std::set<std::string> handle, code, open1;
+    std::vector<std::string> o1AssumeLines; // O1 copies listed open-unproven, printed under the block
     for (const Function *F : body)
       for (const Instruction &I : instructions(*F)) {
         const Value *A = nullptr;
@@ -3149,14 +3150,54 @@ void CallGraphPass::checkContainerClosure() {
               return true;
         return false;
       };
-      std::string badCopy;
+      std::vector<std::string> badCopies; // every failing copy (reported, not only the first)
+      std::vector<std::string> o1Unclassified; // block copies whose destination the check cannot classify
       for (auto &[M, _] : Ctx->Modules)
         for (Function &F : *M)
           for (const Instruction &I : instructions(F)) {
             const auto *MT = dyn_cast<MemTransferInst>(&I);
             if (!MT) continue;
             const std::string K = fieldKey(MT, MT->getRawDest());
-            if (K.empty()) continue;
+            if (K.empty()) {
+              // A destination no field names (a pointer loaded from a field,
+              // a local, an array): by what it points to (Fable 2026-10-17, a
+              // checker soundness fix; before such copies were not checked).
+              // An element struct, or the owner's handle array (a load of a
+              // handle field): checked as below. A local or a global: no
+              // element. Anything else: unclassifiable, listed.
+              const Value *Dst = MT->getRawDest()->stripPointerCasts();
+              const Value *DB = getUnderlyingObject(Dst);
+              if (isa<AllocaInst>(DB) || isa<GlobalVariable>(DB)) continue;
+              bool candidate = false;
+              if (const auto *DL = dyn_cast<LoadInst>(Dst)) {
+                // A load of a handle field (the owner's array), of a link
+                // field or of a closed cursor field (an element).
+                const std::string HK = fieldKey(DL, DL->getPointerOperand());
+                candidate = !HK.empty() && (handle.count(HK) || links.count(HK) ||
+                                            (cursorOpen.count(HK) && cursorOpen[HK].empty()));
+              }
+              StructType *PT = candidate ? nullptr : pointees.get(Dst, Dst->getContext());
+              if (PT && PT->hasName()) candidate = embedsElem(stripStructNameSuffix(PT->getName()).drop_front(7), 0);
+              else if (!candidate) {
+                o1Unclassified.push_back(F.getName().str() + ": " + valueText(MT));
+                continue;
+              }
+              if (!candidate) continue;
+              if (!body.count(&F)) {
+                const size_t mark = eoMark();
+                const std::string a = elemOwner(MT->getRawDest(), 0), v = elemOwner(MT->getRawSource(), 0);
+                eoSettle(mark, !a.empty() && a == v);
+                if (!a.empty() && a == v) {
+                  inlineSites.push_back(F.getName().str() + ": " + valueText(MT));
+                  continue;
+                }
+              } else {
+                const uint8_t src = get(baseOf(MT->getRawSource())) & ~NUL;
+                if (src && !(src & ~(DER | FRS))) continue;
+              }
+              badCopies.push_back(F.getName().str() + ": " + valueText(MT) + " (destination named by what it points to)");
+              continue;
+            }
             // The destination range [off, off + len) against the link fields
             // of a container struct embedded at the start, and the owner's
             // handle fields.
@@ -3187,9 +3228,20 @@ void CallGraphPass::checkContainerClosure() {
                 continue;
               }
             }
-            if (badCopy.empty()) badCopy = F.getName().str() + ": " + valueText(MT);
+            badCopies.push_back(F.getName().str() + ": " + valueText(MT));
           }
-      if (!badCopy.empty()) open1.insert("an element copied from another value [" + badCopy + "]");
+      if (!badCopies.empty()) {
+        std::string l = "an element copied from another value: " + std::to_string(badCopies.size()) + " copies";
+        for (const std::string &b : badCopies) l += " [" + b + "]";
+        open1.insert(l);
+      }
+      if (!o1Unclassified.empty()) {
+        o1AssumeLines.push_back("  O1: " + std::to_string(o1Unclassified.size()) +
+                                " block copies whose destination is no named field and points to nothing the check "
+                                "can name (open-unproven, each an ASSUMPTION):");
+        for (const std::string &u : o1Unclassified)
+          o1AssumeLines.push_back("    ASSUMPTION a block copy into no element: " + u);
+      }
     }
     std::string o1 = open1.empty() ? "O1 PASS" : "O1 FAIL(open:";
     for (const std::string &K : open1) {
@@ -3885,7 +3937,8 @@ void CallGraphPass::checkContainerClosure() {
     for (const std::string &o : C.obligations) cline("  " + o);
     // The assumptions a verdict rests on (Fable 2026-10-16: "VERIFIED under n
     // assumptions", each listed).
-    size_t nAssume = 0;
+    for (const std::string &x : o1AssumeLines) cline(x);
+    size_t nAssume = o1AssumeLines.empty() ? 0 : o1AssumeLines.size() - 1;
     for (const std::string &x : derefLines) cline("  row " + x);
     for (const std::string &x : derefFail) cline("  row FAIL " + x);
     cursorInstance.insert(cursorUsed.begin(), cursorUsed.end());

@@ -10205,6 +10205,11 @@ bool CallGraphPass::runCellResolution() {
          << " phis of loads)\n";
       for (const std::string &r : unionCopyRows) RO << "T " << r << "\n";
     }
+    if (!unionEmbedTyped.empty()) {
+      RO << "SUMMARY union stores typed by a declared embedding: " << unionEmbedTyped.size()
+         << " (R2: a pointer to T, which embeds P at offset 0, fits the one member whose field points to P)\n";
+      for (const std::string &r : unionEmbedTyped) RO << "T " << r << "\n";
+    }
     if (!unionAddrTyped.empty()) {
       RO << "SUMMARY union stores typed by a constant address's debug type: " << unionAddrTyped.size()
          << " (every object starting at the address, at each level, fits the one member)\n";

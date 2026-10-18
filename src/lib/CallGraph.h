@@ -353,6 +353,8 @@ protected:
   // (C') Union stores typed by a constant address's debug type: the listed
   // assumption per store (rule report).
   std::vector<std::string> unionAddrTyped;
+  // R2: union stores typed by a declared embedding (rule report).
+  std::vector<std::string> unionEmbedTyped;
   // (C'') One-field union copies (Fable 2026-10-17): a store whose value is
   // a load of the same union field (struct, union offset, offset in it,
   // size) of another object, directly or through an -O0 spill local, is a

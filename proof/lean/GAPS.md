@@ -951,6 +951,36 @@ Obligations left open:
      field without its keys. -O3 shapes left as ordinary stores, counted: a
      vector load/store copying several fields at once, a phi of loads of the
      field. On nm-O0: elfxx-x86.c:1934 and elflink.c:1803 among 12 copies.
+   - A read's member is typed by its loaded value's uses seen through
+     no-op casts (R1, Fable 2026-10-17, a bug fix): clang -O0's typed IR,
+     upgraded to opaque pointers, keeps `bitcast ptr %v to ptr` between a
+     load and its store into a declared local, its GEP base or a call's
+     actual; the walk stopped at the cast and left the read untyped (the
+     whole slot), which the design never meant. Only names reads the census
+     could name before through the same uses; counted ("n reads typed
+     through a no-op cast").
+   - A pointer to struct T that no member fits fits the member whose field
+     at that offset points to P, when the debug info declares P as T's
+     member at offset 0, transitively (R2, Fable 2026-10-17): the C upcast
+     idiom (`(struct bfd_link_hash_entry *) hi`, hi a struct
+     elf_link_hash_entry *), both names holding for one address. Used only
+     when no member fits T itself; the levels of the chain together fit one
+     member, or the access is typed by none (several: the shared class). It
+     rests on the DI embedding table, and on the premise that a pointer to T
+     stored at the slot is meant as the P-typed member. Listed per store in
+     the rule report ("typed member m by its value's type T *, which embeds P
+     at offset 0") and counted per (T, P) pair, stores and reads.
+   - O1's block copies (Fable 2026-10-17, a checker soundness fix): a
+     block copy whose destination no field names (a pointer loaded from a
+     field, an array) was not checked, although it can write an element as
+     a named one does. It is now classified by what the destination points
+     to: an element struct (the pointee embeds one), a load of a link field
+     or of a closed cursor field (an element), or of a handle field (the
+     owner's array): checked as a named destination is (the source an
+     element of the same owner, or in the body derived or fresh); a local
+     or a global: no element; anything else: open-unproven, listed per copy
+     as an ASSUMPTION ("a block copy into no element") and counted in the
+     verdict's assumptions. Every failing copy is listed with a count.
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

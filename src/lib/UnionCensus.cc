@@ -192,6 +192,7 @@ std::string stripSuffix(StringRef N) {
 void CallGraphPass::runUnionCensus() {
   uncheckedReads.clear();
   unionAddrTyped.clear();
+  unionEmbedTyped.clear();
   unionCopyOf.clear();
   unionCopyTags.clear();
   unionCopyRows.clear();
@@ -522,31 +523,44 @@ void CallGraphPass::runUnionCensus() {
   valueKeyFwd = valueKey;
   // What a read is used as: the variable it is stored into, or its
   // debug value, or the struct its GEP users index it as.
-  auto readKey = [&](const LoadInst *LI) -> std::string {
+  // R1 (Fable 2026-10-17, a bug fix): the loaded value's uses are walked
+  // through no-op casts (bitcast, addrspacecast: the typed IR clang -O0
+  // upgraded to opaque pointers keeps `bitcast ptr %v to ptr`), as valueKey
+  // already does for debug values; `casts` false gives the walk before R1
+  // (counted).
+  auto readKey = [&](const LoadInst *LI, bool casts = true) -> std::string {
     for (auto *DVI : dbgValuesOf(LI))
       if (auto *Var = DVI->getVariable())
         return typeKey(Var->getType());
-    for (const User *U : LI->users()) {
+    std::vector<const User *> usersR(LI->users().begin(), LI->users().end());
+    std::vector<const Value *> asLI{LI};
+    for (size_t ui = 0; casts && ui < usersR.size(); ui++)
+      if (isa<BitCastInst>(usersR[ui]) || isa<AddrSpaceCastInst>(usersR[ui])) {
+        asLI.push_back(usersR[ui]);
+        for (const User *U2 : usersR[ui]->users()) usersR.push_back(U2);
+      }
+    auto isLI = [&](const Value *X) { return std::find(asLI.begin(), asLI.end(), X) != asLI.end(); };
+    for (const User *U : usersR) {
       if (const auto *SI = dyn_cast<StoreInst>(U))
-        if (SI->getValueOperand() == LI)
+        if (isLI(SI->getValueOperand()))
           if (const auto *A = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
             for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(A)))
               if (auto *Var = DDI->getVariable())
                 return typeKey(Var->getType());
       if (const auto *G = dyn_cast<GetElementPtrInst>(U))
-        if (G->getPointerOperand() == LI)
+        if (isLI(G->getPointerOperand()))
           if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
             if (ST->hasName() && !isAnonStruct(ST))
               return "ptr:" + stripSuffix(ST->getName());
       if (const auto *CB = dyn_cast<CallBase>(U)) {
-        if (CB->getCalledOperand() == LI)
+        if (isLI(CB->getCalledOperand()))
           return "fnptr";
         // Passed to a call: the callee's declared parameter type.
         if (const Function *T = CB->getCalledFunction())
           if (const DISubprogram *SP = getFuncDef(const_cast<Function *>(T))->getSubprogram())
             if (auto *STy = SP->getType())
               for (unsigned j = 0; j < CB->arg_size(); j++)
-                if (CB->getArgOperand(j) == LI && j + 1 < STy->getTypeArray().size())
+                if (isLI(CB->getArgOperand(j)) && j + 1 < STy->getTypeArray().size())
                   return typeKey(STy->getTypeArray()[j + 1]);
       }
     }
@@ -585,8 +599,10 @@ void CallGraphPass::runUnionCensus() {
   // one whose layout holds a field of that type at rel, through nested
   // structs (debug info only: a verdict gained with -g). Several members
   // that fit: not typed, its own class (`shared`).
+  size_t r1Reads = 0;                                      // R1: reads typed through a no-op cast
+  std::map<std::string, std::pair<size_t, size_t>> r2Pairs; // R2: "T>P" -> (stores, reads) typed by it
   auto memberOf = [&](const UnionField &U, const std::string &key, int64_t rel, bool *byLayout = nullptr,
-                      bool *shared = nullptr) {
+                      bool *shared = nullptr, std::string *embedVia = nullptr) {
     std::vector<std::string> hits;
     for (auto &[nm, tk] : U.members)
       if (tk == key)
@@ -611,6 +627,38 @@ void CallGraphPass::runUnionCensus() {
     if (hits.size() == 1 && !voidKey) {
       if (byLayout) *byLayout = true;
       return hits[0];
+    }
+    // R2 (Fable 2026-10-17): a pointer to struct T that no member fits fits a
+    // member whose field there points to P, P declared T's member at offset
+    // 0 (transitively; the DI embedding table): the C upcast, both names of
+    // one address. The levels of the chain together fit one member, or none
+    // is typed.
+    if (hits.empty() && !voidKey && key.rfind("ptr:", 0) == 0) {
+      std::set<std::string> eh;
+      std::string T = key.substr(4), via;
+      for (int lv = 0; lv < 8; lv++) {
+        auto eit = embeddedAt.find({T, 0});
+        if (eit == embeddedAt.end()) break;
+        T = eit->second.first;
+        bool fit = false;
+        for (size_t i = 0; i < U.members.size() && i < U.memberTypes.size(); i++) {
+          const auto *C = dyn_cast_or_null<DICompositeType>(stripDI(U.memberTypes[i]));
+          if (C && layoutHas(C, rel, "ptr:" + T, 0)) {
+            eh.insert(U.members[i].first);
+            fit = true;
+          }
+        }
+        if (fit && via.empty()) via = key.substr(4) + ">" + T;
+      }
+      if (eh.size() == 1) {
+        if (byLayout) *byLayout = true;
+        if (embedVia) *embedVia = via;
+        return *eh.begin();
+      }
+      if (eh.size() > 1) {
+        if (shared) *shared = true;
+        return std::string("ambiguous");
+      }
     }
     if (hits.size() <= 1) // none fits; or a void * that one member's void * field fits: no member
       return std::string("?");
@@ -909,6 +957,7 @@ void CallGraphPass::runUnionCensus() {
     bool viaCall = false;
     std::string addrWhy; // (C') typed by a constant address's debug type
     const LoadInst *copyOf = nullptr; // (C'') a load of the same union field it copies
+    std::string embedVia;              // R2: "T>P", typed by the embedding of P in T
   };
   std::map<const UnionField *, std::vector<Site>> writes, reads;
   // Co-writes into the same object: (function, base, embed, struct) ->
@@ -1148,7 +1197,8 @@ void CallGraphPass::runUnionCensus() {
             s.member = am;
             s.addrWhy = why;
           } else {
-            s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0), rel, &s.byLayout, &s.shared);
+            s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0), rel, &s.byLayout, &s.shared, &s.embedVia);
+            if (!s.embedVia.empty()) r2Pairs[s.embedVia].first++;
           }
           // (C'') A copy of the same union field from another object.
           auto sameField = [&](const LoadInst *L) {
@@ -1175,7 +1225,12 @@ void CallGraphPass::runUnionCensus() {
             }
           }
         } else
-          s.member = memberOf(*U, readKey(cast<LoadInst>(&I)), rel, &s.byLayout, &s.shared);
+        {
+          const std::string rk = readKey(cast<LoadInst>(&I));
+          s.member = memberOf(*U, rk, rel, &s.byLayout, &s.shared, &s.embedVia);
+          if (rk != "?" && readKey(cast<LoadInst>(&I), false) == "?") r1Reads++; // typed through a no-op cast (R1)
+          if (!s.embedVia.empty()) r2Pairs[s.embedVia].second++;
+        }
         if (!s.shared && (s.member == "?" || s.member == "ambiguous")) {
           // Typed-pointer IR (upgraded): an access of the storage type is a
           // GEP into the union struct; any other member keeps a no-op
@@ -3294,6 +3349,18 @@ void CallGraphPass::runUnionCensus() {
         if (real(w.member)) {
           unionKeyNames[w.I] = {prefix + "#" + w.member};
           keyedW++;
+          if (!w.embedVia.empty()) {
+            std::string st;
+            raw_string_ostream os(st);
+            w.I->print(os);
+            st = StringRef(os.str()).ltrim().str();
+            st = st.substr(0, st.find(", !dbg"));
+            const size_t gt = w.embedVia.find('>');
+            unionEmbedTyped.push_back("ASSUMPTION a store over union " + U->structName + "." + U->fieldName +
+                                      " typed member " + w.member + " by its value's type " + w.embedVia.substr(0, gt) +
+                                      " *, which embeds " + w.embedVia.substr(gt + 1) + " at offset 0: " +
+                                      w.I->getFunction()->getName().str() + ": " + st);
+          }
           if (!w.addrWhy.empty()) {
             std::string st;
             raw_string_ostream os(st);
@@ -3559,6 +3626,17 @@ void CallGraphPass::runUnionCensus() {
              << "check (warned, see UNCHECKED lines; before tag keys, net count from the tagged fields)" << t << "\n";
     }
     {
+      errs() << "UnionKeys: " << r1Reads << " reads typed through a no-op cast of the loaded value (R1)\n";
+      {
+        size_t ws = 0, rs = 0;
+        for (auto &[k, c] : r2Pairs) ws += c.first, rs += c.second;
+        errs() << "UnionKeys: " << ws << " stores and " << rs
+               << " reads typed by a declared embedding (R2: a pointer to T fits a field pointing to P, T's member at offset 0):";
+        for (auto &[k, c] : r2Pairs)
+          errs() << " [" << k.substr(0, k.find('>')) << " embeds " << k.substr(k.find('>') + 1) << "] " << c.first
+                 << " stores, " << c.second << " reads;";
+        errs() << "\n";
+      }
       errs() << "UnionKeys: " << unionCopyOf.size()
              << " one-field union copies keep the source's member keys (C''); left as ordinary stores at -O3 shapes: "
              << unionCopyVector << " vector copies of several fields, " << unionCopyPhi << " phis of loads of the field\n";

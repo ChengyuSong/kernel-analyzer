@@ -3,7 +3,7 @@
 // constructor is called through syms' code field with secs as its owner
 // actual, so the call's result is not paired with the table its field is
 // read from, and `*sub = *h` stays "an element copied from another value".
-// LOG: O1 FAIL\(open: an element copied from another value \[main: call void @llvm.memcpy
+// LOG: O1 FAIL\(open: an element copied from another value: 1 copies \[main: call void @llvm.memcpy
 // NOLOG: inline insert: [0-9]+ same-owner
 #include <stdlib.h>
 #include <string.h>

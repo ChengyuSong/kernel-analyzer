@@ -6327,6 +6327,43 @@ bool CallGraphPass::runCellResolution() {
       copyStat[curCopy].edges++;
     }
   };
+  // The offset side of a byte copy whose other side is an any-offset cell
+  // (Fable 2026-10-17, a soundness fix): every cell of the object in the
+  // copied range [off, off + len) (to the end of the region when the length
+  // is unknown; the any-offset cell of an unlabeled object), the write side
+  // or the read side; memoized per (object, offset, length, side).
+  std::map<std::tuple<uint32_t, int64_t, int64_t, bool>, std::vector<uint32_t>> anyRangeMemo;
+  auto anyRange = [&](uint32_t o, int64_t off, int64_t len, bool read) -> std::vector<uint32_t> {
+    const auto mk = std::make_tuple(o, off, len, read);
+    if (auto it = anyRangeMemo.find(mk); it != anyRangeMemo.end()) return it->second;
+    std::vector<uint32_t> out;
+    boost::unordered_flat_set<std::pair<uint32_t, int64_t>> seen;
+    const auto [ro, ra] = locate(o, off);
+    const int64_t L = std::max<int64_t>(1, std::min<int64_t>(len >= 0 ? len : regionLen(ro, ra), (int64_t)kExpandCap));
+    for (int64_t k = 0; k < L; k++) {
+      const auto [o2, x] = locate(o, off + k);
+      const Obj &O2 = objs[o2];
+      if (O2.fn) break;
+      if (O2.layout && !O2.repeats && (x < 0 || x >= O2.size)) break;
+      const int64_t key = copyKey(O2, x);
+      if (!seen.insert({o2, key}).second) {
+        if (O2.repeats && k >= O2.size) break; // the rest repeats
+        continue;
+      }
+      if (key == kCopyAny) {
+        markBytes(o2);
+        const Cell &A = cells[anyOf(o2)];
+        out.push_back(read ? A.load : A.store);
+      } else {
+        const auto [u, pn] = contentOf(o2, key);
+        out.push_back(read ? pn : u);
+      }
+    }
+    anyRangeMemo.emplace(mk, out);
+    return out;
+  };
+  size_t anyRangeEdges = 0;
+  std::vector<size_t> anyRangeByCopy(copies.size()); // per byte copy: the edges above
   auto copyPair = [&](uint32_t ci, uint32_t fs, uint32_t fd) {
     if (soupStop) return; // the profiler stopped: no more work
     // The time cap, also between the pairs of a long byte-copy expansion
@@ -6353,7 +6390,23 @@ bool CallGraphPass::runCellResolution() {
     if (S.kind == CellKind::Any || D.kind == CellKind::Any) {
       if (CFLCellLeakCensus)
         leakCopyEdge.try_emplace((uint64_t)find(S.load) << 32 | find(D.store), ci);
-      addEdge(S.load, D.store); // any offset: everything to everything
+      if (S.kind == CellKind::Any && D.kind == CellKind::Any) {
+        addEdge(S.load, D.store); // any offset to any offset: everything to everything
+        return;
+      }
+      // One side any-offset: its cell meets every cell of the other side's
+      // range (before, only the cell at the copy's start: the rest of the
+      // range was lost).
+      const int64_t len = copies[ci].len;
+      if (S.kind == CellKind::Any) {
+        const std::vector<Member> md = memb[fd];
+        for (auto [od, eb] : md)
+          for (uint32_t n : anyRange(od, decOff(eb), len, false)) { addEdge(S.load, n); anyRangeEdges++; anyRangeByCopy[ci]++; }
+      } else {
+        const std::vector<Member> ms = memb[fs];
+        for (auto [os, ea] : ms)
+          for (uint32_t n : anyRange(os, decOff(ea), len, true)) { addEdge(n, D.store); anyRangeEdges++; anyRangeByCopy[ci]++; }
+      }
       return;
     }
     const std::vector<Member> ms = memb[fs], md = memb[fd];
@@ -9215,7 +9268,16 @@ bool CallGraphPass::runCellResolution() {
              << (R.all ? " (every receiver)" : "") << "\n");
   CG_LOG("Cells: " << copies.size() << " byte copies, " << copyPairs
          << " cell pairs copied, " << copyEdges << " content edges, "
-         << effectiveTyped << " unknown destinations typed by the source\n");
+         << effectiveTyped << " unknown destinations typed by the source; " << anyRangeEdges
+         << " edges between an any-offset side and the other side's range\n");
+  {
+    std::vector<std::pair<size_t, size_t>> byCopy;
+    for (size_t ci = 0; ci < anyRangeByCopy.size(); ci++)
+      if (anyRangeByCopy[ci]) byCopy.emplace_back(anyRangeByCopy[ci], ci);
+    std::sort(byCopy.begin(), byCopy.end(), std::greater<>());
+    for (auto &[n, ci] : byCopy)
+      CG_LOG("Cells:   any-offset range copy " << instLoc(copies[ci].at) << ": " << n << " edges\n");
+  }
   watchdog.phase("report: defects");
   reportDefects();
   CG_LOG("Cells: " << g_innerAllocSites

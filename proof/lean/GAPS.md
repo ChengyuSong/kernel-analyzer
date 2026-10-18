@@ -1111,6 +1111,20 @@ Not mechanized. Checked by executions:
 - httpd O0 to completion: icalls JSON and log identical;
 - tcpdump O0 at 1,300,000 pops: census log identical.
 
+A copy with an any-offset side (Fable 2026-10-17, a soundness fix): when
+one side's cell is an any-offset cell (an unlabeled object's bytes, or a
+labeled object reached at an unknown offset), the walk above does not run;
+that cell meets every cell of the other side's range instead: [off, off +
+L) of the other side's object (L the copy's length; unknown, the region's
+extent as the walk takes it; the any-offset cell of an unlabeled object),
+the write side when the any-offset cell is the source, the read side when
+it is the destination. The any-offset cell itself reads and writes all its
+object's cells (linkAny), so every byte of both ranges meets every byte of
+the other: sound. Before, the any-offset cell met only the other side's
+cell at the copy's start, and the rest of the range was lost: a struct
+copied into a byte buffer at a runtime offset and back kept only its first
+field (t_cells_bytecopy_any_range_a.c / _b.c: t.b() had no target).
+
 ## Bytes is not a label; written labels; label extent (CellSolver, 2026-10-11, plan 3.53 rule 1)
 
 An unlabeled object is unnamed: its cells are its raw byte offsets. Three

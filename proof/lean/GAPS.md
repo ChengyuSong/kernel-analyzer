@@ -899,6 +899,33 @@ Obligations left open:
      Counted: "UnionKeys: n void* members read and written as any member",
      per member its writes, reads, and the reads keyed by another member
      that now see its writes.
+   - A store whose value is a constant address inside a global with debug
+     info ((C'), Fable 2026-10-17: the global itself, &g[i], &g.f, any
+     constant GEP) is typed by the debug type of the objects starting at
+     that address: the global's type walked by byte offset (an array's
+     element, the member of a struct holding the offset, each member of a
+     union; never a bitfield). Several objects start at one address (a
+     struct and its first member; -O3 folds &g[i] into &g[i].first), so
+     each level is tried, and the store is the one member that fits over
+     every level together (the census's own member match, by type or by
+     layout); a level that fits several members, or levels that fit
+     different members, type nothing (#?). It rests on the debug info
+     naming the global's layout: the address is an object of that type,
+     and a store of it into a union names the member whose field has that
+     pointer type there. Listed per store in the rule report ("ASSUMPTION
+     a store over union S.u typed as member m by its value's debug type
+     (T *, a constant address inside g)"). On nm-O0 it types the three
+     `&_bfd_std_section[k]` stores into bfd_link_hash_entry.u.def.section
+     (coff_gc_sweep_symbol, set_symbol_value,
+     assign_file_positions_for_non_load_sections).
+   - A void * value or use names no member by layout ((C')): C converts
+     void * to any member's pointer type, so `e->u.b.q = mk()` with mk
+     returning void * is a store of b whatever void * fields other members
+     have at that offset. Before, the census typed it as the member with a
+     void * field there (a), and a read of b keyed by its own member
+     excluded it: unsound (t_cells_union_void_value.c). Now it types no
+     member (#?): only widens. The member declared void * keeps its own
+     rule (above).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

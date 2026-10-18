@@ -350,6 +350,9 @@ protected:
   // which the final count is printed; a closure that rests on one lists it
   // (the containers' cursor check).
   std::map<const llvm::Instruction *, std::string> uncheckedReads;
+  // (C') Union stores typed by a constant address's debug type: the listed
+  // assumption per store (rule report).
+  std::vector<std::string> unionAddrTyped;
   // Tag fields 3.51 widened (no admitted tag), by "struct.S": "S+off: why".
   std::map<std::string, std::vector<std::string>> widenedTagsOf;
   // --cfl-union-keys=tag (cell solver): the keyed union slots (struct,

@@ -10170,6 +10170,11 @@ bool CallGraphPass::runCellResolution() {
             "excluded by its member name)\n";
       for (const std::string &r : taggedDisagreeRows) RO << "T tag/member disagreement: " << r << "\n";
     }
+    if (!unionAddrTyped.empty()) {
+      RO << "SUMMARY union stores typed by a constant address's debug type: " << unionAddrTyped.size()
+         << " (every object starting at the address, at each level, fits the one member)\n";
+      for (const std::string &r : unionAddrTyped) RO << "T " << r << "\n";
+    }
     if (!taggedUntested.empty()) {
       RO << "SUMMARY tagged fields untested reads " << taggedUntested.size()
          << " (reads of a field with candidate tags that no tag test guards: every writer)\n";

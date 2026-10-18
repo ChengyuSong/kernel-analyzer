@@ -191,6 +191,7 @@ std::string stripSuffix(StringRef N) {
 
 void CallGraphPass::runUnionCensus() {
   uncheckedReads.clear();
+  unionAddrTyped.clear();
   // ---- 1. Union fields of structs, from debug info ----
   std::map<std::pair<std::string, uint64_t>, UnionField> unions; // (S, off)
   std::map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> fieldsOf;
@@ -592,19 +593,92 @@ void CallGraphPass::runUnionCensus() {
       return std::string("ambiguous");
     if (key == "?" || key.empty() || rel < 0)
       return std::string("?");
+    // A void * value or use names no member by layout: C converts void * to
+    // any member's pointer type (Fable 2026-10-17, (C')), so one member's
+    // void * field fitting it types nothing; several fitting stay the shared
+    // class. The member declared void * itself is matched above (its own
+    // rule, 093752c).
+    const bool voidKey = key == "ptr:void";
     for (size_t i = 0; i < U.members.size() && i < U.memberTypes.size(); i++) {
       const auto *C = dyn_cast_or_null<DICompositeType>(stripDI(U.memberTypes[i]));
       if (C && layoutHas(C, rel, key, 0))
         hits.push_back(U.members[i].first);
     }
-    if (hits.size() == 1) {
+    if (hits.size() == 1 && !voidKey) {
       if (byLayout) *byLayout = true;
       return hits[0];
     }
-    if (hits.empty())
+    if (hits.size() <= 1) // none fits; or a void * that one member's void * field fits: no member
       return std::string("?");
     if (shared) *shared = true;
     return std::string("ambiguous");
+  };
+  // (C', Fable 2026-10-17) A stored value that is a constant address inside
+  // a global with debug info (the global, &g[i], &g.f: a constant GEP) has
+  // the debug type of every object that starts at that address: walked by
+  // byte offset, an array's element, the member of a struct (each member of
+  // a union) holding the offset, never a bitfield. A struct starts with its
+  // first member (and -O3 folds &g[i] into &g[i].first), so each level that
+  // starts there is tried; the store is the one member that, over every
+  // level, fits (memberOf), and no member when a level fits several or the
+  // levels fit different members. `why` names the type and the global.
+  // Not a constant address inside a global: "" (the rule does not apply).
+  std::function<void(const DIType *, int64_t, std::vector<const DIType *> &, int)> typesAt =
+      [&](const DIType *T, int64_t rel, std::vector<const DIType *> &out, int depth) {
+        T = stripDI(T);
+        if (!T || rel < 0 || depth > 8) return;
+        if (rel == 0) out.push_back(T);
+        const auto *C = dyn_cast<DICompositeType>(T);
+        if (!C) return;
+        if (C->getTag() == dwarf::DW_TAG_array_type) {
+          const DIType *E = stripDI(C->getBaseType());
+          const int64_t es = E ? (int64_t)((E->getSizeInBits() + 7) / 8) : 0;
+          if (es > 0) typesAt(E, rel % es, out, depth + 1);
+          return;
+        }
+        if (C->getTag() != dwarf::DW_TAG_structure_type && C->getTag() != dwarf::DW_TAG_union_type) return;
+        for (const DINode *N : C->getElements()) {
+          const auto *D = dyn_cast<DIDerivedType>(N);
+          if (!D || D->getTag() != dwarf::DW_TAG_member || D->isStaticMember() || D->isBitField()) continue;
+          const int64_t MO = (int64_t)(D->getOffsetInBits() / 8), MS = (int64_t)((D->getSizeInBits() + 7) / 8);
+          if (rel >= MO && rel < MO + std::max<int64_t>(MS, 1)) typesAt(D->getBaseType(), rel - MO, out, depth + 1);
+        }
+      };
+  auto addrMember = [&](const UnionField &U, const Value *V, int64_t rel, std::string &why) -> std::string {
+    V = V->stripPointerCasts();
+    const GlobalVariable *GV = dyn_cast<GlobalVariable>(V);
+    int64_t off = 0;
+    if (!GV)
+      if (const auto *G = dyn_cast<GEPOperator>(V)) {
+        GV = dyn_cast<GlobalVariable>(G->getPointerOperand()->stripPointerCasts());
+        if (!GV) return "";
+        APInt O(GV->getParent()->getDataLayout().getIndexTypeSizeInBits(G->getType()), 0);
+        if (!G->accumulateConstantOffset(GV->getParent()->getDataLayout(), O)) return "";
+        off = O.getSExtValue();
+      }
+    if (!GV) return "";
+    SmallVector<DIGlobalVariableExpression *, 1> GVEs;
+    GV->getDebugInfo(GVEs);
+    if (GVEs.empty()) return "";
+    std::vector<const DIType *> ts;
+    typesAt(GVEs[0]->getVariable()->getType(), off, ts, 0);
+    if (ts.empty()) return "";
+    std::set<std::string> fits;
+    std::string names;
+    for (const DIType *T : ts) {
+      std::string key;
+      if (!T->getName().empty()) key = "ptr:" + T->getName().str();
+      else if (isa<DIDerivedType>(T)) key = "ptr:" + typeKey(T);
+      else continue; // an unnamed struct or array: no key
+      const std::string m = memberOf(U, key, rel);
+      if (m == "ambiguous") return "?";
+      if (m == "?") continue;
+      fits.insert(m);
+      names += (names.empty() ? "" : ", ") + key.substr(4) + " *";
+    }
+    if (fits.size() != 1) return fits.empty() ? "" : "?";
+    why = names + ", a constant address inside " + GV->getName().str();
+    return *fits.begin();
   };
   // A name for a constant written into a field: a tag value.
   auto constKey = [](const Value *V) -> std::string {
@@ -810,6 +884,7 @@ void CallGraphPass::runUnionCensus() {
     uint64_t embed = 0;
     CoSet co;          // tag candidates written to the same object
     bool viaCall = false;
+    std::string addrWhy; // (C') typed by a constant address's debug type
   };
   std::map<const UnionField *, std::vector<Site>> writes, reads;
   // Co-writes into the same object: (function, base, embed, struct) ->
@@ -1042,9 +1117,16 @@ void CallGraphPass::runUnionCensus() {
         s.base = Q.base;
         s.embed = Q.embed;
         const int64_t rel = (int64_t)Q.off - (int64_t)U->off;
-        if (const auto *SI = dyn_cast<StoreInst>(&I))
-          s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0), rel, &s.byLayout, &s.shared);
-        else
+        if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+          std::string why;
+          const std::string am = addrMember(*U, SI->getValueOperand(), rel, why);
+          if (!am.empty()) {
+            s.member = am;
+            s.addrWhy = why;
+          } else {
+            s.member = memberOf(*U, valueKey(SI->getValueOperand(), 0), rel, &s.byLayout, &s.shared);
+          }
+        } else
           s.member = memberOf(*U, readKey(cast<LoadInst>(&I)), rel, &s.byLayout, &s.shared);
         if (!s.shared && (s.member == "?" || s.member == "ambiguous")) {
           // Typed-pointer IR (upgraded): an access of the storage type is a
@@ -3143,8 +3225,20 @@ void CallGraphPass::runUnionCensus() {
           if (G.at.size() < 6) G.at.push_back(locOf(w.I));
           continue;
         }
-        if (real(w.member)) { unionKeyNames[w.I] = {prefix + "#" + w.member}; keyedW++; }
-        else {
+        if (real(w.member)) {
+          unionKeyNames[w.I] = {prefix + "#" + w.member};
+          keyedW++;
+          if (!w.addrWhy.empty()) {
+            std::string st;
+            raw_string_ostream os(st);
+            w.I->print(os);
+            st = StringRef(os.str()).ltrim().str();
+            st = st.substr(0, st.find(", !dbg"));
+            unionAddrTyped.push_back("ASSUMPTION a store over union " + U->structName + "." + U->fieldName +
+                                     " typed as member " + w.member + " by its value's debug type (" + w.addrWhy +
+                                     "): " + w.I->getFunction()->getName().str() + ": " + st);
+          }
+        } else {
           unionUnknownOf[w.I] = prefix;
           if (!pointerless(w)) {
             Unkeyed &K = unkeyedOf[prefix];
@@ -3399,6 +3493,9 @@ void CallGraphPass::runUnionCensus() {
              << "check (warned, see UNCHECKED lines; before tag keys, net count from the tagged fields)" << t << "\n";
     }
     {
+      errs() << "UnionKeys: " << unionAddrTyped.size()
+             << " stores typed by a constant address's debug type (C': every object starting at the address fits the one member)\n";
+      for (const std::string &r : unionAddrTyped) errs() << "UnionKeys:   " << r << "\n";
       size_t gw = 0, gr = 0;
       for (auto &[g, G] : genericOf) gw += G.writes, gr += G.reads;
       errs() << "UnionKeys: " << genericOf.size()

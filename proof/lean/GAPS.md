@@ -1168,6 +1168,36 @@ Obligations left open:
        of the block; a length or offset that is not one value by name; a
        use of an entry reclaimed after the save (objalloc_free_block;
        undefined behavior, not modeled).
+     - Unreachable by name (Fable 2026-10-19, (b); the known bits of
+       plan 3.51(3), applied to a guard instead of a tag). The guard: the
+       nearest conditional branch dominating H's allocation (the IR's
+       dominator tree; the edge into H's side dominates the allocation and,
+       checked, every save and restore of H) whose condition is icmp eq/ne 0
+       of a chain of and-by-constant, lshr-by-constant, zext and trunc
+       ending at the load of a named word W, and whose edge requires a
+       nonzero mask (composed through the chain); any other operand is no
+       guard. Checked, not assumed: (1) every object of W's address (the
+       object-identity walk above) is a zeroing allocation: calloc, or a
+       call to a function every non-null result of which is a call
+       memset to 0 over that call's size argument on every path to the
+       return (a null edge of the result exempts its path); an OPEN reason
+       or any other object declines; (2) every store of W's key keeps the
+       mask from the same word (or(and(load of W at the store's address,
+       C covering the mask), Y), Y's mask bits known zero) or clears it
+       (every mask bit known zero, LLVM's known bits); a store of another
+       width, any write named otherwise over W's bytes (a field's writes,
+       above; a constant-zero memset clears), or a non-zero initializer
+       slot over W declines. Then, by induction over an execution's
+       writes, the mask bits of every such word stay zero, the guard's edge
+       is never taken, and H's code never runs: its restores move nothing.
+       O1 excludes them with one ASSUMPTION per restore ("unreachable by
+       name: restore <loc>: guard <loc> (mask 0x<m> of <W>), n named stores
+       each keeping or clearing it (k keep; clears: <locs>), objects
+       zero-allocated at <sites>"); the mask is printed, not a macro name.
+       A guard that fails a check prints "guard ...: not unreachable by
+       name (<the first check that fails>)". The candidate is still
+       reported; the graph is not pruned (dead-branch pruning is a separate
+       lever). Writes by unnamed address: the standing naming assumption.
      - Cases: test/t_cells_container_snapshot_{holder,other_offset,
        foreign_save,two_types,identity,initializer,nullwrite,cover}.c
        (identity: a path refuted by another allocation site, one by
@@ -1175,7 +1205,9 @@ Obligations left open:
        holder's field initialized to a static table and stored a heap one,
        both relevant; nullwrite: a constant-zero memset over the field,
        listed, the refutation holds; cover: a block copy over the field,
-       OPEN, nothing refuted).
+       OPEN, nothing refuted); t_cells_container_snapshot_{unreachable,
+       setbit,memcpy,malloc}.c (unreachable by name, and its three
+       declines).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

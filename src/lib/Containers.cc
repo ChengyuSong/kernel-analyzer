@@ -23,6 +23,7 @@
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Dominators.h>
 
 namespace {
@@ -1370,7 +1371,8 @@ void CallGraphPass::checkContainerClosure() {
     // owner.
     size_t moves = 0;
     std::map<const MemTransferInst *, std::string> snapRestores; // a snapshot holder's restores -> the holder
-    size_t snapMoves = 0;
+    std::set<const MemTransferInst *> snapUnreachable; // restores of a holder unreachable by name (its ASSUMPTION listed)
+    size_t snapMoves = 0, snapUnreach = 0;
     std::map<std::string, const StoreInst *> firstBad1;
     // A store, in the body, into the owner or one of its elements (or a
     // fresh element of the body), of a value derived from the same owner
@@ -3623,6 +3625,11 @@ void CallGraphPass::checkContainerClosure() {
           // type literal); a slot no type names opens every field load.
           std::map<std::string, std::vector<const Constant *>> initVals;
           std::vector<std::string> initUnnamed;
+          // Every non-zero initializer slot of any type, by the structs
+          // around it: (struct, offset in it, bytes, global); for a word's
+          // initial value ((b)).
+          struct InitSlot { std::string S; int64_t off, len; std::string gv; };
+          std::vector<InitSlot> initNonZero;
           bool initDone = false;
           // Every named write's bytes, for a field's cover check: a store
           // (its value's store size) or a memory intrinsic (its length; a
@@ -3636,6 +3643,7 @@ void CallGraphPass::checkContainerClosure() {
           // a write named otherwise over them (a store named at an outer
           // struct or at another offset, a store of another width, a block
           // copy, a memset), or "".
+          auto KO_of = [](const std::string &K) { return (int64_t)std::stoll(K.substr(K.rfind('+') + 1)); };
           auto coverOpen = [&](const std::string &K, int64_t size) -> std::string {
             if (!writesDone) {
               writesDone = true;
@@ -3647,6 +3655,10 @@ void CallGraphPass::checkContainerClosure() {
                     int64_t len = 0;
                     if (const auto *St = dyn_cast<StoreInst>(&I))
                       Addr = St->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(St->getValueOperand()->getType());
+                    else if (const auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+                      Addr = RMW->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(RMW->getValOperand()->getType());
+                    else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(&I))
+                      Addr = CX->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(CX->getNewValOperand()->getType());
                     else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
                       Addr = MI->getRawDest();
                       const auto *Len = dyn_cast<ConstantInt>(MI->getLength());
@@ -3688,7 +3700,10 @@ void CallGraphPass::checkContainerClosure() {
                 continue;
               }
               if (!n++)
-                why = std::string(isa<MemSetInst>(W.I) ? "a memset" : isa<MemTransferInst>(W.I) ? "a block copy" : "a store") +
+                why = std::string(isa<MemSetInst>(W.I)        ? "a memset"
+                                  : isa<MemTransferInst>(W.I) ? "a block copy"
+                                  : isa<StoreInst>(W.I)       ? "a store"
+                                                              : "an atomic write") +
                       " named " + stripStructNameSuffix(W.S->getName()).str() + "+" + std::to_string(W.off) + " (" +
                       std::to_string(W.len) + " bytes) over " + K + " " + snapLoc(W.I);
             }
@@ -3739,6 +3754,17 @@ void CallGraphPass::checkContainerClosure() {
                   } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
                     const int64_t es = (int64_t)MDL.getTypeAllocSize(CA->getType()->getElementType());
                     for (unsigned e = 0; e < CA->getNumOperands(); e++) walk(CA->getOperand(e), b + e * es);
+                  } else if (!C->getType()->isPointerTy()) {
+                    // A non-zero scalar or data slot: named like a pointer slot.
+                    const int64_t len = (int64_t)MDL.getTypeStoreSize(C->getType());
+                    std::set<std::string> keys;
+                    for (const auto &[n, st] : anc) keys.insert(n + "+" + std::to_string(b - st));
+                    for (const DIGlobalVariableExpression *GVE : GVEs)
+                      if (const DIGlobalVariable *DV = GVE->getVariable()) diKeysAt(DV->getType(), 0, b, keys, 0);
+                    for (const std::string &k : keys) {
+                      const size_t q = k.rfind('+');
+                      initNonZero.push_back({k.substr(0, q), std::stoll(k.substr(q + 1)), len, GV.getName().str()});
+                    }
                   } else if (C->getType()->isPointerTy()) {
                     std::set<std::string> keys;
                     for (const auto &[n, st] : anc) keys.insert(n + "+" + std::to_string(b - st));
@@ -3756,6 +3782,7 @@ void CallGraphPass::checkContainerClosure() {
           };
           std::set<std::string> fieldOnPath;
           std::function<void(const Value *, int64_t, int, std::set<Obj> &, std::set<std::string> &)> objsOf;
+          std::map<std::string, const Value *> objSite; // an object's name -> its allocation (call, alloca, global)
           std::function<bool(const Function *, int)> isWrapper = [&](const Function *F, int d) {
             if (d > 3 || F->isDeclaration()) return false;
             bool any = false;
@@ -3861,16 +3888,22 @@ void CallGraphPass::checkContainerClosure() {
             if (const auto *CB = dyn_cast<CallBase>(V)) {
               const Function *G = CB->getCalledFunction();
               if (!G) return (void)open.insert("an indirect call's result " + snapLoc(CB));
-              if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0))
-                return (void)out.insert({G->getName().str() + " at " + snapLoc(CB), off});
+              if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0)) {
+                const std::string on = G->getName().str() + " at " + snapLoc(CB);
+                objSite.emplace(on, CB);
+                return (void)out.insert({on, off});
+              }
               if (G->isDeclaration()) return (void)open.insert("an extern call's result " + snapLoc(CB));
               for (const Instruction &I : instructions(*G))
                 if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
                   objsOf(R->getReturnValue(), off, d + 1, out, open);
               return;
             }
-            if (isa<AllocaInst>(V) || isa<GlobalValue>(V))
-              return (void)out.insert({(isa<GlobalValue>(V) ? "@" + V->getName().str() : "local " + valueText(V)), off});
+            if (isa<AllocaInst>(V) || isa<GlobalValue>(V)) {
+              const std::string on = isa<GlobalValue>(V) ? "@" + V->getName().str() : "local " + valueText(V);
+              objSite.emplace(on, V);
+              return (void)out.insert({on, off});
+            }
             open.insert("a value no rule follows " + valueText(V));
           };
           auto objText = [](const std::set<Obj> &o, const std::set<std::string> &op) {
@@ -3983,6 +4016,237 @@ void CallGraphPass::checkContainerClosure() {
                                   (premiseOpen.empty() ? "PROVEN, element struct " + T->getName().str() + ":"
                                                        : "OPEN-UNPROVEN (" + premiseOpen + "):") +
                                   prem);
+          // Unreachable by name (Fable 2026-10-19, (b); the known bits of
+          // plan 3.51(3), for a guard): the nearest conditional branch above
+          // H's allocation whose edge into it requires a nonzero mask of a
+          // named word W (icmp eq/ne 0 of and-by-constant, lshr-by-constant,
+          // zext and trunc ending at W's load). H never runs when every object
+          // of W is zero at allocation and every write of W keeps the mask
+          // from the same word or clears it: no write names W otherwise, and
+          // no initializer is non-zero over it. The graph is not pruned.
+          {
+            const Function *HF = A->getFunction();
+            DominatorTree GDT(const_cast<Function &>(*HF));
+            const DataLayout &HDL = HF->getParent()->getDataLayout();
+            // The nearest guard above I (of the word named wantK, if given):
+            // (branch, its edge, W's load, mask).
+            struct Guard { const BranchInst *BR = nullptr; int edge = -1; const LoadInst *W = nullptr; APInt mask; };
+            auto guardOf = [&](const Instruction *I, const std::string &wantK) {
+              Guard g;
+              for (const DomTreeNode *N = GDT.getNode(I->getParent())->getIDom(); N && !g.W; N = N->getIDom()) {
+                const auto *BR = dyn_cast<BranchInst>(N->getBlock()->getTerminator());
+                if (!BR || !BR->isConditional()) continue;
+                int edge = -1;
+                for (int k = 0; k < 2; k++)
+                  if (GDT.dominates(BasicBlockEdge(N->getBlock(), BR->getSuccessor(k)), I->getParent())) edge = k;
+                const auto *IC = dyn_cast<ICmpInst>(BR->getCondition());
+                const auto *Z = IC ? dyn_cast<ConstantInt>(IC->getOperand(1)) : nullptr;
+                if (edge < 0 || !IC || !IC->isEquality() || !Z || !Z->isZero() || !IC->getOperand(0)->getType()->isIntegerTy())
+                  continue;
+                if ((IC->getPredicate() == ICmpInst::ICMP_NE) != (edge == 0)) continue; // the edge requires no bit set
+                const Value *X = IC->getOperand(0);
+                APInt m = APInt::getAllOnes(X->getType()->getIntegerBitWidth());
+                for (int k = 0; k < 16; k++) {
+                  if (const auto *L = dyn_cast<LoadInst>(X)) {
+                    if (L->getType()->isIntegerTy() && !m.isZero() &&
+                        (wantK.empty() || fieldKey(L, L->getPointerOperand()) == wantK))
+                      g.W = L, g.mask = m, g.BR = BR, g.edge = edge;
+                    break;
+                  }
+                  const auto *BO = dyn_cast<BinaryOperator>(X);
+                  const auto *C = BO ? dyn_cast<ConstantInt>(BO->getOperand(1)) : nullptr;
+                  if (const auto *ZX = dyn_cast<ZExtInst>(X)) m = m.trunc(ZX->getSrcTy()->getIntegerBitWidth()), X = ZX->getOperand(0);
+                  else if (const auto *T = dyn_cast<TruncInst>(X)) m = m.zext(T->getSrcTy()->getIntegerBitWidth()), X = T->getOperand(0);
+                  else if (C && BO->getOpcode() == Instruction::And) m &= C->getValue(), X = BO->getOperand(0);
+                  else if (C && BO->getOpcode() == Instruction::LShr && C->getValue().ult(m.getBitWidth()))
+                    m = m.shl(C->getZExtValue()), X = BO->getOperand(0);
+                  else break; // another shape: no guard
+                }
+              }
+              return g;
+            };
+            const Guard G0 = guardOf(A, "");
+            const BranchInst *GBR = G0.BR;
+            const LoadInst *W = G0.W;
+            const APInt mask = G0.mask;
+            if (W) {
+              std::string decline;
+              const std::string K = fieldKey(W, W->getPointerOperand());
+              const int64_t wlen = (int64_t)HDL.getTypeStoreSize(W->getType());
+              if (K.empty()) decline = "the guard's word is named by no field";
+              // Every save and restore of H under a guard of its own (Fable:
+              // "every use ... dominated by a test"): of the same word, its
+              // mask within W's, so the one proof covers it.
+              std::set<std::string> guardLocs{snapLoc(GBR)};
+              for (const auto *v : {&hSaves, &eSaves, &hOuts, &eOuts})
+                for (const MemTransferInst *MT : *v) {
+                  if (!decline.empty()) break;
+                  const Guard g = MT->getFunction() == HF ? guardOf(MT, K) : Guard();
+                  if (!g.W || fieldKey(g.W, g.W->getPointerOperand()) != K || g.mask.getBitWidth() != mask.getBitWidth() ||
+                      !g.mask.isSubsetOf(mask))
+                    decline = "a copy of the holder under no guard of the word: " + snapLoc(MT);
+                  else
+                    guardLocs.insert(snapLoc(g.BR));
+                }
+              // (1) Every object of W is zero at allocation: calloc, or a
+              // function every non-null result of which is memset to 0 over
+              // its allocation's size on every path to its return.
+              std::function<void(const Value *, std::set<const Value *> &, std::set<const Value *> &)> defsOf =
+                  [&](const Value *V, std::set<const Value *> &out, std::set<const Value *> &seen) {
+                    V = castsOnly(V);
+                    if (isa<ConstantPointerNull>(V) || !seen.insert(V).second) return;
+                    if (const auto *L = dyn_cast<LoadInst>(V); L && transientSlot(castsOnly(L->getPointerOperand()))) {
+                      const Value *SL = castsOnly(L->getPointerOperand());
+                      for (const User *U : SL->users())
+                        if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == SL)
+                          defsOf(St->getValueOperand(), out, seen);
+                      return;
+                    }
+                    if (const auto *PN = dyn_cast<PHINode>(V)) {
+                      for (const Value *In : PN->incoming_values()) defsOf(In, out, seen);
+                      return;
+                    }
+                    out.insert(V);
+                  };
+              auto onlyDef = [&](const Value *V, const Value *X) {
+                std::set<const Value *> d, seen;
+                defsOf(V, d, seen);
+                return d.size() == 1 && *d.begin() == X;
+              };
+              auto zeroing = [&](const Function *G) {
+                std::set<const Value *> defs, seen;
+                for (const Instruction &I : instructions(*G))
+                  if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue()) defsOf(R->getReturnValue(), defs, seen);
+                if (defs.empty()) return false;
+                for (const Value *X : defs) {
+                  const auto *XC = dyn_cast<CallBase>(X);
+                  if (!XC) return false;
+                  std::set<const Value *> sizes;
+                  for (const Value *Arg : XC->args())
+                    if (Arg->getType()->isIntegerTy()) sizes.insert(resolve(Arg));
+                  std::set<const Instruction *> zs;
+                  for (const Instruction &I : instructions(*G))
+                    if (const auto *MS = dyn_cast<MemSetInst>(&I))
+                      if (const auto *V0 = dyn_cast<ConstantInt>(MS->getValue());
+                          V0 && V0->isZero() && onlyDef(MS->getRawDest(), X) && sizes.count(resolve(MS->getLength())))
+                        zs.insert(MS);
+                  if (zs.empty()) return false;
+                  // Every path from X to a return passes a memset of X or X's null edge.
+                  std::vector<const BasicBlock *> work;
+                  std::set<const BasicBlock *> seenB;
+                  bool done = false;
+                  for (const Instruction *I = XC->getNextNode(); I && !done; I = I->getNextNode()) done = zs.count(I);
+                  if (!done) work.push_back(XC->getParent());
+                  bool first = true;
+                  while (!work.empty()) {
+                    const BasicBlock *B = work.back();
+                    work.pop_back();
+                    if (!first) {
+                      if (!seenB.insert(B).second) continue;
+                      bool z = false;
+                      for (const Instruction &I : *B) z |= zs.count(&I) > 0;
+                      if (z) continue;
+                    }
+                    first = false;
+                    const Instruction *T = B->getTerminator();
+                    if (isa<ReturnInst>(T)) return false;
+                    int skip = -1;
+                    if (const auto *BR = dyn_cast<BranchInst>(T); BR && BR->isConditional())
+                      if (const auto *IC = dyn_cast<ICmpInst>(BR->getCondition()); IC && IC->isEquality() &&
+                                                                                 isa<ConstantPointerNull>(IC->getOperand(1)) &&
+                                                                                 onlyDef(IC->getOperand(0), X))
+                        skip = IC->getPredicate() == ICmpInst::ICMP_EQ ? 0 : 1;
+                    for (unsigned k = 0; k < T->getNumSuccessors(); k++)
+                      if ((int)k != skip) work.push_back(T->getSuccessor(k));
+                  }
+                }
+                return true;
+              };
+              std::set<Obj> wo;
+              std::set<std::string> wop, zeroAt;
+              if (decline.empty()) {
+                objsOf(W->getPointerOperand(), 0, 0, wo, wop);
+                if (!wop.empty())
+                  decline = "the word's objects are open: " + std::to_string(wop.size()) + " reasons, e.g. " + *wop.begin();
+                for (const Obj &o : wo) {
+                  if (!decline.empty()) break;
+                  auto it = objSite.find(o.first);
+                  const auto *CB = it == objSite.end() ? nullptr : dyn_cast<CallBase>(it->second);
+                  const Function *G = CB ? CB->getCalledFunction() : nullptr;
+                  if (G && (G->getName() == "calloc" || (!G->isDeclaration() && zeroing(G)))) zeroAt.insert(o.first);
+                  else decline = "an object not zero-allocated: " + o.first + " +" + std::to_string(o.second);
+                }
+                if (decline.empty() && wo.empty()) decline = "the word has no object";
+              }
+              // (2) Every store of W keeps the mask from the same word or
+              // clears it; no write names W otherwise; no initializer is
+              // non-zero over it.
+              const size_t kp = K.rfind('+');
+              const std::string KS = K.substr(0, kp == std::string::npos ? 0 : kp);
+              std::vector<std::string> clears;
+              size_t keeps = 0;
+              if (decline.empty())
+                for (auto &[M, _] : Ctx->Modules)
+                  for (const Function &F : *M)
+                    for (const Instruction &I : instructions(F)) {
+                      const auto *St = dyn_cast<StoreInst>(&I);
+                      if (!St || !decline.empty() || fieldKey(St, St->getPointerOperand()) != K) continue;
+                      const Value *V = St->getValueOperand();
+                      if (!V->getType()->isIntegerTy() || V->getType()->getIntegerBitWidth() != mask.getBitWidth()) {
+                        decline = "a store of another width: " + snapLoc(St);
+                        break;
+                      }
+                      const KnownBits KB = computeKnownBits(V, M->getDataLayout());
+                      if ((KB.Zero & mask) == mask) {
+                        clears.push_back(snapLoc(St));
+                        continue;
+                      }
+                      bool kept = false;
+                      if (const auto *O = dyn_cast<BinaryOperator>(V); O && O->getOpcode() == Instruction::Or)
+                        for (int k = 0; k < 2 && !kept; k++) {
+                          const auto *An = dyn_cast<BinaryOperator>(O->getOperand(k));
+                          const auto *C = An && An->getOpcode() == Instruction::And ? dyn_cast<ConstantInt>(An->getOperand(1)) : nullptr;
+                          const auto *L2 = C ? dyn_cast<LoadInst>(An->getOperand(0)) : nullptr;
+                          kept = L2 && castsOnly(L2->getPointerOperand()) == castsOnly(St->getPointerOperand()) &&
+                                 (C->getValue() & mask) == mask &&
+                                 (computeKnownBits(O->getOperand(1 - k), M->getDataLayout()).Zero & mask) == mask;
+                        }
+                      if (kept) keeps++;
+                      else decline = "a store that may set the mask: " + snapLoc(St);
+                    }
+              if (decline.empty())
+                if (std::string c = coverOpen(K, wlen); !c.empty()) decline = c;
+              if (decline.empty()) {
+                buildInit();
+                for (const InitSlot &IS : initNonZero)
+                  if (IS.S == KS && IS.off < KO_of(K) + wlen && KO_of(K) < IS.off + IS.len) {
+                    decline = "a non-zero initializer over the word: @" + IS.gv;
+                    break;
+                  }
+              }
+              SmallString<16> mhex;
+              mask.toStringUnsigned(mhex, 16);
+              std::string gl;
+              for (const std::string &g : guardLocs) gl += (gl.empty() ? "" : ", ") + g;
+              const std::string gtext = "guard " + gl + " (mask 0x" + std::string(mhex) + " of " +
+                                        (K.empty() ? std::string("an unnamed word") : K) + ")";
+              if (decline.empty()) {
+                std::string zs, cs;
+                for (const std::string &z : zeroAt) zs += (zs.empty() ? "" : ", ") + z;
+                for (const std::string &c : clears) cs += (cs.empty() ? "" : ", ") + c;
+                for (const auto *v : {&hOuts, &eOuts})
+                  for (const MemTransferInst *MT : *v) {
+                    snapUnreachable.insert(MT);
+                    o1AssumeLines.push_back("    ASSUMPTION unreachable by name: restore " + snapLoc(MT) + ": " + gtext + ", " +
+                                            std::to_string(keeps + clears.size()) + " named stores each keeping or clearing it (" +
+                                            std::to_string(keeps) + " keep; clears: " + (cs.empty() ? "none" : cs) +
+                                            "), objects zero-allocated at " + zs);
+                  }
+                continue;
+              }
+              o1AssumeLines.push_back("  snapshot holder " + hname + ": " + gtext + ": not unreachable by name (" + decline + ")");
+            }
+          }
           if (!premiseOpen.empty()) continue;
           // The restores O1 counts as moves within one owner.
           for (const MemTransferInst *MT : hOuts) {
@@ -4581,6 +4845,10 @@ void CallGraphPass::checkContainerClosure() {
                 snapMoves++;
                 continue;
               }
+              if (snapUnreachable.count(MT)) {
+                snapUnreach++;
+                continue;
+              }
               if (!body.count(&F)) {
                 const size_t mark = eoMark();
                 const std::string a = elemOwner(MT->getRawDest(), 0), v = elemOwner(MT->getRawSource(), 0);
@@ -4613,6 +4881,10 @@ void CallGraphPass::checkContainerClosure() {
             if (!covers) continue;
             if (snapRestores.count(MT)) {
               snapMoves++;
+              continue;
+            }
+            if (snapUnreachable.count(MT)) {
+              snapUnreach++;
               continue;
             }
             if (body.count(&F)) {
@@ -4978,6 +5250,8 @@ void CallGraphPass::checkContainerClosure() {
     if (moves) o1 += " (" + std::to_string(moves) + " element moves within one owner)";
     if (snapMoves)
       o1 += " (" + std::to_string(snapMoves) + " restores out of a snapshot holder: moves within one owner)";
+    if (snapUnreach)
+      o1 += " (" + std::to_string(snapUnreach) + " restores of a snapshot holder unreachable by name, listed)";
     // O6 (body reads): every pointer field of an element the body reads
     // is one the body writes (a body read of an owner-written field would
     // see the body's object without the owner's writes).

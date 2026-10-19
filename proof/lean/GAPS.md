@@ -2117,31 +2117,71 @@ only.
   only the names past T's size change from bytes past the layout to the
   container's members (no type narrowing, rule untouched). The row object
   layout below uses the same rule for a constructor's element.
-- **Row object layout** (Fable 2026-10-14): a row object (O, s, elem) takes
-  its OWNER's constructor's element: the code-field feeds are paired with
-  their owner where the constant is fed (up the formal/formal call
-  sites: `bfd_hash_table_init(&nbfd->section_htab,
-  bfd_section_hash_newfunc)`), and an owner object matches a feed whose
-  owner value holds its cell (object and offset). One constructor: its
-  struct; several: the largest of them; none known at the mint: the
-  container's largest. A constructor's element is its own fresh block of
-  constant size (a call, or a certified pool carve; a chunk-relative
-  carve is the same request as the constant one), typed by a typed step,
-  else a local variable's debug type, else the unique struct of that size
-  that embeds a struct the body steps through on an element (the size
-  label above); every constructor's struct must embed that
-  body struct at offset 0, or the mint is refused ("element size
-  unknown"). The row object has no trailing object (asserted: a write
-  past its layout is a wrong pairing); inherited body offsets past its
-  element belong to other owners' larger elements and are not inherited.
-- **Statement:** an owner's elements are all made by the constructor its
-  code field holds, so its row object is laid out as that element; the
-  constructors' structs share the body's element struct at offset 0, so
-  the body's own accesses name the same bytes in every element.
+- **Row objects by constructor type** (Fable 2026-10-19; replaces the
+  2026-10-14 "Row object layout" rule). An owner's constructors are the
+  code-field feeds paired with their owner where the constant is fed (up
+  the formal/formal call sites: `bfd_hash_table_init(&nbfd->section_htab,
+  bfd_section_hash_newfunc)`), by the static by-name walk of the code
+  field's stores; an unknown on that walk opens the code field and O4
+  rejects the whole container (per-owner refusal waits for owner identity
+  by name). A constructor's element is its own fresh block of constant
+  size (a call, or a certified pool carve; a chunk-relative carve is the
+  same request as the constant one), typed by a typed step, else a local
+  variable's debug type, else the unique struct of that size that embeds
+  a struct the body steps through on an element; every constructor's
+  struct must embed that body struct at offset 0, or the mint is refused
+  ("element size unknown"). A constructor measuring several sizes has
+  each struct.
+  - A row object is (owner object, owner offset, mint site, T): one per
+    element struct T of a constructor fed to that owner, laid out as T,
+    and the row's result and row cell point to every one of them. Two
+    constructors of one T share the object (the key is the type);
+    isomorphic structs stay separate (different names). A constructor
+    with no struct type is its own T: one unlabeled row object with byte
+    cells.
+  - No layout is chosen among constructors (no largest, no common
+    prefix, no container-wide fallback): two structs folded into one
+    layout merge cells across names, which the design forbids, a shared
+    prefix included.
+  - The owner's T set grows with the facts: a fact at a feed's owner
+    value adds the feed's types to each owner it holds, and mints them
+    at every mint site that owner has reached; a mint mints every type
+    known for its owner. A minted object keeps its layout. At a fixpoint
+    the objects do not depend on the order facts arrive; at a stop they
+    are partial, like any fact.
+  - An owner reached by no feed has no elements: at a fixpoint no
+    constructor reached it (the walk is complete, or O4 rejected the
+    container), so its rows return nothing; counted ("rows of owners
+    with no constructor fed: n"). No unlabeled fallback object: one
+    beside every typed row would put byte cells there, the soup again.
+  - An access past T's size on a T object (a step, an inherited body
+    field, a block copy's bytes) names no cell of this object: it is
+    another type's field. It is dropped and counted, not asserted (at a
+    stop the other type's object may not be minted yet). At the end of
+    the solve each such access must have found an in-range row object of
+    the same owner, else it is listed as a wrong pairing, per access,
+    stated, not asserted. Inherited body offsets past T are the same
+    rule.
+- **Statement:** every element an owner's rows can return was made by a
+  constructor fed to that owner, as that constructor's struct; the row
+  objects of an owner are exactly its constructors' structs, so each
+  element's bytes are named by its own struct, and the answer is the
+  union over the owner's constructors. The constructors' structs share
+  the body's element struct at offset 0, so the body's own accesses name
+  the same bytes in every element.
+- **The 2026-10-14 rule's code was unsound.** It said "asserted: a write
+  past its layout is a wrong pairing", and that part was right, but the
+  assertion sat in tailOf, which a row object never reaches; the layout
+  was fixed at the first mint from the constructors the owner's feeds
+  held then (else the container's largest), and an access past it went
+  to the object's outside cell. Witness: test/t_cells_container_row_late_ctor.c
+  (big_newfunc reaches the owner late; e->fc() answered [] where the
+  program calls ga).
 
 Not mechanized. The census re-cut (nm-new, sqlite3; tcpdump unchanged)
 measures it after the gates. Cases: test/t_cells_container_mint.c,
-test/t_cells_container_poolchunk.c.
+test/t_cells_container_poolchunk.c, test/t_cells_container_row_late_ctor.c
+(and its _ctl control), test/t_cells_container_row_two_ctors.c.
 
 **Pool chunks inside the body** (Fable 2026-10-14). O3 (containment):
 every fresh block the body makes goes only into the owner's storage.

@@ -263,4 +263,13 @@ offsets/sizes, taint). Fields are byte offsets; a memory location is a
 cell node (origin, name). Constant-GEP value nodes are deduplicated by
 byte offset. Consumer gate: 44 runs byte-identical.
 
+REMOVED — the row object's chosen layouts (2026-10-19, Fable): the
+largest constructor element of several (`rowsByLargestOfSeveral`) and
+the container's largest element when the owner's constructor was not
+yet known (`rowsByGlobalLargest`, `containerElemType`), with the "row
+object ... constructors {...} -> T" log line. A row object is now one
+per (owner, owner offset, mint site, constructor type); GAPS "Row
+objects by constructor type". The fixed first-mint layout was unsound
+(test/t_cells_container_row_late_ctor.c).
+
 Every removed option is an error in KAMain naming this ledger.

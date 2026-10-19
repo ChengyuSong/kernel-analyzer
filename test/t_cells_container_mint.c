@@ -11,8 +11,8 @@
 // LOG: Container: bfd_hash .*code fields \([1-9][0-9]* targets
 // LOG: VERIFIED \(rows applied\)
 // LOG: element mint: [1-9][0-9]* mint links
-// LOG: row objects minted \(2 by the owner's constructor, 0 by the largest of several, 0 by the container's largest
-// LOG: constructors \{my_newfunc\} -> struct.my_entry
+// LOG: row objects minted \(2 by a constructor's element struct, 0 unlabeled
+// LOG: : struct.my_entry, constructors \{my_newfunc\}
 #include <stdlib.h>
 #include <string.h>
 typedef void (*fn)(void);

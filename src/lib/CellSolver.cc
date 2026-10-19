@@ -123,7 +123,7 @@ struct Obj {
   // A container element minted per owner (plan 3.55): the owner object
   // (UINT32_MAX: not a row object).
   uint32_t rowOwner = UINT32_MAX;
-  // Laid out at mint as the largest constructor element: never a tail.
+  // Laid out at mint as its constructor's element struct: never a tail.
   bool rowLaidOut = false;
   const Function *fn = nullptr;
   Type *layout = nullptr; // null: unlabeled
@@ -869,6 +869,9 @@ bool CallGraphPass::runCellResolution() {
   std::vector<std::vector<uint32_t>> rowsAt; // owner pointer -> its container row links
   std::vector<std::vector<uint32_t>> mintsAt; // owner pointer -> its element mint links
   std::vector<std::vector<uint32_t>> inheritAt; // a body's element value -> the containers it serves
+  // An owner value at a code-field feeding site -> (container, feed index
+  // into containerOwnerCtors): the constructors fed to the owners it holds.
+  std::vector<std::vector<std::pair<uint32_t, uint32_t>>> feedsAt;
   std::vector<std::vector<FieldEdge>> fieldOut;
   std::vector<char> anyLoop;
   // Per node: the fact it holds under each name (unification by name).
@@ -882,7 +885,7 @@ bool CallGraphPass::runCellResolution() {
     size_t cap = std::max<size_t>(n, pts.size() * 3 / 2);
     const size_t old = repOf.size();
     pts.resize(cap); pend.resize(cap); succ.resize(cap); inWL.resize(cap, 0);
-    hubsOf.resize(cap); rowsAt.resize(cap); mintsAt.resize(cap); inheritAt.resize(cap);
+    hubsOf.resize(cap); rowsAt.resize(cap); mintsAt.resize(cap); inheritAt.resize(cap); feedsAt.resize(cap);
     fieldOut.resize(cap); anyLoop.resize(cap, 0);
     byName.resize(cap);
     oneCell.resize(cap, UINT32_MAX);
@@ -1151,6 +1154,13 @@ bool CallGraphPass::runCellResolution() {
     inGraph[o] = inGraph[canon(mintLinks[i].out)] = 1;
     mintsAt[o].push_back(i);
   }
+  for (uint32_t ci = 0; ci < containerOwnerCtors.size(); ci++)
+    for (uint32_t k = 0; k < containerOwnerCtors[ci].size(); k++) {
+      const NodeIndex n = getRepNodeForValue(containerOwnerCtors[ci][k].first);
+      if (n == AndersNodeFactory::InvalidIndex) continue;
+      inGraph[canon(n)] = 1;
+      feedsAt[canon(n)].push_back({ci, k});
+    }
   for (uint32_t ci = 0; ci < containerElemSources.size(); ci++)
     for (const Value *E : containerElemSources[ci]) {
       const NodeIndex n = getRepNodeForValue(E);
@@ -1328,6 +1338,8 @@ bool CallGraphPass::runCellResolution() {
     mintsAt[m].clear();
     inheritAt[r].insert(inheritAt[r].end(), inheritAt[m].begin(), inheritAt[m].end());
     inheritAt[m].clear();
+    feedsAt[r].insert(feedsAt[r].end(), feedsAt[m].begin(), feedsAt[m].end());
+    feedsAt[m].clear();
     fieldOut[r].insert(fieldOut[r].end(), fieldOut[m].begin(),
                        fieldOut[m].end());
     fieldOut[m].clear();
@@ -1794,7 +1806,7 @@ bool CallGraphPass::runCellResolution() {
   std::function<void(Obj &)> segmentLabel;
   auto tailOf = [&](uint32_t o) -> uint32_t {
     if (objs[o].tailObj != UINT32_MAX) return objs[o].tailObj;
-    assert(!objs[o].rowLaidOut && "a row object laid out as its largest constructor element has no tail");
+    assert(!objs[o].rowLaidOut && "a row object laid out as its constructor's element struct has no tail");
     Obj T;
     T.origin = objs[o].origin;
     T.parentObj = o;
@@ -4842,25 +4854,63 @@ bool CallGraphPass::runCellResolution() {
       if (L.out != AndersNodeFactory::InvalidIndex) addEdge(it->second, canon(L.out));
     }
   };
-  // The element mint: (owner object, site) -> the row object; per
-  // container, the row objects minted, and the (body element, row object)
-  // pairs whose inherited fields are linked.
-  std::map<std::pair<uint32_t, const Value *>, uint32_t> mintedObj;
+  // Row objects by constructor type (Fable 2026-10-19; replaces the
+  // 2026-10-14 layout, fixed at the first mint from the constructors then
+  // known, whose later constructors' fields fell outside it): one row
+  // object per (owner object, owner offset, mint site, T), T the element
+  // struct of a constructor fed to that owner, or the constructor itself
+  // when it has none (an unlabeled object). The owner's T set grows with
+  // the facts at the feeding sites' owner values (linkFeed); a minted
+  // object keeps its layout. No layout is chosen among constructors.
+  using RowT = std::pair<StructType *, const Function *>; // (T, null) or (null, untyped constructor)
+  using OwnerKey = std::tuple<uint32_t, uint32_t, int64_t>; // (container, owner object, owner offset)
+  std::map<std::tuple<uint32_t, int64_t, const Value *, RowT>, uint32_t> mintedObj;
   std::vector<std::vector<uint32_t>> mintedOf(containerElemSources.size());
+  // An owner's T set, in the order the feeds reached it, and the
+  // constructors fed per T (the row object's report line).
+  std::map<OwnerKey, std::vector<RowT>> ownerTypes;
+  std::map<std::pair<OwnerKey, RowT>, std::set<std::string>> ownerTypeCtors;
+  // The mint links an owner has reached, with the owner fact's offset
+  // (INT64_MIN: any) for the row cell.
+  std::map<OwnerKey, std::vector<std::pair<uint32_t, int64_t>>> ownerMints;
   boost::unordered_flat_set<uint64_t> inherited;
-  size_t inheritLinks = 0, rowsLaidOut = 0, rowsByOwnerCtor = 0, rowsByLargestOfSeveral = 0, rowsByGlobalLargest = 0;
+  size_t inheritLinks = 0, rowsTyped = 0, rowsUntyped = 0;
+  // Accesses past a row object's T (Fable 2026-10-19): the access names no
+  // cell of this object, it is another type's field; dropped and counted.
+  // At the end, each must have found an in-range row object of the same
+  // owner, else it is listed as a wrong pairing (stated, not asserted).
+  // Keyed (owner object, access kind, a, b): a step (label, destination
+  // node), an inherited field (container, offset), a block copy (call).
+  using RowAccess = std::tuple<uint32_t, int, uint64_t, uint64_t>;
+  std::map<RowAccess, std::string> rowPast; // -> a description of one drop
+  std::set<RowAccess> rowInRange;
+  size_t rowPastDrops = 0;
+  auto rowAccess = [&](uint32_t R, int kind, uint64_t a, uint64_t b, bool past, int64_t off) {
+    const RowAccess k{objs[R].rowOwner, kind, a, b};
+    if (!past) {
+      rowInRange.insert(k);
+      return;
+    }
+    rowPastDrops++;
+    if (!rowPast.count(k))
+      rowPast[k] = "+" + std::to_string(off) + " on obj#" + std::to_string(R) + " (" + objs[R].label + ", " +
+                   std::to_string(objs[R].size) + " bytes)";
+  };
   // Row object R inherits body element C's body-written fields (C -> R).
   auto inheritFields = [&](uint32_t C, uint32_t R, uint32_t ci) {
     if (C == R || objs[C].rowOwner != UINT32_MAX || objs[C].fn || !inherited.insert((uint64_t)C << 32 | R).second)
       return;
     for (int64_t w : containerInherit[ci]) {
-      // A row object laid out by its owner's constructor has no bytes past
-      // that element: offsets the body writes on larger elements of other
-      // owners are not its fields.
-      if (objs[R].rowLaidOut && w >= objs[R].size) continue;
       // A body write at no constant offset rejects a minting container
       // (Containers.cc): never here.
       assert(w >= 0 && "an inherited field at no constant offset");
+      // Offsets the body writes past T are fields of other constructors'
+      // elements, not of this object: the access rule above.
+      if (objs[R].rowLaidOut) {
+        const bool past = w >= objs[R].size;
+        rowAccess(R, 1, ci, (uint64_t)w, past, w);
+        if (past) continue;
+      }
       // Through forwards and trailing objects on both sides.
       const auto [co, cw] = locate(C, w);
       const auto [ro, rw] = locate(R, w);
@@ -4869,83 +4919,100 @@ bool CallGraphPass::runCellResolution() {
       inheritLinks++;
     }
   };
+  // The row object (o, e, L.site, T) of mint link li, minted on first use,
+  // linked to the link's result, its row cell and the body's elements.
+  auto mintRow = [&](uint32_t li, uint32_t o, int64_t e, int64_t off, const RowT &T) {
+    const MintLink &L = mintLinks[li];
+    auto [it, ins] = mintedObj.try_emplace(std::make_tuple(o, e, L.site, T), 0);
+    if (ins) {
+      const NodeIndex sn = NF.getValueNodeFor(L.site);
+      const uint32_t R = newObj(sn == AndersNodeFactory::InvalidIndex ? L.out : sn, nullptr);
+      it->second = R;
+      objs[R].rowOwner = o;
+      if (T.first) {
+        Obj &O = objs[R];
+        O.layout = T.first;
+        O.size = (int64_t)DL.getTypeAllocSize(O.layout);
+        O.label = typeLabel(O.layout);
+        O.repeats = false;
+        O.rowLaidOut = true;
+        rowsTyped++;
+      } else {
+        rowsUntyped++;
+      }
+      std::string cs;
+      for (const std::string &n : ownerTypeCtors[{OwnerKey{(uint32_t)L.cont, o, e}, T}]) cs += (cs.empty() ? "" : " ") + n;
+      CG_LOG("Cells: row object obj#" << R << " at " << nodeDescFn(canon(L.out)).substr(0, 100) << " of owner "
+             << describeFn(objs[o]).substr(0, 100) << " +" << decOff(e) << ": "
+             << (T.first ? typeLabel(T.first) : std::string("untyped (unlabeled)")) << ", constructors {" << cs
+             << "}\n");
+      mintedOf[L.cont].push_back(R);
+      // Its inherited fields from every body element already known.
+      for (const Value *E : containerElemSources[L.cont])
+        if (const NodeIndex n = getRepNodeForValue(E); n != AndersNodeFactory::InvalidIndex) {
+          std::vector<uint32_t> gs;
+          pts[find(canon(n))].forEach([&](uint32_t g) { gs.push_back(g); });
+          for (uint32_t g : gs) inheritFields(cells[g].obj, R, L.cont);
+        }
+    }
+    const uint32_t fr = cellAt(it->second, 0);
+    add(find(canon(L.out)), fr);
+    if (L.name != UINT32_MAX) {
+      auto [rc, rins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
+      if (rins) rc->second = newNode(NK::RowCell, o);
+      add(find(rc->second), fr);
+    }
+    // Storage visibility and the body's own writes: the row object is
+    // one of the body's elements.
+    for (const Value *E : containerElemSources[L.cont])
+      if (const NodeIndex n = getRepNodeForValue(E); n != AndersNodeFactory::InvalidIndex) add(find(canon(n)), fr);
+  };
   std::function<void(uint32_t, uint32_t)> linkMint = [&](uint32_t li, uint32_t f) {
     const CellKind kind = cells[findFact(f)].kind;
     if (kind != CellKind::Off && kind != CellKind::Any) { rowSkipped++; return; }
-    const MintLink &L = mintLinks[li];
+    const size_t cont = mintLinks[li].cont;
     const std::vector<Member> ms = memb[findFact(f)];
     for (auto [o, e] : ms) {
-      auto [it, ins] = mintedObj.try_emplace(std::make_pair(o, L.site), 0);
-      if (ins) {
-        const NodeIndex sn = NF.getValueNodeFor(L.site);
-        it->second = newObj(sn == AndersNodeFactory::InvalidIndex ? L.out : sn, nullptr);
-        objs[it->second].rowOwner = o;
-        // Its layout (Fable 2026-10-14): its OWNER's constructor's element
-        // (the constants fed into o's code field at the feeding sites whose
-        // owner value holds o); several: the largest of them; none known
-        // yet: the container's largest. A write past it asserts (a wrong
-        // pairing), it never falls back to a tail.
-        StructType *RT = nullptr;
-        if (L.cont < containerOwnerCtors.size()) {
-          std::set<const Function *> ctors;
-          for (const auto &[V, fs] : containerOwnerCtors[L.cont]) {
-            const NodeIndex vn = getRepNodeForValue(V);
-            if (vn == AndersNodeFactory::InvalidIndex) continue;
-            bool holds = false;
-            pts[find(canon(vn))].forEach([&](uint32_t g) {
-              for (auto [mo, me] : memb[findFact(g)])
-                holds |= mo == o && me == e; // the same owner: object and offset (an object may embed several)
-            });
-            if (holds) ctors.insert(fs.begin(), fs.end());
-          }
-          for (const Function *Fc : ctors)
-            if (auto tit = containerCtorType[L.cont].find(Fc); tit != containerCtorType[L.cont].end() && tit->second)
-              if (!RT || DL.getTypeAllocSize(tit->second) > DL.getTypeAllocSize(RT)) RT = tit->second;
-          if (RT) (ctors.size() == 1 ? rowsByOwnerCtor : rowsByLargestOfSeveral)++;
-          std::vector<std::string> cn; // by name: the set's order follows the heap
-          for (const Function *Fc : ctors) cn.push_back(Fc->getName().str());
-          std::sort(cn.begin(), cn.end());
-          std::string cs;
-          for (const std::string &n : cn) cs += (cs.empty() ? "" : " ") + n;
-          CG_LOG("Cells: row object at " << nodeDescFn(canon(L.out)).substr(0, 100) << " of owner "
-                 << describeFn(objs[o]).substr(0, 100) << ": constructors {" << cs << "}"
-                 << (RT ? " -> " + typeLabel(RT) : std::string(" -> none known")) << "\n");
+      const OwnerKey ok{(uint32_t)cont, o, e};
+      const int64_t off = kind == CellKind::Any ? INT64_MIN : decOff(e);
+      auto &seen = ownerMints[ok];
+      if (std::find(seen.begin(), seen.end(), std::make_pair(li, off)) == seen.end()) seen.push_back({li, off});
+      // Copies: minting grows ownerTypes' vectors only through linkFeed.
+      const std::vector<RowT> ts = ownerTypes[ok];
+      for (const RowT &T : ts) mintRow(li, o, e, off, T);
+    }
+  };
+  // A feed (owner value, constructors fs) reached by fact f: every owner
+  // (o, e) f holds gains the element types of fs, minted at every mint
+  // link that owner has reached.
+  auto linkFeed = [&](uint32_t ci, uint32_t k, uint32_t f) {
+    const CellKind kind = cells[findFact(f)].kind;
+    if (kind != CellKind::Off && kind != CellKind::Any) return;
+    const std::set<const Function *> &fs = containerOwnerCtors[ci][k].second;
+    std::vector<std::pair<RowT, std::string>> ts;
+    for (const Function *Fc : fs) {
+      auto tit = containerCtorType[ci].find(Fc);
+      if (tit == containerCtorType[ci].end() || tit->second.empty())
+        ts.push_back({RowT{nullptr, Fc}, Fc->getName().str()});
+      else
+        for (StructType *T : tit->second) ts.push_back({RowT{T, nullptr}, Fc->getName().str()});
+    }
+    const std::vector<Member> ms = memb[findFact(f)];
+    for (auto [o, e] : ms) {
+      const OwnerKey ok{ci, o, e};
+      std::vector<RowT> fresh;
+      for (const auto &[T, fn] : ts) {
+        ownerTypeCtors[{ok, T}].insert(fn);
+        auto &have = ownerTypes[ok];
+        if (std::find(have.begin(), have.end(), T) == have.end()) {
+          have.push_back(T);
+          fresh.push_back(T);
         }
-        if (!RT && L.cont < containerElemType.size() && containerElemType[L.cont]) {
-          RT = containerElemType[L.cont];
-          rowsByGlobalLargest++;
-        }
-        if (RT) {
-          Obj &R = objs[it->second];
-          R.layout = RT;
-          R.size = (int64_t)DL.getTypeAllocSize(R.layout);
-          R.label = typeLabel(R.layout);
-          R.repeats = false;
-          R.rowLaidOut = true;
-          rowsLaidOut++;
-        }
-        mintedOf[L.cont].push_back(it->second);
-        // Its inherited fields from every body element already known.
-        const uint32_t R = it->second;
-        for (const Value *E : containerElemSources[L.cont])
-          if (const NodeIndex n = getRepNodeForValue(E); n != AndersNodeFactory::InvalidIndex) {
-            std::vector<uint32_t> gs;
-            pts[find(canon(n))].forEach([&](uint32_t g) { gs.push_back(g); });
-            for (uint32_t g : gs) inheritFields(cells[g].obj, R, L.cont);
-          }
       }
-      const uint32_t fr = cellAt(it->second, 0);
-      add(find(canon(L.out)), fr);
-      if (L.name != UINT32_MAX) {
-        const int64_t off = kind == CellKind::Any ? INT64_MIN : decOff(e);
-        auto [rc, rins] = rowCell.try_emplace(std::make_tuple(o, off, L.name), 0);
-        if (rins) rc->second = newNode(NK::RowCell, o);
-        add(find(rc->second), fr);
-      }
-      // Storage visibility and the body's own writes: the row object is
-      // one of the body's elements.
-      for (const Value *E : containerElemSources[L.cont])
-        if (const NodeIndex n = getRepNodeForValue(E); n != AndersNodeFactory::InvalidIndex) add(find(canon(n)), fr);
+      if (fresh.empty()) continue;
+      const std::vector<std::pair<uint32_t, int64_t>> seen = ownerMints[ok];
+      for (const RowT &T : fresh)
+        for (auto [li, off] : seen) mintRow(li, o, e, off, T);
     }
   };
   // Plan 3.54: object bookkeeping of the split formals.
@@ -5098,6 +5165,16 @@ bool CallGraphPass::runCellResolution() {
     for (size_t i = 0; i < memb[f].size(); i++) {
       const Member mb = memb[f][i];
       const std::vector<uint32_t> &R = stepOne(mb.first, mb.second, li);
+      if (objs[mb.first].rowLaidOut) {
+        // A row object's access past its T: the outside cell is another
+        // type's field, dropped (the row-object access rule).
+        bool past = false;
+        for (size_t j = 0; j < R.size(); j++) past |= cells[R[j]].kind == CellKind::Out && cells[R[j]].obj == mb.first;
+        rowAccess(mb.first, 0, li, find(dst), past, decOff(mb.second) + lazyLabels[li].off);
+        for (size_t j = 0; j < R.size(); j++)
+          if (!(cells[R[j]].kind == CellKind::Out && cells[R[j]].obj == mb.first)) add(dst, R[j]);
+        continue;
+      }
       for (size_t j = 0; j < R.size(); j++) add(dst, R[j]);
     }
   };
@@ -6243,6 +6320,14 @@ bool CallGraphPass::runCellResolution() {
     const auto [ro, ra] = locate(os, a);
     const int64_t L = std::min<int64_t>(len >= 0 ? len : regionLen(ro, ra),
                                         (int64_t)kExpandCap);
+    // A row object's bytes past its T are another type's fields: the walk
+    // below stops there (as on any single object), counted by the
+    // row-object access rule, per side.
+    for (int side = 0; side < 2; side++) {
+      const auto [o2, x2] = side ? locate(od, b) : std::make_pair(ro, ra);
+      if (objs[o2].rowLaidOut && L > 0)
+        rowAccess(o2, 2, (uint64_t)(uintptr_t)at, side, x2 < 0 || x2 + L > objs[o2].size, x2 + L);
+    }
     if (CFLCellSoupProfile && L > 0) {
       // Typed -> byte array (in) and byte array -> typed (out).
       auto cellsOf = [&](uint32_t o, int64_t from, int64_t n) {
@@ -7820,6 +7905,8 @@ bool CallGraphPass::runCellResolution() {
         for (uint32_t f : delta) linkRow(rowsAt[n][ri], f);
       for (size_t mi = 0; mi < mintsAt[n].size(); mi++)
         for (uint32_t f : delta) linkMint(mintsAt[n][mi], f);
+      for (size_t fi = 0; fi < feedsAt[n].size(); fi++)
+        for (uint32_t f : delta) linkFeed(feedsAt[n][fi].first, feedsAt[n][fi].second, f);
       for (size_t ii = 0; ii < inheritAt[n].size(); ii++) {
         const uint32_t ci = inheritAt[n][ii];
         for (uint32_t f : delta)
@@ -8014,10 +8101,46 @@ bool CallGraphPass::runCellResolution() {
   }
   if (!mintLinks.empty())
     CG_LOG("Cells: element mint: " << mintLinks.size() << " mint links (" << inlineInserts
-           << " inline inserts), " << mintedObj.size() << " row objects minted (" << rowsByOwnerCtor
-           << " by the owner's constructor, " << rowsByLargestOfSeveral << " by the largest of several, "
-           << rowsByGlobalLargest << " by the container's largest element: owner's constructor unknown), "
-           << inheritLinks << " inherited field links\n");
+           << " inline inserts), " << mintedObj.size() << " row objects minted (" << rowsTyped
+           << " by a constructor's element struct, " << rowsUntyped
+           << " unlabeled: a constructor with no struct type), " << inheritLinks << " inherited field links\n");
+  if (!mintLinks.empty()) {
+    size_t unfed = 0;
+    for (const auto &[ok, seen] : ownerMints)
+      if (auto it = ownerTypes.find(ok); it == ownerTypes.end() || it->second.empty()) unfed++;
+    // A step's destination node may have merged since it was recorded.
+    auto canonAccess = [&](RowAccess k) {
+      if (std::get<1>(k) == 0) std::get<3>(k) = find((uint32_t)std::get<3>(k));
+      return k;
+    };
+    std::set<RowAccess> hit;
+    for (const RowAccess &k : rowInRange) hit.insert(canonAccess(k));
+    std::map<RowAccess, std::string> wrong;
+    for (const auto &[k, d] : rowPast)
+      if (!hit.count(canonAccess(k))) wrong.try_emplace(canonAccess(k), d);
+    CG_LOG("Cells: row objects: rows of owners with no constructor fed: " << unfed << " (of " << ownerMints.size()
+           << " owners reached at a mint); accesses past a row object's type: " << rowPastDrops << " dropped, "
+           << rowPast.size() << " distinct, " << wrong.size()
+           << " with no in-range row object of the same owner (wrong pairings, listed)\n");
+    std::vector<std::string> lines;
+    for (const auto &[k, d] : wrong) {
+      const auto [own, kind, a, b] = k;
+      std::string acc;
+      if (kind == 0) {
+        const LazyLabel &L = lazyLabels[a];
+        acc = "step " + (L.ty ? typeLabel(const_cast<StructType *>(L.ty)) : std::string("untyped")) + " +" +
+              std::to_string(L.off) + " to " + nodeDescFn((uint32_t)b).substr(0, 160);
+      } else if (kind == 1) {
+        acc = "inherited field +" + std::to_string(b) + " of container " + std::to_string(a);
+      } else {
+        acc = "block copy " + instLoc(reinterpret_cast<const Instruction *>(a));
+      }
+      lines.push_back("Cells:   wrong pairing: " + acc + ": " + d + ", owner " + describeFn(objs[own]).substr(0, 100) +
+                      "\n");
+    }
+    std::sort(lines.begin(), lines.end());
+    for (const std::string &l : lines) CG_LOG(l);
+  }
   if (!rowLinks.empty())
     CG_LOG("Cells: container rows: " << rowLinks.size() << " row links at call sites, " << rowCell.size()
            << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped

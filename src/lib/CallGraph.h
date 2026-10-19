@@ -607,14 +607,12 @@ protected:
   std::vector<std::vector<const llvm::Value *>> containerElemSources;
   std::vector<std::vector<int64_t>> containerInherit;
   std::vector<std::map<const llvm::Function *, unsigned>> containerCtors;
-  // The row object's layout (Fable 2026-10-14): the largest element type
-  // among the constructors (all share the base entry as a prefix).
-  std::vector<llvm::StructType *> containerElemType;
   // Per verified container: each code-field feed as (the owner value at
   // the feeding site, the constructors fed there), and each constructor's
-  // element struct: a row object takes its OWNER's constructor's layout.
+  // element structs, in IR order (one per allocation size it measures): a
+  // row object per (owner, element struct of a constructor fed to it).
   std::vector<std::vector<std::pair<const llvm::Value *, std::set<const llvm::Function *>>>> containerOwnerCtors;
-  std::vector<std::map<const llvm::Function *, llvm::StructType *>> containerCtorType;
+  std::vector<std::map<const llvm::Function *, std::vector<llvm::StructType *>>> containerCtorType;
   // Snapshot holders ((3''), Fable 2026-10-18): a fresh block holding saves
   // of one owner's handle array and elements (Containers.cc). With its
   // entsize premise proven, the solver makes the block two objects: the

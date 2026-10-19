@@ -573,7 +573,6 @@ void CallGraphPass::checkContainerClosure() {
   containerElemSources.clear();
   containerInherit.clear();
   containerCtors.clear();
-  containerElemType.clear();
   containerOwnerCtors.clear();
   containerCtorType.clear();
   snapshotHolders.clear();
@@ -4737,7 +4736,6 @@ void CallGraphPass::checkContainerClosure() {
         containerElemSources.resize(ci + 1);
         containerInherit.resize(ci + 1);
         containerCtors.resize(ci + 1);
-        containerElemType.resize(ci + 1, nullptr);
         containerOwnerCtors.resize(ci + 1);
         containerCtorType.resize(ci + 1);
       }
@@ -4814,13 +4812,12 @@ void CallGraphPass::checkContainerClosure() {
             for (int64_t w = off & ~int64_t(7); w < off + len; w += 8) W.insert(w);
         }
       containerInherit[ci].assign(W.begin(), W.end());
-      // The row object's layout: each constructor's element is its fresh
+      // The row objects' layouts: each constructor's element is its fresh
       // block, of the constant size the block's call passes, typed by the
-      // struct of that size its typed uses step through; the row object
-      // takes the largest (they share the base entry as a prefix, so two
-      // constructors' fields at one offset are the same bytes of one
-      // object). A size not constant, or no struct of that size, refuses
-      // the mint.
+      // struct of that size its typed uses step through; the solver mints
+      // one row object per element struct of a constructor fed to the
+      // owner (Fable 2026-10-19), never one layout chosen among them. A
+      // size not constant, or no struct of that size, refuses the mint.
       std::string sizeFail;
       StructType *elemT = nullptr;
       std::vector<StructType *> ctorTypes;
@@ -4906,8 +4903,8 @@ void CallGraphPass::checkContainerClosure() {
           }
           measured = true;
           ctorTypes.push_back(found);
-          if (StructType *&CT = containerCtorType[ci][T]; !CT || EDL.getTypeAllocSize(found) > EDL.getTypeAllocSize(CT))
-            CT = found;
+          if (auto &CTs = containerCtorType[ci][T]; std::find(CTs.begin(), CTs.end(), found) == CTs.end())
+            CTs.push_back(found);
           if (!elemT || EDL.getTypeAllocSize(found) > EDL.getTypeAllocSize(elemT)) elemT = found;
         }
         if (!measured && !chunkRelative.empty() && sizeFail.empty()) sizeFail = chunkRelative;
@@ -4936,7 +4933,16 @@ void CallGraphPass::checkContainerClosure() {
           sizeFail = "no struct the body steps through on an element is embedded at offset 0 of every constructor's"
                      " element (struct analyzer)";
       }
-      containerElemType[ci] = elemT;
+      // The report line's constructor types, before a refusal clears them.
+      std::vector<std::string> cts; // by name: the map's order follows the heap
+      for (const auto &[Fc, Ts] : containerCtorType[ci]) {
+        std::string t;
+        for (StructType *T : Ts) t += " " + T->getName().str() + " (" + std::to_string(EDL.getTypeAllocSize(T)) + " bytes)";
+        cts.push_back(Fc->getName().str() + ":" + t);
+      }
+      std::sort(cts.begin(), cts.end());
+      std::string ctl;
+      for (const std::string &c : cts) ctl += (ctl.empty() ? "" : "; ") + c;
       // A body write at no constant element offset cannot be inherited
       // field by field: a container that mints (an ELEM(ret) row or a
       // constructor) is rejected.
@@ -4951,17 +4957,14 @@ void CallGraphPass::checkContainerClosure() {
         containerElemSources[ci].clear();
         containerCtors[ci].clear();
         containerInherit[ci].clear();
-        containerElemType[ci] = nullptr;
         containerOwnerCtors[ci].clear();
         containerCtorType[ci].clear();
       }
       std::string ws;
       for (int64_t w : W) ws += " " + std::to_string(w);
       cline("  element mint: " + std::to_string(containerElemSources[ci].size()) + " element sources in the body, " +
-            std::to_string(containerCtors[ci].size()) + " constructors (row objects laid out as " +
-            (elemT ? elemT->getName().str() + ", " + std::to_string(EDL.getTypeAllocSize(elemT)) + " bytes"
-                   : std::string("none")) +
-            "), inherited offsets {" + ws + " }");
+            std::to_string(containerCtors[ci].size()) + " constructors (row objects by constructor type: " +
+            (ctl.empty() ? std::string("none") : ctl) + "), inherited offsets {" + ws + " }");
       if (C.verified)
         for (const auto &[fn, R] : C.rows)
           if (auto it = byName.find(fn); it != byName.end() && R.ownerDeref < 0) containerRowOf[it->second] = {ci, R};

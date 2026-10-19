@@ -2234,6 +2234,7 @@ void CallGraphPass::computeTaggedFields() {
   std::vector<Prod> prods;
   std::map<std::tuple<std::string, int64_t, int64_t>, int64_t> prodIdx;
   size_t testsUnstable = 0, setTestsMade = 0, dispatchTestsMade = 0, dispatchTestsDropped = 0;
+  size_t writersUnderTest = 0; // untagged writers a stable test of their tag dominates (measured, reporting only)
   // Reads (Ef null): stable against F writes. Retags (Ef set): each
   // test's composed D effect up to the access, parallel to tests.
   std::string lastTestsWhy; // the last testsAt's reason for dropping tests
@@ -3971,6 +3972,7 @@ void CallGraphPass::computeTaggedFields() {
     std::map<const Instruction *, EntryAdm> entryAdm;
     std::set<const Instruction *> entryAll;
     std::vector<bool> namedW(fs.size(), false);
+    std::vector<std::string> unknownWhy(fs.size()); // an untagged writer: why its tag is unknown (reports)
     std::vector<TaggedPair> fPairs;
     std::vector<std::set<uint32_t>> fPairAs;
     std::vector<std::string> fDims;
@@ -4309,12 +4311,13 @@ void CallGraphPass::computeTaggedFields() {
         if ((LD.open || LD.entry) && ob.r == 2) {
           // Only mapped from an open tag: the content is read under the
           // mapping writes' images of an unknown tag.
+          const Instruction *firstOpen = nullptr; // in IR order: mapAt follows a pointer set
+          for (const Instruction *d : ob.mapAt)
+            if (tagStoreAt.at(d)->unknown && (!firstOpen || irOrderLess(d, firstOpen))) firstOpen = d;
+          if (firstOpen && !writers[i].unknown) writers[i].why = "mapped by an unevaluable tag write at " + locOf(firstOpen);
           for (const Instruction *d : ob.mapAt) {
             const TagStore *t = tagStoreAt.at(d);
-            if (t->unknown) {
-              if (!writers[i].unknown) writers[i].why = "mapped by an unevaluable tag write at " + locOf(d);
-              writers[i].unknown = true;
-            }
+            if (t->unknown) writers[i].unknown = true;
             for (const Term &tm : t->terms)
               if (tm.src == 'c') { if (!concretize({tm}, writers[i].tags)) writers[i].unknown = true; }
               else if (tm.src == 's') writers[i].topMaps.push_back(tm);
@@ -5049,6 +5052,9 @@ void CallGraphPass::computeTaggedFields() {
       for (size_t i = 0; i < writers.size(); i++) any |= !writers[i].unknown;
       if (!any) continue;
       for (size_t i = 0; i < writers.size(); i++) if (!writers[i].unknown) namedW[i] = true;
+      for (size_t i = 0; i < writers.size(); i++)
+        if (writers[i].unknown && unknownWhy[i].empty())
+          unknownWhy[i] = "by +" + std::to_string(dOff) + ": " + (writers[i].why.empty() ? std::string("?") : writers[i].why);
       // Entry-keyed reads (plan 3.54) collect a union over D fields
       // (installed below); the others intersect over Ds (keyRead).
       size_t entryKeyed = 0;
@@ -5215,6 +5221,7 @@ void CallGraphPass::computeTaggedFields() {
     // with '!' (bfd.tdata's member tekhex_data did start with "t").
     const std::string prefix = S + "+" + std::to_string(Ff.second) + "#!t";
     const std::string tagAll = prefix + "?", censusAll = censusPrefix + "?";
+    std::vector<std::string> everyTag; // the writes keyed every tag (tagAll), each with its cause (reports)
     const int64_t fsz = (int64_t)fs.front().I->getModule()->getDataLayout().getPointerSize();
     std::set<const Instruction *> mine;
     for (const FAccess &w : fs) mine.insert(w.I);
@@ -5265,6 +5272,12 @@ void CallGraphPass::computeTaggedFields() {
       bool tookCensus = false;
       for (auto &[I, ks] : unionKeyNames) {
         if (mine.count(I) || !isCensus(I) || !overF(I)) continue;
+        if (isa<StoreInst>(I)) {
+          std::string k;
+          for (const std::string &x : ks) k += (k.empty() ? "" : " ") + x;
+          everyTag.push_back(locOf(I) + ": a write of another member over F's bytes {" + k +
+                             "} (the pair evaluates only F's own writers' tags)");
+        }
         ks.push_back(isa<StoreInst>(I) ? tagAll : censusAll);
         tookCensus = true;
         (isa<StoreInst>(I) ? censusDropNotF : censusReadsKept)++;
@@ -5274,7 +5287,25 @@ void CallGraphPass::computeTaggedFields() {
         if (isCensus(fs[i].I)) ks = unionKeyNames[fs[i].I], tookCensus = true, censusDropF++;
         else ks.push_back(censusAll); // untyped by member: every member
         if (namedW[i]) ks.push_back(prefix + "w" + std::to_string(i)), writersTagged++;
-        else ks.push_back(tagAll), writersUntagged++; // untagged: every tag
+        else {
+          ks.push_back(tagAll), writersUntagged++; // untagged: every tag
+          // Measured (reporting only): whether a stable test of the tag on
+          // its object dominates the writer, as one keys a read.
+          std::string under;
+          for (const TaggedPair &P : fPairs) {
+            std::vector<Test> tests;
+            std::set<uint32_t> as;
+            const size_t c1 = testsUnstable, c2 = setTestsMade, c3 = dispatchTestsMade, c4 = dispatchTestsDropped;
+            testsAt(fs[i].I, fs[i].obj, Field{S, P.D}, Ff, tests, as);
+            testsUnstable = c1, setTestsMade = c2, dispatchTestsMade = c3, dispatchTestsDropped = c4; // not a read's
+            under += (under.empty() ? "" : "; ") + std::string("+") + std::to_string(P.D) + ": " +
+                     (tests.empty() ? lastTestsWhy : std::to_string(tests.size()) + " stable dominating tests");
+            writersUnderTest += !tests.empty();
+          }
+          everyTag.push_back(locOf(fs[i].I) + ": F's writer, its tag unknown " +
+                             (unknownWhy[i].empty() ? std::string("(no tag store evaluated)") : "(" + unknownWhy[i] + ")") +
+                             " [" + under + "]");
+        }
         unionKeyNames[fs[i].I] = ks;
         tagWriteOf[fs[i].I] = prefix;
       }
@@ -5442,7 +5473,12 @@ void CallGraphPass::computeTaggedFields() {
     std::string dims;
     for (const std::string &d : fDims) dims += (dims.empty() ? "" : ", ") + d;
     taggedReport.push_back("KEYS " + S + "+" + std::to_string(Ff.second) + " by " + dims + ": " +
-                           std::to_string(readAdm.size()) + " reads keyed");
+                           std::to_string(readAdm.size()) + " reads keyed" +
+                           (everyTag.empty() ? std::string()
+                                             : "; " + std::to_string(everyTag.size()) + " writes keyed every tag (" +
+                                                   tagAll + "), which every keyed read admits:"));
+    std::sort(everyTag.begin(), everyTag.end()); // filled from pointer-keyed maps: by text (fn, file:line first)
+    for (const std::string &e : everyTag) taggedReport.push_back("    every tag: " + e);
   }
   for (auto &[M, _] : Ctx->Modules) // the entry reads in IR order (their hub keys)
     for (Function &F : *M)
@@ -5497,10 +5533,13 @@ void CallGraphPass::computeTaggedFields() {
          << (storesUnwatchable ? " (e.g. " + unwatchableAt + ")" : std::string()) << "\n");
   {
     const Function *top = nullptr;
-    for (auto &[F, n] : walkBlocksBy) if (!top || n > walkBlocksBy[top]) top = F;
+    for (auto &[F, n] : walkBlocksBy) // a tie: the first by name (the map's order follows the heap)
+      if (!top || n > walkBlocksBy[top] || (n == walkBlocksBy[top] && F->getName() < top->getName())) top = F;
     {
       std::string sites;
-      for (const Instruction *I : eqMergeSites) if (sites.size() < 300) sites += " " + locOf(I);
+      std::vector<const Instruction *> es(eqMergeSites.begin(), eqMergeSites.end());
+      std::sort(es.begin(), es.end(), irOrderLess); // the cut keeps the first in IR order, not by pointer
+      for (const Instruction *I : es) if (sites.size() < 300) sites += " " + locOf(I);
       CG_LOG("TaggedFields: pointer-equality identity merges: " << eqMergeSites.size() << " (" << sites << " )\n");
     }
     CG_LOG("TaggedFields: time: tag sets " << tagsSecs << " s (" << tagsComputes << " computations), content effects "
@@ -5533,7 +5572,8 @@ void CallGraphPass::computeTaggedFields() {
          << censusDropF << ", other writes over F's bytes made every tag " << censusDropNotF
          << ", reads over F's bytes keeping their member key " << censusReadsKept << "); " << ppChannelCallees
          << " callees with per-use parameter channels; " << valueTests
-         << " value tests narrowing a tag taken at its load\n");
+         << " value tests narrowing a tag taken at its load; " << writersUnderTest
+         << " untagged writers under a stable dominating test of their tag (measured)\n");
   // The census's UNCHECKED reads a tag pair keys by a stable dominating
   // test: checked now, so no longer listed assumptions; the final count is
   // net of them (a read the pair does not key keeps its member key).
@@ -5585,7 +5625,7 @@ void CallGraphPass::computeTaggedFields() {
     std::set<std::pair<const Instruction *, const Instruction *>> shown;
     // Per tagged write excluded: the reads, and the maps by which their
     // tests admit its tag (rule report).
-    std::map<const Instruction *, std::pair<std::set<const Instruction *>, std::set<std::string>>> byW;
+    std::map<const Instruction *, std::pair<std::set<const Instruction *>, std::set<std::string>>, IROrder> byW; // rows in IR order
     for (auto &[R, ws] : p3Excluded)
       for (auto &[W, tg] : ws) {
         if (!tg) continue;

@@ -4902,8 +4902,11 @@ bool CallGraphPass::runCellResolution() {
             if (auto tit = containerCtorType[L.cont].find(Fc); tit != containerCtorType[L.cont].end() && tit->second)
               if (!RT || DL.getTypeAllocSize(tit->second) > DL.getTypeAllocSize(RT)) RT = tit->second;
           if (RT) (ctors.size() == 1 ? rowsByOwnerCtor : rowsByLargestOfSeveral)++;
+          std::vector<std::string> cn; // by name: the set's order follows the heap
+          for (const Function *Fc : ctors) cn.push_back(Fc->getName().str());
+          std::sort(cn.begin(), cn.end());
           std::string cs;
-          for (const Function *Fc : ctors) cs += (cs.empty() ? "" : " ") + Fc->getName().str();
+          for (const std::string &n : cn) cs += (cs.empty() ? "" : " ") + n;
           CG_LOG("Cells: row object at " << nodeDescFn(canon(L.out)).substr(0, 100) << " of owner "
                  << describeFn(objs[o]).substr(0, 100) << ": constructors {" << cs << "}"
                  << (RT ? " -> " + typeLabel(RT) : std::string(" -> none known")) << "\n");
@@ -10248,6 +10251,7 @@ bool CallGraphPass::runCellResolution() {
          << " untested; outside-domain entries " << taggedOutsideEntries.size() << ", premise broken at "
          << (stoppedAt ? std::string("unknown (the solve stopped: no icall answers)") : std::to_string(domainBroken.size()))
          << "\n";
+    std::sort(domainBroken.begin(), domainBroken.end()); // fnsOutside and the callee sets are pointer-ordered
     for (const std::string &d : domainBroken) RO << "T outside domain broken: " << d << "\n";
     if (!taggedPairs.empty()) {
       // Which functions the outside can call (their address reaches it),

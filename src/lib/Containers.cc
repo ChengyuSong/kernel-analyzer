@@ -1638,7 +1638,7 @@ void CallGraphPass::checkContainerClosure() {
     std::set<std::string> holderAssumed, holderInstance; // rule A: reads of open holders; closed holders used
     std::set<std::string> p3Assumed; // P3: cursor reads of both schemes, the stores excluded by member name
     std::set<std::string> uncheckedCursor; // "field\tread": a cursor read admitted by an UNCHECKED census key
-    std::vector<std::string> derefReadChecked;
+    std::set<const CallBase *> derefReadChecked; // by instruction: ownerShape re-evaluates a row call's owner
     auto eoMark = [&]() { return eoPending.size(); };
     auto eoSettle = [&](size_t mark, bool admitted) {
       if (admitted)
@@ -1721,7 +1721,7 @@ void CallGraphPass::checkContainerClosure() {
       if (!L1 || c < 0) return self();
       const std::string site = F->getName().str() + ": " + valueText(CB) + " (owner read as " + valueText(L1) + ")";
       if (c == 1) eoPending.push_back("d" + site);
-      else derefReadChecked.push_back(site);
+      else derefReadChecked.insert(CB);
       return ownerShape(L1, 0);
     };
     std::function<std::string(const Value *)> cursorClosed;
@@ -3336,7 +3336,7 @@ void CallGraphPass::checkContainerClosure() {
           ownPath.erase(V);
           return ok;
         };
-        std::set<const Instruction *> cands;
+        std::set<const Instruction *, IROrder> cands; // rows and holders in IR order, not by pointer
         for (auto &[M, _] : Ctx->Modules)
           for (const Function &F : *M)
             for (const Instruction &I : instructions(F))
@@ -3355,6 +3355,7 @@ void CallGraphPass::checkContainerClosure() {
           std::vector<const Value *> starts, hLens; // region-start offsets, handle-copy lengths
           std::vector<const Value *> elemPtrs;
           std::map<const Value *, int> slots; // -O0 locals it occupies, by region
+          std::vector<const Value *> slotOrder; // the same, in the order met (the walk's IR use order)
           std::vector<const Value *> joins; // phis and selects: every entry derived
           auto setFail = [&](const std::string &w) {
             if (fail.empty()) fail = w;
@@ -3387,7 +3388,8 @@ void CallGraphPass::checkContainerClosure() {
                                                                     : std::string("into it: ")) + siteOf(S));
                   break;
                 }
-                if (auto [sit, ins] = slots.emplace(SL, r); !ins && sit->second != r) {
+                if (auto [sit, ins] = slots.emplace(SL, r); ins) slotOrder.push_back(SL);
+                else if (sit->second != r) {
                   setFail("a local holding both regions: " + siteOf(S));
                   break;
                 }
@@ -3468,7 +3470,8 @@ void CallGraphPass::checkContainerClosure() {
           }
           // Every store into a slot it occupies, and every entry of a join,
           // null or derived in the same region.
-          for (const auto &[SL, r] : slots)
+          for (const Value *SL : slotOrder) {
+            const int r = slots[SL];
             for (const User *U : SL->users())
               if (const auto *S = dyn_cast<StoreInst>(U); S && fail.empty()) {
                 const Value *v = S->getValueOperand();
@@ -3476,6 +3479,7 @@ void CallGraphPass::checkContainerClosure() {
                 auto it = region.find(v);
                 if (it == region.end() || it->second != r) setFail("a local also holding another value: " + siteOf(S));
               }
+          }
           for (const Value *J : joins) {
             if (!fail.empty()) break;
             const auto *I = cast<Instruction>(J);
@@ -5034,7 +5038,6 @@ void CallGraphPass::checkContainerClosure() {
       cline("  holders: " + std::to_string(localArraysRefused.size()) +
             " locals pointing to a fresh block are no holder (another pointer stored to them too)");
     if (!derefReadChecked.empty() || !derefReadAssumed.empty()) {
-      std::sort(derefReadChecked.begin(), derefReadChecked.end());
       cline("  deref owner read at a row call, one value with a read of the slot (S6): " +
             std::to_string(derefReadChecked.size()) + " checked, " + std::to_string(derefReadAssumed.size()) +
             " ASSUMPTION");

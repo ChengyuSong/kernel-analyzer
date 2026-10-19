@@ -2739,18 +2739,13 @@ void CallGraphPass::runUnionCensus() {
   // Is fact g (found at a test whose path reaches I) intact at I, and at
   // every lower frame's read point from that frame's entry (`below`)?
   // Why the last path check failed (verbose report: which condition).
-  std::map<std::string, std::pair<size_t, std::string>> pathFails;
+  // The example is the first failing instruction in IR order (irOrderLess),
+  // not the first met: the walk's order follows pointer sets.
+  std::map<std::string, std::pair<size_t, const Instruction *>> pathFails;
   auto failAt = [&](const std::string &why, const Instruction *X) {
     auto &e = pathFails[why];
-    if (e.first++ == 0 && X) {
-      std::string d = X->getFunction()->getName().str();
-      if (const DILocation *L = X->getDebugLoc())
-        d += ":" + std::to_string(L->getLine());
-      std::string is;
-      raw_string_ostream os(is);
-      X->print(os);
-      e.second = d + " " + os.str().substr(0, 120);
-    }
+    e.first++;
+    if (X && (!e.second || irOrderLess(X, e.second))) e.second = X;
   };
   // A usable fact (plan 3.31): (A) write -> check, factPreserved; (B)
   // check -> read: no path from the test to the read (and from each lower
@@ -3491,7 +3486,7 @@ void CallGraphPass::runUnionCensus() {
         }
         if (K.at.size() < 6) {
           std::string d = std::string("read ") + locOf(r.I) + " (" + why;
-          if (!A.tagUnknown.empty()) d += ": " + locOf(*A.tagUnknown.begin());
+          if (!A.tagUnknown.empty()) d += ": " + locOf(*std::min_element(A.tagUnknown.begin(), A.tagUnknown.end(), irOrderLess));
           d += "; {";
           for (const std::string &m : A.members) d += m + " ";
           K.at.push_back(d.substr(0, d.size() - 1) + "})");
@@ -3686,9 +3681,19 @@ void CallGraphPass::runUnionCensus() {
     std::vector<std::pair<size_t, std::string>> pf;
     for (auto &[w, e] : pathFails) pf.push_back({e.first, w});
     std::sort(pf.rbegin(), pf.rend());
-    for (size_t i = 0; i < pf.size() && i < 20; i++)
-      errs() << "UnionKeys:   " << pf[i].first << "  " << pf[i].second << "  e.g. "
-             << pathFails[pf[i].second].second << "\n";
+    for (size_t i = 0; i < pf.size() && i < 20; i++) {
+      std::string d;
+      if (const Instruction *X = pathFails[pf[i].second].second) {
+        d = X->getFunction()->getName().str();
+        if (const DILocation *L = X->getDebugLoc())
+          d += ":" + std::to_string(L->getLine());
+        std::string is;
+        raw_string_ostream os(is);
+        X->print(os);
+        d += " " + os.str().substr(0, 120);
+      }
+      errs() << "UnionKeys:   " << pf[i].first << "  " << pf[i].second << "  e.g. " << d << "\n";
+    }
     errs() << "UnionKeys: facts broken by tag writes outside the union's writes:\n";
     for (auto &[k, B] : breakers) {
       std::string t;

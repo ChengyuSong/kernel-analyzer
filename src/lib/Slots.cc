@@ -567,3 +567,29 @@ std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx) {
         if (const auto *CB = dyn_cast<CallBase>(&I); CB && Ctx->IndirectCallInsts.count(CB)) out.push_back(CB);
   return out;
 }
+
+bool irOrderLess(const Instruction *A, const Instruction *B) {
+  if (A == B) return false;
+  // Positions per function, computed on first use and again when the
+  // function has gained an instruction since.
+  static DenseMap<const Function *, DenseMap<const Instruction *, unsigned>> pos;
+  auto indexOf = [](const Instruction *I) {
+    auto &P = pos[I->getFunction()];
+    if (!P.count(I)) {
+      P.clear();
+      unsigned k = 0;
+      for (const Instruction &J : instructions(*I->getFunction())) P[&J] = k++;
+    }
+    return P.lookup(I);
+  };
+  auto line = [](const Instruction *I) {
+    const DILocation *L = I->getDebugLoc();
+    return std::make_pair(L ? L->getFilename() : StringRef(), L ? L->getLine() : 0u);
+  };
+  const StringRef fa = A->getFunction()->getName(), fb = B->getFunction()->getName();
+  if (fa != fb) return fa < fb;
+  if (A->getFunction() != B->getFunction()) // two unnamed functions: their modules' order
+    return A->getModule()->getModuleIdentifier() < B->getModule()->getModuleIdentifier();
+  if (line(A) != line(B)) return line(A) < line(B);
+  return indexOf(A) < indexOf(B);
+}

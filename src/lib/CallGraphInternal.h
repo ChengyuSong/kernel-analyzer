@@ -282,6 +282,13 @@ std::string diDeclaredStruct(const Value *P, bool pointee);
 // The indirect calls in IR order (module, function, instruction): the
 // context keeps them in a pointer set, whose order follows the heap layout.
 std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx);
+// A deterministic order on instructions for reports, where a pointer
+// set's order follows the heap: function name, debug file:line, position
+// in the function.
+bool irOrderLess(const Instruction *A, const Instruction *B);
+struct IROrder {
+  bool operator()(const Instruction *A, const Instruction *B) const { return irOrderLess(A, B); }
+};
 // The named structs bytes [lo, hi) of T lie in (T itself, members,
 // array elements folded to element 0), each with the interval inside it.
 void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,

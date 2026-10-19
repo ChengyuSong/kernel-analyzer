@@ -1098,12 +1098,46 @@ Obligations left open:
        pointer local it declares; not a size lookup). Every store into
        the length field, walked back through formals to the actuals of
        direct calls with the table pointer and the code field's value
-       along, is a path. Every path is relevant: a table pointer's struct
-       steps are declared types, which C casts away (`elf_hash_table
-       (info)` is a cast of info->hash), so they cannot decide which
-       tables the owner can be. The premise is therefore proven only when
-       every init of the length field in the program gives one T. Object
-       identity by name, at both ends, is the next rule. The chain is
+       along, is a path. A table pointer's struct steps are declared
+       types, which C casts away (`elf_hash_table (info)` is a cast of
+       info->hash), so they cannot decide which tables the owner can be.
+       Relevance is by object identity by name, at both ends (Fable
+       2026-10-19, (a)): the objects the length field's address can be, as
+       (allocation site, offset), for the holder's element-copy length
+       read and for each path's size store (its offset carried up the
+       table chain). The walk goes through casts, -O0 locals (every
+       store), constant steps, joins, formals to the actuals of direct
+       calls, a defined callee's returns (an allocator wrapper, every
+       return a noalias extern call or null, is its call site), and a load
+       of a named field: the objects of the field's writes, defined once
+       here (Fable 2026-10-19).
+       - A field's writes, for K = (S, o) of width w: (1) every store of
+         key K of a pointer (a store of a non-pointer value: OPEN); (2)
+         every global initializer pointer named by K: each non-null
+         pointer slot is named by every struct around it, the IR's named
+         structs and the global's debug type (a union initializer makes
+         the IR type literal), and a slot of a global with neither (no
+         debug type, in no named struct) opens every field load; (3)
+         every other write whose named bytes cover K's: a store named at
+         an outer struct, at another offset or of another width, a block
+         copy, a memset (structCover over the write's named slot and
+         length, a runtime length to the struct's end): OPEN, with the
+         count and the first; except (4) a memset whose value is the
+         constant 0, a null write: listed with its site and bytes, adding
+         no object (zero bytes are null, null names no object; the
+         solver's own null). Writes by unnamed address remain the
+         standing naming assumption.
+       Anything else is OPEN with its reason (an address-taken formal, an
+       indirect call's result, a runtime step, a load of no named field,
+       the depth limit). A path is refuted when both ends are closed and
+       share no object: then no execution's size store on that path writes
+       the holder's field, since every write of the walked fields is named
+       (the standing naming assumption) and distinct sites or offsets are
+       distinct addresses. A path with any OPEN reason stays relevant,
+       printed with every reason. The premise is proven only when every
+       relevant path gives one T; with every path refuted it stays open
+       (no init of the holder's table by name). Refuted paths are listed
+       with their objects. The chain is
        printed as the IR has it: casts are stripped, every GEP step is
        kept, including all-zero-index ones. On every path the length is
        a constant equal to sizeof(T(newfunc)),
@@ -1117,8 +1151,10 @@ Obligations left open:
        <owner struct> (the table its handle saves read): H <alloc>;
        handle save <locs>; element saves <locs>; restores <locs>; premise
        PROVEN, element struct T: <paths>" or "OPEN-UNPROVEN (<first
-       open path>): <paths>", or "snapshot holder candidate <alloc>: no
-       holder (<the first use or check that fails>)".
+       open path>): <paths>", then "holder's entsize field at <objects>;
+       n paths refuted by object identity" and one "[REFUTED <path>,
+       entsize field at <objects>]" each, or "snapshot holder candidate
+       <alloc>: no holder (<the first use or check that fails>)".
      - Statement: the handle image holds, slot by slot, every value the
        owner's handle array held at any save, and the element image
        every value an element of the owner held at any save. A restore
@@ -1132,6 +1168,14 @@ Obligations left open:
        of the block; a length or offset that is not one value by name; a
        use of an entry reclaimed after the save (objalloc_free_block;
        undefined behavior, not modeled).
+     - Cases: test/t_cells_container_snapshot_{holder,other_offset,
+       foreign_save,two_types,identity,initializer,nullwrite,cover}.c
+       (identity: a path refuted by another allocation site, one by
+       another offset of the holder's allocation; initializer: the
+       holder's field initialized to a static table and stored a heap one,
+       both relevant; nullwrite: a constant-zero memset over the field,
+       listed, the refutation holds; cover: a block copy over the field,
+       OPEN, nothing refuted).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

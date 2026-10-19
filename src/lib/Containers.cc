@@ -3523,7 +3523,7 @@ void CallGraphPass::checkContainerClosure() {
           // sizeof(T), T the type its constructor allocates; one T.
           const size_t ep = entsizeKey.rfind('+');
           const std::string ES = entsizeKey.substr(0, ep);
-          struct Path { std::vector<std::string> chain; const Value *tbl, *size, *nf; std::string open; };
+          struct Path { std::vector<std::string> chain; const Value *tbl, *size, *nf; std::string open; int64_t off = 0; };
           std::vector<Path> paths;
           auto resolve = [&](const Value *V) {
             for (int k = 0; k < 8; k++) {
@@ -3553,6 +3553,9 @@ void CallGraphPass::checkContainerClosure() {
             while (const auto *G = dyn_cast<GEPOperator>(P.tbl)) {
               if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()); ST && ST->hasName())
                 P.chain.push_back(stripStructNameSuffix(ST->getName()).str());
+              APInt Off(64, 0);
+              if (P.off != INT64_MIN && G->accumulateConstantOffset(DL0, Off)) P.off += Off.getSExtValue();
+              else P.off = INT64_MIN;
               P.tbl = resolve(G->getPointerOperand());
             }
             const Function *F = nullptr;
@@ -3598,17 +3601,302 @@ void CallGraphPass::checkContainerClosure() {
                           G2 && tbl && resolve(G2->getPointerOperand()) == resolve(tbl))
                         nf = S2->getValueOperand();
                   Path P{{}, tbl ? tbl : S->getPointerOperand(), S->getValueOperand(), nf, tbl ? "" : "a size store at no field step"};
+                  // The size field's offset from the table (the object
+                  // identity below names the field's own address).
+                  if (APInt Off(64, 0); G && G->accumulateConstantOffset(DL0, Off)) P.off = Off.getSExtValue();
+                  else P.off = INT64_MIN;
                   if (!P.open.empty()) paths.push_back(P);
                   else walk(P, 0);
                 }
-          // Every path is relevant (Fable 2026-10-18): a GEP's struct is a
-          // declared type (C casts it away), so the table's struct steps say
-          // nothing about which tables this owner can be; the chain is
-          // printed, not used. Object identity by name is the premise's next
-          // rule.
+          // Object identity by name (Fable 2026-10-19, (a)): the objects
+          // an address can be, as (allocation site, offset): through
+          // casts, -O0 locals (every store), constant steps, joins, formals
+          // to direct actuals, a defined callee's returns (an allocator
+          // wrapper, every return a noalias extern call or null at +0, is
+          // its call site), a load of a named field (every store of that
+          // key in the program). Anything else is open, by its reason.
+          using Obj = std::pair<std::string, int64_t>;
+          std::map<std::string, std::pair<std::set<Obj>, std::set<std::string>>> fieldObjs; // memo per key
+          // A global initializer is a write too: each of its non-null pointer
+          // slots is named by every struct around it, the IR's named structs
+          // and the global's debug type (a union initializer makes the IR
+          // type literal); a slot no type names opens every field load.
+          std::map<std::string, std::vector<const Constant *>> initVals;
+          std::vector<std::string> initUnnamed;
+          bool initDone = false;
+          // Every named write's bytes, for a field's cover check: a store
+          // (its value's store size) or a memory intrinsic (its length; a
+          // runtime length to the end of the struct) at its named slot.
+          struct NamedWrite { StructType *S; int64_t off, len; const Instruction *I; };
+          std::vector<NamedWrite> namedWrites;
+          bool writesDone = false;
+          std::set<std::string> keysWalked, keysCovered; // for the log
+          std::set<std::string> nullWrites; // constant-zero memsets over a walked field: null, no object (listed)
+          // Why a field's bytes may hold what its own named stores do not:
+          // a write named otherwise over them (a store named at an outer
+          // struct or at another offset, a store of another width, a block
+          // copy, a memset), or "".
+          auto coverOpen = [&](const std::string &K, int64_t size) -> std::string {
+            if (!writesDone) {
+              writesDone = true;
+              for (auto &[M, _] : Ctx->Modules) {
+                const DataLayout &MDL = M->getDataLayout();
+                for (const Function &F : *M)
+                  for (const Instruction &I : instructions(F)) {
+                    const Value *Addr = nullptr;
+                    int64_t len = 0;
+                    if (const auto *St = dyn_cast<StoreInst>(&I))
+                      Addr = St->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(St->getValueOperand()->getType());
+                    else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+                      Addr = MI->getRawDest();
+                      const auto *Len = dyn_cast<ConstantInt>(MI->getLength());
+                      len = Len ? (int64_t)Len->getZExtValue() : (int64_t)1 << 40;
+                    }
+                    StructType *WS = nullptr;
+                    int64_t woff = 0;
+                    // A store into an -O0 scalar local names no field.
+                    if (!Addr || (isa<StoreInst>(&I) && isa<AllocaInst>(Addr->stripPointerCasts())) ||
+                        !namedSlot(&I, Addr, MDL, pointees, WS, woff) || !WS || !WS->hasName() || len <= 0)
+                      continue;
+                    namedWrites.push_back({WS, woff, len, &I});
+                  }
+              }
+            }
+            const size_t p = K.rfind('+');
+            const std::string KS = K.substr(0, p);
+            const int64_t KO = std::stoll(K.substr(p + 1));
+            std::string why;
+            size_t n = 0;
+            for (const NamedWrite &W : namedWrites) {
+              const bool own = isa<StoreInst>(W.I) && W.len == size && W.off == KO &&
+                               stripStructNameSuffix(W.S->getName()) == KS;
+              if (own) continue;
+              const auto *MS = dyn_cast<MemSetInst>(W.I);
+              const bool zero = MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero();
+              bool hits = false;
+              structCover(W.S, W.off, W.off + W.len, W.I->getModule()->getDataLayout(),
+                          [&](StructType *ST, int64_t lo, int64_t hi) {
+                            hits |= ST->hasName() && stripStructNameSuffix(ST->getName()) == KS && lo < KO + size && KO < hi;
+                          });
+              if (!hits) continue;
+              // Zero bytes are null, and null names no object (Fable
+              // 2026-10-19): listed, not open.
+              if (zero) {
+                nullWrites.insert("a memset 0 named " + stripStructNameSuffix(W.S->getName()).str() + "+" +
+                                  std::to_string(W.off) + " (" + std::to_string(W.len) + " bytes) over " + K + " " +
+                                  snapLoc(W.I));
+                continue;
+              }
+              if (!n++)
+                why = std::string(isa<MemSetInst>(W.I) ? "a memset" : isa<MemTransferInst>(W.I) ? "a block copy" : "a store") +
+                      " named " + stripStructNameSuffix(W.S->getName()).str() + "+" + std::to_string(W.off) + " (" +
+                      std::to_string(W.len) + " bytes) over " + K + " " + snapLoc(W.I);
+            }
+            return n ? std::to_string(n) + " writes named otherwise over " + K + ", e.g. " + why : std::string();
+          };
+          std::function<void(const DIType *, int64_t, int64_t, std::set<std::string> &, int)> diKeysAt =
+              [&](const DIType *Ty, int64_t tOff, int64_t b, std::set<std::string> &keys, int d) {
+                const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(Ty));
+                if (!CT || d > 32) return;
+                if (CT->getTag() == dwarf::DW_TAG_array_type) {
+                  const auto *E = diStrip(CT->getBaseType());
+                  const int64_t es = E ? (int64_t)(E->getSizeInBits() / 8) : 0;
+                  if (es > 0) diKeysAt(E, tOff + (b - tOff) / es * es, b, keys, d + 1);
+                  return;
+                }
+                const auto tag = CT->getTag();
+                if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_union_type && tag != dwarf::DW_TAG_class_type)
+                  return;
+                if (!CT->getName().empty())
+                  keys.insert(std::string(tag == dwarf::DW_TAG_union_type ? "union." : tag == dwarf::DW_TAG_class_type ? "class." : "struct.") +
+                              CT->getName().str() + "+" + std::to_string(b - tOff));
+                for (const DINode *E : CT->getElements()) {
+                  const auto *Mb = dyn_cast<DIDerivedType>(E);
+                  if (!Mb || Mb->getTag() != dwarf::DW_TAG_member || Mb->isStaticMember()) continue;
+                  const int64_t mo = tOff + (int64_t)(Mb->getOffsetInBits() / 8), ms = (int64_t)(Mb->getSizeInBits() / 8);
+                  if (b >= mo && (ms == 0 || b < mo + ms)) diKeysAt(Mb->getBaseType(), mo, b, keys, d + 1);
+                }
+              };
+          auto buildInit = [&]() {
+            if (initDone) return;
+            initDone = true;
+            for (auto &[M, _] : Ctx->Modules) {
+              const DataLayout &MDL = M->getDataLayout();
+              for (const GlobalVariable &GV : M->globals()) {
+                if (!GV.hasInitializer()) continue;
+                SmallVector<DIGlobalVariableExpression *, 2> GVEs;
+                GV.getDebugInfo(GVEs);
+                std::vector<std::pair<std::string, int64_t>> anc; // the IR named structs around, (name, start)
+                std::function<void(const Constant *, int64_t)> walk = [&](const Constant *C, int64_t b) {
+                  if (C->isNullValue() || isa<UndefValue>(C)) return;
+                  if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
+                    StructType *ST = CS->getType();
+                    const StructLayout *SL = MDL.getStructLayout(ST);
+                    const bool named = ST->hasName();
+                    if (named) anc.push_back({stripStructNameSuffix(ST->getName()).str(), b});
+                    for (unsigned i = 0; i < CS->getNumOperands(); i++) walk(CS->getOperand(i), b + (int64_t)SL->getElementOffset(i));
+                    if (named) anc.pop_back();
+                  } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+                    const int64_t es = (int64_t)MDL.getTypeAllocSize(CA->getType()->getElementType());
+                    for (unsigned e = 0; e < CA->getNumOperands(); e++) walk(CA->getOperand(e), b + e * es);
+                  } else if (C->getType()->isPointerTy()) {
+                    std::set<std::string> keys;
+                    for (const auto &[n, st] : anc) keys.insert(n + "+" + std::to_string(b - st));
+                    for (const DIGlobalVariableExpression *GVE : GVEs)
+                      if (const DIGlobalVariable *DV = GVE->getVariable()) diKeysAt(DV->getType(), 0, b, keys, 0);
+                    // A global with a debug type names its slots: one in no
+                    // struct (a scalar or an array of pointers) is no field.
+                    if (keys.empty() && GVEs.empty()) initUnnamed.push_back("@" + GV.getName().str() + " +" + std::to_string(b));
+                    for (const std::string &k : keys) initVals[k].push_back(C);
+                  }
+                };
+                walk(GV.getInitializer(), 0);
+              }
+            }
+          };
+          std::set<std::string> fieldOnPath;
+          std::function<void(const Value *, int64_t, int, std::set<Obj> &, std::set<std::string> &)> objsOf;
+          std::function<bool(const Function *, int)> isWrapper = [&](const Function *F, int d) {
+            if (d > 3 || F->isDeclaration()) return false;
+            bool any = false;
+            for (const Instruction &I : instructions(*F))
+              if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue()) {
+                std::vector<const Value *> vs{R->getReturnValue()};
+                std::set<const Value *> seen;
+                while (!vs.empty()) {
+                  const Value *V = castsOnly(vs.back());
+                  vs.pop_back();
+                  if (!seen.insert(V).second || isa<ConstantPointerNull>(V)) continue;
+                  if (const auto *L = dyn_cast<LoadInst>(V); L && transientSlot(castsOnly(L->getPointerOperand()))) {
+                    for (const User *U : castsOnly(L->getPointerOperand())->users())
+                      if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == castsOnly(L->getPointerOperand()))
+                        vs.push_back(St->getValueOperand());
+                    continue;
+                  }
+                  if (const auto *PN = dyn_cast<PHINode>(V)) {
+                    for (const Value *In : PN->incoming_values()) vs.push_back(In);
+                    continue;
+                  }
+                  const auto *CB = dyn_cast<CallBase>(V);
+                  const Function *G = CB ? CB->getCalledFunction() : nullptr;
+                  if (!G || !(G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, d + 1))) return false;
+                  any = true;
+                }
+              }
+            return any;
+          };
+          objsOf = [&](const Value *V, int64_t off, int d, std::set<Obj> &out, std::set<std::string> &open) {
+            V = castsOnly(V);
+            if (d > 16) return (void)open.insert("too deep at " + valueText(V));
+            if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return;
+            if (const auto *G = dyn_cast<GEPOperator>(V)) {
+              APInt Off(64, 0);
+              if (!G->accumulateConstantOffset(DL0, Off)) return (void)open.insert("a runtime step " + valueText(V));
+              return objsOf(G->getPointerOperand(), off + Off.getSExtValue(), d + 1, out, open);
+            }
+            if (const auto *PN = dyn_cast<PHINode>(V)) {
+              for (const Value *In : PN->incoming_values()) objsOf(In, off, d + 1, out, open);
+              return;
+            }
+            if (const auto *SI = dyn_cast<SelectInst>(V)) {
+              objsOf(SI->getTrueValue(), off, d + 1, out, open);
+              objsOf(SI->getFalseValue(), off, d + 1, out, open);
+              return;
+            }
+            if (const auto *L = dyn_cast<LoadInst>(V)) {
+              const Value *SL = castsOnly(L->getPointerOperand());
+              if (transientSlot(SL)) {
+                for (const User *U : SL->users())
+                  if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == SL)
+                    objsOf(St->getValueOperand(), off, d + 1, out, open);
+                return;
+              }
+              const std::string K = fieldKey(L, L->getPointerOperand());
+              if (K.empty()) return (void)open.insert("a load of no named field " + valueText(V));
+              std::pair<std::set<Obj>, std::set<std::string>> r;
+              if (auto it = fieldObjs.find(K); it != fieldObjs.end()) r = it->second;
+              else {
+                // A cycle through K adds nothing (the least fixpoint: what
+                // the other stores give). A result computed inside another
+                // key's cycle may miss what comes through that key, so only
+                // a result with no key under way is kept.
+                if (!fieldOnPath.insert(K).second) return;
+                for (auto &[M, _] : Ctx->Modules)
+                  for (const Function &F : *M)
+                    for (const Instruction &I : instructions(F))
+                      if (const auto *St = dyn_cast<StoreInst>(&I); St && fieldKey(St, St->getPointerOperand()) == K) {
+                        if (St->getValueOperand()->getType()->isPointerTy())
+                          objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
+                        else
+                          r.second.insert("a store of a non-pointer value into " + K + " " + snapLoc(St));
+                      }
+                keysWalked.insert(K);
+                if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
+                    !c.empty())
+                  r.second.insert(c), keysCovered.insert(K);
+                buildInit();
+                if (auto iv = initVals.find(K); iv != initVals.end())
+                  for (const Constant *C : iv->second) objsOf(C, 0, d + 1, r.first, r.second);
+                if (!initUnnamed.empty())
+                  r.second.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
+                                  initUnnamed.front() + ")");
+                fieldOnPath.erase(K);
+                if (fieldOnPath.empty()) fieldObjs[K] = r;
+              }
+              for (const Obj &x : r.first) out.insert({x.first, x.second + off});
+              for (const std::string &x : r.second) open.insert(x);
+              if (r.first.empty() && r.second.empty()) open.insert("no pointer store of " + K);
+              return;
+            }
+            if (const auto *Ar = dyn_cast<Argument>(V)) {
+              const Function *F = Ar->getParent();
+              if (F->hasAddressTaken()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken");
+              bool any = false;
+              for (const User *U : F->users())
+                if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F && Ar->getArgNo() < CB->arg_size())
+                  any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, d + 1, out, open);
+              if (!any) open.insert("a formal of " + F->getName().str() + ", which has no caller");
+              return;
+            }
+            if (const auto *CB = dyn_cast<CallBase>(V)) {
+              const Function *G = CB->getCalledFunction();
+              if (!G) return (void)open.insert("an indirect call's result " + snapLoc(CB));
+              if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0))
+                return (void)out.insert({G->getName().str() + " at " + snapLoc(CB), off});
+              if (G->isDeclaration()) return (void)open.insert("an extern call's result " + snapLoc(CB));
+              for (const Instruction &I : instructions(*G))
+                if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
+                  objsOf(R->getReturnValue(), off, d + 1, out, open);
+              return;
+            }
+            if (isa<AllocaInst>(V) || isa<GlobalValue>(V))
+              return (void)out.insert({(isa<GlobalValue>(V) ? "@" + V->getName().str() : "local " + valueText(V)), off});
+            open.insert("a value no rule follows " + valueText(V));
+          };
+          auto objText = [](const std::set<Obj> &o, const std::set<std::string> &op) {
+            std::string t;
+            for (const Obj &x : o) t += (t.empty() ? "" : "; ") + x.first + " +" + std::to_string(x.second);
+            for (const std::string &x : op) t += (t.empty() ? "" : "; ") + std::string("OPEN ") + x;
+            return t.empty() ? std::string("none") : t;
+          };
+          // The holder end: the entsize field the element copies' length reads.
+          std::set<Obj> hObjs;
+          std::set<std::string> hOpen;
+          {
+            const Value *Ln = eSaves.empty() ? nullptr : eSaves.front()->getLength();
+            while (Ln && isa<CastInst>(Ln)) Ln = cast<CastInst>(Ln)->getOperand(0);
+            if (const auto *L = dyn_cast_or_null<LoadInst>(Ln)) objsOf(L->getPointerOperand(), 0, 0, hObjs, hOpen);
+            else hOpen.insert("an element copy length read from no load");
+          }
+          // A path is relevant unless object identity by name refutes it: its
+          // size store's field and the holder's are both closed (no OPEN
+          // reason) and share no object. A GEP's struct is a declared type
+          // (C casts it away), so the table's struct steps decide nothing;
+          // the chain is printed, not used (Fable 2026-10-18).
           StructType *T = nullptr;
           std::string premiseOpen;
-          std::vector<std::string> pathLines;
+          std::vector<std::string> pathLines, refutedLines;
+          size_t relevant = 0;
           for (const Path &P : paths) {
             std::string chain;
             for (auto it = P.chain.rbegin(); it != P.chain.rend(); ++it) chain += (chain.empty() ? "" : ".") + *it;
@@ -3617,6 +3905,18 @@ void CallGraphPass::checkContainerClosure() {
             std::string line = "table " + (chain.empty() ? std::string("(no struct step)") : chain) + ", entsize " +
                                (K ? std::to_string(K->getZExtValue()) : P.size ? valueText(P.size) : std::string("?")) +
                                ", newfunc " + (NF ? NF->getName().str() : P.nf ? valueText(P.nf) : std::string("?"));
+            std::set<Obj> po;
+            std::set<std::string> pOpen;
+            if (P.off != INT64_MIN) objsOf(P.tbl, P.off, 0, po, pOpen);
+            else pOpen.insert("a runtime step on the table's chain");
+            bool meets = false;
+            for (const Obj &x : po) meets |= hObjs.count(x) > 0;
+            line += ", entsize field at " + objText(po, pOpen);
+            if (hOpen.empty() && pOpen.empty() && !meets) {
+              refutedLines.push_back(line);
+              continue;
+            }
+            relevant++;
             std::string why = P.open;
             StructType *PT = nullptr;
             if (why.empty() && !K) why = "entsize not constant";
@@ -3655,6 +3955,7 @@ void CallGraphPass::checkContainerClosure() {
           }
           if (!premiseOpen.empty()) T = nullptr;
           if (paths.empty()) premiseOpen = "no store of " + entsizeKey;
+          else if (!relevant) premiseOpen = "every init path refuted by object identity";
           auto locs = [&](const std::vector<const MemTransferInst *> &v) {
             std::string s;
             for (const MemTransferInst *MT : v) s += (s.empty() ? "" : ", ") + snapLoc(MT);
@@ -3664,6 +3965,18 @@ void CallGraphPass::checkContainerClosure() {
           outs.insert(outs.end(), eOuts.begin(), eOuts.end());
           std::string prem;
           for (const std::string &p : pathLines) prem += " [" + p + "]";
+          prem += "; holder's entsize field at " + objText(hObjs, hOpen) + "; " + std::to_string(refutedLines.size()) +
+                  " paths refuted by object identity (closed, no object of the holder's)";
+          for (const std::string &p : refutedLines) prem += " [REFUTED " + p + "]";
+          prem += "; " + std::to_string(nullWrites.size()) + " null writes over a walked field (constant-zero memsets, no object)";
+          for (const std::string &w : nullWrites) prem += " [" + w + "]";
+          {
+            std::string ks;
+            for (const std::string &k : keysCovered) ks += (ks.empty() ? "" : ", ") + k;
+            CG_LOG("Container: snapshot holder " << hname << ": object identity walked " << keysWalked.size()
+                   << " field keys, " << keysCovered.size() << " open by writes named otherwise" << (ks.empty() ? "" : ": ")
+                   << ks << "\n");
+          }
           o1AssumeLines.push_back("  snapshot holder of " + outer + " (the table its handle saves read): H " + hname +
                                   "; handle save " + locs(hSaves) + "; element saves " + locs(eSaves) +
                                   " (each " + entsizeKey + " bytes); restores " + locs(outs) + "; premise " +

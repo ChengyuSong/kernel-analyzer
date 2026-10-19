@@ -1127,6 +1127,26 @@ Obligations left open:
          no object (zero bytes are null, null names no object; the
          solver's own null). Writes by unnamed address remain the
          standing naming assumption.
+       - A union read keyed per key (keysOf: the keys the solver files it
+         under, the census's or a tag pair's) reads only the stores of K
+         its keys admit (Fable 2026-10-19, (ii)): a store keyed by a key
+         the read does not list, nor the slot's catch-all, is another
+         member's and excluded; an unkeyed store is admitted. The solver
+         files the read under the same keys (applyUnionKeys), so the walk
+         admits every store the solver's read can see. A field's result is
+         kept per (K, the read's keys).
+       - A certified pool's carve (Carves.cc) is an allocation: a carve
+         reached directly is its own object; a defined callee every return
+         of which is a noalias extern call, a certified carve, such a
+         callee's call or null is an allocator wrapper at its call site,
+         with the pools it carves from. A refused pool's carve is OPEN,
+         named with the pool's verdict. A recursive return adds what the
+         other returns give.
+       - A cycle through a field read with the same keys adds nothing (the
+         least fixpoint: what the other writes give) and is counted apart:
+         a field every write of which is cut so is empty, not OPEN as a
+         field with no pointer store (nm-O0's bfd_preserve: the saved
+         tdata is a load of the slot being walked).
        Anything else is OPEN with its reason (an address-taken formal, an
        indirect call's result, a runtime step, a load of no named field,
        the depth limit). A path is refuted when both ends are closed and
@@ -1194,6 +1214,20 @@ Obligations left open:
        name: restore <loc>: guard <loc> (mask 0x<m> of <W>), n named stores
        each keeping or clearing it (k keep; clears: <locs>), objects
        zero-allocated at <sites>"); the mask is printed, not a macro name.
+       (r1, Fable 2026-10-19 (ii)) An object in which W lies only past
+       every size the object can have is no object of W (an access past
+       an object is in another): dropped before (1) and listed
+       with the size's source: a global's or a local's type; malloc's
+       argument, calloc's product; for a zeroing wrapper, the argument its
+       memset 0 covers (the size it clears is the size it asked for); an
+       argument is a constant, or a formal of a function never address-taken
+       resolved to its direct callers' constant actuals (the largest). An
+       object of no such size is kept. (r2) A zeroing wrapper whose
+       allocation is a certified pool's carve is a zeroing allocation at
+       its call site, resting on the pool's certificate: one ASSUMPTION
+       per such object ("pool <P>: <wrapper> at <site> is an object of its
+       own, zeroed by its callee (a carve of the certified pool; Carves.cc:
+       <verdict>)"). A refused pool's carve declines (1) as OPEN.
        A guard that fails a check prints "guard ...: not unreachable by
        name (<the first check that fails>)". The candidate is still
        reported; the graph is not pruned (dead-branch pruning is a separate

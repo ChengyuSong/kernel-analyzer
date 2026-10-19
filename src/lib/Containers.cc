@@ -3781,10 +3781,25 @@ void CallGraphPass::checkContainerClosure() {
             }
           };
           std::set<std::string> fieldOnPath;
+          // For the guard word's log: cycle cuts, fields whose every store
+          // was cut, union reads walked by key, stores they excluded.
+          size_t cycleCuts = 0;
+          std::set<std::string> cutEmpty, keysUnionWalked, unionExcluded;
           std::function<void(const Value *, int64_t, int, std::set<Obj> &, std::set<std::string> &)> objsOf;
           std::map<std::string, const Value *> objSite; // an object's name -> its allocation (call, alloca, global)
+          // An object made by a certified pool's carves (Carves.cc): its pools.
+          std::map<std::string, std::set<std::string>> objPools;
+          // An allocator wrapper: every return a noalias extern call, a
+          // certified pool's carve (its own allocation site, Carves.cc), a
+          // wrapper's call, or null; a recursive call adds what the other
+          // returns give (the least fixpoint). A refused pool's carve is no
+          // allocation.
+          std::set<std::string> wrapPools;
+          std::set<const Function *> wrapStack;
           std::function<bool(const Function *, int)> isWrapper = [&](const Function *F, int d) {
             if (d > 3 || F->isDeclaration()) return false;
+            if (!wrapStack.insert(F).second) return true;
+            struct Pop { std::set<const Function *> &s; const Function *f; ~Pop() { s.erase(f); } } pop{wrapStack, F};
             bool any = false;
             for (const Instruction &I : instructions(*F))
               if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue()) {
@@ -3804,10 +3819,18 @@ void CallGraphPass::checkContainerClosure() {
                     for (const Value *In : PN->incoming_values()) vs.push_back(In);
                     continue;
                   }
+                  if (const auto *CI = dyn_cast<Instruction>(V)) {
+                    if (auto pit = poolCarvePool.find(CI); pit != poolCarvePool.end()) {
+                      wrapPools.insert(pit->second);
+                      any = true;
+                      continue;
+                    }
+                    if (poolRefusedCarvePool.count(CI)) return false;
+                  }
                   const auto *CB = dyn_cast<CallBase>(V);
                   const Function *G = CB ? CB->getCalledFunction() : nullptr;
                   if (!G || !(G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, d + 1))) return false;
-                  any = true;
+                  any |= !wrapStack.count(G);
                 }
               }
             return any;
@@ -3816,6 +3839,17 @@ void CallGraphPass::checkContainerClosure() {
             V = castsOnly(V);
             if (d > 16) return (void)open.insert("too deep at " + valueText(V));
             if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return;
+            if (const auto *CI = dyn_cast<Instruction>(V)) {
+              if (auto pit = poolCarvePool.find(CI); pit != poolCarvePool.end()) {
+                const std::string on = "a carve of pool " + pit->second + " at " + snapLoc(CI);
+                objSite.emplace(on, CI);
+                objPools[on].insert(pit->second);
+                return (void)out.insert({on, off});
+              }
+              if (auto rit = poolRefusedCarvePool.find(CI); rit != poolRefusedCarvePool.end())
+                return (void)open.insert("a carve of pool " + rit->second + " at " + snapLoc(CI) + " (" +
+                                         poolVerdicts[rit->second] + ")");
+            }
             if (const auto *G = dyn_cast<GEPOperator>(V)) {
               APInt Off(64, 0);
               if (!G->accumulateConstantOffset(DL0, Off)) return (void)open.insert("a runtime step " + valueText(V));
@@ -3840,23 +3874,49 @@ void CallGraphPass::checkContainerClosure() {
               }
               const std::string K = fieldKey(L, L->getPointerOperand());
               if (K.empty()) return (void)open.insert("a load of no named field " + valueText(V));
+              // A union read keyed by the census or a tag pair (keysOf: what
+              // the solver files it under) reads only the stores its keys
+              // admit: a store keyed by another key is another member's; an
+              // unkeyed store (the slot's catch-all) is admitted.
+              const std::vector<std::string> *rk = keysOf(L);
+              std::string MK = K, rkCatch;
+              if (rk) {
+                for (const std::string &k : *rk) MK += "\t" + k;
+                rkCatch = rk->front().substr(0, rk->front().rfind('#')) + "#?";
+              }
+              auto admits = [&](const StoreInst *St) {
+                const std::vector<std::string> *sk = rk ? keysOf(St) : nullptr;
+                if (!sk) return true;
+                for (const std::string &k : *sk)
+                  if (k == rkCatch || std::find(rk->begin(), rk->end(), k) != rk->end()) return true;
+                return false;
+              };
               std::pair<std::set<Obj>, std::set<std::string>> r;
-              if (auto it = fieldObjs.find(K); it != fieldObjs.end()) r = it->second;
+              bool cutOnly = cutEmpty.count(MK) > 0;
+              if (auto it = fieldObjs.find(MK); it != fieldObjs.end()) r = it->second;
               else {
                 // A cycle through K adds nothing (the least fixpoint: what
-                // the other stores give). A result computed inside another
-                // key's cycle may miss what comes through that key, so only
-                // a result with no key under way is kept.
-                if (!fieldOnPath.insert(K).second) return;
+                // the other stores give), and is counted apart: a field whose
+                // every store is cut so is empty, not open for want of a
+                // store. A result computed inside another key's cycle may
+                // miss what comes through that key, so only a result with no
+                // key under way is kept.
+                if (!fieldOnPath.insert(MK).second) return (void)cycleCuts++;
+                const size_t cuts0 = cycleCuts;
                 for (auto &[M, _] : Ctx->Modules)
                   for (const Function &F : *M)
                     for (const Instruction &I : instructions(F))
                       if (const auto *St = dyn_cast<StoreInst>(&I); St && fieldKey(St, St->getPointerOperand()) == K) {
+                        if (!admits(St)) {
+                          unionExcluded.insert(snapLoc(St));
+                          continue;
+                        }
                         if (St->getValueOperand()->getType()->isPointerTy())
                           objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
                         else
                           r.second.insert("a store of a non-pointer value into " + K + " " + snapLoc(St));
                       }
+                if (rk) keysUnionWalked.insert(K);
                 keysWalked.insert(K);
                 if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
                     !c.empty())
@@ -3867,12 +3927,16 @@ void CallGraphPass::checkContainerClosure() {
                 if (!initUnnamed.empty())
                   r.second.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
                                   initUnnamed.front() + ")");
-                fieldOnPath.erase(K);
-                if (fieldOnPath.empty()) fieldObjs[K] = r;
+                fieldOnPath.erase(MK);
+                cutOnly = r.first.empty() && r.second.empty() && cycleCuts > cuts0;
+                if (fieldOnPath.empty()) {
+                  fieldObjs[MK] = r;
+                  if (cutOnly) cutEmpty.insert(MK);
+                }
               }
               for (const Obj &x : r.first) out.insert({x.first, x.second + off});
               for (const std::string &x : r.second) open.insert(x);
-              if (r.first.empty() && r.second.empty()) open.insert("no pointer store of " + K);
+              if (r.first.empty() && r.second.empty() && !cutOnly) open.insert("no pointer store of " + K);
               return;
             }
             if (const auto *Ar = dyn_cast<Argument>(V)) {
@@ -3888,9 +3952,11 @@ void CallGraphPass::checkContainerClosure() {
             if (const auto *CB = dyn_cast<CallBase>(V)) {
               const Function *G = CB->getCalledFunction();
               if (!G) return (void)open.insert("an indirect call's result " + snapLoc(CB));
+              wrapPools.clear();
               if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0)) {
                 const std::string on = G->getName().str() + " at " + snapLoc(CB);
                 objSite.emplace(on, CB);
+                if (!wrapPools.empty()) objPools[on].insert(wrapPools.begin(), wrapPools.end());
                 return (void)out.insert({on, off});
               }
               if (G->isDeclaration()) return (void)open.insert("an extern call's result " + snapLoc(CB));
@@ -4162,21 +4228,93 @@ void CallGraphPass::checkContainerClosure() {
                 }
                 return true;
               };
+              // r1: an object's size, from its allocation: a global's or a
+              // local's type; malloc's argument, calloc's product; for a
+              // zeroing wrapper, the argument its memset 0 covers (the size
+              // the program clears is the size it asked for). An argument
+              // is a constant, or a formal of a function never address-taken
+              // resolved to its direct callers' constant actuals (the
+              // largest). An access past every size it can have is in no such
+              // object: dropped, listed with the size's source.
+              std::function<bool(const Value *, std::set<uint64_t> &, bool &, int)> constsOf =
+                  [&](const Value *V, std::set<uint64_t> &cs, bool &viaFormal, int d) -> bool {
+                if (d > 4) return false;
+                V = resolve(V);
+                if (const auto *C = dyn_cast<ConstantInt>(V)) return cs.insert(C->getZExtValue()), true;
+                const auto *A = dyn_cast<Argument>(V);
+                if (!A || A->getParent()->hasAddressTaken()) return false;
+                viaFormal = true;
+                bool any = false;
+                for (const User *U : A->getParent()->users()) {
+                  const auto *CB = dyn_cast<CallBase>(U);
+                  if (!CB || CB->getCalledOperand() != A->getParent() || A->getArgNo() >= CB->arg_size() ||
+                      !constsOf(CB->getArgOperand(A->getArgNo()), cs, viaFormal, d + 1))
+                    return false;
+                  any = true;
+                }
+                return any;
+              };
+              auto objSize = [&](const std::string &on, std::string &src) -> int64_t {
+                auto it = objSite.find(on);
+                if (it == objSite.end()) return -1;
+                if (const auto *GV = dyn_cast<GlobalVariable>(it->second)) {
+                  src = "its global's type";
+                  return (int64_t)GV->getParent()->getDataLayout().getTypeAllocSize(GV->getValueType());
+                }
+                if (const auto *AI = dyn_cast<AllocaInst>(it->second))
+                  if (auto sz = AI->getAllocationSize(AI->getModule()->getDataLayout()); sz && !sz->isScalable()) {
+                    src = "its local's type";
+                    return (int64_t)sz->getFixedValue();
+                  }
+                const auto *CB = dyn_cast<CallBase>(it->second);
+                const Function *G = CB ? CB->getCalledFunction() : nullptr;
+                if (!G) return -1;
+                std::vector<const Value *> args;
+                if (G->getName() == "malloc" || G->getName() == "calloc") {
+                  for (const Value *A : CB->args()) args.push_back(A);
+                } else if (!G->isDeclaration() && zeroing(G)) {
+                  for (const Instruction &I : instructions(*G))
+                    if (const auto *MS = dyn_cast<MemSetInst>(&I))
+                      if (const auto *A = dyn_cast<Argument>(resolve(MS->getLength())); A && A->getParent() == G)
+                        if (const auto *V0 = dyn_cast<ConstantInt>(MS->getValue()); V0 && V0->isZero()) {
+                          args = {CB->getArgOperand(A->getArgNo())};
+                          break;
+                        }
+                }
+                if (args.empty()) return -1;
+                uint64_t size = 1;
+                bool viaFormal = false;
+                std::string vals;
+                for (const Value *A : args) {
+                  std::set<uint64_t> cs;
+                  if (!constsOf(A, cs, viaFormal, 0) || cs.empty()) return -1;
+                  size *= *cs.rbegin();
+                  for (uint64_t c : cs) vals += (vals.empty() ? "" : ", ") + std::to_string(c);
+                }
+                src = std::string(viaFormal ? "its direct callers' actuals (" : "a constant argument (") + vals + ")";
+                return (int64_t)size;
+              };
               std::set<Obj> wo;
-              std::set<std::string> wop, zeroAt;
+              std::set<std::string> wop, zeroAt, dropped;
               if (decline.empty()) {
                 objsOf(W->getPointerOperand(), 0, 0, wo, wop);
                 if (!wop.empty())
                   decline = "the word's objects are open: " + std::to_string(wop.size()) + " reasons, e.g. " + *wop.begin();
                 for (const Obj &o : wo) {
-                  if (!decline.empty()) break;
+                  std::string src;
+                  if (const int64_t sz = objSize(o.first, src); sz >= 0 && o.second + wlen > sz) {
+                    dropped.insert(o.first + " +" + std::to_string(o.second) + ": past its size " + std::to_string(sz) +
+                                   " (" + src + ")");
+                    continue;
+                  }
+                  if (!decline.empty()) continue; // every object is still checked for its size
                   auto it = objSite.find(o.first);
                   const auto *CB = it == objSite.end() ? nullptr : dyn_cast<CallBase>(it->second);
                   const Function *G = CB ? CB->getCalledFunction() : nullptr;
                   if (G && (G->getName() == "calloc" || (!G->isDeclaration() && zeroing(G)))) zeroAt.insert(o.first);
                   else decline = "an object not zero-allocated: " + o.first + " +" + std::to_string(o.second);
                 }
-                if (decline.empty() && wo.empty()) decline = "the word has no object";
+                if (decline.empty() && zeroAt.empty()) decline = "the word has no object";
               }
               // (2) Every store of W keeps the mask from the same word or
               // clears it; no write names W otherwise; no initializer is
@@ -4230,7 +4368,23 @@ void CallGraphPass::checkContainerClosure() {
               for (const std::string &g : guardLocs) gl += (gl.empty() ? "" : ", ") + g;
               const std::string gtext = "guard " + gl + " (mask 0x" + std::string(mhex) + " of " +
                                         (K.empty() ? std::string("an unnamed word") : K) + ")";
+              CG_LOG("Container: snapshot holder " << hname << ": guard word " << K << "; the holder's object walks: "
+                     << keysUnionWalked.size() << " union fields read by key (" << unionExcluded.size()
+                     << " stores another member's, excluded), " << cycleCuts << " cycle cuts (adding nothing; "
+                     << cutEmpty.size() << " fields every store of which is cut), " << dropped.size()
+                     << " objects past their size, dropped\n");
+              for (const std::string &x : dropped)
+                o1AssumeLines.push_back("    snapshot holder " + hname + ": dropped from the word's objects: " + x);
               if (decline.empty()) {
+                // A certified pool's carve through a zeroing wrapper is an
+                // object of its own at the wrapper's call site, resting on
+                // the pool's certificate.
+                for (const std::string &z : zeroAt)
+                  if (auto pit = objPools.find(z); pit != objPools.end())
+                    for (const std::string &P : pit->second)
+                      o1AssumeLines.push_back("    ASSUMPTION pool " + P + ": " + z +
+                                              " is an object of its own, zeroed by its callee (a carve of the certified "
+                                              "pool; Carves.cc: " + poolVerdicts[P] + ")");
                 std::string zs, cs;
                 for (const std::string &z : zeroAt) zs += (zs.empty() ? "" : ", ") + z;
                 for (const std::string &c : clears) cs += (cs.empty() ? "" : ", ") + c;

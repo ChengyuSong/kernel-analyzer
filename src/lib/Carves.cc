@@ -92,6 +92,7 @@ struct HV {
 } // namespace
 
 void CallGraphPass::checkPoolCarves() {
+  poolVerdicts.clear();
   // A field access's key: the debug-info struct of the base pointer (the
   // IR merges isomorphic structs: objalloc and demangler_engine are one IR
   // type), else the IR struct; "" if the access names no struct field.
@@ -838,12 +839,15 @@ void CallGraphPass::checkPoolCarves() {
     for (auto &[_, f] : rewinds) rw += pool(f) == p;
     auto rit = refused.find(p);
     if (isRefused(p)) nRefused++;
-    CG_LOG("PoolCarve: " << (isRefused(p) ? "REFUSED" : "POOL") << " fields" << fl
-           << "; carves" << (fm.empty() ? " none" : fm) << "; rewinds " << rw
-           << (rit == refused.end() ? "" : "; refused by " + std::to_string(rit->second.size()) + " uses")
-           << "\n");
-    if (auto sit = structural.find(p); sit != structural.end())
+    const std::string verdict = std::string(isRefused(p) ? "REFUSED" : "POOL") + " fields" + fl + "; carves" +
+                                (fm.empty() ? " none" : fm) + "; rewinds " + std::to_string(rw) +
+                                (rit == refused.end() ? "" : "; refused by " + std::to_string(rit->second.size()) + " uses");
+    poolVerdicts[p] = verdict;
+    CG_LOG("PoolCarve: " << verdict << "\n");
+    if (auto sit = structural.find(p); sit != structural.end()) {
+      poolVerdicts[p] += "; refused: " + sit->second;
       CG_LOG("PoolCarve:   refused: " << sit->second << "\n");
+    }
     if (!isRefused(p)) {
       std::set<const Instruction *> hs;
       for (auto &[I, f] : bookkeeping)
@@ -869,6 +873,7 @@ void CallGraphPass::checkPoolCarves() {
   // The effect: certified pools' carves and bookkeeping.
   poolCarves.clear();
   poolCarvePool.clear();
+  poolRefusedCarvePool.clear();
   poolCarveSizes.clear();
   poolBookkeeping.clear();
   poolHandleFields.clear();
@@ -884,7 +889,8 @@ void CallGraphPass::checkPoolCarves() {
         poolCarves[c.I] = c.form;
         poolCarvePool[c.I] = pool(c.field);
         poolCarveSizes[c.I] = c.size;
-      }
+      } else
+        poolRefusedCarvePool[c.I] = pool(c.field);
     for (auto &[I, f] : bookkeeping)
       if (!isRefused(pool(f))) poolBookkeeping.insert(I);
     // Every load and store of a certified pool's handle field, by pool:

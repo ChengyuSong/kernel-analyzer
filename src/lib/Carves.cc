@@ -868,6 +868,7 @@ void CallGraphPass::checkPoolCarves() {
                << "\n");
   // The effect: certified pools' carves and bookkeeping.
   poolCarves.clear();
+  poolCarvePool.clear();
   poolCarveSizes.clear();
   poolBookkeeping.clear();
   poolHandleFields.clear();
@@ -881,6 +882,7 @@ void CallGraphPass::checkPoolCarves() {
     for (const Carve &c : carves)
       if (!isRefused(pool(c.field))) {
         poolCarves[c.I] = c.form;
+        poolCarvePool[c.I] = pool(c.field);
         poolCarveSizes[c.I] = c.size;
       }
     for (auto &[I, f] : bookkeeping)

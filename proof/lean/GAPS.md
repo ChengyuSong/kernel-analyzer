@@ -981,6 +981,56 @@ Obligations left open:
      or a global: no element; anything else: open-unproven, listed per copy
      as an ASSUMPTION ("a block copy into no element") and counted in the
      verdict's assumptions. Every failing copy is listed with a count.
+   - O1's block copies by name (Fable 2026-10-17/18): "anything else"
+     above is decided by the destination's origins by name, a walk over
+     the IR alone (no solver fact, so the verdict is the same at any stop
+     at which it is read). Steps: casts, GEPs, freeze and pointer-vector
+     shuffles, inserts and extracts to their operands; a -O0 slot to the
+     values stored into it; a named field S+off to every value stored
+     there program-wide (a vector store over it included, lane by lane),
+     every global initializer's value there, the values stored through
+     its address where that address escapes into a callee (`*ptr = p`),
+     and, for a whole-struct copy over it, the same field of the source (a
+     source of the same struct, or a local of it with its own direct
+     stores); a formal to the actuals of its direct calls; a call with a
+     body to its returns; a bodiless call through its summary's
+     ALIAS(ret<-argN); an indirect call through the closed code field to an
+     element, any other indirect call to the returns of the functions its
+     callee holds by the same walk; a load through a pointer, when the
+     pointer's names are all named fields, locals and globals, to the
+     values stored there or through them. Leaves: an allocation site, a
+     local, a global; a certified pool's carve (a chunk); an element: a
+     constructor's allocation or carve, a constructor's or a row's result,
+     a load of a handle, link or closed cursor field.
+     - Verdict per copy: an element among the origins: checked as a
+       named destination is; none and no unknown: no element, no
+       assumption; any unknown: open-unproven, an ASSUMPTION. Every
+       copy's class and origins are rows of the rule report; the log
+       groups the open ones by root (the field, formal, call or
+       instruction the walk could not pass) with counts.
+     - The element premise: elements are exactly the constructors'
+       allocations. The block's own checks establish it (O3: every
+       insert's ELEM argument and replace/rename's ELEM(arg2) must be a
+       constructor's element going only into the owner's storage); where
+       one of them is open the block fails, and this classification adds
+       nothing to it.
+     - The pool premise, once per pool: a carve outside the constructors
+       is a chunk apart from every element. It rests on the pool's carve
+       certificate (Carves.cc), which is over the pool's handle fields and
+       every access to them program-wide, so it covers every caller; a
+       carve row's call counts as a chunk only when a certified carve of
+       the pool is in it or in a function it calls directly, else the
+       walk stops there (unknown).
+     - Unknown by design: a formal of an address-taken function (its
+       indirect callers are not enumerated by name, and solved targets
+       would make the verdict depend on the stop); a formal with no
+       caller (an entry); an inttoptr; a bodiless call with no summary
+       or a summary that does not return an argument; a field written by
+       a block copy from another name or whose address escapes into
+       anything but stores through it; any other instruction. Declared
+       types are not consulted (C casts them away). Writes through a
+       pointer no name reaches are not enumerated, as in every O1 field
+       closure: the same discipline.
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

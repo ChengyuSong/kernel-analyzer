@@ -616,6 +616,7 @@ protected:
   // targets (Containers.cc).
   void checkContainerPremises(bool stopped);
   std::unordered_map<const llvm::Instruction *, std::string> poolCarves;
+  std::unordered_map<const llvm::Instruction *, std::string> poolCarvePool; // a certified carve -> its pool
   // A carve's size (plan 3.53 row 1), by form: before-bump the bump n,
   // counter the decrement, minus-len the length, all n * scale bytes;
   // header the chunk call's size minus off. Neither n nor chunk: the

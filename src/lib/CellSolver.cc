@@ -9275,8 +9275,19 @@ bool CallGraphPass::runCellResolution() {
     for (size_t ci = 0; ci < anyRangeByCopy.size(); ci++)
       if (anyRangeByCopy[ci]) byCopy.emplace_back(anyRangeByCopy[ci], ci);
     std::sort(byCopy.begin(), byCopy.end(), std::greater<>());
+    // An -O3 copy inlined into one function from several call sites shares
+    // its file:line: the line also names where it was inlined, and the copy.
+    auto inlinedAt = [](const Instruction *I) {
+      std::string s;
+      if (!I) return s;
+      if (const DILocation *L = I->getDebugLoc())
+        for (const DILocation *IA = L->getInlinedAt(); IA; IA = IA->getInlinedAt())
+          s += " inlined at " + IA->getFilename().str() + ":" + std::to_string(IA->getLine());
+      return s;
+    };
     for (auto &[n, ci] : byCopy)
-      CG_LOG("Cells:   any-offset range copy " << instLoc(copies[ci].at) << ": " << n << " edges\n");
+      CG_LOG("Cells:   any-offset range copy " << instLoc(copies[ci].at) << inlinedAt(copies[ci].at)
+                                                << " (byte copy " << ci << "): " << n << " edges\n");
   }
   watchdog.phase("report: defects");
   reportDefects();

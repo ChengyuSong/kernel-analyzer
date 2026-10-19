@@ -1872,6 +1872,25 @@ void CallGraphPass::computeTaggedFields() {
   using EffKey = std::tuple<std::string, int64_t, const Function *, unsigned>;
   std::map<EffKey, Eff> effs;
   std::map<EffKey, std::set<EffKey>> effReaders;
+  // A key's IR order: the function's module and place in it, the argument,
+  // the field. Readers are re-queued in this order, so the worklist's
+  // history (and every tuple a round makes) does not follow addresses.
+  std::map<const Function *, std::pair<unsigned, unsigned>> fnPos;
+  {
+    unsigned mi = 0;
+    for (auto &[M, _] : Ctx->Modules) {
+      unsigned fi = 0;
+      for (const Function &F : *M) fnPos[&F] = {mi, fi++};
+      mi++;
+    }
+  }
+  auto effIROrder = [&](const EffKey &a, const EffKey &b) {
+    return std::make_tuple(fnPos[std::get<2>(a)], std::get<3>(a), std::get<0>(a), std::get<1>(a)) <
+           std::make_tuple(fnPos[std::get<2>(b)], std::get<3>(b), std::get<0>(b), std::get<1>(b));
+  };
+  // before()'s loops cut at 8 rounds (open, listed): the one step of the
+  // effect computation not shown monotone.
+  std::vector<std::string> loopLimitAt;
   std::vector<EffKey> effStack;
   std::deque<EffKey> effWl;
   std::set<EffKey> effInWl;
@@ -1908,7 +1927,12 @@ void CallGraphPass::computeTaggedFields() {
         const bool again = cyc.count(I) && (E.maps.size() != memo[I].second.maps.size() || E.open != memo[I].second.open);
         memo[I].second = E;
         if (!again) break;
-        if (round == 7) { E.open = true; E.why = "a loop that does not settle"; }
+        if (round == 7) {
+          E.open = true;
+          E.why = "a loop that does not settle at " + locOf(I);
+          loopLimitAt.push_back(Dc.X.first + "+" + std::to_string(Dc.X.second) + " in " + Fn->getName().str() + " at " +
+                                locOf(I));
+        }
       }
       memo[I] = {1, E};
       return E;
@@ -2043,7 +2067,9 @@ void CallGraphPass::computeTaggedFields() {
         if (R.maps.size() > 256 && !R.open) { R.open = true; R.why = "too many maps in " + QH->getName().str(); }
         if (sameEff(R, effs[q])) continue;
         effs[q] = std::move(R);
-        for (const EffKey &r : effReaders[q])
+        std::vector<EffKey> rs(effReaders[q].begin(), effReaders[q].end());
+        std::sort(rs.begin(), rs.end(), effIROrder);
+        for (const EffKey &r : rs)
           if (effInWl.insert(r).second) effWl.push_back(r);
       }
       effSolving = false;
@@ -4236,6 +4262,7 @@ void CallGraphPass::computeTaggedFields() {
         if (same) break;
         if (round == 11) {
           ceUnsettled++;
+          loopLimitAt.push_back("content effects of " + Df.first + "+" + std::to_string(Df.second) + " (12 rounds)");
           for (auto &[key, ce] : ceMemo) ce.open = true; // did not settle: unknown
         }
       }
@@ -5561,7 +5588,16 @@ void CallGraphPass::computeTaggedFields() {
     CG_LOG("TaggedFields: walks " << walksBack << " backward, " << walksFwd << " forward, " << walkBlocks
            << " blocks (most in " << (top ? top->getName().str() : std::string("-")) << ": "
            << (top ? walkBlocksBy[top] : 0) << "); " << sumComputes << " summary computations, "
-           << walkBounds << " walks at the bound; " << taggedAssumes.size() << " alias assumptions\n");
+           << walkBounds << " walks at the bound; " << loopLimitAt.size()
+           << " loops that do not settle (a walk's loop in 8 rounds, a pair's content effects in 12; open, listed)\n");
+    for (const std::string &l : loopLimitAt) CG_LOG("TaggedFields:   loop that does not settle: " << l << "\n");
+    // The alias assumptions reported are the ones an answer rests on: the
+    // tagged pairs' (the solver checks them). A tuple a walk made whose
+    // result no pair took is no assumption of anything.
+    std::set<uint32_t> held;
+    for (const auto &v : taggedPairAssumes) held.insert(v.begin(), v.end());
+    CG_LOG("TaggedFields: alias assumptions the tagged pairs rest on (the solver checks them): " << held.size() << "; "
+           << taggedAssumes.size() - held.size() << " tuples made by walks no answer rests on, not reported\n");
   }
   CG_LOG("TaggedFields: " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
          << " s; " << pairsKeyed << " pairs keyed (" << writersTagged << " tagged writers, "

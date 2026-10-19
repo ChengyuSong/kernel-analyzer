@@ -1262,7 +1262,12 @@ Obligations left open:
      monotone: its fixpoint is the least solution of the constraints plus
      the flips the facts force. Facts that would have failed an assumption
      still arrive, because nothing removes a fact. That is why a checked
-     assumption is sound.
+     assumption is sound. The assumptions reported are the ones an answer
+     rests on, the tagged pairs' (the solver checks them); a tuple a walk
+     made whose result no pair took (a walk for a read left unkeyed, a
+     stability check that dropped its test, a round of an effect before
+     it settled) is no assumption of anything and is counted apart, not
+     reported (Fable 2026-10-19).
    - Tag sets past 4096 values widen to their known bits (agreeing bits
      known, the rest free); tests over a widened set evaluate as may-hold.
    - Composition. A call between a test and a retag is a function from D
@@ -1279,6 +1284,29 @@ Obligations left open:
      Recursion is solved as rounds from the empty effect. This rests on
      the premise, printed with the report's assumptions, that a call
      returns only through its returns: longjmp is not modeled.
+     - The fixpoint is unique (Fable 2026-10-19). An effect is (maps, a
+       set of terms kept sorted and unique; open, a flag; assumes, a
+       set). The transfer of a callee's effect into a caller's composes
+       each of the caller's prefix terms with each of the callee's terms
+       (composeT) and pushes the results, ORs open, and unions the
+       assumes: joins only, nothing removed, so it is monotone in the
+       callee effects; the cut at more than 256 maps opens the effect
+       only as maps grow, monotone too. Terms are bounded masks and
+       filter indices, so the lattice is finite. The worklist starts
+       every effect at the bottom (no maps, closed, no assumes) and
+       re-queues a key's readers on every change until none changes, so
+       it reaches the least fixpoint whatever the order. Readers are
+       re-queued in IR order (module, function, argument, field), so the
+       history, and every tuple a round makes, is the same in every run.
+     - The one step not shown monotone: a loop inside one walk (before())
+       is iterated to its own fixpoint and cut at 8 rounds, the effect
+       then open ("a loop that does not settle at <loc>"). How many rounds
+       a loop needs is not shown monotone in its inputs, so a cut could
+       open an effect that a larger input would close. So is a pair's
+       content effects, iterated as rounds and cut at 12 (every effect
+       then open). Every cut is counted and listed in the TaggedFields
+       line (the field, and the function and loop for a walk's). nm-O0 and
+       nm-O3: 0 cuts.
    - Reads are stable against F writes only. A D write between a test and
      a read leaves the content the test spoke for in place.
    - Inside a region dominated by a pointer-equality edge (the true

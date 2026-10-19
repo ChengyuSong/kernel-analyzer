@@ -642,7 +642,12 @@ void CallGraphPass::confirmFreshWrappers() {
           }
           return true;
         };
-        // R1: trace returns to fresh sources.
+        // R1: trace returns to fresh sources. A formal returned unchanged
+        // (bfd_hash_newfunc's `if (entry == NULL) entry = alloc (...);
+        // return entry;`, Fable 2026-10-17) is the realloc shape when a fresh
+        // source returns too: FRESH ALIAS(ret=argK) BODY, per call site.
+        SmallVector<int, 2> retFormals;
+        bool sawFresh = false;
         SmallPtrSet<const Value *, 16> onRetPath;
         SmallVector<const Value *, 8> work;
         bool ok = true;
@@ -656,7 +661,11 @@ void CallGraphPass::confirmFreshWrappers() {
           if (!onRetPath.insert(v).second) continue;
           if (isa<ConstantPointerNull>(v) || isa<UndefValue>(v)) continue;
           // A carve of a certified pool is a fresh object (rule 3).
-          if (const auto *CI = dyn_cast<Instruction>(v); CI && poolCarves.count(CI)) continue;
+          if (const auto *CI = dyn_cast<Instruction>(v); CI && poolCarves.count(CI)) { sawFresh = true; continue; }
+          if (const auto *A = dyn_cast<Argument>(v); A && A->getParent() == &F && A->getType()->isPointerTy()) {
+            retFormals.push_back((int)A->getArgNo());
+            continue;
+          }
           if (const auto *CE = dyn_cast<ConstantExpr>(v)) {
             if (CE->getOpcode() == Instruction::IntToPtr) continue; // ERR_PTR
             ok = false;
@@ -664,6 +673,7 @@ void CallGraphPass::confirmFreshWrappers() {
           }
           if (const auto *CB = dyn_cast<CallBase>(v)) {
             if (!calleeFresh(CB)) { ok = false; r1bad = v; }
+            else sawFresh = true;
             continue;
           }
           if (const auto *PN = dyn_cast<PHINode>(v)) {
@@ -707,6 +717,18 @@ void CallGraphPass::confirmFreshWrappers() {
                    << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
           }
           continue;
+        }
+        if (!retFormals.empty()) {
+          std::sort(retFormals.begin(), retFormals.end());
+          retFormals.erase(std::unique(retFormals.begin(), retFormals.end()), retFormals.end());
+          if (!sawFresh || retFormals.size() > 1) {
+            g_freshRejRet++;
+            static std::set<const Function *> loggedFormal; // once per function, not per round
+            if (!quiet && loggedFormal.insert(&F).second)
+              CG_LOG("ConfirmFresh R1: " << F.getName() << " returns "
+                     << (sawFresh ? "several of its formals" : "a formal and no fresh object") << "\n");
+            continue;
+          }
         }
         // R2/B: classify every use of the fresh object graph. Allowed:
         // the return path, null checks, and — the STEP-B extension —
@@ -1127,6 +1149,24 @@ void CallGraphPass::confirmFreshWrappers() {
               continue;
             }
             if (isa<ConstantPointerNull>(tv)) continue;
+            // A fresh object of the wrapper's own (a pool carve, a call of a
+            // pure-fresh allocator: FRESH, no other atom) in the actual is
+            // covered by the wrapper's FRESH (Fable 2026-10-17: the derived
+            // newfuncs pass their own block to bfd_hash_newfunc).
+            if (const auto *TI = dyn_cast<Instruction>(tv); TI && poolCarves.count(TI)) continue;
+            if (const auto *TB = dyn_cast<CallBase>(tv))
+              if (const Function *TF = TB->getCalledFunction()) {
+                const Function *TD = TF->isDeclaration() ? getFuncDef(const_cast<Function *>(TF)) : TF;
+                if (!assumed.empty() && assumed.count(TD)) continue;
+                if (Ctx->AllocFuncs.count(TF) || (TD && Ctx->AllocFuncs.count(TD))) {
+                  auto sit = Ctx->FuncSummaries.find(TF);
+                  if (sit == Ctx->FuncSummaries.end() && TD) sit = Ctx->FuncSummaries.find(TD);
+                  bool pure = true;
+                  if (sit != Ctx->FuncSummaries.end())
+                    for (const auto &A : sit->second->atoms) pure &= A.kind == GlobalContext::SummaryAtom::Fresh;
+                  if (pure) continue;
+                }
+              }
             if (const auto *TL = dyn_cast<LoadInst>(tv)) {
               if (const AllocaInst *AI = isSpillSlot(TL->getPointerOperand())) {
                 SmallVector<const StoreInst *, 4> defs;
@@ -1162,6 +1202,7 @@ void CallGraphPass::confirmFreshWrappers() {
           g_escapeBuckets["alias-src-untraced"]++;
           continue;
         }
+        aliasArgs.append(retFormals.begin(), retFormals.end()); // a formal returned unchanged
         std::sort(aliasArgs.begin(), aliasArgs.end());
         aliasArgs.erase(std::unique(aliasArgs.begin(), aliasArgs.end()), aliasArgs.end());
         std::sort(cpyArgs.begin(), cpyArgs.end());
@@ -1265,8 +1306,8 @@ void CallGraphPass::confirmFreshWrappers() {
         if (phase == Lfp || phase == GfpPromote) g_poolCertExempt.insert(certExempt.begin(), certExempt.end());
         if (phase == GfpPromote) gfpPromoted++;
         changed = true;
-        if (g_freshPromoted <= 20)
-          CG_LOG("ConfirmFresh: promoted " << F.getName()
+        if (g_freshPromoted <= 20 || !retFormals.empty())
+          CG_LOG("ConfirmFresh: promoted " << F.getName() << (retFormals.empty() ? "" : " [fresh-or-arg]")
                  << (initArgs.empty() ? "" : " [alloc-init]")
                  << (cpyArgs.empty() ? "" : " [copy]")
                  << (aliasArgs.empty() ? "" : " [realloc]") << " (round "

@@ -1517,6 +1517,17 @@ that reaches the argument they name:
   i of the wrapper that reaches argK. Null may also reach it (the
   realloc(NULL, n) path). Anything else reaching it rejects the wrapper
   (`alias-src-untraced`).
+- A formal returned unchanged (bfd_hash_newfunc's `if (entry == NULL)
+  entry = alloc (...); return entry;`, Fable 2026-10-17) is the realloc
+  shape inferred: when a fresh source also returns, the wrapper is FRESH
+  ALIAS(ret=arg_i) BODY (logged "[fresh-or-arg]"); a formal and no fresh
+  source, or several formals, reject it (R1). Null reaching the formal is
+  the fresh path, as for realloc(NULL, n).
+- What reaches an inherited ALIAS's argument may also be a fresh object of
+  the wrapper's own: a certified pool's carve, or a call of an allocator
+  whose summary is FRESH alone (or one assumed in the same round). The
+  wrapper's own FRESH names it per call site already, so it is covered
+  (the derived newfuncs pass their own block to bfd_hash_newfunc).
 A callee with any other atom is not a fresh source.
 
 Statement:

@@ -1147,6 +1147,23 @@ Obligations left open:
          a field every write of which is cut so is empty, not OPEN as a
          field with no pointer store (nm-O0's bfd_preserve: the saved
          tdata is a load of the slot being walked).
+       - (A, Fable 2026-10-19) An element of a handle field's array is a
+         slot by name: an address that is one pointer-sized step (any
+         index, runtime or constant) from the array a handle field H of a
+         checked container holds, where the array is a load of H or a
+         value stored into H (through -O0 slots, at most 4 hops: a new
+         table before `table->table = newtable`). A load of such an element
+         gives the objects of every store into an element of H's array; a
+         memset 0 into it is null; a block copy into it, or the array
+         passed to a call, is OPEN with its site. Null, a global or a
+         formal is no array by name. A load through an -O0 slot holding
+         addresses reads each address the slot is stored (a field or an
+         element; null adds nothing). Writes into the array by another
+         address: the standing naming assumption.
+       - (A) An indirect call whose callee is a load of a closed code field
+         (O4's: every store into it a function constant, no aggregate copy
+         of the owner) returns what its targets return, each as a direct
+         callee (an allocator wrapper is its call site).
        Anything else is OPEN with its reason (an address-taken formal, an
        indirect call's result, a runtime step, a load of no named field,
        the depth limit). A path is refuted when both ends are closed and
@@ -1155,8 +1172,12 @@ Obligations left open:
        (the standing naming assumption) and distinct sites or offsets are
        distinct addresses. A path with any OPEN reason stays relevant,
        printed with every reason. The premise is proven only when every
-       relevant path gives one T; with every path refuted it stays open
-       (no init of the holder's table by name). Refuted paths are listed
+       relevant path gives one T: each path is tagged with its own
+       element type, and the premise reports the set of them over the
+       relevant paths, OPEN-UNPROVEN when it has more than one member (not
+       the first path's T against the others: the verdict does not depend
+       on the order paths are found, Fable 2026-10-19); with every path
+       refuted it stays open (no init of the holder's table by name). Refuted paths are listed
        with their objects. The chain is
        printed as the IR has it: casts are stripped, every GEP step is
        kept, including all-zero-index ones. On every path the length is
@@ -1228,6 +1249,28 @@ Obligations left open:
        per such object ("pool <P>: <wrapper> at <site> is an object of its
        own, zeroed by its callee (a carve of the certified pool; Carves.cc:
        <verdict>)"). A refused pool's carve declines (1) as OPEN.
+       (s1, Fable 2026-10-19) A certified pool's carve is as long as its
+       length (CarveSize: the form's n times its scale; a header carve
+       malloc(HDR + n) at HDR is n), and that length counts only when it is
+       a constant or the size formal rounded up to the pool's alignment A,
+       (x + A-1) & -A with the constants summing to A-1 (-O0 keeps them as
+       two steps) and A from the mask, through -O0 slots and integer
+       casts. A slot whose round-up reads the slot itself is the least
+       fixpoint of S = values + R(S), R the round-up (monotone,
+       idempotent, R(x) >= x): R(max values). An object at a wrapper's call
+       site has every return of the wrapper sized this way (a certified
+       carve, a malloc, another such wrapper with its formals bound to the
+       actuals), the formals bound to the call's actuals (constants, or a
+       formal of a non-address-taken function resolved to its direct
+       callers' actuals, the largest); a carve reached directly binds its
+       function's formals to their direct callers' actuals. The object is
+       dropped as r1 drops one ("its size argument (n, rounded to A)
+       through <wrapper>; pool <P> (Carves.cc: <verdict>)", or "(max of k
+       direct actuals: n, rounded to A)"). Any other length (a product, a
+       refused pool's carve, an address-taken formal) leaves the object
+       unsized: kept and listed ("kept, its size unknown: <obj>: <the
+       failed condition>; wrapper <W>; pool <P> (...)"). Every reason the
+       word's objects are open is logged, not only the first.
        A guard that fails a check prints "guard ...: not unreachable by
        name (<the first check that fails>)". The candidate is still
        reported; the graph is not pruned (dead-branch pruning is a separate
@@ -1241,7 +1284,13 @@ Obligations left open:
        listed, the refutation holds; cover: a block copy over the field,
        OPEN, nothing refuted); t_cells_container_snapshot_{unreachable,
        setbit,memcpy,malloc}.c (unreachable by name, and its three
-       declines).
+       declines); t_cells_container_snapshot_{s1,s1control}.c (a sized
+       non-zeroing carve through bfd_alloc dropped; a length twice the
+       formal kept, unsized, with the failed condition);
+       t_cells_container_snapshot_{handlearray,handlearraynull,
+       handlearraygrow}.c (a hash entry reached through table[_index] and
+       the newfunc call; null stored into the handle and passed to a call
+       is no array; a new table through two -O0 slots).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

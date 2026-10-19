@@ -3835,6 +3835,200 @@ void CallGraphPass::checkContainerClosure() {
               }
             return any;
           };
+          // (A) The closed code field an indirect call loads its callee from
+          // (O4's: every store into it a function constant), or "".
+          std::set<std::string> codeCallsWalked;
+          auto codeFieldOf = [&](const CallBase *CB) -> std::string {
+            const auto *Lc = dyn_cast<LoadInst>(castsOnly(CB->getCalledOperand()));
+            const std::string CK = Lc ? fieldKey(Lc, Lc->getPointerOperand()) : "";
+            auto tit = codeTargets.find(CK);
+            if (CK.empty() || !code.count(CK) || codeOpen.count(CK) || tit == codeTargets.end() || tit->second.empty())
+              return "";
+            return CK;
+          };
+          // (A) A handle field's array (Fable 2026-10-19): the handle field K
+          // whose array V is, by name: a load of K, or a value stored into K
+          // (a new table before `table->table = newtable`), through -O0
+          // slots; "" otherwise.
+          std::function<std::string(const Value *, int)> arrayOf = [&](const Value *V, int d) -> std::string {
+            V = castsOnly(V);
+            if (d > 4 || !isa<Instruction>(V)) return ""; // null, a global, a formal: no array by name
+            if (const auto *L = dyn_cast<LoadInst>(V)) {
+              const Value *SL = castsOnly(L->getPointerOperand());
+              if (transientSlot(SL)) {
+                std::string k;
+                for (const User *U : SL->users())
+                  if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == SL) {
+                    if (isa<ConstantPointerNull>(castsOnly(St->getValueOperand()))) continue;
+                    const std::string a = arrayOf(St->getValueOperand(), d + 1);
+                    if (a.empty() || (!k.empty() && a != k)) return "";
+                    k = a;
+                  }
+                return k;
+              }
+              if (const std::string K = fieldKey(L, L->getPointerOperand()); handle.count(K)) return K;
+            }
+            // A value stored into K, through -O0 slots (a statement
+            // expression's temporary, then the local).
+            std::vector<std::pair<const Value *, int>> w{{V, 0}};
+            while (!w.empty()) {
+              auto [X, h] = w.back();
+              w.pop_back();
+              for (const User *U : X->users()) {
+                if (isa<CastInst>(U)) {
+                  w.push_back({U, h});
+                  continue;
+                }
+                const auto *St = dyn_cast<StoreInst>(U);
+                if (!St || St->getValueOperand() != X) continue;
+                const Value *SP = castsOnly(St->getPointerOperand());
+                if (const std::string K = fieldKey(St, St->getPointerOperand()); handle.count(K)) return K;
+                if (transientSlot(SP) && h < 4)
+                  for (const User *LU : SP->users())
+                    if (isa<LoadInst>(LU)) w.push_back({LU, h + 1});
+              }
+            }
+            return "";
+          };
+          // The slots an address can be: a named field "K", or an element of
+          // handle field K's array "K[]" (one index over pointers, any value),
+          // through -O0 slots holding addresses; false when one is neither.
+          std::function<bool(const Instruction *, const Value *, std::set<std::string> &, int)> slotsOf =
+              [&](const Instruction *I, const Value *P, std::set<std::string> &ks, int d) -> bool {
+            P = castsOnly(P);
+            if (d > 4) return false;
+            if (const auto *L = dyn_cast<LoadInst>(P); L && transientSlot(castsOnly(L->getPointerOperand()))) {
+              bool any = false;
+              for (const User *U : castsOnly(L->getPointerOperand())->users())
+                if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == castsOnly(L->getPointerOperand())) {
+                  if (isa<ConstantPointerNull>(castsOnly(St->getValueOperand()))) continue;
+                  if (!slotsOf(I, St->getValueOperand(), ks, d + 1)) return false;
+                  any = true;
+                }
+              return any;
+            }
+            if (const auto *G = dyn_cast<GEPOperator>(P); G && G->getNumIndices() == 1 && G->getSourceElementType()->isPointerTy())
+              if (const std::string K = arrayOf(G->getPointerOperand(), 0); !K.empty()) return ks.insert(K + "[]"), true;
+            if (const std::string K = arrayOf(P, 0); !K.empty()) return ks.insert(K + "[]"), true;
+            if (isa<AllocaInst>(P)) return false;
+            if (const std::string K = fieldKey(I, P); !K.empty()) return ks.insert(K), true;
+            return false;
+          };
+          // Handle field K's array: what flows out of an element is what
+          // flows in, by name: every store into an element, a memset 0 null;
+          // a block copy into it, or the array passing where elements are
+          // written unseen (a call, a store elsewhere), is OPEN.
+          std::map<std::string, std::pair<std::set<Obj>, std::set<std::string>>> elemObjs;
+          std::set<std::string> elemWalked;
+          std::function<void(const std::string &, int64_t, int, std::set<Obj> &, std::set<std::string> &)> walkElems =
+              [&](const std::string &K, int64_t off, int d, std::set<Obj> &out, std::set<std::string> &open) {
+            const std::string MK = K + "[]";
+            std::pair<std::set<Obj>, std::set<std::string>> r;
+            if (auto it = elemObjs.find(MK); it != elemObjs.end()) r = it->second;
+            else {
+              if (!fieldOnPath.insert(MK).second) return (void)cycleCuts++;
+              elemWalked.insert(K);
+              for (auto &[M, _] : Ctx->Modules)
+                for (const Function &F : *M)
+                  for (const Instruction &I : instructions(F)) {
+                    std::set<std::string> ks;
+                    if (const auto *St = dyn_cast<StoreInst>(&I)) {
+                      if (transientSlot(castsOnly(St->getPointerOperand())) || !slotsOf(St, St->getPointerOperand(), ks, 0) ||
+                          !ks.count(MK))
+                        continue;
+                      if (St->getValueOperand()->getType()->isPointerTy())
+                        objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
+                      else
+                        r.second.insert("a store of a non-pointer value into " + K + "'s array " + snapLoc(St));
+                    } else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+                      if (!slotsOf(MI, MI->getRawDest(), ks, 0) || !ks.count(MK)) continue;
+                      const auto *MS = dyn_cast<MemSetInst>(MI);
+                      if (MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero()) continue;
+                      r.second.insert("a block copy into " + K + "'s array " + snapLoc(MI));
+                    } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+                      for (const Value *A : CB->args())
+                        if (A->getType()->isPointerTy() && !arrayOf(A, 0).empty() && arrayOf(A, 0) == K)
+                          r.second.insert(K + "'s array passed to " +
+                                          (CB->getCalledFunction() ? CB->getCalledFunction()->getName().str()
+                                                                   : std::string("an indirect call")) +
+                                          " " + snapLoc(CB));
+                    }
+                  }
+              fieldOnPath.erase(MK);
+              if (fieldOnPath.empty()) elemObjs[MK] = r;
+            }
+            for (const Obj &x : r.first) out.insert({x.first, x.second + off});
+            for (const std::string &x : r.second) open.insert(x);
+          };
+          // A field read: the objects of every store of K (and K's covering
+          // writes and initializers), kept per (K, the read's keys).
+          std::function<void(const std::string &, const LoadInst *, int64_t, int, std::set<Obj> &, std::set<std::string> &)>
+              walkField = [&](const std::string &K, const LoadInst *L, int64_t off, int d, std::set<Obj> &out,
+                              std::set<std::string> &open) {
+            // A union read keyed by the census or a tag pair (keysOf: what
+            // the solver files it under) reads only the stores its keys
+            // admit: a store keyed by another key is another member's; an
+            // unkeyed store (the slot's catch-all) is admitted.
+            const std::vector<std::string> *rk = keysOf(L);
+            std::string MK = K, rkCatch;
+            if (rk) {
+              for (const std::string &k : *rk) MK += "\t" + k;
+              rkCatch = rk->front().substr(0, rk->front().rfind('#')) + "#?";
+            }
+            auto admits = [&](const StoreInst *St) {
+              const std::vector<std::string> *sk = rk ? keysOf(St) : nullptr;
+              if (!sk) return true;
+              for (const std::string &k : *sk)
+                if (k == rkCatch || std::find(rk->begin(), rk->end(), k) != rk->end()) return true;
+              return false;
+            };
+            std::pair<std::set<Obj>, std::set<std::string>> r;
+            bool cutOnly = cutEmpty.count(MK) > 0;
+            if (auto it = fieldObjs.find(MK); it != fieldObjs.end()) r = it->second;
+            else {
+              // A cycle through K adds nothing (the least fixpoint: what
+              // the other stores give), and is counted apart: a field whose
+              // every store is cut so is empty, not open for want of a
+              // store. A result computed inside another key's cycle may
+              // miss what comes through that key, so only a result with no
+              // key under way is kept.
+              if (!fieldOnPath.insert(MK).second) return (void)cycleCuts++;
+              const size_t cuts0 = cycleCuts;
+              for (auto &[M, _] : Ctx->Modules)
+                for (const Function &F : *M)
+                  for (const Instruction &I : instructions(F))
+                    if (const auto *St = dyn_cast<StoreInst>(&I); St && fieldKey(St, St->getPointerOperand()) == K) {
+                      if (!admits(St)) {
+                        unionExcluded.insert(snapLoc(St));
+                        continue;
+                      }
+                      if (St->getValueOperand()->getType()->isPointerTy())
+                        objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
+                      else
+                        r.second.insert("a store of a non-pointer value into " + K + " " + snapLoc(St));
+                    }
+              if (rk) keysUnionWalked.insert(K);
+              keysWalked.insert(K);
+              if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
+                  !c.empty())
+                r.second.insert(c), keysCovered.insert(K);
+              buildInit();
+              if (auto iv = initVals.find(K); iv != initVals.end())
+                for (const Constant *C : iv->second) objsOf(C, 0, d + 1, r.first, r.second);
+              if (!initUnnamed.empty())
+                r.second.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
+                                initUnnamed.front() + ")");
+              fieldOnPath.erase(MK);
+              cutOnly = r.first.empty() && r.second.empty() && cycleCuts > cuts0;
+              if (fieldOnPath.empty()) {
+                fieldObjs[MK] = r;
+                if (cutOnly) cutEmpty.insert(MK);
+              }
+            }
+            for (const Obj &x : r.first) out.insert({x.first, x.second + off});
+            for (const std::string &x : r.second) open.insert(x);
+            if (r.first.empty() && r.second.empty() && !cutOnly) open.insert("no pointer store of " + K);
+          };
           objsOf = [&](const Value *V, int64_t off, int d, std::set<Obj> &out, std::set<std::string> &open) {
             V = castsOnly(V);
             if (d > 16) return (void)open.insert("too deep at " + valueText(V));
@@ -3873,70 +4067,16 @@ void CallGraphPass::checkContainerClosure() {
                 return;
               }
               const std::string K = fieldKey(L, L->getPointerOperand());
-              if (K.empty()) return (void)open.insert("a load of no named field " + valueText(V));
-              // A union read keyed by the census or a tag pair (keysOf: what
-              // the solver files it under) reads only the stores its keys
-              // admit: a store keyed by another key is another member's; an
-              // unkeyed store (the slot's catch-all) is admitted.
-              const std::vector<std::string> *rk = keysOf(L);
-              std::string MK = K, rkCatch;
-              if (rk) {
-                for (const std::string &k : *rk) MK += "\t" + k;
-                rkCatch = rk->front().substr(0, rk->front().rfind('#')) + "#?";
-              }
-              auto admits = [&](const StoreInst *St) {
-                const std::vector<std::string> *sk = rk ? keysOf(St) : nullptr;
-                if (!sk) return true;
-                for (const std::string &k : *sk)
-                  if (k == rkCatch || std::find(rk->begin(), rk->end(), k) != rk->end()) return true;
-                return false;
-              };
-              std::pair<std::set<Obj>, std::set<std::string>> r;
-              bool cutOnly = cutEmpty.count(MK) > 0;
-              if (auto it = fieldObjs.find(MK); it != fieldObjs.end()) r = it->second;
-              else {
-                // A cycle through K adds nothing (the least fixpoint: what
-                // the other stores give), and is counted apart: a field whose
-                // every store is cut so is empty, not open for want of a
-                // store. A result computed inside another key's cycle may
-                // miss what comes through that key, so only a result with no
-                // key under way is kept.
-                if (!fieldOnPath.insert(MK).second) return (void)cycleCuts++;
-                const size_t cuts0 = cycleCuts;
-                for (auto &[M, _] : Ctx->Modules)
-                  for (const Function &F : *M)
-                    for (const Instruction &I : instructions(F))
-                      if (const auto *St = dyn_cast<StoreInst>(&I); St && fieldKey(St, St->getPointerOperand()) == K) {
-                        if (!admits(St)) {
-                          unionExcluded.insert(snapLoc(St));
-                          continue;
-                        }
-                        if (St->getValueOperand()->getType()->isPointerTy())
-                          objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
-                        else
-                          r.second.insert("a store of a non-pointer value into " + K + " " + snapLoc(St));
-                      }
-                if (rk) keysUnionWalked.insert(K);
-                keysWalked.insert(K);
-                if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
-                    !c.empty())
-                  r.second.insert(c), keysCovered.insert(K);
-                buildInit();
-                if (auto iv = initVals.find(K); iv != initVals.end())
-                  for (const Constant *C : iv->second) objsOf(C, 0, d + 1, r.first, r.second);
-                if (!initUnnamed.empty())
-                  r.second.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
-                                  initUnnamed.front() + ")");
-                fieldOnPath.erase(MK);
-                cutOnly = r.first.empty() && r.second.empty() && cycleCuts > cuts0;
-                if (fieldOnPath.empty()) {
-                  fieldObjs[MK] = r;
-                  if (cutOnly) cutEmpty.insert(MK);
-                }
-              }
-              for (const Obj &x : r.first) out.insert({x.first, x.second + off});
-              for (const std::string &x : r.second) open.insert(x);
-              if (r.first.empty() && r.second.empty() && !cutOnly) open.insert("no pointer store of " + K);
+              if (!K.empty()) return walkField(K, L, off, d, out, open);
+              // A load through an address no field names: each address it
+              // can be (through -O0 slots) is a named field or an element of
+              // a handle field's array (an array index at run time).
+              std::set<std::string> ks;
+              if (!slotsOf(L, L->getPointerOperand(), ks, 0))
+                return (void)open.insert("a load of no named field " + valueText(V));
+              for (const std::string &k : ks)
+                if (k.back() == ']') walkElems(k.substr(0, k.size() - 2), off, d, out, open);
+                else walkField(k, L, off, d, out, open);
               return;
             }
             if (const auto *Ar = dyn_cast<Argument>(V)) {
@@ -3950,19 +4090,33 @@ void CallGraphPass::checkContainerClosure() {
               return;
             }
             if (const auto *CB = dyn_cast<CallBase>(V)) {
-              const Function *G = CB->getCalledFunction();
-              if (!G) return (void)open.insert("an indirect call's result " + snapLoc(CB));
-              wrapPools.clear();
-              if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0)) {
-                const std::string on = G->getName().str() + " at " + snapLoc(CB);
-                objSite.emplace(on, CB);
-                if (!wrapPools.empty()) objPools[on].insert(wrapPools.begin(), wrapPools.end());
-                return (void)out.insert({on, off});
+              // (A) An indirect call through a closed code field returns
+              // what its targets return.
+              std::vector<const Function *> Gs;
+              if (const Function *G = CB->getCalledFunction()) Gs.push_back(G);
+              else {
+                const std::string CK = codeFieldOf(CB);
+                if (CK.empty()) return (void)open.insert("an indirect call's result " + snapLoc(CB));
+                codeCallsWalked.insert(CK);
+                Gs.assign(codeTargets[CK].begin(), codeTargets[CK].end());
               }
-              if (G->isDeclaration()) return (void)open.insert("an extern call's result " + snapLoc(CB));
-              for (const Instruction &I : instructions(*G))
-                if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
-                  objsOf(R->getReturnValue(), off, d + 1, out, open);
+              for (const Function *G : Gs) {
+                wrapPools.clear();
+                if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0)) {
+                  const std::string on = G->getName().str() + " at " + snapLoc(CB);
+                  objSite.emplace(on, CB);
+                  if (!wrapPools.empty()) objPools[on].insert(wrapPools.begin(), wrapPools.end());
+                  out.insert({on, off});
+                  continue;
+                }
+                if (G->isDeclaration()) {
+                  open.insert("an extern call's result " + snapLoc(CB));
+                  continue;
+                }
+                for (const Instruction &I : instructions(*G))
+                  if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
+                    objsOf(R->getReturnValue(), off, d + 1, out, open);
+              }
               return;
             }
             if (isa<AllocaInst>(V) || isa<GlobalValue>(V)) {
@@ -3994,6 +4148,7 @@ void CallGraphPass::checkContainerClosure() {
           // the chain is printed, not used (Fable 2026-10-18).
           StructType *T = nullptr;
           std::string premiseOpen;
+          std::map<std::string, StructType *> elemTs; // element type by name, over the relevant paths
           std::vector<std::string> pathLines, refutedLines;
           size_t relevant = 0;
           for (const Path &P : paths) {
@@ -4047,12 +4202,18 @@ void CallGraphPass::checkContainerClosure() {
                 why = "entsize " + std::to_string(K->getZExtValue()) + " is not sizeof " + PT->getName().str() + " (" +
                       std::to_string(DL0.getTypeAllocSize(PT)) + ")";
             }
-            if (why.empty() && T && PT != T) why = "a second element struct " + PT->getName().str();
-            if (why.empty()) T = PT;
+            // The element type is the set over the relevant paths (Fable
+            // 2026-10-19), not the first path's: each path names its own.
+            if (why.empty()) elemTs[PT->getName().str()] = PT;
             else if (premiseOpen.empty()) premiseOpen = line + ": " + why;
-            pathLines.push_back(line + (why.empty() ? ": sizeof " + PT->getName().str() : ": OPEN " + why));
+            pathLines.push_back(line + (why.empty() ? ": T = " + PT->getName().str() + " (sizeof)" : ": OPEN " + why));
           }
-          if (!premiseOpen.empty()) T = nullptr;
+          if (premiseOpen.empty() && elemTs.size() > 1) {
+            std::string ts;
+            for (const auto &[n, _] : elemTs) ts += (ts.empty() ? "" : ", ") + n;
+            premiseOpen = "element types {" + ts + "} over the relevant paths, more than one";
+          }
+          T = premiseOpen.empty() && elemTs.size() == 1 ? elemTs.begin()->second : nullptr;
           if (paths.empty()) premiseOpen = "no store of " + entsizeKey;
           else if (!relevant) premiseOpen = "every init path refuted by object identity";
           auto locs = [&](const std::vector<const MemTransferInst *> &v) {
@@ -4254,6 +4415,208 @@ void CallGraphPass::checkContainerClosure() {
                 }
                 return any;
               };
+              // s1 (Fable 2026-10-19): a certified pool's carve is as long as
+              // its length, and its length must be the size formal rounded up
+              // to the pool's alignment A, (x + A-1) & -A (through -O0 slots
+              // and integer casts), or a constant; else the object is unsized
+              // and kept.
+              struct Ext {
+                bool ok = true, none = true;
+                uint64_t v = 0, A = 0;
+                size_t k = 0; // direct actuals read
+                // A round-up of a slot the walk is already reading (`len =
+                // (len + A-1) & -A`): applied to the slot's other values.
+                const Value *pendSlot = nullptr;
+                uint64_t pendA = 0;
+                std::string why;
+              };
+              auto join = [](Ext &a, const Ext &b) {
+                a.k += b.k;
+                if (b.pendSlot) a.pendSlot = b.pendSlot, a.pendA = std::max(a.pendA, b.pendA);
+                if (!a.ok) return;
+                if (!b.ok) return (void)(a.ok = false, a.why = b.why);
+                if (b.none) return;
+                a.v = a.none ? b.v : std::max(a.v, b.v);
+                a.none = false;
+                if (b.A) a.A = b.A;
+              };
+              auto fail = [](const std::string &w) {
+                Ext e;
+                e.ok = false, e.why = w;
+                return e;
+              };
+              using Bind = std::function<Ext(const Argument *)>;
+              auto intOf = [&](const Value *V) {
+                for (V = castsOnly(V); const auto *C = dyn_cast<CastInst>(V);) {
+                  if (!isa<ZExtInst>(C) && !isa<TruncInst>(C)) break;
+                  V = castsOnly(C->getOperand(0));
+                }
+                return V;
+              };
+              std::function<Ext(const Value *, const Bind &, std::set<const Value *> &, int)> lenOf =
+                  [&](const Value *V, const Bind &bind, std::set<const Value *> &onPath, int d) -> Ext {
+                if (d > 16) return fail("too deep at " + valueText(V));
+                V = intOf(V);
+                if (const auto *C = dyn_cast<ConstantInt>(V)) {
+                  Ext e;
+                  e.none = false, e.v = C->getZExtValue();
+                  return e;
+                }
+                if (const auto *A = dyn_cast<Argument>(V)) return bind(A);
+                if (const auto *L = dyn_cast<LoadInst>(V); L && transientSlot(castsOnly(L->getPointerOperand()))) {
+                  const Value *SL = castsOnly(L->getPointerOperand());
+                  if (!onPath.insert(SL).second) {
+                    Ext c; // a cycle: adds nothing unless a round-up is on it
+                    c.pendSlot = SL;
+                    return c;
+                  }
+                  Ext e;
+                  for (const User *U : SL->users())
+                    if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == SL)
+                      join(e, lenOf(St->getValueOperand(), bind, onPath, d + 1));
+                  onPath.erase(SL);
+                  if (e.pendSlot == SL) {
+                    // The least fixpoint of S = vals + R(S) with R the round-up
+                    // (monotone, idempotent, R(x) >= x): R(max vals).
+                    // A plain copy round the cycle (x = x) adds nothing.
+                    if (e.ok && !e.none && e.pendA) e.v = (e.v + e.pendA - 1) & ~(e.pendA - 1), e.A = e.pendA;
+                    e.pendSlot = nullptr, e.pendA = 0;
+                  }
+                  return e;
+                }
+                if (const auto *PN = dyn_cast<PHINode>(V)) {
+                  Ext e;
+                  for (const Value *In : PN->incoming_values()) join(e, lenOf(In, bind, onPath, d + 1));
+                  return e;
+                }
+                if (const auto *SI = dyn_cast<SelectInst>(V)) {
+                  Ext e = lenOf(SI->getTrueValue(), bind, onPath, d + 1);
+                  join(e, lenOf(SI->getFalseValue(), bind, onPath, d + 1));
+                  return e;
+                }
+                if (const auto *B = dyn_cast<BinaryOperator>(V); B && B->getOpcode() == Instruction::And)
+                  if (const auto *M = dyn_cast<ConstantInt>(B->getOperand(1)); M && M->isNegative() && (-M->getValue()).isPowerOf2()) {
+                    const uint64_t A = (-M->getValue()).getZExtValue();
+                    // x + c1 - c2 ... with the constants summing to A-1 (-O0
+                    // keeps `+ A - 1` as two steps).
+                    int64_t sum = 0;
+                    const Value *X = intOf(B->getOperand(0));
+                    for (int k = 0; k < 4; k++) {
+                      const auto *Ad = dyn_cast<BinaryOperator>(X);
+                      const auto *K = Ad ? dyn_cast<ConstantInt>(Ad->getOperand(1)) : nullptr;
+                      if (!K || (Ad->getOpcode() != Instruction::Add && Ad->getOpcode() != Instruction::Sub)) break;
+                      sum += Ad->getOpcode() == Instruction::Add ? K->getSExtValue() : -K->getSExtValue();
+                      X = intOf(Ad->getOperand(0));
+                    }
+                    if (sum == (int64_t)A - 1) {
+                      Ext e = lenOf(X, bind, onPath, d + 1);
+                      if (e.ok && !e.none) e.v = (e.v + A - 1) & ~(A - 1), e.A = A;
+                      if (e.pendSlot) e.pendA = std::max(e.pendA, A);
+                      return e;
+                    }
+                  }
+                return fail("length not a round-up of the size formal (" + valueText(V) + ")");
+              };
+              // A formal of a function no one takes the address of: its direct
+              // callers' actuals, the largest.
+              std::function<Ext(const Argument *, int)> directBind = [&](const Argument *A, int d) -> Ext {
+                const Function *F = A->getParent();
+                if (F->hasAddressTaken()) return fail("a formal of " + F->getName().str() + ", address-taken");
+                if (d > 6) return fail("too deep at a formal of " + F->getName().str());
+                Ext e;
+                for (const User *U : F->users()) {
+                  const auto *CB = dyn_cast<CallBase>(U);
+                  if (!CB || CB->getCalledOperand() != F || A->getArgNo() >= CB->arg_size()) return fail("an address use of " + F->getName().str());
+                  std::set<const Value *> op;
+                  Ext x = lenOf(CB->getArgOperand(A->getArgNo()), [&](const Argument *B) { return directBind(B, d + 1); }, op, 0);
+                  x.k = std::max<size_t>(x.k, 1);
+                  join(e, x);
+                }
+                if (e.ok && e.none) return fail("a formal of " + F->getName().str() + ", which has no caller");
+                return e;
+              };
+              std::map<std::string, std::string> s1Why;   // a kept object's unsized reason
+              std::set<const Function *> lenStack;
+              // The length of what F returns, its formals bound by bind; the
+              // pools its carves come from.
+              std::function<Ext(const Function *, const Bind &, std::set<std::string> &, int)> retLen =
+                  [&](const Function *F, const Bind &bind, std::set<std::string> &pools, int d) -> Ext {
+                if (d > 4) return fail("too deep in " + F->getName().str());
+                if (!lenStack.insert(F).second) return Ext{}; // a recursive return adds what the others give
+                Ext e;
+                std::vector<const Value *> vs;
+                std::set<const Value *> seen;
+                for (const Instruction &I : instructions(*F))
+                  if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue()) vs.push_back(R->getReturnValue());
+                while (!vs.empty() && e.ok) {
+                  const Value *V = castsOnly(vs.back());
+                  vs.pop_back();
+                  if (!seen.insert(V).second || isa<ConstantPointerNull>(V)) continue;
+                  if (const auto *L = dyn_cast<LoadInst>(V); L && transientSlot(castsOnly(L->getPointerOperand()))) {
+                    for (const User *U : castsOnly(L->getPointerOperand())->users())
+                      if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == castsOnly(L->getPointerOperand()))
+                        vs.push_back(St->getValueOperand());
+                    continue;
+                  }
+                  if (const auto *PN = dyn_cast<PHINode>(V)) {
+                    for (const Value *In : PN->incoming_values()) vs.push_back(In);
+                    continue;
+                  }
+                  if (const auto *SI = dyn_cast<SelectInst>(V)) {
+                    vs.push_back(SI->getTrueValue()), vs.push_back(SI->getFalseValue());
+                    continue;
+                  }
+                  const auto *CI = dyn_cast<Instruction>(V);
+                  if (auto pit = CI ? poolCarvePool.find(CI) : poolCarvePool.end(); pit != poolCarvePool.end()) {
+                    pools.insert(pit->second);
+                    auto zit = poolCarveSizes.find(CI);
+                    std::set<const Value *> op;
+                    if (zit != poolCarveSizes.end() && zit->second.n) {
+                      Ext x = lenOf(zit->second.n, bind, op, 0);
+                      if (x.ok && !x.none) x.v *= zit->second.scale;
+                      join(e, x);
+                    } else if (zit != poolCarveSizes.end() && zit->second.chunk) {
+                      // malloc(HDR + n) carved at HDR is n bytes.
+                      const CallBase *CC = zit->second.chunk;
+                      const auto *Ad = CC->arg_size() ? dyn_cast<BinaryOperator>(intOf(CC->getArgOperand(0))) : nullptr;
+                      Ext x = fail("a header carve's chunk size not HDR + n " + snapLoc(CC));
+                      if (Ad && Ad->getOpcode() == Instruction::Add)
+                        for (unsigned o = 0; o < 2; o++)
+                          if (const auto *K = dyn_cast<ConstantInt>(intOf(Ad->getOperand(o))); K && K->getSExtValue() == zit->second.off)
+                            x = lenOf(Ad->getOperand(1 - o), bind, op, 0);
+                      join(e, x);
+                    } else {
+                      join(e, fail("a carve of unknown size " + snapLoc(CI)));
+                    }
+                    continue;
+                  }
+                  if (CI && poolRefusedCarvePool.count(CI)) {
+                    join(e, fail("a refused pool's carve " + snapLoc(CI)));
+                    continue;
+                  }
+                  const auto *CB = dyn_cast<CallBase>(V);
+                  const Function *G = CB ? CB->getCalledFunction() : nullptr;
+                  if (!G) {
+                    join(e, fail("a return no rule sizes " + valueText(V)));
+                    continue;
+                  }
+                  std::set<const Value *> op;
+                  if (G->getName() == "malloc") {
+                    join(e, lenOf(CB->getArgOperand(0), bind, op, 0));
+                    continue;
+                  }
+                  if (G->isDeclaration()) {
+                    join(e, fail("an extern allocation " + G->getName().str()));
+                    continue;
+                  }
+                  join(e, retLen(G, [&, CB](const Argument *B) {
+                         std::set<const Value *> op2;
+                         return lenOf(CB->getArgOperand(B->getArgNo()), bind, op2, 0);
+                       }, pools, d + 1));
+                }
+                lenStack.erase(F);
+                return e;
+              };
               auto objSize = [&](const std::string &on, std::string &src) -> int64_t {
                 auto it = objSite.find(on);
                 if (it == objSite.end()) return -1;
@@ -4266,6 +4629,22 @@ void CallGraphPass::checkContainerClosure() {
                     src = "its local's type";
                     return (int64_t)sz->getFixedValue();
                   }
+                // s1: a carve reached directly, its length's formals bound to
+                // their direct callers' actuals.
+                if (const auto *CI = dyn_cast<Instruction>(it->second); CI && poolCarvePool.count(CI)) {
+                  auto zit = poolCarveSizes.find(CI);
+                  std::set<const Value *> op;
+                  Ext e = zit == poolCarveSizes.end() || !zit->second.n
+                              ? fail("a carve whose length is not its size operand " + snapLoc(CI))
+                              : lenOf(zit->second.n, [&](const Argument *B) { return directBind(B, 0); }, op, 0);
+                  const std::string P = poolCarvePool[CI];
+                  const std::string pv = P + " (Carves.cc: " + poolVerdicts[P] + ")";
+                  if (!e.ok || e.none) return s1Why[on] = (e.ok ? std::string("no length") : e.why) + "; pool " + pv, -1;
+                  e.v *= zit->second.scale;
+                  src = "its size argument (max of " + std::to_string(std::max<size_t>(e.k, 1)) + " direct actuals: " +
+                        std::to_string(e.v) + (e.A ? ", rounded to " + std::to_string(e.A) : std::string()) + "); pool " + pv;
+                  return (int64_t)e.v;
+                }
                 const auto *CB = dyn_cast<CallBase>(it->second);
                 const Function *G = CB ? CB->getCalledFunction() : nullptr;
                 if (!G) return -1;
@@ -4280,6 +4659,20 @@ void CallGraphPass::checkContainerClosure() {
                           args = {CB->getArgOperand(A->getArgNo())};
                           break;
                         }
+                }
+                if (args.empty() && objPools.count(on)) {
+                  // s1: a wrapper over certified pools at this call site.
+                  std::set<std::string> pools;
+                  Ext e = retLen(G, [&](const Argument *B) {
+                    std::set<const Value *> op;
+                    return lenOf(CB->getArgOperand(B->getArgNo()), [&](const Argument *C2) { return directBind(C2, 0); }, op, 0);
+                  }, pools, 0);
+                  std::string pv;
+                  for (const std::string &P : pools) pv += (pv.empty() ? "" : ", ") + P + " (Carves.cc: " + poolVerdicts[P] + ")";
+                  if (!e.ok || e.none) return s1Why[on] = (e.ok ? std::string("no length") : e.why) + "; wrapper " + G->getName().str() + "; pool " + pv, -1;
+                  src = "its size argument (" + std::to_string(e.v) + (e.A ? ", rounded to " + std::to_string(e.A) : std::string()) +
+                        ") through " + G->getName().str() + "; pool " + pv;
+                  return (int64_t)e.v;
                 }
                 if (args.empty()) return -1;
                 uint64_t size = 1;
@@ -4372,9 +4765,15 @@ void CallGraphPass::checkContainerClosure() {
                      << keysUnionWalked.size() << " union fields read by key (" << unionExcluded.size()
                      << " stores another member's, excluded), " << cycleCuts << " cycle cuts (adding nothing; "
                      << cutEmpty.size() << " fields every store of which is cut), " << dropped.size()
-                     << " objects past their size, dropped\n");
+                     << " objects past their size, dropped, " << s1Why.size() << " kept unsized; "
+                     << elemWalked.size() << " handle arrays read by element, " << codeCallsWalked.size()
+                     << " indirect calls through closed code fields followed\n");
               for (const std::string &x : dropped)
                 o1AssumeLines.push_back("    snapshot holder " + hname + ": dropped from the word's objects: " + x);
+              for (const auto &[o, why] : s1Why)
+                o1AssumeLines.push_back("    snapshot holder " + hname + ": kept, its size unknown: " + o + ": " + why);
+              // Every reason the word's objects are open, not only the first.
+              for (const std::string &x : wop) CG_LOG("Container: snapshot holder " << hname << ": open: " << x << "\n");
               if (decline.empty()) {
                 // A certified pool's carve through a zeroing wrapper is an
                 // object of its own at the wrapper's call site, resting on

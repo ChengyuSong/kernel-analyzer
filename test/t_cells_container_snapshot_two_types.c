@@ -4,7 +4,7 @@
 // element structs, so the entsize premise is open, the holder
 // is listed with its premise OPEN-UNPROVEN, the solver keeps the block one
 // object, and O1 fails on both restores as before.
-// LOG: snapshot holder of .*premise OPEN-UNPROVEN \(.*a second element struct
+// LOG: snapshot holder of .*premise OPEN-UNPROVEN \(element types \{struct.big_entry, struct.my_entry\} over the relevant paths, more than one\)
 // LOG: O1 FAIL\(open: an element copied from another value: 2 copies
 // NOLOG: snapshot element image
 #include <stdlib.h>

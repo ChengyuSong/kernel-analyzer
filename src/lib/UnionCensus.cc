@@ -2788,8 +2788,12 @@ void CallGraphPass::runUnionCensus() {
       }
       return false;
     };
-    for (const BasicBlock *B : fwd) {
-      if (!bwd.count(B)) continue;
+    // In function order: the writer met first, whose kind the path check's
+    // reason names, is the IR-order first (a set of block pointers would
+    // make it the address-order first, a different one per run).
+    for (const BasicBlock &BB : *SB->getParent()) {
+      const BasicBlock *B = &BB;
+      if (!fwd.count(B) || !bwd.count(B)) continue;
       const bool whole = onCycle(B);
       bool on = whole || B != SB;
       for (const Instruction &I : *B) {

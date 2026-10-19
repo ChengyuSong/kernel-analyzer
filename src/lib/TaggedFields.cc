@@ -2133,7 +2133,12 @@ void CallGraphPass::computeTaggedFields() {
       };
       for (const Instruction *I = dl->getNextNode(); I; I = I->getNextNode())
         if (bad(*I)) return false;
-      for (const BasicBlock *B : mid) {
+      // In function order (as below): the scan stops at the first write, and
+      // writes() makes the alias assumptions it passes, so which tuples
+      // exist must not follow block addresses.
+      for (const BasicBlock &MB : *BB->getParent()) {
+        const BasicBlock *B = &MB;
+        if (!mid.count(B)) continue;
         if (d2.blocks.count(B)) { unstableWhy = "the object's pointer merges between the test's load and its branch"; return false; }
         for (const Instruction &I : *B)
           if (bad(I)) return false;
@@ -2186,8 +2191,11 @@ void CallGraphPass::computeTaggedFields() {
         for (const BasicBlock *N : successors(B)) w2.push_back(N);
       }
     }
-    for (const BasicBlock *B : bwd)
-      if (fwd.count(B)) {
+    // In function order: the first write met ends the scan, and writes()
+    // makes the alias assumptions it passes on the way.
+    for (const BasicBlock &BBr : *at->getFunction()) {
+      const BasicBlock *B = &BBr;
+      if (bwd.count(B) && fwd.count(B)) {
         if (idDefs.blocks.count(B) && (B != at->getParent() || atCycle)) { unstableWhy = "the object's pointer merges between"; return false; }
         for (const Instruction &I : *B) {
           if (idDefs.insts.count(&I) && !(B == at->getParent() && at->comesBefore(&I) && !atCycle)) {
@@ -2197,6 +2205,7 @@ void CallGraphPass::computeTaggedFields() {
           if (writes(I)) { unstableWhy = "a write at " + locOf(&I); return false; }
         }
       }
+    }
     return true;
   };
   // A test of D on the access's object dominating it, stable up to it.

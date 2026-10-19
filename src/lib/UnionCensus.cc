@@ -424,6 +424,77 @@ void CallGraphPass::runUnionCensus() {
       return nullptr;
     return &it->second;
   };
+  // A member by the struct an access steps through (Fable 2026-10-18, a
+  // gap: the 4382 read of u.i.link was typed by its value use only). The
+  // leaves of a layout: (offset, kind), a pointer "p" or a scalar by its
+  // width; an array, a bitfield or a union inside it matches nothing.
+  std::function<bool(Type *, uint64_t, const DataLayout &, std::vector<std::pair<uint64_t, std::string>> &)> irLeaves =
+      [&](Type *T, uint64_t off, const DataLayout &DL, std::vector<std::pair<uint64_t, std::string>> &out) -> bool {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      if (ST->isOpaque()) return false;
+      const StructLayout *SL = DL.getStructLayout(ST);
+      for (unsigned i = 0; i < ST->getNumElements(); i++)
+        if (!irLeaves(ST->getElementType(i), off + SL->getElementOffset(i), DL, out)) return false;
+      return true;
+    }
+    if (T->isPointerTy()) return out.push_back({off, "p"}), true;
+    if (T->isIntegerTy() || T->isFloatingPointTy())
+      return out.push_back({off, (T->isIntegerTy() ? "i" : "f") + std::to_string(DL.getTypeSizeInBits(T))}), true;
+    return false;
+  };
+  std::function<bool(const DIType *, uint64_t, std::vector<std::pair<uint64_t, std::string>> &, int)> diLeaves =
+      [&](const DIType *T, uint64_t off, std::vector<std::pair<uint64_t, std::string>> &out, int d) -> bool {
+    T = stripDI(T);
+    if (!T || d > 8) return false;
+    if (const auto *C = dyn_cast<DICompositeType>(T)) {
+      if (C->getTag() == dwarf::DW_TAG_enumeration_type) return out.push_back({off, "i" + std::to_string(C->getSizeInBits())}), true;
+      if (C->getTag() != dwarf::DW_TAG_structure_type) return false; // a union or an array
+      for (const DINode *E : C->getElements())
+        if (const auto *M = dyn_cast<DIDerivedType>(E); M && M->getTag() == dwarf::DW_TAG_member) {
+          if (M->isBitField() || M->isStaticMember()) return false;
+          if (!diLeaves(M->getBaseType(), off + M->getOffsetInBits() / 8, out, d + 1)) return false;
+        }
+      return true;
+    }
+    if (const auto *D = dyn_cast<DIDerivedType>(T); D && D->getTag() == dwarf::DW_TAG_pointer_type)
+      return out.push_back({off, "p"}), true;
+    if (const auto *B = dyn_cast<DIBasicType>(T)) {
+      const bool fl = B->getEncoding() == dwarf::DW_ATE_float;
+      return out.push_back({off, (fl ? "f" : "i") + std::to_string(B->getSizeInBits())}), true;
+    }
+    return false;
+  };
+  // The member whose debug type has the layout of the struct the access's
+  // address steps through at the union's start, when exactly one does;
+  // matched by layout, never by the struct's IR name (isomorphic anonymous
+  // structs merge across translation units). "" when none or several.
+  auto memberByStep = [&](const Instruction *I, const UnionField &U) -> std::string {
+    const DataLayout &DL = I->getModule()->getDataLayout();
+    // Casts only: stripPointerCasts would also drop an all-zero-index GEP,
+    // the step into a member struct's first field.
+    auto casts = [](const Value *V) {
+      while (isa<BitCastOperator>(V) || isa<AddrSpaceCastOperator>(V)) V = cast<Operator>(V)->getOperand(0);
+      return V;
+    };
+    for (const Value *P = casts(getLoadStorePointerOperand(I)); const auto *G = dyn_cast<GEPOperator>(P);
+         P = casts(G->getPointerOperand())) {
+      auto *ST = dyn_cast<StructType>(G->getSourceElementType());
+      if (!ST || (ST->hasName() && ST->getName().starts_with("union."))) continue;
+      const Pos Q = position(G->getPointerOperand(), DL);
+      if (unionAt(Q) != &U || Q.off != U.off) continue;
+      std::vector<std::pair<uint64_t, std::string>> want;
+      if (!irLeaves(ST, 0, DL, want)) return "";
+      std::string hit;
+      for (size_t i = 0; i < U.members.size() && i < U.memberTypes.size(); i++) {
+        std::vector<std::pair<uint64_t, std::string>> got;
+        if (!diLeaves(U.memberTypes[i], 0, got, 0) || got != want) continue;
+        if (!hit.empty()) return ""; // several members of this layout
+        hit = U.members[i].first;
+      }
+      return hit;
+    }
+    return "";
+  };
   // The field of S containing an offset (its start), or none.
   auto fieldAt = [&](const std::string &S, uint64_t off) -> int64_t {
     auto fit = fieldsOf.find(S);
@@ -967,6 +1038,7 @@ void CallGraphPass::runUnionCensus() {
   // Loads of each (struct, field): where callback fields are read.
   std::map<std::pair<std::string, uint64_t>, std::vector<const LoadInst *>> loadsAt;
   size_t accesses = 0, membersByShape = 0;
+  size_t membersByStep = 0, stepConflicts = 0; // typed by the member struct stepped through; step and value disagree
   for (auto &[M, _] : Ctx->Modules) {
     const DataLayout &DL = M->getDataLayout();
     for (Function &F : *M)
@@ -1230,6 +1302,19 @@ void CallGraphPass::runUnionCensus() {
           s.member = memberOf(*U, rk, rel, &s.byLayout, &s.shared, &s.embedVia);
           if (rk != "?" && readKey(cast<LoadInst>(&I), false) == "?") r1Reads++; // typed through a no-op cast (R1)
           if (!s.embedVia.empty()) r2Pairs[s.embedVia].second++;
+        }
+        // The member struct the address steps through: the member when
+        // the value use names none; a value use naming another member makes
+        // the access ambiguous, with no precedence (Fable 2026-10-18).
+        if (const std::string sm = memberByStep(&I, *U); !sm.empty() && s.member != sm) {
+          if (s.member == "?") {
+            s.member = sm;
+            s.byLayout = true;
+            membersByStep++;
+          } else if (s.member != "ambiguous") {
+            s.member = "ambiguous";
+            stepConflicts++;
+          }
         }
         if (!s.shared && (s.member == "?" || s.member == "ambiguous")) {
           // Typed-pointer IR (upgraded): an access of the storage type is a
@@ -3609,7 +3694,9 @@ void CallGraphPass::runUnionCensus() {
   }
   if (!CFLCensusUnions) {
     errs() << "UnionKeys: " << membersByShape
-           << " accesses named by their address shape (storage-type GEP / no-op bitcast)\n";
+           << " accesses named by their address shape (storage-type GEP / no-op bitcast); " << membersByStep
+           << " by the member struct their address steps through (" << stepConflicts
+           << " made ambiguous: the value use names another member)\n";
     errs() << "UnionKeys: " << unionKeyNames.size() << " union accesses keyed ("
            << CFLUnionKeys << "); " << pointerlessReads
            << " reads carry no pointer (no key); facts usable beyond program-wide stability "

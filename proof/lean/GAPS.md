@@ -926,6 +926,25 @@ Obligations left open:
      excluded it: unsound (t_cells_union_void_value.c). Now it types no
      member (#?): only widens. The member declared void * keeps its own
      rule (above).
+   - A member by the struct its address steps through (item 0, Fable
+     2026-10-18, a gap). A union access whose address steps, at the
+     union's start, through a struct S is the member whose debug type has
+     S's layout, when exactly one member does. Layouts are compared leaf
+     by leaf: each pointer or scalar's offset and kind (pointer, integer
+     or float of its width), through nested structs. An array, a bitfield
+     or a union inside either layout matches nothing. S's IR name is
+     never used, since isomorphic anonymous structs merge across
+     translation units. It applies only when the access's own value use
+     names no member. A value use naming another member makes the access
+     ambiguous, with no precedence either way. Several members of S's
+     layout: none, as before. Before, the access was typed by its value
+     use alone, so a read of u.i.link that is only copied (elflink.c:4382,
+     5239) was "?". Its tag keys then admitted every member's writes,
+     because P3's member exclusion needs the read's member. Now it is
+     member i, and the other members' writes are excluded by name: a
+     per-read ASSUMPTION listing them (the P3 route). Precision comes only
+     through that listed exclusion. The typing itself is the program's
+     own access, as a member's field name is.
    - A one-field union copy ((C''), Fable 2026-10-17): a store whose
      value, stripped of no-op casts, is a load of the same union field of
      an object (same struct, union offset, offset in the union, type), the

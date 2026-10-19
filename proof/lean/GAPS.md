@@ -1031,6 +1031,88 @@ Obligations left open:
        types are not consulted (C casts them away). Writes through a
        pointer no name reaches are not enumerated, as in every O1 field
        closure: the same discipline.
+   - Snapshot holders ((3''), Fable 2026-10-17/18). A candidate is a
+     fresh block a block copy fills from the owner's handle array (a
+     load of a handle field). It is a holder when every use of it, by
+     name (casts, offset-0 steps, phis and selects, -O0 locals holding
+     only its values), is one of: a copy into its start from that handle
+     array (a handle save); a runtime byte step from its start, which
+     begins the element region, or a non-negative step (a zext or a
+     constant) within that region; a copy into the region from an
+     element of the same owner, of a length read from a named field,
+     one field for every element copy in and out (an element save); a
+     copy out of it; a null test; free. The
+     region's start offsets and every handle copy's length must be one
+     value by name: one SSA value, or reads of one -O0 local whose
+     stores are its entry-block zero initializer and one store that
+     dominates the allocation. So every read made while the block exists
+     sees that store, the element region begins exactly where the handle
+     copies end, and the two images never overlap. An element of the
+     owner by name: a read of a slot of its handle array (the same owner
+     shape as the handle save), or of a link or closed cursor field of
+     such an element, through casts, offset-0 steps, joins and -O0
+     locals. A local's reaching store is the nearest one before the read
+     in its block or up its chain of unique predecessors (its address is
+     never taken, so no other write reaches it), else every store to it.
+     A cycle (`p = p->next`) holds, the greatest fixpoint, as for cursors.
+     - Then the block holds only that owner's handle and element content.
+       A copy out of its start into the owner's handle array, and a copy
+       out of the element region into an element of the owner, are
+       moves within one owner: O1 counts them ("restores out of a
+       snapshot holder"), they are no failure.
+     - The block is two solver objects: the handle image (the
+       allocation's own object, a repeating pointer) and the element
+       image (one struct T, not repeating, at offset 0 of every
+       element-region pointer: the region's runtime steps are dropped by
+       name, the steps' field edges cut). The element saves and restores
+       are whole-struct copies of T (length sizeof T), key-preserving
+       cell to cell.
+     - The precision loss, stated: the element image is
+       field-insensitive across images. Every restore receives, field by
+       field, the union of every save of this owner, not the one image
+       the program restores into it. Sound and over-approximate. It is
+       exact only where the owner's elements are already one object to
+       the solver's view of its content.
+     - Premise (entsize): T is the type the owner's constructor allocates
+       (the row object's rule: the struct of the constructor's fresh
+       block's constant size its typed uses step through, else the
+       pointer local it declares; not a size lookup). Every store into
+       the length field, walked back through formals to the actuals of
+       direct calls with the table pointer and the code field's value
+       along, is a path. Every path is relevant: a table pointer's struct
+       steps are declared types, which C casts away (`elf_hash_table
+       (info)` is a cast of info->hash), so they cannot decide which
+       tables the owner can be. The premise is therefore proven only when
+       every init of the length field in the program gives one T. Object
+       identity by name, at both ends, is the next rule. The chain is
+       printed as the IR has it: casts are stripped, every GEP step is
+       kept, including all-zero-index ones. On every path the length is
+       a constant equal to sizeof(T(newfunc)),
+       with newfunc a function whose element struct is T, and all paths
+       give one T. A non-constant length, a non-function newfunc, an
+       address-taken or uncalled function on the way, several structs in
+       one constructor or across paths: OPEN-UNPROVEN, printed per path
+       (table steps, length, newfunc). The holder is then listed but not
+       used: no move, one object, the copies' lengths unknown.
+     - The rule report has one row per candidate: "snapshot holder of
+       <owner struct> (the table its handle saves read): H <alloc>;
+       handle save <locs>; element saves <locs>; restores <locs>; premise
+       PROVEN, element struct T: <paths>" or "OPEN-UNPROVEN (<first
+       open path>): <paths>", or "snapshot holder candidate <alloc>: no
+       holder (<the first use or check that fails>)".
+     - Statement: the handle image holds, slot by slot, every value the
+       owner's handle array held at any save, and the element image
+       every value an element of the owner held at any save. A restore
+       writes into the handle array, and into each element, a subset of
+       that. Every write into the block is a save from this owner, so a
+       restore moves only the owner's content within the owner: the
+       closure O1 checks holds through it.
+     - Unknown by design: a save whose source is no element of the owner
+       by name (an unkeyed cursor read: nm-O0's 4382, whose read of
+       u.i.link admits the unknown-tag def/undef stores); any other use
+       of the block; a length or offset that is not one value by name; a
+       use of an entry reclaimed after the save (objalloc_free_block;
+       undefined behavior, not modeled).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

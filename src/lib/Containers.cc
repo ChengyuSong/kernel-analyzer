@@ -69,6 +69,69 @@ void CallGraphPass::checkContainerClosure() {
     if (!namedSlot(I, Addr, I->getModule()->getDataLayout(), pointees, S, off) || !S || !S->hasName()) return "";
     return stripStructNameSuffix(S->getName()).str() + "+" + std::to_string(off);
   };
+  // A constructor's element type (the row object's rule, Fable 2026-10-14):
+  // the struct of the fresh block's constant size sz that its derived values
+  // step through, else the debug type of a local the constructor T declares
+  // as a pointer to a struct of that size; null when neither decides.
+  auto structOfSize = [&](const Instruction *I0, uint64_t sz, const Function *T) -> StructType * {
+    const DataLayout &EDL = Ctx->Modules.front().first->getDataLayout();
+    StructType *found = nullptr;
+    SmallVector<const Value *, 8> w{I0};
+    SmallPtrSet<const Value *, 16> seenV;
+    while (!w.empty() && !found) {
+      const Value *V = w.pop_back_val();
+      if (!seenV.insert(V).second) continue;
+      for (const User *U : V->users()) {
+        if (const auto *G = dyn_cast<GEPOperator>(U)) {
+          if (auto *ST = dyn_cast<StructType>(G->getSourceElementType());
+              ST && ST->isSized() && EDL.getTypeAllocSize(ST) == sz) {
+            found = ST;
+            break;
+          }
+          if (G->hasAllZeroIndices()) w.push_back(U);
+        } else if (isa<CastInst>(U) || isa<PHINode>(U) || isa<SelectInst>(U)) {
+          w.push_back(U);
+        } else if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V) {
+          if (transientSlot(S->getPointerOperand()->stripPointerCasts()))
+            for (const User *LU : S->getPointerOperand()->stripPointerCasts()->users())
+              if (isa<LoadInst>(LU)) w.push_back(LU);
+        }
+      }
+    }
+    // No typed step (-O3 steps by bytes): the debug type of a local
+    // variable the constructor declares as a pointer to a struct of that size
+    // (`struct elf_strtab_hash_entry *ret`, optimized out but declared),
+    // by its IR name; two different such structs decide nothing.
+    if (!found) {
+      std::set<StructType *> cands;
+      for (const Instruction &J : instructions(*T)) {
+        const auto *DV = dyn_cast<DbgVariableIntrinsic>(&J);
+        if (!DV || DV->getVariable()->getArg()) continue; // a local, not a parameter (`table`)
+        const DIType *DT = DV->getVariable()->getType();
+        bool viaPtr = false;
+        for (int k = 0; k < 8 && DT; k++) {
+          const auto *D = dyn_cast<DIDerivedType>(DT);
+          if (!D) break;
+          if (D->getTag() == dwarf::DW_TAG_pointer_type) {
+            if (viaPtr) { DT = nullptr; break; }
+            viaPtr = true;
+          } else if (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_const_type &&
+                     D->getTag() != dwarf::DW_TAG_volatile_type) {
+            DT = nullptr;
+            break;
+          }
+          DT = D->getBaseType();
+        }
+        const auto *CT = dyn_cast_or_null<DICompositeType>(DT);
+        if (!viaPtr || !CT || CT->getName().empty() || CT->getSizeInBits() != sz * 8) continue;
+        if (auto *ST = StructType::getTypeByName(T->getContext(), ("struct." + CT->getName()).str());
+            ST && ST->isSized() && EDL.getTypeAllocSize(ST) == sz)
+          cands.insert(ST);
+      }
+      if (cands.size() == 1) found = *cands.begin();
+    }
+    return found;
+  };
   auto isFresh = [&](const CallBase *CB) {
     const Function *C = CB ? CB->getCalledFunction() : nullptr;
     if (!C) return false;
@@ -513,6 +576,7 @@ void CallGraphPass::checkContainerClosure() {
   containerElemType.clear();
   containerOwnerCtors.clear();
   containerCtorType.clear();
+  snapshotHolders.clear();
   auto cline = [&](const std::string &l) {
     CG_LOG("Container: " << l << "\n");
     containerReport.push_back(l);
@@ -1306,6 +1370,8 @@ void CallGraphPass::checkContainerClosure() {
     // owner's handle field, in the body, of a value derived from the same
     // owner.
     size_t moves = 0;
+    std::map<const MemTransferInst *, std::string> snapRestores; // a snapshot holder's restores -> the holder
+    size_t snapMoves = 0;
     std::map<std::string, const StoreInst *> firstBad1;
     // A store, in the body, into the owner or one of its elements (or a
     // fresh element of the body), of a value derived from the same owner
@@ -3142,6 +3208,482 @@ void CallGraphPass::checkContainerClosure() {
           else if (ok) ok = false, firstBad1[K] = S;
         if (!ok) open1.insert(K);
       }
+      // Snapshot holders ((3''), Fable 2026-10-17/18): a fresh block whose
+      // every use, by name, is a save of the owner's handle array at its
+      // start, a save of the same owner's elements (each of the owner's
+      // entsize) into a region begun by a runtime-offset step of the handle
+      // save's length, a copy out, a null test or free holds only that
+      // owner's handle and element content: a copy out of it into the
+      // owner's handle array or into an element of the owner is a move
+      // within one owner. The solver makes it two objects (the handle image
+      // and one struct of the element type) when the entsize premise holds.
+      {
+        // Casts only (bitcast, addrspacecast): stripPointerCasts would also
+        // drop an all-zero-index GEP, a step the chains below report.
+        auto castsOnly = [](const Value *V) {
+          while (isa<BitCastOperator>(V) || isa<AddrSpaceCastOperator>(V)) V = cast<Operator>(V)->getOperand(0);
+          return V;
+        };
+        auto snapLoc = [](const Instruction *I) {
+          std::string l = I->getFunction()->getName().str();
+          if (const DebugLoc &DLc = I->getDebugLoc()) l += " " + DLc->getFilename().str() + ":" + std::to_string(DLc.getLine());
+          return l;
+        };
+        // One value by name: the same SSA value, or a load of one -O0
+        // local whose stores are its entry-block zero initializer and one
+        // more store dominating the block's allocation (every read made
+        // while the block exists sees that store's value).
+        auto oneValue = [&](const Value *V, const Instruction *A) -> const Value * {
+          V = V->stripPointerCasts();
+          const auto *L = dyn_cast<LoadInst>(V);
+          const Value *SL = L ? L->getPointerOperand()->stripPointerCasts() : nullptr;
+          if (!L || !transientSlot(SL)) return V;
+          const StoreInst *only = nullptr;
+          for (const User *U : SL->users())
+            if (const auto *S = dyn_cast<StoreInst>(U)) {
+              const auto *K = dyn_cast<ConstantInt>(S->getValueOperand());
+              if (K && K->isZero() && S->getParent() == &S->getFunction()->getEntryBlock()) continue;
+              if (only) return nullptr;
+              only = S;
+            }
+          if (!only || only->getFunction() != A->getFunction()) return nullptr;
+          DominatorTree DT(const_cast<Function &>(*A->getFunction()));
+          return DT.dominates(only, A) ? SL : nullptr;
+        };
+        // An owner's handle array: a load of a handle field; its owner shape
+        // (the struct the field is in) and the outermost struct its address
+        // steps through from its base.
+        auto handleLoad = [&](const Value *V, std::string &owner, std::string &outer) {
+          const auto *L = dyn_cast<LoadInst>(V->stripPointerCasts());
+          if (!L) return false;
+          const std::string K = fieldKey(L, L->getPointerOperand());
+          if (!handle.count(K)) return false;
+          const std::string sh = ownerShape(L->getPointerOperand(), 0);
+          if (sh.empty()) return false;
+          const int64_t ko = std::stoll(K.substr(K.rfind('+') + 1));
+          const size_t p = sh.find('+');
+          const int64_t at = (p == std::string::npos ? 0 : std::stoll(sh.substr(p + 1))) - ko;
+          const std::string root = p == std::string::npos ? sh : sh.substr(0, p);
+          owner = at ? root + "+" + std::to_string(at) : root;
+          outer = K.substr(0, K.rfind('+'));
+          for (const Value *A = castsOnly(L->getPointerOperand()); const auto *G = dyn_cast<GEPOperator>(A);
+               A = castsOnly(G->getPointerOperand()))
+            if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()); ST && ST->hasName())
+              outer = stripStructNameSuffix(ST->getName()).str();
+          return true;
+        };
+        // The owner's entsize: a load (through integer casts) of an owner
+        // struct's field; its key.
+        auto sizeField = [&](const Value *V) -> std::string {
+          while (const auto *C = dyn_cast<CastInst>(V)) V = C->getOperand(0);
+          const auto *L = dyn_cast<LoadInst>(V);
+          if (!L || !L->getType()->isIntegerTy()) return "";
+          return fieldKey(L, L->getPointerOperand());
+        };
+        // An element of the owner by name: a read of a slot of its handle
+        // array, or of a link or closed cursor field of such an element,
+        // through casts, offset-0 steps, -O0 locals and joins; a cycle
+        // (`p = p->next`) holds (the greatest fixpoint, as for cursors).
+        std::set<const Value *> ownPath;
+        std::function<bool(const Value *, const std::string &, int)> ownElem = [&](const Value *V, const std::string &own,
+                                                                                    int d) -> bool {
+          V = V->stripPointerCasts();
+          if (isa<ConstantPointerNull>(V)) return true;
+          if (d > 16) return false;
+          if (!ownPath.insert(V).second) return true;
+          bool ok = false;
+          if (const auto *L = dyn_cast<LoadInst>(V)) {
+            const Value *P = L->getPointerOperand()->stripPointerCasts();
+            if (transientSlot(P)) {
+              // The local's address is never taken: the nearest store to it
+              // before the read, in its block or up the chain of unique
+              // predecessors, is the only one that reaches it; else every
+              // store to it.
+              const StoreInst *last = nullptr;
+              const BasicBlock *BB = L->getParent();
+              const Instruction *I = L->getPrevNode();
+              for (int hops = 0; !last && BB && hops < 64; hops++) {
+                for (; I && !last; I = I->getPrevNode())
+                  if (const auto *S = dyn_cast<StoreInst>(I); S && S->getPointerOperand()->stripPointerCasts() == P) last = S;
+                BB = BB->getUniquePredecessor();
+                I = BB ? &BB->back() : nullptr;
+              }
+              if (last) {
+                ok = ownElem(last->getValueOperand(), own, d + 1);
+              } else {
+                for (const User *U : P->users())
+                  if (const auto *S = dyn_cast<StoreInst>(U)) {
+                    ok = ownElem(S->getValueOperand(), own, d + 1);
+                    if (!ok) break;
+                  }
+              }
+            } else if (const std::string K = fieldKey(L, L->getPointerOperand());
+                       !K.empty() && !handle.count(K) && (links.count(K) || cursorClosed(L).empty())) {
+              ok = ownElem(baseOf(L->getPointerOperand()), own, d + 1);
+            } else if (const auto *G = dyn_cast<GEPOperator>(P); G && G->getNumIndices() == 1) {
+              std::string o, x;
+              ok = handleLoad(G->getPointerOperand(), o, x) && o == own;
+            }
+          } else if (isa<PHINode>(V) || isa<SelectInst>(V)) {
+            const auto *I = cast<Instruction>(V);
+            ok = true;
+            for (unsigned k = isa<SelectInst>(I) ? 1 : 0; k < I->getNumOperands() && ok; k++)
+              ok = ownElem(I->getOperand(k), own, d + 1);
+          } else if (const auto *G = dyn_cast<GEPOperator>(V)) {
+            APInt Off(64, 0);
+            ok = G->accumulateConstantOffset(DL0, Off) && Off.isZero() && ownElem(G->getPointerOperand(), own, d + 1);
+          }
+          ownPath.erase(V);
+          return ok;
+        };
+        std::set<const Instruction *> cands;
+        for (auto &[M, _] : Ctx->Modules)
+          for (const Function &F : *M)
+            for (const Instruction &I : instructions(F))
+              if (const auto *MT = dyn_cast<MemTransferInst>(&I)) {
+                std::string o, x;
+                if (!handleLoad(MT->getRawSource(), o, x)) continue;
+                if (const auto *A = dyn_cast_or_null<Instruction>(freshOf(MT->getRawDest(), 0)); A && isa<CallBase>(A))
+                  cands.insert(A);
+              }
+        for (const Instruction *A : cands) {
+          const std::string hname = snapLoc(A);
+          std::map<const Value *, int> region; // 0: the handle region (the block's start), 1: the element region
+          std::vector<std::pair<const Value *, int>> work{{A, 0}};
+          std::string fail, owner, outer, entsizeKey;
+          std::vector<const MemTransferInst *> hSaves, eSaves, hOuts, eOuts;
+          std::vector<const Value *> starts, hLens; // region-start offsets, handle-copy lengths
+          std::vector<const Value *> elemPtrs;
+          std::map<const Value *, int> slots; // -O0 locals it occupies, by region
+          std::vector<const Value *> joins; // phis and selects: every entry derived
+          auto setFail = [&](const std::string &w) {
+            if (fail.empty()) fail = w;
+          };
+          while (!work.empty() && fail.empty()) {
+            auto [V, r] = work.back();
+            work.pop_back();
+            if (auto it = region.find(V); it != region.end()) {
+              if (it->second != r) setFail("a value in both regions: " + valueText(V));
+              continue;
+            }
+            region[V] = r;
+            for (const User *U : V->users()) {
+              const auto *UI = dyn_cast<Instruction>(U);
+              if (!UI) {
+                setFail("a constant use");
+                break;
+              }
+              if (isa<DbgInfoIntrinsic>(UI) || UI->isLifetimeStartOrEnd() || isa<ICmpInst>(UI)) continue;
+              if (isa<CastInst>(UI)) {
+                work.push_back({UI, r});
+              } else if (isa<PHINode>(UI) || isa<SelectInst>(UI)) {
+                if (const auto *SI = dyn_cast<SelectInst>(UI); SI && SI->getCondition() == V) continue;
+                joins.push_back(UI);
+                work.push_back({UI, r});
+              } else if (const auto *S = dyn_cast<StoreInst>(UI)) {
+                const Value *SL = S->getPointerOperand()->stripPointerCasts();
+                if (S->getValueOperand() != V || !transientSlot(SL)) {
+                  setFail("a store " + (S->getValueOperand() == V ? std::string("of it into memory: ")
+                                                                    : std::string("into it: ")) + siteOf(S));
+                  break;
+                }
+                if (auto [sit, ins] = slots.emplace(SL, r); !ins && sit->second != r) {
+                  setFail("a local holding both regions: " + siteOf(S));
+                  break;
+                }
+                for (const User *LU : SL->users())
+                  if (isa<LoadInst>(LU)) work.push_back({LU, r});
+              } else if (const auto *G = dyn_cast<GetElementPtrInst>(UI)) {
+                if (G->getPointerOperand() != V) {
+                  setFail("an index use: " + siteOf(G));
+                  break;
+                }
+                APInt Off(64, 0);
+                if (G->accumulateConstantOffset(DL0, Off)) {
+                  if (!Off.isZero()) {
+                    setFail("a constant step: " + siteOf(G));
+                    break;
+                  }
+                  work.push_back({G, r});
+                  continue;
+                }
+                const bool bytes = G->getNumIndices() == 1 && G->getSourceElementType()->isIntegerTy(8);
+                const Value *Ix = G->getOperand(1);
+                if (!bytes) {
+                  setFail("a step not in bytes: " + siteOf(G));
+                  break;
+                }
+                if (r == 0) {
+                  starts.push_back(Ix); // the element region starts here
+                } else if (!isa<ZExtInst>(Ix) && !(isa<ConstantInt>(Ix) && !cast<ConstantInt>(Ix)->isNegative())) {
+                  setFail("a step that may be negative: " + siteOf(G));
+                  break;
+                }
+                elemPtrs.push_back(G);
+                work.push_back({G, 1});
+              } else if (const auto *MT = dyn_cast<MemTransferInst>(UI)) {
+                const bool into = MT->getArgOperand(0) == V;
+                if (into && MT->getArgOperand(1) == V) {
+                  setFail("a copy within it: " + siteOf(MT));
+                  break;
+                }
+                if (r == 0) {
+                  hLens.push_back(MT->getLength());
+                  if (into) {
+                    std::string o, x;
+                    if (!handleLoad(MT->getRawSource(), o, x)) {
+                      setFail("a copy into its start from no handle array: " + siteOf(MT));
+                      break;
+                    }
+                    if (!owner.empty() && o != owner) {
+                      setFail("handle saves of two owners: " + siteOf(MT));
+                      break;
+                    }
+                    owner = o;
+                    outer = x;
+                    hSaves.push_back(MT);
+                  } else {
+                    hOuts.push_back(MT);
+                  }
+                } else {
+                  const std::string E = sizeField(MT->getLength());
+                  if (E.empty() || (!entsizeKey.empty() && E != entsizeKey)) {
+                    setFail("an element copy whose length is no one owner field: " + siteOf(MT));
+                    break;
+                  }
+                  entsizeKey = E;
+                  (into ? eSaves : eOuts).push_back(MT);
+                }
+              } else if (const auto *CB = dyn_cast<CallBase>(UI)) {
+                const Function *G = CB->getCalledFunction();
+                if (!G || (G->getName() != "free" && G->getName() != "cfree")) {
+                  setFail("passed to " + (G ? G->getName().str() : std::string("an indirect call")) + ": " + siteOf(CB));
+                  break;
+                }
+              } else {
+                setFail("a use: " + siteOf(UI));
+                break;
+              }
+            }
+          }
+          // Every store into a slot it occupies, and every entry of a join,
+          // null or derived in the same region.
+          for (const auto &[SL, r] : slots)
+            for (const User *U : SL->users())
+              if (const auto *S = dyn_cast<StoreInst>(U); S && fail.empty()) {
+                const Value *v = S->getValueOperand();
+                if (isa<ConstantPointerNull>(v->stripPointerCasts())) continue;
+                auto it = region.find(v);
+                if (it == region.end() || it->second != r) setFail("a local also holding another value: " + siteOf(S));
+              }
+          for (const Value *J : joins) {
+            if (!fail.empty()) break;
+            const auto *I = cast<Instruction>(J);
+            for (unsigned k = isa<SelectInst>(I) ? 1 : 0; k < I->getNumOperands(); k++) {
+              const Value *v = I->getOperand(k);
+              if (isa<ConstantPointerNull>(v->stripPointerCasts())) continue;
+              if (!region.count(v)) setFail("a join with another value: " + siteOf(I));
+            }
+          }
+          if (fail.empty() && hSaves.empty()) setFail("no handle save");
+          if (fail.empty() && eSaves.empty()) setFail("no element save");
+          // The element region begins where the handle copies end (Fable
+          // 2026-10-18): every start offset and every handle copy's length
+          // one value by name.
+          const Value *tab = nullptr;
+          if (fail.empty()) {
+            std::vector<const Value *> all(starts);
+            all.insert(all.end(), hLens.begin(), hLens.end());
+            for (const Value *v : all) {
+              const Value *c = oneValue(v, A);
+              if (!c || (tab && c != tab)) {
+                setFail("an element region not begun at the handle copies' length: " + valueText(v));
+                break;
+              }
+              tab = c;
+            }
+          }
+          // The element saves: elements of the same owner, by name.
+          if (fail.empty())
+            for (const MemTransferInst *MT : eSaves)
+              if (!ownElem(MT->getRawSource(), owner, 0)) {
+                setFail("an element save from no element of the owner: " + siteOf(MT));
+                break;
+              }
+          if (!fail.empty()) {
+            o1AssumeLines.push_back("  snapshot holder candidate " + hname + ": no holder (" + fail + ")");
+            continue;
+          }
+          // The entsize premise: every store into the size field that can
+          // reach this owner, walked back through formals to direct actuals
+          // with the table pointer and the code field's value along, stores
+          // sizeof(T), T the type its constructor allocates; one T.
+          const size_t ep = entsizeKey.rfind('+');
+          const std::string ES = entsizeKey.substr(0, ep);
+          struct Path { std::vector<std::string> chain; const Value *tbl, *size, *nf; std::string open; };
+          std::vector<Path> paths;
+          auto resolve = [&](const Value *V) {
+            for (int k = 0; k < 8; k++) {
+              V = castsOnly(V);
+              if (const auto *C = dyn_cast<CastInst>(V); C && C->getOperand(0)->getType()->isIntegerTy()) {
+                V = C->getOperand(0);
+                continue;
+              }
+              const auto *L = dyn_cast<LoadInst>(V);
+              const Value *SL = L ? castsOnly(L->getPointerOperand()) : nullptr;
+              if (!L || !transientSlot(SL)) break;
+              const StoreInst *only = nullptr;
+              for (const User *U : SL->users())
+                if (const auto *S = dyn_cast<StoreInst>(U)) {
+                  if (only) return V;
+                  only = S;
+                }
+              if (!only) break;
+              V = only->getValueOperand();
+            }
+            return V;
+          };
+          std::function<void(Path, int)> walk = [&](Path P, int d) {
+            P.tbl = resolve(P.tbl);
+            if (P.size) P.size = resolve(P.size);
+            if (P.nf) P.nf = resolve(P.nf);
+            while (const auto *G = dyn_cast<GEPOperator>(P.tbl)) {
+              if (const auto *ST = dyn_cast<StructType>(G->getSourceElementType()); ST && ST->hasName())
+                P.chain.push_back(stripStructNameSuffix(ST->getName()).str());
+              P.tbl = resolve(G->getPointerOperand());
+            }
+            const Function *F = nullptr;
+            for (const Value *v : {P.tbl, P.size, P.nf})
+              if (const auto *Ar = dyn_cast_or_null<Argument>(v)) F = Ar->getParent();
+            if (!F || d > 8) {
+              if (d > 8) P.open = "too deep";
+              paths.push_back(P);
+              return;
+            }
+            std::vector<const CallBase *> cs;
+            for (const User *U : F->users())
+              if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) cs.push_back(CB);
+            if (F->hasAddressTaken() || cs.empty()) {
+              P.open = "a formal of " + F->getName().str() + (F->hasAddressTaken() ? ", address-taken" : ", which has no caller");
+              paths.push_back(P);
+              return;
+            }
+            for (const CallBase *CB : cs) {
+              Path Q = P;
+              auto sub = [&](const Value *v) -> const Value * {
+                const auto *Ar = dyn_cast_or_null<Argument>(v);
+                return Ar && Ar->getParent() == F && Ar->getArgNo() < CB->arg_size() ? CB->getArgOperand(Ar->getArgNo()) : v;
+              };
+              Q.tbl = sub(P.tbl);
+              Q.size = sub(P.size);
+              Q.nf = sub(P.nf);
+              walk(Q, d + 1);
+            }
+          };
+          for (auto &[M, _] : Ctx->Modules)
+            for (const Function &F : *M)
+              for (const Instruction &I : instructions(F))
+                if (const auto *S = dyn_cast<StoreInst>(&I); S && fieldKey(S, S->getPointerOperand()) == entsizeKey) {
+                  // The table: the size field's base; the newfunc: the code
+                  // field stored on the same base in the same function.
+                  const auto *G = dyn_cast<GEPOperator>(castsOnly(S->getPointerOperand()));
+                  const Value *tbl = G ? castsOnly(G->getPointerOperand()) : nullptr;
+                  const Value *nf = nullptr;
+                  for (const Instruction &J : instructions(F))
+                    if (const auto *S2 = dyn_cast<StoreInst>(&J); S2 && code.count(fieldKey(S2, S2->getPointerOperand())))
+                      if (const auto *G2 = dyn_cast<GEPOperator>(castsOnly(S2->getPointerOperand()));
+                          G2 && tbl && resolve(G2->getPointerOperand()) == resolve(tbl))
+                        nf = S2->getValueOperand();
+                  Path P{{}, tbl ? tbl : S->getPointerOperand(), S->getValueOperand(), nf, tbl ? "" : "a size store at no field step"};
+                  if (!P.open.empty()) paths.push_back(P);
+                  else walk(P, 0);
+                }
+          // Every path is relevant (Fable 2026-10-18): a GEP's struct is a
+          // declared type (C casts it away), so the table's struct steps say
+          // nothing about which tables this owner can be; the chain is
+          // printed, not used. Object identity by name is the premise's next
+          // rule.
+          StructType *T = nullptr;
+          std::string premiseOpen;
+          std::vector<std::string> pathLines;
+          for (const Path &P : paths) {
+            std::string chain;
+            for (auto it = P.chain.rbegin(); it != P.chain.rend(); ++it) chain += (chain.empty() ? "" : ".") + *it;
+            const auto *K = dyn_cast_or_null<ConstantInt>(P.size);
+            const auto *NF = dyn_cast_or_null<Function>(P.nf ? P.nf->stripPointerCasts() : nullptr);
+            std::string line = "table " + (chain.empty() ? std::string("(no struct step)") : chain) + ", entsize " +
+                               (K ? std::to_string(K->getZExtValue()) : P.size ? valueText(P.size) : std::string("?")) +
+                               ", newfunc " + (NF ? NF->getName().str() : P.nf ? valueText(P.nf) : std::string("?"));
+            std::string why = P.open;
+            StructType *PT = nullptr;
+            if (why.empty() && !K) why = "entsize not constant";
+            if (why.empty() && !NF) why = "newfunc not a function";
+            if (why.empty()) {
+              // The constructor's element: a fresh block of constant size it
+              // makes itself (not through another constructor of the body).
+              for (const Instruction &I : instructions(*NF)) {
+                uint64_t sz = 0;
+                if (const auto *CB = dyn_cast<CallBase>(&I)) {
+                  if (!CB->getType()->isPointerTy() || !(get(CB) & FRS)) continue;
+                  if (const Function *Gf = CB->getCalledFunction(); Gf && body.count(Gf)) continue;
+                  unsigned consts = 0;
+                  uint64_t prod = 1;
+                  for (const Value *Arg : CB->args())
+                    if (const auto *C = dyn_cast<ConstantInt>(Arg); C && C->getBitWidth() >= 32) prod *= C->getZExtValue(), consts++;
+                  if (consts == 0 || consts > 2) continue;
+                  sz = prod;
+                } else {
+                  continue;
+                }
+                if (StructType *ST = structOfSize(&I, sz, NF)) {
+                  if (PT && PT != ST) why = "two element structs in " + NF->getName().str();
+                  PT = ST;
+                }
+              }
+              if (why.empty() && !PT) why = "no element struct of " + NF->getName().str();
+              if (why.empty() && (uint64_t)DL0.getTypeAllocSize(PT) != K->getZExtValue())
+                why = "entsize " + std::to_string(K->getZExtValue()) + " is not sizeof " + PT->getName().str() + " (" +
+                      std::to_string(DL0.getTypeAllocSize(PT)) + ")";
+            }
+            if (why.empty() && T && PT != T) why = "a second element struct " + PT->getName().str();
+            if (why.empty()) T = PT;
+            else if (premiseOpen.empty()) premiseOpen = line + ": " + why;
+            pathLines.push_back(line + (why.empty() ? ": sizeof " + PT->getName().str() : ": OPEN " + why));
+          }
+          if (!premiseOpen.empty()) T = nullptr;
+          if (paths.empty()) premiseOpen = "no store of " + entsizeKey;
+          auto locs = [&](const std::vector<const MemTransferInst *> &v) {
+            std::string s;
+            for (const MemTransferInst *MT : v) s += (s.empty() ? "" : ", ") + snapLoc(MT);
+            return s.empty() ? std::string("none") : s;
+          };
+          std::vector<const MemTransferInst *> outs(hOuts);
+          outs.insert(outs.end(), eOuts.begin(), eOuts.end());
+          std::string prem;
+          for (const std::string &p : pathLines) prem += " [" + p + "]";
+          o1AssumeLines.push_back("  snapshot holder of " + outer + " (the table its handle saves read): H " + hname +
+                                  "; handle save " + locs(hSaves) + "; element saves " + locs(eSaves) +
+                                  " (each " + entsizeKey + " bytes); restores " + locs(outs) + "; premise " +
+                                  (premiseOpen.empty() ? "PROVEN, element struct " + T->getName().str() + ":"
+                                                       : "OPEN-UNPROVEN (" + premiseOpen + "):") +
+                                  prem);
+          if (!premiseOpen.empty()) continue;
+          // The restores O1 counts as moves within one owner.
+          for (const MemTransferInst *MT : hOuts) {
+            std::string o, x;
+            if (handleLoad(MT->getRawDest(), o, x) && o == owner) snapRestores[MT] = hname;
+          }
+          for (const MemTransferInst *MT : eOuts)
+            if (ownElem(MT->getRawDest(), owner, 0)) snapRestores[MT] = hname;
+          SnapshotHolder SH;
+          SH.alloc = A;
+          SH.elem = T;
+          SH.elemPtrs = elemPtrs;
+          for (const auto *v : {&eSaves, &eOuts})
+            for (const MemTransferInst *MT : *v) SH.elemCopies.insert(MT);
+          snapshotHolders.push_back(std::move(SH));
+        }
+      }
       // A block copy anywhere whose destination is an element struct (one
       // embedding a container struct) is a store of the source's fields:
       // the source an element of the same owner, or in the body derived or
@@ -3719,6 +4261,10 @@ void CallGraphPass::checkContainerClosure() {
                 }
               }
               if (!candidate) continue;
+              if (snapRestores.count(MT)) {
+                snapMoves++;
+                continue;
+              }
               if (!body.count(&F)) {
                 const size_t mark = eoMark();
                 const std::string a = elemOwner(MT->getRawDest(), 0), v = elemOwner(MT->getRawSource(), 0);
@@ -3749,6 +4295,10 @@ void CallGraphPass::checkContainerClosure() {
             bool covers = false;
             for (int64_t p0 : pos) covers |= p0 >= off && p0 < off + len;
             if (!covers) continue;
+            if (snapRestores.count(MT)) {
+              snapMoves++;
+              continue;
+            }
             if (body.count(&F)) {
               const uint8_t src = get(baseOf(MT->getRawSource())) & ~NUL;
               if (src && !(src & ~(DER | FRS))) continue;
@@ -4110,6 +4660,8 @@ void CallGraphPass::checkContainerClosure() {
     if (!bad3.empty()) o3 += ")";
     if (poolChunks) o3 += " (" + std::to_string(poolChunks) + " pool chunks allocated inside the body: certified pool storage)";
     if (moves) o1 += " (" + std::to_string(moves) + " element moves within one owner)";
+    if (snapMoves)
+      o1 += " (" + std::to_string(snapMoves) + " restores out of a snapshot holder: moves within one owner)";
     // O6 (body reads): every pointer field of an element the body reads
     // is one the body writes (a body read of an owner-written field would
     // see the body's object without the owner's writes).
@@ -4326,62 +4878,9 @@ void CallGraphPass::checkContainerClosure() {
           } else {
             continue;
           }
-          // Its type: a struct of that size its derived values step through.
-          StructType *found = nullptr;
-          SmallVector<const Value *, 8> w{&I};
-          SmallPtrSet<const Value *, 16> seenV;
-          while (!w.empty() && !found) {
-            const Value *V = w.pop_back_val();
-            if (!seenV.insert(V).second) continue;
-            for (const User *U : V->users()) {
-              if (const auto *G = dyn_cast<GEPOperator>(U)) {
-                if (auto *ST = dyn_cast<StructType>(G->getSourceElementType());
-                    ST && ST->isSized() && EDL.getTypeAllocSize(ST) == sz) {
-                  found = ST;
-                  break;
-                }
-                if (G->hasAllZeroIndices()) w.push_back(U);
-              } else if (isa<CastInst>(U) || isa<PHINode>(U) || isa<SelectInst>(U)) {
-                w.push_back(U);
-              } else if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V) {
-                if (transientSlot(S->getPointerOperand()->stripPointerCasts()))
-                  for (const User *LU : S->getPointerOperand()->stripPointerCasts()->users())
-                    if (isa<LoadInst>(LU)) w.push_back(LU);
-              }
-            }
-          }
-          // No typed step (-O3 steps by bytes): the debug type of a local
-          // variable the constructor declares as a pointer to a struct of that size
-          // (`struct elf_strtab_hash_entry *ret`, optimized out but declared),
-          // by its IR name; two different such structs decide nothing.
-          if (!found) {
-            std::set<StructType *> cands;
-            for (const Instruction &J : instructions(*T)) {
-              const auto *DV = dyn_cast<DbgVariableIntrinsic>(&J);
-              if (!DV || DV->getVariable()->getArg()) continue; // a local, not a parameter (`table`)
-              const DIType *DT = DV->getVariable()->getType();
-              bool viaPtr = false;
-              for (int k = 0; k < 8 && DT; k++) {
-                const auto *D = dyn_cast<DIDerivedType>(DT);
-                if (!D) break;
-                if (D->getTag() == dwarf::DW_TAG_pointer_type) {
-                  if (viaPtr) { DT = nullptr; break; }
-                  viaPtr = true;
-                } else if (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_const_type &&
-                           D->getTag() != dwarf::DW_TAG_volatile_type) {
-                  DT = nullptr;
-                  break;
-                }
-                DT = D->getBaseType();
-              }
-              const auto *CT = dyn_cast_or_null<DICompositeType>(DT);
-              if (!viaPtr || !CT || CT->getName().empty() || CT->getSizeInBits() != sz * 8) continue;
-              if (auto *ST = StructType::getTypeByName(T->getContext(), ("struct." + CT->getName()).str());
-                  ST && ST->isSized() && EDL.getTypeAllocSize(ST) == sz)
-                cands.insert(ST);
-            }
-            if (cands.size() == 1) found = *cands.begin();
-          }
+          // Its type: a struct of that size its derived values step through,
+          // else a pointer local the constructor declares (structOfSize).
+          StructType *found = structOfSize(&I, sz, T);
           // Last: the one struct of that size that holds a struct the body
           // steps through on an element at offset 0 (the struct analyzer's
           // embedding table).

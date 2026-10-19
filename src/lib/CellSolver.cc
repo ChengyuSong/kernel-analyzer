@@ -1229,17 +1229,30 @@ bool CallGraphPass::runCellResolution() {
   const size_t staticEdges = edgeSet.size();
   struct ByteCopy { uint32_t src, dst; int64_t len; const Instruction *at; };
   std::vector<ByteCopy> copies;
+  // Snapshot holders ((3''), Containers.cc, the entsize premise proven):
+  // their element saves and restores are whole-struct copies of the
+  // element type, and their element-region pointers point to the element
+  // image at offset 0 (seeded below), their runtime-offset steps dropped.
+  std::unordered_map<const Instruction *, int64_t> snapLen;
+  boost::unordered_flat_set<uint32_t> snapCut;
+  for (const SnapshotHolder &SH : snapshotHolders) {
+    for (const Instruction *I : SH.elemCopies) snapLen[I] = (int64_t)DL.getTypeAllocSize(SH.elem);
+    for (const Value *V : SH.elemPtrs)
+      if (const NodeIndex vn = NF.getValueNodeFor(V); vn != AndersNodeFactory::InvalidIndex) snapCut.insert(canon(vn));
+  }
   for (auto &[sN, dN, len, at] : byteCopies) {
     const uint32_t a = canon(sN), b = canon(dN);
     inGraph[a] = inGraph[b] = 1;
     copiesAt[a].push_back(copies.size());
     if (b != a) copiesAt[b].push_back(copies.size());
-    copies.push_back({a, b, len, at});
+    auto lit = snapLen.find(at);
+    copies.push_back({a, b, lit == snapLen.end() ? len : lit->second, at});
   }
   for (auto &[f, t, li] : lazyFEdges) {
     const uint32_t a = canon(f), b = canon(t);
     inGraph[a] = inGraph[b] = 1;
     assert(!isHub[b] && "a field address is never a dereference");
+    if (snapCut.count(b)) continue; // a snapshot holder's element-region step
     if (a != b || lazyLabels[li].off != 0 || lazyLabels[li].stride != 0)
       fieldOut[a].push_back({b, li, 0});
   }
@@ -2889,6 +2902,8 @@ bool CallGraphPass::runCellResolution() {
       std::chrono::duration<double>(Clock::now() - t0).count();
   size_t heapLabeled = 0, heapUnlabeled = 0, heapConflict = 0, heapPtrArrays = 0, heapScalarArrays = 0,
          heapBytesMarked = 0;
+  std::set<const Value *> snapAllocs;
+  for (const SnapshotHolder &SH : snapshotHolders) snapAllocs.insert(SH.alloc);
   auto newObj = [&](NodeIndex origin, const Value *V) -> uint32_t {
     Obj O;
     O.origin = origin;
@@ -2897,6 +2912,12 @@ bool CallGraphPass::runCellResolution() {
     } else if (const auto *AI = dyn_cast_or_null<AllocaInst>(V)) {
       O.layout = AI->getAllocatedType();
       O.repeats = AI->isArrayAllocation();
+    } else if (const auto *C = dyn_cast_or_null<CallBase>(V); C && snapAllocs.count(C)) {
+      // A snapshot holder's handle image: the owner's handle array's slots.
+      O.layout = PointerType::get(C->getContext(), 0);
+      O.repeats = true;
+      O.declArray = true;
+      O.ident = "snapshot handle image";
     } else if (const auto *C = dyn_cast_or_null<CallBase>(V)) {
       auto lit = labels.find(C);
       if (!CFLCellTraceObj.empty()) {
@@ -3132,6 +3153,26 @@ bool CallGraphPass::runCellResolution() {
       add(n, cellAt(o, 0));
       objSeeds++;
     }
+  }
+  // A snapshot holder's element image ((3'')): one struct of the element
+  // type at offset 0 of every element-region pointer, field-insensitive
+  // across the images (exact for one owner's elements).
+  for (const SnapshotHolder &SH : snapshotHolders) {
+    const NodeIndex vn = SH.elemPtrs.empty() ? AndersNodeFactory::InvalidIndex : NF.getValueNodeFor(SH.elemPtrs.front());
+    if (vn == AndersNodeFactory::InvalidIndex) continue;
+    Obj O;
+    O.origin = vn;
+    O.layout = SH.elem;
+    O.size = (int64_t)DL.getTypeAllocSize(SH.elem);
+    O.label = typeLabel(O.layout);
+    O.ident = "snapshot element image of " + O.label;
+    objs.push_back(std::move(O));
+    const uint32_t e = objs.size() - 1;
+    for (const Value *V : SH.elemPtrs)
+      if (const NodeIndex pn = NF.getValueNodeFor(V); pn != AndersNodeFactory::InvalidIndex && inGraph[canon(pn)]) {
+        add(canon(pn), cellAt(e, 0));
+        objSeeds++;
+      }
   }
   CG_LOG("Cells: allocation sites: " << repNotSite << " seeded by their own node under a class representative "
          << "that is not the site (" << [&] {

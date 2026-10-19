@@ -615,6 +615,19 @@ protected:
   // element struct: a row object takes its OWNER's constructor's layout.
   std::vector<std::vector<std::pair<const llvm::Value *, std::set<const llvm::Function *>>>> containerOwnerCtors;
   std::vector<std::map<const llvm::Function *, llvm::StructType *>> containerCtorType;
+  // Snapshot holders ((3''), Fable 2026-10-18): a fresh block holding saves
+  // of one owner's handle array and elements (Containers.cc). With its
+  // entsize premise proven, the solver makes the block two objects: the
+  // handle image (the allocation's own, a repeating pointer) and the
+  // element image (one struct elem, at offset 0 of every element-region
+  // pointer), and the element copies whole-struct copies of elem.
+  struct SnapshotHolder {
+    const llvm::Instruction *alloc = nullptr;
+    llvm::StructType *elem = nullptr;
+    std::vector<const llvm::Value *> elemPtrs; // region starts and steps, in IR order
+    std::set<const llvm::Instruction *> elemCopies;
+  };
+  std::vector<SnapshotHolder> snapshotHolders;
   // After the solve: the pure rows' indirect calls against the solver's
   // targets (Containers.cc).
   void checkContainerPremises(bool stopped);

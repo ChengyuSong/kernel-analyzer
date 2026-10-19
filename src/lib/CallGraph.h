@@ -339,6 +339,9 @@ protected:
   // ... and the accesses of a keyed union whose key is unknown, with the
   // union's name prefix "struct.S+off".
   std::map<const llvm::Instruction *, std::string> unionUnknownOf;
+  // ... and the member the union census types each store into a union by
+  // ("" when it types none; reporting only).
+  std::map<const llvm::Instruction *, std::string> unionWriteMember;
   // Every union field of a struct (debug info), by "struct.S" and byte
   // offset: its field name, size, and the union census's short verdict
   // (read by the containers' cursor check, plan 3.55 Q-d).

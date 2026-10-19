@@ -1263,8 +1263,12 @@ void CallGraphPass::runUnionCensus() {
             }
           }
         }
-        if (isa<StoreInst>(&I)) writes[U].push_back(s);
-        else reads[U].push_back(s);
+        if (isa<StoreInst>(&I)) {
+          unionWriteMember[&I] = s.member;
+          writes[U].push_back(s);
+        } else {
+          reads[U].push_back(s);
+        }
       }
   }
 

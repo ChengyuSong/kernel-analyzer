@@ -2157,6 +2157,7 @@ void CallGraphPass::checkContainerClosure() {
       const int64_t KO = std::stoll(K.substr(kp + 1));
       const auto [uoff, UN] = unionAround(KS, KO);
       std::string why, firstUnkeyed;
+      std::vector<std::string> unkeyedSites; // every store of another member without union keys
       size_t stores = 0, others = 0, unkeyed = 0, wholeCopies = 0, fieldCopies = 0;
       bool othersKeyed = true;
       std::set<std::string> otherKeys;
@@ -2172,6 +2173,11 @@ void CallGraphPass::checkContainerClosure() {
         else {
           othersKeyed = false;
           if (!unkeyed++) firstUnkeyed = F.getName().str() + ": " + text;
+          auto mit = unionWriteMember.find(&I);
+          unkeyedSites.push_back(F.getName().str() + ": " + text + " (member " +
+                                 (mit == unionWriteMember.end() || mit->second.empty() ? std::string("untyped")
+                                                                                       : mit->second) +
+                                 ")");
         }
       };
       for (auto &[M, _] : Ctx->Modules)
@@ -2246,6 +2252,10 @@ void CallGraphPass::checkContainerClosure() {
                                                            : std::string()) +
                                               ")"
                                         : "not closed (" + why + ")");
+      if (!why.empty() && unkeyedSites.size() > 1) {
+        elemCursorLines[K] += "; the stores of another member without union keys:";
+        for (const std::string &u : unkeyedSites) elemCursorLines[K] += " [" + u + "]";
+      }
       cursorOpen[K] = why;
       cursorStack.pop_back();
       if (!why.empty()) {

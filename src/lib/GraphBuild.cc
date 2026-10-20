@@ -2922,6 +2922,13 @@ bool CallGraphPass::runOnFunction(Function *F) {
   // Use InstVisitor to handle instructions.
   InstHandler visitor(*this, F);
   visitor.visit(F);
+  // Object identity's formal rule found the indirect calls before this set
+  // was filled, by isIndirectCallSite; the two must agree.
+  if (CFLCells)
+    for (const Instruction &I : instructions(*F))
+      if (const auto *CB = dyn_cast<CallBase>(&I))
+        assert(isIndirectCallSite(CB) == (!CB->getCalledFunction() && Ctx->IndirectCallInsts.count(CB)) &&
+               "the indirect calls by isIndirectCallSite are the graph build's");
 
   if (allocaSummaryActive) {
     emitLocalAllocaSummaryEdges();

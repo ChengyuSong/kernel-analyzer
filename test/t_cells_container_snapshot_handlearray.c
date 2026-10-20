@@ -4,11 +4,14 @@
 // bfd_hash_table+0's array, index at run time) gives what the stores into
 // that array give, and bfd_hash_insert's newfunc call (a closed code field)
 // gives what its targets return. At the commit before: "a load of no named
-// field".
+// field". The newfuncs' formals have the indirect call as their caller
+// ((f): their address only reaches table->newfunc through
+// bfd_hash_table_init_n), whose entry actual is null.
 // LOG: 1 handle arrays read by element, [1-9][0-9]* indirect calls through closed code fields followed
 // LOG: not unreachable by name
 // LOG: open: a block copy into struct.bfd_hash_table\+0's array snap
-// LOG: open: a formal of my_newfunc, address-taken
+// LOG: formal rule: my_newfunc: bfd_hash_table_init_n -> stored into struct.bfd_hash_table\+8 .*; callers: indirect bfd_hash_insert
+// NOLOG: open: a formal of
 // NOLOG: a load of no named field
 // NOLOG: an indirect call's result
 #include <stdlib.h>

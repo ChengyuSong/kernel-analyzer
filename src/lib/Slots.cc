@@ -568,6 +568,18 @@ std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx) {
   return out;
 }
 
+bool isIndirectCallSite(const CallBase *CB) {
+  if (CB->isInlineAsm() || CB->getCalledFunction()) return false;
+  const Value *CO = CB->getCalledOperand()->stripPointerCastsAndAliases();
+  if (const auto *CE = dyn_cast<ConstantExpr>(CO)) {
+    if (CE->getOpcode() == Instruction::GetElementPtr)
+      CO = cast<GEPOperator>(CE)->getPointerOperand()->stripPointerCastsAndAliases();
+    else if (CE->getOpcode() == Instruction::BitCast)
+      CO = CE->getOperand(0);
+  }
+  return !isa<Function>(CO) && !isa<GlobalIFunc>(CO);
+}
+
 bool irOrderLess(const Instruction *A, const Instruction *B) {
   if (A == B) return false;
   // Positions per function, computed on first use and again when the

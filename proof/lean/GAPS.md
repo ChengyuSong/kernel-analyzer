@@ -1164,6 +1164,21 @@ Obligations left open:
          (O4's: every store into it a function constant, no aggregate copy
          of the owner) returns what its targets return, each as a direct
          callee (an allocator wrapper is its call site).
+       - (f, Fable 2026-10-19) A formal of an address-taken function F has
+         known callers when F's address only feeds closed code fields:
+         every use of F is a direct call, a store of F into a code field
+         closed in O1(d)'s sense whose targets include F, or an actual to a
+         defined init function that is not address-taken, whose formal has
+         one use (at -O0 a store into its slot, the slot read by one load
+         and used no other way), the value stored into such a field or
+         passed down to another such init function the same way. Then the
+         only calls that can reach F are its direct calls and the indirect
+         calls through those fields (an indirect call elsewhere would need
+         F's address from somewhere else, and there is none), so F's
+         formal has those callers' actuals; a cycle through the formal is
+         a cycle cut as above. An address in a constant, a second use of a
+         slot, an address-taken or bodiless init function, or a store
+         elsewhere leaves the formal OPEN, with why it is logged.
        - The walk computes the least fixpoint of these rules over nodes (a
          value, a field read under its keys, a handle array's elements): a
          node's objects are the union of its successors', each shifted by
@@ -2224,7 +2239,13 @@ bodies are solved as today).
   constants (code-field closure: every store into the field is a function
   constant, a formal fed only by constants, null or a same-owner reload; an
   aggregate copy of the owner opens it); the solver's targets at that site
-  are checked to agree (post-solve). A pure row's own indirect calls are a
+  are checked to agree (post-solve). The same closure gives object
+  identity's formal rule (f, Fable 2026-10-19): when every address use of
+  an address-taken F is an actual to a non-address-taken init function
+  that passes it down to a store into such a closed code field, F's
+  callers are its direct callers and the indirect calls through that
+  field (found by the graph build's own test, isIndirectCallSite, which
+  runOnFunction checks against the context's indirect-call set). A pure row's own indirect calls are a
   premise checked after the solve against the solver's targets (no target,
   or each target with no pointer store, no block copy, no indirect call);
   a check made at a stop is labeled so, and no number comes from it.

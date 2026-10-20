@@ -3911,6 +3911,119 @@ void CallGraphPass::checkContainerClosure() {
               return "";
             return CK;
           };
+          // (f) A formal of an address-taken function F has known callers
+          // when F's address only feeds closed code fields (Fable 2026-10-19):
+          // every use of F is a direct call, a store of F into a code field
+          // closed in O1(d)'s sense whose targets include F, or an actual to
+          // a defined init function that is not address-taken, whose formal
+          // has one use: (-O0) a store into its slot, loaded once and the
+          // slot used no other way; the value is stored into such a field or
+          // passed down to another such init function the same way. F's
+          // callers are then its direct callers and every indirect call
+          // through those fields. Why the rule does not apply, or the field,
+          // the init chain and the callers, is kept for the log.
+          struct Fed { std::vector<const CallBase *> callers; std::string text, why; };
+          std::map<const Function *, Fed> fedOf;
+          auto fedCallers = [&](const Function *F) -> const Fed & {
+            if (auto it = fedOf.find(F); it != fedOf.end()) return it->second;
+            Fed R;
+            std::set<std::string> ks;
+            std::vector<std::string> chains;
+            // V (F's address, or the init formal it arrives in) goes only into
+            // closed code fields of F, or down a chain of init functions.
+            std::set<const Argument *> onPath, done;
+            std::function<bool(const Value *, const Function *, std::string)> feeds =
+                [&](const Value *V, const Function *H, std::string chain) -> bool {
+              const Value *X = V;
+              if (H) {
+                // An init formal: one use, a store into its -O0 slot loaded
+                // once (or, without a slot, the use itself).
+                if (!X->hasOneUse()) return R.why = "the formal of " + H->getName().str() + " has " +
+                                                    std::to_string(X->getNumUses()) + " uses", false;
+                if (const auto *St = dyn_cast<StoreInst>(*X->user_begin());
+                    St && St->getValueOperand() == X && transientSlot(castsOnly(St->getPointerOperand()))) {
+                  const Value *SL = castsOnly(St->getPointerOperand());
+                  const LoadInst *L = nullptr;
+                  for (const User *U : SL->users()) {
+                    if (U == St) continue;
+                    const auto *LU = dyn_cast<LoadInst>(U);
+                    if (!LU || L) return R.why = "the slot of " + H->getName().str() + "'s formal has a second use", false;
+                    L = LU;
+                  }
+                  if (!L) return R.why = "the slot of " + H->getName().str() + "'s formal is never read", false;
+                  X = L;
+                }
+              }
+              for (const User *U : X->users()) {
+                if (const auto *CB = dyn_cast<CallBase>(U); CB && !H && CB->getCalledOperand() == X) continue;
+                if (const auto *St = dyn_cast<StoreInst>(U); St && St->getValueOperand() == X) {
+                  const std::string K = fieldKey(St, St->getPointerOperand());
+                  auto tit = codeTargets.find(K);
+                  if (K.empty() || !code.count(K) || codeOpen.count(K) || tit == codeTargets.end() || !tit->second.count(F))
+                    return R.why = "a store of it not into a closed code field of it: " + snapLoc(St), false;
+                  ks.insert(K);
+                  chains.push_back(chain + (chain.empty() ? "" : " -> ") + "stored into " + K + " " + snapLoc(St));
+                  continue;
+                }
+                const auto *CB = dyn_cast<CallBase>(U);
+                const Function *G = CB ? CB->getCalledFunction() : nullptr;
+                if (!G || G->isDeclaration() || G->hasAddressTaken())
+                  return R.why = "passed to " + (G ? G->getName().str() + (G->isDeclaration() ? ", no body" : ", address-taken")
+                                                   : std::string("an indirect call")) +
+                                 (CB ? " " + snapLoc(CB) : std::string()),
+                         false;
+                for (unsigned a = 0; a < CB->arg_size(); a++) {
+                  if (CB->getArgOperand(a) != X) continue;
+                  const Argument *A = G->getArg(a);
+                  if (done.count(A)) continue;
+                  if (!onPath.insert(A).second) return R.why = "a cycle of init functions at " + G->getName().str(), false;
+                  if (!feeds(A, G, chain + (chain.empty() ? "" : " -> ") + G->getName().str())) return false;
+                  onPath.erase(A);
+                  done.insert(A);
+                }
+              }
+              return true;
+            };
+            bool ok = F->hasAddressTaken();
+            if (!ok) R.why = "not address-taken";
+            for (const User *U : F->users()) {
+              if (!ok || isa<Instruction>(U)) continue;
+              // An address in a constant: named by the global it initializes.
+              std::string where = "a constant";
+              std::vector<const User *> w{U};
+              std::set<const User *> seen;
+              while (!w.empty() && seen.size() < 64) {
+                const User *X = w.back();
+                w.pop_back();
+                if (!seen.insert(X).second) continue;
+                if (const auto *GV = dyn_cast<GlobalVariable>(X)) {
+                  where = "the initializer of @" + GV->getName().str();
+                  break;
+                }
+                for (const User *XU : X->users()) w.push_back(XU);
+              }
+              R.why = "its address in " + where, ok = false;
+            }
+            if (ok) ok = feeds(F, nullptr, "");
+            if (ok && ks.empty()) R.why = "its address feeds no code field", ok = false;
+            if (ok) {
+              for (const User *U : F->users())
+                if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) R.callers.push_back(CB);
+              // Every indirect call, in IR order (the context's set of them is
+              // not filled yet here; runOnFunction checks the two agree).
+              for (auto &[M, _] : Ctx->Modules)
+                for (const Function &G : *M)
+                  for (const Instruction &I : instructions(G))
+                    if (const auto *CB = dyn_cast<CallBase>(&I); CB && isIndirectCallSite(CB) && ks.count(codeFieldOf(CB)))
+                      R.callers.push_back(CB);
+              std::string fs, cs;
+              for (const std::string &c : chains) fs += (fs.empty() ? "" : "; ") + c;
+              for (const CallBase *CB : R.callers)
+                cs += (cs.empty() ? "" : ", ") + std::string(CB->getCalledFunction() ? "direct " : "indirect ") + snapLoc(CB);
+              R.text = fs + "; callers: " + (cs.empty() ? std::string("none") : cs);
+            }
+            return fedOf[F] = R;
+          };
           // (A) A handle field's array (Fable 2026-10-19): the handle field K
           // whose array V is, by name: a load of K, or a value stored into K
           // (a new table before `table->table = newtable`), through -O0
@@ -4129,11 +4242,16 @@ void CallGraphPass::checkContainerClosure() {
               }
               if (const auto *Ar = dyn_cast<Argument>(V)) {
                 const Function *F = Ar->getParent();
-                if (F->hasAddressTaken()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken");
                 bool any = false;
-                for (const User *U : F->users())
-                  if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F && Ar->getArgNo() < CB->arg_size())
-                    any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, out, open);
+                if (F->hasAddressTaken()) {
+                  const Fed &fd = fedCallers(F);
+                  if (fd.text.empty()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken");
+                  for (const CallBase *CB : fd.callers)
+                    if (Ar->getArgNo() < CB->arg_size()) any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, out, open);
+                } else
+                  for (const User *U : F->users())
+                    if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F && Ar->getArgNo() < CB->arg_size())
+                      any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, out, open);
                 if (!any) open.insert("a formal of " + F->getName().str() + ", which has no caller");
                 return;
               }
@@ -4826,6 +4944,13 @@ void CallGraphPass::checkContainerClosure() {
                 o1AssumeLines.push_back("    snapshot holder " + hname + ": dropped from the word's objects: " + x);
               for (const auto &[o, why] : s1Why)
                 o1AssumeLines.push_back("    snapshot holder " + hname + ": kept, its size unknown: " + o + ": " + why);
+              // (f) per formal, by function name: the field, chain and callers,
+              // or why the rule does not apply.
+              std::map<std::string, const Fed *> fedByName;
+              for (const auto &[F, fd] : fedOf) fedByName[F->getName().str()] = &fd;
+              for (const auto &[fn, fd] : fedByName)
+                CG_LOG("Container: snapshot holder " << hname << ": formal rule: " << fn << ": "
+                       << (fd->text.empty() ? "not applied, " + fd->why : fd->text) << "\n");
               for (const std::string &x : keptObjs) CG_LOG("Container: snapshot holder " << hname << ": kept: " << x << "\n");
               CG_LOG("Container: snapshot holder " << hname << ": object walks: " << nodeCount << " nodes, "
                      << format("%.3f", walkSecs) << " s\n");

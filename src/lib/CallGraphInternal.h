@@ -282,6 +282,12 @@ std::string diDeclaredStruct(const Value *P, bool pointee);
 // The indirect calls in IR order (module, function, instruction): the
 // context keeps them in a pointer set, whose order follows the heap layout.
 std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx);
+// A call the graph build takes as indirect (visitCallBase's test): not
+// inline asm, and no function or ifunc is its callee once casts, aliases
+// and a constant GEP or bitcast are looked through. runOnFunction checks,
+// under --cfl-cells, that these are exactly its function's indirect calls
+// in the context's set, so a scan made before the set is filled agrees.
+bool isIndirectCallSite(const CallBase *CB);
 // A deterministic order on instructions for reports, where a pointer
 // set's order follows the heap: function name, debug file:line, position
 // in the function.

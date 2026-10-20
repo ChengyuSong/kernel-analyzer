@@ -304,6 +304,16 @@ void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
 void structCoverToUnions(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
                          const std::function<void(StructType *, int64_t, int64_t)> &visit,
                          const std::function<void(StructType *, int64_t, int64_t)> &onUnion);
+// The keys byte b of an object of debug type Ty (starting at tOff) is
+// named by: every named struct, union or class around it, with b's
+// offset in it (array elements by their own start).
+void diKeysAt(const DIType *Ty, int64_t tOff, int64_t b, std::set<std::string> &keys, int d);
+// Every non-null slot of GV's initializer (a pointer, or a scalar or data
+// leaf) at byte b, with the names it lies at: the IR named structs around
+// it and GV's debug type. hasDI: GV has a debug type; inLiteral: a literal
+// IR struct (a union initializer's) holds the slot.
+void initSlots(const GlobalVariable &GV, const DataLayout &DL,
+               const std::function<void(const Constant *, int64_t, const std::set<std::string> &, bool, bool)> &visit);
 extern size_t g_intStoreUnmodeled;
 extern size_t g_intArgUnmodeled;
 extern size_t g_initCEDeclined;

@@ -1027,6 +1027,42 @@ Obligations left open:
        copy's class and origins are rows of the rule report; the log
        groups the open ones by root (the field, formal, call or
        instruction the walk could not pass) with counts.
+     - Initializers and empty loads (Fable 2026-10-20, (0), a soundness
+       fix). A global initializer's slot is named by every IR named struct
+       around it and by the global's debug type (initSlots, shared with the
+       object walk's initializer table): a union initializer makes the IR
+       type literal, and before, such a slot (every bfd_target vector and
+       elf_backend_data in nm) had no name, so a load of its field found no
+       value and closed empty. A slot in a literal IR struct of a global
+       with no debug type has no name: a load of a name whose struct may lie
+       over it in the global's bytes is open ("initializer slots unnamed at
+       @G +b"). A load that finds no value is open, never an empty close: a
+       named field with no value stored by name, a load through a pointer
+       with none through its addresses, an -O0 local never stored, a global
+       with no initializer and no store; a global reached through a pointer
+       contributes its initializer at the address read. After this an empty
+       origin set means null or undef constants only. Consumers of the
+       origins: O1's copies by name (empty: no element), R1's covers and
+       check (2) (empty: close), the callee walk (requires a function
+       among the origins, so empty was never closed there), and object
+       identity's initializer table (the same naming; an unnamed slot opens
+       it, as before). A local's fields are named as any object's are:
+       only a -O0 slot (an alloca used only as the address of its own
+       loads and stores) names no field. Before, every address into an
+       alloca named none, so a field-0 write into an address-taken local
+       (its GEP (0, 0) strips to the alloca; fields 1 and up were named)
+       was missing from every list of writes by name (the values stored
+       by name, the field feeds, the element stores, the keeps, O1's
+       copies) and the cover skipped it as a store into a local. Found,
+       not fixed here (the same alloca exclusion, each its own item):
+       CellSolver's mod sets, Carves.cc's field key, TaggedFields'
+       accessor check, Summaries' pool-field accesses. Cases:
+       test/t_cells_container_o1_byname_{vector,vectornodi}.c (a vector
+       global initialized through a union: with debug information the
+       data load and the indirect call through it close by name; without
+       it both are open), test/t_cells_container_o1_byname_localfield.c
+       (an element stored into an address-taken local's field 0 and read
+       by name through a pointer to it: the copy is into an element).
      - The element premise: elements are exactly the constructors'
        allocations. The block's own checks establish it (O3: every
        insert's ELEM argument and replace/rename's ELEM(arg2) must be a
@@ -1329,8 +1365,9 @@ Obligations left open:
        order with its keys); a write that closes away is counted
        ("cover K: N unnamed-destination writes: a close, b reach, c open
        (z constant-zero memsets, null)"); a constant-zero memset writes
-       null. The origin walks count the indirect calls they follow apart
-       ("cover: N indirect calls through closed code fields followed").
+       null. The origin walks count the indirect call sites they follow
+       apart ("cover: N indirect call sites through closed code fields
+       followed"; distinct sites, not visits).
        (H, Fable 2026-10-19) A recognized snapshot holder's block H
        carries exactly the structs of its saves' sources (the handle
        array's pointer range, and element bytes of the paired entsize),

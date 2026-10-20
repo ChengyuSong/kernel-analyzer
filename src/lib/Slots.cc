@@ -13,6 +13,7 @@
 
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
+#include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/Operator.h>
@@ -522,6 +523,79 @@ void structCoverToUnions(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,
                          const std::function<void(StructType *, int64_t, int64_t)> &visit,
                          const std::function<void(StructType *, int64_t, int64_t)> &onUnion) {
   structCoverRec(T, lo, hi, DL, visit, 0, &onUnion);
+}
+
+void diKeysAt(const DIType *Ty, int64_t tOff, int64_t b, std::set<std::string> &keys, int d) {
+  // Typedefs and qualifiers stripped.
+  for (int i = 0; i < 16 && Ty; i++) {
+    const auto *D = dyn_cast<DIDerivedType>(Ty);
+    if (!D) break;
+    const auto tag = D->getTag();
+    if (tag != dwarf::DW_TAG_typedef && tag != dwarf::DW_TAG_const_type && tag != dwarf::DW_TAG_volatile_type &&
+        tag != dwarf::DW_TAG_restrict_type)
+      break;
+    Ty = D->getBaseType();
+  }
+  const auto *CT = dyn_cast_or_null<DICompositeType>(Ty);
+  if (!CT || d > 32) return;
+  if (CT->getTag() == dwarf::DW_TAG_array_type) {
+    const DIType *E = CT->getBaseType();
+    for (int i = 0; i < 16 && E; i++) {
+      const auto *D = dyn_cast<DIDerivedType>(E);
+      if (!D || (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_const_type &&
+                 D->getTag() != dwarf::DW_TAG_volatile_type && D->getTag() != dwarf::DW_TAG_restrict_type))
+        break;
+      E = D->getBaseType();
+    }
+    const int64_t es = E ? (int64_t)(E->getSizeInBits() / 8) : 0;
+    if (es > 0) diKeysAt(E, tOff + (b - tOff) / es * es, b, keys, d + 1);
+    return;
+  }
+  const auto tag = CT->getTag();
+  if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_union_type && tag != dwarf::DW_TAG_class_type) return;
+  if (!CT->getName().empty())
+    keys.insert(std::string(tag == dwarf::DW_TAG_union_type ? "union." : tag == dwarf::DW_TAG_class_type ? "class." : "struct.") +
+                CT->getName().str() + "+" + std::to_string(b - tOff));
+  for (const DINode *E : CT->getElements()) {
+    const auto *Mb = dyn_cast<DIDerivedType>(E);
+    if (!Mb || Mb->getTag() != dwarf::DW_TAG_member || Mb->isStaticMember()) continue;
+    const int64_t mo = tOff + (int64_t)(Mb->getOffsetInBits() / 8), ms = (int64_t)(Mb->getSizeInBits() / 8);
+    if (b >= mo && (ms == 0 || b < mo + ms)) diKeysAt(Mb->getBaseType(), mo, b, keys, d + 1);
+  }
+}
+
+void initSlots(const GlobalVariable &GV, const DataLayout &DL,
+               const std::function<void(const Constant *, int64_t, const std::set<std::string> &, bool, bool)> &visit) {
+  if (!GV.hasInitializer()) return;
+  SmallVector<DIGlobalVariableExpression *, 2> GVEs;
+  GV.getDebugInfo(GVEs);
+  std::vector<std::pair<std::string, int64_t>> anc; // the IR named structs around, (name, start)
+  int literal = 0;                                   // literal IR structs around
+  std::function<void(const Constant *, int64_t)> walk = [&](const Constant *C, int64_t b) {
+    if (C->isNullValue() || isa<UndefValue>(C)) return;
+    if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
+      StructType *ST = CS->getType();
+      const StructLayout *SL = DL.getStructLayout(ST);
+      const bool named = ST->hasName();
+      if (named) anc.push_back({stripStructNameSuffix(ST->getName()).str(), b});
+      else literal++;
+      for (unsigned i = 0; i < CS->getNumOperands(); i++) walk(CS->getOperand(i), b + (int64_t)SL->getElementOffset(i));
+      if (named) anc.pop_back();
+      else literal--;
+      return;
+    }
+    if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+      const int64_t es = (int64_t)DL.getTypeAllocSize(CA->getType()->getElementType());
+      for (unsigned e = 0; e < CA->getNumOperands(); e++) walk(CA->getOperand(e), b + e * es);
+      return;
+    }
+    std::set<std::string> keys;
+    for (const auto &[n, st] : anc) keys.insert(n + "+" + std::to_string(b - st));
+    for (const DIGlobalVariableExpression *GVE : GVEs)
+      if (const DIGlobalVariable *DV = GVE->getVariable()) diKeysAt(DV->getType(), 0, b, keys, 0);
+    visit(C, b, keys, !GVEs.empty(), literal > 0);
+  };
+  walk(GV.getInitializer(), 0);
 }
 
 // The debug-info struct a declared object is, or a pointer value points

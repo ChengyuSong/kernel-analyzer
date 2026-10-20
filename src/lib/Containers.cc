@@ -23,6 +23,7 @@
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Support/Format.h>
@@ -63,10 +64,12 @@ void CallGraphPass::checkContainerClosure() {
   // A field access's key: its IR struct (linker suffix stripped) and offset,
   // named by its struct GEP or TBAA tag, an array member at a variable index,
   // or at offset 0 with neither by the address's pointee (one naming rule
-  // with the link words, plan 3.55 R3 D3).
+  // with the link words, plan 3.55 R3 D3). A -O0 slot names no field (it
+  // names the local itself); an address-taken local's fields are named as
+  // any object's are, field 0 too (its GEP (0, 0) strips to the alloca).
   PointeeResolver pointees(Ctx);
   auto fieldKey = [&](const Instruction *I, const Value *Addr) -> std::string {
-    if (isa<AllocaInst>(Addr->stripPointerCasts())) return "";
+    if (transientSlot(Addr->stripPointerCasts())) return "";
     StructType *S = nullptr;
     int64_t off = 0;
     if (!namedSlot(I, Addr, I->getModule()->getDataLayout(), pointees, S, off) || !S || !S->hasName()) return "";
@@ -969,7 +972,7 @@ void CallGraphPass::checkContainerClosure() {
     std::map<const Argument *, StructType *> premise;
     auto ckey = [&](const Instruction *I, const Value *A) -> std::string {
       if (!declared) return fieldKey(I, A);
-      if (isa<AllocaInst>(A->stripPointerCasts())) return "";
+      if (transientSlot(A->stripPointerCasts())) return "";
       StructType *S = nullptr;
       int64_t off = 0;
       if (!namedSlot(I, A, CDL, pointees, S, off) || !S->hasName()) {
@@ -3249,6 +3252,8 @@ void CallGraphPass::checkContainerClosure() {
       // it, and this classification inherits their openness.
       std::map<std::string, std::vector<const Value *>> storedAt; // field key -> values stored there
       std::map<std::string, std::vector<std::string>> fieldUnknown; // field key -> block copies over it from elsewhere
+      struct UnnamedSlot { const GlobalVariable *G; int64_t b, size; };
+      std::vector<UnnamedSlot> initSlotsUnnamed; // pointer slots no name reads (literal IR struct, no debug type)
       std::vector<std::pair<std::string, const MemTransferInst *>> fieldCopies;
       for (auto &[M, _] : Ctx->Modules) {
         const DataLayout &MDL = M->getDataLayout();
@@ -3274,24 +3279,19 @@ void CallGraphPass::checkContainerClosure() {
               if (!K.empty()) fieldCopies.emplace_back(K, MT);
             }
           }
-        // Global initializers: every pointer at a named struct's offset.
-        std::function<void(const Constant *)> initWalk = [&](const Constant *C) {
-          if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
-            StructType *ST = CS->getType();
-            const StructLayout *SL = ST->hasName() ? MDL.getStructLayout(ST) : nullptr;
-            for (unsigned i = 0; i < CS->getNumOperands(); i++) {
-              const Constant *E = CS->getOperand(i);
-              if (SL && E->getType()->isPointerTy() && !E->isNullValue())
-                storedAt[stripStructNameSuffix(ST->getName()).str() + "+" +
-                         std::to_string(SL->getElementOffset(i))].push_back(E);
-              initWalk(E);
-            }
-          } else if (isa<ConstantArray>(C)) {
-            for (const Use &U : C->operands()) initWalk(cast<Constant>(U.get()));
-          }
-        };
+        // Global initializers: every non-null pointer at each name its slot
+        // lies at, the IR named structs around it and the global's debug
+        // type (a union initializer makes the IR type literal: its slots are
+        // named by the declaration alone). A slot in a literal struct of a
+        // global with no debug type has no name: a load of a name that may
+        // lie over it is open.
         for (const GlobalVariable &G : M->globals())
-          if (G.hasInitializer()) initWalk(G.getInitializer());
+          initSlots(G, MDL, [&](const Constant *C, int64_t b, const std::set<std::string> &keys, bool hasDI, bool inLiteral) {
+            if (!C->getType()->isPointerTy()) return;
+            for (const std::string &k : keys) storedAt[k].push_back(C);
+            if (keys.empty() && !hasDI && inLiteral)
+              initSlotsUnnamed.push_back({&G, b, (int64_t)MDL.getTypeAllocSize(G.getValueType())});
+          });
       }
       // A block copy over a field: from the same field of another object of
       // the struct (a struct copy) it brings that field's own values; from
@@ -3438,8 +3438,8 @@ void CallGraphPass::checkContainerClosure() {
             if (!unk.empty()) fieldUnknown[FK].push_back(*unk.begin() + " (its address escapes)");
             for (const Value *W : vals) storedAt[FK].push_back(W);
           }
-      size_t icallClosed = 0; // indirect calls whose callee closes by name (d)
-      size_t *icallCount = &icallClosed; // where originsOf counts them (a snapshot cover counts its own)
+      std::set<const CallBase *> icallClosed; // indirect call sites whose callee closes by name (d)
+      std::set<const CallBase *> *icallCount = &icallClosed; // where originsOf records them (a snapshot cover keeps its own)
       // The field keys a load of type T at K reads: K, and for a vector of
       // pointers each lane's field.
       auto laneKeys = [&](const std::string &K, Type *T) {
@@ -3451,6 +3451,25 @@ void CallGraphPass::checkContainerClosure() {
             ks.push_back(SN + "+" + std::to_string(o0 + l * 8));
         }
         return ks;
+      };
+      // A by-name load of K that may read an unnamed initializer slot (K's
+      // struct fitting over it in the global's bytes): why, or "".
+      std::map<std::string, int64_t> structBytes; // a named struct's size, by name
+      if (!initSlotsUnnamed.empty())
+        for (auto &[M, _] : Ctx->Modules)
+          for (StructType *ST : M->getIdentifiedStructTypes())
+            if (ST->hasName() && !ST->isOpaque() && ST->isSized())
+              structBytes.emplace(stripStructNameSuffix(ST->getName()).str(), (int64_t)M->getDataLayout().getTypeAllocSize(ST));
+      auto unnamedSlotUnder = [&](const std::string &K) -> std::string {
+        if (initSlotsUnnamed.empty()) return "";
+        const size_t p = K.rfind('+');
+        const int64_t o = std::stoll(K.substr(p + 1));
+        const auto it = structBytes.find(K.substr(0, p));
+        const int64_t sz = it == structBytes.end() ? 0 : it->second;
+        for (const UnnamedSlot &u : initSlotsUnnamed)
+          if (o <= u.b && u.b - o + sz <= u.size)
+            return "initializer slots unnamed at @" + u.G->getName().str() + " +" + std::to_string(u.b);
+        return "";
       };
       std::function<Origins(const Value *, int)> originsOf = [&](const Value *D0, int depth) {
         Origins O;
@@ -3537,9 +3556,12 @@ void CallGraphPass::checkContainerClosure() {
           }
           if (const auto *L = dyn_cast<LoadInst>(I)) {
             const Value *A = L->getPointerOperand()->stripPointerCasts();
+            // A load that finds no value is open, never an empty close.
             if (transientSlot(A)) {
+              bool any = false;
               for (const User *U : A->users())
-                if (const auto *S = dyn_cast<StoreInst>(U)) work.push_back(S->getValueOperand());
+                if (const auto *S = dyn_cast<StoreInst>(U)) work.push_back(S->getValueOperand()), any = true;
+              if (!any) O.unknown.insert("a load of an -O0 local never stored in " + loc(L));
               continue;
             }
             const std::string K = fieldKey(L, L->getPointerOperand());
@@ -3553,8 +3575,13 @@ void CallGraphPass::checkContainerClosure() {
                   O.unknown.insert("field " + LK + " not closed by name: " + fu->second.front());
                   continue;
                 }
-                if (const auto sit = storedAt.find(LK); sit != storedAt.end())
+                if (const std::string un = unnamedSlotUnder(LK); !un.empty()) {
+                  O.unknown.insert("a load of " + LK + " in " + loc(L) + ": " + un);
+                  continue;
+                }
+                if (const auto sit = storedAt.find(LK); sit != storedAt.end() && !sit->second.empty())
                   for (const Value *W : sit->second) work.push_back(W);
+                else O.unknown.insert("a load of " + LK + " in " + loc(L) + ": no value stored by name");
               }
               continue;
             }
@@ -3569,6 +3596,8 @@ void CallGraphPass::checkContainerClosure() {
                 }
               if (escapes) O.unknown.insert("a load of global " + G->getName().str() + ", whose address escapes");
               else if (G->hasInitializer()) work.push_back(G->getInitializer());
+              else if (std::none_of(G->user_begin(), G->user_end(), [](const User *U) { return isa<StoreInst>(U); }))
+                O.unknown.insert("a load of global " + G->getName().str() + ": no initializer, no store");
               continue;
             }
             // Through a pointer: the addresses it can hold by name (a named
@@ -3612,7 +3641,17 @@ void CallGraphPass::checkContainerClosure() {
             std::vector<const Value *> vals;
             std::set<std::string> unk;
             if (why.empty())
-              for (const Value *Ob : objs) storesThrough(Ob, vals, unk, vis);
+              for (const Value *Ob : objs) {
+                storesThrough(Ob, vals, unk, vis);
+                // A global's own initializer at the address read.
+                if (const auto *GV = dyn_cast<GlobalVariable>(Ob); GV && GV->hasInitializer()) {
+                  if (Constant *IC = ConstantFoldLoadFromConst(const_cast<Constant *>(GV->getInitializer()), L->getType(), APInt(64, 0),
+                                                               GV->getParent()->getDataLayout()))
+                    vals.push_back(IC);
+                  else unk.insert("the initializer of @" + GV->getName().str() + " read in " + loc(L));
+                }
+              }
+            const size_t elemsBefore = O.elements.size();
             if (why.empty())
               for (const std::string &FK : fks) {
                 if (handle.count(FK) || links.count(FK) || (cursorOpen.count(FK) && cursorOpen[FK].empty())) {
@@ -3621,9 +3660,14 @@ void CallGraphPass::checkContainerClosure() {
                 }
                 if (auto fu = fieldUnknown.find(FK); fu != fieldUnknown.end())
                   unk.insert("field " + FK + " not closed by name: " + fu->second.front());
-                else if (const auto sit = storedAt.find(FK); sit != storedAt.end())
+                else if (const std::string un = unnamedSlotUnder(FK); !un.empty())
+                  unk.insert("field " + FK + ": " + un);
+                else if (const auto sit = storedAt.find(FK); sit != storedAt.end() && !sit->second.empty())
                   vals.insert(vals.end(), sit->second.begin(), sit->second.end());
+                else unk.insert("field " + FK + ": no value stored by name");
               }
+            if (why.empty() && unk.empty() && vals.empty() && O.elements.size() == elemsBefore)
+              why = "no value stored through its addresses";
             if (!why.empty() || !unk.empty()) {
               O.unknown.insert("a load through a pointer in " + loc(L) + ": " + (why.empty() ? *unk.begin() : why));
               continue;
@@ -3661,7 +3705,7 @@ void CallGraphPass::checkContainerClosure() {
                   if (const auto *Ret = dyn_cast<ReturnInst>(&RI); Ret && Ret->getReturnValue())
                     work.push_back(Ret->getReturnValue());
               O.leaves.insert("returns of " + std::to_string(fns.size()) + " functions the call in " + loc(CB) + " can reach by name");
-              ++*icallCount;
+              icallCount->insert(CB);
               continue;
             }
             if (ctorsHere.count(G)) {
@@ -4170,7 +4214,7 @@ void CallGraphPass::checkContainerClosure() {
           struct CoverReason { const Instruction *I; std::string why; std::vector<std::string> keys; };
           std::vector<CoverReason> coverReasons;
           std::map<std::string, size_t> coverReasonAt;
-          size_t coverIcalls = 0; // indirect calls the covers' origin walks follow through closed code fields
+          std::set<const CallBase *> coverIcalls; // indirect call sites the covers' origin walks follow through closed code fields
           bool writesDone = false;
           std::set<std::string> keysWalked, keysCovered; // for the log
           std::set<std::string> nullWrites; // constant-zero memsets over a walked field: null, no object (listed)
@@ -4201,9 +4245,9 @@ void CallGraphPass::checkContainerClosure() {
                     }
                     StructType *WS = nullptr;
                     int64_t woff = 0;
-                    // A store into an -O0 scalar local names no field (it
-                    // names the local itself).
-                    if (!Addr || (isa<StoreInst>(&I) && isa<AllocaInst>(Addr->stripPointerCasts()))) continue;
+                    // A store into a -O0 slot names no field (it names the
+                    // local itself).
+                    if (!Addr || (isa<StoreInst>(&I) && transientSlot(Addr->stripPointerCasts()))) continue;
                     const bool named = namedSlot(&I, Addr, MDL, pointees, WS, woff) && WS && WS->hasName();
                     if (len <= 0) continue;
                     if (!named) {
@@ -4305,7 +4349,7 @@ void CallGraphPass::checkContainerClosure() {
               }
               auto it = unnamedOrigins.find(U.I);
               if (it == unnamedOrigins.end()) {
-                size_t *const own = icallCount;
+                std::set<const CallBase *> *const own = icallCount;
                 icallCount = &coverIcalls;
                 Origins O = originsOf(U.dest, 0);
                 icallCount = own;
@@ -4399,75 +4443,27 @@ void CallGraphPass::checkContainerClosure() {
               res = reasons.front() + (reasons.size() > 1 ? " (and " + std::to_string(reasons.size() - 1) + " more)" : "");
             return unnamedDone[ck] = res;
           };
-          std::function<void(const DIType *, int64_t, int64_t, std::set<std::string> &, int)> diKeysAt =
-              [&](const DIType *Ty, int64_t tOff, int64_t b, std::set<std::string> &keys, int d) {
-                const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(Ty));
-                if (!CT || d > 32) return;
-                if (CT->getTag() == dwarf::DW_TAG_array_type) {
-                  const auto *E = diStrip(CT->getBaseType());
-                  const int64_t es = E ? (int64_t)(E->getSizeInBits() / 8) : 0;
-                  if (es > 0) diKeysAt(E, tOff + (b - tOff) / es * es, b, keys, d + 1);
-                  return;
-                }
-                const auto tag = CT->getTag();
-                if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_union_type && tag != dwarf::DW_TAG_class_type)
-                  return;
-                if (!CT->getName().empty())
-                  keys.insert(std::string(tag == dwarf::DW_TAG_union_type ? "union." : tag == dwarf::DW_TAG_class_type ? "class." : "struct.") +
-                              CT->getName().str() + "+" + std::to_string(b - tOff));
-                for (const DINode *E : CT->getElements()) {
-                  const auto *Mb = dyn_cast<DIDerivedType>(E);
-                  if (!Mb || Mb->getTag() != dwarf::DW_TAG_member || Mb->isStaticMember()) continue;
-                  const int64_t mo = tOff + (int64_t)(Mb->getOffsetInBits() / 8), ms = (int64_t)(Mb->getSizeInBits() / 8);
-                  if (b >= mo && (ms == 0 || b < mo + ms)) diKeysAt(Mb->getBaseType(), mo, b, keys, d + 1);
-                }
-              };
           auto buildInit = [&]() {
             if (initDone) return;
             initDone = true;
             for (auto &[M, _] : Ctx->Modules) {
               const DataLayout &MDL = M->getDataLayout();
-              for (const GlobalVariable &GV : M->globals()) {
-                if (!GV.hasInitializer()) continue;
-                SmallVector<DIGlobalVariableExpression *, 2> GVEs;
-                GV.getDebugInfo(GVEs);
-                std::vector<std::pair<std::string, int64_t>> anc; // the IR named structs around, (name, start)
-                std::function<void(const Constant *, int64_t)> walk = [&](const Constant *C, int64_t b) {
-                  if (C->isNullValue() || isa<UndefValue>(C)) return;
-                  if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
-                    StructType *ST = CS->getType();
-                    const StructLayout *SL = MDL.getStructLayout(ST);
-                    const bool named = ST->hasName();
-                    if (named) anc.push_back({stripStructNameSuffix(ST->getName()).str(), b});
-                    for (unsigned i = 0; i < CS->getNumOperands(); i++) walk(CS->getOperand(i), b + (int64_t)SL->getElementOffset(i));
-                    if (named) anc.pop_back();
-                  } else if (const auto *CA = dyn_cast<ConstantArray>(C)) {
-                    const int64_t es = (int64_t)MDL.getTypeAllocSize(CA->getType()->getElementType());
-                    for (unsigned e = 0; e < CA->getNumOperands(); e++) walk(CA->getOperand(e), b + e * es);
-                  } else if (!C->getType()->isPointerTy()) {
+              for (const GlobalVariable &GV : M->globals())
+                initSlots(GV, MDL, [&](const Constant *C, int64_t b, const std::set<std::string> &keys, bool hasDI, bool) {
+                  if (!C->getType()->isPointerTy()) {
                     // A non-zero scalar or data slot: named like a pointer slot.
                     const int64_t len = (int64_t)MDL.getTypeStoreSize(C->getType());
-                    std::set<std::string> keys;
-                    for (const auto &[n, st] : anc) keys.insert(n + "+" + std::to_string(b - st));
-                    for (const DIGlobalVariableExpression *GVE : GVEs)
-                      if (const DIGlobalVariable *DV = GVE->getVariable()) diKeysAt(DV->getType(), 0, b, keys, 0);
                     for (const std::string &k : keys) {
                       const size_t q = k.rfind('+');
                       initNonZero.push_back({k.substr(0, q), std::stoll(k.substr(q + 1)), len, GV.getName().str()});
                     }
-                  } else if (C->getType()->isPointerTy()) {
-                    std::set<std::string> keys;
-                    for (const auto &[n, st] : anc) keys.insert(n + "+" + std::to_string(b - st));
-                    for (const DIGlobalVariableExpression *GVE : GVEs)
-                      if (const DIGlobalVariable *DV = GVE->getVariable()) diKeysAt(DV->getType(), 0, b, keys, 0);
-                    // A global with a debug type names its slots: one in no
-                    // struct (a scalar or an array of pointers) is no field.
-                    if (keys.empty() && GVEs.empty()) initUnnamed.push_back("@" + GV.getName().str() + " +" + std::to_string(b));
-                    for (const std::string &k : keys) initVals[k].push_back(C);
+                    return;
                   }
-                };
-                walk(GV.getInitializer(), 0);
-              }
+                  // A global with a debug type names its slots: one in no
+                  // struct (a scalar or an array of pointers) is no field.
+                  if (keys.empty() && !hasDI) initUnnamed.push_back("@" + GV.getName().str() + " +" + std::to_string(b));
+                  for (const std::string &k : keys) initVals[k].push_back(C);
+                });
             }
           };
           // For the guard word's log: cycle cuts, fields whose every store
@@ -5661,8 +5657,8 @@ void CallGraphPass::checkContainerClosure() {
                 CG_LOG("Container: snapshot holder " << hname << ": cover: unnamed-destination write " << snapLoc(r.I) << ": "
                        << r.why << " (over " << ks << ")\n");
               }
-              CG_LOG("Container: snapshot holder " << hname << ": cover: " << coverIcalls
-                     << " indirect calls through closed code fields followed\n");
+              CG_LOG("Container: snapshot holder " << hname << ": cover: " << coverIcalls.size()
+                     << " indirect call sites through closed code fields followed\n");
               CG_LOG("Container: snapshot holder " << hname << ": object walks: " << nodeCount << " nodes, "
                      << format("%.3f", walkSecs) << " s\n");
               // Every reason the word's objects are open, not only the first.
@@ -5845,8 +5841,8 @@ void CallGraphPass::checkContainerClosure() {
                                 std::to_string(o1IntoElement) + " into an element (checked), " +
                                 std::to_string(o1NoElement) + " into no element (origins by name), " +
                                 std::to_string(o1Unclassified.size()) + " open-unproven (each an ASSUMPTION) through " +
-                                std::to_string(o1Roots.size()) + " roots; " + std::to_string(icallClosed) +
-                                " indirect calls closed by their callee's names; elements are the constructors' "
+                                std::to_string(o1Roots.size()) + " roots; " + std::to_string(icallClosed.size()) +
+                                " indirect call sites closed by their callee's names; elements are the constructors' "
                                 "allocations, as the block's insert checks establish (each copy: the rule report)");
         std::vector<std::pair<size_t, std::string>> roots;
         for (const auto &[r, n] : o1Roots) roots.emplace_back(n, r);

@@ -25,6 +25,7 @@
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
+#include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/Support/Format.h>
 #include <chrono>
@@ -4085,6 +4086,80 @@ void CallGraphPass::checkContainerClosure() {
             o1AssumeLines.push_back("  snapshot holder candidate " + hname + ": no holder (" + fail + ")");
             continue;
           }
+          // R2 (Fable 2026-10-20, (ii')): a restore gives back what a save
+          // read when the two are paired: the restore's source base and the
+          // save's destination base are one value, and so are their sizes;
+          // one value is the same SSA value or loads of a -O0 slot whose
+          // stores are exactly one, not counting a store of constant 0 into
+          // a size slot (a copy of zero bytes writes nothing) or of null
+          // into a base slot (null names no object). Path-insensitive. Any
+          // other restore stays OPEN: "ranges not paired".
+          std::set<const MemTransferInst *> pairedRestores;
+          std::map<const MemTransferInst *, std::string> unpairedWhy;
+          {
+            auto slotName = [&](const Value *SL) {
+              for (DbgDeclareInst *D : findDbgDeclares(const_cast<Value *>(SL)))
+                return D->getVariable()->getName().str();
+              return std::string("a -O0 local");
+            };
+            // The value V is, or null with the reason it is none.
+            auto oneOf = [&](const Value *V, bool size, std::string &why) -> const Value * {
+              V = castsOnly(V);
+              while (const auto *C = dyn_cast<CastInst>(V)) V = castsOnly(C->getOperand(0));
+              const auto *L = dyn_cast<LoadInst>(V);
+              const Value *SL = L ? castsOnly(L->getPointerOperand()) : nullptr;
+              if (!L || !transientSlot(SL)) return V;
+              size_t n = 0;
+              bool cursor = false;
+              for (const User *U : SL->users())
+                if (const auto *S = dyn_cast<StoreInst>(U)) {
+                  const Value *SV = castsOnly(S->getValueOperand());
+                  if (size ? isa<ConstantInt>(SV) && cast<ConstantInt>(SV)->isZero() : isa<ConstantPointerNull>(SV))
+                    continue;
+                  n++;
+                  if (const auto *G = dyn_cast<GEPOperator>(SV))
+                    if (const auto *GL = dyn_cast<LoadInst>(castsOnly(G->getPointerOperand()));
+                        GL && castsOnly(GL->getPointerOperand()) == SL)
+                      cursor = true;
+                }
+              if (n == 1) return SL;
+              why = slotName(SL) + ": " + std::to_string(n) + " stores" + (cursor ? ", a cursor" : "");
+              return nullptr;
+            };
+            auto pairOf = [&](const std::vector<const MemTransferInst *> &outs,
+                              const std::vector<const MemTransferInst *> &saves) {
+              for (const MemTransferInst *R : outs) {
+                std::string why;
+                for (const MemTransferInst *Sv : saves) {
+                  std::string wb, ws, wb2, ws2;
+                  const Value *rb = oneOf(R->getRawSource(), false, wb), *sb = oneOf(Sv->getRawDest(), false, wb2);
+                  const Value *rs = oneOf(R->getLength(), true, ws), *ss = oneOf(Sv->getLength(), true, ws2);
+                  if (rb && rb == sb && rs && rs == ss) {
+                    pairedRestores.insert(R);
+                    CG_LOG("Container: snapshot holder " << hname << ": restore " << snapLoc(R)
+                                                         << ": paired with save " << snapLoc(Sv) << "\n");
+                    why.clear();
+                    break;
+                  }
+                  if (why.empty()) {
+                    std::vector<std::string> ps;
+                    if (!rb || !sb || rb != sb)
+                      ps.push_back("base: " + (!wb.empty() ? wb : !wb2.empty() ? wb2 : std::string("two values")));
+                    if (!rs || !ss || rs != ss)
+                      ps.push_back("size: " + (!ws.empty() ? ws : !ws2.empty() ? ws2 : std::string("two values")));
+                    for (const std::string &x : ps) why += (why.empty() ? "" : "; ") + x;
+                    why += " (save " + snapLoc(Sv) + ")";
+                  }
+                }
+                if (pairedRestores.count(R)) continue;
+                unpairedWhy[R] = "ranges not paired (" + why + ")";
+                CG_LOG("Container: snapshot holder " << hname << ": restore " << snapLoc(R) << ": " << unpairedWhy[R]
+                                                     << "\n");
+              }
+            };
+            pairOf(hOuts, hSaves);
+            pairOf(eOuts, eSaves);
+          }
           // The entsize premise: every store into the size field that can
           // reach this owner, walked back through formals to direct actuals
           // with the table pointer and the code field's value along, stores
@@ -4223,6 +4298,52 @@ void CallGraphPass::checkContainerClosure() {
           // struct or at another offset, a store of another width, a block
           // copy, a memset), or "".
           auto KO_of = [](const std::string &K) { return (int64_t)std::stoll(K.substr(K.rfind('+') + 1)); };
+          // R2 (Fable 2026-10-20, (i)): a block copy over K whose source is
+          // read under a name that puts the same key K at the same place in
+          // the copy brings K's own values: a cycle, nothing added. It rests
+          // on the name premise (the writes named otherwise over K are
+          // counted by name program-wide), so the source object needs no
+          // condition of its own. Every overlap of K must be whole.
+          std::set<const MemTransferInst *> kToKCopies; // for the log
+          auto kToK = [&](const MemTransferInst *MT, StructType *WS, int64_t woff, int64_t len, const std::string &KS,
+                          int64_t KO, int64_t size) {
+            const DataLayout &MDL = MT->getModule()->getDataLayout();
+            StructType *SS = nullptr;
+            int64_t soff = 0;
+            if (len <= 0 || len >= ((int64_t)1 << 40) || !namedSlot(MT, MT->getRawSource(), MDL, pointees, SS, soff) ||
+                !SS || !SS->hasName())
+              return false;
+            // Does K (KS's byte KO) begin at byte x of T?
+            auto keyAt = [&](Type *T, int64_t x) {
+              for (int d = 0; d < 64 && x >= 0; d++) {
+                if (auto *ST = dyn_cast<StructType>(T)) {
+                  if (ST->isOpaque()) return false;
+                  if (ST->hasName() && stripStructNameSuffix(ST->getName()) == KS && x == KO)
+                    return true;
+                  const StructLayout *SL = MDL.getStructLayout(ST);
+                  if (x >= (int64_t)SL->getSizeInBytes()) return false;
+                  const unsigned i = SL->getElementContainingOffset((uint64_t)x);
+                  x -= (int64_t)SL->getElementOffset(i);
+                  T = ST->getElementType(i);
+                } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+                  const int64_t es = (int64_t)MDL.getTypeAllocSize(AT->getElementType());
+                  if (es <= 0 || x >= es * (int64_t)AT->getNumElements()) return false;
+                  x %= es;
+                  T = AT->getElementType();
+                } else {
+                  return false;
+                }
+              }
+              return false;
+            };
+            bool any = false;
+            for (int64_t p = 1 - size; p < len; p++) {
+              if (!keyAt(WS, woff + p)) continue;
+              if (p < 0 || p + size > len || !keyAt(SS, soff + p)) return false;
+              any = true;
+            }
+            return any;
+          };
           auto coverOpen = [&](const std::string &K, int64_t size) -> std::string {
             if (!writesDone) {
               writesDone = true;
@@ -4275,6 +4396,17 @@ void CallGraphPass::checkContainerClosure() {
                             hits |= ST->hasName() && stripStructNameSuffix(ST->getName()) == KS && lo < KO + size && KO < hi;
                           });
               if (!hits) continue;
+              std::string tail;
+              if (const auto *MT = dyn_cast<MemTransferInst>(W.I)) {
+                // A paired restore gives back what its save read under the
+                // same name: a cycle.
+                if (pairedRestores.count(MT)) continue;
+                if (auto u = unpairedWhy.find(MT); u != unpairedWhy.end()) tail = ": " + u->second;
+                else if (kToK(MT, W.S, W.off, W.len, KS, KO, size)) {
+                  kToKCopies.insert(MT);
+                  continue;
+                }
+              }
               // Zero bytes are null, and null names no object (Fable
               // 2026-10-19): listed, not open.
               if (zero) {
@@ -4289,7 +4421,8 @@ void CallGraphPass::checkContainerClosure() {
                                   : isa<StoreInst>(W.I)       ? "a store"
                                                               : "an atomic write") +
                       " named " + stripStructNameSuffix(W.S->getName()).str() + "+" + std::to_string(W.off) + " (" +
-                      std::to_string(W.len) + " bytes) over " + K + " " + snapLoc(W.I);
+                      (W.len >= ((int64_t)1 << 40) ? std::string("a runtime length") : std::to_string(W.len) + " bytes") +
+                      ") over " + K + " " + snapLoc(W.I) + tail;
             }
             return n ? std::to_string(n) + " writes named otherwise over " + K + ", e.g. " + why : std::string();
           };
@@ -4345,6 +4478,11 @@ void CallGraphPass::checkContainerClosure() {
               if (const auto *MS = dyn_cast<MemSetInst>(U.I);
                   MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero()) {
                 nNull++;
+                continue;
+              }
+              // A paired restore gives back what its save read (R2): close.
+              if (const auto *MT = dyn_cast<MemTransferInst>(U.I); MT && pairedRestores.count(MT)) {
+                nClose++;
                 continue;
               }
               auto it = unnamedOrigins.find(U.I);
@@ -4804,7 +4942,11 @@ void CallGraphPass::checkContainerClosure() {
                       if (!slotsOf(MI, MI->getRawDest(), ks, 0) || !ks.count(MK)) continue;
                       const auto *MS = dyn_cast<MemSetInst>(MI);
                       if (MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero()) continue;
-                      open.insert("a block copy into " + K + "'s array " + snapLoc(MI));
+                      if (const auto *MT = dyn_cast<MemTransferInst>(MI); MT && pairedRestores.count(MT)) continue;
+                      const auto *MT = dyn_cast<MemTransferInst>(MI);
+                      auto u = MT ? unpairedWhy.find(MT) : unpairedWhy.end();
+                      open.insert("a block copy into " + K + "'s array " + snapLoc(MI) +
+                                  (u != unpairedWhy.end() ? ": " + u->second : std::string()));
                     } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
                       for (const Value *A : CB->args())
                         if (A->getType()->isPointerTy() && !arrayOf(A, 0).empty() && arrayOf(A, 0) == K)
@@ -5657,6 +5799,9 @@ void CallGraphPass::checkContainerClosure() {
                 CG_LOG("Container: snapshot holder " << hname << ": cover: unnamed-destination write " << snapLoc(r.I) << ": "
                        << r.why << " (over " << ks << ")\n");
               }
+              for (const MemTransferInst *MT : std::set<const MemTransferInst *, IROrder>(kToKCopies.begin(), kToKCopies.end()))
+                CG_LOG("Container: snapshot holder " << hname << ": cover: a block copy from the same key, nothing added (R2): "
+                                                     << snapLoc(MT) << "\n");
               CG_LOG("Container: snapshot holder " << hname << ": cover: " << coverIcalls.size()
                      << " indirect call sites through closed code fields followed\n");
               CG_LOG("Container: snapshot holder " << hname << ": object walks: " << nodeCount << " nodes, "

@@ -1377,6 +1377,37 @@ Obligations left open:
        owner's elements); a block with any other use is not a holder and
        stays an untyped allocation. So, in that holder's covers, an
        origin that is H reaches a field only as an element does.
+       (R2, Fable 2026-10-20) Copies that add nothing. (i) A block copy
+       over a walked field K whose source is read under a name that puts
+       the same key K at the same place in the copy (every overlap of K
+       whole; e.g. section_hash_entry and bfd_link_hash_entry both begin
+       with a bfd_hash_entry root) brings K's own values: a cycle. It
+       rests on the name premise: every write named otherwise over K is
+       counted by name program-wide (and every write with no named slot
+       by its origins, R1), so the source object needs no condition of
+       its own; a source under another name, or none, keeps K open. (ii')
+       A save and a restore of a recognized holder are paired when their
+       base and size are the same SSA value or loads of a -O0 slot whose
+       stores, excluding stores of constant 0 into the size slot (a copy
+       of zero bytes writes nothing) and of null into the base slot (null
+       names no object), are exactly one; otherwise the restore stays
+       OPEN ("ranges not paired (<the slot>: N stores[, a cursor])"). The
+       pairing is path-insensitive: the save's and the restore's common
+       guard is not used. A paired restore gives back what its save read,
+       under the same name: a cycle in the walk, in the covers and in the
+       array walk. Each restore's outcome is logged. The recognition
+       already requires every handle copy's length to be one value (an
+       -O0 local's entry-block 0 and one dominating store), so a size
+       mismatch on a handle restore is no holder before any pairing. An
+       element restore copies from a cursor (old_ent advanced by the
+       entsize after each copy) and is never paired: cursor
+       correspondence (both loops walk the same table in the same order
+       with the same stride) is the open lever, not proposed. The
+       recognition lists element restores as restores because they copy
+       out of H's element region with the owner's size field as length;
+       it does not match a restore to the save it returns, so H typing's
+       premise (every use of H is a save or a restore) does not depend on
+       that match.
      - Cases: test/t_cells_container_snapshot_{holder,other_offset,
        foreign_save,two_types,identity,initializer,nullwrite,cover}.c
        (identity: a path refuted by another allocation site, one by
@@ -1396,7 +1427,14 @@ Obligations left open:
        t_cells_container_snapshot_{unnamedcover,unnamedcoverctl,
        holderextra}.c (R1: a copy through a loaded void pointer onto the
        word's object declines; the same pointer holding another block is
-       counted, not a reason; a block with one more store is no holder).
+       counted, not a reason; a block with one more store is no holder);
+       t_cells_container_snapshot_{ktok,pairbase,pairtwo,pairmismatch}.c
+       (R2: a copy into the owner from a struct sharing its root adds
+       nothing and the guard holds; a base slot with two stores leaves the
+       handle restore unpaired and the array open; a size slot with two
+       real stores, and a restore of another size value, are no holder);
+       memcpy and cover copy from bytes and from another struct name (R2's
+       controls); handlearray's handle restore pairs ((ii')).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

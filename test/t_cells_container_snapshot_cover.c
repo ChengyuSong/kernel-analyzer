@@ -1,6 +1,7 @@
 // t_cells_container_snapshot_cover.c — (3'') premise relevance by
 // object identity by name (Fable 2026-10-19, (a)): a block copy over the
-// holder's field (memcpy into ref from ref2) writes what ref2's field
+// holder's field (memcpy into ref from ref2, a struct ref_b: another name,
+// so R2's copy by the same key does not apply) writes what ref2's field
 // holds, which ref.o's own stores do not name: the holder's field is OPEN,
 // so q's init is not refuted and the premise stays open (two element
 // structs). Without the cover check, q's path would be refuted.
@@ -80,7 +81,8 @@ __attribute__((noinline)) int bfd_hash_table_init_n(struct bfd_hash_table *table
 }
 struct owner { struct bfd_hash_table table; int flags; };
 struct ref { int pad; struct owner *o; };
-struct ref ref, ref2;
+struct ref ref;
+struct ref_b { int pad; struct owner *o; } ref2;
 __attribute__((noinline)) struct my_entry *snap(struct owner *o, const char *name) {
   struct bfd_hash_table *t = &o->table;
   size_t tabsize = 0;

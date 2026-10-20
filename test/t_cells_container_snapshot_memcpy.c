@@ -1,7 +1,10 @@
 // t_cells_container_snapshot_memcpy.c — (3'') unreachable by name, control
 // (Fable 2026-10-19, (b)): as t_cells_container_snapshot_unreachable.c, and
 // a block copy into the owner covers the word: its bytes are what the
-// template held, which no named store decides; the rule declines.
+// template held, which no named store decides; the rule declines. The
+// template is bytes (no struct name), so R2's copy by the same key does not
+// apply (R2's control, Fable 2026-10-20; with a struct owner template it
+// would: t_cells_container_snapshot_ktok.c).
 // LOG: guard snap .*\(mask 0x40 of struct.owner\+40\): not unreachable by name \([0-9]+ writes named otherwise over struct.owner\+40, e.g. a block copy
 // LOG: O1 FAIL\(open: an element copied from another value: 2 copies
 // NOLOG: ASSUMPTION unreachable by name
@@ -77,7 +80,7 @@ __attribute__((noinline)) int bfd_hash_table_init_n(struct bfd_hash_table *table
 }
 #define AS_NEEDED 1
 struct owner { struct bfd_hash_table table; unsigned int lo : 6; unsigned int cls : 4; unsigned int hi : 3; };
-struct owner tmpl;
+unsigned char tmpl[sizeof(struct owner)];
 __attribute__((noinline)) struct my_entry *snap(struct owner *o, const char *name) {
   struct bfd_hash_table *t = &o->table;
   size_t tabsize = 0;
@@ -116,7 +119,7 @@ int main(int argc, char **argv) {
   if (!o) return 1;
   set_lo(o);
   drop_needed(o);
-  if (argc > 4) memcpy(o, &tmpl, sizeof *o);
+  if (argc > 4) memcpy(o, tmpl, sizeof *o);
   if (argc > 2)
     bfd_hash_table_init_n(&o->table, big_newfunc, sizeof(struct big_entry), 61);
   else

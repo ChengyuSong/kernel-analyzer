@@ -9,7 +9,12 @@
 // bfd_hash_table_init_n), whose entry actual is null.
 // LOG: 1 handle arrays read by element, [1-9][0-9]* indirect calls through closed code fields followed
 // LOG: not unreachable by name
-// LOG: open: a block copy into struct.bfd_hash_table\+0's array snap
+// R2 (ii'): the handle restore pairs with its save (old_tab and tabsize are
+// -O0 slots whose stores, besides the null and 0 inits, are one each), so the
+// block copy into the array gives back what the save read; at the commit
+// before it was open.
+// LOG: restore snap .*: paired with save snap
+// NOLOG: open: a block copy into struct.bfd_hash_table\+0's array snap
 // LOG: formal rule: my_newfunc: bfd_hash_table_init_n -> stored into struct.bfd_hash_table\+8 .*; callers: indirect bfd_hash_insert
 // NOLOG: open: a formal of
 // NOLOG: a load of no named field

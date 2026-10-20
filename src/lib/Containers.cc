@@ -3350,6 +3350,17 @@ void CallGraphPass::checkContainerClosure() {
         for (const User *U : F->users())
           if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) out.push_back(CB);
       };
+      // Casts only (bitcast, addrspacecast): stripPointerCasts would also
+      // drop an all-zero-index GEP, a step the chains below report.
+      auto castsOnly = [](const Value *V) {
+        while (isa<BitCastOperator>(V) || isa<AddrSpaceCastOperator>(V)) V = cast<Operator>(V)->getOperand(0);
+        return V;
+      };
+      auto snapLoc = [](const Instruction *I) {
+        std::string l = I->getFunction()->getName().str();
+        if (const DebugLoc &DLc = I->getDebugLoc()) l += " " + DLc->getFilename().str() + ":" + std::to_string(DLc.getLine());
+        return l;
+      };
       struct Origins {
         std::set<std::string> leaves, unknown, elements;
         std::map<std::string, std::set<std::string>> pools; // certified pool -> its carves reached
@@ -3472,6 +3483,29 @@ void CallGraphPass::checkContainerClosure() {
             return "initializer slots unnamed at @" + u.G->getName().str() + " +" + std::to_string(u.b);
         return "";
       };
+      // (f) A formal of an address-taken function F has known callers
+      // when F's address only feeds closed code fields (Fable 2026-10-19):
+      // every use of F is a direct call, a store of F into a code field
+      // closed in O1(d)'s sense whose targets include F, or an actual to
+      // a defined init function that is not address-taken, whose formal
+      // has one use: (-O0) a store into its slot, loaded once and the
+      // slot used no other way; the value is stored into such a field or
+      // passed down to another such init function the same way. F's
+      // callers are then its direct callers and every indirect call
+      // through those fields. Why the rule does not apply, or the field,
+      // the init chain and the callers, is kept for the log.
+      // (R3, Fable 2026-10-20) F's address may also lie in slots of
+      // constant initializers: see r3Slot below. The callers are defined
+      // after originsOf, which consults them for an address-taken formal.
+      struct Fed { std::vector<const CallBase *> callers; std::string text, why; };
+      struct GVByName {
+        bool operator()(const GlobalVariable *A, const GlobalVariable *B) const { return A->getName() < B->getName(); }
+      };
+      std::map<const Function *, Fed> fedOf;
+      std::function<const Fed &(const Function *)> fedCallers;
+      // R3's read-side census walks block copy sources with every
+      // address-taken formal open (no callers consulted).
+      bool formalsOpen = false;
       std::function<Origins(const Value *, int)> originsOf = [&](const Value *D0, int depth) {
         Origins O;
         std::set<const Value *> seen;
@@ -3508,8 +3542,17 @@ void CallGraphPass::checkContainerClosure() {
             const Function *F = A->getParent();
             std::vector<const CallBase *> cs;
             callerOf(F, cs);
-            if (F->hasAddressTaken()) O.unknown.insert("a formal of address-taken " + F->getName().str());
-            else if (cs.empty()) O.unknown.insert("a formal of " + F->getName().str() + ", which has no caller");
+            if (F->hasAddressTaken()) {
+              // (f) and R3: its callers when the rule applies.
+              const Fed *fd = formalsOpen ? nullptr : &fedCallers(F);
+              if (!fd || fd->text.empty())
+                O.unknown.insert("a formal of address-taken " + F->getName().str() + (fd ? ": " + fd->why : std::string()));
+              else if (fd->callers.empty())
+                O.unknown.insert("a formal of " + F->getName().str() + ", which has no caller");
+              else
+                for (const CallBase *CB : fd->callers)
+                  if (A->getArgNo() < CB->arg_size()) work.push_back(CB->getArgOperand(A->getArgNo()));
+            } else if (cs.empty()) O.unknown.insert("a formal of " + F->getName().str() + ", which has no caller");
             else
               for (const CallBase *CB : cs)
                 if (A->getArgNo() < CB->arg_size()) work.push_back(CB->getArgOperand(A->getArgNo()));
@@ -3776,6 +3819,318 @@ void CallGraphPass::checkContainerClosure() {
         }
         return O;
       };
+      // (A) The closed code field an indirect call loads its callee from
+      // (O4's: every store into it a function constant), or "".
+      auto codeFieldOf = [&](const CallBase *CB) -> std::string {
+        const auto *Lc = dyn_cast<LoadInst>(castsOnly(CB->getCalledOperand()));
+        const std::string CK = Lc ? fieldKey(Lc, Lc->getPointerOperand()) : "";
+        auto tit = codeTargets.find(CK);
+        if (CK.empty() || !code.count(CK) || codeOpen.count(CK) || tit == codeTargets.end() || tit->second.empty())
+          return "";
+        return CK;
+      };
+      // (R3, Fable 2026-10-20) A slot of a constant global's initializer
+      // holding F at a key S+o is closed when (a) no write in a body lies
+      // over S+o under S or any name embedding S there (a constant-zero
+      // memset and a store of null excepted), and (r) every read of S+o by
+      // name is an indirect call's callee: each load named S+o is only
+      // called, compared, or kept in -O0 slots read only that way, and no
+      // block copy reads it by name. The callers are then the indirect
+      // calls those loads reach as callee (directly or through -O0 slots),
+      // any base: (a) and the
+      // global being an IR constant take the role of O4's closed code
+      // field (no write changes the slot), and an open base costs
+      // precision at the actuals only. "" when closed, else why not.
+      struct R3Span { int64_t lo, hi; const Instruction *I; };
+      std::map<std::string, std::vector<R3Span>> r3WritesAt, r3CopiesAt; // struct name -> spans
+      std::map<std::string, std::vector<const LoadInst *>> r3LoadsAt;    // key -> its loads
+      bool r3Indexed = false;
+      std::map<std::string, std::string> r3SlotWhy;
+      std::map<std::string, std::vector<const CallBase *>> r3CallsAt; // key -> the indirect calls its loads reach as callee
+      auto r3Index = [&] {
+        r3Indexed = true;
+        for (auto &[M, _] : Ctx->Modules) {
+          const DataLayout &MDL = M->getDataLayout();
+          for (const Function &G : *M)
+            for (const Instruction &I : instructions(G)) {
+              const Value *Addr = nullptr;
+              int64_t len = 0;
+              bool none = false; // writes no function: null, or a constant-zero memset
+              if (const auto *St = dyn_cast<StoreInst>(&I)) {
+                Addr = St->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(St->getValueOperand()->getType());
+                none = isa<ConstantPointerNull>(St->getValueOperand()->stripPointerCasts());
+              } else if (const auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
+                Addr = RMW->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(RMW->getValOperand()->getType());
+              } else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+                Addr = CX->getPointerOperand(), len = (int64_t)MDL.getTypeStoreSize(CX->getNewValOperand()->getType());
+              } else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+                Addr = MI->getRawDest();
+                const auto *Len = dyn_cast<ConstantInt>(MI->getLength());
+                len = Len ? (int64_t)Len->getZExtValue() : (int64_t)1 << 40;
+                if (const auto *MS = dyn_cast<MemSetInst>(MI))
+                  if (const auto *CV = dyn_cast<ConstantInt>(MS->getValue())) none = CV->isZero();
+                if (const auto *MT = dyn_cast<MemTransferInst>(MI)) {
+                  StructType *SS = nullptr;
+                  int64_t soff = 0;
+                  if (len > 0 && namedSlot(MT, MT->getRawSource(), MDL, pointees, SS, soff) && SS && SS->hasName())
+                    structCover(SS, soff, soff + len, MDL, [&](StructType *ST, int64_t lo, int64_t hi) {
+                      if (ST->hasName()) r3CopiesAt[stripStructNameSuffix(ST->getName()).str()].push_back({lo, hi, MT});
+                    });
+                }
+              } else if (const auto *L = dyn_cast<LoadInst>(&I)) {
+                if (const std::string K = fieldKey(L, L->getPointerOperand()); !K.empty())
+                  for (const std::string &k : laneKeys(K, L->getType())) r3LoadsAt[k].push_back(L);
+                continue;
+              }
+              StructType *WS = nullptr;
+              int64_t woff = 0;
+              if (!Addr || none || len <= 0 || (isa<StoreInst>(&I) && transientSlot(Addr->stripPointerCasts())) ||
+                  !namedSlot(&I, Addr, MDL, pointees, WS, woff) || !WS || !WS->hasName())
+                continue;
+              structCover(WS, woff, woff + len, MDL, [&](StructType *ST, int64_t lo, int64_t hi) {
+                if (ST->hasName()) r3WritesAt[stripStructNameSuffix(ST->getName()).str()].push_back({lo, hi, &I});
+              });
+            }
+        }
+      };
+      auto r3Slot = [&](const std::string &k) -> const std::string & {
+        if (auto it = r3SlotWhy.find(k); it != r3SlotWhy.end()) return it->second;
+        if (!r3Indexed) r3Index();
+        const size_t p = k.rfind('+');
+        const std::string KS = k.substr(0, p);
+        const int64_t KO = std::stoll(k.substr(p + 1));
+        std::string why;
+        // (a) a write in a body over the key, by its name or an embedding one.
+        if (auto it = r3WritesAt.find(KS); it != r3WritesAt.end())
+          for (const R3Span &w : it->second)
+            if (w.lo < KO + 8 && KO < w.hi) {
+              why = "a write in a body over it: " + snapLoc(w.I) + ": " + valueText(w.I);
+              break;
+            }
+        // (r) a read by name other than an indirect call's callee.
+        if (why.empty())
+          if (auto it = r3CopiesAt.find(KS); it != r3CopiesAt.end())
+            for (const R3Span &c : it->second)
+              if (c.lo < KO + 8 && KO < c.hi) {
+                why = "a block copy of it by name: " + snapLoc(c.I);
+                break;
+              }
+        if (why.empty())
+          if (auto it = r3LoadsAt.find(k); it != r3LoadsAt.end())
+            for (const LoadInst *L : it->second) {
+              std::vector<const Value *> w{L};
+              std::set<const Value *> seen;
+              while (!w.empty() && why.empty()) {
+                const Value *X = w.back();
+                w.pop_back();
+                if (!seen.insert(X).second) continue;
+                for (const User *XU : X->users()) {
+                  if (const auto *CB = dyn_cast<CallBase>(XU); CB && castsOnly(CB->getCalledOperand()) == X &&
+                                                               llvm::none_of(CB->args(), [&](const Use &A) { return A.get() == X; })) {
+                    r3CallsAt[k].push_back(CB);
+                    continue;
+                  }
+                  if (isa<ICmpInst>(XU)) continue;
+                  if (isa<BitCastOperator>(XU) || isa<AddrSpaceCastOperator>(XU)) {
+                    w.push_back(XU);
+                    continue;
+                  }
+                  if (const auto *St = dyn_cast<StoreInst>(XU); St && St->getValueOperand() == X && transientSlot(castsOnly(St->getPointerOperand()))) {
+                    for (const User *SU : castsOnly(St->getPointerOperand())->users())
+                      if (isa<LoadInst>(SU)) w.push_back(SU);
+                    continue;
+                  }
+                  why = "its load " + snapLoc(L) + " has another use: " +
+                        (isa<Instruction>(XU) ? snapLoc(cast<Instruction>(XU)) + ": " : std::string()) + valueText(XU);
+                  break;
+                }
+              }
+              if (!why.empty()) break;
+            }
+        return r3SlotWhy[k] = why;
+      };
+      // (R3, D1) The read side's block copies: a copy whose source no name
+      // reads may copy out of a vector global. Each source is walked once,
+      // with every address-taken formal open. A copy whose source is
+      // named reads that name's cells (the name premise). An unnamed
+      // source whose known origins hold one of F's globals makes F open;
+      // one whose origins are open rests on the byte-cell premise (plan
+      // 3.53: a pointer copied as bytes would be a leak), each copy an
+      // ASSUMPTION row of the rule report.
+      bool r3Census = false;
+      size_t r3NamedOpen = 0;
+      std::vector<std::pair<const MemTransferInst *, std::set<const Value *>>> r3Unnamed; // unnamed sources, IR order
+      std::vector<const MemTransferInst *> r3ByteRows;                                  // of them, the open ones
+      auto r3Copies = [&](const std::set<const GlobalVariable *, GVByName> &Gs) -> std::string {
+        if (!r3Census) {
+          r3Census = true;
+          const bool was = formalsOpen;
+          formalsOpen = true;
+          for (auto &[M, _] : Ctx->Modules)
+            for (const Function &G : *M)
+              for (const Instruction &I : instructions(G)) {
+                const auto *MT = dyn_cast<MemTransferInst>(&I);
+                if (!MT) continue;
+                StructType *SS = nullptr;
+                int64_t soff = 0;
+                const bool named = namedSlot(MT, MT->getRawSource(), MT->getModule()->getDataLayout(), pointees, SS, soff) && SS &&
+                                   SS->hasName();
+                const Origins O = originsOf(MT->getRawSource(), 0);
+                if (named) {
+                  if (!O.unknown.empty()) r3NamedOpen++;
+                  continue;
+                }
+                r3Unnamed.emplace_back(MT, O.objs);
+                if (!O.unknown.empty()) r3ByteRows.push_back(MT);
+              }
+          formalsOpen = was;
+        }
+        for (const auto &[MT, objs] : r3Unnamed)
+          for (const GlobalVariable *GV : Gs)
+            if (objs.count(GV)) return "a byte copy from @" + GV->getName().str() + ": " + snapLoc(MT);
+        return "";
+      };
+      fedCallers = [&](const Function *F) -> const Fed & {
+        if (auto it = fedOf.find(F); it != fedOf.end()) return it->second;
+        Fed R;
+        std::set<std::string> ks;
+        std::vector<std::string> chains;
+        // V (F's address, or the init formal it arrives in) goes only into
+        // closed code fields of F, or down a chain of init functions.
+        std::set<const Argument *> onPath, done;
+        std::function<bool(const Value *, const Function *, std::string)> feeds =
+            [&](const Value *V, const Function *H, std::string chain) -> bool {
+          const Value *X = V;
+          if (H) {
+            // An init formal: one use, a store into its -O0 slot loaded
+            // once (or, without a slot, the use itself).
+            if (!X->hasOneUse()) return R.why = "the formal of " + H->getName().str() + " has " +
+                                                std::to_string(X->getNumUses()) + " uses", false;
+            if (const auto *St = dyn_cast<StoreInst>(*X->user_begin());
+                St && St->getValueOperand() == X && transientSlot(castsOnly(St->getPointerOperand()))) {
+              const Value *SL = castsOnly(St->getPointerOperand());
+              const LoadInst *L = nullptr;
+              for (const User *U : SL->users()) {
+                if (U == St) continue;
+                const auto *LU = dyn_cast<LoadInst>(U);
+                if (!LU || L) return R.why = "the slot of " + H->getName().str() + "'s formal has a second use", false;
+                L = LU;
+              }
+              if (!L) return R.why = "the slot of " + H->getName().str() + "'s formal is never read", false;
+              X = L;
+            }
+          }
+          for (const User *U : X->users()) {
+            if (const auto *CB = dyn_cast<CallBase>(U); CB && !H && CB->getCalledOperand() == X) continue;
+            if (!H && isa<Constant>(U)) continue; // an initializer slot (R3, below)
+            if (const auto *St = dyn_cast<StoreInst>(U); St && St->getValueOperand() == X) {
+              const std::string K = fieldKey(St, St->getPointerOperand());
+              auto tit = codeTargets.find(K);
+              if (K.empty() || !code.count(K) || codeOpen.count(K) || tit == codeTargets.end() || !tit->second.count(F))
+                return R.why = "a store of it not into a closed code field of it: " + snapLoc(St), false;
+              ks.insert(K);
+              chains.push_back(chain + (chain.empty() ? "" : " -> ") + "stored into " + K + " " + snapLoc(St));
+              continue;
+            }
+            const auto *CB = dyn_cast<CallBase>(U);
+            const Function *G = CB ? CB->getCalledFunction() : nullptr;
+            if (!G || G->isDeclaration() || G->hasAddressTaken())
+              return R.why = "passed to " + (G ? G->getName().str() + (G->isDeclaration() ? ", no body" : ", address-taken")
+                                               : std::string("an indirect call")) +
+                             (CB ? " " + snapLoc(CB) : std::string()),
+                     false;
+            for (unsigned a = 0; a < CB->arg_size(); a++) {
+              if (CB->getArgOperand(a) != X) continue;
+              const Argument *A = G->getArg(a);
+              if (done.count(A)) continue;
+              if (!onPath.insert(A).second) return R.why = "a cycle of init functions at " + G->getName().str(), false;
+              if (!feeds(A, G, chain + (chain.empty() ? "" : " -> ") + G->getName().str())) return false;
+              onPath.erase(A);
+              done.insert(A);
+            }
+          }
+          return true;
+        };
+        bool ok = F->hasAddressTaken();
+        if (!ok) R.why = "not address-taken";
+        // (R3) An address in a constant: the globals whose initializers
+        // hold it; a constant used any other way is refused.
+        std::set<const GlobalVariable *, GVByName> inits;
+        for (const User *U : F->users()) {
+          if (!ok || isa<Instruction>(U)) continue;
+          std::vector<const User *> w{U};
+          std::set<const User *> seen;
+          while (ok && !w.empty()) {
+            const User *X = w.back();
+            w.pop_back();
+            if (!seen.insert(X).second) continue;
+            if (const auto *GV = dyn_cast<GlobalVariable>(X)) {
+              inits.insert(GV);
+              continue;
+            }
+            if (!isa<Constant>(X) || isa<GlobalValue>(X)) {
+              R.why = "its address in a constant used " + (isa<Instruction>(X) ? "in a body: " + snapLoc(cast<Instruction>(X))
+                                                                                   : "otherwise: " + valueText(X)),
+              ok = false;
+              break;
+            }
+            for (const User *XU : X->users()) w.push_back(XU);
+          }
+        }
+        std::set<std::string> r3ks;
+        for (const GlobalVariable *GV : inits) {
+          if (!ok) break;
+          if (!GV->isConstant()) {
+            R.why = "writable global @" + GV->getName().str(), ok = false;
+            break;
+          }
+          bool found = false;
+          initSlots(*GV, GV->getParent()->getDataLayout(),
+                    [&](const Constant *C, int64_t b, const std::set<std::string> &keys, bool, bool) {
+                      if (!ok || C->stripPointerCasts() != F) return;
+                      found = true;
+                      const std::string at = "@" + GV->getName().str() + " +" + std::to_string(b);
+                      if (keys.empty()) return (void)(R.why = "initializer slot unnamed at " + at, ok = false);
+                      std::string kl;
+                      for (const std::string &k : keys) {
+                        if (const std::string &why = r3Slot(k); !why.empty())
+                          return (void)(R.why = "initializer slot " + at + ": " + k + ": " + why, ok = false);
+                        r3ks.insert(k);
+                        kl += (kl.empty() ? "" : "/") + k;
+                      }
+                      chains.push_back("initializer slot " + at + " [" + kl + "]");
+                    });
+          if (ok && !found) R.why = "its address in @" + GV->getName().str() + " at no slot", ok = false;
+        }
+        if (ok && !inits.empty())
+          if (const std::string why = r3Copies(inits); !why.empty()) R.why = why, ok = false;
+        if (ok) ok = feeds(F, nullptr, "");
+        if (ok && ks.empty() && r3ks.empty()) R.why = "its address feeds no code field and lies in no initializer", ok = false;
+        if (ok) {
+          for (const User *U : F->users())
+            if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) R.callers.push_back(CB);
+          // Every indirect call, in IR order (the context's set of them is
+          // not filled yet here; runOnFunction checks the two agree).
+          for (auto &[M, _] : Ctx->Modules)
+            for (const Function &G : *M)
+              for (const Instruction &I : instructions(G))
+                if (const auto *CB = dyn_cast<CallBase>(&I); CB && isIndirectCallSite(CB) && ks.count(codeFieldOf(CB)))
+                  R.callers.push_back(CB);
+          // R3: the indirect calls a slot key's loads reach as callee, directly
+          // or through -O0 slots ((r) walked them), in IR order.
+          std::set<const Instruction *, IROrder> r3Calls;
+          for (const std::string &k : r3ks)
+            for (const CallBase *CB : r3CallsAt[k])
+              if (isIndirectCallSite(CB) && llvm::find(R.callers, CB) == R.callers.end()) r3Calls.insert(CB);
+          for (const Instruction *CI : r3Calls) R.callers.push_back(cast<CallBase>(CI));
+          std::string fs, cs;
+          for (const std::string &c : chains) fs += (fs.empty() ? "" : "; ") + c;
+          for (const CallBase *CB : R.callers)
+            cs += (cs.empty() ? "" : ", ") + std::string(CB->getCalledFunction() ? "direct " : "indirect ") + snapLoc(CB);
+          R.text = fs + "; callers: " + (cs.empty() ? std::string("none") : cs);
+        }
+        return fedOf[F] = R;
+      };
       // Snapshot holders ((3''), Fable 2026-10-17/18): a fresh block whose
       // every use, by name, is a save of the owner's handle array at its
       // start, a save of the same owner's elements (each of the owner's
@@ -3786,17 +4141,6 @@ void CallGraphPass::checkContainerClosure() {
       // within one owner. The solver makes it two objects (the handle image
       // and one struct of the element type) when the entsize premise holds.
       {
-        // Casts only (bitcast, addrspacecast): stripPointerCasts would also
-        // drop an all-zero-index GEP, a step the chains below report.
-        auto castsOnly = [](const Value *V) {
-          while (isa<BitCastOperator>(V) || isa<AddrSpaceCastOperator>(V)) V = cast<Operator>(V)->getOperand(0);
-          return V;
-        };
-        auto snapLoc = [](const Instruction *I) {
-          std::string l = I->getFunction()->getName().str();
-          if (const DebugLoc &DLc = I->getDebugLoc()) l += " " + DLc->getFilename().str() + ":" + std::to_string(DLc.getLine());
-          return l;
-        };
         // One value by name: the same SSA value, or a load of one -O0
         // local whose stores are its entry-block zero initializer and one
         // more store dominating the block's allocation (every read made
@@ -4723,130 +5067,7 @@ void CallGraphPass::checkContainerClosure() {
               }
             return any;
           };
-          // (A) The closed code field an indirect call loads its callee from
-          // (O4's: every store into it a function constant), or "".
           std::set<std::string> codeCallsWalked;
-          auto codeFieldOf = [&](const CallBase *CB) -> std::string {
-            const auto *Lc = dyn_cast<LoadInst>(castsOnly(CB->getCalledOperand()));
-            const std::string CK = Lc ? fieldKey(Lc, Lc->getPointerOperand()) : "";
-            auto tit = codeTargets.find(CK);
-            if (CK.empty() || !code.count(CK) || codeOpen.count(CK) || tit == codeTargets.end() || tit->second.empty())
-              return "";
-            return CK;
-          };
-          // (f) A formal of an address-taken function F has known callers
-          // when F's address only feeds closed code fields (Fable 2026-10-19):
-          // every use of F is a direct call, a store of F into a code field
-          // closed in O1(d)'s sense whose targets include F, or an actual to
-          // a defined init function that is not address-taken, whose formal
-          // has one use: (-O0) a store into its slot, loaded once and the
-          // slot used no other way; the value is stored into such a field or
-          // passed down to another such init function the same way. F's
-          // callers are then its direct callers and every indirect call
-          // through those fields. Why the rule does not apply, or the field,
-          // the init chain and the callers, is kept for the log.
-          struct Fed { std::vector<const CallBase *> callers; std::string text, why; };
-          std::map<const Function *, Fed> fedOf;
-          auto fedCallers = [&](const Function *F) -> const Fed & {
-            if (auto it = fedOf.find(F); it != fedOf.end()) return it->second;
-            Fed R;
-            std::set<std::string> ks;
-            std::vector<std::string> chains;
-            // V (F's address, or the init formal it arrives in) goes only into
-            // closed code fields of F, or down a chain of init functions.
-            std::set<const Argument *> onPath, done;
-            std::function<bool(const Value *, const Function *, std::string)> feeds =
-                [&](const Value *V, const Function *H, std::string chain) -> bool {
-              const Value *X = V;
-              if (H) {
-                // An init formal: one use, a store into its -O0 slot loaded
-                // once (or, without a slot, the use itself).
-                if (!X->hasOneUse()) return R.why = "the formal of " + H->getName().str() + " has " +
-                                                    std::to_string(X->getNumUses()) + " uses", false;
-                if (const auto *St = dyn_cast<StoreInst>(*X->user_begin());
-                    St && St->getValueOperand() == X && transientSlot(castsOnly(St->getPointerOperand()))) {
-                  const Value *SL = castsOnly(St->getPointerOperand());
-                  const LoadInst *L = nullptr;
-                  for (const User *U : SL->users()) {
-                    if (U == St) continue;
-                    const auto *LU = dyn_cast<LoadInst>(U);
-                    if (!LU || L) return R.why = "the slot of " + H->getName().str() + "'s formal has a second use", false;
-                    L = LU;
-                  }
-                  if (!L) return R.why = "the slot of " + H->getName().str() + "'s formal is never read", false;
-                  X = L;
-                }
-              }
-              for (const User *U : X->users()) {
-                if (const auto *CB = dyn_cast<CallBase>(U); CB && !H && CB->getCalledOperand() == X) continue;
-                if (const auto *St = dyn_cast<StoreInst>(U); St && St->getValueOperand() == X) {
-                  const std::string K = fieldKey(St, St->getPointerOperand());
-                  auto tit = codeTargets.find(K);
-                  if (K.empty() || !code.count(K) || codeOpen.count(K) || tit == codeTargets.end() || !tit->second.count(F))
-                    return R.why = "a store of it not into a closed code field of it: " + snapLoc(St), false;
-                  ks.insert(K);
-                  chains.push_back(chain + (chain.empty() ? "" : " -> ") + "stored into " + K + " " + snapLoc(St));
-                  continue;
-                }
-                const auto *CB = dyn_cast<CallBase>(U);
-                const Function *G = CB ? CB->getCalledFunction() : nullptr;
-                if (!G || G->isDeclaration() || G->hasAddressTaken())
-                  return R.why = "passed to " + (G ? G->getName().str() + (G->isDeclaration() ? ", no body" : ", address-taken")
-                                                   : std::string("an indirect call")) +
-                                 (CB ? " " + snapLoc(CB) : std::string()),
-                         false;
-                for (unsigned a = 0; a < CB->arg_size(); a++) {
-                  if (CB->getArgOperand(a) != X) continue;
-                  const Argument *A = G->getArg(a);
-                  if (done.count(A)) continue;
-                  if (!onPath.insert(A).second) return R.why = "a cycle of init functions at " + G->getName().str(), false;
-                  if (!feeds(A, G, chain + (chain.empty() ? "" : " -> ") + G->getName().str())) return false;
-                  onPath.erase(A);
-                  done.insert(A);
-                }
-              }
-              return true;
-            };
-            bool ok = F->hasAddressTaken();
-            if (!ok) R.why = "not address-taken";
-            for (const User *U : F->users()) {
-              if (!ok || isa<Instruction>(U)) continue;
-              // An address in a constant: named by the global it initializes.
-              std::string where = "a constant";
-              std::vector<const User *> w{U};
-              std::set<const User *> seen;
-              while (!w.empty() && seen.size() < 64) {
-                const User *X = w.back();
-                w.pop_back();
-                if (!seen.insert(X).second) continue;
-                if (const auto *GV = dyn_cast<GlobalVariable>(X)) {
-                  where = "the initializer of @" + GV->getName().str();
-                  break;
-                }
-                for (const User *XU : X->users()) w.push_back(XU);
-              }
-              R.why = "its address in " + where, ok = false;
-            }
-            if (ok) ok = feeds(F, nullptr, "");
-            if (ok && ks.empty()) R.why = "its address feeds no code field", ok = false;
-            if (ok) {
-              for (const User *U : F->users())
-                if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) R.callers.push_back(CB);
-              // Every indirect call, in IR order (the context's set of them is
-              // not filled yet here; runOnFunction checks the two agree).
-              for (auto &[M, _] : Ctx->Modules)
-                for (const Function &G : *M)
-                  for (const Instruction &I : instructions(G))
-                    if (const auto *CB = dyn_cast<CallBase>(&I); CB && isIndirectCallSite(CB) && ks.count(codeFieldOf(CB)))
-                      R.callers.push_back(CB);
-              std::string fs, cs;
-              for (const std::string &c : chains) fs += (fs.empty() ? "" : "; ") + c;
-              for (const CallBase *CB : R.callers)
-                cs += (cs.empty() ? "" : ", ") + std::string(CB->getCalledFunction() ? "direct " : "indirect ") + snapLoc(CB);
-              R.text = fs + "; callers: " + (cs.empty() ? std::string("none") : cs);
-            }
-            return fedOf[F] = R;
-          };
           // (A) A handle field's array (Fable 2026-10-19): the handle field K
           // whose array V is, by name: a load of K, or a value stored into K
           // (a new table before `table->table = newtable`), through -O0
@@ -5073,7 +5294,7 @@ void CallGraphPass::checkContainerClosure() {
                 bool any = false;
                 if (F->hasAddressTaken()) {
                   const Fed &fd = fedCallers(F);
-                  if (fd.text.empty()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken");
+                  if (fd.text.empty()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken: " + fd.why);
                   for (const CallBase *CB : fd.callers)
                     if (Ar->getArgNo() < CB->arg_size()) any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, out, open);
                 } else
@@ -6001,6 +6222,20 @@ void CallGraphPass::checkContainerClosure() {
         o1ReportLines.insert(o1ReportLines.end(), o1NameLines.begin(), o1NameLines.end());
         for (const std::string &u : o1Unclassified) {
           o1ReportLines.push_back("    ASSUMPTION a block copy into no element: " + u);
+          nO1Assume++;
+        }
+      }
+      // (R3, D1) The byte-cell premise R3's read side rests on, when R3
+      // looked at a vector: each copy with an unnamed, open source.
+      if (r3Census) {
+        CG_LOG("Container: R3 read side: " << (r3NamedOpen + r3ByteRows.size()) << " block copies with open source: "
+               << r3NamedOpen << " under another name (name premise), " << r3ByteRows.size()
+               << " unnamed (byte-cell ASSUMPTION rows)\n");
+        o1AssumeLines.push_back("  R3 read side: a byte copy with an open source carries no code pointer; a pointer copied as "
+                                "bytes would be a leak (plan 3.53): " + std::to_string(r3ByteRows.size()) + " copies");
+        for (const MemTransferInst *MT : r3ByteRows) {
+          o1AssumeLines.push_back("    ASSUMPTION a byte copy with an open source carries no code pointer: " + snapLoc(MT) + ": " +
+                                  valueText(MT));
           nO1Assume++;
         }
       }

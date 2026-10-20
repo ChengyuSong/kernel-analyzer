@@ -1215,6 +1215,55 @@ Obligations left open:
          a cycle cut as above. An address in a constant, a second use of a
          slot, an address-taken or bodiless init function, or a store
          elsewhere leaves the formal OPEN, with why it is logged.
+       - (R3, Fable 2026-10-20) Formals through constant vectors. A formal
+         of an address-taken F also has known callers when each use of F's
+         address is a direct call, one of (f)'s uses, or a slot of the
+         initializer of a global that is an IR constant (isConstant()): a
+         write into a constant is undefined, so no write, named, unnamed
+         or with open origins, changes the slot. Each such slot is named
+         (initSlots: the IR named structs around it and the global's debug
+         type; an unnamed slot, a union initializer at -g0, leaves F OPEN:
+         "initializer slot unnamed at @G +b"), and for each of its keys
+         S+o: (a) no write in a body lies over S+o under S or under a name
+         embedding S there (a constant-zero memset and a store of null
+         write no function; a function constant stored in a body is a
+         write), and (r) every read of S+o by name is an indirect call's
+         callee: each load named S+o is only called, compared, or kept in
+         -O0 slots read only that way, and no block copy reads S+o by name.
+         F's callers are then its direct callers and every indirect call
+         those loads reach as callee (directly or through -O0 slots), any
+         base. (a) and the constant global take the role of O4's closed
+         code field, so O4's check is not needed; an open base costs
+         precision at the actuals only. A writable vector stays OPEN
+         ("writable global @G"): nm's elf backend tables
+         (elfxx-target.h's `static struct elf_backend_data elfNN_bed`) are
+         written at a runtime offset by bfd_elf_set_pagesize (bfd.c:2115
+         `*((bfd_vma *) ((char *) bed + offset)) = size;`), and writes
+         with open origins may reach them. That store is an integer with no
+         origin under --cfl-alloc-origins; proving that per store is a
+         lever, not taken. The read side's block copies: a copy whose
+         source is read under a struct name reads that name's cells (the
+         name premise); a copy with an unnamed source whose known origins
+         hold one of F's globals leaves F OPEN; one whose origins are open
+         (each source walked once, every address-taken formal open) rests
+         on the byte-cell premise of plan 3.53: a byte copy carries no
+         code pointer, a pointer copied as bytes would be a leak. Each such
+         copy is an ASSUMPTION row of the rule report ("R3 read side"),
+         with the log count of copies under another name and unnamed. The
+         caller side is not given: a vector function's stores through its
+         formal into a caller's local (nm.c:1112's minisyms, filled by
+         bfd_read_minisymbols through BFD_SEND) need the call's targets,
+         so those writes stay OPEN. A function with no call reaching it by
+         name has no caller: its formal stays OPEN ("which has no caller"),
+         as for any function never called. The covers' origins
+         (originsOf) consult the same callers for (f) and R3; (f) adds no
+         cover close on nm-O0. (f)'s callers are its fields' direct callee
+         loads, with no read-side check: a load of a closed code field kept
+         in a -O0 slot or passed on would hide a caller (none in nm: the
+         one field, struct.bfd_hash_table+8, is loaded 2 times at -O0 and
+         once at -O3, each directly called); open, the same walk as (r).
+         Cases: t_cells_container_snapshot_vectorformal{,slot,w,nodi,
+         named,byte}.c.
        - The walk computes the least fixpoint of these rules over nodes (a
          value, a field read under its keys, a handle array's elements): a
          node's objects are the union of its successors', each shifted by

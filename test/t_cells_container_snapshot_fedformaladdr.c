@@ -4,8 +4,10 @@
 // not closed (O1(d): a feed through an address-taken function's formal
 // opens it), so the walk stops at bfd_hash_insert's indirect call, OPEN,
 // and never reaches the newfunc formals; the rule, asked about
-// bfd_hash_table_init's own formal, does not apply.
-// LOG: formal rule: bfd_hash_table_init: not applied, its address in the initializer of @init_hook
+// bfd_hash_table_init's own formal, does not apply: init_hook is a
+// writable global (R3, Fable 2026-10-20: only a constant vector names
+// its callers).
+// LOG: formal rule: bfd_hash_table_init: not applied, writable global @init_hook
 // LOG: open: an indirect call's result bfd_hash_insert
 // NOLOG: formal rule: my_newfunc:
 #include <stdlib.h>

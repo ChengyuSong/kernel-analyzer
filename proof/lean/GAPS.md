@@ -1164,9 +1164,28 @@ Obligations left open:
          (O4's: every store into it a function constant, no aggregate copy
          of the owner) returns what its targets return, each as a direct
          callee (an allocator wrapper is its call site).
+       - The walk computes the least fixpoint of these rules over nodes (a
+         value, a field read under its keys, a handle array's elements): a
+         node's objects are the union of its successors', each shifted by
+         its step's offset. It is depth-first with Tarjan's SCCs. A node
+         met again while its SCC is under way adds nothing there (a cycle
+         cut): in an SCC every member reaches every other, so with steps
+         summing to offset 0 all members have the same objects up to their
+         offsets, and those arrive at the root. Every member of a finished
+         SCC gets the root's objects shifted by its offset from the root;
+         only finished SCCs are kept, each node's result relative to its
+         own offset. A cycle whose steps do not sum to offset 0 (p = p + 8
+         in a loop) has no finite set of objects and is OPEN ("a cycle
+         through V stepping the offset by n"). Keeping results changes only
+         the order in which objects are found, not the least fixpoint: a
+         kept result is the fixpoint of its node, and a result not kept is
+         recomputed. Past a node budget (200000 nodes per holder) a node
+         not yet walked is OPEN ("budget exhausted at V"), counted and
+         reported; a result under a budget cut is not kept. This replaces
+         the depth limit of 16, which cut the walk without a cycle.
        Anything else is OPEN with its reason (an address-taken formal, an
        indirect call's result, a runtime step, a load of no named field,
-       the depth limit). A path is refuted when both ends are closed and
+       the node budget). A path is refuted when both ends are closed and
        share no object: then no execution's size store on that path writes
        the holder's field, since every write of the walked fields is named
        (the standing naming assumption) and distinct sites or offsets are

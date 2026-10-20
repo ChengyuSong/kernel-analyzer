@@ -25,6 +25,8 @@
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/IR/Dominators.h>
+#include <llvm/Support/Format.h>
+#include <chrono>
 
 namespace {
 
@@ -3618,7 +3620,6 @@ void CallGraphPass::checkContainerClosure() {
           // its call site), a load of a named field (every store of that
           // key in the program). Anything else is open, by its reason.
           using Obj = std::pair<std::string, int64_t>;
-          std::map<std::string, std::pair<std::set<Obj>, std::set<std::string>>> fieldObjs; // memo per key
           // A global initializer is a write too: each of its non-null pointer
           // slots is named by every struct around it, the IR's named structs
           // and the global's debug type (a union initializer makes the IR
@@ -3780,12 +3781,76 @@ void CallGraphPass::checkContainerClosure() {
               }
             }
           };
-          std::set<std::string> fieldOnPath;
           // For the guard word's log: cycle cuts, fields whose every store
           // was cut, union reads walked by key, stores they excluded.
           size_t cycleCuts = 0;
           std::set<std::string> cutEmpty, keysUnionWalked, unionExcluded;
-          std::function<void(const Value *, int64_t, int, std::set<Obj> &, std::set<std::string> &)> objsOf;
+          // Object identity is a least fixpoint over nodes (a value, a field
+          // read under its keys, a handle array's elements): a node's objects
+          // are the union of its successors', each shifted by its step's
+          // offset. The walk is depth-first with Tarjan's SCCs: a node met
+          // again while its SCC is under way adds nothing there (a cycle cut;
+          // its objects arrive at the SCC's root), and every member of a
+          // finished SCC has the root's objects, shifted by its offset from
+          // the root. A cycle whose steps do not sum to offset 0 is OPEN.
+          // Only a finished SCC's results are kept, each relative to its
+          // node; a result under a budget cut is not kept. Past the node
+          // budget, a node not yet walked is OPEN by name.
+          using ORes = std::pair<std::set<Obj>, std::set<std::string>>;
+          std::map<std::string, ORes> nodeMemo;
+          std::map<std::string, std::pair<size_t, int64_t>> onStack; // (index, offset) of a node whose SCC is under way
+          std::vector<std::string> nodeStack;
+          std::vector<size_t *> lowStack;
+          const size_t nodeBudget = 200000;
+          size_t nodeCount = 0, budgetCuts = 0, offCycles = 0;
+          double walkSecs = 0; // the walks' own time, from each top-level node
+          auto visit = [&](const std::string &key, const std::function<std::string()> &name, int64_t off,
+                           std::set<Obj> &out, std::set<std::string> &open,
+                           const std::function<void(int64_t, std::set<Obj> &, std::set<std::string> &)> &body) {
+            if (auto it = nodeMemo.find(key); it != nodeMemo.end()) {
+              for (const Obj &x : it->second.first) out.insert({x.first, x.second + off});
+              open.insert(it->second.second.begin(), it->second.second.end());
+              return;
+            }
+            if (auto it = onStack.find(key); it != onStack.end()) {
+              if (it->second.second != off)
+                offCycles++, open.insert("a cycle through " + name() + " stepping the offset by " +
+                                         std::to_string(off - it->second.second));
+              else
+                cycleCuts++;
+              if (!lowStack.empty()) *lowStack.back() = std::min(*lowStack.back(), it->second.first);
+              return;
+            }
+            if (nodeCount >= nodeBudget) return (void)(budgetCuts++, open.insert("budget exhausted at " + name()));
+            const bool top = lowStack.empty();
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t idx = nodeCount++;
+            size_t low = idx;
+            onStack[key] = {idx, off};
+            nodeStack.push_back(key);
+            lowStack.push_back(&low);
+            const size_t b0 = budgetCuts;
+            ORes r;
+            body(off, r.first, r.second);
+            lowStack.pop_back();
+            if (!lowStack.empty()) *lowStack.back() = std::min(*lowStack.back(), low);
+            if (low == idx)
+              for (bool more = true; more;) {
+                const std::string m = nodeStack.back();
+                nodeStack.pop_back();
+                const int64_t mo = onStack[m].second;
+                onStack.erase(m);
+                more = m != key;
+                if (budgetCuts != b0) continue;
+                ORes &mr = nodeMemo[m];
+                for (const Obj &x : r.first) mr.first.insert({x.first, x.second - mo});
+                mr.second = r.second;
+              }
+            out.insert(r.first.begin(), r.first.end());
+            open.insert(r.second.begin(), r.second.end());
+            if (top) walkSecs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+          };
+          std::function<void(const Value *, int64_t, std::set<Obj> &, std::set<std::string> &)> objsOf;
           std::map<std::string, const Value *> objSite; // an object's name -> its allocation (call, alloca, global)
           // An object made by a certified pool's carves (Carves.cc): its pools.
           std::map<std::string, std::set<std::string>> objPools;
@@ -3918,15 +3983,12 @@ void CallGraphPass::checkContainerClosure() {
           // flows in, by name: every store into an element, a memset 0 null;
           // a block copy into it, or the array passing where elements are
           // written unseen (a call, a store elsewhere), is OPEN.
-          std::map<std::string, std::pair<std::set<Obj>, std::set<std::string>>> elemObjs;
           std::set<std::string> elemWalked;
-          std::function<void(const std::string &, int64_t, int, std::set<Obj> &, std::set<std::string> &)> walkElems =
-              [&](const std::string &K, int64_t off, int d, std::set<Obj> &out, std::set<std::string> &open) {
+          std::function<void(const std::string &, int64_t, std::set<Obj> &, std::set<std::string> &)> walkElems =
+              [&](const std::string &K, int64_t off, std::set<Obj> &out, std::set<std::string> &open) {
             const std::string MK = K + "[]";
-            std::pair<std::set<Obj>, std::set<std::string>> r;
-            if (auto it = elemObjs.find(MK); it != elemObjs.end()) r = it->second;
-            else {
-              if (!fieldOnPath.insert(MK).second) return (void)cycleCuts++;
+            visit("f" + MK, [&] { return MK; }, off, out, open,
+                  [&](int64_t off, std::set<Obj> &out, std::set<std::string> &open) {
               elemWalked.insert(K);
               for (auto &[M, _] : Ctx->Modules)
                 for (const Function &F : *M)
@@ -3937,33 +3999,29 @@ void CallGraphPass::checkContainerClosure() {
                           !ks.count(MK))
                         continue;
                       if (St->getValueOperand()->getType()->isPointerTy())
-                        objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
+                        objsOf(St->getValueOperand(), off, out, open);
                       else
-                        r.second.insert("a store of a non-pointer value into " + K + "'s array " + snapLoc(St));
+                        open.insert("a store of a non-pointer value into " + K + "'s array " + snapLoc(St));
                     } else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) {
                       if (!slotsOf(MI, MI->getRawDest(), ks, 0) || !ks.count(MK)) continue;
                       const auto *MS = dyn_cast<MemSetInst>(MI);
                       if (MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero()) continue;
-                      r.second.insert("a block copy into " + K + "'s array " + snapLoc(MI));
+                      open.insert("a block copy into " + K + "'s array " + snapLoc(MI));
                     } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
                       for (const Value *A : CB->args())
                         if (A->getType()->isPointerTy() && !arrayOf(A, 0).empty() && arrayOf(A, 0) == K)
-                          r.second.insert(K + "'s array passed to " +
-                                          (CB->getCalledFunction() ? CB->getCalledFunction()->getName().str()
-                                                                   : std::string("an indirect call")) +
-                                          " " + snapLoc(CB));
+                          open.insert(K + "'s array passed to " +
+                                      (CB->getCalledFunction() ? CB->getCalledFunction()->getName().str()
+                                                               : std::string("an indirect call")) +
+                                      " " + snapLoc(CB));
                     }
                   }
-              fieldOnPath.erase(MK);
-              if (fieldOnPath.empty()) elemObjs[MK] = r;
-            }
-            for (const Obj &x : r.first) out.insert({x.first, x.second + off});
-            for (const std::string &x : r.second) open.insert(x);
+            });
           };
           // A field read: the objects of every store of K (and K's covering
           // writes and initializers), kept per (K, the read's keys).
-          std::function<void(const std::string &, const LoadInst *, int64_t, int, std::set<Obj> &, std::set<std::string> &)>
-              walkField = [&](const std::string &K, const LoadInst *L, int64_t off, int d, std::set<Obj> &out,
+          std::function<void(const std::string &, const LoadInst *, int64_t, std::set<Obj> &, std::set<std::string> &)>
+              walkField = [&](const std::string &K, const LoadInst *L, int64_t off, std::set<Obj> &out,
                               std::set<std::string> &open) {
             // A union read keyed by the census or a tag pair (keysOf: what
             // the solver files it under) reads only the stores its keys
@@ -3982,17 +4040,11 @@ void CallGraphPass::checkContainerClosure() {
                 if (k == rkCatch || std::find(rk->begin(), rk->end(), k) != rk->end()) return true;
               return false;
             };
-            std::pair<std::set<Obj>, std::set<std::string>> r;
-            bool cutOnly = cutEmpty.count(MK) > 0;
-            if (auto it = fieldObjs.find(MK); it != fieldObjs.end()) r = it->second;
-            else {
-              // A cycle through K adds nothing (the least fixpoint: what
-              // the other stores give), and is counted apart: a field whose
-              // every store is cut so is empty, not open for want of a
-              // store. A result computed inside another key's cycle may
-              // miss what comes through that key, so only a result with no
-              // key under way is kept.
-              if (!fieldOnPath.insert(MK).second) return (void)cycleCuts++;
+            // A cycle through K adds nothing (the least fixpoint: what the
+            // other stores give), and is counted apart: a field whose every
+            // store is cut so is empty, not open for want of a store.
+            visit("f" + MK, [&] { return K; }, off, out, open,
+                  [&](int64_t off, std::set<Obj> &out, std::set<std::string> &open) {
               const size_t cuts0 = cycleCuts;
               for (auto &[M, _] : Ctx->Modules)
                 for (const Function &F : *M)
@@ -4003,128 +4055,125 @@ void CallGraphPass::checkContainerClosure() {
                         continue;
                       }
                       if (St->getValueOperand()->getType()->isPointerTy())
-                        objsOf(St->getValueOperand(), 0, d + 1, r.first, r.second);
+                        objsOf(St->getValueOperand(), off, out, open);
                       else
-                        r.second.insert("a store of a non-pointer value into " + K + " " + snapLoc(St));
+                        open.insert("a store of a non-pointer value into " + K + " " + snapLoc(St));
                     }
               if (rk) keysUnionWalked.insert(K);
               keysWalked.insert(K);
               if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
                   !c.empty())
-                r.second.insert(c), keysCovered.insert(K);
+                open.insert(c), keysCovered.insert(K);
               buildInit();
               if (auto iv = initVals.find(K); iv != initVals.end())
-                for (const Constant *C : iv->second) objsOf(C, 0, d + 1, r.first, r.second);
+                for (const Constant *C : iv->second) objsOf(C, off, out, open);
               if (!initUnnamed.empty())
-                r.second.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
-                                initUnnamed.front() + ")");
-              fieldOnPath.erase(MK);
-              cutOnly = r.first.empty() && r.second.empty() && cycleCuts > cuts0;
-              if (fieldOnPath.empty()) {
-                fieldObjs[MK] = r;
-                if (cutOnly) cutEmpty.insert(MK);
+                open.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
+                            initUnnamed.front() + ")");
+              if (out.empty() && open.empty()) {
+                if (cycleCuts > cuts0) cutEmpty.insert(MK);
+                else open.insert("no pointer store of " + K);
               }
-            }
-            for (const Obj &x : r.first) out.insert({x.first, x.second + off});
-            for (const std::string &x : r.second) open.insert(x);
-            if (r.first.empty() && r.second.empty() && !cutOnly) open.insert("no pointer store of " + K);
+            });
           };
-          objsOf = [&](const Value *V, int64_t off, int d, std::set<Obj> &out, std::set<std::string> &open) {
+          objsOf = [&](const Value *V, int64_t off, std::set<Obj> &out, std::set<std::string> &open) {
             V = castsOnly(V);
-            if (d > 16) return (void)open.insert("too deep at " + valueText(V));
             if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V)) return;
-            if (const auto *CI = dyn_cast<Instruction>(V)) {
-              if (auto pit = poolCarvePool.find(CI); pit != poolCarvePool.end()) {
-                const std::string on = "a carve of pool " + pit->second + " at " + snapLoc(CI);
-                objSite.emplace(on, CI);
-                objPools[on].insert(pit->second);
-                return (void)out.insert({on, off});
+            visit("v" + std::to_string((uintptr_t)V), [&] { return valueText(V); }, off, out, open,
+                  [&](int64_t off, std::set<Obj> &out, std::set<std::string> &open) {
+              if (const auto *CI = dyn_cast<Instruction>(V)) {
+                if (auto pit = poolCarvePool.find(CI); pit != poolCarvePool.end()) {
+                  const std::string on = "a carve of pool " + pit->second + " at " + snapLoc(CI);
+                  objSite.emplace(on, CI);
+                  objPools[on].insert(pit->second);
+                  return (void)out.insert({on, off});
+                }
+                if (auto rit = poolRefusedCarvePool.find(CI); rit != poolRefusedCarvePool.end())
+                  return (void)open.insert("a carve of pool " + rit->second + " at " + snapLoc(CI) + " (" +
+                                           poolVerdicts[rit->second] + ")");
               }
-              if (auto rit = poolRefusedCarvePool.find(CI); rit != poolRefusedCarvePool.end())
-                return (void)open.insert("a carve of pool " + rit->second + " at " + snapLoc(CI) + " (" +
-                                         poolVerdicts[rit->second] + ")");
-            }
-            if (const auto *G = dyn_cast<GEPOperator>(V)) {
-              APInt Off(64, 0);
-              if (!G->accumulateConstantOffset(DL0, Off)) return (void)open.insert("a runtime step " + valueText(V));
-              return objsOf(G->getPointerOperand(), off + Off.getSExtValue(), d + 1, out, open);
-            }
-            if (const auto *PN = dyn_cast<PHINode>(V)) {
-              for (const Value *In : PN->incoming_values()) objsOf(In, off, d + 1, out, open);
-              return;
-            }
-            if (const auto *SI = dyn_cast<SelectInst>(V)) {
-              objsOf(SI->getTrueValue(), off, d + 1, out, open);
-              objsOf(SI->getFalseValue(), off, d + 1, out, open);
-              return;
-            }
-            if (const auto *L = dyn_cast<LoadInst>(V)) {
-              const Value *SL = castsOnly(L->getPointerOperand());
-              if (transientSlot(SL)) {
-                for (const User *U : SL->users())
-                  if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == SL)
-                    objsOf(St->getValueOperand(), off, d + 1, out, open);
+              if (const auto *G = dyn_cast<GEPOperator>(V)) {
+                APInt Off(64, 0);
+                if (!G->accumulateConstantOffset(DL0, Off)) return (void)open.insert("a runtime step " + valueText(V));
+                return objsOf(G->getPointerOperand(), off + Off.getSExtValue(), out, open);
+              }
+              if (const auto *PN = dyn_cast<PHINode>(V)) {
+                for (const Value *In : PN->incoming_values()) objsOf(In, off, out, open);
                 return;
               }
-              const std::string K = fieldKey(L, L->getPointerOperand());
-              if (!K.empty()) return walkField(K, L, off, d, out, open);
-              // A load through an address no field names: each address it
-              // can be (through -O0 slots) is a named field or an element of
-              // a handle field's array (an array index at run time).
-              std::set<std::string> ks;
-              if (!slotsOf(L, L->getPointerOperand(), ks, 0))
-                return (void)open.insert("a load of no named field " + valueText(V));
-              for (const std::string &k : ks)
-                if (k.back() == ']') walkElems(k.substr(0, k.size() - 2), off, d, out, open);
-                else walkField(k, L, off, d, out, open);
-              return;
-            }
-            if (const auto *Ar = dyn_cast<Argument>(V)) {
-              const Function *F = Ar->getParent();
-              if (F->hasAddressTaken()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken");
-              bool any = false;
-              for (const User *U : F->users())
-                if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F && Ar->getArgNo() < CB->arg_size())
-                  any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, d + 1, out, open);
-              if (!any) open.insert("a formal of " + F->getName().str() + ", which has no caller");
-              return;
-            }
-            if (const auto *CB = dyn_cast<CallBase>(V)) {
-              // (A) An indirect call through a closed code field returns
-              // what its targets return.
-              std::vector<const Function *> Gs;
-              if (const Function *G = CB->getCalledFunction()) Gs.push_back(G);
-              else {
-                const std::string CK = codeFieldOf(CB);
-                if (CK.empty()) return (void)open.insert("an indirect call's result " + snapLoc(CB));
-                codeCallsWalked.insert(CK);
-                Gs.assign(codeTargets[CK].begin(), codeTargets[CK].end());
+              if (const auto *SI = dyn_cast<SelectInst>(V)) {
+                objsOf(SI->getTrueValue(), off, out, open);
+                objsOf(SI->getFalseValue(), off, out, open);
+                return;
               }
-              for (const Function *G : Gs) {
-                wrapPools.clear();
-                if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0)) {
-                  const std::string on = G->getName().str() + " at " + snapLoc(CB);
-                  objSite.emplace(on, CB);
-                  if (!wrapPools.empty()) objPools[on].insert(wrapPools.begin(), wrapPools.end());
-                  out.insert({on, off});
-                  continue;
+              if (const auto *L = dyn_cast<LoadInst>(V)) {
+                const Value *SL = castsOnly(L->getPointerOperand());
+                if (transientSlot(SL)) {
+                  for (const User *U : SL->users())
+                    if (const auto *St = dyn_cast<StoreInst>(U); St && castsOnly(St->getPointerOperand()) == SL)
+                      objsOf(St->getValueOperand(), off, out, open);
+                  return;
                 }
-                if (G->isDeclaration()) {
-                  open.insert("an extern call's result " + snapLoc(CB));
-                  continue;
-                }
-                for (const Instruction &I : instructions(*G))
-                  if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
-                    objsOf(R->getReturnValue(), off, d + 1, out, open);
+                const std::string K = fieldKey(L, L->getPointerOperand());
+                if (!K.empty()) return walkField(K, L, off, out, open);
+                // A load through an address no field names: each address it
+                // can be (through -O0 slots) is a named field or an element of
+                // a handle field's array (an array index at run time).
+                std::set<std::string> ks;
+                if (!slotsOf(L, L->getPointerOperand(), ks, 0))
+                  return (void)open.insert("a load of no named field " + valueText(V));
+                for (const std::string &k : ks)
+                  if (k.back() == ']') walkElems(k.substr(0, k.size() - 2), off, out, open);
+                  else walkField(k, L, off, out, open);
+                return;
               }
-              return;
-            }
-            if (isa<AllocaInst>(V) || isa<GlobalValue>(V)) {
-              const std::string on = isa<GlobalValue>(V) ? "@" + V->getName().str() : "local " + valueText(V);
-              objSite.emplace(on, V);
-              return (void)out.insert({on, off});
-            }
-            open.insert("a value no rule follows " + valueText(V));
+              if (const auto *Ar = dyn_cast<Argument>(V)) {
+                const Function *F = Ar->getParent();
+                if (F->hasAddressTaken()) return (void)open.insert("a formal of " + F->getName().str() + ", address-taken");
+                bool any = false;
+                for (const User *U : F->users())
+                  if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F && Ar->getArgNo() < CB->arg_size())
+                    any = true, objsOf(CB->getArgOperand(Ar->getArgNo()), off, out, open);
+                if (!any) open.insert("a formal of " + F->getName().str() + ", which has no caller");
+                return;
+              }
+              if (const auto *CB = dyn_cast<CallBase>(V)) {
+                // (A) An indirect call through a closed code field returns
+                // what its targets return.
+                std::vector<const Function *> Gs;
+                if (const Function *G = CB->getCalledFunction()) Gs.push_back(G);
+                else {
+                  const std::string CK = codeFieldOf(CB);
+                  if (CK.empty()) return (void)open.insert("an indirect call's result " + snapLoc(CB));
+                  codeCallsWalked.insert(CK);
+                  Gs.assign(codeTargets[CK].begin(), codeTargets[CK].end());
+                }
+                for (const Function *G : Gs) {
+                  wrapPools.clear();
+                  if (G->isDeclaration() ? G->hasRetAttribute(Attribute::NoAlias) : isWrapper(G, 0)) {
+                    const std::string on = G->getName().str() + " at " + snapLoc(CB);
+                    objSite.emplace(on, CB);
+                    if (!wrapPools.empty()) objPools[on].insert(wrapPools.begin(), wrapPools.end());
+                    out.insert({on, off});
+                    continue;
+                  }
+                  if (G->isDeclaration()) {
+                    open.insert("an extern call's result " + snapLoc(CB));
+                    continue;
+                  }
+                  for (const Instruction &I : instructions(*G))
+                    if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
+                      objsOf(R->getReturnValue(), off, out, open);
+                }
+                return;
+              }
+              if (isa<AllocaInst>(V) || isa<GlobalValue>(V)) {
+                const std::string on = isa<GlobalValue>(V) ? "@" + V->getName().str() : "local " + valueText(V);
+                objSite.emplace(on, V);
+                return (void)out.insert({on, off});
+              }
+              open.insert("a value no rule follows " + valueText(V));
+            });
           };
           auto objText = [](const std::set<Obj> &o, const std::set<std::string> &op) {
             std::string t;
@@ -4138,7 +4187,7 @@ void CallGraphPass::checkContainerClosure() {
           {
             const Value *Ln = eSaves.empty() ? nullptr : eSaves.front()->getLength();
             while (Ln && isa<CastInst>(Ln)) Ln = cast<CastInst>(Ln)->getOperand(0);
-            if (const auto *L = dyn_cast_or_null<LoadInst>(Ln)) objsOf(L->getPointerOperand(), 0, 0, hObjs, hOpen);
+            if (const auto *L = dyn_cast_or_null<LoadInst>(Ln)) objsOf(L->getPointerOperand(), 0, hObjs, hOpen);
             else hOpen.insert("an element copy length read from no load");
           }
           // A path is relevant unless object identity by name refutes it: its
@@ -4161,7 +4210,7 @@ void CallGraphPass::checkContainerClosure() {
                                ", newfunc " + (NF ? NF->getName().str() : P.nf ? valueText(P.nf) : std::string("?"));
             std::set<Obj> po;
             std::set<std::string> pOpen;
-            if (P.off != INT64_MIN) objsOf(P.tbl, P.off, 0, po, pOpen);
+            if (P.off != INT64_MIN) objsOf(P.tbl, P.off, po, pOpen);
             else pOpen.insert("a runtime step on the table's chain");
             bool meets = false;
             for (const Obj &x : po) meets |= hObjs.count(x) > 0;
@@ -4688,18 +4737,21 @@ void CallGraphPass::checkContainerClosure() {
                 return (int64_t)size;
               };
               std::set<Obj> wo;
-              std::set<std::string> wop, zeroAt, dropped;
+              std::set<std::string> wop, zeroAt, dropped, keptObjs;
               if (decline.empty()) {
-                objsOf(W->getPointerOperand(), 0, 0, wo, wop);
+                objsOf(W->getPointerOperand(), 0, wo, wop);
                 if (!wop.empty())
                   decline = "the word's objects are open: " + std::to_string(wop.size()) + " reasons, e.g. " + *wop.begin();
                 for (const Obj &o : wo) {
                   std::string src;
-                  if (const int64_t sz = objSize(o.first, src); sz >= 0 && o.second + wlen > sz) {
+                  const int64_t sz = objSize(o.first, src);
+                  if (sz >= 0 && o.second + wlen > sz) {
                     dropped.insert(o.first + " +" + std::to_string(o.second) + ": past its size " + std::to_string(sz) +
                                    " (" + src + ")");
                     continue;
                   }
+                  keptObjs.insert(o.first + " +" + std::to_string(o.second) +
+                                  (sz >= 0 ? ", size " + std::to_string(sz) + " (" + src + ")" : std::string(", size unknown")));
                   if (!decline.empty()) continue; // every object is still checked for its size
                   auto it = objSite.find(o.first);
                   const auto *CB = it == objSite.end() ? nullptr : dyn_cast<CallBase>(it->second);
@@ -4767,11 +4819,16 @@ void CallGraphPass::checkContainerClosure() {
                      << cutEmpty.size() << " fields every store of which is cut), " << dropped.size()
                      << " objects past their size, dropped, " << s1Why.size() << " kept unsized; "
                      << elemWalked.size() << " handle arrays read by element, " << codeCallsWalked.size()
-                     << " indirect calls through closed code fields followed\n");
+                     << " indirect calls through closed code fields followed; " << nodeCount << " nodes walked (budget "
+                     << nodeBudget << "), " << budgetCuts << " budget cuts, " << offCycles
+                     << " cycles stepping the offset\n");
               for (const std::string &x : dropped)
                 o1AssumeLines.push_back("    snapshot holder " + hname + ": dropped from the word's objects: " + x);
               for (const auto &[o, why] : s1Why)
                 o1AssumeLines.push_back("    snapshot holder " + hname + ": kept, its size unknown: " + o + ": " + why);
+              for (const std::string &x : keptObjs) CG_LOG("Container: snapshot holder " << hname << ": kept: " << x << "\n");
+              CG_LOG("Container: snapshot holder " << hname << ": object walks: " << nodeCount << " nodes, "
+                     << format("%.3f", walkSecs) << " s\n");
               // Every reason the word's objects are open, not only the first.
               for (const std::string &x : wop) CG_LOG("Container: snapshot holder " << hname << ": open: " << x << "\n");
               if (decline.empty()) {

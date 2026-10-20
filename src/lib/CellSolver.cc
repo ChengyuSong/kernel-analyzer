@@ -10444,7 +10444,7 @@ bool CallGraphPass::runCellResolution() {
       RO << "SUMMARY union one-field copies keeping the source's member keys: " << unionCopyOf.size()
          << " (C''; left as ordinary stores at -O3 shapes: " << unionCopyVector << " vector copies, " << unionCopyPhi
          << " phis of loads)\n";
-      for (const std::string &r : unionCopyRows) RO << "T " << r << "\n";
+      for (const auto &[I, r] : unionCopyRows) RO << "T " << r << "\n";
     }
     if (!unionEmbedTyped.empty()) {
       RO << "SUMMARY union stores typed by a declared embedding: " << unionEmbedTyped.size()

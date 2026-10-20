@@ -3420,10 +3420,10 @@ void CallGraphPass::runUnionCensus() {
           st = StringRef(os.str()).ltrim().str();
           st = st.substr(0, st.find(", !dbg"));
           const Pos WQ = position(cast<StoreInst>(w.I)->getPointerOperand(), w.I->getModule()->getDataLayout());
-          unionCopyRows.push_back("ASSUMPTION a copy of union " + U->structName + "." + U->fieldName + "+" +
-                                  std::to_string((int64_t)WQ.off - (int64_t)U->off) +
-                                  " between two objects keeps the source's member key under the store's own tag keys: " +
-                                  w.I->getFunction()->getName().str() + ": " + st);
+          unionCopyRows.emplace_back(w.I, "ASSUMPTION a copy of union " + U->structName + "." + U->fieldName + "+" +
+                                          std::to_string((int64_t)WQ.off - (int64_t)U->off) +
+                                          " between two objects keeps the source's member key under the store's own tag keys: " +
+                                          w.I->getFunction()->getName().str() + ": " + st);
           unionUnknownOf[w.I] = prefix;
           continue;
         }
@@ -3696,6 +3696,10 @@ void CallGraphPass::runUnionCensus() {
                                      ", reads " + std::to_string(keyedR) + "/" + std::to_string(Rd.size())
                                : std::string());
   }
+  // The unions come in pointer order (touched is a set of pointers), so
+  // the copy rows are put in IR order for the reports.
+  std::stable_sort(unionCopyRows.begin(), unionCopyRows.end(),
+                   [](const auto &a, const auto &b) { return irOrderLess(a.first, b.first); });
   if (!CFLCensusUnions) {
     errs() << "UnionKeys: " << membersByShape
            << " accesses named by their address shape (storage-type GEP / no-op bitcast); " << membersByStep
@@ -3730,7 +3734,7 @@ void CallGraphPass::runUnionCensus() {
       errs() << "UnionKeys: " << unionCopyOf.size()
              << " one-field union copies keep the source's member keys (C''); left as ordinary stores at -O3 shapes: "
              << unionCopyVector << " vector copies of several fields, " << unionCopyPhi << " phis of loads of the field\n";
-      for (const std::string &r : unionCopyRows) errs() << "UnionKeys:   " << r << "\n";
+      for (const auto &[I, r] : unionCopyRows) errs() << "UnionKeys:   " << r << "\n";
       errs() << "UnionKeys: " << unionAddrTyped.size()
              << " stores typed by a constant address's debug type (C': every object starting at the address fits the one member)\n";
       for (const std::string &r : unionAddrTyped) errs() << "UnionKeys:   " << r << "\n";

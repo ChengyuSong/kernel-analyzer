@@ -368,7 +368,7 @@ protected:
   // the -O3 shapes left as ordinary stores, counted.
   std::map<const llvm::Instruction *, const llvm::LoadInst *> unionCopyOf;   // store -> the load it copies
   std::map<const llvm::Instruction *, std::vector<std::string>> unionCopyTags; // store -> its tag keys
-  std::vector<std::string> unionCopyRows;
+  std::vector<std::pair<const llvm::Instruction *, std::string>> unionCopyRows; // in IR order (irOrderLess)
   size_t unionCopyVector = 0, unionCopyPhi = 0;
   // Tag fields 3.51 widened (no admitted tag), by "struct.S": "S+off: why".
   std::map<std::string, std::vector<std::string>> widenedTagsOf;

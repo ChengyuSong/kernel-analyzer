@@ -3490,10 +3490,13 @@ void CallGraphPass::checkContainerClosure() {
       // a defined init function that is not address-taken, whose formal
       // has one use: (-O0) a store into its slot, loaded once and the
       // slot used no other way; the value is stored into such a field or
-      // passed down to another such init function the same way. F's
-      // callers are then its direct callers and every indirect call
-      // through those fields. Why the rule does not apply, or the field,
-      // the init chain and the callers, is kept for the log.
+      // passed down to another such init function the same way; and each
+      // such field's loads by name are only called, compared, or kept in
+      // -O0 slots read only that way (r3Read, R3's (r); Fable 2026-10-20).
+      // F's callers are then its direct callers and every indirect call
+      // through those fields, directly or through those slots. Why the
+      // rule does not apply, or the field, the init chain and the callers,
+      // is kept for the log.
       // (R3, Fable 2026-10-20) F's address may also lie in slots of
       // constant initializers: see r3Slot below. The callers are defined
       // after originsOf, which consults them for an address-taken formal.
@@ -3845,7 +3848,8 @@ void CallGraphPass::checkContainerClosure() {
       std::map<std::string, std::vector<R3Span>> r3WritesAt, r3CopiesAt; // struct name -> spans
       std::map<std::string, std::vector<const LoadInst *>> r3LoadsAt;    // key -> its loads
       bool r3Indexed = false;
-      std::map<std::string, std::string> r3SlotWhy;
+      std::map<std::string, std::string> r3SlotWhy, r3ReadWhy;
+      std::map<std::string, std::set<const Instruction *, IROrder>> r3KtoKAt; // key -> its K-to-K block copies, allowed (for the log)
       std::map<std::string, std::vector<const CallBase *>> r3CallsAt; // key -> the indirect calls its loads reach as callee
       auto r3Index = [&] {
         r3Indexed = true;
@@ -3893,28 +3897,66 @@ void CallGraphPass::checkContainerClosure() {
             }
         }
       };
-      auto r3Slot = [&](const std::string &k) -> const std::string & {
-        if (auto it = r3SlotWhy.find(k); it != r3SlotWhy.end()) return it->second;
+      // (r) a read by name other than an indirect call's callee; shared by
+      // R3's slots and (f)'s closed code fields. Fills r3CallsAt[k].
+      auto r3Read = [&](const std::string &k) -> const std::string & {
+        if (auto it = r3ReadWhy.find(k); it != r3ReadWhy.end()) return it->second;
         if (!r3Indexed) r3Index();
         const size_t p = k.rfind('+');
         const std::string KS = k.substr(0, p);
         const int64_t KO = std::stoll(k.substr(p + 1));
         std::string why;
-        // (a) a write in a body over the key, by its name or an embedding one.
-        if (auto it = r3WritesAt.find(KS); it != r3WritesAt.end())
-          for (const R3Span &w : it->second)
-            if (w.lo < KO + 8 && KO < w.hi) {
-              why = "a write in a body over it: " + snapLoc(w.I) + ": " + valueText(w.I);
-              break;
+        // A copy that keeps K at the same place in a destination named so
+        // (K-to-K, R2's test, from the source side) leaves the value under
+        // K, whose loads are checked below.
+        auto keyAt = [&](Type *T, int64_t x, const DataLayout &MDL) {
+          for (int d = 0; d < 64 && x >= 0; d++) {
+            if (auto *ST = dyn_cast<StructType>(T)) {
+              if (ST->isOpaque()) return false;
+              if (ST->hasName() && stripStructNameSuffix(ST->getName()) == KS && x == KO) return true;
+              const StructLayout *SL = MDL.getStructLayout(ST);
+              if (x >= (int64_t)SL->getSizeInBytes()) return false;
+              const unsigned i = SL->getElementContainingOffset((uint64_t)x);
+              x -= (int64_t)SL->getElementOffset(i);
+              T = ST->getElementType(i);
+            } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+              const int64_t es = (int64_t)MDL.getTypeAllocSize(AT->getElementType());
+              if (es <= 0 || x >= es * (int64_t)AT->getNumElements()) return false;
+              x %= es;
+              T = AT->getElementType();
+            } else {
+              return false;
             }
-        // (r) a read by name other than an indirect call's callee.
-        if (why.empty())
-          if (auto it = r3CopiesAt.find(KS); it != r3CopiesAt.end())
-            for (const R3Span &c : it->second)
-              if (c.lo < KO + 8 && KO < c.hi) {
-                why = "a block copy of it by name: " + snapLoc(c.I);
-                break;
-              }
+          }
+          return false;
+        };
+        auto kToK = [&](const MemTransferInst *MT) {
+          const DataLayout &MDL = MT->getModule()->getDataLayout();
+          const auto *Len = dyn_cast<ConstantInt>(MT->getLength());
+          StructType *SS = nullptr, *DS = nullptr;
+          int64_t soff = 0, doff = 0;
+          if (!Len || !namedSlot(MT, MT->getRawSource(), MDL, pointees, SS, soff) || !SS ||
+              !namedSlot(MT, MT->getRawDest(), MDL, pointees, DS, doff) || !DS)
+            return false;
+          const int64_t len = (int64_t)Len->getZExtValue();
+          bool any = false;
+          for (int64_t q = -7; q < len; q++) {
+            if (!keyAt(SS, soff + q, MDL)) continue;
+            if (q < 0 || q + 8 > len || !keyAt(DS, doff + q, MDL)) return false;
+            any = true;
+          }
+          return any;
+        };
+        if (auto it = r3CopiesAt.find(KS); it != r3CopiesAt.end())
+          for (const R3Span &c : it->second) {
+            if (!(c.lo < KO + 8 && KO < c.hi)) continue;
+            if (kToK(cast<MemTransferInst>(c.I))) {
+              r3KtoKAt[k].insert(c.I);
+              continue;
+            }
+            why = "a block copy of it by name: " + snapLoc(c.I);
+            break;
+          }
         if (why.empty())
           if (auto it = r3LoadsAt.find(k); it != r3LoadsAt.end())
             for (const LoadInst *L : it->second) {
@@ -3947,6 +3989,23 @@ void CallGraphPass::checkContainerClosure() {
               }
               if (!why.empty()) break;
             }
+        return r3ReadWhy[k] = why;
+      };
+      auto r3Slot = [&](const std::string &k) -> const std::string & {
+        if (auto it = r3SlotWhy.find(k); it != r3SlotWhy.end()) return it->second;
+        if (!r3Indexed) r3Index();
+        const size_t p = k.rfind('+');
+        const std::string KS = k.substr(0, p);
+        const int64_t KO = std::stoll(k.substr(p + 1));
+        std::string why;
+        // (a) a write in a body over the key, by its name or an embedding one.
+        if (auto it = r3WritesAt.find(KS); it != r3WritesAt.end())
+          for (const R3Span &w : it->second)
+            if (w.lo < KO + 8 && KO < w.hi) {
+              why = "a write in a body over it: " + snapLoc(w.I) + ": " + valueText(w.I);
+              break;
+            }
+        if (why.empty()) why = r3Read(k);
         return r3SlotWhy[k] = why;
       };
       // (R3, D1) The read side's block copies: a copy whose source no name
@@ -4106,6 +4165,11 @@ void CallGraphPass::checkContainerClosure() {
           if (const std::string why = r3Copies(inits); !why.empty()) R.why = why, ok = false;
         if (ok) ok = feeds(F, nullptr, "");
         if (ok && ks.empty() && r3ks.empty()) R.why = "its address feeds no code field and lies in no initializer", ok = false;
+        // (f) with (r): each closed code field's loads by name are only
+        // called, compared, or kept in -O0 slots read only that way.
+        for (const std::string &k : ks)
+          if (ok)
+            if (const std::string &why = r3Read(k); !why.empty()) R.why = "its field " + k + ": " + why, ok = false;
         if (ok) {
           for (const User *U : F->users())
             if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) R.callers.push_back(CB);
@@ -4116,9 +4180,13 @@ void CallGraphPass::checkContainerClosure() {
               for (const Instruction &I : instructions(G))
                 if (const auto *CB = dyn_cast<CallBase>(&I); CB && isIndirectCallSite(CB) && ks.count(codeFieldOf(CB)))
                   R.callers.push_back(CB);
-          // R3: the indirect calls a slot key's loads reach as callee, directly
-          // or through -O0 slots ((r) walked them), in IR order.
+          // The indirect calls a code field's or slot key's loads reach as
+          // callee, directly or through -O0 slots ((r) walked them), in IR
+          // order.
           std::set<const Instruction *, IROrder> r3Calls;
+          for (const std::string &k : ks)
+            for (const CallBase *CB : r3CallsAt[k])
+              if (isIndirectCallSite(CB) && llvm::find(R.callers, CB) == R.callers.end()) r3Calls.insert(CB);
           for (const std::string &k : r3ks)
             for (const CallBase *CB : r3CallsAt[k])
               if (isIndirectCallSite(CB) && llvm::find(R.callers, CB) == R.callers.end()) r3Calls.insert(CB);
@@ -6010,6 +6078,12 @@ void CallGraphPass::checkContainerClosure() {
               for (const auto &[fn, fd] : fedByName)
                 CG_LOG("Container: snapshot holder " << hname << ": formal rule: " << fn << ": "
                        << (fd->text.empty() ? "not applied, " + fd->why : fd->text) << "\n");
+              for (const auto &[k, cs] : r3KtoKAt) {
+                std::string ls;
+                for (const Instruction *I : cs) ls += (ls.empty() ? "" : ", ") + snapLoc(I);
+                CG_LOG("Container: snapshot holder " << hname << ": formal rule: field " << k << ": " << cs.size()
+                       << " block copies K-to-K allowed: " << ls << "\n");
+              }
               for (const std::string &x : keptObjs) CG_LOG("Container: snapshot holder " << hname << ": kept: " << x << "\n");
               for (const std::string &x : coverLog) CG_LOG("Container: snapshot holder " << hname << ": " << x << "\n");
               std::stable_sort(coverReasons.begin(), coverReasons.end(),

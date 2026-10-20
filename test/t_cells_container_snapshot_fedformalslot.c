@@ -1,9 +1,13 @@
-// t_cells_container_snapshot_fedformalslot.c — (f) control (Fable
-// 2026-10-19): as fedformal, but bfd_hash_table_init_n reads its newfunc
-// formal twice (a null test before the store), so the slot has a second
-// use: the rule does not apply and the newfunc formals stay OPEN.
-// LOG: formal rule: my_newfunc: not applied, the slot of bfd_hash_table_init_n's formal has a second use
-// LOG: open: a formal of my_newfunc, address-taken
+// t_cells_container_snapshot_fedformalslot.c — (f) with (r) (Fable
+// 2026-10-20): as fedformal, plus mk_extra, which calls the newfunc field
+// through a local (-O0: the field's load stored into nf's slot, reloaded,
+// called). (r) admits the slot, so that call is a caller too and its
+// actuals enter the walks. At the commit before (23c978c) the callers were
+// only the calls whose callee is the field's load itself: "callers:
+// indirect bfd_hash_insert ...", without mk_extra's call.
+// LOG: formal rule: my_newfunc: bfd_hash_table_init -> .*; callers: indirect bfd_hash_insert .*, indirect mk_extra
+// LOG: formal rule: big_newfunc: bfd_hash_table_init -> .*; callers: indirect bfd_hash_insert .*, indirect mk_extra
+// NOLOG: open: a formal of my_newfunc
 #include <stdlib.h>
 #include <string.h>
 typedef void (*fn)(void);
@@ -66,7 +70,6 @@ static struct bfd_hash_entry *big_newfunc(struct bfd_hash_entry *entry, struct b
 }
 __attribute__((noinline)) int bfd_hash_table_init_n(struct bfd_hash_table *table, newfunc_t newfunc, unsigned int entsize,
                                                     unsigned int size) {
-  if (newfunc == NULL) return 0;
   table->table = calloc(size, sizeof(struct bfd_hash_entry *));
   if (table->table == NULL) return 0;
   table->size = size;
@@ -119,6 +122,10 @@ __attribute__((noinline)) void drop_needed(struct bfd *b) { b->tdata.own->cls = 
 static struct bfd_hash_table g_tab;
 __attribute__((noinline)) void mk_ent(struct bfd *b) { b->tdata.any = bfd_hash_lookup(&g_tab, "k", 1, 0); }
 __attribute__((noinline)) void mk_own(struct bfd *b) { b->tdata.own = calloc(1, sizeof(struct owner)); }
+__attribute__((noinline)) struct bfd_hash_entry *mk_extra(struct bfd_hash_table *t) {
+  newfunc_t nf = t->newfunc;
+  return nf(NULL, t, "x");
+}
 int main(int argc, char **argv) {
   struct bfd *b = calloc(1, sizeof(struct bfd));
   if (!b) return 1;
@@ -133,6 +140,7 @@ int main(int argc, char **argv) {
   else
     bfd_hash_table_init(&b->tdata.own->table, my_newfunc, sizeof(struct my_entry));
   bfd_hash_lookup(&b->tdata.own->table, argv[0], 1, 0);
+  mk_extra(&g_tab);
   struct my_entry *e = snap(b, argv[1]);
   if (e) e->fa(); // CHECK: ga gb
   return 0;

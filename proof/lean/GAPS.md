@@ -1257,13 +1257,25 @@ Obligations left open:
          name has no caller: its formal stays OPEN ("which has no caller"),
          as for any function never called. The covers' origins
          (originsOf) consult the same callers for (f) and R3; (f) adds no
-         cover close on nm-O0. (f)'s callers are its fields' direct callee
-         loads, with no read-side check: a load of a closed code field kept
-         in a -O0 slot or passed on would hide a caller (none in nm: the
-         one field, struct.bfd_hash_table+8, is loaded 2 times at -O0 and
-         once at -O3, each directly called); open, the same walk as (r).
-         Cases: t_cells_container_snapshot_vectorformal{,slot,w,nodi,
-         named,byte}.c.
+         cover close on nm-O0. (f) checks the same read side (r) on each
+         closed code field it stores into (Fable 2026-10-20): every load
+         by the field's name is only an indirect call's callee, compared,
+         or kept in -O0 slots read only so, and no block copy reads it by
+         name unless the copy is K-to-K (R2's test: its destination is
+         named so that K lies at the same place, every overlap of K
+         whole); otherwise "not applied, its field K: <why>". The same
+         copy clause holds for R3's slots. A K-to-K copy puts the field's
+         value at a cell of the same key K, and (r) checks every load of K
+         at any base, so a call through the copy is already among the
+         callers. The allowed copies are logged per field. (f)'s callers
+         include the calls through those -O0 slots: at f86a9e6 a call
+         through a -O0 local was no caller of (f), a gap now closed, and a
+         load passed on was not checked. nm-O0: struct.bfd_hash_table+8 is
+         loaded 2 times, each directly called, and copied K-to-K by
+         bfd_preserve_save and bfd_preserve_restore (format.c:130/162).
+         Cases: t_cells_container_snapshot_vectorformal{,slot,w,nodi,named,
+         byte}.c, t_cells_container_snapshot_fedformal{read,slot,ktok,
+         copy}.c.
        - The walk computes the least fixpoint of these rules over nodes (a
          value, a field read under its keys, a handle array's elements): a
          node's objects are the union of its successors', each shifted by

@@ -4695,6 +4695,7 @@ void CallGraphPass::checkContainerClosure() {
           std::vector<UnnamedWrite> unnamedWrites;
           std::map<const Instruction *, Origins> unnamedOrigins;
           std::map<std::string, std::string> unnamedDone; // K (+"#W" for check (2)) -> its reason
+          std::map<std::string, std::array<size_t, 3>> unnamedCounts; // the same key -> close, reach, open
           std::vector<std::string> coverLog;
           // Each unnamed-destination write that is a reason, once, with the
           // keys it is one for (listed in IR order).
@@ -4756,7 +4757,8 @@ void CallGraphPass::checkContainerClosure() {
             }
             return any;
           };
-          auto coverOpen = [&](const std::string &K, int64_t size) -> std::string {
+          // Every write, named or not, once.
+          auto collectWrites = [&] {
             if (!writesDone) {
               writesDone = true;
               for (auto &[M, _] : Ctx->Modules) {
@@ -4791,6 +4793,9 @@ void CallGraphPass::checkContainerClosure() {
                   }
               }
             }
+          };
+          auto coverOpen = [&](const std::string &K, int64_t size) -> std::string {
+            collectWrites();
             const size_t p = K.rfind('+');
             const std::string KS = K.substr(0, p);
             const int64_t KO = std::stoll(K.substr(p + 1));
@@ -4880,9 +4885,24 @@ void CallGraphPass::checkContainerClosure() {
             }
             return "";
           };
-          auto unnamedOpen = [&](const std::string &K, const std::set<const Value *> *W) -> std::string {
+          // The object walk (object identity by name, below) and its objects'
+          // sites; check (2) by offset (unnamedOpen with the word) uses them.
+          std::function<void(const Value *, int64_t, std::set<Obj> &, std::set<std::string> &)> objsOf;
+          std::map<std::string, const Value *> objSite; // an object's name -> its allocation (call, alloca, global)
+          // Check (2) by offset (Fable 2026-10-20): a write whose origins
+          // include one of the word's objects does not reach the word when
+          // its destination's object walk (objsOf, with offsets) is closed
+          // and, in each of the word's objects, the bytes it writes are
+          // disjoint from the word's. Otherwise it keeps the origins
+          // verdict. One line per such write, for the log.
+          std::vector<std::string> offsetLines;
+          size_t offsetClosed = 0, offsetTried = 0;
+          auto unnamedOpen = [&](const std::string &K, const std::set<const Value *> *W,
+                                 const std::map<std::string, std::set<int64_t>> *wordAt = nullptr,
+                                 int64_t wlen = 0) -> std::string {
             const std::string ck = K + (W ? "#W" : "");
             if (auto d = unnamedDone.find(ck); d != unnamedDone.end()) return d->second;
+            collectWrites();
             const std::string KS = K.substr(0, K.rfind('+'));
             size_t nClose = 0, nReach = 0, nOpen = 0, nNull = 0;
             std::vector<std::string> reasons;
@@ -4908,7 +4928,7 @@ void CallGraphPass::checkContainerClosure() {
               const Origins &O = it->second;
               const Module *M = U.I->getModule();
               std::string why;
-              bool open = false;
+              bool open = false, wordReach = false;
               if (!O.unknown.empty()) {
                 why = "its origins are open (" + *O.unknown.begin() + ")", open = true;
               } else {
@@ -4916,6 +4936,7 @@ void CallGraphPass::checkContainerClosure() {
                   if (W) {
                     if (W->count(Al)) {
                       why = "its destination may be the word's object at " + snapLoc(cast<Instruction>(Al));
+                      wordReach = true;
                       break;
                     }
                     continue;
@@ -4950,7 +4971,7 @@ void CallGraphPass::checkContainerClosure() {
                 for (const Value *Ob : objs) {
                   if (!why.empty()) break;
                   if (W) {
-                    if (W->count(Ob)) why = "its destination may be the word's object " + Ob->getName().str();
+                    if (W->count(Ob)) why = "its destination may be the word's object " + Ob->getName().str(), wordReach = true;
                     continue;
                   }
                   Type *T = nullptr;
@@ -4973,6 +4994,36 @@ void CallGraphPass::checkContainerClosure() {
                     why = "its destination may be an element (" + *O.elements.begin() + ") of " + E +
                           ", which is, embeds or is embedded with " + KS;
               }
+              if (wordReach && !open && wordAt) {
+                const DataLayout &MDL = M->getDataLayout();
+                int64_t len = (int64_t)1 << 40;
+                if (const auto *St = dyn_cast<StoreInst>(U.I)) len = (int64_t)MDL.getTypeStoreSize(St->getValueOperand()->getType());
+                else if (const auto *RMW = dyn_cast<AtomicRMWInst>(U.I)) len = (int64_t)MDL.getTypeStoreSize(RMW->getValOperand()->getType());
+                else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(U.I)) len = (int64_t)MDL.getTypeStoreSize(CX->getNewValOperand()->getType());
+                else if (const auto *MI = dyn_cast<MemIntrinsic>(U.I))
+                  if (const auto *Len = dyn_cast<ConstantInt>(MI->getLength())) len = (int64_t)Len->getZExtValue();
+                std::set<Obj> uo;
+                std::set<std::string> uop;
+                objsOf(U.dest, 0, uo, uop);
+                std::string offs;
+                bool hit = false;
+                for (const Obj &o : uo)
+                  if (auto wit = wordAt->find(o.first); wit != wordAt->end()) {
+                    offs += (offs.empty() ? "+" : ", +") + std::to_string(o.second);
+                    for (int64_t w : wit->second) hit |= o.second < w + wlen && w < o.second + len;
+                  }
+                offsetTried++;
+                const std::string head = "check (2) by offset: " + snapLoc(U.I) + ": " +
+                                         (offs.empty() ? std::string("no offset in the word's objects")
+                                                       : "offsets " + offs + (hit ? " hit the word" : " miss the word"));
+                if (!hit && uop.empty()) {
+                  offsetLines.push_back(head + "; walk closed: does not reach");
+                  offsetClosed++;
+                  nClose++;
+                  continue;
+                }
+                offsetLines.push_back(head + (hit ? std::string() : "; walk open: " + *uop.begin()));
+              }
               if (why.empty()) {
                 nClose++;
                 continue;
@@ -4991,6 +5042,7 @@ void CallGraphPass::checkContainerClosure() {
             std::string res;
             if (!reasons.empty())
               res = reasons.front() + (reasons.size() > 1 ? " (and " + std::to_string(reasons.size() - 1) + " more)" : "");
+            unnamedCounts[ck] = {nClose, nReach, nOpen};
             return unnamedDone[ck] = res;
           };
           auto buildInit = [&]() {
@@ -5085,8 +5137,6 @@ void CallGraphPass::checkContainerClosure() {
             open.insert(r.second.begin(), r.second.end());
             if (top) walkSecs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
           };
-          std::function<void(const Value *, int64_t, std::set<Obj> &, std::set<std::string> &)> objsOf;
-          std::map<std::string, const Value *> objSite; // an object's name -> its allocation (call, alloca, global)
           // An object made by a certified pool's carves (Carves.cc): its pools.
           std::map<std::string, std::set<std::string>> objPools;
           // An allocator wrapper: every return a noalias extern call, a
@@ -5973,6 +6023,7 @@ void CallGraphPass::checkContainerClosure() {
               };
               std::set<Obj> wo;
               std::set<std::string> wop, zeroAt, dropped, keptObjs;
+              std::map<std::string, std::set<int64_t>> wordAt; // a kept object of the word -> the word's offsets in it
               if (decline.empty()) {
                 objsOf(W->getPointerOperand(), 0, wo, wop);
                 if (!wop.empty())
@@ -5987,6 +6038,7 @@ void CallGraphPass::checkContainerClosure() {
                   }
                   keptObjs.insert(o.first + " +" + std::to_string(o.second) +
                                   (sz >= 0 ? ", size " + std::to_string(sz) + " (" + src + ")" : std::string(", size unknown")));
+                  wordAt[o.first].insert(o.second);
                   if (!decline.empty()) continue; // every object is still checked for its size
                   auto it = objSite.find(o.first);
                   const auto *CB = it == objSite.end() ? nullptr : dyn_cast<CallBase>(it->second);
@@ -6034,6 +6086,16 @@ void CallGraphPass::checkContainerClosure() {
                     }
               if (decline.empty())
                 if (std::string c = coverOpen(K, wlen); !c.empty()) decline = c;
+              // Check (2)'s writes with no named slot against the word's kept
+              // objects, run whenever the word has kept objects (all with a
+              // site), so the log shows it even when a step above declined
+              // (Fable 2026-10-20). It decides only when nothing declined.
+              std::set<const Value *> Wkept;
+              bool c2Run = !wordAt.empty();
+              for (const auto &[o, _] : wordAt)
+                if (auto it = objSite.find(o); it != objSite.end()) Wkept.insert(it->second);
+                else c2Run = false;
+              const std::string c2 = c2Run ? unnamedOpen(K, &Wkept, &wordAt, wlen) : std::string();
               if (decline.empty()) {
                 // R1: the writes with no named slot, against the word's
                 // objects (closed: every object the word can lie in).
@@ -6041,8 +6103,12 @@ void CallGraphPass::checkContainerClosure() {
                 for (const std::string &z : zeroAt)
                   if (auto it = objSite.find(z); it != objSite.end()) Wsites.insert(it->second);
                   else decline = "the word's object " + z + " has no site to decide unnamed-destination writes against";
-                if (decline.empty())
-                  if (std::string u = unnamedOpen(K, &Wsites); !u.empty()) decline = u;
+                if (decline.empty()) {
+                  // Nothing declined: every kept object is zero-allocated
+                  // and has a site, so the run above is this check.
+                  assert(c2Run && Wsites == Wkept && "check (2) ran against other objects than the word's");
+                  if (!c2.empty()) decline = c2;
+                }
               }
               if (decline.empty()) {
                 buildInit();
@@ -6086,6 +6152,15 @@ void CallGraphPass::checkContainerClosure() {
               }
               for (const std::string &x : keptObjs) CG_LOG("Container: snapshot holder " << hname << ": kept: " << x << "\n");
               for (const std::string &x : coverLog) CG_LOG("Container: snapshot holder " << hname << ": " << x << "\n");
+              if (c2Run) {
+                const auto &cc = unnamedCounts.at(K + "#W");
+                CG_LOG("Container: snapshot holder " << hname << ": check (2) on the word (" << Wkept.size()
+                       << " kept objects' sites): " << cc[0] << " close / " << cc[1] << " reach / " << cc[2]
+                       << " open; first reason: " << (c2.empty() ? std::string("none") : c2) << "\n");
+                for (const std::string &x : offsetLines) CG_LOG("Container: snapshot holder " << hname << ": " << x << "\n");
+                CG_LOG("Container: snapshot holder " << hname << ": check (2) by offset: " << offsetClosed << " of "
+                       << offsetTried << " REACH writes closed\n");
+              }
               std::stable_sort(coverReasons.begin(), coverReasons.end(),
                                [](const CoverReason &a, const CoverReason &b) { return irOrderLess(a.I, b.I); });
               for (const CoverReason &r : coverReasons) {

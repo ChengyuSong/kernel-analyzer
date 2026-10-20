@@ -1429,6 +1429,31 @@ Obligations left open:
        null. The origin walks count the indirect call sites they follow
        apart ("cover: N indirect call sites through closed code fields
        followed"; distinct sites, not visits).
+       (Check (2) by offset, Fable 2026-10-20) An unnamed-destination
+       write whose origins include one of the word's objects does not
+       reach the word when its destination's object walk (objsOf, with
+       offsets) is closed and, in each of the word's objects, the bytes it
+       writes are disjoint from the word's; a write whose object walk is
+       open keeps the origins verdict. The walk carries offsets from the
+       object's start through constant steps, joins, -O0 locals, formals
+       and field loads, so a write with a runtime step on its chain opens
+       it and keeps the origins verdict (nm-O0, measured: 542 of the 1846
+       unnamed-destination writes have a runtime step); a chain with no
+       named field on it is decided by the same walk (1304 constant
+       chains, 1205 of them with no named struct step on some path,
+       measured). Each such write is logged ("check (2) by offset: <loc>:
+       offsets +a, +b miss the word; walk open: <first reason>", or "walk
+       closed: does not reach", or "hit the word") with a count ("n of m
+       REACH writes closed"). Check (2) is run against the word's kept
+       objects whenever it has kept objects, also after an earlier step
+       declined, and logged ("check (2) on the word (N kept objects'
+       sites): a close / b reach / c open; first reason: ..."); it decides
+       only when nothing declined before it. nm-O0: 1478 / 6 / 363, first
+       reason display_rel_file nm.c:1170; 0 of 6 closed by offset (their
+       offsets, +160/+800, +168/+816, +0, all miss the word at +3212, but
+       each walk carries the word's own open reasons, elflink.c:5234 and
+       display_rel_file). Cases: t_cells_container_snapshot_offset{miss,
+       hit,open}.c.
        (H, Fable 2026-10-19) A recognized snapshot holder's block H
        carries exactly the structs of its saves' sources (the handle
        array's pointer range, and element bytes of the paired entsize),

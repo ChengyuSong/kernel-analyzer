@@ -3211,6 +3211,526 @@ void CallGraphPass::checkContainerClosure() {
           else if (ok) ok = false, firstBad1[K] = S;
         if (!ok) open1.insert(K);
       }
+      // A block copy anywhere whose destination is an element struct (one
+      // embedding a container struct) is a store of the source's fields:
+      // the source an element of the same owner, or in the body derived or
+      // fresh; memset is a null store (Fable 2026-10-14, per-field
+      // decomposition). Destinations named by the copy's struct access.
+      std::set<std::string> elemStructs;
+      for (const std::string &L : links) elemStructs.insert(L.substr(0, L.rfind('+')));
+      std::function<bool(StringRef, int)> embedsElem = [&](StringRef Tag, int d) -> bool {
+        if (elemStructs.count("struct." + Tag.str())) return true;
+        if (d > 4) return false;
+        auto dit = diStructs.find(Tag.str());
+        if (dit == diStructs.end()) return false;
+        for (const DINode *E : dit->second->getElements())
+          if (const auto *M = dyn_cast<DIDerivedType>(E); M && M->getTag() == dwarf::DW_TAG_member)
+            if (const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(M->getBaseType()));
+                CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && M->getOffsetInBits() == 0 &&
+                embedsElem(CT->getName(), d + 1))
+              return true;
+        return false;
+      };
+      std::vector<std::string> badCopies; // every failing copy (reported, not only the first)
+      std::vector<std::string> o1Unclassified; // block copies whose destination the check cannot classify
+      // A destination's origins by name (Fable 2026-10-17): a program-wide
+      // walk over the IR only (no solver facts, so no stop changes it).
+      // Steps: casts and GEPs to their base; a -O0 local to the values
+      // stored into it; a named field S+off to every value stored into
+      // S+off and every global initializer's value there (a block copy over
+      // the field from another name: unknown); a formal to the actuals of
+      // its direct calls (an address-taken function's, or one with no
+      // caller: unknown); a call with a body to its returned values. Leaves:
+      // an allocation (a pool carve: a chunk), a local, a global, an
+      // element (a constructor's allocation, a constructor's or a row's
+      // result, a load of a handle, link or closed cursor field), or
+      // unknown with its reason. Elements are exactly the constructors'
+      // allocations: the block's insert checks (O3, ELEM rows) establish
+      // it, and this classification inherits their openness.
+      std::map<std::string, std::vector<const Value *>> storedAt; // field key -> values stored there
+      std::map<std::string, std::vector<std::string>> fieldUnknown; // field key -> block copies over it from elsewhere
+      std::vector<std::pair<std::string, const MemTransferInst *>> fieldCopies;
+      for (auto &[M, _] : Ctx->Modules) {
+        const DataLayout &MDL = M->getDataLayout();
+        for (Function &F : *M)
+          for (const Instruction &I : instructions(F)) {
+            if (const auto *S = dyn_cast<StoreInst>(&I); S && S->getValueOperand()->getType()->isPointerTy()) {
+              const std::string K = fieldKey(S, S->getPointerOperand());
+              if (!K.empty()) storedAt[K].push_back(S->getValueOperand());
+            } else if (const auto *VT = S ? dyn_cast<FixedVectorType>(S->getValueOperand()->getType()) : nullptr;
+                       VT && VT->getElementType()->isPointerTy()) {
+              // A vector of pointers stored over consecutive fields (-O3's
+              // paired stores): each lane's field gets the vector's values.
+              const std::string K = fieldKey(S, S->getPointerOperand());
+              if (!K.empty()) {
+                const std::string SN = K.substr(0, K.rfind('+'));
+                const int64_t o0 = std::stoll(K.substr(K.rfind('+') + 1));
+                const int64_t w = (int64_t)MDL.getTypeAllocSize(VT->getElementType());
+                for (unsigned l = 0; l < VT->getNumElements(); l++)
+                  storedAt[SN + "+" + std::to_string(o0 + l * w)].push_back(S->getValueOperand());
+              }
+            } else if (const auto *MT = dyn_cast<MemTransferInst>(&I)) {
+              const std::string K = fieldKey(MT, MT->getRawDest());
+              if (!K.empty()) fieldCopies.emplace_back(K, MT);
+            }
+          }
+        // Global initializers: every pointer at a named struct's offset.
+        std::function<void(const Constant *)> initWalk = [&](const Constant *C) {
+          if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
+            StructType *ST = CS->getType();
+            const StructLayout *SL = ST->hasName() ? MDL.getStructLayout(ST) : nullptr;
+            for (unsigned i = 0; i < CS->getNumOperands(); i++) {
+              const Constant *E = CS->getOperand(i);
+              if (SL && E->getType()->isPointerTy() && !E->isNullValue())
+                storedAt[stripStructNameSuffix(ST->getName()).str() + "+" +
+                         std::to_string(SL->getElementOffset(i))].push_back(E);
+              initWalk(E);
+            }
+          } else if (isa<ConstantArray>(C)) {
+            for (const Use &U : C->operands()) initWalk(cast<Constant>(U.get()));
+          }
+        };
+        for (const GlobalVariable &G : M->globals())
+          if (G.hasInitializer()) initWalk(G.getInitializer());
+      }
+      // A block copy over a field: from the same field of another object of
+      // the struct (a struct copy) it brings that field's own values; from
+      // anything else, unknown.
+      for (const auto &[K, MT] : fieldCopies) {
+        const std::string S = K.substr(0, K.rfind('+'));
+        const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
+        const auto *LenC = dyn_cast<ConstantInt>(MT->getLength());
+        const int64_t len = LenC ? (int64_t)LenC->getZExtValue() : INT64_MAX / 2;
+        const std::string SK = fieldKey(MT, MT->getRawSource());
+        bool same = SK == K;
+        // From a local of the struct, at the same offset: its fields' values
+        // are the writes keyed by the struct (through any pointer to it)
+        // and the local's own direct stores (added below).
+        const AllocaInst *srcLocal = nullptr;
+        {
+          APInt SO(64, 0);
+          const Value *SB = MT->getRawSource()->stripAndAccumulateConstantOffsets(MT->getModule()->getDataLayout(), SO, true);
+          if (const auto *AI = dyn_cast<AllocaInst>(SB))
+            if (auto *ST = dyn_cast<StructType>(AI->getAllocatedType());
+                ST && ST->hasName() && stripStructNameSuffix(ST->getName()).str() == S && SO.getSExtValue() == off)
+              same = true, srcLocal = AI;
+        }
+        for (auto it = storedAt.lower_bound(S + "+"); it != storedAt.end() && it->first.compare(0, S.size() + 1, S + "+") == 0; ++it) {
+          const int64_t o = std::stoll(it->first.substr(S.size() + 1));
+          if (o >= off && o < off + len && !same)
+            fieldUnknown[it->first].push_back("a block copy from another name: " + MT->getFunction()->getName().str() + ": " + valueText(MT));
+        }
+        if (srcLocal) {
+          const DataLayout &LDL = MT->getModule()->getDataLayout();
+          for (const Instruction &J : instructions(*MT->getFunction())) {
+            const Value *A = nullptr, *Val = nullptr;
+            if (const auto *St = dyn_cast<StoreInst>(&J)) A = St->getPointerOperand(), Val = St->getValueOperand();
+            else if (const auto *MJ = dyn_cast<MemTransferInst>(&J)) A = MJ->getRawDest();
+            if (!A) continue;
+            APInt LO(64, 0);
+            if (A->stripAndAccumulateConstantOffsets(LDL, LO, true) != srcLocal) continue;
+            if (!Val) { // a block copy into the local: the fields it covers come from elsewhere
+              const auto *JL = dyn_cast<ConstantInt>(cast<MemTransferInst>(&J)->getLength());
+              const int64_t jl = JL ? (int64_t)JL->getZExtValue() : INT64_MAX / 2;
+              const StructLayout *SL = LDL.getStructLayout(cast<StructType>(srcLocal->getAllocatedType()));
+              for (unsigned e = 0; e < SL->getMemberOffsets().size(); e++) {
+                const int64_t eo = (int64_t)SL->getElementOffset(e);
+                if (eo >= LO.getSExtValue() && eo < LO.getSExtValue() + jl)
+                  fieldUnknown[S + "+" + std::to_string(eo)].push_back("a block copy into a local the struct is copied from: " + MT->getFunction()->getName().str() + ": " +
+                                                                       valueText(&J));
+              }
+              continue;
+            }
+            if (Val->getType()->isPointerTy()) storedAt[S + "+" + std::to_string(LO.getSExtValue())].push_back(Val);
+          }
+        }
+      }
+      auto callerOf = [](const Function *F, std::vector<const CallBase *> &out) {
+        for (const User *U : F->users())
+          if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) out.push_back(CB);
+      };
+      struct Origins {
+        std::set<std::string> leaves, unknown, elements;
+        std::map<std::string, std::set<std::string>> pools; // certified pool -> its carves reached
+        std::set<const Value *> objs;                        // the locals and globals among the leaves
+        std::set<const Instruction *, IROrder> allocs;       // the allocations and pool carves among them (their sites, in IR order)
+      };
+      // The values stored through pointer P (a local or a global whose
+      // address is passed on, an output parameter's formal): its own stores,
+      // through -O0 slots holding it, casts, the formals of direct callees
+      // with bodies it is passed to, and bodiless callees' summaries (a
+      // STORE atom into it). Anything else that uses P: unknown.
+      std::function<void(const Value *, std::vector<const Value *> &, std::set<std::string> &, std::set<const Value *> &)>
+          storesThrough = [&](const Value *P, std::vector<const Value *> &out, std::set<std::string> &unk,
+                              std::set<const Value *> &vis) {
+            if (!vis.insert(P).second) return;
+            for (const User *U : P->users()) {
+              const auto *UI = dyn_cast<Instruction>(U);
+              if (!UI || isa<DbgInfoIntrinsic>(UI) || UI->isLifetimeStartOrEnd() || isa<ICmpInst>(UI)) continue;
+              // A memset through it writes a byte pattern, no pointer value.
+              if (const auto *MS = dyn_cast<MemSetInst>(UI); MS && MS->getRawDest() == P) continue;
+              if (const auto *L = dyn_cast<LoadInst>(UI); L && L->getPointerOperand() == P) continue;
+              if (const auto *S = dyn_cast<StoreInst>(UI)) {
+                if (S->getPointerOperand() == P && S->getValueOperand() != P) {
+                  out.push_back(S->getValueOperand());
+                  continue;
+                }
+                if (S->getValueOperand() == P && transientSlot(S->getPointerOperand()->stripPointerCasts())) {
+                  for (const User *V : S->getPointerOperand()->stripPointerCasts()->users())
+                    if (const auto *L = dyn_cast<LoadInst>(V)) storesThrough(L, out, unk, vis);
+                  continue;
+                }
+              }
+              if (isa<BitCastInst>(UI) || isa<AddrSpaceCastInst>(UI)) {
+                storesThrough(UI, out, unk, vis);
+                continue;
+              }
+              if (const auto *CB = dyn_cast<CallBase>(UI)) {
+                const Function *H = CB->getCalledFunction();
+                bool ok = H != nullptr;
+                for (unsigned a = 0; ok && a < CB->arg_size(); a++) {
+                  if (CB->getArgOperand(a) != P) continue;
+                  if (!H->isDeclaration() && !H->hasAddressTaken() && a < H->arg_size()) {
+                    storesThrough(H->getArg(a), out, unk, vis);
+                  } else if (H->isDeclaration()) {
+                    auto sit = Ctx->FuncSummaries.find(H);
+                    if (sit == Ctx->FuncSummaries.end() || !sit->second) {
+                      ok = false;
+                      break;
+                    }
+                    for (const auto &At : sit->second->atoms) {
+                      if (At.dst != (int)a) continue;
+                      if (At.kind == GlobalContext::SummaryAtom::Store && At.src >= 0 && (unsigned)At.src < CB->arg_size())
+                        out.push_back(CB->getArgOperand(At.src));
+                      else if (At.kind != GlobalContext::SummaryAtom::Alias)
+                        ok = false;
+                    }
+                  } else {
+                    ok = false;
+                  }
+                }
+                if (ok) continue;
+              }
+              unk.insert("a pointer to a local or global used by " + UI->getFunction()->getName().str() + ": " + valueText(UI));
+            }
+          };
+      // A named field's address that escapes (passed to a callee that
+      // stores through it, `*ptr = p`, held in a local): the values stored
+      // through it are the field's too; anything else it reaches: the
+      // field is unknown.
+      for (auto &[M, _] : Ctx->Modules)
+        for (Function &F : *M)
+          for (const Instruction &I : instructions(F)) {
+            if (!isa<GetElementPtrInst>(&I) || !I.getType()->isPointerTy()) continue;
+            bool escapes = false;
+            for (const User *U : I.users())
+              if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == &I) continue;
+              else if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == &I && St->getValueOperand() != &I) continue;
+              else if (isa<DbgInfoIntrinsic>(U) || isa<GetElementPtrInst>(U) || isa<ICmpInst>(U)) continue;
+              else escapes = true;
+            if (!escapes) continue;
+            const std::string FK = fieldKey(&I, &I);
+            if (FK.empty()) continue;
+            std::set<const Value *> vis;
+            std::vector<const Value *> vals;
+            std::set<std::string> unk;
+            storesThrough(&I, vals, unk, vis);
+            if (!unk.empty()) fieldUnknown[FK].push_back(*unk.begin() + " (its address escapes)");
+            for (const Value *W : vals) storedAt[FK].push_back(W);
+          }
+      size_t icallClosed = 0; // indirect calls whose callee closes by name (d)
+      size_t *icallCount = &icallClosed; // where originsOf counts them (a snapshot cover counts its own)
+      // The field keys a load of type T at K reads: K, and for a vector of
+      // pointers each lane's field.
+      auto laneKeys = [&](const std::string &K, Type *T) {
+        std::vector<std::string> ks{K};
+        if (const auto *VT = dyn_cast<FixedVectorType>(T); VT && VT->getElementType()->isPointerTy()) {
+          const std::string SN = K.substr(0, K.rfind('+'));
+          const int64_t o0 = std::stoll(K.substr(K.rfind('+') + 1));
+          for (unsigned l = 1; l < VT->getNumElements(); l++)
+            ks.push_back(SN + "+" + std::to_string(o0 + l * 8));
+        }
+        return ks;
+      };
+      std::function<Origins(const Value *, int)> originsOf = [&](const Value *D0, int depth) {
+        Origins O;
+        std::set<const Value *> seen;
+        std::vector<const Value *> work{D0};
+        auto loc = [](const Instruction *I) {
+          std::string l = I->getFunction()->getName().str();
+          if (const DebugLoc &DLc = I->getDebugLoc()) l += " " + DLc->getFilename().str() + ":" + std::to_string(DLc.getLine());
+          return l;
+        };
+        while (!work.empty()) {
+          const Value *V = work.back();
+          work.pop_back();
+          if (!seen.insert(V).second) continue;
+          if (seen.size() > 100000) {
+            O.unknown.insert("the walk exceeds 100000 values");
+            break;
+          }
+          if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V) || isa<ConstantAggregateZero>(V)) continue;
+          if (const auto *CV = dyn_cast<ConstantVector>(V)) {
+            for (const Use &U : CV->operands()) work.push_back(U.get());
+            continue;
+          }
+          if (const auto *G = dyn_cast<GlobalValue>(V)) {
+            O.leaves.insert("global " + G->getName().str());
+            O.objs.insert(G);
+            continue;
+          }
+          if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
+            if (CE->getOpcode() == Instruction::GetElementPtr || CE->isCast()) work.push_back(CE->getOperand(0));
+            else O.unknown.insert("a constant expression: " + valueText(CE));
+            continue;
+          }
+          if (const auto *A = dyn_cast<Argument>(V)) {
+            const Function *F = A->getParent();
+            std::vector<const CallBase *> cs;
+            callerOf(F, cs);
+            if (F->hasAddressTaken()) O.unknown.insert("a formal of address-taken " + F->getName().str());
+            else if (cs.empty()) O.unknown.insert("a formal of " + F->getName().str() + ", which has no caller");
+            else
+              for (const CallBase *CB : cs)
+                if (A->getArgNo() < CB->arg_size()) work.push_back(CB->getArgOperand(A->getArgNo()));
+            continue;
+          }
+          const auto *I = dyn_cast<Instruction>(V);
+          if (!I) {
+            O.unknown.insert("a value: " + valueText(V));
+            continue;
+          }
+          if (isa<AllocaInst>(I)) {
+            O.leaves.insert("local " + loc(I));
+            O.objs.insert(I);
+            continue;
+          }
+          if (poolCarves.count(I)) {
+            if (ctorsHere.count(I->getFunction())) O.elements.insert("a constructor's carve in " + loc(I));
+            else O.pools[poolCarvePool.at(I)].insert("a carve in " + loc(I)), O.allocs.insert(I);
+            continue;
+          }
+          if (isa<CastInst>(I) || isa<GetElementPtrInst>(I) || isa<FreezeInst>(I)) {
+            if (isa<IntToPtrInst>(I)) O.unknown.insert("an inttoptr in " + loc(I));
+            else work.push_back(I->getOperand(0));
+            continue;
+          }
+          if (const auto *PN = dyn_cast<PHINode>(I)) {
+            for (const Value *In : PN->incoming_values()) work.push_back(In);
+            continue;
+          }
+          if (const auto *SL = dyn_cast<SelectInst>(I)) {
+            work.push_back(SL->getTrueValue());
+            work.push_back(SL->getFalseValue());
+            continue;
+          }
+          // Vectors of pointers: a lane's origins are the vector's (its
+          // operands, all lanes).
+          if (isa<ShuffleVectorInst>(I) || isa<InsertElementInst>(I)) {
+            work.push_back(I->getOperand(0));
+            work.push_back(I->getOperand(1));
+            continue;
+          }
+          if (isa<ExtractElementInst>(I)) {
+            work.push_back(I->getOperand(0));
+            continue;
+          }
+          if (const auto *L = dyn_cast<LoadInst>(I)) {
+            const Value *A = L->getPointerOperand()->stripPointerCasts();
+            if (transientSlot(A)) {
+              for (const User *U : A->users())
+                if (const auto *S = dyn_cast<StoreInst>(U)) work.push_back(S->getValueOperand());
+              continue;
+            }
+            const std::string K = fieldKey(L, L->getPointerOperand());
+            if (!K.empty()) {
+              for (const std::string &LK : laneKeys(K, L->getType())) {
+                if (handle.count(LK) || links.count(LK) || (cursorOpen.count(LK) && cursorOpen[LK].empty())) {
+                  O.elements.insert("a load of " + LK + " in " + loc(L));
+                  continue;
+                }
+                if (auto fu = fieldUnknown.find(LK); fu != fieldUnknown.end()) {
+                  O.unknown.insert("field " + LK + " not closed by name: " + fu->second.front());
+                  continue;
+                }
+                if (const auto sit = storedAt.find(LK); sit != storedAt.end())
+                  for (const Value *W : sit->second) work.push_back(W);
+              }
+              continue;
+            }
+            if (const auto *G = dyn_cast<GlobalVariable>(A)) {
+              bool escapes = false;
+              for (const User *U : G->users())
+                if (const auto *S = dyn_cast<StoreInst>(U)) {
+                  if (S->getPointerOperand() == G) work.push_back(S->getValueOperand());
+                  else escapes = true;
+                } else if (!isa<LoadInst>(U)) {
+                  escapes = true;
+                }
+              if (escapes) O.unknown.insert("a load of global " + G->getName().str() + ", whose address escapes");
+              else if (G->hasInitializer()) work.push_back(G->getInitializer());
+              continue;
+            }
+            // Through a pointer: the addresses it can hold by name (a named
+            // field's address, a local's, a global's), each read as itself:
+            // a field's stored values, the values stored through a local's or
+            // a global's address. Anything else: unknown.
+            std::set<std::string> fks;
+            std::set<const Value *> objs, avis;
+            std::string why;
+            std::vector<const Value *> aw{A};
+            while (!aw.empty() && why.empty()) {
+              const Value *X = aw.back();
+              aw.pop_back();
+              if (!avis.insert(X).second) continue;
+              if (avis.size() > 10000) why = "the address walk exceeds 10000 values";
+              else if (isa<ConstantPointerNull>(X)) continue;
+              else if (isa<AllocaInst>(X) || isa<GlobalVariable>(X)) objs.insert(X);
+              else if (const auto *XA = dyn_cast<Argument>(X)) {
+                const Function *F = XA->getParent();
+                std::vector<const CallBase *> cs;
+                callerOf(F, cs);
+                if (F->hasAddressTaken() || cs.empty()) why = "the address is a formal of " + F->getName().str() + (F->hasAddressTaken() ? ", address-taken" : ", which has no caller");
+                for (const CallBase *CB : cs)
+                  if (XA->getArgNo() < CB->arg_size()) aw.push_back(CB->getArgOperand(XA->getArgNo()));
+              } else if (const auto *XL = dyn_cast<LoadInst>(X); XL && transientSlot(XL->getPointerOperand()->stripPointerCasts())) {
+                for (const User *U : XL->getPointerOperand()->stripPointerCasts()->users())
+                  if (const auto *St = dyn_cast<StoreInst>(U)) aw.push_back(St->getValueOperand());
+              } else if (isa<BitCastInst>(X) || isa<AddrSpaceCastInst>(X)) {
+                aw.push_back(cast<Instruction>(X)->getOperand(0));
+              } else if (const auto *XP = dyn_cast<PHINode>(X)) {
+                for (const Value *In : XP->incoming_values()) aw.push_back(In);
+              } else if (const auto *XI = dyn_cast<Instruction>(X); XI && isa<GetElementPtrInst>(XI)) {
+                const std::string FK = fieldKey(XI, XI);
+                if (FK.empty()) why = "the address is an unnamed step in " + loc(XI) + ": " + valueText(XI);
+                else fks.insert(FK);
+              } else {
+                why = "the address is " + valueText(X);
+              }
+            }
+            std::set<const Value *> vis;
+            std::vector<const Value *> vals;
+            std::set<std::string> unk;
+            if (why.empty())
+              for (const Value *Ob : objs) storesThrough(Ob, vals, unk, vis);
+            if (why.empty())
+              for (const std::string &FK : fks) {
+                if (handle.count(FK) || links.count(FK) || (cursorOpen.count(FK) && cursorOpen[FK].empty())) {
+                  O.elements.insert("a load of " + FK + " through its address in " + loc(L));
+                  continue;
+                }
+                if (auto fu = fieldUnknown.find(FK); fu != fieldUnknown.end())
+                  unk.insert("field " + FK + " not closed by name: " + fu->second.front());
+                else if (const auto sit = storedAt.find(FK); sit != storedAt.end())
+                  vals.insert(vals.end(), sit->second.begin(), sit->second.end());
+              }
+            if (!why.empty() || !unk.empty()) {
+              O.unknown.insert("a load through a pointer in " + loc(L) + ": " + (why.empty() ? *unk.begin() : why));
+              continue;
+            }
+            for (const Value *W : vals) work.push_back(W);
+            continue;
+          }
+          if (const auto *CB = dyn_cast<CallBase>(I)) {
+            const Function *G = CB->getCalledFunction();
+            if (!G) {
+              if (const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
+                const std::string K = fieldKey(CL, CL->getPointerOperand());
+                if (code.count(K) && !codeOpen.count(K)) {
+                  O.elements.insert("a constructor's result through " + K + " in " + loc(CB));
+                  continue;
+                }
+              }
+              // (d) The callee's origins by name (a named field's stores and
+              // initializers): every function it can hold, then their
+              // returns; any other origin, unknown.
+              const Origins OC = depth < 4 ? originsOf(CB->getCalledOperand(), depth + 1) : Origins();
+              std::vector<const Function *> fns;
+              bool closed = depth < 4 && OC.unknown.empty() && OC.elements.empty() && OC.pools.empty() &&
+                            OC.objs.size() == OC.leaves.size() && !OC.objs.empty();
+              for (const Value *Ob : OC.objs)
+                if (const auto *Fn = dyn_cast<Function>(Ob); Fn && !Fn->isDeclaration()) fns.push_back(Fn);
+                else closed = false;
+              if (!closed) {
+                O.unknown.insert("an indirect call in " + loc(CB) +
+                                 (OC.unknown.empty() ? std::string() : " (its callee: " + *OC.unknown.begin() + ")"));
+                continue;
+              }
+              for (const Function *Fn : fns)
+                for (const Instruction &RI : instructions(*Fn))
+                  if (const auto *Ret = dyn_cast<ReturnInst>(&RI); Ret && Ret->getReturnValue())
+                    work.push_back(Ret->getReturnValue());
+              O.leaves.insert("returns of " + std::to_string(fns.size()) + " functions the call in " + loc(CB) + " can reach by name");
+              ++*icallCount;
+              continue;
+            }
+            if (ctorsHere.count(G)) {
+              O.elements.insert("constructor " + G->getName().str() + "'s result in " + loc(CB));
+              continue;
+            }
+            const bool alloc = isFresh(CB) || carveFns.count(G->getName().str());
+            if (alloc && ctorsHere.count(CB->getFunction())) {
+              O.elements.insert("a constructor's allocation " + G->getName().str() + " in " + loc(CB));
+              continue;
+            }
+            if (carveFns.count(G->getName().str())) {
+              // A carve row: the certified pools of its carves (its own, or
+              // those of the functions it calls directly).
+              std::set<std::string> ps;
+              auto carvesIn = [&](const Function *H) {
+                for (const Instruction &J : instructions(*H))
+                  if (auto pit = poolCarvePool.find(&J); pit != poolCarvePool.end()) ps.insert(pit->second);
+              };
+              carvesIn(G);
+              for (const Instruction &J : instructions(*G))
+                if (const auto *CJ = dyn_cast<CallBase>(&J); CJ && CJ->getCalledFunction() && !CJ->getCalledFunction()->isDeclaration())
+                  carvesIn(CJ->getCalledFunction());
+              if (ps.empty()) O.unknown.insert("carve row " + G->getName().str() + " with no certified pool's carve, in " + loc(CB));
+              for (const std::string &pn : ps) O.pools[pn].insert("carve row " + G->getName().str() + " in " + loc(CB));
+              if (!ps.empty()) O.allocs.insert(CB);
+              continue;
+            }
+            if (alloc) {
+              O.leaves.insert("allocation " + G->getName().str() + " in " + loc(CB));
+              O.allocs.insert(CB);
+              continue;
+            }
+            if (const CR *R = rowOf(G); R && R->role != CR::Carve) {
+              O.elements.insert("row " + G->getName().str() + "'s result in " + loc(CB));
+              continue;
+            }
+            if (G->isDeclaration()) {
+              // A summary's returned values (strrchr's ALIAS(ret<-arg0@X):
+              // its argument's origins); a summary that loads the result, or
+              // none: unknown.
+              auto sit = Ctx->FuncSummaries.find(G);
+              bool viaSummary = sit != Ctx->FuncSummaries.end() && sit->second && !sit->second->atoms.empty();
+              std::vector<unsigned> from;
+              if (viaSummary)
+                for (const auto &At : sit->second->atoms) {
+                  if (At.dst != -1) continue;
+                  if (At.kind == GlobalContext::SummaryAtom::Alias && At.src >= 0 && (unsigned)At.src < CB->arg_size())
+                    from.push_back(At.src);
+                  else viaSummary = false;
+                }
+              if (!viaSummary || from.empty()) {
+                O.unknown.insert("a call of " + G->getName().str() + " (no body" +
+                                 (sit == Ctx->FuncSummaries.end() ? "" : ", its summary names no returned argument") +
+                                 ") in " + loc(CB));
+                continue;
+              }
+              for (unsigned a : from) work.push_back(CB->getArgOperand(a));
+              continue;
+            }
+            for (const Instruction &RI : instructions(*G))
+              if (const auto *Ret = dyn_cast<ReturnInst>(&RI); Ret && Ret->getReturnValue())
+                work.push_back(Ret->getReturnValue());
+            continue;
+          }
+          O.unknown.insert("an instruction in " + loc(I) + ": " + valueText(I));
+        }
+        return O;
+      };
       // Snapshot holders ((3''), Fable 2026-10-17/18): a fresh block whose
       // every use, by name, is a save of the owner's handle array at its
       // start, a save of the same owner's elements (each of the owner's
@@ -3637,6 +4157,20 @@ void CallGraphPass::checkContainerClosure() {
           // runtime length to the end of the struct) at its named slot.
           struct NamedWrite { StructType *S; int64_t off, len; const Instruction *I; };
           std::vector<NamedWrite> namedWrites;
+          // Every write with no named slot (R1, Fable 2026-10-19), in IR
+          // order: decided by its destination's origins (originsOf), as
+          // writing any byte of each origin object.
+          struct UnnamedWrite { const Instruction *I; const Value *dest; };
+          std::vector<UnnamedWrite> unnamedWrites;
+          std::map<const Instruction *, Origins> unnamedOrigins;
+          std::map<std::string, std::string> unnamedDone; // K (+"#W" for check (2)) -> its reason
+          std::vector<std::string> coverLog;
+          // Each unnamed-destination write that is a reason, once, with the
+          // keys it is one for (listed in IR order).
+          struct CoverReason { const Instruction *I; std::string why; std::vector<std::string> keys; };
+          std::vector<CoverReason> coverReasons;
+          std::map<std::string, size_t> coverReasonAt;
+          size_t coverIcalls = 0; // indirect calls the covers' origin walks follow through closed code fields
           bool writesDone = false;
           std::set<std::string> keysWalked, keysCovered; // for the log
           std::set<std::string> nullWrites; // constant-zero memsets over a walked field: null, no object (listed)
@@ -3667,10 +4201,15 @@ void CallGraphPass::checkContainerClosure() {
                     }
                     StructType *WS = nullptr;
                     int64_t woff = 0;
-                    // A store into an -O0 scalar local names no field.
-                    if (!Addr || (isa<StoreInst>(&I) && isa<AllocaInst>(Addr->stripPointerCasts())) ||
-                        !namedSlot(&I, Addr, MDL, pointees, WS, woff) || !WS || !WS->hasName() || len <= 0)
+                    // A store into an -O0 scalar local names no field (it
+                    // names the local itself).
+                    if (!Addr || (isa<StoreInst>(&I) && isa<AllocaInst>(Addr->stripPointerCasts()))) continue;
+                    const bool named = namedSlot(&I, Addr, MDL, pointees, WS, woff) && WS && WS->hasName();
+                    if (len <= 0) continue;
+                    if (!named) {
+                      unnamedWrites.push_back({&I, Addr});
                       continue;
+                    }
                     namedWrites.push_back({WS, woff, len, &I});
                   }
               }
@@ -3709,6 +4248,156 @@ void CallGraphPass::checkContainerClosure() {
                       std::to_string(W.len) + " bytes) over " + K + " " + snapLoc(W.I);
             }
             return n ? std::to_string(n) + " writes named otherwise over " + K + ", e.g. " + why : std::string();
+          };
+          // Does a struct named Inner lie anywhere in one named Outer (the
+          // embedding table, by name in module M)?
+          auto structByName = [](const Module *M, StringRef N) -> StructType * {
+            for (StructType *ST : M->getIdentifiedStructTypes())
+              if (ST->hasName() && stripStructNameSuffix(ST->getName()) == N && !ST->isOpaque()) return ST;
+            return nullptr;
+          };
+          auto holdsAny = [&](StructType *Outer, StringRef Inner, const Module *M) {
+            StructType *IT = structByName(M, Inner);
+            const StructInfo *OI = Outer ? Ctx->structAnalyzer.getStructInfo(Outer, const_cast<Module *>(M)) : nullptr;
+            const StructInfo *II = IT ? Ctx->structAnalyzer.getStructInfo(IT, const_cast<Module *>(M)) : nullptr;
+            return OI && II && II->getContainers().count(OI->getRealType());
+          };
+          // R1 (Fable 2026-10-19): the writes with no named slot over field
+          // K, by their destinations' origins. An open origin, or an
+          // allocation with no declared type (walk covers), is OPEN; a
+          // local or global whose declared type holds K's struct, or an
+          // element of a struct that is, embeds or is embedded with it,
+          // reaches K. For check (2) (W: the word's objects, a closed set)
+          // an allocation, local or global reaches only if it is in W.
+          // Constant-zero memsets write null. One reason per key.
+          // The container's element struct that is, embeds or is embedded
+          // with KS (anywhere, transitively), or "".
+          auto elemRel = [&](const std::string &KS, const Module *M) -> std::string {
+            for (const std::string &E : elemStructs) {
+              StructType *ET = structByName(M, StringRef(E).drop_front(7));
+              StructType *KT = structByName(M, StringRef(KS).drop_front(7));
+              bool rel = E == KS || (KT && holdsAny(KT, StringRef(E).drop_front(7), M)) ||
+                         (ET && holdsAny(ET, StringRef(KS).drop_front(7), M));
+              if (!rel && ET)
+                if (const StructInfo *EI = Ctx->structAnalyzer.getStructInfo(ET, const_cast<Module *>(M)))
+                  for (const auto &[CT, offs] : EI->getContainers())
+                    if (auto *CST = const_cast<StructType *>(CT);
+                        CST && ((CST->hasName() && stripStructNameSuffix(CST->getName()) == KS) ||
+                                holdsAny(CST, StringRef(KS).drop_front(7), M))) {
+                      rel = true;
+                      break;
+                    }
+              if (rel) return E;
+            }
+            return "";
+          };
+          auto unnamedOpen = [&](const std::string &K, const std::set<const Value *> *W) -> std::string {
+            const std::string ck = K + (W ? "#W" : "");
+            if (auto d = unnamedDone.find(ck); d != unnamedDone.end()) return d->second;
+            const std::string KS = K.substr(0, K.rfind('+'));
+            size_t nClose = 0, nReach = 0, nOpen = 0, nNull = 0;
+            std::vector<std::string> reasons;
+            for (const UnnamedWrite &U : unnamedWrites) {
+              if (const auto *MS = dyn_cast<MemSetInst>(U.I);
+                  MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero()) {
+                nNull++;
+                continue;
+              }
+              auto it = unnamedOrigins.find(U.I);
+              if (it == unnamedOrigins.end()) {
+                size_t *const own = icallCount;
+                icallCount = &coverIcalls;
+                Origins O = originsOf(U.dest, 0);
+                icallCount = own;
+                it = unnamedOrigins.emplace(U.I, std::move(O)).first;
+              }
+              const Origins &O = it->second;
+              const Module *M = U.I->getModule();
+              std::string why;
+              bool open = false;
+              if (!O.unknown.empty()) {
+                why = "its origins are open (" + *O.unknown.begin() + ")", open = true;
+              } else {
+                for (const Value *Al : O.allocs) {
+                  if (W) {
+                    if (W->count(Al)) {
+                      why = "its destination may be the word's object at " + snapLoc(cast<Instruction>(Al));
+                      break;
+                    }
+                    continue;
+                  }
+                  // This holder's block H carries exactly its saves' sources:
+                  // the handle array's pointers and the owner's elements (the
+                  // recognition above checked every use of H).
+                  if (Al == A) {
+                    if (const std::string E = elemRel(KS, M); !E.empty()) {
+                      why = "its destination may be the snapshot holder's block " + snapLoc(A) + " (element bytes of " + E +
+                            ", which is, embeds or is embedded with " + KS + ")";
+                      break;
+                    }
+                    continue;
+                  }
+                  const auto *CB = dyn_cast<CallBase>(Al);
+                  const std::string an = CB && CB->getCalledFunction() ? CB->getCalledFunction()->getName().str()
+                                                                         : std::string("a pool carve");
+                  why = "origins include an untyped allocation (" + an + " at " + snapLoc(cast<Instruction>(Al)) +
+                        "), not typed",
+                  open = true;
+                  break;
+                }
+                // In a fixed order (globals by name, then locals in IR order),
+                // so the reason names the same object on every run.
+                std::vector<const Value *> objs(O.objs.begin(), O.objs.end());
+                std::stable_sort(objs.begin(), objs.end(), [](const Value *x, const Value *y) {
+                  const auto *ix = dyn_cast<Instruction>(x), *iy = dyn_cast<Instruction>(y);
+                  if (!ix || !iy) return !ix && (iy || x->getName() < y->getName());
+                  return irOrderLess(ix, iy);
+                });
+                for (const Value *Ob : objs) {
+                  if (!why.empty()) break;
+                  if (W) {
+                    if (W->count(Ob)) why = "its destination may be the word's object " + Ob->getName().str();
+                    continue;
+                  }
+                  Type *T = nullptr;
+                  if (const auto *AI = dyn_cast<AllocaInst>(Ob)) T = AI->getAllocatedType();
+                  else if (const auto *GV = dyn_cast<GlobalVariable>(Ob)) T = GV->getValueType();
+                  if (!T || !T->isSized()) continue;
+                  const DataLayout &ODL = isa<Instruction>(Ob) ? cast<Instruction>(Ob)->getModule()->getDataLayout()
+                                                                : cast<GlobalValue>(Ob)->getParent()->getDataLayout();
+                  bool holds = false;
+                  structCover(T, 0, (int64_t)ODL.getTypeAllocSize(T), ODL, [&](StructType *ST, int64_t, int64_t) {
+                    holds |= ST->hasName() && stripStructNameSuffix(ST->getName()) == KS;
+                  });
+                  if (holds)
+                    why = std::string("its destination may be ") + (isa<AllocaInst>(Ob) ? "a local" : "global") + " " +
+                          (isa<AllocaInst>(Ob) ? snapLoc(cast<Instruction>(Ob)) : Ob->getName().str()) +
+                          ", whose declared type holds " + KS;
+                }
+                if (why.empty() && !O.elements.empty())
+                  if (const std::string E = elemRel(KS, M); !E.empty())
+                    why = "its destination may be an element (" + *O.elements.begin() + ") of " + E +
+                          ", which is, embeds or is embedded with " + KS;
+              }
+              if (why.empty()) {
+                nClose++;
+                continue;
+              }
+              (open ? nOpen : nReach)++;
+              reasons.push_back("an unnamed-destination write over " + K + ": " + why + " " + snapLoc(U.I));
+              const std::string rk = snapLoc(U.I) + ": " + why;
+              auto [rit, fresh] = coverReasonAt.try_emplace(rk, coverReasons.size());
+              if (fresh) coverReasons.push_back({U.I, why, {}});
+              coverReasons[rit->second].keys.push_back(K + (W ? " (check (2))" : ""));
+            }
+            coverLog.push_back("cover " + K + (W ? " (check (2), against the word's objects)" : "") + ": " +
+                               std::to_string(nClose + nReach + nOpen) + " unnamed-destination writes: " +
+                               std::to_string(nClose) + " close, " + std::to_string(nReach) + " reach, " +
+                               std::to_string(nOpen) + " open (" + std::to_string(nNull) + " constant-zero memsets, null)");
+            std::string res;
+            if (!reasons.empty())
+              res = reasons.front() + (reasons.size() > 1 ? " (and " + std::to_string(reasons.size() - 1) + " more)" : "");
+            return unnamedDone[ck] = res;
           };
           std::function<void(const DIType *, int64_t, int64_t, std::set<std::string> &, int)> diKeysAt =
               [&](const DIType *Ty, int64_t tOff, int64_t b, std::set<std::string> &keys, int d) {
@@ -4177,6 +4866,7 @@ void CallGraphPass::checkContainerClosure() {
               if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
                   !c.empty())
                 open.insert(c), keysCovered.insert(K);
+              if (std::string u = unnamedOpen(K, nullptr); !u.empty()) open.insert(u), keysCovered.insert(K);
               buildInit();
               if (auto iv = initVals.find(K); iv != initVals.end())
                 for (const Constant *C : iv->second) objsOf(C, off, out, open);
@@ -4918,6 +5608,16 @@ void CallGraphPass::checkContainerClosure() {
               if (decline.empty())
                 if (std::string c = coverOpen(K, wlen); !c.empty()) decline = c;
               if (decline.empty()) {
+                // R1: the writes with no named slot, against the word's
+                // objects (closed: every object the word can lie in).
+                std::set<const Value *> Wsites;
+                for (const std::string &z : zeroAt)
+                  if (auto it = objSite.find(z); it != objSite.end()) Wsites.insert(it->second);
+                  else decline = "the word's object " + z + " has no site to decide unnamed-destination writes against";
+                if (decline.empty())
+                  if (std::string u = unnamedOpen(K, &Wsites); !u.empty()) decline = u;
+              }
+              if (decline.empty()) {
                 buildInit();
                 for (const InitSlot &IS : initNonZero)
                   if (IS.S == KS && IS.off < KO_of(K) + wlen && KO_of(K) < IS.off + IS.len) {
@@ -4952,6 +5652,17 @@ void CallGraphPass::checkContainerClosure() {
                 CG_LOG("Container: snapshot holder " << hname << ": formal rule: " << fn << ": "
                        << (fd->text.empty() ? "not applied, " + fd->why : fd->text) << "\n");
               for (const std::string &x : keptObjs) CG_LOG("Container: snapshot holder " << hname << ": kept: " << x << "\n");
+              for (const std::string &x : coverLog) CG_LOG("Container: snapshot holder " << hname << ": " << x << "\n");
+              std::stable_sort(coverReasons.begin(), coverReasons.end(),
+                               [](const CoverReason &a, const CoverReason &b) { return irOrderLess(a.I, b.I); });
+              for (const CoverReason &r : coverReasons) {
+                std::string ks;
+                for (const std::string &k : r.keys) ks += (ks.empty() ? "" : ", ") + k;
+                CG_LOG("Container: snapshot holder " << hname << ": cover: unnamed-destination write " << snapLoc(r.I) << ": "
+                       << r.why << " (over " << ks << ")\n");
+              }
+              CG_LOG("Container: snapshot holder " << hname << ": cover: " << coverIcalls
+                     << " indirect calls through closed code fields followed\n");
               CG_LOG("Container: snapshot holder " << hname << ": object walks: " << nodeCount << " nodes, "
                      << format("%.3f", walkSecs) << " s\n");
               // Every reason the word's objects are open, not only the first.
@@ -4999,522 +5710,6 @@ void CallGraphPass::checkContainerClosure() {
           snapshotHolders.push_back(std::move(SH));
         }
       }
-      // A block copy anywhere whose destination is an element struct (one
-      // embedding a container struct) is a store of the source's fields:
-      // the source an element of the same owner, or in the body derived or
-      // fresh; memset is a null store (Fable 2026-10-14, per-field
-      // decomposition). Destinations named by the copy's struct access.
-      std::set<std::string> elemStructs;
-      for (const std::string &L : links) elemStructs.insert(L.substr(0, L.rfind('+')));
-      std::function<bool(StringRef, int)> embedsElem = [&](StringRef Tag, int d) -> bool {
-        if (elemStructs.count("struct." + Tag.str())) return true;
-        if (d > 4) return false;
-        auto dit = diStructs.find(Tag.str());
-        if (dit == diStructs.end()) return false;
-        for (const DINode *E : dit->second->getElements())
-          if (const auto *M = dyn_cast<DIDerivedType>(E); M && M->getTag() == dwarf::DW_TAG_member)
-            if (const auto *CT = dyn_cast_or_null<DICompositeType>(diStrip(M->getBaseType()));
-                CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && M->getOffsetInBits() == 0 &&
-                embedsElem(CT->getName(), d + 1))
-              return true;
-        return false;
-      };
-      std::vector<std::string> badCopies; // every failing copy (reported, not only the first)
-      std::vector<std::string> o1Unclassified; // block copies whose destination the check cannot classify
-      // A destination's origins by name (Fable 2026-10-17): a program-wide
-      // walk over the IR only (no solver facts, so no stop changes it).
-      // Steps: casts and GEPs to their base; a -O0 local to the values
-      // stored into it; a named field S+off to every value stored into
-      // S+off and every global initializer's value there (a block copy over
-      // the field from another name: unknown); a formal to the actuals of
-      // its direct calls (an address-taken function's, or one with no
-      // caller: unknown); a call with a body to its returned values. Leaves:
-      // an allocation (a pool carve: a chunk), a local, a global, an
-      // element (a constructor's allocation, a constructor's or a row's
-      // result, a load of a handle, link or closed cursor field), or
-      // unknown with its reason. Elements are exactly the constructors'
-      // allocations: the block's insert checks (O3, ELEM rows) establish
-      // it, and this classification inherits their openness.
-      std::map<std::string, std::vector<const Value *>> storedAt; // field key -> values stored there
-      std::map<std::string, std::vector<std::string>> fieldUnknown; // field key -> block copies over it from elsewhere
-      std::vector<std::pair<std::string, const MemTransferInst *>> fieldCopies;
-      for (auto &[M, _] : Ctx->Modules) {
-        const DataLayout &MDL = M->getDataLayout();
-        for (Function &F : *M)
-          for (const Instruction &I : instructions(F)) {
-            if (const auto *S = dyn_cast<StoreInst>(&I); S && S->getValueOperand()->getType()->isPointerTy()) {
-              const std::string K = fieldKey(S, S->getPointerOperand());
-              if (!K.empty()) storedAt[K].push_back(S->getValueOperand());
-            } else if (const auto *VT = S ? dyn_cast<FixedVectorType>(S->getValueOperand()->getType()) : nullptr;
-                       VT && VT->getElementType()->isPointerTy()) {
-              // A vector of pointers stored over consecutive fields (-O3's
-              // paired stores): each lane's field gets the vector's values.
-              const std::string K = fieldKey(S, S->getPointerOperand());
-              if (!K.empty()) {
-                const std::string SN = K.substr(0, K.rfind('+'));
-                const int64_t o0 = std::stoll(K.substr(K.rfind('+') + 1));
-                const int64_t w = (int64_t)MDL.getTypeAllocSize(VT->getElementType());
-                for (unsigned l = 0; l < VT->getNumElements(); l++)
-                  storedAt[SN + "+" + std::to_string(o0 + l * w)].push_back(S->getValueOperand());
-              }
-            } else if (const auto *MT = dyn_cast<MemTransferInst>(&I)) {
-              const std::string K = fieldKey(MT, MT->getRawDest());
-              if (!K.empty()) fieldCopies.emplace_back(K, MT);
-            }
-          }
-        // Global initializers: every pointer at a named struct's offset.
-        std::function<void(const Constant *)> initWalk = [&](const Constant *C) {
-          if (const auto *CS = dyn_cast<ConstantStruct>(C)) {
-            StructType *ST = CS->getType();
-            const StructLayout *SL = ST->hasName() ? MDL.getStructLayout(ST) : nullptr;
-            for (unsigned i = 0; i < CS->getNumOperands(); i++) {
-              const Constant *E = CS->getOperand(i);
-              if (SL && E->getType()->isPointerTy() && !E->isNullValue())
-                storedAt[stripStructNameSuffix(ST->getName()).str() + "+" +
-                         std::to_string(SL->getElementOffset(i))].push_back(E);
-              initWalk(E);
-            }
-          } else if (isa<ConstantArray>(C)) {
-            for (const Use &U : C->operands()) initWalk(cast<Constant>(U.get()));
-          }
-        };
-        for (const GlobalVariable &G : M->globals())
-          if (G.hasInitializer()) initWalk(G.getInitializer());
-      }
-      // A block copy over a field: from the same field of another object of
-      // the struct (a struct copy) it brings that field's own values; from
-      // anything else, unknown.
-      for (const auto &[K, MT] : fieldCopies) {
-        const std::string S = K.substr(0, K.rfind('+'));
-        const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
-        const auto *LenC = dyn_cast<ConstantInt>(MT->getLength());
-        const int64_t len = LenC ? (int64_t)LenC->getZExtValue() : INT64_MAX / 2;
-        const std::string SK = fieldKey(MT, MT->getRawSource());
-        bool same = SK == K;
-        // From a local of the struct, at the same offset: its fields' values
-        // are the writes keyed by the struct (through any pointer to it)
-        // and the local's own direct stores (added below).
-        const AllocaInst *srcLocal = nullptr;
-        {
-          APInt SO(64, 0);
-          const Value *SB = MT->getRawSource()->stripAndAccumulateConstantOffsets(MT->getModule()->getDataLayout(), SO, true);
-          if (const auto *AI = dyn_cast<AllocaInst>(SB))
-            if (auto *ST = dyn_cast<StructType>(AI->getAllocatedType());
-                ST && ST->hasName() && stripStructNameSuffix(ST->getName()).str() == S && SO.getSExtValue() == off)
-              same = true, srcLocal = AI;
-        }
-        for (auto it = storedAt.lower_bound(S + "+"); it != storedAt.end() && it->first.compare(0, S.size() + 1, S + "+") == 0; ++it) {
-          const int64_t o = std::stoll(it->first.substr(S.size() + 1));
-          if (o >= off && o < off + len && !same)
-            fieldUnknown[it->first].push_back("a block copy from another name: " + MT->getFunction()->getName().str() + ": " + valueText(MT));
-        }
-        if (srcLocal) {
-          const DataLayout &LDL = MT->getModule()->getDataLayout();
-          for (const Instruction &J : instructions(*MT->getFunction())) {
-            const Value *A = nullptr, *Val = nullptr;
-            if (const auto *St = dyn_cast<StoreInst>(&J)) A = St->getPointerOperand(), Val = St->getValueOperand();
-            else if (const auto *MJ = dyn_cast<MemTransferInst>(&J)) A = MJ->getRawDest();
-            if (!A) continue;
-            APInt LO(64, 0);
-            if (A->stripAndAccumulateConstantOffsets(LDL, LO, true) != srcLocal) continue;
-            if (!Val) { // a block copy into the local: the fields it covers come from elsewhere
-              const auto *JL = dyn_cast<ConstantInt>(cast<MemTransferInst>(&J)->getLength());
-              const int64_t jl = JL ? (int64_t)JL->getZExtValue() : INT64_MAX / 2;
-              const StructLayout *SL = LDL.getStructLayout(cast<StructType>(srcLocal->getAllocatedType()));
-              for (unsigned e = 0; e < SL->getMemberOffsets().size(); e++) {
-                const int64_t eo = (int64_t)SL->getElementOffset(e);
-                if (eo >= LO.getSExtValue() && eo < LO.getSExtValue() + jl)
-                  fieldUnknown[S + "+" + std::to_string(eo)].push_back("a block copy into a local the struct is copied from: " + MT->getFunction()->getName().str() + ": " +
-                                                                       valueText(&J));
-              }
-              continue;
-            }
-            if (Val->getType()->isPointerTy()) storedAt[S + "+" + std::to_string(LO.getSExtValue())].push_back(Val);
-          }
-        }
-      }
-      auto callerOf = [](const Function *F, std::vector<const CallBase *> &out) {
-        for (const User *U : F->users())
-          if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == F) out.push_back(CB);
-      };
-      struct Origins {
-        std::set<std::string> leaves, unknown, elements;
-        std::map<std::string, std::set<std::string>> pools; // certified pool -> its carves reached
-        std::set<const Value *> objs;                        // the locals and globals among the leaves
-      };
-      // The values stored through pointer P (a local or a global whose
-      // address is passed on, an output parameter's formal): its own stores,
-      // through -O0 slots holding it, casts, the formals of direct callees
-      // with bodies it is passed to, and bodiless callees' summaries (a
-      // STORE atom into it). Anything else that uses P: unknown.
-      std::function<void(const Value *, std::vector<const Value *> &, std::set<std::string> &, std::set<const Value *> &)>
-          storesThrough = [&](const Value *P, std::vector<const Value *> &out, std::set<std::string> &unk,
-                              std::set<const Value *> &vis) {
-            if (!vis.insert(P).second) return;
-            for (const User *U : P->users()) {
-              const auto *UI = dyn_cast<Instruction>(U);
-              if (!UI || isa<DbgInfoIntrinsic>(UI) || UI->isLifetimeStartOrEnd() || isa<ICmpInst>(UI)) continue;
-              // A memset through it writes a byte pattern, no pointer value.
-              if (const auto *MS = dyn_cast<MemSetInst>(UI); MS && MS->getRawDest() == P) continue;
-              if (const auto *L = dyn_cast<LoadInst>(UI); L && L->getPointerOperand() == P) continue;
-              if (const auto *S = dyn_cast<StoreInst>(UI)) {
-                if (S->getPointerOperand() == P && S->getValueOperand() != P) {
-                  out.push_back(S->getValueOperand());
-                  continue;
-                }
-                if (S->getValueOperand() == P && transientSlot(S->getPointerOperand()->stripPointerCasts())) {
-                  for (const User *V : S->getPointerOperand()->stripPointerCasts()->users())
-                    if (const auto *L = dyn_cast<LoadInst>(V)) storesThrough(L, out, unk, vis);
-                  continue;
-                }
-              }
-              if (isa<BitCastInst>(UI) || isa<AddrSpaceCastInst>(UI)) {
-                storesThrough(UI, out, unk, vis);
-                continue;
-              }
-              if (const auto *CB = dyn_cast<CallBase>(UI)) {
-                const Function *H = CB->getCalledFunction();
-                bool ok = H != nullptr;
-                for (unsigned a = 0; ok && a < CB->arg_size(); a++) {
-                  if (CB->getArgOperand(a) != P) continue;
-                  if (!H->isDeclaration() && !H->hasAddressTaken() && a < H->arg_size()) {
-                    storesThrough(H->getArg(a), out, unk, vis);
-                  } else if (H->isDeclaration()) {
-                    auto sit = Ctx->FuncSummaries.find(H);
-                    if (sit == Ctx->FuncSummaries.end() || !sit->second) {
-                      ok = false;
-                      break;
-                    }
-                    for (const auto &At : sit->second->atoms) {
-                      if (At.dst != (int)a) continue;
-                      if (At.kind == GlobalContext::SummaryAtom::Store && At.src >= 0 && (unsigned)At.src < CB->arg_size())
-                        out.push_back(CB->getArgOperand(At.src));
-                      else if (At.kind != GlobalContext::SummaryAtom::Alias)
-                        ok = false;
-                    }
-                  } else {
-                    ok = false;
-                  }
-                }
-                if (ok) continue;
-              }
-              unk.insert("a pointer to a local or global used by " + UI->getFunction()->getName().str() + ": " + valueText(UI));
-            }
-          };
-      // A named field's address that escapes (passed to a callee that
-      // stores through it, `*ptr = p`, held in a local): the values stored
-      // through it are the field's too; anything else it reaches: the
-      // field is unknown.
-      for (auto &[M, _] : Ctx->Modules)
-        for (Function &F : *M)
-          for (const Instruction &I : instructions(F)) {
-            if (!isa<GetElementPtrInst>(&I) || !I.getType()->isPointerTy()) continue;
-            bool escapes = false;
-            for (const User *U : I.users())
-              if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == &I) continue;
-              else if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == &I && St->getValueOperand() != &I) continue;
-              else if (isa<DbgInfoIntrinsic>(U) || isa<GetElementPtrInst>(U) || isa<ICmpInst>(U)) continue;
-              else escapes = true;
-            if (!escapes) continue;
-            const std::string FK = fieldKey(&I, &I);
-            if (FK.empty()) continue;
-            std::set<const Value *> vis;
-            std::vector<const Value *> vals;
-            std::set<std::string> unk;
-            storesThrough(&I, vals, unk, vis);
-            if (!unk.empty()) fieldUnknown[FK].push_back(*unk.begin() + " (its address escapes)");
-            for (const Value *W : vals) storedAt[FK].push_back(W);
-          }
-      size_t icallClosed = 0; // indirect calls whose callee closes by name (d)
-      // The field keys a load of type T at K reads: K, and for a vector of
-      // pointers each lane's field.
-      auto laneKeys = [&](const std::string &K, Type *T) {
-        std::vector<std::string> ks{K};
-        if (const auto *VT = dyn_cast<FixedVectorType>(T); VT && VT->getElementType()->isPointerTy()) {
-          const std::string SN = K.substr(0, K.rfind('+'));
-          const int64_t o0 = std::stoll(K.substr(K.rfind('+') + 1));
-          for (unsigned l = 1; l < VT->getNumElements(); l++)
-            ks.push_back(SN + "+" + std::to_string(o0 + l * 8));
-        }
-        return ks;
-      };
-      std::function<Origins(const Value *, int)> originsOf = [&](const Value *D0, int depth) {
-        Origins O;
-        std::set<const Value *> seen;
-        std::vector<const Value *> work{D0};
-        auto loc = [](const Instruction *I) {
-          std::string l = I->getFunction()->getName().str();
-          if (const DebugLoc &DLc = I->getDebugLoc()) l += " " + DLc->getFilename().str() + ":" + std::to_string(DLc.getLine());
-          return l;
-        };
-        while (!work.empty()) {
-          const Value *V = work.back();
-          work.pop_back();
-          if (!seen.insert(V).second) continue;
-          if (seen.size() > 100000) {
-            O.unknown.insert("the walk exceeds 100000 values");
-            break;
-          }
-          if (isa<ConstantPointerNull>(V) || isa<UndefValue>(V) || isa<ConstantAggregateZero>(V)) continue;
-          if (const auto *CV = dyn_cast<ConstantVector>(V)) {
-            for (const Use &U : CV->operands()) work.push_back(U.get());
-            continue;
-          }
-          if (const auto *G = dyn_cast<GlobalValue>(V)) {
-            O.leaves.insert("global " + G->getName().str());
-            O.objs.insert(G);
-            continue;
-          }
-          if (const auto *CE = dyn_cast<ConstantExpr>(V)) {
-            if (CE->getOpcode() == Instruction::GetElementPtr || CE->isCast()) work.push_back(CE->getOperand(0));
-            else O.unknown.insert("a constant expression: " + valueText(CE));
-            continue;
-          }
-          if (const auto *A = dyn_cast<Argument>(V)) {
-            const Function *F = A->getParent();
-            std::vector<const CallBase *> cs;
-            callerOf(F, cs);
-            if (F->hasAddressTaken()) O.unknown.insert("a formal of address-taken " + F->getName().str());
-            else if (cs.empty()) O.unknown.insert("a formal of " + F->getName().str() + ", which has no caller");
-            else
-              for (const CallBase *CB : cs)
-                if (A->getArgNo() < CB->arg_size()) work.push_back(CB->getArgOperand(A->getArgNo()));
-            continue;
-          }
-          const auto *I = dyn_cast<Instruction>(V);
-          if (!I) {
-            O.unknown.insert("a value: " + valueText(V));
-            continue;
-          }
-          if (isa<AllocaInst>(I)) {
-            O.leaves.insert("local " + loc(I));
-            O.objs.insert(I);
-            continue;
-          }
-          if (poolCarves.count(I)) {
-            if (ctorsHere.count(I->getFunction())) O.elements.insert("a constructor's carve in " + loc(I));
-            else O.pools[poolCarvePool.at(I)].insert("a carve in " + loc(I));
-            continue;
-          }
-          if (isa<CastInst>(I) || isa<GetElementPtrInst>(I) || isa<FreezeInst>(I)) {
-            if (isa<IntToPtrInst>(I)) O.unknown.insert("an inttoptr in " + loc(I));
-            else work.push_back(I->getOperand(0));
-            continue;
-          }
-          if (const auto *PN = dyn_cast<PHINode>(I)) {
-            for (const Value *In : PN->incoming_values()) work.push_back(In);
-            continue;
-          }
-          if (const auto *SL = dyn_cast<SelectInst>(I)) {
-            work.push_back(SL->getTrueValue());
-            work.push_back(SL->getFalseValue());
-            continue;
-          }
-          // Vectors of pointers: a lane's origins are the vector's (its
-          // operands, all lanes).
-          if (isa<ShuffleVectorInst>(I) || isa<InsertElementInst>(I)) {
-            work.push_back(I->getOperand(0));
-            work.push_back(I->getOperand(1));
-            continue;
-          }
-          if (isa<ExtractElementInst>(I)) {
-            work.push_back(I->getOperand(0));
-            continue;
-          }
-          if (const auto *L = dyn_cast<LoadInst>(I)) {
-            const Value *A = L->getPointerOperand()->stripPointerCasts();
-            if (transientSlot(A)) {
-              for (const User *U : A->users())
-                if (const auto *S = dyn_cast<StoreInst>(U)) work.push_back(S->getValueOperand());
-              continue;
-            }
-            const std::string K = fieldKey(L, L->getPointerOperand());
-            if (!K.empty()) {
-              for (const std::string &LK : laneKeys(K, L->getType())) {
-                if (handle.count(LK) || links.count(LK) || (cursorOpen.count(LK) && cursorOpen[LK].empty())) {
-                  O.elements.insert("a load of " + LK + " in " + loc(L));
-                  continue;
-                }
-                if (auto fu = fieldUnknown.find(LK); fu != fieldUnknown.end()) {
-                  O.unknown.insert("field " + LK + " not closed by name: " + fu->second.front());
-                  continue;
-                }
-                if (const auto sit = storedAt.find(LK); sit != storedAt.end())
-                  for (const Value *W : sit->second) work.push_back(W);
-              }
-              continue;
-            }
-            if (const auto *G = dyn_cast<GlobalVariable>(A)) {
-              bool escapes = false;
-              for (const User *U : G->users())
-                if (const auto *S = dyn_cast<StoreInst>(U)) {
-                  if (S->getPointerOperand() == G) work.push_back(S->getValueOperand());
-                  else escapes = true;
-                } else if (!isa<LoadInst>(U)) {
-                  escapes = true;
-                }
-              if (escapes) O.unknown.insert("a load of global " + G->getName().str() + ", whose address escapes");
-              else if (G->hasInitializer()) work.push_back(G->getInitializer());
-              continue;
-            }
-            // Through a pointer: the addresses it can hold by name (a named
-            // field's address, a local's, a global's), each read as itself:
-            // a field's stored values, the values stored through a local's or
-            // a global's address. Anything else: unknown.
-            std::set<std::string> fks;
-            std::set<const Value *> objs, avis;
-            std::string why;
-            std::vector<const Value *> aw{A};
-            while (!aw.empty() && why.empty()) {
-              const Value *X = aw.back();
-              aw.pop_back();
-              if (!avis.insert(X).second) continue;
-              if (avis.size() > 10000) why = "the address walk exceeds 10000 values";
-              else if (isa<ConstantPointerNull>(X)) continue;
-              else if (isa<AllocaInst>(X) || isa<GlobalVariable>(X)) objs.insert(X);
-              else if (const auto *XA = dyn_cast<Argument>(X)) {
-                const Function *F = XA->getParent();
-                std::vector<const CallBase *> cs;
-                callerOf(F, cs);
-                if (F->hasAddressTaken() || cs.empty()) why = "the address is a formal of " + F->getName().str() + (F->hasAddressTaken() ? ", address-taken" : ", which has no caller");
-                for (const CallBase *CB : cs)
-                  if (XA->getArgNo() < CB->arg_size()) aw.push_back(CB->getArgOperand(XA->getArgNo()));
-              } else if (const auto *XL = dyn_cast<LoadInst>(X); XL && transientSlot(XL->getPointerOperand()->stripPointerCasts())) {
-                for (const User *U : XL->getPointerOperand()->stripPointerCasts()->users())
-                  if (const auto *St = dyn_cast<StoreInst>(U)) aw.push_back(St->getValueOperand());
-              } else if (isa<BitCastInst>(X) || isa<AddrSpaceCastInst>(X)) {
-                aw.push_back(cast<Instruction>(X)->getOperand(0));
-              } else if (const auto *XP = dyn_cast<PHINode>(X)) {
-                for (const Value *In : XP->incoming_values()) aw.push_back(In);
-              } else if (const auto *XI = dyn_cast<Instruction>(X); XI && isa<GetElementPtrInst>(XI)) {
-                const std::string FK = fieldKey(XI, XI);
-                if (FK.empty()) why = "the address is an unnamed step in " + loc(XI) + ": " + valueText(XI);
-                else fks.insert(FK);
-              } else {
-                why = "the address is " + valueText(X);
-              }
-            }
-            std::set<const Value *> vis;
-            std::vector<const Value *> vals;
-            std::set<std::string> unk;
-            if (why.empty())
-              for (const Value *Ob : objs) storesThrough(Ob, vals, unk, vis);
-            if (why.empty())
-              for (const std::string &FK : fks) {
-                if (handle.count(FK) || links.count(FK) || (cursorOpen.count(FK) && cursorOpen[FK].empty())) {
-                  O.elements.insert("a load of " + FK + " through its address in " + loc(L));
-                  continue;
-                }
-                if (auto fu = fieldUnknown.find(FK); fu != fieldUnknown.end())
-                  unk.insert("field " + FK + " not closed by name: " + fu->second.front());
-                else if (const auto sit = storedAt.find(FK); sit != storedAt.end())
-                  vals.insert(vals.end(), sit->second.begin(), sit->second.end());
-              }
-            if (!why.empty() || !unk.empty()) {
-              O.unknown.insert("a load through a pointer in " + loc(L) + ": " + (why.empty() ? *unk.begin() : why));
-              continue;
-            }
-            for (const Value *W : vals) work.push_back(W);
-            continue;
-          }
-          if (const auto *CB = dyn_cast<CallBase>(I)) {
-            const Function *G = CB->getCalledFunction();
-            if (!G) {
-              if (const auto *CL = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
-                const std::string K = fieldKey(CL, CL->getPointerOperand());
-                if (code.count(K) && !codeOpen.count(K)) {
-                  O.elements.insert("a constructor's result through " + K + " in " + loc(CB));
-                  continue;
-                }
-              }
-              // (d) The callee's origins by name (a named field's stores and
-              // initializers): every function it can hold, then their
-              // returns; any other origin, unknown.
-              const Origins OC = depth < 4 ? originsOf(CB->getCalledOperand(), depth + 1) : Origins();
-              std::vector<const Function *> fns;
-              bool closed = depth < 4 && OC.unknown.empty() && OC.elements.empty() && OC.pools.empty() &&
-                            OC.objs.size() == OC.leaves.size() && !OC.objs.empty();
-              for (const Value *Ob : OC.objs)
-                if (const auto *Fn = dyn_cast<Function>(Ob); Fn && !Fn->isDeclaration()) fns.push_back(Fn);
-                else closed = false;
-              if (!closed) {
-                O.unknown.insert("an indirect call in " + loc(CB) +
-                                 (OC.unknown.empty() ? std::string() : " (its callee: " + *OC.unknown.begin() + ")"));
-                continue;
-              }
-              for (const Function *Fn : fns)
-                for (const Instruction &RI : instructions(*Fn))
-                  if (const auto *Ret = dyn_cast<ReturnInst>(&RI); Ret && Ret->getReturnValue())
-                    work.push_back(Ret->getReturnValue());
-              O.leaves.insert("returns of " + std::to_string(fns.size()) + " functions the call in " + loc(CB) + " can reach by name");
-              icallClosed++;
-              continue;
-            }
-            if (ctorsHere.count(G)) {
-              O.elements.insert("constructor " + G->getName().str() + "'s result in " + loc(CB));
-              continue;
-            }
-            const bool alloc = isFresh(CB) || carveFns.count(G->getName().str());
-            if (alloc && ctorsHere.count(CB->getFunction())) {
-              O.elements.insert("a constructor's allocation " + G->getName().str() + " in " + loc(CB));
-              continue;
-            }
-            if (carveFns.count(G->getName().str())) {
-              // A carve row: the certified pools of its carves (its own, or
-              // those of the functions it calls directly).
-              std::set<std::string> ps;
-              auto carvesIn = [&](const Function *H) {
-                for (const Instruction &J : instructions(*H))
-                  if (auto pit = poolCarvePool.find(&J); pit != poolCarvePool.end()) ps.insert(pit->second);
-              };
-              carvesIn(G);
-              for (const Instruction &J : instructions(*G))
-                if (const auto *CJ = dyn_cast<CallBase>(&J); CJ && CJ->getCalledFunction() && !CJ->getCalledFunction()->isDeclaration())
-                  carvesIn(CJ->getCalledFunction());
-              if (ps.empty()) O.unknown.insert("carve row " + G->getName().str() + " with no certified pool's carve, in " + loc(CB));
-              for (const std::string &pn : ps) O.pools[pn].insert("carve row " + G->getName().str() + " in " + loc(CB));
-              continue;
-            }
-            if (alloc) {
-              O.leaves.insert("allocation " + G->getName().str() + " in " + loc(CB));
-              continue;
-            }
-            if (const CR *R = rowOf(G); R && R->role != CR::Carve) {
-              O.elements.insert("row " + G->getName().str() + "'s result in " + loc(CB));
-              continue;
-            }
-            if (G->isDeclaration()) {
-              // A summary's returned values (strrchr's ALIAS(ret<-arg0@X):
-              // its argument's origins); a summary that loads the result, or
-              // none: unknown.
-              auto sit = Ctx->FuncSummaries.find(G);
-              bool viaSummary = sit != Ctx->FuncSummaries.end() && sit->second && !sit->second->atoms.empty();
-              std::vector<unsigned> from;
-              if (viaSummary)
-                for (const auto &At : sit->second->atoms) {
-                  if (At.dst != -1) continue;
-                  if (At.kind == GlobalContext::SummaryAtom::Alias && At.src >= 0 && (unsigned)At.src < CB->arg_size())
-                    from.push_back(At.src);
-                  else viaSummary = false;
-                }
-              if (!viaSummary || from.empty()) {
-                O.unknown.insert("a call of " + G->getName().str() + " (no body" +
-                                 (sit == Ctx->FuncSummaries.end() ? "" : ", its summary names no returned argument") +
-                                 ") in " + loc(CB));
-                continue;
-              }
-              for (unsigned a : from) work.push_back(CB->getArgOperand(a));
-              continue;
-            }
-            for (const Instruction &RI : instructions(*G))
-              if (const auto *Ret = dyn_cast<ReturnInst>(&RI); Ret && Ret->getReturnValue())
-                work.push_back(Ret->getReturnValue());
-            continue;
-          }
-          O.unknown.insert("an instruction in " + loc(I) + ": " + valueText(I));
-        }
-        return O;
-      };
       auto joinSet = [](const std::set<std::string> &S) {
         std::string r;
         for (const std::string &x : S) r += (r.empty() ? "" : "; ") + x;

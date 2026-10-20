@@ -1308,7 +1308,38 @@ Obligations left open:
        A guard that fails a check prints "guard ...: not unreachable by
        name (<the first check that fails>)". The candidate is still
        reported; the graph is not pruned (dead-branch pruning is a separate
-       lever). Writes by unnamed address: the standing naming assumption.
+       lever).
+       (R1, Fable 2026-10-19) Writes with no named slot (a store or a
+       memory intrinsic whose destination no struct access names; a store
+       straight into an -O0 local names the local itself) are not assumed
+       away: each is decided by its destination's origins (the by-name
+       origin walk of O1, originsOf), as writing any byte of each origin
+       object. For the guard word (check (2)), W's objects are a closed
+       set (every object the word can lie in): an origin allocation, local
+       or global reaches W's bytes only if it is one of W's objects; an
+       element origin reaches them if the container's element struct is,
+       embeds or is embedded with W's struct (StructInfo::containers). For
+       a field the object walk reads (its cover, above), a local or global
+       reaches the field when its declared type holds the field's struct,
+       an element as for W, and an allocation with no declared type is
+       OPEN ("an unnamed-destination write over K: origins include an
+       untyped allocation (<fn> at <site>), not typed"). Open origins are
+       OPEN in both. A write that reaches or is OPEN is a write named
+       otherwise (one reason per key, every such write listed once in IR
+       order with its keys); a write that closes away is counted
+       ("cover K: N unnamed-destination writes: a close, b reach, c open
+       (z constant-zero memsets, null)"); a constant-zero memset writes
+       null. The origin walks count the indirect calls they follow apart
+       ("cover: N indirect calls through closed code fields followed").
+       (H, Fable 2026-10-19) A recognized snapshot holder's block H
+       carries exactly the structs of its saves' sources (the handle
+       array's pointer range, and element bytes of the paired entsize),
+       because the recognition checks that every use of H is one of its
+       saves or restores (the use walk over H, its -O0 slots and joins,
+       and the saves' sources by name: a handle array of one owner, that
+       owner's elements); a block with any other use is not a holder and
+       stays an untyped allocation. So, in that holder's covers, an
+       origin that is H reaches a field only as an element does.
      - Cases: test/t_cells_container_snapshot_{holder,other_offset,
        foreign_save,two_types,identity,initializer,nullwrite,cover}.c
        (identity: a path refuted by another allocation site, one by
@@ -1324,7 +1355,11 @@ Obligations left open:
        t_cells_container_snapshot_{handlearray,handlearraynull,
        handlearraygrow}.c (a hash entry reached through table[_index] and
        the newfunc call; null stored into the handle and passed to a call
-       is no array; a new table through two -O0 slots).
+       is no array; a new table through two -O0 slots);
+       t_cells_container_snapshot_{unnamedcover,unnamedcoverctl,
+       holderextra}.c (R1: a copy through a loaded void pointer onto the
+       word's object declines; the same pointer holding another block is
+       counted, not a reason; a block with one more store is no holder).
    - Tag-write values by their known bits (plan 3.51 (3), Fable
      2026-10-16): a value the evaluator cannot evaluate by its operands
      (a call's result, a load it does not follow) is the set LLVM's

@@ -564,7 +564,14 @@ bool CallGraphPass::doFinalization(Module *M) {
     // our miss. compat>0 = a plausible dispatch site exists yet no
     // data flow reached it: the candidate FALSE-NEGATIVE inventory.
     size_t atUnusedCompat = 0, atUnusedNoSite = 0;
-    for (const Function *F : Ctx->AddressTakenFuncs) {
+    // In IR order (module, then position), never the set's pointer order.
+    std::vector<const Function *> atInIR;
+    for (auto &MP : Ctx->Modules)
+      for (const Function &G : *MP.first)
+        if (Ctx->AddressTakenFuncs.count(&G))
+          atInIR.push_back(&G);
+    assert(atInIR.size() == Ctx->AddressTakenFuncs.size() && "every address-taken function is in a module");
+    for (const Function *F : atInIR) {
       if (allCallees.find(F) != allCallees.end()) {
         used++;
       } else {
@@ -693,9 +700,8 @@ bool CallGraphPass::doModulePass(Module *M) {
   // its keys, plan 3.55 Q-d); under --cfl-cells nothing between its old
   // place and here runs (tracepoint keys are refused, the confirmers and
   // censuses are off unless asked).
-  // Under --cfl-reachable the bodies the build emits are known only as they
-  // are reached: no table, and the mint has nothing to check against.
-  if (CFLCells && !CFLReachable && iteration == 0 && M == Ctx->Modules.front().first)
+  // --cfl-cells refuses --cfl-reachable (KAMain.cc): every body is emitted.
+  if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
     buildMintTable(); // what each allocation is minted as, before the closure reads it
   if (CFLCells && (CFLContainerClosure || !Ctx->Containers.empty()) && iteration == 0 &&
       M == Ctx->Modules.front().first)
@@ -831,6 +837,10 @@ bool CallGraphPass::solve() {
     dumpRawGraph(CFLDumpAGraph); // before presolve: raw value nodes
   if (CFLCells) { // no presolve: cells are never unified
     if (CFLConstructCensus && iteration == 0) runConstructCensus();
+    // A later iteration mints at the allocator calls the earlier ones
+    // resolved (indirect calls marked in Ctx->AllocSites): the table is
+    // rebuilt over them (iteration 0's is built before the closure).
+    if (iteration > 0) buildMintTable();
     bool again = runCellResolution();
     iteration++;
     return again;

@@ -298,6 +298,9 @@ protected:
     // with their sizes in bytes; diSeen: some receiver has a debug type.
     std::map<std::string, uint64_t> mergedIdents;
     bool diSeen = false;
+    // A5a: every struct the site's own receivers declare ("struct.N" by
+    // debug name).
+    std::set<std::string> declStructs;
     // A variable or field received it (declared or not): with no
     // declaration, its type declares nothing (char *, void *) by rule;
     // without one the result went straight to a return or a call.
@@ -348,6 +351,9 @@ protected:
   // (the IR name stays, counted), and the rows of those whose sites name
   // several identities (the IR name stays, reported), in IR order.
   std::unordered_set<const llvm::Value *> allocNoDI;
+  // A5a: per allocation, the structs its creating sites' own receivers
+  // declare.
+  std::unordered_map<const llvm::Value *, std::set<std::string>> allocDeclStructs;
   std::vector<std::string> identConflictRows;
   // The site census's counts for the rule report (staticLabels): sites,
   // sites whose only receiver is a struct-pointer field (no declaration),

@@ -308,13 +308,32 @@ void CallGraphPass::labelAllocationSites(
       }
       return nullptr;
     };
+    // A receiver declaration of the site itself (A5a, Fable 2026-10-21): a
+    // variable whose frame (its subprogram and the inlinedAt of its
+    // dbg.value or dbg.declare) is the call's own frame or one the call was
+    // inlined into, by (subprogram, inlinedAt), so two inlinings of one
+    // function stay apart; or a receiving field's pointee. Never a frame
+    // inlined beside the call that the value is passed to (-O3
+    // _bfd_x86_elf_link_hash_table_create: `table` of
+    // _bfd_link_hash_table_init beside `ret`).
+    std::set<std::pair<const DISubprogram *, const DILocation *>> frames;
+    if (const DILocation *CL = C->getDebugLoc())
+      for (const DILocation *F = CL; F; F = F->getInlinedAt())
+        frames.insert({F->getScope()->getSubprogram(), F->getInlinedAt()});
+    else if (const DISubprogram *SP = C->getFunction()->getSubprogram())
+      frames.insert({SP, nullptr});
+    auto own = [&](const DILocalVariable *V, const DILocation *At) {
+      return V && At && frames.count({V->getScope()->getSubprogram(), At->getInlinedAt()});
+    };
     // A4: a receiver's declared struct pointee that the linked IR merged
     // away (no IR struct of its name): a debug identity of the object, with
-    // the struct's size.
+    // the struct's size. A5a: every declared struct pointee, by its debug
+    // name.
     auto noteMerged = [&](const DIType *T) {
       if (!T) return;
       L.diSeen = true;
       const StringRef N = ka::diStructName(T, true);
+      if (!N.empty()) L.declStructs.insert("struct." + N.str());
       if (N.empty() || llvm::StructType::getTypeByName(C->getContext(), "struct." + N.str())) return;
       const DIType *P = T;
       for (int i = 0; i < 16 && P; i++) {
@@ -332,7 +351,7 @@ void CallGraphPass::labelAllocationSites(
       SmallVector<DbgValueInst *, 2> DVs;
       findDbgValues(DVs, const_cast<CallBase *>(C));
       for (DbgValueInst *DV : DVs) {
-        noteMerged(DV->getVariable()->getType());
+        if (own(DV->getVariable(), DV->getDebugLoc())) noteMerged(DV->getVariable()->getType());
         L.hasReceiver = true;
         if (L.siteDeclared.empty())
           L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
@@ -394,7 +413,7 @@ void CallGraphPass::labelAllocationSites(
           }
           if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
             for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI))) {
-              noteMerged(DDI->getVariable()->getType());
+              if (own(DDI->getVariable(), DDI->getDebugLoc())) noteMerged(DDI->getVariable()->getType());
               L.hasReceiver = true;
               if (L.siteDeclared.empty())
                 L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
@@ -992,6 +1011,7 @@ void CallGraphPass::staticLabels(
   // site: the IR name stays, counted.
   allocMergedIdent.clear();
   allocNoDI.clear();
+  allocDeclStructs.clear();
   identConflictRows.clear();
   {
     std::map<const CallBase *, std::map<std::string, uint64_t>> mi;
@@ -1006,6 +1026,7 @@ void CallGraphPass::staticLabels(
         auto &ids = mi[A];
         ids.insert(SL.mergedIdents.begin(), SL.mergedIdents.end());
         if (SL.diSeen) seen.insert(A);
+        allocDeclStructs[A].insert(SL.declStructs.begin(), SL.declStructs.end());
       }
     }
     llvm::sort(order, [&](const CallBase *a, const CallBase *b) { return irPos.at(a) < irPos.at(b); });

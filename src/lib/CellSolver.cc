@@ -1838,6 +1838,19 @@ bool CallGraphPass::runCellResolution() {
   // on the IR name because no site receiver has a debug type; kept because
   // the debug identity's size is not the label's (layouts differ).
   size_t heapMergedIdents = 0, heapIdentNoDI = 0, heapIdentSizeDiffer = 0;
+  // A5a: heap objects named by the container their receiver declares where
+  // the size is k x their label; the conflicts' rows (IR order at the
+  // report).
+  // A5a's size readings, over every allocation site (the table's), in IR
+  // order: not only the objects this solve reaches.
+  size_t heapReadingsRelabeled = 0;
+  std::vector<std::pair<const CallBase *, std::string>> readingsRows;
+  if (mintTable)
+    for (const CallBase *C : mintTable->order) {
+      const SizeTerms::HeapMint &H = mintTable->at.at(C);
+      if (H.readings == 'r') heapReadingsRelabeled++;
+      if (H.readings == 'c') readingsRows.push_back({C, instLoc(C) + ": " + H.readingsRow});
+    }
   auto noteIdent = [&](Obj &O, const std::string &id) {
     if (id.empty() || id == O.label) return;
     O.ident = id;
@@ -1850,11 +1863,15 @@ bool CallGraphPass::runCellResolution() {
   auto &sizeOps = ST.sizeOps;
   auto &containerOfSize = ST.containerOfSize;
   auto &termMemo = ST.termMemo;
-  auto &sizeZextMask = ST.sizeZextMask;
-  auto &sizeWhenZero = ST.sizeWhenZero, &sizeHeaderStore = ST.sizeHeaderStore, &sizeCarvePhi = ST.sizeCarvePhi;
-  auto &carveUnknownSize = ST.carveUnknownSize;
   auto &zeroProductSites = ST.zeroProductSites;
   auto &sizeLabelAmbiguous = ST.sizeLabelAmbiguous;
+  // A memo-level size-term count: the heap mints' part is the table's
+  // evaluator's, the carves' part this solve's.
+  auto withTable = [&](auto SizeTerms::*m) {
+    auto u = ST.*m;
+    if (mintTable) u.insert((mintTable->terms.get()->*m).begin(), (mintTable->terms.get()->*m).end());
+    return u.size();
+  };
   size_t promotedUnknownSize = 0;
   // ... and what their extents are: an array (the product's factor is the
   // label's size) or one then unknown (a multiple of no label's size).
@@ -2303,14 +2320,14 @@ bool CallGraphPass::runCellResolution() {
         }
       }
       // What the allocation is minted as (AllocExtents.cc, heapMint): the
-      // table's decision, made before the container closure.
-      const SizeTerms::HeapMint H = ST.heapMint(C, lit != labels.end() ? &lit->second : nullptr);
-      if (mintTable && iteration == 0) {
-        auto tit = mintTable->at.find(C);
-        assert((tit != mintTable->at.end() ? tit->second.sameObject(H) : !H.layout && !H.byteAccessed) &&
-               "the mint's decision is the table's");
-        (void)tit;
-      }
+      // table's decision, made before the container closure; its per-site
+      // counts are counted here, as the object is minted.
+      assert(mintTable && "--cfl-cells mints from the table (refused with --cfl-reachable)");
+      const auto tit = mintTable->at.find(C);
+      assert(tit != mintTable->at.end() && "every call the solve mints has a table entry");
+      const SizeTerms::HeapMint &H = tit->second;
+      zeroProductSites.insert(H.zeroProduct.begin(), H.zeroProduct.end());
+      for (const std::string &k : H.ambiguous) sizeLabelAmbiguous[k]++;
       O.layout = H.layout;
       O.size = H.size;
       O.label = H.label;
@@ -7509,7 +7526,7 @@ bool CallGraphPass::runCellResolution() {
          << " element sizes; extents: " << extentArrays << " arrays by size, " << extentOne
          << " one by size, " << extentHeader << " header + data by size, " << extentUnknown
          << " one then unknown (size unknown; " << promotedUnknownSize
-         << " of them fresh wrappers with an unknown size term; " << carveUnknownSize.size()
+         << " of them fresh wrappers with an unknown size term; " << withTable(&SizeTerms::carveUnknownSize)
          << " pool carves with an unknown size term), " << zeroProductSites.size()
          << " sized by a product through a zero-guarded wrapper (" << zeroProductArrays.size()
          << " arrays: the factor is the label's size; " << zeroProductUnknown.size()
@@ -9059,17 +9076,23 @@ bool CallGraphPass::runCellResolution() {
          << " header + trailing data), " << heapUnlabeled
          << " unlabeled (" << heapBytesMarked << " used as bytes from mint), " << heapConflict
          << " with conflicting labels (of " << scalarConflictRows.size()
-         << " allocations whose scalar label meets struct evidence, A3), "
-         << heapContainerRelabeled << " relabeled to the container their size names, "
+         << " allocations whose scalar label meets struct evidence, A3; " << readingsRows.size()
+         << " whose size is k x their label and a container's, no receiver naming one, A5), "
+         << heapContainerRelabeled << " relabeled to the container their size names, " << heapReadingsRelabeled
+         << " to the container their receiver declares where the size is k x the label (A5), "
          << heapContainerAmbiguous << " ambiguous size labels (several containers of that size; the label stays)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
          << anyCells << " any-offset, " << outMints << " outside)\n");
   {
     size_t unknownFns = 0;
-    for (const auto &[F, t] : termMemo) unknownFns += !t.known;
-    CG_LOG("Cells: size terms (A2'): " << sizeWhenZero.size() << " carves by \"n, K when n == 0\", " << sizeCarvePhi.size()
-           << " carve phis by their carve term, " << sizeHeaderStore.size() << " header carves by the store H := c + n, "
-           << sizeZextMask.size() << " zext masks read as -al; " << unknownFns << " fresh functions still unknown\n");
+    auto memo = termMemo;
+    if (mintTable) memo.insert(mintTable->terms->termMemo.begin(), mintTable->terms->termMemo.end());
+    for (const auto &[F, t] : memo) unknownFns += !t.known;
+    CG_LOG("Cells: size terms (A2'): " << withTable(&SizeTerms::sizeWhenZero) << " carves by \"n, K when n == 0\", "
+           << withTable(&SizeTerms::sizeCarvePhi) << " carve phis by their carve term, "
+           << withTable(&SizeTerms::sizeHeaderStore) << " header carves by the store H := c + n, "
+           << withTable(&SizeTerms::sizeZextMask) << " zext masks read as -al; " << unknownFns
+           << " fresh functions still unknown\n");
   }
   CG_LOG("Cells: trailing arrays (A1): " << trailingElemTails << " trailing objects are their header's trailing array's "
          << "further elements (size sizeof(T) + k * sizeof(E)); " << trailingElemLinks
@@ -9680,6 +9703,14 @@ bool CallGraphPass::runCellResolution() {
        << " allocations whose agreed scalar label meets a struct GEP on a join containing the result or a receiving "
        << "field declared a struct pointer: unlabeled, both candidates\n";
     for (const std::string &r : scalarConflictRows) RO << "B conflict " << r << "\n";
+    // A5a: allocations whose size is k x their label and also a container's
+    // that embeds it at 0, no receiver naming one: unlabeled, in IR order.
+    std::stable_sort(readingsRows.begin(), readingsRows.end(),
+                     [&](const auto &a, const auto &b) { return stableKey(a.first) < stableKey(b.first); });
+    RO << "SUMMARY size readings (A5): " << heapReadingsRelabeled
+       << " heap objects named by the container their receiver declares where the size is k x the label; "
+       << readingsRows.size() << " allocations with no receiver naming a container: unlabeled, every reading\n";
+    for (const auto &[C, r] : readingsRows) RO << "A5 readings " << r << "\n";
     // A4: allocations whose sites' receivers name several merged-away debug
     // identities: the IR name stays (a rename, not a label conflict).
     RO << "SUMMARY merged identities (A4): " << heapMergedIdents << " heap objects named at mint by their site's "

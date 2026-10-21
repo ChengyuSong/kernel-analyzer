@@ -1939,7 +1939,29 @@ and every answer, is the IR struct's. The IR name stays, counted, when
 no receiver at any site has a debug type or the sizes differ, and
 stays, reported ("A4 identities", one row per allocation in IR order),
 when the sites name several; neither is a label conflict, since the
-layout is one. The site's reach (row 3, Fable 2026-10-13): the receiving
+layout is one. A site's own receiver (A4, A5; Fable 2026-10-21) is a
+variable whose frame, its subprogram with the inlinedAt of its dbg.value
+or dbg.declare, is the call's own frame or one the call was inlined into
+(compared as pairs, so two inlinings of one function stay apart), or a
+receiving field's pointee; a frame inlined beside the call that the value
+is passed to is not (-O3 _bfd_x86_elf_link_hash_table_create: the formal
+`table` of the inlined _bfd_link_hash_table_init is excluded, `ret` and
+bfd_zmalloc's `ptr` count). The size readings (A5a, Fable 2026-10-21): a
+constant size S = k x sizeof(L), k >= 2, with L a struct label and the
+extent an array, is an array of L by rule 1, and it is also any struct C
+that embeds L at offset 0 with sizeof(C) = S (the embedding table): C
+inheritance whose container's size happens to be a multiple of its head's
+(2088 = 29 x 72, elf_x86_link_hash_table over bfd_link_hash_table). Three
+outcomes. A receiver declaring exactly one such C (its IR copies one
+layout) names the object C: relabeled, one object (counted). A receiver
+declaring L is in both readings and selects nothing, and no declaration
+selects nothing: a conflict, the site unlabeled, every reading in the row
+("A5 readings <loc>: k x L (sz) vs C1 (S) ...", one row per allocation
+site in IR order, over every site, not only those a capped solve
+reaches). Receivers naming several Cs: a conflict too. Never kept as an
+array of L when a C reads it: picking either reading unchecked misnames
+the other's cells; unlabeled, the object's cells are bytes, which costs
+precision, not soundness. The site's reach (row 3, Fable 2026-10-13): the receiving
 declaration is a variable's or a struct field's (`opt_state->space =
 malloc(..)`: the field's declared member type, through nested members; a
 store to a struct global or local itself is its member at offset 0), a

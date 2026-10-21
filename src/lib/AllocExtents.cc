@@ -4,6 +4,7 @@
 #include "Annotation.h"
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
+#include "StructAnalyzer.h"
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/IntrinsicInst.h>
@@ -749,7 +750,10 @@ CallGraphPass::SizeTerms::SizeTerms(CallGraphPass &Pass, const DataLayout &Layou
     if (t.align || t.zeroK >= 0) {
       const SizeTerm e = callTerm(C, C->getFunction());
       if (fromTerm(e)) {
-        if (t.zeroK >= 0 && !e.isConst()) zeroProductSites.insert(C); // row (2)
+        if (t.zeroK >= 0 && !e.isConst()) { // row (2)
+          zeroProductSites.insert(C);
+          if (zeroNote) zeroNote->push_back(C);
+        }
         return true;
       }
       return t.align && fromTerm(multiple(t.align));
@@ -801,7 +805,9 @@ CallGraphPass::SizeTerms::SizeTerms(CallGraphPass &Pass, const DataLayout &Layou
     if (n > 1) {
       std::string c;
       for (const std::string &x : cands) c += (c.empty() ? "" : ", ") + x;
-      sizeLabelAmbiguous[typeLabel(const_cast<StructType *>(S)) + " at " + std::to_string(k) + " bytes: {" + c + "}"]++;
+      const std::string key = typeLabel(const_cast<StructType *>(S)) + " at " + std::to_string(k) + " bytes: {" + c + "}";
+      sizeLabelAmbiguous[key]++;
+      if (ambiguousNote) ambiguousNote->push_back(key);
     }
     return n == 1 ? one : nullptr;
   };
@@ -844,6 +850,13 @@ CallGraphPass::SizeTerms::Extent CallGraphPass::SizeTerms::extentOf(Type *layout
 
 CallGraphPass::SizeTerms::HeapMint CallGraphPass::SizeTerms::heapMint(const CallBase *C, std::set<std::string> *L) {
   HeapMint H;
+  assert(!zeroNote && !ambiguousNote && "a mint does not nest");
+  zeroNote = &H.zeroProduct;
+  ambiguousNote = &H.ambiguous;
+  struct Unnote {
+    SizeTerms &T;
+    ~Unnote() { T.zeroNote = nullptr, T.ambiguousNote = nullptr; }
+  } unnote{*this};
   // Labels of one object at its start, one embedding the other at
   // offset 0 (my_memory_mgr and its first member jpeg_memory_mgr:
   // `mem->pub.f = ..`): the container is the object's type.
@@ -932,6 +945,61 @@ CallGraphPass::SizeTerms::HeapMint CallGraphPass::SizeTerms::heapMint(const Call
         H.containerAmbiguous = true; // the label stays
       }
     }
+  // A5a (Fable 2026-10-21): a constant size S = k x sizeof(L), k >= 2, is
+  // an array of L by rule 1, and it is also any struct C that embeds L at
+  // offset 0 with sizeof(C) = S (the embedding table): C inheritance whose
+  // container happens to be a multiple of its head (-O3
+  // _bfd_x86_elf_link_hash_table_create: 2088 = 29 x bfd_link_hash_table).
+  // The site's own receivers select: a declaration naming one such C names
+  // the object C; a declaration naming L is in both readings and selects
+  // nothing. Not selected: a conflict, unlabeled, with its row.
+  if (H.layout && H.repeats && !H.declArray)
+    if (auto *LS = dyn_cast<StructType>(H.layout)) {
+      std::vector<const Value *> ops;
+      int64_t add = 0;
+      uint64_t prod = 1;
+      bool known = sizeOps(C, ops, add);
+      for (const Value *X : ops)
+        if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(X))) prod *= K->getZExtValue();
+        else known = false;
+      const uint64_t S = prod + add, sz = (uint64_t)H.size;
+      const StructInfo *SI =
+          known && S > sz && S % sz == 0 && extentOf(LS, sz, C).kind == 'a'
+              ? P.Ctx->structAnalyzer.getStructInfo(LS, const_cast<Module *>(C->getModule()))
+              : nullptr;
+      std::map<std::string, std::vector<StructType *>> cands; // container name -> its IR types
+      if (SI)
+        for (auto &[ct, offs] : SI->getContainers())
+          if (offs.count(0) && ct->isSized() && DL.getTypeAllocSize(const_cast<StructType *>(ct)) == S)
+            cands[stripStructNameSuffix(ct->getName()).str()].push_back(const_cast<StructType *>(ct));
+      if (!cands.empty()) {
+        std::vector<StructType *> picked;
+        size_t names = 0;
+        if (auto dit = P.allocDeclStructs.find(C); dit != P.allocDeclStructs.end())
+          for (auto &[cn, ts] : cands)
+            if (dit->second.count(cn)) names++, picked = ts;
+        // One named container; its IR copies (the linker's suffixes) one layout.
+        bool one = names == 1;
+        for (StructType *T2 : picked) one &= T2 == picked[0] || T2->isLayoutIdentical(picked[0]);
+        if (one) {
+          H.layout = picked[0];
+          H.size = (int64_t)S;
+          H.label = typeLabel(H.layout);
+          H.repeats = false;
+          H.readings = 'r';
+        } else {
+          std::string row = std::to_string(S / sz) + " x " + typeLabel(LS) + " (" + std::to_string(sz) + ")";
+          for (auto &[cn, ts] : cands) row += " vs " + cn + " (" + std::to_string(S) + ")";
+          H.readingsRow = row;
+          H.readings = 'c';
+          H.layout = nullptr;
+          H.label.clear();
+          H.size = 0;
+          H.repeats = false;
+          H.labelKind = 'c';
+        }
+      }
+    }
   // A4 (Fable 2026-10-20): a heap struct label whose receivers declare a
   // struct the linked IR merged away, of the label's size, carries that
   // debug identity (rndx_ext read as Elf_External_Sym_Shndx).
@@ -992,13 +1060,16 @@ void CallGraphPass::buildMintTable() {
   labelsQuiet = true;
   staticLabels(labels);
   labelsQuiet = false;
+  const auto marked = Ctx->AllocSites;
   Ctx->AllocSites = buildSites;
   std::swap(accessNames, own);
-  // Its own evaluator: the solve's (CellSolver.cc) keeps its memo and its
-  // counters to the calls the mint makes.
-  SizeTerms ST(*this, DL);
+  // Its own evaluator; the solve's (CellSolver.cc) evaluates the carves.
   auto T = std::make_shared<MintTable>();
-  // In IR order, so the evaluator's memo fills the same way in every run.
+  T->terms = std::make_unique<SizeTerms>(*this, DL);
+  SizeTerms &ST = *T->terms;
+  // Every call the solve may mint a heap object for (a marked allocation
+  // site, a labeled call, a call whose result is used as bytes only), in IR
+  // order, so the evaluator's memo fills the same way in every run.
   for (auto &[M, _] : Ctx->Modules)
     for (const Function &F : *M)
       for (const Instruction &I : instructions(F)) {
@@ -1007,9 +1078,11 @@ void CallGraphPass::buildMintTable() {
         if (auto lit = labels.find(C); lit != labels.end()) {
           std::set<std::string> l = lit->second;
           T->at.emplace(C, ST.heapMint(C, &l));
-        } else if (allocBytesOnly.count(C)) {
+        } else if (allocBytesOnly.count(C) || marked.count(const_cast<CallBase *>(C))) {
           T->at.emplace(C, ST.heapMint(C, nullptr));
-        }
+        } else
+          continue;
+        T->order.push_back(C);
       }
   mintTable = T;
 }

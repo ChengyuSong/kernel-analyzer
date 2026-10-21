@@ -7,7 +7,7 @@
 // the containers here are not. kmalloc_trace(s, flags, size) (6.8.2): the
 // row's SIZE(arg2) is read before the allocator table, whose kmalloc*
 // prefix entry would take arg0, the cache.
-// LOG: 2 relabeled to the container their size names, 1 ambiguous size labels
+// LOG: 2 relabeled to the container their size names, 0 to the container their receiver declares where the size is k x the label \(A5\), 1 ambiguous size labels
 // LOG: ambiguous size label: struct.dev2 at 24 bytes: \{struct.boxa, struct.boxb\}
 #include <stddef.h>
 void *kmem_cache_alloc_trace(void *s, unsigned flags, size_t size);

@@ -162,6 +162,11 @@ struct CallGraphPass::SizeTerms {
   // Allocations sized by a product through a zero-guarded wrapper (row
   // (2): bfd_alloc2(abfd, n, 72) = a multiple of 72).
   std::set<const llvm::CallBase *> zeroProductSites;
+  // While a heapMint runs: the per-site counts it makes (zeroProductSites
+  // inserts, sizeLabelAmbiguous keys), so a mint read from the table counts
+  // them as the mint did.
+  std::vector<const llvm::CallBase *> *zeroNote = nullptr;
+  std::vector<std::string> *ambiguousNote = nullptr;
   std::map<std::string, size_t> sizeLabelAmbiguous; // "S at k: {candidates}" -> objects
 
   // The extent a label covers (plan 3.53, rule 1): a T at the start, and
@@ -201,6 +206,13 @@ struct CallGraphPass::SizeTerms {
     bool identNoted = false; // ident was set by a debug identity (counted per IR label / identity pair)
     bool extentSet = false;
     Extent extent;
+    // A5a: 'r' the container the site's receiver declares, 'c' a conflict
+    // (readings: the row's text, "k x L (sz) vs C (S), ...").
+    char readings = 0;
+    std::string readingsRow;
+    // Per-site counts the mint made (see zeroNote, ambiguousNote).
+    std::vector<const llvm::CallBase *> zeroProduct;
+    std::vector<std::string> ambiguous;
     bool sameObject(const HeapMint &o) const {
       return layout == o.layout && size == o.size && label == o.label && ident == o.ident && repeats == o.repeats &&
              declArray == o.declArray && declScalar == o.declScalar && byteAccessed == o.byteAccessed &&
@@ -212,6 +224,10 @@ struct CallGraphPass::SizeTerms {
 
 struct CallGraphPass::MintTable {
   std::unordered_map<const llvm::CallBase *, SizeTerms::HeapMint> at;
+  std::vector<const llvm::CallBase *> order; // the entries in IR order
+  // The table's evaluator: its memo-level counts are the heap part of the
+  // log's size-term counts (the solve's evaluator counts the carves).
+  std::unique_ptr<SizeTerms> terms;
 };
 
 #endif

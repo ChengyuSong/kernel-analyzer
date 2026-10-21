@@ -6,7 +6,7 @@
 // struct the linker merged coff_comdat_info into): a conflict,
 // the site unlabeled with both candidates; never a label (row 3).
 // CFLAGS: -O2
-// LOG: 1 with conflicting labels \(of 1 allocations whose scalar label meets struct evidence, A3\)
+// LOG: 1 with conflicting labels \(of 1 allocations whose scalar label meets struct evidence, A3; 0 whose size is k x their label
 // LOG: 0 arrays of a declared scalar
 #include <stdlib.h>
 typedef void (*fn)(void);

@@ -213,6 +213,13 @@ int main(int argc, char **argv) {
         cliErrors.push_back("--cfl-cells requires --cfl-alloc-origins, "
                             "--cfl-whole-program and --cfl-outside=pure "
                             "(its origins are objects and functions only)");
+      if (CFLReachable)
+        cliErrors.push_back("--cfl-cells refuses --cfl-reachable: its heap "
+                            "objects are minted from a table of every "
+                            "allocation site, built before each solve over "
+                            "every body; reachability emits bodies only as "
+                            "they are reached, so the sites and their "
+                            "labels would differ");
       if (CFLNamedPlanes || CFLChannelCells || CFLLazyAddress ||
           CFLKeyCells || CFLBatchRoots > 0 || CFLLazyMint ||
           CFLFlowsToSlice || CFLBidiPrune || CFLPreSolveOnce ||

@@ -10423,7 +10423,7 @@ bool CallGraphPass::runCellResolution() {
     std::set<const CallBase *> outTargeted;
     for (bool grew = true; grew;) {
       grew = false;
-      for (const CallBase *CS : Ctx->IndirectCallInsts) {
+      for (const CallBase *CS : icallsSorted) { // stable order: a cell keeps its first five boundaries
         if (outTargeted.count(CS) || CS->isInlineAsm()) continue;
         std::set<uint32_t> deps;
         std::set<const Value *> seen;
@@ -10460,7 +10460,7 @@ bool CallGraphPass::runCellResolution() {
     std::vector<std::string> depRows;
     size_t nComplete = 0, nDepend = 0;
     std::map<std::string, size_t> byKind, byBodiless;
-    for (const CallBase *CS : Ctx->IndirectCallInsts) {
+    for (const CallBase *CS : icallsSorted) {
       std::set<uint32_t> out;
       std::set<const Value *> seen;
       calleeDeps(CS->getCalledOperand(), out, seen);

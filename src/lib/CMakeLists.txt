@@ -13,6 +13,7 @@ set (KACoreSource
   GraphBuild.cc
   Presolve.cc
   FlowsToSolver.cc
+  AllocExtents.cc
   CellSolver.cc
   Names.cc
   NamedCells.cc

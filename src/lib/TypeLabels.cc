@@ -677,7 +677,8 @@ void CallGraphPass::labelAllocationSites(
                     if (Var->getName() == "retval" || Var->getName().empty()) var = "return slot";
                   }
                 if (!Slot->hasName() && var == "unnamed slot") var = "return slot or temporary";
-                CG_DEBUG("TypeLabels: result slot holds other values: " << C->getFunction()->getName() << " slot "
+                if (!labelsQuiet)
+                  CG_DEBUG("TypeLabels: result slot holds other values: " << C->getFunction()->getName() << " slot "
                          << var << " also holds " << other << "\n");
               } else if (auto ld = FA.loads.find(K); ld != FA.loads.end()) {
                 L.cursorSlot = true;
@@ -896,7 +897,7 @@ void CallGraphPass::staticLabels(
       sharedDeclared += SL.slotUnclassified && decl;
       undeclared += !decl && !sfOnly;
       undeclaredByRule += !decl && !sfOnly && SL.hasReceiver;
-      if (!decl && !sfOnly && !SL.hasReceiver && VerboseLevel >= 3) {
+      if (!decl && !sfOnly && !SL.hasReceiver && VerboseLevel >= 3 && !labelsQuiet) {
         const Function *CF = C->getCalledFunction();
         CG_DEBUG("TypeLabels: no receiving variable: " << C->getFunction()->getName() << "::call "
                  << (CF ? CF->getName() : StringRef("?")) << "\n");
@@ -911,7 +912,8 @@ void CallGraphPass::staticLabels(
     censusSegFieldSites = 0;
     for (auto &[C, SL] : siteLabel) censusSegFieldSites += SL.segFieldReceivers > 0;
     for (auto &[A, e] : scalarAgreed) scalars += !e.empty();
-    CG_LOG("TypeLabels: allocation sites " << siteLabel.size() << ": " << field
+    if (!labelsQuiet)
+      CG_LOG("TypeLabels: allocation sites " << siteLabel.size() << ": " << field
            << " receivers are struct fields (their declared member type, 1b), " << cursor
            << " result slots are cursors walking the block (followed), " << unclassified
            << " result slots also hold other values (unclassified), " << reached
@@ -1081,7 +1083,8 @@ void CallGraphPass::staticLabels(
     }
   for (auto &[A, arr] : allocSegmentArrays) sArr += arr.size();
   censusSegments = {sStruct, sArr, sPtr, sScal, sBytes};
-  CG_LOG("TypeLabels: segments the sites declare: " << sStruct << " a struct (" << sArr
+  if (!labelsQuiet)
+    CG_LOG("TypeLabels: segments the sites declare: " << sStruct << " a struct (" << sArr
          << " of them indexed by a stride of it: arrays without an extent), " << sPtr << " arrays of pointer slots, "
          << sScal << " arrays of a declared scalar, " << sBytes << " bytes (a char receiver); "
          << censusSegFieldSites << " sites declare one through a struct field receiving its address\n");

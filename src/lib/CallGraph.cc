@@ -693,6 +693,10 @@ bool CallGraphPass::doModulePass(Module *M) {
   // its keys, plan 3.55 Q-d); under --cfl-cells nothing between its old
   // place and here runs (tracepoint keys are refused, the confirmers and
   // censuses are off unless asked).
+  // Under --cfl-reachable the bodies the build emits are known only as they
+  // are reached: no table, and the mint has nothing to check against.
+  if (CFLCells && !CFLReachable && iteration == 0 && M == Ctx->Modules.front().first)
+    buildMintTable(); // what each allocation is minted as, before the closure reads it
   if (CFLCells && (CFLContainerClosure || !Ctx->Containers.empty()) && iteration == 0 &&
       M == Ctx->Modules.front().first)
     checkContainerClosure();

@@ -678,6 +678,18 @@ protected:
     char how = 0;
   };
   std::unordered_map<const llvm::Instruction *, CarveSize> poolCarveSizes;
+  // A heap allocation's size as a term of its callee, and the label and
+  // extent it is minted with (AllocExtents.h).
+  struct SizeTerms;
+  // Every allocation call's mint decision, computed once at iteration 0
+  // before the container closure (buildMintTable); the mint checks its own
+  // decision against it.
+  struct MintTable;
+  std::shared_ptr<MintTable> mintTable;
+  void buildMintTable();
+  // staticLabels without its log lines (the table's call; the solve's own
+  // call logs them where they always were).
+  bool labelsQuiet = false;
   std::unordered_set<const llvm::Instruction *> poolBookkeeping;
   // The certified pools' handle fields ("objalloc+0"), checked after the
   // solve: a write into one outside the forms is a rule row.

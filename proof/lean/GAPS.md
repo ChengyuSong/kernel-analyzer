@@ -1808,6 +1808,19 @@ changes:
   below. Anything else is not a trailing array: any other size, or a
   remainder that is not whole elements, leaves the trailing object as
   before. Counted ("trailing arrays (A1)").
+  Trailing [1] and [0] clause (gap 2, Fable 2026-10-20): a size that is
+  a multiple of sizeof(T) reads as an array of T, but two Ts break that
+  reading. A T ending in a flexible array member (`E a[]`, [0] in the IR)
+  has no arrays (C11 6.7.2.1p3), so the object is the header T and its
+  trailing elements, never an array of T. For a T ending in an array of one
+  E (the pre-C99 struct hack), both readings are legal: the data after T is
+  the next T, or more elements of the array. A variable index on that
+  array, on an object read as an array of T, therefore reaches every
+  element offset of T that its stride lands on (folded), besides its own
+  cell. Each such (allocation, step) is a premise row in the rule report
+  ("P trailing [1] index on an array of T at <site> by <step>: reaches
+  offsets {...} of T (both readings kept)"), counted with the FAM headers
+  in "trailing [1] arrays (gap 2)".
   Segment clause (Fable, 2026-10-13): an allocation is a sequence of
   segments, the header T and then the tail,
   and rule 1 applies to the tail recursively. The tail's label is the

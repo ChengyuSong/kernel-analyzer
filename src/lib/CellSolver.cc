@@ -627,9 +627,13 @@ bool innermostArraySpan(Type *T, int64_t off, const DataLayout &DL, int64_t &lo,
 // member, recursively, an array of 0 or 1 elements ending at T's end (the
 // flexible-array idiom `x[0]` / `x[1]`; an array declared longer is a
 // field of its own, and what follows it is a segment, labeled by its use).
-Type *trailingArrayElem(Type *T, const DataLayout &DL) {
+Type *trailingArrayElem(Type *T, const DataLayout &DL, uint64_t *n = nullptr) {
   for (int depth = 0; depth < 64 && T; depth++) {
-    if (auto *AT = dyn_cast<ArrayType>(T)) return AT->getNumElements() <= 1 ? AT->getElementType() : nullptr;
+    if (auto *AT = dyn_cast<ArrayType>(T)) {
+      if (AT->getNumElements() > 1) return nullptr;
+      if (n) *n = AT->getNumElements();
+      return AT->getElementType();
+    }
     auto *ST = dyn_cast<StructType>(T);
     if (!ST || ST->isOpaque() || ST->getNumElements() == 0) return nullptr;
     const StructLayout *SL = DL.getStructLayout(ST);
@@ -2569,6 +2573,7 @@ bool CallGraphPass::runCellResolution() {
   size_t extentArrays = 0, extentOne = 0, extentHeader = 0, extentUnknown = 0,
          arraysExtended = 0, extendRefused = 0, readStepsSkipped = 0, varByteAny = 0,
          tailIndexAny = 0;
+  size_t famHeaders = 0; // gap 2: FAM structs whose size is a multiple of theirs, header + tail
   auto setExtent = [&](Obj &O, const Value *V) {
     O.tail = false;
     O.repeats = false;
@@ -2583,7 +2588,14 @@ bool CallGraphPass::runCellResolution() {
           promotedUnknownSize++; // a fresh wrapper (promoted or a row) whose size term is unknown
     if (sized && headerPlusTail(ops, at, add)) { O.tail = true; extentHeader++; tailObjects++; }
     else if (sized && exactlyOne(ops, at, add)) extentOne++;
-    else if (sized && sizeIsMultiple(ops, at, add)) { O.repeats = true; extentArrays++; }
+    else if (sized && sizeIsMultiple(ops, at, add)) {
+      // A struct ending in a flexible array member (`E a[]`, [0] in the IR)
+      // has no arrays (C11 6.7.2.1p3): a multiple of its size is the header
+      // and its trailing array's elements, never an array of T (gap 2).
+      uint64_t n = 2;
+      if (O.layout && trailingArrayElem(O.layout, DL, &n) && n == 0) { O.tail = true; extentHeader++; tailObjects++; famHeaders++; }
+      else { O.repeats = true; extentArrays++; }
+    }
     else { O.tail = true; O.tailUnsized = true; extentUnknown++; }
   };
   // A1 (Fable 2026-10-20): an allocation of sizeof(T) + k * sizeof(E) for a
@@ -3260,6 +3272,10 @@ bool CallGraphPass::runCellResolution() {
   // array is undefined behavior: counted, the address stays.
   size_t indexInBoundedArray = 0; // a variable index into a declared array field within T: within its bound
   size_t segArrayOtherStride = 0; // another stride over a segment array: data after it, folded
+  // Gap 2: (allocation, step) -> the element offsets of T a [1] trailing
+  // array index on an array of T reaches.
+  std::map<std::pair<const Instruction *, const Instruction *>, std::pair<std::string, std::set<int64_t>>> trail1Rows;
+  size_t trail1Steps = 0;
   size_t indexOutsideArray = 0, indexAsOffset = 0, indexStays = 0, leafMerges = 0, byteStepUB = 0,
          byteStepStays = 0, byteStepContainer = 0, byteStepStructRel = 0,
          byteWalkStays = 0, byteWalkStructRel = 0;
@@ -3435,6 +3451,29 @@ bool CallGraphPass::runCellResolution() {
       // 1]`) stays in the element instead of leaving the T.
       out.push_back(tailIndex ? cellAtArr(o, pos) : cellAt(o, pos));
       return;
+    }
+    // Gap 2 (Fable 2026-10-20): an array of T whose last member is a [1]
+    // trailing array: the struct-hack reading (the index runs on into the
+    // data after T) and the array reading (that data is the next T) are
+    // both legal, so the index reaches every element offset of T its stride
+    // lands on, folded, besides its own. A premise row per site.
+    if (O.repeats && !O.tail && !O.declArray) {
+      uint64_t n = 2;
+      int64_t lo = 0, hi = 0, esz = 0;
+      if (trailingArrayElem(O.layout, DL, &n) && n == 1 && innermostArraySpan(O.layout, pos, DL, lo, hi, esz) && hi >= O.size &&
+          s % esz == 0) {
+        const int64_t g = std::gcd(s, O.size);
+        auto &row = trail1Rows[{dyn_cast_or_null<Instruction>(NF.getValueForNode(O.origin)),
+                                curStepDst < G ? dyn_cast_or_null<Instruction>(NF.getValueForNode(curStepDst)) : nullptr}];
+        row.first = O.label;
+        std::set<int64_t> &offs = row.second;
+        for (int64_t j = pos % g; j < O.size; j += g) {
+          offs.insert(j);
+          out.push_back(folded(o, j));
+        }
+        trail1Steps++;
+        return;
+      }
     }
     if (s % e == 0) { out.push_back(folded(o, pos)); return; }
     const int64_t g = std::gcd(s, e), r0 = (((pos - b) % g) + g) % g;
@@ -9779,6 +9818,9 @@ bool CallGraphPass::runCellResolution() {
   CG_LOG("Cells: trailing arrays (A1): " << trailingElemTails << " trailing objects are their header's trailing array's "
          << "further elements (size sizeof(T) + k * sizeof(E)); " << trailingElemLinks
          << " variable indexes ran on into them\n");
+  CG_LOG("Cells: trailing [1] arrays (gap 2): " << trail1Rows.size() << " indexes on an array of T reach every element "
+         << "offset their stride lands on (both readings kept), " << trail1Steps << " steps; " << famHeaders
+         << " structs ending in a flexible array member sized a multiple of theirs read as header + tail\n");
   for (const auto &[k, n] : sizeLabelAmbiguous)
     CG_LOG("Cells:   ambiguous size label: " << k << " (" << n << " objects)\n");
   CG_LOG("Cells: anonymous structs label nothing: " << anonObjects
@@ -10371,6 +10413,30 @@ bool CallGraphPass::runCellResolution() {
        << scalarStructWrites << " writes (" << scalarStructSteps << " struct steps); struct array followed by other "
        << "data at a variable offset (another stride over a segment array, folded into its element cells): "
        << segArrayOtherStride << " steps\n";
+    // Gap 2: the [1] trailing-array indexes on arrays of T, in IR order
+    // (function, line; the step's after the allocation's).
+    {
+      RO << "SUMMARY trailing [1] arrays (gap 2): " << trail1Rows.size() << " indexes on an array of T reach every element "
+         << "offset their stride lands on (both readings kept), " << trail1Steps << " steps; " << famHeaders
+         << " structs ending in a flexible array member sized a multiple of theirs read as header + tail\n";
+      auto key = [](const Instruction *I) {
+        const unsigned l = I && I->getDebugLoc() ? I->getDebugLoc().getLine() : 0;
+        const unsigned c = I && I->getDebugLoc() ? I->getDebugLoc().getCol() : 0;
+        return std::make_tuple(I ? I->getFunction()->getName().str() : std::string(), l, c);
+      };
+      std::vector<std::pair<std::pair<const Instruction *, const Instruction *>, std::pair<std::string, std::set<int64_t>>>> v(
+          trail1Rows.begin(), trail1Rows.end());
+      std::stable_sort(v.begin(), v.end(), [&](const auto &a, const auto &b) {
+        return std::make_pair(key(a.first.first), key(a.first.second)) < std::make_pair(key(b.first.first), key(b.first.second));
+      });
+      for (const auto &[k, r] : v) {
+        std::string offs;
+        for (int64_t j : r.second) offs += (offs.empty() ? "" : ", ") + std::to_string(j);
+        RO << "P trailing [1] index on an array of " << r.first << " at " << (k.first ? instLoc(k.first) : std::string("?"))
+           << " by " << (k.second ? instLoc(k.second) : std::string("?")) << ": reaches offsets {" << offs << "} of "
+           << r.first << " (both readings kept)\n";
+      }
+    }
     // Rule 4: one row per (site, source label, destination label); types
     // that print as one label (renamed copies of a struct) are one row.
     std::map<std::string, size_t> relayLines;

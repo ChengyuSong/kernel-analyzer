@@ -36,6 +36,8 @@
 #include "CallGraphInternal.h"
 #include "NamedCells.h"
 
+#include <llvm/IR/Dominators.h>
+
 namespace {
 
 std::string instLocStr(const Instruction *I) {
@@ -460,14 +462,58 @@ void CallGraphPass::checkPoolCarves() {
             }
           } else if (form == "before-bump") {
             uint64_t sc = 0;
-            z.n = oneOf(h.field, [&](const Value *V) -> const Value * {
+            auto bumpOf = [&](const Value *V) -> const Value * {
               const auto *B = dyn_cast<GEPOperator>(V->stripPointerCasts());
               if (!B || B->getNumIndices() != 1 || stepsBack(B) || !loadsField(B->getPointerOperand(), h.field, 0))
                 return nullptr;
               if (sc && sc != scaleOf(B)) sc = UINT64_MAX;
               else sc = scaleOf(B);
               return B->idx_begin()->get();
-            });
+            };
+            z.n = oneOf(h.field, bumpOf);
+            if (!z.n) {
+              // Two bumps (A2' (1), -O3 bfd_alloc): a variable x, and a
+              // constant K only on blocks dominated by the true edge of
+              // `x == 0`, x on none of them: "x, K when x == 0".
+              sc = 0;
+              std::vector<std::pair<const StoreInst *, const Value *>> bs;
+              for (const Instruction &J : instructions(F))
+                if (const auto *S = dyn_cast<StoreInst>(&J); S && fieldKey(S, S->getPointerOperand()) == h.field)
+                  if (const Value *x = bumpOf(S->getValueOperand())) bs.push_back({S, x});
+              const Value *X = nullptr;
+              const ConstantInt *K = nullptr;
+              bool ok = sc && sc != UINT64_MAX;
+              for (auto &[S, x] : bs) {
+                if (const auto *c = dyn_cast<ConstantInt>(x)) {
+                  if (K && K->getValue() != c->getValue()) ok = false;
+                  K = c;
+                } else if (X && X != x) ok = false;
+                else X = x;
+              }
+              if (ok && X && K && !K->isNegative()) {
+                DominatorTree DT(const_cast<Function &>(F));
+                // The true edges of the branches on `X == 0`.
+                std::vector<BasicBlockEdge> zero;
+                for (const User *U : X->users())
+                  if (const auto *Cmp = dyn_cast<ICmpInst>(U);
+                      Cmp && Cmp->getPredicate() == ICmpInst::ICMP_EQ && Cmp->getOperand(0) == X &&
+                      isa<ConstantInt>(Cmp->getOperand(1)) && cast<ConstantInt>(Cmp->getOperand(1))->isZero())
+                    for (const User *CU : Cmp->users())
+                      if (const auto *Br = dyn_cast<BranchInst>(CU); Br && Br->isConditional() && Br->getCondition() == Cmp)
+                        zero.emplace_back(Br->getParent(), Br->getSuccessor(0));
+                auto underZero = [&](const StoreInst *S) {
+                  for (const BasicBlockEdge &E : zero)
+                    if (DT.dominates(E, S->getParent())) return true;
+                  return false;
+                };
+                for (auto &[S, x] : bs) ok = ok && (isa<ConstantInt>(x) ? underZero(S) : !underZero(S));
+                if (ok) {
+                  z.n = X;
+                  z.zeroK = (int64_t)K->getZExtValue();
+                  z.how = 'z';
+                }
+              }
+            }
             if (sc == UINT64_MAX || !sc) z.n = nullptr;
             else z.scale = sc;
           } else if (form == "header" && G && h.flavor == 'C' && h.alloc) {
@@ -488,6 +534,45 @@ void CallGraphPass::checkPoolCarves() {
             if (B == h.alloc && G->accumulateConstantOffset(F.getParent()->getDataLayout(), off)) {
               z.chunk = h.alloc;
               z.off = off.getSExtValue();
+            }
+            // A header carve c followed by the store H := c + x into its
+            // pool's bump field (A2' (3), -O3 objalloc's new small chunk):
+            // the piece is x, the rest of the chunk the later carves' space.
+            const Value *x = nullptr;
+            uint64_t sc = 0;
+            bool one = true;
+            for (const User *U : I->users())
+              if (const auto *G2 = dyn_cast<GEPOperator>(U); G2 && G2->getPointerOperand() == I && G2->getNumIndices() == 1)
+                for (const User *GU : G2->users())
+                  if (const auto *S = dyn_cast<StoreInst>(GU); S && S->getValueOperand() == G2) {
+                    const std::string k = fieldKey(S, S->getPointerOperand());
+                    if (!bumpFields.count(k) || pool(k) != pool(h.pool)) continue;
+                    if (x && (x != G2->idx_begin()->get() || sc != scaleOf(G2))) one = false;
+                    x = G2->idx_begin()->get();
+                    sc = scaleOf(G2);
+                  }
+            // Also H := chunk + off2 (the GEPs folded: c + 8 written chunk +
+            // 24): the constant piece off2 - off.
+            if (z.chunk)
+              for (const User *U : h.alloc->users())
+                if (const auto *G2 = dyn_cast<GEPOperator>(U); G2 && G2 != G && G2->getPointerOperand() == h.alloc)
+                  for (const User *GU : G2->users())
+                    if (const auto *S = dyn_cast<StoreInst>(GU); S && S->getValueOperand() == G2) {
+                      const std::string k = fieldKey(S, S->getPointerOperand());
+                      APInt o2(64, 0);
+                      if (!bumpFields.count(k) || pool(k) != pool(h.pool) ||
+                          !G2->accumulateConstantOffset(F.getParent()->getDataLayout(), o2) || o2.getSExtValue() <= z.off)
+                        continue;
+                      const Value *c = ConstantInt::get(Type::getInt64Ty(F.getContext()), o2.getSExtValue() - z.off);
+                      if (x && (!isa<ConstantInt>(x) || cast<ConstantInt>(x)->getSExtValue() != o2.getSExtValue() - z.off || sc != 1))
+                        one = false;
+                      x = c;
+                      sc = 1;
+                    }
+            if (x && one && sc) {
+              z.n = x;
+              z.scale = sc;
+              z.how = 'h';
             }
           }
           return z;

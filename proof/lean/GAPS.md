@@ -1767,7 +1767,11 @@ changes:
   (a)), so bfd_alloc2(abfd, n, 72) is an array of coff_symbol_struct with
   no tail; at the site a product of the caller's own formals is a
   multiple of c. Counted ("sized by a product through a zero-guarded
-  wrapper"). The gcd fact stays for returns that genuinely disagree.
+  wrapper"), split by the extent the site gets: an array when c is the
+  label's size, one then unknown when c is a multiple of no label's size
+  (on nm-O3 these are header-plus-data sizes whose factor is 8, such as
+  elf.c:4549's sizeof (T) - 8 + k x 8, which -O3 folds to (k + 9) x 8).
+  The gcd fact stays for returns that genuinely disagree.
   A pool carve's size (rule 3) by its form: before-bump, the bump n;
   counter, the decrement; minus-len, the length; header, the chunk
   call's size minus the header offset (each n times its GEP's element
@@ -2213,6 +2217,35 @@ establish it:
   on it, only when every incoming value is one: a reload of the cursor,
   a chunk's free-space start, null, or such a join. Otherwise the carve
   sits on the free-space operand, and the other operands keep flowing.
+
+**Carve sizes (A2', Fable 2026-10-20).** A carve's size term is exact IR
+arithmetic, or unknown:
+- Before-bump: the bump n of `store H, p + n`, one value for every bump
+  store of H in the function. Two bumps read as the piecewise term
+  "x, K when x == 0" only when the constant bump K sits on blocks
+  dominated by the true edge of `x == 0` and the variable bump x on none
+  of them (-O3 bfd_alloc: x = `select (n == 0), 8, round8(n)`); any other
+  mix stays unknown.
+- Header: n for `malloc(HDR + n) + HDR`. A header carve c followed by the
+  store `H := c + x` into its pool's bump field is a piece of x: the rest
+  of the chunk is the later carves' space (a store `H := chunk + off2`
+  is the constant piece `off2 - HDR`). "chunk - HDR" remains only for a
+  header carve with no such store.
+- A join that is itself a certified carve (the return phi of an inlined
+  objalloc_alloc) reads its own carve term joined with its incoming
+  carves' terms; an incoming load of the pool's fields is the
+  before-bump result. This reading rests on the certification's "the
+  before-bump result is a load of H". An incoming constant carve on the
+  true edge of `x == 0`, x the join's bump, is x's zero case: it joins
+  when the term reads that constant there, the zero case's value after
+  the term's rounding (round_al(zeroK) for an aligned term: -O3
+  bfd_hash_allocate is round8(n ? n : 1), whose zero case reads 8). Equal
+  terms give that term, others the gcd fact; only a constant labels.
+  Count-times-size with an overflow check (bfd_alloc2, bfd_zalloc2) is not
+  a form: unknown, counted.
+Counted: "size terms (A2'): a carves by "n, K when n == 0", b carve phis
+by their carve term, c header carves by the store H := c + n, d zext masks
+read as -al; e fresh functions still unknown".
   This is the allocate-unless-provided shape: `phi [carve, entry]` in
   bfd_hash_newfunc's family, and `phi [carve, string]` in bfd_hash_lookup.
 - **Chunk bases.** An allocation stored into a handle field is accessed
@@ -2551,6 +2584,14 @@ only.
   kmem_cache_alloc_trace / _node_trace, 6.8.2 kmalloc_trace /
   kmalloc_node_trace, 6.18.7 __kmalloc_cache_noprof / _node_noprof (the
   request, arg2 / arg3).
+  The term evaluator (A2', Fable 2026-10-20) reads constants, formals,
+  sums, products, shifts, casts, `x ? x : k` (select on `x == 0`, umax with
+  1), `(x + al - 1) & -al` rounding, and the mask `2^k - al` in place of
+  `-al` when the IR bounds the sum below 2^k (`zext_iN(y) + c` with
+  `2^N - 1 + c < 2^k`; -O3 bfd_hash_allocate's `& 0x1fffffff8`). A pool
+  carve's term is its form's size (see "Pool carves", A2'). Anything else
+  is unknown and counted ("size terms (A2'): ... still unknown", and the
+  extents' "fresh wrappers with an unknown size term").
   Worked example (5.18): snd_hda_codec_device_init allocates
   kmem_cache_alloc_trace(.., 1640) and first uses it as struct
   hdac_device (944 bytes). In the 5.18 kernel IR (2,623 modules) the only

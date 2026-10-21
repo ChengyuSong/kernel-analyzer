@@ -36,6 +36,7 @@
 #include <numeric>
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/DebugInfo.h>
+#include <llvm/IR/Dominators.h>
 
 using namespace llvm;
 
@@ -2226,6 +2227,7 @@ bool CallGraphPass::runCellResolution() {
     }
     return !idx.empty();
   };
+  std::set<const Instruction *> sizeZextMask; // A2' (4): masks 2^k - al read as -al
   // V's term in F's formals.
   std::function<SizeTerm(const Value *, const Function *, int)> termIn =
       [&](const Value *V, const Function *F, int d) -> SizeTerm {
@@ -2315,11 +2317,28 @@ bool CallGraphPass::runCellResolution() {
     case Instruction::Sub:
       if (K1) return plusK(termIn(B->getOperand(0), F, d + 1), -K1->getSExtValue());
       return {};
-    case Instruction::And:
+    case Instruction::And: {
       // x & -al: a multiple of al whatever x is; (n + al - 1) & -al is n
-      // rounded up.
-      if (K1 && K1->isNegative() && (-K1->getValue()).isPowerOf2()) {
-        const uint64_t al = (-K1->getValue()).getZExtValue();
+      // rounded up. A mask 2^k - al is the same when x < 2^k, which the IR
+      // bounds for zext_iN(y) + c with 2^N - 1 + c < 2^k (-O3 bfd_hash_allocate:
+      // (zext_i32(n) + 7) & 0x1fffffff8).
+      uint64_t al = 0;
+      if (K1 && K1->isNegative() && (-K1->getValue()).isPowerOf2()) al = (-K1->getValue()).getZExtValue();
+      else if (K1 && !K1->isZero() && K1->getBitWidth() == 64) {
+        const uint64_t m = K1->getZExtValue(), lo = m & (~m + 1);
+        const auto *A = dyn_cast<BinaryOperator>(B->getOperand(0));
+        const auto *Z = dyn_cast<ZExtInst>(A && A->getOpcode() == Instruction::Add ? A->getOperand(0) : B->getOperand(0));
+        const auto *C = A && A->getOpcode() == Instruction::Add ? dyn_cast<ConstantInt>(A->getOperand(1)) : nullptr;
+        const uint64_t c = C && !C->isNegative() ? C->getZExtValue() : 0;
+        if (lo > 1 && llvm::isPowerOf2_64(m + lo) && Z && (!A || A->getOpcode() != Instruction::Add || C)) {
+          const unsigned N = Z->getSrcTy()->getIntegerBitWidth();
+          if (N < 63 && (1ULL << N) - 1 + c < m + lo) {
+            al = lo;
+            sizeZextMask.insert(B);
+          }
+        }
+      }
+      if (al) {
         // (y + al - 1) & -al, also ((y + al) - 1) & -al: y rounded up, read
         // from the sum's own operand (y may itself be rounded).
         int64_t k = 0;
@@ -2342,12 +2361,16 @@ bool CallGraphPass::runCellResolution() {
         return multiple(al);
       }
       return {};
+    }
     default:
       return {};
     }
   };
   std::unordered_map<const Function *, SizeTerm> termMemo;
   std::set<const Function *> termBusy;
+  // A2' counters: carves sized by "n, K when n == 0", by header-then-store,
+  // carve phis read by their carve term, zext masks read as -al.
+  std::set<const Instruction *> sizeWhenZero, sizeHeaderStore, sizeCarvePhi;
   std::set<const Instruction *> carveUnknownSize;
   std::function<SizeTerm(const Function *)> termOfFn;
   // The term of call C expressed in F's formals (F null: C's own operands
@@ -2394,8 +2417,22 @@ bool CallGraphPass::runCellResolution() {
     auto it = poolCarveSizes.find(I);
     const Function *F = I->getFunction();
     SizeTerm t;
-    if (it != poolCarveSizes.end() && it->second.n)
+    if (it != poolCarveSizes.end() && it->second.n) {
       t = timesT(termIn(it->second.n, F, 0), constT(it->second.scale));
+      // "n, zeroK when n == 0" (A2' (1)): n's own term when it is never
+      // zero or already reads zeroK there; one formal takes the zero case.
+      if (const int64_t zk = it->second.zeroK; zk >= 0 && t.known) {
+        const int64_t zks = zk * (int64_t)it->second.scale;
+        if (t.isConst()) t = t.c ? t : constT((uint64_t)zks);
+        else if (nonzero(t) || t.zeroK == zks) {
+        } else if (!t.partial && !t.align && t.zeroK < 0 && t.formals.size() == 1 && t.c == 1 && !t.add)
+          t.zeroK = zks;
+        else
+          t = {};
+      }
+      if (t.known && it->second.how == 'z') sizeWhenZero.insert(I);
+      if (t.known && it->second.how == 'h') sizeHeaderStore.insert(I);
+    }
     else if (it != poolCarveSizes.end() && it->second.chunk) {
       // malloc(HDR + n) carved at HDR is n (the sum's own operand, not the
       // sum's term less HDR: a rounded n stays exact).
@@ -2429,6 +2466,63 @@ bool CallGraphPass::runCellResolution() {
       const Value *V = work.back()->stripPointerCasts();
       work.pop_back();
       if (!seen.insert(V).second || isa<ConstantPointerNull>(V)) continue;
+      // A phi that is itself a certified carve (A2' (2), -O3 bfd_alloc's
+      // return): its carve term, joined with its incoming carves' terms; an
+      // incoming load of its pool's fields (through phis) is the before-bump
+      // result the certification names, covered by the phi's own term. An
+      // incoming constant carve on the true edge of `n == 0`, n the phi's
+      // bump, is n's zero case: it joins when the term reads it there.
+      if (const auto *PC = dyn_cast<PHINode>(V); PC && poolCarves.count(PC)) {
+        SizeTerm own = carveTerm(PC);
+        if (!own.known) { bad = true; break; }
+        const auto pit = poolCarvePool.find(PC);
+        const auto zit = poolCarveSizes.find(PC);
+        const Value *bump = zit != poolCarveSizes.end() ? zit->second.n : nullptr;
+        std::unique_ptr<DominatorTree> DT;
+        auto onZeroEdge = [&](const Instruction *J) {
+          if (!bump) return false;
+          if (!DT) DT = std::make_unique<DominatorTree>(const_cast<Function &>(*F));
+          for (const User *U : bump->users())
+            if (const auto *Cmp = dyn_cast<ICmpInst>(U); Cmp && Cmp->getPredicate() == ICmpInst::ICMP_EQ &&
+                                                        Cmp->getOperand(0) == bump && isa<ConstantInt>(Cmp->getOperand(1)) &&
+                                                        cast<ConstantInt>(Cmp->getOperand(1))->isZero())
+              for (const User *CU : Cmp->users())
+                if (const auto *Br = dyn_cast<BranchInst>(CU); Br && Br->isConditional() && Br->getCondition() == Cmp &&
+                                                               DT->dominates(BasicBlockEdge(Br->getParent(), Br->getSuccessor(0)), J->getParent()))
+                  return true;
+          return false;
+        };
+        std::vector<const Value *> in(PC->incoming_values().begin(), PC->incoming_values().end());
+        std::set<const Value *> inSeen;
+        for (size_t i = 0; i < in.size() && !bad; i++) {
+          const Value *X = in[i]->stripPointerCasts();
+          if (!inSeen.insert(X).second || isa<ConstantPointerNull>(X)) continue;
+          const auto *XI = dyn_cast<Instruction>(X);
+          if (const auto *P2 = dyn_cast<PHINode>(X); P2 && !poolCarves.count(P2)) {
+            in.insert(in.end(), P2->incoming_values().begin(), P2->incoming_values().end());
+            continue;
+          }
+          if (const auto *L = dyn_cast<LoadInst>(X); L && pit != poolCarvePool.end()) {
+            const auto fa = poolFieldAccess.find(L);
+            if (fa != poolFieldAccess.end() && fa->second == pit->second) continue; // the bump base
+          }
+          if (!XI || !poolCarves.count(XI)) { bad = true; break; }
+          SizeTerm t = carveTerm(XI);
+          // The term's value in its zero case: zeroK, rounded when the term
+          // is (round8(n ? n : 1) reads 8 there).
+          if (t.isConst() && own.known && own.zeroK >= 0 && !own.add && !own.partial && onZeroEdge(XI)) {
+            const uint64_t zv = own.align ? (((uint64_t)own.zeroK + own.align - 1) & ~(own.align - 1)) : (uint64_t)own.zeroK;
+            if (t.c == zv) t = own;
+          }
+          own = joinT(own, t);
+          bad = !own.known;
+        }
+        if (bad) break;
+        sizeCarvePhi.insert(PC);
+        agreed = agreed ? joinT(*agreed, own) : own;
+        bad = !agreed->known;
+        continue;
+      }
       if (const auto *PN = dyn_cast<PHINode>(V)) { for (const Value *In : PN->incoming_values()) work.push_back(In); continue; }
       if (const auto *SI = dyn_cast<SelectInst>(V)) { work.push_back(SI->getTrueValue()); work.push_back(SI->getFalseValue()); continue; }
       if (const auto *L = dyn_cast<LoadInst>(V)) // -O0: a slot only loaded and stored: every value stored
@@ -2481,6 +2575,9 @@ bool CallGraphPass::runCellResolution() {
   // Allocations sized by a product through a zero-guarded wrapper (row
   // (2): bfd_alloc2(abfd, n, 72) = a multiple of 72).
   std::set<const CallBase *> zeroProductSites;
+  // ... and what their extents are: an array (the product's factor is the
+  // label's size) or one then unknown (a multiple of no label's size).
+  std::set<const CallBase *> zeroProductArrays, zeroProductUnknown;
   // The size of an allocation site V as operands and an addend (size =
   // add + the product of ops; an undef operand is a factor not known),
   // false when the size is unknown. A call's inner term is evaluated at
@@ -2597,6 +2694,7 @@ bool CallGraphPass::runCellResolution() {
       else { O.repeats = true; extentArrays++; }
     }
     else { O.tail = true; O.tailUnsized = true; extentUnknown++; }
+    if (C && zeroProductSites.count(C)) (O.repeats ? zeroProductArrays : zeroProductUnknown).insert(C);
   };
   // A1 (Fable 2026-10-20): an allocation of sizeof(T) + k * sizeof(E) for a
   // T that ends in a trailing array of E (`asection *sections[1]`): the size
@@ -8269,8 +8367,15 @@ bool CallGraphPass::runCellResolution() {
          << " one by size, " << extentHeader << " header + data by size, " << extentUnknown
          << " one then unknown (size unknown; " << promotedUnknownSize
          << " of them fresh wrappers with an unknown size term; " << carveUnknownSize.size()
-         << " pool carves with an unknown size term; " << zeroProductSites.size()
-         << " sized by a product through a zero-guarded wrapper), " << arraysExtended << " made arrays by a T-stride access ("
+         << " pool carves with an unknown size term), " << zeroProductSites.size()
+         << " sized by a product through a zero-guarded wrapper (" << zeroProductArrays.size()
+         << " arrays: the factor is the label's size; " << zeroProductUnknown.size()
+         << " a multiple of no label's size: one then unknown"
+         << (zeroProductSites.size() != zeroProductArrays.size() + zeroProductUnknown.size()
+                 ? "; " + std::to_string(zeroProductSites.size() - zeroProductArrays.size() - zeroProductUnknown.size()) +
+                       " other (no labeled extent at mint, one, or header)"
+                 : std::string())
+         << "), " << arraysExtended << " made arrays by a T-stride access ("
          << extendRefused << " refused: typed trailing data; " << tailIndexAny
          << " other variable indexes also reach the data after the T); " << tailWritesFolded
          << " writes of another struct into the data after a T (rule (b): not admitted); " << readStepsSkipped
@@ -9815,6 +9920,13 @@ bool CallGraphPass::runCellResolution() {
          << heapContainerAmbiguous << " ambiguous size labels (several containers of that size; the label stays)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
          << anyCells << " any-offset, " << outMints << " outside)\n");
+  {
+    size_t unknownFns = 0;
+    for (const auto &[F, t] : termMemo) unknownFns += !t.known;
+    CG_LOG("Cells: size terms (A2'): " << sizeWhenZero.size() << " carves by \"n, K when n == 0\", " << sizeCarvePhi.size()
+           << " carve phis by their carve term, " << sizeHeaderStore.size() << " header carves by the store H := c + n, "
+           << sizeZextMask.size() << " zext masks read as -al; " << unknownFns << " fresh functions still unknown\n");
+  }
   CG_LOG("Cells: trailing arrays (A1): " << trailingElemTails << " trailing objects are their header's trailing array's "
          << "further elements (size sizeof(T) + k * sizeof(E)); " << trailingElemLinks
          << " variable indexes ran on into them\n");

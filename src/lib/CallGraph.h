@@ -645,6 +645,13 @@ protected:
     uint64_t scale = 1;
     const llvm::CallBase *chunk = nullptr;
     int64_t off = 0;
+    // A before-bump carve whose bump is n, and the constant zeroK on the
+    // blocks dominated by the true edge of `n == 0` (A2' (1)): "n, zeroK
+    // when n == 0". -1: none.
+    int64_t zeroK = -1;
+    // How the size was read (A2' counters): 'z' the zero case above, 'h' a
+    // header carve c followed by the store H := c + n (the piece is n).
+    char how = 0;
   };
   std::unordered_map<const llvm::Instruction *, CarveSize> poolCarveSizes;
   std::unordered_set<const llvm::Instruction *> poolBookkeeping;

@@ -134,6 +134,14 @@ struct UnionField {
   std::set<std::string> storageMembers;
 };
 
+// Unions in name order (struct, offset: the key of their table), so that
+// passes over them and their listings never follow pointer order.
+struct ByUnion {
+  bool operator()(const UnionField *a, const UnionField *b) const {
+    return std::tie(a->structName, a->off) < std::tie(b->structName, b->off);
+  }
+};
+
 // The typed-pointer LLVM type a member lowers to, as a class: pointers to
 // char-like or void are one type (i8*), pointers to a named struct are
 // that struct's pointer, integers by width.
@@ -1030,7 +1038,7 @@ void CallGraphPass::runUnionCensus() {
     const LoadInst *copyOf = nullptr; // (C'') a load of the same union field it copies
     std::string embedVia;              // R2: "T>P", typed by the embedding of P in T
   };
-  std::map<const UnionField *, std::vector<Site>> writes, reads;
+  std::map<const UnionField *, std::vector<Site>, ByUnion> writes, reads;
   // Co-writes into the same object: (function, base, embed, struct) ->
   // stores of a constant / function / global / flag bit into a field.
   using ObjKey = std::tuple<const Function *, const Value *, uint64_t, std::string>;
@@ -1587,7 +1595,7 @@ void CallGraphPass::runUnionCensus() {
   for (auto &[K, co] : coWrites)
     for (auto &[f, vs] : co)
       writersOf[{std::get<3>(K), f}].push_back(K);
-  std::map<const UnionField *, std::set<ObjKey>> unionCtx;
+  std::map<const UnionField *, std::set<ObjKey>, ByUnion> unionCtx;
   for (auto &[U, W] : writes)
     for (Site &s : W)
       if (s.I) {
@@ -2428,7 +2436,7 @@ void CallGraphPass::runUnionCensus() {
   std::map<std::string, Unkeyed> unkeyedOf;
   struct Line { size_t accesses; std::string text; };
   std::vector<Line> lines;
-  std::set<const UnionField *> touched;
+  std::set<const UnionField *, ByUnion> touched;
   for (auto &[U, _] : writes) touched.insert(U);
   for (auto &[U, _] : reads) touched.insert(U);
   auto real = [](const std::string &m) { return m != "?" && m != "ambiguous"; };

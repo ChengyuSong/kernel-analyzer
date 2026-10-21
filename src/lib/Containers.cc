@@ -3065,7 +3065,13 @@ void CallGraphPass::checkContainerClosure() {
               continue;
             }
           }
-          bool done = false;
+          // Every owner group of the function is read, and the verdict
+          // combines their readings in one precedence (relink, implicit
+          // insert, link store on the inserted element): a store whose
+          // address is a derived slot of several groups (an element's
+          // embedded root) is never judged by whichever group's owner text
+          // sorts first.
+          bool done = false, relink = false, implicit = false, paired = false, linkStore = false;
           if (gs)
             for (auto &SG : *gs) {
               Group &Gp = SG.second;
@@ -3081,9 +3087,8 @@ void CallGraphPass::checkContainerClosure() {
               if (derivedSlot && (vc & (OC_VAL | OC_WORD))) {
                 // A relink (4(a)): a derived value into a derived slot
                 // (an inlined remove, a rotate, __rb_change_child).
-                o1Admit["owner-code relinks"]++;
-                done = true;
-                break;
+                relink = true;
+                continue;
               }
               if (derivedSlot && V->getType()->isPointerTy()) {
                 // An implicit insert: paired with an insert row call in this
@@ -3115,21 +3120,30 @@ void CallGraphPass::checkContainerClosure() {
                   matched |= isE(R->elem);
                   for (int e : R->moreElems) matched |= isE(e);
                 }
-                // One site, whichever slots its address may name.
-                if (implicitSeen.insert(I).second) {
-                  (matched ? implicitMatched : implicitUnmatched).push_back(siteText(I));
-                  if (matched) o1Admit["implicit inserts (matched)"]++;
-                  else fail("an implicit insert with no insert row call on the same element and owner", I);
-                }
-                done = true;
-                break;
+                implicit = true;
+                paired |= matched;
+                continue;
               }
-              if (baseIsInserted && (vc & (OC_VAL | OC_WORD))) {
-                o1Admit["link stores on the inserted element"]++;
-                done = true;
-                break;
-              }
+              if (baseIsInserted && (vc & (OC_VAL | OC_WORD))) linkStore = true;
             }
+          if (relink) {
+            o1Admit["owner-code relinks"]++;
+            done = true;
+          } else if (implicit) {
+            // An implicit insert: matched when an insert row call pairs it
+            // in some group whose derived slot the address is (that call's
+            // owner is the slot's owner). One site, whichever slots its
+            // address may name.
+            if (implicitSeen.insert(I).second) {
+              (paired ? implicitMatched : implicitUnmatched).push_back(siteText(I));
+              if (paired) o1Admit["implicit inserts (matched)"]++;
+              else fail("an implicit insert with no insert row call on the same element and owner", I);
+            }
+            done = true;
+          } else if (linkStore) {
+            o1Admit["link stores on the inserted element"]++;
+            done = true;
+          }
           if (!done && !inBody && !gs && kind == 'h' && V->getType()->isPointerTy()) {
             // An element stored into a handle in a function that calls no
             // row (__llist_add, static inline: no symbol to row).

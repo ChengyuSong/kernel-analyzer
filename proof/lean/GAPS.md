@@ -3038,7 +3038,17 @@ never applied.
   function takes the same element (SSA value) and the same owner value
   (SSA value or constant GEP shape); an unmatched one fails O1 with its
   site. A row that is also owner code (timerqueue_add calls
-  rb_insert_color) is checked both ways.
+  rb_insert_color) is checked both ways. A store whose address is a
+  derived slot of several owners in the function is judged by all of
+  them, never by the first one visited (Fable 2026-10-21): it is a relink
+  if it is one under some owner; otherwise an implicit insert, matched
+  when some owner it is a derived slot of has the pairing insert row call
+  (that call's owner is the slot's owner); otherwise a link store on the
+  inserted element if it is one under some owner. The subset's
+  xfrm_policy_inexact_insert_node stores node %269 into the root or a link
+  of the inner tree %130 = &n->root, n an element of the outer tree %1:
+  the slot is %130's, matched by rb_insert_color(%269, %130); under %1 it
+  is only an element's field.
 - **Inline asm (D4):** an asm's memory effects are the graph build's
   model (asmModel, called by both): an indirect output stores each direct
   pointer (or witnessed pointer-width) input, an indirect input is read

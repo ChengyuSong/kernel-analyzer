@@ -3233,6 +3233,22 @@ static bool labelsCover(const Function &F, std::string &why) {
 
 void CallGraphPass::runSummaryProvers(Module *M) {
   curDL = &M->getDataLayout();
+  // Listings and adoption visit functions in IR order (module, then
+  // position), never in a pointer-keyed container's order.
+  DenseMap<const Function *, size_t> irPos;
+  auto inIROrder = [&](auto &&Fs) {
+    if (irPos.empty())
+      for (auto &[mod, mname] : Ctx->Modules)
+        for (const Function &F : *mod) irPos.try_emplace(&F, irPos.size());
+    std::vector<const Function *> v;
+    for (auto &&X : Fs) {
+      if constexpr (std::is_pointer_v<std::decay_t<decltype(X)>>) v.push_back(X);
+      else v.push_back(X.first);
+    }
+    for (const Function *F : v) assert(irPos.count(F) && "a listed function outside the modules");
+    llvm::sort(v, [&](const Function *a, const Function *b) { return irPos.lookup(a) < irPos.lookup(b); });
+    return v;
+  };
   // Engine check of drafted label atoms (plan 3.46): a file entry that
   // replaces a body defined here must carry the body's naming evidence.
   // MISSING: a typed step of the body the entry does not state; EXTRA: a
@@ -3240,8 +3256,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
   // can state (the entry loses it under --cfl-cells).
   if (CFLCells) {
     size_t nOk = 0, nBad = 0;
-    for (auto &[F, Sp] : Ctx->FuncSummaries) {
-      const GlobalContext::FuncSummary &S = *Sp;
+    for (const Function *F : inIROrder(Ctx->FuncSummaries)) {
+      const GlobalContext::FuncSummary &S = *Ctx->FuncSummaries.find(F)->second;
       if (F->isDeclaration() || S.none || S.body || S.fresh) continue;
       if (!S.noop && S.atoms.empty()) continue;
       std::set<std::tuple<int, int, std::string>> body, drafted;
@@ -3848,7 +3864,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                  << nRed << " redundant (prover re-derives) / " << nCore
                  << " core (audit load-bearing)\n");
       }
-      for (const Function *F : ok)
+      for (const Function *F : inIROrder(ok))
         CG_LOG("NoopProp: OK " << F->getName() << "\n");
       std::string hist;
       for (auto &kv : refuseHist)
@@ -5464,7 +5480,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
     // wiring cut, body KEPT (never g_noopBodies: their proofs allow
     // formal-independent icalls/asm which body-skip would erase).
     size_t nLabels = 0, nUncovered = 0;
-    for (const Function *F : okEmpty) {
+    for (const Function *F : inIROrder(okEmpty)) {
       if (adoptSkip(F)) continue;
       GlobalContext::FuncSummary S;
       if (CFLCells) {
@@ -5481,7 +5497,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       Ctx->FuncSummaries[F] = &Ctx->OwnedSummaries.back();
       nEmptyAd++;
     }
-    for (const Function *F : ok) {
+    for (const Function *F : inIROrder(ok)) {
       if (adoptSkip(F)) continue;
       GlobalContext::FuncSummary S;
       S.noop = true;
@@ -5506,7 +5522,8 @@ void CallGraphPass::runSummaryProvers(Module *M) {
       nNoop++;
     }
     size_t nInexact = 0;
-    for (auto &[F, pas] : props) {
+    for (const Function *F : inIROrder(props)) {
+      const auto &pas = props.find(F)->second;
       if (adoptSkip(F)) continue;
       // Under --cfl-cells an atom with a wildcard offset (@X), MVX/LDX,
       // or a two-level atom the prover proposes (no exact inner offset)

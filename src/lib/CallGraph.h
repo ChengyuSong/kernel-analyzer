@@ -289,6 +289,10 @@ protected:
     bool fieldReceiver = false, cursorSlot = false, slotUnclassified = false;
     // A struct-pointer field received it: a base-class slot, no declaration.
     bool structFieldSeen = false;
+    // A3: struct evidence against a scalar label, never a label: (struct,
+    // where) for a struct GEP on a join containing the result and for a
+    // receiving field whose debug type points to a struct.
+    std::vector<std::pair<std::string, std::string>> structAgainst;
     // A variable or field received it (declared or not): with no
     // declaration, its type declares nothing (char *, void *) by rule;
     // without one the result went straight to a return or a call.
@@ -325,6 +329,12 @@ protected:
   // string functions): marked used as bytes at mint (ruling A; a mark,
   // not a label).
   std::unordered_set<const llvm::Value *> allocBytesOnly;
+  // A3 (Fable 2026-10-21): allocations whose agreed scalar label (ruling A)
+  // meets struct evidence on the same object (a struct GEP on a join
+  // containing the result, or a receiving field declared a struct
+  // pointer): left unlabeled, a conflict; one rule report row each, in IR
+  // order.
+  std::vector<std::string> scalarConflictRows;
   // The site census's counts for the rule report (staticLabels): sites,
   // sites whose only receiver is a struct-pointer field (no declaration),
   // sites whose receiver kind is unclassified (a result slot also holding

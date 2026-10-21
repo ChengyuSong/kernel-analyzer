@@ -35,6 +35,14 @@
 
 namespace {
 
+// "function file:line" of an instruction (rule report rows).
+std::string tlLoc(const llvm::Instruction *I) {
+  std::string s = I->getFunction()->getName().str();
+  if (const llvm::DILocation *L = I->getDebugLoc())
+    s += " " + L->getFilename().str() + ":" + std::to_string(L->getLine());
+  return s;
+}
+
 std::string structKey(const llvm::StructType *ST) {
   return stripStructNameSuffix(ST->getName()).str();
 }
@@ -350,6 +358,13 @@ void CallGraphPass::labelAllocationSites(
             if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue())) {
               L.hasReceiver = true;
               if (!diPointee(MT, C->getModule()).empty()) L.structFieldSeen = true;
+              // A3: the field's declared struct pointee is evidence against
+              // a scalar label (by its debug name: the linked IR may have
+              // merged the struct away), not a label (row 3).
+              if (const StringRef N = ka::diStructName(MT, true); !N.empty())
+                L.structAgainst.push_back({"struct." + N.str(), "the receiving field struct." + Tag.str() + "+" +
+                                                                     std::to_string(A.getZExtValue()) + " at " +
+                                                                     tlLoc(SI)});
             }
             if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue());
                 MT && L.siteDeclared.empty() && L.sitePtrArray.empty() && L.siteScalar.empty()) {
@@ -463,6 +478,24 @@ void CallGraphPass::labelAllocationSites(
       else if (T->isAggregateType()) L.structAccess = true;
       else if (const std::string n = scalarName(T); !n.empty()) L.scalarTypes.insert(n);
     };
+    // A3: a struct GEP on a join (phi, select) that has the object among its
+    // incomings may step on it: evidence against a scalar label only (it
+    // may step on the other incomings).
+    std::set<const Value *> joinSeen;
+    auto joinEvidence = [&](const Value *J) {
+      std::vector<const Value *> jw{J};
+      while (!jw.empty() && joinSeen.size() < 64) {
+        const Value *X = jw.back();
+        jw.pop_back();
+        if (!joinSeen.insert(X).second) continue;
+        for (const User *JU : X->users())
+          if (isa<PHINode>(JU) || isa<SelectInst>(JU) || (isa<CastInst>(JU) && JU->getType()->isPointerTy()))
+            jw.push_back(JU);
+          else if (const auto *JG = dyn_cast<GetElementPtrInst>(JU); JG && JG->getPointerOperand() == X)
+            if (auto *ST = dyn_cast<llvm::StructType>(JG->getSourceElementType()); namedStruct(ST))
+              L.structAgainst.push_back({structKey(ST), "a join at " + tlLoc(JG)});
+      }
+    };
     for (size_t i = 0; i < work.size(); i++) {
       const auto [V, off] = work[i];
       if (off > 0) segWalk(V, off, 0);
@@ -475,6 +508,8 @@ void CallGraphPass::labelAllocationSites(
         if (const auto *CI = dyn_cast<CastInst>(U)) {
           if (CI->getType()->isPointerTy())
             push(CI, off);
+        } else if (isa<PHINode>(U) || isa<SelectInst>(U)) {
+          joinEvidence(U);
         } else if (const auto *LI = dyn_cast<LoadInst>(U)) {
           if (!LI->getType()->isPointerTy() && !LI->getType()->isAggregateType())
             L.scalarUse = true;
@@ -797,13 +832,28 @@ void CallGraphPass::staticLabels(
   };
   std::map<const CallBase *, std::string> scalarAgreed; // "" : no agreement
   std::map<const CallBase *, bool> bytesAgreed;
-  for (auto &[C, SL0] : siteLabel) {
+  // A3: struct evidence on the allocation from any creating site: struct ->
+  // where (the first in IR order).
+  std::map<const CallBase *, std::map<std::string, std::string>> against;
+  // Creating sites and allocations in IR order (siteLabel is keyed by
+  // pointer).
+  std::map<const CallBase *, size_t> irPos;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I)) irPos.emplace(CB, irPos.size());
+  std::vector<const CallBase *> sitesInIR;
+  for (auto &[C, SL0] : siteLabel) sitesInIR.push_back(C);
+  llvm::sort(sitesInIR, [&](const CallBase *a, const CallBase *b) { return irPos.at(a) < irPos.at(b); });
+  for (const CallBase *C : sitesInIR) {
+    const AllocSiteLabel &SL0 = siteLabel.at(C);
     std::set<const CallBase *> allocs;
     allocationsOfCall(C, allocs);
     const AllocSiteLabel SL = effective(C, SL0);
     const std::string e = scalarOf(SL);
     const bool b = bytesOnly(SL);
     for (const CallBase *A : allocs) {
+      for (auto &[S, where] : SL0.structAgainst) against[A].try_emplace(S, where);
       auto [it, ins] = scalarAgreed.try_emplace(A, e);
       if (!ins && it->second != e) it->second.clear();
       auto [bt, bins] = bytesAgreed.try_emplace(A, b);
@@ -888,11 +938,30 @@ void CallGraphPass::staticLabels(
       }
       if (auto it = scalarAgreed.find(A); it != scalarAgreed.end() && !it->second.empty()) {
         L.insert("scal[]:" + it->second);
+        // A3: struct evidence on the same object makes it a conflict: both
+        // candidates, no label.
+        if (auto ag = against.find(A); ag != against.end())
+          for (auto &[S, where] : ag->second) L.insert(S);
         continue;
       }
       L.insert(SL.types.begin(), SL.types.end());
       if (SL.types.empty() && !SL.declared.empty())
         L.insert(SL.declared);
+    }
+  }
+  // A3 rows: one per allocation whose scalar label met struct evidence, in
+  // IR order.
+  scalarConflictRows.clear();
+  {
+    std::vector<const CallBase *> conf;
+    for (auto &[A, e] : scalarAgreed)
+      if (!e.empty() && against.count(A)) conf.push_back(A);
+    llvm::sort(conf, [&](const CallBase *a, const CallBase *b) { return irPos.at(a) < irPos.at(b); });
+    for (const CallBase *A : conf) {
+      std::string r = tlLoc(A) + ": scal[]:" + scalarAgreed.at(A) + " vs ";
+      bool first = true;
+      for (auto &[S, where] : against.at(A)) r += (first ? "" : "; ") + S + " (" + where + ")", first = false;
+      scalarConflictRows.push_back(r);
     }
   }
   // A declared object by its debug-info type: linking unifies structurally

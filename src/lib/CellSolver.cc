@@ -9915,7 +9915,8 @@ bool CallGraphPass::runCellResolution() {
          << " arrays of pointer slots, " << heapScalarArrays << " arrays of a declared scalar, " << tailObjects
          << " header + trailing data), " << heapUnlabeled
          << " unlabeled (" << heapBytesMarked << " used as bytes from mint), " << heapConflict
-         << " with conflicting labels, "
+         << " with conflicting labels (of " << scalarConflictRows.size()
+         << " allocations whose scalar label meets struct evidence, A3), "
          << heapContainerRelabeled << " relabeled to the container their size names, "
          << heapContainerAmbiguous << " ambiguous size labels (several containers of that size; the label stays)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
@@ -10525,6 +10526,12 @@ bool CallGraphPass::runCellResolution() {
        << scalarStructWrites << " writes (" << scalarStructSteps << " struct steps); struct array followed by other "
        << "data at a variable offset (another stride over a segment array, folded into its element cells): "
        << segArrayOtherStride << " steps\n";
+    // A3: allocations whose scalar label (ruling A) meets struct evidence on
+    // the same object, left unlabeled, in IR order.
+    RO << "SUMMARY scalar label conflicts (A3): " << scalarConflictRows.size()
+       << " allocations whose agreed scalar label meets a struct GEP on a join containing the result or a receiving "
+       << "field declared a struct pointer: unlabeled, both candidates\n";
+    for (const std::string &r : scalarConflictRows) RO << "B conflict " << r << "\n";
     // Gap 2: the [1] trailing-array indexes on arrays of T, in IR order
     // (function, line; the step's after the allocation's).
     {

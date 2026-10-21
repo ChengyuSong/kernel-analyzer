@@ -1916,7 +1916,18 @@ uses, and the list must not be "completed" with them: rule 1 lets a
 fresh block take a copy source's layout (the bison YYSTYPE shape).
 memset is neutral. A creating site that classes the block otherwise
 gives neither (every site must agree; escapes of the pointer do not
-disqualify). The site's reach (row 3, Fable 2026-10-13): the receiving
+disqualify). Struct evidence against a scalar label (A3, Fable
+2026-10-21): a struct GEP on a phi or select that has the result among its
+incomings (skb_ext_add: the refcount stored as an int, then skb_ext steps
+on a phi with the old extension), or a receiving struct field whose debug
+type points to a struct (coffcode.h:1121 at -O3: comdat = bfd_alloc(16),
+->symbol stored through the result, ->name through a reload of the field,
+in the IR struct the linker merged coff_comdat_info into), makes the
+scalar label a conflict: the site is unlabeled, both candidates reported
+(rule report "B conflict", one row per allocation in IR order). Evidence
+only, never a label: the join may step on its other incomings, and the
+field is a base-class slot (row 3), so over-removal costs precision, not
+soundness. The site's reach (row 3, Fable 2026-10-13): the receiving
 declaration is a variable's or a struct field's (`opt_state->space =
 malloc(..)`: the field's declared member type, through nested members; a
 store to a struct global or local itself is its member at offset 0), a

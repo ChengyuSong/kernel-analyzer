@@ -164,6 +164,11 @@ struct Obj {
   // The trailing object is there because the size said nothing (not
   // because it said T plus data): it never takes a label of its own.
   bool tailUnsized = false;
+  // The k further elements of the header's trailing array (an allocation
+  // of sizeof(T) + k * sizeof(E), T ending in an array of E; plan 3.51's
+  // trailing arrays): labeled an array of E, and an index running on
+  // past the header's array reaches its elements.
+  bool trailingElems = false;
   // Used as bytes while unlabeled: a variable byte access, or a side of a
   // byte copy (plan 3.53 rule 1 (ii)). Its layout is its first typed use,
   // so a later struct write does not label it: a rule (b) row.
@@ -616,6 +621,23 @@ bool innermostArraySpan(Type *T, int64_t off, const DataLayout &DL, int64_t &lo,
     T = AT->getElementType();
   }
   return found;
+}
+
+// The element type of the trailing array T ends in, or null: its last
+// member, recursively, an array of 0 or 1 elements ending at T's end (the
+// flexible-array idiom `x[0]` / `x[1]`; an array declared longer is a
+// field of its own, and what follows it is a segment, labeled by its use).
+Type *trailingArrayElem(Type *T, const DataLayout &DL) {
+  for (int depth = 0; depth < 64 && T; depth++) {
+    if (auto *AT = dyn_cast<ArrayType>(T)) return AT->getNumElements() <= 1 ? AT->getElementType() : nullptr;
+    auto *ST = dyn_cast<StructType>(T);
+    if (!ST || ST->isOpaque() || ST->getNumElements() == 0) return nullptr;
+    const StructLayout *SL = DL.getStructLayout(ST);
+    const unsigned i = ST->getNumElements() - 1;
+    if (SL->getElementOffset(i) + DL.getTypeAllocSize(ST->getElementType(i)) != SL->getSizeInBytes()) return nullptr;
+    T = ST->getElementType(i);
+  }
+  return nullptr;
 }
 
 // The last store into slot S at or before I, walking back in I's block.
@@ -1793,6 +1815,9 @@ bool CallGraphPass::runCellResolution() {
     return (O.ident.empty() ? O.label : O.ident) + "+" + std::to_string(c);
   };
   // The address fact (o, off): exact, or folded (off is element 0's).
+  // A trailing object's label from its header's trailing array (A1).
+  std::function<void(Obj &, const Obj &)> trailingLabel;
+  size_t trailingElemTails = 0, trailingElemLinks = 0;
   // The trailing object of header+tail object o, minted on first use.
   size_t tailMinted = 0, tailMoved = 0, segmentsLabeled = 0, segmentArrays = 0, segmentsBytes = 0,
          segmentsPtrArrays = 0, segmentsScalarArrays = 0;
@@ -1815,6 +1840,7 @@ bool CallGraphPass::runCellResolution() {
     // (row (3): a constant-offset cast declares [c, c + sizeof B) as a
     // receiver declares T at 0; the size only ever governed the extent).
     if (segmentLabel) segmentLabel(T);
+    if (!T.layout && !T.byteAccessed && trailingLabel) trailingLabel(T, objs[o]);
     objs.push_back(std::move(T));
     objs[o].tailObj = objs.size() - 1;
     tailMinted++;
@@ -2559,6 +2585,38 @@ bool CallGraphPass::runCellResolution() {
     else if (sized && exactlyOne(ops, at, add)) extentOne++;
     else if (sized && sizeIsMultiple(ops, at, add)) { O.repeats = true; extentArrays++; }
     else { O.tail = true; O.tailUnsized = true; extentUnknown++; }
+  };
+  // A1 (Fable 2026-10-20): an allocation of sizeof(T) + k * sizeof(E) for a
+  // T that ends in a trailing array of E (`asection *sections[1]`): the size
+  // conforms, and the trailing object is the array's k further elements.
+  // Only a known constant size whose remainder past T is a whole number
+  // of elements; any other size leaves the tail as before.
+  trailingLabel = [&](Obj &T, const Obj &H) {
+    if (!H.layout || H.repeats || !H.tail || H.tailUnsized) return;
+    Type *E = trailingArrayElem(H.layout, DL);
+    if (!E || !E->isSized()) return;
+    const int64_t e = (int64_t)DL.getTypeAllocSize(E);
+    std::vector<const Value *> ops;
+    int64_t add = 0;
+    const Value *V = NF.getValueForNode(T.origin);
+    if (!e || !V || !sizeOps(V, ops, add)) return;
+    uint64_t prod = 1;
+    for (const Value *X : ops)
+      if (const auto *K = dyn_cast<ConstantInt>(sizeThrough(X))) prod *= K->getZExtValue();
+      else return;
+    const int64_t rest = (int64_t)prod + add - T.base;
+    if (rest <= 0 || rest % e) return;
+    T.layout = E;
+    T.size = e;
+    T.label = typeLabel(E);
+    T.repeats = true;
+    T.declArray = true;
+    T.trailingElems = true;
+    if (!isa<StructType>(E)) {
+      T.ident = T.label + "[]";
+      T.declScalar = !E->isPointerTy();
+    }
+    trailingElemTails++;
   };
   segmentLabel = [&](Obj &T) {
     const Value *V = NF.getValueForNode(T.origin);
@@ -3334,15 +3392,23 @@ bool CallGraphPass::runCellResolution() {
         // The unlabeled remainder: past the labeled segments (an index from
         // T landing in a segment of another label is assumed within bound).
         uint32_t t = tailOf(o);
-        while (objs[t].layout && objs[t].fwd == UINT32_MAX && objs[t].tail && !objs[t].repeats) {
-          indexInBoundedArray++;
-          t = tailOf(t);
-        }
-        if (objs[t].layout && objs[t].fwd == UINT32_MAX) indexInBoundedArray++; // the last segment: no remainder
-        else {
-          tailIndexAny++;
-          if (!objs[t].layout) tailLinkedUnlabeled.insert(t);
-          out.push_back(anyOf(t));
+        // The header's trailing array runs on into its further elements (A1).
+        // (Its own element cell is added below, as for any index.)
+        if (objs[t].trailingElems && s != 1 && inArray && innermostArraySpan(O.layout, pos, DL, lo, hi, esz) && hi >= O.size &&
+            esz == objs[t].size) {
+          trailingElemLinks++;
+          out.push_back(cellAt(t, ((pos - lo) % esz + esz) % esz));
+        } else {
+          while (objs[t].layout && objs[t].fwd == UINT32_MAX && objs[t].tail && !objs[t].repeats) {
+            indexInBoundedArray++;
+            t = tailOf(t);
+          }
+          if (objs[t].layout && objs[t].fwd == UINT32_MAX) indexInBoundedArray++; // the last segment: no remainder
+          else {
+            tailIndexAny++;
+            if (!objs[t].layout) tailLinkedUnlabeled.insert(t);
+            out.push_back(anyOf(t));
+          }
         }
       } else
         indexInBoundedArray++;
@@ -9710,6 +9776,9 @@ bool CallGraphPass::runCellResolution() {
          << heapContainerAmbiguous << " ambiguous size labels (several containers of that size; the label stays)), "
          << cells.size() << " cells (" << offCells << " named offsets, "
          << anyCells << " any-offset, " << outMints << " outside)\n");
+  CG_LOG("Cells: trailing arrays (A1): " << trailingElemTails << " trailing objects are their header's trailing array's "
+         << "further elements (size sizeof(T) + k * sizeof(E)); " << trailingElemLinks
+         << " variable indexes ran on into them\n");
   for (const auto &[k, n] : sizeLabelAmbiguous)
     CG_LOG("Cells:   ambiguous size label: " << k << " (" << n << " objects)\n");
   CG_LOG("Cells: anonymous structs label nothing: " << anonObjects

@@ -1796,6 +1796,18 @@ changes:
   bound"). The link remains for the implicit array of T (no array holds
   the address), an array ending at T's end (a trailing or flexible array,
   `[0]`, `[1]` or any N whose end is the layout's size), and a byte index.
+  Trailing-array clause (A1, Fable 2026-10-20; plan 3.51's trailing
+  arrays): a T whose last member is, recursively, an array of 0 or 1
+  elements of E ending at T's end (`asection *sections[1]`), allocated
+  with a known constant size of sizeof(T) + k * sizeof(E), k >= 1, conforms: the
+  trailing object is the array's k further elements, labeled an array of
+  E at mint, and a variable index on that array running past T's end
+  reaches its element cell at the same element offset (besides its own,
+  as any index). An array declared longer is a field of its own: what
+  follows T is a segment, labeled by its declaration or first use, as
+  below. Anything else is not a trailing array: any other size, or a
+  remainder that is not whole elements, leaves the trailing object as
+  before. Counted ("trailing arrays (A1)").
   Segment clause (Fable, 2026-10-13): an allocation is a sequence of
   segments, the header T and then the tail,
   and rule 1 applies to the tail recursively. The tail's label is the

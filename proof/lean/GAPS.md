@@ -1927,7 +1927,19 @@ scalar label a conflict: the site is unlabeled, both candidates reported
 (rule report "B conflict", one row per allocation in IR order). Evidence
 only, never a label: the join may step on its other incomings, and the
 field is a base-class slot (row 3), so over-removal costs precision, not
-soundness. The site's reach (row 3, Fable 2026-10-13): the receiving
+soundness. The merged identity (A4, Fable 2026-10-21): the IR linker
+merges structurally identical structs under one name (elflink.c:9521's
+symshndxbuf, an Elf_External_Sym_Shndx array, reads as rndx_ext), so a
+heap object labeled by an IR struct takes the debug name of a struct
+its site's own receivers declare (a variable's type or a receiving
+field's pointee, through the reach below; never a use elsewhere; the
+IR carries no sizeof type) when no IR struct has that name and its size
+is the label's. A rename only: the layout, hence every cell's offsets
+and every answer, is the IR struct's. The IR name stays, counted, when
+no receiver at any site has a debug type or the sizes differ, and
+stays, reported ("A4 identities", one row per allocation in IR order),
+when the sites name several; neither is a label conflict, since the
+layout is one. The site's reach (row 3, Fable 2026-10-13): the receiving
 declaration is a variable's or a struct field's (`opt_state->space =
 malloc(..)`: the field's declared member type, through nested members; a
 store to a struct global or local itself is its member at offset 0), a

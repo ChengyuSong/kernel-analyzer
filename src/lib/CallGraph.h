@@ -293,6 +293,11 @@ protected:
     // where) for a struct GEP on a join containing the result and for a
     // receiving field whose debug type points to a struct.
     std::vector<std::pair<std::string, std::string>> structAgainst;
+    // A4: the structs the site's receiving variables or fields point to by
+    // their debug type that the linked IR merged away under another name,
+    // with their sizes in bytes; diSeen: some receiver has a debug type.
+    std::map<std::string, uint64_t> mergedIdents;
+    bool diSeen = false;
     // A variable or field received it (declared or not): with no
     // declaration, its type declares nothing (char *, void *) by rule;
     // without one the result went straight to a return or a call.
@@ -335,6 +340,15 @@ protected:
   // pointer): left unlabeled, a conflict; one rule report row each, in IR
   // order.
   std::vector<std::string> scalarConflictRows;
+  // A4 (Fable 2026-10-20): per allocation, the debug identity its creating
+  // sites' receivers declare for a struct the linked IR merged away, and
+  // its size; applied at mint to a struct label of the same size.
+  std::unordered_map<const llvm::Value *, std::pair<std::string, uint64_t>> allocMergedIdent;
+  // A4: allocations none of whose sites has a receiver with a debug type
+  // (the IR name stays, counted), and the rows of those whose sites name
+  // several identities (the IR name stays, reported), in IR order.
+  std::unordered_set<const llvm::Value *> allocNoDI;
+  std::vector<std::string> identConflictRows;
   // The site census's counts for the rule report (staticLabels): sites,
   // sites whose only receiver is a struct-pointer field (no declaration),
   // sites whose receiver kind is unclassified (a result slot also holding

@@ -308,6 +308,23 @@ void CallGraphPass::labelAllocationSites(
       }
       return nullptr;
     };
+    // A4: a receiver's declared struct pointee that the linked IR merged
+    // away (no IR struct of its name): a debug identity of the object, with
+    // the struct's size.
+    auto noteMerged = [&](const DIType *T) {
+      if (!T) return;
+      L.diSeen = true;
+      const StringRef N = ka::diStructName(T, true);
+      if (N.empty() || llvm::StructType::getTypeByName(C->getContext(), "struct." + N.str())) return;
+      const DIType *P = T;
+      for (int i = 0; i < 16 && P; i++) {
+        const auto *D = dyn_cast<DIDerivedType>(P);
+        if (!D) break;
+        P = D->getBaseType();
+      }
+      const uint64_t sz = P ? P->getSizeInBits() / 8 : 0;
+      L.mergedIdents.try_emplace("struct." + N.str(), sz);
+    };
     // The variable that receives the result, by its declared type (plan
     // 3.53 1b: the site's own declaration comes first): a dbg.value on the
     // result, or the slot the result is stored to (dbg.declare).
@@ -315,6 +332,7 @@ void CallGraphPass::labelAllocationSites(
       SmallVector<DbgValueInst *, 2> DVs;
       findDbgValues(DVs, const_cast<CallBase *>(C));
       for (DbgValueInst *DV : DVs) {
+        noteMerged(DV->getVariable()->getType());
         L.hasReceiver = true;
         if (L.siteDeclared.empty())
           L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
@@ -357,6 +375,7 @@ void CallGraphPass::labelAllocationSites(
             Tag.consume_front("struct.");
             if (const DIType *MT = diMemberAt(accessNames->diStruct(Tag), A.getZExtValue())) {
               L.hasReceiver = true;
+              noteMerged(MT);
               if (!diPointee(MT, C->getModule()).empty()) L.structFieldSeen = true;
               // A3: the field's declared struct pointee is evidence against
               // a scalar label (by its debug name: the linked IR may have
@@ -375,6 +394,7 @@ void CallGraphPass::labelAllocationSites(
           }
           if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
             for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI))) {
+              noteMerged(DDI->getVariable()->getType());
               L.hasReceiver = true;
               if (L.siteDeclared.empty())
                 L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
@@ -962,6 +982,41 @@ void CallGraphPass::staticLabels(
       bool first = true;
       for (auto &[S, where] : against.at(A)) r += (first ? "" : "; ") + S + " (" + where + ")", first = false;
       scalarConflictRows.push_back(r);
+    }
+  }
+  // A4: the merged-away identity per allocation: the one its creating
+  // sites' receivers name (sites naming none do not count); several: the IR
+  // name stays and a row says which; no receiver with a debug type at any
+  // site: the IR name stays, counted.
+  allocMergedIdent.clear();
+  allocNoDI.clear();
+  identConflictRows.clear();
+  {
+    std::map<const CallBase *, std::map<std::string, uint64_t>> mi;
+    std::set<const CallBase *> seen;
+    std::vector<const CallBase *> order;
+    for (const CallBase *C : sitesInIR) {
+      const AllocSiteLabel &SL = siteLabel.at(C);
+      std::set<const CallBase *> allocs;
+      allocationsOfCall(C, allocs);
+      for (const CallBase *A : allocs) {
+        if (!mi.count(A)) order.push_back(A);
+        auto &ids = mi[A];
+        ids.insert(SL.mergedIdents.begin(), SL.mergedIdents.end());
+        if (SL.diSeen) seen.insert(A);
+      }
+    }
+    llvm::sort(order, [&](const CallBase *a, const CallBase *b) { return irPos.at(a) < irPos.at(b); });
+    for (const CallBase *A : order) {
+      const auto &ids = mi.at(A);
+      if (!seen.count(A)) allocNoDI.insert(A);
+      if (ids.size() == 1) allocMergedIdent.emplace(A, *ids.begin());
+      else if (ids.size() > 1) {
+        std::string r = tlLoc(A) + ":";
+        bool first = true;
+        for (auto &[id, sz] : ids) r += (first ? " " : " vs ") + id + " (" + std::to_string(sz) + " bytes)", first = false;
+        identConflictRows.push_back(r);
+      }
     }
   }
   // A declared object by its debug-info type: linking unifies structurally

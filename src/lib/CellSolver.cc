@@ -2075,6 +2075,10 @@ bool CallGraphPass::runCellResolution() {
   // Objects whose debug-info identity differs from the IR struct the
   // linker kept: (IR label, identity) -> count.
   std::map<std::pair<std::string, std::string>, size_t> identPairs;
+  // A4: heap struct objects named at mint by their site's debug type; kept
+  // on the IR name because no site receiver has a debug type; kept because
+  // the debug identity's size is not the label's (layouts differ).
+  size_t heapMergedIdents = 0, heapIdentNoDI = 0, heapIdentSizeDiffer = 0;
   auto noteIdent = [&](Obj &O, const std::string &id) {
     if (id.empty() || id == O.label) return;
     O.ident = id;
@@ -3214,6 +3218,20 @@ bool CallGraphPass::runCellResolution() {
             heapContainerAmbiguous++; // the label stays
           }
         }
+    // A4 (Fable 2026-10-20): a heap struct label whose receivers declare a
+    // struct the linked IR merged away, of the label's size, carries that
+    // debug identity (rndx_ext read as Elf_External_Sym_Shndx).
+    if (O.layout && isa<StructType>(O.layout) && O.ident.empty())
+      if (const auto *C = dyn_cast_or_null<CallBase>(V)) {
+        if (auto mi = allocMergedIdent.find(C); mi != allocMergedIdent.end()) {
+          if (mi->second.second == (uint64_t)DL.getTypeAllocSize(O.layout)) {
+            noteIdent(O, mi->second.first);
+            heapMergedIdents += O.ident == mi->second.first;
+          } else
+            heapIdentSizeDiffer++;
+        } else if (allocNoDI.count(C))
+          heapIdentNoDI++;
+      }
     // A declared array (of a scalar, ruling A; of pointer slots, 1b) is an
     // array of its element whatever the size says: no header, no trailing
     // object.
@@ -9961,7 +9979,12 @@ bool CallGraphPass::runCellResolution() {
       if (line.size() < 600) line += " " + k.second + " as " + k.first + " x" + std::to_string(c) + ";";
     }
     CG_LOG("Cells: debug-info identities the linked IR merged away: " << n << " objects ("
-           << identPairs.size() << " identity / IR struct pairs):" << line << "\n");
+           << identPairs.size() << " identity / IR struct pairs; A4: " << heapMergedIdents
+           << " heap objects named at mint by their site's debug type (of " << allocMergedIdent.size()
+           << " allocations whose sites name one), " << heapIdentNoDI
+           << " struct-labeled heap objects with no debug type at any site (IR name), " << heapIdentSizeDiffer
+           << " whose site's identity is not the label's size (IR name), " << identConflictRows.size()
+           << " allocations whose sites name several identities (IR name)):" << line << "\n");
   }
   {
     std::string why;
@@ -10532,6 +10555,13 @@ bool CallGraphPass::runCellResolution() {
        << " allocations whose agreed scalar label meets a struct GEP on a join containing the result or a receiving "
        << "field declared a struct pointer: unlabeled, both candidates\n";
     for (const std::string &r : scalarConflictRows) RO << "B conflict " << r << "\n";
+    // A4: allocations whose sites' receivers name several merged-away debug
+    // identities: the IR name stays (a rename, not a label conflict).
+    RO << "SUMMARY merged identities (A4): " << heapMergedIdents << " heap objects named at mint by their site's "
+       << "debug type; IR name kept: " << heapIdentNoDI << " with no debug type at any site, " << heapIdentSizeDiffer
+       << " whose identity is not the label's size, " << identConflictRows.size()
+       << " allocations whose sites name several identities\n";
+    for (const std::string &r : identConflictRows) RO << "A4 identities " << r << "\n";
     // Gap 2: the [1] trailing-array indexes on arrays of T, in IR order
     // (function, line; the step's after the allocation's).
     {

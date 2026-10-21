@@ -288,13 +288,7 @@ std::vector<const CallBase *> icallsInIROrder(const GlobalContext *Ctx);
 // under --cfl-cells, that these are exactly its function's indirect calls
 // in the context's set, so a scan made before the set is filled agrees.
 bool isIndirectCallSite(const CallBase *CB);
-// A deterministic order on instructions for reports, where a pointer
-// set's order follows the heap: function name, debug file:line, position
-// in the function.
-bool irOrderLess(const Instruction *A, const Instruction *B);
-struct IROrder {
-  bool operator()(const Instruction *A, const Instruction *B) const { return irOrderLess(A, B); }
-};
+// irOrderLess / IROrder: CallGraph.h.
 // The named structs bytes [lo, hi) of T lie in (T itself, members,
 // array elements folded to element 0), each with the interval inside it.
 void structCover(Type *T, int64_t lo, int64_t hi, const DataLayout &DL,

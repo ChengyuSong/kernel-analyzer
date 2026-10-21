@@ -5671,7 +5671,11 @@ void CallGraphPass::computeTaggedFields() {
     // Per tagged write excluded: the reads, and the maps by which their
     // tests admit its tag (rule report).
     std::map<const Instruction *, std::pair<std::set<const Instruction *>, std::set<std::string>>, IROrder> byW; // rows in IR order
-    for (auto &[R, ws] : p3Excluded)
+    for (auto &[R, wsHeap] : p3Excluded) {
+      // The writes were filed from unionKeyNames (pointer order): logged
+      // in IR order.
+      auto ws = wsHeap;
+      std::stable_sort(ws.begin(), ws.end(), [](const auto &a, const auto &b) { return irOrderLess(a.first, b.first); });
       for (auto &[W, tg] : ws) {
         if (!tg) continue;
         auto &bw = byW[W];
@@ -5683,6 +5687,7 @@ void CallGraphPass::computeTaggedFields() {
           CG_LOG("UnionKeys:   tag/member disagreement: " << locOf(W) << " admitted by its tag at " << locOf(R)
                  << ", another member by the census\n");
       }
+    }
     for (auto &[W, bw] : byW) {
       // Grouped by map: "<map>: 0xA -> 0xB, ...".
       std::map<std::string, std::vector<std::string>> byMap;

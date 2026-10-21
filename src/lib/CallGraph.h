@@ -21,6 +21,13 @@
 // IR predicates the graph build and the baseline's export share.
 bool shouldSkipValue(const llvm::Value *V); // compiler-introduced values
 bool containsPointerType(llvm::Type *T);   // T is or holds a pointer
+// A deterministic order on instructions for reports, where a pointer
+// set's order follows the heap: function name, debug file:line, position
+// in the function.
+bool irOrderLess(const llvm::Instruction *A, const llvm::Instruction *B);
+struct IROrder {
+  bool operator()(const llvm::Instruction *A, const llvm::Instruction *B) const { return irOrderLess(A, B); }
+};
 
 // Builds the constraint graph from IR and resolves indirect calls with
 // the rooted flows-to solver. The CFL-reachability baseline
@@ -779,8 +786,9 @@ protected:
   // (field and tag, site, map).
   std::vector<std::tuple<std::string, const llvm::Instruction *, std::string>> taggedInPlace;
   // P3 (Fable 2026-10-17): per read of both schemes, the writes it excludes
-  // by their member name (the write, tagged: a tag/member disagreement).
-  std::map<const llvm::Instruction *, std::vector<std::pair<const llvm::Instruction *, bool>>> p3Excluded;
+  // by their member name (the write, tagged: a tag/member disagreement);
+  // reads in IR order, so the log lists them the same in every build.
+  std::map<const llvm::Instruction *, std::vector<std::pair<const llvm::Instruction *, bool>>, IROrder> p3Excluded;
   size_t p3Reads = 0;
   // Per (tag-keyed read, writer): the maps on the provenance chains of the
   // tags by which the read's tests admit the writer (empty label: the

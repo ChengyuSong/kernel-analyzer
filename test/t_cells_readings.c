@@ -7,7 +7,7 @@
 // conflict, unlabeled. mk3: the receiver declares struct head, the label
 // itself, in both readings: selects nothing, a conflict.
 // CFLAGS: -O2
-// LOG: 2 whose size is k x their label and a container's, no receiver naming one, A5\), 0 relabeled to the container their size names, 1 to the container their receiver declares where the size is k x the label \(A5\)
+// LOG: 2 whose size is k x their label and a container's, no receiver naming one, A5; 0 kmem_cache_\* objects whose cache size several or no structs embedding their label have, A5b\), 0 relabeled to the container their size names, 1 to the container their receiver declares where the size is k x the label \(A5\)
 #include <stdlib.h>
 struct head { long a; long b; };
 struct cont { struct head h; void (*f)(void); long pad; };

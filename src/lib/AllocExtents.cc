@@ -535,7 +535,10 @@ CallGraphPass::SizeTerms::SizeTerms(CallGraphPass &Pass, const DataLayout &Layou
     // A row's SIZE is read before the allocator table (GAPS "Size label"):
     // an explicit row beats the table's prefix guess (kmalloc* takes arg0,
     // the cache, in kmalloc_trace(s, flags, size)).
-    if (FS && FS->fresh && !FS->sizeArgs.empty()) inner = {true, 1, FS->sizeArgs};
+    uint64_t cacheS = 0;
+    std::string cacheWhy;
+    if (cacheSize(C, cacheS, cacheWhy) == 's') inner = constT(cacheS); // A5b: the cache's object size
+    else if (FS && FS->fresh && !FS->sizeArgs.empty()) inner = {true, 1, FS->sizeArgs};
     else if (sigOf(CF->getName(), idx)) inner = {true, 1, idx};
     else if (FS && FS->fresh && !CF->isDeclaration())
       inner = termOfFn(CF);
@@ -813,6 +816,67 @@ CallGraphPass::SizeTerms::SizeTerms(CallGraphPass &Pass, const DataLayout &Layou
   };
 }
 
+char CallGraphPass::SizeTerms::cacheSize(const CallBase *C, uint64_t &S, std::string &why) {
+  const Function *CF = C->getCalledFunction();
+  if (!CF) return 'n';
+  const StringRef cn = CF->getName();
+  if (cn != "kmem_cache_alloc" && cn != "kmem_cache_zalloc" && cn != "kmem_cache_alloc_node") return 'n';
+  S = 0;
+  why.clear();
+  const auto *LI = C->arg_size() ? dyn_cast<LoadInst>(C->getArgOperand(0)->stripPointerCasts()) : nullptr;
+  const auto *G = LI ? dyn_cast<GlobalVariable>(LI->getPointerOperand()->stripPointerCasts()) : nullptr;
+  if (!G) {
+    why = "cache not a load of a global";
+    return 'r';
+  }
+  if (!G->hasLocalLinkage() && !CFLWholeProgram) {
+    why = "cache global @" + G->getName().str() + " not internal, run not whole-program";
+    return 'r';
+  }
+  // The global's copies: itself if internal, else every module's of its
+  // name (the modules are linked by name).
+  std::vector<const GlobalVariable *> copies;
+  if (G->hasLocalLinkage()) copies.push_back(G);
+  else
+    for (auto &[M, _] : P.Ctx->Modules)
+      if (const GlobalVariable *X = M->getNamedGlobal(G->getName()); X && !X->hasLocalLinkage()) copies.push_back(X);
+  const StoreInst *only = nullptr;
+  size_t stores = 0;
+  for (const GlobalVariable *X : copies) {
+    if (X->hasInitializer() && !X->getInitializer()->isNullValue()) {
+      why = "cache global @" + G->getName().str() + " has a non-null initializer";
+      return 'r';
+    }
+    for (const User *U : X->users()) {
+      if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == X) continue;
+      if (const auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand() == X && St->getValueOperand() != X) {
+        stores++, only = St;
+        continue;
+      }
+      why = "cache global @" + G->getName().str() + " used other than loaded and stored";
+      return 'r';
+    }
+  }
+  if (stores != 1) {
+    why = "cache global @" + G->getName().str() + " stored " + std::to_string(stores) + " times";
+    return 'r';
+  }
+  const auto *CC = dyn_cast<CallBase>(only->getValueOperand()->stripPointerCasts());
+  const Function *KF = CC ? CC->getCalledFunction() : nullptr;
+  if (!KF || (KF->getName() != "kmem_cache_create" && KF->getName() != "kmem_cache_create_usercopy")) {
+    why = "cache global @" + G->getName().str() + " stored a value not made by kmem_cache_create";
+    return 'r';
+  }
+  const auto *K = CC->arg_size() > 1 ? dyn_cast<ConstantInt>(CC->getArgOperand(1)) : nullptr;
+  if (!K || K->isZero()) {
+    why = "cache global @" + G->getName().str() + ": kmem_cache_create's size not a nonzero constant";
+    return 'r';
+  }
+  S = K->getZExtValue();
+  why = "@" + G->getName().str();
+  return 's';
+}
+
 CallGraphPass::SizeTerms::Extent CallGraphPass::SizeTerms::extentOf(Type *layout, uint64_t at, const Value *V) {
   Extent E;
   const auto *C = dyn_cast_or_null<CallBase>(V);
@@ -926,13 +990,65 @@ CallGraphPass::SizeTerms::HeapMint CallGraphPass::SizeTerms::heapMint(const Call
       H.anon = true;
     }
   }
+  // A5b (Fable 2026-10-21): a kmem_cache_* object is one object of its
+  // cache's size: the label itself when that is its size, else the one
+  // struct of that size embedding the label at offset 0 (k_itimer: its
+  // list_head written first, 256 bytes); several such structs, or none: a
+  // conflict, unlabeled, with its row. Never an array of the label, so
+  // neither the size label nor A5a's readings below apply.
+  uint64_t cacheS = 0;
+  std::string cacheWhy;
+  const char ck = cacheSize(C, cacheS, cacheWhy);
+  if (ck == 'r') {
+    H.cache = 'x';
+    H.cacheRow = cacheWhy;
+  } else if (ck == 's') {
+    const std::string cacheText = "cache " + cacheWhy + " " + std::to_string(cacheS);
+    H.cacheRow = cacheText;
+    if (!H.layout) H.cache = 'u';
+    else if (H.declArray) H.cache = 'k';
+    else {
+      auto *LS = dyn_cast<StructType>(H.layout);
+      assert(LS && "a heap label not declared an array is a struct");
+      if ((uint64_t)H.size == cacheS) H.cache = 'l';
+      else {
+        std::map<std::string, std::vector<StructType *>> cands; // container name -> its IR types
+        if (const StructInfo *SI = P.Ctx->structAnalyzer.getStructInfo(LS, const_cast<Module *>(C->getModule())))
+          for (auto &[ct, offs] : SI->getContainers())
+            if (offs.count(0) && ct->isSized() && DL.getTypeAllocSize(const_cast<StructType *>(ct)) == cacheS)
+              cands[stripStructNameSuffix(ct->getName()).str()].push_back(const_cast<StructType *>(ct));
+        bool one = cands.size() == 1;
+        if (one)
+          for (StructType *T2 : cands.begin()->second)
+            one &= T2 == cands.begin()->second[0] || T2->isLayoutIdentical(cands.begin()->second[0]);
+        if (one) {
+          H.layout = cands.begin()->second[0];
+          H.size = (int64_t)cacheS;
+          H.label = typeLabel(H.layout);
+          H.cache = 'r';
+        } else {
+          std::string row = cacheText + ": " + typeLabel(LS) + " (" + std::to_string(H.size) + ")";
+          for (auto &[cn, ts] : cands) row += " vs " + cn + " (" + std::to_string(cacheS) + ")";
+          if (cands.empty()) row += ", no struct of that size embeds it at 0";
+          H.cacheRow = row;
+          H.cache = cands.empty() ? 'n' : 'c';
+          H.layout = nullptr;
+          H.label.clear();
+          H.size = 0;
+          H.repeats = false;
+          H.labelKind = 'c';
+        }
+      }
+    }
+  }
+  const bool cacheSized = ck == 's';
   // A constant size larger than the label where some struct of exactly
   // that size starts with the label: the label is the first member of a
   // container (C inheritance: the allocating code writes only `pub`),
   // not a header before trailing data (GAPS "Size label"). One such
   // container: its type; several (cjpeg -O3: huff and phuff encoders are
   // both 200 bytes): the label stays, counted with the candidates.
-  if (H.layout && H.repeats)
+  if (H.layout && H.repeats && !cacheSized)
     if (const auto *ST = dyn_cast<StructType>(H.layout)) {
       size_t n = 0;
       if (StructType *CT = containerOfSize(C, ST, H.size, n)) {
@@ -953,7 +1069,7 @@ CallGraphPass::SizeTerms::HeapMint CallGraphPass::SizeTerms::heapMint(const Call
   // The site's own receivers select: a declaration naming one such C names
   // the object C; a declaration naming L is in both readings and selects
   // nothing. Not selected: a conflict, unlabeled, with its row.
-  if (H.layout && H.repeats && !H.declArray)
+  if (H.layout && H.repeats && !H.declArray && !cacheSized)
     if (auto *LS = dyn_cast<StructType>(H.layout)) {
       std::vector<const Value *> ops;
       int64_t add = 0;

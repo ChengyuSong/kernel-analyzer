@@ -169,6 +169,15 @@ struct CallGraphPass::SizeTerms {
   std::vector<std::string> *ambiguousNote = nullptr;
   std::map<std::string, size_t> sizeLabelAmbiguous; // "S at k: {candidates}" -> objects
 
+  // A5b (Fable 2026-10-21): the size of a kmem_cache_alloc,
+  // kmem_cache_zalloc or kmem_cache_alloc_node call is its cache's object
+  // size when the cache is a load of a global whose one write (null
+  // initializer, every other use a load) stores a kmem_cache_create or
+  // kmem_cache_create_usercopy call with a constant size; the global
+  // internal or the run whole-program (then its every module's copy is
+  // read). 'n': not such a call; 's': *S; 'r': refused, *why.
+  char cacheSize(const llvm::CallBase *C, uint64_t &S, std::string &why);
+
   // The extent a label covers (plan 3.53, rule 1): a T at the start, and
   // what the allocation's size says of the rest, for a label whose end is
   // byte `at` of the allocation V. A constant or a multiple of T's size is
@@ -210,6 +219,14 @@ struct CallGraphPass::SizeTerms {
     // (readings: the row's text, "k x L (sz) vs C (S), ...").
     char readings = 0;
     std::string readingsRow;
+    // A5b: a slab object is one object of its cache's size. 'l' the label
+    // is that size; 'r' named by the one struct of that size embedding the
+    // label at 0; 'c' several such structs, 'n' none (both unlabeled, a
+    // conflict); 'u' no mint label; 'k' a declared array, kept; 'x' the
+    // cache's size refused. cacheRow: the row's text (the cache, its size,
+    // the candidates; or why refused).
+    char cache = 0;
+    std::string cacheRow;
     // Per-site counts the mint made (see zeroNote, ambiguousNote).
     std::vector<const llvm::CallBase *> zeroProduct;
     std::vector<std::string> ambiguous;

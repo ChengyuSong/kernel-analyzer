@@ -1961,7 +1961,27 @@ site in IR order, over every site, not only those a capped solve
 reaches). Receivers naming several Cs: a conflict too. Never kept as an
 array of L when a C reads it: picking either reading unchecked misnames
 the other's cells; unlabeled, the object's cells are bytes, which costs
-precision, not soundness. The site's reach (row 3, Fable 2026-10-13): the receiving
+precision, not soundness. The cache sizes (A5b, Fable 2026-10-21): a
+kmem_cache_alloc, kmem_cache_zalloc or kmem_cache_alloc_node object is one
+object of its cache's size, when the cache argument is a load of a global
+whose only write (null initializer; every other use a load) stores a
+kmem_cache_create or kmem_cache_create_usercopy call with a constant
+nonzero size, and the global is internal or the run whole-program (then
+the write is looked for in every module's copy of the name); otherwise
+refused, the reason counted and the site listed. One object, never an
+array (a slab hands out one object per call): the label itself when its
+size is the cache's; else the one struct of the cache's size embedding the
+label at offset 0 names it (-O2 kernel do_timer_create: list_head, the
+first member its init writes, in @posix_timers_cache of 256 bytes, is
+struct k_itimer); several such structs, or none: a conflict, unlabeled,
+its row. A site with no mint label keeps its size term (rows "no mint
+label", for the census-only names to come); a declared array (a scalar's)
+is kept. The size label and A5a's readings do not apply to a sized cache
+object. The mint table that holds these decisions (05ed76b; the solve's
+only source since A5a) is rebuilt before every solve iteration: a later
+iteration marks allocation sites the first did not, at indirect calls the
+previous solve resolved to an allocator (cjpeg jinit_read_gif rdgif.c:707
+-> alloc_small), and a table built once would have no entry for them. The site's reach (row 3, Fable 2026-10-13): the receiving
 declaration is a variable's or a struct field's (`opt_state->space =
 malloc(..)`: the field's declared member type, through nested members; a
 store to a struct global or local itself is its member at offset 0), a

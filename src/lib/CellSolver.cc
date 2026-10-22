@@ -1851,6 +1851,27 @@ bool CallGraphPass::runCellResolution() {
       if (H.readings == 'r') heapReadingsRelabeled++;
       if (H.readings == 'c') readingsRows.push_back({C, instLoc(C) + ": " + H.readingsRow});
     }
+  // A5b: the kmem_cache_* allocations by what their cache's size makes of
+  // them (HeapMint::cache), over every site of the table, in IR order;
+  // rows: the conflicts, the refusals, the sites with no mint label.
+  std::map<char, size_t> cacheKinds;
+  std::map<std::string, size_t> cacheRefusals; // why, without the global -> sites
+  std::vector<std::pair<const CallBase *, std::string>> cacheRows;
+  if (mintTable)
+    for (const CallBase *C : mintTable->order) {
+      const SizeTerms::HeapMint &H = mintTable->at.at(C);
+      if (!H.cache) continue;
+      cacheKinds[H.cache]++;
+      if (H.cache == 'x') {
+        const std::string &w = H.cacheRow;
+        const size_t q = w.find(" @"), e = q == std::string::npos ? q : w.find_first_of(" :", q + 2);
+        cacheRefusals[q == std::string::npos ? w : w.substr(0, q) + (e == std::string::npos ? "" : w.substr(e))]++;
+      }
+      if (H.cache == 'c' || H.cache == 'n') cacheRows.push_back({C, "conflict " + instLoc(C) + ": " + H.cacheRow});
+      else if (H.cache == 'x') cacheRows.push_back({C, "refused " + instLoc(C) + ": " + H.cacheRow});
+      else if (H.cache == 'u') cacheRows.push_back({C, "no mint label " + instLoc(C) + ": " + H.cacheRow});
+      else if (H.cache == 'r') cacheRows.push_back({C, "named " + instLoc(C) + ": " + H.cacheRow + " -> " + H.label});
+    }
   auto noteIdent = [&](Obj &O, const std::string &id) {
     if (id.empty() || id == O.label) return;
     O.ident = id;
@@ -9077,7 +9098,9 @@ bool CallGraphPass::runCellResolution() {
          << " unlabeled (" << heapBytesMarked << " used as bytes from mint), " << heapConflict
          << " with conflicting labels (of " << scalarConflictRows.size()
          << " allocations whose scalar label meets struct evidence, A3; " << readingsRows.size()
-         << " whose size is k x their label and a container's, no receiver naming one, A5), "
+         << " whose size is k x their label and a container's, no receiver naming one, A5; "
+         << (cacheKinds.count('c') ? cacheKinds.at('c') : 0) + (cacheKinds.count('n') ? cacheKinds.at('n') : 0)
+         << " kmem_cache_* objects whose cache size several or no structs embedding their label have, A5b), "
          << heapContainerRelabeled << " relabeled to the container their size names, " << heapReadingsRelabeled
          << " to the container their receiver declares where the size is k x the label (A5), "
          << heapContainerAmbiguous << " ambiguous size labels (several containers of that size; the label stays)), "
@@ -9093,6 +9116,18 @@ bool CallGraphPass::runCellResolution() {
            << withTable(&SizeTerms::sizeHeaderStore) << " header carves by the store H := c + n, "
            << withTable(&SizeTerms::sizeZextMask) << " zext masks read as -al; " << unknownFns
            << " fresh functions still unknown\n");
+  }
+  {
+    size_t sized = 0, all = 0;
+    for (auto &[k, n] : cacheKinds) all += n, sized += k != 'x' ? n : 0;
+    std::string refused;
+    for (auto &[w, n] : cacheRefusals) refused += (refused.empty() ? "" : ", ") + std::to_string(n) + " " + w;
+    auto kind = [&](char k) { auto it = cacheKinds.find(k); return it == cacheKinds.end() ? (size_t)0 : it->second; };
+    CG_LOG("Cells: cache sizes (A5b): " << all << " kmem_cache_* allocations, " << sized << " sized by their cache ("
+           << kind('l') << " its label's size, " << kind('r') << " named by the one struct of that size embedding the label, "
+           << kind('c') << " several such structs and " << kind('n') << " none: unlabeled, " << kind('u')
+           << " with no mint label, " << kind('k') << " declared arrays kept), " << kind('x') << " refused"
+           << (refused.empty() ? "" : " (" + refused + ")") << "\n");
   }
   CG_LOG("Cells: trailing arrays (A1): " << trailingElemTails << " trailing objects are their header's trailing array's "
          << "further elements (size sizeof(T) + k * sizeof(E)); " << trailingElemLinks
@@ -9711,6 +9746,19 @@ bool CallGraphPass::runCellResolution() {
        << " heap objects named by the container their receiver declares where the size is k x the label; "
        << readingsRows.size() << " allocations with no receiver naming a container: unlabeled, every reading\n";
     for (const auto &[C, r] : readingsRows) RO << "A5 readings " << r << "\n";
+    // A5b: the kmem_cache_* allocations their cache sizes, in IR order.
+    std::stable_sort(cacheRows.begin(), cacheRows.end(),
+                     [&](const auto &a, const auto &b) { return stableKey(a.first) < stableKey(b.first); });
+    {
+      size_t all = 0;
+      for (auto &[k, n] : cacheKinds) all += n;
+      auto kind = [&](char k) { auto it = cacheKinds.find(k); return it == cacheKinds.end() ? (size_t)0 : it->second; };
+      RO << "SUMMARY cache sizes (A5b): " << all << " kmem_cache_* allocations: " << kind('l')
+         << " the label's size, " << kind('r') << " named by the one struct of the cache's size embedding the label, "
+         << kind('c') + kind('n') << " conflicts (unlabeled), " << kind('u') << " with no mint label, " << kind('k')
+         << " declared arrays kept, " << kind('x') << " refused\n";
+    }
+    for (const auto &[C, r] : cacheRows) RO << "A5b " << r << "\n";
     // A4: allocations whose sites' receivers name several merged-away debug
     // identities: the IR name stays (a rename, not a label conflict).
     RO << "SUMMARY merged identities (A4): " << heapMergedIdents << " heap objects named at mint by their site's "

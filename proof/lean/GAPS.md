@@ -1946,7 +1946,17 @@ or dbg.declare, is the call's own frame or one the call was inlined into
 receiving field's pointee; a frame inlined beside the call that the value
 is passed to is not (-O3 _bfd_x86_elf_link_hash_table_create: the formal
 `table` of the inlined _bfd_link_hash_table_init is excluded, `ret` and
-bfd_zmalloc's `ptr` count). The size readings (A5a, Fable 2026-10-21): a
+bfd_zmalloc's `ptr` count). One frame rule for every site source (A5c,
+Fable 2026-10-21): the site's declaration (siteDeclared, sitePtrArray,
+siteScalar: the variable that receives the result, by dbg.value or by
+the dbg.declare of the slot it is stored to) is read through the same
+rule, so an inlined sibling's formal is never the site's label (it is
+that function's variable; it still counts as a receiver, so the site is
+"received by a variable whose type declares nothing" when no own receiver
+declares). Counted before it was made (s3/A5cm): no mint label changes
+over the 5,345 sites of the twelve gate programs; -O3
+libbfd.c:275 keeps elf_x86_link_hash_table, now by `ret` itself instead
+of `table` (bfd_link_hash_table) and A5a's reading. The size readings (A5a, Fable 2026-10-21): a
 constant size S = k x sizeof(L), k >= 2, with L a struct label and the
 extent an array, is an array of L by rule 1, and it is also any struct C
 that embeds L at offset 0 with sizeof(C) = S (the embedding table): C

@@ -1,11 +1,16 @@
 // t_cells_readings.c — A5a (Fable 2026-10-21): a constant size that is k x
 // the label's and also a container's (struct cont and struct other embed
 // struct head at offset 0, 32 = 2 x 16) has two readings; the site's own
-// receivers select. mk: the label comes from the inlined init_head's formal
-// (struct head *), the receiver `c` in mk's own frame declares struct cont:
-// named struct cont. mk2: the receiver is a void *: no declaration, a
-// conflict, unlabeled. mk3: the receiver declares struct head, the label
-// itself, in both readings: selects nothing, a conflict.
+// receivers select. mk: the receiver `c` in mk's own frame declares struct
+// cont, which names the site directly (A5c: the inlined init_head's formal
+// struct head * is not mk's variable, so it no longer labels the site).
+// mk4: the receiver is the field holder.p (struct cont *); the label is the
+// struct head the inlined init_head writes, and the field's struct cont
+// selects the container: named struct cont (before A5c the formal's struct
+// head was the site's declaration, a conflict). mk2: the receiver is a
+// void *: no declaration, a conflict, unlabeled. mk3: the receiver declares
+// struct head, the label itself, in both readings: selects nothing, a
+// conflict.
 // CFLAGS: -O2
 // LOG: 2 whose size is k x their label and a container's, no receiver naming one, A5; 0 kmem_cache_\* objects whose cache size several or no structs embedding their label have, A5b\), 0 relabeled to the container their size names, 1 to the container their receiver declares where the size is k x the label \(A5\)
 #include <stdlib.h>
@@ -18,6 +23,7 @@ static void init_head(struct head *h) { h->a = 1; h->b = 2; }
 struct cont *gc;
 struct other *go;
 void *gv;
+struct holder { long tag; struct cont *p; } hold;
 __attribute__((noinline)) void mk(void) {
   struct cont *c = malloc(sizeof *c);
   init_head(&c->h);
@@ -33,9 +39,13 @@ __attribute__((noinline)) void mk3(void) {
   init_head(h);
   go = (struct other *)h;
 }
+__attribute__((noinline)) void mk4(void) {
+  hold.p = malloc(sizeof(struct cont));
+  init_head((struct head *)hold.p);
+}
 __attribute__((noinline)) void set(void) { gc->f = fa; go->g = fb; }
 int main(void) {
-  mk(); mk2(); mk3(); set();
+  mk(); mk2(); mk3(); mk4(); set();
   gc->f(); // CHECK: fa CHECK-NOT: fb
   go->g();
   return 0;

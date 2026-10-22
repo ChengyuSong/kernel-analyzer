@@ -346,13 +346,17 @@ void CallGraphPass::labelAllocationSites(
     };
     // The variable that receives the result, by its declared type (plan
     // 3.53 1b: the site's own declaration comes first): a dbg.value on the
-    // result, or the slot the result is stored to (dbg.declare).
+    // result, or the slot the result is stored to (dbg.declare). Only a
+    // variable in the call's own frame declares (A5c, the frame rule A4 and
+    // A5a use): an inlined sibling's formal is that function's, not the
+    // site's.
     {
       SmallVector<DbgValueInst *, 2> DVs;
       findDbgValues(DVs, const_cast<CallBase *>(C));
       for (DbgValueInst *DV : DVs) {
-        if (own(DV->getVariable(), DV->getDebugLoc())) noteMerged(DV->getVariable()->getType());
         L.hasReceiver = true;
+        if (!own(DV->getVariable(), DV->getDebugLoc())) continue;
+        noteMerged(DV->getVariable()->getType());
         if (L.siteDeclared.empty())
           L.siteDeclared = diPointee(DV->getVariable()->getType(), C->getModule());
         if (L.sitePtrArray.empty())
@@ -413,8 +417,9 @@ void CallGraphPass::labelAllocationSites(
           }
           if (const auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()->stripPointerCasts()))
             for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI))) {
-              if (own(DDI->getVariable(), DDI->getDebugLoc())) noteMerged(DDI->getVariable()->getType());
               L.hasReceiver = true;
+              if (!own(DDI->getVariable(), DDI->getDebugLoc())) continue;
+              noteMerged(DDI->getVariable()->getType());
               if (L.siteDeclared.empty())
                 L.siteDeclared = diPointee(DDI->getVariable()->getType(), C->getModule());
               if (L.sitePtrArray.empty())

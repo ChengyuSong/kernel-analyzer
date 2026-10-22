@@ -1853,7 +1853,8 @@ bool CallGraphPass::runCellResolution() {
     }
   // A5b: the kmem_cache_* allocations by what their cache's size makes of
   // them (HeapMint::cache), over every site of the table, in IR order;
-  // rows: the conflicts, the refusals, the sites with no mint label.
+  // rows: the conflicts, the refusals, the sites with no mint label, the
+  // named and the declared arrays kept (the label's size alone has none).
   std::map<char, size_t> cacheKinds;
   std::map<std::string, size_t> cacheRefusals; // why, without the global -> sites
   std::vector<std::pair<const CallBase *, std::string>> cacheRows;
@@ -1871,6 +1872,8 @@ bool CallGraphPass::runCellResolution() {
       else if (H.cache == 'x') cacheRows.push_back({C, "refused " + instLoc(C) + ": " + H.cacheRow});
       else if (H.cache == 'u') cacheRows.push_back({C, "no mint label " + instLoc(C) + ": " + H.cacheRow});
       else if (H.cache == 'r') cacheRows.push_back({C, "named " + instLoc(C) + ": " + H.cacheRow + " -> " + H.label});
+      else if (H.cache == 'k')
+        cacheRows.push_back({C, "declared array kept " + instLoc(C) + ": " + H.cacheRow + ", label " + H.label});
     }
   auto noteIdent = [&](Obj &O, const std::string &id) {
     if (id.empty() || id == O.label) return;

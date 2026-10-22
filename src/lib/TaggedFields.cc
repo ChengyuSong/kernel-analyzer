@@ -5188,8 +5188,9 @@ void CallGraphPass::computeTaggedFields() {
                              " reads keyed by predicates of both");
     }
     // Plan 3.54: an entry-keyed read admits the union of its fields'
-    // admissions, intersected with what a test of every entry admits.
-    std::map<const Instruction *, const EntryAdm *> entryKeyedF;
+    // admissions, intersected with what a test of every entry admits. In IR
+    // order: it orders taggedEntryFormals, so the T entry rows.
+    std::map<const Instruction *, const EntryAdm *, IROrder> entryKeyedF;
     for (auto &[I, ea] : entryAdm) {
       if (entryAll.count(I)) continue;
       const std::vector<size_t> u(ea.adm.begin(), ea.adm.end());

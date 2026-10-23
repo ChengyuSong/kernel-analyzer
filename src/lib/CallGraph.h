@@ -770,6 +770,18 @@ protected:
   std::vector<std::string> siteNameRows;             // not named, IR order (rule report)
   std::string siteNameSummary;
   void buildSiteNames();
+  // Packed partial arrays (Fable 2026-10-22, rule (a)): a global whose
+  // debug type is an array of T and whose IR type is a literal struct (a
+  // partially initialized array, an array of union-initialized elements)
+  // is labeled T[n] when its premise holds: equal allocation sizes, and
+  // every leaf of the literal starts, modulo sizeof(T), at a leaf of T
+  // with the same pointer-ness (padding: zero or undef). TypeLabels.cc;
+  // the cells read a global's layout through globalLayout.
+  std::map<const llvm::GlobalVariable *, llvm::Type *> packedArrayLayout;
+  std::vector<std::string> packedArrayRows;    // IR order: labeled, then not labeled (rule report)
+  size_t packedArrayLabeled = 0, packedArrayRefused = 0;
+  void labelPackedArrays();
+  llvm::Type *globalLayout(const llvm::GlobalVariable *GV) const;
   // A write of `bytes` at byte `off` of S's L, of value V (type VT):
   // "" when its span is a run of whole fields of L with pointer-ness equal
   // per field (B5), else why not. A union slot is the union census's.

@@ -674,6 +674,8 @@ bool CallGraphPass::doModulePass(Module *M) {
   if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
   if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
+    labelPackedArrays(); // rule (a): before anything reads a global's layout
+  if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
     computeLinkWords(); // plan 3.55 R1: tagged-pointer link words (report only; read by R3's LINKWORD storage)
 
   if (CFLConfirmInvoke && iteration == 0 && M == Ctx->Modules.front().first)

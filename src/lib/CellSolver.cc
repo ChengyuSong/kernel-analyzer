@@ -2320,7 +2320,7 @@ bool CallGraphPass::runCellResolution() {
     Obj O;
     O.origin = origin;
     if (const auto *GV = dyn_cast_or_null<GlobalVariable>(V)) {
-      O.layout = GV->getValueType();
+      O.layout = globalLayout(GV); // a packed partial array: its DI array (rule (a))
     } else if (const auto *AI = dyn_cast_or_null<AllocaInst>(V)) {
       O.layout = AI->getAllocatedType();
       O.repeats = AI->isArrayAllocation();
@@ -2640,6 +2640,19 @@ bool CallGraphPass::runCellResolution() {
   extendToArrayFn = extendToArray;
   // arr: the result is an element address of its byte array (provenance).
   // elem: the element struct the index steps over (typed evidence).
+  // The (b) count (Fable 2026-10-22, measurement): steps over a labeled
+  // object that is not an array, by the step's site and the object's label:
+  // a variable index (it stays at its offset), a constant element index
+  // outside an array (it moves as a byte offset), a walk (a stride cycle:
+  // the walk stays at its residue). bKindNow marks the step being made;
+  // stepBKind keeps it for the memoized step.
+  char bKindNow = 0;
+  std::map<std::tuple<uint32_t, int64_t, uint32_t>, char> stepBKind;
+  std::map<std::pair<const Instruction *, std::string>, std::array<size_t, 3>> bSites;
+  auto recordB = [&](uint32_t dst, uint32_t o, char k) {
+    const auto *I = dst < G ? dyn_cast_or_null<Instruction>(NF.getValueForNode(dst)) : nullptr;
+    bSites[{I, objs[o].label}][k == 'v' ? 0 : k == 'k' ? 1 : 2]++;
+  };
   auto strideCells = [&](uint32_t o, int64_t x, int64_t s,
                          std::vector<uint32_t> &out, bool arr, const StructType *elem) {
     auto folded = [&](uint32_t o2, int64_t at) { return arr ? cellAtArr(o2, at) : cellAt(o2, at); };
@@ -2727,7 +2740,7 @@ bool CallGraphPass::runCellResolution() {
       // points to is a single object (the object itself, or one embedded
       // in it), an array of one: the index stays (counted: undefined
       // behavior past element 0).
-      if (!O.repeats) indexOutsideArray++;
+      if (!O.repeats) indexOutsideArray++, bKindNow = 'v';
       // A T followed by data: the index is some element, an address of
       // the implicit array (folded), so a constant step after it (`p[i -
       // 1]`) stays in the element instead of leaving the T.
@@ -2783,6 +2796,7 @@ bool CallGraphPass::runCellResolution() {
     if (!ins) return it->second;
     std::vector<uint32_t> res;
     stepCalls++;
+    bKindNow = 0;
     assert(li < lazyLabels.size() && o < objs.size() && "stepOne: a label or object out of range");
     // The member's own cell at `off` (an Off cell of object o).
     const Cell C{o, CellKind::Off, off, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0};
@@ -2872,7 +2886,7 @@ bool CallGraphPass::runCellResolution() {
                            inArray;
         if (L.arith && L.extent > 1 && L.off % L.extent == 0 && !O.tail && !inArray &&
             L.off != 0)
-          indexAsOffset++;
+          indexAsOffset++, bKindNow = 'k';
         if (index && L.off != 0) indexStays++;
         // An untyped constant offset k from inside an array of bytes (n
         // elements; folded, the address stands for every element). Where
@@ -2928,6 +2942,7 @@ bool CallGraphPass::runCellResolution() {
     }
     std::sort(res.begin(), res.end());
     res.erase(std::unique(res.begin(), res.end()), res.end());
+    if (bKindNow) stepBKind[key] = bKindNow;
     auto &slot = stepMemo[key]; // cellAt may rehash
     slot = std::move(res);
     return slot;
@@ -4552,6 +4567,7 @@ bool CallGraphPass::runCellResolution() {
     for (size_t i = 0; i < memb[f].size(); i++) {
       const Member mb = memb[f][i];
       const std::vector<uint32_t> &R = stepOne(mb.first, mb.second, li);
+      if (auto bk = stepBKind.find({mb.first, mb.second, li}); bk != stepBKind.end()) recordB(dst, mb.first, bk->second);
       if (objs[mb.first].rowLaidOut) {
         // A row object's access past its T: the outside cell is another
         // type's field, dropped (the row-object access rule).
@@ -4573,6 +4589,7 @@ bool CallGraphPass::runCellResolution() {
   std::vector<uint32_t> walkOut;
   walkOne = [&](uint32_t o, int64_t c, uint32_t li, int64_t g, uint32_t dst) {
     walkOut.clear();
+    bKindNow = 0;
     // An index walk (p++) stays where it is; a member-step walk moves by
     // its member offset first. An untyped offset walking from inside a
     // byte array (bufpt[-1] in a loop) is an index of the array: it stays
@@ -4593,11 +4610,13 @@ bool CallGraphPass::runCellResolution() {
           byteWalkStructRel++;
           strideCells(o, decOff(c) + L.off, g, walkOut, false, L.elem);
         }
+        if (bKindNow == 'v') recordB(dst, o, 'w');
         for (uint32_t f2 : walkOut) add(dst, f2);
         return;
       }
     }
     strideCells(o, decOff(c) + (L.arith || L.stride ? 0 : L.off), g, walkOut, arr, L.elem);
+    if (bKindNow == 'v') recordB(dst, o, 'w');
     for (uint32_t f2 : walkOut) add(dst, f2);
   };
   auto applyWalk = [&](uint32_t f, const FieldEdge &e) {
@@ -7639,6 +7658,25 @@ bool CallGraphPass::runCellResolution() {
            << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped
            << " owner facts not an object offset)\n");
 
+  {
+    // The (b) count: per site (IR order) and object label.
+    std::vector<std::pair<std::pair<const Instruction *, std::string>, std::array<size_t, 3>>> bs(bSites.begin(), bSites.end());
+    std::stable_sort(bs.begin(), bs.end(), [](const auto &x, const auto &y) {
+      const Instruction *a = x.first.first, *b = y.first.first;
+      if (!a || !b) return a && !b;
+      return irOrderLess(a, b);
+    });
+    std::array<size_t, 3> tot{}, sites{};
+    for (const auto &[k, c] : bs)
+      for (int i = 0; i < 3; i++) tot[i] += c[i], sites[i] += c[i] > 0;
+    CG_LOG("Cells: (b) count: over a labeled object that is not an array: " << tot[0]
+           << " variable-index steps at " << sites[0] << " (site, label) pairs (the index stays at its offset), " << tot[1]
+           << " constant element indexes at " << sites[1] << " (moved as a byte offset), " << tot[2] << " walks at "
+           << sites[2] << " (a stride cycle: the walk stays at its residue)\n");
+    for (const auto &[k, c] : bs)
+      CG_LOG("Cells:   (b) " << (k.first ? instLoc(k.first) : std::string("?")) << " over " << k.second << ": "
+                            << c[0] << " variable-index, " << c[1] << " constant-index, " << c[2] << " walk\n");
+  }
   CG_LOG("Cells: " << walkEdges << " field edges on cycles (pointer walks), "
          << walkSteps << " walk steps, " << indexOutsideArray
          << " variable indexes on a single object (array of one), " << segArrayOtherStride
@@ -9868,6 +9906,13 @@ bool CallGraphPass::runCellResolution() {
          << " declared arrays kept, " << kind('x') << " refused\n";
     }
     for (const auto &[C, r] : cacheRows) RO << "A5b " << r << "\n";
+    // Rule (a): globals labeled by their DI array, and those whose premise
+    // fails, in IR order.
+    if (!packedArrayRows.empty()) {
+      RO << "SUMMARY packed arrays (a): " << packedArrayLabeled << " globals labeled by their DI array, "
+         << packedArrayRefused << " not labeled\n";
+      for (const std::string &r : packedArrayRows) RO << "PACKED " << r << "\n";
+    }
     // B: site names; the sites not named, and the (c) breaks, in IR order.
     if (!siteNames.empty()) {
       RO << "SUMMARY site names (B): " << siteNameSummary << "; learned " << siteLearned << "; (c) checked at solve "

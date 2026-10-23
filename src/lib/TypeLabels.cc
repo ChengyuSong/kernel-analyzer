@@ -1144,7 +1144,7 @@ void CallGraphPass::runTypeLabelCensus(
   auto declOf = [&](const Value *V, OriginLabel &L) {
     Type *T = nullptr;
     if (const auto *GV = dyn_cast<GlobalVariable>(V))
-      T = GV->getValueType();
+      T = globalLayout(GV);
     else if (const auto *AI = dyn_cast<AllocaInst>(V))
       T = AI->getAllocatedType();
     if (!T)
@@ -1742,4 +1742,197 @@ void CallGraphPass::runTypeLabelCensus(
          << " unknown), b " << bAcc.size() << " accesses (" << bOnly.size()
          << " only-incompatible), c " << ruleC.size() << " -> "
          << CFLRuleReport << "\n";
+}
+
+// ---- Packed partial arrays (Fable 2026-10-22, rule (a)) ----
+//
+// clang emits a partially initialized array (`f_t tbl[16] = {[1] = f, [5] =
+// f}`), or an array whose elements' unions are initialized by different
+// members, as a literal struct: `<{ ptr x6, [10 x ptr] zeroinitializer }>`
+// for `[16 x ptr]`. Labeled by that literal, its initializer writes land in
+// per-field cells and an index over it is an index over one object. The
+// debug type names the array: the global is labeled T[n] when the premise
+// is checked: (1) the literal's allocation size is the DI array's, (2)
+// every leaf of the literal (a scalar or a pointer, through nested structs
+// and arrays), taken modulo sizeof(T), starts at a leaf of T with the same
+// pointer-ness, or lies in T's padding with a zero or undef value. Else the
+// global keeps its literal and one row says why.
+namespace {
+const DIType *stripDIQual(const DIType *T) {
+  for (int i = 0; i < 16 && T; i++) {
+    const auto *D = dyn_cast<DIDerivedType>(T);
+    if (!D) break;
+    const auto t = D->getTag();
+    if (t != dwarf::DW_TAG_typedef && t != dwarf::DW_TAG_const_type && t != dwarf::DW_TAG_volatile_type &&
+        t != dwarf::DW_TAG_restrict_type)
+      break;
+    T = D->getBaseType();
+  }
+  return T;
+}
+// The IR type of a debug type of `bytes` bytes, or null.
+Type *irOfDI(const DIType *T, Module &M, uint64_t bytes) {
+  T = stripDIQual(T);
+  if (!T || !bytes) return nullptr;
+  LLVMContext &C = M.getContext();
+  if (const auto *D = dyn_cast<DIDerivedType>(T)) {
+    const auto t = D->getTag();
+    if (t == dwarf::DW_TAG_pointer_type || t == dwarf::DW_TAG_reference_type || t == dwarf::DW_TAG_rvalue_reference_type)
+      return PointerType::get(C, 0);
+    return nullptr;
+  }
+  if (const auto *B = dyn_cast<DIBasicType>(T)) {
+    if (B->getEncoding() == dwarf::DW_ATE_float) return bytes == 4 ? Type::getFloatTy(C) : bytes == 8 ? Type::getDoubleTy(C) : nullptr;
+    return IntegerType::get(C, (unsigned)(bytes * 8));
+  }
+  const auto *CT = dyn_cast<DICompositeType>(T);
+  if (!CT) return nullptr;
+  const auto tag = CT->getTag();
+  if (tag == dwarf::DW_TAG_enumeration_type) return IntegerType::get(C, (unsigned)(bytes * 8));
+  if (tag == dwarf::DW_TAG_array_type) {
+    const DIType *E = stripDIQual(CT->getBaseType());
+    const uint64_t es = E ? E->getSizeInBits() / 8 : 0;
+    Type *IE = es ? irOfDI(E, M, es) : nullptr;
+    return IE && bytes % es == 0 ? ArrayType::get(IE, bytes / es) : nullptr;
+  }
+  if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_union_type) return nullptr;
+  if (CT->getName().empty()) return nullptr;
+  const std::string want = std::string(tag == dwarf::DW_TAG_union_type ? "union." : "struct.") + CT->getName().str();
+  // The identified struct of that name and size; of several (link
+  // suffixes), the first by name.
+  StructType *best = nullptr;
+  for (StructType *ST : M.getIdentifiedStructTypes())
+    if (ST->hasName() && !ST->isOpaque() && stripStructNameSuffix(ST->getName()) == want &&
+        M.getDataLayout().getTypeAllocSize(ST) == bytes &&
+        (!best || ST->getName() < best->getName()))
+      best = ST;
+  return best;
+}
+struct PackLeaf { int64_t off, size; bool ptr, zero; };
+// The leaves of type T at `base` (with the constant C laid over it, null:
+// zero); false past `cap` leaves.
+bool packLeaves(Type *T, const Constant *C, int64_t base, const DataLayout &DL, std::vector<PackLeaf> &out, size_t cap) {
+  if (out.size() > cap) return false;
+  if (auto *ST = dyn_cast<StructType>(T)) {
+    const StructLayout *SL = DL.getStructLayout(ST);
+    for (unsigned i = 0; i < ST->getNumElements(); i++)
+      if (!packLeaves(ST->getElementType(i), C ? C->getAggregateElement(i) : nullptr,
+                      base + (int64_t)SL->getElementOffset(i), DL, out, cap))
+        return false;
+    return true;
+  }
+  if (auto *AT = dyn_cast<ArrayType>(T)) {
+    const int64_t es = (int64_t)DL.getTypeAllocSize(AT->getElementType());
+    for (uint64_t i = 0; i < AT->getNumElements(); i++)
+      if (!packLeaves(AT->getElementType(), C ? C->getAggregateElement((unsigned)i) : nullptr, base + (int64_t)i * es, DL,
+                      out, cap))
+        return false;
+    return true;
+  }
+  out.push_back({base, (int64_t)DL.getTypeStoreSize(T), T->isPointerTy(),
+                 !C || C->isNullValue() || isa<UndefValue>(C)});
+  return true;
+}
+// The literal's elements, runs of one type compressed: "<{ 6 x ptr, [10 x ptr] }>".
+std::string compactLiteral(StructType *ST) {
+  auto ts = [](Type *T) {
+    std::string s;
+    raw_string_ostream os(s);
+    T->print(os, false, /*NoDetails=*/true);
+    return os.str();
+  };
+  std::string r = ST->isPacked() ? "<{ " : "{ ";
+  for (unsigned i = 0; i < ST->getNumElements();) {
+    unsigned j = i;
+    while (j < ST->getNumElements() && ST->getElementType(j) == ST->getElementType(i)) j++;
+    r += (i ? ", " : "") + (j - i > 1 ? std::to_string(j - i) + " x " : std::string()) + ts(ST->getElementType(i));
+    i = j;
+  }
+  return r + (ST->isPacked() ? " }>" : " }");
+}
+} // namespace
+
+void CallGraphPass::labelPackedArrays() {
+  packedArrayLayout.clear();
+  packedArrayRows.clear();
+  packedArrayLabeled = packedArrayRefused = 0;
+  auto ts = [](Type *T) {
+    std::string s;
+    raw_string_ostream os(s);
+    T->print(os, false, /*NoDetails=*/true);
+    return os.str();
+  };
+  for (auto &[M, _] : Ctx->Modules)
+    for (GlobalVariable &GV : M->globals()) {
+      auto *LT = dyn_cast<StructType>(GV.getValueType());
+      if (!LT || !LT->isLiteral() || !GV.hasInitializer()) continue;
+      SmallVector<DIGlobalVariableExpression *, 1> GVEs;
+      GV.getDebugInfo(GVEs);
+      const DIType *DT = GVEs.empty() ? nullptr : stripDIQual(GVEs[0]->getVariable()->getType());
+      const auto *AT = dyn_cast_or_null<DICompositeType>(DT);
+      if (!AT || AT->getTag() != dwarf::DW_TAG_array_type) continue;
+      const DataLayout &DL = M->getDataLayout();
+      const std::string lit = compactLiteral(LT), head = "packed array @" + GV.getName().str() + ": ";
+      const DIType *DE = stripDIQual(AT->getBaseType());
+      const uint64_t esz = DE ? DE->getSizeInBits() / 8 : 0, asz = DL.getTypeAllocSize(LT);
+      std::string why;
+      int64_t at = -1;
+      Type *T = esz ? irOfDI(DE, *M, esz) : nullptr;
+      if (!esz) why = "the DI element has no size";
+      else if (!T) why = "the DI element has no IR type of its size";
+      else if (AT->getSizeInBits() / 8 != asz) why = "allocation " + std::to_string(asz) + " is not the DI array's " + std::to_string(AT->getSizeInBits() / 8);
+      else if (asz % esz) why = "allocation " + std::to_string(asz) + " is not a multiple of " + std::to_string(esz);
+      std::vector<PackLeaf> lits, els;
+      if (why.empty() && (!packLeaves(LT, GV.getInitializer(), 0, DL, lits, 1u << 20) ||
+                          !packLeaves(T, nullptr, 0, DL, els, 1u << 20)))
+        why = "more than 2^20 leaves";
+      if (why.empty()) {
+        // T's leaves by start; the bytes T's fields cover.
+        std::map<int64_t, PackLeaf> start;
+        std::vector<char> covered(esz, 0);
+        for (const PackLeaf &l : els) {
+          start.emplace(l.off, l);
+          for (int64_t b = l.off; b < l.off + l.size && b < (int64_t)esz; b++) covered[b] = 1;
+        }
+        for (const PackLeaf &l : lits) {
+          const int64_t r = l.off % (int64_t)esz;
+          if (r + l.size > (int64_t)esz) { why = "a field crosses an element boundary", at = l.off; break; }
+          if (auto s = start.find(r); s != start.end()) {
+            if (s->second.ptr != l.ptr) {
+              why = std::string(l.ptr ? "a pointer" : "a non-pointer") + " over " + (s->second.ptr ? "a pointer" : "a non-pointer") +
+                    " field of T";
+              at = l.off;
+              break;
+            }
+            continue;
+          }
+          if (covered[r]) { why = "a field starts inside a field of T", at = l.off; break; }
+          if (l.ptr || !l.zero) { why = "a non-zero field in T's padding", at = l.off; break; }
+        }
+      }
+      if (!why.empty()) {
+        packedArrayRefused++;
+        packedArrayRows.push_back(head + "not labeled (DI " + (T ? ts(T) : std::string("?")) + "[" +
+                                  std::to_string(esz ? asz / esz : 0) + "], literal " + lit + "): " + why +
+                                  (at >= 0 ? " at +" + std::to_string(at) : std::string()));
+        continue;
+      }
+      Type *L = ArrayType::get(T, asz / esz);
+      packedArrayLayout[&GV] = L;
+      packedArrayLabeled++;
+      uint64_t tail = 0;
+      if (auto *TA = dyn_cast<ArrayType>(LT->getElementType(LT->getNumElements() - 1)))
+        if (const Constant *Last = GV.getInitializer()->getAggregateElement(LT->getNumElements() - 1); Last && Last->isNullValue())
+          tail = TA->getNumElements();
+      packedArrayRows.push_back(head + "labeled " + ts(L) + " from DI (literal " + lit + ", " +
+                                std::to_string(LT->getNumElements()) + " fields, zero tail " + std::to_string(tail) + ")");
+    }
+  CG_LOG("Cells: packed arrays (rule (a)): " << packedArrayLabeled << " globals labeled by their DI array, "
+                                             << packedArrayRefused << " not labeled\n");
+  for (const std::string &r : packedArrayRows) CG_LOG("Cells:   " << r << "\n");
+}
+
+llvm::Type *CallGraphPass::globalLayout(const GlobalVariable *GV) const {
+  if (auto it = packedArrayLayout.find(GV); it != packedArrayLayout.end()) return it->second;
+  return GV->getValueType();
 }

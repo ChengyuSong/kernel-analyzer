@@ -7392,6 +7392,112 @@ bool CallGraphPass::runCellResolution() {
       if (wireResolvedCallee(CS, F)) newPairs++;
   }
 
+  // (c) (B2, Fable 2026-10-21/22): a by-origins write (no struct step in
+  // its address) whose destination facts include a named site's object,
+  // and which the site's web did not find, is judged at each offset of its
+  // cells in L exactly as (i) judges a write it finds (judgeFoundWrite):
+  // checked, or OPEN / FAIL with its reason, and the site then loses its
+  // name for every later build (siteBrokenAtSolve), one row per (site,
+  // write) in IR order. An any-offset cell is not judged: the solver writes
+  // its value into every cell of the object, so no name is assumed.
+  // Learned labels (B3): sites with no mint label whose object the solve
+  // labeled.
+  size_t siteChecked = 0, siteAnyAtSolve = 0, siteLearned = 0, siteBreaksNow = 0;
+  const size_t siteRowsBefore = siteBreakRows.size();
+  if (!siteNames.empty()) {
+    std::unordered_map<const CallBase *, size_t> siteIdx;
+    for (size_t i = 0; i < siteNameOrder.size(); i++) siteIdx[siteNameOrder[i]] = i;
+    std::vector<const CallBase *> newlyBroken;
+    for (auto &[M, _] : Ctx->Modules) {
+      const DataLayout &MDL = M->getDataLayout();
+      for (const Function &Fn : *M)
+        for (const Instruction &I : instructions(Fn)) {
+          const Value *Addr = nullptr;
+          if (const auto *St = dyn_cast<StoreInst>(&I)) Addr = St->getPointerOperand();
+          else if (const auto *RMW = dyn_cast<AtomicRMWInst>(&I)) Addr = RMW->getPointerOperand();
+          else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) Addr = CX->getPointerOperand();
+          else if (const auto *MI = dyn_cast<MemIntrinsic>(&I)) Addr = MI->getRawDest();
+          if (!Addr || addressStructStep(Addr)) continue;
+          const NodeIndex v = NF.getValueNodeFor(Addr);
+          if (v == AndersNodeFactory::InvalidIndex || v >= G) continue;
+          const uint32_t cn = getCanonicalNode(v);
+          if (cn >= G) continue;
+          std::map<size_t, std::set<int64_t>> at; // site (IR order) -> offsets in L (-1: any-offset)
+          pts[find(cn)].forEach([&](uint32_t x) {
+            const Cell &Ce = cells[findFact(x)];
+            if (Ce.kind == CellKind::Func || Ce.obj >= objs.size()) return;
+            const Obj &O = objs[Ce.obj];
+            if (O.fn || O.rowOwner != UINT32_MAX) return;
+            uint32_t top = Ce.obj;
+            while (objs[top].parentObj != UINT32_MAX) top = objs[top].parentObj;
+            const auto *CB = dyn_cast_or_null<CallBase>(NF.getValueForNode(objs[top].origin));
+            auto sn = CB ? siteNames.find(CB) : siteNames.end();
+            if (sn == siteNames.end() || sn->second.verdict != 'n' || sn->second.found.count(&I)) return;
+            // A one-then-unknown block's trailing object is not L's.
+            if (top != Ce.obj && !sn->second.trailing) return;
+            at[siteIdx.at(CB)].insert(Ce.kind == CellKind::Off ? Ce.off + O.base : -1);
+          });
+          for (auto &[si, offs] : at) {
+            const CallBase *CB = siteNameOrder[si];
+            const SiteName &SN = siteNames.at(CB);
+            if (offs.count(-1)) siteAnyAtSolve++;
+            std::string row;
+            bool judged = false;
+            for (int64_t off : offs) {
+              if (off < 0) continue;
+              judged = true;
+              const WriteVerdict wv = judgeFoundWrite(SN, solveWrite(&I, off), MDL);
+              if (wv.cls.empty()) continue;
+              const auto *Cl = dyn_cast<CallBase>(&I);
+              const std::string what = Cl && Cl->getCalledFunction() ? Cl->getCalledFunction()->getName().str()
+                                                                     : std::string(I.getOpcodeName());
+              row = "(c) " + (wv.cls == "FAIL" ? std::string("FAIL: ") : "OPEN (" + wv.cls + "): ") + wv.why +
+                    " over " + SN.label + "+" + std::to_string(off) + " at " + instLoc(CB) +
+                    ", found at solve by " + what + " " + instLoc(&I);
+              break;
+            }
+            if (!judged) continue;
+            if (row.empty()) {
+              siteChecked++;
+              continue;
+            }
+            siteBreaksNow++;
+            if (siteBreakSeen.insert({CB, &I}).second) siteBreakRows.push_back(row);
+            if (siteBrokenAtSolve.try_emplace(CB, row).second) newlyBroken.push_back(CB);
+          }
+        }
+    }
+    // Covers are decided once, at the closure: a name one of them rested
+    // on cannot be withdrawn after it.
+    for (const CallBase *CB : newlyBroken)
+      if (auto u = siteCoverUsed.find(CB); u != siteCoverUsed.end()) {
+        errs() << "ERROR: --cfl-cells: covers were decided by the name of " << instLoc(CB)
+               << " (site names, B6), which the solve breaks: " << siteBrokenAtSolve.at(CB)
+               << "; covers are decided once, before the solve. The " << u->second.size()
+               << " decisions that rested on it:\n";
+        for (const std::string &d : u->second) errs() << "  " << d << "\n";
+        exit(1);
+      }
+    for (const CallBase *CB : newlyBroken) {
+      SiteName &SN = siteNames.at(CB);
+      SN.verdict = 'c', SN.why = "(c)", SN.first = siteBrokenAtSolve.at(CB);
+    }
+    if (!newlyBroken.empty()) siteNamesReport(false);
+    std::set<const Value *> learnedSites;
+    for (const Obj &O : objs)
+      if (!O.fn && O.learnedLayout && O.parentObj == UINT32_MAX)
+        if (const auto *CB = dyn_cast_or_null<CallBase>(NF.getValueForNode(O.origin));
+            CB && mintTable && mintTable->at.count(CB) && !mintTable->at.at(CB).layout)
+          learnedSites.insert(CB);
+    siteLearned = learnedSites.size();
+    CG_LOG("Cells: site names (B): " << siteNameSummary << "; learned " << siteLearned << "; (c) checked at solve "
+           << siteChecked << ", not checked " << siteBreaksNow << " (" << newlyBroken.size()
+           << " sites untyped by them), any-offset writes (no name assumed) " << siteAnyAtSolve << " (solve state "
+           << (stoppedAt ? "stop at " + std::to_string(stoppedAt) + " pops" : std::string("fixpoint")) << ")\n");
+    for (size_t i = siteRowsBefore; i < siteBreakRows.size(); i++)
+      CG_LOG("Cells: site names (B): " << siteBreakRows[i] << "\n");
+  }
+
   watchdog.phase("report");
   // ---- Report ----
   size_t factMass = 0, offCells = 0, anyCells = 0;
@@ -9762,6 +9868,15 @@ bool CallGraphPass::runCellResolution() {
          << " declared arrays kept, " << kind('x') << " refused\n";
     }
     for (const auto &[C, r] : cacheRows) RO << "A5b " << r << "\n";
+    // B: site names; the sites not named, and the (c) breaks, in IR order.
+    if (!siteNames.empty()) {
+      RO << "SUMMARY site names (B): " << siteNameSummary << "; learned " << siteLearned << "; (c) checked at solve "
+         << siteChecked << " (last solve), not checked " << siteBreakRows.size()
+         << " over all solves, any-offset writes (no name assumed) "
+         << siteAnyAtSolve << "\n";
+      for (const std::string &r : siteNameRows) RO << "B site " << r << "\n";
+      for (const std::string &r : siteBreakRows) RO << "B " << r << "\n";
+    }
     // A4: allocations whose sites' receivers name several merged-away debug
     // identities: the IR name stays (a rename, not a label conflict).
     RO << "SUMMARY merged identities (A4): " << heapMergedIdents << " heap objects named at mint by their site's "

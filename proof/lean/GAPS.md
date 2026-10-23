@@ -2117,6 +2117,114 @@ Not mechanized. Checked by executions:
   t_tagged_both/compose/fnptr, whose reads stepped before the writers
   labeled the object).
 
+## Site names (SiteNames.cc, B, Fable 2026-10-21/22)
+
+A fresh allocation site whose mint label is L (the mint table's label,
+with A1 / gap 2 trailing arrays, A4 identities, A5a containers, A5b cache
+sizes; A3 and A5 conflicts are unlabeled and out) is NAMED L for the
+covers (B6) when (i) every write found from it is checked against L and
+(iii) its size conforms. The name is a premise: the object's cells are
+L's fields, so a cover may close a field of L that a by-origins write
+reaches only at other offsets. The premise is discharged in parts:
+
+- (i), by the site's web: casts, -O0 slots, joins, GEPs (offset or
+  stride), the formals of direct callees, recursively, and returns (a
+  direct callee returning its formal is followed into the caller's web;
+  a wrapper's allocation into every direct caller). Cycles are cut and
+  counted. A write is checked when it is a struct step (rule (b), at the
+  solve); a store whose span is a run of whole fields of L at a constant
+  offset or at a stride of L, of an array in L or of the trailing array,
+  with pointer-ness equal per field (B5: a pointer value, or a value
+  carrying a ptrtoint, only on whole pointer fields; a non-pointer value
+  over a pointer field passes, counted constant or data); a memset whose
+  byte is not ptrtoint-derived, of any value and any length (a repeated
+  byte is never a pointer; the length is the extent's question, counted
+  "runtime length"); a block copy whose source's name puts L at the same
+  place (K-to-K); a bodiless callee decided by func_summaries.txt atoms
+  only (B4: a store atom judged as a store; a byte atom passes over no
+  pointer field of L; NOOP passes). OPEN, with its reason, otherwise: a
+  runtime offset or a stride of no array of L (runtime), a copy from an
+  open source (D1) or another name (copy), an indirect call, always
+  (call; R5 is C), a bodiless call with no atom (call), a byte atom over
+  a pointer field (bodiless write), a vararg, a return to an indirect or
+  unknown caller (return), a memset of a ptrtoint-derived byte (memset).
+  FAIL: a store off L's layout, of the wrong pointer-ness, or at a
+  constant offset past the extent (a one-then-unknown block's bytes past
+  L are its trailing object's, not L's).
+- (iii): the mint's size term is sizeof(L), n x sizeof(L), sizeof(L) + k
+  trailing elements, or runtime; otherwise untyped by size.
+- (iv): a union slot inside L never untypes the site; it is the union
+  census's (keyed: member cells; unkeyed: the slot's confluence cell).
+- (c), at the solve: escape by a store to memory is not an OPEN reason in
+  (i); a by-origins write (no struct step in its address) whose
+  destination facts include a named site's object and which the web did
+  not find is judged by the same function at each offset of its cells in
+  L. Checked: counted. OPEN or FAIL: the site loses its name for every
+  later build (labels are only removed, so the iteration terminates),
+  one rule-report row per (site, write). There is no second oracle that
+  grades a fact as imprecise: a write the solve finds is evidence like a
+  write the walk finds. An any-offset cell is not judged: the solver
+  writes its value into every content cell of the object (linkAny), so no
+  name is assumed.
+
+The obligation: a name is a premise, and its withdrawal only adds cells
+and flows, never removes one. An untyped allocation's writes open the
+covers that reach it (origins include an untyped allocation); a named
+site's are decided by the offset walk against L (check (2) by offset). So
+withdrawing a name can only turn a close into an open. Covers are decided
+once, at the container closure before the solve: a cover decision that
+judged an offset against L rests on the name (a closed walk that never
+meets the object does not read L, and does not count), and a name the
+solve withdraws under such a decision is refused, with the site, its (c)
+row and every decision on it printed. The closure is not re-run; no
+instance on the gate programs. What remains a premise: the (c) rows
+(each withdraws its name); the atoms of func_summaries.txt; the outcomes
+are named, untyped with its reason, or a label conflict (A3, A5).
+
+### Covers by site names: the least solution (Fable 2026-10-22)
+
+A by-origins write on a named site has one destination walk, apart from
+the holder's object walk (its own Tarjan state and memo) and consulting
+no cover: it gives the write's objects with offsets, its own open
+reasons, and Fd(U), the field keys it reads through. Each unnamed-
+destination write over a key K is self-standing open or reach (its
+origins are open or untyped, its destination walk is open on its own, a
+write not on L's fields, or one that writes K's word), close, or
+dependent: close on its own walk if every key of Fd(U) is closed. The
+covers are the LEAST solution of
+
+  open(K) <- self-standing(K) | exists a dependent write U over K with
+             some K' in Fd(U) open,
+
+solved by rounds from the self-standing covers (round 0); a cover opens
+in round r when a key it reads opened in a round before r, so the
+solution does not depend on the order covers are asked in. An open
+cover's reason reads through a key of a strictly lower round to a
+self-standing reason (finite). A cover closed only by the least solution
+(a dependency cycle with no self-standing reason) is listed per cycle.
+A write's origins are examined in IR order up to the first self-standing
+one; a write self-standing on any origin rests on no name: its lines on
+named sites read "not decided" and no decision is recorded for it. A
+decision on a name (the refusal's input) is recorded only for a write
+whose every examined line is self-standing closed or dependent, and a
+dependent one only when the solution closes every key it reads; the
+verdict, the covers, the rows and the stops do not depend on the order.
+
+Why it is sound: a closed B6 write never writes a key word (a write that
+reaches the word is self-standing), so a key's contents come only from
+its named stores and covering writes, and a B6 write's destination walk
+reads keys whose contents are exactly those when every key it reads is
+closed. The induction is over execution steps, with the invariant "every
+closed key holds only what its named stores and covering writes put
+there", for all keys at once: it holds at the first step (fresh memory),
+and each write preserves it, because a write closed in the solution lands
+where its walk says given the invariant before the step. Mutual
+dependence without a self-standing reason therefore closes. This is the
+argument that licenses the object walk's cycle cuts and R2's K-to-K
+cycles. Deciding a cover under way as OPEN is the greatest-open
+approximation of the same system: sound, but weaker, and its cost
+depends on the order covers are asked in (on nm-O0 it did not finish).
+
 ## Confirmed fresh wrappers (Summaries confirmFreshWrappers, 2026-10-11, plan 3.53 follow-ups 1 and 2)
 
 A function with a body and no summary is confirmed as an allocation

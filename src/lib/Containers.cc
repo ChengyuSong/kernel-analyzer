@@ -4910,25 +4910,61 @@ void CallGraphPass::checkContainerClosure() {
           // disjoint from the word's. Otherwise it keeps the origins
           // verdict. One line per such write, for the log.
           std::vector<std::string> offsetLines;
+          std::vector<std::string> siteCoverLines; // B6: each by-origins write on an allocation, by its site's name
           size_t offsetClosed = 0, offsetTried = 0;
-          auto unnamedOpen = [&](const std::string &K, const std::set<const Value *> *W,
-                                 const std::map<std::string, std::set<int64_t>> *wordAt = nullptr,
-                                 int64_t wlen = 0) -> std::string {
+          // B6 (Fable 2026-10-22): the covers are decided as a least
+          // fixpoint. A write on a named site has ONE destination walk
+          // (destWalk, set with the walk below), cached per write, apart from
+          // the holder's walk (its own Tarjan state and memo) and consulting
+          // no cover: it gives the write's objects, its own open reasons and
+          // Fd, the field keys it reads through. A cover's writes are each
+          // self-standing (open or reach on their own: origins open, untyped,
+          // not on L's fields, the word) or close, or close if every key of
+          // their Fd is closed (dependent). open(K) is the LEAST solution of
+          // open(K) <- self-standing(K) | a dependent write over K with some
+          // K' in Fd open, solved by rounds from the self-standing covers
+          // (order-independent); an open cover's reason reads through keys of
+          // strictly lower round to a self-standing reason. A cover closed
+          // only by the least solution (a dependency cycle with no
+          // self-standing reason) is listed. GAPS.md: Site names, covers.
+          std::function<void(const Instruction *, const Value *, std::set<Obj> &, std::set<std::string> &,
+                              std::set<std::string> &)>
+              destWalk;
+          std::map<const Instruction *, std::pair<std::set<Obj>, std::set<std::string>>> destDone;
+          bool inDest = false; // the walk is a destination walk: a field read records its key, no cover asked
+          size_t destWalks = 0, lfpCycles = 0, lfpCycleKeys = 0;
+          std::vector<std::string> lfpLines; // covers closed only by the least solution, one line per cycle
+          size_t siteLinesShown = 0, lfpShown = 0, destWalksShown = 0;
+          // One write of a cover, before the solve.
+          struct CoverEntry {
+            const Instruction *I;
+            char kind; // 'o' open, 'r' reach (self-standing), 'd' dependent
+            std::string why, site;
+            std::set<std::string> fd;
+          };
+          struct CondLine { size_t line; const CallBase *CB; std::set<std::string> fd; }; // CB: the decision judged an offset
+          struct CoverLocal {
+            std::vector<CoverEntry> entries; // in write order
+            size_t nClose = 0, nNull = 0;
+            std::vector<std::string> siteLines;
+            std::vector<CondLine> cond; // B6 lines whose close waits on Fd
+          };
+          std::map<std::string, CoverLocal> coverLocals;
+          auto coverLocal = [&](const std::string &K, const std::set<const Value *> *W,
+                                const std::map<std::string, std::set<int64_t>> *wordAt, int64_t wlen) {
             const std::string ck = K + (W ? "#W" : "");
-            if (auto d = unnamedDone.find(ck); d != unnamedDone.end()) return d->second;
+            CoverLocal &CL = coverLocals[ck];
             collectWrites();
             const std::string KS = K.substr(0, K.rfind('+'));
-            size_t nClose = 0, nReach = 0, nOpen = 0, nNull = 0;
-            std::vector<std::string> reasons;
             for (const UnnamedWrite &U : unnamedWrites) {
               if (const auto *MS = dyn_cast<MemSetInst>(U.I);
                   MS && isa<ConstantInt>(MS->getValue()) && cast<ConstantInt>(MS->getValue())->isZero()) {
-                nNull++;
+                CL.nNull++;
                 continue;
               }
               // A paired restore gives back what its save read (R2): close.
               if (const auto *MT = dyn_cast<MemTransferInst>(U.I); MT && pairedRestores.count(MT)) {
-                nClose++;
+                CL.nClose++;
                 continue;
               }
               auto it = unnamedOrigins.find(U.I);
@@ -4941,8 +4977,10 @@ void CallGraphPass::checkContainerClosure() {
               }
               const Origins &O = it->second;
               const Module *M = U.I->getModule();
-              std::string why;
-              bool open = false, wordReach = false;
+              std::string why, condSite;
+              bool open = false, wordReach = false, cond = false;
+              std::set<std::string> condFd;
+              const size_t condStart = CL.cond.size();
               if (!O.unknown.empty()) {
                 why = "its origins are open (" + *O.unknown.begin() + ")", open = true;
               } else {
@@ -4969,6 +5007,79 @@ void CallGraphPass::checkContainerClosure() {
                   const auto *CB = dyn_cast<CallBase>(Al);
                   const std::string an = CB && CB->getCalledFunction() ? CB->getCalledFunction()->getName().str()
                                                                          : std::string("a pool carve");
+                  // B6 (Fable 2026-10-21): a site named L (SiteNames.cc) is
+                  // decided by the object walk's offsets against L, as check
+                  // (2) by offset: every offset at which the walk (closed)
+                  // meets the site's object is a run of whole fields of L that
+                  // misses the word: close; one that holds the word: reach; an
+                  // open walk, a walk not meeting the site, or a write not on
+                  // L's fields: open, with that reason.
+                  if (auto sn = CB ? siteNames.find(CB) : siteNames.end(); sn != siteNames.end() && sn->second.verdict == 'n') {
+                    const SiteName &SN = sn->second;
+                    const DataLayout &MDL = M->getDataLayout();
+                    Type *VT = nullptr;
+                    const Value *SV = nullptr;
+                    uint64_t len = 0;
+                    if (const auto *St = dyn_cast<StoreInst>(U.I)) SV = St->getValueOperand();
+                    else if (const auto *RMW = dyn_cast<AtomicRMWInst>(U.I)) SV = RMW->getValOperand();
+                    else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(U.I)) SV = CX->getNewValOperand();
+                    if (SV) VT = SV->getType(), len = MDL.getTypeStoreSize(VT).getFixedValue();
+                    std::set<Obj> uo;
+                    std::set<std::string> uop;
+                    std::set<std::string> fd;
+                    destWalk(U.I, U.dest, uo, uop, fd);
+                    std::vector<int64_t> at;
+                    for (const Obj &o : uo)
+                      if (auto os = objSite.find(o.first); os != objSite.end() && os->second == Al) at.push_back(o.second);
+                    const std::string site = an + " at " + snapLoc(CB) + " (named " + SN.label + ")";
+                    std::string bwhy;
+                    char bv = 'c';
+                    if (!uop.empty()) bwhy = "its walk is open: " + *uop.begin(), bv = 'o';
+                    else if (at.empty()) bwhy = "its walk is closed and does not meet the object"; // as check (2): close
+                    for (int64_t o : at) {
+                      if (bv != 'c') break;
+                      if (const std::string bad = judgeSiteWrite(SN, o, len, VT, SV, MDL); !bad.empty()) {
+                        bwhy = "not on its fields: " + bad, bv = 'o';
+                        break;
+                      }
+                      if (siteWriteHolds(SN, o, (int64_t)len, KS, std::stoll(K.substr(K.rfind('+') + 1)), 8, MDL))
+                        bwhy = "it writes the word at +" + std::to_string(o), bv = 'r';
+                    }
+                    CL.siteLines.push_back(snapLoc(U.I) + " over " + K + " on " + site + ": " +
+                                             (bv == 'c' ? "close" + (bwhy.empty() ? std::string() : ": " + bwhy)
+                                              : bv == 'r' ? "reach: " + bwhy
+                                                          : "open: " + bwhy));
+                    // The decision rests on the name when it judged an offset
+                    // against L; a closed walk that never meets the object
+                    // does not read L.
+                    // Close on its own walk, which read keys: close if they
+                    // close (the solve below decides, and records the decision).
+                    if (bv == 'c' && !fd.empty()) {
+                      cond = true, condFd = fd, condSite = site;
+                      CL.cond.push_back({CL.siteLines.size() - 1, at.empty() ? nullptr : CB, fd});
+                      continue;
+                    }
+                    if (bv != 'o' && !at.empty())
+                      if (std::string d = "snapshot holder " + hname + ": " + CL.siteLines.back();
+                          std::find(siteCoverUsed[CB].begin(), siteCoverUsed[CB].end(), d) == siteCoverUsed[CB].end())
+                        siteCoverUsed[CB].push_back(d);
+                    if (bv == 'c') continue;
+                    why = "origins include a named allocation (" + site + "), " + bwhy;
+                    open = bv == 'o';
+                    break;
+                  }
+                  if (CB) {
+                    auto sn = siteNames.find(CB);
+                    CL.siteLines.push_back(snapLoc(U.I) + " over " + K + " on " + an + " at " + snapLoc(CB) + ": untyped (" +
+                                             (sn == siteNames.end() ? std::string("no mint label")
+                                                                    : sn->second.verdict == 'f' ? "FAIL"
+                                                                    : sn->second.verdict == 's' ? "untyped by size"
+                                                                                                : "open (" + sn->second.why + ")") +
+                                             ")");
+                  } else {
+                    CL.siteLines.push_back(snapLoc(U.I) + " over " + K + " on a pool carve at " +
+                                             snapLoc(cast<Instruction>(Al)) + ": untyped");
+                  }
                   why = "origins include an untyped allocation (" + an + " at " + snapLoc(cast<Instruction>(Al)) +
                         "), not typed",
                   open = true;
@@ -5033,31 +5144,184 @@ void CallGraphPass::checkContainerClosure() {
                 if (!hit && uop.empty()) {
                   offsetLines.push_back(head + "; walk closed: does not reach");
                   offsetClosed++;
-                  nClose++;
+                  CL.nClose++;
                   continue;
                 }
                 offsetLines.push_back(head + (hit ? std::string() : "; walk open: " + *uop.begin()));
               }
               if (why.empty()) {
-                nClose++;
+                if (cond) CL.entries.push_back({U.I, 'd', std::string(), condSite, condFd});
+                else CL.nClose++;
                 continue;
               }
-              (open ? nOpen : nReach)++;
-              reasons.push_back("an unnamed-destination write over " + K + ": " + why + " " + snapLoc(U.I));
-              const std::string rk = snapLoc(U.I) + ": " + why;
-              auto [rit, fresh] = coverReasonAt.try_emplace(rk, coverReasons.size());
-              if (fresh) coverReasons.push_back({U.I, why, {}});
-              coverReasons[rit->second].keys.push_back(K + (W ? " (check (2))" : ""));
+              // Self-standing on another origin: a site's close that waits on
+              // Fd decides nothing (its keys are not solved, no decision rests
+              // on the name).
+              for (size_t c = condStart; c < CL.cond.size(); c++)
+                CL.siteLines[CL.cond[c].line] += "; not decided: the write is self-standing on another origin";
+              CL.cond.resize(condStart);
+              CL.entries.push_back({U.I, open ? 'o' : 'r', why, std::string(), {}});
             }
-            coverLog.push_back("cover " + K + (W ? " (check (2), against the word's objects)" : "") + ": " +
-                               std::to_string(nClose + nReach + nOpen) + " unnamed-destination writes: " +
-                               std::to_string(nClose) + " close, " + std::to_string(nReach) + " reach, " +
-                               std::to_string(nOpen) + " open (" + std::to_string(nNull) + " constant-zero memsets, null)");
-            std::string res;
-            if (!reasons.empty())
-              res = reasons.front() + (reasons.size() > 1 ? " (and " + std::to_string(reasons.size() - 1) + " more)" : "");
-            unnamedCounts[ck] = {nClose, nReach, nOpen};
-            return unnamedDone[ck] = res;
+          };
+          // The least solution over ck0 and every cover its dependent writes
+          // read, transitively; each is decided, logged and kept once.
+          auto solveCovers = [&](const std::string &ck0) {
+            std::vector<std::string> keys{ck0};
+            std::set<std::string> inSolve{ck0};
+            for (size_t i = 0; i < keys.size(); i++)
+              for (const CoverEntry &e : coverLocals.at(keys[i]).entries)
+                for (const std::string &k : e.fd)
+                  if (!unnamedDone.count(k) && inSolve.insert(k).second) {
+                    coverLocal(k, nullptr, nullptr, 0);
+                    keys.push_back(k);
+                  }
+            // The round a cover opens in (0: self-standing); a cover decided
+            // before this solve is open at round -1 when its reason is.
+            std::map<std::string, int> round;
+            auto openAt = [&](const std::string &k) -> int {
+              if (auto d = unnamedDone.find(k); d != unnamedDone.end()) return d->second.empty() ? INT_MAX : -1;
+              auto r = round.find(k);
+              return r == round.end() ? INT_MAX : r->second;
+            };
+            for (const std::string &k : keys)
+              for (const CoverEntry &e : coverLocals.at(k).entries)
+                if (e.kind != 'd') round.emplace(k, 0);
+            for (int r = 1;; r++) {
+              std::vector<std::string> opened;
+              for (const std::string &k : keys) {
+                if (round.count(k)) continue;
+                bool any = false;
+                for (const CoverEntry &e : coverLocals.at(k).entries)
+                  for (const std::string &f : e.fd) any |= openAt(f) < r;
+                if (any) opened.push_back(k);
+              }
+              if (opened.empty()) break;
+              for (const std::string &k : opened) round[k] = r;
+            }
+            // Decide in round order, so a reason reads only covers decided
+            // before it (strictly lower round): the chain is finite.
+            std::vector<std::string> byRound(keys);
+            std::stable_sort(byRound.begin(), byRound.end(),
+                             [&](const std::string &x, const std::string &y) { return openAt(x) < openAt(y); });
+            for (const std::string &ck : byRound) {
+              const CoverLocal &CL = coverLocals.at(ck);
+              const bool W = ck.size() > 2 && ck.compare(ck.size() - 2, 2, "#W") == 0;
+              const std::string K = W ? ck.substr(0, ck.size() - 2) : ck;
+              size_t nClose = CL.nClose, nReach = 0, nOpen = 0;
+              std::vector<std::tuple<const Instruction *, std::string>> open; // in write order
+              // The first reason: the first self-standing one, else through
+              // the key of lowest round (decided before this one).
+              std::string first;
+              const Instruction *firstI = nullptr;
+              const std::string *firstVia = nullptr;
+              for (const CoverEntry &e : CL.entries) {
+                if (e.kind != 'd') {
+                  (e.kind == 'o' ? nOpen : nReach)++;
+                  open.emplace_back(e.I, e.why);
+                  if (first.empty()) first = e.why, firstI = e.I;
+                  continue;
+                }
+                // The key of Fd decided open first (then by name).
+                const std::string *via = nullptr;
+                for (const std::string &f : e.fd)
+                  if (openAt(f) != INT_MAX && (!via || openAt(f) < openAt(*via))) via = &f;
+                if (!via) {
+                  nClose++;
+                  continue;
+                }
+                nOpen++;
+                const std::string why =
+                    "origins include a named allocation (" + e.site + "), its walk reads " + *via + ", whose cover is open";
+                open.emplace_back(e.I, why);
+                if (!firstVia || openAt(*via) < openAt(*firstVia)) firstVia = via, firstI = first.empty() ? e.I : firstI;
+              }
+              // No self-standing reason: the cover opened in a later round
+              // than every key it reads through first, decided before it.
+              if (first.empty() && firstVia)
+                for (const CoverEntry &e : CL.entries)
+                  if (e.kind == 'd' && e.fd.count(*firstVia)) {
+                    first = "origins include a named allocation (" + e.site + "), its walk reads " + *firstVia +
+                            ", whose cover is open: " + unnamedDone.at(*firstVia);
+                    firstI = e.I;
+                    break;
+                  }
+              std::string res;
+              if (!open.empty()) {
+                res = "an unnamed-destination write over " + K + ": " + first + " " + snapLoc(firstI) +
+                      (open.size() > 1 ? " (and " + std::to_string(open.size() - 1) + " more)" : "");
+              }
+              for (const auto &[I, why] : open) {
+                auto [rit, fresh] = coverReasonAt.try_emplace(snapLoc(I) + ": " + why, coverReasons.size());
+                if (fresh) coverReasons.push_back({I, why, {}});
+                coverReasons[rit->second].keys.push_back(K + (W ? " (check (2))" : ""));
+              }
+              std::vector<std::string> lines(CL.siteLines);
+              for (const CondLine &c : CL.cond) {
+                const std::string *via = nullptr;
+                for (const std::string &f : c.fd)
+                  if (openAt(f) != INT_MAX && (!via || openAt(f) < openAt(*via))) via = &f;
+                if (via) {
+                  lines[c.line] += "; open by the solve: its walk reads " + *via + ", whose cover is open";
+                  continue;
+                }
+                lines[c.line] += "; its walk reads " + std::to_string(c.fd.size()) + " keys, every cover closed";
+                if (c.CB)
+                  if (std::string d = "snapshot holder " + hname + ": " + lines[c.line];
+                      std::find(siteCoverUsed[c.CB].begin(), siteCoverUsed[c.CB].end(), d) == siteCoverUsed[c.CB].end())
+                    siteCoverUsed[c.CB].push_back(d);
+              }
+              siteCoverLines.insert(siteCoverLines.end(), lines.begin(), lines.end());
+              coverLog.push_back("cover " + K + (W ? " (check (2), against the word's objects)" : "") + ": " +
+                                 std::to_string(nClose + nReach + nOpen) + " unnamed-destination writes: " +
+                                 std::to_string(nClose) + " close, " + std::to_string(nReach) + " reach, " +
+                                 std::to_string(nOpen) + " open (" + std::to_string(CL.nNull) +
+                                 " constant-zero memsets, null)");
+              unnamedCounts[ck] = {nClose, nReach, nOpen};
+              unnamedDone[ck] = res;
+            }
+            // Covers closed only by the least solution: the cycles among the
+            // closed covers of this solve, by their dependent writes' Fd.
+            std::vector<std::string> closed;
+            for (const std::string &k : keys)
+              if (unnamedDone.at(k).empty()) closed.push_back(k);
+            std::map<std::string, size_t> idx, low;
+            std::vector<std::string> stk;
+            std::set<std::string> onStk;
+            size_t next = 0;
+            std::function<void(const std::string &)> scc = [&](const std::string &k) {
+              idx[k] = low[k] = next++;
+              stk.push_back(k), onStk.insert(k);
+              bool self = false;
+              for (const CoverEntry &e : coverLocals.at(k).entries)
+                for (const std::string &f : e.fd) {
+                  if (!inSolve.count(f) || !unnamedDone.at(f).empty()) continue;
+                  self |= f == k;
+                  if (!idx.count(f)) scc(f), low[k] = std::min(low[k], low[f]);
+                  else if (onStk.count(f)) low[k] = std::min(low[k], idx[f]);
+                }
+              if (low[k] != idx[k]) return;
+              std::vector<std::string> comp;
+              for (std::string m; m != k;) m = stk.back(), stk.pop_back(), onStk.erase(m), comp.push_back(m);
+              if (comp.size() < 2 && !self) return;
+              std::sort(comp.begin(), comp.end());
+              std::string ks;
+              for (const std::string &m : comp) ks += (ks.empty() ? "" : ", ") + m;
+              lfpCycles++, lfpCycleKeys += comp.size();
+              lfpLines.push_back("covers closed by the least solution (cycle of " + std::to_string(comp.size()) +
+                                 " keys: " + ks + ")");
+            };
+            for (const std::string &k : closed)
+              if (!idx.count(k)) scc(k);
+          };
+          auto unnamedOpen = [&](const std::string &K, const std::set<const Value *> *W,
+                                 const std::map<std::string, std::set<int64_t>> *wordAt = nullptr,
+                                 int64_t wlen = 0) -> std::string {
+            assert(!inDest && "a destination walk asks no cover");
+            const std::string ck = K + (W ? "#W" : "");
+            if (auto d = unnamedDone.find(ck); d != unnamedDone.end()) return d->second;
+            coverLocal(K, W, wordAt, wlen);
+            solveCovers(ck);
+            return unnamedDone.at(ck);
           };
           auto buildInit = [&]() {
             if (initDone) return;
@@ -5357,17 +5621,20 @@ void CallGraphPass::checkContainerClosure() {
               if (std::string c = coverOpen(K, (int64_t)L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
                   !c.empty())
                 open.insert(c), keysCovered.insert(K);
-              if (std::string u = unnamedOpen(K, nullptr); !u.empty()) open.insert(u), keysCovered.insert(K);
+              // A destination walk asks no cover: it records K (Fd, B6).
+              if (!inDest)
+                if (std::string u = unnamedOpen(K, nullptr); !u.empty()) open.insert(u), keysCovered.insert(K);
               buildInit();
               if (auto iv = initVals.find(K); iv != initVals.end())
                 for (const Constant *C : iv->second) objsOf(C, off, out, open);
               if (!initUnnamed.empty())
                 open.insert(std::to_string(initUnnamed.size()) + " initializer pointers no type names (" +
                             initUnnamed.front() + ")");
-              if (out.empty() && open.empty()) {
+              if (out.empty() && std::all_of(open.begin(), open.end(), [](const std::string &x) { return !x.empty() && x[0] == '\x01'; })) {
                 if (cycleCuts > cuts0) cutEmpty.insert(MK);
                 else open.insert("no pointer store of " + K);
               }
+              if (inDest) open.insert("\x01" + K);
             });
           };
           objsOf = [&](const Value *V, int64_t off, std::set<Obj> &out, std::set<std::string> &open) {
@@ -5480,6 +5747,48 @@ void CallGraphPass::checkContainerClosure() {
             for (const std::string &x : op) t += (t.empty() ? "" : "; ") + std::string("OPEN ") + x;
             return t.empty() ? std::string("none") : t;
           };
+          // The destination walks' own state, kept across them: their memo is
+          // shared (no destination walk asks a cover, so a node's result does
+          // not depend on which walk asked it); a field read records its key
+          // as "\x01K" among the open reasons, split off as Fd.
+          decltype(nodeMemo) dMemo;
+          decltype(onStack) dOnStack;
+          decltype(nodeStack) dNodeStack;
+          decltype(lowStack) dLowStack;
+          size_t dNodes = 0, dBudgetCuts = 0, dOffCycles = 0, dCycleCuts = 0;
+          double dSecs = 0;
+          std::set<std::string> dKeysWalked, dKeysCovered, dKeysUnion, dUnionExcluded, dCutEmpty, dCodeCalls, dElems, dNull;
+          std::set<const MemTransferInst *> dKToK;
+          destWalk = [&](const Instruction *I, const Value *D, std::set<Obj> &out, std::set<std::string> &open,
+                         std::set<std::string> &fd) {
+            auto d = destDone.find(I);
+            if (d == destDone.end()) {
+              auto swapAll = [&] {
+                std::swap(dMemo, nodeMemo), std::swap(dOnStack, onStack), std::swap(dNodeStack, nodeStack);
+                std::swap(dLowStack, lowStack), std::swap(dNodes, nodeCount), std::swap(dBudgetCuts, budgetCuts);
+                std::swap(dOffCycles, offCycles), std::swap(dCycleCuts, cycleCuts), std::swap(dSecs, walkSecs);
+                std::swap(dKeysWalked, keysWalked), std::swap(dKeysCovered, keysCovered), std::swap(dKeysUnion, keysUnionWalked);
+                std::swap(dUnionExcluded, unionExcluded), std::swap(dCutEmpty, cutEmpty), std::swap(dCodeCalls, codeCallsWalked);
+                std::swap(dElems, elemWalked), std::swap(dNull, nullWrites), std::swap(dKToK, kToKCopies);
+              };
+              const double s0 = dSecs;
+              std::set<Obj> o;
+              std::set<std::string> op;
+              swapAll();
+              inDest = true;
+              objsOf(D, 0, o, op);
+              inDest = false;
+              swapAll();
+              destWalks++;
+              if (!lowStack.empty()) walkSecs -= dSecs - s0; // the enclosing walk's time counts its own nodes only
+              d = destDone.emplace(I, std::make_pair(std::move(o), std::move(op))).first;
+            }
+            out = d->second.first;
+            open.clear(), fd.clear();
+            for (const std::string &x : d->second.second)
+              if (!x.empty() && x[0] == '\x01') fd.insert(x.substr(1));
+              else open.insert(x);
+          };
           // The holder end: the entsize field the element copies' length reads.
           std::set<Obj> hObjs;
           std::set<std::string> hOpen;
@@ -5584,6 +5893,19 @@ void CallGraphPass::checkContainerClosure() {
             CG_LOG("Container: snapshot holder " << hname << ": object identity walked " << keysWalked.size()
                    << " field keys, " << keysCovered.size() << " open by writes named otherwise" << (ks.empty() ? "" : ": ")
                    << ks << "\n");
+            // B6: the destination walks and the covers decided so far.
+            for (; siteLinesShown < siteCoverLines.size(); siteLinesShown++)
+              CG_LOG("Container: snapshot holder " << hname << ": site names (B6): " << siteCoverLines[siteLinesShown] << "\n");
+            for (; lfpShown < lfpLines.size(); lfpShown++)
+              CG_LOG("Container: snapshot holder " << hname << ": " << lfpLines[lfpShown] << "\n");
+            if (destWalks != destWalksShown || !destWalksShown) {
+              destWalksShown = destWalks;
+              CG_LOG("Container: snapshot holder " << hname << ": site names (B6): destination walks: " << destWalks
+                     << " writes, " << dNodes << " nodes, " << format("%.3f", dSecs) << " s; " << dCycleCuts
+                     << " cycle cuts, " << dOffCycles << " cycles stepping the offset, " << dBudgetCuts
+                     << " budget cuts; covers closed by the least solution: " << lfpCycleKeys << " in " << lfpCycles
+                     << " cycles\n");
+            }
           }
           o1AssumeLines.push_back("  snapshot holder of " + outer + " (the table its handle saves read): H " + hname +
                                   "; handle save " + locs(hSaves) + "; element saves " + locs(eSaves) +
@@ -6166,6 +6488,21 @@ void CallGraphPass::checkContainerClosure() {
               }
               for (const std::string &x : keptObjs) CG_LOG("Container: snapshot holder " << hname << ": kept: " << x << "\n");
               for (const std::string &x : coverLog) CG_LOG("Container: snapshot holder " << hname << ": " << x << "\n");
+              {
+                // B6: the destination walks and the covers decided so far.
+                for (; siteLinesShown < siteCoverLines.size(); siteLinesShown++)
+                  CG_LOG("Container: snapshot holder " << hname << ": site names (B6): " << siteCoverLines[siteLinesShown] << "\n");
+                for (; lfpShown < lfpLines.size(); lfpShown++)
+                  CG_LOG("Container: snapshot holder " << hname << ": " << lfpLines[lfpShown] << "\n");
+                if (destWalks != destWalksShown || !destWalksShown) {
+                  destWalksShown = destWalks;
+                  CG_LOG("Container: snapshot holder " << hname << ": site names (B6): destination walks: " << destWalks
+                         << " writes, " << dNodes << " nodes, " << format("%.3f", dSecs) << " s; " << dCycleCuts
+                         << " cycle cuts, " << dOffCycles << " cycles stepping the offset, " << dBudgetCuts
+                         << " budget cuts; covers closed by the least solution: " << lfpCycleKeys << " in " << lfpCycles
+                         << " cycles\n");
+                }
+              }
               if (c2Run) {
                 const auto &cc = unnamedCounts.at(K + "#W");
                 CG_LOG("Container: snapshot holder " << hname << ": check (2) on the word (" << Wkept.size()

@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <functional>
+#include <tuple>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +34,8 @@ struct IROrder {
 // the rooted flows-to solver. The CFL-reachability baseline
 // (src/baseline/CFLCGPass) derives from it to reuse the graph build and
 // overrides the solve and the hooks marked "baseline".
+class PointeeResolver;
+
 class CallGraphPass : public IterativeModulePass {
 protected:
   class InstHandler : public llvm::InstVisitor<InstHandler> {
@@ -700,6 +703,86 @@ protected:
   struct MintTable;
   std::shared_ptr<MintTable> mintTable;
   void buildMintTable();
+  // Site names (B, Fable 2026-10-21; SiteNames.cc): a fresh allocation
+  // site whose mint label is L, named L for the covers when every write
+  // found from it is checked against L ((i)) and its size conforms
+  // ((iii)); built from the mint table, before the container closure and
+  // before every solve.
+  struct SiteName {
+    llvm::Type *layout = nullptr; // L's layout
+    std::string label;
+    int64_t size = 0;             // sizeof(L)
+    bool repeats = false;         // an array of L
+    bool trailing = false;        // L's trailing array runs on (A1 / gap 2)
+    llvm::Type *trailElem = nullptr;
+    int64_t trailAt = 0;          // the trailing array's first byte
+    // 'n' named, 'o' open, 'f' FAIL, 's' untyped by size.
+    char verdict = 0;
+    std::string why;      // the open or FAIL kind; the size, untyped by size
+    std::string first;    // its first write, with its location
+    std::string sizeKind; // (iii)
+    std::set<const llvm::Instruction *> found; // every write found from the site
+    std::map<std::string, size_t> kinds;       // write kind -> count
+    size_t cycles = 0, constOverPtr = 0, dataOverPtr = 0, unkeyedUnion = 0, keyedUnion = 0;
+    bool pastIsTrailingObject = false; // a 'u'/'h' one-then-unknown block: bytes past L are another object's
+  };
+  // A write found from a site: by its web ((i)) or at the solve ((c)).
+  struct FoundWrite {
+    const llvm::Instruction *I;
+    int64_t off; // -1: a runtime offset
+    uint64_t bytes;
+    llvm::Type *VT;
+    const llvm::Value *V;
+    char kind; // 's' struct step, 'u' store, 'm' memset (V: its byte), 'c' copy, 'o' open, 'n' NOOP call, 'b' bodiless byte write
+    int64_t sd; // the stride it repeats at, 0 none
+    std::string cat, why, srcName;
+    int64_t srcOff = 0;
+  };
+  // Its verdict against S (a 'u', 'm' or 'c' write): cls "" when
+  // checked (kind: what checked it), else the open kind or "FAIL", with why.
+  struct WriteVerdict {
+    std::string cls, why;
+    std::vector<std::string> kinds; // what checked it (a store at a stride: two)
+    bool inUnion = false, constOverPtr = false, dataOverPtr = false;
+    std::tuple<std::string, uint64_t, uint64_t> unionSlot;
+  };
+  WriteVerdict judgeFoundWrite(const SiteName &S, const FoundWrite &w, const llvm::DataLayout &DL);
+  // (c): the write I found at the solve at byte off of S's L (-1: an
+  // any-offset cell is never passed), as (i) would record it.
+  FoundWrite solveWrite(const llvm::Instruction *I, int64_t off);
+  std::shared_ptr<PointeeResolver> solvePointees; // solveWrite's copy sources
+  // (c) (Fable 2026-10-22): a site a write found at the solve does not
+  // check loses its name for every later build (labels are only removed);
+  // its row. Kept across iterations.
+  std::map<const llvm::CallBase *, std::string> siteBrokenAtSolve;
+  // Every (c) row, one per (site, write), over all iterations, in the order
+  // found (IR order per solve).
+  std::vector<std::string> siteBreakRows;
+  std::set<std::pair<const llvm::CallBase *, const llvm::Instruction *>> siteBreakSeen;
+  // The sites a cover's B6 decision rested on (close or reach), at the
+  // closure (iteration 0), with each decision: a name broken at the solve
+  // under one of them is refused, since covers are decided once.
+  std::map<const llvm::CallBase *, std::vector<std::string>> siteCoverUsed;
+  // The rows and the summary of siteNames (log: one line per site).
+  void siteNamesReport(bool logRows);
+  std::unordered_map<const llvm::CallBase *, SiteName> siteNames;
+  std::vector<const llvm::CallBase *> siteNameOrder; // IR order
+  std::vector<std::string> siteNameRows;             // not named, IR order (rule report)
+  std::string siteNameSummary;
+  void buildSiteNames();
+  // A write of `bytes` at byte `off` of S's L, of value V (type VT):
+  // "" when its span is a run of whole fields of L with pointer-ness equal
+  // per field (B5), else why not. A union slot is the union census's.
+  struct SiteWriteNote {
+    bool inUnion = false, constOverPtr = false, dataOverPtr = false;
+    std::tuple<std::string, uint64_t, uint64_t> unionSlot;
+  };
+  std::string judgeSiteWrite(const SiteName &S, int64_t off, uint64_t bytes, llvm::Type *VT, const llvm::Value *V,
+                             const llvm::DataLayout &DL, SiteWriteNote *note = nullptr);
+  // Do bytes [off, off + len) of S's L hold bytes [koff, koff + klen) of a
+  // struct named KS ("struct.T") anywhere in its layout (B6)?
+  bool siteWriteHolds(const SiteName &S, int64_t off, int64_t len, llvm::StringRef KS, int64_t koff, int64_t klen,
+                      const llvm::DataLayout &DL);
   // staticLabels without its log lines (the table's call; the solve's own
   // call logs them where they always were).
   bool labelsQuiet = false;

@@ -276,6 +276,10 @@ bool namedSlot(const Instruction *I, const Value *Addr, const DataLayout &DL, Po
 // inside the base's struct (else a step past the layout: P.pastS); else the
 // resolver. A non-zero leading index is never evidence of the base's type.
 bool namedPtr(const Value *V, const DataLayout &DL, PointeeResolver &P, StructType *&S, int64_t &off, int depth = 0);
+// Does the address A reach its object through a struct step (a GEP whose
+// indices step through a struct type, any depth through casts and GEPs)?
+// Such an access is rule (b)'s at the solve (SiteNames.cc).
+bool addressStructStep(const Value *A);
 // CellSolver.cc: the debug-info struct ("struct.<tag>") a declared object
 // is, or (pointee) a pointer value points to; "" if none.
 std::string diDeclaredStruct(const Value *P, bool pointee);

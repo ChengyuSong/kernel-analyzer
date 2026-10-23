@@ -702,7 +702,10 @@ bool CallGraphPass::doModulePass(Module *M) {
   // censuses are off unless asked).
   // --cfl-cells refuses --cfl-reachable (KAMain.cc): every body is emitted.
   if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
+  {
     buildMintTable(); // what each allocation is minted as, before the closure reads it
+    buildSiteNames(); // B: which sites are named for the covers
+  }
   if (CFLCells && (CFLContainerClosure || !Ctx->Containers.empty()) && iteration == 0 &&
       M == Ctx->Modules.front().first)
     checkContainerClosure();
@@ -840,7 +843,7 @@ bool CallGraphPass::solve() {
     // A later iteration mints at the allocator calls the earlier ones
     // resolved (indirect calls marked in Ctx->AllocSites): the table is
     // rebuilt over them (iteration 0's is built before the closure).
-    if (iteration > 0) buildMintTable();
+    if (iteration > 0) buildMintTable(), buildSiteNames();
     bool again = runCellResolution();
     iteration++;
     return again;

@@ -14,6 +14,7 @@ set (KACoreSource
   Presolve.cc
   FlowsToSolver.cc
   AllocExtents.cc
+  SiteNames.cc
   CellSolver.cc
   Names.cc
   NamedCells.cc

@@ -9597,6 +9597,31 @@ bool CallGraphPass::runCellResolution() {
             poolWithdrawRows.push_back(p + ": " + row);
           }
         }
+    // (d) The free space of a pool that takes bytes before the bump holds
+    // no pointer fact: the bytes are characters until the bump hands them
+    // out as the carve's object. A fact in a chunk's cell past its header
+    // withdraws the pool (P1, Fable 2026-10-23).
+    for (auto &[p, sites] : poolPreBump) {
+      if (poolWithdrawnAtSolve.count(p)) continue;
+      const auto &allocs = poolChunkAllocs[p];
+      const int64_t hdr = poolChunkHeader.count(p) ? poolChunkHeader.at(p) : 0;
+      for (uint32_t f = 0; f < cells.size(); f++) {
+        const Cell &c = cells[f];
+        if (c.kind != CellKind::Off && c.kind != CellKind::Any) continue;
+        if (c.kind == CellKind::Off && c.off < hdr) continue;
+        const Value *OV = NF.getValueForNode(objs[c.obj].origin);
+        const auto *OI = dyn_cast_or_null<Instruction>(OV);
+        if (!OI || !allocs.count(OI) || c.load == UINT32_MAX || pts[find(c.load)].count() == 0) continue;
+        std::string ss;
+        for (const std::string &x : sites) ss += (ss.empty() ? "" : ", ") + x;
+        const std::string row = "pool withdrawn at the solve: a pointer fact in the free space of " + describe(objs[c.obj]) +
+                                (c.kind == CellKind::Any ? " (any offset)" : " at +" + std::to_string(c.off)) +
+                                ", where bytes are written before the bump (" + ss + ")";
+        if (poolWithdrawnAtSolve.try_emplace(p, row).second) newlyWithdrawn.push_back(p);
+        poolWithdrawRows.push_back(p + ": " + row);
+        break;
+      }
+    }
     for (const std::string &p : newlyWithdrawn)
       if (auto u = poolCertUsed.find(p); u != poolCertUsed.end()) {
         errs() << "ERROR: --cfl-cells: decisions before the solve rested on pool " << p

@@ -4,7 +4,10 @@
 // its object receives e->fn (empty before: the access was invisible to
 // the carve rule while its store was dropped as a handle store).
 // Executed: f twice. 9547f21 answers [] at e->fn(); S1 [f].
-// LOG: PoolCarve: 1 pools \(0 refused\), 3 handle fields .* 5 carve sites
+// One carve per hand-out: mk's e is carved at its cursor load, once (P1:
+// 732d45a carved each of e's three slot loads, 5 sites, one hand-out split
+// into three objects).
+// LOG: PoolCarve: 1 pools \(0 refused\), 3 handle fields .* 3 carve sites
 #include <stdlib.h>
 struct chunk { struct chunk *next; };
 struct pool { char *cur; char *end; struct chunk *chunks; };

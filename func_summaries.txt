@@ -980,23 +980,22 @@ fmodf NOOP
 casemap NOOP
 
 @scope all
-# ---- httpd / APR pools (2026-08-13, ka-bench corpora) ----
-# apr_palloc carves from shared allocator blocks; FRESH on the leaf
-# dup/create family severs per-callsite object identity from the pool
-# blocks. APR source arg is arg1 (arg0 = pool). AUDIT RULE (learned
-# 2026-08-13 validation): a summary SKIPS the body, so NEVER summarize
-# a function whose body contains an indirect call — it starves.
-# REJECTED by that audit: apr_palloc + apr_psprintf/apr_pvsprintf
-# (pool->abort_fn dispatch in apr_palloc; psprintf_flush passed to
-# apr_vformatter inside apr_pvsprintf): measured -5 REAL pairs
-# (apr_palloc->abort_on_oom, apr_vformatter->psprintf_flush).
-# Entries below are audited dispatch-free bodies. A/B VERDICT
-# (2026-08-13, httpd HEAD FI): ANSWER-NEUTRAL (-0/+0 vs no-summary
-# base) — pool fusion does NOT drive httpd icall V-sets (ap_hook
-# channel territory); kept as audited-sound identity hygiene, same
-# policy as fwnode_connection_find_match. pstrcat is FRESH-only under
-# the declared text-serialization assumption (pointer cells do not
-# survive byte formatting).
+# ---- httpd / APR pools: bodiless externs only ----
+@scope extern
+# These entries stand only for an APR that is not linked (a bodiless
+# extern call keeps a sound summary instead of answering nothing). With
+# APR linked the bodies are inferred: the pool carve (Carves.cc, P1, Fable
+# 2026-10-23) certifies the memnode pool (apr_palloc's hand-outs are
+# carves; the confirmer does not promote apr_palloc (R3: its failure path
+# calls pool->abort_fn through a pointer), so they are one object per
+# carve site; the allocator's free lists are link fields;
+# apr_bucket_alloc's small and whole-tail hand-outs are carves), and these
+# entries are inert. APR source arg is
+# arg1 (arg0 = pool). pstrcat is FRESH-only under the declared
+# text-serialization assumption (pointer cells do not survive byte
+# formatting). (2026-08-13 audit: a summary skips a body, so a body with an
+# indirect call is never summarized; apr_palloc and apr_psprintf have one
+# and have no entry.)
 apr_pcalloc FRESH
 apr_pmemdup FRESH CPY(ret<-arg1)
 apr_pstrdup FRESH CPY(ret<-arg1)
@@ -1004,6 +1003,7 @@ apr_pstrndup FRESH CPY(ret<-arg1)
 apr_pstrmemdup FRESH CPY(ret<-arg1)
 apr_pstrcat FRESH
 apr_bucket_alloc FRESH
+@scope all
 
 # ---- postgres memory contexts: WITHDRAWN (2026-08-13 validation) ----
 # The whole palloc/MemoryContextAlloc/repalloc/pstrdup family FAILS

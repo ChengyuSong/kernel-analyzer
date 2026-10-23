@@ -802,6 +802,16 @@ protected:
   // The certified pools' handle fields ("objalloc+0"), checked after the
   // solve: a write into one outside the forms is a rule row.
   std::set<std::string> poolHandleFields;
+  // A handle field that is an array (a link field's free[] lists, P1 G1):
+  // its bytes; every cell from its offset up to offset + bytes is one of it.
+  std::map<std::string, int64_t> poolHandleFieldBytes;
+  // (d) (P1, Fable 2026-10-23): a certified pool whose free space takes
+  // bytes before the bump that hands them out: its chunk allocation calls,
+  // the chunk header's bytes (the refill offset), and the sites; the solve
+  // withdraws the pool if a pointer fact lands in a chunk's free space.
+  std::map<std::string, std::set<const llvm::Instruction *>> poolChunkAllocs;
+  std::map<std::string, int64_t> poolChunkHeader;
+  std::map<std::string, std::vector<std::string>> poolPreBump;
   // Stores whose value is a certified pool's handle value (the bump,
   // rewinds, refills into handle fields, chunk list links): not modeled.
   std::unordered_set<const llvm::Instruction *> poolHandleStores;

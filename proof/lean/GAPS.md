@@ -2553,6 +2553,89 @@ handle field; the solve checks it.
   certified pools): A accesses outside the pools' forms, W pools
   withdrawn at the solve") and the rule report's SUMMARY line.
 
+**The APR forms (P1, Fable 2026-10-23).** What the carve preserves is
+the same for every form: each hand-out is a fresh object (its own
+allocation site, per caller through the FRESH confirmer), and the
+forms only identify where a hand-out happens and how big it is.
+- **(a) A bump through a carry field.** `pool->self_first_avail = pool +
+  K; node->first_avail = pool->self_first_avail`: a load of field J
+  stored into the cursor H bumps H by K when every store to J in the
+  program is (a load of H) + K, one K. Any other store to J: no carry,
+  with a row naming it.
+- **(b) A bump through an end slot.** `endp = node->first_avail + K`
+  computed first (into a -O0 slot every store of which is H + K, one
+  K), then `node->first_avail = endp`: the carve and the bump read the
+  node the end was computed on (no store to the node's slot can run
+  after the end's node load and before the carve's, unless an end store
+  recomputes the end first), else refused with the store.
+- **(c) A whole tail.** A node the function obtains from a chunk source
+  and keeps (its uses: its own header fields, compares, stores into
+  fields of its own hand-out, chunk formals) hands out all of its free
+  space, or all past its bump, as one object; any other use refuses
+  with the use named.
+- **(d) Bytes written before the bump.** A byte copy into or out of the
+  free space, or a free-space pointer kept only in char-pointer fields
+  (a formatter's cursor and end), writes characters that the later bump
+  hands out as the carve's object. Checked at the solve: a pointer fact
+  in a chunk's cell past its header withdraws the pool (the S1
+  withdrawal).
+- **(e) A refill.** `node->first_avail = node + HDR` sets the cursor to
+  the chunk's first carve position; one row per site.
+- **G1 link fields.** A field every store of which (program-wide) is a
+  chunk base or null holds chunk bases; a pointer to it (`&node->next`,
+  `&free[i]`, kept in a slot or in a field every store of which is such
+  an address) loads chunk bases and stores only chunk bases or null;
+  stepped by a constant it stays in its array (no-UB: the walk stays
+  inside `free[]`; a scalar link stepped would leave its object). Link
+  fields are handle fields, so S1 checks every other access.
+- **G2 chunk sources, G5 chunk formals.** A built function every return
+  of which is a chunk base or null returns chunk bases; a formal of a
+  function whose address is never taken, every direct call of which
+  passes a chunk base or null, is a chunk base. A call to a certified
+  pool's chunk source is the pool's bookkeeping (its result is a chunk
+  base), so the confirmer does not count it as a side effect of the
+  wrapper that makes it (apr_palloc); the confirmer records that use of
+  the certificate, and S1's withdrawal at the solve covers it like any
+  other (a withdrawn pool with a recorded use refuses the run). Linked
+  httpd's apr_palloc is still not promoted: R3 rejects its failure
+  path's `pool->abort_fn(APR_ENOMEM)`, a call through a pointer, so its
+  hand-outs are one object per carve site.
+- **G3 end bounds.** A chunk-base GEP stored only into non-bump header
+  fields of the same chunk is a free-space pointer; its loads are
+  compared or measured, or judged as free-space pointers.
+- **G4 bodies not built.** The carve premise ranges over the accesses in
+  the model; a body replaced by its summary is not in the model, and the
+  summary's audit stands for it.
+- **One fixpoint.** G1, G2 and G5 depend on each other (a free list's
+  loads are chunk bases when its stores are, which come from the
+  sources' results and the formals' callers): the greatest fixpoint,
+  every candidate assumed and the check run from the initial handle
+  fields, the candidates a run contradicts removed (each with its
+  reason), until a run removes none. Sound: every value a run of the
+  program stores, returns or passes traces to a source that is not an
+  assumption (an allocation, null). The candidates are pruned before the
+  first run to the shapes that can hold (a return of another shape fails
+  every run), which leaves the fixpoint unchanged.
+- **A slot holds one hand-out.** A free-space pointer stored into a -O0
+  slot is the hand-out (the carve is the stored value); otherwise every
+  load of the slot would be a carve of its own, one hand-out split into
+  objects that do not share their writes.
+- **A saved cursor is followed load by load.** A slot some load of which
+  is stored back into a handle field (libiberty's objalloc_free_block
+  keeps a chunk's saved cursor in a local and writes it back as the
+  pool's cursor) is not carved at the store; each of its loads is judged
+  where it is used, as at 732d45a (row "slot followed load by load").
+  This is sound only while at most one of the slot's loads is handed
+  out: the loads name one free-space pointer, so one carve among them is
+  the slot's one hand-out, and the others are rewinds (written back into
+  the bump or another handle field: handle stores) or bookkeeping
+  (compared, measured). Two loads carved apart would split one hand-out
+  into two objects that need not share their writes, a missed flow; a
+  saved cursor carved from more than one of its loads refuses the pool
+  ("saved cursor handed out twice", naming the slot and both carves;
+  t_pool_savedcursor2.c). objalloc_free_block's local is only written
+  back (objalloc.c:295) and measured (:296), so nothing is carved from it.
+
 **Handle stores are not modeled.** A certified pool's handle values are
 not data: cursor reloads, free-space pointers, chunk pointers, rewind
 values.

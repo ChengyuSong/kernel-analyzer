@@ -465,6 +465,8 @@ void CallGraphPass::confirmFreshWrappers() {
     }
   };
   size_t redundantRows = 0;
+  std::map<std::string, std::set<std::string>> promotedRet;         // promoted wrapper -> its return-path callees
+  std::map<std::string, std::set<const Instruction *>> promotedCarves; // promoted wrapper -> the pool carves it returns
   size_t round = 0;
   // Phases. Lfp: rounds promote wrappers over confirmed allocators until
   // none is added (least fixpoint). Then the recursive candidates (members
@@ -649,6 +651,7 @@ void CallGraphPass::confirmFreshWrappers() {
         SmallVector<int, 2> retFormals;
         bool sawFresh = false;
         SmallVector<const Instruction *, 4> certUsed; // pool instructions the certificate judged (S1)
+        std::set<std::string> retCallees;              // the calls on the return path (hand-outs below)
         SmallPtrSet<const Value *, 16> onRetPath;
         SmallVector<const Value *, 8> work;
         bool ok = true;
@@ -679,6 +682,7 @@ void CallGraphPass::confirmFreshWrappers() {
           if (const auto *CB = dyn_cast<CallBase>(v)) {
             if (!calleeFresh(CB)) { ok = false; r1bad = v; }
             else sawFresh = true;
+            if (const Function *RC = CB->getCalledFunction()) retCallees.insert(RC->getName().str());
             continue;
           }
           if (const auto *PN = dyn_cast<PHINode>(v)) {
@@ -1317,6 +1321,9 @@ void CallGraphPass::confirmFreshWrappers() {
           else if (aliasArgs.empty()) g_freshInit++;
         }
         g_freshPromoted++;
+        promotedRet[F.getName().str()] = retCallees;
+        for (const Instruction *PI : certUsed)
+          if (poolCarves.count(PI)) promotedCarves[F.getName().str()].insert(PI);
         if (phase == Lfp || phase == GfpPromote) {
           g_poolCertExempt.insert(certExempt.begin(), certExempt.end());
           for (const Instruction *PI : certExempt) notePoolCertUse(PI, "FRESH " + F.getName().str() + " (confirmer)");
@@ -1345,6 +1352,35 @@ void CallGraphPass::confirmFreshWrappers() {
     }
   }
   restoreCounters();
+  // P1 (Fable 2026-10-23): the hand-outs the promoted carve wrappers make,
+  // one object per call from outside them, against the carve sites inside.
+  if (!promotedCarves.empty()) {
+    std::set<std::string> wrap;
+    std::set<const Instruction *> sites;
+    for (auto &[f, cs] : promotedCarves) wrap.insert(f), sites.insert(cs.begin(), cs.end());
+    for (bool grew = true; grew;) {
+      grew = false;
+      for (auto &[f, rc] : promotedRet)
+        if (!wrap.count(f))
+          for (const std::string &c : rc)
+            if (wrap.count(c)) {
+              wrap.insert(f);
+              grew = true;
+              break;
+            }
+    }
+    size_t handouts = 0;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        if (!wrap.count(F.getName().str()))
+          for (const Instruction &I : instructions(F))
+            if (const auto *CB = dyn_cast<CallBase>(&I))
+              if (const Function *CF = CB->getCalledFunction(); CF && wrap.count(CF->getName().str())) handouts++;
+    std::string ws;
+    for (const std::string &w : wrap) ws += " " + w;
+    CG_LOG("ConfirmFresh: pool hand-outs " << handouts << " (carve sites before " << sites.size() << "), through "
+           << wrap.size() << " carve wrappers:" << ws.substr(0, 400) << "\n");
+  }
   if (gfpRounds)
     CG_LOG("ConfirmFresh: recursive candidates: " << gfpRounds << " probe rounds, " << gfpPromoted
            << " promoted at the greatest fixpoint\n");

@@ -34,6 +34,10 @@
 // carves").
 
 #include "CallGraphInternal.h"
+#include <llvm/Analysis/CFG.h>
+#include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/IR/DebugInfo.h>
+#include <chrono>
 #include "NamedCells.h"
 
 #include <llvm/IR/Dominators.h>
@@ -85,10 +89,14 @@ bool localSlot(const Value *A) {
 // (a pointer into a chunk's free space), C = a chunk base (an allocation
 // stored into a handle field, or a load of a list field).
 struct HV {
-  char flavor = 'C';
+  char flavor = 'C';               // C chunk base, B free-space pointer, L link pointer (P1 G1)
   std::string field;               // the field it was loaded from ("" for an allocation)
   const CallBase *alloc = nullptr; // the allocation it is (C), in this function
   std::string pool;                // a field of its pool
+  std::set<std::string> links;     // L: the link fields it addresses
+  const Instruction *src = nullptr; // B: the cursor load it comes from
+  const StoreInst *saved = nullptr; // B: the saved-cursor slot store it was reloaded from
+  const LoadInst *savedLoad = nullptr; // B: and the slot load
 };
 
 } // namespace
@@ -99,11 +107,28 @@ void CallGraphPass::checkPoolCarves() {
   // IR merges isomorphic structs: objalloc and demangler_engine are one IR
   // type), else the IR struct; "" if the access names no struct field.
   std::set<std::string> irFallback;
-  auto fieldKey = [&](const Instruction *I, const Value *Addr) -> std::string {
+  // Array fields keyed by their element accesses: key -> the array's bytes.
+  std::map<std::string, int64_t> arrayBytes;
+  std::function<std::string(const Instruction *, const Value *)> fieldKey = [&](const Instruction *I,
+                                                                                const Value *Addr) -> std::string {
     if (isa<AllocaInst>(Addr->stripPointerCasts())) return "";
     StructType *S = nullptr;
     int64_t off = 0;
-    if (!accessSlot(I, Addr, I->getModule()->getDataLayout(), S, off)) return "";
+    if (!accessSlot(I, Addr, I->getModule()->getDataLayout(), S, off)) {
+      // An element of an array field (`allocator->free[i]`, P1 G1): the
+      // array field's key, every element one field.
+      const Value *A = Addr; // casts only: free[0] is an all-zero GEP
+      while (const auto *BC = dyn_cast<BitCastOperator>(A)) A = BC->getOperand(0);
+      const auto *G = dyn_cast<GEPOperator>(A);
+      if (!G || !isa<ArrayType>(G->getSourceElementType()) || G->getNumIndices() != 2) return "";
+      const auto *Z = dyn_cast<ConstantInt>(G->idx_begin()->get());
+      const GEPOperator *B = structGEP(G->getPointerOperand());
+      if (!Z || !Z->isZero() || !B || !isa<StructType>(B->getSourceElementType()) || B->hasAllZeroIndices()) return "";
+      const std::string k = fieldKey(I, G->getPointerOperand());
+      if (!k.empty())
+        arrayBytes[k] = (int64_t)I->getModule()->getDataLayout().getTypeAllocSize(G->getSourceElementType());
+      return k;
+    }
     // An element of an array of S (`(cp + 1)->m`) is the same field.
     if (const int64_t sz = (int64_t)I->getModule()->getDataLayout().getTypeAllocSize(S); sz > 0)
       off = ((off % sz) + sz) % sz;
@@ -152,6 +177,69 @@ void CallGraphPass::checkPoolCarves() {
     return it != Ctx->FuncSummaries.end() && it->second->freeArg == (int)ai;
   };
 
+  // A body GraphBuild does not build (a summary replaces it, or it is
+  // skipped) is not judged (G4, Fable 2026-10-23, P1): the carve premise
+  // ranges over the accesses in the model; a body replaced by its summary
+  // is not in the model, and the summary's audit stands for it.
+  // Casts only: stripPointerCasts would also strip an all-zero GEP, which
+  // is &node->next (a link address), not the node (P1 G1).
+  auto castsOnly = [](const Value *V) {
+    for (;;) {
+      if (const auto *BC = dyn_cast<BitCastOperator>(V)) V = BC->getOperand(0);
+      else if (const auto *AC = dyn_cast<AddrSpaceCastOperator>(V)) V = AC->getOperand(0);
+      else return V;
+    }
+  };
+  // (d) Is the field "S+off" a char pointer by debug info (the leaf member
+  // at that byte offset, through nested structs and typedefs)?
+  std::map<std::string, const DICompositeType *> diStructs;
+  for (auto &[M, _] : Ctx->Modules) {
+    DebugInfoFinder DF;
+    DF.processModule(*M);
+    for (const DIType *T : DF.types())
+      if (const auto *CT = dyn_cast<DICompositeType>(T);
+          CT && CT->getTag() == dwarf::DW_TAG_structure_type && !CT->getName().empty() && !CT->getElements().empty())
+        diStructs.emplace(CT->getName().str(), CT);
+  }
+  auto charPtrField = [&](const std::string &key) {
+    const size_t plus = key.rfind('+');
+    if (plus == std::string::npos) return false;
+    auto it = diStructs.find(key.substr(0, plus));
+    if (it == diStructs.end()) return false;
+    uint64_t off = std::stoull(key.substr(plus + 1)) * 8;
+    const DIType *T = it->second;
+    for (int d = 0; d < 8 && T; d++) {
+      while (const auto *DT = dyn_cast<DIDerivedType>(T)) {
+        if (DT->getTag() == dwarf::DW_TAG_pointer_type) {
+          const DIType *B = DT->getBaseType();
+          for (const auto *BD = dyn_cast_or_null<DIDerivedType>(B); BD && BD->getTag() != dwarf::DW_TAG_pointer_type;
+               BD = dyn_cast_or_null<DIDerivedType>(B))
+            B = BD->getBaseType();
+          const auto *BT = dyn_cast_or_null<DIBasicType>(B);
+          return off == 0 && BT && (BT->getEncoding() == dwarf::DW_ATE_signed_char || BT->getEncoding() == dwarf::DW_ATE_unsigned_char);
+        }
+        T = DT->getBaseType();
+        if (!T) return false;
+      }
+      const auto *CT = dyn_cast<DICompositeType>(T);
+      if (!CT) return false;
+      const DIType *next = nullptr;
+      for (const DINode *E : CT->getElements())
+        if (const auto *Mb = dyn_cast<DIDerivedType>(E); Mb && Mb->getTag() == dwarf::DW_TAG_member &&
+                                                           Mb->getOffsetInBits() <= off &&
+                                                           off < Mb->getOffsetInBits() + std::max<uint64_t>(Mb->getSizeInBits(), 1)) {
+          off -= Mb->getOffsetInBits();
+          next = Mb->getBaseType();
+          break;
+        }
+      T = next;
+    }
+    return false;
+  };
+  auto unjudged = [&](const Function &F) {
+    return F.isDeclaration() || F.empty() || (Ctx->AllocFuncs.count(&F) && !summaryKeepsBody(Ctx, &F)) ||
+           Ctx->ContainerFuncs.count(&F) || shouldSkipFunction(&F);
+  };
   // Does V come from an allocation (through casts, GEPs, local slots)?
   // The slot walks below go 8 hops deep; at -O0 a slot has many loads and
   // stores, so each query remembers the (value, depth) pairs it has seen:
@@ -201,6 +289,22 @@ void CallGraphPass::checkPoolCarves() {
     return false;
   };
 
+  // The field V is a load of, through casts and -O0 local slots whose every
+  // store is such a load of one field; "" if none or several.
+  std::function<std::string(const Value *, int)> loadedField = [&](const Value *V, int d) -> std::string {
+    V = V->stripPointerCasts();
+    const auto *L = dyn_cast<LoadInst>(V);
+    if (!L || d > 4) return "";
+    if (!localSlot(L->getPointerOperand())) return fieldKey(L, L->getPointerOperand());
+    std::string k;
+    for (const User *U : L->getPointerOperand()->users())
+      if (const auto *S = dyn_cast<StoreInst>(U)) {
+        const std::string ks = loadedField(S->getValueOperand(), d + 1);
+        if (ks.empty() || (!k.empty() && ks != k)) return "";
+        k = ks;
+      }
+    return k;
+  };
   // Does GEP G step back (a negative constant, or the negation of a
   // length: `p - n`)?
   auto stepsBack = [](const GEPOperator *G) {
@@ -240,7 +344,11 @@ void CallGraphPass::checkPoolCarves() {
     parent.emplace(a, a);
     parent.emplace(b, b);
     const std::string ra = pool(a), rb = pool(b);
-    if (ra != rb) parent[rb] = ra;
+    if (ra == rb) return;
+    // A placeholder pool ("@" + a chunk source or formal, P1) is never the
+    // representative of a set that has a field.
+    if (ra[0] == '@' && rb[0] != '@') parent[ra] = rb;
+    else parent[rb] = ra;
   };
 
   struct Carve { const Instruction *I; std::string form, field; CarveSize size; };
@@ -248,15 +356,36 @@ void CallGraphPass::checkPoolCarves() {
   std::vector<Carve> carves;
   std::vector<Refusal> refusals;
   std::vector<std::pair<const Instruction *, std::string>> rewinds;
+  // (e) Refills (Fable 2026-10-23, P1): a chunk base + header stored into a
+  // bump field, the cursor set to the chunk's first carve position.
+  std::vector<std::pair<const Instruction *, std::string>> refills;
+  // A -O0 slot holding a free-space pointer whose load is stored back into a
+  // handle field (a saved cursor): followed load by load, not carved at the
+  // store. (store into the slot, store back, its handle field)
+  struct SavedCursor { const StoreInst *S, *Back; std::string field; };
+  std::vector<SavedCursor> savedCursors;
+  // (d) Bytes written into the free space before the bump that hands them
+  // out (Fable 2026-10-23): byte copies and char-pointer cursors, judged
+  // again at the solve.
+  std::vector<std::pair<const Instruction *, std::string>> preBump; // (use, what)
+  std::vector<std::pair<const Instruction *, std::string>> chunkAllocs; // (allocation call, a field of its pool)
+  std::vector<std::pair<const Instruction *, std::string>> preBumpPool; // (use, a field of its pool)
   // The pools' own bookkeeping: stores into handle fields, rewinds,
   // pointer arithmetic on handles (with a field of their pool).
   std::vector<std::pair<const Instruction *, std::string>> bookkeeping;
 
   // Bumps and counter decrements, per function; counter carves name M.
   std::map<const Function *, std::set<std::string>> bumpIn, counterIn;
+  // (b) The bump through a slot (Fable 2026-10-23): `endp = node->first_avail
+  // + K` computed first (on one or more paths: the -O0 slot every store of
+  // which is H + K, one K), then `node->first_avail = endp` after the carve.
+  // Per (function, field): K, and the end stores (the same-node check).
+  std::map<std::pair<const Function *, std::string>, int64_t> slotBumpK;
+  std::map<std::pair<const Function *, std::string>, std::vector<const StoreInst *>> slotBumpEnds;
+  std::map<std::pair<const Function *, std::string>, std::vector<const StoreInst *>> slotBumps;
   for (auto &[M, _] : Ctx->Modules)
     for (Function &F : *M) {
-      if (F.isDeclaration()) continue;
+      if (unjudged(F)) continue;
       for (const Instruction &I : instructions(F)) {
         const auto *SI = dyn_cast<StoreInst>(&I);
         if (!SI) continue;
@@ -264,6 +393,30 @@ void CallGraphPass::checkPoolCarves() {
         if (k.empty()) continue;
         const Value *V = SI->getValueOperand();
         if (V->getType()->isPointerTy() && fromAlloc(V, 0)) refilled.insert(k);
+        if (const auto *LE = dyn_cast<LoadInst>(V->stripPointerCasts());
+            LE && V->getType()->isPointerTy() && localSlot(LE->getPointerOperand())) {
+          int64_t K = -1;
+          std::vector<const StoreInst *> ends;
+          for (const User *U : LE->getPointerOperand()->users())
+            if (const auto *ES = dyn_cast<StoreInst>(U); ES && ES->getPointerOperand() == LE->getPointerOperand()) {
+              const auto *EG = dyn_cast<GEPOperator>(ES->getValueOperand()->stripPointerCasts());
+              APInt eo(64, 0);
+              if (!EG || !EG->accumulateConstantOffset(F.getParent()->getDataLayout(), eo) || eo.getSExtValue() <= 0 ||
+                  !loadsField(EG->getPointerOperand(), k, 0) || (K >= 0 && K != eo.getSExtValue())) {
+                K = -2;
+                break;
+              }
+              K = eo.getSExtValue();
+              ends.push_back(ES);
+            }
+          if (K > 0) {
+            bumpIn[&F].insert(k);
+            bumpFields.insert(k);
+            slotBumpK[{&F, k}] = K;
+            slotBumpEnds[{&F, k}] = ends;
+            slotBumps[{&F, k}].push_back(SI);
+          }
+        }
         if (V->getType()->isPointerTy()) {
           const auto *G = dyn_cast<GEPOperator>(V->stripPointerCasts());
           if (G && !G->hasAllZeroIndices() && loadsField(G->getPointerOperand(), k, 0)) {
@@ -283,6 +436,64 @@ void CallGraphPass::checkPoolCarves() {
         }
       }
     }
+  // (a) A bump through a field of the carved chunk (Fable 2026-10-23, P1):
+  // `pool = node->first_avail; pool->self_first_avail = (char *)pool + K;
+  // node->first_avail = pool->self_first_avail;`. A field J is a carry of
+  // H when EVERY store to J in the program stores (a load of H) + K, one
+  // constant K for all; then `H := load J` bumps H by K. Any other store
+  // to J: not a carry, and the store is named (carryRefused).
+  std::map<std::string, std::pair<std::string, int64_t>> carry; // J -> (H, K)
+  std::map<std::string, std::pair<const StoreInst *, std::string>> carryRefused; // J -> (the store that is not H + K, H)
+  std::map<std::pair<const Function *, std::string>, int64_t> carryBumpK; // (F, H) -> K of its bump through J
+  {
+    std::map<std::string, std::vector<const StoreInst *>> storesOf;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        if (!unjudged(F))
+          for (const Instruction &I : instructions(F))
+            if (const auto *SI = dyn_cast<StoreInst>(&I); SI && SI->getValueOperand()->getType()->isPointerTy())
+              if (const std::string k = fieldKey(SI, SI->getPointerOperand()); !k.empty()) storesOf[k].push_back(SI);
+    // Every store judged (IR order): the first (H, K) a store gives is the
+    // candidate; any store that is not H + K names the field's refusal.
+    for (auto &[j, ss] : storesOf) {
+      std::string h;
+      int64_t K = -1;
+      const StoreInst *bad = nullptr;
+      for (const StoreInst *SI : ss) {
+        const auto *G = dyn_cast<GEPOperator>(SI->getValueOperand()->stripPointerCasts());
+        APInt off(64, 0);
+        std::string hk;
+        if (G && G->accumulateConstantOffset(SI->getModule()->getDataLayout(), off) && off.getSExtValue() > 0)
+          hk = loadedField(G->getPointerOperand(), 0);
+        if (hk.empty() || hk == j || (!h.empty() && (hk != h || off.getSExtValue() != K))) {
+          if (!bad) bad = SI;
+          continue;
+        }
+        if (h.empty()) h = hk, K = off.getSExtValue();
+      }
+      if (h.empty()) continue; // no store of the form: not a candidate
+      if (bad) {
+        carryRefused[j] = {bad, h};
+        continue;
+      }
+      carry[j] = {h, K};
+    }
+    // The bumps through a carry: H := load J.
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        if (!unjudged(F))
+          for (const Instruction &I : instructions(F))
+            if (const auto *SI = dyn_cast<StoreInst>(&I)) {
+              const auto *L = dyn_cast<LoadInst>(SI->getValueOperand()->stripPointerCasts());
+              if (!L) continue;
+              const std::string j = fieldKey(L, L->getPointerOperand());
+              auto c = carry.find(j);
+              if (c == carry.end() || fieldKey(SI, SI->getPointerOperand()) != c->second.first) continue;
+              bumpIn[&F].insert(c->second.first);
+              bumpFields.insert(c->second.first);
+              carryBumpK[{&F, c->second.first}] = c->second.second;
+            }
+  }
   // Counter carves: gep (load M), C with C decremented here (its reload,
   // or the decremented value itself at -O3).
   auto counterCarve = [&](const GEPOperator *G, const Function *F, std::string *cOut = nullptr) -> std::string {
@@ -318,7 +529,7 @@ void CallGraphPass::checkPoolCarves() {
   };
   for (auto &[M, _] : Ctx->Modules)
     for (Function &F : *M)
-      if (!F.isDeclaration())
+      if (!unjudged(F))
         for (const Instruction &I : instructions(F))
           if (const auto *G = dyn_cast<GEPOperator>(&I))
             if (std::string m = counterCarve(G, &F); !m.empty()) baseFields.insert(m);
@@ -341,20 +552,275 @@ void CallGraphPass::checkPoolCarves() {
     return;
   }
 
+  // G2 (Fable 2026-10-23, P1): a chunk source is a built function every
+  // one of whose returns is a chunk base or null (through slots, joins and
+  // casts); its call results are chunk bases of its pool, by name (the call
+  // may name a declaration). G1, G2 and G5 depend on each other (a free
+  // list's loads are chunk bases when its stores are, which come from the
+  // sources' results), so they are the greatest fixpoint: every candidate
+  // assumed, the check run from the initial handle fields, the candidates
+  // the run contradicts removed, and the check run again until it removes
+  // none. Sound: every value a run of the program stores or returns traces
+  // to a source that is not an assumption (an allocation, null).
+  std::map<std::string, std::string> chunkSources; // name -> a field of its pool
+  std::map<std::string, size_t> chunkReturns;
+  // G1 (Fable 2026-10-23, P1): link fields (every store a chunk base or
+  // null), link-holding fields (every store an address of a link field); a
+  // link pointer loads and stores its links. G5: a formal every direct call
+  // of whose function passes a chunk base or null is a chunk base (the dual
+  // of G2).
+  std::map<std::string, std::string> linkFields;                 // key -> a field of its pool
+  std::map<std::string, std::set<std::string>> linkHolding;      // key -> the link fields it holds addresses of
+  std::map<std::string, size_t> linkGood, holdGood;               // the last round's stores, per field
+  std::map<std::string, const Instruction *> linkBad, holdBad;    // the first store that is not one
+  std::map<std::pair<std::string, unsigned>, std::string> chunkParams; // (function, arg) -> a field of its pool
+  std::map<std::pair<std::string, unsigned>, size_t> paramGood;
+  std::set<std::pair<std::string, unsigned>> paramBad;
+  std::vector<const Instruction *> linkSteps;                     // L +- constant inside an array link field
+  std::map<std::string, std::set<std::string>> holdLast;          // the last round's link addresses stored, per field
+  // G3: chunk-base GEPs stored into the same chunk's non-bump header
+  // fields (end bounds), by receiving field.
+  std::map<std::string, std::set<const Instruction *>> boundStores;
+  // Two addresses of one chunk base: the same value, or two loads of one
+  // -O0 slot in one block with no store to the slot between them.
+  auto sameBase = [&](const Value *A, const Value *B) {
+    A = A->stripPointerCasts();
+    B = B->stripPointerCasts();
+    if (A == B) return true;
+    const auto *LA = dyn_cast<LoadInst>(A), *LB = dyn_cast<LoadInst>(B);
+    if (!LA || !LB || LA->getPointerOperand() != LB->getPointerOperand() || !localSlot(LA->getPointerOperand()) ||
+        LA->getParent() != LB->getParent())
+      return false;
+    if (LB->comesBefore(LA)) std::swap(LA, LB);
+    for (const Instruction *I = LA->getNextNode(); I && I != LB; I = I->getNextNode())
+      if (const auto *S = dyn_cast<StoreInst>(I); S && S->getPointerOperand() == LA->getPointerOperand()) return false;
+    return true;
+  };
+  // The candidates (by the IR's shapes; the runs decide).
+  std::set<std::string> lmis; // link and link-holding fields whose link pointers a run used otherwise
+  std::map<std::string, std::string> lmisAt; // the first such use, per field
+  std::map<std::string, bool> srcLast;
+  std::map<std::string, const Instruction *> srcWhyLast;
+  std::vector<std::string> removedRows; // every candidate a run removed, with its reason
+  std::map<std::string, std::string> srcPoolLast;
+  {
+    // Sources: every return traces (through casts, slots, joins) to null,
+    // an allocation call, a call of another candidate, or a load through a
+    // link candidate (a link field, or a pointer a slot holds: `*ref`).
+    // The same greatest fixpoint: a return of any other shape is never a
+    // chunk base, so its function fails every run and is only removed
+    // before the first. Computed after the link candidates.
+    // Link fields: a pointer field whose address is stored somewhere
+    // (&node->next, &free[i]); link-holding fields: a field such addresses,
+    // or loads of a link-holding field, are stored into.
+    auto linkAddr = [&](const Value *V) -> std::string {
+      const auto *G = dyn_cast<GEPOperator>(castsOnly(V));
+      if (!G || !G->getResultElementType()->isPointerTy()) return "";
+      const auto *I = dyn_cast<Instruction>(G);
+      if (!I) return "";
+      if (isa<ArrayType>(G->getSourceElementType()) || (structGEP(G) && isa<StructType>(G->getSourceElementType())))
+        return fieldKey(I, G);
+      return "";
+    };
+    for (int pass = 0; pass < 2; pass++)
+      for (auto &[M, _] : Ctx->Modules)
+        for (Function &F : *M)
+          if (!unjudged(F))
+            for (const Instruction &I : instructions(F))
+              if (const auto *S = dyn_cast<StoreInst>(&I); S && S->getValueOperand()->getType()->isPointerTy()) {
+                const std::string k = fieldKey(S, S->getPointerOperand());
+                if (k.empty()) continue;
+                const Value *X = castsOnly(S->getValueOperand());
+                if (const std::string l = linkAddr(X); !l.empty()) {
+                  linkFields.emplace(l, l);
+                  linkHolding[k].insert(l);
+                } else if (const auto *L = dyn_cast<LoadInst>(X)) {
+                  if (auto lh = linkHolding.find(fieldKey(L, L->getPointerOperand())); lh != linkHolding.end()) {
+                    const std::set<std::string> ls = lh->second;
+                    linkHolding[k].insert(ls.begin(), ls.end());
+                  }
+                }
+              }
+    // &free[i] kept in a slot is a link address too (a store into a slot
+    // has no key above).
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        if (!unjudged(F))
+          for (const Instruction &I : instructions(F))
+            if (const auto *S = dyn_cast<StoreInst>(&I); S && localSlot(S->getPointerOperand()))
+              if (const std::string l = linkAddr(S->getValueOperand()); !l.empty()) linkFields.emplace(l, l);
+    {
+      std::map<std::string, std::set<std::string>> callsOf; // candidate -> the functions its returns call
+      std::set<std::string> cand;
+      for (auto &[M, _] : Ctx->Modules)
+        for (Function &F : *M) {
+          if (unjudged(F) || !F.getReturnType()->isPointerTy()) continue;
+          std::set<const Value *> seen;
+          std::set<std::string> calls;
+          std::function<bool(const Value *, int)> shape = [&](const Value *V, int d) -> bool {
+            V = castsOnly(V);
+            if (isa<ConstantPointerNull>(V) || !seen.insert(V).second) return true;
+            if (d > 8) return false;
+            if (const auto *L = dyn_cast<LoadInst>(V)) {
+              const Value *A = castsOnly(L->getPointerOperand());
+              if (!localSlot(A)) {
+                if (linkFields.count(fieldKey(L, A))) return true;
+                const auto *LA = dyn_cast<LoadInst>(A);
+                return LA && localSlot(LA->getPointerOperand()); // *ref
+              }
+              bool any = false;
+              for (const User *U : A->users())
+                if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == A) {
+                  if (!shape(S->getValueOperand(), d + 1)) return false;
+                  any = true;
+                }
+              return any;
+            }
+            if (const auto *P = dyn_cast<PHINode>(V)) {
+              for (const Value *In : P->incoming_values())
+                if (!shape(In, d + 1)) return false;
+              return true;
+            }
+            if (const auto *Sel = dyn_cast<SelectInst>(V))
+              return shape(Sel->getTrueValue(), d + 1) && shape(Sel->getFalseValue(), d + 1);
+            if (const auto *CB = dyn_cast<CallBase>(V)) {
+              if (isAllocCall(CB)) return true;
+              const Function *CF = CB->getCalledFunction();
+              if (!CF) return false;
+              calls.insert(CF->getName().str());
+              return true;
+            }
+            return false;
+          };
+          bool ok = true, any = false;
+          for (const Instruction &I : instructions(F))
+            if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue())
+              any = true, ok = ok && shape(R->getReturnValue(), 0);
+          if (ok && any) cand.insert(F.getName().str()), callsOf[F.getName().str()] = calls;
+        }
+      for (bool cut = true; cut;) {
+        cut = false;
+        for (auto it = cand.begin(); it != cand.end();) {
+          bool ok = true;
+          for (const std::string &c : callsOf[*it]) ok &= cand.count(c) > 0;
+          if (ok) ++it;
+          else it = cand.erase(it), cut = true;
+        }
+      }
+      for (const std::string &f : cand) chunkSources[f] = "@" + f;
+    }
+    // Formals: those that reach (through casts and slots) a store into a
+    // link field, or a candidate formal of a direct call.
+    std::map<std::pair<std::string, unsigned>, std::set<std::pair<std::string, unsigned>>> passesTo;
+    std::set<std::pair<std::string, unsigned>> direct;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M) {
+        if (unjudged(F) || F.hasAddressTaken()) continue;
+        for (const Argument &A : F.args()) {
+          if (!A.getType()->isPointerTy()) continue;
+          const std::pair<std::string, unsigned> me{F.getName().str(), A.getArgNo()};
+          std::vector<const Value *> w{&A};
+          std::set<const Value *> seen;
+          while (!w.empty()) {
+            const Value *V = w.back();
+            w.pop_back();
+            if (!seen.insert(V).second || seen.size() > 64) continue;
+            for (const User *U : V->users()) {
+              if (isa<CastInst>(U)) w.push_back(U);
+              else if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V) {
+                if (localSlot(S->getPointerOperand())) {
+                  for (const User *LU : S->getPointerOperand()->users())
+                    if (isa<LoadInst>(LU)) w.push_back(LU);
+                } else if (linkFields.count(fieldKey(S, S->getPointerOperand()))) {
+                  direct.insert(me);
+                }
+              } else if (const auto *CB = dyn_cast<CallBase>(U)) {
+                if (const Function *CF = CB->getCalledFunction(); CF && !CF->isDeclaration())
+                  for (unsigned ai = 0; ai < CB->arg_size(); ai++)
+                    if (CB->getArgOperand(ai) == V) passesTo[me].insert({CF->getName().str(), ai});
+              }
+            }
+          }
+        }
+      }
+    std::set<std::pair<std::string, unsigned>> cand = direct;
+    for (bool grew = true; grew;) {
+      grew = false;
+      for (auto &[f, to] : passesTo)
+        if (!cand.count(f))
+          for (auto &t : to)
+            if (cand.count(t)) {
+              cand.insert(f);
+              grew = true;
+              break;
+            }
+    }
+    for (auto &fa : cand) chunkParams[fa] = "@" + fa.first + "#" + std::to_string(fa.second);
+  }
+  const std::set<std::string> handle0 = handleFields;
+  const auto parent0 = parent;
+  unsigned restarts = 0;
+  for (;; restarts++) {
+  const auto tRun = std::chrono::steady_clock::now();
+  size_t rounds = 0;
+  handleFields = handle0;
+  parent = parent0;
+  interior.clear();
+  chunkReturns.clear();
+  lmis.clear();
+  lmisAt.clear();
   // To a fixpoint over the handle fields; the last round records.
   for (;;) {
     const size_t before = handleFields.size(), beforeInterior = interior.size();
+    rounds++;
+    std::map<std::string, bool> srcObs;
+    std::map<std::string, std::string> srcPoolObs;
+    std::map<std::string, const Instruction *> srcWhyObs; // the first return that is not a chunk base
+    std::map<std::string, size_t> lg, hg;
+    std::map<std::string, const Instruction *> lb, hb;
+    std::map<std::pair<std::string, unsigned>, std::string> paramPool;
+    // A stored pointer value's class: 'C' chunk base or null, 'L' a link
+    // address, ' ' anything else (in the function's own analysis).
+    std::map<std::pair<std::string, unsigned>, size_t> pg;
+    std::set<std::pair<std::string, unsigned>> pb;
     carves.clear();
     bookkeeping.clear();
     refusals.clear();
     rewinds.clear();
+    refills.clear();
+    savedCursors.clear();
+    preBump.clear();
+    chunkAllocs.clear();
+    preBumpPool.clear();
+    boundStores.clear();
+    linkSteps.clear();
+    std::map<std::string, std::set<std::string>> holdLinks; // key -> the link fields its L stores address
     for (auto &[M, _] : Ctx->Modules)
       for (Function &F : *M) {
-        if (F.isDeclaration()) continue;
+        if (unjudged(F)) continue;
         std::map<const Value *, HV> hv;
         std::vector<const Value *> work;
+        std::vector<std::pair<const Value *, HV>> mixed; // values that are a link pointer and a handle
+        std::vector<std::pair<const StoreInst *, HV>> linkStores; // stores through link pointers
+        std::vector<std::pair<const Instruction *, HV>> pendingSteps; // steps of a link pointer with no array link yet
+        std::vector<std::pair<const StoreInst *, HV>> unkeyedStores;   // handles stored where no field key names the address
+        // Saved-cursor slots: per slot load, its first carve (one hand-out
+        // at most may come out of a saved cursor).
+        std::map<const StoreInst *, std::map<const LoadInst *, std::pair<const Instruction *, HV>, IROrder>, IROrder> savedCarves;
         auto add = [&](const Value *V, const HV &h) {
-          if (hv.emplace(V, h).second) work.push_back(V);
+          auto [it, fresh] = hv.emplace(V, h);
+          if (fresh) {
+            work.push_back(V);
+          } else if (h.flavor == 'L' && it->second.flavor == 'L') {
+            const size_t b = it->second.links.size();
+            it->second.links.insert(h.links.begin(), h.links.end());
+            if (it->second.links.size() != b) work.push_back(V);
+          } else if ((h.flavor == 'L') != (it->second.flavor == 'L')) {
+            // One value, a link pointer by one path and a handle by another.
+            const HV &l = h.flavor == 'L' ? h : it->second;
+            lmis.insert(l.field);
+            mixed.push_back({V, l});
+          }
         };
         // Allocations stored (through casts, GEPs, local slots) into a
         // handle field are chunk bases.
@@ -382,23 +848,69 @@ void CallGraphPass::checkPoolCarves() {
         // Chunk bases first: a free-space pointer stored into a chunk's
         // header is a handle, which needs the header's base known.
         std::vector<std::pair<const Value *, HV>> bSeeds;
+        for (const Argument &A : F.args())
+          if (auto cp = chunkParams.find({F.getName().str(), A.getArgNo()}); cp != chunkParams.end()) {
+            HV h;
+            h.pool = cp->second;
+            add(&A, h);
+          }
+        // A value stored somewhere (not only used as an address).
+        auto storedAsValue = [](const Value *V) {
+          for (const User *U : V->users())
+            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V) return true;
+          return false;
+        };
         for (const Instruction &I : instructions(F)) {
+          if (const auto *G = dyn_cast<GetElementPtrInst>(&I); G && isa<ArrayType>(G->getSourceElementType()) &&
+                                                               storedAsValue(G)) {
+            // &free[i] (an element of an array link field) kept in a slot.
+            const std::string k = fieldKey(G, G);
+            if (auto lf = linkFields.find(k); lf != linkFields.end()) {
+              HV h;
+              h.flavor = 'L';
+              h.links = {k};
+              h.field = k;
+              h.pool = lf->second;
+              add(G, h);
+            }
+            continue;
+          }
           if (const auto *L = dyn_cast<LoadInst>(&I)) {
             if (!L->getType()->isPointerTy()) continue;
             const std::string k = fieldKey(L, L->getPointerOperand());
+            if (auto lh = linkHolding.find(k); lh != linkHolding.end() && !lh->second.empty()) {
+              HV h;
+              h.flavor = 'L';
+              h.links = lh->second;
+              h.field = k;
+              h.pool = linkFields.count(*lh->second.begin()) ? linkFields.at(*lh->second.begin()) : k;
+              add(L, h);
+              continue;
+            }
             if (handleFields.count(k)) {
               HV h;
               h.flavor = (bumpFields.count(k) || baseFields.count(k) || interior.count(k)) ? 'B' : 'C';
               h.field = h.pool = k;
+              h.src = L;
               if (h.flavor == 'B') bSeeds.push_back({L, h});
               else add(L, h);
             }
           } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+            if (const Function *CF = CB->getCalledFunction(); CF && CB->getType()->isPointerTy())
+              if (auto cs = chunkSources.find(CF->getName().str()); cs != chunkSources.end()) {
+                HV h;
+                h.alloc = CB;
+                h.pool = cs->second;
+                add(CB, h);
+                bookkeeping.push_back({CB, cs->second}); // the pool's own state: a chunk obtained
+                continue;
+              }
             if (!isAllocCall(CB) || !CB->getType()->isPointerTy()) continue;
             if (std::string k = reachesHandle(CB, 0); !k.empty()) {
               HV h;
               h.alloc = CB;
               h.pool = k;
+              chunkAllocs.push_back({CB, k});
               add(CB, h);
             }
           }
@@ -408,9 +920,13 @@ void CallGraphPass::checkPoolCarves() {
         };
         // Is V (a B value) the bump: stored into its own field?
         auto isBump = [&](const Value *V, const HV &h) {
+          auto se = slotBumpEnds.find({&F, h.field});
           for (const User *U : V->users())
-            if (const auto *S = dyn_cast<StoreInst>(U))
-              if (S->getValueOperand() == V && fieldKey(S, S->getPointerOperand()) == h.field) return true;
+            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V) {
+              if (fieldKey(S, S->getPointerOperand()) == h.field) return true;
+              // (b) the end, computed first into the end slot
+              if (se != slotBumpEnds.end() && std::count(se->second.begin(), se->second.end(), S)) return true;
+            }
           return false;
         };
         // A carve's size by its form (CallGraph.h, CarveSize); a size
@@ -460,6 +976,14 @@ void CallGraphPass::checkPoolCarves() {
               });
               z.scale = scaleOf(G);
             }
+          } else if (form == "before-bump" && slotBumpK.count({&F, h.field})) {
+            // (b): the bump through the end slot: K bytes.
+            z.n = ConstantInt::get(Type::getInt64Ty(F.getContext()), slotBumpK.at({&F, h.field}));
+            z.scale = 1;
+          } else if (form == "before-bump" && carryBumpK.count({&F, h.field})) {
+            // (a): the bump through the carry field: K bytes.
+            z.n = ConstantInt::get(Type::getInt64Ty(F.getContext()), carryBumpK.at({&F, h.field}));
+            z.scale = 1;
           } else if (form == "before-bump") {
             uint64_t sc = 0;
             auto bumpOf = [&](const Value *V) -> const Value * {
@@ -581,14 +1105,150 @@ void CallGraphPass::checkPoolCarves() {
           // One pointer, one carve: a cast (or zero-offset GEP) of a carve
           // is that carve, recorded at the value it casts.
           if (const auto *B = dyn_cast<Instruction>(I->stripPointerCasts())) I = B;
+          if (h.saved) savedCarves[h.saved].emplace(h.savedLoad, std::make_pair(I, h));
           for (const Carve &c : carves)
             if (c.I == I) return;
           carves.push_back({I, form, f, sizeOf(I, form, h)});
         };
         auto refuse = [&](const HV &h, const std::string &why, const Instruction *at) {
+          if (h.flavor == 'L' && !h.field.empty()) lmisAt.emplace(h.field, instLocStr(at) + ": " + why);
           refusals.push_back({h.pool, why, at});
         };
         // A data use of V: the forms, or a refusal.
+        // The node a cursor load reads through: the slot it is loaded from
+        // (-O0) or the value itself, and its load (the same-node check).
+        auto nodeLoadOf = [&](const Value *X) -> const LoadInst * {
+          X = X->stripPointerCasts();
+          while (const auto *G = dyn_cast<GEPOperator>(X)) X = G->getPointerOperand()->stripPointerCasts();
+          const auto *L = dyn_cast<LoadInst>(X);
+          if (!L) return nullptr;
+          const GEPOperator *NG = structGEP(L->getPointerOperand());
+          const auto *N = NG ? dyn_cast<LoadInst>(NG->getPointerOperand()->stripPointerCasts()) : nullptr;
+          return N && localSlot(N->getPointerOperand()) ? N : nullptr;
+        };
+        // The node a field address is of: the -O0 slot load under its GEP.
+        auto nodeOfAddr = [&](const Value *A) -> const LoadInst * {
+          const GEPOperator *G = structGEP(A);
+          const auto *N = G ? dyn_cast<LoadInst>(castsOnly(G->getPointerOperand())) : nullptr;
+          return N && localSlot(N->getPointerOperand()) ? N : nullptr;
+        };
+        // (b) same node: no store to the node's slot can run between the
+        // load the end was computed on and the carve's (or the bump's) load.
+        // Is To reachable from just after From without passing an
+        // instruction of Avoid?
+        auto reachAvoiding = [&](const Instruction *From, const Instruction *To,
+                                 const std::set<const Instruction *> &Avoid) {
+          std::set<const BasicBlock *> seen;
+          std::vector<const Instruction *> w{From->getNextNode()};
+          while (!w.empty()) {
+            const Instruction *I = w.back();
+            w.pop_back();
+            for (; I; I = I->getNextNode()) {
+              if (I == To) return true;
+              if (Avoid.count(I)) break;
+              if (I->isTerminator())
+                for (const BasicBlock *Su : successors(I->getParent()))
+                  if (seen.insert(Su).second) w.push_back(&Su->front());
+            }
+          }
+          return false;
+        };
+        // The end and the carve read one node when no store to the node's
+        // slot can run after the end's node load and before the carve's,
+        // unless an end store (recomputing the end) follows it first.
+        auto sameNode = [&](const LoadInst *Ne, const LoadInst *Nc, const std::set<const Instruction *> &ends) {
+          if (!Ne || !Nc || Ne->getPointerOperand() != Nc->getPointerOperand()) return false;
+          for (const User *U : Ne->getPointerOperand()->users())
+            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == Ne->getPointerOperand())
+              if (isPotentiallyReachable(Ne, S) && reachAvoiding(S, Nc, ends)) return false;
+          return true;
+        };
+        // (c) The chunk-source call a free-space value's node is, when the
+        // node comes from one such call in this function (through a slot
+        // every store of which is that call) and does not escape: its uses
+        // are header accesses, compares, stores into fields of its own
+        // hand-out, and chunk formals; null otherwise.
+        std::function<const CallBase *(const Value *, int)> nodeCall = [&](const Value *X, int d) -> const CallBase * {
+          X = X->stripPointerCasts();
+          if (const auto *CB = dyn_cast<CallBase>(X)) {
+            const Function *CF = CB->getCalledFunction();
+            return CF && chunkSources.count(CF->getName().str()) ? CB : nullptr;
+          }
+          const auto *L = dyn_cast<LoadInst>(X);
+          if (!L || d > 3 || !localSlot(L->getPointerOperand())) return nullptr;
+          const CallBase *one = nullptr;
+          for (const User *U : L->getPointerOperand()->users())
+            if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == L->getPointerOperand()) {
+              const CallBase *c = nodeCall(S->getValueOperand(), d + 1);
+              if (!c || (one && one != c)) return nullptr;
+              one = c;
+            }
+          return one;
+        };
+        auto handoutNode = [&](const Value *V) -> const CallBase * {
+          const Value *X = V->stripPointerCasts();
+          while (const auto *G = dyn_cast<GEPOperator>(X)) X = G->getPointerOperand()->stripPointerCasts();
+          if (const auto *L = dyn_cast<LoadInst>(X); L && localSlot(L->getPointerOperand())) {
+            // A slot of hand-outs (and other pieces): the one node whose
+            // hand-out it holds; several such nodes, none.
+            const CallBase *one = nullptr;
+            for (const User *U : L->getPointerOperand()->users())
+              if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == L->getPointerOperand()) {
+                const Value *Y = castsOnly(S->getValueOperand());
+                while (const auto *G = dyn_cast<GEPOperator>(Y)) Y = castsOnly(G->getPointerOperand());
+                const auto *YL = dyn_cast<LoadInst>(Y);
+                const GEPOperator *NG = YL ? structGEP(YL->getPointerOperand()) : nullptr;
+                const CallBase *c = NG && bumpFields.count(fieldKey(YL, YL->getPointerOperand()))
+                                        ? nodeCall(NG->getPointerOperand(), 0) : nullptr;
+                if (c && one && one != c) return nullptr;
+                if (c) one = c;
+              }
+            return one;
+          }
+          const auto *L = dyn_cast<LoadInst>(X);
+          const GEPOperator *NG = L ? structGEP(L->getPointerOperand()) : nullptr;
+          if (!NG || !bumpFields.count(fieldKey(L, L->getPointerOperand()))) return nullptr;
+          return nodeCall(NG->getPointerOperand(), 0);
+        };
+        std::map<const CallBase *, std::string> escapeOf; // the node call -> "" or its escaping use
+        auto escapes = [&](const CallBase *CB) -> std::string {
+          if (auto it = escapeOf.find(CB); it != escapeOf.end()) return it->second;
+          std::string why;
+          std::vector<const Value *> w{CB};
+          std::set<const Value *> seen;
+          while (!w.empty() && why.empty()) {
+            const Value *X = w.back();
+            w.pop_back();
+            if (!seen.insert(X).second) continue;
+            for (const User *U : X->users()) {
+              if (isa<ICmpInst>(U) || isa<DbgInfoIntrinsic>(U)) continue;
+              if (isa<CastInst>(U)) { w.push_back(U); continue; }
+              if (const auto *G = dyn_cast<GEPOperator>(U); G && structGEP(G) && G->getPointerOperand()->stripPointerCasts() == X->stripPointerCasts()) {
+                bool header = true; // the node's own fields, read or written
+                for (const User *GU : G->users())
+                  header &= (isa<LoadInst>(GU)) || (isa<StoreInst>(GU) && cast<StoreInst>(GU)->getPointerOperand() == G);
+                if (header) continue;
+              }
+              if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == X) {
+                if (localSlot(S->getPointerOperand())) {
+                  for (const User *LU : S->getPointerOperand()->users())
+                    if (isa<LoadInst>(LU)) w.push_back(LU);
+                  continue;
+                }
+                if (handoutNode(S->getPointerOperand()) == CB) continue; // into its own hand-out's field
+              }
+              if (const auto *C = dyn_cast<CallBase>(U); C && C != CB && C->getCalledFunction()) {
+                bool ok = true;
+                for (unsigned ai = 0; ai < C->arg_size(); ai++)
+                  if (C->getArgOperand(ai) == X) ok &= chunkParams.count({C->getCalledFunction()->getName().str(), ai}) > 0;
+                if (ok) continue;
+              }
+              why = isa<Instruction>(U) ? instText(cast<Instruction>(U)) : std::string("a constant");
+              break;
+            }
+          }
+          return escapeOf[CB] = why;
+        };
         auto dataUse = [&](const Value *V, const HV &h, const Instruction *at) {
           const auto *I = dyn_cast<Instruction>(V);
           if (!I) return refuse(h, "a constant handle used as data: " + instText(at), at);
@@ -597,9 +1257,65 @@ void CallGraphPass::checkPoolCarves() {
             if (const auto *G = dyn_cast<GEPOperator>(V)) {
               if (!counterCarve(G, &F).empty()) return carve(I, "counter", h.field, h);
             }
+            // (c) The whole tail of a node this function obtained and keeps:
+            // the free space past its bump (or all of it, with no bump).
+            const bool past = isBump(V, h);
+            // Is the node bumped in this function (a store into the cursor
+            // of that node)? Then a pre-bump read is a before-bump carve.
+            auto nodeBumped = [&](const CallBase *CB) {
+              for (const Instruction &J : instructions(F))
+                if (const auto *S = dyn_cast<StoreInst>(&J); S && fieldKey(S, S->getPointerOperand()) == h.field)
+                  if (const GEPOperator *AG = structGEP(S->getPointerOperand()); AG && nodeCall(AG->getPointerOperand(), 0) == CB)
+                    return true;
+              return false;
+            };
+            if (const CallBase *CB = handoutNode(V); CB && (past || !nodeBumped(CB))) {
+              const std::string why = escapes(CB);
+              if (why.empty()) return carve(I, "whole-tail", h.field, h);
+              return refuse(h, "a whole tail whose node escapes (" + why + "): " + instText(at), at);
+            }
+            if (slotBumpK.count({&F, h.field})) {
+              // (b) The carve and the bump read the node the end was computed on.
+              const LoadInst *Nc = nodeLoadOf(h.src ? h.src : V);
+              std::set<const Instruction *> ends(slotBumpEnds[{&F, h.field}].begin(), slotBumpEnds[{&F, h.field}].end());
+              for (const StoreInst *E : slotBumpEnds[{&F, h.field}])
+                if (!sameNode(nodeLoadOf(E->getValueOperand()), Nc, ends))
+                  return refuse(h, "a carve whose end was computed on another node (" + instText(E) + "): " + instText(at), at);
+              for (const StoreInst *Bs : slotBumps[{&F, h.field}])
+                if (!sameNode(Nc, nodeOfAddr(Bs->getPointerOperand()), {}))
+                  return refuse(h, "a carve whose bump writes another node (" + instText(Bs) + "): " + instText(at), at);
+            }
             if (bumpIn.count(&F) && bumpIn[&F].count(h.field)) {
               const auto *G = dyn_cast<GEPOperator>(V);
               return carve(I, G && !G->hasAllZeroIndices() ? "minus-len" : "before-bump", h.field, h);
+            }
+            // (d) pre-bump bytes: a byte copy into or out of the free space,
+            // or the free-space pointer (or one past an offset of it) kept
+            // only in char-pointer fields (a formatter's cursor and end).
+            if (isa<MemTransferInst>(at)) {
+              preBump.push_back({at, "a byte copy"});
+              preBumpPool.push_back({at, h.pool});
+              return;
+            }
+            {
+              const Value *P = isa<GEPOperator>(at) ? static_cast<const Value *>(at) : V;
+              std::vector<std::string> keys;
+              bool ok = true;
+              for (const User *U : P->users()) {
+                if (isa<ICmpInst>(U) || isa<PtrToIntInst>(U) || isa<DbgInfoIntrinsic>(U)) continue;
+                const auto *S = dyn_cast<StoreInst>(U);
+                const std::string k = S && S->getValueOperand() == P ? fieldKey(S, S->getPointerOperand()) : "";
+                if (k.empty() || !charPtrField(k)) {
+                  ok = false;
+                  break;
+                }
+                keys.push_back(k);
+              }
+              if (ok && !keys.empty()) {
+                preBump.push_back({at, "kept in the char pointer " + keys.front()});
+                preBumpPool.push_back({at, h.pool});
+                return;
+              }
             }
             return refuse(h, "a pointer into the free space used as data where nothing bumps it: " + instText(at), at);
           }
@@ -617,6 +1333,78 @@ void CallGraphPass::checkPoolCarves() {
               const auto *UI = dyn_cast<Instruction>(U);
               if (!UI || isa<DbgInfoIntrinsic>(UI)) continue;
               if (isa<ICmpInst>(UI)) continue;
+              if (h.flavor == 'L') { // a link pointer (G1)
+                const std::string l0 = *h.links.begin();
+                if (isa<PtrToIntInst>(UI)) {
+                  bookkeeping.push_back({UI, l0});
+                  continue;
+                }
+                if (const auto *L = dyn_cast<LoadInst>(UI)) { // a link: a chunk base
+                  HV c;
+                  c.pool = h.pool;
+                  c.field = l0;
+                  add(L, c);
+                  bookkeeping.push_back({L, l0});
+                  continue;
+                }
+                if (const auto *S = dyn_cast<StoreInst>(UI)) {
+                  if (S->getPointerOperand() == V && S->getValueOperand() != V) {
+                    // A store into the links: judged with every store to them,
+                    // once the function's values are all known.
+                    linkStores.push_back({S, h});
+                    bookkeeping.push_back({S, l0});
+                    continue;
+                  }
+                  const Value *A = S->getPointerOperand();
+                  if (localSlot(A)) {
+                    for (const User *LU : A->users())
+                      if (isa<LoadInst>(LU)) add(LU, h);
+                    continue;
+                  }
+                  if (const std::string k = fieldKey(S, A); !k.empty()) { // a link-holding field
+                    holdLinks[k].insert(h.links.begin(), h.links.end());
+                    hg[k]++;
+                    handleFields.insert(k);
+                    join(h.pool, k);
+                    bookkeeping.push_back({S, k});
+                    continue;
+                  }
+                  lmis.insert(h.field), refuse(h, "a link pointer stored where no struct field names it: " + instText(S), S);
+                  continue;
+                }
+                if (isa<CastInst>(UI)) {
+                  add(UI, h);
+                  continue;
+                }
+                if (const auto *G = dyn_cast<GetElementPtrInst>(UI)) {
+                  // ref +- 1 over free[] (under no-UB, the walk stays inside
+                  // it): the step keeps the array links; a scalar link field
+                  // stepped would leave its object, which no-UB excludes.
+                  HV st = h;
+                  st.links.clear();
+                  for (const std::string &k : h.links)
+                    if (arrayBytes.count(k)) st.links.insert(k);
+                  if (G->getNumIndices() == 1 && isa<ConstantInt>(G->idx_begin()->get())) {
+                    // Judged once the links are all known (they grow as the
+                    // slot's stores arrive; a step is re-run when they do).
+                    if (st.links.empty()) {
+                      pendingSteps.push_back({G, h});
+                    } else {
+                      linkSteps.push_back(G);
+                      add(G, st);
+                    }
+                    continue;
+                  }
+                  lmis.insert(h.field), refuse(h, "a link pointer stepped other than by a constant inside an array link field: " + instText(G), G);
+                  continue;
+                }
+                if (isa<PHINode>(UI) || isa<SelectInst>(UI)) {
+                  add(UI, h); // its other incoming values are checked below
+                  continue;
+                }
+                lmis.insert(h.field), refuse(h, "a link pointer used other than to load or store its links: " + instText(UI), UI);
+                continue;
+              }
             if (isa<PtrToIntInst>(UI)) {
               bookkeeping.push_back({UI, h.pool});
               continue;
@@ -625,14 +1413,46 @@ void CallGraphPass::checkPoolCarves() {
                 if (S->getValueOperand() == V) {
                   const Value *A = S->getPointerOperand();
                   if (localSlot(A)) {
+                    // A free-space pointer kept in a -O0 slot is a hand-out: the carve
+                    // is the stored value, so every load of the slot sees one object
+                    // (each load a carve would split one hand-out). The end slot of a
+                    // slot bump ((b)) keeps the pointer a handle: its loads bump.
+                    // A slot whose loads are stored back into a handle field
+                    // is a saved cursor (a rewind through a local): its loads
+                    // are followed, each judged where it is used.
+                    auto savedCursor = [&]() {
+                      for (const User *LU : A->users())
+                        if (isa<LoadInst>(LU))
+                          for (const User *SU : LU->users())
+                            if (const auto *SS = dyn_cast<StoreInst>(SU); SS && SS->getValueOperand() == LU)
+                              if (const std::string k = fieldKey(SS, SS->getPointerOperand());
+                                  !k.empty() && (k == h.field || handleFields.count(k))) {
+                                if (std::none_of(savedCursors.begin(), savedCursors.end(),
+                                                 [&](const SavedCursor &c) { return c.S == S; }))
+                                  savedCursors.push_back({S, SS, k});
+                                return true;
+                              }
+                      return false;
+                    };
+                    auto se = slotBumpEnds.find({&F, h.field});
+                    const bool endSlot = se != slotBumpEnds.end() && std::count(se->second.begin(), se->second.end(), S);
+                    const bool saved = h.flavor == 'B' && !endSlot && savedCursor();
+                    if (h.flavor == 'B' && !endSlot && !saved) {
+                      dataUse(V, h, S);
+                      continue;
+                    }
                     for (const User *LU : A->users())
-                      if (isa<LoadInst>(LU)) add(LU, h);
+                      if (const auto *L = dyn_cast<LoadInst>(LU)) {
+                        HV hl = h;
+                        if (saved) hl.saved = S, hl.savedLoad = L;
+                        add(L, hl);
+                      }
                     continue;
                   }
                   const std::string k = fieldKey(S, A);
                   if (k.empty()) {
                     if (h.flavor == 'B') dataUse(V, h, S);
-                    else refuse(h, "stored where no struct field names it: " + instText(S), S);
+                    else unkeyedStores.push_back({S, h}); // through a link pointer, or refused after the drain
                     continue;
                   }
                   if (h.flavor == 'B' && k == h.field) continue; // the bump (or a re-store)
@@ -666,8 +1486,11 @@ void CallGraphPass::checkPoolCarves() {
               }
               if (const auto *CB = dyn_cast<CallBase>(UI)) {
                 bool ok = CB->getCalledOperand() != V;
+                const Function *CF = CB->getCalledFunction();
                 for (unsigned ai = 0; ok && ai < CB->arg_size(); ai++)
-                  if (CB->getArgOperand(ai) == V && !freesArg(CB, ai)) ok = false;
+                  if (CB->getArgOperand(ai) == V && !freesArg(CB, ai) &&
+                      !(h.flavor == 'C' && CF && chunkParams.count({CF->getName().str(), ai}))) // G5: a chunk formal
+                    ok = false;
                 if (!ok) dataUse(V, h, CB);
                 continue;
               }
@@ -698,17 +1521,48 @@ void CallGraphPass::checkPoolCarves() {
                 // A chunk base: a header field access (a struct GEP) stays a
                 // handle; any other offset is the header carve or a refusal.
                 if (structGEP(G) && isa<StructType>(G->getSourceElementType())) {
+                  // &node->next kept somewhere: a link pointer (G1).
+                  if (const std::string k = fieldKey(G, G); linkFields.count(k) && storedAsValue(G)) {
+                    HV l;
+                    l.flavor = 'L';
+                    l.links = {k};
+                    l.field = k;
+                    l.pool = h.pool;
+                    add(G, l);
+                    continue;
+                  }
                   add(G, h);
                   continue;
                 }
-                bool cmpOnly = true, space = false;
+                bool cmpOnly = true, space = false, bound = !G->user_empty();
                 for (const User *GU : G->users()) {
                   cmpOnly &= isa<ICmpInst>(GU) || isa<PtrToIntInst>(GU) || isa<DbgInfoIntrinsic>(GU);
                   if (const auto *GS = dyn_cast<StoreInst>(GU))
                     space |= GS->getValueOperand() == G && bumpFields.count(fieldKey(GS, GS->getPointerOperand()));
+                  // G3 (Fable 2026-10-23, P1): an end bound, stored only into
+                  // non-bump header fields of the same chunk base.
+                  const auto *GS = dyn_cast<StoreInst>(GU);
+                  const std::string bk = GS && GS->getValueOperand() == G ? fieldKey(GS, GS->getPointerOperand()) : "";
+                  const GEPOperator *AG = GS ? structGEP(GS->getPointerOperand()) : nullptr;
+                  if (bk.empty() || bumpFields.count(bk) || !AG || !sameBase(AG->getPointerOperand(), G->getPointerOperand()))
+                    bound = false;
                 }
                 if (cmpOnly) continue;
+                if (bound && !space) { // the chunk's end, saved in its own header
+                  for (const User *GU : G->users())
+                    boundStores[fieldKey(cast<StoreInst>(GU), cast<StoreInst>(GU)->getPointerOperand())].insert(
+                        cast<StoreInst>(GU));
+                  HV b = h;
+                  b.flavor = 'B';
+                  b.field.clear();
+                  add(G, b);
+                  continue;
+                }
                 if (space) { // the chunk's free space, stored into a bump field
+                  for (const User *GU : G->users())
+                    if (const auto *GS = dyn_cast<StoreInst>(GU); GS && GS->getValueOperand() == G)
+                      if (const std::string k = fieldKey(GS, GS->getPointerOperand()); bumpFields.count(k))
+                        refills.push_back({GS, k});
                   HV b = h;
                   b.flavor = 'B';
                   b.field.clear();
@@ -769,6 +1623,7 @@ void CallGraphPass::checkPoolCarves() {
                 dataUse(V, h, UI);
                 continue;
               }
+              if (isa<ReturnInst>(UI) && h.flavor == 'C' && chunkSources.count(F.getName().str())) continue;
               dataUse(V, h, UI); // returned, or any other use
             }
           }
@@ -776,6 +1631,47 @@ void CallGraphPass::checkPoolCarves() {
         drain();
         for (auto &[V, h] : bSeeds) add(V, h);
         drain();
+        // A saved cursor followed load by load hands out at most one of its
+        // loads: two loads carved apart would split one hand-out into two
+        // objects that do not share their writes.
+        for (auto &[S, byLoad] : savedCarves)
+          if (byLoad.size() > 1) {
+            auto a = byLoad.begin(), b = std::next(a);
+            refuse(a->second.second,
+                   "saved cursor handed out twice: the slot stored at " + instLocStr(S) + " is carved at " +
+                       instLocStr(a->second.first) + " (" + instText(a->second.first) + ") and at " +
+                       instLocStr(b->second.first) + " (" + instText(b->second.first) + ")",
+                   b->second.first);
+          }
+        for (auto &[V, h] : mixed)
+          if (const auto *I = dyn_cast<Instruction>(V))
+            refuse(h, "a value that is a link pointer by one path and a chunk handle by another: " + instText(I), I);
+        for (auto &[S, h] : unkeyedStores)
+          if (auto it = hv.find(castsOnly(S->getPointerOperand())); it == hv.end() || it->second.flavor != 'L')
+            refuse(h, "stored where no struct field names it: " + instText(S), S);
+        for (auto &[G, h] : pendingSteps)
+          if (!hv.count(G))
+            lmis.insert(h.field),
+                refuse(h, "a link pointer stepped other than by a constant inside an array link field: " + instText(G), G);
+        for (auto &[S, h] : linkStores) {
+          const Value *X = castsOnly(S->getValueOperand());
+          auto it = hv.find(X);
+          const bool ok = isa<ConstantPointerNull>(X) || (it != hv.end() && it->second.flavor == 'C');
+          for (const std::string &k : hv[S->getPointerOperand()].links) {
+            if (ok) lg[k]++;
+            else lb.emplace(k, S);
+          }
+          if (!ok) refuse(h, "a value that is not a chunk base stored through a link pointer: " + instText(S), S);
+        }
+        for (auto &[V, h] : hv) {
+          const auto *I = dyn_cast<Instruction>(V);
+          if (!I || !(isa<PHINode>(I) || isa<SelectInst>(I)) || h.flavor != 'L') continue;
+          for (unsigned i = isa<SelectInst>(I) ? 1 : 0; i < I->getNumOperands(); i++) {
+            const Value *X = castsOnly(I->getOperand(i));
+            if (!isa<ConstantPointerNull>(X) && !(hv.count(X) && hv[X].flavor == 'L'))
+              lmis.insert(h.field), refuse(h, "a link pointer joined with another value: " + instText(I), I);
+          }
+        }
         // A join of chunk bases with anything else is a chunk base used as data.
         for (auto &[V, h] : hv) {
           const auto *I = dyn_cast<Instruction>(V);
@@ -806,6 +1702,89 @@ void CallGraphPass::checkPoolCarves() {
             continue;
           }
           refuse(h, "a chunk base joined with data: " + instText(I), I);
+        }
+        // G1: every keyed pointer store, classified for the link fields (a
+        // chunk base) and the link-holding fields (a link address); null
+        // is both. G5: every direct call's pointer arguments.
+        for (const Instruction &I : instructions(F)) {
+          if (const auto *S = dyn_cast<StoreInst>(&I); S && S->getValueOperand()->getType()->isPointerTy()) {
+            const std::string k = fieldKey(S, S->getPointerOperand());
+            if (k.empty()) continue;
+            const Value *X = castsOnly(S->getValueOperand());
+            if (isa<ConstantPointerNull>(X)) continue;
+            auto it = hv.find(X);
+            const char c = it == hv.end() ? ' ' : it->second.flavor;
+            if (c == 'C') lg[k]++;
+            else lb.emplace(k, S);
+            if (c != 'L') hb.emplace(k, S);
+          } else if (const auto *CB = dyn_cast<CallBase>(&I)) {
+            const Function *CF = CB->getCalledFunction();
+            if (!CF || CF->isDeclaration() || CB->getCalledOperand()->stripPointerCasts() != CF) continue;
+            for (unsigned ai = 0; ai < CB->arg_size() && ai < CF->arg_size(); ai++) {
+              const Value *X = castsOnly(CB->getArgOperand(ai));
+              if (!X->getType()->isPointerTy() || isa<ConstantPointerNull>(X)) continue;
+              auto it = hv.find(X);
+              if (it != hv.end() && it->second.flavor == 'C') {
+                pg[{CF->getName().str(), ai}]++;
+                paramPool.emplace(std::make_pair(CF->getName().str(), ai), it->second.pool);
+              } else {
+                pb.insert({CF->getName().str(), ai});
+              }
+            }
+          }
+        }
+        // G2: every return a chunk base or null (through slots every store
+        // of which is one, joins and casts): a chunk source.
+        if (F.getReturnType()->isPointerTy()) {
+          std::set<const Value *> seenC;
+          std::string cp;
+          const Value *failLeaf = nullptr; // the value that is not a chunk base
+          std::function<bool(const Value *, int)> allC = [&](const Value *V, int d) -> bool {
+            V = castsOnly(V);
+            if (isa<ConstantPointerNull>(V) || !seenC.insert(V).second) return true;
+            if (d > 8) return false;
+            if (const auto *L = dyn_cast<LoadInst>(V); L && localSlot(L->getPointerOperand())) {
+              bool any = false;
+              for (const User *U : L->getPointerOperand()->users())
+                if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == L->getPointerOperand()) {
+                  if (!allC(S->getValueOperand(), d + 1)) return false;
+                  any = true;
+                }
+              return any;
+            }
+            if (const auto *P = dyn_cast<PHINode>(V)) {
+              for (const Value *In : P->incoming_values())
+                if (!allC(In, d + 1)) return false;
+              return true;
+            }
+            if (const auto *Sel = dyn_cast<SelectInst>(V))
+              return allC(Sel->getTrueValue(), d + 1) && allC(Sel->getFalseValue(), d + 1);
+            // A field's address is not the chunk (an all-zero GEP is).
+            if (const auto *G = dyn_cast<GEPOperator>(V); G && !G->hasAllZeroIndices()) {
+              if (!failLeaf) failLeaf = V;
+              return false;
+            }
+            auto it = hv.find(V);
+            if (it == hv.end() || it->second.flavor != 'C') {
+              if (!failLeaf) failLeaf = V;
+              return false;
+            }
+            cp = it->second.pool;
+            return true;
+          };
+          bool all = true;
+          size_t n = 0;
+          for (const Instruction &I : instructions(F))
+            if (const auto *R = dyn_cast<ReturnInst>(&I); R && R->getReturnValue()) {
+              n++;
+              if (all && !allC(R->getReturnValue(), 0)) {
+                all = false;
+                srcWhyObs[F.getName().str()] = failLeaf && isa<Instruction>(failLeaf) ? cast<Instruction>(failLeaf) : R;
+              }
+            }
+          srcObs[F.getName().str()] = all && n && !cp.empty();
+          if (all && n && !cp.empty()) srcPoolObs[F.getName().str()] = cp;
+          chunkReturns[F.getName().str()] = n;
         }
         // Stores into handle fields of values that are not handles.
         for (const Instruction &I : instructions(F)) {
@@ -842,10 +1821,75 @@ void CallGraphPass::checkPoolCarves() {
           }
         }
       }
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        if (!F.isDeclaration() && unjudged(F))
+          for (const Instruction &I : instructions(F))
+            if (const auto *CB = dyn_cast<CallBase>(&I))
+              if (const Function *CF = CB->getCalledFunction())
+                for (unsigned ai = 0; ai < CB->arg_size(); ai++) pb.insert({CF->getName().str(), ai});
+    // A source's or formal's placeholder pool is the pool its chunk bases
+    // come from (the returns' and the calls' pools).
+    for (auto &[f, p] : srcPoolObs) join(p, "@" + f);
+    for (auto &[fa, p] : paramPool) join(p, "@" + fa.first + "#" + std::to_string(fa.second));
+    linkGood = lg, holdGood = hg, linkBad = lb, holdBad = hb, paramGood = pg, paramBad = pb;
+    srcLast = srcObs, srcPoolLast = srcPoolObs, srcWhyLast = srcWhyObs;
+    holdLast = holdLinks;
     if (handleFields.size() == before && interior.size() == beforeInterior) break;
     for (const std::string &f : handleFields) parent.emplace(f, f);
   }
-
+  // Remove the candidates this run contradicts; run again if any.
+  CG_LOG("PoolCarve: run " << restarts + 1 << ": " << rounds << " rounds, "
+         << std::chrono::duration<double>(std::chrono::steady_clock::now() - tRun).count() << " s; candidates: "
+         << chunkSources.size() << " sources, " << chunkParams.size() << " formals, " << linkFields.size()
+         << " link fields, " << linkHolding.size() << " link-holding fields; " << handleFields.size()
+         << " handle fields\n");
+  bool removed = false;
+  const std::string run = "run " + std::to_string(restarts + 1) + ": ";
+  for (auto it = chunkSources.begin(); it != chunkSources.end();)
+    if (!srcLast[it->first]) {
+      const Instruction *W = srcWhyLast.count(it->first) ? srcWhyLast[it->first] : nullptr;
+      removedRows.push_back(run + "chunk source " + it->first + " removed: " +
+                            (W ? "a returned value that is not a chunk base or null at " + instLocStr(W) + ": " + instText(W)
+                               : std::string("no chunk base in its returns")));
+      it = chunkSources.erase(it), removed = true;
+    } else ++it;
+  for (auto it = chunkParams.begin(); it != chunkParams.end();)
+    if (paramBad.count(it->first) || !paramGood[it->first]) {
+      removedRows.push_back(run + "chunk formal " + it->first.first + " arg" + std::to_string(it->first.second) +
+                            " removed: " + (paramBad.count(it->first) ? "a call passes a value that is not a chunk base"
+                                                                      : "no direct call passes a chunk base"));
+      it = chunkParams.erase(it), removed = true;
+    } else ++it;
+  for (auto it = linkFields.begin(); it != linkFields.end();)
+    if (linkBad.count(it->first) || !linkGood[it->first] || !handleFields.count(it->first) || lmis.count(it->first)) {
+      const Instruction *W = linkBad.count(it->first) ? linkBad[it->first] : nullptr;
+      removedRows.push_back(run + "link field " + it->first + " removed: " +
+                            (W ? "a store that is not a chunk base or null at " + instLocStr(W) + ": " + instText(W)
+                             : lmis.count(it->first) ? "a link pointer to it used otherwise at " + lmisAt[it->first]
+                             : !linkGood[it->first] ? std::string("no store of a chunk base")
+                                                     : std::string("not a handle field")));
+      it = linkFields.erase(it), removed = true;
+    } else ++it;
+  for (auto it = linkHolding.begin(); it != linkHolding.end();) {
+    if (holdBad.count(it->first) || !holdGood[it->first] || lmis.count(it->first)) {
+      const Instruction *W = holdBad.count(it->first) ? holdBad[it->first] : nullptr;
+      removedRows.push_back(run + "link-pointer field " + it->first + " removed: " +
+                            (W ? "a store that is not a link address or null at " + instLocStr(W) + ": " + instText(W)
+                             : lmis.count(it->first) ? "a link pointer loaded from it used otherwise at " + lmisAt[it->first]
+                                                     : std::string("no store of a link address")));
+      it = linkHolding.erase(it), removed = true;
+      continue;
+    }
+    std::set<std::string> now;
+    for (const std::string &l : holdLast[it->first])
+      if (linkFields.count(l)) now.insert(l);
+    if (now != it->second) it->second = now, removed = true;
+    ++it;
+  }
+  if (!removed) break;
+  }
+  for (auto &[f, p] : chunkSources) p = srcPoolLast[f];
   // Report per pool.
   std::map<std::string, std::set<std::string>> fields;
   for (const std::string &f : handleFields) fields[pool(f)].insert(f);
@@ -858,13 +1902,13 @@ void CallGraphPass::checkPoolCarves() {
   }
   std::map<std::string, std::vector<const Refusal *>> refused;
   for (const Refusal &r : refusals)
-    refused[handleFields.count(r.field) ? pool(r.field) : r.field].push_back(&r);
+    refused[parent.count(r.field) ? pool(r.field) : r.field].push_back(&r);
   // A handle field whose address is taken (`&q->tail` passed to an
   // extend function) is written where the checks do not look.
   std::map<std::string, std::string> addrTaken;
   for (auto &[M, _] : Ctx->Modules)
     for (Function &F : *M)
-      if (!F.isDeclaration())
+      if (!unjudged(F))
         for (const Instruction &I : instructions(F)) {
           const auto *G = dyn_cast<GetElementPtrInst>(&I);
           // A field's address indexes into the struct; an all-zero GEP is
@@ -878,6 +1922,17 @@ void CallGraphPass::checkPoolCarves() {
             for (const User *U : V->users()) {
               if (const auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == V) continue;
               if (const auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == V && S->getValueOperand() != V)
+                continue;
+              // An element of an array field (free[i]), and a link field's
+              // address kept as a link pointer (G1: judged as one).
+              if (const auto *AG = dyn_cast<GEPOperator>(U);
+                  AG && AG->getPointerOperand() == V && isa<ArrayType>(AG->getSourceElementType()) && d < 4) {
+                if (const User *B = badUse(U, d + 1)) return B;
+                continue;
+              }
+              if (const auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand() == V && linkFields.count(k) &&
+                                                          (localSlot(S->getPointerOperand()) ||
+                                                           linkHolding.count(fieldKey(S, S->getPointerOperand()))))
                 continue;
               if (isa<DbgInfoIntrinsic>(U)) continue;
               if (isa<BitCastInst>(U) && d < 4) {
@@ -920,12 +1975,14 @@ void CallGraphPass::checkPoolCarves() {
       fm += " " + form + " " + std::to_string(n);
       if (const size_t u = unsized[p][form]) fm += " (" + std::to_string(u) + " of them size unknown)";
     }
-    size_t rw = 0;
+    size_t rw = 0, sc = 0;
     for (auto &[_, f] : rewinds) rw += pool(f) == p;
+    for (const SavedCursor &c : savedCursors) sc += pool(c.field) == p;
     auto rit = refused.find(p);
     if (isRefused(p)) nRefused++;
     const std::string verdict = std::string(isRefused(p) ? "REFUSED" : "POOL") + " fields" + fl + "; carves" +
                                 (fm.empty() ? " none" : fm) + "; rewinds " + std::to_string(rw) +
+                                "; saved cursors " + std::to_string(sc) +
                                 (rit == refused.end() ? "" : "; refused by " + std::to_string(rit->second.size()) + " uses");
     poolVerdicts[p] = verdict;
     CG_LOG("PoolCarve: " << verdict << "\n");
@@ -942,12 +1999,88 @@ void CallGraphPass::checkPoolCarves() {
     }
     for (const Instruction *I : headerCarves[p])
       CG_LOG("PoolCarve:   header carve " << instLocStr(I) << ": " << instText(I) << "\n");
+    // The first eight uses; every use at --verbose=3.
     if (rit != refused.end())
-      for (size_t i = 0; i < rit->second.size() && i < 8; i++)
-        CG_LOG("PoolCarve:   refusing use " << instLocStr(rit->second[i]->I) << ": " << rit->second[i]->why
-               << "\n");
+      for (size_t i = 0; i < rit->second.size(); i++) {
+        if (i < 8)
+          CG_LOG("PoolCarve:   refusing use " << instLocStr(rit->second[i]->I) << ": " << rit->second[i]->why << "\n");
+        else
+          CG_DEBUG("PoolCarve:   refusing use " << instLocStr(rit->second[i]->I) << ": " << rit->second[i]->why << "\n");
+      }
   }
   for (auto &[I, f] : rewinds) CG_LOG("PoolCarve: rewind " << f << " at " << instLocStr(I) << ": " << instText(I) << "\n");
+  for (auto &[I, f] : refills) CG_LOG("PoolCarve: refill " << f << " at " << instLocStr(I) << ": " << instText(I) << "\n");
+  for (const SavedCursor &c : savedCursors)
+    CG_LOG("PoolCarve: slot followed load by load at " << instLocStr(c.S) << ": saved cursor stored back to " << c.field
+           << " at " << instLocStr(c.Back) << ": " << instText(c.Back) << "\n");
+  for (auto &[I, what] : preBump)
+    CG_LOG("PoolCarve: bytes written before the bump (" << what << ") at " << instLocStr(I) << ": " << instText(I)
+           << "; withdrawn if a pointer fact lands in the free space at the solve\n");
+  for (auto &[j, hk] : carry)
+    if (handleFields.count(hk.first))
+      CG_LOG("PoolCarve: carry " << j << " = " << hk.first << " + " << hk.second << " (a load of " << j
+             << " stored into " << hk.first << " bumps it by " << hk.second << ")\n");
+  CG_LOG("PoolCarve: chunk sources, link fields and chunk formals: the greatest fixpoint after " << restarts + 1
+         << " runs of the check\n");
+  for (const std::string &r : removedRows) CG_LOG("PoolCarve:   " << r << "\n");
+  for (auto &[f, p] : chunkSources)
+    if (handleFields.count(p))
+      CG_LOG("PoolCarve: chunk source " << f << ": " << chunkReturns[f] << " returns, every one a chunk base of "
+             << pool(p) << " or null\n");
+  for (auto &[k, ss] : boundStores) {
+    size_t loads = 0, other = 0;
+    for (auto &[M, _] : Ctx->Modules)
+      for (Function &F : *M)
+        if (!unjudged(F))
+          for (const Instruction &I : instructions(F))
+            if (const auto *L = dyn_cast<LoadInst>(&I); L && fieldKey(L, L->getPointerOperand()) == k) {
+              loads++;
+              for (const User *U : L->users())
+                if (!isa<ICmpInst>(U) && !isa<PtrToIntInst>(U) && !isa<DbgInfoIntrinsic>(U)) {
+                  other++;
+                  break;
+                }
+            }
+    CG_LOG("PoolCarve: bound field " << k << ": " << ss.size() << " stores, " << loads << " loads"
+           << (other ? ", " + std::to_string(other) + " used otherwise (judged as free-space pointers)"
+                     : std::string(" all compared or measured"))
+           << "\n");
+  }
+  for (auto &[k, p] : linkFields)
+    CG_LOG("PoolCarve: link field " << k << ": " << linkGood[k] << " stores, all chunk bases or null\n");
+  for (auto &[k, ls] : linkHolding) {
+    std::string l;
+    for (const std::string &x : ls) l += " " + x;
+    CG_LOG("PoolCarve: link-pointer field " << k << " holds addresses of" << l << " (" << holdGood[k] << " stores)\n");
+  }
+  if (!linkSteps.empty())
+    CG_LOG("PoolCarve: link pointer steps: " << linkSteps.size()
+           << " by a constant over an array link field, under no-UB (the walk stays inside the array)\n");
+  for (auto &[fa, p] : chunkParams)
+    CG_LOG("PoolCarve: chunk formal " << fa.first << " arg" << fa.second << ": " << paramGood[fa]
+           << " direct calls, every one passes a chunk base of " << pool(p) << " or null\n");
+  // The bodies not judged that access a handle field.
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M) {
+      if (F.isDeclaration() || F.empty() || !unjudged(F)) continue;
+      bool touches = false;
+      for (const Instruction &I : instructions(F)) {
+        const Value *A = nullptr;
+        if (const auto *L = dyn_cast<LoadInst>(&I)) A = L->getPointerOperand();
+        else if (const auto *S = dyn_cast<StoreInst>(&I)) A = S->getPointerOperand();
+        if (A && handleFields.count(fieldKey(&I, A))) touches = true;
+      }
+      if (!touches) continue;
+      auto sit = Ctx->FuncSummaries.find(&F);
+      CG_LOG("PoolCarve: body not judged: " << F.getName()
+             << (sit != Ctx->FuncSummaries.end() && sit->second->fresh ? " replaced by its summary (FRESH)"
+                                                                       : " not built")
+             << "\n");
+    }
+  for (auto &[j, sh] : carryRefused)
+    if (handleFields.count(sh.second))
+      CG_LOG("PoolCarve: no carry " << j << " of " << sh.second << ": a store into it that is not " << sh.second
+             << " + one constant at " << instLocStr(sh.first) << ": " << instText(sh.first) << "\n");
   if (VerboseLevel >= 3)
     for (const Carve &c : carves)
       CG_DEBUG("PoolCarve: carve " << c.form << " " << c.field << " at " << instLocStr(c.I) << ": " << instText(c.I)
@@ -980,6 +2113,23 @@ void CallGraphPass::checkPoolCarves() {
         poolRefusedCarvePool[c.I] = pool(c.field);
     for (auto &[I, f] : bookkeeping)
       if (!isRefused(pool(f))) poolBookkeeping.insert(I), poolBookkeepingPool[I] = pool(f);
+    // (d): the pools whose free space takes bytes before the bump.
+    poolChunkAllocs.clear();
+    poolChunkHeader.clear();
+    poolPreBump.clear();
+    for (auto &[I, f] : preBumpPool)
+      if (!isRefused(pool(f))) poolPreBump[pool(f)].push_back(instLocStr(I));
+    for (auto &[I, f] : chunkAllocs)
+      if (poolPreBump.count(pool(f))) poolChunkAllocs[pool(f)].insert(I);
+    for (auto &[I, f] : refills) {
+      const auto *S = cast<StoreInst>(I);
+      APInt off(64, 0);
+      if (const auto *G = dyn_cast<GEPOperator>(castsOnly(S->getValueOperand()));
+          G && poolPreBump.count(pool(f)) && G->accumulateConstantOffset(S->getModule()->getDataLayout(), off)) {
+        auto [it, fresh] = poolChunkHeader.try_emplace(pool(f), off.getSExtValue());
+        if (!fresh) it->second = std::min(it->second, off.getSExtValue());
+      }
+    }
     // Every load and store of a certified pool's handle field, by pool:
     // the confirmer's certificate-bound exemption (plan 3.55 (a)) reads the
     // same certificate.
@@ -998,7 +2148,7 @@ void CallGraphPass::checkPoolCarves() {
   for (const std::string &f : handleFields) fb += irFallback.count(f);
   CG_LOG("PoolCarve: " << nPools << " pools (" << nRefused << " refused), " << handleFields.size()
          << " handle fields (" << fb << " keyed by the IR type at some access: no debug info there), " << carves.size()
-         << " carve sites, " << rewinds.size() << " rewinds; " << cursors
+         << " carve sites, " << rewinds.size() << " rewinds, " << savedCursors.size() << " saved cursors; " << cursors
          << " bumped fields never refilled (cursors)\n");
 }
 

@@ -86,6 +86,8 @@ extern boost::unordered_flat_set<const Function *> g_noopBodies;
 extern bool g_sumAuthoritative;
 bool shouldSkipFunction(const Function *F);
 StringRef stripStructNameSuffix(StringRef Name);
+// K1a: the TBAA base names resolved to a suffixed IR type, ambiguous, typeless.
+void logTbaaNames();
 bool isAnonStructName(StringRef Name);
 // A union slot keyed in two schemes (TaggedFields: a tag pair over a slot
 // the union census keys by member): each scheme's catch-all key ("every

@@ -829,6 +829,7 @@ bool CallGraphPass::solve() {
   // A pool the previous solve withdrew (S1) is built as ordinary code
   // first: the mint table reads the certified carves.
   if (CFLCells && iteration > 0) applyPoolWithdrawals();
+  if (iteration == 0) logTbaaNames(); // after the build: every access named once
   if (VerboseLevel >= 2) {
     size_t byKind[4] = {0, 0, 0, 0};
     for (const GraphEdge &E : Graph.edges())

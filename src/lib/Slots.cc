@@ -95,14 +95,78 @@ bool accessSlot(const Instruction *I, const Value *Addr, const DataLayout &DL,
   if (!S || !isAnonStruct(S)) return true;
   return enclosingNamed(Addr, DL, S, off) || tbaaSlot(I, S, off);
 }
+// The IR struct a struct-path TBAA base names (K1a, Fable 2026-10-23):
+// struct.N itself, else the one suffixed struct.N.k (the linker's renaming)
+// whose element offsets include every member offset the base lists; with
+// several such candidates, none (logged once with the candidates); with
+// none, none (a struct the module has no IR type for). Per module and name.
+static std::map<std::pair<const Module *, std::string>, StructType *> g_tbaaBase;
+static std::map<std::string, std::vector<std::string>> g_tbaaAmbiguous;
+static std::set<std::string> g_tbaaResolved, g_tbaaTypeless;
+static std::set<const Instruction *> g_tbaaAccResolved, g_tbaaAccAmbiguous, g_tbaaAccTypeless; // accesses tbaaSlot saw
+static StructType *tbaaBaseType(const Module &M, const MDNode *B, StringRef N) {
+  const std::string name = ("struct." + N).str();
+  if (StructType *S = StructType::getTypeByName(M.getContext(), name)) return S;
+  auto [it, fresh] = g_tbaaBase.try_emplace({&M, name}, nullptr);
+  if (!fresh) return it->second;
+  std::vector<int64_t> offs;
+  for (unsigned i = 2; i < B->getNumOperands(); i += 2)
+    if (const auto *O = mdconst::dyn_extract<ConstantInt>(B->getOperand(i))) offs.push_back(O->getSExtValue());
+  std::vector<StructType *> cands;
+  for (StructType *T : M.getIdentifiedStructTypes()) {
+    if (T->isOpaque() || !T->hasName() || stripStructNameSuffix(T->getName()) != name) continue;
+    const StructLayout *SL = M.getDataLayout().getStructLayout(T);
+    std::set<int64_t> starts;
+    for (unsigned e = 0; e < T->getNumElements(); e++) starts.insert((int64_t)SL->getElementOffset(e));
+    bool fits = true;
+    for (int64_t o : offs) fits &= starts.count(o) > 0 && o < (int64_t)SL->getSizeInBytes();
+    if (fits) cands.push_back(T);
+  }
+  if (cands.size() == 1) {
+    g_tbaaResolved.insert(name);
+    return it->second = cands[0];
+  }
+  if (cands.empty()) {
+    g_tbaaTypeless.insert(name);
+    return nullptr;
+  }
+  std::vector<std::string> &l = g_tbaaAmbiguous[name];
+  for (StructType *T : cands) l.push_back(T->getName().str());
+  std::sort(l.begin(), l.end());
+  std::string t;
+  for (const std::string &x : l) t += " " + x;
+  CG_LOG("TBAA base " << N << ": " << cands.size() << " candidates" << t << ", not named\n");
+  return nullptr;
+}
+void logTbaaNames() {
+  CG_LOG("TBAA base names without their own IR type: " << g_tbaaResolved.size()
+         << " resolved to the one suffixed type with their member offsets, " << g_tbaaAmbiguous.size()
+         << " ambiguous (not named), " << g_tbaaTypeless.size() << " with no IR type (not named); accesses named by them "
+         << g_tbaaAccResolved.size() << ", not named " << g_tbaaAccAmbiguous.size() << " ambiguous and "
+         << g_tbaaAccTypeless.size() << " typeless\n");
+  for (const std::string &n : g_tbaaResolved)
+    CG_LOG("TBAA base " << n.substr(7) << ": named by "
+           << [&] {
+                for (auto &[k, T] : g_tbaaBase)
+                  if (k.second == n && T) return T->getName().str();
+                return std::string("?");
+              }()
+           << "\n");
+  for (const std::string &n : g_tbaaTypeless) CG_LOG("TBAA base " << n.substr(7) << ": no IR type, not named\n");
+}
+
 static bool tbaaSlot(const Instruction *I, StructType *&S, int64_t &off) {
   const MDNode *Tag = I->getMetadata(LLVMContext::MD_tbaa);
   if (!Tag || Tag->getNumOperands() < 3 || Tag->getOperand(0) == Tag->getOperand(1)) return false;
   const auto *B = dyn_cast<MDNode>(Tag->getOperand(0));
   const auto *N = B && B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
   const auto *TO = mdconst::dyn_extract<ConstantInt>(Tag->getOperand(2));
-  if (!N || !TO) return false;
-  S = StructType::getTypeByName(I->getContext(), ("struct." + N->getString()).str());
+  if (!N || !TO || N->getString().empty()) return false;
+  S = tbaaBaseType(*I->getModule(), B, N->getString());
+  if (!StructType::getTypeByName(I->getContext(), ("struct." + N->getString()).str())) {
+    const std::string name = ("struct." + N->getString()).str();
+    (S ? g_tbaaAccResolved : g_tbaaAmbiguous.count(name) ? g_tbaaAccAmbiguous : g_tbaaAccTypeless).insert(I);
+  }
   if (!S || isAnonStruct(S)) return false;
   // The tag's offset is relative to the base struct; the address must be
   // the struct's start plus that offset, which the tag asserts.

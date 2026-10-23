@@ -52,6 +52,21 @@ void ConstraintGraph::addFieldAnyLoop(NodeIndex n) {
   edgeList.push_back({n, n, EdgeKind::FieldAny, 0});
 }
 
+bool ConstraintGraph::removeDeref(NodeIndex ptr, NodeIndex cell) {
+  checkNode(ptr, "deref removal");
+  checkNode(cell, "deref removal");
+  auto it = std::find_if(edgeList.begin(), edgeList.end(),
+                         [&](const GraphEdge &E) {
+                           return E.kind == EdgeKind::Deref && E.from == ptr &&
+                                  E.to == cell;
+                         });
+  if (it == edgeList.end())
+    return false;
+  edgeList.erase(it);
+  removals++;
+  return true;
+}
+
 bool ConstraintGraph::removeCopy(NodeIndex src, NodeIndex dst) {
   checkNode(src, "copy removal");
   checkNode(dst, "copy removal");

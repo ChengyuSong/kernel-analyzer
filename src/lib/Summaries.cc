@@ -648,6 +648,7 @@ void CallGraphPass::confirmFreshWrappers() {
         // source returns too: FRESH ALIAS(ret=argK) BODY, per call site.
         SmallVector<int, 2> retFormals;
         bool sawFresh = false;
+        SmallVector<const Instruction *, 4> certUsed; // pool instructions the certificate judged (S1)
         SmallPtrSet<const Value *, 16> onRetPath;
         SmallVector<const Value *, 8> work;
         bool ok = true;
@@ -661,7 +662,11 @@ void CallGraphPass::confirmFreshWrappers() {
           if (!onRetPath.insert(v).second) continue;
           if (isa<ConstantPointerNull>(v) || isa<UndefValue>(v)) continue;
           // A carve of a certified pool is a fresh object (rule 3).
-          if (const auto *CI = dyn_cast<Instruction>(v); CI && poolCarves.count(CI)) { sawFresh = true; continue; }
+          if (const auto *CI = dyn_cast<Instruction>(v); CI && poolCarves.count(CI)) {
+            sawFresh = true;
+            certUsed.push_back(CI);
+            continue;
+          }
           if (const auto *A = dyn_cast<Argument>(v); A && A->getParent() == &F && A->getType()->isPointerTy()) {
             retFormals.push_back((int)A->getArgNo());
             continue;
@@ -793,7 +798,10 @@ void CallGraphPass::confirmFreshWrappers() {
               if (const auto *SI = dyn_cast<StoreInst>(U)) {
                 // The pool's own bump (p + n stored back into H) moves
                 // no object: the next carve is another.
-                if (poolBookkeeping.count(SI)) continue;
+                if (poolBookkeeping.count(SI)) {
+                  certUsed.push_back(SI);
+                  continue;
+                }
                 // store INTO the fresh graph is init; storing the fresh
                 // pointer ITSELF somewhere else is an escape — bucket
                 // it by where it lands.
@@ -1072,7 +1080,10 @@ void CallGraphPass::confirmFreshWrappers() {
         for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
              ++II) {
           const Instruction *I2 = &*II;
-          if (poolBookkeeping.count(I2)) continue; // a certified pool's own state
+          if (poolBookkeeping.count(I2)) { // a certified pool's own state
+            certUsed.push_back(I2);
+            continue;
+          }
           if (const auto *SI = dyn_cast<StoreInst>(I2)) {
             if (initStores.count(I2)) continue;
             // A store into a non-escaping local slot moves nothing out
@@ -1153,7 +1164,10 @@ void CallGraphPass::confirmFreshWrappers() {
             // pure-fresh allocator: FRESH, no other atom) in the actual is
             // covered by the wrapper's FRESH (Fable 2026-10-17: the derived
             // newfuncs pass their own block to bfd_hash_newfunc).
-            if (const auto *TI = dyn_cast<Instruction>(tv); TI && poolCarves.count(TI)) continue;
+            if (const auto *TI = dyn_cast<Instruction>(tv); TI && poolCarves.count(TI)) {
+              certUsed.push_back(TI);
+              continue;
+            }
             if (const auto *TB = dyn_cast<CallBase>(tv))
               if (const Function *TF = TB->getCalledFunction()) {
                 const Function *TD = TF->isDeclaration() ? getFuncDef(const_cast<Function *>(TF)) : TF;
@@ -1303,7 +1317,11 @@ void CallGraphPass::confirmFreshWrappers() {
           else if (aliasArgs.empty()) g_freshInit++;
         }
         g_freshPromoted++;
-        if (phase == Lfp || phase == GfpPromote) g_poolCertExempt.insert(certExempt.begin(), certExempt.end());
+        if (phase == Lfp || phase == GfpPromote) {
+          g_poolCertExempt.insert(certExempt.begin(), certExempt.end());
+          for (const Instruction *PI : certExempt) notePoolCertUse(PI, "FRESH " + F.getName().str() + " (confirmer)");
+          for (const Instruction *PI : certUsed) notePoolCertUse(PI, "FRESH " + F.getName().str() + " (confirmer)");
+        }
         if (phase == GfpPromote) gfpPromoted++;
         changed = true;
         if (g_freshPromoted <= 20 || !retFormals.empty())

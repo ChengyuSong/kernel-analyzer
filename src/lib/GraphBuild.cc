@@ -2932,6 +2932,18 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
   if (allocaSummaryActive) {
     emitLocalAllocaSummaryEdges();
+    // A certified carve that reloads a summarized slot (-O0 `return r`)
+    // got no load edges: the slot's stored values are kept, so a
+    // withdrawal (S1) adds the edges the summary would have.
+    if (!poolCarves.empty())
+      for (const Instruction &I : instructions(*F))
+        if (const auto *L = dyn_cast<LoadInst>(&I); L && poolCarves.count(L)) {
+          NodeIndex slot;
+          if (!resolveSummarizedAllocaSlot(L->getPointerOperand(), slot)) continue;
+          auto sv = localAllocaStoreVals.find(slot);
+          auto &kept = poolSlotStoreVals[slot];
+          if (sv != localAllocaStoreVals.end()) kept.assign(sv->second.begin(), sv->second.end());
+        }
   }
   // Clear alloca tracking structures
   localSummarizedAllocaSlots.clear();

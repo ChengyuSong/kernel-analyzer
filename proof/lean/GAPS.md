@@ -2465,7 +2465,8 @@ stay apart), with the IR type as the counted fallback.
 - **A field at offset 0 is accessed by its type.** Its address is the
   struct's address. Passing the struct (`objalloc_alloc(o, n)`) is not a
   taken field address, so a callee is assumed to reach the field through
-  a typed access the checks see.
+  a typed access the checks see. Checked at the solve (S1, below): an
+  access the checks did not see withdraws the pool.
 - **A rewound value is a carve result of the same pool.** A store into a
   bump field whose value is a formal, or a join of handle values with a
   formal (objalloc_free_block's `o->current_ptr = b`), is a rewind with
@@ -2487,33 +2488,70 @@ written through an older carve is not read through the new one. The
 analysis is not temporal. The assumption is the one recorded for
 lookaside and objalloc reuse in func_summaries.txt.
 
-**Post-solve check of the handle cells.** After the solve, every store or
-block copy (memcpy, memmove) whose pointer may reach a certified pool's
-handle cell, other than the pool's own typed accesses classified before
-the solve, is a rule row:
+**The handle cells at the solve (S1, Fable 2026-10-23).** The checks
+before the solve judge the accesses the IR names. A handle field at
+offset 0 of a global pool read by its folded address (`load ptr, ptr @P`
+at -O0, no GEP) is named by the global's struct, so the checks see it.
+The folded @G form and the GEP form carry the same name (S+0), so the
+handle-cell check sees every access to the handle whichever form clang
+emitted. The certificate's premise is that they are every access to a
+handle field; the solve checks it.
 
-> the solver's facts admit a writer of this handle cell outside the pool's
-> forms (site); the carve model assumes that write does not change the
-> handle; sound when the program keeps its pool discipline; first cause:
-> the imprecise pointer at (site)
+- **Check.** After each solve, every load, store and block copy (either
+  end; a memset writes no pointer) whose address facts reach a certified
+  pool's handle cell, and that the carve rule did not judge (not one of
+  the pool's carves, bookkeeping or handle-field accesses), withdraws the
+  pool. One row per (pool, access), in IR order:
 
-- The first cause is the leak census's tag on the reaching fact at the
-  writer's pointer, under --cfl-cell-leak-census.
-- These rows are a class-7 leak into the handle (a store through an
-  imprecise pointer), not a new rule class. They fall with the soup and
-  are tracked in the per-program state like the other counts.
-- The rows check the third hypothesis (a handle reached only through
-  typed accesses) as far as the solver's facts allow. The certificate is
-  kept where rows exist: they come from the solver's imprecision (soup
-  pointers holding the pool descriptor), not from program writes. Under
-  the certificate a handle load has no data use, so anything that lands
-  in a handle cell never flows into program data.
-- Counts at 2026-10-12, run at the cells gate's 200K stop for nm-new:
-  - tcpdump O0/O3: 0;
-  - nm-new O3: 0;
-  - nm-new O0: 358 with handle stores modeled; 0 once they are not (see
-    below). All 358 had their first cause at the bump or the rewind
-    through the imprecise `o`.
+  > P pool: pool withdrawn at the solve: unjudged access to (handle key)
+  > at (site), found by (opcode); first cause: (the leak census's tag)
+
+- **Withdrawal.** The pool leaves the certificate built at iteration 0
+  (checkPoolCarves runs once, before the confirmers: run again it would
+  read their FRESH wrappers). Each of its carves loses its fresh object
+  (the object edge and the allocation site are removed) and gets the
+  edges of the instruction it is; a carve that reloads a summarized
+  local slot gets an edge from each value the build saw stored into the
+  slot (kept at the build for this). Each of its handle stores gets a
+  store's edges. The pool's bookkeeping and handle-field accesses lose
+  their exemption. One more iteration solves the changed graph: it is the
+  graph the build makes with the pool refused (t_pool_withdraw: the same
+  edges by kind and the same origins as with --cfl-pool-carves=false).
+- **Monotone.** A pool once withdrawn stays withdrawn in every later
+  iteration (poolWithdrawnAtSolve only grows; the certificate is only
+  filtered, never rebuilt).
+- **What carries across iterations.** The solver's facts do not: each
+  iteration's solve starts from the edge list with empty fact sets, so a
+  retired carve object's facts vanish with its edge (case (i)). What
+  carries is the call graph: the pairs wired by earlier iterations
+  (Ctx->Callees and their argument and return edges) are never unwired.
+  A pair an earlier solve found through the retired object stays an
+  answer. That adds targets, never removes them, so it is sound; it is
+  counted after any withdrawal ("pairs held from earlier iterations that
+  this solve does not derive: N").
+- **A site name broken at the solve (B, siteBrokenAtSolve)** needs none
+  of this: the solve never reads a site name (only the covers do, decided
+  before the solve and refused if one rested on the name, and the
+  reports), so no fact, cell or pair depends on it.
+- **Refusal.** A decision before the solve that rested on the
+  certificate cannot be withdrawn after it: a FRESH promotion of the
+  confirmer that used a carve as a fresh source or exempted the pool's
+  bookkeeping, or a container verified with a carve, a handle access or
+  a pool chunk. The run is refused (ERROR, exit 1) with every such
+  decision listed, as a cover is for a site name the solve breaks.
+- **Statement.** A pool certified at the fixpoint has no access to a
+  handle cell outside the forms in the solver's facts, so the premise of
+  the checks before the solve holds for every access the solver models;
+  a pool that fails it is solved as ordinary code. A handle store through
+  an imprecise pointer counts: the certificate is no longer kept where
+  the solver admits one.
+- **Instance.** test/t_pool_withdraw.c, executed, calls g; 9547f21
+  answered [f] (peek's load of P.cur through the folded @P was unjudged,
+  and the carve model drops the handle stores, so h->fn = g landed
+  nowhere). S1 withdraws the pool at the solve and answers [f, g].
+- **Counts** are in the log ("pool handle cells (N fields of the
+  certified pools): A accesses outside the pools' forms, W pools
+  withdrawn at the solve") and the rule report's SUMMARY line.
 
 **Handle stores are not modeled.** A certified pool's handle values are
 not data: cursor reloads, free-space pointers, chunk pointers, rewind
@@ -2532,7 +2570,7 @@ values.
   asserting that the pointer is precise.
 - **Hypothesis:** the certificate. Stores of other values into handle
   fields stay modeled (under the certificate there are none, and the
-  post-solve check reports any the solve admits).
+  check at the solve withdraws the pool for any the solve admits).
 - **Counts per pool** are in the PoolCarve report ("N handle stores …
   not modeled"): nm-new objalloc 23 (O0) and 146 (O3); tcpdump newchunk 2 (O0) and 309 (O3, inlined).
 

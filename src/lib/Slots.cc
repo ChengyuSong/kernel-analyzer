@@ -69,7 +69,22 @@ static bool accessSlotAny(const Instruction *I, const Value *Addr, const DataLay
       return true;
     }
   }
-  return tbaaSlot(I, S, off);
+  if (tbaaSlot(I, S, off)) return true;
+  // A struct-typed global accessed at its start without a GEP: clang folds
+  // &G.f0 to @G at -O0 (no TBAA there to name it). The field at offset 0,
+  // named as the all-zero GEP would name it, when no TBAA tag names it (Fable
+  // 2026-10-23, S1).
+  {
+    const Value *B = Addr;
+    while (const auto *BC = dyn_cast<BitCastOperator>(B)) B = BC->getOperand(0);
+    if (const auto *GV = dyn_cast<GlobalVariable>(B))
+      if (auto *GS = dyn_cast<StructType>(GV->getValueType()); GS && GS->hasName() && !GS->isOpaque()) {
+        S = GS;
+        off = 0;
+        return true;
+      }
+  }
+  return false;
 }
 // A field of an anonymous struct is named by the enclosing named struct on
 // the address's chain and the byte offset there (isAnonStruct), else by the

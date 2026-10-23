@@ -961,14 +961,16 @@ void CallGraphPass::checkPoolCarves() {
   poolRefusedCarvePool.clear();
   poolCarveSizes.clear();
   poolBookkeeping.clear();
+  poolBookkeepingPool.clear();
   poolHandleFields.clear();
   poolHandleStores.clear();
   poolFieldAccess.clear();
   if (CFLPoolCarves) {
     for (auto &[I, f] : bookkeeping)
       if (isa<StoreInst>(I) && !isRefused(pool(f))) poolHandleStores.insert(I);
+    poolOfField.clear();
     for (const std::string &f : handleFields)
-      if (!isRefused(pool(f))) poolHandleFields.insert(f);
+      if (!isRefused(pool(f))) poolHandleFields.insert(f), poolOfField[f] = pool(f);
     for (const Carve &c : carves)
       if (!isRefused(pool(c.field))) {
         poolCarves[c.I] = c.form;
@@ -977,7 +979,7 @@ void CallGraphPass::checkPoolCarves() {
       } else
         poolRefusedCarvePool[c.I] = pool(c.field);
     for (auto &[I, f] : bookkeeping)
-      if (!isRefused(pool(f))) poolBookkeeping.insert(I);
+      if (!isRefused(pool(f))) poolBookkeeping.insert(I), poolBookkeepingPool[I] = pool(f);
     // Every load and store of a certified pool's handle field, by pool:
     // the confirmer's certificate-bound exemption (plan 3.55 (a)) reads the
     // same certificate.
@@ -998,4 +1000,85 @@ void CallGraphPass::checkPoolCarves() {
          << " handle fields (" << fb << " keyed by the IR type at some access: no debug info there), " << carves.size()
          << " carve sites, " << rewinds.size() << " rewinds; " << cursors
          << " bumped fields never refilled (cursors)\n");
+}
+
+// S1 (Fable 2026-10-23): a pool withdrawn at the solve leaves the
+// certificate built at iteration 0 (checkPoolCarves runs once, before the
+// confirmers: run again it would read their FRESH wrappers and could
+// certify what the graph never built). Its carves lose their fresh object
+// and get the edges of the instruction each is; its handle stores, which
+// the build dropped, get a store's edges. The next iteration's solve reads
+// the changed edge list.
+extern size_t g_poolCarves;
+void CallGraphPass::applyPoolWithdrawals() {
+  if (poolWithdrawnAtSolve.size() == poolWithdrawnApplied) return;
+  poolWithdrawnApplied = poolWithdrawnAtSolve.size();
+  auto gone = [&](const std::string &p) { return poolWithdrawnAtSolve.count(p) > 0; };
+  std::vector<std::pair<Function *, std::vector<Instruction *>>> released; // in IR order
+  size_t carvesReleased = 0, storesReleased = 0;
+  for (auto &[M, _] : Ctx->Modules)
+    for (Function &F : *M)
+      for (Instruction &I : instructions(F)) {
+        const std::string p = poolOfInst(&I);
+        if (p.empty() || !gone(p)) continue;
+        bool rebuild = false;
+        if (poolCarves.erase(&I)) {
+          const NodeIndex v = getRepNodeForValue(&I);
+          const NodeIndex own = NF.getValueNodeFor(&I);
+          const NodeIndex obj = NF.getObjectNodeFor(&I);
+          assert(v != AndersNodeFactory::InvalidIndex && obj != AndersNodeFactory::InvalidIndex &&
+                 "a certified carve was built as an allocation site");
+          const bool removed = Graph.removeDeref(v, obj);
+          assert(removed && "a certified carve's object edge is in the graph");
+          (void)removed;
+          auto &nodes = AllocSiteNodes[v];
+          nodes.erase(std::remove(nodes.begin(), nodes.end(), own), nodes.end());
+          if (nodes.empty()) AllocSiteNodes.erase(v), AllocSites.erase(v);
+          poolRefusedCarvePool[&I] = poolCarvePool.at(&I);
+          poolCarvePool.erase(&I);
+          poolCarveSizes.erase(&I);
+          g_poolCarves--;
+          carvesReleased++;
+          rebuild = true;
+        }
+        if (poolHandleStores.erase(&I)) storesReleased++, rebuild = true;
+        poolBookkeeping.erase(&I);
+        poolBookkeepingPool.erase(&I);
+        poolFieldAccess.erase(&I);
+        if (!rebuild) continue;
+        if (released.empty() || released.back().first != &F) released.push_back({&F, {}});
+        released.back().second.push_back(&I);
+      }
+  for (auto it = poolHandleFields.begin(); it != poolHandleFields.end();)
+    it = gone(poolOfField.at(*it)) ? poolHandleFields.erase(it) : std::next(it);
+  for (auto &[p, row] : poolWithdrawnAtSolve)
+    if (auto v = poolVerdicts.find(p); v != poolVerdicts.end() && v->second.find("; withdrawn at the solve") == std::string::npos)
+      v->second += "; withdrawn at the solve: " + row;
+  for (auto &[F, insts] : released) {
+    // A carve that reloads a summarized local slot is recorded as the
+    // slot's load and gets an edge from each value the build saw stored
+    // there (poolSlotStoreVals): the slot summary's edges for it. A
+    // handle store into a summarized slot cannot be: its loads' edges were
+    // emitted at iteration 0.
+    collectLocalAllocaSummaries(F);
+    InstHandler visitor(*this, F);
+    for (Instruction *I : insts) visitor.visit(*I);
+    for (auto &[slot, vals] : localAllocaStoreVals)
+      if (!vals.empty()) {
+        errs() << "ERROR: --cfl-cells: a withdrawn pool's handle store in " << F->getName()
+               << " writes a summarized local slot, whose loads' edges were built at iteration 0\n";
+        exit(1);
+      }
+    for (auto &[slot, loads] : localAllocaLoadVals) {
+      auto kept = poolSlotStoreVals.find(slot);
+      assert(kept != poolSlotStoreVals.end() && "a released carve's slot was kept at the build");
+      for (NodeIndex st : kept->second)
+        for (NodeIndex l : loads) addAssignmentEdge(st, l);
+    }
+    localSummarizedAllocaSlots.clear();
+    localAllocaStoreVals.clear();
+    localAllocaLoadVals.clear();
+  }
+  CG_LOG("PoolCarve: withdrawn at the solve: " << poolWithdrawnAtSolve.size() << " pools; " << carvesReleased
+         << " carves and " << storesReleased << " handle stores built as ordinary code\n");
 }

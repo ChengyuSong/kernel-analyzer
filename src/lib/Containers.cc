@@ -62,6 +62,9 @@ bool transientSlot(const Value *A) {
 } // namespace
 
 void CallGraphPass::checkContainerClosure() {
+  // Pool certificate uses (S1) count for the containers this verifies.
+  poolCertDefer = true;
+  poolCertDeferred.clear();
   // A field access's key: its IR struct (linker suffix stripped) and offset,
   // named by its struct GEP or TBAA tag, an array member at a variable index,
   // or at offset 0 with neither by the address's pointee (one naming rule
@@ -153,7 +156,10 @@ void CallGraphPass::checkContainerClosure() {
   std::function<const Value *(const Value *, int)> freshOf = [&](const Value *V, int d) -> const Value * {
     V = V->stripPointerCasts();
     if (const auto *CB = dyn_cast<CallBase>(V)) return isFresh(CB) ? CB : nullptr;
-    if (const auto *I = dyn_cast<Instruction>(V); I && poolCarves.count(I)) return I;
+    if (const auto *I = dyn_cast<Instruction>(V); I && poolCarves.count(I)) {
+      notePoolCertUse(I, "container closure: a carve as a fresh block in " + I->getFunction()->getName().str());
+      return I;
+    }
     if (const auto *PN = dyn_cast<PHINode>(V); PN && d < 4) {
       const Value *any = nullptr;
       for (const Value *In : PN->incoming_values()) {
@@ -247,6 +253,7 @@ void CallGraphPass::checkContainerClosure() {
           if (it == poolFieldAccess.end()) { why = "read through it outside a pool's handle fields"; return false; }
           if (!pool.empty() && pool != it->second) { why = "two pools"; return false; }
           pool = it->second;
+          notePoolCertUse(L, "container closure: a handle read through a closed value in " + L->getFunction()->getName().str());
           continue;
         }
         if (const auto *S = dyn_cast<StoreInst>(UI)) {
@@ -256,6 +263,7 @@ void CallGraphPass::checkContainerClosure() {
             if (it == poolFieldAccess.end()) { why = "written through outside a pool's handle fields"; return false; }
             if (!pool.empty() && pool != it->second) { why = "two pools"; return false; }
             pool = it->second;
+            notePoolCertUse(S, "container closure: a handle write through a closed value in " + S->getFunction()->getName().str());
             continue;
           }
           const Value *A = S->getPointerOperand()->stripPointerCasts();
@@ -702,8 +710,10 @@ void CallGraphPass::checkContainerClosure() {
     if (Cc) ptrMembersOf(Cc, 0, out, 0);
     return out;
   };
+  const auto closureCertUses = std::move(poolCertDeferred);
   for (auto &C : Ctx->Containers) {
     using CR = GlobalContext::ContainerRow;
+    poolCertDeferred.clear();
     C.verified = false;
     C.obligations.clear();
     // The body: the row functions, and the functions only they call
@@ -1203,7 +1213,10 @@ void CallGraphPass::checkContainerClosure() {
       return m ? m : (b ? OTH : 0);
     };
     auto transfer = [&](const Instruction &I) -> uint8_t {
-      if (poolCarves.count(&I)) return FRS; // a certified pool carve: a fresh block
+      if (poolCarves.count(&I)) { // a certified pool carve: a fresh block
+        notePoolCertUse(&I, "container closure: a carve as a fresh block in " + I.getFunction()->getName().str());
+        return FRS;
+      }
       if (const auto *L = dyn_cast<LoadInst>(&I)) return loadClass(L, L->getPointerOperand());
       if (isa<GetElementPtrInst>(&I) || isa<CastInst>(&I)) return get(I.getOperand(0));
       // A link word's arithmetic (tags set, cleared, tested): the pointer it
@@ -3586,6 +3599,7 @@ void CallGraphPass::checkContainerClosure() {
             continue;
           }
           if (poolCarves.count(I)) {
+            notePoolCertUse(I, "container closure: a carve as an element in " + loc(I));
             if (ctorsHere.count(I->getFunction())) O.elements.insert("a constructor's carve in " + loc(I));
             else O.pools[poolCarvePool.at(I)].insert("a carve in " + loc(I)), O.allocs.insert(I);
             continue;
@@ -7030,8 +7044,10 @@ void CallGraphPass::checkContainerClosure() {
       for (size_t k = 0; k < w.size(); k++)
         for (const User *U : w[k]->users()) {
           if (const auto *SI = dyn_cast<StoreInst>(U);
-              SI && SI->getValueOperand() == w[k] && poolHandleStores.count(SI))
+              SI && SI->getValueOperand() == w[k] && poolHandleStores.count(SI)) {
+            notePoolCertUse(SI, "container closure: a pool chunk in " + SI->getFunction()->getName().str());
             return true;
+          }
           if (isa<CastInst>(U)) w.push_back(U);
         }
       return false;
@@ -7259,6 +7275,7 @@ void CallGraphPass::checkContainerClosure() {
             }
             sz = prod;
           } else if (poolCarves.count(&I) && (get(&I) & FRS)) {
+            notePoolCertUse(&I, "container closure: a carve's size in " + I.getFunction()->getName().str());
             auto zit = poolCarveSizes.find(&I);
             const auto *K = zit == poolCarveSizes.end() ? nullptr : dyn_cast_or_null<ConstantInt>(zit->second.n);
             if (!K) {
@@ -7379,6 +7396,17 @@ void CallGraphPass::checkContainerClosure() {
       for (const Function *F : body) bn.push_back(F->getName().str());
       std::sort(bn.begin(), bn.end());
       for (const std::string &n : bn) bl += (bl.empty() ? "" : " ") + n;
+    }
+    if (C.verified) {
+      auto commit = [&](const std::vector<std::pair<std::string, std::string>> &uses) {
+        for (const auto &[p, what] : uses) {
+          auto &v = poolCertUsed[p];
+          const std::string d = "container " + C.name + " verified: " + what;
+          if (std::find(v.begin(), v.end(), d) == v.end()) v.push_back(d);
+        }
+      };
+      commit(closureCertUses);
+      commit(poolCertDeferred);
     }
     cline(C.name + " (" + C.provenance + (C.report ? ", report" : "") + "): " + std::to_string(C.rows.size()) +
           " rows, body {" + bl + "}" +
@@ -7583,6 +7611,8 @@ void CallGraphPass::checkContainerClosure() {
            << " distinct instructions) named by the enclosing named struct and byte offset, "
            << pointees.anonUnnamedN << " lookups (" << pointees.anonUnnamedAt.size()
            << " distinct instructions) unnamed (no enclosing named struct on the access's GEP chain)\n");
+  poolCertDefer = false;
+  poolCertDeferred.clear();
 }
 
 // After the solve: a pure row's indirect calls (Fable 2026-10-14) take the

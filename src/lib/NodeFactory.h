@@ -190,6 +190,11 @@ public:
     NodeIndex getReturnNodeFor(const llvm::Function* f);
     NodeIndex getVarargNodeFor(const llvm::Function* f);
     NodeIndex getDereferenceNodeFor(const NodeIndex ptr);
+    // The object node created for val, or InvalidIndex.
+    NodeIndex getObjectNodeFor(const llvm::Value *val) const {
+        auto it = objNodeMap.find(val);
+        return it == objNodeMap.end() ? InvalidIndex : it->second;
+    }
     // The pointer a dereference node was created for (InvalidIndex for
     // one created without a pointer).
     NodeIndex getDerefParent(NodeIndex deref) const {

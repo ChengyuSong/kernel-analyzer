@@ -808,6 +808,47 @@ protected:
   // Loads and stores of a certified pool's handle fields, by pool (the
   // pool's representative field): the certificate the confirmer reads.
   std::unordered_map<const llvm::Instruction *, std::string> poolFieldAccess;
+  // S1 (Fable 2026-10-23): the premise "every access to a handle field is
+  // seen" is checked at the solve. An access whose address facts reach a
+  // certified pool's handle cell and that the carve rule did not judge
+  // withdraws the pool for every later iteration (pool -> its row); its
+  // carves and handle stores get their ordinary edges then. A decision
+  // that rested on the certificate (the confirmer's exemptions, the
+  // container closure's) is recorded per pool: a withdrawn pool with one
+  // is refused, as a cover's name is (siteCoverUsed).
+  std::map<std::string, std::string> poolWithdrawnAtSolve;
+  std::vector<std::string> poolWithdrawRows; // rule report, in the order found
+  std::map<std::string, std::vector<std::string>> poolCertUsed;
+  std::map<std::string, std::string> poolOfField; // certified handle field -> its pool
+  size_t poolWithdrawnApplied = 0;                // withdrawals already applied to the graph
+  std::unordered_map<const llvm::Instruction *, std::string> poolBookkeepingPool;
+  // The certified pool whose certificate judged I (a carve, bookkeeping, a
+  // handle-field access), or "".
+  std::string poolOfInst(const llvm::Instruction *I) const {
+    if (auto it = poolCarvePool.find(I); it != poolCarvePool.end()) return it->second;
+    if (auto it = poolBookkeepingPool.find(I); it != poolBookkeepingPool.end()) return it->second;
+    if (auto it = poolFieldAccess.find(I); it != poolFieldAccess.end()) return it->second;
+    return "";
+  }
+  // A decision before the solve that rested on the certificate judging I.
+  // While poolCertDefer is set (the container closure, whose uses count
+  // only for a container it verifies) the use waits in poolCertDeferred.
+  // A summarized slot a certified carve reloads: its stored values, kept
+  // from the build for a withdrawal (applyPoolWithdrawals).
+  std::map<NodeIndex, std::vector<NodeIndex>> poolSlotStoreVals;
+  bool poolCertDefer = false;
+  std::vector<std::pair<std::string, std::string>> poolCertDeferred; // (pool, what)
+  void notePoolCertUse(const llvm::Instruction *I, const std::string &what) {
+    const std::string p = poolOfInst(I);
+    if (p.empty()) return;
+    if (poolCertDefer) {
+      poolCertDeferred.push_back({p, what});
+      return;
+    }
+    auto &v = poolCertUsed[p];
+    if (std::find(v.begin(), v.end(), what) == v.end()) v.push_back(what);
+  }
+  void applyPoolWithdrawals();
   // Varargs renderers (plan 3.41): functions whose pointer reads through a
   // va_list are data only (printed, measured, compared, copied as chars):
   // those reads carry no facts; variadic wrappers whose va_lists reach only

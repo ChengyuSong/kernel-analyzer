@@ -826,6 +826,9 @@ void CallGraphPass::logHighDegreeNodes(size_t threshold, size_t topN) {
 }
 
 bool CallGraphPass::solve() {
+  // A pool the previous solve withdrew (S1) is built as ordinary code
+  // first: the mint table reads the certified carves.
+  if (CFLCells && iteration > 0) applyPoolWithdrawals();
   if (VerboseLevel >= 2) {
     size_t byKind[4] = {0, 0, 0, 0};
     for (const GraphEdge &E : Graph.edges())

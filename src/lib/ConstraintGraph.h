@@ -53,6 +53,8 @@ public:
   void addFieldAnyLoop(NodeIndex n);
   // Removes the first Copy edge src -> dst; false if there is none.
   bool removeCopy(NodeIndex src, NodeIndex dst);
+  // Removes the first Deref edge ptr -> cell; false if there is none.
+  bool removeDeref(NodeIndex ptr, NodeIndex cell);
 
   const std::vector<GraphEdge> &edges() const { return edgeList; }
   size_t size() const { return edgeList.size(); }

@@ -3553,3 +3553,38 @@ cursor_nested,deref_owner,outparam,cursor_union_copy,cursor_underway,holder_outp
 holder_outparam_escape,holder_array,holder_local,holder_local_other}.c (the bfd link-hash rows); rows for the rbtree cases in t2_cells_rblib.c,
 shapes in cells_rb.h.
 Not mechanized. Checked by executions; see the commit's gates.
+
+## Walk flags from the final graph (CellSolver collapseCycles, Fable 2026-10-22, ordering)
+
+A field edge on a cycle of the copy and field graph whose steps have a
+nonzero gcd g is a walk: a step along it yields the cells at the
+object's offsets congruent mod g (its residue) instead of one address
+per turn. The flags were set by cycle passes that run when the pop count
+and the edge set have grown enough, so a cycle that closed after the
+last pass was walked by steps, and a fact that crossed an edge before
+its flag was set (or before its g shrank) was never re-applied: the
+answer and the "cycles with offset" rows depended on the schedule
+(tcpdump: an offset cycle through ieee802_11_print's ndo->ndo_snapend -=
+fcslen closed into the ospf_print component in one schedule and not in
+another; 2e45cec).
+
+Now every pass that sets or changes an edge's flag re-presents the
+edge's source facts, and when an iteration's worklist drains a final
+pass runs on its edge set; if it changes a flag, the facts are
+re-presented and the solve goes on. A pass also queues work of its
+own (an absorbed node's facts, a rebound receiver, the facts a dropped
+guard held back, a refold, a keyed wait), which is solved the same way:
+the loop ends when a pass changes no flag and queues nothing. Let W be the set of flags (edge -> g) and F(W) the least
+fixpoint of the propagation under W. F is monotone in W (a walk's
+residue cells contain every cell its steps around the cycle reach, and
+a smaller g contains a larger one's), the cycles of the graph of F(W)
+are monotone in F(W) (edges only grow), and the edge set is finite, so
+the loop W_{k+1} = cycles(graph(F(W_k))) from W_0 = the static cycles
+reaches the least W with W = cycles(graph(F(W))): W_final, a function
+of the program and not of the order facts move. Re-presenting facts on
+every flag change makes the reached state F(W_final) whatever the order
+the flags were set in, so a cut is the same cut in every run. The
+"cycles with offset" rows are read from the final pass; at a stop
+(census, soup cap) they are read from the stop's edge set without
+absorbing any node, and are labeled "at the stop": a stop is a point in
+the schedule, so those rows are schedule-dependent by definition.

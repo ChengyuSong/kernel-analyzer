@@ -1161,6 +1161,11 @@ bool CallGraphPass::runCellResolution() {
   // Collapse the copy cycles of the current graph (static edges and the
   // hub edges added so far).
   size_t collapses = 0, collapsedNodes = 0, walkEdges = 0;
+  // Field edges whose walk flag (or its step) a cycle pass changed: their
+  // sources' facts are re-presented, so every fact crosses the edge under
+  // its final flag whatever pass set it (the schedule decides nothing).
+  std::vector<uint32_t> walkChangedSrc;
+  size_t walkReflags = 0, finalPasses = 0;
   double collapseSecs = 0;
   std::vector<std::vector<uint32_t>> bigCycles; // the largest per collapse (report)
   // Edges inside each big cycle, recorded before the merge erases them.
@@ -1170,6 +1175,7 @@ bool CallGraphPass::runCellResolution() {
   struct PwcComp { size_t size = 0, typed = 0, untyped = 0; bool cls = false; int64_t g = 0; uint32_t rep = 0; };
   std::vector<PwcComp> pwcComps;
   std::vector<uint8_t> inPwc;
+  bool cycleRowsOnly = false; // at a stop: the rows from the stop's edge set, no node absorbed (the stop answers stay)
   auto collapseCycles = [&]() {
     const auto tc = Clock::now();
     collapses++;
@@ -1198,15 +1204,17 @@ bool CallGraphPass::runCellResolution() {
         bigCycleEdges.push_back(std::move(es));
       }
     }
-    for (auto &M : sccs) {
-      const uint32_t r = *std::min_element(M.begin(), M.end());
-      for (uint32_t m : M)
-        if (m != r && find(m) == m) {
-          absorb(find(r), m);
-          collapsedNodes++;
-        }
+    if (!cycleRowsOnly) {
+      for (auto &M : sccs) {
+        const uint32_t r = *std::min_element(M.begin(), M.end());
+        for (uint32_t m : M)
+          if (m != r && find(m) == m) {
+            absorb(find(r), m);
+            collapsedNodes++;
+          }
+      }
+      for (auto &M : sccs) finalize(find(M[0]));
     }
-    for (auto &M : sccs) finalize(find(M[0]));
     {
       // Field edges on a cycle (copy and field edges together) are
       // pointer walks: a step along one yields the object's any-offset
@@ -1253,6 +1261,7 @@ bool CallGraphPass::runCellResolution() {
           if (v != u && comp[v] != comp[u]) continue;
           const int64_t g = compGcd[comp[u]];
           if (g == 0) continue; // offset-free cycle
+          if (e.walk != g) walkChangedSrc.push_back(u), walkReflags++;
           e.walk = g;
           onCycle++;
           selfLoops += v == u;
@@ -1308,6 +1317,7 @@ bool CallGraphPass::runCellResolution() {
           }
   watchdog.phase("static cycle collapse");
   collapseCycles(); // static cycles, before any fact moves
+  walkChangedSrc.clear(); // no fact has moved yet
 
   watchdog.phase("objects and cells");
   // ---- Objects and cells ----
@@ -7122,6 +7132,22 @@ bool CallGraphPass::runCellResolution() {
   }
   uint64_t lastCollapsePops = 0;
   size_t edgesAtCollapse = edgeSet.size();
+  // A cycle pass's changed walk flags: their sources' facts again (a fact
+  // that crossed the edge as a step, or as a walk of a coarser step, is
+  // re-applied under the flag it has now).
+  auto requeueWalks = [&]() {
+    std::sort(walkChangedSrc.begin(), walkChangedSrc.end());
+    walkChangedSrc.erase(std::unique(walkChangedSrc.begin(), walkChangedSrc.end()), walkChangedSrc.end());
+    for (uint32_t u : walkChangedSrc) {
+      const uint32_t r = find(u);
+      std::vector<uint32_t> fs;
+      pts[r].forEach([&](uint32_t f) { fs.push_back(findFact(f)); });
+      if (fs.empty()) continue;
+      pend[r].insert(pend[r].end(), fs.begin(), fs.end());
+      push(r);
+    }
+    walkChangedSrc.clear();
+  };
   uint32_t stoppedAt = 0;
   std::string stopKind; // the stop's name in the final line
   watchdog.phase("worklist");
@@ -7135,6 +7161,22 @@ bool CallGraphPass::runCellResolution() {
         if (!worklist.empty()) continue;
       }
       if (CFLCellOneLabel) flushPending(true);
+      // The final cycle pass (Fable 2026-10-22, ordering): on the drained
+      // iteration's edge set; a flag it changes re-presents its sources'
+      // facts and the solve goes on. The passes queue work of their own
+      // too (an absorbed node's facts, a rebound receiver, the facts a
+      // dropped guard held back, a refold, a keyed wait): the loop ends
+      // when a pass changes no flag and queues nothing. The walk flags are
+      // then the field edges on cycles of the final graph, and the cycle
+      // rows are read from that pass.
+      watchdog.phase("final cycle pass");
+      finalPasses++;
+      collapseCycles();
+      rekeyReceivers();
+      dropMergedGuards();
+      requeueWalks();
+      watchdog.phase("worklist");
+      if (!worklist.empty() || !refoldQueue.empty() || !keyedWait.empty()) continue;
       break;
     }
     const uint32_t n = worklist.back();
@@ -7353,6 +7395,7 @@ bool CallGraphPass::runCellResolution() {
         edgeSet.size() > edgesAtCollapse + edgesAtCollapse / 8) {
       watchdog.phase("periodic cycle collapse");
       collapseCycles();
+      requeueWalks();
       watchdog.phase("rekey receivers");
       rekeyReceivers();
       watchdog.phase("drop merged guards");
@@ -7366,6 +7409,16 @@ bool CallGraphPass::runCellResolution() {
       edgesAtCollapse = edgeSet.size();
     }
   }
+  // At a stop: the cycle rows from the stop's edge set (schedule-
+  // dependent by definition: labeled "at the stop"), nothing absorbed.
+  if (stoppedAt) {
+    cycleRowsOnly = true;
+    collapseCycles();
+    cycleRowsOnly = false;
+    walkChangedSrc.clear();
+  }
+  CG_LOG("Cells: cycle passes: " << collapses << " (" << finalPasses << " final), " << walkReflags
+         << " walk flags set or changed\n");
   // Collect mode runs on through the iterations (a soup often forms only
   // after calls resolve); it ends at the cap or at the last iteration.
   dynEdges = edgeSet.size() - staticEdges;
@@ -10151,7 +10204,7 @@ bool CallGraphPass::runCellResolution() {
       RO << "UB byte-exit " << (n < numNodes ? nodeDesc(n) : std::string("?")) << " steps " << k
          << " from " << describe(objs[o]) << " +" << pos << "\n";
     for (const std::string &d : rrPtrAt) RO << "UB ptr-sub " << d << "\n";
-    RO << "\n== cycles with offset, the ten largest (plan 3.49)\n";
+    RO << "\n== cycles with offset, the ten largest (plan 3.49)" << (stoppedAt ? ", at the stop" : "") << "\n";
     {
       std::vector<PwcComp> top = pwcComps;
       std::sort(top.begin(), top.end(), [](const PwcComp &a, const PwcComp &b) {

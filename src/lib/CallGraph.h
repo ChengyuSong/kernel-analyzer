@@ -832,6 +832,21 @@ protected:
   std::vector<std::string> poolWithdrawRows; // rule report, in the order found
   std::map<std::string, std::vector<std::string>> poolCertUsed;
   std::map<std::string, std::string> poolOfField; // certified handle field -> its pool
+  // LA (Fable 2026-10-24): array-ness decided late. An object read as a T
+  // followed by unknown data whose tail an index linked (its any-offset
+  // cell) before the T-stride evidence made it an array of T keeps that
+  // link for the rest of the solve; the next iteration mints it as the
+  // array (by its site, offset and label), and the final iteration must
+  // see the evidence again. Keyed by (site, base, T label).
+  struct LateArrayRow {
+    std::string decidedBy, linkBy; // the evidence's site; the tail link's site
+    int64_t stride = 0;            // the tail link's stride
+    char kind = 'i';               // 'i' a T-typed index, 'w' a T written at a T stride
+    int redone = 0, confirmed = -1;
+  };
+  std::map<std::tuple<const llvm::Value *, int64_t, std::string>, LateArrayRow> lateArrayDecided;
+  std::vector<std::string> lateArrayRelabeled; // a key whose label changed (never silent)
+  int lateArrayIterations = 0; // iterations run for LA alone
   size_t poolWithdrawnApplied = 0;                // withdrawals already applied to the graph
   std::unordered_map<const llvm::Instruction *, std::string> poolBookkeepingPool;
   // The certified pool whose certificate judged I (a carve, bookkeeping, a

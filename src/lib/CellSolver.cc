@@ -210,6 +210,12 @@ struct Obj {
   // An unlabeled object is an array of unknown element: a variable index
   // of stride s says its element is s bytes (content folds modulo it).
   int64_t period = 0;
+  // LA: the first step that linked the tail's any-offset cell by an index
+  // (strideCells), and whether the object was minted as an array because
+  // an earlier iteration decided its array-ness late.
+  const Instruction *tailLinkSite = nullptr;
+  int64_t tailLinkStride = 0;
+  bool lateArray = false;
   uint32_t func = UINT32_MAX;
   // Its content nodes (by folded offset, for the any and residue cells),
   // its any-offset cell (reads and writes exactly those) and outside cell.
@@ -2019,8 +2025,37 @@ bool CallGraphPass::runCellResolution() {
     }
     if (C && zeroProductSites.count(C)) (O.repeats ? zeroProductArrays : zeroProductUnknown).insert(C);
   };
+  // LA (Fable 2026-10-24): an object an earlier iteration found to be an
+  // array only after an index had linked its tail is minted as the array,
+  // as extendToArray leaves a fresh one (no tail object yet). Keyed by its
+  // site, its offset in the allocation and its label; this iteration's
+  // decisions (lateArrayNew) apply from the next one, and the final
+  // iteration sees each decided key's evidence again (lateConfirmed).
+  using LateKey = std::tuple<const Value *, int64_t, std::string>;
+  std::map<LateKey, LateArrayRow> lateArrayNew;
+  std::set<LateKey> lateConfirmed;
+  size_t lateMinted = 0;
+  char extendKind = 'i'; // the evidence extendToArray is called on: 'i' index, 'w' write
+  auto lateKey = [&](const Obj &O) -> LateKey {
+    return {NF.getValueForNode(O.origin), O.base, O.layout ? typeLabel(O.layout) : std::string()};
+  };
+  auto applyLateArray = [&](Obj &O) {
+    if (!O.layout || !O.tail || O.repeats || lateArrayDecided.empty()) return;
+    if (!lateArrayDecided.count(lateKey(O))) return;
+    O.tail = false;
+    O.tailUnsized = false;
+    O.repeats = true;
+    O.lateArray = true;
+    lateMinted++;
+  };
+  // The final iteration's witness: the evidence that decided a key, met
+  // again on the object minted as the array.
+  auto confirmLate = [&](const Obj &O) {
+    if (O.lateArray) lateConfirmed.insert(lateKey(O));
+  };
   auto setExtent = [&](Obj &O, const Value *V) {
     applyExtent(O, ST.extentOf(O.layout, (uint64_t)(O.base + O.size), V), dyn_cast_or_null<CallBase>(V));
+    applyLateArray(O);
   };
   // A1 (Fable 2026-10-20): an allocation of sizeof(T) + k * sizeof(E) for a
   // T that ends in a trailing array of E (`asection *sections[1]`): the size
@@ -2193,7 +2228,9 @@ bool CallGraphPass::runCellResolution() {
     // array of T, never a chain of trailing objects.
     if (O.parentObj != UINT32_MAX && objs[O.parentObj].tailObj == o &&
         S == objs[O.parentObj].layout) {
+      extendKind = 'w';
       extendToArrayFn(O.parentObj); // a T written at a T stride: an array of T
+      extendKind = 'i';
       return;
     }
     if (O.parentObj != UINT32_MAX && objs[O.parentObj].tailUnsized &&
@@ -2476,6 +2513,7 @@ bool CallGraphPass::runCellResolution() {
         O.tail = H.tail;
         O.repeats = H.repeats;
       }
+      applyLateArray(O);
       objs.push_back(std::move(O));
       return objs.size() - 1;
     }
@@ -2677,6 +2715,24 @@ bool CallGraphPass::runCellResolution() {
       return;
     }
     arraysExtended++;
+    // LA: an index already linked the tail's any-offset cell (the T alone
+    // was not known to be an array); that link stays for this solve, so the
+    // next iteration mints the object as the array.
+    if (objs[o].tailLinkSite) {
+      const LateKey k = lateKey(objs[o]);
+      assert(!lateArrayDecided.count(k) && "a late-decided object is minted as an array and never extended again");
+      const auto *DI = curStepDst < G ? dyn_cast_or_null<Instruction>(NF.getValueForNode(curStepDst)) : nullptr;
+      LateArrayRow R;
+      R.decidedBy = DI ? instLoc(DI) : std::string("?");
+      R.linkBy = instLoc(objs[o].tailLinkSite);
+      R.stride = objs[o].tailLinkStride;
+      R.kind = extendKind;
+      lateArrayNew.try_emplace(k, R);
+      for (auto &[dk, dr] : lateArrayDecided)
+        if (std::get<0>(dk) == std::get<0>(k) && std::get<1>(dk) == std::get<1>(k) && std::get<2>(dk) != std::get<2>(k))
+          lateArrayRelabeled.push_back("late-array key relabeled " + std::get<2>(dk) + " -> " + std::get<2>(k) + " at " +
+                                       describeFn(objs[o]));
+    }
     if (!CFLCellTraceObj.empty() && describeFn(objs[o]).find(CFLCellTraceObj) != std::string::npos) {
       std::string lab = "?";
       if (curStepLi != UINT32_MAX) {
@@ -2769,9 +2825,12 @@ bool CallGraphPass::runCellResolution() {
     // an array of T. A stride that only equals T's size is no evidence.
     if (objs[o].tail && !objs[o].repeats && elem && elem == objs[o].layout &&
         s % objs[o].size == 0) {
+      extendKind = 'i';
       extendToArray(o);
       std::tie(o, x) = locate(o, x);
     }
+    // LA: the same evidence on an object minted as the array it decided.
+    if (objs[o].lateArray && elem && elem == objs[o].layout && s % objs[o].size == 0) confirmLate(objs[o]);
     // Still a T followed by data whose size said nothing (no T-typed
     // evidence, or the extension refused): a variable index from the T may
     // reach that data, so it reaches the data's any-offset cell too (the
@@ -2812,6 +2871,11 @@ bool CallGraphPass::runCellResolution() {
           else {
             tailIndexAny++;
             if (!objs[t].layout) tailLinkedUnlabeled.insert(t);
+            if (!objs[o].tailLinkSite && curStepDst < G)
+              if (const auto *LI = dyn_cast_or_null<Instruction>(NF.getValueForNode(curStepDst))) {
+                objs[o].tailLinkSite = LI;
+                objs[o].tailLinkStride = s;
+              }
             out.push_back(anyOf(t));
           }
         }
@@ -2923,6 +2987,11 @@ bool CallGraphPass::runCellResolution() {
         }
         requestLayout(C.obj, const_cast<StructType *>(L.ty));
       }
+      // LA: on an object minted as the array a T written at a T stride
+      // decided, that evidence reads as a T written at an element's start.
+      if (O.lateArray && L.ty && (const Type *)L.ty == O.layout && !L.stride && !L.arith && L.writes &&
+          C.off % O.size == 0)
+        confirmLate(O);
       if (!O.layout) {
         if (L.stride) {
           stridedUnlabeled++;
@@ -7521,6 +7590,11 @@ bool CallGraphPass::runCellResolution() {
   watchdog.phase("answers");
   // ---- Answers ----
   size_t resolved = 0, totalTargets = 0, newPairs = 0, typeRej = 0, heldNotDerived = 0;
+  // LA: a solve that decided an array late kept a tail link the evidence
+  // withdrew; it is discarded: its targets are not wired, and the next
+  // iteration solves with those objects minted as arrays.
+  const bool lateDiscard = !stoppedAt && !lateArrayNew.empty();
+  size_t lateUnwired = 0;
   // In IR order, targets in IR order: the wiring order sets the next
   // iteration's edge order.
   const std::vector<const CallBase *> icallSnapshot = icallsSorted;
@@ -7560,9 +7634,16 @@ bool CallGraphPass::runCellResolution() {
     if (!poolWithdrawnAtSolve.empty())
       if (auto cit = Ctx->Callees.find(CS); cit != Ctx->Callees.end())
         for (const Function *F : cit->second) heldNotDerived += !targets.count(F);
+    if (lateDiscard) {
+      lateUnwired += targetsSorted.size();
+      continue;
+    }
     for (const Function *F : targetsSorted)
       if (wireResolvedCallee(CS, F)) newPairs++;
   }
+  if (lateDiscard)
+    CG_LOG("Cells: late arrays (LA): " << lateArrayNew.size() << " decided by this solve, which is discarded: "
+           << lateUnwired << " targets not wired; the next iteration mints them as arrays\n");
   if (!poolWithdrawnAtSolve.empty())
     CG_LOG("Cells: pairs held from earlier iterations that this solve does not derive: " << heldNotDerived
            << " (" << poolWithdrawnAtSolve.size() << " pools withdrawn; kept: extra targets, never fewer)\n");
@@ -9732,6 +9813,52 @@ bool CallGraphPass::runCellResolution() {
       CG_LOG("Cells:   an access outside the pool's forms reaches a handle cell at "
              << instLoc(poolRows[i].first) << ": " << poolRows[i].second << "\n");
   }
+  // LA: this iteration's late decisions apply from the next iteration; the
+  // final iteration (no new pairs, no withdrawal, no late decision) must
+  // have met every decided key's evidence again on the object minted as
+  // the array, or the decision changed the solve so the evidence no
+  // longer reaches it: refused. A stopped solve decides and checks nothing.
+  const size_t lateNew = stoppedAt ? 0 : lateArrayNew.size();
+  for (auto &[k, r] : lateArrayNew)
+    if (!stoppedAt && lateArrayDecided.try_emplace(k, r).second) lateArrayDecided.at(k).redone = iteration + 1;
+  auto lateRow = [&](const LateKey &k, const LateArrayRow &r) {
+    const Value *V = std::get<0>(k);
+    std::string site = !V ? std::string("?")
+                       : isa<Instruction>(V) ? instLoc(cast<Instruction>(V)) : V->getName().str();
+    std::string s = "array-ness decided late: " + site + " " + std::get<2>(k);
+    if (std::get<1>(k)) s += " (+" + std::to_string(std::get<1>(k)) + ")";
+    s += ", decided by " + std::string(r.kind == 'w' ? "a T written at a T stride" : "a T-typed index") + " at " +
+         r.decidedBy + "; tail link made by " + r.linkBy + " (stride " + std::to_string(r.stride) + "); redone in iteration " +
+         std::to_string(r.redone);
+    if (r.confirmed >= 0) s += ", confirmed in iteration " + std::to_string(r.confirmed);
+    return s;
+  };
+  if (!stoppedAt && lateNew == 0 && newPairs == 0 && newlyWithdrawn.empty()) {
+    size_t unconfirmed = 0;
+    for (auto &[k, r] : lateArrayDecided) {
+      if (lateConfirmed.count(k)) {
+        r.confirmed = iteration;
+        continue;
+      }
+      errs() << "ERROR: --cfl-cells: a late array decision (LA) is not confirmed by the final iteration (the T-typed "
+                "evidence no longer reaches the object minted as the array): "
+             << lateRow(k, r) << "\n";
+      unconfirmed++;
+    }
+    if (unconfirmed) exit(1);
+  }
+  {
+    std::vector<std::string> rows;
+    for (auto &[k, r] : lateArrayDecided) rows.push_back(lateRow(k, r));
+    std::sort(rows.begin(), rows.end());
+    size_t confirmed = 0;
+    for (auto &[k, r] : lateArrayDecided) confirmed += r.confirmed >= 0;
+    CG_LOG("Cells: late arrays (LA): " << lateNew << " decided this iteration, " << lateArrayDecided.size()
+           << " in all, minted as arrays " << lateMinted << ", confirmed " << confirmed << "/" << lateArrayDecided.size()
+           << "; extra iterations " << lateArrayIterations << "\n");
+    for (const std::string &r : rows) CG_LOG("Cells:   " << r << "\n");
+    for (const std::string &r : lateArrayRelabeled) CG_LOG("Cells:   " << r << "\n");
+  }
   if (!CFLRuleReport.empty()) {
     std::error_code EC;
     raw_fd_ostream RO(CFLRuleReport, EC, sys::fs::OF_Text);
@@ -10184,6 +10311,18 @@ bool CallGraphPass::runCellResolution() {
       RO << "SUMMARY pd " << pd.size() << " pointer differences carry no facts (sub of two ptrtoint)\n";
     }
     {
+      // LA: objects whose array-ness was decided after an index linked
+      // their tail, minted as the array from the next iteration.
+      std::vector<std::string> rows;
+      size_t confirmed = 0;
+      for (auto &[k, r] : lateArrayDecided) rows.push_back(lateRow(k, r)), confirmed += r.confirmed >= 0;
+      std::sort(rows.begin(), rows.end());
+      for (const std::string &r : rows) RO << "LA " << r << "\n";
+      for (const std::string &r : lateArrayRelabeled) RO << "LA " << r << "\n";
+      RO << "SUMMARY late-array " << lateArrayDecided.size() << " objects, extra iterations " << lateArrayIterations
+         << ", confirmed " << confirmed << "/" << lateArrayDecided.size() << "\n";
+    }
+    {
       std::string k;
       for (auto &[n, c] : byKind) k += ", " + n + " " + std::to_string(c);
       RO << "SUMMARY outside " << nComplete << " indirect calls complete, " << nDepend
@@ -10432,10 +10571,17 @@ bool CallGraphPass::runCellResolution() {
     exit(0);
   }
 
-  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0) finishCollect();
+  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0 && lateNew == 0) finishCollect();
   // A withdrawn pool's carves and handle stores are rebuilt as ordinary
-  // code by the next iteration.
-  if (newPairs == 0 && newlyWithdrawn.empty()) return false;
+  // code by the next iteration, as are late arrays (LA) minted as arrays.
+  if (newPairs == 0 && newlyWithdrawn.empty() && lateNew == 0) return false;
+  if (newPairs == 0 && newlyWithdrawn.empty()) lateArrayIterations++;
+  if (lateNew && iteration + 1 >= (int)CFLFlowsToMaxIters) {
+    errs() << "ERROR: --cfl-cells: the iteration cap (" << CFLFlowsToMaxIters.getValue() << ") leaves " << lateNew
+           << " late array decisions (LA) unapplied; the solve would keep a tail link the evidence withdrew; raise "
+           << "--cfl-flows-to-max-iters\n";
+    exit(1);
+  }
   if (iteration + 1 >= (int)CFLFlowsToMaxIters) {
     if (!CFLIterCapOk) {
       errs() << "ERROR: cell solver hit the iteration cap ("

@@ -3785,3 +3785,51 @@ difference carries no facts: sub of two ptrtoint at F:line" per site,
 "SUMMARY pd N". Case: t_cells_ptrdiff.c (p - q used as an index back
 into the buffer: the target is still found). Not mechanized. Checked by
 executions; see the commit's gates.
+
+## Array-ness decided late (CellSolver strideCells / extendToArray, Fable 2026-10-24, LA)
+
+An allocation read as a T followed by data whose size said nothing (the
+"T then unknown" extent) is not known to be an array of T: a variable
+index from the T may run past it, so strideCells links the trailing
+object's any-offset cell, and a later T-typed index (or a T written at a
+T stride into the tail) makes it an array (extendToArray), which
+forwards the tail's any-offset cell into the array's. The link is not
+withdrawn, so the result depends on whether the evidence or the index
+reached the object first: the same program gives [f] in one propagation
+order and [f, g] in another (t_cells_pwc_stride.c under rule S's node
+order). LA makes the outcome the evidence-first one, by iteration (as
+S1 withdraws a pool and A5a rebuilds the mint table per iteration): an
+extension of an object that already carries such a tail link records
+the object by (allocation site, offset in the allocation, label T); a
+solve that recorded one is discarded (its targets are not wired), and
+every later iteration mints a recorded object as the array of T, as
+extendToArray leaves a fresh one. Pairs wired by iterations before the
+one that recorded the decision are kept (the object was then a T
+followed by unknown data under that iteration's call graph, and the
+link was sound), as S1's "kept: extra targets, never fewer"; only the
+recording solve is discarded. The set only grows over a finite set
+of keys, so the iterations end; at the iteration cap with a new key the
+run is refused. Evidence-first is the solve the order would have given
+had the evidence arrived first: minting the array is exactly the state
+extendToArray produces before any tail link, so no step sees an object
+state the original order could not produce, and the answers of the
+final solve are a sound superset of the program's (each step is the
+rule's own). The decision is an input, so the final iteration checks it:
+each recorded key's evidence (a T-typed index of a multiple of T's size,
+or a T written at an element's start) must reach the object minted as
+the array again, or the run is refused with the row ("not confirmed").
+Deciding happens only through extendToArray's two callers (the T-typed
+index in strideCells, and a T written at a T stride at the parent); the
+write form of the confirmation ('w') is the existing second caller met
+on the minted array (a T written at an element start, no stride or
+arithmetic), not a new rule. A trailing-elements tail (A1) is never
+extended: trailingLabel gives it its element layout at the tail's mint,
+and extendToArray refuses a tail with a layout. A key whose label changes between iterations is never matched and is
+reported ("late-array key relabeled"). Rows: "array-ness decided late:
+<site> T (+base), decided by <evidence> at F:line; tail link made by
+F:line (stride p); redone in iteration k, confirmed in iteration c",
+"SUMMARY late-array N objects, extra iterations k, confirmed N/N".
+Cases: t_cells_pwc_stride_late.c (the walk reaches calloc before
+init's tab[i]: [f, g] before LA, [f] after), t_cells_pwc_stride.c
+(unchanged). Not mechanized. Checked by executions; see the commit's
+gates.

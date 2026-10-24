@@ -103,6 +103,8 @@ struct HV {
 
 void CallGraphPass::checkPoolCarves() {
   poolVerdicts.clear();
+  poolInteriorRefillRows.clear();
+  poolInteriorHeader = poolInteriorBump = poolInteriorNot = 0;
   // A field access's key: the debug-info struct of the base pointer (the
   // IR merges isomorphic structs: objalloc and demangler_engine are one IR
   // type), else the IR struct; "" if the access names no struct field.
@@ -259,6 +261,62 @@ void CallGraphPass::checkPoolCarves() {
             if (fromAlloc(S->getValueOperand(), d + 1)) return true;
     return false;
   };
+  // The allocation V comes from (fromAlloc's walk), and whether V is at a
+  // nonzero offset of it (a GEP with a nonzero index on the way); a slot
+  // with several writes prefers one at offset 0.
+  std::set<std::pair<const Value *, int>> seenAt;
+  std::function<const CallBase *(const Value *, int, bool &)> allocAt = [&](const Value *V, int d,
+                                                                            bool &inner) -> const CallBase * {
+    if (d > 8) return nullptr;
+    if (d == 0) seenAt.clear();
+    if (!seenAt.insert({V, d}).second) return nullptr;
+    V = V->stripPointerCasts();
+    if (const auto *G = dyn_cast<GEPOperator>(V)) {
+      bool in = inner || !G->hasAllZeroIndices();
+      const CallBase *CB = allocAt(G->getPointerOperand(), d + 1, in);
+      if (CB) inner = in;
+      return CB;
+    }
+    if (const auto *CB = dyn_cast<CallBase>(V)) return isAllocCall(CB) ? CB : nullptr;
+    const CallBase *first = nullptr;
+    bool firstIn = false;
+    if (const auto *L = dyn_cast<LoadInst>(V))
+      if (localSlot(L->getPointerOperand()))
+        for (const User *U : L->getPointerOperand()->users())
+          if (const auto *S = dyn_cast<StoreInst>(U)) {
+            bool in = inner;
+            const CallBase *CB = allocAt(S->getValueOperand(), d + 1, in);
+            if (CB && !in) return CB;
+            if (CB && !first) first = CB, firstIn = in;
+          }
+    if (first) inner = firstIn;
+    return first;
+  };
+  // The fields an allocation's result is stored into, at any offset of it
+  // (through casts, GEPs and slots), except the store `except`.
+  auto holdersOf = [&](const CallBase *CB, const StoreInst *except) {
+    std::set<std::string> hs;
+    std::vector<const Value *> w{CB};
+    std::set<const Value *> seen;
+    while (!w.empty()) {
+      const Value *V = w.back();
+      w.pop_back();
+      if (!seen.insert(V).second || seen.size() > 256) continue;
+      for (const User *U : V->users()) {
+        if (isa<CastInst>(U) || isa<GetElementPtrInst>(U)) {
+          w.push_back(U);
+        } else if (const auto *S = dyn_cast<StoreInst>(U); S && S != except && S->getValueOperand() == V) {
+          if (localSlot(S->getPointerOperand())) {
+            for (const User *LU : S->getPointerOperand()->users())
+              if (isa<LoadInst>(LU)) w.push_back(LU);
+          } else if (std::string k = fieldKey(S, S->getPointerOperand()); !k.empty()) {
+            hs.insert(k);
+          }
+        }
+      }
+    }
+    return hs;
+  };
   // Is V a formal of its function (through casts, local slots)?
   std::function<bool(const Value *, int)> fromFormal = [&](const Value *V, int d) -> bool {
     V = V->stripPointerCasts();
@@ -332,6 +390,15 @@ void CallGraphPass::checkPoolCarves() {
   // somewhere; a bumped field never refilled is a cursor over data.
   std::set<std::string> refilled;
   size_t cursors = 0;
+  // RF (Fable 2026-10-24): a refill stores the allocation's own result
+  // (offset 0, through casts and slots). A pointer at a nonzero offset of
+  // an allocation is a refill only as the header form, which the chunk-base
+  // walk records in refills (c + HDR from a chunk base whose every holding
+  // field the closure joins into the pool); any other is not a refill, and
+  // a field with no other refill is a cursor (demoted by the run loop).
+  std::set<std::string> refilled0;
+  std::map<std::string, std::vector<std::pair<const StoreInst *, const CallBase *>>> interiorRefills;
+  std::set<std::string> demotedRefill;
   // Pools: fields joined by a value of one stored into another.
   std::map<std::string, std::string> parent;
   std::function<std::string(const std::string &)> pool = [&](const std::string &f) -> std::string {
@@ -392,7 +459,14 @@ void CallGraphPass::checkPoolCarves() {
         const std::string k = fieldKey(SI, SI->getPointerOperand());
         if (k.empty()) continue;
         const Value *V = SI->getValueOperand();
-        if (V->getType()->isPointerTy() && fromAlloc(V, 0)) refilled.insert(k);
+        if (V->getType()->isPointerTy()) {
+          bool inner = false;
+          if (const CallBase *CB = allocAt(V, 0, inner)) {
+            refilled.insert(k);
+            if (!inner) refilled0.insert(k);
+            else interiorRefills[k].push_back({SI, CB});
+          }
+        }
         if (const auto *LE = dyn_cast<LoadInst>(V->stripPointerCasts());
             LE && V->getType()->isPointerTy() && localSlot(LE->getPointerOperand())) {
           int64_t K = -1;
@@ -757,7 +831,8 @@ void CallGraphPass::checkPoolCarves() {
     }
     for (auto &fa : cand) chunkParams[fa] = "@" + fa.first + "#" + std::to_string(fa.second);
   }
-  const std::set<std::string> handle0 = handleFields;
+  std::set<std::string> handle0 = handleFields;
+  const std::set<std::string> candidates0 = handle0; // RF: the rows are of these fields
   const auto parent0 = parent;
   unsigned restarts = 0;
   for (;; restarts++) {
@@ -1887,8 +1962,58 @@ void CallGraphPass::checkPoolCarves() {
     if (now != it->second) it->second = now, removed = true;
     ++it;
   }
+  // RF: a field taken as refilled only by pointers at a nonzero offset of
+  // an allocation, none of them a header form this run found, is a cursor.
+  for (auto &[k, rs] : interiorRefills) {
+    if (refilled0.count(k) || demotedRefill.count(k) || !handle0.count(k)) continue;
+    bool header = false;
+    for (auto &[S, CB] : rs)
+      for (auto &[I, f] : refills) header |= I == S;
+    if (header) continue;
+    demotedRefill.insert(k);
+    bumpFields.erase(k);
+    baseFields.erase(k);
+    for (auto &[F, ks] : bumpIn) ks.erase(k);
+    handle0.erase(k);
+    cursors++;
+    removedRows.push_back(run + "pool candidate " + k +
+                          " removed: refilled only at a nonzero offset of an allocation, not the header form (a cursor)");
+    removed = true;
+  }
   if (!removed) break;
   }
+  // RF rows: every store of a pointer at a nonzero offset of an allocation
+  // into a candidate field, the header form or not a refill.
+  for (auto &[k, rs] : interiorRefills)
+    for (auto &[S, CB] : rs) {
+      if (!candidates0.count(k)) continue; // not a pool candidate: its refills decide nothing
+      bool header = false;
+      for (auto &[I, f] : refills) header |= I == S;
+      // The bump after a new chunk's first piece (`o->current_ptr = chunk +
+      // HDR + n`, an inlined allocation call after the refill): a carve of
+      // k's own pool stepped, the pool's own state.
+      bool firstBump = false;
+      if (const auto *BG = dyn_cast<GEPOperator>(S->getValueOperand()->stripPointerCasts()))
+        for (const Carve &c : carves)
+          firstBump |= c.I == BG->getPointerOperand()->stripPointerCasts() && pool(c.field) == pool(k);
+      std::string row = "refill at a nonzero offset of an allocation: ";
+      if (!header && firstBump) {
+        poolInteriorBump++;
+        row += "the bump after a new chunk's first piece (pool " + pool(k) + ")";
+      } else if (header) {
+        poolInteriorHeader++;
+        row += "the header form (a chunk base of pool " + pool(k) + " + its header)";
+      } else {
+        poolInteriorNot++;
+        std::string hs;
+        for (const std::string &h : holdersOf(CB, S)) hs += (hs.empty() ? "" : " ") + h;
+        row += hs.empty() ? "not a refill (not the header form; the chunk is held by no other field)"
+                          : "not a refill (the chunk is also held by " + hs + ")";
+      }
+      row += ": " + k + " at " + instLocStr(S);
+      CG_LOG("PoolCarve: " << row << "\n");
+      poolInteriorRefillRows.push_back(row);
+    }
   for (auto &[f, p] : chunkSources) p = srcPoolLast[f];
   // Report per pool.
   std::map<std::string, std::set<std::string>> fields;

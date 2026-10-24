@@ -2382,6 +2382,36 @@ only when an allocation refills it somewhere. A bumped field that is
 never refilled is a cursor over data. It keeps today's flow and is
 counted.
 
+**A refill is the allocation's own result (RF, Fable 2026-10-24).** A
+store into H refills it when the stored value is the allocation's result
+at offset 0, through casts, zero-index GEPs and slots. A pointer at a
+nonzero offset of an allocation refills H only as the header form: the
+chunk-base walk from the allocation records it (`c + HDR` from a chunk
+base c stored into the bump field). The header form's premise, that c is
+stored into no field outside the pool, is checked by the closure in that
+walk: every field a chunk base is stored into joins the pool as a handle
+field, and its loads are then judged as handles. A use as data refuses
+the pool. Any other nonzero-offset refill is not a refill, and a field
+with no other refill is a cursor: the run loop demotes it and checks
+again. An example is a cursor initialized into the middle of a buffer
+that other fields also hold (rsrc_process_section's write_data:
+`next_string = next_leaf + sizeof_leaves`, peXXigen.c:4333).
+- Before RF, the refill test walked every GEP to the allocation, so such
+  a cursor became a pool of its own. Its carves were "chunks apart from
+  every element", although they lie inside the buffer the other fields
+  use whole: a read through `start` lost what a hand-out wrote
+  (t_cells_pool_interior_refill.c).
+- Every nonzero-offset refill into a pool candidate field is a row:
+  "refill at a nonzero offset of an allocation: the header form (...)",
+  "the bump after a new chunk's first piece (pool P)" (`o->current_ptr =
+  chunk + HDR + n`, the bump of an inlined allocation right after the
+  refill; the pool's own bookkeeping), or "not a refill (the chunk is
+  also held by <fields>)". They are counted in "SUMMARY pool refills at a
+  nonzero offset of an allocation: H header forms, B bumps after a new
+  chunk's first piece, N not a refill (rule RF)".
+- A demoted field keeps the flow of the program, so this only removes
+  certificates.
+
 **Checks.** The hypothesis of carve-as-fresh is that a chunk's carved
 contents are reached only through carve results. Two static checks
 establish it:

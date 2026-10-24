@@ -10533,11 +10533,17 @@ bool CallGraphPass::runCellResolution() {
     }
     RO << "\n== varargs keyed by format specifier (plan 3.47)\n";
     for (const std::string &d : varargReport) RO << "V " << d << "\n";
-    if (!poolHandleFields.empty() || !poolWithdrawRows.empty()) {
+    if (!poolHandleFields.empty() || !poolWithdrawRows.empty() || !poolInteriorRefillRows.empty()) {
       RO << "\n== pool handle cells accessed outside the pools' forms (plan 3.53 rule 3, S1)\n";
       RO << "SUMMARY pool handles " << poolHandleFields.size() << " fields, " << poolRows.size()
          << " accesses outside the forms, " << poolWithdrawnAtSolve.size() << " pools withdrawn at the solve\n";
     }
+    // RF (Fable 2026-10-24): only where there are instances.
+    if (!poolInteriorRefillRows.empty())
+      RO << "SUMMARY pool refills at a nonzero offset of an allocation: " << poolInteriorHeader << " header forms, "
+         << poolInteriorBump << " bumps after a new chunk's first piece, " << poolInteriorNot
+         << " not a refill (rule RF)\n";
+    for (const std::string &r : poolInteriorRefillRows) RO << "P " << r << "\n";
     for (const std::string &r : poolWithdrawRows) RO << "P " << r << "\n";
     CG_LOG("Cells: rule report written to " << CFLRuleReport << "\n");
   }

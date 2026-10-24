@@ -828,6 +828,11 @@ protected:
   std::map<std::string, std::set<const llvm::Instruction *>> poolChunkAllocs;
   std::map<std::string, int64_t> poolChunkHeader;
   std::map<std::string, std::vector<std::string>> poolPreBump;
+  // RF (Fable 2026-10-24): stores of a pointer at a nonzero offset of an
+  // allocation into a pool candidate field; each is the header form, the
+  // bump after a new chunk's first piece, or not a refill. Rule report rows (by field, then IR order) and the two counts.
+  std::vector<std::string> poolInteriorRefillRows;
+  size_t poolInteriorHeader = 0, poolInteriorBump = 0, poolInteriorNot = 0;
   // Stores whose value is a certified pool's handle value (the bump,
   // rewinds, refills into handle fields, chunk list links): not modeled.
   std::unordered_set<const llvm::Instruction *> poolHandleStores;

@@ -25,10 +25,14 @@ PD pointer difference carries no facts: sub of two ptrtoint at png_do_strip_chan
 PD pointer difference carries no facts: sub of two ptrtoint at png_handle_pCAL pngrutil.c:2307
 PD pointer difference carries no facts: sub of two ptrtoint at png_handle_sPLT pngrutil.c:1733
 SUMMARY pd 7 pointer differences carry no facts (sub of two ptrtoint)
+SUMMARY slots promoted 637 (loads 4791, stores 1165): pairs all-to-all 21489 -> reaching 5599, slots cut 97, loads reached from entry 0 (rule S)
 SUMMARY late-array 0 objects, extra iterations 0, confirmed 0/0
 SUMMARY outside 0 indirect calls complete, 9 depend on an outside boundary (--cfl-outside=pure), bodiless call 9, outside indirect call 2
-SUMMARY pwc 22 cycles with offset (typed 5: walks 0, counters 5 retired by the integer-name test and 0 kept on the int-launder fallback; untyped 17, mixed 0; through a C++ class step 0); indirect-call width downstream of the walks: 0 of 9 targets
-SUMMARY pwc-period 0 components with a period from their cycle weights other than their edges' gcd, 0 offset-free (no walk); 0 walks cleared
+SUMMARY pwc 63 cycles with offset (typed 5: walks 0, counters 5 retired by the integer-name test and 0 kept on the int-launder fallback; untyped 58, mixed 0; through a C++ class step 0); indirect-call width downstream of the walks: 0 of 9 targets
+PWC pwc period 2 (edge gcd 1) over bytes at png_do_strip_channel pngtrans.c:541
+PWC pwc period 3 (edge gcd 1) over bytes at png_do_strip_channel pngtrans.c:572
+PWC pwc period 6 (edge gcd 1) over bytes at png_do_strip_channel pngtrans.c:590
+SUMMARY pwc-period 3 components with a period from their cycle weights other than their edges' gcd, 0 offset-free (no walk); 0 walks cleared
 SUMMARY varargs 0 renderers mapped, 0 va_arg reads keyed, 0 unkeyed; call sites: 0 constant format, 0 non-constant, 0 unparsed
 SUMMARY tagged fields 2 pairs keyed, 2 flipped in the solve; alias assumptions 3 held, 1 failed; predicate tests: 0 closed, 11 open; parameter-pair tests: 0 keyed reads, 0 untested; outside-domain entries 0, premise broken at 0
 SUMMARY outside callers: 10 defined functions reach the outside after the solve, 8 of them in the pre-solve domain (8 functions)
@@ -276,16 +280,16 @@ C integer name copied into bytes: 0 positions
 == UB undefined behavior (counted, not followed)
 
 == cycles with offset, the ten largest (plan 3.49)
-P size 11 step 1 typed 0 untyped 12 at png_combine_row:   %91 = load ptr, ptr %5, align 8, !dbg !3979
-P size 11 step 1 typed 0 untyped 12 at png_combine_row:   %277 = load ptr, ptr %8, align 8, !dbg !4083
-P size 7 step 1 typed 0 untyped 21 at png_do_compose:   %126 = load ptr, ptr %15, align 8, !dbg !4371
-P size 5 step 1 typed 0 untyped 1 at _Z14user_read_dataP14png_struct_defPhm:   %22 = load ptr, ptr %21, align 8, !dbg !3942
-P size 5 step 1 typed 0 untyped 1 at _ZNSt3__125__construct_range_forwardINS_9allocatorIhEEKhhhhvEEvRT_PT0_S7_RPT1_:   %19 = load ptr, ptr %18, align 8, !dbg !3944
-P size 5 step 1 typed 0 untyped 16 at png_do_strip_channel:   %37 = load ptr, ptr %8, align 8, !dbg !3968
-P size 4 step 1 typed 0 untyped 5 at png_handle_pCAL:   %79 = load ptr, ptr %12, align 8, !dbg !4018
-P size 3 step 32 typed 0 untyped 2 at png_set_sPLT:   %27 = load ptr, ptr %26, align 8, !dbg !3953
-P size 3 step 32 typed 0 untyped 2 at png_set_unknown_chunks:   %26 = load ptr, ptr %25, align 8, !dbg !3953
-P size 2 step 1 typed 0 untyped 1 at _ZNSt3__16vectorIhNS_9allocatorIhEEE22__base_destruct_at_endEPh:   %11 = load ptr, ptr %5, align 8, !dbg !3928
+P size 12 step 6 typed 0 untyped 6 at png_do_strip_channel:   %203 = load ptr, ptr %8, align 8, !dbg !4120
+P size 6 step 3 typed 0 untyped 3 at png_do_strip_channel:   %146 = load ptr, ptr %8, align 8, !dbg !4069
+P size 5 step 1 typed 0 untyped 1 at _Z14user_read_dataP14png_struct_defPhm:   %32 = load ptr, ptr %31, align 8, !dbg !3952
+P size 5 step 1 typed 0 untyped 1 at _ZNSt3__125__construct_range_forwardINS_9allocatorIhEEKhhhhvEEvRT_PT0_S7_RPT1_:   %25 = load ptr, ptr %24, align 8, !dbg !3952
+P size 4 step 1 typed 0 untyped 2 at png_handle_pCAL:   %324 = load ptr, ptr %12, align 8, !dbg !4136
+P size 4 step 4 typed 0 untyped 2 at png_combine_row:   %548 = load ptr, ptr %20, align 8, !dbg !4327
+P size 4 step 4 typed 0 untyped 2 at png_combine_row:   %551 = load ptr, ptr %21, align 8, !dbg !4329
+P size 4 step 2 typed 0 untyped 2 at png_combine_row:   %607 = load ptr, ptr %24, align 8, !dbg !4395
+P size 4 step 2 typed 0 untyped 2 at png_combine_row:   %610 = load ptr, ptr %25, align 8, !dbg !4397
+P size 4 step 2 typed 0 untyped 2 at png_do_strip_channel:   %84 = load ptr, ptr %8, align 8, !dbg !4012
 
 == outside dependence per indirect call (plan 3.48)
 O bodiless inflateReset2: 9 indirect calls depend on it

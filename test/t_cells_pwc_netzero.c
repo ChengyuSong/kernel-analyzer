@@ -8,7 +8,12 @@
 // not known, as bfd_hash_allocate's is not) into the unlabeled tail, whose
 // any-offset cell then took the write of `other` and gave it to every read
 // through the walked pointer. KAMain.TA6 (09adb58) answers [f, g]; W
-// answers [f] (no walk).
+// answers [f] (no walk). Under S (Fable 2026-10-24) the cycle is gone:
+// `sh = sh->next` overwrites the container_of store before any return, so
+// the -24 value reaches only the ->next load and no copy cycle forms (the
+// O0 slot joined the two stores; -O1 and -O2 fold the -24 into the load
+// the same way); the answer stays [f]. W's offset-free row is exercised by
+// t_cells_slot_vtentry.c.
 // Executed (clang -O0 -fsanitize=address): f twice, exit 0, no report.
 #include <stddef.h>
 #include <stdlib.h>
@@ -40,4 +45,5 @@ int main(int argc, char **argv) {
   free(e2);
   return 0;
 }
-// LOG: offset-free cycle \(edge gcd 24, no walk\) over .* at next_sec .*t_cells_pwc_netzero.c:21
+// LOG: Slots: cut next_sec sh: 3 writes x 5 loads = 15 pairs -> 9 reaching
+// NOLOG: (offset-free cycle|pwc period) .* at next_sec

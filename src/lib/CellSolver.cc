@@ -9245,6 +9245,7 @@ bool CallGraphPass::runCellResolution() {
          << " carved regions (one past an array, used as another type; see CARVE lines); "
          << g_poolCarves << " pool carves (allocation sites; see PoolCarve lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
+  CG_LOG("Cells: " << slotSummaryRow() << "\n");
   if (!taggedPairs.empty())
     CG_LOG("Cells: tagged fields (plan 3.51): " << taggedPairs.size() << " keyed pairs, "
            << taggedFlipped.size() << " flipped to unkeyed during the solve (a byte copy or a watched "
@@ -10310,6 +10311,7 @@ bool CallGraphPass::runCellResolution() {
         RO << "PD pointer difference carries no facts: sub of two ptrtoint at " << instLoc(I) << "\n";
       RO << "SUMMARY pd " << pd.size() << " pointer differences carry no facts (sub of two ptrtoint)\n";
     }
+    RO << "SUMMARY " << slotSummaryRow() << "\n";
     {
       // LA: objects whose array-ness was decided after an index linked
       // their tail, minted as the array from the next iteration.

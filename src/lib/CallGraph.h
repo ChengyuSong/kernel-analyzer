@@ -439,7 +439,21 @@ protected:
   void collectLocalAllocaSummaries(const llvm::Function *F);
   bool isSummarizableAlloca(const llvm::AllocaInst *AI) const;
   bool resolveSummarizedAllocaSlot(const llvm::Value *Ptr, NodeIndex &slotRep);
-  void emitLocalAllocaSummaryEdges();
+  void emitLocalAllocaSummaryEdges(const llvm::Function *F);
+  // Rule S, over the whole build: summarized slots, their loads and writes,
+  // store-load pairs all-to-all and reaching, slots with a pair cut, loads
+  // a path from the entry reaches with no write.
+  struct SlotStats { size_t slots = 0, loads = 0, stores = 0, all = 0, reach = 0, cut = 0, fromEntry = 0; } slotStats;
+  // A summarized slot's load -> the value nodes of the writes that reach it
+  // (this function's; a certified carve keeps its entry for a withdrawal).
+  std::unordered_map<const llvm::Instruction *, std::vector<NodeIndex>> localSlotReachVals;
+  std::string slotSummaryRow() const {
+    const SlotStats &s = slotStats;
+    return "slots promoted " + std::to_string(s.slots) + " (loads " + std::to_string(s.loads) + ", stores " +
+           std::to_string(s.stores) + "): pairs all-to-all " + std::to_string(s.all) + " -> reaching " +
+           std::to_string(s.reach) + ", slots cut " + std::to_string(s.cut) + ", loads reached from entry " +
+           std::to_string(s.fromEntry) + " (rule S)";
+  }
   NodeIndex getRepNodeForValue(const llvm::Value *V);
   NodeIndex getCanonicalNode(NodeIndex n) const;
   void collectCanonicalMembers(NodeIndex n, std::vector<NodeIndex> &out) const;
@@ -860,9 +874,10 @@ protected:
   // A decision before the solve that rested on the certificate judging I.
   // While poolCertDefer is set (the container closure, whose uses count
   // only for a container it verifies) the use waits in poolCertDeferred.
-  // A summarized slot a certified carve reloads: its stored values, kept
-  // from the build for a withdrawal (applyPoolWithdrawals).
-  std::map<NodeIndex, std::vector<NodeIndex>> poolSlotStoreVals;
+  // A certified carve that reloads a summarized slot: the values of the
+  // writes that reach it, kept from the build for a withdrawal
+  // (applyPoolWithdrawals).
+  std::map<const llvm::Instruction *, std::vector<NodeIndex>> poolSlotStoreVals;
   bool poolCertDefer = false;
   std::vector<std::pair<std::string, std::string>> poolCertDeferred; // (pool, what)
   void notePoolCertUse(const llvm::Instruction *I, const std::string &what) {
@@ -1024,8 +1039,11 @@ protected:
   std::unordered_map<NodeIndex, NodeIndex> canonicalNodeMap;
   std::unordered_map<NodeIndex, std::unordered_set<NodeIndex>> canonicalClassMembers;
   std::unordered_set<NodeIndex> localSummarizedAllocaSlots;
-  std::unordered_map<NodeIndex, std::vector<NodeIndex>> localAllocaStoreVals;
-  std::unordered_map<NodeIndex, std::vector<NodeIndex>> localAllocaLoadVals;
+  // A summarized slot's accesses: (the load or write, its value node). The
+  // loads get edges from the writes that reach them (rule S).
+  using SlotAccess = std::pair<const llvm::Instruction *, NodeIndex>;
+  std::unordered_map<NodeIndex, std::vector<SlotAccess>> localAllocaStoreVals;
+  std::unordered_map<NodeIndex, std::vector<SlotAccess>> localAllocaLoadVals;
   std::unordered_set<NodeIndex> moduleDerefEdgeRoots;
 
   unsigned iteration;

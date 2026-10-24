@@ -48,6 +48,40 @@ static const Value *stripAllocaAliasBase(const Value *V) {
   return Cur;
 }
 
+// The writes into local slot AI that reach instruction L: the nearest
+// write on each path back from L (no call can write a slot whose address
+// does not escape). A write is a store, atomicrmw or cmpxchg whose address
+// is AI or an alias of it (pointer casts, zero-offset GEPs). A path that
+// reaches the function entry with no write sets *fromEntry.
+static void reachingStores(const Instruction *L, const AllocaInst *AI,
+                           std::vector<const Instruction *> &out, bool *fromEntry = nullptr) {
+  auto writes = [&](const Instruction &I) {
+    const Value *P = nullptr;
+    if (const auto *S = dyn_cast<StoreInst>(&I)) P = S->getPointerOperand();
+    else if (const auto *A = dyn_cast<AtomicRMWInst>(&I)) P = A->getPointerOperand();
+    else if (const auto *X = dyn_cast<AtomicCmpXchgInst>(&I)) P = X->getPointerOperand();
+    return P && stripAllocaAliasBase(P) == AI;
+  };
+  std::vector<const BasicBlock *> work;
+  std::set<const BasicBlock *> seen;
+  auto scan = [&](const BasicBlock *BB, BasicBlock::const_reverse_iterator from) {
+    for (auto it = from; it != BB->rend(); ++it)
+      if (writes(*it)) {
+        out.push_back(&*it);
+        return;
+      }
+    if (fromEntry && pred_empty(BB)) *fromEntry = true;
+    for (const BasicBlock *P : predecessors(BB))
+      if (seen.insert(P).second) work.push_back(P);
+  };
+  scan(L->getParent(), BasicBlock::const_reverse_iterator(L->getIterator()));
+  while (!work.empty()) {
+    const BasicBlock *BB = work.back();
+    work.pop_back();
+    scan(BB, BB->rbegin());
+  }
+}
+
 static bool isIgnorableAllocaIntrinsic(const CallBase *CB) {
   const Function *CF = CB ? CB->getCalledFunction() : nullptr;
   if (!CF || !CF->isIntrinsic())
@@ -2844,24 +2878,76 @@ bool CallGraphPass::resolveSummarizedAllocaSlot(const Value *Ptr, NodeIndex &slo
   return true;
 }
 
-void CallGraphPass::emitLocalAllocaSummaryEdges() {
-  for (NodeIndex slot : localSummarizedAllocaSlots) {
-    auto storesIt = localAllocaStoreVals.find(slot);
-    auto loadsIt = localAllocaLoadVals.find(slot);
-    if (storesIt == localAllocaStoreVals.end() || loadsIt == localAllocaLoadVals.end())
-      continue;
-
-    const auto &stores = storesIt->second;
-    const auto &loads = loadsIt->second;
-    if (stores.empty() || loads.empty())
-      continue;
-
-    std::unordered_set<NodeIndex> uniqueStores(stores.begin(), stores.end());
-    std::unordered_set<NodeIndex> uniqueLoads(loads.begin(), loads.end());
-
-    for (NodeIndex s : uniqueStores) {
-      for (NodeIndex l : uniqueLoads)
-        addAssignmentEdge(s, l);
+// Rule S: a summarized slot's address is used only by its own loads and
+// writes, so the value a load reads is the value of a write that reaches it
+// along some path (reachingStores); each load gets copy edges from exactly
+// those writes, the edges SSA construction gives (-O3 builds the same graph
+// for the function). A path from the entry with no write is an
+// indeterminate read and adds nothing. The all-to-all product of the slot's
+// writes and loads, the edges before S, is a superset.
+void CallGraphPass::emitLocalAllocaSummaryEdges(const Function *F) {
+  std::unordered_map<const Instruction *, std::vector<NodeIndex>> wrote, read;
+  for (auto &[slot, acc] : localAllocaStoreVals)
+    for (auto &[I, n] : acc) wrote[I].push_back(n);
+  for (auto &[slot, acc] : localAllocaLoadVals)
+    for (auto &[I, n] : acc) read[I].push_back(n);
+  auto slotOf = [&](const Instruction &I) {
+    const Value *P = nullptr;
+    if (const auto *L = dyn_cast<LoadInst>(&I)) P = L->getPointerOperand();
+    else if (const auto *S = dyn_cast<StoreInst>(&I)) P = S->getPointerOperand();
+    else if (const auto *A = dyn_cast<AtomicRMWInst>(&I)) P = A->getPointerOperand();
+    else if (const auto *X = dyn_cast<AtomicCmpXchgInst>(&I)) P = X->getPointerOperand();
+    assert(P && "a summarized slot access is a load or a write");
+    return cast<AllocaInst>(stripAllocaAliasBase(P));
+  };
+  struct PerSlot { size_t stores = 0, loads = 0, reach = 0; };
+  std::map<const AllocaInst *, PerSlot> per;
+  std::vector<const AllocaInst *> order; // IR order of first access
+  auto at = [&](const AllocaInst *AI) -> PerSlot & {
+    if (!per.count(AI)) order.push_back(AI);
+    return per[AI];
+  };
+  for (const Instruction &I : instructions(*F))
+    if (wrote.count(&I)) at(slotOf(I)).stores++;
+  std::set<std::pair<NodeIndex, NodeIndex>> done;
+  for (const Instruction &I : instructions(*F)) {
+    auto r = read.find(&I);
+    if (r == read.end()) continue;
+    const AllocaInst *AI = slotOf(I);
+    PerSlot &S = at(AI);
+    S.loads++;
+    std::vector<const Instruction *> ws;
+    bool fromEntry = false;
+    reachingStores(&I, AI, ws, &fromEntry);
+    slotStats.fromEntry += fromEntry;
+    auto &kept = localSlotReachVals[&I];
+    for (const Instruction *W : ws) {
+      auto w = wrote.find(W);
+      if (w == wrote.end()) continue; // a write of no pointer value: it kills, it adds nothing
+      S.reach++;
+      for (NodeIndex s : w->second) {
+        kept.push_back(s);
+        for (NodeIndex l : r->second)
+          if (done.insert({s, l}).second) addAssignmentEdge(s, l);
+      }
+    }
+  }
+  slotStats.slots += localSummarizedAllocaSlots.size();
+  for (const AllocaInst *AI : order) {
+    const PerSlot &S = per[AI];
+    slotStats.stores += S.stores, slotStats.loads += S.loads;
+    slotStats.all += S.stores * S.loads, slotStats.reach += S.reach;
+    if (S.reach < S.stores * S.loads) {
+      slotStats.cut++;
+      std::string name;
+      for (auto *DDI : findDbgDeclares(const_cast<AllocaInst *>(AI)))
+        if (DDI->getVariable()) name = DDI->getVariable()->getName().str();
+      if (name.empty()) {
+        raw_string_ostream os(name);
+        AI->printAsOperand(os, false);
+      }
+      CG_LOG("Slots: cut " << F->getName() << " " << name << ": " << S.stores << " writes x " << S.loads
+             << " loads = " << S.stores * S.loads << " pairs -> " << S.reach << " reaching\n");
     }
   }
 }
@@ -2931,24 +3017,25 @@ bool CallGraphPass::runOnFunction(Function *F) {
                "the indirect calls by isIndirectCallSite are the graph build's");
 
   if (allocaSummaryActive) {
-    emitLocalAllocaSummaryEdges();
+    emitLocalAllocaSummaryEdges(F);
     // A certified carve that reloads a summarized slot (-O0 `return r`)
-    // got no load edges: the slot's stored values are kept, so a
-    // withdrawal (S1) adds the edges the summary would have.
+    // got no load edges: the values of the writes that reach it are kept,
+    // so a withdrawal (S1) adds the edges the summary would have.
     if (!poolCarves.empty())
       for (const Instruction &I : instructions(*F))
         if (const auto *L = dyn_cast<LoadInst>(&I); L && poolCarves.count(L)) {
           NodeIndex slot;
           if (!resolveSummarizedAllocaSlot(L->getPointerOperand(), slot)) continue;
-          auto sv = localAllocaStoreVals.find(slot);
-          auto &kept = poolSlotStoreVals[slot];
-          if (sv != localAllocaStoreVals.end()) kept.assign(sv->second.begin(), sv->second.end());
+          auto rv = localSlotReachVals.find(L);
+          auto &kept = poolSlotStoreVals[L];
+          if (rv != localSlotReachVals.end()) kept = rv->second;
         }
   }
   // Clear alloca tracking structures
   localSummarizedAllocaSlots.clear();
   localAllocaStoreVals.clear();
   localAllocaLoadVals.clear();
+  localSlotReachVals.clear();
 
   return false;
 }
@@ -3730,7 +3817,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
         Value *lp = I.getOperand(0);
         NodeIndex slotRep;
         if (CGP.resolveSummarizedAllocaSlot(lp, slotRep)) {
-          CGP.localAllocaLoadVals[slotRep].push_back(valNode);
+          CGP.localAllocaLoadVals[slotRep].push_back({&I, valNode});
         } else {
           NodeIndex pN = CGP.getRepNodeForValue(lp);
           if (pN != AndersNodeFactory::InvalidIndex) {
@@ -3815,7 +3902,7 @@ void CallGraphPass::InstHandler::visitLoadInst(LoadInst &I) {
 
   NodeIndex slotRep;
   if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
-    CGP.localAllocaLoadVals[slotRep].push_back(valNode);
+    CGP.localAllocaLoadVals[slotRep].push_back({&I, valNode});
     return;
   }
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
@@ -3975,7 +4062,7 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
         Value *sp = I.getOperand(1);
         NodeIndex slotRep;
         if (CGP.resolveSummarizedAllocaSlot(sp, slotRep)) {
-          CGP.localAllocaStoreVals[slotRep].push_back(valNode);
+          CGP.localAllocaStoreVals[slotRep].push_back({&I, valNode});
         } else {
           NodeIndex pN = CGP.getRepNodeForValue(sp);
           CellWriteSize ws(CGP, CGP.curDL->getTypeStoreSize(val->getType()));
@@ -4024,7 +4111,7 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   Value *ptr = I.getOperand(1);
   NodeIndex slotRep;
   if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
-    CGP.localAllocaStoreVals[slotRep].push_back(valNode);
+    CGP.localAllocaStoreVals[slotRep].push_back({&I, valNode});
     return;
   }
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
@@ -4477,8 +4564,8 @@ void CallGraphPass::InstHandler::visitAtomicRMWInst(AtomicRMWInst &I) {
   Value *ptr = I.getPointerOperand();
   NodeIndex slotRep;
   if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
-    CGP.localAllocaStoreVals[slotRep].push_back(valNode);
-    CGP.localAllocaLoadVals[slotRep].push_back(resNode);
+    CGP.localAllocaStoreVals[slotRep].push_back({&I, valNode});
+    CGP.localAllocaLoadVals[slotRep].push_back({&I, resNode});
     return;
   }
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
@@ -4526,8 +4613,8 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   Value *ptr = I.getPointerOperand();
   NodeIndex slotRep;
   if (CGP.resolveSummarizedAllocaSlot(ptr, slotRep)) {
-    CGP.localAllocaStoreVals[slotRep].push_back(valNode);
-    CGP.localAllocaLoadVals[slotRep].push_back(resNode);
+    CGP.localAllocaStoreVals[slotRep].push_back({&I, valNode});
+    CGP.localAllocaLoadVals[slotRep].push_back({&I, resNode});
     return;
   }
   NodeIndex ptrNode = CGP.getRepNodeForValue(ptr);
@@ -6438,6 +6525,7 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
 
   std::unordered_map<GepKey, NodeIndex, GepKeyHash> gepReps;
   std::unordered_map<NodeIndex, NodeIndex> loadReps;
+  std::unordered_map<const AllocaInst *, bool> summarizableSlot; // rule S: isSummarizableAlloca, per slot
   // --cfl-cells: a keyed union load reads its key's cell only; merging it
   // with a load of another key (or an unkeyed one) through the same
   // pointer would hand it every key's content (jsonReturn: u.pPatch and
@@ -6480,6 +6568,14 @@ bool CallGraphPass::globalDedupScanAccessPaths() {
             continue;
           if (CFLCells && (taggedParamChannels.count(LI) || taggedParamValueChannels.count(LI)))
             continue; // its own channel, not the slot's value
+          // Rule S: a load of a summarized slot reads the writes that reach
+          // it, not the slot's whole value set; two loads of it may differ.
+          if (CFLLocalAllocaSummary)
+            if (const auto *AI = dyn_cast<AllocaInst>(stripAllocaAliasBase(LI->getPointerOperand()))) {
+              auto [sit, fresh] = summarizableSlot.try_emplace(AI, false);
+              if (fresh) sit->second = isSummarizableAlloca(AI);
+              if (sit->second) continue;
+            }
           NodeIndex ptrNode = NF.getValueNodeFor(LI->getPointerOperand());
           NodeIndex valNode = NF.getValueNodeFor(LI);
           if (ptrNode == AndersNodeFactory::InvalidIndex ||
@@ -7313,28 +7409,6 @@ static int paramOf(const Function &F, const Value *V) {
   paramsOf(F, V, out, seen, other);
   return !other && out.size() == 1 ? (int)*out.begin() : -1;
 }
-// The stores into a non-escaping O0 slot that reach load L: the nearest
-// store on each path back from L (no call can write the slot).
-static void reachingStores(const LoadInst *L, const AllocaInst *AI,
-                           std::vector<const StoreInst *> &out) {
-  std::vector<const BasicBlock *> work;
-  std::set<const BasicBlock *> seen;
-  auto scan = [&](const BasicBlock *BB, BasicBlock::const_reverse_iterator from) {
-    for (auto it = from; it != BB->rend(); ++it)
-      if (const auto *S = dyn_cast<StoreInst>(&*it); S && S->getPointerOperand() == AI) {
-        out.push_back(S);
-        return;
-      }
-    for (const BasicBlock *P : predecessors(BB))
-      if (seen.insert(P).second) work.push_back(P);
-  };
-  scan(L->getParent(), BasicBlock::const_reverse_iterator(L->getIterator()));
-  while (!work.empty()) {
-    const BasicBlock *BB = work.back();
-    work.pop_back();
-    scan(BB, BB->rbegin());
-  }
-}
 // A character read from the format: the parameter it is loaded through
 // (through extensions and O0 slots), or -1.
 static int charParam(const Function &F, const Value *V, int depth = 0) {
@@ -7344,10 +7418,12 @@ static int charParam(const Function &F, const Value *V, int depth = 0) {
   if (!L) return -1;
   if (L->getType()->isIntegerTy(8)) return paramOf(F, L->getPointerOperand());
   if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
-    std::vector<const StoreInst *> rs;
+    std::vector<const Instruction *> rs;
     reachingStores(L, AI, rs);
     int p = -1;
-    for (const StoreInst *S : rs) {
+    for (const Instruction *W : rs) {
+      const auto *S = dyn_cast<StoreInst>(W);
+      if (!S) return -1;
       const int q = charParam(F, S->getValueOperand(), depth + 1);
       if (q < 0 || (p >= 0 && p != q)) return -1;
       p = q;
@@ -7453,9 +7529,11 @@ void CallGraphPass::computeVarargKeys() {
         std::vector<const Value *> srcs;
         if (const auto *L = dyn_cast<LoadInst>(C)) {
           if (const auto *AI = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
-            std::vector<const StoreInst *> rs;
+            std::vector<const Instruction *> rs;
             reachingStores(L, AI, rs);
-            for (const StoreInst *St : rs) srcs.push_back(St->getValueOperand());
+            for (const Instruction *W : rs)
+              if (const auto *St = dyn_cast<StoreInst>(W)) srcs.push_back(St->getValueOperand());
+              else srcs.push_back(W); // an atomic write: not a constant or a table field
           }
         } else if (const auto *PN = dyn_cast<PHINode>(C)) {
           for (const Value *In : PN->incoming_values()) srcs.push_back(In);

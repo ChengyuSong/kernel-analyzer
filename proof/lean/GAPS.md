@@ -3824,7 +3824,8 @@ write form of the confirmation ('w') is the existing second caller met
 on the minted array (a T written at an element start, no stride or
 arithmetic), not a new rule. A trailing-elements tail (A1) is never
 extended: trailingLabel gives it its element layout at the tail's mint,
-and extendToArray refuses a tail with a layout. A key whose label changes between iterations is never matched and is
+and extendToArray refuses a tail with a layout. A key whose label
+changes between iterations is never matched and is
 reported ("late-array key relabeled"). Rows: "array-ness decided late:
 <site> T (+base), decided by <evidence> at F:line; tail link made by
 F:line (stride p); redone in iteration k, confirmed in iteration c",
@@ -3833,3 +3834,39 @@ Cases: t_cells_pwc_stride_late.c (the walk reaches calloc before
 init's tab[i]: [f, g] before LA, [f] after), t_cells_pwc_stride.c
 (unchanged). Not mechanized. Checked by executions; see the commit's
 gates.
+
+## A non-escaping local slot is its reaching stores (GraphBuild emitLocalAllocaSummaryEdges, Fable 2026-10-24, S)
+
+A summarized slot (isSummarizableAlloca: a pointer alloca whose address
+is used only by its own pointer loads and writes, through pointer casts
+and zero-offset GEPs, and by lifetime/debug intrinsics; never stored,
+passed to a call, or stepped) has no memory node: its loads take copy
+edges from the values written into it. Before S every write reached every
+load (the all-to-all product). Now a load gets edges from exactly the
+writes that reach it: the nearest write (store, atomicrmw, cmpxchg, through
+any alias of the address) on each path back from the load
+(reachingStores). No call can write the slot, since its address does not
+escape, so the value a load reads is the value of one of those writes;
+the edges are the SSA copies mem2reg would build, and the graph is the one
+-O3 builds for the same function. A path from the function entry with no
+write is an indeterminate read and adds nothing (no fact under no-UB); the
+load is counted. The all-to-all product was a sound superset. The global
+dedup no longer unions the loads of a summarized slot (two loads of it may
+read different writes). A certified carve that reloads a summarized slot
+keeps the values of the writes that reach it, for a withdrawal (S1).
+Instance (nm-O0, s3/Nm2/vt): bfd_elf_gc_record_vtentry's local ptr
+(elflink.c:13820) had 3 writes x 6 loads = 18 pairs; 8 reach. The two
+cycles that made a walk are cut: ptr - 1 -> bfd_realloc's ALIAS(ret=arg0)
+-> ptr (-4: the load before the realloc is reached only by the loaded
+used) and ptr + 1 -> used -> ptr (+4: the load after the realloc is
+reached only by the realloc or zmalloc result); the component is
+offset-free, as at -O3. Rows: "SUMMARY slots promoted N (loads L, stores
+S): pairs all-to-all P -> reaching R, slots cut C, loads reached from
+entry E (rule S)"; at --verbose=2 "Slots: cut F var: W writes x L loads =
+P pairs -> R reaching" per cut slot. Cases: t_cells_slot_vtentry.c (the
+vtentry shape: the walk gone, the offset-free row at -O0),
+t_cells_slot_escape.c (an escaping slot stays memory), t_cells_slot_join.c
+(two branches: both writes reach), t_cells_slot_entry.c (a load reached
+from entry), t_cells_slot_alias.ll (a write through a zero GEP of the
+slot kills the earlier one). Not mechanized. Checked by executions; see
+the commit's gates.

@@ -2219,15 +2219,16 @@ void CallGraphPass::applyPoolWithdrawals() {
                << " writes a summarized local slot, whose loads' edges were built at iteration 0\n";
         exit(1);
       }
-    for (auto &[slot, loads] : localAllocaLoadVals) {
-      auto kept = poolSlotStoreVals.find(slot);
-      assert(kept != poolSlotStoreVals.end() && "a released carve's slot was kept at the build");
-      for (NodeIndex st : kept->second)
-        for (NodeIndex l : loads) addAssignmentEdge(st, l);
-    }
+    for (auto &[slot, loads] : localAllocaLoadVals)
+      for (auto &[L, l] : loads) {
+        auto kept = poolSlotStoreVals.find(L);
+        assert(kept != poolSlotStoreVals.end() && "a released carve's slot load was kept at the build");
+        for (NodeIndex st : kept->second) addAssignmentEdge(st, l);
+      }
     localSummarizedAllocaSlots.clear();
     localAllocaStoreVals.clear();
     localAllocaLoadVals.clear();
+    localSlotReachVals.clear();
   }
   CG_LOG("PoolCarve: withdrawn at the solve: " << poolWithdrawnAtSolve.size() << " pools; " << carvesReleased
          << " carves and " << storesReleased << " handle stores built as ordinary code\n");

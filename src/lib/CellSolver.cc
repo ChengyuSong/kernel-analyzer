@@ -103,10 +103,11 @@ public:
 // step yields the object's any-offset cell (counted).
 constexpr size_t kExpandCap = 1 << 16;
 // A field edge out of a node: its target, label, and for an edge on a
-// cycle (a pointer walk) the gcd of the steps around the cycle.
+// cycle with offset (a pointer walk) the gcd of the component's cycle
+// weights (W).
 struct FieldEdge {
   uint32_t dst, li;
-  int64_t walk; // 0: not on a cycle
+  int64_t walk; // 0: not on a cycle with offset
 };
 // A member of a (possibly unified) cell: an object and its offset there.
 using Member = std::pair<uint32_t, int64_t>;
@@ -1171,9 +1172,11 @@ bool CallGraphPass::runCellResolution() {
   // Edges inside each big cycle, recorded before the merge erases them.
   std::vector<std::vector<std::pair<uint32_t, uint32_t>>> bigCycleEdges;
   // Cycles with offset (plan 3.49; Pearce's positive-weight cycles): the
-  // copy+field SCCs whose steps have a nonzero gcd (pointer walks).
+  // copy+field SCCs whose cycle weights have a nonzero gcd (pointer walks).
   struct PwcComp { size_t size = 0, typed = 0, untyped = 0; bool cls = false; int64_t g = 0; uint32_t rep = 0; };
   std::vector<PwcComp> pwcComps;
+  std::vector<std::pair<const Instruction *, std::string>> pwcPeriodRows; // W rows, the final pass's, IR order
+  size_t pwcWalksCleared = 0; // walks W cleared (an edge off every cycle or on an offset-free one)
   std::vector<uint8_t> inPwc;
   bool cycleRowsOnly = false; // at a stop: the rows from the stop's edge set, no node absorbed (the stop answers stay)
   auto collapseCycles = [&]() {
@@ -1238,9 +1241,18 @@ bool CallGraphPass::runCellResolution() {
           });
       std::map<std::string, size_t> walk;
       size_t onCycle = 0, selfLoops = 0;
-      // The steps around a cycle reach offsets congruent modulo the gcd
-      // of all of them.
-      std::vector<int64_t> compGcd(nc, 0);
+      // The period of a component (W): the offsets reachable between two
+      // of its nodes are the difference of their potentials plus the group
+      // its cycle weights generate. A spanning forest gives every node a
+      // potential (a member or byte step's offset along it, a copy 0); every
+      // other edge inside the component adds its cycle weight
+      // pot[u] + off - pot[v]. A strided or constant-index step stays at its
+      // offset and moves by its index, so its stride and offset join the
+      // group as they are. A component whose cycle weights are all 0 is
+      // offset-free: its field edges are plain steps (around such a cycle
+      // every offset maps to itself). edgeGcd is the gcd of the edges'
+      // steps, the period before W, kept for the row.
+      std::vector<int64_t> compGcd(nc, 0), edgeGcd(nc, 0);
       auto stepOf = [&](const LazyLabel &L) -> int64_t {
         const int64_t o = L.off < 0 ? -L.off : L.off;
         return L.stride ? std::gcd((int64_t)L.stride, o) : o;
@@ -1250,17 +1262,76 @@ bool CallGraphPass::runCellResolution() {
         for (FieldEdge &e : fieldOut[u]) {
           const uint32_t v = find(e.dst);
           if (v != u && comp[v] != comp[u]) continue;
-          compGcd[comp[u]] = std::gcd(compGcd[comp[u]], stepOf(lazyLabels[e.li]));
+          edgeGcd[comp[u]] = std::gcd(edgeGcd[comp[u]], stepOf(lazyLabels[e.li]));
         }
       }
+      {
+        std::vector<int64_t> pot(numNodes, 0);
+        std::vector<uint8_t> placed(numNodes, 0);
+        std::vector<uint32_t> st;
+        for (uint32_t s0 = 0; s0 < numNodes; s0++) {
+          if (find(s0) != s0 || placed[s0] || edgeGcd[comp[s0]] == 0) continue;
+          const uint32_t c = comp[s0];
+          placed[s0] = 1;
+          st.assign(1, s0);
+          while (!st.empty()) {
+            const uint32_t u = st.back();
+            st.pop_back();
+            auto relax = [&](uint32_t v, int64_t w) {
+              if (comp[v] != c) return;
+              if (!placed[v]) {
+                placed[v] = 1;
+                pot[v] = pot[u] + w;
+                st.push_back(v);
+              } else {
+                const int64_t d = pot[u] + w - pot[v];
+                compGcd[c] = std::gcd(compGcd[c], d < 0 ? -d : d);
+              }
+            };
+            for (uint32_t v : succ[u]) relax(find(v), 0);
+            for (FieldEdge &e : fieldOut[u]) {
+              const LazyLabel &L = lazyLabels[e.li];
+              const uint32_t v = find(e.dst);
+              if (comp[v] != c) continue; // leaves the component: on no cycle
+              if (L.stride || L.arith) {
+                compGcd[c] = std::gcd(compGcd[c], stepOf(L));
+                relax(v, 0);
+              } else {
+                relax(v, L.off);
+              }
+            }
+          }
+        }
+        // Every cycle weight is a sum of the component's steps, so the
+        // period is a multiple of their gcd.
+        for (uint32_t c = 0; c < nc; c++)
+          assert((compGcd[c] == 0 || compGcd[c] % edgeGcd[c] == 0) && "W period not a multiple of the edge gcd");
+      }
+      // Rows (the final pass's): a component whose period W changed, at its
+      // first field edge in IR order; edges whose walk W clears.
+      std::map<uint32_t, std::pair<const Instruction *, uint32_t>> periodRow; // comp -> (site, label)
+      size_t cleared = 0;
       std::map<uint32_t, PwcComp> pwcBy;
       for (uint32_t u = 0; u < numNodes; u++) {
         if (find(u) != u) continue;
         for (FieldEdge &e : fieldOut[u]) {
           const uint32_t v = find(e.dst);
-          if (v != u && comp[v] != comp[u]) continue;
-          const int64_t g = compGcd[comp[u]];
-          if (g == 0) continue; // offset-free cycle
+          const bool inComp = v == u || comp[v] == comp[u];
+          const int64_t g = inComp ? compGcd[comp[u]] : 0;
+          if (inComp && edgeGcd[comp[u]] != g) {
+            const auto *I = e.dst < G ? dyn_cast_or_null<Instruction>(NF.getValueForNode(e.dst)) : nullptr;
+            auto it = periodRow.find(comp[u]);
+            if (it == periodRow.end()) periodRow.emplace(comp[u], std::make_pair(I, e.li));
+            else if (I && (!it->second.first || irOrderLess(I, it->second.first))) it->second = {I, e.li};
+          }
+          if (g == 0) { // off every cycle, or on an offset-free one
+            if (e.walk) {
+              e.walk = 0;
+              walkChangedSrc.push_back(u), walkReflags++;
+              cleared++;
+            }
+            continue;
+          }
           if (e.walk != g) walkChangedSrc.push_back(u), walkReflags++;
           e.walk = g;
           onCycle++;
@@ -1275,6 +1346,19 @@ bool CallGraphPass::runCellResolution() {
           if (L.ty && L.ty->hasName() && L.ty->getName().starts_with("class.")) P.cls = true;
         }
       }
+      pwcPeriodRows.clear();
+      for (auto &[c, R] : periodRow) {
+        const LazyLabel &L = lazyLabels[R.second];
+        const std::string lab = L.ty && L.ty->hasName() ? L.ty->getName().str() : std::string("bytes");
+        pwcPeriodRows.push_back({R.first, compGcd[c] ? "pwc period " + std::to_string(compGcd[c]) + " (edge gcd " +
+                                                           std::to_string(edgeGcd[c]) + ") over " + lab + " at " + (R.first ? instLoc(R.first) : std::string("?"))
+                                                     : "offset-free cycle (edge gcd " + std::to_string(edgeGcd[c]) +
+                                                           ", no walk) over " + lab + " at " + (R.first ? instLoc(R.first) : std::string("?"))});
+      }
+      std::stable_sort(pwcPeriodRows.begin(), pwcPeriodRows.end(), [](const auto &a, const auto &b) {
+        return a.first && b.first ? irOrderLess(a.first, b.first) : a.first != nullptr && b.first == nullptr;
+      });
+      pwcWalksCleared += cleared;
       pwcComps.clear();
       inPwc.assign(numNodes, 0);
       for (auto &[c, P] : pwcBy) pwcComps.push_back(P);
@@ -7419,6 +7503,15 @@ bool CallGraphPass::runCellResolution() {
   }
   CG_LOG("Cells: cycle passes: " << collapses << " (" << finalPasses << " final), " << walkReflags
          << " walk flags set or changed\n");
+  {
+    size_t nFree = 0;
+    for (const auto &R : pwcPeriodRows) nFree += R.second.rfind("offset-free", 0) == 0;
+    CG_LOG("Cells: cycle periods (W): " << pwcPeriodRows.size() - nFree
+           << " components with a period from their cycle weights other than their edges' gcd, " << nFree
+           << " offset-free (no walk); " << pwcWalksCleared << " walks cleared\n");
+    if (VerboseLevel >= 2)
+      for (const auto &R : pwcPeriodRows) CG_LOG("Cells:   " << R.second << "\n");
+  }
   // Collect mode runs on through the iterations (a soup often forms only
   // after calls resolve); it ends at the cap or at the last iteration.
   dynEdges = edgeSet.size() - staticEdges;
@@ -10121,6 +10214,14 @@ bool CallGraphPass::runCellResolution() {
          << g_counterKept << " kept on the int-launder fallback; untyped " << un << ", mixed " << mx
          << "; through a C++ class step " << cl << "); indirect-call width downstream of the walks: "
          << wDown << " of " << wAll << " targets\n";
+      size_t nFree = 0;
+      for (const auto &R : pwcPeriodRows) {
+        nFree += R.second.rfind("offset-free", 0) == 0;
+        RO << "PWC " << R.second << "\n";
+      }
+      RO << "SUMMARY pwc-period " << pwcPeriodRows.size() - nFree
+         << " components with a period from their cycle weights other than their edges' gcd, " << nFree
+         << " offset-free (no walk); " << pwcWalksCleared << " walks cleared\n";
     }
     RO << "SUMMARY varargs " << varargMapped << " renderers mapped, " << varargKeyedReads
        << " va_arg reads keyed, " << varargUnkeyedReads << " unkeyed; call sites: "

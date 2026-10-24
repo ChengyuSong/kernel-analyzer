@@ -5,7 +5,7 @@ cjpeg-O3 pairs 527 sha256 210f808bbc2bf21c
 djpeg-O3 pairs 821 sha256 3eadc937257cfeb2
 httpd pairs 468 sha256 e2a9a3f5a67355c8
 tcpdump pairs 6274 sha256 63413fb9158f90b6
-nm-O0 pops 199999 cells 9874 facts 7894586 (1600274 in 3331 key cells of keyed union slots) sha256 6c1ddc9b4dcbd77b
-nm-O3 pops 199999 cells 9442 facts 1003987 (431 in 116 key cells of keyed union slots) sha256 789f3ffa9803fa0a
+nm-O0 pops 199999 cells 10869 facts 13388329 (3047986 in 3827 key cells of keyed union slots) sha256 0ca63f042156f3c5
+nm-O3 pops 199999 cells 9442 facts 1002925 (431 in 116 key cells of keyed union slots) sha256 560f74d3f10ba246
 tiffsplit-O0 pops 64422 cells 2154 facts 726501 (2208 in 28 key cells of keyed union slots) sha256 b45aed6a95bde44c
 tiffsplit-O3 pops 992813 cells 5383 facts 15745408 (0 in 128 key cells of keyed union slots) sha256 8d5324a7fcf4ff00

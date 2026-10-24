@@ -5189,6 +5189,14 @@ void CallGraphPass::InstHandler::visitBinaryOperator(BinaryOperator &I) {
     const NodeIndex p = ptrOf(I.getOperand(0)), q = ptrOf(I.getOperand(1));
     if (p != AndersNodeFactory::InvalidIndex && q != AndersNodeFactory::InvalidIndex)
       CGP.ptrDiffs.emplace_back(CGP.getCanonicalNode(p), CGP.getCanonicalNode(q), &I);
+    // PD: the difference of two pointers is an integer with no object
+    // identity (C defines it within one object or one past it), so it
+    // carries no facts: no edge from either operand. A pointer minus an
+    // integer is a GEP and never comes here.
+    if (isa<PtrToIntOperator>(I.getOperand(0)) && isa<PtrToIntOperator>(I.getOperand(1))) {
+      CGP.ptrDiffCuts.push_back(&I);
+      return;
+    }
   }
 
   // Emit a-edges from EVERY pointer-derived operand to the result, per

@@ -170,6 +170,8 @@ protected:
   // --cfl-cells: pointer subtractions (p, q, the sub): C defines p - q only
   // within one object; the solver reports pairs that are not.
   std::vector<std::tuple<NodeIndex, NodeIndex, const llvm::Instruction *>> ptrDiffs;
+  // --cfl-cells (PD): subs of two ptrtoints, whose result carries no facts.
+  std::vector<const llvm::Instruction *> ptrDiffCuts;
   uint32_t lazyLabelFor(int64_t off, uint32_t stride, bool arith = false,
                         const llvm::StructType *ty = nullptr, uint32_t extent = 0);
   void addFieldEdgesExact(NodeIndex src, NodeIndex dst, int64_t off,

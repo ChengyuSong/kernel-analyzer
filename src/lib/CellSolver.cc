@@ -9156,7 +9156,8 @@ bool CallGraphPass::runCellResolution() {
          << " allocator calls inside kept allocator bodies (no object: the "
             "outer FRESH stands for it); "
          << g_p2iNumberOnly
-         << " ptrtoints used as numbers only (no field-any loop); " << g_dataOnlyGeps
+         << " ptrtoints used as numbers only (no field-any loop); " << ptrDiffCuts.size()
+         << " pointer differences (sub of two ptrtoint) carry no facts (PD); " << g_dataOnlyGeps
          << " GEPs of data pointers (character traffic: no edges, no cells); " << g_intNameLoads
          << " loads of integer names (no facts; " << g_counterRetired << " counters); "
          << g_vaMachineryLoads << " va_list bookkeeping loads (no vararg edges); " << g_carves
@@ -10174,6 +10175,14 @@ bool CallGraphPass::runCellResolution() {
        << tailLinkedThenLabeled << " variable indexes linked a tail labeled later, "
           "pointer subtractions across objects: always "
        << rrPtrAlways << ", may " << rrPtrMay << "\n";
+    {
+      // PD: every sub of two ptrtoints, a cut (its result carries no facts).
+      std::vector<const Instruction *> pd(ptrDiffCuts.begin(), ptrDiffCuts.end());
+      std::stable_sort(pd.begin(), pd.end(), IROrder());
+      for (const Instruction *I : pd)
+        RO << "PD pointer difference carries no facts: sub of two ptrtoint at " << instLoc(I) << "\n";
+      RO << "SUMMARY pd " << pd.size() << " pointer differences carry no facts (sub of two ptrtoint)\n";
+    }
     {
       std::string k;
       for (auto &[n, c] : byKind) k += ", " + n + " " + std::to_string(c);

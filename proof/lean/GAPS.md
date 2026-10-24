@@ -3754,3 +3754,34 @@ t_cells_pwc_stride.c (a strided step in a net-zero cycle: period 72,
 the stride), t_cells_pwc_exit.c (the same cycle plus a stride of 8
 leaving it: period 72, not 8). Not mechanized. Checked by executions; see the commit's
 gates.
+
+## A pointer difference carries no facts (GraphBuild visitBinaryOperator, Fable 2026-10-23, PD)
+
+C defines p - q for two pointers only when both point into one object
+(or one past its end), and its value is an integer, the distance
+between them: it has no object identity. Clang emits it as
+`sub iN (ptrtoint p), (ptrtoint q)`. The graph used to give the sub an
+edge from each operand, so the integer held both pointers' facts and
+carried them wherever the integer went (through further integer
+arithmetic, stores, uleb decoders and byte copies), back into memory
+that is later read as a pointer. Now a sub whose two operands are
+ptrtoints (instructions or constant expressions) gets no edge: its
+result holds no fact. A program without undefined behavior computes the
+difference within one object, and adding it back to a pointer (an
+index, `base + d`) is a GEP whose result takes its facts from the base,
+so every address the program forms from it is still reached; the cut
+holds whatever the operands' fact sets are (two objects there is the
+solver's imprecision or the program's undefined behavior, reported as
+"pointer subtractions across objects"). A pointer minus an integer is a
+GEP and is untouched; a ptrtoint's own edges are unchanged for every
+other use. Instances (nm-O0, s3/Nm1): elf-eh-frame.c:824
+_bfd_elf_parse_eh_frame `length = -(buf - ehbuf) & (per_width - 1)`,
+whose result reached the cie's fields through read_uleb128's shifts
+and a byte copy, and from there the section-contents buffer that
+_bfd_elf_rel_local_sym reads as section data (diag-D8); merge.c:939
+_bfd_merged_section_offset `entry->u.index + (secinfo->contents +
+offset - p)`, 31% of the leak census's byte-cell exits. Rows: "pointer
+difference carries no facts: sub of two ptrtoint at F:line" per site,
+"SUMMARY pd N". Case: t_cells_ptrdiff.c (p - q used as an index back
+into the buffer: the target is still found). Not mechanized. Checked by
+executions; see the commit's gates.

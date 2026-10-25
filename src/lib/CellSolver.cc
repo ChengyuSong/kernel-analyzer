@@ -1191,7 +1191,7 @@ bool CallGraphPass::runCellResolution() {
   std::vector<std::pair<const Instruction *, std::string>> pwcPeriodRows; // W rows, the final pass's, IR order
   size_t pwcWalksCleared = 0; // walks W cleared (an edge off every cycle or on an offset-free one)
   std::vector<uint8_t> inPwc;
-  bool cycleRowsOnly = false; // at a stop: the rows from the stop's edge set, no node absorbed (the stop answers stay)
+  bool cycleRowsOnly = false; // no node absorbed: at a stop (the rows from the stop's edge set; the stop answers stay), and in the final pass with --cfl-cell-collapse=false
   auto collapseCycles = [&]() {
     const auto tc = Clock::now();
     collapses++;
@@ -7377,7 +7377,11 @@ bool CallGraphPass::runCellResolution() {
       // rows are read from that pass.
       watchdog.phase("final cycle pass");
       finalPasses++;
+      // --cfl-cell-collapse=false: the pass flags walks but absorbs no
+      // cycle, so nodes keep their own facts (for --cfl-cell-why).
+      cycleRowsOnly = !CFLCellCollapse;
       collapseCycles();
+      cycleRowsOnly = false;
       rekeyReceivers();
       dropMergedGuards();
       requeueWalks();

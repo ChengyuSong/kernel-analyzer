@@ -1295,10 +1295,12 @@ cl::opt<unsigned> CFLCellSoupTime(
 
 cl::opt<bool> CFLCellCollapse(
   "cfl-cell-collapse",
-  cl::desc("--cfl-cells: collapse copy cycles during the solve (the static "
-           "collapse before any fact moves always runs). Off is a measurement "
-           "instrument: nodes keep their own facts, so --cfl-cell-why can "
-           "follow a fact through what would be one merged class (slower)"),
+  cl::desc("--cfl-cells: collapse copy cycles during the solve, periodically "
+           "and in the final cycle pass (the static collapse before any fact "
+           "moves always runs). Off is a measurement instrument: the final "
+           "pass only flags walks, nodes keep their own facts, so "
+           "--cfl-cell-why can follow a fact through what would be one merged "
+           "class (slower)"),
   cl::init(true));
 
 cl::opt<std::string> CFLCellWhy(

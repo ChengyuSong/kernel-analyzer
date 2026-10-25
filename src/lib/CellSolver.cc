@@ -1527,9 +1527,7 @@ bool CallGraphPass::runCellResolution() {
   // The IR value of the step being applied (its GEP): the edge's own site,
   // a replayed step's recorded site, none for a receiver level's steps.
   // Readers of the step's instruction take it from here; curStepDst's node
-  // is a class representative (three log readers still print that node:
-  // the rule (b) site key, the EXTEND row, the LAYOUT trace; see the next
-  // commit).
+  // is a class representative.
   const Value *curStepSite = nullptr;
   uint32_t curStepLi = UINT32_MAX; // the label of the step or walk being applied
   // --cfl-cell-slot-census: what minted each content cell (the mint cause,
@@ -2237,6 +2235,23 @@ bool CallGraphPass::runCellResolution() {
   // with the steps; a label request on an unsized tail makes it).
   std::function<void(uint32_t)> extendToArrayFn;
   std::function<std::string(uint32_t)> nodeDescFn; // set once nodeDesc exists
+  // A step's site (curStepSite) as nodeDesc prints a value node: the
+  // instruction with its function, an argument by number.
+  auto siteDesc = [](const Value *V) -> std::string {
+    if (const auto *I = dyn_cast_or_null<Instruction>(V)) {
+      std::string is;
+      raw_string_ostream os(is);
+      I->print(os);
+      return (I->getFunction()->getName() + ": ").str() + os.str().substr(0, 140);
+    }
+    if (const auto *A = dyn_cast_or_null<Argument>(V))
+      return (A->getParent()->getName() + " arg" + Twine(A->getArgNo())).str();
+    if (!V) return "?";
+    std::string vs;
+    raw_string_ostream os(vs);
+    V->print(os);
+    return os.str().substr(0, 140);
+  };
   std::function<std::string(const Obj &)> describeFn; // set once describe exists
   size_t bytesWritesRefused = 0;
   // Ruling A: struct steps into storage declared scalar (rule (b): folded
@@ -2301,7 +2316,7 @@ bool CallGraphPass::runCellResolution() {
       bytesWritesRefused++;
       const std::string site =
           !layoutCopyFrom.empty() ? "copy at " + layoutCopyFrom.substr(0, layoutCopyFrom.find(" from "))
-          : curStepDst != UINT32_MAX ? nodeDescFn(curStepDst).substr(0, 120) : std::string("?");
+          : siteDesc(curStepSite).substr(0, 120);
       bytesWritesBy[site + " | " + typeLabel(S)]++;
       return;
     }
@@ -2771,7 +2786,7 @@ bool CallGraphPass::runCellResolution() {
               (L.arith ? " arith" : "");
       }
       CG_LOG("Cells: EXTEND " << describeFn(objs[o]) << " to an array by step [" << lab << "] at "
-             << (curStepDst < G ? nodeDescFn(curStepDst).substr(0, 200) : std::string("?")) << "\n");
+             << siteDesc(curStepSite).substr(0, 200) << "\n");
     }
     objs[o].tail = false;
     objs[o].tailUnsized = false;
@@ -5787,6 +5802,7 @@ bool CallGraphPass::runCellResolution() {
            << mintCause << ") stepping "
            << (curStepNode == UINT32_MAX ? std::string("?") : nodeDesc(curStepNode).substr(0, 160))
            << " into "
+           // The step's destination node (a class representative), not its site.
            << (curStepDst == UINT32_MAX ? std::string("?") : nodeDesc(curStepDst).substr(0, 200))
            << (layoutCopyFrom.empty() ? std::string() : "; the copy at " + layoutCopyFrom) << "\n");
   };

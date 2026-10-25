@@ -2079,7 +2079,7 @@ void CallGraphPass::computeTaggedFields() {
   size_t effClosed = 0, effOpen = 0, ceRounds = 0, ceUnsettled = 0;
   double ceSecs = 0, tagsSecs = 0;
   size_t tagsComputes = 0;
-  std::vector<std::string> effOpenAt;
+  std::vector<std::pair<const Instruction *, std::string>> effOpenAt; // every open site; the first 8 in IR order are printed
   // Can D be written between the test (its load dl, its branch into Succ)
   // and the access at `at`? The last passage: blocks reachable from Succ
   // and reaching `at` without re-entering the test's block.
@@ -4301,7 +4301,7 @@ void CallGraphPass::computeTaggedFields() {
             }
             effSites++;
             (E.open ? effOpen : effClosed)++;
-            if (E.open && effOpenAt.size() < 8) effOpenAt.push_back(locOf(CB) + " -> " + G->getName().str());
+            if (E.open) effOpenAt.push_back({CB, locOf(CB) + " -> " + G->getName().str()});
             const Value *id = argId(CB->getArgOperand(k));
             const Walk L = walkBackM(Fc, CB->getFunction(), id, CB);
             pas.insert(L.assumes.begin(), L.assumes.end());
@@ -5584,8 +5584,12 @@ void CallGraphPass::computeTaggedFields() {
     CG_LOG("TaggedFields: callee D-effects composed: " << effClosed << " closed, " << effOpen << " open ("
            << effComputes << " effect computations; content effects " << ceRounds << " rounds, " << ceUnsettled
            << " pairs unsettled, " << ceSecs << " s)\n");
-    if (VerboseLevel >= 2)
-      for (const std::string &d : effOpenAt) CG_LOG("TaggedFields:   open D-effect at " << d << "\n");
+    if (VerboseLevel >= 2) {
+      std::stable_sort(effOpenAt.begin(), effOpenAt.end(),
+                       [](const auto &a, const auto &b) { return irOrderLess(a.first, b.first); });
+      for (size_t i = 0; i < effOpenAt.size() && i < 8; ++i)
+        CG_LOG("TaggedFields:   open D-effect at " << effOpenAt[i].second << "\n");
+    }
     CG_LOG("TaggedFields: walks " << walksBack << " backward, " << walksFwd << " forward, " << walkBlocks
            << " blocks (most in " << (top ? top->getName().str() : std::string("-")) << ": "
            << (top ? walkBlocksBy[top] : 0) << "); " << sumComputes << " summary computations, "

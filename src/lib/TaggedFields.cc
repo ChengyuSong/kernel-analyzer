@@ -1884,6 +1884,24 @@ void CallGraphPass::computeTaggedFields() {
       mi++;
     }
   }
+  // A guard condition's or a call's IR position: an instruction by its
+  // function and its place in the function's block-then-instruction
+  // order, an argument by its function and number. Orders over guards and
+  // calls then do not follow addresses either.
+  std::map<const Function *, std::map<const Instruction *, unsigned>> instPos;
+  auto condPos = [&](const Value *V) -> std::tuple<std::pair<unsigned, unsigned>, unsigned, unsigned> {
+    if (const auto *I = dyn_cast<Instruction>(V)) {
+      auto &P = instPos[I->getFunction()];
+      if (P.empty()) {
+        unsigned k = 0;
+        for (const Instruction &J : instructions(*I->getFunction())) P[&J] = k++;
+      }
+      return {fnPos.at(I->getFunction()), 0, P.at(I)};
+    }
+    const auto *A = dyn_cast<Argument>(V);
+    assert(A && "a guard condition that is neither an instruction nor an argument");
+    return {fnPos.at(A->getParent()), 1, A->getArgNo()};
+  };
   auto effIROrder = [&](const EffKey &a, const EffKey &b) {
     return std::make_tuple(fnPos[std::get<2>(a)], std::get<3>(a), std::get<0>(a), std::get<1>(a)) <
            std::make_tuple(fnPos[std::get<2>(b)], std::get<3>(b), std::get<0>(b), std::get<1>(b));
@@ -4132,7 +4150,13 @@ void CallGraphPass::computeTaggedFields() {
       // entry, the maps are the caller's own (absorbed) or a retag.
       // The (function, parameter) pairs that can carry an effect: a tag
       // write of the parameter's object, or a call handing it to one.
-      std::set<std::pair<const Function *, unsigned>> carriers;
+      // In IR order (function position, then parameter): the content-effect
+      // rounds and the retag rows iterate it, so neither follows addresses.
+      auto carrierLess = [&](const std::pair<const Function *, unsigned> &a,
+                             const std::pair<const Function *, unsigned> &b) {
+        return std::make_pair(fnPos.at(a.first), a.second) < std::make_pair(fnPos.at(b.first), b.second);
+      };
+      std::set<std::pair<const Function *, unsigned>, decltype(carrierLess)> carriers(carrierLess);
       {
         std::vector<std::pair<const Function *, unsigned>> work;
         for (const TagStore &t : ds)
@@ -4213,11 +4237,13 @@ void CallGraphPass::computeTaggedFields() {
           }
         }
         { // canonical order, no duplicates (rounds compare values)
-          using K = std::tuple<char, int64_t, int64_t, int64_t, std::vector<std::pair<const Value *, bool>>>;
+          // Guards by their conditions' IR positions, not their addresses.
+          using CP = decltype(condPos(nullptr));
+          using K = std::tuple<char, int64_t, int64_t, int64_t, std::vector<std::pair<CP, bool>>>;
           std::map<K, size_t> uniq;
           for (size_t q = 0; q < R.maps.size(); q++) {
-            std::vector<std::pair<const Value *, bool>> gk;
-            for (const Test &t : R.guards[q]) gk.push_back({t.cond, t.onTrue});
+            std::vector<std::pair<CP, bool>> gk;
+            for (const Test &t : R.guards[q]) gk.push_back({condPos(t.cond), t.onTrue});
             uniq.try_emplace(K{R.maps[q].src, R.maps[q].a, R.maps[q].f, R.maps[q].m, gk}, q);
           }
           CEff D;
@@ -4267,10 +4293,21 @@ void CallGraphPass::computeTaggedFields() {
         }
       }
       ceSecs += std::chrono::duration<double>(std::chrono::steady_clock::now() - tce).count();
-      for (auto [G, k] : carriers) {
-        for (const User *U : G->users()) {
-          const auto *CB = dyn_cast<CallBase>(U);
-          if (!CB || CB->getCalledOperand() != G || k >= CB->arg_size()) continue;
+      // The calls handing a carrier's object on, in IR order (the caller's
+      // position, then the call's place in it), so the first-wins rows
+      // below name the IR-first open effect.
+      std::vector<std::tuple<const CallBase *, const Function *, unsigned>> effCalls;
+      for (auto [G, k] : carriers)
+        for (const User *U : G->users())
+          if (const auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == G && k < CB->arg_size())
+            effCalls.push_back({CB, G, k});
+      std::stable_sort(effCalls.begin(), effCalls.end(),
+                       [&](const auto &a, const auto &b) { return condPos(std::get<0>(a)) < condPos(std::get<0>(b)); });
+      {
+        for (const auto &ec : effCalls) {
+          const CallBase *CB = std::get<0>(ec);
+          const Function *G = std::get<1>(ec);
+          const unsigned k = std::get<2>(ec);
           {
             const CEff E = contentEff(G, k);
             if (E.maps.empty() && !E.open) continue; // the incoming content is never retagged
@@ -4308,6 +4345,7 @@ void CallGraphPass::computeTaggedFields() {
             for (const Instruction *w : L.W)
               if (auto it = wIdx.find(w); it != wIdx.end()) {
                 Writer &W = writers[it->second];
+                // First wins: the IR-first open effect (effCalls' order).
                 if (E.open && !W.unknown) W.why = "open call-site effect at " + locOf(CB);
                 if (E.open) W.unknown = true;
                 for (size_t q = 0; q < E.maps.size(); q++) {
@@ -4329,6 +4367,7 @@ void CallGraphPass::computeTaggedFields() {
               continue;
             }
             effUnknownRetag |= E.open;
+            // The IR-first open effect that retags (effCalls' order).
             if (E.open && effOpenSite.empty()) effOpenSite = locOf(CB) + " -> " + G->getName().str();
             effMaps.insert(effMaps.end(), E.maps.begin(), E.maps.end());
             effGuards.insert(effGuards.end(), E.guards.begin(), E.guards.end());

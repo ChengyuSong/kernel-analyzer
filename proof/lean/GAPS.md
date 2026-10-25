@@ -3900,3 +3900,45 @@ t_cells_slot_escape.c (an escaping slot stays memory), t_cells_slot_join.c
 from entry), t_cells_slot_alias.ll (a write through a zero GEP of the
 slot kills the earlier one). Not mechanized. Checked by executions; see
 the commit's gates.
+
+## Pool candidacy runs to a fixpoint with wrapper promotion (Carves runCarveRounds, Fable 2026-10-24, P-ord)
+
+The carve check and the wrapper confirmer depend on each other: the
+confirmer promotes the wrappers over a certified pool's carves (rule 3),
+and a bumped field is a pool candidate only when some store refills it
+with an allocation, which may be a wrapper only the confirmer promotes.
+Run once each, in that order, a cursor refilled from a later promotion was
+never a candidate (nm-O0: the nine pe_ILF_vars cursors over bfd_zmalloc,
+and rsrc_write_data+24). Now round 1 is the check at initialization and
+the confirmer's first run; while the refill test, re-run over the last
+check's cursors with the promotions so far, finds a field it now admits,
+another round runs the check from scratch over those promotions and then
+the confirmer. The confirmer keeps its promotions (a function with a
+summary is never retried; a promotion is not a hand row) and the pool
+carves each promoted wrapper returns, and tries every other function
+again under the new pools. Kept between rounds: the promotions and their
+summaries, the return-path callees and carves of the promoted wrappers,
+the certificate exemptions of their stores, and the init-helper analysis
+cache (initCache: a helper's own stores and formals, read from its body
+alone, never from an allocator set or a pool). Recomputed each round:
+every rejection (the rounds re-judge each unpromoted function), the
+redundancy check of the hand rows, and every carve-check result. A pool
+verdict may change between rounds (a chunk source that is now an
+allocation; a field that now joins it): each change is a row "pool X:
+verdict round k V1 -> round k+1 V2 (reason)". A pool certified in round k
+that round k+1 refuses, with a decision resting on its certificate, refuses
+the run (as S1 refuses a withdrawal at the solve): the promotions made on
+it are single-pass decisions. The decisions are re-keyed to the pool's new
+representative when a join renames it. The candidates grow over a finite
+set of fields and the promotions over a finite set of functions, so the
+rounds end; at 8 rounds with a new candidate the run is refused. The
+refill test of a later round is RF's: a value the last check judged not a
+refill (a pointer at a nonzero offset of an allocation, not the header
+form) is no new candidate, so a demoted field returns only through an
+allocation's own result. Rows:
+"carve round k: N new candidates (...): fields", per round "N candidate
+fields in P pools, M promotions", "pool X: first judged in round k: <its
+verdict>", "carve rounds: K". Case: t_cells_pool_late_wrapper.c (a bump
+pool refilled from a wrapper only the confirmer promotes: a candidate in
+round 2, certified, the two inlined hand-outs two objects: [f, g] before,
+[f] after). Not mechanized. Checked by executions; see the commit's gates.

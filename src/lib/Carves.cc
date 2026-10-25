@@ -105,6 +105,11 @@ void CallGraphPass::checkPoolCarves() {
   poolVerdicts.clear();
   poolInteriorRefillRows.clear();
   poolInteriorHeader = poolInteriorBump = poolInteriorNot = 0;
+  poolNotRefillVals.clear();
+  poolCursorStores.clear();
+  poolFieldFirstStore.clear();
+  poolFieldSets.clear();
+  poolRefusedSet.clear();
   // A field access's key: the debug-info struct of the base pointer (the
   // IR merges isomorphic structs: objalloc and demangler_engine are one IR
   // type), else the IR struct; "" if the access names no struct field.
@@ -450,6 +455,7 @@ void CallGraphPass::checkPoolCarves() {
   std::map<std::pair<const Function *, std::string>, int64_t> slotBumpK;
   std::map<std::pair<const Function *, std::string>, std::vector<const StoreInst *>> slotBumpEnds;
   std::map<std::pair<const Function *, std::string>, std::vector<const StoreInst *>> slotBumps;
+  std::map<std::string, std::vector<const Value *>> storeVals; // field -> the pointer values stored into it
   for (auto &[M, _] : Ctx->Modules)
     for (Function &F : *M) {
       if (unjudged(F)) continue;
@@ -459,6 +465,8 @@ void CallGraphPass::checkPoolCarves() {
         const std::string k = fieldKey(SI, SI->getPointerOperand());
         if (k.empty()) continue;
         const Value *V = SI->getValueOperand();
+        if (V->getType()->isPointerTy()) storeVals[k].push_back(V);
+        poolFieldFirstStore.try_emplace(k, SI);
         if (V->getType()->isPointerTy()) {
           bool inner = false;
           if (const CallBase *CB = allocAt(V, 0, inner)) {
@@ -613,6 +621,7 @@ void CallGraphPass::checkPoolCarves() {
         ++it;
       } else {
         cursors++;
+        poolCursorStores[*it] = storeVals[*it];
         it = set->erase(it);
       }
   for (auto &[F, ks] : bumpIn)
@@ -1976,6 +1985,8 @@ void CallGraphPass::checkPoolCarves() {
     for (auto &[F, ks] : bumpIn) ks.erase(k);
     handle0.erase(k);
     cursors++;
+    poolCursorStores[k] = storeVals[k];
+    for (auto &[S, CB] : rs) poolNotRefillVals.insert(S->getValueOperand()); // no later round's candidate
     removedRows.push_back(run + "pool candidate " + k +
                           " removed: refilled only at a nonzero offset of an allocation, not the header form (a cursor)");
     removed = true;
@@ -2005,6 +2016,7 @@ void CallGraphPass::checkPoolCarves() {
         row += "the header form (a chunk base of pool " + pool(k) + " + its header)";
       } else {
         poolInteriorNot++;
+        poolNotRefillVals.insert(S->getValueOperand());
         std::string hs;
         for (const std::string &h : holdersOf(CB, S)) hs += (hs.empty() ? "" : " ") + h;
         row += hs.empty() ? "not a refill (not the header form; the chunk is held by no other field)"
@@ -2110,6 +2122,8 @@ void CallGraphPass::checkPoolCarves() {
                                 "; saved cursors " + std::to_string(sc) +
                                 (rit == refused.end() ? "" : "; refused by " + std::to_string(rit->second.size()) + " uses");
     poolVerdicts[p] = verdict;
+    poolFieldSets[p] = fs;
+    if (isRefused(p)) poolRefusedSet.insert(p);
     CG_LOG("PoolCarve: " << verdict << "\n");
     if (auto sit = structural.find(p); sit != structural.end()) {
       poolVerdicts[p] += "; refused: " + sit->second;
@@ -2277,10 +2291,142 @@ void CallGraphPass::checkPoolCarves() {
          << " bumped fields never refilled (cursors)\n");
 }
 
+// The refill test's allocation (checkPoolCarves' fromAlloc): V comes from
+// an allocation call (AllocFuncs or a FRESH summary, promoted ones
+// included) through casts, GEPs and -O0 local slots, 8 hops deep.
+bool CallGraphPass::poolFromAlloc(const Value *V0) const {
+  std::set<std::pair<const Value *, int>> seen;
+  std::function<bool(const Value *, int)> from = [&](const Value *V, int d) -> bool {
+    if (d > 8 || !seen.insert({V, d}).second) return false;
+    V = V->stripPointerCasts();
+    if (const auto *G = dyn_cast<GEPOperator>(V)) return from(G->getPointerOperand(), d + 1);
+    if (const auto *CB = dyn_cast<CallBase>(V)) {
+      const Function *C = CB->getCalledFunction();
+      if (!C) return false;
+      if (Ctx->AllocFuncs.count(C)) return true;
+      auto it = Ctx->FuncSummaries.find(C);
+      return it != Ctx->FuncSummaries.end() && it->second->fresh;
+    }
+    if (const auto *L = dyn_cast<LoadInst>(V))
+      if (localSlot(L->getPointerOperand()))
+        for (const User *U : L->getPointerOperand()->users())
+          if (const auto *S = dyn_cast<StoreInst>(U))
+            if (from(S->getValueOperand(), d + 1)) return true;
+    return false;
+  };
+  return from(V0, 0);
+}
+
+// P-ord (Fable 2026-10-24): the carve check and the confirmer depend on each
+// other (the confirmer promotes the wrappers over certified pools' carves;
+// a cursor refilled from a wrapper only the confirmer promotes is a pool
+// candidate only after it does). Round 1 is the check at initialization and
+// the confirmer's first run; each further round re-runs the check from
+// scratch over the promotions so far and then the confirmer, which keeps its
+// promotions and tries the rest, while the refill test, re-run over the
+// last check's cursors, finds a new candidate. The candidates grow over a
+// finite set of fields and the promotions over a finite set of functions,
+// so the rounds end; a cap of 8 refuses the run. A verdict that changes is a
+// row; a pool certified in a round, refused in a later one, with a decision
+// resting on its certificate refuses the run (as S1 at the solve).
+void CallGraphPass::runCarveRounds() {
+  auto candidates = [&]() {
+    size_t n = 0;
+    for (auto &[p, fs] : poolFieldSets) n += fs.size();
+    return n;
+  };
+  CG_LOG("PoolCarve: carve round 1: " << candidates() << " candidate fields in " << poolFieldSets.size() << " pools, "
+         << confirmPromoted.size() << " promotions\n");
+  for (;;) {
+    std::vector<std::string> fresh;
+    for (auto &[f, vs] : poolCursorStores)
+      for (const Value *V : vs)
+        if (!poolNotRefillVals.count(V) && poolFromAlloc(V)) {
+          fresh.push_back(f);
+          break;
+        }
+    std::string fl;
+    for (const std::string &f : fresh) fl += " " + f;
+    if (fresh.empty()) {
+      CG_LOG("PoolCarve: carve rounds: " << carveRound << " (no new candidate after round " << carveRound << ")\n");
+      return;
+    }
+    if (carveRound >= 8) {
+      errs() << "ERROR: --cfl-cells: the carve rounds reach no fixpoint in 8 rounds; new candidates after round "
+             << carveRound << ":" << fl << "\n";
+      exit(1);
+    }
+    // The previous round's pools, by field.
+    std::map<std::string, std::string> oldRep;
+    for (auto &[p, fs] : poolFieldSets)
+      for (const std::string &f : fs) oldRep[f] = p;
+    const auto oldSets = poolFieldSets;
+    const auto oldRefused = poolRefusedSet;
+    const size_t promotedBefore = confirmPromoted.size();
+    carveRound++;
+    CG_LOG("PoolCarve: carve round " << carveRound << ": " << fresh.size() << " new candidates (refilled from a wrapper "
+           << "promoted in round " << carveRound - 1 << "):" << fl << "\n");
+    checkPoolCarves();
+    std::map<std::string, std::string> newRep;
+    for (auto &[p, fs] : poolFieldSets)
+      for (const std::string &f : fs) newRep[f] = p;
+    // Verdict changes, and the decisions resting on a certificate (keyed
+    // by the pool's representative, which a join may change).
+    std::map<std::string, std::vector<std::string>> rekeyed;
+    for (auto &[p, ds] : poolCertUsed)
+      if (!oldSets.count(p)) rekeyed[p] = ds; // not a pool of the last check: kept as it is
+    for (auto &[p, fs] : oldSets) {
+      const std::string q = newRep.count(*fs.begin()) ? newRep[*fs.begin()] : "";
+      const bool wasRefused = oldRefused.count(p), nowRefused = q.empty() || poolRefusedSet.count(q);
+      std::string joined;
+      if (!q.empty())
+        for (const std::string &f : poolFieldSets[q])
+          if (!fs.count(f)) joined += " " + f;
+      if (wasRefused != nowRefused)
+        CG_LOG("PoolCarve: pool " << p << ": verdict round " << carveRound - 1 << " " << (wasRefused ? "REFUSED" : "POOL")
+               << " -> round " << carveRound << " " << (nowRefused ? "REFUSED" : "POOL") << " ("
+               << (q.empty() ? std::string("no longer a pool")
+                             : joined.empty() ? "a chunk source or refill is now an allocation: " + poolVerdicts[q]
+                                              : "fields joined:" + joined + "; " + poolVerdicts[q])
+               << ")\n");
+      auto u = poolCertUsed.find(p);
+      if (u == poolCertUsed.end()) continue;
+      if (!wasRefused && nowRefused) {
+        std::string sites;
+        for (const std::string &f : poolFieldSets[q])
+          if (!fs.count(f))
+            if (auto st = poolFieldFirstStore.find(f); st != poolFieldFirstStore.end())
+              sites += " " + f + " (stored at " + instLocStr(st->second) + ": " + instText(st->second) + ")";
+        errs() << "ERROR: --cfl-cells: decisions before the solve rested on pool " << p << "'s certificate (round "
+               << carveRound - 1 << "), which carve round " << carveRound << " refuses: "
+               << (joined.empty() ? std::string("") : "the fields" + sites + " join it; ") << poolVerdicts[q]
+               << "; the certificate's uses are decided once, before the solve. The " << u->second.size()
+               << " decisions that rested on it:\n";
+        for (const std::string &d : u->second) errs() << "  " << d << "\n";
+        exit(1);
+      }
+      auto &v = rekeyed[q];
+      for (const std::string &d : u->second)
+        if (std::find(v.begin(), v.end(), d) == v.end()) v.push_back(d);
+    }
+    for (auto &[p, fs] : poolFieldSets)
+      if (!oldRep.count(*fs.begin())) {
+        bool any = false;
+        for (const std::string &f : fs) any |= oldRep.count(f) != 0;
+        if (!any) CG_LOG("PoolCarve: pool " << p << ": first judged in round " << carveRound << ": " << poolVerdicts[p] << "\n");
+      }
+    poolCertUsed = std::move(rekeyed);
+    confirmFreshWrappers();
+    CG_LOG("PoolCarve: carve round " << carveRound << ": " << candidates() << " candidate fields in "
+           << poolFieldSets.size() << " pools, " << confirmPromoted.size() - promotedBefore << " promotions\n");
+  }
+}
+
 // S1 (Fable 2026-10-23): a pool withdrawn at the solve leaves the
-// certificate built at iteration 0 (checkPoolCarves runs once, before the
-// confirmers: run again it would read their FRESH wrappers and could
-// certify what the graph never built). Its carves lose their fresh object
+// certificate built at iteration 0 (checkPoolCarves runs in the carve
+// rounds before the graph is built, never after: run then it would read
+// wrappers promoted for a graph already built and could certify what the
+// graph never built). Its carves lose their fresh object
 // and get the edges of the instruction each is; its handle stores, which
 // the build dropped, get a store's edges. The next iteration's solve reads
 // the changed edge list.

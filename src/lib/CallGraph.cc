@@ -671,8 +671,10 @@ bool CallGraphPass::doModulePass(Module *M) {
   NF.setModule(M);
   NF.setDataLayout(&M->getDataLayout());
 
-  if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first)
+  if (CFLConfirmFresh && iteration == 0 && M == Ctx->Modules.front().first) {
     confirmFreshWrappers(); // all modules loaded; AllocFuncs seeded
+    if (CFLCells) runCarveRounds(); // P-ord: carve candidacy and promotion to a fixpoint
+  }
   if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)
     labelPackedArrays(); // rule (a): before anything reads a global's layout
   if (CFLCells && iteration == 0 && M == Ctx->Modules.front().first)

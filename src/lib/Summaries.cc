@@ -419,6 +419,7 @@ void CallGraphPass::confirmFreshWrappers() {
     if (HF->isDeclaration() || HF->empty() ||
         !HF->getReturnType()->isPointerTy())
       continue;
+    if (confirmPromoted.count(HF)) continue; // an earlier carve round's promotion, not a hand row
     if (!HS->fresh || !HS->body || HS->none || HS->noop || HS->pool ||
         HS->freeArg >= 0 || !HS->labels.empty())
       continue;
@@ -465,8 +466,10 @@ void CallGraphPass::confirmFreshWrappers() {
     }
   };
   size_t redundantRows = 0;
-  std::map<std::string, std::set<std::string>> promotedRet;         // promoted wrapper -> its return-path callees
-  std::map<std::string, std::set<const Instruction *>> promotedCarves; // promoted wrapper -> the pool carves it returns
+  // promoted wrapper -> its return-path callees / the pool carves it returns
+  // (members: kept across the carve rounds, P-ord)
+  auto &promotedRet = confirmPromotedRet;
+  auto &promotedCarves = confirmPromotedCarves;
   size_t round = 0;
   // Phases. Lfp: rounds promote wrappers over confirmed allocators until
   // none is added (least fixpoint). Then the recursive candidates (members
@@ -1321,6 +1324,7 @@ void CallGraphPass::confirmFreshWrappers() {
           else if (aliasArgs.empty()) g_freshInit++;
         }
         g_freshPromoted++;
+        confirmPromoted.insert(&F);
         promotedRet[F.getName().str()] = retCallees;
         for (const Instruction *PI : certUsed)
           if (poolCarves.count(PI)) promotedCarves[F.getName().str()].insert(PI);

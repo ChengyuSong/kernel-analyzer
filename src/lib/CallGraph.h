@@ -271,6 +271,12 @@ protected:
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF,
                     int skipArg = -1);
   void confirmFreshWrappers();
+  // Kept across the carve rounds (P-ord): the wrappers the confirmer
+  // promoted (never hand rows), each one's return-path callees, and the pool
+  // carves it returns (positive; valid while their pools stand).
+  std::set<const llvm::Function *> confirmPromoted;
+  std::map<std::string, std::set<std::string>> confirmPromotedRet;
+  std::map<std::string, std::set<const llvm::Instruction *>> confirmPromotedCarves;
   void runInvokeCensus();
   void runConstructCensus();
   void runRegFieldGapReport(); // targeted-fs detector (post-solve)
@@ -623,6 +629,19 @@ protected:
   // pools' own bookkeeping (handle-field stores, rewinds, pointer
   // arithmetic on handles: exempt from the confirmer's R3).
   void checkPoolCarves();
+  // P-ord (Fable 2026-10-24): carve candidacy and the confirmer's wrapper
+  // promotions run in rounds to a fixpoint (runCarveRounds, after the
+  // confirmer's first run). The last check's cursors (bumped or base fields
+  // never refilled) with the values stored into them, for the refill test
+  // re-run after a round of promotions; its pools (representative -> fields)
+  // and which of them it refused.
+  std::map<std::string, std::vector<const llvm::Value *>> poolCursorStores;
+  std::map<std::string, std::set<std::string>> poolFieldSets;
+  std::set<std::string> poolRefusedSet;
+  std::map<std::string, const llvm::Instruction *> poolFieldFirstStore; // the first store into each field (rows)
+  int carveRound = 1;
+  bool poolFromAlloc(const llvm::Value *V) const;
+  void runCarveRounds();
   // Container storage closure (plan 3.55 obligation 1, report only):
   // --cfl-container-closure (Containers.cc).
   void checkContainerClosure();
@@ -833,6 +852,9 @@ protected:
   // bump after a new chunk's first piece, or not a refill. Rule report rows (by field, then IR order) and the two counts.
   std::vector<std::string> poolInteriorRefillRows;
   size_t poolInteriorHeader = 0, poolInteriorBump = 0, poolInteriorNot = 0;
+  // P-ord: the values RF judged not a refill in the last check; a later
+  // round's refill test skips them (they would be new candidates again).
+  std::set<const llvm::Value *> poolNotRefillVals;
   // Stores whose value is a certified pool's handle value (the bump,
   // rewinds, refills into handle fields, chunk list links): not modeled.
   std::unordered_set<const llvm::Instruction *> poolHandleStores;

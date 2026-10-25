@@ -579,7 +579,7 @@ bool CallGraphPass::runFlowsToResolution() {
     // Exact-labelled f-edges, one per recorded edge (self-loops kept:
     // a field edge folded onto its own class is a walk).
     std::set<std::tuple<uint32_t, uint32_t, uint32_t>> seenF;
-    for (auto &[f, t, li] : lazyFEdges) {
+    for (auto &[f, t, li, site] : lazyFEdges) {
       const uint32_t cf = dense(getCanonicalNode(f)), ct = dense(getCanonicalNode(t));
       if (seenF.insert(std::make_tuple(cf, ct, li)).second)
         fEdges.emplace_back(cf, ct, li);

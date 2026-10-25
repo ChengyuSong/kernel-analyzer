@@ -162,7 +162,11 @@ protected:
   // level whose label is being made.
   llvm::SmallVector<const llvm::StructType *, 4> gepElems;
   const llvm::StructType *gepElem = nullptr;
-  std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t>> lazyFEdges; // src, dst, label
+  // src, dst, label, and the edge's site: dst's own IR value, or, for a
+  // field address with none (a GEP's inner level, a fieldwise copy, a
+  // summary's field cell), the instruction being visited when it was made.
+  std::vector<std::tuple<NodeIndex, NodeIndex, uint32_t, const llvm::Value *>> lazyFEdges;
+  const llvm::Value *fieldEdgeSite = nullptr; // the instruction InstHandler is visiting
   // --cfl-cells: byte copies (memcpy, CPY summaries) as copy constraints
   // the cell solver resolves per cell pair: src, dst, length (-1 unknown).
   std::vector<std::tuple<NodeIndex, NodeIndex, int64_t, const llvm::Instruction *>>

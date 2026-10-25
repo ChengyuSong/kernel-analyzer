@@ -1936,7 +1936,8 @@ void CallGraphPass::addFieldEdgesExact(NodeIndex src, NodeIndex dst,
   // Recorded per edge (not per endpoint pair): canonical merging can
   // fold two field nodes into one destination, and each edge keeps its
   // own exact label.
-  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith, ty, extent));
+  const llvm::Value *DV = NF.getValueForNode(dst);
+  lazyFEdges.emplace_back(src, dst, lazyLabelFor(off, stride, arith, ty, extent), DV ? DV : fieldEdgeSite);
 }
 
 NodeIndex CallGraphPass::getFieldPtrNode(NodeIndex parentCanon, int64_t off) {
@@ -3042,10 +3043,14 @@ bool CallGraphPass::runOnFunction(Function *F) {
 
 // Implementation of InstHandler visitor methods
 void CallGraphPass::InstHandler::visit(Instruction &I) {
+  const Value *outerSite = CGP.fieldEdgeSite;
+  CGP.fieldEdgeSite = &I;
   if (CGP.poolCarves.empty() || !CGP.poolCarves.count(&I)) {
     InstVisitor<InstHandler>::visit(I);
+    CGP.fieldEdgeSite = outerSite;
     return;
   }
+  CGP.fieldEdgeSite = outerSite;
   // A carve of a certified pool (plan 3.53 rule 3): a fresh object; the
   // chunk pointer it was computed from does not flow into it.
   NodeIndex valNode = CGP.getRepNodeForValue(&I);

@@ -108,6 +108,13 @@ constexpr size_t kExpandCap = 1 << 16;
 struct FieldEdge {
   uint32_t dst, li;
   int64_t walk; // 0: not on a cycle with offset
+  const llvm::Value *site = nullptr; // the step's own IR value (lazyFEdges), never its class representative's
+};
+// A step recorded on a fact, replayed when its cell merges: the
+// destination node and label (dst << 32 | li) and the step's site.
+struct StepRec {
+  uint64_t dl;
+  const llvm::Value *site;
 };
 // A member of a (possibly unified) cell: an object and its offset there.
 using Member = std::pair<uint32_t, int64_t>;
@@ -1051,13 +1058,13 @@ bool CallGraphPass::runCellResolution() {
     auto lit = snapLen.find(at);
     copies.push_back({a, b, lit == snapLen.end() ? len : lit->second, at});
   }
-  for (auto &[f, t, li] : lazyFEdges) {
+  for (auto &[f, t, li, site] : lazyFEdges) {
     const uint32_t a = canon(f), b = canon(t);
     inGraph[a] = inGraph[b] = 1;
     assert(!isHub[b] && "a field address is never a dereference");
     if (snapCut.count(b)) continue; // a snapshot holder's element-region step
     if (a != b || lazyLabels[li].off != 0 || lazyLabels[li].stride != 0)
-      fieldOut[a].push_back({b, li, 0});
+      fieldOut[a].push_back({b, li, 0, site});
   }
 
   // Watched stores (plan 3.51 ruling B): by the solver node of the store's
@@ -1422,7 +1429,7 @@ bool CallGraphPass::runCellResolution() {
   std::vector<std::vector<Member>> memb;
   std::vector<std::vector<uint32_t>> anyDst; // field-any loops: any cells
   std::vector<std::vector<FieldEdge>> walkDst;
-  std::vector<std::vector<uint64_t>> stepDst;
+  std::vector<std::vector<StepRec>> stepDst;
   size_t cappedMints = 0, outMints = 0;
   auto internName = [&](const std::string &s) { return NF.internCellName(s); };
   auto findFact = [&](uint32_t f) {
@@ -1517,6 +1524,13 @@ bool CallGraphPass::runCellResolution() {
   size_t splitCells = 0, keyedCells = 0, lateSplits = 0;
   size_t trailingArrays = 0; // trailing objects of a header taken as arrays of unknown extent
   uint32_t curStepFact = UINT32_MAX, curStepNode = UINT32_MAX, curStepDst = UINT32_MAX;
+  // The IR value of the step being applied (its GEP): the edge's own site,
+  // a replayed step's recorded site, none for a receiver level's steps.
+  // Readers of the step's instruction take it from here; curStepDst's node
+  // is a class representative (three log readers still print that node:
+  // the rule (b) site key, the EXTEND row, the LAYOUT trace; see the next
+  // commit).
+  const Value *curStepSite = nullptr;
   uint32_t curStepLi = UINT32_MAX; // the label of the step or walk being applied
   // --cfl-cell-slot-census: what minted each content cell (the mint cause,
   // the arrival being applied, and for a step or walk its result node).
@@ -1524,6 +1538,7 @@ bool CallGraphPass::runCellResolution() {
     std::string cause;
     Why why;
     uint32_t stepDst = UINT32_MAX;
+    const Value *stepSite = nullptr;
   };
   boost::unordered_flat_map<std::pair<uint32_t, int64_t>, SlotMint> slotMint;
   auto contentOf = [&](uint32_t o, int64_t c) -> std::pair<uint32_t, uint32_t> {
@@ -1542,7 +1557,8 @@ bool CallGraphPass::runCellResolution() {
     if (CFLCellSlotCensus)
       slotMint.try_emplace(std::make_pair(o, c),
                            SlotMint{mintCause, curWhy,
-                                    curWhy.kind == W_STEP || curWhy.kind == W_WALK ? curStepDst : UINT32_MAX});
+                                    curWhy.kind == W_STEP || curWhy.kind == W_WALK ? curStepDst : UINT32_MAX,
+                                    curWhy.kind == W_STEP || curWhy.kind == W_WALK ? curStepSite : nullptr});
     if (CFLCellLeakCensus) {
       leakCellOf.emplace(u, std::make_pair(o, c));
       leakCellOf.emplace(pn, std::make_pair(o, c));
@@ -1831,19 +1847,33 @@ bool CallGraphPass::runCellResolution() {
     const std::vector<Member> ma = memb[a], mb = memb[b];
     const std::vector<uint32_t> xa = anyDst[a], xb = anyDst[b];
     const std::vector<FieldEdge> wa = walkDst[a], wb = walkDst[b];
-    const std::vector<uint64_t> sa = stepDst[a], sb = stepDst[b];
-    auto replay = [&](const std::vector<uint64_t> &S,
+    const std::vector<StepRec> sa = stepDst[a], sb = stepDst[b];
+    auto replay = [&](const std::vector<StepRec> &S,
                       const std::vector<FieldEdge> &W,
                       const std::vector<uint32_t> &X,
                       const std::vector<Member> &M) {
       curStepFact = UINT32_MAX; // a replay: no step to attribute
-      for (uint64_t dl : S)
+      const uint32_t dstWas = curStepDst;
+      const Value *siteWas = curStepSite;
+      for (const StepRec &sr : S)
         for (auto [o, off] : M) {
-          const std::vector<uint32_t> R = stepOne(o, off, (uint32_t)dl);
-          for (uint32_t f2 : R) add((uint32_t)(dl >> 32), f2);
+          // The replayed step's own destination and site, not the last
+          // edge step's.
+          curStepDst = (uint32_t)(sr.dl >> 32);
+          curStepSite = sr.site;
+          const std::vector<uint32_t> R = stepOne(o, off, (uint32_t)sr.dl);
+          for (uint32_t f2 : R) add((uint32_t)(sr.dl >> 32), f2);
         }
+      curStepDst = dstWas;
+      curStepSite = siteWas;
       for (const FieldEdge &e : W)
-        for (auto [o, off] : M) walkOne(o, off, e.li, e.walk, e.dst);
+        for (auto [o, off] : M) {
+          curStepDst = e.dst;
+          curStepSite = e.site;
+          walkOne(o, off, e.li, e.walk, e.dst);
+        }
+      curStepDst = dstWas;
+      curStepSite = siteWas;
       for (uint32_t d : X) {
         anyCause = "merge with a fact in the field-any loop";
         anyCauseNode = d;
@@ -2284,9 +2314,8 @@ bool CallGraphPass::runCellResolution() {
     // pointee (debug info) where the IR merged that struct away.
     if (layoutCopySrc != UINT32_MAX) {
       if (objs[layoutCopySrc].label == O.label) noteIdent(O, objs[layoutCopySrc].ident);
-    } else if (curStepDst < G) {
-      if (const auto *GEP = dyn_cast_or_null<GEPOperator>(NF.getValueForNode(curStepDst)))
-        noteIdent(O, diMergedIdent(GEP->getPointerOperand(), true));
+    } else if (const auto *GEP = dyn_cast_or_null<GEPOperator>(curStepSite)) {
+      noteIdent(O, diMergedIdent(GEP->getPointerOperand(), true));
     }
     setExtent(O, NF.getValueForNode(O.origin));
     if (O.parentObj != UINT32_MAX) trailingArrays += O.repeats;
@@ -2721,7 +2750,7 @@ bool CallGraphPass::runCellResolution() {
     if (objs[o].tailLinkSite) {
       const LateKey k = lateKey(objs[o]);
       assert(!lateArrayDecided.count(k) && "a late-decided object is minted as an array and never extended again");
-      const auto *DI = curStepDst < G ? dyn_cast_or_null<Instruction>(NF.getValueForNode(curStepDst)) : nullptr;
+      const auto *DI = dyn_cast_or_null<Instruction>(curStepSite);
       LateArrayRow R;
       R.decidedBy = DI ? instLoc(DI) : std::string("?");
       R.linkBy = instLoc(objs[o].tailLinkSite);
@@ -2871,8 +2900,8 @@ bool CallGraphPass::runCellResolution() {
           else {
             tailIndexAny++;
             if (!objs[t].layout) tailLinkedUnlabeled.insert(t);
-            if (!objs[o].tailLinkSite && curStepDst < G)
-              if (const auto *LI = dyn_cast_or_null<Instruction>(NF.getValueForNode(curStepDst))) {
+            if (!objs[o].tailLinkSite)
+              if (const auto *LI = dyn_cast_or_null<Instruction>(curStepSite)) {
                 objs[o].tailLinkSite = LI;
                 objs[o].tailLinkStride = s;
               }
@@ -2917,7 +2946,7 @@ bool CallGraphPass::runCellResolution() {
           s % esz == 0) {
         const int64_t g = std::gcd(s, O.size);
         auto &row = trail1Rows[{dyn_cast_or_null<Instruction>(NF.getValueForNode(O.origin)),
-                                curStepDst < G ? dyn_cast_or_null<Instruction>(NF.getValueForNode(curStepDst)) : nullptr}];
+                                dyn_cast_or_null<Instruction>(curStepSite)}];
         row.first = O.label;
         std::set<int64_t> &offs = row.second;
         for (int64_t j = pos % g; j < O.size; j += g) {
@@ -3446,7 +3475,15 @@ bool CallGraphPass::runCellResolution() {
         if (ck == CellKind::Func || ck == CellKind::Out) continue; // no slot
         for (size_t i = 0; i < memb[c].size(); i++) {
           const Member mb = memb[c][i];
+          // A receiver level's steps have no site of their own: none, not
+          // the last edge step's.
+          const uint32_t dstWas = curStepDst;
+          const Value *siteWas = curStepSite;
+          curStepDst = UINT32_MAX;
+          curStepSite = nullptr;
           const std::vector<uint32_t> &S = stepOne(mb.first, mb.second, li);
+          curStepDst = dstWas;
+          curStepSite = siteWas;
           next.insert(next.end(), S.begin(), S.end());
         }
       }
@@ -4725,7 +4762,7 @@ bool CallGraphPass::runCellResolution() {
       return;
     }
     anyCause = "step";
-    stepDst[f].push_back((uint64_t)find(dst) << 32 | li);
+    stepDst[f].push_back({(uint64_t)find(dst) << 32 | li, curStepSite});
     curStepFact = f;
     for (size_t i = 0; i < memb[f].size(); i++) {
       const Member mb = memb[f][i];
@@ -7520,6 +7557,7 @@ bool CallGraphPass::runCellResolution() {
         for (uint32_t f : delta) {
           if (trackWhy) curWhy = {n, f, UINT32_MAX, e.walk ? W_WALK : W_STEP};
           curStepDst = e.dst;
+          curStepSite = e.site;
           curStepLi = e.li;
           if (e.walk) applyWalk(f, e);
           else applyStep(f, e.li, e.dst);
@@ -8847,7 +8885,7 @@ bool CallGraphPass::runCellResolution() {
                                           "any-offset step", "hub link", "byte copy", "dispatch"};
             mint = "minted by [" + M.cause + "] during a " + kinds[M.why.kind];
             if (M.stepDst != UINT32_MAX) {
-              const Value *SV = M.stepDst < G ? NF.getValueForNode(M.stepDst) : nullptr;
+              const Value *SV = M.stepSite;
               if (const auto *SI = dyn_cast_or_null<Instruction>(SV)) {
                 mint += " at " + instLoc(SI) + " " + leakIR(SI);
                 // A step through a struct that does not enclose c here: one

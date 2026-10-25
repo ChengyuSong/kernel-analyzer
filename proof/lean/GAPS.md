@@ -3942,3 +3942,31 @@ verdict>", "carve rounds: K". Case: t_cells_pool_late_wrapper.c (a bump
 pool refilled from a wrapper only the confirmer promotes: a candidate in
 round 2, certified, the two inlined hand-outs two objects: [f, g] before,
 [f] after). Not mechanized. Checked by executions; see the commit's gates.
+
+## A unified cell's members are a set (CellSolver mergeFacts / refold, Fable 2026-10-25, MD)
+
+A cell that two cells of one name became (mergeFacts) lists its member
+objects with their offsets; each side's steps, walks and any-offset
+links are replayed onto the other side's members. Before MD the list
+grew by replay: a refold rewrites member offsets in place (the period or
+element fold, the tail move, the header absorb), so two cells of one
+object folded onto one offset each carried the member, and the merge
+appended it again. A cell refolded k times onto +0 listed its member k+1
+times (tcpdump: pcap_activate_linux's buffer +0 15 times), and every copy
+through it was applied once per copy of the member. MD keeps each list a
+set: a rewrite that moves a member onto another member's (object,
+offset) leaves one, in first-seen order; a merge replays a side's
+records only onto the other side's members it does not hold, and appends
+only those. A member both sides hold already had both sides' records
+applied when it joined each side (a replay onto it is idempotent, the
+same step from the same (object, offset)), and the member set, as a set,
+is the same. The canonical fact set is unchanged: each fact read as
+(object, offset under the object's final period and layout, kind), per
+node, is the same set before and after MD (tcpdump, collapse off and on;
+also for the key cells of keyed union slots). The raw fact count is not:
+the repeated applications also wrote cells the refold had left outside
+their object's table (orphans, RM) at offsets the final period folds
+onto a cell the node already holds, so the count before MD is higher by
+those duplicates. The number of applications changes too, so a stop at
+a fixed pop count lands at another state (the stop pins re-pin). Not
+mechanized. Checked by executions; see the commit's gates.

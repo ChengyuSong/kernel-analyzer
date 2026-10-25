@@ -1437,6 +1437,17 @@ bool CallGraphPass::runCellResolution() {
     return f;
   };
   canonFact = findFact;
+  // A cell's members are a set (MD): a rewrite that moves a member onto
+  // another member's (object, offset) leaves one, in first-seen order.
+  auto dedupMembers = [&](uint32_t f) {
+    std::vector<Member> &M = memb[f];
+    if (M.size() < 2) return;
+    boost::unordered_flat_set<Member> seen;
+    size_t k = 0;
+    for (size_t i = 0; i < M.size(); i++)
+      if (seen.insert(M[i]).second) M[k++] = M[i];
+    M.resize(k);
+  };
   auto newCell = [&](Cell C) {
     cells.push_back(C);
     factRep.push_back(cells.size() - 1);
@@ -1842,7 +1853,15 @@ bool CallGraphPass::runCellResolution() {
     factMerges++;
     mergeNodes(cells[a].store, cells[b].store);
     // stepOne, walkOne and anyOf may mint (growing these vectors): copies.
-    const std::vector<Member> ma = memb[a], mb = memb[b];
+    // A member both sides hold has had both sides' steps applied already:
+    // each side replays onto the other's members it does not hold, and
+    // the merged set holds each member once (MD).
+    std::vector<Member> ma, mb;
+    {
+      const boost::unordered_flat_set<Member> inA(memb[a].begin(), memb[a].end()), inB(memb[b].begin(), memb[b].end());
+      for (const Member &m : memb[a]) if (!inB.count(m)) ma.push_back(m);
+      for (const Member &m : memb[b]) if (!inA.count(m)) mb.push_back(m);
+    }
     const std::vector<uint32_t> xa = anyDst[a], xb = anyDst[b];
     const std::vector<FieldEdge> wa = walkDst[a], wb = walkDst[b];
     const std::vector<StepRec> sa = stepDst[a], sb = stepDst[b];
@@ -2364,6 +2383,7 @@ bool CallGraphPass::runCellResolution() {
         for (Member &mb : memb[f])
           if (mb.first == o && decOff(mb.second) == off)
             mb = {t, encOff(off2, (mb.second & kFoldedBit) != 0)};
+        dedupMembers(f);
         if (cells[f].obj == o) {
           cells[f].obj = t;
           cells[f].off = off2;
@@ -2412,6 +2432,7 @@ bool CallGraphPass::runCellResolution() {
       for (uint32_t f : fs) {
         for (Member &mb : memb[f])
           if (mb.first == o) mb.second = encOff(off, (mb.second & kFoldedBit) != 0);
+        dedupMembers(f);
         if (cells[f].obj == o) {
           cells[f].off = off;
           cells[f].name = nm;
@@ -2814,6 +2835,7 @@ bool CallGraphPass::runCellResolution() {
         const bool bit = (key & 1) != 0;
         for (Member &mb : memb[f])
           if (mb.first == t) mb = {o, encOff(decOff(mb.second) + d, (mb.second & kFoldedBit) != 0)};
+        dedupMembers(f);
         if (cells[f].obj == t) {
           cells[f].obj = o;
           cells[f].off = off;

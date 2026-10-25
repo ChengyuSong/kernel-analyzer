@@ -5,7 +5,11 @@ cjpeg-O3 pairs 527 sha256 210f808bbc2bf21c
 djpeg-O3 pairs 821 sha256 3eadc937257cfeb2
 httpd pairs 468 sha256 e2a9a3f5a67355c8
 tcpdump pairs 6274 sha256 63413fb9158f90b6
-nm-O0 pops 199999 cells 8324 facts 258369 (1129 in 130 key cells of keyed union slots) sha256 30c4abf210a3b6d5
-nm-O3 pops 199999 cells 9442 facts 1002925 (431 in 116 key cells of keyed union slots) sha256 560f74d3f10ba246
-tiffsplit-O0 pops 18943 cells 1452 facts 33449 (169 in 14 key cells of keyed union slots) sha256 fe8b5e1336a661c5
-tiffsplit-O3 pops 992813 cells 5383 facts 15745408 (0 in 128 key cells of keyed union slots) sha256 8d5324a7fcf4ff00
+# nm-O0: census-cap stop at 200,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2): stop-state facts are not comparable across MD (fewer copy applications per pop)
+nm-O0 pops 199999 cells 8299 facts 255989 (1142 in 130 key cells of keyed union slots) sha256 f9664bd965563fad
+# nm-O3: census-cap stop at 200,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2), as nm-O0
+nm-O3 pops 199999 cells 9414 facts 1002428 (431 in 116 key cells of keyed union slots) sha256 2106608757b7709e
+# tiffsplit-O0: census-cap stop at 150,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2), as nm-O0
+tiffsplit-O0 pops 19824 cells 1454 facts 35249 (169 in 14 key cells of keyed union slots) sha256 f048406c3a48038e
+# tiffsplit-O3: census-cap stop at 1,000,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2), as nm-O0
+tiffsplit-O3 pops 992824 cells 5356 facts 16593662 (0 in 128 key cells of keyed union slots) sha256 a738525a65f785fb

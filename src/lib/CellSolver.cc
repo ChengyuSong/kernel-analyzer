@@ -9869,7 +9869,9 @@ bool CallGraphPass::runCellResolution() {
       });
       for (auto [o, k] : perObj)
         CG_LOG("Cells:     source " << describe(objs[o]) << ": " << k << " facts\n");
-      if (recordWhy) explainWhy(find(copies[ci].src), CFLCellWhy);
+      if (recordWhy)
+        for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
+          if (!alt.empty()) explainWhy(find(copies[ci].src), alt.str());
     }
     // --cfl-cell-why=any:OBJ: where OBJ's any-offset cell first arrived.
     if (recordWhy && StringRef(CFLCellWhy).starts_with("any:")) {

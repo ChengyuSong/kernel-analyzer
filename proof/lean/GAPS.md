@@ -3970,3 +3970,30 @@ onto a cell the node already holds, so the count before MD is higher by
 those duplicates. The number of applications changes too, so a stop at
 a fixed pop count lands at another state (the stop pins re-pin). Not
 mechanized. Checked by executions; see the commit's gates.
+
+
+## A refold's rebuild never overwrites a cell minted during it (CellSolver refold, Fable 2026-10-25, RM)
+
+A refold clears the object's offset table and places each folded group's
+merged cell at its key. The merges replay steps, and a replayed step onto
+the object mints its cells into the table being rebuilt; before RM the
+group's placement assigned over such a mint, leaving a live cell outside
+the table: no later refold folds it (a +2 cell kept in a period-2
+object) and no cell of its name merges with it (two +0 cells of one
+object: a store through one and a load through the other do not meet).
+RM places by merging into what a mint left at the key; then any key the
+fold moves is re-placed by the same rule, repeated while a merge mints:
+the keys are the object's folded keys under the fixed period and layout,
+and each pass either moves none or merges two live cells, so it ends.
+Asserted after the rebuild: every cell of the object minted during the
+refold is the table's cell at its key, at an offset the fold keeps, and
+no key of the table is one the fold moves. A mint folds by the period in
+force (cellAt), so it lands at a folded key. Since MD a group's cells
+hold the same members after the rewrite and the replay that minted is
+skipped; the path stays reachable for a group whose cells hold members
+of different objects. Instances: on TLL11 (LL-on tcpdump), 54
+overwrites, 36 in the final solve over 9 objects; on 6cb12e5, the case's
+own, and on tcpdump 46,449 node facts (collapse off; 29,186 on) in live
+cells outside their object's table; on MD (1052f95) none (every fact in a
+cell outside a table is a merged fact id whose representative is in it). Case: t_cells_refold_mint.c. Not mechanized. Checked by executions;
+see the commit's gates.

@@ -1959,7 +1959,7 @@ bool CallGraphPass::runCellResolution() {
   // Unknown objects' facts that passed a node unchecked: object -> (node,
   // fact), re-presented there once the object is typed.
   boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> passedBy;
-  size_t layoutsLearned = 0, refoldMerges = 0, periodsLearned = 0,
+  size_t layoutsLearned = 0, refoldMerges = 0, refoldMintMerges = 0, periodsLearned = 0,
          tailObjects = 0;
   auto requestPeriod = [&](uint32_t o, int64_t s) {
     Obj &O = objs[o];
@@ -2411,17 +2411,40 @@ bool CallGraphPass::runCellResolution() {
       objs[o].loadNodes.push_back({c, ns[0].first, ns[0].second});
     }
     // Exact addresses reduce modulo the element; equal ones become one.
+    auto foldAt = [&](int64_t off) {
+      const Obj &O = objs[o];
+      if (O.repeats) return ((off % O.size) + O.size) % O.size;
+      if (!O.layout && O.period) return ((off % O.period) + O.period) % O.period;
+      return off;
+    };
     std::map<std::pair<int64_t, bool>, std::vector<uint32_t>> byOff;
     for (auto &[key, f] : objs[o].offCells) {
-      int64_t off = key >> 1;
+      const int64_t off = foldAt(key >> 1);
       const bool bit = (key & 1) != 0;
-      const Obj &O = objs[o];
-      assert(!(O.tail && off >= O.size) && "moved to the trailing object above");
-      if (O.repeats) off = ((off % O.size) + O.size) % O.size;
-      else if (!O.layout && O.period) off = ((off % O.period) + O.period) % O.period;
+      assert(!(objs[o].tail && (key >> 1) >= objs[o].size) && "moved to the trailing object above");
       byOff[{off, bit}].push_back(findFact(f));
     }
     objs[o].offCells.clear();
+    // RM: the merges below replay steps, and a replayed step onto o mints
+    // o's cells into the table being rebuilt. A group's cell is placed by
+    // merging into what such a mint left at its key, never over it: an
+    // overwritten cell stays live in the facts that hold it but outside
+    // the table, so no later refold folds it and no cell of its name
+    // merges with it (two cells of one name, a lost alias).
+    const size_t cellsAtRefold = cells.size();
+    auto place = [&](int64_t off, bool bit, uint32_t f) {
+      const int64_t key = off * 2 + (bit ? 1 : 0);
+      auto it = objs[o].offCells.find(key);
+      if (it == objs[o].offCells.end()) {
+        objs[o].offCells.emplace(key, f);
+        return;
+      }
+      const uint32_t was = findFact(it->second); // copied out: the merge may mint into the table
+      if (was == findFact(f)) return;
+      const uint32_t m = mergeFacts(was, f);
+      refoldMintMerges++;
+      objs[o].offCells[key] = findFact(m);
+    };
     for (auto &[ob, G2] : byOff) {
       const auto [off, bit] = ob;
       std::vector<uint32_t> fs = G2;
@@ -2443,8 +2466,44 @@ bool CallGraphPass::runCellResolution() {
         surv = mergeFacts(surv, fs[i]);
         refoldMerges++;
       }
-      objs[o].offCells[off * 2 + (bit ? 1 : 0)] = surv;
+      place(off, bit, surv);
     }
+    // A mint during the rebuild folds by the period in force (cellAt), so
+    // it lands at a folded key; a key the fold moves is re-placed by the
+    // same rule, while a merge mints more. The keys are o's folded keys
+    // under the fixed period and layout, and each pass either finds none
+    // to move or merges two live cells, so this ends.
+    for (bool moved = true; moved;) {
+      moved = false;
+      std::vector<std::pair<int64_t, uint32_t>> stray;
+      for (auto &[key, f] : objs[o].offCells)
+        if (foldAt(key >> 1) != (key >> 1)) stray.push_back({key, f});
+      for (auto &[key, f] : stray) {
+        objs[o].offCells.erase(key);
+        const uint32_t g = findFact(f);
+        const int64_t off = foldAt(key >> 1);
+        for (Member &mb : memb[g])
+          if (mb.first == o) mb.second = encOff(off, (mb.second & kFoldedBit) != 0);
+        dedupMembers(g);
+        if (cells[g].obj == o) {
+          cells[g].off = off;
+          cells[g].name = internName(cellName(o, canonOff(objs[o], off)));
+        }
+        place(off, (key & 1) != 0, g);
+        moved = true;
+      }
+    }
+    // Every cell of o minted during the refold is in the table, at a key
+    // the fold keeps (RM).
+    for (uint32_t f = (uint32_t)cellsAtRefold; f < cells.size(); f++) {
+      if (cells[f].obj != o || cells[f].kind != CellKind::Off || findFact(f) != f) continue;
+      auto it = objs[o].offCells.find(cells[f].off * 2 + (cells[f].folded ? 1 : 0));
+      assert(it != objs[o].offCells.end() && findFact(it->second) == f &&
+             "a cell minted during a refold is outside its object's table (RM)");
+      assert(foldAt(cells[f].off) == cells[f].off && "a cell minted during a refold sits at an offset its fold moves (RM)");
+    }
+    for (auto &[key, f] : objs[o].offCells)
+      assert(foldAt(key >> 1) == (key >> 1) && "a refolded table keeps a key its fold moves (RM)");
     // A content cell minted while the object was unknown and now inside a
     // keyed slot gets its read side: P reads U and keeps every link U
     // had (what read the whole cell still does), and the object's cells
@@ -8028,7 +8087,8 @@ bool CallGraphPass::runCellResolution() {
          << varByteAny << " variable byte steps into unlabeled objects (their any-offset cell), "
          << keyedWaits << " keyed accesses waited for a label (" << keyedFlushed
          << " linked unkeyed at the fixpoint: never labeled) ("
-         << refoldMerges << " cells merged by re-folding)\n");
+         << refoldMerges << " cells merged by re-folding, " << refoldMintMerges
+         << " merged into cells the refold's own replays minted (RM))\n");
   if (CFLCellUnify) canonicalizeSets();
   CG_LOG("Cells: " << leftObject << " byte offsets leaving a single "
          << "object (outside: one past the end, never dereferenced)\n");

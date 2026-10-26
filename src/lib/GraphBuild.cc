@@ -2926,6 +2926,7 @@ void CallGraphPass::emitLocalAllocaSummaryEdges(const Function *F) {
       auto w = wrote.find(W);
       if (w == wrote.end()) continue; // a write of no pointer value: it kills, it adds nothing
       S.reach++;
+      if (const auto *SI = dyn_cast<StoreInst>(W)) promotedSlotWrites[&I].push_back(SI->getValueOperand());
       for (NodeIndex s : w->second) {
         kept.push_back(s);
         for (NodeIndex l : r->second)

@@ -9,7 +9,7 @@ tcpdump pairs 6274 sha256 63413fb9158f90b6
 nm-O0 pops 199999 cells 8299 facts 255989 (1142 in 130 key cells of keyed union slots) sha256 f9664bd965563fad
 # nm-O3: census-cap stop at 200,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2), as nm-O0
 nm-O3 pops 199999 cells 9414 facts 1002428 (431 in 116 key cells of keyed union slots) sha256 2106608757b7709e
-# tiffsplit-O0: census-cap stop at 150,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2), as nm-O0
-tiffsplit-O0 pops 19824 cells 1454 facts 35249 (169 in 14 key cells of keyed union slots) sha256 f048406c3a48038e
+# tiffsplit-O0: census-cap stop at 150,000 pops (not a fixpoint); LL re-pin from four reproducing runs (s3/LLg4/g/cells, tiff r1-r3)
+tiffsplit-O0 pops 19824 cells 1511 facts 33864 (258 in 26 key cells of keyed union slots) sha256 2ba5f9e675339177
 # tiffsplit-O3: census-cap stop at 1,000,000 pops (not a fixpoint); MD re-pin from four reproducing runs (s3/MDg/g/cells, cells2), as nm-O0
 tiffsplit-O3 pops 992824 cells 5356 facts 16593662 (0 in 128 key cells of keyed union slots) sha256 a738525a65f785fb

@@ -892,6 +892,32 @@ protected:
   std::map<std::tuple<const llvm::Value *, int64_t, std::string>, LateArrayRow> lateArrayDecided;
   std::vector<std::string> lateArrayRelabeled; // a key whose label changed (never silent)
   int lateArrayIterations = 0; // iterations run for LA alone
+  // LL (Fable 2026-10-24/25, plan 3.93-3.95): a lazily labeled object's
+  // label is the candidate the evidence tiers choose, not the solve's first
+  // arrival. The candidates are the struct labels written at its offset 0
+  // in a solve; a label written in the object's own frame (A5a's receiver,
+  // the written pointer reaching the allocation by value flow) is chosen,
+  // else the first in program order (moduleOrderLess). A solve whose first
+  // arrival differs is discarded; the next iteration mints the object with
+  // the chosen label, and the final iteration must see that label written
+  // again. Keyed by (site, base).
+  struct LazyLabelRow {
+    const llvm::StructType *label = nullptr; // the chosen label
+    std::string firstArrival;                 // the first arrival of the solve that decided it
+    std::string row;                          // that solve's choice (tier and key)
+    std::vector<std::pair<int, std::string>> seq; // every decision: (iteration, label)
+    int confirmed = -1;
+    int withdrawn = -1;  // the final iteration reached the object with no candidate
+    std::string object;  // the object, as the decision described it
+  };
+  std::map<std::pair<const llvm::Value *, int64_t>, LazyLabelRow> lazyLabelDecided;
+  std::vector<std::string> lazyLabelRelabeled; // "LL relabeled in iteration k: ..."
+  std::vector<std::string> lazyLabelWithdrawn; // "LL decision withdrawn: ..."
+  size_t llWithdrawnBytes = 0;                 // of them, objects used as bytes (rule (b))
+  int lazyLabelIterations = 0; // iterations run for LL decisions
+  // Rule S's promoted slots, kept past the build for LL's own-frame value
+  // flow: a summarized slot's load -> the values its reaching writes store.
+  std::unordered_map<const llvm::Instruction *, std::vector<const llvm::Value *>> promotedSlotWrites;
   size_t poolWithdrawnApplied = 0;                // withdrawals already applied to the graph
   std::unordered_map<const llvm::Instruction *, std::string> poolBookkeepingPool;
   // The certified pool whose certificate judged I (a carve, bookkeeping, a

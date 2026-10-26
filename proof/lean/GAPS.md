@@ -3865,6 +3865,103 @@ init's tab[i]: [f, g] before LA, [f] after), t_cells_pwc_stride.c
 (unchanged). Not mechanized. Checked by executions; see the commit's
 gates.
 
+## A lazy label is chosen by evidence tiers, then program order (CellSolver requestLayout, Fable 2026-10-24/25, LL)
+
+An object with no layout at mint takes the label of the first struct
+written at its offset 0 (requestLayout): the solve's arrival order. When
+several structs are written there, the label, and with it the cells and
+the answers, depended on that order (t_cells_ll_order.c: [fa fb] / [fy]
+under one order, [fa fb fy] under the other). LL makes the choice a
+function of the program. The candidates of an object are the struct
+labels written at its offset 0 in a solve, through a typed step or a
+layout copy, with the census exclusions (the layout itself, a leading
+member of it either way, by stripped name; a copy from the object into
+its own start moves its own content and is no candidate; a row says so).
+Every write is recorded at its own site, also when the step's result is
+memoized (the record is read before the step memo; the solve is
+unchanged). Tier 1, own flow: the origin's result values are the
+allocation or pool hand-out and every call result that receives it by
+return along the wrapper walk (the confirmer's return-path callees:
+newchunk's result, new_stmt's %call, the origin call). A candidate label
+has own-flow evidence when a write's pointer reaches one of them by
+value flow: copies, casts, zero GEPs, phis and selects, a promoted
+pointer slot's load standing for the writes that reach it (rule S),
+never another load (heap field, global, alloca array, union member). The
+writes are the candidate's own sites; a write of a leading member T0 of
+the label at the object's start (a struct.stmt write into a slist, no
+candidate by the exclusions) when the label's layout leads with T0
+(otherwise counted as fitting no candidate); and, read from the IR, an
+all-zero GEP of struct T (or a leading member of the label) written
+through. The last is the access path the graph folds into a copy (the
+field node merges with its base, so no step is made and rule 1 never
+labels by it). It is an interim: when a typed access at offset 0 labels
+like any step (Z), the candidates and this reading coincide and Z's
+commit removes it. It selects among candidates and never adds one; at
+-O3 it reads GEPs only (no TBAA struct path). Exactly one own-flow label
+is chosen; several are ordered by program order; none leaves program order among
+all candidates. Program order (moduleOrderLess): globals before
+instructions, each by module position (a function's place in the module
+list, then the instruction's in the function). A candidate's key is the
+least direct key of its label over the backward closure of the copy
+graph (copy cycles are fine; a copy is an edge of it only from its
+source's start, while a copy from a member inside the source writes that
+member's struct and is a direct key at its own site, as a layout copy
+carries the source's identity only from its start; its row names the
+member, "copy of member +k of T", so a struct the linker renamed reads
+from the log; when the source's own label changes in a later iteration,
+the derived candidate changes with it, under the same iteration form
+and its cap): a typed write's site, or for a source not
+lazily labeled with that label its labeling site, the origin (the
+allocation, alloca or global); a closure with no direct key is refused,
+as is a remaining tie (one instruction writing two candidate labels). A
+receiver level's step has no site of its own (CV): its label is a
+candidate and the note is counted; the field edge's own step records the
+site, and a candidate still without one at a fixpoint decision has no
+direct key (refused; a stopped solve skips it).
+The iteration is LA's: a solve whose first arrival differs from the
+choice is discarded (its targets are not wired), the object is recorded
+by (allocation site, offset in the allocation), and later iterations
+mint it with the chosen label (the write that arrives is still a
+candidate); the final iteration must see the chosen label written at its
+offset 0 again, or no struct written there at all: a decided label is
+applied only when a write arrives, so a final solve in which no
+candidate reaches the object is the solve with no decision for that key
+(the decision is moot: the key stays recorded, with no re-decision and
+no extra iteration, and a row "LL decision withdrawn" says so; this
+includes an object used as bytes first in that solve, whose struct
+writes are rule (b) rows and never give it a layout, the decided label
+or another; the row says which). Both forms are moot for one reason:
+an object used as bytes in the final solve gets no layout whatever the
+decision, and an object no candidate reaches gets none either (a decided
+label is applied only when a write arrives), so the final solve is the
+same with the decision as without it. Another
+label arriving without the chosen one is "not confirmed" and refuses the
+run, naming the object; a key
+decided more than 8 times is refused with its (iteration, label)
+sequence; a stopped solve decides nothing and its rows say so. One
+extra iteration serves LA and LL decisions of the same solve (implemented;
+no case exercises one solve carrying both yet: owed). Premise:
+a label is a checked name whatever the choice (the cells it names are
+the rule's own, and every write still flows: a write of another struct
+is a rule (b) row with its flow kept), so soundness does not rest on the
+choice; LL fixes determinism and independence from the schedule only.
+Rows: "LL label by order: <object> chosen T1 (own flow via F %v:
+<evidence> at F:line | program order[ among own-flow labels]: <key>
+[(through N copies)]) over first-arrival T2 | , the first arrival;
+candidates T n @F:line [(own flow via ...)] [(copied)], ...; decided in
+iteration k, confirmed in iteration c", "LL relabeled in iteration k:
+"<object> T2 -> T1", "LL decision withdrawn: no candidate reaches
+<object> in iteration k (decided T1 over T2 in iteration j)", "LL
+decision withdrawn: <object> is used as bytes in iteration k, its struct
+writes are rule (b) rows (decided T1 over T2 in iteration j)", "LL
+self-copy at F:line (<object>): not a candidate", "SUMMARY lazy-label N
+objects with several candidates, M relabeled, extra iterations k, W
+decided keys reached by no candidate in the final solve[ (B of them
+used as bytes)]". Cases: t_cells_ll_order.c (the program-first write
+arrives second: relabel, answers move), t_cells_ll_same.c (the first
+arrival is the choice, keyed by a global copy source: no decision). Not
+mechanized. Checked by executions; see the commit's gates.
+
 ## A non-escaping local slot is its reaching stores (GraphBuild emitLocalAllocaSummaryEdges, Fable 2026-10-24, S)
 
 A summarized slot (isSummarizableAlloca: a pointer alloca whose address

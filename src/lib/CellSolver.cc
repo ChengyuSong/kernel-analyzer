@@ -2100,6 +2100,78 @@ bool CallGraphPass::runCellResolution() {
   auto confirmLate = [&](const Obj &O) {
     if (O.lateArray) lateConfirmed.insert(lateKey(O));
   };
+  // LL: this solve's lazy-label candidates, per object and label (struct
+  // labels written at the object's offset 0, the census exclusions
+  // applied): how many writes, their sites, and for a copy its sources.
+  struct LLCand {
+    const StructType *ty = nullptr;
+    size_t n = 0;                                   // distinct sites
+    std::vector<const Instruction *> sites, direct; // every site; the typed writes' sites
+    std::set<const Instruction *> seen;
+    std::set<uint32_t> from;                        // a copy's source objects
+    std::string member;                             // a copy from inside a source: "member +k of T"
+  };
+  std::map<uint32_t, std::map<std::string, LLCand>> llCand;
+  std::map<uint32_t, std::string> llFirst; // a lazily labeled object's first arrival in this solve
+  uint32_t llCopySrc = UINT32_MAX;          // the byte copy being applied: its source object (a copy from its start)
+  const Instruction *llCopyAt = nullptr;    // and its instruction
+  std::string llCopyMember;                 // a copy from inside its source: the member it reads
+  size_t llMinted = 0;                      // objects minted with a decided label
+  size_t llSelfCopies = 0;                  // copies from a lazily labeled object into its own start
+  std::set<std::string> llSelfCopyAt;       // their sites (rows)
+  size_t llNoSite = 0;                      // notes from a step with no site of its own (a receiver level)
+  auto llKey = [&](const Obj &O) { return std::make_pair(NF.getValueForNode(O.origin), O.base); };
+  auto llNote = [&](uint32_t o, StructType *T) {
+    // A receiver level's step has no site (CV): its label is still a
+    // candidate, and the field edge's own step, which every fact the
+    // level reaches also takes, records the site. A candidate with no
+    // site at the decision has no direct key (an ERROR there).
+    const Instruction *I = llCopyAt ? llCopyAt : dyn_cast_or_null<Instruction>(curStepSite);
+    assert((I || !curStepSite) && "a lazy-label candidate at a site that is no instruction (LL)");
+    LLCand &c = llCand[o][typeLabel(T)];
+    c.ty = T;
+    if (!I) {
+      llNoSite++;
+      return;
+    }
+    const bool fresh = c.seen.insert(I).second;
+    c.n += fresh;
+    if (fresh) c.sites.push_back(I);
+    if (llCopyAt && llCopySrc == UINT32_MAX && c.member.empty()) c.member = llCopyMember;
+    if (llCopyAt && llCopySrc != UINT32_MAX) c.from.insert(llCopySrc);
+    else if (fresh) c.direct.push_back(I);
+  };
+  // The census exclusions: T is the layout L, a leading member of it, or
+  // has it as a leading member (by stripped struct name).
+  auto llPrefix1 = [&](Type *L, Type *T) {
+    const std::string tn = T && isa<StructType>(T) && cast<StructType>(T)->hasName()
+                               ? stripStructNameSuffix(cast<StructType>(T)->getName()).str() : std::string();
+    for (int d = 0; L && d < 16; d++) {
+      if (L == T) return true;
+      if (auto *LS = dyn_cast<StructType>(L); LS && LS->hasName() && !tn.empty() &&
+                                              stripStructNameSuffix(LS->getName()).str() == tn)
+        return true;
+      if (auto *ST2 = dyn_cast<StructType>(L)) L = ST2->getNumElements() ? ST2->getElementType(0) : nullptr;
+      else if (auto *AT = dyn_cast<ArrayType>(L)) L = AT->getElementType();
+      else return false;
+    }
+    return false;
+  };
+  // A later struct write at offset 0 of a lazily labeled object: its own
+  // label counts toward that label; a leading member either way is no
+  // candidate.
+  // A leading member's write is no candidate, but it is evidence for the
+  // candidates it leads (tier 1): kept per object as (struct, site).
+  std::map<uint32_t, std::vector<std::pair<StructType *, const Instruction *>>> llLead;
+  auto llLater = [&](uint32_t o, StructType *T) {
+    if (!llFirst.count(o) || !T || !objs[o].layout) return;
+    if (typeLabel(T) != objs[o].label && (llPrefix1(objs[o].layout, T) || llPrefix1(T, objs[o].layout))) {
+      if (const auto *I = llCopyAt ? llCopyAt : dyn_cast_or_null<Instruction>(curStepSite))
+        if (llLead[o].size() < 256) llLead[o].push_back({T, I});
+      return;
+    }
+    llNote(o, T);
+  };
   auto setExtent = [&](Obj &O, const Value *V) {
     applyExtent(O, ST.extentOf(O.layout, (uint64_t)(O.base + O.size), V), dyn_cast_or_null<CallBase>(V));
     applyLateArray(O);
@@ -2322,6 +2394,15 @@ bool CallGraphPass::runCellResolution() {
           heapContainerAmbiguous++; // the first-access label stays
         }
       }
+    // LL: a decided key takes its chosen label, whatever arrives first;
+    // the write that arrived is still a candidate of this solve.
+    StructType *const written = S;
+    if (!lazyLabelDecided.empty())
+      if (auto it = lazyLabelDecided.find(llKey(O)); it != lazyLabelDecided.end() && it->second.label != S) {
+        S = const_cast<StructType *>(it->second.label);
+        sz = (int64_t)DL.getTypeAllocSize(S);
+        llMinted++;
+      }
     // An anonymous struct names nothing (isAnonStruct): the object stays
     // unlabeled, its cells by byte offset.
     if (isAnonStruct(S)) {
@@ -2343,6 +2424,8 @@ bool CallGraphPass::runCellResolution() {
     O.size = sz;
     O.label = typeLabel(S);
     O.learnedLayout = true;
+    llFirst[o] = O.label;
+    llNote(o, written);
     if (tailLinkedUnlabeled.erase(o)) tailLinkedThenLabeled++;
     // Its identity: a copy's source's; a written step's pointer's declared
     // pointee (debug info) where the IR merged that struct away.
@@ -3075,6 +3158,11 @@ bool CallGraphPass::runCellResolution() {
                 uint32_t li) -> const std::vector<uint32_t> & {
     const auto key = std::make_tuple(o, eoff, li);
     const int64_t off = decOff(eoff);
+    // LL: every typed write at offset 0 of a lazily labeled object is a
+    // candidate at its own site, also when the step's result is memoized.
+    if (const LazyLabel &L0 = lazyLabels[li]; L0.ty && !L0.stride && !L0.arith && L0.writes && decOff(eoff) == 0 &&
+                                              objs[o].layout)
+      llLater(o, const_cast<StructType *>(L0.ty));
     auto [it, ins] = stepMemo.try_emplace(key);
     if (!ins) return it->second;
     std::vector<uint32_t> res;
@@ -5953,13 +6041,41 @@ bool CallGraphPass::runCellResolution() {
     // Effective type (C11 6.5p6): a copy into an object with no declared
     // type gives it the source's type. An unknown destination copied into
     // from its start learns the struct the source region starts with.
+    // A copy from the object into itself moves its own content (a member
+    // of its own layout): no candidate (counted).
+    if (od == os && objs[od].layout && b == 0 && llFirst.count(od)) {
+      llSelfCopies++;
+      if (at) llSelfCopyAt.insert(instLoc(at) + " (" + describe(objs[od]).substr(0, 120) + ")");
+    }
+    if (od != os && objs[od].layout && b == 0 && objs[os].layout && llFirst.count(od)) {
+      const Obj &Os = objs[os];
+      const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
+      if (StructType *S = structAt(Os.layout, fa, DL)) {
+        // From the source's start the copy carries the source's label (its
+        // key is the source's); from a member inside it, the copy is a
+        // direct write of the member's struct at its own site.
+        llCopyAt = at;
+        llCopySrc = fa == 0 ? os : UINT32_MAX;
+        llCopyMember = fa == 0 ? std::string() : "member +" + std::to_string(fa) + " of " + Os.label;
+        llLater(od, S);
+        llCopyAt = nullptr;
+        llCopySrc = UINT32_MAX;
+        llCopyMember.clear();
+      }
+    }
     if (!objs[od].layout && b == 0 && objs[os].layout) {
       const Obj &Os = objs[os];
       const int64_t fa = Os.repeats ? ((a % Os.size) + Os.size) % Os.size : a;
       if (StructType *S = structAt(Os.layout, fa, DL)) {
         layoutCopyFrom = (at ? instLoc(at) : std::string("?")) + " from " + describe(Os) + " +" + std::to_string(fa);
         layoutCopySrc = fa == 0 ? os : UINT32_MAX; // the source's identity, from its start
+        llCopyAt = at;
+        llCopySrc = fa == 0 ? os : UINT32_MAX; // as above
+        llCopyMember = fa == 0 ? std::string() : "member +" + std::to_string(fa) + " of " + Os.label;
         requestLayout(od, S);
+        llCopyAt = nullptr;
+        llCopySrc = UINT32_MAX;
+        llCopyMember.clear();
         layoutCopyFrom.clear();
         layoutCopySrc = UINT32_MAX;
         if (objs[od].layout) effectiveTyped++;
@@ -7726,13 +7842,349 @@ bool CallGraphPass::runCellResolution() {
   const double solveSecs =
       std::chrono::duration<double>(Clock::now() - tSolve).count();
 
+  // LL (plan 3.95): the label of each lazily labeled object with several
+  // candidates. Tier 1, own flow: a candidate whose written pointer
+  // reaches one of the origin's result values (the allocation or hand-out,
+  // and each call result receiving it by return along the wrapper walk)
+  // by value flow: copies, casts, zero GEPs, phis and selects, a promoted
+  // pointer slot's load standing for the writes that reach it (rule S),
+  // never another load. Exactly one own-flow label is chosen; several are
+  // ordered by program order, none
+  // leaves program order among all. Program order (moduleOrderLess):
+  // globals before instructions, each by module position (a function's
+  // place in the module list, then the instruction's). A label's key is
+  // its least direct key over the backward closure of the copy graph: a
+  // typed write's site, or the origin of a copy source not lazily labeled
+  // with it. A stopped solve decides nothing.
+  watchdog.phase("lazy labels");
+  using OrdPos = std::array<unsigned, 4>;
+  std::map<const Function *, std::pair<unsigned, unsigned>> llFnPos;
+  std::map<const GlobalVariable *, std::pair<unsigned, unsigned>> llGlobPos;
+  std::map<std::string, const Function *> llFnByName;
+  {
+    unsigned mi = 0;
+    for (auto &[M, _] : Ctx->Modules) {
+      unsigned fi = 0, gi = 0;
+      for (const Function &F : *M) {
+        llFnPos[&F] = {mi, fi++};
+        if (!F.isDeclaration()) llFnByName.try_emplace(F.getName().str(), &F);
+      }
+      for (const GlobalVariable &GV : M->globals()) llGlobPos[&GV] = {mi, gi++};
+      mi++;
+    }
+  }
+  std::map<const Function *, std::map<const Instruction *, unsigned>> llInstPos;
+  auto ordPos = [&](const Value *V) -> OrdPos {
+    if (const auto *I = dyn_cast<Instruction>(V)) {
+      auto &P = llInstPos[I->getFunction()];
+      if (P.empty()) {
+        unsigned k = 0;
+        for (const Instruction &J : instructions(*I->getFunction())) P[&J] = k++;
+      }
+      const auto fp = llFnPos.at(I->getFunction());
+      return {1, fp.first, fp.second, P.at(I)};
+    }
+    const auto *GV = dyn_cast<GlobalVariable>(V);
+    assert(GV && "a lazy-label key that is neither an instruction nor a global (LL)");
+    const auto gp = llGlobPos.at(GV);
+    return {0, gp.first, gp.second, 0};
+  };
+  auto moduleOrderLess = [&](const Value *A, const Value *B) { return ordPos(A) < ordPos(B); };
+  // The values a pointer comes from by value flow inside its function; a
+  // load other than a followed promoted slot's stops (byLoad).
+  auto llFlow = [&](const Value *V, bool viaSlots, std::set<const Value *> &out, bool &byLoad) {
+    std::vector<const Value *> wk{V};
+    while (!wk.empty()) {
+      const Value *X = wk.back();
+      wk.pop_back();
+      if (!X || !out.insert(X).second) continue;
+      if (isa<BitCastInst>(X) || isa<AddrSpaceCastInst>(X)) wk.push_back(cast<CastInst>(X)->getOperand(0));
+      else if (const auto *GEP = dyn_cast<GetElementPtrInst>(X)) {
+        if (GEP->hasAllZeroIndices()) wk.push_back(GEP->getPointerOperand());
+      } else if (const auto *PN = dyn_cast<PHINode>(X)) {
+        for (const Value *In : PN->incoming_values()) wk.push_back(In);
+      } else if (const auto *SL = dyn_cast<SelectInst>(X)) {
+        wk.push_back(SL->getTrueValue());
+        wk.push_back(SL->getFalseValue());
+      } else if (const auto *LI = dyn_cast<LoadInst>(X)) {
+        auto it = viaSlots ? promotedSlotWrites.find(LI) : promotedSlotWrites.end();
+        if (it == promotedSlotWrites.end()) {
+          byLoad = true;
+          continue;
+        }
+        for (const Value *Wv : it->second) wk.push_back(Wv);
+      }
+    }
+  };
+  // The pointer a candidate's site writes through.
+  auto llBase = [&](const Instruction *I) -> const Value * {
+    if (const auto *GEP = dyn_cast<GetElementPtrInst>(I)) return GEP->getPointerOperand();
+    if (const auto *SI = dyn_cast<StoreInst>(I)) return SI->getPointerOperand();
+    if (const auto *LI = dyn_cast<LoadInst>(I)) return LI->getPointerOperand();
+    if (const auto *CB = dyn_cast<CallBase>(I)) return CB->arg_size() ? CB->getArgOperand(0) : nullptr;
+    return nullptr;
+  };
+  // Own flow: the origin's result values, the allocation (or hand-out)
+  // and every call result that receives it by return along the wrapper
+  // walk (the fresh wrappers on the origin call's return path, as the
+  // per-caller mint walks them: newchunk's result -> new_stmt's %call ->
+  // the origin call). A candidate site is own flow when the pointer it
+  // writes through reaches one of them by value flow.
+  std::map<std::pair<const Function *, bool>, std::set<const Value *>> llRetSrc;
+  std::map<std::pair<uint32_t, bool>, std::set<const Value *>> llOwnVals;
+  size_t llLoadRejected = 0;
+  auto ownValues = [&](uint32_t o, bool viaSlots) -> const std::set<const Value *> & {
+    auto key = std::make_pair(o, viaSlots);
+    if (auto it = llOwnVals.find(key); it != llOwnVals.end()) return it->second;
+    std::set<const Value *> V;
+    const auto *OI = dyn_cast_or_null<Instruction>(NF.getValueForNode(objs[o].origin));
+    if (OI) {
+      V.insert(OI);
+      std::set<const Function *> done;
+      std::vector<const Function *> wk;
+      if (const auto *CB = dyn_cast<CallBase>(OI))
+        if (const Function *F = CB->getCalledFunction(); F && !F->isDeclaration()) wk.push_back(F);
+      while (!wk.empty()) {
+        const Function *G2 = wk.back();
+        wk.pop_back();
+        if (!done.insert(G2).second) continue;
+        auto rk = std::make_pair(G2, viaSlots);
+        if (!llRetSrc.count(rk)) {
+          std::set<const Value *> rs;
+          bool bl = false;
+          for (const Instruction &J : instructions(*G2))
+            if (const auto *RI = dyn_cast<ReturnInst>(&J); RI && RI->getReturnValue())
+              llFlow(RI->getReturnValue(), viaSlots, rs, bl);
+          llRetSrc[rk] = std::move(rs);
+        }
+        for (const Value *R : llRetSrc.at(rk)) {
+          const auto *RC = dyn_cast<CallBase>(R);
+          const auto *RI = dyn_cast<Instruction>(R);
+          if (!RC && !(RI && poolCarves.count(RI))) continue; // a call result, or a pool's hand-out
+          V.insert(R);
+          // On into a callee on G2's return path (the confirmer's walk).
+          if (RC)
+            if (const Function *H = RC->getCalledFunction(); H && !H->isDeclaration())
+              if (auto cit = confirmPromotedRet.find(G2->getName().str());
+                  cit != confirmPromotedRet.end() && cit->second.count(H->getName().str()))
+                wk.push_back(H);
+        }
+      }
+    }
+    return llOwnVals[key] = std::move(V);
+  };
+  // The own-flow value a site reaches, or none.
+  auto llOwn = [&](uint32_t o, const Instruction *I, bool viaSlots) -> const Value * {
+    const Value *B = llBase(I);
+    if (!B) return nullptr;
+    const std::set<const Value *> &V = ownValues(o, viaSlots);
+    std::set<const Value *> src;
+    bool byLoad = false;
+    llFlow(B, viaSlots, src, byLoad);
+    for (const Value *X : src)
+      if (V.count(X)) return X;
+    if (byLoad && viaSlots) {
+      llLoadRejected++;
+      if (VerboseLevel >= 3)
+        CG_LOG("Cells: LL own flow rejected by a load: " << describe(objs[o]).substr(0, 140) << " at " << instLoc(I) << "\n");
+    }
+    return nullptr;
+  };
+  // The IR access path the graph folds: an all-zero GEP of struct T
+  // written through is a typed write of T at its pointer's offset 0 that
+  // makes no step (the field node folds into its base). Interim until the
+  // typed access at offset 0 labels like any step (Z), tier 1 reads it from
+  // the IR; it selects among candidates, it adds none. -O3 reads GEPs only.
+  auto llWritten = [&](const Value *V) {
+    SmallVector<const Value *, 8> work{V};
+    SmallPtrSet<const Value *, 16> seen;
+    while (!work.empty() && seen.size() < 64) {
+      const Value *X = work.pop_back_val();
+      if (!seen.insert(X).second) continue;
+      for (const User *U : X->users()) {
+        if (const auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == X) return true;
+          continue;
+        }
+        if (const auto *MT = dyn_cast<MemTransferInst>(U)) {
+          if (MT->getRawDest() == X) return true;
+          continue;
+        }
+        if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) || isa<AddrSpaceCastInst>(U)) work.push_back(U);
+      }
+    }
+    return false;
+  };
+  std::map<const Function *, std::vector<const GetElementPtrInst *>> llZeroGeps;
+  auto zeroGepsOf = [&](const Function *F) -> const std::vector<const GetElementPtrInst *> & {
+    auto [it, ins] = llZeroGeps.try_emplace(F);
+    if (ins)
+      for (const Instruction &J : instructions(*F))
+        if (const auto *GEP = dyn_cast<GetElementPtrInst>(&J);
+            GEP && GEP->hasAllZeroIndices() && isa<StructType>(GEP->getSourceElementType()) && llWritten(GEP))
+          it->second.push_back(GEP);
+    return it->second;
+  };
+  size_t llLeadMisfit = 0;
+  struct LLKey { const Value *at = nullptr; std::string desc; size_t copies = 0; };
+  size_t llNonLazyKeys = 0;
+  // The least direct key of label lab over the backward copy closure of o.
+  auto llClosureKey = [&](uint32_t o, const std::string &lab, std::vector<uint32_t> &closure) -> LLKey {
+    LLKey best;
+    auto offer = [&](const Value *V, const std::string &d, size_t n) {
+      if (!best.at || moduleOrderLess(V, best.at)) best = {V, d, n};
+    };
+    std::map<uint32_t, size_t> depth{{o, 0}};
+    std::deque<uint32_t> q{o};
+    while (!q.empty()) {
+      const uint32_t x = q.front();
+      q.pop_front();
+      const size_t d = depth.at(x);
+      closure.push_back(x);
+      const LLCand *c = nullptr;
+      if (auto oit = llCand.find(x); oit != llCand.end())
+        if (auto lit = oit->second.find(lab); lit != oit->second.end()) c = &lit->second;
+      if (!c) {
+        // Not lazily labeled with lab: its labeling site, the origin.
+        const Value *OV = NF.getValueForNode(objs[x].origin);
+        if (const auto *GV = dyn_cast_or_null<GlobalVariable>(OV)) {
+          offer(GV, "global " + GV->getName().str(), d);
+          llNonLazyKeys++;
+        } else if (const auto *OI = dyn_cast_or_null<Instruction>(OV)) {
+          const auto *CB = dyn_cast<CallBase>(OI);
+          const Function *CF = CB ? CB->getCalledFunction() : nullptr;
+          offer(OI, "origin " + (CF ? CF->getName().str() : std::string(OI->getOpcodeName())) + " at " + instLoc(OI), d);
+          llNonLazyKeys++;
+        }
+        continue;
+      }
+      for (const Instruction *I : c->direct) offer(I, "write at " + instLoc(I), d);
+      for (uint32_t sx : c->from)
+        if (depth.try_emplace(sx, d + 1).second) q.push_back(sx);
+    }
+    return best;
+  };
+  struct LLDec { std::pair<const Value *, int64_t> key; const StructType *ty; std::string first, chosen, site; };
+  std::vector<LLDec> llNew;
+  std::vector<std::pair<std::pair<const Value *, int64_t>, std::string>> llRows; // (key, row) per object
+  size_t llMulti = 0, llOne = 0, llSev = 0, llNone = 0, llOneS = 0, llSevS = 0, llNoneS = 0, llHopOnly = 0, llCopyKeyed = 0;
+  bool llError = false;
+  for (auto &[o, m] : llCand) {
+    if (m.size() < 2) continue;
+    llMulti++;
+    std::vector<std::string> own, ownStrict;
+    std::map<std::string, std::string> ownOf; // label -> "via <function> <value>: <evidence>"
+    // The zero-GEP writes in the functions of the object's own-flow values.
+    std::vector<const GetElementPtrInst *> zg;
+    {
+      std::set<const Function *> fs;
+      for (const Value *V : ownValues(o, true))
+        if (const auto *VI = dyn_cast<Instruction>(V)) fs.insert(VI->getFunction());
+      for (const Function *F : fs)
+        for (const GetElementPtrInst *GEP : zeroGepsOf(F)) zg.push_back(GEP);
+    }
+    std::vector<bool> leadFits(llLead.count(o) ? llLead.at(o).size() : 0, false);
+    for (auto &[lab, c] : m) {
+      bool st = false;
+      const Value *lv = nullptr;
+      std::string ev;
+      auto offer = [&](const Instruction *I, const std::string &kind) {
+        st = st || llOwn(o, I, false);
+        if (!lv)
+          if ((lv = llOwn(o, I, true))) ev = kind + " at " + instLoc(I);
+      };
+      for (const Instruction *I : c.sites) offer(I, "write");
+      // A write of a leading member of the label (at the label's offset 0,
+      // the object's start) in own flow is the label's evidence too.
+      if (auto lit = llLead.find(o); lit != llLead.end())
+        for (size_t q = 0; q < lit->second.size(); q++)
+          if (llPrefix1(const_cast<StructType *>(c.ty), lit->second[q].first)) {
+            leadFits[q] = true;
+            offer(lit->second[q].second, "leading-member write of " + typeLabel(lit->second[q].first));
+          }
+      for (const GetElementPtrInst *GEP : zg)
+        if (auto *ZT = cast<StructType>(GEP->getSourceElementType()); llPrefix1(const_cast<StructType *>(c.ty), ZT))
+          offer(GEP, "zero-GEP write of " + typeLabel(ZT));
+      if (lv) {
+        own.push_back(lab);
+        std::string vs;
+        raw_string_ostream os(vs);
+        lv->printAsOperand(os, false);
+        const auto *VI = dyn_cast<Instruction>(lv);
+        ownOf[lab] = "via " + (VI ? VI->getFunction()->getName().str() + " " : std::string()) + os.str() + ": " + ev;
+      }
+      if (st) ownStrict.push_back(lab);
+      llHopOnly += lv && !st;
+    }
+    for (bool f : leadFits) llLeadMisfit += !f;
+    (own.size() == 1 ? llOne : own.size() > 1 ? llSev : llNone)++;
+    (ownStrict.size() == 1 ? llOneS : ownStrict.size() > 1 ? llSevS : llNoneS)++;
+    std::vector<std::string> pool = own;
+    std::string tier = own.size() == 1 ? "own flow " + ownOf.at(own[0]) : own.size() > 1 ? "program order among own-flow labels" : "program order";
+    if (pool.empty())
+      for (auto &[lab, c] : m) pool.push_back(lab);
+    const std::string *best = nullptr;
+    LLKey bk;
+    std::map<std::string, LLKey> keyOf;
+    for (const std::string &lab : pool) {
+      std::vector<uint32_t> closure;
+      const LLKey k = llClosureKey(o, lab, closure);
+      if (!k.at && stoppedAt) continue; // a stopped solve decides nothing; its sites may not have arrived
+      if (!k.at) {
+        std::string cl;
+        for (uint32_t x : closure) cl += " " + describe(objs[x]).substr(0, 100) + ";";
+        errs() << "ERROR: --cfl-cells: a lazy-label candidate (LL) has no direct key in its copy closure: "
+               << describe(objs[o]) << " label " << lab << "; closure:" << cl << "\n";
+        llError = true;
+        continue;
+      }
+      keyOf[lab] = k;
+      if (!best || moduleOrderLess(k.at, bk.at)) best = &lab, bk = k;
+    }
+    if (!best) continue;
+    for (auto &[lab, k] : keyOf)
+      if (lab != *best && k.at == bk.at && !stoppedAt) {
+        errs() << "ERROR: --cfl-cells: a lazy-label tie (LL): one instruction writes both " << *best << " and " << lab
+               << " at offset 0 of " << describe(objs[o]) << " (" << bk.desc << ")\n";
+        llError = true;
+      }
+    llCopyKeyed += bk.copies > 0;
+    const std::pair<const Value *, int64_t> key = llKey(objs[o]);
+    auto dit = lazyLabelDecided.find(key);
+    const std::string first = dit != lazyLabelDecided.end() ? dit->second.firstArrival : llFirst.at(o);
+    std::string r = "LL label by order: " + describe(objs[o]).substr(0, 160) + " chosen " + *best + " (" + tier + ": " +
+                    bk.desc + (bk.copies ? " (through " + std::to_string(bk.copies) + " copies)" : std::string()) + ")";
+    if (*best == first) r += ", the first arrival";
+    else r += " over first-arrival " + first;
+    r += "; candidates";
+    for (auto &[lab, c] : m) {
+      const Instruction *f = nullptr;
+      for (const Instruction *I : c.sites)
+        if (!f || moduleOrderLess(I, f)) f = I;
+      r += " " + lab + " x" + std::to_string(c.n) + " @" + (f ? instLoc(f) : std::string("no site")) + (ownOf.count(lab) ? " (own flow " + ownOf.at(lab) + ")" : "") +
+           (c.from.empty() ? "" : " (copied)") + (c.member.empty() ? "" : " (copy of " + c.member + ")") + ",";
+    }
+    r.pop_back();
+    if (stoppedAt) r += " (stopped solve: not decided)";
+    llRows.push_back({key, r});
+    if (!stoppedAt && *best != objs[o].label)
+      llNew.push_back({key, m.at(*best).ty, objs[o].label, *best, describe(objs[o]).substr(0, 160)});
+  }
+  if (llError) exit(1);
+  CG_LOG("Cells: lazy labels (LL): " << llFirst.size() << " lazily labeled objects, " << llMulti
+         << " with several candidates: " << llOne << " one own-flow label, " << llSev << " several, " << llNone
+         << " none (strict, no promoted slot: " << llOneS << "/" << llSevS << "/" << llNoneS << "; " << llHopOnly
+         << " own-flow labels only through a promoted slot); " << llCopyKeyed << " chosen through copies, "
+         << llNonLazyKeys << " keys from a source not lazily labeled, " << llLoadRejected
+         << " own-flow sites rejected by a load, " << llLeadMisfit << " leading-member writes that fit no candidate, " << llSelfCopies << " copies from the object into its own start (no candidate), " << llNoSite << " notes from a receiver level (no site of their own); " << llNew.size() << " decided by this solve, minted with a decided label "
+         << llMinted << (stoppedAt ? " (stopped solve: not decided)" : "") << "\n");
   watchdog.phase("answers");
   // ---- Answers ----
   size_t resolved = 0, totalTargets = 0, newPairs = 0, typeRej = 0, heldNotDerived = 0;
   // LA: a solve that decided an array late kept a tail link the evidence
   // withdrew; it is discarded: its targets are not wired, and the next
   // iteration solves with those objects minted as arrays.
-  const bool lateDiscard = !stoppedAt && !lateArrayNew.empty();
+  const bool lateDiscard = !stoppedAt && (!lateArrayNew.empty() || !llNew.empty());
   size_t lateUnwired = 0;
   // In IR order, targets in IR order: the wiring order sets the next
   // iteration's edge order.
@@ -7780,9 +8232,12 @@ bool CallGraphPass::runCellResolution() {
     for (const Function *F : targetsSorted)
       if (wireResolvedCallee(CS, F)) newPairs++;
   }
-  if (lateDiscard)
+  if (lateDiscard && !lateArrayNew.empty())
     CG_LOG("Cells: late arrays (LA): " << lateArrayNew.size() << " decided by this solve, which is discarded: "
            << lateUnwired << " targets not wired; the next iteration mints them as arrays\n");
+  if (lateDiscard && !llNew.empty())
+    CG_LOG("Cells: lazy labels (LL): " << llNew.size() << " decided by this solve, which is discarded: "
+           << lateUnwired << " targets not wired; the next iteration mints them with the chosen labels\n");
   if (!poolWithdrawnAtSolve.empty())
     CG_LOG("Cells: pairs held from earlier iterations that this solve does not derive: " << heldNotDerived
            << " (" << poolWithdrawnAtSolve.size() << " pools withdrawn; kept: extra targets, never fewer)\n");
@@ -9974,7 +10429,7 @@ bool CallGraphPass::runCellResolution() {
     if (r.confirmed >= 0) s += ", confirmed in iteration " + std::to_string(r.confirmed);
     return s;
   };
-  if (!stoppedAt && lateNew == 0 && newPairs == 0 && newlyWithdrawn.empty()) {
+  if (!stoppedAt && lateNew == 0 && llNew.empty() && newPairs == 0 && newlyWithdrawn.empty()) {
     size_t unconfirmed = 0;
     for (auto &[k, r] : lateArrayDecided) {
       if (lateConfirmed.count(k)) {
@@ -9999,6 +10454,86 @@ bool CallGraphPass::runCellResolution() {
            << "; extra iterations " << lateArrayIterations << "\n");
     for (const std::string &r : rows) CG_LOG("Cells:   " << r << "\n");
     for (const std::string &r : lateArrayRelabeled) CG_LOG("Cells:   " << r << "\n");
+  }
+  // LL: this solve's decisions apply from the next iteration; a key
+  // decided more than 8 times is refused. The final iteration must see
+  // each decided key's object labeled with the chosen label and that
+  // label written at its offset 0 again, or no struct written there at
+  // all: a decided label is applied only when a write arrives, so a solve
+  // no candidate reaches does not rest on the decision (withdrawn, a row).
+  // Another label arriving without the chosen one is refused.
+  const size_t llNewN = llNew.size();
+  for (const LLDec &d : llNew) {
+    auto [it, fresh] = lazyLabelDecided.try_emplace(d.key);
+    LazyLabelRow &R = it->second;
+    lazyLabelRelabeled.push_back("LL relabeled in iteration " + std::to_string(iteration + 1) + ": " + d.site + " " +
+                                 (fresh ? d.first : typeLabel(const_cast<StructType *>(R.label))) + " -> " + d.chosen);
+    if (fresh) R.firstArrival = d.first;
+    R.label = d.ty;
+    R.object = d.site;
+    R.seq.push_back({iteration, d.chosen});
+    if (R.seq.size() > 8) {
+      std::string q;
+      for (auto &[i, l] : R.seq) q += " (" + std::to_string(i) + ", " + l + ")";
+      errs() << "ERROR: --cfl-cells: a lazy label (LL) decided more than 8 times: " << d.site << "; decisions" << q << "\n";
+      exit(1);
+    }
+  }
+  if (!stoppedAt && lateNew == 0 && llNewN == 0 && newPairs == 0 && newlyWithdrawn.empty()) {
+    size_t unconfirmed = 0;
+    for (auto &[k, R] : lazyLabelDecided) {
+      const std::string lab = typeLabel(const_cast<StructType *>(R.label));
+      bool met = false, reached = false, bytes = false;
+      for (auto &[o, f] : llFirst)
+        if (llKey(objs[o]) == k) {
+          reached = true;
+          if (objs[o].label == lab)
+            if (auto cit = llCand.find(o); cit != llCand.end() && cit->second.count(lab)) met = true;
+        }
+      for (uint32_t o = 0; !reached && o < objs.size(); o++)
+        if (objs[o].origin != UINT32_MAX && objs[o].byteAccessed && llKey(objs[o]) == k) bytes = true;
+      if (met) {
+        R.confirmed = iteration;
+        continue;
+      }
+      if (!reached) {
+        R.withdrawn = iteration;
+        // Used as bytes first (requestLayout keeps that use): the struct
+        // writes that arrive are rule (b) rows, not candidates.
+        const std::string dec = " (decided " + lab + " over " + R.firstArrival + " in iteration " +
+                                std::to_string(R.seq.back().first) + ")";
+        lazyLabelWithdrawn.push_back(
+            bytes ? "LL decision withdrawn: " + R.object + " is used as bytes in iteration " + std::to_string(iteration) +
+                        ", its struct writes are rule (b) rows" + dec
+                  : "LL decision withdrawn: no candidate reaches " + R.object + " in iteration " +
+                        std::to_string(iteration) + dec);
+        llWithdrawnBytes += bytes;
+        continue;
+      }
+      errs() << "ERROR: --cfl-cells: a lazy-label decision (LL) is not confirmed by the final iteration (the chosen "
+                "label's write no longer reaches the object, another label does): "
+             << R.object << " (" << (isa<Instruction>(k.first) ? instLoc(cast<Instruction>(k.first)) : std::string("global"))
+             << ") " << R.seq.back().second << " decided in iteration " << R.seq.back().first << " over first-arrival "
+             << R.firstArrival << "\n";
+      unconfirmed++;
+    }
+    if (unconfirmed) exit(1);
+  }
+  auto llRowText = [&](const std::pair<const Value *, int64_t> &k, const std::string &r) {
+    auto it = lazyLabelDecided.find(k);
+    if (it == lazyLabelDecided.end()) return r;
+    std::string s2 = r + "; decided in iteration " + std::to_string(it->second.seq.back().first);
+    if (it->second.confirmed >= 0) s2 += ", confirmed in iteration " + std::to_string(it->second.confirmed);
+    return s2;
+  };
+  {
+    std::vector<std::string> rows;
+    for (auto &[k, r] : llRows) rows.push_back(llRowText(k, r));
+    std::sort(rows.begin(), rows.end());
+    for (const std::string &r : rows) CG_LOG("Cells:   " << r << "\n");
+    for (const std::string &r : lazyLabelRelabeled) CG_LOG("Cells:   " << r << "\n");
+    for (const std::string &r : lazyLabelWithdrawn) CG_LOG("Cells:   " << r << "\n");
+    for (const std::string &r : llSelfCopyAt) CG_LOG("Cells:   LL self-copy at " << r << ": not a candidate\n");
   }
   if (!CFLRuleReport.empty()) {
     std::error_code EC;
@@ -10465,6 +11000,22 @@ bool CallGraphPass::runCellResolution() {
          << ", confirmed " << confirmed << "/" << lateArrayDecided.size() << "\n";
     }
     {
+      // LL: the label choice of each lazily labeled object with several
+      // candidates, and every relabel.
+      std::vector<std::string> rows;
+      for (auto &[k, r] : llRows) rows.push_back(llRowText(k, r));
+      std::sort(rows.begin(), rows.end());
+      for (const std::string &r : rows) RO << r << "\n";
+      for (const std::string &r : lazyLabelRelabeled) RO << r << "\n";
+      for (const std::string &r : lazyLabelWithdrawn) RO << r << "\n";
+      for (const std::string &r : llSelfCopyAt) RO << "LL self-copy at " << r << ": not a candidate\n";
+      RO << "SUMMARY lazy-label " << llMulti << " objects with several candidates, " << lazyLabelDecided.size()
+         << " relabeled, extra iterations " << lazyLabelIterations
+         << ", " << lazyLabelWithdrawn.size() << " decided keys reached by no candidate in the final solve"
+         << (llWithdrawnBytes ? " (" + std::to_string(llWithdrawnBytes) + " of them used as bytes)" : std::string())
+         << (stoppedAt ? " (stopped solve: not decided)" : "") << "\n";
+    }
+    {
       std::string k;
       for (auto &[n, c] : byKind) k += ", " + n + " " + std::to_string(c);
       RO << "SUMMARY outside " << nComplete << " indirect calls complete, " << nDepend
@@ -10719,11 +11270,19 @@ bool CallGraphPass::runCellResolution() {
     exit(0);
   }
 
-  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0 && lateNew == 0) finishCollect();
+  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0 && lateNew == 0 && llNewN == 0) finishCollect();
   // A withdrawn pool's carves and handle stores are rebuilt as ordinary
   // code by the next iteration, as are late arrays (LA) minted as arrays.
-  if (newPairs == 0 && newlyWithdrawn.empty() && lateNew == 0) return false;
-  if (newPairs == 0 && newlyWithdrawn.empty()) lateArrayIterations++;
+  if (newPairs == 0 && newlyWithdrawn.empty() && lateNew == 0 && llNewN == 0) return false;
+  if (newPairs == 0 && newlyWithdrawn.empty()) {
+    if (lateNew) lateArrayIterations++;
+    if (llNewN) lazyLabelIterations++; // one extra iteration serves both
+  }
+  if (llNewN && iteration + 1 >= (int)CFLFlowsToMaxIters) {
+    errs() << "ERROR: --cfl-cells: the iteration cap (" << CFLFlowsToMaxIters.getValue() << ") leaves " << llNewN
+           << " lazy-label decisions (LL) unapplied; raise --cfl-flows-to-max-iters\n";
+    exit(1);
+  }
   if (lateNew && iteration + 1 >= (int)CFLFlowsToMaxIters) {
     errs() << "ERROR: --cfl-cells: the iteration cap (" << CFLFlowsToMaxIters.getValue() << ") leaves " << lateNew
            << " late array decisions (LA) unapplied; the solve would keep a tail link the evidence withdrew; raise "

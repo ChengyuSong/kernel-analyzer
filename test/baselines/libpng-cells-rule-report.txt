@@ -27,6 +27,7 @@ PD pointer difference carries no facts: sub of two ptrtoint at png_handle_sPLT p
 SUMMARY pd 7 pointer differences carry no facts (sub of two ptrtoint)
 SUMMARY slots promoted 637 (loads 4791, stores 1165): pairs all-to-all 21489 -> reaching 5599, slots cut 97, loads reached from entry 0 (rule S)
 SUMMARY late-array 0 objects, extra iterations 0, confirmed 0/0
+SUMMARY lazy-label 0 objects with several candidates, 0 relabeled, extra iterations 0, 0 decided keys reached by no candidate in the final solve
 SUMMARY outside 0 indirect calls complete, 9 depend on an outside boundary (--cfl-outside=pure), bodiless call 9, outside indirect call 2
 SUMMARY pwc 63 cycles with offset (typed 5: walks 0, counters 5 retired by the integer-name test and 0 kept on the int-launder fallback; untyped 58, mixed 0; through a C++ class step 0); indirect-call width downstream of the walks: 0 of 9 targets
 PWC pwc period 2 (edge gcd 1) over bytes at png_do_strip_channel pngtrans.c:541

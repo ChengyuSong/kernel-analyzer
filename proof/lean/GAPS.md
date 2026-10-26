@@ -4094,3 +4094,33 @@ own, and on tcpdump 46,449 node facts (collapse off; 29,186 on) in live
 cells outside their object's table; on MD (1052f95) none (every fact in a
 cell outside a table is a merged fact id whose representative is in it). Case: t_cells_refold_mint.c. Not mechanized. Checked by executions;
 see the commit's gates.
+
+
+## Walk flags are settled before facts cross (CellSolver cycle passes, Fable 2026-10-26, WF)
+
+A field edge on a cycle with offset is a walk: a fact crossing it yields
+the object's cells at every offset the walk reaches (the any-offset cell
+for a byte step on an unlabeled object), not one address. The cycle is
+often closed only by hub edges made during the solve, so the flag is set
+by a cycle pass after facts moved: by a periodic pass (collapse on, every
+2^18 pops once the edge set grew) or by the final pass on the drained
+worklist. A fact that crossed the edge as a step before stays as the
+step's cell; the pass re-presents the source's facts under the flag, but
+retracts nothing. So the result depended on the pass schedule: on tcpdump
+collapse off held 4,982 node facts (byte cells +0 and +1 of four period-2
+byte objects at nodes holding the same object's any-offset cell) that
+collapse on did not, because only collapse on runs the periodic pass that
+flagged isoclns_print's p+1 (the encapsulation cycle, 961 nodes) before the
+buffers' facts arrived (s3/dR2d..f). WF: a solve starts from the walk
+flags the previous solve's final pass found (by field edge, lazyFEdges
+index); a seeded flag is kept by every pass (refined by gcd where a pass
+finds its cycle) and never cleared; a solve whose final flags differ from
+its seed is redone from them, with the LL/LA redo (one iteration serves
+all). Statement: at the fixpoint, every fact crossing an edge flagged at
+the fixpoint crosses it under that flag from the solve's start, so the
+result does not depend on which pass first found a cycle (asserted: the
+final pass never drops or coarsens a seeded flag). Answers are unchanged
+on every gate program; the redone solves move the stop pins. Cases:
+t_cells_walk_flags.c and t_cells_walk_flags_off.c (the same program with
+collapse off). Not mechanized. Checked by executions; see the commit's
+gates.

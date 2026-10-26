@@ -109,6 +109,7 @@ struct FieldEdge {
   uint32_t dst, li;
   int64_t walk; // 0: not on a cycle with offset
   const llvm::Value *site = nullptr; // the step's own IR value (lazyFEdges), never its class representative's
+  uint32_t lfe = UINT32_MAX;         // its lazyFEdges index (WF: the walk seed's key)
 };
 // A step recorded on a fact, replayed when its cell merges: the
 // destination node and label (dst << 32 | li) and the step's site.
@@ -1058,13 +1059,20 @@ bool CallGraphPass::runCellResolution() {
     auto lit = snapLen.find(at);
     copies.push_back({a, b, lit == snapLen.end() ? len : lit->second, at});
   }
-  for (auto &[f, t, li, site] : lazyFEdges) {
+  // WF: the walk flags this solve starts from (the previous solve's final
+  // flags; none in the first).
+  walkSeed.resize(lazyFEdges.size(), 0);
+  size_t walkSeeded = 0;
+  for (size_t k = 0; k < lazyFEdges.size(); k++) {
+    auto &[f, t, li, site] = lazyFEdges[k];
     const uint32_t a = canon(f), b = canon(t);
     inGraph[a] = inGraph[b] = 1;
     assert(!isHub[b] && "a field address is never a dereference");
     if (snapCut.count(b)) continue; // a snapshot holder's element-region step
-    if (a != b || lazyLabels[li].off != 0 || lazyLabels[li].stride != 0)
-      fieldOut[a].push_back({b, li, 0, site});
+    if (a != b || lazyLabels[li].off != 0 || lazyLabels[li].stride != 0) {
+      fieldOut[a].push_back({b, li, walkSeed[k], site, (uint32_t)k});
+      walkSeeded += walkSeed[k] != 0;
+    }
   }
 
   // Watched stores (plan 3.51 ruling B): by the solver node of the store's
@@ -1176,10 +1184,20 @@ bool CallGraphPass::runCellResolution() {
   // hub edges added so far).
   size_t collapses = 0, collapsedNodes = 0, walkEdges = 0;
   // Field edges whose walk flag (or its step) a cycle pass changed: their
-  // sources' facts are re-presented, so every fact crosses the edge under
-  // its final flag whatever pass set it (the schedule decides nothing).
+  // sources' facts are re-presented under the new flag. What crossed the
+  // edge as a step before stays, so a flag set during the solve makes the
+  // result depend on the pass schedule; WF redoes such a solve from the
+  // flags it ended with (walkSeed).
   std::vector<uint32_t> walkChangedSrc;
   size_t walkReflags = 0, finalPasses = 0;
+  // WF: the pass being run (its kind and pop, for the redo causes), and
+  // the flag the last final pass found for each lazyFEdges index.
+  const char *cyclePassKind = "static";
+  uint64_t cyclePassPop = 0;
+  bool finalCyclePass = false;
+  std::vector<int64_t> walkFinal;
+  struct WalkSet { size_t comp; int64_t g; const char *pass; uint64_t pop; };
+  std::map<uint32_t, WalkSet> walkFirstSet; // lfe -> the first pass that set it beyond the seed
   double collapseSecs = 0;
   std::vector<std::vector<uint32_t>> bigCycles; // the largest per collapse (report)
   // Edges inside each big cycle, recorded before the merge erases them.
@@ -1337,7 +1355,13 @@ bool CallGraphPass::runCellResolution() {
             if (it == periodRow.end()) periodRow.emplace(comp[u], std::make_pair(I, e.li));
             else if (I && (!it->second.first || irOrderLess(I, it->second.first))) it->second = {I, e.li};
           }
+          // WF: a seeded flag (the previous solve's final pass found the
+          // edge on a cycle) stays until this solve's edges close the cycle;
+          // a cycle found here refines it by gcd.
+          const int64_t seed = e.lfe != UINT32_MAX ? walkSeed[e.lfe] : 0;
           if (g == 0) { // off every cycle, or on an offset-free one
+            if (finalCyclePass && e.lfe != UINT32_MAX) walkFinal[e.lfe] = 0;
+            if (seed) continue;
             if (e.walk) {
               e.walk = 0;
               walkChangedSrc.push_back(u), walkReflags++;
@@ -1345,11 +1369,16 @@ bool CallGraphPass::runCellResolution() {
             }
             continue;
           }
-          if (e.walk != g) walkChangedSrc.push_back(u), walkReflags++;
-          e.walk = g;
+          const int64_t ng = seed ? std::gcd(seed, g) : g;
+          if (e.lfe != UINT32_MAX) {
+            if (finalCyclePass) walkFinal[e.lfe] = ng;
+            if (ng != seed) walkFirstSet.try_emplace(e.lfe, WalkSet{compSize[comp[u]], ng, cyclePassKind, cyclePassPop});
+          }
+          if (e.walk != ng) walkChangedSrc.push_back(u), walkReflags++;
+          e.walk = ng;
           onCycle++;
           selfLoops += v == u;
-          walk["step " + std::to_string(g)]++;
+          walk["step " + std::to_string(ng)]++;
           PwcComp &P = pwcBy[comp[u]];
           P.size = compSize[comp[u]];
           P.g = g;
@@ -1413,6 +1442,8 @@ bool CallGraphPass::runCellResolution() {
               if (storeHub[h] != UINT32_MAX) leakCollStores[storeHub[h]].push_back(SI);
           }
   watchdog.phase("static cycle collapse");
+  cyclePassKind = "static";
+  cyclePassPop = 0;
   collapseCycles(); // static cycles, before any fact moves
   walkChangedSrc.clear(); // no fact has moved yet
 
@@ -7577,7 +7608,12 @@ bool CallGraphPass::runCellResolution() {
       // --cfl-cell-collapse=false: the pass flags walks but absorbs no
       // cycle, so nodes keep their own facts (for --cfl-cell-why).
       cycleRowsOnly = !CFLCellCollapse;
+      cyclePassKind = "final";
+      cyclePassPop = pops;
+      finalCyclePass = true;
+      walkFinal.assign(lazyFEdges.size(), 0);
       collapseCycles();
+      finalCyclePass = false;
       cycleRowsOnly = false;
       rekeyReceivers();
       dropMergedGuards();
@@ -7802,6 +7838,8 @@ bool CallGraphPass::runCellResolution() {
     if (CFLCellCollapse && pops - lastCollapsePops >= (1u << 18) &&
         edgeSet.size() > edgesAtCollapse + edgesAtCollapse / 8) {
       watchdog.phase("periodic cycle collapse");
+      cyclePassKind = "periodic";
+      cyclePassPop = pops;
       collapseCycles();
       requeueWalks();
       watchdog.phase("rekey receivers");
@@ -7821,12 +7859,50 @@ bool CallGraphPass::runCellResolution() {
   // dependent by definition: labeled "at the stop"), nothing absorbed.
   if (stoppedAt) {
     cycleRowsOnly = true;
+    cyclePassKind = "stop";
+    cyclePassPop = pops;
     collapseCycles();
     cycleRowsOnly = false;
     walkChangedSrc.clear();
   }
   CG_LOG("Cells: cycle passes: " << collapses << " (" << finalPasses << " final), " << walkReflags
          << " walk flags set or changed\n");
+  // WF: the final pass's flags against the seed. A seeded flag is never
+  // dropped or coarsened (the edges of a program's solve only grow, and a
+  // cycle stays); any other difference means a fact may have crossed an
+  // edge as a step that the fixpoint flags as a walk, and the solve is
+  // redone from the final flags.
+  size_t walkFlagsNew = 0, walkFlagsAt = 0;
+  if (!stoppedAt) {
+    std::vector<uint32_t> changed;
+    for (uint32_t k = 0; k < walkFinal.size(); k++) {
+      const int64_t s0 = walkSeed[k], f0 = walkFinal[k];
+      walkFlagsAt += f0 != 0;
+      assert((!s0 || (f0 && s0 % f0 == 0)) && "WF: the final cycle pass drops or coarsens a seeded walk flag");
+      if (f0 != s0) changed.push_back(k);
+    }
+    walkFlagsNew = changed.size();
+    CG_LOG("Cells: walk flags (WF): " << walkFlagsAt << " at the end of this solve, " << walkSeeded
+           << " seeded, " << walkFlagsNew << " differ from the seed"
+           << (walkFlagsNew ? "; the solve is redone from them" : "") << "\n");
+    if (VerboseLevel >= 2)
+      for (uint32_t k : changed) {
+        const Value *V = std::get<3>(lazyFEdges[k]);
+        const auto *I = dyn_cast_or_null<Instruction>(V);
+        const std::string where = I ? (I->getFunction()->getName() + ": ").str() + instLoc(I)
+                                    : V && V->hasName() ? V->getName().str() : std::string("?");
+        auto it = walkFirstSet.find(k);
+        CG_LOG("Cells:   walk flag " << walkSeed[k] << " -> " << walkFinal[k] << " on field edge #" << k << " at "
+               << where << ": first set "
+               << (it == walkFirstSet.end() ? std::string("?")
+                                            : "to " + std::to_string(it->second.g) + " by the " + it->second.pass +
+                                                  " pass at pop " + std::to_string(it->second.pop) + ", component of " +
+                                                  std::to_string(it->second.comp) + " nodes")
+               << "\n");
+      }
+    if (walkFlagsNew) walkFlagSolves++;
+    walkSeed = walkFinal;
+  }
   {
     size_t nFree = 0;
     for (const auto &R : pwcPeriodRows) nFree += R.second.rfind("offset-free", 0) == 0;
@@ -11270,13 +11346,28 @@ bool CallGraphPass::runCellResolution() {
     exit(0);
   }
 
-  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0 && lateNew == 0 && llNewN == 0) finishCollect();
+  if (CFLCellOneLabel && CFLCellOneLabelMax > 1 && newPairs == 0 && lateNew == 0 && llNewN == 0 && walkFlagsNew == 0)
+    finishCollect();
   // A withdrawn pool's carves and handle stores are rebuilt as ordinary
-  // code by the next iteration, as are late arrays (LA) minted as arrays.
-  if (newPairs == 0 && newlyWithdrawn.empty() && lateNew == 0 && llNewN == 0) return false;
+  // code by the next iteration, as are late arrays (LA) minted as arrays,
+  // labels decided late (LL), and a solve whose walk flags moved (WF).
+  if (newPairs == 0 && newlyWithdrawn.empty() && lateNew == 0 && llNewN == 0 && walkFlagsNew == 0) {
+    CG_LOG("Cells: walk flags: " << walkFlagsAt << " flags at the fixpoint, " << iteration + 1 << " solves ("
+           << walkFlagIterations << " redone for flags)\n");
+    return false;
+  }
+  CG_LOG("Cells: redo: new pairs " << newPairs << ", withdrawn pools " << newlyWithdrawn.size() << ", late arrays "
+         << lateNew << ", labels " << llNewN << ", walk flags " << walkFlagsNew << "\n");
   if (newPairs == 0 && newlyWithdrawn.empty()) {
     if (lateNew) lateArrayIterations++;
-    if (llNewN) lazyLabelIterations++; // one extra iteration serves both
+    if (llNewN) lazyLabelIterations++; // one extra iteration serves all
+    if (!lateNew && !llNewN && walkFlagsNew) walkFlagIterations++;
+  }
+  if (walkFlagsNew && iteration + 1 >= (int)CFLFlowsToMaxIters) {
+    errs() << "ERROR: --cfl-cells: the iteration cap (" << CFLFlowsToMaxIters.getValue() << ") leaves " << walkFlagsNew
+           << " walk flags (WF) unsettled; the solve would keep facts that crossed a walk as a step; raise "
+           << "--cfl-flows-to-max-iters\n";
+    exit(1);
   }
   if (llNewN && iteration + 1 >= (int)CFLFlowsToMaxIters) {
     errs() << "ERROR: --cfl-cells: the iteration cap (" << CFLFlowsToMaxIters.getValue() << ") leaves " << llNewN

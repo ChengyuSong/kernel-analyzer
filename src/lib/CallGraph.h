@@ -915,6 +915,15 @@ protected:
   std::vector<std::string> lazyLabelWithdrawn; // "LL decision withdrawn: ..."
   size_t llWithdrawnBytes = 0;                 // of them, objects used as bytes (rule (b))
   int lazyLabelIterations = 0; // iterations run for LL decisions
+  // WF (Fable 2026-10-26, plan 3.127): walk flags settled before facts
+  // cross. A solve starts from the walk flags the previous solve's final
+  // cycle pass found (by lazyFEdges index; 0 = a step); a solve whose final
+  // flags differ from its seed is redone with them, so every fact crossing
+  // an edge flagged at the fixpoint crosses it as a walk, whatever pass
+  // first found the cycle.
+  std::vector<int64_t> walkSeed;
+  int walkFlagIterations = 0; // iterations run for walk flags alone
+  int walkFlagSolves = 0;     // solves whose final flags differed from their seed
   // Rule S's promoted slots, kept past the build for LL's own-frame value
   // flow: a summarized slot's load -> the values its reaching writes store.
   std::unordered_map<const llvm::Instruction *, std::vector<const llvm::Value *>> promotedSlotWrites;

@@ -1171,6 +1171,15 @@ cl::opt<unsigned> CFLCellWatchdog(
            "time in it, the pops and the RSS, printed by a thread whatever the solver is doing (0: off)"),
   cl::init(60));
 
+cl::opt<unsigned> CFLCellLongPop(
+  "cfl-cell-long-pop",
+  cl::desc("--cfl-cells, with the watchdog on (--verbose=1 or more, --cfl-cell-watchdog): a pop that runs past this "
+           "many seconds gets a line each watchdog interval naming its node, delta and successor counts, the "
+           "operation under way (refold drain, fact merge, copy region, field steps, propagation by edge kind, ...) "
+           "with its subject, a progress count and the RSS; and a closing line with the node, the object and the "
+           "sampled time per operation when it ends (log only; 0: off)"),
+  cl::init(60));
+
 cl::opt<std::string> CFLCellNodeFacts(
   "cfl-cell-node-facts",
   cl::desc("--cfl-cells: write, at the end of the solve or at a stop, every solver node that holds facts, its "

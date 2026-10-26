@@ -627,7 +627,7 @@ bool CallGraphPass::runCellResolution() {
   // The timer progress line (Fable 2026-10-17): the phase the solver is in,
   // whatever it is doing, so a stall is attributable from the log alone.
   SolverWatchdog watchdog;
-  if (VerboseLevel >= 1) watchdog.start(iteration, CFLCellWatchdog);
+  if (VerboseLevel >= 1) watchdog.start(iteration, CFLCellWatchdog, CFLCellLongPop);
   watchdog.phase("kernel dispatch census");
 
   // Kernel dispatch as named cells (plan 3.53, kernel census, Fable
@@ -756,6 +756,7 @@ bool CallGraphPass::runCellResolution() {
   bool admitting = false;
   std::function<void(uint32_t, uint32_t, uint32_t)> guardHold;
   auto add = [&](uint32_t n, uint32_t f) {
+    watchdog.unit(); // LP: facts offered
     n = find(n);
     if (canonFact) f = canonFact(f);
     if (n < guardIdx.size() && guardIdx[n] != UINT32_MAX && !admitting) {
@@ -1211,6 +1212,7 @@ bool CallGraphPass::runCellResolution() {
   std::vector<uint8_t> inPwc;
   bool cycleRowsOnly = false; // no node absorbed: at a stop (the rows from the stop's edge set; the stop answers stay), and in the final pass with --cfl-cell-collapse=false
   auto collapseCycles = [&]() {
+    SolverWatchdog::Scope ws(watchdog, "cycle collapse");
     const auto tc = Clock::now();
     collapses++;
     std::vector<std::vector<uint32_t>> sccs;
@@ -1880,6 +1882,8 @@ bool CallGraphPass::runCellResolution() {
     if (a == b) return a;
     assert(cells[a].kind == CellKind::Off && cells[b].kind == CellKind::Off &&
            "only offset cells merge");
+    SolverWatchdog::Scope ws(watchdog, "fact merge");
+    watchdog.subject(cells[a].obj, cells[a].store, memb[a].size() + memb[b].size());
     factRep[b] = a;
     factMerges++;
     mergeNodes(cells[a].store, cells[b].store);
@@ -1900,6 +1904,7 @@ bool CallGraphPass::runCellResolution() {
                       const std::vector<FieldEdge> &W,
                       const std::vector<uint32_t> &X,
                       const std::vector<Member> &M) {
+      SolverWatchdog::Scope ws(watchdog, "merge replay");
       curStepFact = UINT32_MAX; // a replay: no step to attribute
       const uint32_t dstWas = curStepDst;
       const Value *siteWas = curStepSite;
@@ -1909,6 +1914,7 @@ bool CallGraphPass::runCellResolution() {
           // edge step's.
           curStepDst = (uint32_t)(sr.dl >> 32);
           curStepSite = sr.site;
+          watchdog.unit(); // LP: steps replayed
           const std::vector<uint32_t> R = stepOne(o, off, (uint32_t)sr.dl);
           for (uint32_t f2 : R) add((uint32_t)(sr.dl >> 32), f2);
         }
@@ -1918,6 +1924,7 @@ bool CallGraphPass::runCellResolution() {
         for (auto [o, off] : M) {
           curStepDst = e.dst;
           curStepSite = e.site;
+          watchdog.unit();
           walkOne(o, off, e.li, e.walk, e.dst);
         }
       curStepDst = dstWas;
@@ -2474,6 +2481,8 @@ bool CallGraphPass::runCellResolution() {
   auto canonOff = contentKey;
   auto refold = [&](uint32_t o) {
     MintCause mc(mintCause, "refold", VerboseLevel >= 2);
+    SolverWatchdog::Scope ws(watchdog, "refold");
+    watchdog.subject(o, UINT32_MAX, objs[o].offCells.size());
     // Header+tail: what lay past the header (minted while the object was
     // unknown) moves to the trailing object.
     if (objs[o].tail) {
@@ -3498,6 +3507,7 @@ bool CallGraphPass::runCellResolution() {
     std::sort(top.rbegin(), top.rend());
     for (size_t i = 0; i < top.size() && i < k; i++) {
       const Obj &O = objs[top[i].second];
+      watchdog.heavy((int)i, top[i].second, holders[top[i].second]); // LP: for the long-pop lines
       CG_LOG("Cells:   mass " << top[i].first << " in "
              << holders[top[i].second] << " nodes: " << describe(O) << ", "
              << O.offCells.size() << " cells\n");
@@ -6075,6 +6085,8 @@ bool CallGraphPass::runCellResolution() {
   auto copyRegion = [&](uint32_t os, int64_t a, uint32_t od, int64_t b,
                         int64_t len, const Instruction *at) {
     MintCause mc(mintCause, "byte copy", VerboseLevel >= 2);
+    SolverWatchdog::Scope ws(watchdog, "copy region");
+    watchdog.subject(od, UINT32_MAX, (uint64_t)len);
     // Effective type (C11 6.5p6): a copy into an object with no declared
     // type gives it the source's type. An unknown destination copied into
     // from its start learns the struct the source region starts with.
@@ -7593,9 +7605,23 @@ bool CallGraphPass::runCellResolution() {
   };
   uint32_t stoppedAt = 0;
   std::string stopKind; // the stop's name in the final line
+  // LP: a long pop's closing line (solver data, read on this thread only).
+  auto longPopEnded = [&]() {
+    const SolverWatchdog::Ended e = watchdog.takeLongPop();
+    const uint32_t r = e.Node < numNodes ? find(e.Node) : UINT32_MAX;
+    KA_LOG(1, "CallGraph: Cells: long pop ended: pop #" << e.Seq << " node "
+                  << (r == UINT32_MAX ? std::string("?") : std::to_string(r) + " " + nodeDesc(r).substr(0, 200))
+                  << " took about " << llvm::format("%.0f", e.Secs) << " s (to one watchdog interval), sub-phases sampled "
+                  << e.Subs << ", subject "
+                  << (e.Obj < objs.size() ? describe(objs[e.Obj]) : std::string("none")) << ", RSS "
+                  << llvm::format("%.2f", e.Rss0) << " -> " << llvm::format("%.2f", e.Rss1) << " GB\n");
+  };
   watchdog.phase("worklist");
   while (true) {
-    if (!refoldQueue.empty()) drainRefolds();
+    if (!refoldQueue.empty()) {
+      SolverWatchdog::Scope ws(watchdog, "refold drain");
+      drainRefolds();
+    }
     if (worklist.empty()) {
       if (!keyedWait.empty()) {
         watchdog.phase("flush keyed waits");
@@ -7681,9 +7707,11 @@ bool CallGraphPass::runCellResolution() {
     whyClock = pops;
     if (CFLCellOneLabel && (pops & 0x1fff) == 0 && !pendingConf.empty())
       flushPending(false);
-    if ((pops & 0xfff) == 0) watchdog.pops(pops);
+    watchdog.pop(pops, n, (uint32_t)delta.size(), (uint32_t)succ[n].size());
+    if (watchdog.longPopEnded()) longPopEnded();
     // The progress report scans every fact: only when it prints (PR).
     if (++pops % (1u << 20) == 0 && VerboseLevel >= 2) {
+      SolverWatchdog::Scope ws(watchdog, "progress report");
       size_t mass = 0;
       for (uint32_t m = 0; m < numNodes; m++) mass += pts[m].count();
       CG_LOG("Cells: progress " << pops << " pops, " << worklist.size()
@@ -7736,11 +7764,13 @@ bool CallGraphPass::runCellResolution() {
       }
     }
     if (!dispatchOf.empty() && dispatchOf.count(n)) {
+      SolverWatchdog::Scope ws(watchdog, "dispatch");
       dispatch(n, delta);
       continue;
     }
     if (!recvAt.empty()) {
       auto rit = recvAt.find(n);
+      SolverWatchdog::Scope ws(watchdog, "bind receivers");
       if (rit != recvAt.end())
         for (uint32_t si : std::vector<uint32_t>(rit->second))
           for (uint32_t f : delta) {
@@ -7789,6 +7819,7 @@ bool CallGraphPass::runCellResolution() {
     }
     // Unification by name: a node holds one cell per name.
     if (CFLCellUnify) {
+      SolverWatchdog::Scope ws(watchdog, "unify by name");
       for (uint32_t &f : delta) {
         if (cells[f].kind != CellKind::Off) continue;
         auto [it, ins] = byName[n].try_emplace(cells[f].name, f);
@@ -7797,17 +7828,22 @@ bool CallGraphPass::runCellResolution() {
       if (find(n) != n) continue; // absorbed by a merge: the rep re-runs
     }
     {
+      watchdog.sub("propagate: hub links");
       for (uint32_t h : hubsOf[n])
         for (uint32_t f : delta) {
           if (trackWhy) curWhy = {n, f, UINT32_MAX, W_HUB};
           linkHub(h, f);
         }
+      watchdog.sub("propagate: row links");
       for (size_t ri = 0; ri < rowsAt[n].size(); ri++)
         for (uint32_t f : delta) linkRow(rowsAt[n][ri], f);
+      watchdog.sub("propagate: mint links");
       for (size_t mi = 0; mi < mintsAt[n].size(); mi++)
         for (uint32_t f : delta) linkMint(mintsAt[n][mi], f);
+      watchdog.sub("propagate: feed links");
       for (size_t fi = 0; fi < feedsAt[n].size(); fi++)
         for (uint32_t f : delta) linkFeed(feedsAt[n][fi].first, feedsAt[n][fi].second, f);
+      watchdog.sub("inherit fields");
       for (size_t ii = 0; ii < inheritAt[n].size(); ii++) {
         const uint32_t ci = inheritAt[n][ii];
         for (uint32_t f : delta)
@@ -7815,6 +7851,7 @@ bool CallGraphPass::runCellResolution() {
       }
       curStepNode = n;
       anyCauseNode = n;
+      watchdog.sub("field steps");
       for (size_t ei = 0; ei < fieldOut[n].size(); ei++) {
         const FieldEdge e = fieldOut[n][ei];
         for (uint32_t f : delta) {
@@ -7826,6 +7863,7 @@ bool CallGraphPass::runCellResolution() {
           else applyStep(f, e.li, e.dst);
         }
       }
+      watchdog.sub("any-offset loop");
       if (anyLoop[n])
         for (uint32_t f : delta) {
           const CellKind k = cells[f].kind;
@@ -7834,12 +7872,15 @@ bool CallGraphPass::runCellResolution() {
             toAny(f, n);
         }
     }
+    watchdog.sub("copies");
     if (!copiesAt[n].empty()) applyCopies(n, delta);
+    watchdog.sub("propagate: copy successors");
     for (uint32_t m : succ[n])
       for (uint32_t f : delta) {
         if (trackWhy) curWhy = {n, f, UINT32_MAX, W_EDGE};
         add(m, f);
       }
+    watchdog.unsub(nullptr);
     curWhy = Why();
     if (VerboseLevel >= 2 && pops % (1u << 16) == 0)
       CG_LOG("Cells: at " << pops << " pops: " << finalizes << " finalizes re-ran "

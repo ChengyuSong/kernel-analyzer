@@ -7682,7 +7682,8 @@ bool CallGraphPass::runCellResolution() {
     if (CFLCellOneLabel && (pops & 0x1fff) == 0 && !pendingConf.empty())
       flushPending(false);
     if ((pops & 0xfff) == 0) watchdog.pops(pops);
-    if (++pops % (1u << 20) == 0) {
+    // The progress report scans every fact: only when it prints (PR).
+    if (++pops % (1u << 20) == 0 && VerboseLevel >= 2) {
       size_t mass = 0;
       for (uint32_t m = 0; m < numNodes; m++) mass += pts[m].count();
       CG_LOG("Cells: progress " << pops << " pops, " << worklist.size()

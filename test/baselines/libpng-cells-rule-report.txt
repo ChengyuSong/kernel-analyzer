@@ -3,7 +3,10 @@
 # struct T on an address whose object has another label at that offset;
 # (c) lists the premises the solver assumes (untyped writes and bodiless
 # calls write no struct slot), struct copies between unrelated types, and
-# relay rows: byte copies between differently labeled storage (3.53 rule 4).
+# relay rows: byte copies between differently labeled storage (3.53 rule 4):
+# D distinct regions at the final cell keys relative to the origin, A
+# applications, R regions applied at a since-refolded offset (key != offset
+# in the located object's own frame, either side), printed when R > 0.
 SUMMARY sites 53 allocation sites: 6 whose only receiver is a struct-pointer field (no declaration: a base-class slot), 0 declared through a shared slot (uses not followed), 36 with no declaration (3 result slots also hold another value; 2 of those sites have reloads only their own store reaches: followed for segments)
 SUMMARY segments declared by a receiver: 0 a struct (0 indexed by a stride of it: arrays without an extent), 0 arrays of pointer slots, 0 arrays of a declared scalar, 1 bytes (a char receiver); 0 sites through a struct field receiving the address
 SUMMARY a 0 pointers from data, 0 from constant addresses, 0 from pointers lost before the cast

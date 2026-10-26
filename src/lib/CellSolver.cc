@@ -5756,8 +5756,14 @@ bool CallGraphPass::runCellResolution() {
   // Relay rows (plan 3.53 rule 4): a byte copy between storage of
   // different labels, per (site, source label, destination label); a null
   // label is bytes (an unlabeled object or a char array). The count is
-  // of copied regions.
+  // of applications (a copy re-applied counts again); relayRegions keeps
+  // each application's located region (source object, offset,
+  // destination object, offset, length), mapped to distinct regions at
+  // the report (rows (ii)).
   std::map<std::tuple<const Instruction *, Type *, Type *>, size_t> relayRows;
+  std::map<std::tuple<const Instruction *, Type *, Type *>,
+           std::set<std::tuple<uint32_t, int64_t, uint32_t, int64_t, int64_t>>>
+      relayRegions;
   // Pointer subtractions across objects (kept for the rule report).
   size_t rrPtrAlways = 0, rrPtrMay = 0;
   std::vector<std::string> rrPtrAt;
@@ -6144,7 +6150,10 @@ bool CallGraphPass::runCellResolution() {
       const bool embedded =
           ls && ld && ((isa<StructType>(ls) && startsIn(cast<StructType>(ls), objs[ldo].layout, fold(objs[ldo], ldb))) ||
                        (isa<StructType>(ld) && startsIn(cast<StructType>(ld), objs[lso].layout, fold(objs[lso], lsa))));
-      if (ls != ld && !embedded) relayRows[{at, ls, ld}]++;
+      if (ls != ld && !embedded) {
+        relayRows[{at, ls, ld}]++;
+        relayRegions[{at, ls, ld}].insert({lso, lsa, ldo, ldb, len});
+      }
     }
     if (objs[os].layout && objs[od].layout) {
       const Obj &Os = objs[os], &Od = objs[od];
@@ -10930,7 +10939,10 @@ bool CallGraphPass::runCellResolution() {
        << "# struct T on an address whose object has another label at that offset;\n"
        << "# (c) lists the premises the solver assumes (untyped writes and bodiless\n"
        << "# calls write no struct slot), struct copies between unrelated types, and\n"
-       << "# relay rows: byte copies between differently labeled storage (3.53 rule 4).\n";
+       << "# relay rows: byte copies between differently labeled storage (3.53 rule 4):\n"
+       << "# D distinct regions at the final cell keys relative to the origin, A\n"
+       << "# applications, R regions applied at a since-refolded offset (key != offset\n"
+       << "# in the located object's own frame, either side), printed when R > 0.\n";
     RO << "SUMMARY sites " << censusSites << " allocation sites: " << censusStructFieldOnly
        << " whose only receiver is a struct-pointer field (no declaration: a base-class slot), "
        << censusSharedDeclared << " declared through a shared slot (uses not followed), " << censusUndeclared
@@ -11037,11 +11049,50 @@ bool CallGraphPass::runCellResolution() {
     }
     // Rule 4: one row per (site, source label, destination label); types
     // that print as one label (renamed copies of a struct) are one row.
-    std::map<std::string, size_t> relayLines;
-    for (auto &[k, n] : relayRows) {
-      auto [I, ls, ld] = k;
-      auto lab = [](Type *T) { return T ? typeLabel(T) : std::string("bytes"); };
-      relayLines[(I ? instLoc(I) : std::string("?")) + ": " + lab(ls) + " into " + lab(ld)] += n;
+    // A row counts its applications (A) and its distinct regions (D): each
+    // recorded region with both sides located again (forwarding, existing
+    // tails) and mapped to the cell key of the final layout and period,
+    // relative to the origin (the allocation's offset, so a tail relabel
+    // moves no region). R counts the recorded regions whose key differs
+    // from their offset on either side in the located object's own frame,
+    // before the origin shift: applied at an offset the object folded
+    // since. Read-only: the mapping mints and refolds nothing (asserted).
+    struct RelayLine {
+      size_t apps = 0;
+      std::set<std::tuple<uint32_t, int64_t, uint32_t, int64_t, int64_t>> raw, regions;
+    };
+    std::map<std::string, RelayLine> relayLines;
+    {
+      const size_t cellsBefore = cells.size(), objsBefore = objs.size(), tailsBefore = tailMinted;
+      auto locateRO = [&](uint32_t o, int64_t off) -> std::pair<uint32_t, int64_t> {
+        while (objs[o].fwd != UINT32_MAX) {
+          off += objs[o].fwdOff;
+          o = objs[o].fwd;
+        }
+        while (objs[o].tail && off >= objs[o].size) {
+          assert(objs[o].tailObj != UINT32_MAX && "a recorded relay region lies in a tail that was never minted");
+          off -= objs[o].size;
+          o = objs[o].tailObj;
+        }
+        return {o, off};
+      };
+      for (auto &[k, n] : relayRows) {
+        auto [I, ls, ld] = k;
+        auto lab = [](Type *T) { return T ? typeLabel(T) : std::string("bytes"); };
+        RelayLine &L = relayLines[(I ? instLoc(I) : std::string("?")) + ": " + lab(ls) + " into " + lab(ld)];
+        L.apps += n;
+        for (auto [so, sa, dO, db, len] : relayRegions[k]) {
+          const auto [lso, lsa] = locateRO(so, sa);
+          const auto [ldo, ldb] = locateRO(dO, db);
+          const int64_t ks = contentKey(objs[lso], lsa), kd = contentKey(objs[ldo], ldb);
+          if (ks != lsa || kd != ldb) L.raw.insert({so, sa, dO, db, len});
+          L.regions.insert({objs[lso].origin, objs[lso].base + ks, objs[ldo].origin, objs[ldo].base + kd, len});
+        }
+      }
+      assert(cells.size() == cellsBefore && objs.size() == objsBefore && tailMinted == tailsBefore &&
+             "the relay region mapping minted a cell or an object");
+      CG_LOG("Cells: relay regions: the report minted " << cells.size() - cellsBefore << " cells, "
+             << objs.size() - objsBefore << " objects\n");
     }
     RO << "SUMMARY c " << modUntypedWrites << " untyped writes and " << modBodiless
        << " calls of bodiless functions assumed to write no struct slot; "
@@ -11270,7 +11321,11 @@ bool CallGraphPass::runCellResolution() {
     for (auto &[c, k] : bTop) RO << "B x" << c << " object " << k.first << " stepped as " << k.second << "\n";
     RO << "\n== (c) premises and copies between unrelated structs\n";
     for (const std::string &d : copyMismatchAt) RO << "C copy " << d << "\n";
-    for (auto &[r, n] : relayLines) RO << "C relay " << r << " (" << n << " regions)\n";
+    for (auto &[r, L] : relayLines) {
+      RO << "C relay " << r << " (" << L.regions.size() << " regions, " << L.apps << " applications";
+      if (!L.raw.empty()) RO << ", " << L.raw.size() << " applied at a since-refolded offset";
+      RO << ")\n";
+    }
     RO << "C integer name copied into bytes: " << intNameToBytes << " positions\n";
     for (const std::string &d : intNameToBytesAt) RO << "C int-to-bytes " << d << "\n";
     RO << "\n== UB undefined behavior (counted, not followed)\n";

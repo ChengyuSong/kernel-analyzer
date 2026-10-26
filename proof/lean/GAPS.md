@@ -4120,7 +4120,33 @@ all). Statement: at the fixpoint, every fact crossing an edge flagged at
 the fixpoint crosses it under that flag from the solve's start, so the
 result does not depend on which pass first found a cycle (asserted: the
 final pass never drops or coarsens a seeded flag). Answers are unchanged
-on every gate program; the redone solves move the stop pins. Cases:
+on every gate program; the stop pins did not move (gate WFg). Cases:
 t_cells_walk_flags.c and t_cells_walk_flags_off.c (the same program with
 collapse off). Not mechanized. Checked by executions; see the commit's
 gates.
+
+
+## A relay row counts its distinct regions apart from its applications (CellSolver rule report, Fable 2026-10-25, rows (ii))
+
+Log-only. A relay row (3.53 rule 4: a byte copy between storage of
+different labels, per site and label pair) counted each application of the
+copy (one per source member x destination member each time the copy edge
+is applied), so a copy re-applied after a member set grew, or applied once
+per member of a merged cell, counted again, and the count depended on the
+schedule (tcpdump 3685 with collapse off, 3624 on, over the same 351
+rows, at e0679a7; 3591 and 3593 after WF). The row now also counts its distinct regions: each application's
+located region (source object and offset, destination object and offset,
+length) is kept, and at the report each side is located again (forwarding
+and the tails that exist; the report mints and refolds nothing, asserted:
+cells, objects and tails unchanged), mapped to the cell key under the
+object's final layout and period, and taken relative to the origin
+(Obj::base + key, so a tail relabel moves no region). D is the number of
+distinct mapped regions, A the applications (the old count, unchanged),
+and R the recorded regions whose key differs from their offset on either
+side in the located object's own frame, before the origin shift (applied
+at an offset the object has folded since; a fold of an array element
+past the first counts too, since the frame's key is element 0). Model
+statement: D counts the final solve's copy applications mapped to final
+cell keys; the solve is unchanged. Case: t_cells_relay_regions.c (one
+region, two applications, R = 1). Not mechanized. Checked by executions;
+see the commit's gates.

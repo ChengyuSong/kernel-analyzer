@@ -43,6 +43,11 @@ std::string valueText(const Value *V) {
   return b == std::string::npos ? s : s.substr(b);
 }
 
+// An instruction's text in a --cfl-container-closure line: built only
+// with the flag, the only way it is printed (ST: the text numbers the
+// whole module); without it the entry keeps its "F: " head.
+std::string closureText(const Value *V) { return CFLContainerClosure ? valueText(V) : std::string(); }
+
 // An alloca used only as the address of loads and stores (a -O0 local).
 bool transientSlot(const Value *A) {
   const auto *AI = dyn_cast<AllocaInst>(A);
@@ -412,7 +417,7 @@ void CallGraphPass::checkContainerClosure() {
           const Function *CF = VC->getCalledFunction();
           calledFeeds[K][CF ? CF->getName().str() : std::string("an indirect call")]++;
           fields[K].foreignSI.push_back(SI);
-          if (fields[K].foreign.size() < 3) fields[K].foreign.push_back(F.getName().str() + ": " + valueText(SI));
+          if (fields[K].foreign.size() < 3) fields[K].foreign.push_back(F.getName().str() + ": " + closureText(SI));
           else fields[K].foreign.push_back("");
         } else if (isa<ConstantPointerNull>(V->stripPointerCasts())) {
           fields[K].nulls++;
@@ -420,7 +425,7 @@ void CallGraphPass::checkContainerClosure() {
           fields[K].restores++;
         } else if (fields[K].foreign.size() < 3) {
           fields[K].foreignSI.push_back(SI);
-          fields[K].foreign.push_back(F.getName().str() + ": " + valueText(SI));
+          fields[K].foreign.push_back(F.getName().str() + ": " + closureText(SI));
         } else {
           fields[K].foreignSI.push_back(SI);
           fields[K].foreign.push_back("");
@@ -446,7 +451,7 @@ void CallGraphPass::checkContainerClosure() {
     auto fail = [&](const std::string &why, const Instruction *At) {
       n++;
       auto &ex = uses[why];
-      if (ex.size() < 2) ex.push_back(At->getFunction()->getName().str() + ": " + valueText(At));
+      if (ex.size() < 2) ex.push_back(At->getFunction()->getName().str() + ": " + closureText(At));
     };
     while (!work.empty()) {
       const Value *V = work.back();

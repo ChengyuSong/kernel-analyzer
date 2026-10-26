@@ -34,6 +34,7 @@
 // carves").
 
 #include "CallGraphInternal.h"
+#include "DeferredText.h"
 #include <llvm/Analysis/CFG.h>
 #include <llvm/BinaryFormat/Dwarf.h>
 #include <llvm/IR/DebugInfo.h>
@@ -424,7 +425,7 @@ void CallGraphPass::checkPoolCarves() {
   };
 
   struct Carve { const Instruction *I; std::string form, field; CarveSize size; };
-  struct Refusal { std::string field, why; const Instruction *I; };
+  struct Refusal { std::string field; DeferredText why; const Instruction *I; };
   std::vector<Carve> carves;
   std::vector<Refusal> refusals;
   std::vector<std::pair<const Instruction *, std::string>> rewinds;
@@ -681,10 +682,10 @@ void CallGraphPass::checkPoolCarves() {
   };
   // The candidates (by the IR's shapes; the runs decide).
   std::set<std::string> lmis; // link and link-holding fields whose link pointers a run used otherwise
-  std::map<std::string, std::string> lmisAt; // the first such use, per field
+  std::map<std::string, DeferredText> lmisAt; // the first such use, per field
   std::map<std::string, bool> srcLast;
   std::map<std::string, const Instruction *> srcWhyLast;
-  std::vector<std::string> removedRows; // every candidate a run removed, with its reason
+  std::vector<DeferredText> removedRows; // every candidate a run removed, with its reason
   std::map<std::string, std::string> srcPoolLast;
   {
     // Sources: every return traces (through casts, slots, joins) to null,
@@ -1194,7 +1195,7 @@ void CallGraphPass::checkPoolCarves() {
             if (c.I == I) return;
           carves.push_back({I, form, f, sizeOf(I, form, h)});
         };
-        auto refuse = [&](const HV &h, const std::string &why, const Instruction *at) {
+        auto refuse = [&](const HV &h, const DeferredText &why, const Instruction *at) {
           if (h.flavor == 'L' && !h.field.empty()) lmisAt.emplace(h.field, instLocStr(at) + ": " + why);
           refusals.push_back({h.pool, why, at});
         };
@@ -1335,7 +1336,7 @@ void CallGraphPass::checkPoolCarves() {
         };
         auto dataUse = [&](const Value *V, const HV &h, const Instruction *at) {
           const auto *I = dyn_cast<Instruction>(V);
-          if (!I) return refuse(h, "a constant handle used as data: " + instText(at), at);
+          if (!I) return refuse(h, DeferredText("a constant handle used as data: ", [at] { return instText(at); }), at);
           if (h.flavor == 'B') {
             if (h.field.empty() && h.alloc) return carve(I, "header", h.pool, h); // a new chunk's first piece
             if (const auto *G = dyn_cast<GEPOperator>(V)) {
@@ -1356,7 +1357,7 @@ void CallGraphPass::checkPoolCarves() {
             if (const CallBase *CB = handoutNode(V); CB && (past || !nodeBumped(CB))) {
               const std::string why = escapes(CB);
               if (why.empty()) return carve(I, "whole-tail", h.field, h);
-              return refuse(h, "a whole tail whose node escapes (" + why + "): " + instText(at), at);
+              return refuse(h, DeferredText("a whole tail whose node escapes (" + why + "): ", [at] { return instText(at); }), at);
             }
             if (slotBumpK.count({&F, h.field})) {
               // (b) The carve and the bump read the node the end was computed on.
@@ -1364,10 +1365,10 @@ void CallGraphPass::checkPoolCarves() {
               std::set<const Instruction *> ends(slotBumpEnds[{&F, h.field}].begin(), slotBumpEnds[{&F, h.field}].end());
               for (const StoreInst *E : slotBumpEnds[{&F, h.field}])
                 if (!sameNode(nodeLoadOf(E->getValueOperand()), Nc, ends))
-                  return refuse(h, "a carve whose end was computed on another node (" + instText(E) + "): " + instText(at), at);
+                  return refuse(h, DeferredText("a carve whose end was computed on another node (", [E, at] { return instText(E) + "): " + instText(at); }), at);
               for (const StoreInst *Bs : slotBumps[{&F, h.field}])
                 if (!sameNode(Nc, nodeOfAddr(Bs->getPointerOperand()), {}))
-                  return refuse(h, "a carve whose bump writes another node (" + instText(Bs) + "): " + instText(at), at);
+                  return refuse(h, DeferredText("a carve whose bump writes another node (", [Bs, at] { return instText(Bs) + "): " + instText(at); }), at);
             }
             if (bumpIn.count(&F) && bumpIn[&F].count(h.field)) {
               const auto *G = dyn_cast<GEPOperator>(V);
@@ -1401,12 +1402,12 @@ void CallGraphPass::checkPoolCarves() {
                 return;
               }
             }
-            return refuse(h, "a pointer into the free space used as data where nothing bumps it: " + instText(at), at);
+            return refuse(h, DeferredText("a pointer into the free space used as data where nothing bumps it: ", [at] { return instText(at); }), at);
           }
           if (const auto *G = dyn_cast<GEPOperator>(V))
             if (h.alloc && G->hasAllConstantIndices() && !G->hasAllZeroIndices())
               return carve(I, "header", h.pool, h);
-          refuse(h, "a chunk base used as data: " + instText(at), at);
+          refuse(h, DeferredText("a chunk base used as data: ", [at] { return instText(at); }), at);
         };
         auto drain = [&]() {
           while (!work.empty()) {
@@ -1453,7 +1454,7 @@ void CallGraphPass::checkPoolCarves() {
                     bookkeeping.push_back({S, k});
                     continue;
                   }
-                  lmis.insert(h.field), refuse(h, "a link pointer stored where no struct field names it: " + instText(S), S);
+                  lmis.insert(h.field), refuse(h, DeferredText("a link pointer stored where no struct field names it: ", [S] { return instText(S); }), S);
                   continue;
                 }
                 if (isa<CastInst>(UI)) {
@@ -1479,14 +1480,14 @@ void CallGraphPass::checkPoolCarves() {
                     }
                     continue;
                   }
-                  lmis.insert(h.field), refuse(h, "a link pointer stepped other than by a constant inside an array link field: " + instText(G), G);
+                  lmis.insert(h.field), refuse(h, DeferredText("a link pointer stepped other than by a constant inside an array link field: ", [G] { return instText(G); }), G);
                   continue;
                 }
                 if (isa<PHINode>(UI) || isa<SelectInst>(UI)) {
                   add(UI, h); // its other incoming values are checked below
                   continue;
                 }
-                lmis.insert(h.field), refuse(h, "a link pointer used other than to load or store its links: " + instText(UI), UI);
+                lmis.insert(h.field), refuse(h, DeferredText("a link pointer used other than to load or store its links: ", [UI] { return instText(UI); }), UI);
                 continue;
               }
             if (isa<PtrToIntInst>(UI)) {
@@ -1559,13 +1560,13 @@ void CallGraphPass::checkPoolCarves() {
                 // V as the address: a chunk base's header field.
                 if (h.flavor == 'C' && !fieldKey(S, S->getPointerOperand()).empty()) continue;
                 if (h.flavor == 'B') dataUse(V, h, S); // through the carve, or refused
-                else refuse(h, "written through: " + instText(S), S);
+                else refuse(h, DeferredText("written through: ", [S] { return instText(S); }), S);
                 continue;
               }
               if (const auto *L = dyn_cast<LoadInst>(UI)) {
                 if (h.flavor == 'C' && !fieldKey(L, L->getPointerOperand()).empty()) continue;
                 if (h.flavor == 'B') dataUse(V, h, L); // through the carve, or refused
-                else refuse(h, "read through: " + instText(L), L);
+                else refuse(h, DeferredText("read through: ", [L] { return instText(L); }), L);
                 continue;
               }
               if (const auto *CB = dyn_cast<CallBase>(UI)) {
@@ -1721,22 +1722,23 @@ void CallGraphPass::checkPoolCarves() {
         for (auto &[S, byLoad] : savedCarves)
           if (byLoad.size() > 1) {
             auto a = byLoad.begin(), b = std::next(a);
+            const Instruction *Ia = a->second.first, *Ib = b->second.first;
             refuse(a->second.second,
-                   "saved cursor handed out twice: the slot stored at " + instLocStr(S) + " is carved at " +
-                       instLocStr(a->second.first) + " (" + instText(a->second.first) + ") and at " +
-                       instLocStr(b->second.first) + " (" + instText(b->second.first) + ")",
-                   b->second.first);
+                   DeferredText("saved cursor handed out twice: the slot stored at " + instLocStr(S) + " is carved at " +
+                                    instLocStr(Ia) + " (",
+                                [Ia, Ib] { return instText(Ia) + ") and at " + instLocStr(Ib) + " (" + instText(Ib) + ")"; }),
+                   Ib);
           }
         for (auto &[V, h] : mixed)
           if (const auto *I = dyn_cast<Instruction>(V))
-            refuse(h, "a value that is a link pointer by one path and a chunk handle by another: " + instText(I), I);
+            refuse(h, DeferredText("a value that is a link pointer by one path and a chunk handle by another: ", [I] { return instText(I); }), I);
         for (auto &[S, h] : unkeyedStores)
           if (auto it = hv.find(castsOnly(S->getPointerOperand())); it == hv.end() || it->second.flavor != 'L')
-            refuse(h, "stored where no struct field names it: " + instText(S), S);
+            refuse(h, DeferredText("stored where no struct field names it: ", [S] { return instText(S); }), S);
         for (auto &[G, h] : pendingSteps)
           if (!hv.count(G))
             lmis.insert(h.field),
-                refuse(h, "a link pointer stepped other than by a constant inside an array link field: " + instText(G), G);
+                refuse(h, DeferredText("a link pointer stepped other than by a constant inside an array link field: ", [G] { return instText(G); }), G);
         for (auto &[S, h] : linkStores) {
           const Value *X = castsOnly(S->getValueOperand());
           auto it = hv.find(X);
@@ -1745,7 +1747,7 @@ void CallGraphPass::checkPoolCarves() {
             if (ok) lg[k]++;
             else lb.emplace(k, S);
           }
-          if (!ok) refuse(h, "a value that is not a chunk base stored through a link pointer: " + instText(S), S);
+          if (!ok) refuse(h, DeferredText("a value that is not a chunk base stored through a link pointer: ", [S] { return instText(S); }), S);
         }
         for (auto &[V, h] : hv) {
           const auto *I = dyn_cast<Instruction>(V);
@@ -1753,7 +1755,7 @@ void CallGraphPass::checkPoolCarves() {
           for (unsigned i = isa<SelectInst>(I) ? 1 : 0; i < I->getNumOperands(); i++) {
             const Value *X = castsOnly(I->getOperand(i));
             if (!isa<ConstantPointerNull>(X) && !(hv.count(X) && hv[X].flavor == 'L'))
-              lmis.insert(h.field), refuse(h, "a link pointer joined with another value: " + instText(I), I);
+              lmis.insert(h.field), refuse(h, DeferredText("a link pointer joined with another value: ", [I] { return instText(I); }), I);
           }
         }
         // A join of chunk bases with anything else is a chunk base used as data.
@@ -1785,7 +1787,7 @@ void CallGraphPass::checkPoolCarves() {
             }
             continue;
           }
-          refuse(h, "a chunk base joined with data: " + instText(I), I);
+          refuse(h, DeferredText("a chunk base joined with data: ", [I] { return instText(I); }), I);
         }
         // G1: every keyed pointer store, classified for the link fields (a
         // chunk base) and the link-holding fields (a link address); null
@@ -1901,7 +1903,7 @@ void CallGraphPass::checkPoolCarves() {
           } else if (!carved) {
             HV h;
             h.field = k;
-            refuse(h, "a value that is not a chunk pointer stored into it: " + instText(S), S);
+            refuse(h, DeferredText("a value that is not a chunk pointer stored into it: ", [S] { return instText(S); }), S);
           }
         }
       }
@@ -1934,8 +1936,9 @@ void CallGraphPass::checkPoolCarves() {
     if (!srcLast[it->first]) {
       const Instruction *W = srcWhyLast.count(it->first) ? srcWhyLast[it->first] : nullptr;
       removedRows.push_back(run + "chunk source " + it->first + " removed: " +
-                            (W ? "a returned value that is not a chunk base or null at " + instLocStr(W) + ": " + instText(W)
-                               : std::string("no chunk base in its returns")));
+                            (W ? DeferredText("a returned value that is not a chunk base or null at " + instLocStr(W) + ": ",
+                                              [W] { return instText(W); })
+                               : DeferredText("no chunk base in its returns")));
       it = chunkSources.erase(it), removed = true;
     } else ++it;
   for (auto it = chunkParams.begin(); it != chunkParams.end();)
@@ -1949,19 +1952,21 @@ void CallGraphPass::checkPoolCarves() {
     if (linkBad.count(it->first) || !linkGood[it->first] || !handleFields.count(it->first) || lmis.count(it->first)) {
       const Instruction *W = linkBad.count(it->first) ? linkBad[it->first] : nullptr;
       removedRows.push_back(run + "link field " + it->first + " removed: " +
-                            (W ? "a store that is not a chunk base or null at " + instLocStr(W) + ": " + instText(W)
+                            (W ? DeferredText("a store that is not a chunk base or null at " + instLocStr(W) + ": ",
+                                              [W] { return instText(W); })
                              : lmis.count(it->first) ? "a link pointer to it used otherwise at " + lmisAt[it->first]
-                             : !linkGood[it->first] ? std::string("no store of a chunk base")
-                                                     : std::string("not a handle field")));
+                             : !linkGood[it->first] ? DeferredText("no store of a chunk base")
+                                                     : DeferredText("not a handle field")));
       it = linkFields.erase(it), removed = true;
     } else ++it;
   for (auto it = linkHolding.begin(); it != linkHolding.end();) {
     if (holdBad.count(it->first) || !holdGood[it->first] || lmis.count(it->first)) {
       const Instruction *W = holdBad.count(it->first) ? holdBad[it->first] : nullptr;
       removedRows.push_back(run + "link-pointer field " + it->first + " removed: " +
-                            (W ? "a store that is not a link address or null at " + instLocStr(W) + ": " + instText(W)
+                            (W ? DeferredText("a store that is not a link address or null at " + instLocStr(W) + ": ",
+                                              [W] { return instText(W); })
                              : lmis.count(it->first) ? "a link pointer loaded from it used otherwise at " + lmisAt[it->first]
-                                                     : std::string("no store of a link address")));
+                                                     : DeferredText("no store of a link address")));
       it = linkHolding.erase(it), removed = true;
       continue;
     }
@@ -2161,7 +2166,7 @@ void CallGraphPass::checkPoolCarves() {
              << " stored into " << hk.first << " bumps it by " << hk.second << ")\n");
   CG_LOG("PoolCarve: chunk sources, link fields and chunk formals: the greatest fixpoint after " << restarts + 1
          << " runs of the check\n");
-  for (const std::string &r : removedRows) CG_LOG("PoolCarve:   " << r << "\n");
+  for (const DeferredText &r : removedRows) CG_LOG("PoolCarve:   " << r << "\n");
   for (auto &[f, p] : chunkSources)
     if (handleFields.count(p))
       CG_LOG("PoolCarve: chunk source " << f << ": " << chunkReturns[f] << " returns, every one a chunk base of "

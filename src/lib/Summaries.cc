@@ -13,6 +13,7 @@
 // Part of CallGraphPass; shared declarations in CallGraphInternal.h.
 
 #include "CallGraphInternal.h"
+#include "DeferredText.h"
 
 static size_t g_freshPromoted = 0, g_freshRejRet = 0, g_freshRejEscape = 0,
               g_freshRejSide = 0, g_freshInit = 0, g_escapeSamples = 0,
@@ -724,9 +725,8 @@ void CallGraphPass::confirmFreshWrappers() {
           if ((!quiet || !CFLTraceFunc.empty()) && (r1Samples++ < 20 || !CFLTraceFunc.empty()) && r1bad) {
             // With --cfl-trace-func every R1 rejection is logged (a
             // wrapper that should have been promoted is debugged here).
-            std::string t; raw_string_ostream os(t); os << *r1bad;
             CG_LOG("ConfirmFresh R1: " << F.getName() << " returns "
-                   << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
+                   << StringRef(irPrint(*r1bad)).ltrim().substr(0, 80) << "\n");
           }
           continue;
         }
@@ -1140,9 +1140,8 @@ void CallGraphPass::confirmFreshWrappers() {
         if (!ok) {
           g_freshRejSide++;
           if (!CFLTraceFunc.empty() && r3bad) {
-            std::string t; raw_string_ostream os(t); os << *r3bad;
             CG_LOG("ConfirmFresh R3: " << F.getName() << " side effect "
-                   << StringRef(os.str()).ltrim().substr(0, 80) << "\n");
+                   << StringRef(irPrint(*r3bad)).ltrim().substr(0, 80) << "\n");
           }
           continue;
         }
@@ -3706,14 +3705,13 @@ void CallGraphPass::runSummaryProvers(Module *M) {
         }
         return true;
       };
-      auto eligible = [&](const Function &F, std::string &why) {
+      auto eligible = [&](const Function &F, DeferredText &why) {
         for (const auto &BB : F) {
           for (const auto &I : BB) {
             if (const auto *CB = dyn_cast<CallBase>(&I)) {
               if (CB->isInlineAsm()) {
                 if (asmTransferFree(CB)) continue;
-                { std::string t; raw_string_ostream os(t); os << I;
-                  why = "asm " + os.str(); } return false;
+                why = DeferredText("asm ", [IP = &I] { return irPrint(*IP); }); return false;
               }
               if (const auto *II = dyn_cast<IntrinsicInst>(CB)) {
                 switch (II->getIntrinsicID()) {
@@ -3807,8 +3805,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                   }
                 }
                 if (!localOk) {
-                  std::string t; raw_string_ostream os(t); os << I;
-                  why = "ptr-store " + os.str(); return false;
+                  why = DeferredText("ptr-store ", [IP = &I] { return irPrint(*IP); }); return false;
                 }
                 continue;
               }
@@ -3843,8 +3840,7 @@ void CallGraphPass::runSummaryProvers(Module *M) {
                     return false;
                   };
                   if (!selfOk(V, 8)) {
-                    std::string t; raw_string_ostream os(t); os << I;
-                    why = "int-launder-store " + os.str(); return false;
+                    why = DeferredText("int-launder-store ", [IP = &I] { return irPrint(*IP); }); return false;
                   }
                 }
               }
@@ -3880,10 +3876,10 @@ void CallGraphPass::runSummaryProvers(Module *M) {
             if (canon != &F || ok.count(canon)) continue;
             auto sit = Ctx->FuncSummaries.find(canon);
             if (sit != Ctx->FuncSummaries.end()) continue; // already covered
-            std::string why;
+            DeferredText why;
             if (eligible(F, why)) { ok.insert(canon); changed = true; }
             else if (rounds == 1) {
-              refuseHist[why.substr(0, why.find(' '))]++;
+              refuseHist[why.head().substr(0, why.head().find(' '))]++;
               CG_LOG("NoopProp: REFUSED " << F.getName() << " [" << why
                      << "]\n");
             }
@@ -3906,13 +3902,13 @@ void CallGraphPass::runSummaryProvers(Module *M) {
             auto sit = Ctx->FuncSummaries.find(canon);
             if (sit == Ctx->FuncSummaries.end() || !sit->second->noop)
               continue;
-            std::string why;
+            DeferredText why;
             if (eligible(F, why)) {
               CG_LOG("NoopProp: FILE-REDUNDANT " << F.getName() << "\n");
               nRed++;
             } else {
               CG_LOG("NoopProp: FILE-CORE " << F.getName() << " ["
-                     << why.substr(0, why.find(' ')) << "]\n");
+                     << why.head().substr(0, why.head().find(' ')) << "]\n");
               nCore++;
             }
           }

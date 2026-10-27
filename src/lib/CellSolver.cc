@@ -1102,6 +1102,9 @@ bool CallGraphPass::runCellResolution() {
   // solve goes on.
   boost::unordered_flat_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> keyedWait;
   std::function<void(uint32_t, uint32_t)> linkHubFn; // set once linkHub exists
+  // GL: a fact merge (b into a) re-keys the receiver and guard level nodes
+  // keyed by b (set once the level maps exist).
+  std::function<void(uint32_t, uint32_t)> levelRekey;
   size_t keyedWaits = 0, keyedFlushed = 0;
   std::function<void(uint32_t, uint32_t)> watchCheck;
   // Alias assumptions (plan 3.51): an entry on a node is the identity side
@@ -1920,6 +1923,7 @@ bool CallGraphPass::runCellResolution() {
     factRep[b] = a;
     factMerges++;
     mergeNodes(cells[a].store, cells[b].store);
+    if (levelRekey) levelRekey(a, b);
     // stepOne, walkOne and anyOf may mint (growing these vectors): copies.
     // A member both sides hold has had both sides' steps applied already:
     // each side replays onto the other's members it does not hold, and
@@ -3772,6 +3776,60 @@ bool CallGraphPass::runCellResolution() {
   // Holder g at level L of site si for receiver f: g's slot content into
   // the level node.
   boost::unordered_flat_map<uint64_t, uint32_t> guardLevel; // (guard, holder, level) -> node
+  auto levelKey = [](uint32_t siOrGuard, uint32_t level, uint32_t f) {
+    return ((uint64_t)siOrGuard << 40) ^ ((uint64_t)level << 32) ^ f;
+  };
+  // GL (Fable 2026-10-26): a level node denotes the holder values at its
+  // (site or guard, level) reached from one receiver cell, a class of
+  // facts; it is keyed by the class's canonical fact. Every key, by the
+  // canonical fact it uses (guardLevel or not, key).
+  boost::unordered_flat_map<uint32_t, std::vector<std::pair<bool, uint64_t>>> levelKeysOf;
+  size_t levelRekeys = 0, levelMerges = 0;
+  levelRekey = [&](uint32_t a, uint32_t b) {
+    auto kit = levelKeysOf.find(b);
+    if (kit == levelKeysOf.end()) return;
+    const std::vector<std::pair<bool, uint64_t>> ks = std::move(kit->second);
+    levelKeysOf.erase(kit);
+    for (const auto &[isGuard, key] : ks) {
+      auto &M = isGuard ? guardLevel : recvLevel;
+      auto mit = M.find(key);
+      if (mit == M.end()) continue;
+      const uint32_t node = mit->second;
+      M.erase(mit);
+      LevelKey K = dispatchOf.at(node);
+      K.f = a;
+      const uint64_t nk = levelKey(isGuard ? K.guard : K.si, K.level, a);
+      levelRekeys++;
+      if (auto e = M.find(nk); e != M.end()) {
+        // The merged cell's level node: one node, the union of both. No
+        // pending work is lost: absorb moves the absorbed node's facts,
+        // successors, hubs, rows, field edges and copies to the survivor
+        // and clears its pend; finalize re-pends every fact of the
+        // survivor and pushes it; the pop loop skips a node that is no
+        // longer its own representative ("merged: its facts moved to the
+        // rep"). The survivor is the smaller id (mergeNodes), so the key
+        // takes find(keep).
+        // Re-entrancy: mergeNodes is absorb + finalize. absorb reads
+        // entryOfA, entryOfAo and chanOfNode (populated only at setup, never
+        // during the solve; a hit only poisons an entry) and moves per-node
+        // vectors and maps; finalize rewrites succ and edgeSet and pushes.
+        // Neither reaches mergeFacts, levelRekey, recvLevel, guardLevel or
+        // levelKeysOf: a nested fact merge can happen only at a later pop,
+        // after this returns. No iterator or reference into these maps is
+        // held across the call (keep is copied out; M is re-indexed after).
+        const uint32_t keep = e->second;
+        mergeNodes(keep, node);
+        const uint32_t r = find(keep);
+        M[nk] = r;
+        dispatchOf[r] = K;
+        levelMerges++;
+      } else {
+        M.emplace(nk, node);
+        dispatchOf[node] = K;
+        levelKeysOf[a].push_back({isGuard, nk});
+      }
+    }
+  };
   auto linkLevel = [&](uint32_t si, uint32_t f, uint32_t level, uint32_t g,
                        uint32_t guard = UINT32_MAX) {
     assert(si < recvSites.size() && level < recvSites[si].lis.size() && g < cells.size() &&
@@ -3803,12 +3861,15 @@ bool CallGraphPass::runCellResolution() {
       slots.swap(next);
     }
     auto &M = guard == UINT32_MAX ? recvLevel : guardLevel;
-    const uint64_t key =
-        ((uint64_t)(guard == UINT32_MAX ? si : guard) << 40) ^ ((uint64_t)level << 32) ^ f;
+    // GL: keyed by the receiver's canonical fact (the steps above may have
+    // merged facts); a later merge re-keys it (levelRekey).
+    f = findFact(f);
+    const uint64_t key = levelKey(guard == UINT32_MAX ? si : guard, level, f);
     auto [it, ins] = M.try_emplace(key, 0);
     if (ins) {
       it->second = newNode(guard == UINT32_MAX ? NK::Dispatch : NK::GuardLevel, si);
       dispatchOf[it->second] = {si, f, level, guard};
+      levelKeysOf[f].push_back({guard != UINT32_MAX, key});
       if (level == 0 && guard == UINT32_MAX) recvBound++;
     }
     const uint32_t P = it->second;
@@ -6059,7 +6120,78 @@ bool CallGraphPass::runCellResolution() {
       CG_LOG("Cells:   orphan dereference node #" << orphans[i] << ", value " << v.substr(0, 200) << "\n");
     }
   };
+  // GL1 (Fable 2026-10-26): a receiver-dispatch or holder-guard level node
+  // is keyed by (site or guard, level, receiver cell); a fact merge re-keys
+  // it (levelRekey). Counted per map at every report: entries whose
+  // receiver fact is no longer canonical, keys (canonical) with more than
+  // one node, and for each such pair whether the nodes' facts and
+  // out-edges differ; both counts are asserted 0 (GL).
+  auto levelDupCensus = [&]() {
+    auto canonSet = [&](const Facts &F) {
+      std::vector<uint32_t> v;
+      F.forEach([&](uint32_t f) { v.push_back(findFact(f)); });
+      llvm::sort(v);
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+      return v;
+    };
+    auto succSet = [&](uint32_t n) {
+      std::vector<uint32_t> v;
+      for (uint32_t x : succ[n]) v.push_back(find(x));
+      llvm::sort(v);
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+      return v;
+    };
+    for (int g = 0; g < 2; g++) {
+      const auto &M = g ? guardLevel : recvLevel;
+      size_t stale = 0;
+      std::map<std::tuple<uint32_t, uint32_t, uint32_t>, std::vector<uint32_t>> byKey;
+      for (const auto &[k, n] : M) {
+        const LevelKey &K = dispatchOf.at(n);
+        const uint32_t cf = K.f == UINT32_MAX ? UINT32_MAX : findFact(K.f);
+        stale += cf != K.f;
+        byKey[{K.guard == UINT32_MAX ? K.si : K.guard, K.level, cf}].push_back(n);
+      }
+      size_t dupKeys = 0, pairs = 0, sameClass = 0, factsDiffer = 0, edgesDiffer = 0;
+      std::vector<std::string> rows;
+      for (auto &[key, ns] : byKey) {
+        if (ns.size() < 2) continue;
+        dupKeys++;
+        llvm::sort(ns);
+        for (size_t i = 1; i < ns.size(); i++) {
+          pairs++;
+          const uint32_t a = find(ns[0]), b = find(ns[i]);
+          if (a == b) {
+            sameClass++;
+            continue;
+          }
+          const bool fd = canonSet(pts[a]) != canonSet(pts[b]), ed = succSet(a) != succSet(b);
+          factsDiffer += fd;
+          edgesDiffer += ed;
+          if (rows.size() < 10)
+            rows.push_back(nodeDesc(ns[0]) + ": facts " + std::to_string(pts[a].count()) + " / " +
+                           std::to_string(pts[b].count()) + (fd ? " (differ)" : " (same)") + ", out-edges " +
+                           std::to_string(succSet(a).size()) + " / " + std::to_string(succSet(b).size()) +
+                           (ed ? " (differ)" : " (same)"));
+        }
+      }
+      CG_LOG("Cells: level nodes (GL1), " << (g ? "holder guard" : "receiver dispatch") << ": " << M.size()
+             << " nodes, " << stale << " keyed by a receiver fact no longer canonical, " << dupKeys
+             << " keys with more than one node once canonical (" << pairs << " pairs: " << sameClass
+             << " in one class, " << factsDiffer << " with different facts, " << edgesDiffer
+             << " with different out-edges); " << (g ? "" : std::to_string(levelRekeys) + " re-keyed by a fact merge, " +
+                                                          std::to_string(levelMerges) + " merged into the merged cell's node (both maps)")
+             << "\n");
+      for (const std::string &r : rows) CG_LOG("Cells:   GL1 pair: " << r << "\n");
+      // GL: one level node per (site or guard, level) and fact class.
+      if (stale || dupKeys) {
+        errs() << "ERROR: --cfl-cells: " << stale << " level nodes keyed by a stale receiver fact, " << dupKeys
+               << " keys with more than one node (GL)\n";
+        assert(false && "GL: a level node per (site or guard, level) and receiver cell");
+      }
+    }
+  };
   auto reportDefects = [&]() {
+    levelDupCensus();
     whyAtReport();
     orphanDerefCensus();
     CG_LOG("Cells: " << copyMismatches

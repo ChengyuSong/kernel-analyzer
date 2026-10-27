@@ -4150,3 +4150,23 @@ statement: D counts the final solve's copy applications mapped to final
 cell keys; the solve is unchanged. Case: t_cells_relay_regions.c (one
 region, two applications, R = 1). Not mechanized. Checked by executions;
 see the commit's gates.
+
+## One level node per (site or guard, level) and receiver cell (CellSolver levelRekey, Fable 2026-10-26, GL)
+
+A receiver-dispatch or holder-guard level node N(s, L, c, g) denotes the
+level-L holder values at receiver site s (holder guard g) reached from
+receiver cell c, a class of facts under the fact union-find. It is keyed
+by the class's canonical fact. Obligation: at most one level node per
+(s, L, g) and fact class; its facts are the union of what reached any
+member of the class; a fact merge computes that union monotonically
+(mergeFacts re-keys every level node keyed by the absorbed fact to the
+surviving one, and where the survivor already has a node the two nodes
+merge, mergeNodes: facts, successors, hubs, rows, field edges and copies
+move to the survivor, which re-pends every fact); re-dispatch through
+the merged node is idempotent (the same holder values to the same
+targets). Before GL a fact merge left the absorbed fact's key in place,
+so a later lookup by the canonical fact minted a second node for one
+class (MW tree, tiffsplit-O3: 630 holder-guard nodes, 120 keyed by a
+stale fact, 40 keys with two or more nodes). The census of the two maps
+is an assertion at every report: 0 stale keys, 0 keys with more than one
+node. Not mechanized. Checked by executions; see the commit's gates.

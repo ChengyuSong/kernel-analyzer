@@ -568,8 +568,11 @@ protected:
   };
   // XN: what made a node that has no IR value, for its name: the kind,
   // the call site (or global) it was made for, the summary atom's ordinal
-  // in its row, and the atom's operand and offset (-1: none).
-  struct SynthOrigin { const char *kind; const llvm::Value *at; int64_t atom, arg, off; };
+  // in its row, and the atom's operand and offset (-1: none); SO: the
+  // summarized function whose row it is (an indirect call applies one row
+  // per target at one site), none for a tracepoint junction.
+  struct SynthOrigin { const char *kind; const llvm::Value *at; int64_t atom, arg, off;
+                       const llvm::Function *fn = nullptr; };
   boost::unordered_flat_map<NodeIndex, SynthOrigin> synthOrigin;
   // Synthetic field pointers: node -> (base, byte offset).
   boost::unordered_flat_map<NodeIndex, std::pair<NodeIndex, int64_t>>

@@ -3486,7 +3486,8 @@ bool CallGraphPass::runCellResolution() {
     if (n == NF.getUniversalPtrNode()) return "the universal pointer";
     if (auto it = synthOrigin.find(n); it != synthOrigin.end()) {
       const SynthOrigin &S = it->second;
-      return std::string(S.kind) + (S.atom >= 0 ? " of atom " + std::to_string(S.atom) : std::string()) +
+      return std::string(S.kind) + (S.fn ? " of " + S.fn->getName().str() : std::string()) +
+             (S.atom >= 0 ? (S.fn ? " atom " : " of atom ") + std::to_string(S.atom) : std::string()) +
              (S.arg >= 0 ? " arg" + std::to_string(S.arg) : std::string()) +
              (S.off >= 0 ? " +" + std::to_string(S.off) : std::string()) + " at " + siteName(S.at);
     }

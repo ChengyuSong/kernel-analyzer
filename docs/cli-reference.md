@@ -1,6 +1,6 @@
 # KAMain and KABaseline command-line reference
 
-Generated 2026-10-26 by `tools/gen-cli-reference.py` from the
+Generated 2026-10-27 by `tools/gen-cli-reference.py` from the
 `cl::opt` definitions (`src/lib/Flags.cc` for options both binaries share,
 `src/baseline/BaselineMain.cc` for the baseline's own). The descriptions in
 the code are the source of truth; the grouping is the flag census of
@@ -178,7 +178,7 @@ Removed options are errors that name their replacement; the list is in
 - **`--cfl-container-closure`** (default `false`): --cfl-cells, report only (plan 3.55 obligation 1): container storage closure. A struct field is closed when every store into it stores a fresh block, null, or its own reload of the same owner (the feed condition); where addresses read from it go is reported as information. A fed block whose site sends it elsewhere too (not only into the field, transient uses or a pool API: a callee whose formal reaches only one certified pool's handle fields, recursively; 3.55 (b)) leaves its site unpaired. Reported per field (--verbose=2, and the rule report's CLOSURE section)
 - **`--cfl-cell-trace-obj`** (default `""`): With --cfl-cell-census-formal: a backward path from the formal to the origin of an object whose description contains this
 - **`--cfl-cell-why`** (default `""`): --cfl-cells instrument: record the first cause of every fact arrival (edge, hub link, step, walk, any-offset, byte copy); at the heaviest byte copy, explain how its source pointer came to hold a cell of the object whose description contains this
-- **`--cfl-cell-why-at`** (default `""`): --cfl-cell-why instrument: also explain why each node whose description contains this holds the --cfl-cell-why object
+- **`--cfl-cell-why-at`** (default `""`): --cfl-cell-why instrument: also explain why each node whose description contains this holds the --cfl-cell-why object (several patterns: alternatives separated by '|')
 - **`--cfl-cell-collapse`** (default `true`): --cfl-cells: collapse copy cycles during the solve, periodically and in the final cycle pass (the static collapse before any fact moves always runs). Off is a measurement instrument: the final pass only flags walks, nodes keep their own facts, so --cfl-cell-why can follow a fact through what would be one merged class (slower)
 - **`--cfl-cell-soup-profile`** (default `false`): --cfl-cells instrument (plan 3.34): never stops; every fact landing on a node where its name is incompatible with the node's first name is foreign, and inherits the ENTRY of the fact it came from or, at the first such join, makes this node its entry. Reports entries and construct classes ranked by the foreign facts they explain, the hubs, and width per formal and per struct field
 - **`--cfl-cell-leak-census`** (default `false`): --cfl-cell-soup-profile measurement: every non-char object's fact in a byte-named cell (i8[]) is walked back, along first arrivals, to the first edge where it entered a byte cell; the entries are classified (struct field, byte copy, buffer read as a struct, pointer stored into char storage, vararg or bodiless boundary, other) and ranked by the facts they explain at the profiler's stop point, with the inert check of byte cells

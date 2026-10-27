@@ -1322,7 +1322,8 @@ cl::opt<std::string> CFLCellWhy(
 cl::opt<std::string> CFLCellWhyAt(
   "cfl-cell-why-at",
   cl::desc("--cfl-cell-why instrument: also explain why each node whose "
-           "description contains this holds the --cfl-cell-why object"),
+           "description contains this holds the --cfl-cell-why object "
+           "(several patterns: alternatives separated by '|')"),
   cl::init(""));
 
 cl::opt<bool> CFLCellOneLabel(

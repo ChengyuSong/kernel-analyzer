@@ -6117,24 +6117,36 @@ bool CallGraphPass::runCellResolution() {
   };
   // --cfl-cell-why-at=NODE: why the nodes NODE describes hold the object;
   // run at every report (a one-label stop, a census-at or soup-cap stop,
-  // the fixpoint), from reportDefects.
+  // the fixpoint), from reportDefects. Several node patterns: alternatives
+  // separated by '|' (XW); a node is asked when any of them matches, once.
   auto whyAtReport = [&]() {
     if (recordWhy && !CFLCellWhyAt.empty()) {
       IdScope ids(idScope);
+      std::vector<std::string> at;
+      for (StringRef alt : llvm::split(StringRef(CFLCellWhyAt.getValue()), '|'))
+        if (!alt.empty()) at.push_back(alt.str());
+      std::vector<bool> hit(at.size());
       std::set<uint32_t> asked;
       boost::unordered_flat_map<uint32_t, uint32_t> classSize;
       for (uint32_t m = 0; m < numNodes; m++) classSize[find(m)]++;
       // Only nodes whose class holds a fact can hold the object (and only
       // those are described: an orphan dereference node has no pointer).
-      for (uint32_t m = 0; m < numNodes; m++)
-        if (pts[find(m)].count() && nodeDesc(m).find(CFLCellWhyAt) != std::string::npos &&
-            asked.insert(find(m)).second) {
-          CG_LOG("Cells: why-at " << nodeDesc(m) << ": a class of "
+      for (uint32_t m = 0; m < numNodes; m++) {
+        if (!pts[find(m)].count()) continue;
+        const std::string d = nodeDesc(m);
+        bool any = false;
+        for (size_t i = 0; i < at.size(); i++)
+          if (d.find(at[i]) != std::string::npos) hit[i] = any = true;
+        if (any && asked.insert(find(m)).second) {
+          CG_LOG("Cells: why-at " << d << ": a class of "
                  << classSize[find(m)] << " nodes, represented by " << nodeDesc(find(m)) << "\n");
           for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
             if (!alt.empty()) explainWhy(find(m), alt.str());
         }
-      if (asked.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
+      }
+      if (at.empty()) CG_LOG("Cells: no node matches '" << CFLCellWhyAt << "'\n");
+      for (size_t i = 0; i < at.size(); i++)
+        if (!hit[i]) CG_LOG("Cells: no node matches '" << at[i] << "'\n");
     }
   };
   // Orphan dereference nodes (Fable 2026-10-15): a dereference node with

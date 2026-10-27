@@ -5,8 +5,8 @@
 // z/w first by pop, then x/y. Unfiltered the mode stops at z/w; filtered on
 // struct.X it skips z/w (counted) and stops at x/y.
 // KAFLAGS: --cfl-cell-one-label --cfl-cell-one-label-object=[struct.X
-// LOG: A = struct.Y\+0 @0 of \{main::call malloc #[0-9]+ \[struct.Y\]\}
-// LOG: B = struct.X\+0 @0 of \{main::call malloc #[0-9]+ \[struct.X\]\}
+// LOG: A = struct.Y\+0 @0 of \{main::call malloc @[^ ]+ #[0-9]+ \[struct.Y\]\}
+// LOG: B = struct.X\+0 @0 of \{main::call malloc @[^ ]+ #[0-9]+ \[struct.X\]\}
 // NOLOG: \[struct.W\]\}
 #include <stdlib.h>
 typedef void (*fn)(void);

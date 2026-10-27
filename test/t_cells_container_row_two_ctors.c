@@ -3,10 +3,10 @@
 // paths, each writing fa of its own element struct (my_newfunc ga,
 // big_newfunc gc). e->fa() answers both, one row object per type, and no
 // row object takes the other constructor's layout.
-// LOG: row object obj#[0-9]+ at .*: struct.my_entry, constructors \{my_newfunc\}
-// LOG: row object obj#[0-9]+ at .*: struct.big_entry, constructors \{big_newfunc\}
-// NOLOG: row object obj#[0-9]+ at .*: struct.my_entry, constructors \{[^}]*big_newfunc
-// NOLOG: row object obj#[0-9]+ at .*: struct.big_entry, constructors \{[^}]*my_newfunc
+// LOG: row object .* at .*: struct.my_entry, constructors \{my_newfunc\}
+// LOG: row object .* at .*: struct.big_entry, constructors \{big_newfunc\}
+// NOLOG: row object .* at .*: struct.my_entry, constructors \{[^}]*big_newfunc
+// NOLOG: row object .* at .*: struct.big_entry, constructors \{[^}]*my_newfunc
 #include <stdlib.h>
 #include <string.h>
 typedef void (*fn)(void);

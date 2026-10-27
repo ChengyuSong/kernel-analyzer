@@ -5,7 +5,7 @@
 // A block kept as void * is first written as S through p (no label at its
 // site: the site's value is untyped).
 // KAFLAGS: --cfl-cell-why=[struct.S
-// LOG: LAYOUT main::call malloc #[0-9]+ \[struct.S\] learned struct.S at pop [0-9]+ \(member \+8\) stepping main:
+// LOG: LAYOUT main::call malloc @[^ ]+ #[0-9]+ \[id #[0-9]+\] \[struct.S\] learned struct.S at pop [0-9]+ \(member \+8\) stepping main:
 #include <stdlib.h>
 typedef void (*fn)(void);
 struct S { long a; fn f; long b; };

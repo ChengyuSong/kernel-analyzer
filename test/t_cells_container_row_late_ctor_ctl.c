@@ -2,8 +2,8 @@
 // t_cells_container_row_late_ctor.c: big_newfunc reaches the owner at a
 // direct init call. Two row objects, one per constructor type, as in the
 // late case (at 68b1c4d: one, laid out as the larger, big_entry).
-// LOG: row object obj#[0-9]+ at .*: struct.my_entry, constructors \{my_newfunc\}
-// LOG: row object obj#[0-9]+ at .*: struct.big_entry, constructors \{big_newfunc\}
+// LOG: row object .* at .*: struct.my_entry, constructors \{my_newfunc\}
+// LOG: row object .* at .*: struct.big_entry, constructors \{big_newfunc\}
 // LOG: accesses past a row object's type: [0-9]+ dropped, [0-9]+ distinct, 0 with no in-range row object
 #include <stdlib.h>
 #include <string.h>

@@ -33,6 +33,6 @@ int main(int argc, char **argv) {
   free(p);
   return 0;
 }
-// LOG: LL label by order: main::call malloc #[0-9]+ \[struct.B array\] chosen struct.B \(program order: global gB \(through 1 copies\)\), the first arrival; candidates struct.A x1 @wa .*t_cells_ll_same.c:22, struct.B x1 @wb .*t_cells_ll_same.c:23 \(copied\)
+// LOG: LL label by order: main::call malloc @[^ ]+ #[0-9]+ \[struct.B array\] chosen struct.B \(program order: global gB \(through 1 copies\)\), the first arrival; candidates struct.A x1 @wa .*t_cells_ll_same.c:22, struct.B x1 @wb .*t_cells_ll_same.c:23 \(copied\)
 // NOLOG: lazy labels \(LL\): [0-9]+ decided by this solve, which is discarded
 // NOLOG: LL relabeled

@@ -2240,6 +2240,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
     if (a == AndersNodeFactory::InvalidIndex) continue;
     NodeIndex base = summaryFieldPtr(a, LA.off);
     NodeIndex sink = getCanonicalNode(NF.createValueNode());
+    synthOrigin[sink] = {"label sink", CS, (int64_t)(&LA - S.labels.data()), LA.arg, LA.off};
     addFieldEdgesExact(getCanonicalNode(base), sink, 0, 0, false, Ty);
     g_sumLabels++;
   }
@@ -2552,6 +2553,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
             "@" + CS->getFunction()->getName().str();
         g_opaqueProvenance[subVal] = tag;
         g_opaqueProvenance[subObj] = tag;
+        const int64_t ai = &A - S.atoms.data();
+        synthOrigin[subVal] = {"fresh-sub value", CS, ai, -1, -1};
+        synthOrigin[subObj] = {"fresh-sub object", CS, ai, -1, -1};
       }
       Graph.addDeref(subVal, subObj);
       addAllocSite(subVal, subVal); // origin identity for the mint loop
@@ -2675,6 +2679,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         break;
       NodeIndex v = NF.createValueNode();
       g_opaqueProvenance[v] = "mvx-value";
+      synthOrigin[v] = {"move-x value", CS, (int64_t)(&A - S.atoms.data()), -1, -1};
       addAssignmentEdge(summaryDerefCell(c, A.srcByteOff), v);
       if (Graph.fieldSensitive())
         addFieldWildcardLoop(v, "summary-mvx");

@@ -18,7 +18,9 @@
 // members moved). When one pop runs past the threshold the thread prints a
 // line each interval naming them; when that pop ends it leaves the sampled
 // sub-phase times for the solver thread, which prints the closing line
-// (node and object descriptions are solver data, read there only).
+// (node and object descriptions are solver data, read there only). The
+// interval lines name the node and the subjects by solver index; the
+// closing line names every sampled one (XN).
 //
 //===----------------------------------------------------------------------===//
 
@@ -36,6 +38,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 class SolverWatchdog {
 public:
@@ -84,6 +87,7 @@ public:
     uint32_t Node = UINT32_MAX, Obj = UINT32_MAX;
     double Secs = 0, Rss0 = 0, Rss1 = 0;
     std::string Subs;
+    std::vector<uint32_t> Objs, Nodes; // the subjects sampled, first seen first
   };
   bool longPopEnded() const { return LongEnded.load(std::memory_order_relaxed); }
   Ended takeLongPop() {
@@ -164,6 +168,8 @@ private:
     Last.Rss0 = LongRss0;
     Last.Rss1 = rss;
     Last.Subs = subs.empty() ? "none sampled" : subs;
+    Last.Objs.assign(SampObj, SampObj + NSampObj);
+    Last.Nodes.assign(SampNode, SampNode + NSampNode);
     LongEnded.store(true, std::memory_order_relaxed);
     InLong = false;
   }
@@ -192,6 +198,7 @@ private:
       LongNode = PopNode.load(std::memory_order_relaxed);
       LongRss0 = WatchRss;
       for (int i = 0; i < NSubs; i++) SubName[i] = nullptr, SubSecs[i] = 0;
+      NSampObj = NSampNode = 0;
     }
     // Sampled: the interval goes to the sub-phase seen at its end.
     for (int i = 0; i < NSubs; i++)
@@ -202,26 +209,37 @@ private:
       }
     const uint32_t obj = SubObj.load(std::memory_order_relaxed);
     LongObj = obj;
-    char subj[160];
+    // The distinct subjects sampled (named by the closing line).
+    auto note = [](uint32_t *A, int &N, uint32_t x) {
+      if (x == UINT32_MAX) return;
+      for (int i = 0; i < N; i++)
+        if (A[i] == x) return;
+      if (N < NSamp) A[N++] = x;
+    };
+    note(SampObj, NSampObj, obj);
+    if (obj == UINT32_MAX) note(SampNode, NSampNode, SubNode.load(std::memory_order_relaxed));
+    char subj[192];
     if (obj != UINT32_MAX) {
       uint64_t h = UINT64_MAX;
       for (int i = 0; i < NHeavy; i++)
         if (HeavyObj[i].load(std::memory_order_relaxed) == obj) h = HeavyHolders[i].load(std::memory_order_relaxed);
       char hs[64] = "";
       if (h != UINT64_MAX) std::snprintf(hs, sizeof(hs), ", %llu holder nodes at the last mass report", (unsigned long long)h);
-      std::snprintf(subj, sizeof(subj), "obj #%u (size %llu%s)", obj,
+      std::snprintf(subj, sizeof(subj), "obj#%u (solver index; named in the closing line) (size %llu%s)", obj,
                     (unsigned long long)SubSize.load(std::memory_order_relaxed), hs);
     } else {
       const uint32_t sn = SubNode.load(std::memory_order_relaxed);
       if (sn != UINT32_MAX)
-        std::snprintf(subj, sizeof(subj), "node %u (size %llu)", sn, (unsigned long long)SubSize.load(std::memory_order_relaxed));
+        std::snprintf(subj, sizeof(subj), "node#%u (solver index; named in the closing line) (size %llu)", sn,
+                      (unsigned long long)SubSize.load(std::memory_order_relaxed));
       else
         std::snprintf(subj, sizeof(subj), "none");
     }
     char line[512];
     const int n = std::snprintf(
         line, sizeof(line),
-        "CallGraph: Cells: long pop (iteration %d) for at least %.0f s: pop #%llu node %u (class n/a, delta %u facts, "
+        "CallGraph: Cells: long pop (iteration %d) for at least %.0f s: pop #%llu node#%u (solver index; named in the "
+        "closing line) (class n/a, delta %u facts, "
         "succ %u), in %s [subject: %s], units %llu (+%llu in the last interval), RSS %.2f GB (%+.2f)\n",
         Iter, secs, (unsigned long long)seq, LongNode, PopDelta.load(std::memory_order_relaxed),
         PopSucc.load(std::memory_order_relaxed), sub, subj, (unsigned long long)units,
@@ -266,6 +284,9 @@ private:
   bool InLong = false;
   uint32_t LongNode = UINT32_MAX, LongObj = UINT32_MAX;
   const char *SubName[NSubs] = {};
+  static constexpr int NSamp = 32;
+  uint32_t SampObj[NSamp] = {}, SampNode[NSamp] = {};
+  int NSampObj = 0, NSampNode = 0;
   double SubSecs[NSubs] = {};
   Ended Last;
   int Iter = 0;

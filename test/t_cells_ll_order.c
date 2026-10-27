@@ -34,5 +34,5 @@ int main(int argc, char **argv) {
   return 0;
 }
 // LOG: lazy labels \(LL\): 1 decided by this solve, which is discarded
-// LOG: LL label by order: main::call malloc #[0-9]+ \[struct.A array\] chosen struct.A \(program order: write at wa .*t_cells_ll_order.c:22\) over first-arrival struct.B; candidates struct.A x1 @wa .*t_cells_ll_order.c:22, struct.B x1 @wb .*t_cells_ll_order.c:23; decided in iteration 0, confirmed in iteration [0-9]+
-// LOG: LL relabeled in iteration 1: main::call malloc #[0-9]+ \[struct.B array\] struct.B -> struct.A
+// LOG: LL label by order: main::call malloc @[^ ]+ #[0-9]+ \[struct.A array\] chosen struct.A \(program order: write at wa .*t_cells_ll_order.c:22\) over first-arrival struct.B; candidates struct.A x1 @wa .*t_cells_ll_order.c:22, struct.B x1 @wb .*t_cells_ll_order.c:23; decided in iteration 0, confirmed in iteration [0-9]+
+// LOG: LL relabeled in iteration 1: main::call malloc @[^ ]+ #[0-9]+ \[struct.B array\] struct.B -> struct.A

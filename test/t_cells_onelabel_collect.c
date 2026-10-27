@@ -8,7 +8,7 @@
 // KAFLAGS: --cfl-cell-one-label --cfl-cell-one-label-object=[struct.X --cfl-cell-one-label-max=3
 // LOG: NAME CONFLICT #[123] at pop [0-9]+ \[fn-ptr: (yes|no), in cone: (yes|no)\]: .*a step as struct.Y of a cell of another struct
 // LOG: NAME CONFLICT #[123] at pop [0-9]+ \[fn-ptr: (yes|no), in cone: (yes|no)\]: .*A = struct.[XZ]\+0
-// LOG: path of 'main::call malloc #[0-9]+' into
+// LOG: path of 'main::call malloc @[^ ]+ #[0-9]+' into
 // LOG: stopped at [0-9]+ pops \(one-label stop, 3 conflicts\)
 #include <stdlib.h>
 struct X { long a; long b; };

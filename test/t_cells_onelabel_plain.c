@@ -6,8 +6,8 @@
 // them.
 // KAFLAGS: --cfl-cell-one-label --cfl-cell-one-label-object=[struct.P
 // LOG: \(outside the icall cone: .*\) \[fn-ptr: no, in cone: no\]
-// LOG: = struct.P\+0 @0 of \{main::call malloc #[0-9]+ \[struct.P\]\}
-// LOG: = struct.Q\+0 @0 of \{main::call malloc #[0-9]+ \[struct.Q\]\}
+// LOG: = struct.P\+0 @0 of \{main::call malloc @[^ ]+ #[0-9]+ \[struct.P\]\}
+// LOG: = struct.Q\+0 @0 of \{main::call malloc @[^ ]+ #[0-9]+ \[struct.Q\]\}
 // LOG: stopped at [0-9]+ pops \(one-label stop, 1 conflict\)
 #include <stdlib.h>
 struct P { long a; long b; };

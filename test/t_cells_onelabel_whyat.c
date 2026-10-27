@@ -4,8 +4,8 @@
 // gc's nodes hold the T object. Only nodes holding a fact are described.
 // KAFLAGS: --cfl-cell-one-label --cfl-cell-one-label-object=[struct.T --cfl-cell-one-label-max=1 --cfl-cell-why=[struct.T --cfl-cell-why-at=gc:
 // LOG: NAME CONFLICT at pop [0-9]+: gc: .* now stepped as struct.K
-// LOG: why-at gc: .*: class [0-9]+ of [0-9]+ nodes
-// LOG: why does gc: .* hold struct.T\+0 @0 of \{main::call malloc #[0-9]+ \[struct.T\]\}
+// LOG: why-at gc: .*: a class of [0-9]+ nodes
+// LOG: why does gc: .* hold struct.T\+0 @0 of \{main::call malloc @[^ ]+ #[0-9]+ \[id #[0-9]+\] \[struct.T\]\}
 // LOG: stopped at [0-9]+ pops \(one-label stop, 1 conflict\)
 #include <stddef.h>
 #include <stdlib.h>

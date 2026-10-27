@@ -7,8 +7,8 @@
 // the program calls ga. Now the owner has a row object per constructor
 // type: my_entry's drops the +40 access (another type's field), big_entry's
 // holds fc.
-// LOG: row object obj#[0-9]+ at .*: struct.my_entry, constructors \{my_newfunc\}
-// LOG: row object obj#[0-9]+ at .*: struct.big_entry, constructors \{big_newfunc\}
+// LOG: row object .* at .*: struct.my_entry, constructors \{my_newfunc\}
+// LOG: row object .* at .*: struct.big_entry, constructors \{big_newfunc\}
 // LOG: accesses past a row object's type: [1-9][0-9]* dropped, [0-9]+ distinct, 0 with no in-range row object
 #include <stdlib.h>
 #include <string.h>

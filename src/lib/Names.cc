@@ -1255,6 +1255,8 @@ CallGraphPass::tracepointJunctions(const GlobalVariable *KeyGV) {
     return it->second;
   NodeIndex fnJ = getCanonicalNode(NF.createValueNode(nullptr));
   NodeIndex dataJ = getCanonicalNode(NF.createValueNode(nullptr));
+  synthOrigin[fnJ] = {"tracepoint function junction", KeyGV, -1, -1, -1};
+  synthOrigin[dataJ] = {"tracepoint data junction", KeyGV, -1, -1, -1};
   auto p = std::make_pair(fnJ, dataJ);
   g_tpKeyJunctionMap.emplace(keyN, p);
   return p;

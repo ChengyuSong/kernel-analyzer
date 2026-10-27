@@ -1761,6 +1761,14 @@ bool CallGraphPass::runCellResolution() {
     while (i < n.size() && isdigit((unsigned char)n[i])) i++;
     return "?" + n.substr(i); // "?#o+k" -> "?+k"
   };
+  // A content node's cell as names show it (XF): a key in a byte array is
+  // named "i8[]" for every array, and an unlabeled object's cell "?" for
+  // every offset, so the name carries the offset, as a cell's name does
+  // (" @off"): the name is the key.
+  auto contentCellName = [&](uint32_t o, int64_t c) -> std::string {
+    const std::string n = shownCell(cellName(o, c));
+    return n == "i8[]" || !objs[o].layout ? n + " @" + std::to_string(c) : n;
+  };
   // The address fact (o, off): exact, or folded (off is element 0's).
   // A trailing object's label from its header's trailing array (A1).
   std::function<void(Obj &, const Obj &)> trailingLabel;
@@ -5298,7 +5306,7 @@ bool CallGraphPass::runCellResolution() {
       return std::string(nodeKind[m - G] == NK::Key        ? "content key"
                          : nodeKind[m - G] == NK::ReadSide ? "content read side (P), replaced"
                                                            : "content, replaced") +
-             " " + shownCell(cellName(a, C.c)) + " (" + C.view +
+             " " + contentCellName(a, C.c) + " (" + C.view +
              (C.key == UINT32_MAX ? std::string() : " " + NF.cellNameString(C.key)) + ") of " + describe(objs[a]) + id;
     }
     case NK::Receiver:
@@ -5357,14 +5365,14 @@ bool CallGraphPass::runCellResolution() {
       for (uint32_t o = 0; o < objs.size(); o++) {
         for (auto &[c, up] : objs[o].content)
           if (up.first == m || up.second == m)
-            return "content " + shownCell(cellName(o, c)) +
+            return "content " + contentCellName(o, c) +
                    (up.first == up.second ? ""
                     : up.first == m      ? " (U)"
                                          : " (P)") +
                    " of " + describe(objs[o]) + idTag(m);
         for (auto &[kk, kn] : objs[o].keyed)
           if (kn == m)
-            return "content " + shownCell(cellName(o, (int64_t)(uint32_t)(kk >> 32))) +
+            return "content " + contentCellName(o, (int64_t)(uint32_t)(kk >> 32)) +
                    " (K " + NF.cellNameString((uint32_t)kk) + ") of " + describe(objs[o]) + idTag(m);
       }
       return kindDesc(m);
@@ -5661,7 +5669,7 @@ bool CallGraphPass::runCellResolution() {
           f = findFact(f);
           const Cell &C = cells[f];
           for (auto [o, off] : memb[f]) byLabel[describe(objs[o])]++;
-          nameCount[C.kind == CellKind::Off ? NF.cellNameString(C.name)
+          nameCount[C.kind == CellKind::Off ? shownCell(NF.cellNameString(C.name))
                     : C.kind == CellKind::Func ? "fn"
                     : C.kind == CellKind::Any ? "*" : "out"]++;
         });
@@ -8634,12 +8642,12 @@ bool CallGraphPass::runCellResolution() {
       for (auto &[c, up] : objs[o].content)
         for (const uint32_t m : {up.first, up.second})
           if (std::string *s = at(m); s && s->empty())
-            *s = "content " + shownCell(cellName(o, c)) +
+            *s = "content " + contentCellName(o, c) +
                  (up.first == up.second ? "" : up.first == m ? " (U)" : " (P)") + " of " + describe(objs[o]) +
                  idTag(m);
       for (auto &[kk, kn] : objs[o].keyed)
         if (std::string *s = at(kn); s && s->empty())
-          *s = "content " + shownCell(cellName(o, (int64_t)(uint32_t)(kk >> 32))) + " (K " +
+          *s = "content " + contentCellName(o, (int64_t)(uint32_t)(kk >> 32)) + " (K " +
                NF.cellNameString((uint32_t)kk) + ") of " + describe(objs[o]) + idTag(kn);
     }
     std::error_code EC;
@@ -8658,6 +8666,42 @@ bool CallGraphPass::runCellResolution() {
       const std::string nm = m < G ? nodeDesc(m) : !d[m - G].empty() ? d[m - G] : kindDesc(m);
       if (auto [it, ins] = named.try_emplace(nm, m); !ins) {
         errs() << "Cells: two nodes share the name '" << nm << "' (ids " << it->second << ", " << m << ")\n";
+        // What each one is: its kind, the object it is made for, and its
+        // cell within the object (offset/key c, key name, view).
+        for (const uint32_t x : {it->second, m}) {
+          errs() << "Cells:   node " << x << ": ";
+          if (x < G) {
+            errs() << "graph node\n";
+            continue;
+          }
+          const NK k = nodeKind[x - G];
+          const uint32_t a = nodeAbout[x - G];
+          errs() << nkName[(size_t)k];
+          if (k == NK::Content || k == NK::Key || k == NK::ReadSide || k == NK::RowCell || k == NK::AnyRead ||
+              k == NK::AnyWrite) {
+            const NodeCell &nc = nodeCell[x - G];
+            errs() << ", object " << a << " " << describe(objs[a]) << ", cell c=" << nc.c << " key="
+                   << (nc.key == UINT32_MAX ? std::string("none") : NF.cellNameString(nc.key)) << " view="
+                   << (nc.view ? std::string(1, nc.view) : std::string("none")) << ", cell name " << contentCellName(a, nc.c);
+          } else if (auto dit = dispatchOf.find(x); dit != dispatchOf.end()) {
+            const LevelKey &K = dit->second;
+            errs() << ", site " << K.si << ", level " << K.level << ", guard "
+                   << (K.guard == UINT32_MAX ? std::string("none")
+                                             : std::to_string(K.guard) + " (node " +
+                                                   std::to_string(guards[K.guard].node) + ")")
+                   << ", receiver fact " << (K.f == UINT32_MAX ? std::string("none") : std::to_string(K.f) + " " +
+                                                                    factDescP(K.f));
+            if (K.f != UINT32_MAX && K.f < cells.size()) {
+              const Cell &Ce = cells[K.f];
+              errs() << " (now fact " << findFact(K.f) << "; cell of object " << Ce.obj << ", kind "
+                     << (Ce.kind == CellKind::Off ? "off" : Ce.kind == CellKind::Any ? "any" : "other") << ", off "
+                     << Ce.off << (Ce.folded ? ", folded" : ", exact") << ")";
+            }
+          } else {
+            errs() << ", about " << a;
+          }
+          errs() << ", " << pts[x].count() << " facts\n";
+        }
         assert(false && "two nodes share a name");
       }
       PO << nm << "\t" << c << "\n";

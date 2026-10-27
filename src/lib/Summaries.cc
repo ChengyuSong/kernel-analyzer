@@ -2509,7 +2509,9 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
         needPooled = true;
         break;
       }
-      chainRegs.push_back({key, blk, getFuncDef(fn), A.fk, CS});
+      // DX: canonicalFunc, so a bodiless callback registered from two
+      // modules is one target, not one declaration per module.
+      chainRegs.push_back({key, blk, canonicalFunc(fn), A.fk, CS});
       g_chainReg++;
       break;
     }

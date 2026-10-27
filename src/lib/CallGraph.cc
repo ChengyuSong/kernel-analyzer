@@ -51,6 +51,13 @@ Function* CallGraphPass::getFuncDef(Function *F) {
     return F;
 }
 
+Function *CallGraphPass::canonicalFunc(Function *F) {
+  Function *D = getFuncDef(F);
+  if (!D->isDeclaration()) return D;
+  auto it = Ctx->ExtFuncs.find(D->getGUID());
+  return it != Ctx->ExtFuncs.end() ? it->second : D;
+}
+
 size_t g_intArgUnmodeled = 0;
 // Global-initializer constant expressions that may carry a pointer but
 // have no transfer rule (e.g. sub/add/trunc over ptrtoint: relative

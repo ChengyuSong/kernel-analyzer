@@ -91,6 +91,10 @@ protected:
   };
 
   llvm::Function *getFuncDef(llvm::Function*);
+  // getFuncDef, and for a function with no body in any module the one
+  // declaration Ctx->ExtFuncs keeps (the node factory's canonical form):
+  // one Function per symbol (DX).
+  llvm::Function *canonicalFunc(llvm::Function *);
   bool runOnFunction(llvm::Function*);
   // --cfl-reachable: process F's body (and, transitively, its direct and
   // summary-bound callees) the first time it is reached.

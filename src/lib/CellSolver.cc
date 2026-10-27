@@ -326,6 +326,9 @@ std::pair<int64_t, int64_t> foldPeriod(Type *T, int64_t off, const DataLayout &D
 // path still share a name (XN's census asserts).
 static boost::unordered_flat_set<const GlobalValue *> gSharedSymbols;
 static size_t gSharedGroups = 0;
+// DX (Fable 2026-10-27): declarations collapsed into their canonical
+// declaration at the function seeds (XN's census prints them).
+static size_t gDeclCollapsed = 0, gDeclSymbols = 0;
 static bool gSymSuffix = true; // off: the bare name (XN's count of suffixed names)
 static void collectSharedSymbols(const ModuleList &Ms) {
   std::map<std::pair<bool, std::string>, std::vector<const GlobalValue *>> defs;
@@ -2893,12 +2896,20 @@ bool CallGraphPass::runCellResolution() {
   // ---- Seeds: functions and objects ----
   size_t funcSeeds = 0, objSeeds = 0;
   std::unordered_map<const Function *, uint32_t> funcFact;
+  // DX: a function with no body in any module (the kernel's assembly-only
+  // copy_user_generic_unrolled) has one declaration per module that names
+  // it, and getFuncDef returns each one itself; the node factory maps them
+  // all to the one Ctx->ExtFuncs keeps for the symbol, and so does the
+  // function object (canonicalFunc): one symbol, one object.
+  std::map<const Function *, std::set<const Function *>> declsOf; // canonical -> the declarations seeded
   for (const Function *F : addrTakenSorted) {
     const NodeIndex vn = NF.getValueNodeFor(F);
     if (vn == AndersNodeFactory::InvalidIndex) continue;
     const uint32_t n = canon(vn);
     if (!inGraph[n]) continue;
-    const Function *FD = getFuncDef(const_cast<Function *>(F));
+    const Function *FR = getFuncDef(const_cast<Function *>(F));
+    const Function *FD = canonicalFunc(const_cast<Function *>(FR));
+    if (FD->isDeclaration()) declsOf[FD].insert(FR);
     auto [it, ins] = funcFact.try_emplace(FD, 0);
     if (ins) {
       Obj O;
@@ -2914,6 +2925,12 @@ bool CallGraphPass::runCellResolution() {
     add(n, it->second);
     funcSeeds++;
   }
+  gDeclCollapsed = gDeclSymbols = 0;
+  for (const auto &[FD, Ds] : declsOf)
+    if (Ds.size() > 1) {
+      gDeclCollapsed += Ds.size() - 1;
+      gDeclSymbols++;
+    }
   auto isOrigin = [&](NodeIndex m) {
     if (!NF.isValueNode(m)) return false;
     if (AllocSites.count(m)) return true;
@@ -8914,7 +8931,8 @@ bool CallGraphPass::runCellResolution() {
     }
     CG_LOG("Cells: object names (XN): " << objs.size() << " objects, all distinct; " << byKind
            << " named by their mint kind (no IR value); " << withModule << " objects named with their module ("
-           << gSharedGroups << " name groups defined more than once)\n");
+           << gSharedGroups << " name groups defined more than once); " << gDeclCollapsed
+           << " declaration objects collapsed into their canonical declaration (" << gDeclSymbols << " symbols)\n");
   }
   // The part of factMass in the key cells of keyed union slots: a key cell
   // is fed by its slot's unkeyed cell (U -> K -> P), so it repeats U's

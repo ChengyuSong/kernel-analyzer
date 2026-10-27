@@ -316,6 +316,44 @@ std::pair<int64_t, int64_t> foldPeriod(Type *T, int64_t off, const DataLayout &D
   return {0, 0};
 }
 
+// XK (Fable 2026-10-27): a function or global defined more than once
+// across the linked modules (the kernel's static event_show in several
+// files; internal symbols are not linked) is named with its module's
+// source file (the module identifier, the bitcode path as given, when the
+// source file name is empty). The set is the name group, built from every
+// module before the solve, so a name does not depend on object order; a
+// name defined once stays as it is. Two definitions with one name and one
+// path still share a name (XN's census asserts).
+static boost::unordered_flat_set<const GlobalValue *> gSharedSymbols;
+static size_t gSharedGroups = 0;
+static bool gSymSuffix = true; // off: the bare name (XN's count of suffixed names)
+static void collectSharedSymbols(const ModuleList &Ms) {
+  std::map<std::pair<bool, std::string>, std::vector<const GlobalValue *>> defs;
+  for (const auto &mp : Ms) {
+    for (const Function &F : *mp.first)
+      if (!F.isDeclaration() && F.hasName()) defs[{true, F.getName().str()}].push_back(&F);
+    for (const GlobalVariable &GV : mp.first->globals())
+      if (!GV.isDeclaration() && GV.hasName()) defs[{false, GV.getName().str()}].push_back(&GV);
+  }
+  gSharedSymbols.clear();
+  gSharedGroups = 0;
+  for (const auto &[k, gs] : defs)
+    if (gs.size() > 1) {
+      gSharedGroups++;
+      gSharedSymbols.insert(gs.begin(), gs.end());
+    }
+}
+static std::string symName(const GlobalValue *G) {
+  std::string s = G->getName().str();
+  if (gSymSuffix && gSharedSymbols.count(G)) {
+    const Module *M = G->getParent();
+    std::string p = M->getSourceFileName();
+    if (p.empty()) p = M->getModuleIdentifier();
+    s += " (" + p + ")";
+  }
+  return s;
+}
+
 // "function file:line" of an instruction (reports).
 std::string instLoc(const Instruction *I) {
   if (!I) return "?";
@@ -629,6 +667,7 @@ bool CallGraphPass::runCellResolution() {
   using Clock = std::chrono::steady_clock;
   const auto t0 = Clock::now();
   const DataLayout &DL = Ctx->Modules.front().first->getDataLayout();
+  collectSharedSymbols(Ctx->Modules);
   // The timer progress line (Fable 2026-10-17): the phase the solver is in,
   // whatever it is doing, so a stall is attributable from the log alone.
   SolverWatchdog watchdog;
@@ -2408,10 +2447,10 @@ bool CallGraphPass::runCellResolution() {
       std::string is;
       raw_string_ostream os(is);
       I->print(os);
-      return (I->getFunction()->getName() + ": ").str() + os.str().substr(0, 140);
+      return symName(I->getFunction()) + ": " + os.str().substr(0, 140);
     }
     if (const auto *A = dyn_cast_or_null<Argument>(V))
-      return (A->getParent()->getName() + " arg" + Twine(A->getArgNo())).str();
+      return symName(A->getParent()) + " arg" + std::to_string(A->getArgNo());
     if (!V) return "?";
     std::string vs;
     raw_string_ostream os(vs);
@@ -3455,7 +3494,7 @@ bool CallGraphPass::runCellResolution() {
   };
   auto siteName = [&](const Value *V) -> std::string {
     if (const auto *I = dyn_cast<Instruction>(V)) {
-      std::string s = (I->getFunction()->getName() + "::" + I->getOpcodeName()).str();
+      std::string s = symName(I->getFunction()) + "::" + I->getOpcodeName();
       if (const auto *CB = dyn_cast<CallBase>(I))
         if (const Function *CF = CB->getCalledFunction()) s += " " + CF->getName().str();
       if (const DILocation *L = I->getDebugLoc())
@@ -3463,7 +3502,8 @@ bool CallGraphPass::runCellResolution() {
       return s + " #" + std::to_string(instPos(I));
     }
     if (const auto *A = dyn_cast<Argument>(V))
-      return "arg#" + std::to_string(A->getArgNo()) + " of " + A->getParent()->getName().str();
+      return "arg#" + std::to_string(A->getArgNo()) + " of " + symName(A->getParent());
+    if (const auto *GVn = dyn_cast<GlobalValue>(V); GVn && GVn->hasName()) return symName(GVn);
     if (V->hasName()) return V->getName().str();
     // Never an empty name: an unnamed global prints its slot and type,
     // a constant expression itself.
@@ -3486,7 +3526,7 @@ bool CallGraphPass::runCellResolution() {
     if (n == NF.getUniversalPtrNode()) return "the universal pointer";
     if (auto it = synthOrigin.find(n); it != synthOrigin.end()) {
       const SynthOrigin &S = it->second;
-      return std::string(S.kind) + (S.fn ? " of " + S.fn->getName().str() : std::string()) +
+      return std::string(S.kind) + (S.fn ? " of " + symName(S.fn) : std::string()) +
              (S.atom >= 0 ? (S.fn ? " atom " : " of atom ") + std::to_string(S.atom) : std::string()) +
              (S.arg >= 0 ? " arg" + std::to_string(S.arg) : std::string()) +
              (S.off >= 0 ? " +" + std::to_string(S.off) : std::string()) + " at " + siteName(S.at);
@@ -3494,7 +3534,7 @@ bool CallGraphPass::runCellResolution() {
     return "";
   };
   auto describe = [&](const Obj &O) {
-    if (O.fn) return "fn " + O.fn->getName().str();
+    if (O.fn) return "fn " + symName(O.fn);
     std::string where;
     if (O.rowOwner != UINT32_MAX) {
       // A row object is one per (owner, owner offset, link site, row type).
@@ -8845,18 +8885,24 @@ bool CallGraphPass::runCellResolution() {
   // their mint kind (counted).
   {
     boost::unordered_flat_map<std::string, uint32_t> named;
-    size_t byKind = 0;
+    size_t byKind = 0, withModule = 0;
     for (uint32_t o = 0; o < objs.size(); o++) {
       const Obj &O = objs[o];
       byKind += !O.fn && O.rowOwner == UINT32_MAX && !NF.getValueForNode(O.origin);
       const std::string nm = describe(O);
+      if (!gSharedSymbols.empty()) { // XK: named with a module somewhere in it
+        gSymSuffix = false;
+        withModule += describe(O) != nm;
+        gSymSuffix = true;
+      }
       if (auto [it, ins] = named.try_emplace(nm, o); !ins) {
         errs() << "Cells: two objects share the name '" << nm << "' (objects " << it->second << ", " << o << ")\n";
         assert(false && "two objects share a name");
       }
     }
     CG_LOG("Cells: object names (XN): " << objs.size() << " objects, all distinct; " << byKind
-           << " named by their mint kind (no IR value)\n");
+           << " named by their mint kind (no IR value); " << withModule << " objects named with their module ("
+           << gSharedGroups << " name groups defined more than once)\n");
   }
   // The part of factMass in the key cells of keyed union slots: a key cell
   // is fed by its slot's unkeyed cell (U -> K -> P), so it repeats U's

@@ -10405,6 +10405,22 @@ bool CallGraphPass::runCellResolution() {
          << g_poolCarves << " pool carves (allocation sites; see PoolCarve lines); "
          << g_freeDropped << " deallocator stores into or of the freed block (FREE)\n");
   CG_LOG("Cells: " << slotSummaryRow() << "\n");
+  // TG: pointer tags set by a variable (known bits below 8), and the
+  // variable or/xor whose bits are unbounded (still a field-any loop).
+  std::vector<const Instruction *> tagVarSets(g_tagVarSets.begin(), g_tagVarSets.end()),
+      tagVarRefused(g_tagVarRefused.begin(), g_tagVarRefused.end());
+  std::sort(tagVarSets.begin(), tagVarSets.end(), irOrderLess);
+  std::sort(tagVarRefused.begin(), tagVarRefused.end(), irOrderLess);
+  auto tagSite = [](const Instruction *I) {
+    std::string op;
+    raw_string_ostream os(op);
+    I->printAsOperand(os, false);
+    return instLoc(I) + " " + os.str();
+  };
+  CG_LOG("Cells: " << tagVarSets.size() << " pointer tag sets by a variable whose known bits lie below 8 (TG); "
+         << tagVarRefused.size() << " variable or/xor refused: bits unbounded\n");
+  for (const Instruction *I : tagVarSets) CG_LOG("Cells:   TG tag set at " << tagSite(I) << "\n");
+  for (const Instruction *I : tagVarRefused) CG_LOG("Cells:   TG refused (bits unbounded) at " << tagSite(I) << "\n");
   if (!taggedPairs.empty())
     CG_LOG("Cells: tagged fields (plan 3.51): " << taggedPairs.size() << " keyed pairs, "
            << taggedFlipped.size() << " flipped to unkeyed during the solve (a byte copy or a watched "
@@ -11850,6 +11866,14 @@ bool CallGraphPass::runCellResolution() {
          << " not a refill (rule RF)\n";
     for (const std::string &r : poolInteriorRefillRows) RO << "P " << r << "\n";
     for (const std::string &r : poolWithdrawRows) RO << "P " << r << "\n";
+    // TG: only where there are instances.
+    if (!tagVarSets.empty() || !tagVarRefused.empty()) {
+      RO << "\n== pointer tags set by a variable (TG)\n";
+      RO << "SUMMARY tag sets by a variable whose known bits lie below 8: " << tagVarSets.size()
+         << "; variable or/xor refused, bits unbounded: " << tagVarRefused.size() << "\n";
+      for (const Instruction *I : tagVarSets) RO << "TG set " << tagSite(I) << "\n";
+      for (const Instruction *I : tagVarRefused) RO << "TG refused " << tagSite(I) << "\n";
+    }
     RO.flush();
     assert(ROText.find(" [id #") == std::string::npos && "--cfl-cells: a rule report row carries an id (XN)");
     ROFile << ROText;

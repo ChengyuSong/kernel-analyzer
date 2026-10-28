@@ -6,6 +6,7 @@
 // Names.cc, Summaries.cc, Census.cc, Dump.cc). Not for other users.
 
 #include <llvm/ADT/BitVector.h>
+#include <llvm/ADT/SetVector.h>
 #include <llvm/IR/DebugInfo.h>
 #include <llvm/IR/GetElementPtrTypeIterator.h>
 #include <llvm/IR/Operator.h>
@@ -340,6 +341,9 @@ extern size_t g_sinkArenaSites;
 extern size_t g_innerAllocSites;
 // --cfl-cells: ptrtoints whose integer never becomes a pointer (no wildcard).
 extern size_t g_p2iNumberOnly;
+// --cfl-cells (TG): or/xor pointer tag sets by a variable whose known bits
+// lie below 8, and variable or/xor refused because their bits are unbounded.
+extern llvm::SmallSetVector<const llvm::Instruction *, 8> g_tagVarSets, g_tagVarRefused;
 // --cfl-cells: GEPs that carve a new object out of an allocation.
 extern size_t g_carves;
 extern size_t g_poolCarves;

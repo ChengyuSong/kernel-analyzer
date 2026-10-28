@@ -14,7 +14,9 @@
 
 #include "CallGraphInternal.h"
 
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/BinaryFormat/Dwarf.h>
+#include <llvm/Support/KnownBits.h>
 #include <llvm/IR/Dominators.h>
 
 namespace {
@@ -5077,9 +5079,13 @@ static void p2iEscapeCensus(const Value *PTI, const char *where) {
          << (F ? F->getName() : StringRef("<constexpr>")) << "\n";
 }
 
+// TG: the variable or/xor tag sets of walks that proved their ptrtoint,
+// and the variable or/xor that refused one (bits unbounded).
+SmallSetVector<const Instruction *, 8> g_tagVarSets, g_tagVarRefused;
 static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
   SmallVector<const Value *, 16> wl{PTI};
   SmallPtrSet<const Value *, 32> seen{PTI};
+  SmallVector<const Instruction *, 2> tagVarSets;
   g_tagWalkWhy = "";
   unsigned steps = 0;
   while (!wl.empty()) {
@@ -5092,11 +5098,26 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       if (isa<IntToPtrInst>(U) || isa<ICmpInst>(U) || isa<SwitchInst>(U))
         continue; // round trip at offset 0 / compare: exact
       if (const auto *BO = dyn_cast<BinaryOperator>(U)) {
-        const auto *CI = dyn_cast<ConstantInt>(
-            BO->getOperand(BO->getOperand(0) == V ? 1 : 0));
+        const Value *Other = BO->getOperand(BO->getOperand(0) == V ? 1 : 0);
+        const auto *CI = dyn_cast<ConstantInt>(Other);
         if (!CI) {
-          g_tagWalkWhy = "arith-var";
-          return false;
+          // TG: an or/xor whose variable operand's known bits all lie
+          // below 8 sets tag bits, as a constant c < 8 does (rb_node's
+          // parent_color = parent | (old & 1)).
+          if (BO->getOpcode() != Instruction::Or && BO->getOpcode() != Instruction::Xor) {
+            g_tagWalkWhy = "arith-var";
+            return false;
+          }
+          const KnownBits KB = computeKnownBits(Other, BO->getModule()->getDataLayout());
+          if (KB.countMaxActiveBits() > 3) {
+            g_tagWalkWhy = "orxor-var-unbounded";
+            g_tagVarRefused.insert(BO);
+            return false;
+          }
+          tagVarSets.push_back(BO);
+          if (seen.insert(U).second)
+            wl.push_back(U);
+          continue;
         }
         const uint64_t c = CI->getZExtValue();
         switch (BO->getOpcode()) {
@@ -5196,6 +5217,8 @@ static bool ptrToIntTagRoundTripOnly(const Value *PTI) {
       return false;
     }
   }
+  for (const Instruction *I : tagVarSets)
+    g_tagVarSets.insert(I);
   return true;
 }
 

@@ -4175,3 +4175,29 @@ class (MW tree, tiffsplit-O3: 630 holder-guard nodes, 120 keyed by a
 stale fact, 40 keys with two or more nodes). The census of the two maps
 is an assertion at every report: 0 stale keys, 0 keys with more than one
 node. Not mechanized. Checked by executions; see the commit's gates.
+
+## Pointer tags set by a variable below 8 (GraphBuild ptrToIntTagRoundTripOnly, Fable 2026-10-27, TG)
+
+The tag round trip (Link words above) keeps p's facts through ptrtoint
+| k for a constant k < 8: bits below 8 are tags, not offsets, so the
+tagged value points at the same cell as p. TG extends the premise from a
+constant to a value. An or/xor whose other operand's known bits
+(llvm::computeKnownBits, the module's DataLayout, no assumption cache)
+are zero at bit 3 and above (countMaxActiveBits() <= 3) sets tag bits as
+a constant k < 8 does, and the walk continues. Statement: for such an
+operand t, (ptrtoint p) | t and (ptrtoint p) ^ t differ from ptrtoint p
+only in bits 0-2, so after the round trip's clear (& ~c with ~c < 8) or
+at a compare the value is p's address. Assumed, as for the constant
+case: p's low three bits are zero (alignment 8), so a tag does not carry
+into the address; the rb_node words TG covers have alignment 8. An
+or/xor with a variable operand whose bits are not bounded below 8 is
+refused with the reason "orxor-var-unbounded" (it was "arith-var") and
+stays a field-any loop; and/add/sub with a variable stay "arith-var".
+Instances (kernel 5.18, desk, kwhy3/kwhy5): rb_erase %4's parent word
+(%82 = and %81, 1), rb_replace_node %16 and %26 (and %13, 1 / and %23,
+1). Refused: __queue_work %162 (work_color << 4: bounded only by the
+source). Census line "N pointer tag sets by a variable whose known bits
+lie below 8 (TG); M variable or/xor refused: bits unbounded", each site
+listed in IR order, and a rule-report section where there are instances.
+Case: t_cells_tg_rbtag.c. Not mechanized. Checked by executions; see the
+commit's gates.

@@ -1082,9 +1082,19 @@ void CallGraphPass::confirmFreshWrappers() {
           continue;
         }
         // R3: no pointer side effects elsewhere (classified init stores
-        // are exempt — they become atoms).
+        // are exempt — they become atoms). The decision is the first
+        // rejecting instruction; under --cfl-trace-func the scan goes on
+        // through the whole body and every rejecting instruction is
+        // printed with its class (R3t), then the return path's sources.
+        const bool r3trace = !CFLTraceFunc.empty();
         const Instruction *r3bad = nullptr;
-        for (auto II = inst_begin(F), IE = inst_end(F); II != IE && ok;
+        SmallVector<std::pair<const Instruction *, std::string>, 8> r3all;
+        auto r3reject = [&](const Instruction *I2, std::string cls) {
+          ok = false;
+          if (!r3bad) r3bad = I2;
+          if (r3trace) r3all.push_back({I2, std::move(cls)});
+        };
+        for (auto II = inst_begin(F), IE = inst_end(F); II != IE && (ok || r3trace);
              ++II) {
           const Instruction *I2 = &*II;
           if (poolBookkeeping.count(I2)) { // a certified pool's own state
@@ -1096,10 +1106,8 @@ void CallGraphPass::confirmFreshWrappers() {
             // A store into a non-escaping local slot moves nothing out
             // of the function; the reload's uses are judged above.
             if (isSpillSlot(SI->getPointerOperand())) continue;
-            if (containsPointerType(SI->getValueOperand()->getType())) {
-              ok = false;
-              r3bad = I2;
-            }
+            if (containsPointerType(SI->getValueOperand()->getType()))
+              r3reject(I2, "pointer store");
             continue;
           }
           if (const auto *CB = dyn_cast<CallBase>(I2)) {
@@ -1124,24 +1132,84 @@ void CallGraphPass::confirmFreshWrappers() {
               if (nit != Ctx->FuncSummaries.end() && nit->second->noop)
                 continue;
             }
-            bool ptrInvolved =
-                containsPointerType(CB->getType()) && !onRetPath.count(CB);
+            const bool ptrResult = containsPointerType(CB->getType()) && !onRetPath.count(CB);
+            bool ptrArg = false;
             for (const Value *a2 : CB->args())
-              if (containsPointerType(a2->getType())) ptrInvolved = true;
-            if (!CF || ptrInvolved) { ok = false; r3bad = I2; }
+              if (containsPointerType(a2->getType())) ptrArg = true;
+            if (!CF)
+              r3reject(I2, "indirect call");
+            else if (ptrArg || ptrResult)
+              r3reject(I2, ptrArg && ptrResult ? "pointer-arg call + pointer result off the return path"
+                           : ptrArg            ? "pointer-arg call"
+                                               : "pointer result off the return path");
             continue;
           }
           if (isa<PtrToIntInst>(I2) || isa<AtomicRMWInst>(I2) ||
-              isa<AtomicCmpXchgInst>(I2)) {
-            ok = false;
-            r3bad = I2;
-          }
+              isa<AtomicCmpXchgInst>(I2))
+            r3reject(I2, "ptrtoint-atomic");
         }
         if (!ok) {
           g_freshRejSide++;
-          if (!CFLTraceFunc.empty() && r3bad) {
+          if (r3trace && r3bad) {
             CG_LOG("ConfirmFresh R3: " << F.getName() << " side effect "
                    << StringRef(irPrint(*r3bad)).ltrim().substr(0, 80) << "\n");
+            // R3t: every rejecting instruction, in body order (the first
+            // is the decision's), with its class and source line.
+            for (size_t k = 0; k < r3all.size(); k++) {
+              const Instruction *RI = r3all[k].first;
+              std::string loc;
+              if (const DebugLoc &DL = RI->getDebugLoc())
+                loc = " @" + DL->getFilename().str() + ":" + std::to_string(DL.getLine());
+              CG_LOG("ConfirmFresh R3t: " << F.getName() << " reject " << k + 1 << "/" << r3all.size()
+                     << " [" << r3all[k].second << "]" << loc << " "
+                     << StringRef(irPrint(*RI)).ltrim().substr(0, 120) << "\n");
+            }
+            // The return path's sources (R1 accepted them): each an
+            // allocator result (a fresh callee, promoted or not, or one
+            // assumed fresh at the fixpoint), a pool carve, a formal, null,
+            // or other. A spill-slot reload resolves to the stores that reach
+            // it (as R1 reads it), and its sources print "(via slot)"; a load
+            // with no reaching store, or not from a slot, is "other (load)".
+            std::map<std::string, size_t> srcs;
+            SmallPtrSet<const Value *, 16> seenRet;
+            std::function<void(const Value *, bool)> retSrc = [&](const Value *v, bool viaSlot) {
+              if (!seenRet.insert(v).second) return;
+              const std::string via = viaSlot ? " (via slot)" : "";
+              if (isa<ConstantPointerNull>(v) || isa<UndefValue>(v)) {
+                srcs["null" + via]++;
+              } else if (const auto *A = dyn_cast<Argument>(v)) {
+                srcs["formal " + std::to_string(A->getArgNo()) + via]++;
+              } else if (const auto *CI = dyn_cast<Instruction>(v); CI && poolCarves.count(CI)) {
+                srcs["pool carve" + via]++;
+              } else if (const auto *CB = dyn_cast<CallBase>(v)) {
+                const Function *CF = CB->getCalledFunction();
+                const bool asm_ = CF && !assumed.empty() &&
+                                  assumed.count(CF->isDeclaration() ? getFuncDef(const_cast<Function *>(CF)) : CF);
+                srcs[std::string(asm_ ? "assumed-fresh result " : "allocator result ") +
+                     (CF ? CF->getName().str() : std::string("(indirect)")) + via]++;
+              } else if (const auto *PN = dyn_cast<PHINode>(v)) {
+                for (const Value *iv : PN->incoming_values()) retSrc(iv, viaSlot);
+              } else if (const auto *Sel = dyn_cast<SelectInst>(v)) {
+                retSrc(Sel->getTrueValue(), viaSlot);
+                retSrc(Sel->getFalseValue(), viaSlot);
+              } else if (const auto *Cast = dyn_cast<CastInst>(v)) {
+                retSrc(Cast->getOperand(0), viaSlot);
+              } else if (const auto *L = dyn_cast<LoadInst>(v)) {
+                SmallVector<const StoreInst *, 4> defs;
+                if (const AllocaInst *AI = isSpillSlot(L->getPointerOperand()))
+                  reachingSlotStores(L, AI, defs);
+                if (defs.empty()) srcs["other (load)"]++;
+                for (const StoreInst *D : defs) retSrc(D->getValueOperand(), true);
+              } else {
+                srcs["other" + via]++;
+              }
+            };
+            for (auto &BB : F)
+              if (const auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+                if (RI->getReturnValue()) retSrc(RI->getReturnValue(), false);
+            std::string line;
+            for (const auto &[c, n] : srcs) line += (line.empty() ? "" : ", ") + c + (n > 1 ? " x" + std::to_string(n) : "");
+            CG_LOG("ConfirmFresh R3t: " << F.getName() << " return path: " << line << "\n");
           }
           continue;
         }

@@ -215,7 +215,7 @@ Removed options are errors that name their replacement; the list is in
 
 ## Trace and dump
 
-- **`--cfl-trace-func`** (default `""`): Trace flows-to fact propagation for the address-taken function whose name contains this substring: log every class its root reaches (capped) and the final reach set, to localize where a flow is lost
+- **`--cfl-trace-func`** (default `""`): Trace flows-to fact propagation for the address-taken function whose name contains this substring: log every class its root reaches (capped) and the final reach set, to localize where a flow is lost; any value also logs every ConfirmFresh R1 and R3 refusal (R3: every rejecting instruction with its class, and the return path's sources)
 - **`--cfl-trace-first`** (default `false`): With --cfl-trace-func: log only the first arrival of each traced root at each class (bounded by the class count, no event cap), which is what a backward chain walk reads
 - **`--cfl-trace-fptr`** (default `""`): After the flows-to fixpoint, dump a backward slice from the fptr class of icalls in functions whose name contains this substring, annotated with traced-root presence, to localize where a flow is severed
 - **`--cfl-trace-meet`** (default `""`): Two origin names (comma-separated substrings of a function, global, alloca or allocation-call name such as _bfd_new_bfd::call:bfd_zmalloc) that must never alias: report the first classes that come to hold both, with each origin's derivation chain (edge kind, source class, residue) walked back to its seed — the exact place the analysis unions them

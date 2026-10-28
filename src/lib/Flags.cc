@@ -72,7 +72,9 @@ cl::opt<std::string> CFLTraceFunc(
   cl::desc("Trace flows-to fact propagation for the address-taken function "
            "whose name contains this substring: log every class its root "
            "reaches (capped) and the final reach set, to localize where a "
-           "flow is lost"),
+           "flow is lost; any value also logs every ConfirmFresh R1 and R3 "
+           "refusal (R3: every rejecting instruction with its class, and the "
+           "return path's sources)"),
   cl::init(""));
 
 cl::opt<bool> CFLTraceFirst(

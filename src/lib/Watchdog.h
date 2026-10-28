@@ -6,7 +6,10 @@
 // timeout or an OOM labeled from the log alone). The thread reads atomics
 // only, never a solver or LLVM structure; each tick is one preformatted line
 // written in one write(2) call (KA_LOG composes its lines the same way, so a
-// tick lands between lines); RSS comes from /proc/self/statm. It starts with
+// tick lands between lines); RSS comes from /proc/self/statm. Beside the
+// wall seconds since the watchdog started it prints the process's CPU seconds
+// (getrusage, user + system) over the same interval, so a slow phase reads as
+// compute or as a loaded machine (WD). It starts with
 // the solver and is stopped and joined before the solver's summary prints
 // (and by its destructor on any other way out).
 //
@@ -35,6 +38,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
+#include <sys/resource.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -102,6 +106,7 @@ public:
     Interval = IntervalSecs;
     LongPop = LongPopSecs;
     Start = nowNs();
+    CpuStart = cpuSecs();
     Stop = false;
     T = std::thread([this] { run(); });
   }
@@ -135,6 +140,11 @@ private:
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+  }
+  static double cpuSecs() {
+    struct rusage u;
+    if (::getrusage(RUSAGE_SELF, &u) != 0) return -1;
+    return u.ru_utime.tv_sec + u.ru_stime.tv_sec + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6;
   }
   static double rssGB() {
     char buf[128];
@@ -253,9 +263,9 @@ private:
       const double rss = rssGB();
       char line[256];
       const int n = std::snprintf(line, sizeof(line),
-                                  "CallGraph: Cells: watchdog (iteration %d) at %.0f s: phase %s for %.0f s, %llu pops, "
-                                  "RSS %.2f GB\n",
-                                  Iter, (now - Start) / 1e9, Phase.load(std::memory_order_relaxed),
+                                  "CallGraph: Cells: watchdog (iteration %d) at %.0f s (cpu %.0f s): phase %s for %.0f s, "
+                                  "%llu pops, RSS %.2f GB\n",
+                                  Iter, (now - Start) / 1e9, cpuSecs() - CpuStart, Phase.load(std::memory_order_relaxed),
                                   (now - PhaseSince.load(std::memory_order_relaxed)) / 1e9,
                                   (unsigned long long)Pops.load(std::memory_order_relaxed), rss);
       emit(line, n, sizeof(line));
@@ -292,6 +302,7 @@ private:
   int Iter = 0;
   unsigned Interval = 60, LongPop = 0;
   int64_t Start = 0;
+  double CpuStart = 0;
   bool Stop = false;
   std::mutex M;
   std::condition_variable CV;

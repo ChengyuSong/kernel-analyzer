@@ -3082,6 +3082,11 @@ embedded at a constant offset (tif->tif_tagmethods.vsetfield: two GEPs at
   and is not widened into the certificate (zlib does write z_stream
   fields: libpng's zstream pair is uncertified, its address escapes at
   the zlib calls).
+- The premise's callees are resolved across modules (XT, Fable
+  2026-10-27): a direct call through one module's declaration of a
+  function another module defines is a call of that body, whose writes
+  enter the caller's mod set; only a callee no module defines is
+  bodiless ("calls of bodiless functions" in the rule report's SUMMARY c).
 
 **Saved and restored methods.** A codec's cleanup restores the method
 it saved at install (`tif->tif_tagmethods.vgetfield = sp->vgetparent`),

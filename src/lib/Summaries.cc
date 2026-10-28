@@ -6058,7 +6058,7 @@ void CallGraphPass::unadoptKeyedBodies() {
       if (keyed.count(F)) continue;
       for (const Instruction &I : instructions(*F))
         if (const auto *CB = dyn_cast<CallBase>(&I))
-          if (const Function *C = CB->getCalledFunction(); C && keyed.count(C)) {
+          if (const Function *C = CB->getCalledFunction(); C && keyed.count(getFuncDef(const_cast<Function *>(C)))) { // XT
             keyed.insert(F);
             changed = true;
             break;

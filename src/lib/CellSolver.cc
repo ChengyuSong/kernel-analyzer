@@ -671,6 +671,19 @@ bool CallGraphPass::runCellResolution() {
   const auto t0 = Clock::now();
   const DataLayout &DL = Ctx->Modules.front().first->getDataLayout();
   collectSharedSymbols(Ctx->Modules);
+  // XT: direct calls through a module's declaration of a function another
+  // module defines (the population the mod sets now check as bodies).
+  size_t xtCalls = 0;
+  std::set<const Function *> xtCallees;
+  for (const auto &mp : Ctx->Modules)
+    for (Function &F : *mp.first)
+      for (Instruction &I : instructions(F))
+        if (const auto *CB = dyn_cast<CallBase>(&I))
+          if (Function *C = CB->getCalledFunction(); C && C->isDeclaration() && !C->isIntrinsic())
+            if (const Function *D = getFuncDef(C); !D->isDeclaration()) {
+              xtCalls++;
+              xtCallees.insert(D);
+            }
   // The timer progress line (Fable 2026-10-17): the phase the solver is in,
   // whatever it is doing, so a stall is attributable from the log alone.
   SolverWatchdog watchdog;
@@ -4143,8 +4156,12 @@ bool CallGraphPass::runCellResolution() {
               else modUntypedWrites++;
               continue;
             }
-            if (C->isDeclaration()) { modBodiless++; continue; }
-            calls[&F].push_back(C);
+            // XT: a callee defined in another module is reached through
+            // this module's declaration; its body is checked, so only a
+            // callee with no body anywhere counts as bodiless.
+            const Function *CD = getFuncDef(const_cast<Function *>(C));
+            if (CD->isDeclaration()) { modBodiless++; continue; }
+            calls[&F].push_back(CD);
             continue;
           }
           auto cit = Ctx->Callees.find(CB);
@@ -4215,7 +4232,7 @@ bool CallGraphPass::runCellResolution() {
           if (slotMatches(w, slot)) return true;
         return false;
       }
-      return mayWrite(C, slot);
+      return mayWrite(getFuncDef(const_cast<Function *>(C)), slot); // XT: across modules
     }
     auto cit = Ctx->Callees.find(CB);
     if (cit == Ctx->Callees.end()) return false;
@@ -8436,7 +8453,8 @@ bool CallGraphPass::runCellResolution() {
           V.insert(R);
           // On into a callee on G2's return path (the confirmer's walk).
           if (RC)
-            if (const Function *H = RC->getCalledFunction(); H && !H->isDeclaration())
+            if (const Function *H = RC->getCalledFunction() ? getFuncDef(RC->getCalledFunction()) : nullptr;
+                H && !H->isDeclaration()) // XT: a callee in another module
               if (auto cit = confirmPromotedRet.find(G2->getName().str());
                   cit != confirmPromotedRet.end() && cit->second.count(H->getName().str()))
                 wk.push_back(H);
@@ -8934,6 +8952,8 @@ bool CallGraphPass::runCellResolution() {
            << gSharedGroups << " name groups defined more than once); " << gDeclCollapsed
            << " declaration objects collapsed into their canonical declaration (" << gDeclSymbols << " symbols)\n");
   }
+  CG_LOG("Cells: cross-module calls (XT): " << xtCalls << " direct calls through a declaration of a function "
+         << "another module defines (" << xtCallees.size() << " callees), checked as bodies\n");
   // The part of factMass in the key cells of keyed union slots: a key cell
   // is fed by its slot's unkeyed cell (U -> K -> P), so it repeats U's
   // facts by construction; each key adds them again.

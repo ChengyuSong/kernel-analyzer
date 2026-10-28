@@ -12,7 +12,10 @@
 # KAMAIN= overrides the binary. A case may be LLVM assembly (t_cells_*.ll,
 # directives in "; //" comments): a shape only older front ends emit (the
 # kernel's clang-14 zero-index GEPs), assembled as written; its MODULEs are
-# compiled with its CFLAGS.
+# compiled with its CFLAGS. "// KAFLAGS: ..." adds analyzer flags, split
+# as xargs splits them: quotes group (an object name with spaces in a why
+# pattern is one quoted argument), | and globs are literal, and nothing is
+# expanded or run.
 set -u
 cd "$(dirname "$0")"
 BIN=${KAMAIN:-../release/lib/KAMain}
@@ -26,6 +29,9 @@ for c in t_pool_*.c t_cells_*.c t_cells_*.ll; do
   flags=$(grep -o "// CFLAGS: .*" "$c" | sed 's|// CFLAGS: ||')
   [ -z "$flags" ] && flags="-O0"
   kaflags=$(grep -o "// KAFLAGS: .*" "$c" | sed 's|// KAFLAGS: ||')
+  kl=$(printf '%s' "$kaflags" | xargs -r -n1 printf '%s\n') || { echo "FAIL[$n]: KAFLAGS do not parse"; fail=1; continue; }
+  kargs=()
+  [ -n "$kl" ] && mapfile -t kargs <<< "$kl"
   if [ "${c##*.}" = ll ]; then
     "$(dirname "$CLANG")/llvm-as" "$c" -o "$OUT/$n.bc" || { echo "FAIL[$n]: assemble"; fail=1; continue; }
   else
@@ -37,7 +43,7 @@ for c in t_pool_*.c t_cells_*.c t_cells_*.ll; do
     mods+=("$OUT/${m%.c}.bc")
   done
   timeout 120 "$BIN" --verbose=2 --func-summaries=../func_summaries.txt --cfl-cells --cfl-union-keys=tag \
-    --cfl-alloc-origins --cfl-whole-program $kaflags --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" "${mods[@]}" > "$OUT/$n.log" 2>&1
+    --cfl-alloc-origins --cfl-whole-program "${kargs[@]}" --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" "${mods[@]}" > "$OUT/$n.log" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL[$n]: exit $rc (124: did not finish in 120 s)"; fail=1; continue; fi
   maxc=$(grep -o "// MAXCELLS: [0-9]*" "$c" | grep -o "[0-9]*$")

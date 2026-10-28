@@ -1317,13 +1317,16 @@ cl::opt<std::string> CFLCellWhy(
   cl::desc("--cfl-cells instrument: record the first cause of every fact "
            "arrival (edge, hub link, step, walk, any-offset, byte copy); at "
            "the heaviest byte copy, explain how its source pointer came to "
-           "hold a cell of the object whose description contains this"),
+           "hold a cell of the object whose description contains this "
+           "(as a log prints it, or with the why output's ids; several "
+           "objects: alternatives separated by '|')"),
   cl::init(""));
 cl::opt<std::string> CFLCellWhyAt(
   "cfl-cell-why-at",
   cl::desc("--cfl-cell-why instrument: also explain why each node whose "
            "description contains this holds the --cfl-cell-why object "
-           "(several patterns: alternatives separated by '|')"),
+           "(as a log prints it, or with the why output's ids; several "
+           "patterns: alternatives separated by '|')"),
   cl::init(""));
 
 cl::opt<bool> CFLCellOneLabel(

@@ -3587,6 +3587,23 @@ bool CallGraphPass::runCellResolution() {
            (O.repeats ? " array" : "") + "]";
   };
   describeFn = describe;
+  // XP (Fable 2026-10-26): a --cfl-cell-why or --cfl-cell-why-at pattern
+  // matches a description in either form: as every log prints it (no
+  // ids), so a pattern copied from a --verbose=2 log matches, or with the
+  // ids, as the why output prints it (a pattern may name an id).
+  auto whyForms = [&](auto &&desc) {
+    const int saved = idScope;
+    idScope = 0;
+    std::pair<std::string, std::string> d;
+    d.first = desc();
+    idScope = 1;
+    d.second = desc();
+    idScope = saved;
+    return d;
+  };
+  auto inWhyForms = [](const std::pair<std::string, std::string> &d, StringRef pat) {
+    return d.first.find(pat.str()) != std::string::npos || d.second.find(pat.str()) != std::string::npos;
+  };
   // A fact matches --cfl-cell-one-label-object when an object it holds
   // does (its description contains the pattern).
   oneLabelMatch = [&](uint32_t f) {
@@ -3718,11 +3735,10 @@ bool CallGraphPass::runCellResolution() {
       auto is = [&](uint32_t o) {
         if (o >= cache.size()) cache.resize(objs.size() + 64, -1);
         if (cache[o] < 0) {
-          IdScope ids(idScope); // a pattern may name an object by its id
-          const std::string d = describe(objs[o]);
+          const auto d = whyForms([&] { return describe(objs[o]); });
           bool hit = false;
           for (StringRef alt : llvm::split(StringRef(want), '|'))
-            hit |= !alt.empty() && d.find(alt.str()) != std::string::npos;
+            hit |= !alt.empty() && inWhyForms(d, alt);
           cache[o] = hit;
         }
         return cache[o] == 1;
@@ -6062,9 +6078,9 @@ bool CallGraphPass::runCellResolution() {
     const std::string ind(2 + depth * 4, ' ');
     auto matches = [&](uint32_t f) {
       f = findFact(f);
-      if (describe(objs[cells[f].obj]).find(want) != std::string::npos) return true;
+      if (inWhyForms(whyForms([&] { return describe(objs[cells[f].obj]); }), want)) return true;
       for (auto [o, e] : memb[f])
-        if (describe(objs[o]).find(want) != std::string::npos) return true;
+        if (inWhyForms(whyForms([&] { return describe(objs[o]); }), want)) return true;
       return false;
     };
     uint32_t f0 = UINT32_MAX;
@@ -6168,9 +6184,10 @@ bool CallGraphPass::runCellResolution() {
       for (uint32_t m = 0; m < numNodes; m++) {
         if (!pts[find(m)].count()) continue;
         const std::string d = nodeDesc(m);
+        const auto forms = whyForms([&] { return nodeDesc(m); });
         bool any = false;
         for (size_t i = 0; i < at.size(); i++)
-          if (d.find(at[i]) != std::string::npos) hit[i] = any = true;
+          if (inWhyForms(forms, at[i])) hit[i] = any = true;
         if (any && asked.insert(find(m)).second) {
           CG_LOG("Cells: why-at " << d << ": a class of "
                  << classSize[find(m)] << " nodes, represented by " << nodeDesc(find(m)) << "\n");
@@ -6365,8 +6382,9 @@ bool CallGraphPass::runCellResolution() {
     IdScope ids(idScope);
     const std::string d = describe(objs[o]);
     bool want = !CFLCellTraceObj.empty() && d.find(CFLCellTraceObj) != std::string::npos;
+    const auto forms = whyForms([&] { return describe(objs[o]); });
     for (StringRef alt : llvm::split(StringRef(CFLCellWhy.getValue()), '|'))
-      if (!want && !alt.empty() && d.find(alt.str()) != std::string::npos) want = true;
+      if (!want && !alt.empty() && inWhyForms(forms, alt)) want = true;
     if (!want) return;
     CG_LOG("Cells: LAYOUT " << d << " learned " << typeLabel(S) << " at pop " << pops << " ("
            << mintCause << ") stepping "
@@ -10316,7 +10334,7 @@ bool CallGraphPass::runCellResolution() {
       for (auto &[key, w] : factWhy) {
         const uint32_t f = (uint32_t)key;
         if (f >= cells.size() || cells[f].kind != CellKind::Any) continue;
-        if (describe(objs[cells[f].obj]).find(want) == std::string::npos) continue;
+        if (!inWhyForms(whyForms([&] { return describe(objs[cells[f].obj]); }), want)) continue;
         if (w.t < bestT) { bestT = w.t; bestKey = key; }
       }
       if (bestT == UINT32_MAX) {

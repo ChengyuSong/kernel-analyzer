@@ -853,7 +853,12 @@ void CallGraphPass::checkContainerClosure() {
         [&](const Value *V, std::set<const Function *> &out, std::set<const Argument *> &onStack) -> bool {
       V = V->stripPointerCasts();
       if (isa<ConstantPointerNull>(V)) return true;
-      if (const auto *Fn = dyn_cast<Function>(V)) { out.insert(Fn); return true; }
+      // DR: a constant from a module that only declares the function names
+      // its definition (canonicalFunc), so the constructor's body is typed.
+      if (const auto *Fn = dyn_cast<Function>(V)) {
+        out.insert(canonicalFunc(const_cast<Function *>(Fn)));
+        return true;
+      }
       const Argument *A = formalOf(V);
       if (!A || !onStack.insert(A).second) return false; // another value, or a cycle
       const Function *F = A->getParent();
@@ -902,7 +907,7 @@ void CallGraphPass::checkContainerClosure() {
           if (OA && VA && OA->getParent() == VA->getParent()) {
             pairUp(OA, VA, 0);
           } else if (const auto *Fn = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts())) {
-            ownerFeeds.push_back({B, {Fn}});
+            ownerFeeds.push_back({B, {canonicalFunc(const_cast<Function *>(Fn))}}); // DR
           }
         }
         if (constsOf(S->getValueOperand(), T, onStack)) continue;

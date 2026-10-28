@@ -3756,6 +3756,13 @@ bool CallGraphPass::runCellResolution() {
     };
   }
   watchdog.phase("method dispatch");
+  // DT: the phase's sub-steps timed (log only): receivers and holder
+  // guards, the method-identity tests, the mod sets they build (buildMod),
+  // and the rest up to the propagation setup.
+  const auto tDisp = Clock::now();
+  auto tGuards = tDisp, tIds = tDisp;
+  double dtModSecs = 0;
+  size_t dtModFns = 0, dtModEdges = 0, dtModRounds = 0, dtModSlots = 0;
   // ---- Method dispatch (--cfl-cell-receivers) ----
   // A method call (*(p.path.slot))(.., p, ..) (dispatchReceiver; the graph
   // does not wire the receiver argument): each object o at p reaches the
@@ -4144,6 +4151,7 @@ bool CallGraphPass::runCellResolution() {
   auto buildMod = [&]() {
     if (modBuilt) return;
     modBuilt = true;
+    const auto tMod = Clock::now();
     boost::unordered_flat_map<const Function *, std::vector<const Function *>> calls;
     for (auto &[M, _] : Ctx->Modules)
       for (Function &F : *M) {
@@ -4200,6 +4208,7 @@ bool CallGraphPass::runCellResolution() {
     }
     for (bool grew = true; grew;) {
       grew = false;
+      dtModRounds++;
       for (auto &[F, cs] : calls)
         modOf.update(F, [&](ModSet &MS) {
           for (const Function *C : cs) {
@@ -4212,6 +4221,12 @@ bool CallGraphPass::runCellResolution() {
           }
         });
     }
+    dtModFns = calls.size();
+    for (auto &[F, cs] : calls) {
+      dtModEdges += cs.size();
+      modOf.with(F, [&](const ModSet &MS) { dtModSlots += MS.slots.size(); });
+    }
+    dtModSecs = std::chrono::duration<double>(Clock::now() - tMod).count();
   };
   auto mayWrite = [&](const Function *F, const std::pair<std::string, int64_t> &slot) {
     bool any = false;
@@ -4376,6 +4391,7 @@ bool CallGraphPass::runCellResolution() {
       if (cit == Ctx->Callees.end()) continue;
       for (const Function *F : cit->second) tryHolderGuards(si, F, false);
     }
+    tGuards = Clock::now();
     CG_LOG("Cells: holder guards: " << guards.size() << " reloads guarded; "
            << guardModFallback << " methods that may rewrite the path (premise checked: no guard); "
            << modBodiless << " calls of bodiless functions and " << modUntypedWrites
@@ -4619,6 +4635,7 @@ bool CallGraphPass::runCellResolution() {
     for (const std::string &d : idGuardAt) CG_LOG("Cells:   " << d << "\n");
     for (const std::string &d : idTestAt) CG_LOG("Cells:   identity test " << d << "\n");
   }
+  tIds = Clock::now();
   guardHold = [&](uint32_t gi, uint32_t n, uint32_t f) {
     assert(gi < guards.size() && f < cells.size() && "guardHold: a guard or fact out of range");
     Guard &Gd = guards[gi];
@@ -4849,6 +4866,13 @@ bool CallGraphPass::runCellResolution() {
     }
   };
 
+  {
+    auto secs = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    CG_LOG("Cells: dispatch timing (DT): receivers and holder guards " << secs(tDisp, tGuards)
+           << " s; method-identity tests " << secs(tGuards, tIds) << " s; the rest of the phase "
+           << secs(tIds, Clock::now()) << " s; the mod sets (built in this phase if at all) " << dtModSecs << " s (" << dtModFns << " functions with calls, "
+           << dtModEdges << " call edges, " << dtModRounds << " rounds, " << dtModSlots << " slot entries)\n");
+  }
   watchdog.phase("propagation setup");
   // ---- Propagation (difference propagation over a worklist) ----
   const auto tSolve = Clock::now();

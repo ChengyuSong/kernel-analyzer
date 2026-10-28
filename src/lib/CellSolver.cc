@@ -846,6 +846,9 @@ bool CallGraphPass::runCellResolution() {
   };
   boost::unordered_flat_set<uint64_t> edgeSet;
   size_t dynEdges = 0;
+  // --cfl-cell-why: content edges recorded with a byte copy's cause, and
+  // those made by the any-offset branch of copyPair (BC).
+  size_t copyEdgesRecorded = 0, anyCopyEdgesRecorded = 0;
   auto addEdge = [&](uint32_t a, uint32_t b) {
     a = find(a);
     b = find(b);
@@ -855,9 +858,11 @@ bool CallGraphPass::runCellResolution() {
       pts[a].forEach([&](uint32_t f) { add(b, f); });
       return;
     }
-    // A byte copy's content edges are not recorded (a copy makes millions
-    // of edges); the chain names them "static copy or byte copy".
-    if (recordWhy && curWhy.kind != W_COPY) edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy);
+    // Every dynamic edge's first cause, a byte copy's content edges
+    // included (BC: the chain names the copy; their count and the map's
+    // size are reported, whyEdgeReport).
+    if (recordWhy && edgeWhy.try_emplace((uint64_t)a << 32 | b, curWhy).second && curWhy.kind == W_COPY)
+      copyEdgesRecorded++;
     const Why saved = curWhy;
     pts[a].forEach([&](uint32_t f) {
       curWhy = {a, f, UINT32_MAX, W_EDGE};
@@ -6117,12 +6122,18 @@ bool CallGraphPass::runCellResolution() {
           pointers.push_back({find(e.node), e.fact});
         } else if (e.kind == W_COPY) {
           how = "byte copy " + instLoc(copies[e.node].at) + " (" +
-                whyDesc(e.fact) + " into " + whyDesc(e.extra) + ")";
+                whyDesc(e.fact) + " into " + whyDesc(e.extra) + "): " +
+                nodeDesc(w.node) + " -> " + nodeDesc(n);
           pointers.push_back({find(copies[e.node].src), e.fact});
         } else if (e.kind == W_OTHER && eit != edgeWhy.end()) {
           how = "edge (made outside the propagation loop)";
         } else if (eit == edgeWhy.end()) {
-          how = "static copy edge or byte-copy content edge (unrecorded)";
+          // Every edge is made by addEdge and recorded there under
+          // --cfl-cell-why, the static ones at setup ("made outside the
+          // propagation loop") and byte-copy content edges included (BC):
+          // a key with no entry is an edge a node merge moved to its
+          // representative (recorded under the merged node's id).
+          how = "edge carried by a node merge (unrecorded)";
         } else {
           static const char *kn[] = {"other", "edge", "step", "walk", "any-offset", "hub", "copy", "dispatch"};
           how = std::string("edge made during a ") + kn[e.kind] + " at " +
@@ -6297,6 +6308,12 @@ bool CallGraphPass::runCellResolution() {
   auto reportDefects = [&]() {
     levelDupCensus();
     whyAtReport();
+    // BC: what recording every dynamic edge's cause costs.
+    if (recordWhy)
+      CG_LOG("Cells: why: " << copyEdgesRecorded << " byte-copy content edges recorded ("
+             << anyCopyEdgesRecorded << " made in the any-offset branch) of " << edgeWhy.size()
+             << " dynamic edges recorded; the edge-cause map holds " << edgeWhy.bucket_count() << " slots ("
+             << ((edgeWhy.bucket_count() * (sizeof(std::pair<const uint64_t, Why>) + 1)) >> 20) << " MB)\n");
     orphanDerefCensus();
     CG_LOG("Cells: " << copyMismatches
            << " copies between unrelated structs (copied byte by byte, "
@@ -6738,6 +6755,13 @@ bool CallGraphPass::runCellResolution() {
   std::vector<size_t> anyRangeByCopy(copies.size()); // per byte copy: the edges above
   auto copyPair = [&](uint32_t ci, uint32_t fs, uint32_t fd) {
     if (soupStop) return; // the profiler stopped: no more work
+    // The copy is the cause of every edge and mint below (BC), for this
+    // call only: the caller's cause is restored on every exit.
+    struct WhyScope {
+      Why &w;
+      const Why saved;
+      ~WhyScope() { w = saved; }
+    } whyScope{curWhy, curWhy};
     // The time cap, also between the pairs of a long byte-copy expansion
     // (its edges may bring no new fact, so the arrival check never runs).
     static uint32_t copyTick = 0;
@@ -6759,11 +6783,16 @@ bool CallGraphPass::runCellResolution() {
     copyStat[ci].pairs++;
     for (auto [o, e] : memb[fs]) copyStat[ci].srcObjs.insert(o);
     for (auto [o, e] : memb[fd]) copyStat[ci].dstObjs.insert(o);
+    // The copy is the cause of the any-offset branch's edges and mints
+    // too (BC: they were recorded under the caller's cause).
+    if (trackWhy) curWhy = {ci, fs, fd, W_COPY};
+    const size_t copyEdgesBefore = copyEdgesRecorded;
     if (S.kind == CellKind::Any || D.kind == CellKind::Any) {
       if (CFLCellLeakCensus)
         leakCopyEdge.try_emplace((uint64_t)find(S.load) << 32 | find(D.store), ci);
       if (S.kind == CellKind::Any && D.kind == CellKind::Any) {
         addEdge(S.load, D.store); // any offset to any offset: everything to everything
+        anyCopyEdgesRecorded += copyEdgesRecorded - copyEdgesBefore;
         return;
       }
       // One side any-offset: its cell meets every cell of the other side's
@@ -6779,12 +6808,12 @@ bool CallGraphPass::runCellResolution() {
         for (auto [os, ea] : ms)
           for (uint32_t n : anyRange(os, decOff(ea), len, true)) { addEdge(n, D.store); anyRangeEdges++; anyRangeByCopy[ci]++; }
       }
+      anyCopyEdgesRecorded += copyEdgesRecorded - copyEdgesBefore;
       return;
     }
     const std::vector<Member> ms = memb[fs], md = memb[fd];
     curCopyDst = find(copies[ci].dst);
     curCopySrcFact = fs;
-    if (trackWhy) curWhy = {ci, fs, fd, W_COPY};
     for (auto [os, ea] : ms)
       for (auto [od, eb] : md)
         copyRegion(os, decOff(ea), od, decOff(eb), copies[ci].len, copies[ci].at);

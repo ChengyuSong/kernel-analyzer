@@ -1643,9 +1643,8 @@ void loadFuncSummaries(GlobalContext *Ctx, const std::string &path) {
             badRow(("bad owner reference '*" + v + "'").str());
         } else if (k == "OWNER") argOf(v, R.owner);
         else if (k == "ELEM" && R.elem != -2) {
-          // A second element argument (llist_add_batch's chain end): checked
-          // in a report block; applying it is not built.
-          if (!curContainer->report) badRow("a second ELEM is checked in report blocks only (applying it is not built)");
+          // A second element argument (llist_add_batch's chain end): checked,
+          // and applied per site by CA when the container is verified.
           int e = -2;
           argOf(v, e);
           if (e < 0) badRow("a second ELEM must be an argument");

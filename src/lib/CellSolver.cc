@@ -9121,6 +9121,11 @@ bool CallGraphPass::runCellResolution() {
     CG_LOG("Cells: container rows: " << rowLinks.size() << " row links at call sites, " << rowCell.size()
            << " owner element cells, " << rowFacts << " owner facts linked (" << rowSkipped
            << " owner facts not an object offset)\n");
+  for (size_t ci = 0; ci < caOn.size(); ci++)
+    if (caOn[ci])
+      CG_LOG("Cells: container " << Ctx->Containers[ci].name << ": rows applied per site (CA): " << caSites[ci]
+             << " insert sites, " << caEdges[ci] << " edges (handle and link writes); " << caBodyStores[ci]
+             << " body writes into the declared storage not made\n");
 
   {
     // The (b) count: per site (IR order) and object label.

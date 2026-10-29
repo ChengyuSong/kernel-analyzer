@@ -2455,6 +2455,8 @@ void CallGraphPass::checkContainerClosure() {
     // rule names is a naming failure, never a pass.
     std::map<std::string, size_t> o1Admit;
     std::map<std::string, std::vector<std::string>> o1Fail;
+    std::set<const Instruction *> caCand; // CA: the body's writes into declared storage
+    size_t atomicWrites = 0;              // IR cmpxchg / atomicrmw writes into declared storage
     std::vector<std::string> o1Naming, implicitMatched, implicitUnmatched, wordLines, unionSites;
     std::map<std::string, size_t> unionStorage; // class 2: storage inside a union (writes)
     std::vector<std::string> plainFieldSites;   // an element pointer kept in a plain field (examples)
@@ -2894,6 +2896,7 @@ void CallGraphPass::checkContainerClosure() {
       // A write by the asm model's raw-pointer rule (every value input
       // through every raw pointer input) fails under its own class.
       bool rawWrite = false;
+      bool atomicWrite = false; // an IR cmpxchg or atomicrmw (storage-check completeness, CA)
       auto fail = [&](const std::string &why, const Instruction *I) {
         o1Fail[rawWrite ? "asm model over-approximation (a raw pointer input written): " + why : why].push_back(siteText(I));
       };
@@ -3005,6 +3008,8 @@ void CallGraphPass::checkContainerClosure() {
           }
         }
         if (covered.empty()) return;
+        if (atomicWrite) atomicWrites++;
+        if (inBody && wk == WStore) caCand.insert(I); // CA: a store or an asm slot store (copies and fills stay)
         // A copy over exactly the element's declared link record (every
         // LINK and LINKWORD slot of the element struct, its whole size):
         // rb_replace_node's `*new = *victim`, the victim's parent word with
@@ -3182,6 +3187,19 @@ void CallGraphPass::checkContainerClosure() {
             if (const auto *S = dyn_cast<StoreInst>(&I)) {
               onWrite(S, S->getPointerOperand(), S->getValueOperand(),
                       (int64_t)CDL.getTypeStoreSize(S->getValueOperand()->getType()), WStore);
+            } else if (const auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
+              // An IR cmpxchg writes its new value (if it wins): a store.
+              atomicWrite = true;
+              onWrite(CX, CX->getPointerOperand(), CX->getNewValOperand(),
+                      (int64_t)CDL.getTypeStoreSize(CX->getNewValOperand()->getType()), WStore);
+              atomicWrite = false;
+            } else if (const auto *RW = dyn_cast<AtomicRMWInst>(&I)) {
+              // An atomicrmw writes its operand (xchg) or a value computed
+              // from it and the old value: a store of the operand's kind.
+              atomicWrite = true;
+              onWrite(RW, RW->getPointerOperand(), RW->getValOperand(),
+                      (int64_t)CDL.getTypeStoreSize(RW->getValOperand()->getType()), WStore);
+              atomicWrite = false;
             } else if (const auto *MS = dyn_cast<MemSetInst>(&I)) {
               const auto *Len = dyn_cast<ConstantInt>(MS->getLength());
               onWrite(MS, MS->getDest(), MS->getValue(), Len ? (int64_t)Len->getZExtValue() : -1, WFill);
@@ -6888,6 +6906,20 @@ void CallGraphPass::checkContainerClosure() {
               bad3.insert(fn + ": stored into " + valueText(S));
               continue;
             }
+            // An IR cmpxchg or atomicrmw (CA): the element as the address is a
+            // write through it, as the expected value a compare; as the new
+            // value, a store into the address, judged like a store's.
+            if (isa<AtomicCmpXchgInst>(UI) || isa<AtomicRMWInst>(UI)) {
+              const auto *CX = dyn_cast<AtomicCmpXchgInst>(UI);
+              const auto *RW = dyn_cast<AtomicRMWInst>(UI);
+              const Value *P = CX ? CX->getPointerOperand() : RW->getPointerOperand();
+              const Value *NV = CX ? CX->getNewValOperand() : RW->getValOperand();
+              if (P == E || (CX && CX->getCompareOperand() == E && NV != E)) continue;
+              const uint8_t b = get(baseOf(P)) & ~NUL;
+              if (b && !(b & ~(OWN | DER | FRS)) && !E->getType()->isIntegerTy()) continue; // into the owner's storage
+              bad3.insert(fn + ": stored by an atomic into " + valueText(UI));
+              continue;
+            }
             if (const auto *CB = dyn_cast<CallBase>(UI)) {
               const Function *G = CB->getCalledFunction();
               // An inline asm, by the graph build's model: the element stored
@@ -7150,6 +7182,25 @@ void CallGraphPass::checkContainerClosure() {
     C.verified = holds && !C.report;
     if (C.verified) {
       const size_t ci = &C - &Ctx->Containers[0];
+      if (caOn.size() <= ci) {
+        caOn.resize(ci + 1, 0);
+        caHandleKeys.resize(ci + 1);
+        caLinkKeys.resize(ci + 1);
+        caSites.resize(ci + 1, 0);
+        caEdges.resize(ci + 1, 0);
+        caBodyStores.resize(ci + 1, 0);
+      }
+      // CA: declared storage, a handle that holds elements (an inferred
+      // handle holds a bucket array: today's application).
+      if (declared && !declHandle.empty()) {
+        caOn[ci] = 1;
+        caHandleKeys[ci].assign(declHandle.begin(), declHandle.end());
+        for (const std::set<std::string> *D : {&declLink, &declWord})
+          caLinkKeys[ci].insert(caLinkKeys[ci].end(), D->begin(), D->end());
+        for (const Instruction *I : caCand) caSkip.emplace(I, ci);
+        caBodyStores[ci] = caCand.size();
+      } else
+        cline("  CA not applied: an array handle (the handle is inferred, not declared storage)");
       if (containerBodies.size() <= ci) {
         containerBodies.resize(ci + 1);
         containerElemSources.resize(ci + 1);
@@ -7515,7 +7566,8 @@ void CallGraphPass::checkContainerClosure() {
             "; link word" + list(declWord) + "; unused declared storage" + list(unusedDecl));
       std::string adm;
       for (auto &[k, n] : o1Admit) adm += (adm.empty() ? "" : ", ") + k + " " + std::to_string(n);
-      cline("  storage writes admitted: " + (adm.empty() ? std::string("none") : adm));
+      cline("  storage writes admitted: " + (adm.empty() ? std::string("none") : adm) + "; " +
+            std::to_string(atomicWrites) + " atomic writes (IR cmpxchg or atomicrmw) among the checked writes");
       if (!unionStorage.empty()) {
         cline("  storage inside a union (a declared slot in the IR's member, which is clang's representative; "
               "counted, not a write of the slot): " + std::to_string(unionStorage["writes"]) + " writes");

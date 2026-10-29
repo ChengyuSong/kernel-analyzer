@@ -704,6 +704,16 @@ protected:
   // row object per (owner, element struct of a constructor fed to it).
   std::vector<std::vector<std::pair<const llvm::Value *, std::set<const llvm::Function *>>>> containerOwnerCtors;
   std::vector<std::map<const llvm::Function *, std::vector<llvm::StructType *>>> containerCtorType;
+  // CA (Fable 2026-10-28): a verified container with declared storage
+  // whose handle holds elements applies each insert row's handle and link
+  // writes at the call site, with the site's owner and elements; the body's
+  // own writes into declared storage are not made. Per container: in
+  // scope, the declared handle keys and link (and link word) keys, and the
+  // counts; caSkip = the body writes not made (stores, asm slot stores).
+  std::vector<char> caOn;
+  std::vector<std::vector<std::string>> caHandleKeys, caLinkKeys;
+  std::vector<size_t> caSites, caEdges, caBodyStores;
+  std::map<const llvm::Instruction *, size_t> caSkip; // instruction -> container
   // Snapshot holders ((3''), Fable 2026-10-18): a fresh block holding saves
   // of one owner's handle array and elements (Containers.cc). With its
   // entsize premise proven, the solver makes the block two objects: the

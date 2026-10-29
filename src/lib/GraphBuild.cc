@@ -992,7 +992,60 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
         rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), in, out, elemsName});
         if (in != AndersNodeFactory::InvalidIndex && out != AndersNodeFactory::InvalidIndex)
           addAssignmentEdge(in, out); // the insert hands back its own element too
+        // A further element (llist_add_batch's chain end) enters the cell too.
+        if (R.role == CR::Insert)
+          for (int e : R.moreElems)
+            if ((unsigned)e < CS->arg_size())
+              rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), nodeOf(CS->getArgOperand(e)),
+                                  AndersNodeFactory::InvalidIndex, elemsName});
         retBound = true;
+      }
+      // CA (Fable 2026-10-28): an insert's handle and link writes, made
+      // here with this site's owner and elements (the body's own are not
+      // made: caSkip). Each element enters each handle slot of the owner;
+      // each element's link slots receive the owner's elements (the
+      // handle's content, this site's own included) and the site's other
+      // elements (a chain).
+      const size_t ci = rit->second.cont;
+      if (ci < caOn.size() && caOn[ci] && R.role == CR::Insert && R.owner >= 0 && (unsigned)R.owner < CS->arg_size()) {
+        std::vector<NodeIndex> elems;
+        if (R.elem >= 0 && (unsigned)R.elem < CS->arg_size()) elems.push_back(getCanonicalNode(nodeOf(CS->getArgOperand(R.elem))));
+        for (int e : R.moreElems)
+          if ((unsigned)e < CS->arg_size()) elems.push_back(getCanonicalNode(nodeOf(CS->getArgOperand(e))));
+        // The address of key K ("struct.T+off") on the object base points at.
+        auto keyAddr = [&](NodeIndex base, const std::string &K) {
+          const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
+          if (off == 0) return base;
+          const NodeIndex parent = getCanonicalNode(base);
+          const NodeIndex f = getFieldPtrNode(parent, off);
+          addFieldEdgesExact(parent, getCanonicalNode(f), off, 0, false,
+                             StructType::getTypeByName(CS->getContext(), K.substr(0, K.rfind('+'))));
+          return getCanonicalNode(f);
+        };
+        CellWriteSize ws(*this, curDL->getPointerSize());
+        const NodeIndex own = getCanonicalNode(nodeOf(CS->getArgOperand(R.owner)));
+        size_t edges = 0;
+        for (const std::string &H : caHandleKeys[ci]) {
+          const NodeIndex hd = getRepDerefNode(keyAddr(own, H));
+          // The owner's elements (the handle's content, this site's
+          // included: a static copy), for the links.
+          const NodeIndex t = getCanonicalNode(NF.createValueNode());
+          addAssignmentEdge(hd, t);
+          edges++;
+          for (NodeIndex e : elems) {
+            addAssignmentEdge(e, hd);
+            edges++;
+            for (const std::string &L : caLinkKeys[ci]) {
+              const NodeIndex ld = getRepDerefNode(keyAddr(e, L));
+              addAssignmentEdge(t, ld);
+              edges++;
+              for (NodeIndex e2 : elems)
+                if (e2 != e) addAssignmentEdge(e2, ld), edges++;
+            }
+          }
+        }
+        caSites[ci]++;
+        caEdges[ci] += edges;
       }
     }
   // (d) An inline insert (Fable 2026-10-14): an owner-code call to a
@@ -2576,6 +2629,9 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
   // pointer inputs (asmModel: the one model of an asm's memory effects,
   // also read by the container checker).
   const AsmModel AM = asmModel(CS, curDL);
+  // CA: a verified container body's asm store into its declared storage
+  // (try_cmpxchg on the handle) is made per row call site instead.
+  const bool caSkipped = CFLCells && !caSkip.empty() && caSkip.count(&CS);
   for (const AsmModel::Slot &Sl : AM.slots) {
     NodeIndex ptrNode = getRepNodeForValue(Sl.ptr);
     if (ptrNode == AndersNodeFactory::InvalidIndex)
@@ -2583,6 +2639,7 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
     NodeIndex derefNode = getRepDerefNode(ptrNode);
 
     if (Sl.output) {
+      if (caSkipped) continue;
       // store to *ptr — any ptr-typed direct input, or witnessed
       // ptr-width int input, could be what the asm stores
       for (const AsmModel::Value_ &In : Sl.stores) {
@@ -2656,7 +2713,7 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
         addAssignmentEdge(derefP, dstNode);
         g_asmRegLoads++;
       }
-      if (AM.memEffects) {
+      if (AM.memEffects && !caSkipped) {
         for (const AsmModel::Value_ &In : AM.valueInputs) {
           if (!In.ok && In.declined) g_asmLaunderDeclined++;
           if (!In.ok)
@@ -4022,6 +4079,9 @@ void CallGraphPass::InstHandler::visitStoreInst(StoreInst &I) {
   // one adds nothing a consumer can read, wherever it lands (plan 3.53
   // rule 3; GAPS.md "Pool carves").
   if (!CGP.poolHandleStores.empty() && CGP.poolHandleStores.count(&I)) return;
+  // CA: a verified container body's store into its declared storage is
+  // made per row call site instead (the row block in handleCall).
+  if (CFLCells && !CGP.caSkip.empty() && CGP.caSkip.count(&I)) return;
   Value *val = I.getOperand(0);
   // --cfl-cells, FREE(argN): inside a deallocator, a store through the
   // freed block (pBuf->pNext = ...) or of it (db->lookaside.pFree = pBuf)
@@ -4580,7 +4640,9 @@ void CallGraphPass::InstHandler::visitAtomicRMWInst(AtomicRMWInst &I) {
   assert(ptrNode != AndersNodeFactory::InvalidIndex &&
          "Failed to find atomicrmw ptr node");
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
-  {
+  // CA: a verified container body's atomic write into its declared
+  // storage is made per row call site instead; the old value is still read.
+  if (!(CFLCells && !CGP.caSkip.empty() && CGP.caSkip.count(&I))) {
     CellWriteSize ws(CGP, CGP.curDL ? CGP.curDL->getTypeStoreSize(I.getType()) : 0);
     CGP.addAssignmentEdge(valNode, derefNode);
   }
@@ -4629,7 +4691,7 @@ void CallGraphPass::InstHandler::visitAtomicCmpXchgInst(AtomicCmpXchgInst &I) {
   assert(ptrNode != AndersNodeFactory::InvalidIndex &&
          "Failed to find cmpxchg ptr node");
   NodeIndex derefNode = CGP.getRepDerefNode(ptrNode);
-  {
+  if (!(CFLCells && !CGP.caSkip.empty() && CGP.caSkip.count(&I))) { // CA, as in atomicrmw
     CellWriteSize ws(CGP, CGP.curDL ? CGP.curDL->getTypeStoreSize(I.getNewValOperand()->getType()) : 0);
     CGP.addAssignmentEdge(valNode, derefNode);
   }

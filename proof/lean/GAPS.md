@@ -4201,3 +4201,48 @@ lie below 8 (TG); M variable or/xor refused: bits unbounded", each site
 listed in IR order, and a rule-report section where there are instances.
 Case: t_cells_tg_rbtag.c. Not mechanized. Checked by executions; see the
 commit's gates.
+
+## A verified container's insert is applied per call site (GraphBuild row block, Containers O1, Fable 2026-10-28, CA)
+
+A verified container (plan 3.55) applies its rows at call sites outside
+its body: the results come from the owner's element cell, but the body's
+side effects ran through the body's formals, which every caller shares,
+so an insert's store of the element into head->first and of the old first
+into the element's link wrote every caller's element into every caller's
+head (the kernel's llist_add_batch: kwhy7's entry of the kvfree_rcu page
+into every llist). CA, for a verified container with declared storage
+whose handle holds elements: the body's writes into declared handle, link
+and link-word slots (the O1 storage walk's in-body stores, asm slot stores
+included: try_cmpxchg) are not made, and each insert row call site makes,
+with its own owner O and elements E: E into each handle slot of O; the
+handle's content (O's elements) and the site's other elements into each
+link and link-word slot of each E. Statement: the storage check proves
+every write into declared storage is a row write (the body's) or an
+admitted owner-code form; in any execution, after a sequence of row calls
+on owner O, O's handle and the links of O's elements hold only elements
+inserted on O (the body's moves among link slots permute O's elements,
+never another owner's); the per-site edges give each handle exactly its
+sites' elements and each element's links O's elements, a superset of
+every reachable state, with no edge from another owner's site. Assumed:
+the verdict's premises (O1-O6, the row premise). Not applied: a verified
+container whose handle is inferred (bfd_hash, sqlite3_hash: the handle
+holds a bucket array, logged "CA not applied: an array handle"). Body
+copies and fills over storage stay (rb_replace_node's *new = *victim).
+A row called from inside the body gets no per-site write (the rebalancing
+writes are permutations, covered as above). Count line "container N: rows
+applied per site (CA): S insert sites, E edges (handle and link writes);
+B body writes into the declared storage not made". A second ELEM (the
+chain end of llist_add_batch) is now allowed outside report blocks; it
+enters the element cell and is linked to the site's other elements.
+The link writes give each element "the owner's elements": the handle's
+content as a static copy, which includes the elements this site inserts
+(an over-approximation of the elements present before the insert).
+Storage-check completeness, carried by CA: the O1 walk now visits an IR
+cmpxchg and atomicrmw as writes (they were unseen: a container could
+verify over an unchecked write into its storage), counted in the storage
+line ("N atomic writes"), and O3 judges an element given to one as the
+new value like a store into the address; CA skips them per site like the
+asm form. Cases: t_cells_container_ca.c (the asm form, two callers, the
+dispatch {fa, fb} -> {fb}), t_cells_container_ca_atomic.ll (IR cmpxchg).
+Not mechanized. Checked by executions; see the
+commit's gates.

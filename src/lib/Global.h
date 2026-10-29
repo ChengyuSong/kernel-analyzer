@@ -257,7 +257,7 @@ public:
     int pool = -2;   // argN (carve)
     int key = -2;    // argN (deliverable 2)
     std::string field; // T+off of the key (deliverable 2)
-    std::vector<int> moreElems; // further ELEM(argN) (llist_add_batch's chain end); report blocks only
+    std::vector<int> moreElems; // further ELEM(argN) (llist_add_batch's chain end); applied per site by CA
     unsigned line = 0;
   };
   // A container's declared storage (`@storage HANDLE(T+off) LINK(T+off)

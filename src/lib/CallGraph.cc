@@ -77,6 +77,12 @@ size_t g_staticCallWired = 0, g_staticCallNoKey = 0,
 size_t g_asmSlotLoads = 0, g_asmSlotStores = 0,
               g_asmWidthWitnessed = 0, g_asmLaunderDeclined = 0,
               g_asmRegLoads = 0, g_asmRegStores = 0, g_asmRegCopies = 0;
+// AC: asm calls wired by register
+size_t g_acCallTokens = 0, g_acSites = 0, g_acByOperand = 0, g_acByName = 0,
+       g_acByConstraint = 0, g_acByTie = 0, g_acByText = 0, g_acUnboundPtr = 0,
+       g_acUnboundPtrActuals = 0, g_acUnboundInt = 0, g_acRetBound = 0,
+       g_acMultiAtomSites = 0, g_acMultiAtomActuals = 0, g_acUnresolved = 0,
+       g_acExtraWirings = 0, g_acRowsMulti = 0;
 
 size_t g_intLoadUnmodeled = 0;
 
@@ -432,6 +438,18 @@ bool CallGraphPass::doFinalization(Module *M) {
            << " reg-through loads + " << g_asmRegStores << " stores + "
            << g_asmRegCopies << " copies; declined " << g_asmLaunderDeclined
            << " unwitnessed launder candidates\n");
+    if (g_acCallTokens)
+      CG_LOG("InlineAsm: asm calls wired by register: " << g_acSites << " sites, "
+             << g_acByOperand + g_acByName << " callees (by operand: " << g_acByOperand
+             << ", by literal name: " << g_acByName << "); formals bound by constraint "
+             << g_acByConstraint << ", by tie " << g_acByTie << ", by text move " << g_acByText
+             << "; unbound: " << g_acUnboundPtr << " pointer formals (" << g_acUnboundPtrActuals
+             << " pointer inputs), " << g_acUnboundInt << " integer formals; " << g_acRetBound
+             << " returns from rax; atoms applied to a multi-bound formal: " << g_acMultiAtomSites
+             << " sites, " << g_acMultiAtomActuals << " actuals; summary ledgers count each wiring of a"
+             << " multi-bound site: " << g_acExtraWirings << " extra wirings; container rows at a"
+             << " multi-bound asm call: " << g_acRowsMulti << "; " << g_acUnresolved
+             << " unresolved targets (indirect, not a function immediate, or no IR definition)\n");
     if (!Ctx->SummarySpecs.empty())
       CG_LOG("FuncSummary LEDGER: " << Ctx->FuncSummaries.size()
              << " functions summarized; applied " << g_sumCpy << " CPY, "

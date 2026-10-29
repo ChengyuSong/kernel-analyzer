@@ -2407,8 +2407,7 @@ bool CallGraphPass::applySummaryAtoms(const CallActuals &Act,
       // source fields are runtime stores).
       if (CFLCells) {
         // The cell solver copies cell by cell (arrays as one element).
-        byteCopies.emplace_back(getCanonicalNode(s), getCanonicalNode(d),
-                                (int64_t)-1, CS);
+        pushByteCopy({getCanonicalNode(s), getCanonicalNode(d), (int64_t)-1, CS});
       } else if (flowsTo() && Graph.fieldSensitive() && exactFieldLabels()) {
         // Exact addresses: no residue set to relay; a byte copy of
         // unknown extent is the range wildcard on both sides.
@@ -2586,7 +2585,16 @@ bool CallGraphPass::applySummaryAtoms(const CallActuals &Act,
       }
       // DX: canonicalFunc, so a bodiless callback registered from two
       // modules is one target, not one declaration per module.
-      chainRegs.push_back({key, blk, canonicalFunc(fn), A.fk, CS});
+      assert(!isa<InlineAsm>(CS->getCalledOperand()) &&
+             "chain atoms at an inline-asm call are unmodeled: ChainDispatchRec stores operand indices, not the register-bound actuals");
+      {
+        const ChainRegRec rec{key, blk, canonicalFunc(fn), A.fk, CS};
+        if (!acPushed(chainRegs, acFrom.reg, [&](const ChainRegRec &o) {
+              return o.key == rec.key && o.blk == rec.blk && o.fn == rec.fn &&
+                     o.selfFk == rec.selfFk && o.cs == rec.cs;
+            }))
+          chainRegs.push_back(rec);
+      }
       g_chainReg++;
       break;
     }
@@ -2600,7 +2608,14 @@ bool CallGraphPass::applySummaryAtoms(const CallActuals &Act,
               : canonChainKey(dyn_cast<GlobalValue>(
                     Act.arg(A.dst)->stripPointerCasts()));
       if (!key) { g_chainCallDyn++; needPooled = true; break; }
-      if (!chainDispatches.empty() && chainDispatches.back().cs == CS &&
+      assert(!isa<InlineAsm>(CS->getCalledOperand()) &&
+             "chain atoms at an inline-asm call are unmodeled: ChainDispatchRec stores operand indices, not the register-bound actuals");
+      if (acPushed(chainDispatches, acFrom.disp, [&](const ChainDispatchRec &o) {
+            return o.cs == CS && o.key == key &&
+                   llvm::is_contained(o.binds, std::make_pair((int)A.fk, (int)A.src));
+          })) {
+        // AC: this repeat wiring's bind is already recorded.
+      } else if (!chainDispatches.empty() && chainDispatches.back().cs == CS &&
           chainDispatches.back().key == key) {
         chainDispatches.back().binds.push_back({A.fk, A.src});
       } else {

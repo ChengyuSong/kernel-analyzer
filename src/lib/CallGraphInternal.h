@@ -355,6 +355,9 @@ extern size_t g_userCertCopySites, g_userCertGetSites;
 extern size_t g_tagRoundTrips;
 extern size_t g_staticCallWired, g_staticCallNoKey, g_staticCallUpdates, g_staticCallDynUpdate, g_tracepointProbes, g_staticCallTpIter;
 extern size_t g_asmSlotLoads, g_asmSlotStores, g_asmWidthWitnessed, g_asmLaunderDeclined, g_asmRegLoads, g_asmRegStores, g_asmRegCopies;
+extern size_t g_acCallTokens, g_acSites, g_acByOperand, g_acByName, g_acByConstraint, g_acByTie, g_acByText,
+    g_acUnboundPtr, g_acUnboundPtrActuals, g_acUnboundInt, g_acRetBound, g_acMultiAtomSites, g_acMultiAtomActuals,
+    g_acUnresolved, g_acExtraWirings, g_acRowsMulti;
 extern size_t g_intProvStores, g_intProvLoads;
 extern size_t g_intLoadUnmodeled;
 bool constantHasPtrToInt(const Constant *C, unsigned depth);

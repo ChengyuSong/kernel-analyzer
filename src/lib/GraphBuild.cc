@@ -786,8 +786,8 @@ bool CallGraphPass::handleMemcpy(const CallBase *CS) {
     const auto *lenC = CS->arg_size() > 2
                            ? dyn_cast<ConstantInt>(CS->getArgOperand(2))
                            : nullptr;
-    byteCopies.emplace_back(getCanonicalNode(srcNode), getCanonicalNode(dstNode),
-                            lenC ? (int64_t)lenC->getZExtValue() : (int64_t)-1, CS);
+    pushByteCopy({getCanonicalNode(srcNode), getCanonicalNode(dstNode),
+                  lenC ? (int64_t)lenC->getZExtValue() : (int64_t)-1, CS});
     return false;
   }
 
@@ -978,6 +978,7 @@ bool CallGraphPass::handleCall(const CallActuals &Act, const Function *CF,
         rit != containerRowOf.end() && !containerBodies[rit->second.cont].count(CS->getFunction())) {
       using CR = GlobalContext::ContainerRow;
       const CR &R = rit->second.row;
+      if (acRepeat) acNoteRow(CS, CF);
       auto nodeOf = [&](const Value *V) {
         NodeIndex n = getRepNodeForValue(V);
         if (n == AndersNodeFactory::InvalidIndex) n = getCanonicalNode(NF.createValueNode(V));
@@ -993,8 +994,8 @@ bool CallGraphPass::handleCall(const CallActuals &Act, const Function *CF,
       if (R.owner >= 0 && (unsigned)R.owner < Act.size() && resPtr &&
           (R.role == CR::Lookup || R.role == CR::Insert) && R.elem == -1) {
         const NodeIndex own = nodeOf(Act.arg(R.owner)), out = nodeOf(Act.result);
-        if (R.role == CR::Lookup) rowLinks.push_back({own, AndersNodeFactory::InvalidIndex, out, elemsName});
-        if (mints) mintLinks.push_back({own, out, elemsName, CS, rit->second.cont});
+        if (R.role == CR::Lookup) pushRowLink({own, AndersNodeFactory::InvalidIndex, out, elemsName});
+        if (mints) pushMintLink({own, out, elemsName, CS, rit->second.cont});
         retBound = true;
       }
       if ((R.role == CR::Lookup || R.role == CR::Insert) && R.owner >= 0 && (unsigned)R.owner < Act.size() &&
@@ -1002,14 +1003,14 @@ bool CallGraphPass::handleCall(const CallActuals &Act, const Function *CF,
         NodeIndex in = AndersNodeFactory::InvalidIndex, out = AndersNodeFactory::InvalidIndex;
         if (R.role == CR::Insert && (unsigned)R.elem < Act.size()) in = nodeOf(Act.arg(R.elem));
         if (resPtr) out = nodeOf(Act.result);
-        rowLinks.push_back({nodeOf(Act.arg(R.owner)), in, out, elemsName});
+        pushRowLink({nodeOf(Act.arg(R.owner)), in, out, elemsName});
         if (in != AndersNodeFactory::InvalidIndex && out != AndersNodeFactory::InvalidIndex)
           addAssignmentEdge(in, out); // the insert hands back its own element too
         // A further element (llist_add_batch's chain end) enters the cell too.
         if (R.role == CR::Insert)
           for (int e : R.moreElems)
             if ((unsigned)e < Act.size())
-              rowLinks.push_back({nodeOf(Act.arg(R.owner)), nodeOf(Act.arg(e)),
+              pushRowLink({nodeOf(Act.arg(R.owner)), nodeOf(Act.arg(e)),
                                   AndersNodeFactory::InvalidIndex, elemsName});
         retBound = true;
       }
@@ -1057,8 +1058,10 @@ bool CallGraphPass::handleCall(const CallActuals &Act, const Function *CF,
             }
           }
         }
-        caSites[ci]++;
-        caEdges[ci] += edges;
+        if (!acRepeat) {
+          caSites[ci]++;
+          caEdges[ci] += edges;
+        }
       }
     }
   // (d) An inline insert (Fable 2026-10-14): an owner-code call to a
@@ -1075,8 +1078,9 @@ bool CallGraphPass::handleCall(const CallActuals &Act, const Function *CF,
       if (own == AndersNodeFactory::InvalidIndex) own = getCanonicalNode(NF.createValueNode(Act.arg(cit->second)));
       NodeIndex out = getRepNodeForValue(Act.result);
       if (out == AndersNodeFactory::InvalidIndex) out = getCanonicalNode(NF.createValueNode(Act.result));
-      mintLinks.push_back({own, out, NF.internCellName(Ctx->Containers[ci].name + ".elems"), CS, ci});
-      inlineInserts++;
+      pushMintLink({own, out, NF.internCellName(Ctx->Containers[ci].name + ".elems"), CS, ci});
+      if (acRepeat) acNoteRow(CS, CF);
+      else inlineInserts++;
       retBound = true;
       break;
     }
@@ -2753,28 +2757,181 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
     }
   }
 
-  // 3. Call detection in asm text.
-  // Match "call[q] <funcname>" patterns and look up targets in Ctx->Funcs.
+  // 3. Calls in the asm text, wired by register (AC).
+  handleAsmCalls(CS, Constraints, cToArg, cToRet);
+}
+
+// AC (Fable 2026-10-28): the SysV register an asm constraint code or an
+// AT&T register name denotes: 0..5 = rdi, rsi, rdx, rcx, r8, r9 (the
+// argument registers, in formal order), 6 = rax; -1 otherwise.
+static int asmRegOfName(StringRef N) {
+  static const char *const Names[7][4] = {
+      {"rdi", "edi", "di", "dil"}, {"rsi", "esi", "si", "sil"},
+      {"rdx", "edx", "dx", "dl"},  {"rcx", "ecx", "cx", "cl"},
+      {"r8", "r8d", "r8w", "r8b"}, {"r9", "r9d", "r9w", "r9b"},
+      {"rax", "eax", "ax", "al"}};
+  for (int r = 0; r < 7; r++)
+    for (const char *Nm : Names[r])
+      if (N == Nm) return r;
+  return -1;
+}
+static int asmRegOfCode(StringRef C) {
+  if (C.size() == 1) {
+    switch (C[0]) {
+    case 'D': return 0;
+    case 'S': return 1;
+    case 'd': return 2;
+    case 'c': return 3;
+    case 'a': return 6;
+    default: return -1;
+    }
+  }
+  if (C.consume_front("{") && C.consume_back("}")) return asmRegOfName(C);
+  return -1;
+}
+static int asmRegOfConstraint(const InlineAsm::ConstraintInfo &CI) {
+  for (const std::string &C : CI.Codes)
+    if (int r = asmRegOfCode(C); r >= 0) return r;
+  return -1;
+}
+// An operand reference "$k", "${k}" or "${k:M}" at S[p]; -1 if none.
+static int asmOperandRef(StringRef S, size_t p, size_t *endOut = nullptr) {
+  if (p >= S.size() || S[p] != '$') return -1;
+  size_t q = p + 1;
+  const bool brace = q < S.size() && S[q] == '{';
+  if (brace) q++;
+  size_t d = q;
+  while (q < S.size() && isdigit((unsigned char)S[q])) q++;
+  if (q == d) return -1;
+  int k = std::stoi(S.substr(d, q - d).str());
+  if (brace) {
+    size_t e = S.find('}', q);
+    if (e == StringRef::npos) return -1;
+    q = e + 1;
+  }
+  if (endOut) *endOut = q;
+  return k;
+}
+// The input operand a strict AT&T "mov|movq $k, %REG" in the asm text
+// before Pos binds to register R: the last such move, and nothing after it
+// before Pos may write R (only blank lines, labels, directives, comments
+// and mov/lea into another register may follow); -1 if none.
+static int asmTextMoveBinding(StringRef S, size_t Pos, int R) {
+  int bound = -1;
+  SmallVector<StringRef, 16> Lines;
+  S.substr(0, Pos).split(Lines, '\n');
+  for (StringRef Ln : Lines) {
+    SmallVector<StringRef, 4> Ins;
+    Ln.split(Ins, ';');
+    for (StringRef I : Ins) {
+      I = I.trim();
+      if (I.empty() || I.starts_with("#") || I.starts_with(".") ||
+          I.ends_with(":"))
+        continue;
+      StringRef Op = I.take_while([](char c) { return isalpha((unsigned char)c); });
+      StringRef Rest = I.drop_front(Op.size()).trim();
+      const size_t comma = Rest.rfind(',');
+      StringRef Dst = comma == StringRef::npos ? StringRef() : Rest.substr(comma + 1).trim();
+      StringRef Src = comma == StringRef::npos ? Rest : Rest.substr(0, comma).trim();
+      const int dstReg = Dst.consume_front("%") ? asmRegOfName(Dst) : -1;
+      const bool isMov = Op == "mov" || Op == "movq";
+      if (isMov && dstReg == R) {
+        size_t e = 0;
+        const int k = asmOperandRef(Src, 0, &e);
+        bound = (k >= 0 && e == Src.size()) ? k : -1;
+        continue;
+      }
+      if (bound < 0) continue;
+      // After the binding move: only a mov or lea into another register.
+      const bool movLea = isMov || Op == "lea" || Op == "leaq";
+      if (!(movLea && Dst.size() && dstReg != R && !Dst.contains('(')))
+        bound = -1;
+    }
+  }
+  return bound;
+}
+
+// AC: a container row reached by a repeat wiring of a multi-bound asm
+// call: counted once per (site, callee) and named.
+void CallGraphPass::acNoteRow(const CallBase *CS, const Function *CF) {
+  if (acRowNoted) return;
+  acRowNoted = true;
+  g_acRowsMulti++;
+  WARNING("InlineAsm: container row at a multi-bound asm call in "
+          << CS->getFunction()->getName() << " to " << CF->getName() << "\n");
+}
+
+void CallGraphPass::handleAsmCalls(
+    CallBase &CS, const std::vector<InlineAsm::ConstraintInfo> &Constraints,
+    const std::vector<int> &cToArg, const std::vector<int> &cToRet) {
+  assert(!acRepeat && "asm call wirings do not nest");
+  auto *IA = cast<InlineAsm>(CS.getCalledOperand());
   StringRef asmStr = IA->getAsmString();
+  // Operand k of the text is the k-th constraint that is not a clobber.
+  std::vector<unsigned> opToC;
+  for (unsigned i = 0; i < Constraints.size(); i++)
+    if (Constraints[i].Type != InlineAsm::isClobber) opToC.push_back(i);
+  auto argOfC = [&](unsigned c) -> Value * {
+    const int a = cToArg[c];
+    return a >= 0 && (unsigned)a < CS.arg_size() ? CS.getArgOperand(a) : nullptr;
+  };
+  auto fnOfC = [&](unsigned c) -> Function * {
+    const auto &CI = Constraints[c];
+    if (CI.Type != InlineAsm::isInput || CI.isIndirect ||
+        std::find(CI.Codes.begin(), CI.Codes.end(), "i") == CI.Codes.end())
+      return nullptr;
+    Value *V = argOfC(c);
+    return V ? dyn_cast<Function>(V->stripPointerCasts()) : nullptr;
+  };
+  // The callees, each with the text position of the call naming it (the
+  // text-move binding reads the text before it) and how it was named.
+  struct Target { Function *F; size_t pos; bool byOperand; };
+  std::vector<Target> targets;
+  SmallPtrSet<const Function *, 4> seen;
+  auto addTarget = [&](Function *F, size_t pos, bool byOp) {
+    if (Function *D = getFuncDef(F)) F = D;
+    if (seen.insert(F).second) targets.push_back({F, pos, byOp});
+  };
+  // The text position of the first call naming an operand: the asm's
+  // other "i" Function operands (the alternatives) are added after every
+  // call token is scanned, at that position, so a callee the text calls
+  // itself keeps its own call's position (its own text move).
+  size_t altPos = StringRef::npos;
   size_t pos = 0;
   while (pos < asmStr.size()) {
-    // Find "call" keyword
     size_t callPos = asmStr.find("call", pos);
     if (callPos == StringRef::npos)
       break;
-
     // Skip the "call" keyword and optional suffix (callq, etc.)
     size_t cur = callPos + 4;
     while (cur < asmStr.size() && isalpha(asmStr[cur]))
       cur++;
-    // Skip whitespace
     while (cur < asmStr.size() && (asmStr[cur] == ' ' || asmStr[cur] == '\t'))
       cur++;
     if (cur >= asmStr.size()) break;
-
-    // Skip optional '*' (indirect call indicator) — we can't resolve those
-    if (asmStr[cur] == '*' || asmStr[cur] == '%' || asmStr[cur] == '$') {
+    g_acCallTokens++;
+    // "*"-prefixed and register targets are indirect: unresolved.
+    if (asmStr[cur] == '*' || asmStr[cur] == '%') {
+      g_acUnresolved++;
       pos = cur + 1;
+      continue;
+    }
+    // "${k:P}": operand k, an "i" Function; the asm's other "i" Function
+    // operands are its alternatives (ALTERNATIVE's replacement calls).
+    if (asmStr[cur] == '$') {
+      size_t e = cur;
+      const int k = asmOperandRef(asmStr, cur, &e);
+      Function *F = k >= 0 && (unsigned)k < opToC.size() ? fnOfC(opToC[k]) : nullptr;
+      if (!F) {
+        g_acUnresolved++;
+        WARNING("InlineAsm: call operand " << asmStr.substr(cur, e - cur)
+                << " is not a function immediate (unmodeled) in "
+                << CS.getFunction()->getName() << "\n");
+      } else {
+        addTarget(F, callPos, true);
+        if (altPos == StringRef::npos) altPos = callPos;
+      }
+      pos = std::max(e, cur + 1);
       continue;
     }
 
@@ -2805,7 +2962,7 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
       auto it = Ctx->Funcs.find(guid);
       if (it != Ctx->Funcs.end()) {
         CG_LOG("InlineAsm: detected call to " << funcName << " in asm text\n");
-        handleCall(&CS, it->second);
+        addTarget(it->second, callPos, false);
         found = true;
       } else {
         // Census the unresolved residue loudly: static_call trampolines
@@ -2826,12 +2983,160 @@ void CallGraphPass::handleInlineAsm(CallBase &CS) {
           it = Ctx->Funcs.find(guid);
           if (it != Ctx->Funcs.end()) {
             CG_LOG("InlineAsm: detected call to " << variant << " in asm text\n");
-            handleCall(&CS, it->second);
+            addTarget(it->second, callPos, false);
+            found = true;
           }
         }
       }
+      if (!found) g_acUnresolved++;
     }
     pos = cur;
+  }
+  if (altPos != StringRef::npos)
+    for (unsigned c : opToC)
+      if (Function *G = fnOfC(c)) addTarget(G, altPos, true);
+  if (targets.empty())
+    return;
+  g_acSites++;
+
+  // Register bindings that do not depend on the call's text position:
+  // a direct input whose constraint names the register, else a tied input
+  // whose output names it.
+  Value *byConstraint[7] = {}, *byTie[7] = {};
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    const auto &CI = Constraints[i];
+    if (CI.Type != InlineAsm::isInput || CI.isIndirect) continue;
+    Value *V = argOfC(i);
+    if (!V) continue;
+    if (int r = asmRegOfConstraint(CI); r >= 0 && r < 6 && !byConstraint[r])
+      byConstraint[r] = V;
+    if (CI.Codes.size() == 1 && !CI.Codes[0].empty() &&
+        llvm::all_of(CI.Codes[0], [](char c) { return isdigit((unsigned char)c); })) {
+      const unsigned o = std::stoul(CI.Codes[0]); // the tied output's operand
+      if (o < Constraints.size())
+        if (int r = asmRegOfConstraint(Constraints[o]); r >= 0 && r < 6 && !byTie[r])
+          byTie[r] = V;
+    }
+  }
+  // The pointer inputs, for an unbound pointer formal: every direct input
+  // of pointer type that is not a callee immediate.
+  std::vector<const Value *> ptrInputs;
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    const auto &CI = Constraints[i];
+    if (CI.Type != InlineAsm::isInput || CI.isIndirect || fnOfC(i)) continue;
+    const Value *V = argOfC(i);
+    if (!V) continue;
+    if (auto *PTI = dyn_cast<PtrToIntOperator>(V)) V = PTI->getPointerOperand();
+    if (V->getType()->isPointerTy() &&
+        std::find(ptrInputs.begin(), ptrInputs.end(), V) == ptrInputs.end())
+      ptrInputs.push_back(V);
+  }
+  // The return: the output bound to rax (its element of an aggregate
+  // result, as extractvalue reads it).
+  std::vector<const Value *> results;
+  for (unsigned i = 0; i < Constraints.size(); i++) {
+    const auto &CI = Constraints[i];
+    if (CI.Type != InlineAsm::isOutput || CI.isIndirect || asmRegOfConstraint(CI) != 6 ||
+        cToRet[i] < 0)
+      continue;
+    if (!CS.getType()->isStructTy()) {
+      results.push_back(&CS);
+    } else {
+      for (const User *U : CS.users())
+        if (auto *EV = dyn_cast<ExtractValueInst>(U))
+          if (EV->getNumIndices() == 1 && EV->getIndices()[0] == (unsigned)cToRet[i])
+            results.push_back(EV);
+    }
+    break;
+  }
+  const bool traced = !CFLTraceFunc.empty() &&
+                      CS.getFunction()->getName().contains(CFLTraceFunc);
+  for (const Target &T : targets) {
+    Function *F = T.F;
+    (T.byOperand ? g_acByOperand : g_acByName)++;
+    std::string line;
+    raw_string_ostream LS(line);
+    LS << "InlineAsm: asm call in " << CS.getFunction()->getName() << " to "
+       << F->getName() << (T.byOperand ? " (by operand)" : " (by literal name)");
+    // Per formal: its actuals (more than one: an unbound pointer formal
+    // receiving every pointer input).
+    std::vector<std::vector<const Value *>> actuals(F->arg_size());
+    std::vector<bool> multi(F->arg_size(), false);
+    for (unsigned i = 0; i < F->arg_size(); i++) {
+      Type *FT = F->getArg(i)->getType();
+      const Value *V = nullptr;
+      const char *how = nullptr;
+      if (i < 6) {
+        if (byConstraint[i]) V = byConstraint[i], how = "constraint", g_acByConstraint++;
+        else if (byTie[i]) V = byTie[i], how = "tie", g_acByTie++;
+        else if (int k = asmTextMoveBinding(asmStr, T.pos, i);
+                 k >= 0 && (unsigned)k < opToC.size() &&
+                 Constraints[opToC[k]].Type == InlineAsm::isInput &&
+                 !Constraints[opToC[k]].isIndirect && argOfC(opToC[k]))
+          V = argOfC(opToC[k]), how = "text move", g_acByText++;
+      }
+      LS << "; formal " << i;
+      if (V) {
+        actuals[i].push_back(V);
+        LS << " <- " << how;
+      } else if (containsPointerType(FT) && !ptrInputs.empty()) {
+        actuals[i] = ptrInputs;
+        multi[i] = ptrInputs.size() > 1;
+        g_acUnboundPtr++;
+        g_acUnboundPtrActuals += ptrInputs.size();
+        LS << " unbound pointer <- " << ptrInputs.size() << " pointer inputs";
+      } else {
+        // Nothing: the formal type's null constant, as a call passing none.
+        actuals[i].push_back(Constant::getNullValue(FT));
+        (containsPointerType(FT) ? g_acUnboundPtr : g_acUnboundInt)++;
+        LS << (containsPointerType(FT) ? " unbound pointer, no pointer input"
+                                       : " unbound integer, nothing");
+      }
+    }
+    LS << "; return " << (F->getReturnType()->isVoidTy() ? "void"
+                          : results.empty() ? "unbound"
+                                            : "<- rax output");
+    if (!F->getReturnType()->isVoidTy() && !results.empty()) g_acRetBound++;
+    // One wiring per actual of the multi-bound formals (their union); an
+    // atom naming such a formal is applied once per actual.
+    size_t variants = std::max<size_t>(1, results.size());
+    for (auto &A : actuals) variants = std::max(variants, A.size());
+    if (variants > 1) {
+      auto sit = Ctx->FuncSummaries.find(F);
+      size_t named = 0;
+      if (sit != Ctx->FuncSummaries.end())
+        for (unsigned i = 0; i < F->arg_size(); i++) {
+          if (!multi[i]) continue;
+          bool hit = false;
+          for (const auto &A : sit->second->atoms)
+            hit |= A.dst == (int)i || A.src == (int)i;
+          if (hit) named += actuals[i].size();
+        }
+      if (named) {
+        g_acMultiAtomSites++;
+        g_acMultiAtomActuals += named;
+        LS << "; atoms applied to a multi-bound formal: " << named << " actuals";
+      }
+    }
+    // The repeat wirings (v >= 1) count no site counter again and push no
+    // record entry equal to one this pair already pushed (acRepeat); the
+    // summary ledgers count every wiring (each is an atom application).
+    acFrom = {rowLinks.size(), mintLinks.size(), chainRegs.size(),
+              chainDispatches.size(), byteCopies.size()};
+    acRowNoted = false;
+    g_acExtraWirings += variants - 1;
+    for (size_t v = 0; v < variants; v++) {
+      CallActuals Act(&CS);
+      Act.callee = F;
+      Act.args.clear();
+      for (auto &A : actuals) Act.args.push_back(A[std::min(v, A.size() - 1)]);
+      Act.result = results.empty() ? nullptr : results[std::min(v, results.size() - 1)];
+      acRepeat = v > 0;
+      handleCall(Act, F);
+    }
+    acRepeat = false;
+    if (traced) errs() << LS.str() << "\n";
+    else CG_LOG(LS.str() << "\n");
   }
 }
 

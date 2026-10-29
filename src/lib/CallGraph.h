@@ -4,6 +4,7 @@
 #include <llvm/IR/Value.h>
 #include <llvm/IR/InstVisitor.h>
 #include <llvm/IR/GlobalIFunc.h>
+#include <llvm/IR/InlineAsm.h>
 
 #include <memory>
 #include <cstdint>
@@ -102,8 +103,9 @@ protected:
   void seedReachable();
   void reachLedger();
   bool handleMemcpy(const llvm::CallBase*);
-  // The actuals a call's wiring reads (AC0): the site, its arguments (a
-  // null one is unbound), the value that receives the return (null: none)
+  // The actuals a call's wiring reads (AC0): the site, its arguments (an
+  // asm call's unbound formal gets its type's null constant), the value
+  // that receives the return (null: none)
   // and the statically named callee. A call instruction's own view is its
   // operands, itself and getCalledFunction().
   struct CallActuals {
@@ -471,6 +473,9 @@ protected:
                            const llvm::Value *DataV, bool fromWalker);
   void bindTracepointMediatorPairs();
   void handleInlineAsm(llvm::CallBase &CS);
+  void handleAsmCalls(llvm::CallBase &CS,
+                      const std::vector<llvm::InlineAsm::ConstraintInfo> &Constraints,
+                      const std::vector<int> &cToArg, const std::vector<int> &cToRet);
   void collectLocalAllocaSummaries(const llvm::Function *F);
   bool isSummarizableAlloca(const llvm::AllocaInst *AI) const;
   bool resolveSummarizedAllocaSlot(const llvm::Value *Ptr, NodeIndex &slotRep);
@@ -712,6 +717,38 @@ protected:
   };
   std::vector<MintLink> mintLinks;
   size_t inlineInserts = 0; // (d): owner-code constructor calls minted
+  // AC: a multi-bound asm call is wired once per actual (handleAsmCalls);
+  // on the repeat wirings (acRepeat) the per-site counters are not counted
+  // again and a record entry equal to one this (site, callee) already
+  // pushed is not pushed again (acFrom: the records' sizes before its
+  // first wiring). acRowNoted: its container row was counted and warned.
+  bool acRepeat = false, acRowNoted = false;
+  struct { size_t row = 0, mint = 0, reg = 0, disp = 0, copy = 0; } acFrom;
+  template <class V, class E>
+  bool acPushed(const V &vec, size_t from, const E &eq) const {
+    if (!acRepeat) return false;
+    for (size_t i = from; i < vec.size(); i++)
+      if (eq(vec[i])) return true;
+    return false;
+  }
+  void acNoteRow(const llvm::CallBase *CS, const llvm::Function *CF);
+  void pushRowLink(const RowLink &L) {
+    if (!acPushed(rowLinks, acFrom.row, [&](const RowLink &o) {
+          return o.owner == L.owner && o.in == L.in && o.out == L.out && o.name == L.name;
+        }))
+      rowLinks.push_back(L);
+  }
+  void pushMintLink(const MintLink &L) {
+    if (!acPushed(mintLinks, acFrom.mint, [&](const MintLink &o) {
+          return o.owner == L.owner && o.out == L.out && o.name == L.name &&
+                 o.site == L.site && o.cont == L.cont;
+        }))
+      mintLinks.push_back(L);
+  }
+  void pushByteCopy(const std::tuple<NodeIndex, NodeIndex, int64_t, const llvm::Instruction *> &C) {
+    if (!acPushed(byteCopies, acFrom.copy, [&](const auto &o) { return o == C; }))
+      byteCopies.push_back(C);
+  }
   // Per verified container: the body's element values (constructor results
   // in the body), the byte offsets the body writes on an element, and the
   // constructors (code-field targets) with the argument that carries the

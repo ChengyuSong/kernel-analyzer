@@ -4206,12 +4206,21 @@ bool CallGraphPass::runCellResolution() {
       modOf.update(F, [](ModSet &) {});
       for (const Function *C : cs) modOf.update(C, [](ModSet &) {});
     }
+    // DT2: the rounds walk the callers in module order, not the map's
+    // pointer order, so the round count is reproducible (the sets are the
+    // least fixpoint either way).
+    std::vector<const Function *> order;
+    for (auto &[M, _] : Ctx->Modules)
+      for (const Function &F : *M)
+        if (calls.count(&F)) order.push_back(&F);
+    assert(order.size() == calls.size() &&
+           "every function with calls belongs to a loaded module");
     for (bool grew = true; grew;) {
       grew = false;
       dtModRounds++;
-      for (auto &[F, cs] : calls)
+      for (const Function *F : order)
         modOf.update(F, [&](ModSet &MS) {
-          for (const Function *C : cs) {
+          for (const Function *C : calls.find(F)->second) {
             if (C == F) continue; // its own set: already in MS
             modOf.with(C, [&](const ModSet &CM) {
               if (CM.all && !MS.all) { MS.all = true; grew = true; }

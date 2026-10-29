@@ -2280,10 +2280,18 @@ static const GlobalValue *resolveChainKeySym(GlobalContext *Ctx,
 bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
                                       const GlobalContext::FuncSummary &S,
                                       bool *retBound, const Function *SF) {
+  return applySummaryAtoms(CallActuals(CS), S, retBound, SF);
+}
+
+// The atoms read the call's actuals from Act (AC0).
+bool CallGraphPass::applySummaryAtoms(const CallActuals &Act,
+                                      const GlobalContext::FuncSummary &S,
+                                      bool *retBound, const Function *SF) {
+  const CallBase *CS = Act.site;
   // Label atoms (plan 3.46): a typed step of T from argN + K into a node
   // of its own; nothing transfers.
   for (const auto &LA : S.labels) {
-    if (LA.arg < 0 || (unsigned)LA.arg >= CS->arg_size()) continue;
+    if (LA.arg < 0 || (unsigned)LA.arg >= Act.size()) continue;
     const llvm::StructType *Ty = LA.ty;
     if (!Ty) {
       static std::map<std::string, const llvm::StructType *> byName;
@@ -2303,7 +2311,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       Ty = it->second;
       if (!Ty) continue;
     }
-    NodeIndex a = getRepNodeForValue(CS->getArgOperand(LA.arg));
+    NodeIndex a = getRepNodeForValue(Act.arg(LA.arg));
     if (a == AndersNodeFactory::InvalidIndex) continue;
     NodeIndex base = summaryFieldPtr(a, LA.off);
     NodeIndex sink = getCanonicalNode(NF.createValueNode());
@@ -2332,8 +2340,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
   };
   auto nodeForRef = [&](int ref, bool create) -> NodeIndex {
     const Value *v =
-        ref < 0 ? (const Value *)CS
-                : ((unsigned)ref < CS->arg_size() ? CS->getArgOperand(ref)
+        ref < 0 ? Act.result
+                : ((unsigned)ref < Act.size() ? Act.arg(ref)
                                                   : nullptr);
     if (!v) { g_sumSkipped++; return AndersNodeFactory::InvalidIndex; }
     NodeIndex n = getRepNodeForValue(v);
@@ -2474,12 +2482,12 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       // feeds it. A.off==1 adds RET-TRANSPARENCY: the callsite value
       // receives (only) the invoked fn's return — severs the
       // ret-pooling hub channel (fwnode devcon family, task #31).
-      if ((unsigned)A.dst >= CS->arg_size() ||
-          (A.src >= 0 && (unsigned)A.src >= CS->arg_size())) {
+      if ((unsigned)A.dst >= Act.size() ||
+          (A.src >= 0 && (unsigned)A.src >= Act.size())) {
         g_sumSkipped++;
         break;
       }
-      const Value *fv = CS->getArgOperand(A.dst)->stripPointerCasts();
+      const Value *fv = Act.arg(A.dst)->stripPointerCasts();
       if (isa<ConstantPointerNull>(fv))
         break; // null fn: never invoked, nothing to bind
       const auto *RF = dyn_cast<Function>(fv);
@@ -2525,8 +2533,8 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::ChainReg: {
-      if ((unsigned)A.src >= CS->arg_size() ||
-          (A.dst >= 0 && (unsigned)A.dst >= CS->arg_size())) {
+      if ((unsigned)A.src >= Act.size() ||
+          (A.dst >= 0 && (unsigned)A.dst >= Act.size())) {
         g_sumSkipped++;
         break;
       }
@@ -2540,10 +2548,10 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
           key = canonChainKey(key);
       } else if (A.dst >= 0) {
         key = canonChainKey(dyn_cast<GlobalValue>(
-            CS->getArgOperand(A.dst)->stripPointerCasts()));
+            Act.arg(A.dst)->stripPointerCasts()));
       }
       const auto *blk = dyn_cast<GlobalVariable>(
-          CS->getArgOperand(A.src)->stripPointerCasts());
+          Act.arg(A.src)->stripPointerCasts());
       Function *fn = nullptr;
       if (blk && blk->hasInitializer()) {
         // walk the constant initializer to the fn at byte offset A.off
@@ -2583,14 +2591,14 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       break;
     }
     case GlobalContext::SummaryAtom::ChainCall: {
-      if ((A.gsym.empty() && (unsigned)A.dst >= CS->arg_size()) ||
-          (unsigned)A.src >= CS->arg_size()) { g_sumSkipped++; break; }
+      if ((A.gsym.empty() && (unsigned)A.dst >= Act.size()) ||
+          (unsigned)A.src >= Act.size()) { g_sumSkipped++; break; }
       if (chainFinalized) { g_chainLate++; needPooled = true; break; }
       const GlobalValue *key =
           !A.gsym.empty()
               ? resolveChainKeySym(Ctx, CS, A.gsym)
               : canonChainKey(dyn_cast<GlobalValue>(
-                    CS->getArgOperand(A.dst)->stripPointerCasts()));
+                    Act.arg(A.dst)->stripPointerCasts()));
       if (!key) { g_chainCallDyn++; needPooled = true; break; }
       if (!chainDispatches.empty() && chainDispatches.back().cs == CS &&
           chainDispatches.back().key == key) {
@@ -2617,7 +2625,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       // "<synthetic>" in weld blame / traces — the x20 15-subsys
       // unattributable bucket (2026-08-25).
       {
-        const Function *TF = CS->getCalledFunction();
+        const Function *TF = Act.callee;
         std::string tag =
             "freshsub:" + (TF ? TF->getName().str() : std::string("<icall>")) +
             "@" + CS->getFunction()->getName().str();
@@ -2680,7 +2688,7 @@ bool CallGraphPass::applySummaryAtoms(const CallBase *CS,
       Function *siteF = nullptr;
       if (!A.siteFn.empty()) {
         siteF = CS->getModule()->getFunction(A.siteFn);
-      } else if (const Function *TF = CS->getCalledFunction()) {
+      } else if (const Function *TF = Act.callee) {
         siteF = const_cast<Function *>(TF);
       }
       if (siteF) siteF = getFuncDef(siteF);

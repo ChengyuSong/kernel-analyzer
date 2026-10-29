@@ -102,7 +102,22 @@ protected:
   void seedReachable();
   void reachLedger();
   bool handleMemcpy(const llvm::CallBase*);
+  // The actuals a call's wiring reads (AC0): the site, its arguments (a
+  // null one is unbound), the value that receives the return (null: none)
+  // and the statically named callee. A call instruction's own view is its
+  // operands, itself and getCalledFunction().
+  struct CallActuals {
+    const llvm::CallBase *site;
+    std::vector<const llvm::Value *> args;
+    const llvm::Value *result;
+    const llvm::Function *callee;
+    explicit CallActuals(const llvm::CallBase *CS);
+    unsigned size() const { return args.size(); }
+    const llvm::Value *arg(unsigned i) const { return args[i]; }
+  };
   bool handleCall(const llvm::CallBase*, const llvm::Function*,
+                  int opsSkipArg = -1);
+  bool handleCall(const CallActuals &, const llvm::Function*,
                   int opsSkipArg = -1);
   bool removeCallEdges(const llvm::CallBase*, const llvm::Function*);
   bool isCompatibleType(const llvm::Type *T1, const llvm::Type *T2);
@@ -255,6 +270,10 @@ protected:
                          const GlobalContext::FuncSummary &S,
                          bool *retBound = nullptr,
                          const llvm::Function *SF = nullptr);
+  bool applySummaryAtoms(const CallActuals &CA,
+                         const GlobalContext::FuncSummary &S,
+                         bool *retBound = nullptr,
+                         const llvm::Function *SF = nullptr);
   // Keyed pair-channels (CHAINREG/CHAINCALL): registrations and
   // dispatch sites collected during edge construction, wired per key
   // (cross product) after the last module. Keys are chain-head
@@ -277,6 +296,8 @@ protected:
   void finalizeChainPairs();
   const llvm::GlobalValue *canonChainKey(const llvm::GlobalValue *G);
   void wireCallArgs(const llvm::CallBase *CS, const llvm::Function *CF,
+                    int skipArg = -1);
+  void wireCallArgs(const CallActuals &CA, const llvm::Function *CF,
                     int skipArg = -1);
   void confirmFreshWrappers();
   // Kept across the carve rounds (P-ord): the wrappers the confirmer

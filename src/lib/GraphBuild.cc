@@ -942,8 +942,21 @@ static std::string tagWalkTag(const char *base) {
   return std::string(base) + ":" + (*g_tagWalkWhy ? g_tagWalkWhy : "clean");
 }
 size_t g_intStoreUnmodeled = 0;
+CallGraphPass::CallActuals::CallActuals(const CallBase *CS)
+    : site(CS), result(CS), callee(CS->getCalledFunction()) {
+  for (const Use &U : CS->args()) args.push_back(U.get());
+}
+
 bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
                                int opsSkipArg) {
+  return handleCall(CallActuals(CS), CF, opsSkipArg);
+}
+
+// The wiring of one call to CF, reading the actuals from Act (AC0).
+bool CallGraphPass::handleCall(const CallActuals &Act, const Function *CF,
+                               int opsSkipArg) {
+  const CallBase *CS = Act.site;
+  const bool resPtr = Act.result && Act.result->getType()->isPointerTy();
   if (CF->isIntrinsic()) {
     // handle intrinsic functions
     return false;
@@ -960,7 +973,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
   // its side effects through them stay); the result comes only from the
   // row: a lookup reads the owner's element cell, an insert writes its
   // element there (and may hand back an element of the cell, or its own).
-  if (CFLCells && CS->getCalledFunction())
+  if (CFLCells && Act.callee)
     if (auto rit = containerRowOf.find(CF);
         rit != containerRowOf.end() && !containerBodies[rit->second.cont].count(CS->getFunction())) {
       using CR = GlobalContext::ContainerRow;
@@ -975,28 +988,28 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       // this site. A lookup with CREATE mints too, unless the create
       // argument is the constant false (then it only looks up).
       bool mints = R.elem == -1 && (R.role == CR::Insert || R.role == CR::Lookup);
-      if (mints && R.role == CR::Lookup && R.create >= 0 && (unsigned)R.create < CS->arg_size())
-        if (const auto *KC = dyn_cast<ConstantInt>(CS->getArgOperand(R.create)); KC && KC->isZero()) mints = false;
-      if (R.owner >= 0 && (unsigned)R.owner < CS->arg_size() && CS->getType()->isPointerTy() &&
+      if (mints && R.role == CR::Lookup && R.create >= 0 && (unsigned)R.create < Act.size())
+        if (const auto *KC = dyn_cast<ConstantInt>(Act.arg(R.create)); KC && KC->isZero()) mints = false;
+      if (R.owner >= 0 && (unsigned)R.owner < Act.size() && resPtr &&
           (R.role == CR::Lookup || R.role == CR::Insert) && R.elem == -1) {
-        const NodeIndex own = nodeOf(CS->getArgOperand(R.owner)), out = nodeOf(CS);
+        const NodeIndex own = nodeOf(Act.arg(R.owner)), out = nodeOf(Act.result);
         if (R.role == CR::Lookup) rowLinks.push_back({own, AndersNodeFactory::InvalidIndex, out, elemsName});
         if (mints) mintLinks.push_back({own, out, elemsName, CS, rit->second.cont});
         retBound = true;
       }
-      if ((R.role == CR::Lookup || R.role == CR::Insert) && R.owner >= 0 && (unsigned)R.owner < CS->arg_size() &&
+      if ((R.role == CR::Lookup || R.role == CR::Insert) && R.owner >= 0 && (unsigned)R.owner < Act.size() &&
           R.elem != -1) {
         NodeIndex in = AndersNodeFactory::InvalidIndex, out = AndersNodeFactory::InvalidIndex;
-        if (R.role == CR::Insert && (unsigned)R.elem < CS->arg_size()) in = nodeOf(CS->getArgOperand(R.elem));
-        if (CS->getType()->isPointerTy()) out = nodeOf(CS);
-        rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), in, out, elemsName});
+        if (R.role == CR::Insert && (unsigned)R.elem < Act.size()) in = nodeOf(Act.arg(R.elem));
+        if (resPtr) out = nodeOf(Act.result);
+        rowLinks.push_back({nodeOf(Act.arg(R.owner)), in, out, elemsName});
         if (in != AndersNodeFactory::InvalidIndex && out != AndersNodeFactory::InvalidIndex)
           addAssignmentEdge(in, out); // the insert hands back its own element too
         // A further element (llist_add_batch's chain end) enters the cell too.
         if (R.role == CR::Insert)
           for (int e : R.moreElems)
-            if ((unsigned)e < CS->arg_size())
-              rowLinks.push_back({nodeOf(CS->getArgOperand(R.owner)), nodeOf(CS->getArgOperand(e)),
+            if ((unsigned)e < Act.size())
+              rowLinks.push_back({nodeOf(Act.arg(R.owner)), nodeOf(Act.arg(e)),
                                   AndersNodeFactory::InvalidIndex, elemsName});
         retBound = true;
       }
@@ -1007,11 +1020,11 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       // handle's content, this site's own included) and the site's other
       // elements (a chain).
       const size_t ci = rit->second.cont;
-      if (ci < caOn.size() && caOn[ci] && R.role == CR::Insert && R.owner >= 0 && (unsigned)R.owner < CS->arg_size()) {
+      if (ci < caOn.size() && caOn[ci] && R.role == CR::Insert && R.owner >= 0 && (unsigned)R.owner < Act.size()) {
         std::vector<NodeIndex> elems;
-        if (R.elem >= 0 && (unsigned)R.elem < CS->arg_size()) elems.push_back(getCanonicalNode(nodeOf(CS->getArgOperand(R.elem))));
+        if (R.elem >= 0 && (unsigned)R.elem < Act.size()) elems.push_back(getCanonicalNode(nodeOf(Act.arg(R.elem))));
         for (int e : R.moreElems)
-          if ((unsigned)e < CS->arg_size()) elems.push_back(getCanonicalNode(nodeOf(CS->getArgOperand(e))));
+          if ((unsigned)e < Act.size()) elems.push_back(getCanonicalNode(nodeOf(Act.arg(e))));
         // The address of key K ("struct.T+off") on the object base points at.
         auto keyAddr = [&](NodeIndex base, const std::string &K) {
           const int64_t off = std::stoll(K.substr(K.rfind('+') + 1));
@@ -1023,7 +1036,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
           return getCanonicalNode(f);
         };
         CellWriteSize ws(*this, curDL->getPointerSize());
-        const NodeIndex own = getCanonicalNode(nodeOf(CS->getArgOperand(R.owner)));
+        const NodeIndex own = getCanonicalNode(nodeOf(Act.arg(R.owner)));
         size_t edges = 0;
         for (const std::string &H : caHandleKeys[ci]) {
           const NodeIndex hd = getRepDerefNode(keyAddr(own, H));
@@ -1052,16 +1065,16 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
   // verified container's constructor (a code-field target) makes an
   // element of the owner passed to it: RET is minted per owner at this
   // site and enters the owner's element cell.
-  if (CFLCells && CS->getCalledFunction() && !retBound && CS->getType()->isPointerTy())
+  if (CFLCells && Act.callee && !retBound && resPtr)
     for (size_t ci = 0; ci < containerCtors.size(); ci++) {
       auto cit = containerCtors[ci].find(CF);
       if (cit == containerCtors[ci].end() || containerBodies[ci].count(CS->getFunction()) ||
-          cit->second >= CS->arg_size())
+          cit->second >= Act.size())
         continue;
-      NodeIndex own = getRepNodeForValue(CS->getArgOperand(cit->second));
-      if (own == AndersNodeFactory::InvalidIndex) own = getCanonicalNode(NF.createValueNode(CS->getArgOperand(cit->second)));
-      NodeIndex out = getRepNodeForValue(CS);
-      if (out == AndersNodeFactory::InvalidIndex) out = getCanonicalNode(NF.createValueNode(CS));
+      NodeIndex own = getRepNodeForValue(Act.arg(cit->second));
+      if (own == AndersNodeFactory::InvalidIndex) own = getCanonicalNode(NF.createValueNode(Act.arg(cit->second)));
+      NodeIndex out = getRepNodeForValue(Act.result);
+      if (out == AndersNodeFactory::InvalidIndex) out = getCanonicalNode(NF.createValueNode(Act.result));
       mintLinks.push_back({own, out, NF.internCellName(Ctx->Containers[ci].name + ".elems"), CS, ci});
       inlineInserts++;
       retBound = true;
@@ -1078,7 +1091,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
     // cell into the pool, 4 reader sites went full-pool, +27k pairs).
     // Indirect resolutions keep the pooled arg/ret wiring.
     const bool directSite =
-        CS->getCalledFunction() ||
+        Act.callee ||
         !Ctx->IndirectCallInsts.count(const_cast<llvm::CallBase *>(CS));
     // TRANSFER-FREE summaries (NOOP/EMPTY: zero atoms) are safe at
     // indirectly-resolved sites too: they only SKIP wiring, so at a
@@ -1102,7 +1115,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
                           sit->second->atoms.empty() &&
                           !sit->second->fresh && !sit->second->noop && !sit->second->none;
     if (sit != Ctx->FuncSummaries.end() && !freeOnly && (directSite || transferFree)) {
-      if (!applySummaryAtoms(CS, *sit->second, &retBound, sit->first))
+      if (!applySummaryAtoms(Act, *sit->second, &retBound, sit->first))
         return false;
       // Invoke atom with dynamic fn at this callsite: fall through to
       // the pooled arg/ret wiring (sound, LEDGERed). retBound=true
@@ -1130,7 +1143,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
       return false;
   }
 
-  wireCallArgs(CS, CF, opsSkipArg);
+  wireCallArgs(Act, CF, opsSkipArg);
 
   // handle return (pointer or pointer-bearing aggregate, e.g. {ptr,ptr})
   if (!retBound && containsPointerType(CF->getReturnType())) {
@@ -1143,7 +1156,7 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
     retNode = getCanonicalNode(retNode);
     // The callsite may not have a value node if it discards the return value
     // (e.g., void-typed callsite matched via permissive isCompatible)
-    NodeIndex callNode = getRepNodeForValue(CS);
+    NodeIndex callNode = Act.result ? getRepNodeForValue(Act.result) : AndersNodeFactory::InvalidIndex;
     if (callNode != AndersNodeFactory::InvalidIndex)
       addAssignmentEdge(retNode, callNode);
   } else if (!retBound && curDL &&
@@ -1162,14 +1175,14 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
         !CF->empty())
       retNode = NF.createReturnNode(CF);
     if (retNode != AndersNodeFactory::InvalidIndex &&
-        retNode != NF.getUniversalPtrNode()) {
+        retNode != NF.getUniversalPtrNode() && Act.result) {
       retNode = getCanonicalNode(retNode);
-      NodeIndex callNode = getRepNodeForValue(CS);
+      NodeIndex callNode = getRepNodeForValue(Act.result);
       if (callNode == AndersNodeFactory::InvalidIndex)
-        callNode = getCanonicalNode(NF.createValueNode(CS));
+        callNode = getCanonicalNode(NF.createValueNode(Act.result));
       addAssignmentEdge(retNode, callNode);
       // Segment-local field claim for the call-result segment.
-      if (Graph.fieldSensitive() && !ptrToIntTagRoundTripOnly(CS))
+      if (Graph.fieldSensitive() && !ptrToIntTagRoundTripOnly(Act.result))
         addFieldWildcardLoop(callNode,
                              tagWalkTag("int-callret-dirty-segment").c_str());
     }
@@ -1184,16 +1197,22 @@ bool CallGraphPass::handleCall(const CallBase *CS, const Function *CF,
 // edge: the callsite's fresh object is its return identity).
 void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
                                  int skipArg) {
+  wireCallArgs(CallActuals(CS), CF, skipArg);
+}
+
+void CallGraphPass::wireCallArgs(const CallActuals &Act, const Function *CF,
+                                 int skipArg) {
+  const CallBase *CS = Act.site;
   // handle args:
   // - fixed arguments map to formal params
   // - variadic tail (if any) maps to the callee's vararg summary node
-  unsigned numArgs = CS->arg_size();
+  unsigned numArgs = Act.size();
   unsigned numFormals = CF->arg_size();
   unsigned minArgs = std::min(numArgs, numFormals);
   for (unsigned i = 0; i < minArgs; i++) {
     if ((int)i == skipArg)
       continue; // ops-pairs tightening: receiver bound per-pair instead
-    Value *arg = CS->getArgOperand(i);
+    const Value *arg = Act.arg(i);
     // First-class aggregates ({ptr,ptr} closures, coerced small structs)
     // carry pointer identity by value — skip only pointer-free types.
     if (!containsPointerType(arg->getType())) {
@@ -1265,7 +1284,7 @@ void CallGraphPass::wireCallArgs(const CallBase *CS, const Function *CF,
       std::vector<std::string> keys;
       const bool keyed = varargKeysAt(CS, CF, keys);
       for (unsigned i = numFormals; i < numArgs; i++) {
-        Value *arg = CS->getArgOperand(i);
+        const Value *arg = Act.arg(i);
         const NodeIndex varargNode = keyed ? varargKeyNode(CF, keys[i - numFormals]) : poolNode;
         if (!containsPointerType(arg->getType())) {
           // Laundered ints ride varargs too (non-benign-fmt callsites

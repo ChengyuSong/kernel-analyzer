@@ -15,7 +15,10 @@
 # compiled with its CFLAGS. "// KAFLAGS: ..." adds analyzer flags, split
 # as xargs splits them: quotes group (an object name with spaces in a why
 # pattern is one quoted argument), | and globs are literal, and nothing is
-# expanded or run.
+# expanded or run. "// CGEDGE: caller callee..." on a call's line: the
+# --callgraph-json lists each callee as a direct edge of caller at that
+# line, in the caller's callees and in the callee's callers (function ids
+# matched by their name after the last ':').
 set -u
 cd "$(dirname "$0")"
 BIN=${KAMAIN:-../release/lib/KAMain}
@@ -42,8 +45,10 @@ for c in t_pool_*.c t_cells_*.c t_cells_*.ll; do
     "$CLANG" -g $flags -emit-llvm -c "$m" -o "$OUT/${m%.c}.bc" || { echo "FAIL[$n]: compile $m"; fail=1; continue 2; }
     mods+=("$OUT/${m%.c}.bc")
   done
+  cgargs=()
+  grep -q "// CGEDGE:" "$c" && cgargs=(--callgraph-json="$OUT/$n.cg.json")
   timeout 120 "$BIN" --verbose=2 --func-summaries=../func_summaries.txt --cfl-cells --cfl-union-keys=tag \
-    --cfl-alloc-origins --cfl-whole-program "${kargs[@]}" --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" "${mods[@]}" > "$OUT/$n.log" 2>&1
+    --cfl-alloc-origins --cfl-whole-program "${kargs[@]}" "${cgargs[@]}" --cfl-dump-icalls-json="$OUT/$n.json" "$OUT/$n.bc" "${mods[@]}" > "$OUT/$n.log" 2>&1
   rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL[$n]: exit $rc (124: did not finish in 120 s)"; fail=1; continue; fi
   maxc=$(grep -o "// MAXCELLS: [0-9]*" "$c" | grep -o "[0-9]*$")
@@ -58,6 +63,29 @@ for c in t_pool_*.c t_cells_*.c t_cells_*.ll; do
   while read -r re; do
     [ -n "$re" ] && grep -qE "$re" "$OUT/$n.log" && bad="$bad [NOLOG $re]"
   done < <(grep -o "// NOLOG: .*" "$c" | sed 's|// NOLOG: ||')
+  if [ ${#cgargs[@]} -gt 0 ]; then
+    bad="$bad$(python3 - "$OUT/$n.cg.json" "$c" <<'PY'
+import json, sys
+fns = json.load(open(sys.argv[1]))["functions"]
+def fid(name):
+    ids = [k for k in fns if k.split(":")[-1] == name]
+    return ids[0] if len(ids) == 1 else None
+bad = []
+for ln, text in enumerate(open(sys.argv[2]), 1):
+    if "// CGEDGE:" not in text:
+        continue
+    caller, *callees = text.split("// CGEDGE:")[1].split()
+    r = fid(caller)
+    for callee in callees:
+        e = fid(callee)
+        if (r is None or e is None
+                or {"callee": e, "call_type": "direct", "line": ln} not in fns[r]["callees"]
+                or {"caller": r, "call_type": "direct", "line": ln} not in fns[e]["callers"]):
+            bad.append(f" [CGEDGE {caller} {callee} line {ln}]")
+print("".join(bad))
+PY
+)"
+  fi
   if [ -n "$bad" ]; then echo "FAIL[$n]:$bad"; fail=1; continue; fi
   # A measurement-only case (LOG/NOLOG, no CHECK: the mode stops without answers).
   if ! grep -q "// CHECK:" "$c"; then echo "PASS[$n] (log only)"; continue; fi

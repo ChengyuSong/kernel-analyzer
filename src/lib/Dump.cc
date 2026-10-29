@@ -463,6 +463,10 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     if (F && !(F->isIntrinsic() && !isImportantIntrinsic(F)))
       AllFuncs.insert(F);
   }
+  for (auto &[CS, FS] : Ctx->AsmCallees) {
+    AllFuncs.insert(CS->getFunction());
+    AllFuncs.insert(FS.begin(), FS.end());
+  }
   // One entry per function ID. An external symbol (a bare-name ID) is
   // the definition the analysis linked it to (getFuncDef; its
   // declarations otherwise). Every other ID is keyed by its file and can
@@ -496,6 +500,9 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
     auto &merged = MergedCallers[getFuncId(F)];
     merged.insert(merged.end(), CIS.begin(), CIS.end());
   }
+  for (auto &[CS, FS] : Ctx->AsmCallees)
+    for (const Function *F : FS)
+      MergedCallers[getFuncId(F)].push_back(CS);
   for (auto &E : MergedCallers) {
     auto &V = E.second;
     std::sort(V.begin(), V.end(), [&](const CallBase *A, const CallBase *B) {
@@ -533,14 +540,18 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
       for (auto &BB : *Body) {
         for (auto &I : BB) {
           const CallBase *CI = dyn_cast<CallBase>(&I);
-          if (!CI || CI->isInlineAsm())
+          if (!CI)
             continue;
 
-          auto it = Ctx->Callees.find(CI);
-          if (it == Ctx->Callees.end())
+          // An asm's calls are listed from AsmCallees (AC's targets).
+          const CalleeMap &Map =
+              CI->isInlineAsm() ? Ctx->AsmCallees : Ctx->Callees;
+          auto it = Map.find(CI);
+          if (it == Map.end())
             continue;
 
-          bool isDirect = (CI->getCalledFunction() != nullptr);
+          // A call the asm text makes names its callee: direct.
+          bool isDirect = CI->getCalledFunction() || CI->isInlineAsm();
           unsigned line = getCallLine(CI);
 
           std::vector<std::pair<std::string, const Function *>> Targets;
@@ -586,7 +597,7 @@ void CallGraphPass::dumpCallGraphJSON(StringRef Path) {
         const Function *CallerF = CI->getFunction();
         if (!CallerF || (CallerF->isIntrinsic() && !isImportantIntrinsic(CallerF)))
           continue;
-        bool isDirect = (CI->getCalledFunction() != nullptr);
+        bool isDirect = CI->getCalledFunction() || CI->isInlineAsm();
         unsigned line = getCallLine(CI);
         if (CI->getMetadata("ka.sunk") &&
             !seenCallers.insert({getFuncId(CallerF), isDirect, line}).second)

@@ -3054,6 +3054,7 @@ void CallGraphPass::handleAsmCalls(
   for (const Target &T : targets) {
     Function *F = T.F;
     (T.byOperand ? g_acByOperand : g_acByName)++;
+    Ctx->AsmCallees[&CS].insert(F);
     std::string line;
     raw_string_ostream LS(line);
     LS << "InlineAsm: asm call in " << CS.getFunction()->getName() << " to "

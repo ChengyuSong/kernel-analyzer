@@ -288,6 +288,12 @@ public:
   // Map a function to all potential caller instructions.
   CallerMap Callers;
 
+  // An inline asm call site to the functions its text calls (AC's
+  // targets, getFuncDef'd). Kept out of Callees, which every resolver,
+  // dump and census reads as the call answer; only callgraph-json lists
+  // these, as direct edges at the asm's line.
+  CalleeMap AsmCallees;
+
   // Indirect call instructions
   CallInstSet IndirectCallInsts;
 
